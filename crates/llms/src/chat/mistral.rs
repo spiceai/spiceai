@@ -40,7 +40,7 @@ use snafu::ResultExt;
 use std::{
     collections::HashMap,
     num::NonZeroUsize,
-    path::Path,
+    path::{Path, PathBuf},
     pin::Pin,
     str::FromStr,
     sync::{
@@ -95,10 +95,10 @@ impl MistralLlama {
         tokenizer_config: &Path,
     ) -> Box<dyn ModelPaths> {
         Box::new(LocalModelPaths::new(
-            tokenizer.map(Into::into).unwrap_or_default(),
+            tokenizer.map_or(PathBuf::default(), Into::into),
             // Not needed for LLama2 / DuckDB Chat, but needed in `EricLBuehler/mistral.rs`.
-            tokenizer.map(Into::into).unwrap_or_default(),
-            tokenizer_config.into(),
+            tokenizer.map_or(PathBuf::default(), Into::into),
+            Some(tokenizer_config.to_path_buf()),
             vec![model_weights.into()],
             None,
             None,

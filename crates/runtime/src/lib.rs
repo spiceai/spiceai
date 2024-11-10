@@ -808,9 +808,32 @@ impl Runtime {
     fn load_view(&self, view: &View) -> Result<()> {
         let df = Arc::clone(&self.df);
         df.register_view(view.name.clone(), view.sql.clone())
-            .context(UnableToAttachViewSnafu)?;
+            .context(UnableToAttachViewSnafu)
+            .inspect_err(|_| {
+                self.status
+                    .update_view(&view.name, status::ComponentStatus::Error);
+            })?;
 
+        self.status
+            .update_view(&view.name, status::ComponentStatus::Ready);
         Ok(())
+    }
+
+    fn remove_view(&self, view: &View) {
+        if self.df.table_exists(view.name.clone()) {
+            if let Err(e) = self.df.remove_view(&view.name) {
+                tracing::warn!("Unable to unload view {}: {}", &view.name, e);
+                return;
+            }
+        }
+        tracing::info!("Unloaded view {}", &view.name);
+    }
+
+    fn update_view(&self, view: &View) {
+        self.status
+            .update_view(&view.name, status::ComponentStatus::Refreshing);
+        self.remove_view(view);
+        let _ = self.load_view(view);
     }
 
     async fn load_catalog_connector(&self, catalog: &Catalog) -> Result<Arc<dyn DataConnector>> {
@@ -1565,6 +1588,113 @@ impl Runtime {
         Ok(())
     }
 
+    async fn apply_model_diff(&self, current_app: &Arc<App>, new_app: &Arc<App>) {
+        for model in &new_app.models {
+            if let Some(current_model) = current_app.models.iter().find(|m| m.name == model.name) {
+                if current_model != model {
+                    self.update_model(model).await;
+                }
+            } else {
+                self.status
+                    .update_model(&model.name, status::ComponentStatus::Initializing);
+                self.load_model(model).await;
+            }
+        }
+
+        // Remove models that are no longer in the app
+        for model in &current_app.models {
+            if !new_app.models.iter().any(|m| m.name == model.name) {
+                self.status
+                    .update_model(&model.name, status::ComponentStatus::Disabled);
+                self.remove_model(model).await;
+            }
+        }
+    }
+
+    fn apply_view_diff(&self, current_app: &Arc<App>, new_app: &Arc<App>) {
+        let valid_views = Self::get_valid_views(new_app, LogErrors(true));
+        let existing_views = Self::get_valid_views(current_app, LogErrors(false));
+        for view in valid_views {
+            if let Some(current_view) = existing_views.iter().find(|v| v.name == view.name) {
+                if view != *current_view {
+                    self.update_view(&view);
+                }
+            } else {
+                self.status
+                    .update_view(&view.name, status::ComponentStatus::Initializing);
+                let _ = self.load_view(&view);
+            }
+        }
+
+        // Remove views that are no longer in the app
+        for view in &current_app.views {
+            if !new_app.views.iter().any(|v| v.name == view.name) {
+                let view = match View::try_from(view.clone()) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::error!("Could not remove view {}: {e}", view.name);
+                        continue;
+                    }
+                };
+                self.status
+                    .update_view(&view.name, status::ComponentStatus::Disabled);
+                self.remove_view(&view);
+            }
+        }
+    }
+
+    async fn apply_dataset_diff(&self, current_app: &Arc<App>, new_app: &Arc<App>) {
+        let valid_datasets = Self::get_valid_datasets(new_app, LogErrors(true));
+        let existing_datasets = Self::get_valid_datasets(current_app, LogErrors(false));
+
+        for ds in valid_datasets {
+            if let Some(current_ds) = existing_datasets.iter().find(|d| d.name == ds.name) {
+                if ds != *current_ds {
+                    self.update_dataset(ds).await;
+                }
+            } else {
+                self.status
+                    .update_dataset(&ds.name, status::ComponentStatus::Initializing);
+                self.load_dataset(ds).await;
+            }
+        }
+
+        // Remove datasets that are no longer in the app
+        for ds in &current_app.datasets {
+            if !new_app.datasets.iter().any(|d| d.name == ds.name) {
+                let ds = match Dataset::try_from(ds.clone()) {
+                    Ok(ds) => ds,
+                    Err(e) => {
+                        tracing::error!("Could not remove dataset {}: {e}", ds.name);
+                        continue;
+                    }
+                };
+                self.status
+                    .update_dataset(&ds.name, status::ComponentStatus::Disabled);
+                self.remove_dataset(&ds).await;
+            }
+        }
+    }
+
+    async fn apply_catalog_diff(&self, current_app: &Arc<App>, new_app: &Arc<App>) {
+        let valid_catalogs = Self::get_valid_catalogs(new_app, LogErrors(true));
+        let existing_catalogs = Self::get_valid_catalogs(current_app, LogErrors(false));
+
+        for catalog in &valid_catalogs {
+            if let Some(current_catalog) = existing_catalogs.iter().find(|c| c.name == catalog.name)
+            {
+                if catalog != current_catalog {
+                    // It isn't currently possible to remove catalogs once they have been loaded in DataFusion. `load_catalog` will overwrite the existing catalog.
+                    self.load_catalog(catalog).await;
+                }
+            } else {
+                self.status
+                    .update_catalog(&catalog.name, status::ComponentStatus::Initializing);
+                self.load_catalog(catalog).await;
+            }
+        }
+    }
+
     async fn start_pods_watcher(&self) -> notify::Result<()> {
         let mut pods_watcher = self.pods_watcher.write().await;
         let Some(mut pods_watcher) = pods_watcher.take() else {
@@ -1583,80 +1713,10 @@ impl Runtime {
                 tracing::debug!("Updated pods information: {:?}", new_app);
                 tracing::debug!("Previous pods information: {:?}", current_app);
 
-                // Check for new and updated catalogs
-                let valid_catalogs = Self::get_valid_catalogs(&new_app, LogErrors(true));
-                let existing_catalogs = Self::get_valid_catalogs(current_app, LogErrors(false));
-
-                for catalog in &valid_catalogs {
-                    if let Some(current_catalog) =
-                        existing_catalogs.iter().find(|c| c.name == catalog.name)
-                    {
-                        if catalog != current_catalog {
-                            // It isn't currently possible to remove catalogs once they have been loaded in DataFusion. `load_catalog` will overwrite the existing catalog.
-                            self.load_catalog(catalog).await;
-                        }
-                    } else {
-                        self.status
-                            .update_catalog(&catalog.name, status::ComponentStatus::Initializing);
-                        self.load_catalog(catalog).await;
-                    }
-                }
-
-                // Check for new and updated datasets
-                let valid_datasets = Self::get_valid_datasets(&new_app, LogErrors(true));
-                let existing_datasets = Self::get_valid_datasets(current_app, LogErrors(false));
-
-                for ds in valid_datasets {
-                    if let Some(current_ds) = existing_datasets.iter().find(|d| d.name == ds.name) {
-                        if ds != *current_ds {
-                            self.update_dataset(ds).await;
-                        }
-                    } else {
-                        self.status
-                            .update_dataset(&ds.name, status::ComponentStatus::Initializing);
-                        self.load_dataset(ds).await;
-                    }
-                }
-
-                // Remove datasets that are no longer in the app
-                for ds in &current_app.datasets {
-                    if !new_app.datasets.iter().any(|d| d.name == ds.name) {
-                        let ds = match Dataset::try_from(ds.clone()) {
-                            Ok(ds) => ds,
-                            Err(e) => {
-                                tracing::error!("Could not remove dataset {}: {e}", ds.name);
-                                continue;
-                            }
-                        };
-                        self.status
-                            .update_dataset(&ds.name, status::ComponentStatus::Disabled);
-                        self.remove_dataset(&ds).await;
-                    }
-                }
-
-                // check for new and updated models
-                for model in &new_app.models {
-                    if let Some(current_model) =
-                        current_app.models.iter().find(|m| m.name == model.name)
-                    {
-                        if current_model != model {
-                            self.update_model(model).await;
-                        }
-                    } else {
-                        self.status
-                            .update_model(&model.name, status::ComponentStatus::Initializing);
-                        self.load_model(model).await;
-                    }
-                }
-
-                // Remove models that are no longer in the app
-                for model in &current_app.models {
-                    if !new_app.models.iter().any(|m| m.name == model.name) {
-                        self.status
-                            .update_model(&model.name, status::ComponentStatus::Disabled);
-                        self.remove_model(model).await;
-                    }
-                }
+                self.apply_catalog_diff(current_app, &new_app).await;
+                self.apply_dataset_diff(current_app, &new_app).await;
+                self.apply_view_diff(current_app, &new_app);
+                self.apply_model_diff(current_app, &new_app).await;
 
                 *current_app = new_app;
             } else {

@@ -582,6 +582,20 @@ impl DataFusion {
         self.ctx.catalog(catalog).is_some()
     }
 
+    pub fn remove_view(&self, view_name: &TableReference) -> Result<()> {
+        if !self.ctx.table_exist(view_name.clone()).unwrap_or(false) {
+            return Ok(());
+        }
+
+        if let Err(e) = self.ctx.deregister_table(view_name.clone()) {
+            return UnableToDeleteTableSnafu {
+                reason: e.to_string(),
+            }
+            .fail();
+        }
+        Ok(())
+    }
+
     pub async fn remove_table(&self, dataset_name: &TableReference) -> Result<()> {
         if !self.ctx.table_exist(dataset_name.clone()).unwrap_or(false) {
             return Ok(());
