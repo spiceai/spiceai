@@ -37,8 +37,8 @@ use tokenizers::Tokenizer;
 use crate::{
     chunking::{Chunker, ChunkingConfig, RecursiveSplittingChunker},
     embeddings::{
-        candle::util::link_files_into_tmp_dir, Embed, Error, FailedToCreateEmbeddingSnafu,
-        FailedToInstantiateEmbeddingModelSnafu, Result,
+        candle::util::link_files_into_tmp_dir, encode_embedding, Embed, Error,
+        FailedToCreateEmbeddingSnafu, FailedToInstantiateEmbeddingModelSnafu, Result,
     },
 };
 
@@ -235,6 +235,8 @@ impl Embed for TeiEmbed {
     ) -> Result<CreateEmbeddingResponse, OpenAIError> {
         let model_name = req.model.clone();
         let inputs = inputs_from_openai(&req.input);
+        let format = req.encoding_format.unwrap_or_default();
+
         let batch_size = inputs.len();
         let results = self.embed_futures(inputs).await.map_err(|e| {
             OpenAIError::ApiError(ApiError {
@@ -250,7 +252,7 @@ impl Embed for TeiEmbed {
         for (i, r) in results.into_iter().enumerate() {
             embeddings.push(Embedding {
                 object: "embedding".to_string(),
-                embedding: r.results,
+                embedding: encode_embedding(&format, r.results),
                 index: i as u32,
             });
             prompt_tokens += r.metadata.prompt_tokens as u32;

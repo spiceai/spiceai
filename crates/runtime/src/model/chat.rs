@@ -56,16 +56,7 @@ pub async fn try_to_chat_model<S: ::std::hash::BuildHasher>(
     params: &HashMap<String, SecretString, S>,
     rt: Arc<Runtime>,
 ) -> Result<Box<dyn Chat>, LlmError> {
-    let model_id = component.get_model_id();
-    let prefix = component.get_source().ok_or(LlmError::UnknownModelSource {
-        source: format!(
-            "Unknown model source for spicepod component from: {}",
-            component.from.clone()
-        )
-        .into(),
-    })?;
-
-    let model = construct_model(&prefix, model_id, component, params)?;
+    let model = construct_model(component, params)?;
 
     // Handle tool usage
     let spice_tool_opt: Option<SpiceToolsOptions> = extract_secret!(params, "spice_tools")
@@ -97,11 +88,17 @@ pub async fn try_to_chat_model<S: ::std::hash::BuildHasher>(
 }
 
 pub fn construct_model<S: ::std::hash::BuildHasher>(
-    prefix: &ModelSource,
-    model_id: Option<String>,
     component: &spicepod::component::model::Model,
     params: &HashMap<String, SecretString, S>,
 ) -> Result<Box<dyn Chat>, LlmError> {
+    let model_id = component.get_model_id();
+    let prefix = component.get_source().ok_or(LlmError::UnknownModelSource {
+        source: format!(
+            "Unknown model source for spicepod component from: {}",
+            component.from.clone()
+        )
+        .into(),
+    })?;
     let model = match prefix {
         ModelSource::HuggingFace => {
             let Some(id) = model_id else {
@@ -123,16 +120,19 @@ pub fn construct_model<S: ::std::hash::BuildHasher>(
                 })?
                 .clone();
             let tokenizer_path = component.find_any_file_path(ModelFileType::Tokenizer);
-            let tokenizer_config_path = component
-                .find_any_file_path(ModelFileType::TokenizerConfig)
-                .ok_or(LlmError::FailedToLoadTokenizer {
-                    source: "No 'tokenizer_config_path' parameter provided".into(),
-                })?;
+            let tokenizer_config_path =
+                component.find_any_file_path(ModelFileType::TokenizerConfig);
+            let config_path = component.find_any_file_path(ModelFileType::Config);
+            let chat_template_literal = params
+                .get("chat_template")
+                .map(|s| s.expose_secret().as_str());
 
             llms::chat::create_local_model(
                 &weights_path,
+                config_path.as_deref(),
                 tokenizer_path.as_deref(),
-                tokenizer_config_path.as_ref(),
+                tokenizer_config_path.as_deref(),
+                chat_template_literal,
             )
         }
         ModelSource::SpiceAI => Err(LlmError::UnsupportedTaskForModel {
