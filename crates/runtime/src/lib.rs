@@ -1674,7 +1674,7 @@ impl Runtime {
             Ok(deps) => construct_effected_in_topological_order(deps,&views_that_changed ),
         }.unwrap_or(valid_views.iter().map(|v| v.name.clone()).collect());
 
-        for view_name in afffected_views_in_order_of_dependencies {
+        for view_name in affected_views_in_order_of_dependencies {
             if let Some(view) = valid_views.iter().find(|v| v.name == view_name) {
                 if existing_views.iter().any(|v| v.name == view.name) {
                     // Update view even if unchanged, as it may have dependencies that have changed
