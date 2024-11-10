@@ -117,14 +117,14 @@ pub fn construct_effected_in_topological_order<
         }
     }
 
-    // Find all dependent nodes.
-    let mut dependent_nodes = nodes.iter().cloned().collect::<HashSet<T>>();
+    // Find all effected nodes.
+    let mut effected_nodes = nodes.iter().cloned().collect::<HashSet<T>>();
     let mut q = nodes.iter().cloned().collect::<VecDeque<T>>();
 
     while let Some(node) = q.pop_front() {
         if let Some(dependents) = reverse_graph.get(&node) {
             for dep in dependents {
-                if dependent_nodes.insert(dep.clone()) {
+                if effected_nodes.insert(dep.clone()) {
                     // Add to queue if insert was successful (not already in set).
                     q.push_back(dep.clone());
                 }
@@ -132,10 +132,23 @@ pub fn construct_effected_in_topological_order<
         }
     }
 
-    // Construct topological ordering of dependent nodes.
+    // Construct topological ordering over effected nodes.
     let nodes = graph
         .into_iter()
-        .filter(|(node, _)| dependent_nodes.contains(node))
+        .filter_map(|(node, deps)| {
+            if effected_nodes.contains(&node) {
+                Some((
+                    node,
+                    // Filter out dependencies that are not in effected nodes subtree.
+                    // These are nodes that impact nodes in the subtree, but are not affected by the change.
+                    deps.into_iter()
+                        .filter(|dep| effected_nodes.contains(dep))
+                        .collect(),
+                ))
+            } else {
+                None
+            }
+        })
         .collect::<HashMap<T, Vec<T>>>();
 
     construct_topological_ordering(nodes)
@@ -154,8 +167,27 @@ mod tests {
         nodes.insert("D", vec![]);
 
         assert_eq!(
-            construct_topological_ordering(nodes),
+            construct_topological_ordering(nodes.clone()),
             Some(vec!["D", "C", "B", "A"])
+        );
+
+        assert_eq!(
+            construct_effected_in_topological_order(nodes.clone(), &["D"]),
+            Some(vec!["D", "C", "B", "A"])
+        );
+
+        assert_eq!(
+            construct_effected_in_topological_order(nodes.clone(), &["B"]),
+            Some(vec!["B", "A"])
+        );
+
+        assert_eq!(
+            construct_effected_in_topological_order(nodes.clone(), &["A"]),
+            Some(vec!["A"])
+        );
+        assert_eq!(
+            construct_effected_in_topological_order(nodes.clone(), &[]),
+            Some(vec![])
         );
     }
 
@@ -171,9 +203,15 @@ mod tests {
         nodes.insert("G", vec!["H"]);
         nodes.insert("H", vec![]);
 
+        let result = construct_topological_ordering(nodes.clone()).expect("Should not be None");
+        assert!(
+            result == vec!["H", "D", "G", "C", "F", "B", "E", "A"]
+                || result == vec!["D", "H", "C", "G", "B", "F", "A", "E"]
+        );
+
         assert_eq!(
-            construct_topological_ordering(nodes),
-            Some(vec!["H", "D", "G", "C", "F", "B", "E", "A"])
+            construct_effected_in_topological_order(nodes.clone(), &["H"]),
+            Some(vec!["H", "G", "F", "E"])
         );
     }
 
@@ -198,6 +236,10 @@ mod tests {
         nodes.insert("B", vec!["C"]);
         nodes.insert("C", vec!["A"]);
 
-        assert_eq!(construct_topological_ordering(nodes), None);
+        assert_eq!(construct_topological_ordering(nodes.clone()), None);
+        assert_eq!(
+            construct_effected_in_topological_order(nodes.clone(), &["A"]),
+            None
+        );
     }
 }
