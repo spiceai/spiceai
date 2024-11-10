@@ -1616,6 +1616,9 @@ impl Runtime {
         }
     }
 
+    /// Update views based on changed between the current and new app.
+    /// This function will update views that have changed, and remove views that are no longer in the app.
+    /// It will also update views that have dependencies that have changed.
     fn apply_view_diff(&self, current_app: &Arc<App>, new_app: &Arc<App>) {
         let valid_views = Self::get_valid_views(new_app, LogErrors(true));
         let existing_views = Self::get_valid_views(current_app, LogErrors(false));
@@ -1648,7 +1651,8 @@ impl Runtime {
             }
         }
 
-        // Get ordering of views to load, including those unchanged
+        // Get ordering of views to load, including those unchanged but with dependencies that have changed
+        // If we can't determine the order, we'll just load the views in the order they are in the app
         let afffected_views_in_order_of_dependencies = match valid_views
             .iter()
             .map(|v| {
