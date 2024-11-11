@@ -42,10 +42,13 @@ use opentelemetry_proto::tonic::metrics::v1::metric::Data;
 use opentelemetry_proto::tonic::metrics::v1::number_data_point::Value;
 use opentelemetry_proto::tonic::metrics::v1::DataPointFlags;
 use opentelemetry_proto::tonic::metrics::v1::NumberDataPoint;
+use runtime_auth::layer::grpc::make_interceptor;
+use runtime_auth::GrpcAuth;
 use secrecy::ExposeSecret;
 use snafu::prelude::*;
 use tonic::async_trait;
 use tonic::codec::CompressionEncoding;
+use tonic::service::interceptor;
 use tonic::transport::{Identity, Server, ServerTlsConfig};
 use tonic::Request;
 use tonic::Response;
@@ -101,7 +104,7 @@ const TIME_UNIX_NANO_COLUMN_NAME: &str = "time_unix_nano";
 const START_TIME_UNIX_NANO_COLUMN_NAME: &str = "start_time_unix_nano";
 
 pub struct Service {
-    data_fusion: Arc<DataFusion>,
+    datafusion: Arc<DataFusion>,
     once_tracer: OnceTracer,
 }
 
@@ -117,14 +120,11 @@ impl MetricsService for Service {
             for scope_metric in resource_metric.scope_metrics {
                 for metric in scope_metric.metrics {
                     if let Some(data) = metric.data {
-                        let existing_schema = match self
-                            .data_fusion
-                            .get_arrow_schema(metric.name.as_str())
-                            .await
-                        {
-                            Ok(schema) => Some(schema),
-                            Err(_) => None,
-                        };
+                        let existing_schema =
+                            match self.datafusion.get_arrow_schema(metric.name.as_str()).await {
+                                Ok(schema) => Some(schema),
+                                Err(_) => None,
+                            };
                         let (record_batch_result, data_points_count) = metric_data_to_record_batch(
                             metric.name.as_str(),
                             &data,
@@ -135,7 +135,7 @@ impl MetricsService for Service {
                         match record_batch_result {
                             Ok(record_batch) => {
                                 if !self
-                                    .data_fusion
+                                    .datafusion
                                     .is_writable(&TableReference::bare(metric.name.to_string()))
                                 {
                                     warn_once!(
@@ -156,7 +156,7 @@ impl MetricsService for Service {
 
                                 let mut write_failed = false;
                                 if let Err(e) = self
-                                    .data_fusion
+                                    .datafusion
                                     .write_data(
                                         TableReference::bare(metric.name.as_str()),
                                         data_update,
@@ -586,11 +586,12 @@ fn append_null(
 
 pub async fn start(
     bind_address: SocketAddr,
-    data_fusion: Arc<DataFusion>,
+    datafusion: Arc<DataFusion>,
     tls_config: Option<Arc<TlsConfig>>,
+    grpc_auth: Option<Arc<dyn GrpcAuth + Send + Sync>>,
 ) -> Result<()> {
     let service = Service {
-        data_fusion,
+        datafusion,
         once_tracer: OnceTracer::new(),
     };
     let svc = MetricsServiceServer::new(service).accept_compressed(CompressionEncoding::Gzip);
@@ -610,6 +611,7 @@ pub async fn start(
     }
 
     server
+        .layer(interceptor(make_interceptor(grpc_auth)))
         .add_service(create_health_service().await)
         .add_service(svc)
         .serve(bind_address)

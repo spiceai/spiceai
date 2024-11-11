@@ -26,6 +26,7 @@ mod tool_use;
 
 pub use chat::{try_to_chat_model, LLMModelStore};
 pub use embed::{try_to_embedding, EmbeddingModelStore};
+pub use tool_use::ToolUsingChat;
 
 use crate::DataFusion;
 

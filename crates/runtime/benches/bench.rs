@@ -127,17 +127,17 @@ async fn main() -> Result<(), String> {
                 run_connector_bench(connector, &upload_results_dataset, args.bench_name.as_ref()).await?;
             }
             let accelerators: Vec<Acceleration> = vec![
-                create_acceleration("arrow", acceleration::Mode::Memory, None),
+                create_acceleration("arrow", acceleration::Mode::Memory, args.bench_name.as_ref()),
                 #[cfg(feature = "duckdb")]
-                create_acceleration("duckdb", acceleration::Mode::Memory, None),
+                create_acceleration("duckdb", acceleration::Mode::Memory, args.bench_name.as_ref()),
                 #[cfg(feature = "duckdb")]
-                create_acceleration("duckdb", acceleration::Mode::File, None),
+                create_acceleration("duckdb", acceleration::Mode::File, args.bench_name.as_ref()),
                 #[cfg(feature = "sqlite")]
-                create_acceleration("sqlite", acceleration::Mode::Memory, None),
+                create_acceleration("sqlite", acceleration::Mode::Memory, args.bench_name.as_ref()),
                 #[cfg(feature = "sqlite")]
-                create_acceleration("sqlite", acceleration::Mode::File, None),
+                create_acceleration("sqlite", acceleration::Mode::File, args.bench_name.as_ref()),
                 #[cfg(feature = "postgres")]
-                create_acceleration("postgres", acceleration::Mode::Memory, Some(get_postgres_params(true, &args.bench_name))),
+                create_acceleration("postgres", acceleration::Mode::Memory, args.bench_name.as_ref()),
             ];
             for accelerator in accelerators {
                 run_accelerator_bench(accelerator.clone(), &upload_results_dataset, "tpch").await?;
@@ -156,22 +156,7 @@ async fn main() -> Result<(), String> {
                 _ => return Err(format!("Invalid mode parameter for {accelerator} accelerator")),
             };
 
-            let params: Option<Params> = {
-                #[cfg(feature = "postgres")]
-                {
-                    if accelerator == "postgres" {
-                        Some(get_postgres_params(true, &args.bench_name))
-                    } else {
-                        None
-                    }
-                }
-                #[cfg(not(feature = "postgres"))]
-                {
-                    None
-                }
-            };
-
-            let acceleration = create_acceleration(accelerator, mode, params);
+            let acceleration = create_acceleration(accelerator, mode, args.bench_name.as_ref());
 
             match args.bench_name.as_ref() {
                 "tpch" => {
@@ -179,6 +164,9 @@ async fn main() -> Result<(), String> {
                 }
                 "tpcds" => {
                     run_accelerator_bench(acceleration, &upload_results_dataset, "tpcds").await?;
+                }
+                "clickbench" => {
+                    run_accelerator_bench(acceleration, &upload_results_dataset, "clickbench").await?;
                 }
                 _ => return Err(format!("Invalid mode bench_name parameter {}", args.bench_name)),
             }
@@ -306,11 +294,13 @@ async fn run_accelerator_bench(
     Ok(())
 }
 
-fn create_acceleration(
-    engine: &str,
-    mode: acceleration::Mode,
-    params: Option<Params>,
-) -> Acceleration {
+fn create_acceleration(engine: &str, mode: acceleration::Mode, bench_name: &str) -> Acceleration {
+    let params: Option<Params> = match engine {
+        #[cfg(feature = "postgres")]
+        "postgres" => Some(get_postgres_params(true, bench_name)),
+        _ => None,
+    };
+
     Acceleration {
         engine: Some(engine.to_string()),
         mode,
@@ -479,7 +469,7 @@ async fn record_explain_plan(
     query: &str,
 ) -> Result<(), String> {
     // TODO: Turn on snapshot for tpcds queries after tpcds hardening
-    if query_name.starts_with("tpcds") {
+    if query_name.starts_with("tpcds") || query_name.starts_with("clickbench") {
         return Ok(());
     }
 

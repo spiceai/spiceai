@@ -737,6 +737,8 @@ impl TableProvider for AcceleratedTable {
             federated_insert_plan,
         ]));
 
+        self.refresher().set_initial_load_completed(true);
+
         Ok(union_plan)
     }
 }

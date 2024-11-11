@@ -286,7 +286,7 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
 /// # Errors
 ///
 /// Returns an error if the Flight service returns an error.
-async fn get_records(
+pub async fn get_records(
     mut client: FlightServiceClient<Channel>,
     line: &str,
     api_key: Option<&String>,

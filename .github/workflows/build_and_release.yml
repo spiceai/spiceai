@@ -37,7 +37,7 @@ jobs:
             target_arch: aarch64
             target_arch_go: arm64
           - name: macOS x64 (Intel)
-            runner: macos-13
+            runner: macos-14-large # https://github.com/actions/runner-images
             target_os: darwin
             target_arch: x86_64
             target_arch_go: amd64

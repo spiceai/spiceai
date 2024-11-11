@@ -22,9 +22,10 @@ use std::{
 };
 use tokio::sync::Mutex;
 
-use super::SpiceModelTool;
-
-pub mod builtin;
+use super::{
+    builtin::catalog::BuiltinToolCatalog, catalog::SpiceToolCatalog,
+    memory::catalog::MemoryToolCatalog, SpiceModelTool,
+};
 
 pub trait ToolFactory: Send + Sync {
     fn construct(
@@ -44,8 +45,18 @@ pub async fn register_tool_factory(from_source: &str, tool: Arc<dyn ToolFactory>
     registry.insert(from_source.to_string(), tool);
 }
 
-pub async fn register_all() {
-    register_tool_factory("builtin", Arc::new(builtin::BuiltinToolFactory {})).await;
+pub async fn register_all_factories() {
+    register_tool_factory("builtin", Arc::new(BuiltinToolCatalog {})).await;
+    register_tool_factory("memory", Arc::new(MemoryToolCatalog {})).await;
+}
+
+/// Get all catalogs available by default in the spice runtime.
+#[must_use]
+pub fn default_available_catalogs() -> Vec<Arc<dyn SpiceToolCatalog>> {
+    vec![
+        Arc::new(BuiltinToolCatalog {}),
+        Arc::new(MemoryToolCatalog {}),
+    ]
 }
 
 #[allow(clippy::implicit_hasher)]

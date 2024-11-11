@@ -1,3 +1,4 @@
+use datafusion::common::DFSchema;
 use snafu::prelude::*;
 
 #[derive(Debug, Snafu)]
@@ -43,7 +44,7 @@ pub fn verify_schema(
         let a_data_type = a.data_type();
         let b_data_type = b.data_type();
 
-        if a_data_type != b_data_type {
+        if !DFSchema::datatype_is_semantically_equal(a_data_type, b_data_type) {
             return SchemaMismatchDataTypeSnafu {
                 name: a.name(),
                 expected: format!("{a_data_type}"),

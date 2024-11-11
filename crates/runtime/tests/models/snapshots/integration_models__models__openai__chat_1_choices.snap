@@ -1,0 +1,5 @@
+---
+source: crates/runtime/tests/models/openai.rs
+expression: "format!(\"{:?}\", _response.choices)"
+---
+[ChatChoice { index: 0, message: ChatCompletionResponseMessage { content: Some("10"), refusal: None, tool_calls: None, role: Assistant, function_call: None }, finish_reason: Some(Stop), logprobs: None }]

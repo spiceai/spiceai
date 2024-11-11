@@ -16,6 +16,7 @@ limitations under the License.
 
 pub mod api_key;
 pub mod error;
+pub mod layer;
 mod traits;
 
 pub use traits::*;
