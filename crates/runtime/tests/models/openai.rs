@@ -33,8 +33,9 @@ use crate::{
     models::{
         create_api_bindings_config, get_executed_tasks, get_params_with_secrets,
         get_taxi_trips_dataset, get_tpcds_dataset, json_is_single_row_with_value,
-        normalize_embeddings_response, normalize_search_response, send_chat_completions_request,
-        send_nsql_request, send_search_request,
+        normalize_chat_completion_response, normalize_embeddings_response,
+        normalize_search_response, send_chat_completions_request, send_nsql_request,
+        send_search_request,
     },
     utils::{runtime_ready_check, verify_env_secret_exists},
 };
@@ -313,11 +314,9 @@ async fn openai_test_chat_completion() -> Result<(), anyhow::Error> {
         false,
     ).await?;
 
-    tracing::debug!("Response received: {:?}", response);
-
-    assert_eq!(
-        response["choices"][0]["message"]["content"].as_str(),
-        Some("10")
+    insta::assert_snapshot!(
+        "chat_completion",
+        normalize_chat_completion_response(response, false)
     );
 
     Ok(())

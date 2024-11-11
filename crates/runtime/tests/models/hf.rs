@@ -25,7 +25,7 @@ use llms::chat::create_hf_model;
 use runtime::{
     auth::EndpointAuth,
     model::ToolUsingChat,
-    tools::{get_tools, options::SpiceToolsOptions},
+    tools::{options::SpiceToolsOptions, utils::get_tools},
     Runtime,
 };
 use spicepod::component::{
@@ -39,9 +39,9 @@ use crate::{
     init_tracing,
     models::{
         create_api_bindings_config, get_taxi_trips_dataset, get_tpcds_dataset,
-        json_is_single_row_with_value, normalize_embeddings_response, normalize_search_response,
-        send_chat_completions_request, send_embeddings_request, send_nsql_request,
-        send_search_request,
+        json_is_single_row_with_value, normalize_chat_completion_response,
+        normalize_embeddings_response, normalize_search_response, send_chat_completions_request,
+        send_embeddings_request, send_nsql_request, send_search_request,
     },
     utils::runtime_ready_check,
 };
@@ -238,8 +238,7 @@ async fn huggingface_test_embeddings() -> Result<(), anyhow::Error> {
 async fn huggingface_test_chat_completion() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(None);
 
-    let mut model_with_tools =
-        get_huggingface_model("microsoft/Phi-3-mini-4k-instruct", "phi3", "hf_model");
+    let mut model_with_tools = get_huggingface_model(HF_TEST_MODEL, HF_TEST_MODEL_TYPE, "hf_model");
     model_with_tools
         .params
         .insert("spice_tools".to_string(), "auto".into());
@@ -266,7 +265,7 @@ async fn huggingface_test_chat_completion() -> Result<(), anyhow::Error> {
         () = rt.load_components() => {}
     }
 
-    let _response = send_chat_completions_request(
+    let response = send_chat_completions_request(
         http_base_url.as_str(),
         vec![
             ("system".to_string(), "You are an assistant that responds to queries by providing only the requested data values without extra explanation.".to_string()),
@@ -276,9 +275,12 @@ async fn huggingface_test_chat_completion() -> Result<(), anyhow::Error> {
         false,
     ).await?;
 
-    // Result verification is disabled due to issue below: model does not use tools and can't provide the expected response.
+    // Message content verification is disabled due to issue below: model does not use tools and can't provide the expected response.
     // https://github.com/spiceai/spiceai/issues/3426
-    // assert_eq!(response["choices"][0]["message"]["content"].as_str(), Some("10"));
+    insta::assert_snapshot!(
+        "chat_completion",
+        normalize_chat_completion_response(response, true)
+    );
 
     Ok(())
 }

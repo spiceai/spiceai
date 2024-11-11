@@ -216,6 +216,49 @@ fn normalize_embeddings_response(mut json: Value) -> String {
     json.to_string()
 }
 
+/// Normalizes chat completion response for consistent snapshot testing by replacing dynamic values
+fn normalize_chat_completion_response(mut json: Value, normalize_message_content: bool) -> String {
+    // Replace `content`
+    if normalize_message_content {
+        if let Some(choices) = json.get_mut("choices").and_then(|c| c.as_array_mut()) {
+            for choice in choices {
+                if let Some(message) = choice.get_mut("message") {
+                    if let Some(content) = message.get_mut("content") {
+                        *content = json!("content_val");
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(created) = json.get_mut("created") {
+        *created = json!("created_val");
+    }
+
+    // Replace `completion_tokens`, `prompt_tokens`, and `total_tokens` fields in `usage`
+    if let Some(usage) = json.get_mut("usage") {
+        if let Some(completion_tokens) = usage.get_mut("completion_tokens") {
+            *completion_tokens = json!("completion_tokens_val");
+        }
+        if let Some(prompt_tokens) = usage.get_mut("prompt_tokens") {
+            *prompt_tokens = json!("prompt_tokens_val");
+        }
+        if let Some(total_tokens) = usage.get_mut("total_tokens") {
+            *total_tokens = json!("total_tokens_val");
+        }
+    }
+
+    if let Some(system_fingerprint) = json.get_mut("system_fingerprint") {
+        *system_fingerprint = json!("system_fingerprint_val");
+    }
+
+    if let Some(id) = json.get_mut("id") {
+        *id = json!("id_val");
+    }
+
+    json.to_string()
+}
+
 async fn send_embeddings_request(
     base_url: &str,
     model: &str,
