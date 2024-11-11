@@ -395,7 +395,7 @@ mod tests {
     use std::pin::Pin;
     use url::Url;
 
-    use crate::dataconnector::DataConnectorFactory;
+    use crate::dataconnector::{DataConnectorFactory, DataConnectorParams};
     use crate::parameters::ParameterSpec;
 
     use super::*;
@@ -413,12 +413,13 @@ mod tests {
     impl DataConnectorFactory for TestConnector {
         fn create(
             &self,
-            params: Parameters,
-            _metadata: Option<HashMap<String, String>>,
+            params: DataConnectorParams,
         ) -> Pin<Box<dyn Future<Output = crate::dataconnector::NewDataConnectorResult> + Send>>
         {
             Box::pin(async move {
-                let connector = Self { params };
+                let connector = Self {
+                    params: params.parameters,
+                };
                 Ok(Arc::new(connector) as Arc<dyn DataConnector>)
             })
         }

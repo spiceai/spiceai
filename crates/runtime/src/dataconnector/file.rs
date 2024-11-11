@@ -19,7 +19,6 @@ use crate::component::dataset::Dataset;
 use async_trait::async_trait;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use snafu::prelude::*;
-use std::collections::HashMap;
 use std::future::Future;
 use std::path::Path;
 use std::path::PathBuf;
@@ -31,6 +30,7 @@ use std::{any::Any, env};
 use tokio::sync::mpsc;
 use url::Url;
 
+use super::DataConnectorParams;
 use super::{
     listing::ListingTableConnector, DataConnector, DataConnectorFactory, DataConnectorResult,
     InvalidConfigurationSnafu, ParameterSpec, Parameters,
@@ -82,10 +82,13 @@ const PARAMETERS: &[ParameterSpec] = &[
 impl DataConnectorFactory for FileFactory {
     fn create(
         &self,
-        params: Parameters,
-        _metadata: Option<HashMap<String, String>>,
+        params: DataConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
-        Box::pin(async move { Ok(Arc::new(File { params }) as Arc<dyn DataConnector>) })
+        Box::pin(async move {
+            Ok(Arc::new(File {
+                params: params.parameters,
+            }) as Arc<dyn DataConnector>)
+        })
     }
 
     fn prefix(&self) -> &'static str {

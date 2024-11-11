@@ -26,12 +26,13 @@ use datafusion_table_providers::sql::db_connection_pool::{
 };
 use snafu::prelude::*;
 use std::any::Any;
-use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use super::{DataConnector, DataConnectorError, DataConnectorFactory, ParameterSpec, Parameters};
+use super::{
+    DataConnector, DataConnectorError, DataConnectorFactory, DataConnectorParams, ParameterSpec,
+};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -75,11 +76,10 @@ const PARAMETERS: &[ParameterSpec] = &[
 impl DataConnectorFactory for PostgresFactory {
     fn create(
         &self,
-        params: Parameters,
-        _metadata: Option<HashMap<String, String>>,
+        params: DataConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
-            match PostgresConnectionPool::new(params.to_secret_map()).await {
+            match PostgresConnectionPool::new(params.parameters.to_secret_map()).await {
                 Ok(pool) => {
                     let postgres_factory = PostgresTableFactory::new(Arc::new(pool));
                     Ok(Arc::new(Postgres { postgres_factory }) as Arc<dyn DataConnector>)

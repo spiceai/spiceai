@@ -16,6 +16,7 @@ limitations under the License.
 
 use super::DataConnector;
 use super::DataConnectorFactory;
+use super::DataConnectorParams;
 use super::ParameterSpec;
 use super::Parameters;
 use crate::component::catalog::Catalog;
@@ -125,10 +126,13 @@ const PARAMETERS: &[ParameterSpec] = &[
 impl DataConnectorFactory for UnityCatalogFactory {
     fn create(
         &self,
-        params: Parameters,
-        _metadata: Option<HashMap<String, String>>,
+        params: DataConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
-        Box::pin(async move { Ok(Arc::new(UnityCatalog { params }) as Arc<dyn DataConnector>) })
+        Box::pin(async move {
+            Ok(Arc::new(UnityCatalog {
+                params: params.parameters,
+            }) as Arc<dyn DataConnector>)
+        })
     }
 
     fn prefix(&self) -> &'static str {

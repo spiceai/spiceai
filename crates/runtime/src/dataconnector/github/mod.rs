@@ -54,7 +54,7 @@ use url::Url;
 
 use super::{
     graphql::default_spice_client, DataConnector, DataConnectorError, DataConnectorFactory,
-    ParameterSpec, Parameters,
+    DataConnectorParams, ParameterSpec, Parameters,
 };
 
 mod commits;
@@ -290,13 +290,12 @@ const PARAMETERS: &[ParameterSpec] = &[
 impl DataConnectorFactory for GithubFactory {
     fn create(
         &self,
-        params: Parameters,
-        _metadata: Option<HashMap<String, String>>,
+        params: DataConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
-        let token = params.get("token").expose().ok();
-        let client_id = params.get("client_id").expose().ok();
-        let private_key = params.get("private_key").expose().ok();
-        let installation_id = params.get("installation_id").expose().ok();
+        let token = params.parameters.get("token").expose().ok();
+        let client_id = params.parameters.get("client_id").expose().ok();
+        let private_key = params.parameters.get("private_key").expose().ok();
+        let installation_id = params.parameters.get("installation_id").expose().ok();
 
         let token_provider: Option<Arc<dyn TokenProvider>> =
             match (token, client_id, private_key, installation_id) {
@@ -315,7 +314,7 @@ impl DataConnectorFactory for GithubFactory {
 
         Box::pin(async move {
             Ok(Arc::new(Github {
-                params,
+                params: params.parameters,
                 token: token_provider,
             }) as Arc<dyn DataConnector>)
         })

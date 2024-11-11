@@ -27,12 +27,13 @@ use datafusion_table_providers::sql::db_connection_pool::{
 use mysql_async::prelude::ToValue;
 use snafu::prelude::*;
 use std::any::Any;
-use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use super::{DataConnector, DataConnectorError, DataConnectorFactory, ParameterSpec, Parameters};
+use super::{
+    DataConnector, DataConnectorError, DataConnectorFactory, DataConnectorParams, ParameterSpec,
+};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -75,15 +76,14 @@ const PARAMETERS: &[ParameterSpec] = &[
 impl DataConnectorFactory for MySQLFactory {
     fn create(
         &self,
-        params: Parameters,
-        _metadata: Option<HashMap<String, String>>,
+        params: DataConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             let pool: Arc<
                 dyn DbConnectionPool<mysql_async::Conn, &'static (dyn ToValue + Sync)>
                     + Send
                     + Sync,
-            > = match MySQLConnectionPool::new(params.to_secret_map()).await {
+            > = match MySQLConnectionPool::new(params.parameters.to_secret_map()).await {
                 Ok(pool) => Arc::new(pool),
                 Err(error) => match error {
                     mysqlpool::Error::InvalidUsernameOrPassword { .. } => {

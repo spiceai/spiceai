@@ -16,8 +16,8 @@ limitations under the License.
 
 use super::DataConnector;
 use super::DataConnectorFactory;
+use super::DataConnectorParams;
 use super::ParameterSpec;
-use super::Parameters;
 use async_trait::async_trait;
 use data_components::snowflake::SnowflakeTableFactory;
 use data_components::Read;
@@ -30,7 +30,6 @@ use itertools::Itertools;
 use snafu::prelude::*;
 use snowflake_api::SnowflakeApi;
 use std::any::Any;
-use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -78,14 +77,13 @@ const PARAMETERS: &[ParameterSpec] = &[
 impl DataConnectorFactory for SnowflakeFactory {
     fn create(
         &self,
-        params: Parameters,
-        _metadata: Option<HashMap<String, String>>,
+        params: DataConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             let pool: Arc<
                 dyn DbConnectionPool<Arc<SnowflakeApi>, &'static (dyn Sync)> + Send + Sync,
             > = Arc::new(
-                SnowflakeConnectionPool::new(&params.to_secret_map())
+                SnowflakeConnectionPool::new(&params.parameters.to_secret_map())
                     .await
                     .context(UnableToCreateSnowflakeConnectionPoolSnafu)?,
             );

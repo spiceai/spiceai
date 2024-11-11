@@ -22,7 +22,6 @@ use data_components::mssql::{
 };
 use datafusion::datasource::TableProvider;
 use snafu::{ResultExt, Snafu};
-use std::collections::HashMap;
 use std::num::ParseIntError;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -30,8 +29,8 @@ use std::{any::Any, future::Future};
 use tiberius::{Config, EncryptionLevel};
 
 use super::{
-    DataConnector, DataConnectorFactory, DataConnectorResult, ParameterSpec, Parameters,
-    UnableToGetReadProviderSnafu,
+    DataConnector, DataConnectorFactory, DataConnectorParams, DataConnectorResult, ParameterSpec,
+    Parameters, UnableToGetReadProviderSnafu,
 };
 
 #[derive(Debug, Snafu)]
@@ -169,12 +168,11 @@ impl SqlServerFactory {
 impl DataConnectorFactory for SqlServerFactory {
     fn create(
         &self,
-        params: Parameters,
-        _metadata: Option<HashMap<String, String>>,
+        params: DataConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
-        Box::pin(
-            async move { Ok(Arc::new(SqlServer::new(&params).await?) as Arc<dyn DataConnector>) },
-        )
+        Box::pin(async move {
+            Ok(Arc::new(SqlServer::new(&params.parameters).await?) as Arc<dyn DataConnector>)
+        })
     }
 
     fn prefix(&self) -> &'static str {

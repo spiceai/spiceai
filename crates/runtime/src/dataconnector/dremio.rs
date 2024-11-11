@@ -16,8 +16,8 @@ limitations under the License.
 
 use super::DataConnector;
 use super::DataConnectorFactory;
+use super::DataConnectorParams;
 use super::ParameterSpec;
-use super::Parameters;
 use crate::component::dataset::Dataset;
 use crate::dataconnector::DataConnectorError;
 use async_trait::async_trait;
@@ -34,7 +34,6 @@ use flight_client::FlightClient;
 use ns_lookup::verify_endpoint_connection;
 use snafu::prelude::*;
 use std::any::Any;
-use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -108,11 +107,11 @@ const PARAMETERS: &[ParameterSpec] = &[
 impl DataConnectorFactory for DremioFactory {
     fn create(
         &self,
-        params: Parameters,
-        _metadata: Option<HashMap<String, String>>,
+        params: DataConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             let endpoint: Arc<str> = params
+                .parameters
                 .get("endpoint")
                 .expose()
                 .ok_or_else(|p| Error::MissingParameter {
@@ -127,8 +126,18 @@ impl DataConnectorFactory for DremioFactory {
                 })?;
 
             let credentials = Credentials::new(
-                params.get("username").expose().ok().unwrap_or_default(),
-                params.get("password").expose().ok().unwrap_or_default(),
+                params
+                    .parameters
+                    .get("username")
+                    .expose()
+                    .ok()
+                    .unwrap_or_default(),
+                params
+                    .parameters
+                    .get("password")
+                    .expose()
+                    .ok()
+                    .unwrap_or_default(),
             );
             let flight_client = FlightClient::try_new(endpoint, credentials, None)
                 .await

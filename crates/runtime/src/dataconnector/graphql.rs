@@ -23,12 +23,12 @@ use data_components::{
 use datafusion::datasource::TableProvider;
 use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
 use snafu::ResultExt;
-use std::{any::Any, collections::HashMap, future::Future, pin::Pin, sync::Arc};
+use std::{any::Any, future::Future, pin::Pin, sync::Arc};
 use url::Url;
 
 use super::{
-    DataConnector, DataConnectorError, DataConnectorFactory, InvalidConfigurationSnafu,
-    ParameterSpec, Parameters,
+    DataConnector, DataConnectorError, DataConnectorFactory, DataConnectorParams,
+    InvalidConfigurationSnafu, ParameterSpec, Parameters,
 };
 
 pub struct GraphQL {
@@ -75,11 +75,12 @@ const PARAMETERS: &[ParameterSpec] = &[
 impl DataConnectorFactory for GraphQLFactory {
     fn create(
         &self,
-        params: Parameters,
-        _metadata: Option<HashMap<String, String>>,
+        params: DataConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
-            let graphql = GraphQL { params };
+            let graphql = GraphQL {
+                params: params.parameters,
+            };
             Ok(Arc::new(graphql) as Arc<dyn DataConnector>)
         })
     }

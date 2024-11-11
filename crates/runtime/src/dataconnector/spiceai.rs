@@ -17,8 +17,8 @@ limitations under the License.
 use super::DataConnector;
 use super::DataConnectorError;
 use super::DataConnectorFactory;
+use super::DataConnectorParams;
 use super::ParameterSpec;
-use super::Parameters;
 use super::UnableToGetReadProviderSnafu;
 use crate::component::catalog::Catalog;
 use crate::component::dataset::acceleration::RefreshMode;
@@ -49,7 +49,6 @@ use ns_lookup::verify_endpoint_connection;
 use snafu::prelude::*;
 use std::any::Any;
 use std::borrow::Borrow;
-use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -127,8 +126,7 @@ const PARAMETERS: &[ParameterSpec] = &[
 impl DataConnectorFactory for SpiceAIFactory {
     fn create(
         &self,
-        params: Parameters,
-        metadata: Option<HashMap<String, String>>,
+        params: DataConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         let default_flight_url: Arc<str> = if cfg!(feature = "dev") {
             "https://dev-flight.spiceai.io".into()
@@ -137,6 +135,7 @@ impl DataConnectorFactory for SpiceAIFactory {
         };
         Box::pin(async move {
             let url: Arc<str> = params
+                .parameters
                 .get("endpoint")
                 .expose()
                 .ok()
@@ -150,22 +149,20 @@ impl DataConnectorFactory for SpiceAIFactory {
             })?;
 
             let api_key = params
+                .parameters
                 .get("api_key")
                 .expose()
                 .ok_or_else(|p| MissingRequiredParameterSnafu { parameter: p.0 }.build())?;
             let mut credentials = Credentials::new("", api_key);
 
-            let metadata_map = metadata
-                .as_ref()
-                .and_then(|m| m.get("spiceai_app_id"))
-                .and_then(|app_id| {
-                    app_id.parse().ok().map(|parsed_app_id| {
-                        let mut map = MetadataMap::new();
-                        map.insert("x-spiceai-app-id", parsed_app_id);
-                        credentials = Credentials::new(app_id, api_key);
-                        map
-                    })
-                });
+            let metadata_map = params.metadata.get("spiceai_app_id").and_then(|app_id| {
+                app_id.parse().ok().map(|parsed_app_id| {
+                    let mut map = MetadataMap::new();
+                    map.insert("x-spiceai-app-id", parsed_app_id);
+                    credentials = Credentials::new(app_id, api_key);
+                    map
+                })
+            });
 
             let flight_client = FlightClient::try_new(url, credentials, metadata_map)
                 .await

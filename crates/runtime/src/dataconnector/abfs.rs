@@ -15,13 +15,15 @@ limitations under the License.
 */
 
 use super::listing::{build_fragments, ListingTableConnector};
-use super::{DataConnector, DataConnectorFactory, DataConnectorResult, ParameterSpec, Parameters};
+use super::{
+    DataConnector, DataConnectorFactory, DataConnectorParams, DataConnectorResult, ParameterSpec,
+    Parameters,
+};
 
 use crate::component::dataset::Dataset;
 use snafu::prelude::*;
 use std::any::Any;
 use std::clone::Clone;
-use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::string::String;
@@ -149,26 +151,29 @@ const PARAMETERS: &[ParameterSpec] = &[
 impl DataConnectorFactory for AzureBlobFSFactory {
     fn create(
         &self,
-        mut params: Parameters,
-        _metadata: Option<HashMap<String, String>>,
+        mut params: DataConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
-        if let Some(sas_token) = params.get("sas_string").expose().ok() {
+        if let Some(sas_token) = params.parameters.get("sas_string").expose().ok() {
             if let Some(sas_token) = sas_token.strip_prefix('?') {
-                params.insert("sas_string".to_string(), sas_token.to_string().into());
+                params
+                    .parameters
+                    .insert("sas_string".to_string(), sas_token.to_string().into());
             }
         }
 
         Box::pin(async move {
-            let access_key = params.get("access_key").expose().ok();
-            let bearer_token = params.get("bearer_token").expose().ok();
-            let sas_string = params.get("sas_string").expose().ok();
-            let skip_signature = params.get("skip_signature").expose().ok();
-            let use_emulator = params.get("use_emulator").expose().ok();
+            let access_key = params.parameters.get("access_key").expose().ok();
+            let bearer_token = params.parameters.get("bearer_token").expose().ok();
+            let sas_string = params.parameters.get("sas_string").expose().ok();
+            let skip_signature = params.parameters.get("skip_signature").expose().ok();
+            let use_emulator = params.parameters.get("use_emulator").expose().ok();
 
             let use_emulator = use_emulator.is_some_and(|b| b.parse::<bool>().unwrap_or(false));
 
             if use_emulator {
-                let azure = AzureBlobFS { params };
+                let azure = AzureBlobFS {
+                    params: params.parameters,
+                };
                 Ok(Arc::new(azure) as Arc<dyn DataConnector>)
             } else {
                 let conflicting = [
@@ -181,7 +186,9 @@ impl DataConnectorFactory for AzureBlobFSFactory {
                     Err(Box::new(Error::InvalidKeyAuthCombination)
                         as Box<dyn std::error::Error + Send + Sync>)
                 } else {
-                    let azure = AzureBlobFS { params };
+                    let azure = AzureBlobFS {
+                        params: params.parameters,
+                    };
                     Ok(Arc::new(azure) as Arc<dyn DataConnector>)
                 }
             }

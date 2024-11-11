@@ -30,8 +30,6 @@ use crate::dataaccelerator::get_accelerator_engine;
 
 use super::validate_identifier;
 
-const INVALID_TYPE_ACTION_SUPPORTED_CONNECTORS: [&str; 1] = ["duckdb"];
-
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
@@ -66,11 +64,6 @@ pub enum Error {
         field: String,
         source: fundu::ParseError,
     },
-
-    #[snafu(display(
-        "The parameter 'invalid_type_action' is not supported for the dataset '{name}'"
-    ))]
-    InvalidTypeActionNotSupported { name: String },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -171,7 +164,7 @@ impl TryFrom<spicepod_dataset::Dataset> for Dataset {
 
         let table_reference = Dataset::parse_table_reference(&dataset.name)?;
 
-        let dataset = Dataset {
+        Ok(Dataset {
             from: dataset.from,
             name: table_reference,
             mode: Mode::from(dataset.mode),
@@ -197,19 +190,7 @@ impl TryFrom<spicepod_dataset::Dataset> for Dataset {
             schema: None,
             app: None,
             invalid_type_action: dataset.invalid_type_action.map(InvalidTypeAction::from),
-        };
-
-        let source = dataset.source();
-        if !INVALID_TYPE_ACTION_SUPPORTED_CONNECTORS.contains(&source.as_str()) {
-            return Err(crate::Error::UnableToInitializeDataConnector {
-                source: Error::InvalidTypeActionNotSupported {
-                    name: dataset.name.to_string(),
-                }
-                .into(),
-            });
-        }
-
-        Ok(dataset)
+        })
     }
 }
 

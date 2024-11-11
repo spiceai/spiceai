@@ -1189,7 +1189,7 @@ impl Runtime {
             return Ok(Arc::new(LocalPodConnector::new(Arc::clone(&self.df))));
         }
 
-        match dataconnector::create_new_connector_with_params(source, params).await {
+        match dataconnector::create_new_connector(source, params).await {
             Some(dc) => dc.context(UnableToInitializeDataConnectorSnafu {}),
             None => UnknownDataConnectorSnafu {
                 data_connector: source,

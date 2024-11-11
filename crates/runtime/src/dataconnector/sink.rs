@@ -17,7 +17,7 @@ limitations under the License.
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 
-use std::{any::Any, collections::HashMap, fmt, pin::Pin, sync::Arc};
+use std::{any::Any, fmt, pin::Pin, sync::Arc};
 
 use crate::component::dataset::{acceleration::RefreshMode, Dataset};
 use datafusion::{
@@ -34,7 +34,7 @@ use datafusion::{
 };
 use futures::Future;
 
-use super::{DataConnector, DataConnectorFactory, ParameterSpec, Parameters};
+use super::{DataConnector, DataConnectorFactory, DataConnectorParams, ParameterSpec};
 
 /// A no-op connector that allows for Spice to act as a "sink" for data.
 ///
@@ -69,8 +69,7 @@ impl SinkConnectorFactory {
 impl DataConnectorFactory for SinkConnectorFactory {
     fn create(
         &self,
-        _params: Parameters,
-        _metadata: Option<HashMap<String, String>>,
+        _params: DataConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             let schema = Schema::new(vec![Field::new("placeholder", DataType::Utf8, false)]);

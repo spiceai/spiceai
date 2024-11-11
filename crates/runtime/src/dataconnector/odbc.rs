@@ -27,12 +27,11 @@ use db_connection_pool::dbconnection::odbcconn::ODBCDbConnectionPool;
 use db_connection_pool::odbcpool::ODBCPool;
 use snafu::prelude::*;
 use std::any::Any;
-use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use super::{DataConnector, DataConnectorFactory, ParameterSpec, Parameters};
+use super::{DataConnector, DataConnectorFactory, DataConnectorParams, ParameterSpec};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -178,35 +177,36 @@ fn driver_is_file(driver: &str) -> bool {
 impl DataConnectorFactory for ODBCFactory {
     fn create(
         &self,
-        params: Parameters,
-        _metadata: Option<HashMap<String, String>>,
+        params: DataConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
-            let dialect = if let Some(sql_dialect) = params.get("sql_dialect").expose().ok() {
-                let sql_dialect = SQLDialectParam::new(sql_dialect);
-                sql_dialect.try_into()
-            } else {
-                let driver = params
-                    .get("connection_string")
-                    .expose()
-                    .ok_or_else(|p| MissingParameterSnafu { param: p.0 }.build())?
-                    .to_lowercase();
+            let dialect =
+                if let Some(sql_dialect) = params.parameters.get("sql_dialect").expose().ok() {
+                    let sql_dialect = SQLDialectParam::new(sql_dialect);
+                    sql_dialect.try_into()
+                } else {
+                    let driver = params
+                        .parameters
+                        .get("connection_string")
+                        .expose()
+                        .ok_or_else(|p| MissingParameterSnafu { param: p.0 }.build())?
+                        .to_lowercase();
 
-                let driver = driver
-                    .split(';')
-                    .find(|s| s.starts_with("driver="))
-                    .context(NoDriverSpecifiedSnafu)?;
+                    let driver = driver
+                        .split(';')
+                        .find(|s| s.starts_with("driver="))
+                        .context(NoDriverSpecifiedSnafu)?;
 
-                // explicitly check if the user has tried to specify a file path
-                if driver_is_file(driver) {
-                    return Err(Error::DirectDriverNotPermitted {}.into());
-                }
+                    // explicitly check if the user has tried to specify a file path
+                    if driver_is_file(driver) {
+                        return Err(Error::DirectDriverNotPermitted {}.into());
+                    }
 
-                Ok(ODBCProfile::from(driver).into())
-            }?;
+                    Ok(ODBCProfile::from(driver).into())
+                }?;
 
             let pool: Arc<ODBCDbConnectionPool> = Arc::new(
-                ODBCPool::new(params.to_secret_map())
+                ODBCPool::new(params.parameters.to_secret_map())
                     .context(UnableToCreateODBCConnectionPoolSnafu)?,
             );
 
