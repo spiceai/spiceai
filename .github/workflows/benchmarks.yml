@@ -67,7 +67,9 @@ jobs:
         uses: arduino/setup-protoc@v3
 
       - name: Install Required Packages
-        run: sudo apt install build-essential
+        run: |
+          sudo apt-get update
+          sudo apt install -y build-essential unixodbc-dev unixodbc
 
       - name: Build benchmark binary
         run: cargo bench -p runtime --features ${{ env.FEATURES }} --profile release --no-run
