@@ -54,7 +54,7 @@ env:
 jobs:
   build-database-bench-binary:
     name: Build Benchmark Test Binary
-    runs-on: ubuntu-latest
+    runs-on: spiceai-large-runners
     steps:
       - uses: actions/checkout@v4
 
