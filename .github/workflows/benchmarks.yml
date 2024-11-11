@@ -67,7 +67,7 @@ jobs:
         uses: arduino/setup-protoc@v3
 
       - name: Install Required Packages
-        uses: sudo apt install build-essential
+        run: sudo apt install build-essential
 
       - name: Build benchmark binary
         run: cargo bench -p runtime --features ${{ env.FEATURES }} --profile release --no-run
