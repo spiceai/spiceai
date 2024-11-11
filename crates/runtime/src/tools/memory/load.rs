@@ -30,7 +30,7 @@ use crate::{
     Runtime,
 };
 
-use super::DEFAULT_MEMORY_TABLE;
+use super::{memory_table_name, DEFAULT_MEMORY_TABLE};
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct LoadMemoryParams {
@@ -82,6 +82,8 @@ impl SpiceModelTool for LoadMemoryTool {
         rt: Arc<Runtime>,
     ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::load_memory", tool = self.name(), input = arg);
+
+        let table_name = memory_table_name(&rt).await?;
         let result: Result<Value, Box<dyn std::error::Error + Send + Sync>> = async {
             let params: LoadMemoryParams = serde_json::from_str(arg).boxed()?;
             let last_interval = fundu::parse_duration(params.last.as_str()).boxed()?;
@@ -90,8 +92,7 @@ impl SpiceModelTool for LoadMemoryTool {
                 .datafusion()
                 .query_builder(
                     &format!(
-                        "SELECT value FROM {} WHERE created_at > (NOW() - INTERVAL '{}' SECOND);",
-                        DEFAULT_MEMORY_TABLE,
+                        "SELECT value FROM {table_name} WHERE created_at > (NOW() - INTERVAL '{}' SECOND);",
                         last_interval.as_secs()
                     ),
                     Protocol::Internal,

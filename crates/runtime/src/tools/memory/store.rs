@@ -30,7 +30,7 @@ use crate::{
     Runtime,
 };
 
-use super::{try_from, MemoryTableElement, DEFAULT_MEMORY_TABLE};
+use super::{memory_table_name, try_from, MemoryTableElement, DEFAULT_MEMORY_TABLE};
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct StoreMemoryParams {
@@ -96,6 +96,7 @@ impl SpiceModelTool for StoreMemoryTool {
         rt: Arc<Runtime>,
     ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::store_memory", tool = self.name(), input = arg);
+        let table_name = memory_table_name(&rt).await?;
         let result: Result<Value, Box<dyn std::error::Error + Send + Sync>> = async {
             let params: StoreMemoryParams = serde_json::from_str(arg).boxed()?;
 
@@ -104,7 +105,7 @@ impl SpiceModelTool for StoreMemoryTool {
 
             rt.datafusion()
                 .write_data(
-                    TableReference::parse_str(DEFAULT_MEMORY_TABLE),
+                    table_name,
                     DataUpdate {
                         schema: batch.schema(),
                         data: vec![batch],

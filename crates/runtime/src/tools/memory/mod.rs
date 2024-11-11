@@ -18,8 +18,11 @@ use std::sync::Arc;
 
 use arrow::array::{ArrayRef, RecordBatch, StringArray, TimestampSecondArray};
 use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef, TimeUnit};
+use datafusion::sql::TableReference;
 use once_cell::sync::Lazy;
 use uuid::Uuid;
+
+use crate::Runtime;
 
 pub mod catalog;
 pub mod load;
@@ -67,4 +70,31 @@ pub fn try_from(data: &[MemoryTableElement]) -> Result<RecordBatch, ArrowError> 
             Arc::new(created_at) as ArrayRef,
         ],
     )
+}
+
+/// Determine the name of the table to use to store/load memories.
+async fn memory_table_name(
+    rt: &Arc<Runtime>,
+) -> Result<TableReference, Box<dyn std::error::Error + Send + Sync>> {
+    let app_lock = rt.app.read().await;
+    let Some(app) = app_lock.as_deref() else {
+        return Err(Box::<dyn std::error::Error + Send + Sync>::from(
+            "App not initialized",
+        ));
+    };
+
+    match app.datasets_of_connector_type("memory").split_first() {
+        Some((table, t)) => {
+            if !t.is_empty() {
+                tracing::warn!(
+                    "Multiple memory tables found, using the first one: {}",
+                    table
+                );
+            }
+            Ok(TableReference::parse_str(table.as_str()))
+        }
+        None => Err(Box::<dyn std::error::Error + Send + Sync>::from(
+            "No memory table found",
+        )),
+    }
 }
