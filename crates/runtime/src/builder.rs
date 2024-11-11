@@ -125,7 +125,7 @@ impl RuntimeBuilder {
     pub async fn build(self) -> Runtime {
         dataconnector::register_all().await;
         dataaccelerator::register_all().await;
-        tools::factory::register_all().await;
+        tools::factory::register_all_factories().await;
         document_parse::register_all().await;
 
         let status = match self.runtime_status {

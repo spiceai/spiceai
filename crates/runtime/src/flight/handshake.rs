@@ -25,8 +25,8 @@ use tonic::{
 };
 use uuid::Uuid;
 
-use crate::flight::auth;
 use crate::timing::{TimeMeasurement, TimedStream};
+use runtime_auth::layer::flight as flight_auth;
 
 use super::metrics;
 
@@ -37,7 +37,7 @@ pub(crate) fn handle(
     metadata: &MetadataMap,
     basic_auth: Option<&Arc<dyn FlightBasicAuth + Send + Sync>>,
 ) -> Result<Response<HandshakeResponseStream>, Status> {
-    let token = match auth::validate_basic_auth_handshake(metadata, basic_auth)? {
+    let token = match flight_auth::validate_basic_auth_handshake(metadata, basic_auth)? {
         Some(token) => token,
         None => Uuid::new_v4().to_string(),
     };

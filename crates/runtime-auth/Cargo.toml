@@ -11,3 +11,10 @@ version.workspace = true
 [dependencies]
 app = { path = "../app" }
 axum.workspace = true
+tonic.workspace = true
+tower.workspace = true
+tracing.workspace = true
+futures.workspace = true
+base64.workspace = true
+pin-project.workspace = true
+http.workspace = true

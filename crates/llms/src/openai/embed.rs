@@ -39,9 +39,13 @@ impl Embed for Openai {
         &self,
         req: CreateEmbeddingRequest,
     ) -> Result<CreateEmbeddingResponse, OpenAIError> {
+        let outer_model = req.model.clone();
         let mut inner_req = req.clone();
         inner_req.model.clone_from(&self.model);
-        self.client.embeddings().create(inner_req).await
+        let mut resp = self.client.embeddings().create(inner_req).await?;
+
+        resp.model = outer_model;
+        Ok(resp)
     }
 
     async fn embed(&self, input: EmbeddingInput) -> EmbedResult<Vec<Vec<f32>>> {
@@ -78,13 +82,13 @@ impl Embed for Openai {
                 async move {
                     let embedding: Vec<Vec<f32>> = local_client
                         .embeddings()
-                        .create(req)
+                        .create_float(req)
                         .await
                         .boxed()
                         .map_err(|source| EmbedError::FailedToCreateEmbedding { source })?
                         .data
-                        .iter()
-                        .map(|d| d.embedding.clone())
+                        .into_iter()
+                        .map(|d| d.embedding.into())
                         .collect();
                     Ok::<Vec<Vec<f32>>, EmbedError>(embedding)
                 }

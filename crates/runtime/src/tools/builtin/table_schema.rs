@@ -34,7 +34,7 @@ use spicepod::component::dataset::{column::Column, Dataset};
 use std::{collections::HashMap, sync::Arc};
 
 use crate::{
-    tools::{parameters, SpiceModelTool},
+    tools::{utils::parameters, SpiceModelTool},
     Runtime,
 };
 use snafu::ResultExt;
@@ -226,18 +226,6 @@ impl Default for TableSchemaTool {
             "table_schema",
             Some("Retrieve the schema of all available SQL tables".to_string()),
         )
-    }
-}
-
-impl From<TableSchemaTool> for spicepod::component::tool::Tool {
-    fn from(val: TableSchemaTool) -> Self {
-        spicepod::component::tool::Tool {
-            from: format!("builtin:{}", val.name()),
-            name: val.name().to_string(),
-            description: val.description().map(ToString::to_string),
-            params: HashMap::default(),
-            depends_on: Vec::default(),
-        }
     }
 }
 

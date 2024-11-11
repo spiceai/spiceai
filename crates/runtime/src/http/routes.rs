@@ -31,9 +31,10 @@ use axum::{
     routing::{get, post, Router},
     Extension,
 };
+use runtime_auth::layer::http::AuthLayer;
 use tokio::time::Instant;
 
-use super::{auth::AuthLayer, metrics, v1};
+use super::{metrics, v1};
 
 pub(crate) fn routes(
     rt: &Arc<Runtime>,

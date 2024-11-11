@@ -67,38 +67,80 @@ fn to_openai_response(resp: &ChatCompletionResponse) -> Result<CreateChatComplet
 
 impl MistralLlama {
     pub fn from(
-        tokenizer: Option<&Path>,
         model_weights: &Path,
-        tokenizer_config: &Path,
+        config: Option<&Path>,
+        tokenizer: Option<&Path>,
+        tokenizer_config: Option<&Path>,
+        chat_template_literal: Option<&str>,
     ) -> Result<Self> {
+        if !model_weights.exists() {
+            return Err(ChatError::LocalModelNotFound {
+                expected_path: model_weights.to_string_lossy().to_string(),
+            });
+        }
+
+        if let Some(config) = config {
+            if !config.exists() {
+                return Err(ChatError::LocalModelConfigNotFound {
+                    expected_path: config.to_string_lossy().to_string(),
+                });
+            }
+        }
+
+        if let Some(tokenizer) = tokenizer {
+            if !tokenizer.exists() {
+                return Err(ChatError::LocalTokenizerNotFound {
+                    expected_path: tokenizer.to_string_lossy().to_string(),
+                });
+            }
+        }
+
+        if let Some(tokenizer_config) = tokenizer_config {
+            if !tokenizer_config.exists() {
+                return Err(ChatError::LocalTokenizerNotFound {
+                    expected_path: tokenizer_config.to_string_lossy().to_string(),
+                });
+            }
+        }
+
+        let paths = Self::create_paths(model_weights, config, tokenizer, tokenizer_config);
+        let model_id = model_weights.to_string_lossy().to_string();
+        let device = Self::get_device();
+
         let extension = model_weights
             .extension()
             .and_then(|e| e.to_str())
             .unwrap_or_default();
-        match extension {
-            "ggml" => match tokenizer {
-                Some(tokenizer) => Self::from_ggml(tokenizer, model_weights, tokenizer_config),
-                None => Err(ChatError::FailedToLoadModel {
-                    source: "Tokenizer path is required for GGML model".into(),
-                }),
-            },
-            "gguf" => Self::from_gguf(tokenizer, model_weights, tokenizer_config),
-            _ => Err(ChatError::FailedToLoadModel {
-                source: format!("Unknown model type: {extension}").into(),
-            }),
-        }
+        let pipeline = match extension {
+            "ggml" => Self::load_ggml_pipeline(paths, &device, &model_id, chat_template_literal)?,
+            "gguf" => Self::load_gguf_pipeline(paths, &device, &model_id, chat_template_literal)?,
+            _ => {
+                return Err(ChatError::FailedToLoadModel {
+                    source: format!("Unknown model type: {extension}").into(),
+                })
+            }
+        };
+
+        Ok(Self::from_pipeline(pipeline))
     }
 
+    /// Create paths object, [`ModelPaths`], to create new [`MistralLlama`].
+    ///
+    /// `model_weights`: Currently only single file formats (GGUF, GGML, safetensors).
+    /// `config`: e.g. `config.json`. Not needed for GGUF.
+    /// `tokenizer`: e.g. `tokenizer.json`. Not needed for GGUF.
+    /// `tokenizer_config`: e.g. `tokenizer_config.json`. Not needed for GGUF.
+    ///
     fn create_paths(
         model_weights: &Path,
+        config: Option<&Path>,
         tokenizer: Option<&Path>,
-        tokenizer_config: &Path,
+        tokenizer_config: Option<&Path>,
     ) -> Box<dyn ModelPaths> {
         Box::new(LocalModelPaths::new(
             tokenizer.map(Into::into).unwrap_or_default(),
-            // Not needed for LLama2 / DuckDB Chat, but needed in `EricLBuehler/mistral.rs`.
-            tokenizer.map(Into::into).unwrap_or_default(),
-            tokenizer_config.into(),
+            config.map(Into::into).unwrap_or_default(),
+            tokenizer_config.map(Into::into),
             vec![model_weights.into()],
             None,
             None,
@@ -115,13 +157,29 @@ impl MistralLlama {
     fn load_gguf_pipeline(
         paths: Box<dyn ModelPaths>,
         device: &Device,
-        _tokenizer: Option<&Path>,
         model_id: &str,
+        chat_template_literal: Option<&str>,
     ) -> Result<Arc<tokio::sync::Mutex<dyn Pipeline + Sync + Send>>> {
-        let chat_template = paths
+        // Note: GGUF supports chat templates in the file, but since GGML/llama.cpp does
+        // not write them into GGUF with their conversions, often it requires user
+        // override via the template.
+        // See `<https://github.com/ggerganov/ggml/pull/302#issuecomment-1784164986>`
+        let mut chat_template = paths
             .get_template_filename()
             .clone()
             .map(|f| f.to_string_lossy().to_string());
+
+        // mistralrs currently does not support both `chat_template` string literals and a template file (e.g. tokenizer_config.json).
+        // One may want both since the template file has more configurations for the model.
+        // Default to use file over string literal.
+        if let Some(filename) = chat_template.as_ref() {
+            if chat_template_literal.is_some() {
+                tracing::warn!("For GGUF model, both a template file was specific '{filename}' and a string literal chat_template. For GGUF only one can be provided, defaulting to the file.");
+            };
+        } else {
+            tracing::debug!("For GGUF model, no chat template file provided. Using the provided chat template literal.");
+            chat_template = chat_template_literal.map(Into::into);
+        };
 
         let gguf_file: Vec<String> = paths
             .get_weight_filenames()
@@ -152,13 +210,14 @@ impl MistralLlama {
     fn load_ggml_pipeline(
         paths: Box<dyn ModelPaths>,
         device: &Device,
-        tokenizer: &Path,
         model_id: &str,
+        chat_template_literal: Option<&str>,
     ) -> Result<Arc<tokio::sync::Mutex<dyn Pipeline + Sync + Send>>> {
+        let tokenizer = paths.get_tokenizer_filename().to_string_lossy().to_string();
         GGMLLoaderBuilder::new(
             GGMLSpecificConfig::default(),
-            None,
-            Some(tokenizer.to_string_lossy().to_string()),
+            chat_template_literal.map(ToString::to_string),
+            Some(tokenizer),
             None,
             String::new(),
             model_id.to_string(),
@@ -174,41 +233,6 @@ impl MistralLlama {
             None,
         )
         .map_err(|e| ChatError::FailedToLoadModel { source: e.into() })
-    }
-
-    pub fn from_gguf(
-        tokenizer: Option<&Path>,
-        model_weights: &Path,
-        tokenizer_config: &Path,
-    ) -> Result<Self> {
-        let paths = Self::create_paths(model_weights, tokenizer, tokenizer_config);
-        let model_id = model_weights
-            .file_name()
-            .and_then(|x| x.to_str())
-            .map_or_else(
-                || model_weights.to_string_lossy().to_string(),
-                std::string::ToString::to_string,
-            );
-
-        let device = Self::get_device();
-
-        let pipeline = Self::load_gguf_pipeline(paths, &device, tokenizer, &model_id)?;
-
-        Ok(Self::from_pipeline(pipeline))
-    }
-
-    pub fn from_ggml(
-        tokenizer: &Path,
-        model_weights: &Path,
-        tokenizer_config: &Path,
-    ) -> Result<Self> {
-        let paths = Self::create_paths(model_weights, Some(tokenizer), tokenizer_config);
-        let model_id = model_weights.to_string_lossy().to_string();
-        let device = Self::get_device();
-
-        let pipeline = Self::load_ggml_pipeline(paths, &device, tokenizer, &model_id)?;
-
-        Ok(Self::from_pipeline(pipeline))
     }
 
     /// Get the device to use for the model.

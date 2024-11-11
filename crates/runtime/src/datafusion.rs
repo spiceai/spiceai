@@ -406,7 +406,7 @@ impl DataFusion {
     #[must_use]
     pub fn is_writable(&self, table_reference: &TableReference) -> bool {
         if let Ok(writers) = self.data_writers.read() {
-            writers.iter().any(|s| s == table_reference)
+            writers.iter().any(|s| s.resolved_eq(table_reference))
         } else {
             false
         }
@@ -557,6 +557,9 @@ impl DataFusion {
             },
         )?;
 
+        self.runtime_status
+            .update_dataset(&table_reference, status::ComponentStatus::Ready);
+
         Ok(())
     }
 
@@ -577,6 +580,20 @@ impl DataFusion {
     #[must_use]
     pub fn catalog_exists(&self, catalog: &str) -> bool {
         self.ctx.catalog(catalog).is_some()
+    }
+
+    pub fn remove_view(&self, view_name: &TableReference) -> Result<()> {
+        if !self.ctx.table_exist(view_name.clone()).unwrap_or(false) {
+            return Ok(());
+        }
+
+        if let Err(e) = self.ctx.deregister_table(view_name.clone()) {
+            return UnableToDeleteTableSnafu {
+                reason: e.to_string(),
+            }
+            .fail();
+        }
+        Ok(())
     }
 
     pub async fn remove_table(&self, dataset_name: &TableReference) -> Result<()> {

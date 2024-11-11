@@ -16,14 +16,13 @@ limitations under the License.
 
 use std::{fmt::Debug, sync::Arc};
 
-use auth::AuthLayer;
 use axum::Router;
 use hyper_util::{
     rt::{TokioExecutor, TokioIo},
     server::conn::auto::Builder,
     service::TowerToHyperService,
 };
-use runtime_auth::HttpAuth;
+use runtime_auth::{layer::http::AuthLayer, HttpAuth};
 use snafu::prelude::*;
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
 use tokio_rustls::TlsAcceptor;
@@ -36,7 +35,6 @@ use crate::{
     Runtime,
 };
 
-mod auth;
 mod metrics;
 mod routes;
 mod v1;

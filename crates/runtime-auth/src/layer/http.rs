@@ -14,13 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::{AuthVerdict, HttpAuth};
 use axum::{
     body::Body,
     http::StatusCode,
     http::{Request, Response},
 };
 use futures::future::BoxFuture;
-use runtime_auth::{AuthVerdict, HttpAuth};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use tower::{Layer, Service};
@@ -73,7 +73,7 @@ where
         Box::pin(async move {
             let (parts, body) = req.into_parts();
 
-            match auth_verifier.http(&parts) {
+            match auth_verifier.http_verify(&parts) {
                 Ok(AuthVerdict::Allow) => inner.call(Request::from_parts(parts, body)).await,
                 Ok(AuthVerdict::Deny) => Ok(unauthorized_response()),
                 Err(e) => {

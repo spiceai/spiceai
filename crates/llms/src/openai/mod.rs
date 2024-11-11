@@ -60,6 +60,7 @@ impl Openai {
         if let Some(api_base) = api_base {
             cfg = cfg.with_api_base(api_base);
         }
+
         Self {
             client: Client::with_config(cfg),
             model,
