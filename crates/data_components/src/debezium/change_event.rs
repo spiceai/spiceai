@@ -141,12 +141,12 @@ pub struct Source {
     pub ts_ms: i64,
     pub snapshot: String,
     pub db: String,
-    pub sequence: String,
-    pub schema: String,
     pub table: String,
+    pub sequence: Option<String>,
+    pub schema: Option<String>,
     #[serde(rename = "txId")]
-    pub tx_id: i64,
-    pub lsn: i64,
+    pub tx_id: Option<i64>,
+    pub lsn: Option<i64>,
     pub xmin: Option<serde_json::Value>,
 }
 
