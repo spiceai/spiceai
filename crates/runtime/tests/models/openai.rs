@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
 use app::AppBuilder;
 use async_openai::types::{
@@ -31,9 +31,10 @@ use spicepod::component::{
 use crate::{
     init_tracing, init_tracing_with_task_history,
     models::{
-        create_api_bindings_config, get_executed_tasks, get_taxi_trips_dataset, get_tpcds_dataset,
-        json_is_single_row_with_value, normalize_embeddings_response, normalize_search_response,
-        send_chat_completions_request, send_nsql_request, send_search_request,
+        create_api_bindings_config, get_executed_tasks, get_params_with_secrets,
+        get_taxi_trips_dataset, get_tpcds_dataset, json_is_single_row_with_value,
+        normalize_embeddings_response, normalize_search_response, send_chat_completions_request,
+        send_nsql_request, send_search_request,
     },
     utils::{runtime_ready_check, verify_env_secret_exists},
 };
@@ -352,14 +353,7 @@ async fn openai_test_chat_messages() -> Result<(), anyhow::Error> {
         .params
         .insert("spice_tools".to_string(), "auto".into());
 
-    let params = model_with_tools
-        .params
-        .clone()
-        .into_iter()
-        .map(|(k, v)| (k, v.to_string()))
-        .collect::<HashMap<_, _>>();
-
-    let model_secrets = rt.get_params_with_secrets(&params).await;
+    let model_secrets = get_params_with_secrets(&model_with_tools.params, &rt).await;
 
     let tool_model = try_to_chat_model(&model_with_tools, &model_secrets, Arc::clone(&rt)).await?;
 
@@ -378,7 +372,7 @@ async fn openai_test_chat_messages() -> Result<(), anyhow::Error> {
 
     insta::assert_snapshot!("chat_1_choices", format!("{:?}", response.choices));
 
-    let tasks = get_executed_tasks(&rt, task_start_time.into()).await;
+    let tasks = get_executed_tasks(&rt, task_start_time.into()).await?;
 
     assert!(
         tasks.iter().any(|t| { t.0 == "tool_use::list_datasets" }),

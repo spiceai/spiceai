@@ -9519,6 +9519,7 @@ dependencies = [
  "tower 0.5.1",
  "tracing",
  "tracing-futures",
+ "tracing-opentelemetry",
  "tracing-subscriber",
  "tract-core",
  "url",

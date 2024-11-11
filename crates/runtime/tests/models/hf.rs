@@ -17,9 +17,17 @@ limitations under the License.
 use std::sync::Arc;
 
 use app::AppBuilder;
-use async_openai::types::{ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestUserMessageArgs, CreateChatCompletionRequestArgs, EmbeddingInput};
+use async_openai::types::{
+    ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestUserMessageArgs,
+    CreateChatCompletionRequestArgs, EmbeddingInput,
+};
 use llms::chat::create_hf_model;
-use runtime::{auth::EndpointAuth, model::ToolUsingChat, tools::{get_tools, options::SpiceToolsOptions}, Runtime};
+use runtime::{
+    auth::EndpointAuth,
+    model::ToolUsingChat,
+    tools::{get_tools, options::SpiceToolsOptions},
+    Runtime,
+};
 use spicepod::component::{
     embeddings::{ColumnEmbeddingConfig, Embeddings},
     model::Model,
@@ -30,7 +38,10 @@ use llms::chat::Chat;
 use crate::{
     init_tracing,
     models::{
-        create_api_bindings_config, get_taxi_trips_dataset, get_tpcds_dataset, normalize_embeddings_response, normalize_search_response, send_chat_completions_request, send_embeddings_request, send_search_request
+        create_api_bindings_config, get_taxi_trips_dataset, get_tpcds_dataset,
+        json_is_single_row_with_value, normalize_embeddings_response, normalize_search_response,
+        send_chat_completions_request, send_embeddings_request, send_nsql_request,
+        send_search_request,
     },
     utils::runtime_ready_check,
 };
@@ -227,12 +238,11 @@ async fn huggingface_test_embeddings() -> Result<(), anyhow::Error> {
 async fn huggingface_test_chat_completion() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(None);
 
-    let mut model_with_tools = get_huggingface_model(
-        "microsoft/Phi-3-mini-4k-instruct",
-        "phi3",
-        "hf_model",
-    );
-    model_with_tools.params.insert("spice_tools".to_string(), "auto".into());
+    let mut model_with_tools =
+        get_huggingface_model("microsoft/Phi-3-mini-4k-instruct", "phi3", "hf_model");
+    model_with_tools
+        .params
+        .insert("spice_tools".to_string(), "auto".into());
 
     let app = AppBuilder::new("text-to-sql")
         .with_dataset(get_taxi_trips_dataset())
@@ -275,14 +285,18 @@ async fn huggingface_test_chat_completion() -> Result<(), anyhow::Error> {
 
 #[tokio::test]
 async fn huggingface_test_chat_messages() -> Result<(), anyhow::Error> {
-    let model = Arc::new(create_hf_model("microsoft/Phi-3-mini-4k-instruct", &Some("phi3".to_string()), None)?);
+    let model = Arc::new(create_hf_model(
+        HF_TEST_MODEL,
+        &Some(HF_TEST_MODEL_TYPE.to_string()),
+        None,
+    )?);
 
     let app = AppBuilder::new("ai-app")
         .with_dataset(get_taxi_trips_dataset())
         .build();
 
     let rt = Arc::new(Runtime::builder().with_app(app).build().await);
-    
+
     tokio::select! {
         () = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
             return Err(anyhow::anyhow!("Timed out waiting for components to load"));
@@ -291,11 +305,11 @@ async fn huggingface_test_chat_messages() -> Result<(), anyhow::Error> {
     }
 
     let tool_model = Box::new(ToolUsingChat::new(
-            Arc::clone(&model),
-            Arc::clone(&rt),
-            get_tools(Arc::clone(&rt), &SpiceToolsOptions::Auto).await,
-            Some(10),
-        ));
+        Arc::clone(&model),
+        Arc::clone(&rt),
+        get_tools(Arc::clone(&rt), &SpiceToolsOptions::Auto).await,
+        Some(10),
+    ));
 
     let req = CreateChatCompletionRequestArgs::default()
         .messages(vec![ChatCompletionRequestSystemMessageArgs::default()
@@ -318,7 +332,6 @@ async fn huggingface_test_chat_messages() -> Result<(), anyhow::Error> {
     insta::assert_snapshot!("chat_1_choices", format!("{:?}", response.choices));
 
     Ok(())
-
 }
 
 fn get_huggingface_model(

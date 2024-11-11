@@ -14,7 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::{
+    collections::HashMap,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+};
 
 use arrow::array::StringArray;
 use async_openai::types::EmbeddingInput;
@@ -23,6 +26,7 @@ use futures::TryStreamExt;
 use rand::Rng;
 use reqwest::Client;
 use runtime::{config::Config, datafusion::query::Protocol, Runtime};
+use secrecy::SecretString;
 use spicepod::component::{
     dataset::{acceleration::Acceleration, Dataset},
     params::Params,
@@ -284,35 +288,33 @@ async fn send_chat_completions_request(
 }
 
 /// Retrieves executed tasks from the task history since the given timestamp.
-async fn get_executed_tasks(rt: &Runtime, since: DateTime<Utc>) -> Vec<(String, String)> {
+async fn get_executed_tasks(
+    rt: &Runtime,
+    since: DateTime<Utc>,
+) -> Result<Vec<(String, String)>, anyhow::Error> {
     let query = format!("SELECT task, input FROM runtime.task_history WHERE start_time >= '{}' ORDER BY start_time, task;", since.to_rfc3339());
     let query_result = rt
         .datafusion()
         .query_builder(&query, Protocol::Internal)
         .build()
         .run()
-        .await
-        .expect("Fetch tasks from task_history");
-    let data = query_result
-        .data
-        .try_collect::<Vec<_>>()
-        .await
-        .expect("collect data from query result");
+        .await?;
+    let data = query_result.data.try_collect::<Vec<_>>().await?;
 
     let mut tasks = Vec::new();
 
     for batch in data {
         let task_column = batch
-            .column(batch.schema().index_of("task").expect("task column"))
+            .column(batch.schema().index_of("task")?)
             .as_any()
             .downcast_ref::<StringArray>()
-            .expect("task column to be a StringArray");
+            .ok_or(anyhow::anyhow!("Failed to downcast column to StringArray"))?;
 
         let input_column = batch
-            .column(batch.schema().index_of("input").expect("input column"))
+            .column(batch.schema().index_of("input")?)
             .as_any()
             .downcast_ref::<StringArray>()
-            .expect("input column to be a StringArray");
+            .ok_or(anyhow::anyhow!("Failed to downcast column to StringArray"))?;
 
         for i in 0..batch.num_rows() {
             let task = task_column.value(i).to_string();
@@ -321,5 +323,24 @@ async fn get_executed_tasks(rt: &Runtime, since: DateTime<Utc>) -> Vec<(String, 
         }
     }
 
-    tasks
+    Ok(tasks)
+}
+
+async fn get_params_with_secrets(
+    params: &HashMap<String, Value>,
+    rt: &Runtime,
+) -> HashMap<String, SecretString> {
+    let params = params
+        .clone()
+        .iter()
+        .map(|(k, v)| {
+            let k = k.clone();
+            match v.as_str() {
+                Some(s) => (k, s.to_string()),
+                None => (k, v.to_string()),
+            }
+        })
+        .collect::<HashMap<_, _>>();
+
+    rt.get_params_with_secrets(&params).await
 }
