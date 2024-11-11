@@ -130,6 +130,8 @@ async-graphql-axum = "7.0.5"
 bollard = "0.16.1"
 spice-cloud = { path = "../spice_cloud" }
 tracing-subscriber.workspace = true
+tracing-opentelemetry.workspace = true
+opentelemetry_sdk = { workspace = true, features = ["rt-tokio-current-thread"] }
 insta.workspace = true
 azure_storage_blobs = "0.20.0"
 azure_core = "0.20.0"
@@ -152,7 +154,7 @@ clickhouse = [
 cuda = ["llms/cuda"]
 databricks = ["data_components/databricks"]
 debezium = ["data_components/debezium"]
-default = ["keyring-secret-store", "aws-secrets-manager", "sharepoint"]
+default = ["keyring-secret-store", "aws-secrets-manager", "sharepoint", "models", "metal"]
 delta_lake = ["data_components/delta_lake"]
 dev = []
 dremio = []

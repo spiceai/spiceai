@@ -16,10 +16,13 @@ limitations under the License.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
+use arrow::array::StringArray;
 use async_openai::types::EmbeddingInput;
+use chrono::{DateTime, Utc};
+use futures::TryStreamExt;
 use rand::Rng;
 use reqwest::Client;
-use runtime::config::Config;
+use runtime::{config::Config, datafusion::query::Protocol, Runtime};
 use spicepod::component::{
     dataset::{acceleration::Acceleration, Dataset},
     params::Params,
@@ -248,4 +251,75 @@ async fn send_embeddings_request(
         .await?;
 
     Ok(response)
+}
+
+async fn send_chat_completions_request(
+    base_url: &str,
+    messages: Vec<(String, String)>,
+    model: &str,
+    stream: bool,
+) -> Result<Value, reqwest::Error> {
+    let request_body = json!({
+        "messages": messages.iter().map(|(role, content)| {
+            json!({
+                "role": role,
+                "content": content,
+            })
+        }).collect::<Vec<_>>(),
+        "model": model,
+        "stream": stream,
+    });
+
+    let response = Client::new()
+        .post(format!("{base_url}/v1/chat/completions"))
+        .header("Content-Type", "application/json")
+        .json(&request_body)
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<Value>()
+        .await?;
+
+    Ok(response)
+}
+
+/// Retrieves executed tasks from the task history since the given timestamp.
+async fn get_executed_tasks(rt: &Runtime, since: DateTime<Utc>) -> Vec<(String, String)> {
+    let query = format!("SELECT task, input FROM runtime.task_history WHERE start_time >= '{}' ORDER BY start_time, task;", since.to_rfc3339());
+    let query_result = rt
+        .datafusion()
+        .query_builder(&query, Protocol::Internal)
+        .build()
+        .run()
+        .await
+        .expect("Fetch tasks from task_history");
+    let data = query_result
+        .data
+        .try_collect::<Vec<_>>()
+        .await
+        .expect("collect data from query result");
+
+    let mut tasks = Vec::new();
+
+    for batch in data {
+        let task_column = batch
+            .column(batch.schema().index_of("task").expect("task column"))
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("task column to be a StringArray");
+
+        let input_column = batch
+            .column(batch.schema().index_of("input").expect("input column"))
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("input column to be a StringArray");
+
+        for i in 0..batch.num_rows() {
+            let task = task_column.value(i).to_string();
+            let input = input_column.value(i).to_string();
+            tasks.push((task, input));
+        }
+    }
+
+    tasks
 }

@@ -17,19 +17,20 @@ limitations under the License.
 use std::sync::Arc;
 
 use app::AppBuilder;
-use async_openai::types::EmbeddingInput;
-use runtime::{auth::EndpointAuth, Runtime};
+use async_openai::types::{ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestUserMessageArgs, CreateChatCompletionRequestArgs, EmbeddingInput};
+use llms::chat::create_hf_model;
+use runtime::{auth::EndpointAuth, model::ToolUsingChat, tools::{get_tools, options::SpiceToolsOptions}, Runtime};
 use spicepod::component::{
     embeddings::{ColumnEmbeddingConfig, Embeddings},
     model::Model,
 };
 
+use llms::chat::Chat;
+
 use crate::{
     init_tracing,
     models::{
-        create_api_bindings_config, get_taxi_trips_dataset, get_tpcds_dataset,
-        normalize_embeddings_response, normalize_search_response, send_embeddings_request,
-        send_search_request,
+        create_api_bindings_config, get_taxi_trips_dataset, get_tpcds_dataset, normalize_embeddings_response, normalize_search_response, send_chat_completions_request, send_embeddings_request, send_search_request
     },
     utils::{runtime_ready_check, verify_env_secret_exists},
 };
@@ -213,6 +214,104 @@ async fn huggingface_embeddings_test() -> Result<(), anyhow::Error> {
     }
 
     Ok(())
+}
+
+#[tokio::test]
+async fn huggingface_test_chat_completion() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(None);
+
+    let mut model_with_tools = get_huggingface_model(
+        "microsoft/Phi-3-mini-4k-instruct",
+        "phi3",
+        "hf_model",
+    );
+    model_with_tools.params.insert("spice_tools".to_string(), "auto".into());
+
+    let app = AppBuilder::new("text-to-sql")
+        .with_dataset(get_taxi_trips_dataset())
+        .with_model(model_with_tools)
+        .build();
+
+    let api_config = create_api_bindings_config();
+    let http_base_url = format!("http://{}", api_config.http_bind_address);
+    let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+
+    let rt_ref_copy = Arc::clone(&rt);
+    tokio::spawn(async move {
+        Box::pin(rt_ref_copy.start_servers(api_config, None, EndpointAuth::no_auth())).await
+    });
+
+    tokio::select! {
+        // increased timeout to download and load huggingface model
+        () = tokio::time::sleep(std::time::Duration::from_secs(300)) => {
+            return Err(anyhow::anyhow!("Timed out waiting for components to load"));
+        }
+        () = rt.load_components() => {}
+    }
+
+    let _response = send_chat_completions_request(
+        http_base_url.as_str(),
+        vec![
+            ("system".to_string(), "You are an assistant that responds to queries by providing only the requested data values without extra explanation.".to_string()),
+            ("user".to_string(), "Provide the total number of records in the taxi_trips dataset. If known, return a single numeric value.".to_string()),
+        ],
+        "hf_model",
+        false,
+    ).await?;
+
+    // Result verification is disabled due to issue below: model does not use tools and can't provide the expected response.
+    // https://github.com/spiceai/spiceai/issues/3426
+    // assert_eq!(response["choices"][0]["message"]["content"].as_str(), Some("10"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn huggingface_test_chat_messages() -> Result<(), anyhow::Error> {
+    let model = Arc::new(create_hf_model("microsoft/Phi-3-mini-4k-instruct", &Some("phi3".to_string()), None)?);
+
+    let app = AppBuilder::new("ai-app")
+        .with_dataset(get_taxi_trips_dataset())
+        .build();
+
+    let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+    
+    tokio::select! {
+        () = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+            return Err(anyhow::anyhow!("Timed out waiting for components to load"));
+        }
+        () = rt.load_components() => {}
+    }
+
+    let tool_model = Box::new(ToolUsingChat::new(
+            Arc::clone(&model),
+            Arc::clone(&rt),
+            get_tools(Arc::clone(&rt), &SpiceToolsOptions::Auto).await,
+            Some(10),
+        ));
+
+    let req = CreateChatCompletionRequestArgs::default()
+        .messages(vec![ChatCompletionRequestSystemMessageArgs::default()
+            .content("You are an assistant that responds to queries by providing only the requested data values without extra explanation.".to_string())
+            .build()?
+            .into(),ChatCompletionRequestUserMessageArgs::default()
+            .content("Provide the total number of records in the taxi trips dataset. If known, return a single numeric value.".to_string())
+            .build()?
+            .into()])
+        .build()?;
+
+    let mut response = tool_model.chat_request(req).await?;
+
+    // Message content verification is disabled due to issue below: model does not use tools and can't provide the expected response.
+    // https://github.com/spiceai/spiceai/issues/3426
+    response.choices.iter_mut().for_each(|c| {
+        c.message.content = Some("__placeholder__".to_string());
+    });
+
+    insta::assert_snapshot!("chat_1_choices", format!("{:?}", response.choices));
+
+    Ok(())
+
 }
 
 fn get_huggingface_model(
