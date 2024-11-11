@@ -175,6 +175,8 @@ async fn send_search_request(
     Ok(response)
 }
 
+/// Normalizes vector similarity search response for consistent snapshot testing by replacing dynamic
+/// values(such as scores and durations) with placeholders.
 fn normalize_search_response(mut json: Value) -> String {
     if let Some(matches) = json.get_mut("matches").and_then(|m| m.as_array_mut()) {
         for m in matches {
@@ -207,8 +209,6 @@ fn normalize_embeddings_response(mut json: Value) -> String {
     json.to_string()
 }
 
-/// Normalizes semantic search response for consistent snapshot testing by replacing dynamic values
-/// (such as scores and durations) with placeholders.
 async fn send_embeddings_request(
     base_url: &str,
     model: &str,

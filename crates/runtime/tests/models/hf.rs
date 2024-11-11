@@ -24,23 +24,22 @@ use spicepod::component::{
     model::Model,
 };
 
+const HF_TEST_MODEL: &str = "microsoft/Phi-3-mini-4k-instruct";
+const HF_TEST_MODEL_TYPE: &str = "phi3";
+
 use crate::{
     init_tracing,
     models::{
         create_api_bindings_config, get_taxi_trips_dataset, get_tpcds_dataset,
-        normalize_embeddings_response, normalize_search_response, send_embeddings_request,
-        send_search_request,
+        json_is_single_row_with_value, normalize_embeddings_response, normalize_search_response,
+        send_embeddings_request, send_nsql_request, send_search_request,
     },
-    utils::{runtime_ready_check, verify_env_secret_exists},
+    utils::runtime_ready_check,
 };
 
 #[tokio::test]
-async fn huggingface_search_test() -> Result<(), anyhow::Error> {
+async fn huggingface_test_search() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(None);
-
-    verify_env_secret_exists("SPICE_HF_TOKEN")
-        .await
-        .map_err(anyhow::Error::msg)?;
 
     let mut ds_tpcds_item = get_tpcds_dataset("item");
     ds_tpcds_item.embeddings = vec![ColumnEmbeddingConfig {
@@ -94,23 +93,21 @@ async fn huggingface_search_test() -> Result<(), anyhow::Error> {
 }
 
 #[tokio::test]
-async fn huggingface_model_download_test() -> Result<(), anyhow::Error> {
+async fn huggingface_test_nsql() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(None);
-
-    verify_env_secret_exists("SPICE_HF_TOKEN")
-        .await
-        .map_err(anyhow::Error::msg)?;
 
     let app = AppBuilder::new("text-to-sql")
         .with_dataset(get_taxi_trips_dataset())
         .with_model(get_huggingface_model(
-            "meta-llama/Llama-3.2-1B-Instruct",
-            "llama",
+            HF_TEST_MODEL,
+            HF_TEST_MODEL_TYPE,
             "hf_model",
         ))
         .build();
 
     let api_config = create_api_bindings_config();
+    let http_base_url = format!("http://{}", api_config.http_bind_address);
+
     let rt = Arc::new(Runtime::builder().with_app(app).build().await);
 
     let rt_ref_copy = Arc::clone(&rt);
@@ -120,7 +117,7 @@ async fn huggingface_model_download_test() -> Result<(), anyhow::Error> {
 
     tokio::select! {
         // increased timeout to download and load huggingface model
-        () = tokio::time::sleep(std::time::Duration::from_secs(180)) => {
+        () = tokio::time::sleep(std::time::Duration::from_secs(300)) => {
             return Err(anyhow::anyhow!("Timed out waiting for components to load"));
         }
         () = rt.load_components() => {}
@@ -128,16 +125,26 @@ async fn huggingface_model_download_test() -> Result<(), anyhow::Error> {
 
     runtime_ready_check(&rt).await;
 
+    let response = send_nsql_request(
+        http_base_url.as_str(),
+        "how many records in taxi_trips dataset?",
+        Some("hf_model"),
+        Some(false),
+        None,
+    )
+    .await?;
+
+    assert!(
+        json_is_single_row_with_value(&response, 10),
+        "Expected a single record containing the value 10"
+    );
+
     Ok(())
 }
 
 #[tokio::test]
-async fn huggingface_embeddings_test() -> Result<(), anyhow::Error> {
+async fn huggingface_test_embeddings() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(None);
-
-    verify_env_secret_exists("SPICE_HF_TOKEN")
-        .await
-        .map_err(anyhow::Error::msg)?;
 
     let app = AppBuilder::new("text-to-sql")
         .with_embedding(get_huggingface_embeddings(
@@ -223,20 +230,11 @@ fn get_huggingface_model(
     let mut model = Model::new(format!("huggingface:huggingface.co/{}", model.into()), name);
     model
         .params
-        .insert("hf_token".to_string(), "${ secrets:SPICE_HF_TOKEN }".into());
-    model
-        .params
         .insert("model_type".to_string(), model_type.into().into());
 
     model
 }
 
 fn get_huggingface_embeddings(model: impl Into<String>, name: impl Into<String>) -> Embeddings {
-    let mut embeddings =
-        Embeddings::new(format!("huggingface:huggingface.co/{}", model.into()), name);
-    embeddings
-        .params
-        .insert("hf_token".to_string(), "${ secrets:SPICE_HF_TOKEN }".into());
-
-    embeddings
+    Embeddings::new(format!("huggingface:huggingface.co/{}", model.into()), name)
 }
