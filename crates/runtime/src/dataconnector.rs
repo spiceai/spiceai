@@ -263,7 +263,7 @@ pub async fn create_new_connector(
 
     let factory = connector_factory?;
 
-    if !factory.supports_invalid_type_action() {
+    if params.invalid_type_action.is_some() && !factory.supports_invalid_type_action() {
         return Some(Err(DataConnectorError::UnsupportedInvalidTypeAction {
             dataconnector: name.to_string(),
         }
