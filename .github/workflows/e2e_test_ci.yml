@@ -52,8 +52,8 @@ jobs:
                 target_arch_go: "arm64"
               }, {
                 name: "macOS x64 (Intel)",
-                builder: "macos-13",
-                runner: "macos-13",
+                builder: "macos-14-large",
+                runner: "macos-14-large",
                 target_os: "darwin",
                 target_arch: "x86_64",
                 target_arch_go: "amd64"
