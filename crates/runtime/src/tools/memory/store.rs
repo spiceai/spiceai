@@ -16,7 +16,6 @@ limitations under the License.
 
 use arrow::array::RecordBatch;
 use async_trait::async_trait;
-use datafusion::sql::TableReference;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
