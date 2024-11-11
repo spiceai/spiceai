@@ -42,7 +42,7 @@ graph-rs-sdk = {workspace = true, optional=true}
 graphql-parser.workspace = true
 http = {version= "1.1.0", optional=true}
 object_store = { workspace = true }
-rdkafka = { version = "0.36.2", features = ["ssl"], optional = true }
+rdkafka = { version = "0.36.2", features = ["ssl-vendored"], optional = true }
 regex = "1.10.4"
 reqwest.workspace = true
 rusqlite = { workspace = true, optional = true }
