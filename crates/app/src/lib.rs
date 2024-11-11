@@ -83,6 +83,7 @@ impl App {
         }
     }
 
+    /// Retrieve all dataset names that are of a specific connector type.
     pub fn datasets_of_connector_type(&self, prefix: &str) -> Vec<String> {
         self.datasets
             .iter()
