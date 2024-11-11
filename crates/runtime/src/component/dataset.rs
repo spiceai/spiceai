@@ -18,7 +18,7 @@ use acceleration::Engine;
 use app::App;
 use arrow::datatypes::SchemaRef;
 use datafusion::sql::TableReference;
-use datafusion_table_providers::{util::column_reference, InvalidTypeAction};
+use datafusion_table_providers::util::column_reference;
 use snafu::prelude::*;
 use spicepod::component::{
     dataset as spicepod_dataset, dataset::column::Column, embeddings::ColumnEmbeddingConfig,
@@ -112,6 +112,32 @@ impl std::fmt::Display for TimeFormat {
     }
 }
 
+pub enum InvalidTypeAction {
+    Error,
+    Warn,
+    Ignore,
+}
+
+impl From<spicepod_dataset::InvalidTypeAction> for InvalidTypeAction {
+    fn from(action: spicepod_dataset::InvalidTypeAction) -> Self {
+        match action {
+            spicepod_dataset::InvalidTypeAction::Error => InvalidTypeAction::Error,
+            spicepod_dataset::InvalidTypeAction::Warn => InvalidTypeAction::Warn,
+            spicepod_dataset::InvalidTypeAction::Ignore => InvalidTypeAction::Ignore,
+        }
+    }
+}
+
+impl From<InvalidTypeAction> for datafusion_table_providers::InvalidTypeAction {
+    fn from(action: InvalidTypeAction) -> Self {
+        match action {
+            InvalidTypeAction::Error => datafusion_table_providers::InvalidTypeAction::Error,
+            InvalidTypeAction::Warn => datafusion_table_providers::InvalidTypeAction::Warn,
+            InvalidTypeAction::Ignore => datafusion_table_providers::InvalidTypeAction::Ignore,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Dataset {
     pub from: String,
@@ -128,7 +154,7 @@ pub struct Dataset {
     pub embeddings: Vec<ColumnEmbeddingConfig>,
     pub app: Option<Arc<App>>,
     schema: Option<SchemaRef>,
-    pub invalid_type_action: Option<InvalidTypeAction>,
+    pub invalid_type_action: Option<datafusion_table_providers::InvalidTypeAction>,
 }
 
 // Implement a custom PartialEq for Dataset to ignore the app field
@@ -189,7 +215,10 @@ impl TryFrom<spicepod_dataset::Dataset> for Dataset {
             acceleration,
             schema: None,
             app: None,
-            invalid_type_action: dataset.invalid_type_action.map(InvalidTypeAction::from),
+            invalid_type_action: dataset
+                .invalid_type_action
+                .map(InvalidTypeAction::from)
+                .map(Into::into),
         })
     }
 }

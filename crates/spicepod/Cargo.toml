@@ -16,7 +16,6 @@ serde_yaml.workspace = true
 serde-value = "0.7.0"
 snafu.workspace = true
 tracing.workspace = true
-datafusion-table-providers.workspace = true
 
 [features]
 default = []

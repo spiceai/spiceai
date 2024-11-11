@@ -62,16 +62,6 @@ pub enum InvalidTypeAction {
     Ignore,
 }
 
-impl From<InvalidTypeAction> for datafusion_table_providers::InvalidTypeAction {
-    fn from(action: InvalidTypeAction) -> Self {
-        match action {
-            InvalidTypeAction::Error => Self::Error,
-            InvalidTypeAction::Warn => Self::Warn,
-            InvalidTypeAction::Ignore => Self::Ignore,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 #[serde(deny_unknown_fields)]
