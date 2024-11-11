@@ -468,7 +468,7 @@ impl DataConnectorParams {
         let params = dataset.params.clone();
         let mut params = Self::from_params(runtime, &name, params).await?;
         params.metadata.clone_from(&dataset.metadata);
-        params.invalid_type_action = dataset.invalid_type_action;
+        params.invalid_type_action = dataset.invalid_type_action.map(Into::into);
 
         Ok(params)
     }

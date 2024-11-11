@@ -112,6 +112,7 @@ impl std::fmt::Display for TimeFormat {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
 pub enum InvalidTypeAction {
     Error,
     Warn,
@@ -154,7 +155,7 @@ pub struct Dataset {
     pub embeddings: Vec<ColumnEmbeddingConfig>,
     pub app: Option<Arc<App>>,
     schema: Option<SchemaRef>,
-    pub invalid_type_action: Option<datafusion_table_providers::InvalidTypeAction>,
+    pub invalid_type_action: Option<InvalidTypeAction>,
 }
 
 // Implement a custom PartialEq for Dataset to ignore the app field
@@ -215,10 +216,7 @@ impl TryFrom<spicepod_dataset::Dataset> for Dataset {
             acceleration,
             schema: None,
             app: None,
-            invalid_type_action: dataset
-                .invalid_type_action
-                .map(InvalidTypeAction::from)
-                .map(Into::into),
+            invalid_type_action: dataset.invalid_type_action.map(InvalidTypeAction::from),
         })
     }
 }
