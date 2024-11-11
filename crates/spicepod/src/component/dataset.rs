@@ -52,6 +52,26 @@ impl std::fmt::Display for TimeFormat {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum InvalidTypeAction {
+    #[default]
+    Error,
+    Warn,
+    Ignore,
+}
+
+impl From<InvalidTypeAction> for datafusion_table_providers::InvalidTypeAction {
+    fn from(action: InvalidTypeAction) -> Self {
+        match action {
+            InvalidTypeAction::Error => Self::Error,
+            InvalidTypeAction::Warn => Self::Warn,
+            InvalidTypeAction::Ignore => Self::Ignore,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 #[serde(deny_unknown_fields)]
@@ -95,6 +115,9 @@ pub struct Dataset {
 
     #[serde(rename = "dependsOn", default, skip_serializing_if = "Vec::is_empty")]
     pub depends_on: Vec<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invalid_type_action: Option<InvalidTypeAction>,
 }
 
 impl Nameable for Dataset {
@@ -121,6 +144,7 @@ impl Dataset {
             acceleration: None,
             embeddings: Vec::default(),
             depends_on: Vec::default(),
+            invalid_type_action: None,
         }
     }
 }
@@ -142,6 +166,7 @@ impl WithDependsOn<Dataset> for Dataset {
             acceleration: self.acceleration.clone(),
             embeddings: self.embeddings.clone(),
             depends_on: depends_on.to_vec(),
+            invalid_type_action: self.invalid_type_action,
         }
     }
 }
