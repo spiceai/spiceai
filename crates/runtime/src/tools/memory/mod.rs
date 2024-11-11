@@ -22,7 +22,7 @@ use datafusion::sql::TableReference;
 use once_cell::sync::Lazy;
 use uuid::Uuid;
 
-use crate::Runtime;
+use crate::{component::validate_identifier, Runtime};
 
 pub mod catalog;
 pub mod load;
@@ -88,6 +88,11 @@ async fn memory_table_name(
                     "Multiple memory tables found, using the first one: {}",
                     table
                 );
+            }
+            if validate_identifier(table.as_str()).is_err() {
+                return Err(Box::<dyn std::error::Error + Send + Sync>::from(format!(
+                    "Invalid memory table name: '{table}'"
+                )));
             }
             Ok(TableReference::parse_str(table.as_str()))
         }
