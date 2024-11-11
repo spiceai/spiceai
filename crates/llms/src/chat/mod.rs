@@ -69,6 +69,9 @@ pub enum Error {
     #[snafu(display("Local model, expected at {expected_path}, not found"))]
     LocalModelNotFound { expected_path: String },
 
+    #[snafu(display("Local model config, expected at {expected_path}, not found"))]
+    LocalModelConfigNotFound { expected_path: String },
+
     #[snafu(display("Local tokenizer, expected at {expected_path}, not found"))]
     LocalTokenizerNotFound { expected_path: String },
 
@@ -570,41 +573,17 @@ pub fn create_hf_model(
 #[allow(unused_variables)]
 pub fn create_local_model(
     model_weights: &str,
+    config: Option<&str>,
     tokenizer: Option<&str>,
-    tokenizer_config: &str,
+    tokenizer_config: Option<&str>,
+    chat_template_literal: Option<&str>,
 ) -> Result<Box<dyn Chat>> {
-    let w = Path::new(&model_weights);
-    let t = tokenizer.map(Path::new);
-    let tc = Path::new(tokenizer_config);
-
-    if !w.exists() {
-        return Err(Error::LocalModelNotFound {
-            expected_path: w.to_string_lossy().to_string(),
-        });
-    }
-
-    if let Some(tokenizer_path) = t {
-        if !tokenizer_path.exists() {
-            return Err(Error::LocalTokenizerNotFound {
-                expected_path: tokenizer_path.to_string_lossy().to_string(),
-            });
-        }
-    }
-
-    if !tc.exists() {
-        return Err(Error::LocalTokenizerNotFound {
-            expected_path: tc.to_string_lossy().to_string(),
-        });
-    }
-
-    #[cfg(feature = "mistralrs")]
-    {
-        mistral::MistralLlama::from(t, w, tc).map(|x| Box::new(x) as Box<dyn Chat>)
-    }
-    #[cfg(not(feature = "mistralrs"))]
-    {
-        Err(Error::FailedToRunModel {
-            source: "No Chat model feature enabled".into(),
-        })
-    }
+    mistral::MistralLlama::from(
+        Path::new(&model_weights),
+        config.map(Path::new),
+        tokenizer.map(Path::new),
+        tokenizer_config.map(Path::new),
+        chat_template_literal,
+    )
+    .map(|x| Box::new(x) as Box<dyn Chat>)
 }

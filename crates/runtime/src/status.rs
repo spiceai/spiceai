@@ -116,6 +116,11 @@ impl RuntimeStatus {
         self.update_component_status(format!("embedding:{model_name}"), status);
         metrics::embeddings::STATUS.record(status as u64, &[KeyValue::new("model", model_name)]);
     }
+    pub fn update_view(&self, view_name: &TableReference, status: ComponentStatus) {
+        let view_name = view_name.to_string();
+        self.update_component_status(format!("view:{view_name}"), status);
+        metrics::views::STATUS.record(status as u64, &[KeyValue::new("view", view_name)]);
+    }
 
     /// Checks if all registered components have been ready at least once.
     ///

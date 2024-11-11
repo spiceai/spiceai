@@ -41,7 +41,7 @@ use crate::{
 use super::send_embeddings_request;
 
 #[tokio::test]
-async fn openai_nsql_test() -> Result<(), anyhow::Error> {
+async fn openai_test_nsql() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(None);
 
     verify_env_secret_exists("SPICE_OPENAI_API_KEY")
@@ -131,7 +131,7 @@ async fn openai_nsql_test() -> Result<(), anyhow::Error> {
 }
 
 #[tokio::test]
-async fn openai_search_test() -> Result<(), anyhow::Error> {
+async fn openai_test_search() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(None);
 
     verify_env_secret_exists("SPICE_OPENAI_API_KEY")
@@ -190,7 +190,7 @@ async fn openai_search_test() -> Result<(), anyhow::Error> {
 }
 
 #[tokio::test]
-async fn openai_embeddings_test() -> Result<(), anyhow::Error> {
+async fn openai_test_embeddings() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(None);
 
     verify_env_secret_exists("SPICE_OPENAI_API_KEY")

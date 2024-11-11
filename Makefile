@@ -52,6 +52,10 @@ test-integration-without-spiceai-dataset:
 test-integration-models:
 	@cargo test -p runtime --test integration_models --features models -- --nocapture
 
+.PHONY: test-integration-models-without-openai
+test-integration-models-without-openai:
+	@cargo test -p runtime --test integration_models --features models -- --nocapture --skip openai_test
+
 .PHONY: test-bench
 test-bench:
 	@cargo bench -p runtime --features postgres,spark,mysql

@@ -112,7 +112,7 @@ pub(crate) mod catalogs {
 }
 
 pub(crate) mod views {
-    use super::{global, Counter, LazyLock, Meter};
+    use super::{global, Counter, Gauge, LazyLock, Meter};
 
     pub(crate) static VIEWS_METER: LazyLock<Meter> = LazyLock::new(|| global::meter("views"));
 
@@ -120,6 +120,14 @@ pub(crate) mod views {
         VIEWS_METER
             .u64_counter("views_load_error")
             .with_description("Number of errors loading the view.")
+            .init()
+    });
+    pub(crate) static STATUS: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+        VIEWS_METER
+            .u64_gauge("view_status")
+            .with_description(
+                "Status of the views. 1=Initializing, 2=Ready, 3=Disabled, 4=Error, 5=Refreshing.",
+            )
             .init()
     });
 }
