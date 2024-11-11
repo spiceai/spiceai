@@ -406,7 +406,7 @@ impl DataFusion {
     #[must_use]
     pub fn is_writable(&self, table_reference: &TableReference) -> bool {
         if let Ok(writers) = self.data_writers.read() {
-            writers.iter().any(|s| s == table_reference)
+            writers.iter().any(|s| s.resolved_eq(table_reference))
         } else {
             false
         }

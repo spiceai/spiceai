@@ -13,8 +13,6 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::tools::SpiceModelTool;
@@ -75,17 +73,5 @@ impl SpiceModelTool for GetReadinessTool {
         tracing::info!(target: "task_history", parent: &span, captured_output = %captured_output_json);
 
         Ok(Value::Object(statuses_map))
-    }
-}
-
-impl From<GetReadinessTool> for spicepod::component::tool::Tool {
-    fn from(val: GetReadinessTool) -> Self {
-        spicepod::component::tool::Tool {
-            from: format!("builtin:{}", val.name()),
-            name: val.name().to_string(),
-            description: val.description().map(ToString::to_string),
-            params: HashMap::default(),
-            depends_on: Vec::default(),
-        }
     }
 }

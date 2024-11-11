@@ -105,6 +105,12 @@ impl RuntimeStatus {
         metrics::tools::STATUS.record(status as u64, &[KeyValue::new("tool", tool_name)]);
     }
 
+    pub fn update_tool_catalog(&self, catalog_name: &str, status: ComponentStatus) {
+        let name = catalog_name.to_string();
+        self.update_component_status(format!("tool_catalog:{name}"), status);
+        metrics::tools::STATUS.record(status as u64, &[KeyValue::new("tool_catalog", name)]);
+    }
+
     pub fn update_llm(&self, model_name: &str, status: ComponentStatus) {
         let model_name = model_name.to_string();
         self.update_component_status(format!("llm:{model_name}"), status);

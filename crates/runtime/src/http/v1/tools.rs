@@ -25,7 +25,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::Runtime;
+use crate::{tools::Tooling, Runtime};
 
 /// The structure of the JSON elements returned by the `/v1/tools` endpoint.
 #[derive(Serialize, Debug, Clone, PartialEq, Eq, Hash, Default, Deserialize)]
@@ -39,10 +39,13 @@ pub(crate) async fn list(Extension(rt): Extension<Arc<Runtime>>) -> Response {
     let tools = &*rt.tools.read().await;
     let tools = tools
         .iter()
-        .map(|(name, tool)| ListToolElement {
-            name: name.clone(),
-            description: tool.description().map(ToString::to_string),
-            parameters: tool.parameters(),
+        .filter_map(|(name, tool)| match tool {
+            Tooling::Tool(tool) => Some(ListToolElement {
+                name: name.clone(),
+                description: tool.description().map(ToString::to_string),
+                parameters: tool.parameters(),
+            }),
+            Tooling::Catalog(_) => None,
         })
         .collect::<Vec<_>>();
 
@@ -56,7 +59,7 @@ pub(crate) async fn post(
 ) -> Response {
     let tools = &*rt.tools.read().await;
 
-    let Some(tool) = tools.get(&tool_name) else {
+    let Some(Tooling::Tool(tool)) = tools.get(&tool_name) else {
         return (
             StatusCode::NOT_FOUND,
             Json(json!({"message": format!("Tool {tool_name} not found")})),

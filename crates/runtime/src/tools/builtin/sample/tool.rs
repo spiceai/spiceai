@@ -15,14 +15,14 @@ limitations under the License.
 */
 use crate::{
     datafusion::DataFusion,
-    tools::{parameters, SpiceModelTool},
+    tools::{utils::parameters, SpiceModelTool},
     Runtime,
 };
 use arrow::util::pretty::pretty_format_batches;
 use async_trait::async_trait;
 use serde_json::Value;
 use snafu::ResultExt;
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 use tracing::Span;
 use tracing_futures::Instrument;
 
@@ -114,17 +114,5 @@ impl SpiceModelTool for SampleDataTool {
             rt.datafusion(),
         )
         .await
-    }
-}
-
-impl From<SampleDataTool> for spicepod::component::tool::Tool {
-    fn from(val: SampleDataTool) -> Self {
-        spicepod::component::tool::Tool {
-            from: format!("builtin:{}", val.name()),
-            name: val.name().to_string(),
-            description: val.description().map(ToString::to_string),
-            params: HashMap::default(),
-            depends_on: Vec::default(),
-        }
     }
 }

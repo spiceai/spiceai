@@ -82,6 +82,16 @@ impl App {
             default_value
         }
     }
+
+    /// Retrieve all dataset names that are of a specific connector type.
+    #[must_use]
+    pub fn datasets_of_connector_type(&self, prefix: &str) -> Vec<String> {
+        self.datasets
+            .iter()
+            .filter(|d| d.from.starts_with(format!("{prefix}:").as_str()))
+            .map(|d| d.name.clone())
+            .collect()
+    }
 }
 
 #[derive(Debug, Snafu)]

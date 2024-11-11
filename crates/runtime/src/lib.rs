@@ -65,9 +65,10 @@ use timing::TimeMeasurement;
 use tls::TlsConfig;
 use tokio::sync::oneshot::error::RecvError;
 use tokio::sync::RwLock;
-use tools::builtin::get_builtin_tool_spec;
-use tools::factory as tool_factory;
+use tools::catalog::SpiceToolCatalog;
+use tools::factory::{self as tool_factory, default_available_catalogs};
 use tools::SpiceModelTool;
+use tools::Tooling;
 use topological_ordering::construct_effected_in_topological_order;
 use tracing_util::dataset_registered_trace;
 use util::fibonacci_backoff::FibonacciBackoffBuilder;
@@ -201,11 +202,6 @@ pub enum Error {
     #[snafu(display("Specify the SQL string for view {name} using either `sql: SELECT * FROM...` inline or as a file reference with `sql_ref: my_view.sql`"))]
     NeedToSpecifySQLView { name: String },
 
-    #[snafu(display(
-        "A federated table was configured as read_write without setting replication.enabled = true"
-    ))]
-    FederatedReadWriteTableWithoutReplication,
-
     #[snafu(display("An accelerated table was configured as read_write without setting replication.enabled = true"))]
     AcceleratedReadWriteTableWithoutReplication,
 
@@ -298,7 +294,7 @@ pub struct Runtime {
     models: Arc<RwLock<HashMap<String, Model>>>,
     llms: Arc<RwLock<LLMModelStore>>,
     embeds: Arc<RwLock<EmbeddingModelStore>>,
-    tools: Arc<RwLock<HashMap<String, Arc<dyn SpiceModelTool>>>>,
+    tools: Arc<RwLock<HashMap<String, Tooling>>>,
     pods_watcher: Arc<RwLock<Option<podswatcher::PodsWatcher>>>,
     secrets: Arc<RwLock<secrets::Secrets>>,
     datasets_health_monitor: Option<Arc<DatasetsHealthMonitor>>,
@@ -1246,11 +1242,6 @@ impl Runtime {
 
         // FEDERATED TABLE
         if !ds.is_accelerated() {
-            if ds.mode() == dataset::Mode::ReadWrite && !replicate {
-                // A federated dataset was configured as ReadWrite, but the replication setting wasn't set - error out.
-                FederatedReadWriteTableWithoutReplicationSnafu.fail()?;
-            }
-
             let ds_name: TableReference = ds.name.clone();
             self.df
                 .register_table(
@@ -1278,7 +1269,6 @@ impl Runtime {
                     name: ds.name.to_string(),
                 })?;
         let accelerator_engine = acceleration_settings.engine;
-        let replicate = ds.replication.as_ref().map_or(false, |r| r.enabled);
 
         if ds.mode() == dataset::Mode::ReadWrite && !replicate {
             AcceleratedReadWriteTableWithoutReplicationSnafu.fail()?;
@@ -1426,10 +1416,38 @@ impl Runtime {
             }
         }
 
-        // Load all built-in tools, regardless if they are in the spicepod
-        for tool in get_builtin_tool_spec() {
-            self.load_tool(&tool).await;
+        // Load all built-in tools, regardless if they are in the spicepod.
+        // This will enable loading each tool in the catalog, and the catalog as a whole. E.g:
+        //   `spice_tools: models, builtin`
+        //   `spice_tools: sql, load_memory`
+        for ctlg in default_available_catalogs() {
+            self.insert_tool_catalog(&ctlg).await;
+            for tool in ctlg.all().await {
+                self.insert_tool(&tool).await;
+            }
         }
+    }
+
+    async fn insert_tool_catalog(&self, t: &Arc<dyn SpiceToolCatalog>) {
+        let name = t.name().to_string();
+        let mut tools_map = self.tools.write().await;
+
+        tools_map.insert(name.clone(), Arc::clone(t).into());
+        tracing::debug!("Tool catalog {} ready to use", name.clone());
+        metrics::tools::COUNT.add(1, &[KeyValue::new("tool_catalog", name.clone())]);
+        self.status
+            .update_tool_catalog(&name, status::ComponentStatus::Ready);
+    }
+
+    async fn insert_tool(&self, t: &Arc<dyn SpiceModelTool>) {
+        let name = t.name().to_string();
+        let mut tools_map = self.tools.write().await;
+
+        tools_map.insert(name.clone(), Arc::clone(t).into());
+        tracing::debug!("Tool {} ready to use", name.clone());
+        metrics::tools::COUNT.add(1, &[KeyValue::new("tool", name.clone())]);
+        self.status
+            .update_tool(&name, status::ComponentStatus::Ready);
     }
 
     async fn load_tool(&self, tool: &Tool) {
@@ -1442,14 +1460,7 @@ impl Runtime {
             .await
             .context(UnableToInitializeLlmToolSnafu)
         {
-            Ok(t) => {
-                let mut tools_map = self.tools.write().await;
-                tools_map.insert(tool.name.clone(), t);
-                tracing::debug!("Tool {} ready to use", tool.name);
-                metrics::tools::COUNT.add(1, &[KeyValue::new("tool", tool.name.clone())]);
-                self.status
-                    .update_tool(&tool.name, status::ComponentStatus::Ready);
-            }
+            Ok(t) => self.insert_tool(&t).await,
             Err(e) => {
                 metrics::tools::LOAD_ERROR.add(1, &[]);
                 self.status

@@ -37,7 +37,7 @@ use tracing_futures::Instrument;
 
 use super::tool_use::ToolUsingChat;
 use crate::{
-    tools::{get_tools, options::SpiceToolsOptions},
+    tools::{options::SpiceToolsOptions, utils::get_tools},
     Runtime,
 };
 

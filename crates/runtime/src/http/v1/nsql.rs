@@ -25,7 +25,7 @@ use crate::{
             },
             table_schema::{TableSchemaTool, TableSchemaToolParams},
         },
-        create_tool_use_messages,
+        utils::create_tool_use_messages,
     },
     Runtime,
 };
