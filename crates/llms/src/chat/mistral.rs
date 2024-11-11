@@ -40,7 +40,7 @@ use snafu::ResultExt;
 use std::{
     collections::HashMap,
     num::NonZeroUsize,
-    path::{Path, PathBuf},
+    path::Path,
     pin::Pin,
     str::FromStr,
     sync::{
