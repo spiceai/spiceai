@@ -28,8 +28,6 @@ pub mod catalog;
 pub mod load;
 pub mod store;
 
-pub static DEFAULT_MEMORY_TABLE: &str = "spice.public.store";
-
 pub static MEMORY_TABLE_SCHEMA: Lazy<SchemaRef> = Lazy::new(|| {
     Schema::new(vec![
         Field::new("id", DataType::Utf8, false),

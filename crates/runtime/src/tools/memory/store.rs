@@ -30,7 +30,7 @@ use crate::{
     Runtime,
 };
 
-use super::{memory_table_name, try_from, MemoryTableElement, DEFAULT_MEMORY_TABLE};
+use super::{memory_table_name, try_from, MemoryTableElement};
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct StoreMemoryParams {
