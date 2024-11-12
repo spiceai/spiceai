@@ -55,7 +55,7 @@ env:
 jobs:
   build-database-bench-binary:
     name: Build Benchmark Test Binary
-    runs-on: spiceai-large-runners
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -67,8 +67,8 @@ jobs:
       - name: Install Protoc
         uses: arduino/setup-protoc@v3
 
-      - name: Install the cc tool chain for building benchmark binary
-        uses: ./.github/actions/setup-cc
+      # - name: Install the cc tool chain for building benchmark binary
+      #   uses: ./.github/actions/setup-cc
 
       - name: Build benchmark binary
         run: cargo bench -p runtime --features ${{ env.FEATURES }} --profile release --no-run
