@@ -55,7 +55,7 @@ impl std::fmt::Debug for SharepointTableProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SharepointTableProvider")
             .field("include_file_content", &self.include_file_content)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 

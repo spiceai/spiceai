@@ -161,7 +161,6 @@ pub struct FlightTable {
     table_reference: TableReference,
 }
 
-#[allow(clippy::missing_fields_in_debug)]
 impl std::fmt::Debug for FlightTable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FlightTable")
@@ -170,7 +169,7 @@ impl std::fmt::Debug for FlightTable {
             .field("client", &self.client)
             .field("schema", &self.schema)
             .field("table_reference", &self.table_reference)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 

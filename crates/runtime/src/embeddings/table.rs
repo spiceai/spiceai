@@ -64,7 +64,7 @@ impl std::fmt::Debug for EmbeddingTable {
         f.debug_struct("EmbeddingTable")
             .field("base_table", &self.base_table)
             .field("embedded_columns", &self.embedded_columns)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 

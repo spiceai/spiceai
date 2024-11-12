@@ -42,14 +42,13 @@ pub struct DebeziumKafka {
     consumer: &'static KafkaConsumer,
 }
 
-#[allow(clippy::missing_fields_in_debug)]
 impl std::fmt::Debug for DebeziumKafka {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DebeziumKafka")
             .field("schema", &self.schema)
             .field("primary_keys", &self.primary_keys)
             .field("constraints", &self.constraints)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 

@@ -168,12 +168,11 @@ pub struct GithubRestClient {
     token: Arc<dyn TokenProvider>,
 }
 
-#[allow(clippy::missing_fields_in_debug)]
 impl std::fmt::Debug for GithubRestClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GithubRestClient")
             .field("token", &self.token)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
