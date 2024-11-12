@@ -37,8 +37,9 @@ Switching to `as_millis_f64` could improve readability and reduce the need for m
 ## Options
 
 1. Keep existing pattern: `as_secs_f64() * 1000.0`.
-2. Switch to `as_millis_f64`.
-3. Switch to `duration.as_millis() as f64` pattern.
+1. Switch to `as_millis_f64`.
+1. Switch to `duration.as_millis() as f64` pattern.
+1. Copying the underlying implementation of `as_millis_f64`
 
 ## First-Principles
 
@@ -54,6 +55,7 @@ Continue using existing pattern `as_secs_f64() * 1000.0` until `as_millis_f64` i
 - `as_millis_f64` alternative might affect Spice’s stability as the method is not fully supported and has not passed [stabilization review](https://std-dev-guide.rust-lang.org/development/stabilization.html).
 - `duration.as_millis() as f64` alternative loses the sub-milliseconds precision
 - Existing `.as_secs_f64() * 1000.0` is a widely recognized pattern with [extensive usage in Rust projects](https://github.com/search?q=%22.as_secs_f64%28%29+*+1000.0%22+language%3ARust+&type=code)
+- As the existing pattern is used in multiple crates, copying the underlying implementation of `as_millis_f64` into a custom helper function will result in code duplication and maintenance overhead.
 
 **Why not**:
 
