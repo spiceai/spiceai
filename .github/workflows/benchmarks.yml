@@ -55,7 +55,7 @@ env:
 jobs:
   build-database-bench-binary:
     name: Build Benchmark Test Binary
-    runs-on: ubuntu-latest
+    runs-on: spiceai-large-runners
     steps:
       - uses: actions/checkout@v4
 
@@ -67,8 +67,8 @@ jobs:
       - name: Install Protoc
         uses: arduino/setup-protoc@v3
 
-      # - name: Install the cc tool chain for building benchmark binary
-      #   uses: ./.github/actions/setup-cc
+      - name: Install the cc tool chain for building benchmark binary
+        uses: ./.github/actions/setup-cc
 
       - name: Build benchmark binary
         run: cargo bench -p runtime --features ${{ env.FEATURES }} --profile release --no-run
@@ -310,7 +310,7 @@ jobs:
 
       - name: Run benchmark with ${{ matrix.name }}
         if: (github.event.inputs.selected_benchmark == matrix.name && (github.event.inputs.bench_name == matrix.bench || github.event.inputs.bench_name == 'all')) || github.event.inputs.run_all == 'true' || github.event_name == 'schedule'
-        run: ./spice_bench --bench ${{ matrix.cmd }}
+        run: INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" ./spice_bench --bench ${{ matrix.cmd }}
         continue-on-error: true
         env:
           UPLOAD_RESULTS_DATASET: 'spiceai.tests.oss_benchmarks'
@@ -380,7 +380,7 @@ jobs:
 
       - name: Run benchmark with ${{ matrix.name }}
         if: (github.event.inputs.selected_benchmark == matrix.name && (github.event.inputs.bench_name == matrix.bench || github.event.inputs.bench_name == 'all')) || github.event.inputs.run_all == 'true' || github.event_name == 'schedule'
-        run: ./spice_bench --bench ${{ matrix.cmd }}
+        run: INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" ./spice_bench --bench ${{ matrix.cmd }}
         continue-on-error: true
         env:
           UPLOAD_RESULTS_DATASET: 'spiceai.tests.oss_benchmarks'
