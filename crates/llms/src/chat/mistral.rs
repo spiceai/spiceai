@@ -20,19 +20,22 @@ use super::{nsql::SqlGeneration, Chat, Error as ChatError, FailedToRunModelSnafu
 use async_openai::{
     error::{ApiError, OpenAIError},
     types::{
-        ChatCompletionNamedToolChoice, ChatCompletionTool, ChatCompletionToolChoiceOption,
-        CreateChatCompletionRequest, CreateChatCompletionResponse, Stop,
+        ChatChoiceStream, ChatCompletionNamedToolChoice, ChatCompletionRequestUserMessageArgs,
+        ChatCompletionResponseStream, ChatCompletionStreamResponseDelta, ChatCompletionTool,
+        ChatCompletionToolChoiceOption, CreateChatCompletionRequest,
+        CreateChatCompletionRequestArgs, CreateChatCompletionResponse,
+        CreateChatCompletionStreamResponse, Role, Stop,
     },
 };
 use async_stream::stream;
 use async_trait::async_trait;
-use futures::Stream;
+use futures::{Stream, TryStreamExt};
 use mistralrs::{
-    ChatCompletionResponse, Constraint, Device, DeviceMapMetadata, Function, GGMLLoaderBuilder,
-    GGMLSpecificConfig, GGUFLoaderBuilder, GGUFSpecificConfig, LocalModelPaths, MistralRs,
-    MistralRsBuilder, ModelDType, ModelPaths, NormalLoaderBuilder, NormalRequest, Pipeline,
-    Request as MistralRequest, RequestMessage, Response as MistralResponse, SamplingParams,
-    TokenSource, Tool, ToolChoice, ToolType,
+    ChatCompletionChunkResponse, ChatCompletionResponse, ChunkChoice, Constraint, Device,
+    DeviceMapMetadata, Function, GGMLLoaderBuilder, GGMLSpecificConfig, GGUFLoaderBuilder,
+    GGUFSpecificConfig, LocalModelPaths, MistralRs, MistralRsBuilder, ModelDType, ModelPaths,
+    NormalLoaderBuilder, NormalRequest, Pipeline, Request as MistralRequest, RequestMessage,
+    Response as MistralResponse, SamplingParams, TokenSource, Tool, ToolChoice, ToolType,
 };
 
 use secrecy::{ExposeSecret, Secret};
@@ -48,7 +51,7 @@ use std::{
         Arc,
     },
 };
-use tokio::sync::mpsc::{channel, Sender};
+use tokio::sync::mpsc::{channel, Receiver, Sender};
 
 pub struct MistralLlama {
     pipeline: Arc<MistralRs>,
@@ -340,14 +343,41 @@ impl MistralLlama {
         })
     }
 
-    async fn run_internal(
+    /// Prepares and sends a [`CreateChatCompletionRequest`] to the model pipeline.
+    #[allow(deprecated, clippy::cast_possible_truncation)]
+    async fn send_message(
         &self,
-        message: RequestMessage,
-        tools: Option<Vec<Tool>>,
-        tool_choice: Option<ToolChoice>,
-        sampling: Option<SamplingParams>,
-    ) -> Result<ChatCompletionResponse> {
-        let (snd, mut rcv) = channel::<MistralResponse>(10_000);
+        req: CreateChatCompletionRequest,
+    ) -> Result<Receiver<MistralResponse>> {
+        let message = RequestMessage::Chat(
+            req.messages
+                .iter()
+                .map(message_to_mistral)
+                .collect::<Vec<_>>(),
+        );
+
+        let tools: Option<Vec<Tool>> = req.tools.map(|t| t.iter().map(convert_tool).collect());
+        let tool_choice: Option<ToolChoice> = req.tool_choice.map(|s| convert_tool_choice(&s));
+
+        let sampling = SamplingParams {
+            temperature: req.temperature.map(f64::from),
+            top_k: None,
+            top_p: req.top_p.map(f64::from),
+            min_p: None,
+            top_n_logprobs: req.top_logprobs.unwrap_or_default().into(),
+            frequency_penalty: req.frequency_penalty,
+            presence_penalty: req.presence_penalty,
+            stop_toks: req.stop.map(|s| match s {
+                Stop::String(s) => mistralrs::StopTokens::Seqs(vec![s]),
+                Stop::StringArray(s) => mistralrs::StopTokens::Seqs(s),
+            }),
+            max_len: req.max_completion_tokens.map(|x| x as usize),
+            // logits_bias: req.logit_bias,
+            logits_bias: None,
+            n_choices: req.n.unwrap_or(1) as usize,
+            dry_params: None,
+        };
+        let (snd, rcv) = channel::<MistralResponse>(10_000);
 
         tracing::trace!("Sending request to pipeline");
         self.pipeline
@@ -356,38 +386,35 @@ impl MistralLlama {
             .context(FailedToRunModelSnafu)?
             .send(self.to_mistralrs_request(
                 message.clone(),
-                false,
+                req.stream.unwrap_or_default(),
                 snd,
                 tools,
                 tool_choice,
-                sampling,
+                Some(sampling),
             ))
             .await
             .boxed()
             .context(FailedToRunModelSnafu)?;
         tracing::trace!("Request sent!");
 
-        match rcv.recv().await {
-            Some(response) => match response {
-                MistralResponse::Done(resp) => Ok(resp),
-                MistralResponse::ModelError(e, _) => {
-                    Err(ChatError::FailedToRunModel { source: e.into() })
-                }
-                MistralResponse::InternalError(e) | MistralResponse::ValidationError(e) => {
-                    tracing::error!(
-                        "Internal mistral.rs error: {e} for messages: {:#?}",
-                        message.clone()
-                    );
-                    Err(ChatError::FailedToRunModel { source: e })
-                }
+        Ok(rcv)
+    }
 
-                // Don't expect MistralResponse::Chunk, should be streaming only.
-                _ => Err(ChatError::FailedToRunModel {
-                    source: "Unexpected error occurred".into(),
-                }),
-            },
-            None => Err(ChatError::FailedToRunModel {
-                source: "Mistral pipeline unexpectedly closed".into(),
+    /// Process a single `stream=false` request to generate `OpenAi` chat completion.
+    fn post_process_req(resp: MistralResponse) -> Result<ChatCompletionResponse> {
+        match resp {
+            MistralResponse::Done(resp) => Ok(resp),
+            MistralResponse::ModelError(e, _) => {
+                Err(ChatError::FailedToRunModel { source: e.into() })
+            }
+            MistralResponse::InternalError(e) | MistralResponse::ValidationError(e) => {
+                tracing::error!("Internal mistral.rs error: {e}",);
+                Err(ChatError::FailedToRunModel { source: e })
+            }
+
+            // Don't expect MistralResponse::Chunk, should be streaming only.
+            _ => Err(ChatError::FailedToRunModel {
+                source: "Unexpected error occurred".into(),
             }),
         }
     }
@@ -407,96 +434,51 @@ impl Chat for MistralLlama {
         &self,
         prompt: String,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<Option<String>>> + Send>>> {
-        let (snd, mut rcv) = channel::<MistralResponse>(1000);
-        tracing::trace!("Sending request to pipeline");
-        self.pipeline
-            .get_sender()
+        let user_message = ChatCompletionRequestUserMessageArgs::default()
+            .content(prompt)
+            .build()
             .boxed()
-            .context(FailedToRunModelSnafu)?
-            .send(self.to_mistralrs_request(
-                RequestMessage::Completion {
-                    text: prompt,
-                    echo_prompt: false,
-                    best_of: 1,
-                },
-                true,
-                snd,
-                None,
-                None,
-                None,
-            ))
+            .context(FailedToRunModelSnafu)?;
+
+        let resp = self
+            .chat_stream(
+                CreateChatCompletionRequestArgs::default()
+                    .messages(vec![user_message.into()])
+                    .build()
+                    .boxed()
+                    .context(FailedToRunModelSnafu)?,
+            )
             .await
             .boxed()
             .context(FailedToRunModelSnafu)?;
-        tracing::trace!("Request sent!");
-        Ok(Pin::from(Box::new(stream! {
-            while let Some(resp) = rcv.recv().await {
-                tracing::trace!("Received response from pipeline");
-                match resp {
-                    MistralResponse::CompletionChunk(chunk) => {
-                        if let Some(choice) = chunk.choices.first() {
-                            yield Ok(Some(choice.text.clone()));
-                            if choice.finish_reason.is_some() {
-                                break;
-                            }
-                        } else {
-                            yield Ok(None);
-                            break;
-                        }
-                    },
-                    MistralResponse::Chunk(chunk) => {
-                        if let Some(choice) = chunk.choices.first() {
-                            yield Ok(Some(choice.delta.content.clone()));
-                            if choice.finish_reason.is_some() {
-                                break;
-                            }
-                        } else {
-                            yield Ok(None);
-                            break;
-                        }
-                    },
-                    MistralResponse::ModelError(err_msg, _) | MistralResponse::CompletionModelError(err_msg, _) => {
-                        yield Err(ChatError::FailedToRunModel {
-                            source: err_msg.into(),
-                        })
-                    },
-                    MistralResponse::InternalError(err_msg) | MistralResponse::ValidationError(err_msg) => {
-                        yield Err(ChatError::FailedToRunModel {
-                            source: err_msg,
-                        })
-                    },
-                    MistralResponse::CompletionDone(cr) => {
-                        yield Ok(Some(cr.choices[0].text.clone()));
-                        break;
-                    },
-                    MistralResponse::ImageGeneration(_) => {
-                        yield Err(ChatError::UnsupportedModalityType {
-                            modality: "image generation".into(),
-                        });
-                        break;
-                    },
-                    MistralResponse::Done(_) => {
-                        // Only reachable if message is [`RequestMessage::Chat`]. This function is using [`RequestMessage::Completion`].
-                        unreachable!()
-                    },
-                }
-            }
-        })))
+
+        let new_stream = resp
+            .map_ok(|r| r.choices.first().and_then(|c| c.delta.content.clone()))
+            .map_err(|e| ChatError::FailedToRunModel {
+                source: Box::<dyn std::error::Error + Send + Sync>::from(e.to_string()),
+            });
+
+        Ok(Box::pin(new_stream))
     }
 
     async fn run(&self, prompt: String) -> Result<Option<String>> {
+        let user_message = ChatCompletionRequestUserMessageArgs::default()
+            .content(prompt)
+            .build()
+            .boxed()
+            .context(FailedToRunModelSnafu)?;
+
         let resp = self
-            .run_internal(
-                RequestMessage::Completion {
-                    text: prompt,
-                    echo_prompt: false,
-                    best_of: 1,
-                },
-                None,
-                None,
-                None,
+            .chat_request(
+                CreateChatCompletionRequestArgs::default()
+                    .messages(vec![user_message.into()])
+                    .build()
+                    .boxed()
+                    .context(FailedToRunModelSnafu)?,
             )
-            .await?;
+            .await
+            .boxed()
+            .context(FailedToRunModelSnafu)?;
 
         match resp.choices.first() {
             Some(choice) => Ok(choice.message.content.clone()),
@@ -504,44 +486,44 @@ impl Chat for MistralLlama {
         }
     }
 
-    #[allow(deprecated, clippy::cast_possible_truncation)]
+    async fn chat_stream(
+        &self,
+        req: CreateChatCompletionRequest,
+    ) -> Result<ChatCompletionResponseStream, OpenAIError> {
+        let recver = self.send_message(req).await.map_err(|e| {
+            OpenAIError::ApiError(ApiError {
+                message: e.to_string(),
+                r#type: None,
+                param: None,
+                code: None,
+            })
+        })?;
+        Ok(stream_from_response(recver))
+    }
+
     async fn chat_request(
         &self,
         req: CreateChatCompletionRequest,
     ) -> Result<CreateChatCompletionResponse, OpenAIError> {
-        let messages = RequestMessage::Chat(
-            req.messages
-                .iter()
-                .map(message_to_mistral)
-                .collect::<Vec<_>>(),
-        );
-
-        let tools: Option<Vec<Tool>> = req.tools.map(|t| t.iter().map(convert_tool).collect());
-        let tool_choice: Option<ToolChoice> = req.tool_choice.map(|s| convert_tool_choice(&s));
-
-        // TODO confirm this transformtion.
-        let p = SamplingParams {
-            temperature: req.temperature.map(f64::from),
-            top_k: None,
-            top_p: req.top_p.map(f64::from),
-            min_p: None,
-            top_n_logprobs: req.top_logprobs.unwrap_or_default().into(),
-            frequency_penalty: req.frequency_penalty,
-            presence_penalty: req.presence_penalty,
-            stop_toks: req.stop.map(|s| match s {
-                Stop::String(s) => mistralrs::StopTokens::Seqs(vec![s]),
-                Stop::StringArray(s) => mistralrs::StopTokens::Seqs(s),
-            }),
-            max_len: req.max_completion_tokens.map(|x| x as usize),
-            // logits_bias: req.logit_bias,
-            logits_bias: None,
-            n_choices: req.n.unwrap_or(1) as usize,
-            dry_params: None,
+        let mut recver = self.send_message(req).await.map_err(|e| {
+            OpenAIError::ApiError(ApiError {
+                message: e.to_string(),
+                r#type: None,
+                param: None,
+                code: None,
+            })
+        })?;
+        let Some(resp) = recver.recv().await else {
+            return Err(OpenAIError::ApiError(ApiError {
+                message: "model pipeline unexpectedly closed".to_string(),
+                r#type: None,
+                param: None,
+                code: None,
+            }));
         };
 
-        let resp = self
-            .run_internal(messages, tools, tool_choice, Some(p))
-            .await
+        let z = Self::post_process_req(resp)
+            .map(|z| to_openai_response(&z))
             .map_err(|e| {
                 OpenAIError::ApiError(ApiError {
                     message: e.to_string(),
@@ -551,7 +533,7 @@ impl Chat for MistralLlama {
                 })
             })?;
 
-        to_openai_response(&resp).map_err(|e| {
+        z.map_err(|e| {
             OpenAIError::ApiError(ApiError {
                 message: e.to_string(),
                 r#type: None,
@@ -560,6 +542,95 @@ impl Chat for MistralLlama {
             })
         })
     }
+}
+
+fn stream_from_response(
+    mut rcv: Receiver<MistralResponse>,
+) -> Pin<Box<dyn Stream<Item = Result<CreateChatCompletionStreamResponse, OpenAIError>> + Send>> {
+    Pin::from(Box::new(stream! {
+        while let Some(resp) = rcv.recv().await {
+            tracing::trace!("Received response from pipeline");
+
+            match resp {
+                // MistralResponse::CompletionChunk(chunk) => yield chunk_to_openai_stream(chunk),
+                MistralResponse::Chunk(chunk) => yield chunk_to_openai_stream(chunk),
+                MistralResponse::ModelError(err_msg, _) | MistralResponse::CompletionModelError(err_msg, _)=> {
+                    yield Err(OpenAIError::ApiError(ApiError {
+                        message: err_msg,
+                        r#type: None,
+                        param: None,
+                        code: None,
+                    }));
+                },
+                MistralResponse::InternalError(err_msg) | MistralResponse::ValidationError(err_msg) => {
+                    yield Err(OpenAIError::ApiError(ApiError {
+                        message: err_msg.to_string(),
+                        r#type: None,
+                        param: None,
+                        code: None,
+                    }));
+                },
+                MistralResponse::ImageGeneration(_) => {
+                    yield Err(OpenAIError::ApiError(ApiError {
+                        message: "image generation".to_string(),
+                        r#type: None,
+                        param: None,
+                        code: None,
+                    }));
+                },
+                MistralResponse::CompletionChunk(_) | MistralResponse::CompletionDone(_) => {
+                    // Only reachable if message is [`RequestMessage::Completion`]
+                    unreachable!()
+                },
+                MistralResponse::Done(_) => {
+                    // Only reacable if `stream=false`.
+                    unreachable!()
+                },
+            }
+        }
+    }))
+}
+
+/// Convert a [`CompletionChunkResponse`] to a [`CreateChatCompletionStreamResponse`].
+#[allow(clippy::cast_possible_truncation)]
+fn chunk_to_openai_stream(
+    c: ChatCompletionChunkResponse,
+) -> Result<CreateChatCompletionStreamResponse, OpenAIError> {
+    let choices = c
+        .choices
+        .iter()
+        .map(chunk_choices_to_openai)
+        .collect::<Result<Vec<_>, OpenAIError>>()?;
+    Ok(CreateChatCompletionStreamResponse {
+        id: c.id,
+        model: c.model,
+        system_fingerprint: Some(c.system_fingerprint),
+        object: "chat.completion.chunk".to_string(),
+        // mistralrs uses milliseconds, OpenAI uses seconds
+        created: (c.created / 1000) as u32,
+        service_tier: None,
+        usage: None,
+        choices,
+    })
+}
+
+#[allow(deprecated, clippy::cast_possible_truncation)]
+fn chunk_choices_to_openai(choice: &ChunkChoice) -> Result<ChatChoiceStream, OpenAIError> {
+    let role: Role = serde_json::from_str(&format!("\"{}\"", &choice.delta.role))
+        .map_err(OpenAIError::JSONDeserialize)?;
+
+    Ok(ChatChoiceStream {
+        index: choice.index as u32,
+        delta: ChatCompletionStreamResponseDelta {
+            content: Some(choice.delta.content.clone()),
+            function_call: None,
+            tool_calls: None,
+            role: Some(role),
+            refusal: None,
+        },
+        finish_reason: None,
+        logprobs: None,
+    })
 }
 
 fn convert_tool_choice(x: &ChatCompletionToolChoiceOption) -> ToolChoice {
