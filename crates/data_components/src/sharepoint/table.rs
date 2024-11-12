@@ -50,6 +50,15 @@ pub struct SharepointTableProvider {
     include_file_content: bool,
 }
 
+#[allow(clippy::missing_fields_in_debug)]
+impl std::fmt::Debug for SharepointTableProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SharepointTableProvider")
+            .field("include_file_content", &self.include_file_content)
+            .finish()
+    }
+}
+
 impl SharepointTableProvider {
     #[must_use]
     pub fn new(

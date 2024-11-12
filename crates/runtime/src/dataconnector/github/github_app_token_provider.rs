@@ -116,6 +116,16 @@ pub struct GitHubAppTokenProvider {
     token_generator: Arc<dyn TokenGenerator>,
 }
 
+impl std::fmt::Debug for GitHubAppTokenProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GitHubAppTokenProvider")
+            .field("app_client_id", &self.app_client_id)
+            .field("installation_id", &self.installation_id)
+            .field("private_key.len()", &self.private_key.len())
+            .finish_non_exhaustive()
+    }
+}
+
 impl GitHubAppTokenProvider {
     #[must_use]
     pub fn new(app_client_id: Arc<str>, private_key: Arc<str>, installation_id: Arc<str>) -> Self {

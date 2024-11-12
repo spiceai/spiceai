@@ -106,6 +106,18 @@ pub struct GraphQLTableProvider {
     context: Option<Arc<dyn GraphQLContext>>,
 }
 
+#[allow(clippy::missing_fields_in_debug)]
+impl std::fmt::Debug for GraphQLTableProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GraphQLTableProvider")
+            .field("base_query", &self.base_query)
+            .field("gql_schema", &self.gql_schema)
+            .field("table_schema", &self.table_schema)
+            .field("context", &self.context)
+            .finish()
+    }
+}
+
 #[async_trait]
 impl TableProvider for GraphQLTableProvider {
     fn as_any(&self) -> &dyn Any {

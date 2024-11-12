@@ -143,6 +143,7 @@ impl ExecutionPlan for SchemaCastScanExec {
     }
 }
 
+#[derive(Debug)]
 pub struct EnsureSchema {
     input: Arc<dyn TableProvider>,
 }

@@ -31,6 +31,7 @@ use self::write::MemTable;
 pub mod struct_builder;
 pub mod write;
 
+#[derive(Debug)]
 pub struct ArrowFactory {}
 
 impl ArrowFactory {

@@ -93,7 +93,7 @@ pub type ValuePreprocessor = Arc<dyn Fn(&mut Value) -> Result<()>>;
 pub type ErrorChecker = Arc<dyn Fn(&HeaderMap<HeaderValue>, &Value) -> Result<()> + Send + Sync>;
 
 /// A trait optionally provided to GraphQL ``TableProvider``s to alter the behavior of filter push down
-pub trait GraphQLContext: Send + Sync {
+pub trait GraphQLContext: Send + Sync + std::fmt::Debug {
     /// A function executed for each filter push down requested from the ``TableProvider``
     /// A custom implementation can override this function to implement custom filter pushdown logic
     fn filter_pushdown(

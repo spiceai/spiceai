@@ -29,6 +29,7 @@ use crate::Read;
 
 use super::{CatalogId, Result, UCSchema, UCTable, UnityCatalog};
 
+#[derive(Debug)]
 pub struct UnityCatalogProvider {
     schemas: HashMap<String, Arc<dyn SchemaProvider>>,
 }
@@ -93,6 +94,7 @@ impl CatalogProvider for UnityCatalogProvider {
     }
 }
 
+#[derive(Debug)]
 pub struct UnityCatalogSchemaProvider {
     tables: HashMap<String, Arc<dyn TableProvider>>,
 }

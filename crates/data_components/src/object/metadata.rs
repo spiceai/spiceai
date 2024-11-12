@@ -44,6 +44,7 @@ use object_store::{path::Path, ObjectMeta, ObjectStore};
 use super::ObjectStoreContext;
 use url::Url;
 
+#[derive(Debug)]
 pub struct ObjectStoreMetadataTable {
     ctx: ObjectStoreContext,
 }

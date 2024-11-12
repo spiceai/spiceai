@@ -329,7 +329,7 @@ impl DataConnectorFactory for GithubFactory {
     }
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(PartialEq, Eq, Debug)]
 pub(crate) enum GitHubQueryMode {
     Auto,
     Search,

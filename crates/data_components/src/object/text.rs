@@ -52,6 +52,15 @@ pub struct ObjectStoreTextTable {
     document_formatter: Option<Arc<dyn DocumentParser>>,
 }
 
+#[allow(clippy::missing_fields_in_debug)]
+impl std::fmt::Debug for ObjectStoreTextTable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ObjectStoreTextTable")
+            .field("ctx", &self.ctx)
+            .finish()
+    }
+}
+
 impl ObjectStoreTextTable {
     pub fn try_new(
         store: Arc<dyn ObjectStore>,

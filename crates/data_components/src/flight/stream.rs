@@ -58,6 +58,7 @@ pub enum Error {
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
+#[derive(Debug)]
 pub struct FlightTableStreamer {
     table_reference: TableReference,
     flight_client: FlightClient,
