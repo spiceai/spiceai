@@ -83,6 +83,7 @@ Currently supported data connectors for upstream datasets. More coming soon.
 
 | Name            | Description                           | Status            | Protocol/Format                            |
 | --------------- | ------------------------------------- | ----------------- | ------------------------------------------ |
+| `duckdb`        | DuckDB                                | Release Candidate |                                            |
 | `github`        | GitHub                                | Release Candidate |                                            |
 | `mysql`         | MySQL                                 | Release Candidate |                                            |
 | `postgres`      | PostgreSQL                            | Release Candidate |                                            |
@@ -96,7 +97,6 @@ Currently supported data connectors for upstream datasets. More coming soon.
 | `clickhouse`    | Clickhouse                            | Alpha             |                                            |
 | `debezium`      | Debezium CDC                          | Alpha             | Kafka + JSON                               |
 | `dremio`        | [Dremio][dremio]                      | Alpha             | Arrow Flight                               |
-| `duckdb`        | DuckDB                                | Alpha             |                                            |
 | `file`          | File                                  | Alpha             | Parquet, CSV                               |
 | `ftp`, `sftp`   | FTP/SFTP                              | Alpha             | Parquet, CSV                               |
 | `graphql`       | GraphQL                               | Alpha             | JSON                                       |
