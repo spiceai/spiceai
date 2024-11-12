@@ -20,11 +20,11 @@ use super::{nsql::SqlGeneration, Chat, Error as ChatError, FailedToRunModelSnafu
 use async_openai::{
     error::{ApiError, OpenAIError},
     types::{
-        ChatChoiceStream, ChatCompletionNamedToolChoice, ChatCompletionRequestUserMessageArgs,
-        ChatCompletionResponseStream, ChatCompletionStreamResponseDelta, ChatCompletionTool,
-        ChatCompletionToolChoiceOption, CreateChatCompletionRequest,
-        CreateChatCompletionRequestArgs, CreateChatCompletionResponse,
-        CreateChatCompletionStreamResponse, Role, Stop,
+        ChatChoiceLogprobs, ChatChoiceStream, ChatCompletionNamedToolChoice,
+        ChatCompletionRequestUserMessageArgs, ChatCompletionResponseStream,
+        ChatCompletionStreamResponseDelta, ChatCompletionTool, ChatCompletionToolChoiceOption,
+        CreateChatCompletionRequest, CreateChatCompletionRequestArgs, CreateChatCompletionResponse,
+        CreateChatCompletionStreamResponse, FinishReason, Role, Stop,
     },
 };
 use async_stream::stream;
@@ -403,7 +403,16 @@ impl MistralLlama {
     /// Process a single `stream=false` request to generate `OpenAi` chat completion.
     fn post_process_req(resp: MistralResponse) -> Result<ChatCompletionResponse> {
         match resp {
-            MistralResponse::Done(resp) => Ok(resp),
+            MistralResponse::Done(mut resp) => {
+                // mistralrs does not return "tool_calls" as a finish_reason correctly (like OpenAI spec).
+                // This is a workaround to set it correctly.
+                resp.choices.iter_mut().for_each(|c| {
+                    if c.finish_reason == "stop" && !c.message.tool_calls.is_empty() {
+                        c.finish_reason = "tool_calls".to_string();
+                    }
+                });
+                Ok(resp)
+            }
             MistralResponse::ModelError(e, _) => {
                 Err(ChatError::FailedToRunModel { source: e.into() })
             }
@@ -619,6 +628,13 @@ fn chunk_choices_to_openai(choice: &ChunkChoice) -> Result<ChatChoiceStream, Ope
     let role: Role = serde_json::from_str(&format!("\"{}\"", &choice.delta.role))
         .map_err(OpenAIError::JSONDeserialize)?;
 
+    let finish_reason: Option<FinishReason> = choice
+        .finish_reason
+        .as_ref()
+        .map(|f| serde_json::from_str(&format!("\"{f}\"")))
+        .transpose()
+        .map_err(OpenAIError::JSONDeserialize)?;
+
     Ok(ChatChoiceStream {
         index: choice.index as u32,
         delta: ChatCompletionStreamResponseDelta {
@@ -628,7 +644,7 @@ fn chunk_choices_to_openai(choice: &ChunkChoice) -> Result<ChatChoiceStream, Ope
             role: Some(role),
             refusal: None,
         },
-        finish_reason: None,
+        finish_reason,
         logprobs: None,
     })
 }
