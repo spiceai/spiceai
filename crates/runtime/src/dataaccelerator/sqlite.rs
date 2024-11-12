@@ -334,7 +334,7 @@ mod tests {
     use datafusion::{
         common::{Constraints, TableReference, ToDFSchema},
         execution::context::SessionContext,
-        logical_expr::{cast, col, lit, CreateExternalTable},
+        logical_expr::{cast, col, dml::InsertOp, lit, CreateExternalTable},
         physical_plan::collect,
         scalar::ScalarValue,
     };
