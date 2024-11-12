@@ -2,7 +2,11 @@
 
 ## Context
 
-Spice.ai OSS uses the following pattern to obtain and record telemetry metrics in floating-point milliseconds.
+Spice.ai OSS uses the following common pattern to obtain and record telemetry metrics in floating-point milliseconds: 
+
+```rust
+duration.as_secs_f64() * 1000.0
+```
 
 ```rust
 pub fn track_query_execution_duration(duration: Duration, dimensions: &[KeyValue]) {
@@ -10,7 +14,7 @@ pub fn track_query_execution_duration(duration: Duration, dimensions: &[KeyValue
 }
 ```
 
-There is a new `duration.as_millis_f64()` introduced recently, which could simplify this pattern by directly providing millisecond precision as a floating-point number without extra multiplication: [Add as_millis_{f64,f32} helper functions for Duration](https://github.com/rust-lang/libs-team/issues/349)
+There is a newly introduced unstable Rust API `duration.as_millis_f64()`, which could simplify this pattern by directly providing millisecond precision as a floating-point number without extra multiplication: [Add as_millis_{f64,f32} helper functions for Duration](https://github.com/rust-lang/libs-team/issues/349)
 
 ```rust
 #[unstable(feature = "duration_millis_float", issue = "122451")]
