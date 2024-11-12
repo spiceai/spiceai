@@ -17,19 +17,25 @@ limitations under the License.
 use std::sync::Arc;
 
 use app::AppBuilder;
-use async_openai::types::EmbeddingInput;
-use runtime::{auth::EndpointAuth, Runtime};
+use async_openai::types::{
+    ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestUserMessageArgs,
+    CreateChatCompletionRequestArgs, EmbeddingInput,
+};
+
+use runtime::{auth::EndpointAuth, model::try_to_chat_model, Runtime};
 use spicepod::component::{
     embeddings::{ColumnEmbeddingConfig, Embeddings},
     model::Model,
 };
 
 use crate::{
-    init_tracing,
+    init_tracing, init_tracing_with_task_history,
     models::{
-        create_api_bindings_config, get_taxi_trips_dataset, get_tpcds_dataset,
-        json_is_single_row_with_value, normalize_embeddings_response, normalize_search_response,
-        send_nsql_request, send_search_request,
+        create_api_bindings_config, get_executed_tasks, get_params_with_secrets,
+        get_taxi_trips_dataset, get_tpcds_dataset, json_is_single_row_with_value,
+        normalize_chat_completion_response, normalize_embeddings_response,
+        normalize_search_response, send_chat_completions_request, send_nsql_request,
+        send_search_request,
     },
     utils::{runtime_ready_check, verify_env_secret_exists},
 };
@@ -258,6 +264,134 @@ async fn openai_test_embeddings() -> Result<(), anyhow::Error> {
             normalize_embeddings_response(response)
         );
     }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn openai_test_chat_completion() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(None);
+
+    verify_env_secret_exists("SPICE_OPENAI_API_KEY")
+        .await
+        .map_err(anyhow::Error::msg)?;
+
+    let mut model_with_tools = get_openai_model("gpt-4o-mini", "openai_model");
+    model_with_tools
+        .params
+        .insert("spice_tools".to_string(), "auto".into());
+
+    let app = AppBuilder::new("text-to-sql")
+        .with_dataset(get_taxi_trips_dataset())
+        .with_model(model_with_tools)
+        .build();
+
+    let api_config = create_api_bindings_config();
+    let http_base_url = format!("http://{}", api_config.http_bind_address);
+    let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+
+    let rt_ref_copy = Arc::clone(&rt);
+    tokio::spawn(async move {
+        Box::pin(rt_ref_copy.start_servers(api_config, None, EndpointAuth::no_auth())).await
+    });
+
+    tokio::select! {
+        () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+            return Err(anyhow::anyhow!("Timed out waiting for components to load"));
+        }
+        () = rt.load_components() => {}
+    }
+
+    runtime_ready_check(&rt).await;
+
+    let response = send_chat_completions_request(
+        http_base_url.as_str(),
+        vec![
+            ("system".to_string(), "You are an assistant that responds to queries by providing only the requested data values without extra explanation.".to_string()),
+            ("user".to_string(), "Provide the total number of records in the taxi trips dataset. If known, return a single numeric value.".to_string()),
+        ],
+        "openai_model",
+        false,
+    ).await?;
+
+    insta::assert_snapshot!(
+        "chat_completion",
+        normalize_chat_completion_response(response, false)
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn openai_test_chat_messages() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(None);
+
+    verify_env_secret_exists("SPICE_OPENAI_API_KEY")
+        .await
+        .map_err(anyhow::Error::msg)?;
+
+    let app = AppBuilder::new("text-to-sql")
+        .with_dataset(get_taxi_trips_dataset())
+        .build();
+
+    let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+
+    let _tracing = init_tracing_with_task_history(None, &rt);
+
+    tokio::select! {
+        () = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+            return Err(anyhow::anyhow!("Timed out waiting for components to load"));
+        }
+        () = rt.load_components() => {}
+    }
+
+    runtime_ready_check(&rt).await;
+
+    let mut model_with_tools = get_openai_model("gpt-4o-mini", "openai_model");
+    model_with_tools
+        .params
+        .insert("spice_tools".to_string(), "auto".into());
+
+    let model_secrets = get_params_with_secrets(&model_with_tools.params, &rt).await;
+
+    let tool_model = try_to_chat_model(&model_with_tools, &model_secrets, Arc::clone(&rt)).await?;
+
+    let req = CreateChatCompletionRequestArgs::default()
+                .messages(vec![ChatCompletionRequestSystemMessageArgs::default()
+                    .content("You are an assistant that responds to queries by providing only the requested data values without extra explanation.".to_string())
+                    .build()?
+                    .into(),ChatCompletionRequestUserMessageArgs::default()
+                    .content("Provide the total number of records in the taxi trips dataset. If known, return a single numeric value.".to_string())
+                    .build()?
+                    .into()])
+                .build()?;
+
+    let task_start_time = std::time::SystemTime::now();
+    let response = tool_model.chat_request(req).await?;
+
+    insta::assert_snapshot!("chat_1_choices", format!("{:?}", response.choices));
+
+    let tasks = get_executed_tasks(&rt, task_start_time.into()).await?;
+
+    assert!(
+        tasks.iter().any(|t| { t.0 == "tool_use::list_datasets" }),
+        "Expected 'tool_use::list_datasets' task to be executed"
+    );
+    assert!(
+        tasks.iter().any(|t| { t.0 == "tool_use::sql" }),
+        "Expected 'tool_use::sql' task to be executed"
+    );
+
+    let ai_completion_task = tasks
+        .iter()
+        .find(|t| t.0 == "ai_completion")
+        .expect("ai_completion task to be executed");
+
+    // ai_completion input message is deterministic - based on available tools, app configuration, and the input message
+    insta::assert_snapshot!(
+        "chat_1_ai_completion_input",
+        format!("{:?}", ai_completion_task.1)
+    );
 
     Ok(())
 }

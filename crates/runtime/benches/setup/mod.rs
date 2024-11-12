@@ -74,13 +74,18 @@ pub(crate) async fn setup_benchmark(
         .await;
 
     tokio::select! {
-        () = tokio::time::sleep(std::time::Duration::from_secs(60*15)) => { // Databricks can take awhile to start up
+        () = tokio::time::sleep(std::time::Duration::from_secs(15 * 60)) => { // Databricks can take awhile to start up
             panic!("Timed out waiting for datasets to load in setup_benchmark()");
         }
         () = rt.load_components() => {}
     }
 
-    runtime_ready_check(&rt).await;
+    let wait_time = match bench_name {
+        "clickbench" => std::time::Duration::from_secs(3 * 60 * 60),
+        _ => std::time::Duration::from_secs(10 * 60),
+    };
+
+    runtime_ready_check(&rt, wait_time).await;
 
     let benchmark_results =
         BenchmarkResultsBuilder::new(get_commit_sha(), get_branch_name(), ITERATIONS);
@@ -88,13 +93,8 @@ pub(crate) async fn setup_benchmark(
     Ok((benchmark_results, rt))
 }
 
-async fn runtime_ready_check(rt: &Runtime) {
-    assert!(
-        wait_until_true(Duration::from_secs(600), || async {
-            rt.status().is_ready()
-        })
-        .await
-    );
+async fn runtime_ready_check(rt: &Runtime, wait_time: Duration) {
+    assert!(wait_until_true(wait_time, || async { rt.status().is_ready() }).await);
 }
 
 async fn wait_until_true<F, Fut>(max_wait: Duration, mut f: F) -> bool

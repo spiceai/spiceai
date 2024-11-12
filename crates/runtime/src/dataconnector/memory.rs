@@ -19,13 +19,15 @@ use async_trait::async_trait;
 use data_components::arrow::write::MemTable;
 use snafu::ResultExt;
 
-use std::{any::Any, collections::HashMap, pin::Pin, sync::Arc};
+use std::{any::Any, pin::Pin, sync::Arc};
 
 use crate::{component::dataset::Dataset, tools::memory::MEMORY_TABLE_SCHEMA};
 use datafusion::datasource::TableProvider;
 use futures::Future;
 
-use super::{DataConnector, DataConnectorError, DataConnectorFactory, ParameterSpec, Parameters};
+use super::{
+    DataConnector, DataConnectorError, DataConnectorFactory, DataConnectorParams, ParameterSpec,
+};
 
 /// A connector that wraps a [`MemTable`] initialised without data, that can be
 /// written to, and has predefined schema based on the dataset path (see [`Self::schema_from_path`]).
@@ -59,8 +61,7 @@ impl MemoryConnectorFactory {
 impl DataConnectorFactory for MemoryConnectorFactory {
     fn create(
         &self,
-        _params: Parameters,
-        _metadata: Option<HashMap<String, String>>,
+        _params: DataConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move { Ok(Arc::new(MemoryConnector::default()) as Arc<dyn DataConnector>) })
     }

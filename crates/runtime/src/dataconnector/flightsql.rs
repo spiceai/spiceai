@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::{DataConnector, DataConnectorFactory, ParameterSpec, Parameters};
+use super::{DataConnector, DataConnectorFactory, DataConnectorParams, ParameterSpec};
 use crate::component::dataset::Dataset;
 use arrow_flight::sql::client::FlightSqlServiceClient;
 use async_trait::async_trait;
@@ -24,7 +24,6 @@ use datafusion::datasource::TableProvider;
 use flight_client::tls::new_tls_flight_channel;
 use snafu::prelude::*;
 use std::any::Any;
-use std::collections::HashMap;
 use std::pin::Pin;
 use std::{future::Future, sync::Arc};
 
@@ -71,11 +70,11 @@ const PARAMETERS: &[ParameterSpec] = &[
 impl DataConnectorFactory for FlightSQLFactory {
     fn create(
         &self,
-        params: Parameters,
-        _metadata: Option<HashMap<String, String>>,
+        params: DataConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             let endpoint: String = params
+                .parameters
                 .get("endpoint")
                 .expose()
                 .ok_or_else(|p| Error::MissingParameter {
@@ -87,8 +86,8 @@ impl DataConnectorFactory for FlightSQLFactory {
                 .context(UnableToConstructTlsChannelSnafu)?;
 
             let mut client = FlightSqlServiceClient::new(flight_channel);
-            let username = params.get("username").expose().ok();
-            let password = params.get("password").expose().ok();
+            let username = params.parameters.get("username").expose().ok();
+            let password = params.parameters.get("password").expose().ok();
             if let (Some(username), Some(password)) = (username, password) {
                 client
                     .handshake(username, password)

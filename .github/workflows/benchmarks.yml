@@ -24,6 +24,7 @@ on:
           - 'all'
           - 'tpch'
           - 'tpcds'
+          - 'clickbench'
       selected_benchmark:
         description: 'Individual connector/accelerator benchmarks to run'
         required: false
@@ -54,7 +55,7 @@ env:
 jobs:
   build-database-bench-binary:
     name: Build Benchmark Test Binary
-    runs-on: ubuntu-latest
+    runs-on: spiceai-large-runners
     steps:
       - uses: actions/checkout@v4
 
@@ -65,6 +66,9 @@ jobs:
 
       - name: Install Protoc
         uses: arduino/setup-protoc@v3
+
+      - name: Install the cc tool chain for building benchmark binary
+        uses: ./.github/actions/setup-cc
 
       - name: Build benchmark binary
         run: cargo bench -p runtime --features ${{ env.FEATURES }} --profile release --no-run
@@ -330,3 +334,56 @@ jobs:
           AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ secrets.AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY }}
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_S3_ATHENA_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_S3_ATHENA_SECRET_ACCESS_KEY }}
+
+  run-clickbench:
+    name: Run ${{ matrix.name }} Clickbench
+    runs-on: spiceai-large-runners
+    needs: build-database-bench-binary
+
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        include:
+          - cmd: '-a arrow -b clickbench'
+            name: 'arrow accelerator (file mode)'
+            bench: 'clickbench'
+          - cmd: '-a duckdb -m file -b clickbench'
+            name: 'duckdb accelerator (file mode)'
+            bench: 'clickbench'
+          - cmd: '-a duckdb -m memory -b clickbench'
+            name: 'duckdb accelerator (memory mode)'
+            bench: 'clickbench'
+
+    steps:
+      - name: Checkout repository
+        if: (github.event.inputs.selected_benchmark == matrix.name && (github.event.inputs.bench_name == matrix.bench || github.event.inputs.bench_name == 'all')) || github.event.inputs.run_all == 'true' || github.event_name == 'schedule'
+        uses: actions/checkout@v4
+
+      - name: Install required packages
+        run: sudo apt-get update && sudo apt-get install -y unixodbc-dev unixodbc wget
+
+      - name: Set up Spice.ai API Key
+        if: (github.event.inputs.selected_benchmark == matrix.name && (github.event.inputs.bench_name == matrix.bench || github.event.inputs.bench_name == 'all')) || github.event.inputs.run_all == 'true' || github.event_name == 'schedule'
+        run: |
+          echo 'SPICEAI_API_KEY="${{ secrets.SPICE_SECRET_SPICEAI_BENCHMARK_KEY }}"' > .env
+
+      - name: Download benchmark binary
+        if: (github.event.inputs.selected_benchmark == matrix.name && (github.event.inputs.bench_name == matrix.bench || github.event.inputs.bench_name == 'all')) || github.event.inputs.run_all == 'true' || github.event_name == 'schedule'
+        uses: actions/download-artifact@v4
+        with:
+          name: spice_bench
+
+      - name: Make benchmark binary executable
+        if: (github.event.inputs.selected_benchmark == matrix.name && (github.event.inputs.bench_name == matrix.bench || github.event.inputs.bench_name == 'all')) || github.event.inputs.run_all == 'true' || github.event_name == 'schedule'
+        run: chmod +x ./spice_bench
+
+      - name: Run benchmark with ${{ matrix.name }}
+        if: (github.event.inputs.selected_benchmark == matrix.name && (github.event.inputs.bench_name == matrix.bench || github.event.inputs.bench_name == 'all')) || github.event.inputs.run_all == 'true' || github.event_name == 'schedule'
+        run: ./spice_bench --bench ${{ matrix.cmd }}
+        continue-on-error: true
+        env:
+          UPLOAD_RESULTS_DATASET: 'spiceai.tests.oss_benchmarks'
+          CLICKBENCH_S3_ENDPOINT: ${{ secrets.CLICKBENCH_S3_ENDPOINT}}
+          CLICKBENCH_S3_KEY: ${{ secrets.CLICKBENCH_S3_KEY}}
+          CLICKBENCH_S3_SECRET: ${{ secrets.CLICKBENCH_S3_SECRET}}

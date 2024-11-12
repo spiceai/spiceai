@@ -35,13 +35,15 @@ use datafusion::execution::SendableRecordBatchStream;
 use datafusion::logical_expr::{Expr, LogicalPlanBuilder};
 use datafusion::sql::unparser::Unparser;
 use datafusion::sql::TableReference;
+use datafusion_table_providers::InvalidTypeAction;
 use secrecy::SecretString;
 use snafu::prelude::*;
 use std::any::Any;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::Mutex;
+use tokio::sync::RwLock;
 
 use std::future::Future;
 
@@ -221,6 +223,11 @@ pub enum DataConnectorError {
         pattern: String,
         source: globset::Error,
     },
+
+    #[snafu(display(
+        "Invalid type action is not supported for the {dataconnector} Data Connector."
+    ))]
+    UnsupportedInvalidTypeAction { dataconnector: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -247,12 +254,9 @@ pub async fn register_connector_factory(
 /// # Returns
 ///
 /// `None` if the connector for `name` is not registered, otherwise a `Result` containing the result of calling the constructor to create a `DataConnector`.
-#[allow(clippy::implicit_hasher)]
 pub async fn create_new_connector(
     name: &str,
-    params: HashMap<String, SecretString>,
-    secrets: Arc<RwLock<Secrets>>,
-    metadata: Option<HashMap<String, String>>,
+    params: DataConnectorParams,
 ) -> Option<AnyErrorResult<Arc<dyn DataConnector>>> {
     let guard = DATA_CONNECTOR_FACTORY_REGISTRY.lock().await;
 
@@ -260,20 +264,14 @@ pub async fn create_new_connector(
 
     let factory = connector_factory?;
 
-    let params = match Parameters::try_new(
-        &format!("connector {name}"),
-        params.into_iter().collect(),
-        factory.prefix(),
-        secrets,
-        factory.parameters(),
-    )
-    .await
-    {
-        Ok(params) => params,
-        Err(e) => return Some(Err(e)),
-    };
+    if params.invalid_type_action.is_some() && !factory.supports_invalid_type_action() {
+        return Some(Err(DataConnectorError::UnsupportedInvalidTypeAction {
+            dataconnector: name.to_string(),
+        }
+        .into()));
+    }
 
-    let result = factory.create(params, metadata).await;
+    let result = factory.create(params).await;
     Some(result)
 }
 
@@ -331,9 +329,12 @@ pub async fn register_all() {
 pub trait DataConnectorFactory: Send + Sync {
     fn create(
         &self,
-        params: Parameters,
-        metadata: Option<HashMap<String, String>>,
+        params: DataConnectorParams,
     ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>>;
+
+    fn supports_invalid_type_action(&self) -> bool {
+        false
+    }
 
     /// The prefix to use for parameters and secrets for this `DataConnector`.
     ///
@@ -452,4 +453,67 @@ pub async fn get_data(
 
     let record_batch_stream = df.execute_stream().await?;
     Ok((table_provider.schema(), record_batch_stream))
+}
+
+pub struct DataConnectorParams {
+    pub(crate) parameters: Parameters,
+    pub(crate) metadata: HashMap<String, String>,
+    pub(crate) invalid_type_action: Option<InvalidTypeAction>,
+}
+
+impl DataConnectorParams {
+    pub async fn from_dataset(
+        runtime: &Runtime,
+        dataset: Arc<Dataset>,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let name = dataset.source();
+        let params = dataset.params.clone();
+        let mut params = Self::from_params(runtime, &name, params).await?;
+        params.metadata.clone_from(&dataset.metadata);
+        params.invalid_type_action = dataset.invalid_type_action.map(Into::into);
+
+        Ok(params)
+    }
+
+    pub async fn from_secrets(
+        name: &str,
+        params: HashMap<String, SecretString>,
+        secrets: Arc<RwLock<Secrets>>,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let guard = DATA_CONNECTOR_FACTORY_REGISTRY.lock().await;
+
+        let connector_factory = guard.get(name);
+
+        let factory =
+            connector_factory.ok_or(DataConnectorError::InvalidConfigurationNoSource {
+                dataconnector: name.to_string(),
+                message: "No source found for data connector".to_string(),
+            })?;
+
+        let parameters = Parameters::try_new(
+            &format!("connector {name}"),
+            params.into_iter().collect(),
+            factory.prefix(),
+            secrets,
+            factory.parameters(),
+        )
+        .await?;
+
+        Ok(Self {
+            parameters,
+            metadata: HashMap::new(),
+            invalid_type_action: None,
+        })
+    }
+
+    pub async fn from_params(
+        runtime: &Runtime,
+        name: &str,
+        parameters: HashMap<String, String>,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let params = runtime.get_params_with_secrets(&parameters).await;
+        let secrets = runtime.secrets();
+
+        Self::from_secrets(name, params, secrets).await
+    }
 }

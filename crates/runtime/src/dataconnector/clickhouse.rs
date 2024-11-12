@@ -26,7 +26,6 @@ use ns_lookup::verify_ns_lookup_and_tcp_connect;
 use secrecy::ExposeSecret;
 use snafu::prelude::*;
 use std::any::Any;
-use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::str::FromStr;
@@ -35,6 +34,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use url::Url;
 
+use super::DataConnectorParams;
 use super::{DataConnector, DataConnectorError, DataConnectorFactory, Parameters};
 use crate::parameters::{ParamLookup, ParameterSpec};
 
@@ -130,11 +130,10 @@ const PARAMETERS: &[ParameterSpec] = &[
 impl DataConnectorFactory for ClickhouseFactory {
     fn create(
         &self,
-        params: Parameters,
-        _metadata: Option<HashMap<String, String>>,
+        params: DataConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
-            match get_config_from_params(params).await {
+            match get_config_from_params(params.parameters).await {
                 Ok(config) => {
                     let pool = ClickhouseConnectionPool::new(
                         config.options,

@@ -27,7 +27,10 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use super::{DataConnector, DataConnectorError, DataConnectorFactory, ParameterSpec, Parameters};
+use super::{
+    DataConnector, DataConnectorError, DataConnectorFactory, DataConnectorParams, ParameterSpec,
+    Parameters,
+};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -91,11 +94,10 @@ const PARAMETERS: &[ParameterSpec] = &[ParameterSpec::connector("remote").secret
 impl DataConnectorFactory for SparkFactory {
     fn create(
         &self,
-        params: Parameters,
-        _metadata: Option<std::collections::HashMap<String, String>>,
+        params: DataConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
-            match Spark::new(params).await {
+            match Spark::new(params.parameters).await {
                 Ok(spark_connector) => Ok(Arc::new(spark_connector) as Arc<dyn DataConnector>),
                 Err(e) => match e {
                     Error::MissingSparkRemote

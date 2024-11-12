@@ -34,7 +34,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::{collections::HashMap, future::Future};
 
-use super::{DataConnector, DataConnectorFactory, ParameterSpec, Parameters};
+use super::{DataConnector, DataConnectorFactory, DataConnectorParams, ParameterSpec, Parameters};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -290,11 +290,10 @@ const PARAMETERS: &[ParameterSpec] = &[
 impl DataConnectorFactory for DatabricksFactory {
     fn create(
         &self,
-        params: Parameters,
-        _metadata: Option<HashMap<String, String>>,
+        params: DataConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
-            let databricks = Databricks::new(params).await?;
+            let databricks = Databricks::new(params.parameters).await?;
             Ok(Arc::new(databricks) as Arc<dyn DataConnector>)
         })
     }

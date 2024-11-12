@@ -37,6 +37,7 @@ use component::dataset::{self, Dataset};
 use component::view::View;
 use config::Config;
 use dataconnector::localpod::{LocalPodConnector, LOCALPOD_DATACONNECTOR};
+use dataconnector::DataConnectorParams;
 use datafusion::SPICE_RUNTIME_SCHEMA;
 use datasets_health_monitor::DatasetsHealthMonitor;
 use embeddings::connector::EmbeddingConnector;
@@ -843,23 +844,24 @@ impl Runtime {
 
         let source = catalog.provider;
         let params = catalog.params.clone();
-        let data_connector: Arc<dyn DataConnector> = match self
-            .get_dataconnector_from_source(&source, params, None)
+        let params = DataConnectorParams::from_params(self, &source, params)
             .await
-        {
-            Ok(data_connector) => data_connector,
-            Err(err) => {
-                let catalog_name = &catalog.name;
-                self.status
-                    .update_catalog(catalog_name, status::ComponentStatus::Error);
-                metrics::catalogs::LOAD_ERROR.add(1, &[]);
-                warn_spaced!(spaced_tracer, "{} {err}", catalog_name);
-                return UnableToLoadDatasetConnectorSnafu {
-                    dataset: catalog_name.clone(),
+            .context(UnableToInitializeDataConnectorSnafu)?;
+        let data_connector: Arc<dyn DataConnector> =
+            match self.get_dataconnector_from_source(&source, params).await {
+                Ok(data_connector) => data_connector,
+                Err(err) => {
+                    let catalog_name = &catalog.name;
+                    self.status
+                        .update_catalog(catalog_name, status::ComponentStatus::Error);
+                    metrics::catalogs::LOAD_ERROR.add(1, &[]);
+                    warn_spaced!(spaced_tracer, "{} {err}", catalog_name);
+                    return UnableToLoadDatasetConnectorSnafu {
+                        dataset: catalog_name.clone(),
+                    }
+                    .fail();
                 }
-                .fail();
-            }
-        };
+            };
 
         Ok(data_connector)
     }
@@ -868,29 +870,29 @@ impl Runtime {
         let spaced_tracer = Arc::clone(&self.spaced_tracer);
 
         let source = ds.source();
-        let params = ds.params.clone();
-        let metadata = ds.metadata.clone();
-        let data_connector: Arc<dyn DataConnector> = match self
-            .get_dataconnector_from_source(&source, params, Some(metadata))
+        let params = DataConnectorParams::from_dataset(self, Arc::clone(&ds))
             .await
-        {
-            Ok(data_connector) => data_connector,
-            Err(err) => {
-                let ds_name = &ds.name;
-                self.status
-                    .update_dataset(ds_name, status::ComponentStatus::Error);
-                metrics::datasets::LOAD_ERROR.add(1, &[]);
-                warn_spaced!(
-                    spaced_tracer,
-                    "Error initializing dataset {}. {err}",
-                    ds_name.table()
-                );
-                return UnableToLoadDatasetConnectorSnafu {
-                    dataset: ds.name.clone(),
+            .context(UnableToInitializeDataConnectorSnafu)?;
+
+        let data_connector: Arc<dyn DataConnector> =
+            match self.get_dataconnector_from_source(&source, params).await {
+                Ok(data_connector) => data_connector,
+                Err(err) => {
+                    let ds_name = &ds.name;
+                    self.status
+                        .update_dataset(ds_name, status::ComponentStatus::Error);
+                    metrics::datasets::LOAD_ERROR.add(1, &[]);
+                    warn_spaced!(
+                        spaced_tracer,
+                        "Error initializing dataset {}. {err}",
+                        ds_name.table()
+                    );
+                    return UnableToLoadDatasetConnectorSnafu {
+                        dataset: ds.name.clone(),
+                    }
+                    .fail();
                 }
-                .fail();
-            }
-        };
+            };
 
         Ok(data_connector)
     }
@@ -1205,19 +1207,14 @@ impl Runtime {
     async fn get_dataconnector_from_source(
         &self,
         source: &str,
-        params: HashMap<String, String>,
-        metadata: Option<HashMap<String, String>>,
+        params: DataConnectorParams,
     ) -> Result<Arc<dyn DataConnector>> {
-        let secret_map = self.get_params_with_secrets(&params).await;
-
         // Unlike most other data connectors, the localpod connector needs a reference to the current DataFusion instance.
         if source == LOCALPOD_DATACONNECTOR {
             return Ok(Arc::new(LocalPodConnector::new(Arc::clone(&self.df))));
         }
 
-        match dataconnector::create_new_connector(source, secret_map, self.secrets(), metadata)
-            .await
-        {
+        match dataconnector::create_new_connector(source, params).await {
             Some(dc) => dc.context(UnableToInitializeDataConnectorSnafu {}),
             None => UnknownDataConnectorSnafu {
                 data_connector: source,

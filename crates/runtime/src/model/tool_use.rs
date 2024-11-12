@@ -53,6 +53,7 @@ pub struct ToolUsingChat {
 }
 
 impl ToolUsingChat {
+    #[must_use]
     pub fn new(
         inner_chat: Arc<Box<dyn Chat>>,
         rt: Arc<Runtime>,
@@ -67,6 +68,7 @@ impl ToolUsingChat {
         }
     }
 
+    #[must_use]
     pub fn runtime_tools(&self) -> Vec<ChatCompletionTool> {
         self.tools
             .iter()
@@ -82,6 +84,7 @@ impl ToolUsingChat {
             .collect_vec()
     }
 
+    #[must_use]
     pub fn tool_exists(&self, name: &str) -> bool {
         self.tools.iter().any(|t| t.name() == name)
     }

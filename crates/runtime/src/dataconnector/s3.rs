@@ -16,7 +16,8 @@ limitations under the License.
 
 use super::{
     listing::{self, ListingTableConnector},
-    DataConnector, DataConnectorFactory, DataConnectorResult, ParameterSpec, Parameters,
+    DataConnector, DataConnectorFactory, DataConnectorParams, DataConnectorResult, ParameterSpec,
+    Parameters,
 };
 
 use crate::component::dataset::Dataset;
@@ -24,7 +25,6 @@ use crate::parameters::ParamLookup;
 use snafu::prelude::*;
 use std::any::Any;
 use std::clone::Clone;
-use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::string::String;
@@ -104,13 +104,12 @@ const PARAMETERS: &[ParameterSpec] = &[
 impl DataConnectorFactory for S3Factory {
     fn create(
         &self,
-        mut params: Parameters,
-        _metadata: Option<HashMap<String, String>>,
+        mut params: DataConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
-        if let Some(endpoint) = params.get("endpoint").expose().ok() {
+        if let Some(endpoint) = params.parameters.get("endpoint").expose().ok() {
             if endpoint.ends_with('/') {
                 tracing::warn!("Trimming trailing '/' from S3 endpoint {endpoint}");
-                params.insert(
+                params.parameters.insert(
                     "endpoint".to_string(),
                     endpoint.trim_end_matches('/').to_string().into(),
                 );
@@ -118,7 +117,7 @@ impl DataConnectorFactory for S3Factory {
         }
 
         Box::pin(async move {
-            if let Some(auth) = params.get("auth").expose().ok() {
+            if let Some(auth) = params.parameters.get("auth").expose().ok() {
                 if auth != "public" && auth != "iam_role" && auth != "key" {
                     return Err(Box::new(Error::UnsupportedAuthenticationMethod {
                         method: auth.to_string(),
@@ -126,12 +125,15 @@ impl DataConnectorFactory for S3Factory {
                         as Box<dyn std::error::Error + Send + Sync>);
                 }
 
-                if matches!(params.get("key"), ParamLookup::Present(_)) && auth != "key" {
+                if matches!(params.parameters.get("key"), ParamLookup::Present(_)) && auth != "key"
+                {
                     return Err(Box::new(Error::InvalidKeyAuthCombination)
                         as Box<dyn std::error::Error + Send + Sync>);
                 }
             }
-            let s3 = S3 { params };
+            let s3 = S3 {
+                params: params.parameters,
+            };
             Ok(Arc::new(s3) as Arc<dyn DataConnector>)
         })
     }
