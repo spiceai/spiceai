@@ -366,6 +366,7 @@ mod tests {
             options: HashMap::new(),
             constraints: Constraints::empty(),
             column_defaults: HashMap::default(),
+            temporary: false,
         };
         let ctx = SessionContext::new();
         let table = SqliteAccelerator::new()
@@ -385,7 +386,7 @@ mod tests {
         let exec = MockExec::new(vec![Ok(data)], schema);
 
         let insertion = table
-            .insert_into(&ctx.state(), Arc::new(exec), false)
+            .insert_into(&ctx.state(), Arc::new(exec), InsertOp::Append)
             .await
             .expect("insertion should be successful");
 
