@@ -40,26 +40,26 @@ jobs:
           driver-opts: |
             image=moby/buildkit:latest
       
-      - name: Build AMD64 slim image
+      - name: Build AMD64 default image
         uses: docker/build-push-action@v6
         with:
           context: .
           file: Dockerfile
           platforms: linux/amd64
-          outputs: type=docker,name=localhost:5000/spiceai:slim-amd64,dest=/tmp/image-amd64-slim.tar
+          outputs: type=docker,name=localhost:5000/spiceai:default-amd64,dest=/tmp/image-amd64-default.tar
           cache-from: type=gha,scope=build-amd64
           cache-to: type=gha,scope=build-amd64,mode=max
           build-args: |
             REL_VERSION=${{ needs.setup.outputs.rel_version }}
             CARGO_FEATURES=release
 
-      - name: Build AMD64 full image
+      - name: Build AMD64 odbc image
         uses: docker/build-push-action@v6
         with:
           context: .
           file: Dockerfile
           platforms: linux/amd64
-          outputs: type=docker,name=localhost:5000/spiceai:full-amd64,dest=/tmp/image-amd64-full.tar
+          outputs: type=docker,name=localhost:5000/spiceai:odbc-amd64,dest=/tmp/image-amd64-odbc.tar
           cache-from: type=gha,scope=build-amd64
           cache-to: type=gha,scope=build-amd64,mode=max
           build-args: |
@@ -116,26 +116,26 @@ jobs:
           driver-opts: |
             image=moby/buildkit:latest
 
-      - name: Build ARM64 slim image
+      - name: Build ARM64 default image
         uses: docker/build-push-action@v6
         with:
           context: .
           file: Dockerfile
           platforms: linux/arm64
-          outputs: type=docker,name=localhost:5000/spiceai:slim-arm64,dest=/tmp/image-arm64-slim.tar
+          outputs: type=docker,name=localhost:5000/spiceai:default-arm64,dest=/tmp/image-arm64-default.tar
           cache-from: type=gha,scope=build-arm64
           cache-to: type=gha,scope=build-arm64,mode=max
           build-args: |
             REL_VERSION=${{ needs.setup.outputs.rel_version }}
             CARGO_FEATURES=release
 
-      - name: Build ARM64 full image
+      - name: Build ARM64 odbc image
         uses: docker/build-push-action@v6
         with:
           context: .
           file: Dockerfile
           platforms: linux/arm64
-          outputs: type=docker,name=localhost:5000/spiceai:full-arm64,dest=/tmp/image-arm64-full.tar
+          outputs: type=docker,name=localhost:5000/spiceai:odbc-arm64,dest=/tmp/image-arm64-odbc.tar
           cache-from: type=gha,scope=build-arm64
           cache-to: type=gha,scope=build-arm64,mode=max
           build-args: |
@@ -206,10 +206,10 @@ jobs:
         run: |
           echo "REL_VERSION=${REL_VERSION}"
           echo "PUBLISH=${PUBLISH}"
-          variants=("slim" "full" "models")
+          variants=("default" "odbc" "models")
           for variant in "${variants[@]}"; do
             suffix=""
-            if [ "$variant" != "full" ]; then
+            if [ "$variant" != "default" ]; then
               suffix="-${variant}"
             fi
             

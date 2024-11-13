@@ -8,10 +8,12 @@ All criteria must be met for the accelerator to be considered [RC](../definition
 
 | Accelerator | RC Quality | DRI Sign-off |
 | - | - | - |
-| Arrow      | ❌ |  |
-| DuckDB     | ❌ |  |
-| SQLite     | ❌ |  |
-| PostgreSQL | ❌ |  |
+| Accelerator | Beta Quality | DRI Sign-off |
+| ----------- | ------------ | ------------ |
+| Arrow       | ✅           | @sgrebnov    |
+| DuckDB      | ❌           |              |
+| SQLite      | ❌           |              |
+| PostgreSQL  | ❌           |              |
 
 ## RC Release Criteria
 
