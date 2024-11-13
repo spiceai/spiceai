@@ -18,6 +18,7 @@ use crate::component::dataset::Dataset;
 use async_trait::async_trait;
 use data_components::Read;
 use datafusion::datasource::TableProvider;
+use datafusion::sql::sqlparser::dialect::MySqlDialect;
 use datafusion_table_providers::mysql::MySQLTableFactory;
 use datafusion_table_providers::sql::db_connection_pool::{
     dbconnection,
@@ -142,9 +143,16 @@ impl DataConnector for MySQL {
         &self,
         dataset: &Dataset,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
-        match Read::table_provider(&self.mysql_factory, dataset.path().into(), dataset.schema())
-            .await
-        {
+        let tbl = dataset
+            .parse_path(true, Some(&MySqlDialect {}))
+            .boxed()
+            .map_err(|e| super::DataConnectorError::InvalidConfiguration {
+                dataconnector: "mysql".to_string(),
+                source: e,
+                message: format!("Invalid table '{}' in dataset path", dataset.path()),
+            })?;
+
+        match Read::table_provider(&self.mysql_factory, tbl, dataset.schema()).await {
             Ok(provider) => Ok(provider),
             Err(e) => {
                 if let Some(err_source) = e.source() {

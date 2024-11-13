@@ -17,7 +17,13 @@ limitations under the License.
 use acceleration::Engine;
 use app::App;
 use arrow::datatypes::SchemaRef;
-use datafusion::sql::TableReference;
+use datafusion::sql::{
+    sqlparser::{
+        dialect::{Dialect, GenericDialect},
+        parser::{Parser, ParserError},
+    },
+    TableReference,
+};
 use datafusion_table_providers::util::column_reference;
 use snafu::prelude::*;
 use spicepod::component::{
@@ -64,6 +70,9 @@ pub enum Error {
         field: String,
         source: fundu::ParseError,
     },
+
+    #[snafu(display("Error parsing `from` path {path} as table reference: {source}"))]
+    UnableToParseTableReferenceFromPath { path: String, source: ParserError },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -341,6 +350,55 @@ impl Dataset {
         match self.from.find(':') {
             Some(index) => self.from[index + 1..].to_string(),
             None => self.from.clone(),
+        }
+    }
+
+    /// For [`Dataset`]s where the path in the `from` field is a [`TableReference`], parse and return the [`TableReference`].
+    ///
+    ///
+    pub fn parse_path(
+        &self,
+        case_sensitive: bool,
+        dialect: Option<&dyn Dialect>,
+    ) -> Result<TableReference> {
+        // Manually parse the table reference to avoid case folding.
+        if case_sensitive {
+            let path_str = self.path();
+            let dialect = dialect.unwrap_or(&GenericDialect {});
+            let mut parts = Parser::new(dialect)
+                .try_with_sql(path_str.as_str())
+                .context(UnableToParseTableReferenceFromPathSnafu {
+                    path: path_str.clone(),
+                })?
+                .parse_multipart_identifier()
+                .context(UnableToParseTableReferenceFromPathSnafu {
+                    path: path_str.clone(),
+                })?
+                .iter()
+                .map(|i| i.value.clone())
+                .collect::<Vec<_>>()
+                .into_iter();
+
+            let tbl = match (parts.next(), parts.next(), parts.next()) {
+                (Some(catalog), Some(schema), Some(table)) => TableReference::Full {
+                    catalog: catalog.into(),
+                    schema: schema.into(),
+                    table: table.into(),
+                },
+                (Some(schema), Some(table), None) => TableReference::Partial {
+                    schema: schema.into(),
+                    table: table.into(),
+                },
+                (Some(table), None, None) => TableReference::Bare {
+                    table: table.into(),
+                },
+                _ => TableReference::Bare {
+                    table: self.path().into(),
+                },
+            };
+            Ok(tbl)
+        } else {
+            Ok(self.path().into())
         }
     }
 
