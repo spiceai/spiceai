@@ -144,7 +144,7 @@ impl DataConnector for MySQL {
         dataset: &Dataset,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
         let tbl = dataset
-            .table_reference_path(true, Some(&MySqlDialect {}))
+            .parse_path(true, Some(&MySqlDialect {}))
             .boxed()
             .map_err(|e| super::DataConnectorError::InvalidConfiguration {
                 dataconnector: "mysql".to_string(),

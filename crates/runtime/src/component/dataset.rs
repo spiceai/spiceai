@@ -357,7 +357,7 @@ impl Dataset {
     ///
     ///
     #[must_use]
-    pub fn table_reference_path(
+    pub fn parse_path(
         &self,
         case_sensitive: bool,
         dialect: Option<&dyn Dialect>,
