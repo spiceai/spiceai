@@ -126,6 +126,7 @@ assignees: ''
 - [ ] Update versions in [brew taps](https://github.com/spiceai/homebrew-spiceai).
       **Note**: Ensure that the Homebrew taps are updated only after the [binaries have finished building](https://github.com/spiceai/spiceai/actions/workflows/build_and_release.yml).
 - [ ] Remove the released version from the [ROADMAP](https://github.com/spiceai/spiceai/blob/trunk/docs/ROADMAP.md)
+- [ ] Update supported version in SECURITY.md
 - [ ] Set the [release](https://github.com/spiceai/spiceai/releases) as latest release.
 
 ## Announcement Checklist

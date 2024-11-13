@@ -11,7 +11,7 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 ## [v1.0-rc.1 (Nov 2024)](https://github.com/spiceai/spiceai/milestone/45)
 
 - Bugfixes and performance improvements
-- Data Accelerators: Arrow & DuckDB  (Release Candidate)
+- Data Accelerators: Arrow & DuckDB (Release Candidate)
 - DuckDB data connector (Release Candidate)
 - S3 data connector (Release Candidate)
 - PostgreSQL data connector (Release Candidate)
@@ -27,7 +27,7 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 - ODBC Data Connector - Athena, Databricks, MySQL (Release Candidate)
 - Dremio data connector (Beta)
 
-## v1.0-rc.3 (Nov 2024)
+## v1.0-rc.3 (Dec 2024)
 
 - Bugfixes and performance improvements
 - DuckDB data connector (Release Candidate)
@@ -40,14 +40,6 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 - Bugfixes and performance improvements
 - MS SQL data connector (Release Candidate)
 - File data connector (Release Candidate)
-
-## v1.0-rc.5 (Dec 2024)
-
-- Bugfixes and performance improvements
-
-## v1.0-rc.6 (Dec 2024)
-
-- Bugfixes and performance improvements
 - Data Accelerators: SQLite & PostgreSQL (Release Candidate)
 
 ## v1.0-stable (Jan 2025)
@@ -70,7 +62,7 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 - MS SQL data connector (Stable)
 - File data connector (Stable)
 - Dremio data connector (Stable)
-- Model Providers: Anthropic, File (Beta)
+- Model Providers: Anthropic, Groq, Grok, File (Beta)
 - Catalog Providers: Databricks (Beta)
 - FTP/SFTP Data Connector (Beta)
 - Snowflake Data Connector (Beta)
@@ -113,20 +105,23 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 
 ### v1.0-stable Catalog Provider Support
 
-| Name         | Status |
-| ------------ | ------ |
-| `unity_catalog`| Stable |
-| `spice.ai`     | Stable |
-| `databricks`   | Beta   |
+| Name            | Status |
+| --------------- | ------ |
+| `unity_catalog` | Stable |
+| `spice.ai`      | Stable |
+| `databricks`    | Beta   |
 
 ### v1.0-stable Model Provider Support
 
-| Name         | Status |
-| ------------ | ------ |
+| Name          | Status |
+| ------------- | ------ |
 | `openai`      | Stable |
 | `huggingface` | Stable |
-| `anthropic`   | Beta   |
 | `file`        | Beta   |
+| `anthropic`   | Beta   |
+| `azure`       | Beta   |
+| `groq`        | Beta   |
+| `grok`        | Alpha  |
 
 ## v1.1
 
@@ -137,13 +132,6 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 - Ingestion
   - Delta Lake write
   - Iceberg write
-- AI Gateway
-  - Embeddings
-  - Model Providers
-    - OpenAI
-    - Azure OpenAI
-    - Anthropic
-    - Groq
 - Policy
   - Security
   - Data Access
@@ -167,3 +155,4 @@ If you have a feature request or suggestion, please [get in touch](https://githu
     - SlateDB data accelerator
     - RocksDB data accelerator
     - DynamoDB data connector
+  - PostgreSQL API

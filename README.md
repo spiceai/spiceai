@@ -8,13 +8,13 @@
   <a href="https://x.com/intent/follow?screen_name=spice_ai"><img src="https://img.shields.io/twitter/follow/spice_ai.svg?style=social&logo=x" alt="Follow on X"/></a>
 </p>
 
-**Spice** is a portable runtime offering developers a unified SQL interface to materialize, accelerate, and query data from any database, data warehouse, or data lake.
+**Spice** is a portable runtime written in Rust that offers developers a unified SQL interface to materialize, accelerate, and query data from any database, data warehouse, or data lake.
 
 📣 Read the [Spice.ai OSS announcement blog post](https://blog.spiceai.org/posts/2024/03/28/adding-spice-the-next-generation-of-spice.ai-oss/).
 
 Spice connects, fuses, and delivers data to applications, machine-learning models, and AI-backends, functioning as an application-specific, tier-optimized Database CDN.
 
-The Spice runtime, written in Rust, is built-with industry leading technologies such as [Apache DataFusion](https://datafusion.apache.org), Apache Arrow, Apache Arrow Flight, SQLite, and DuckDB.
+Spice is built-with industry leading technologies such as [Apache DataFusion](https://datafusion.apache.org), Apache Arrow, Apache Arrow Flight, SQLite, and DuckDB.
 
 <div align="center">
   <picture>
@@ -22,9 +22,13 @@ The Spice runtime, written in Rust, is built-with industry leading technologies 
   </picture>
 </div>
 
+🎓 [Read the MaterializedView interview on Spice.ai](https://materializedview.io/p/building-a-cdn-for-databases-spice-ai)
+
+🎥 [Watch the CMU Databases Accelerating Data and AI with Spice.ai Open-Source](https://www.youtube.com/watch?v=tyM-ec1lKfU)
+
 ## Why Spice?
 
-Spice makes it easy and fast to query data from one or more sources using SQL. You can co-locate a managed dataset with your application or machine learning model, and accelerate it with Arrow in-memory, SQLite/DuckDB, or with attached PostgreSQL for fast, high-concurrency, low-latency queries. Accelerated engines give you flexibility and control over query cost and performance.
+Spice makes it fast and easy to query data from one or more sources using SQL. You can co-locate a managed dataset with your application or machine learning model, and accelerate it with Arrow in-memory, SQLite/DuckDB, or with attached PostgreSQL for fast, high-concurrency, low-latency queries. Accelerated engines give you flexibility and control over query cost and performance.
 
 <div align="center">
   <picture>
@@ -119,7 +123,7 @@ Currently supported data connectors for upstream datasets. More coming soon.
 Currently supported data stores for local materialization/acceleration. More coming soon.
 
 | Name       | Description                     | Status            | Engine Modes     |
-| ---------- | ------------------------------- | ------------------| ---------------- |
+| ---------- | ------------------------------- | ----------------- | ---------------- |
 | `arrow`    | In-Memory Arrow Records         | Release Candidate | `memory`         |
 | `duckdb`   | Embedded [DuckDB][duckdb]       | Beta              | `memory`, `file` |
 | `postgres` | Attached [PostgreSQL][postgres] | Beta              |                  |
