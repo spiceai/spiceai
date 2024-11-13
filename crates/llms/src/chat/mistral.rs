@@ -545,7 +545,7 @@ impl Chat for MistralLlama {
 fn stream_from_response(
     mut rcv: Receiver<MistralResponse>,
 ) -> Pin<Box<dyn Stream<Item = Result<CreateChatCompletionStreamResponse, OpenAIError>> + Send>> {
-    Pin::from(Box::new(stream! {
+    Box::pin(stream! {
         while let Some(resp) = rcv.recv().await {
             tracing::trace!("Received response from pipeline");
 
