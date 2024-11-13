@@ -420,7 +420,7 @@ dependencies = [
 [[package]]
 name = "arrow-json"
 version = "53.1.0"
-source = "git+https://github.com/spiceai/arrow-rs.git?rev=6013498d7d4d59f7b16d0e28b3e0b379732fbf07#6013498d7d4d59f7b16d0e28b3e0b379732fbf07"
+source = "git+https://github.com/spiceai/arrow-rs.git?rev=63d05723107d6dc5f08acc5461417ee42937adcc#63d05723107d6dc5f08acc5461417ee42937adcc"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
