@@ -3518,7 +3518,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=6ff2ab16e3af08dacf10aa94e3cc30e69799f1b8#6ff2ab16e3af08dacf10aa94e3cc30e69799f1b8"
+source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=ccfbada34c6fc2272f9441686bb4620af327788e#ccfbada34c6fc2272f9441686bb4620af327788e"
 dependencies = [
  "arrow",
  "arrow-json 53.2.0",
@@ -3909,8 +3909,7 @@ checksum = "f25c0e292a7ca6d6498557ff1df68f32c99850012b6ea401cf8daf771f22ff53"
 [[package]]
 name = "duckdb"
 version = "1.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "86844939330ba6ce345c4b5333d3be45c4f0c092779bf9617bba92efb8b841f5"
+source = "git+https://github.com/spiceai/duckdb-rs.git?rev=7d5679acb02011f046f3b819f70d10e9e4ce6e04#7d5679acb02011f046f3b819f70d10e9e4ce6e04"
 dependencies = [
  "arrow",
  "cast",
@@ -6264,8 +6263,7 @@ checksum = "18d287de67fe55fd7e1581fe933d965a5a9477b38e949cfa9f8574ef01506398"
 [[package]]
 name = "libduckdb-sys"
 version = "1.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eac2de5219db852597558df5dcd617ffccd5cbd7b9f5402ccbf899aca6cb6047"
+source = "git+https://github.com/spiceai/duckdb-rs.git?rev=7d5679acb02011f046f3b819f70d10e9e4ce6e04#7d5679acb02011f046f3b819f70d10e9e4ce6e04"
 dependencies = [
  "autocfg",
  "cc",

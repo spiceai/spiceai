@@ -58,6 +58,14 @@ impl DataFusionBuilder {
             .execution
             .listing_table_ignore_subdirectory = false;
 
+        // There are some unidentified bugs in DataFusion that cause schema checks to fail for aggregate functions.
+        // Spice is affected by this - skip the check until all bugs are fixed.
+        // Tracking issue: https://github.com/apache/datafusion/issues/12733
+        df_config
+            .options_mut()
+            .execution
+            .skip_physical_aggregate_schema_check = true;
+
         Self {
             config: df_config,
             status,
