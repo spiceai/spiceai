@@ -19,7 +19,8 @@ use std::{collections::HashMap, fmt::Display, sync::Arc};
 use app::App;
 use arrow::array::{RecordBatch, StringArray};
 use arrow::error::ArrowError;
-use arrow_schema::SchemaRef;
+use arrow::util::pretty::pretty_format_batches;
+use arrow_schema::{Schema, SchemaRef};
 use async_openai::types::EmbeddingInput;
 use datafusion::common::utils::quote_identifier;
 use datafusion::sql::sqlparser::ast::Expr;
@@ -242,27 +243,36 @@ pub struct VectorSearchTableResult {
 }
 
 impl VectorSearchTableResult {
-    pub fn to_matches(&self, table: &TableReference) -> Result<Vec<Match>> {
-        let Some(schema) = self.data.first().map(|b| b.schema()) else {
-            return Ok(vec![]);
-        };
+    /// Return the underlying [`RecordBatch`]s as a pretty formatted table.
+    pub fn to_pretty(&self) -> Result<impl Display, ArrowError> {
+        pretty_format_batches(&self.data)
+    }
 
-        let primary_key_projection = get_projection(&schema, &self.primary_keys);
-        let additional_columns_projection = get_projection(&schema, &self.additional_columns);
-        let embedding_projection = get_projection(&schema, &[self.embedding_column.clone()]);
-
+    pub fn primary_keys_json(&self) -> Result<Vec<HashMap<String, serde_json::Value>>> {
+        let primary_key_projection = get_projection(&self.schema(), &self.primary_keys);
         let primary_keys_records = self
             .data
             .iter()
             .map(|s| s.project(&primary_key_projection))
             .collect::<std::result::Result<Vec<_>, ArrowError>>()
             .context(RecordProcessingSnafu)?;
-        let embedding_records = self
-            .data
-            .iter()
-            .map(|s| s.project(&embedding_projection))
-            .collect::<std::result::Result<Vec<_>, ArrowError>>()
-            .context(RecordProcessingSnafu)?;
+
+        if primary_keys_records
+            .first()
+            .is_some_and(|p| p.num_rows() > 0)
+        {
+            let pk_str = write_to_json_string(&primary_keys_records).context(FormattingSnafu)?;
+            serde_json::from_str(&pk_str)
+                .boxed()
+                .context(FormattingSnafu)
+        } else {
+            Ok(vec![])
+        }
+    }
+
+    pub fn addition_columns_json(&self) -> Result<Vec<HashMap<String, serde_json::Value>>> {
+        let additional_columns_projection =
+            get_projection(&self.schema(), &self.additional_columns);
         let additional_columns_records = self
             .data
             .iter()
@@ -270,6 +280,21 @@ impl VectorSearchTableResult {
             .collect::<std::result::Result<Vec<_>, ArrowError>>()
             .context(RecordProcessingSnafu)?;
 
+        if additional_columns_records
+            .first()
+            .is_some_and(|p| p.num_rows() > 0)
+        {
+            let additional_str =
+                write_to_json_string(&additional_columns_records).context(FormattingSnafu)?;
+            serde_json::from_str(additional_str.as_str())
+                .boxed()
+                .context(FormattingSnafu)
+        } else {
+            Ok(vec![])
+        }
+    }
+
+    pub fn distance_values(&self) -> Result<Vec<f64>> {
         let Some(distances) = self
             .data
             .iter()
@@ -280,44 +305,6 @@ impl VectorSearchTableResult {
                 source: "No distances returned".into(),
             });
         };
-
-        let pks: Vec<HashMap<String, serde_json::Value>> = if primary_keys_records
-            .first()
-            .is_some_and(|p| p.num_rows() > 0)
-        {
-            let pk_str = write_to_json_string(&primary_keys_records).context(FormattingSnafu)?;
-            serde_json::from_str(&pk_str)
-                .boxed()
-                .context(FormattingSnafu)?
-        } else {
-            vec![]
-        };
-
-        let add_cols: Vec<HashMap<String, serde_json::Value>> = if additional_columns_records
-            .first()
-            .is_some_and(|p| p.num_rows() > 0)
-        {
-            let col_str =
-                write_to_json_string(&additional_columns_records).context(FormattingSnafu)?;
-            serde_json::from_str(&col_str)
-                .boxed()
-                .context(FormattingSnafu)?
-        } else {
-            vec![]
-        };
-
-        let values: Vec<String> = embedding_records
-            .iter()
-            .flat_map(|v| {
-                if let Some(col) = v.column(0).as_any().downcast_ref::<StringArray>() {
-                    col.iter()
-                        .map(|v| v.unwrap_or_default().to_string())
-                        .collect::<Vec<String>>()
-                } else {
-                    vec![]
-                }
-            })
-            .collect();
 
         let distances: Option<Vec<_>> = distances
             .iter()
@@ -335,6 +322,51 @@ impl VectorSearchTableResult {
             });
         };
 
+        Ok(distances)
+    }
+
+    pub fn embedding_columns_list(&self) -> Result<Vec<String>> {
+        let embedding_projection = get_projection(&self.schema(), &[self.embedding_column.clone()]);
+        let embedding_records = self
+            .data
+            .iter()
+            .map(|s| s.project(&embedding_projection))
+            .collect::<std::result::Result<Vec<_>, ArrowError>>()
+            .context(RecordProcessingSnafu)?;
+
+        let result = embedding_records
+            .iter()
+            .flat_map(|v| {
+                if let Some(col) = v.column(0).as_any().downcast_ref::<StringArray>() {
+                    col.iter()
+                        .map(|v| v.unwrap_or_default().to_string())
+                        .collect::<Vec<String>>()
+                } else {
+                    vec![]
+                }
+            })
+            .collect();
+
+        Ok(result)
+    }
+
+    pub fn schema(&self) -> SchemaRef {
+        self.data
+            .first()
+            .map_or(Schema::empty().into(), RecordBatch::schema)
+    }
+
+    pub fn to_matches(&self, table: &TableReference) -> Result<Vec<Match>> {
+        // Early exit on no data.
+        if !self.data.first().is_some_and(|d| d.num_rows() > 0) {
+            return Ok(vec![]);
+        }
+
+        let primary_keys_json = self.primary_keys_json()?;
+        let additional_columns_json = self.addition_columns_json()?;
+        let values = self.embedding_columns_list()?;
+        let distances = self.distance_values()?;
+
         values
             .iter()
             .enumerate()
@@ -349,8 +381,8 @@ impl VectorSearchTableResult {
                     value: value.clone(),
                     score: 1.0 - *distance,
                     dataset: table.to_string(),
-                    primary_key: pks.get(i).cloned().unwrap_or_default(),
-                    metadata: add_cols.get(i).cloned().unwrap_or_default(),
+                    primary_key: primary_keys_json.get(i).cloned().unwrap_or_default(),
+                    metadata: additional_columns_json.get(i).cloned().unwrap_or_default(),
                 })
             })
             .collect::<Result<Vec<Match>>>()
