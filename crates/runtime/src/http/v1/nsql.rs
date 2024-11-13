@@ -212,7 +212,7 @@ pub(crate) async fn post(
             let cleaned_query = clean_model_based_sql(&model_sql_query);
 
             if return_sql_only(&accept) {
-                tracing::trace!("Not running query, returning SQL:\n{cleaned_query}");
+                tracing::trace!("Not running query, requested SQL only:\n{cleaned_query}");
                 return (StatusCode::OK, cleaned_query).into_response();
             }
 
