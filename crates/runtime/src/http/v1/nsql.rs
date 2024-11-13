@@ -21,7 +21,7 @@ use crate::{
         builtin::{
             sample::{
                 distinct::DistinctColumnsParams, random::RandomSampleParams, tool::SampleDataTool,
-                SampleTableParams,
+                SampleTableMethod, SampleTableParams,
             },
             table_schema::{TableSchemaTool, TableSchemaToolParams},
         },
@@ -82,11 +82,12 @@ async fn sample_messages(
                 limit: 3,
             }),
         ] {
+            let method = SampleTableMethod::from(&params);
             let msgs = create_tool_use_messages(
                 Arc::clone(&rt),
-                &SampleDataTool::new((&params).into()),
-                "id",
-                params,
+                &SampleDataTool::new(method.clone()),
+                format!("sample-{method:?}").as_str(),
+                &params,
             )
             .instrument(Span::current())
             .await?;
@@ -109,6 +110,13 @@ pub struct Request {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub datasets: Option<Vec<String>>,
+
+    #[serde(default = "default_return_sql")]
+    pub return_sql: bool,
+}
+
+fn default_return_sql() -> bool {
+    false
 }
 
 fn default_sample_data_enabled() -> bool {
@@ -139,7 +147,7 @@ pub(crate) async fn post(
         Arc::clone(&rt),
         &TableSchemaTool::default(),
         "schemas-nsql",
-        TableSchemaToolParams::new(tables.iter().map(ToString::to_string).collect::<Vec<_>>()),
+        &TableSchemaToolParams::new(tables.iter().map(ToString::to_string).collect::<Vec<_>>()),
     )
     .instrument(span.clone())
     .await
@@ -200,6 +208,12 @@ pub(crate) async fn post(
     match sql_gen.parse_response(resp) {
         Ok(Some(model_sql_query)) => {
             let cleaned_query = clean_model_based_sql(&model_sql_query);
+
+            if payload.return_sql {
+                tracing::trace!("Not running query, returning SQL:\n{cleaned_query}");
+                return (StatusCode::OK, cleaned_query).into_response();
+            }
+
             tracing::trace!("Running query:\n{cleaned_query}");
             sql_to_http_response(
                 Arc::clone(&df),
