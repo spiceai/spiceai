@@ -146,7 +146,7 @@ datafusion-execution = { git = "https://github.com/spiceai/datafusion.git", rev 
 object_store = { git = "https://github.com/spiceai/arrow-rs.git", rev = "1f37d9eda6da17b7644115f82d209c00c9566733" }
 
 datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "914bd0836baa6990c5d03f977e5e87fe5eeaf4d6" }
-datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "ebf7a6d707f399649adf0192f2ee781a5e1386c3" }
+datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "ae939912178a09c18ef31aa6379a4bd1fcbb2a4e" }
 
 arrow-odbc = { git = "https://github.com/spiceai/arrow-odbc.git", rev = "dfb1e03a5f0702c1a318db5abf40e762d6b2bcc2" }
 odbc-api = { git = "https://github.com/spiceai/odbc-api.git", rev = "9807702dafdd8679d6bcecb0730b17e55c13e2e1" }
@@ -158,3 +158,5 @@ dotenvy = { git = "https://github.com/spiceai/dotenvy.git", rev = "e5cef1871b080
 
 # Required until next release with opentelemetry 0.26 support: https://github.com/open-telemetry/opentelemetry-rust/pull/2183
 opentelemetry-prometheus = { git = "https://github.com/open-telemetry/opentelemetry-rust.git", rev = "e91138351a689cd21923c15eb48f5fbc95ded807" }
+
+duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "6e7097758320a49f25f578dd54175145a4014582" }
