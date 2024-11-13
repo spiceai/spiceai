@@ -358,24 +358,6 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-  create-pr:
-    runs-on: ubuntu-latest
-    needs: run-database-bench
-    if: always()
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Create PR
-        run: |
-          git config --global user.name 'Spice Benchmark Snapshot Update Bot'
-          git config --global user.email 'bench-snapshot-update-bot@spice.ai'
-          git fetch origin bench-snapshot-update/${{ github.run_id }}
-          git checkout bench-snapshot-update/${{ github.run_id }}
-          gh pr create --title "Update benchmark snapshots" --body "Updated benchmark snapshots" --base trunk --head bench-snapshot-update/${{ github.run_id }}
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
   run-clickbench:
     name: Run ${{ matrix.name }} Clickbench
     runs-on: spiceai-large-runners
@@ -428,3 +410,21 @@ jobs:
           CLICKBENCH_S3_ENDPOINT: ${{ secrets.CLICKBENCH_S3_ENDPOINT}}
           CLICKBENCH_S3_KEY: ${{ secrets.CLICKBENCH_S3_KEY}}
           CLICKBENCH_S3_SECRET: ${{ secrets.CLICKBENCH_S3_SECRET}}
+
+  create-pr:
+    runs-on: ubuntu-latest
+    needs: run-database-bench
+    if: always()
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Create PR
+        run: |
+          git config --global user.name 'Spice Benchmark Snapshot Update Bot'
+          git config --global user.email 'bench-snapshot-update-bot@spice.ai'
+          git fetch origin bench-snapshot-update/${{ github.run_id }}
+          git checkout bench-snapshot-update/${{ github.run_id }}
+          gh pr create --title "Update benchmark snapshots" --body "Updated benchmark snapshots" --base trunk --head bench-snapshot-update/${{ github.run_id }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
