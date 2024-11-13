@@ -3518,7 +3518,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=ccfbada34c6fc2272f9441686bb4620af327788e#ccfbada34c6fc2272f9441686bb4620af327788e"
+source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=00e5e3e0b12ece12474ab399f409296e6345eb93#00e5e3e0b12ece12474ab399f409296e6345eb93"
 dependencies = [
  "arrow",
  "arrow-json 53.2.0",
@@ -3909,7 +3909,7 @@ checksum = "f25c0e292a7ca6d6498557ff1df68f32c99850012b6ea401cf8daf771f22ff53"
 [[package]]
 name = "duckdb"
 version = "1.1.1"
-source = "git+https://github.com/spiceai/duckdb-rs.git?rev=7d5679acb02011f046f3b819f70d10e9e4ce6e04#7d5679acb02011f046f3b819f70d10e9e4ce6e04"
+source = "git+https://github.com/spiceai/duckdb-rs.git?rev=d6f8c3e0dc1ba073a86756eba4dacf044dfa892d#d6f8c3e0dc1ba073a86756eba4dacf044dfa892d"
 dependencies = [
  "arrow",
  "cast",
@@ -6263,7 +6263,7 @@ checksum = "18d287de67fe55fd7e1581fe933d965a5a9477b38e949cfa9f8574ef01506398"
 [[package]]
 name = "libduckdb-sys"
 version = "1.1.1"
-source = "git+https://github.com/spiceai/duckdb-rs.git?rev=7d5679acb02011f046f3b819f70d10e9e4ce6e04#7d5679acb02011f046f3b819f70d10e9e4ce6e04"
+source = "git+https://github.com/spiceai/duckdb-rs.git?rev=d6f8c3e0dc1ba073a86756eba4dacf044dfa892d#d6f8c3e0dc1ba073a86756eba4dacf044dfa892d"
 dependencies = [
  "autocfg",
  "cc",
