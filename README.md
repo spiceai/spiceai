@@ -118,12 +118,12 @@ Currently supported data connectors for upstream datasets. More coming soon.
 
 Currently supported data stores for local materialization/acceleration. More coming soon.
 
-| Name       | Description                     | Status | Engine Modes     |
-| ---------- | ------------------------------- | ------ | ---------------- |
-| `duckdb`   | Embedded [DuckDB][duckdb]       | Beta   | `memory`, `file` |
-| `postgres` | Attached [PostgreSQL][postgres] | Beta   |                  |
-| `arrow`    | In-Memory Arrow Records         | Beta   | `memory`         |
-| `sqlite`   | Embedded [SQLite][sqlite]       | Beta   | `memory`, `file` |
+| Name       | Description                     | Status            | Engine Modes     |
+| ---------- | ------------------------------- | ------------------| ---------------- |
+| `arrow`    | In-Memory Arrow Records         | Release Candidate | `memory`         |
+| `duckdb`   | Embedded [DuckDB][duckdb]       | Beta              | `memory`, `file` |
+| `postgres` | Attached [PostgreSQL][postgres] | Beta              |                  |
+| `sqlite`   | Embedded [SQLite][sqlite]       | Beta              | `memory`, `file` |
 
 [duckdb]: https://docs.spiceai.org/data-accelerators/duckdb
 [postgres]: https://github.com/spiceai/quickstarts/tree/trunk/postgres#postgresql-data-accelerator
