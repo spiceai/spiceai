@@ -43,13 +43,13 @@ Indexes are not required for test coverage, but can be introduced if required fo
 
 #### ClickBench
 
-- [ ] A test script exists that can load ClickBench data into this accelerator in either [file or database mode](../definitions.md).
-- [ ] The accelerator can load ClickBench in either [file or database mode](../definitions.md), and all queries run with no [Major Bugs](../definitions.md).
+- [ ] A test script exists that can load ClickBench data into this accelerator in all [Access Modes](../definitions.md).
+- [ ] The accelerator can load ClickBench in all [Access Modes](../definitions.md), and all queries run with no [Major Bugs](../definitions.md).
 
 #### Data correctness
 
 - [ ] TPC-H SF10 loaded into memory, returned results are identical across source and accelerated queries for all TPC-H queries and TPC-H simple queries.
-- [ ] ClickBench loaded into [file or database mode](../definitions.md), returned results are identical across source and accelerated queries for all ClickBench queries.
+- [ ] ClickBench loaded all [Access Modes](../definitions.md), returned results are identical across source and accelerated queries for all ClickBench queries.
 
 ### Documentation
 
