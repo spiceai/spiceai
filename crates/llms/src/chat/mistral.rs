@@ -586,7 +586,7 @@ fn stream_from_response(
                 },
             }
         }
-    }))
+    })
 }
 
 /// Convert a [`CompletionChunkResponse`] to a [`CreateChatCompletionStreamResponse`].
