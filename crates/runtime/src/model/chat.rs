@@ -59,7 +59,8 @@ pub async fn try_to_chat_model<S: ::std::hash::BuildHasher>(
     let model = construct_model(component, params)?;
 
     // Handle tool usage
-    let spice_tool_opt: Option<SpiceToolsOptions> = extract_secret!(params, "spice_tools")
+    let spice_tool_opt: Option<SpiceToolsOptions> = extract_secret!(params, "tools")
+        .or(extract_secret!(params, "spice_tools"))
         .map(|x| x.parse())
         .transpose()
         .map_err(|_| LlmError::UnsupportedSpiceToolUseParameterError {})?;

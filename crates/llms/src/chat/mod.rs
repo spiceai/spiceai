@@ -98,7 +98,7 @@ pub enum Error {
     #[snafu(display("No model from {from} currently supports {task}"))]
     UnsupportedTaskForModel { from: String, task: String },
 
-    #[snafu(display("Invalid value for 'params.spice_tools'"))]
+    #[snafu(display("Invalid value for 'params.tools'"))]
     UnsupportedSpiceToolUseParameterError {},
 
     #[snafu(display("Runtime does not currently support the {modality} modality"))]
