@@ -414,7 +414,7 @@ jobs:
   create-pr:
     runs-on: ubuntu-latest
     needs: run-database-bench
-    if: always()
+    if: always() && github.event.inputs.update_snapshots == 'always'
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
