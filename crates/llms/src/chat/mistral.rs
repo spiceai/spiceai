@@ -20,10 +20,10 @@ use super::{nsql::SqlGeneration, Chat, Error as ChatError, FailedToRunModelSnafu
 use async_openai::{
     error::{ApiError, OpenAIError},
     types::{
-        ChatChoiceLogprobs, ChatChoiceStream, ChatCompletionNamedToolChoice,
-        ChatCompletionRequestUserMessageArgs, ChatCompletionResponseStream,
-        ChatCompletionStreamResponseDelta, ChatCompletionTool, ChatCompletionToolChoiceOption,
-        CreateChatCompletionRequest, CreateChatCompletionRequestArgs, CreateChatCompletionResponse,
+        ChatChoiceStream, ChatCompletionNamedToolChoice, ChatCompletionRequestUserMessageArgs,
+        ChatCompletionResponseStream, ChatCompletionStreamResponseDelta, ChatCompletionTool,
+        ChatCompletionToolChoiceOption, CreateChatCompletionRequest,
+        CreateChatCompletionRequestArgs, CreateChatCompletionResponse,
         CreateChatCompletionStreamResponse, FinishReason, Role, Stop,
     },
 };
@@ -58,14 +58,11 @@ pub struct MistralLlama {
     counter: AtomicUsize,
 }
 
-#[allow(deprecated)]
-fn to_openai_response(resp: &ChatCompletionResponse) -> Result<CreateChatCompletionResponse> {
-    let resp_str = serde_json::to_string(resp)
-        .boxed()
-        .context(FailedToRunModelSnafu)?;
-    serde_json::from_str(&resp_str)
-        .boxed()
-        .context(FailedToRunModelSnafu)
+fn to_openai_response(
+    resp: &ChatCompletionResponse,
+) -> Result<CreateChatCompletionResponse, OpenAIError> {
+    let resp_str = serde_json::to_string(resp)?;
+    serde_json::from_str(&resp_str).map_err(OpenAIError::from)
 }
 
 impl MistralLlama {
@@ -344,7 +341,7 @@ impl MistralLlama {
     }
 
     /// Prepares and sends a [`CreateChatCompletionRequest`] to the model pipeline.
-    #[allow(deprecated, clippy::cast_possible_truncation)]
+    #[allow(clippy::cast_possible_truncation)]
     async fn send_message(
         &self,
         req: CreateChatCompletionRequest,
@@ -372,12 +369,11 @@ impl MistralLlama {
                 Stop::StringArray(s) => mistralrs::StopTokens::Seqs(s),
             }),
             max_len: req.max_completion_tokens.map(|x| x as usize),
-            // logits_bias: req.logit_bias,
             logits_bias: None,
             n_choices: req.n.unwrap_or(1) as usize,
             dry_params: None,
         };
-        let (snd, rcv) = channel::<MistralResponse>(10_000);
+        let (tx, rx) = channel::<MistralResponse>(10_000);
 
         tracing::trace!("Sending request to pipeline");
         self.pipeline
@@ -387,7 +383,7 @@ impl MistralLlama {
             .send(self.to_mistralrs_request(
                 message.clone(),
                 req.stream.unwrap_or_default(),
-                snd,
+                tx,
                 tools,
                 tool_choice,
                 Some(sampling),
@@ -397,11 +393,11 @@ impl MistralLlama {
             .context(FailedToRunModelSnafu)?;
         tracing::trace!("Request sent!");
 
-        Ok(rcv)
+        Ok(rx)
     }
 
     /// Process a single `stream=false` request to generate `OpenAi` chat completion.
-    fn post_process_req(resp: MistralResponse) -> Result<ChatCompletionResponse> {
+    fn post_process_req(resp: MistralResponse) -> Result<ChatCompletionResponse, OpenAIError> {
         match resp {
             MistralResponse::Done(mut resp) => {
                 // mistralrs does not return "tool_calls" as a finish_reason correctly (like OpenAI spec).
@@ -413,18 +409,29 @@ impl MistralLlama {
                 });
                 Ok(resp)
             }
-            MistralResponse::ModelError(e, _) => {
-                Err(ChatError::FailedToRunModel { source: e.into() })
-            }
+            MistralResponse::ModelError(e, _) => Err(OpenAIError::ApiError(ApiError {
+                message: e,
+                r#type: None,
+                param: None,
+                code: None,
+            })),
             MistralResponse::InternalError(e) | MistralResponse::ValidationError(e) => {
                 tracing::error!("Internal mistral.rs error: {e}",);
-                Err(ChatError::FailedToRunModel { source: e })
+                Err(OpenAIError::ApiError(ApiError {
+                    message: e.to_string(),
+                    r#type: None,
+                    param: None,
+                    code: None,
+                }))
             }
 
             // Don't expect MistralResponse::Chunk, should be streaming only.
-            _ => Err(ChatError::FailedToRunModel {
-                source: "Unexpected error occurred".into(),
-            }),
+            _ => Err(OpenAIError::ApiError(ApiError {
+                message: "Unexpected error occurred".to_string(),
+                r#type: None,
+                param: None,
+                code: None,
+            })),
         }
     }
 }
@@ -531,25 +538,7 @@ impl Chat for MistralLlama {
             }));
         };
 
-        let z = Self::post_process_req(resp)
-            .map(|z| to_openai_response(&z))
-            .map_err(|e| {
-                OpenAIError::ApiError(ApiError {
-                    message: e.to_string(),
-                    r#type: None,
-                    param: None,
-                    code: None,
-                })
-            })?;
-
-        z.map_err(|e| {
-            OpenAIError::ApiError(ApiError {
-                message: e.to_string(),
-                r#type: None,
-                param: None,
-                code: None,
-            })
-        })
+        Self::post_process_req(resp).map(|z| to_openai_response(&z))?
     }
 }
 
