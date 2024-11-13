@@ -356,7 +356,6 @@ impl Dataset {
     /// For [`Dataset`]s where the path in the `from` field is a [`TableReference`], parse and return the [`TableReference`].
     ///
     ///
-    #[must_use]
     pub fn parse_path(
         &self,
         case_sensitive: bool,
