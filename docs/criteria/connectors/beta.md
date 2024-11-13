@@ -12,6 +12,7 @@ All criteria must be met for the connector to be considered Beta, with exception
 | Databricks              | ❌           |              |
 | Delta Lake              | ❌           |              |
 | Dremio                  | ❌           |              |
+| DuckDB                  | ✅           | @peasee      |
 | File                    | ❌           |              |
 | FTP/SFTP                | ❌           |              |
 | GraphQL                 | ❌           |              |

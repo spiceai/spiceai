@@ -67,9 +67,11 @@ if ! type "duckdb" 1> /dev/null 2>&1; then
   echo "'duckdb' is required"
 fi
 
-# Download clickbench data
-wget --no-verbose --continue 'https://datasets.clickhouse.com/hits_compatible/hits.csv.gz'
-gzip -d hits.csv.gz
+# Download clickbench data if not already downloaded and uncompressed
+if [ ! -f hits.csv ]; then
+  wget --no-verbose --continue 'https://datasets.clickhouse.com/hits_compatible/hits.csv.gz'
+  gzip -d hits.csv.gz
+fi
 
 # Command to load clickbench data into DuckDB
 dbname="clickbench.db"

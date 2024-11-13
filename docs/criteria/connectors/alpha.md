@@ -12,6 +12,7 @@ All criteria must be met for the connector to be considered Alpha. As Alpha sign
 | Databricks              | ❌            |              |
 | Delta Lake              | ❌            |              |
 | Dremio                  | ❌            |              |
+| DuckDB                  | ✅            | @peasee      |
 | File                    | ❌            |              |
 | FTP/SFTP                | ❌            |              |
 | GraphQL                 | ❌            |              |
