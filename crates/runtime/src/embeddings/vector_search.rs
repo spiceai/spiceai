@@ -248,6 +248,9 @@ impl VectorSearchTableResult {
         pretty_format_batches(&self.data)
     }
 
+    /// Return the primary keys of the [`VectorSearch::individual_search`] as an array of JSON objects.
+    ///
+    /// Each element is a mapping of the primary key column to its value.
     pub fn primary_keys_json(&self) -> Result<Vec<HashMap<String, serde_json::Value>>> {
         let primary_key_projection = get_projection(&self.schema(), &self.primary_keys);
         let primary_keys_records = self
@@ -270,6 +273,9 @@ impl VectorSearchTableResult {
         }
     }
 
+    /// Return the additional columns of the [`VectorSearch::individual_search`] as an array of JSON objects.
+    ///
+    /// Each element is a mapping of the additional column name to its value.
     pub fn addition_columns_json(&self) -> Result<Vec<HashMap<String, serde_json::Value>>> {
         let additional_columns_projection =
             get_projection(&self.schema(), &self.additional_columns);
@@ -294,6 +300,7 @@ impl VectorSearchTableResult {
         }
     }
 
+    /// Return the distance of each search result.
     pub fn distance_values(&self) -> Result<Vec<f64>> {
         let Some(distances) = self
             .data
@@ -325,6 +332,7 @@ impl VectorSearchTableResult {
         Ok(distances)
     }
 
+    /// Return the input column that was embedded.
     pub fn embedding_columns_list(&self) -> Result<Vec<String>> {
         let embedding_projection = get_projection(&self.schema(), &[self.embedding_column.clone()]);
         let embedding_records = self
@@ -350,6 +358,7 @@ impl VectorSearchTableResult {
         Ok(result)
     }
 
+    /// Retuns the Schema of the full underlying data.
     pub fn schema(&self) -> SchemaRef {
         self.data
             .first()
