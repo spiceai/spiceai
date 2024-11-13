@@ -47,6 +47,8 @@ use tokio::sync::RwLock;
 use tracing::Span;
 use tracing_futures::Instrument;
 
+use super::accept_header_types;
+
 fn clean_model_based_sql(input: &str) -> String {
     let no_dashes = match input.strip_prefix("--") {
         Some(rest) => rest.to_string(),
@@ -110,13 +112,6 @@ pub struct Request {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub datasets: Option<Vec<String>>,
-
-    #[serde(default = "default_return_sql")]
-    pub return_sql: bool,
-}
-
-fn default_return_sql() -> bool {
-    false
 }
 
 fn default_sample_data_enabled() -> bool {
@@ -125,6 +120,13 @@ fn default_sample_data_enabled() -> bool {
 
 fn default_model() -> String {
     "nql".to_string()
+}
+
+/// Checks if the request is asking to only generate SQL.
+fn return_sql_only(accept: &Option<TypedHeader<Accept>>) -> bool {
+    accept
+        .as_ref()
+        .is_some_and(|a| accept_header_types(a).contains(&"application/sql".to_string()))
 }
 
 pub(crate) async fn post(
@@ -209,7 +211,7 @@ pub(crate) async fn post(
         Ok(Some(model_sql_query)) => {
             let cleaned_query = clean_model_based_sql(&model_sql_query);
 
-            if payload.return_sql {
+            if return_sql_only(&accept) {
                 tracing::trace!("Not running query, returning SQL:\n{cleaned_query}");
                 return (StatusCode::OK, cleaned_query).into_response();
             }
