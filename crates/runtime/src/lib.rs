@@ -704,31 +704,66 @@ impl Runtime {
         let valid_datasets = Self::get_valid_datasets(app, LogErrors(true));
         let initialized_datasets = self.initialize_accelerators(&valid_datasets).await;
 
-        // Separate datasets into localpod and non-localpod
-        let (localpod_datasets, non_localpod_datasets): (Vec<_>, Vec<_>) = initialized_datasets
-            .into_iter()
-            .partition(|ds| ds.source() == LOCALPOD_DATACONNECTOR);
-        let mut futures = vec![];
+        // Create a map of dataset names to their futures
+        let mut dataset_futures = HashMap::new();
+        let mut localpod_datasets = Vec::new();
 
-        // Load non-localpod datasets first in parallel
-        for ds in non_localpod_datasets {
+        // First create futures for non-localpod datasets
+        for ds in initialized_datasets {
+            if ds.source() == LOCALPOD_DATACONNECTOR {
+                localpod_datasets.push(ds);
+                continue;
+            }
+
             self.status
                 .update_dataset(&ds.name, status::ComponentStatus::Initializing);
-            futures.push(self.load_dataset(ds));
+            let future = Box::pin(self.load_dataset(ds.clone()));
+            dataset_futures.insert(ds.name.clone(), future);
         }
 
-        if let Some(parallel_num) = app.runtime.num_of_parallel_loading_at_start_up {
-            let stream = futures::stream::iter(futures).buffer_unordered(parallel_num);
-            let _ = stream.collect::<Vec<_>>().await;
-        } else {
-            let _ = join_all(futures).await;
-        }
-
-        // Load localpod datasets
+        // For each localpod dataset, chain it after its parent's future
         for ds in localpod_datasets {
             self.status
                 .update_dataset(&ds.name, status::ComponentStatus::Initializing);
-            self.load_dataset(ds).await;
+
+            // Get the parent dataset path from the localpod dataset
+            let path = ds.path();
+            let path_table_ref = TableReference::parse_str(&path);
+
+            // Find the parent dataset's future
+            let parent_future = dataset_futures.get(&path_table_ref).cloned();
+
+            let localpod_future = match parent_future {
+                Some(parent_future) => {
+                    // Chain the localpod dataset load after its parent
+                    Box::pin(async move {
+                        parent_future.await;
+                        self.load_dataset(ds).await;
+                    })
+                }
+                None => {
+                    // If parent doesn't exist, create a future that will fail
+                    tracing::error!(
+                        "Parent dataset {} not found for localpod dataset {}",
+                        path_table_ref,
+                        ds.name
+                    );
+                    self.status
+                        .update_dataset(&ds.name, status::ComponentStatus::Error);
+                    continue;
+                }
+            };
+
+            dataset_futures.insert(ds.name.clone(), localpod_future);
+        }
+
+        // Execute all futures
+        if let Some(parallel_num) = app.runtime.num_of_parallel_loading_at_start_up {
+            let stream =
+                futures::stream::iter(dataset_futures.into_values()).buffer_unordered(parallel_num);
+            let _ = stream.collect::<Vec<_>>().await;
+        } else {
+            let _ = join_all(dataset_futures.into_values()).await;
         }
 
         // After all datasets have loaded, load the views.
