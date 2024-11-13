@@ -1,6 +1,7 @@
 ---
 source: crates/runtime/benches/bench.rs
 description: "Query: select\n        sum(l_extendedprice) / 7.0 as avg_yearly\nfrom\n    lineitem,\n    part\nwhere\n        p_partkey = l_partkey\n  and p_brand = 'Brand#23'\n  and p_container = 'MED BOX'\n  and l_quantity < (\n    select\n            0.2 * avg(l_quantity)\n    from\n        lineitem\n    where\n            l_partkey = p_partkey\n);"
+snapshot_kind: text
 ---
 +---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
 | plan_type     | plan                                                                                                                                                                                                                    |
@@ -15,8 +16,8 @@ description: "Query: select\n        sum(l_extendedprice) / 7.0 as avg_yearly\nf
 |               |               TableScan: lineitem projection=[l_partkey, l_quantity, l_extendedprice]                                                                                                                                   |
 |               |             Projection: part.p_partkey                                                                                                                                                                                  |
 |               |               BytesProcessedNode                                                                                                                                                                                        |
-|               |                 Filter: part.p_brand = Utf8("Brand#23") AND part.p_container = Utf8("MED BOX")                                                                                                                          |
-|               |                   TableScan: part projection=[p_partkey, p_brand, p_container], partial_filters=[part.p_brand = Utf8("Brand#23"), part.p_container = Utf8("MED BOX")]                                                   |
+|               |                 Filter: part.p_brand = Utf8View("Brand#23") AND part.p_container = Utf8View("MED BOX")                                                                                                                  |
+|               |                   TableScan: part projection=[p_partkey, p_brand, p_container], partial_filters=[part.p_brand = Utf8View("Brand#23"), part.p_container = Utf8View("MED BOX")]                                           |
 |               |         SubqueryAlias: __scalar_sq_1                                                                                                                                                                                    |
 |               |           Projection: CAST(Float64(0.2) * CAST(avg(lineitem.l_quantity) AS Float64) AS Decimal128(30, 15)), lineitem.l_partkey                                                                                          |
 |               |             Aggregate: groupBy=[[lineitem.l_partkey]], aggr=[[avg(lineitem.l_quantity)]]                                                                                                                                |
