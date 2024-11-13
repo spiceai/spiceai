@@ -3,6 +3,15 @@
 ## Processes the results from run_and_monitor.bash into a CSV file
 ## Usage: ./process_results.bash <input_file>
 
+## To use this script, first run:
+## ./setup-tpc-spicepod.bash tpch 10
+## Then start `spice` and monitor its resource usage with:
+## ./run_spice_and_monitor.bash tpch_run.log
+## Then run the queries in a separate terminal with:
+## ./run_queries_and_monitor.bash <query_folder> tpch_run.log
+## Then process the results with:
+## ./process_results.bash tpch_run.log
+
 set -e
 
 if [ -z "$1" ]; then

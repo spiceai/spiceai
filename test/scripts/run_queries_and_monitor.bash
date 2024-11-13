@@ -6,9 +6,13 @@ set -e
 ## At the start of every query, it will inject the query name into the current log file
 ## being used by run_and_monitor.sh
 ## To use this script, first run:
-## ./run_and_monitor.bash tpch_run.log
-## Then run:
+## ./setup-tpc-spicepod.bash tpch 10
+## Then start `spice` and monitor its resource usage with:
+## ./run_spice_and_monitor.bash tpch_run.log
+## Then run the queries in a separate terminal with:
 ## ./run_queries_and_monitor.bash <query_folder> tpch_run.log
+## Then process the results with:
+## ./process_results.bash tpch_run.log
 
 clean_up () {
   ARG=$?
@@ -41,6 +45,7 @@ CHECK_INTERVAL=5
 
 echo "Waiting for spice to load datasets..."
 
+# Wait for the datasets to load
 while true; do
     RESPONSE=$(curl -s http://localhost:8090/v1/ready)
     RCODE=$?
