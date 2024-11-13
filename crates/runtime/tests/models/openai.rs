@@ -279,7 +279,7 @@ async fn openai_test_chat_completion() -> Result<(), anyhow::Error> {
     let mut model_with_tools = get_openai_model("gpt-4o-mini", "openai_model");
     model_with_tools
         .params
-        .insert("spice_tools".to_string(), "auto".into());
+        .insert("tools".to_string(), "auto".into());
 
     let app = AppBuilder::new("text-to-sql")
         .with_dataset(get_taxi_trips_dataset())
@@ -350,7 +350,7 @@ async fn openai_test_chat_messages() -> Result<(), anyhow::Error> {
     let mut model_with_tools = get_openai_model("gpt-4o-mini", "openai_model");
     model_with_tools
         .params
-        .insert("spice_tools".to_string(), "auto".into());
+        .insert("tools".to_string(), "auto".into());
 
     let model_secrets = get_params_with_secrets(&model_with_tools.params, &rt).await;
 

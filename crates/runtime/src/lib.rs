@@ -1415,8 +1415,8 @@ impl Runtime {
 
         // Load all built-in tools, regardless if they are in the spicepod.
         // This will enable loading each tool in the catalog, and the catalog as a whole. E.g:
-        //   `spice_tools: models, builtin`
-        //   `spice_tools: sql, load_memory`
+        //   `tools: models, builtin`
+        //   `tools: sql, load_memory`
         for ctlg in default_available_catalogs() {
             self.insert_tool_catalog(&ctlg).await;
             for tool in ctlg.all().await {

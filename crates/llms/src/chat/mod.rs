@@ -98,7 +98,7 @@ pub enum Error {
     #[snafu(display("No model from {from} currently supports {task}"))]
     UnsupportedTaskForModel { from: String, task: String },
 
-    #[snafu(display("Invalid value for 'params.spice_tools'"))]
+    #[snafu(display("Invalid value for 'params.tools'"))]
     UnsupportedSpiceToolUseParameterError {},
 
     #[snafu(display("Runtime does not currently support the {modality} modality"))]
@@ -561,6 +561,11 @@ pub trait Chat: Sync + Send {
     }
 }
 
+/// Create a model to run locally, via files from Huggingface.
+///
+/// `model_id` uniquely refers to a Huggingface model.
+/// `model_type` is the type of model, if needed to be explicit. Often this can
+///    be inferred from the `.model_type` key in a HF's `config.json`.
 pub fn create_hf_model(
     model_id: &str,
     model_type: &Option<String>,

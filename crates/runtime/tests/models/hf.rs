@@ -241,7 +241,7 @@ async fn huggingface_test_chat_completion() -> Result<(), anyhow::Error> {
     let mut model_with_tools = get_huggingface_model(HF_TEST_MODEL, HF_TEST_MODEL_TYPE, "hf_model");
     model_with_tools
         .params
-        .insert("spice_tools".to_string(), "auto".into());
+        .insert("tools".to_string(), "auto".into());
 
     let app = AppBuilder::new("text-to-sql")
         .with_dataset(get_taxi_trips_dataset())
