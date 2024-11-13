@@ -48,6 +48,14 @@ on:
           - 'sqlite accelerator (memory mode)'
           - 'sqlite accelerator (file mode)'
           - 'postgres accelerator'
+      update_snapshots:
+        description: 'Create PR to update snapshots'
+        required: false
+        default: 'no'
+        type: choice
+        options:
+          - 'always'
+          - 'no'
 
 env:
   FEATURES: 'postgres,spark,mysql,odbc,delta_lake,databricks,duckdb,sqlite'
@@ -310,7 +318,7 @@ jobs:
 
       - name: Run benchmark with ${{ matrix.name }}
         if: (github.event.inputs.selected_benchmark == matrix.name && (github.event.inputs.bench_name == matrix.bench || github.event.inputs.bench_name == 'all')) || github.event.inputs.run_all == 'true' || github.event_name == 'schedule'
-        run: INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" ./spice_bench --bench ${{ matrix.cmd }}
+        run: INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" INSTA_UPDATE=${{ github.event.inputs.update_snapshots}} ./spice_bench --bench ${{ matrix.cmd }}
         continue-on-error: true
         env:
           UPLOAD_RESULTS_DATASET: 'spiceai.tests.oss_benchmarks'
@@ -334,6 +342,21 @@ jobs:
           AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ secrets.AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY }}
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_S3_ATHENA_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_S3_ATHENA_SECRET_ACCESS_KEY }}
+
+      - name: Upload benchmark snapshots to branch
+        if: github.event.inputs.update_snapshots == 'always' && (github.event.inputs.selected_benchmark == matrix.name && (github.event.inputs.bench_name == matrix.bench || github.event.inputs.bench_name == 'all')) || github.event.inputs.run_all == 'true' || github.event_name == 'schedule'
+        run: |
+          git config --global user.name 'Spice Benchmark Snapshot Update Bot'
+          git config --global user.email 'bench-snapshot-update-bot@spice.ai'
+          git checkout -b bench-snapshot-update/${{ github.run_id }}
+          git add '*.snap'
+          git commit -m "Update benchmark snapshots for ${{ matrix.name }} ${{ matrix.bench }}"
+          if git ls-remote --exit-code --heads origin bench-snapshot-update/${{ github.run_id }}; then
+            git pull --rebase origin bench-snapshot-update/${{ github.run_id }}
+          fi
+          git push origin bench-snapshot-update/${{ github.run_id }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   run-clickbench:
     name: Run ${{ matrix.name }} Clickbench
@@ -387,3 +410,21 @@ jobs:
           CLICKBENCH_S3_ENDPOINT: ${{ secrets.CLICKBENCH_S3_ENDPOINT}}
           CLICKBENCH_S3_KEY: ${{ secrets.CLICKBENCH_S3_KEY}}
           CLICKBENCH_S3_SECRET: ${{ secrets.CLICKBENCH_S3_SECRET}}
+
+  create-pr:
+    runs-on: ubuntu-latest
+    needs: run-database-bench
+    if: always() && github.event.inputs.update_snapshots == 'always'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Create PR
+        run: |
+          git config --global user.name 'Spice Benchmark Snapshot Update Bot'
+          git config --global user.email 'bench-snapshot-update-bot@spice.ai'
+          git fetch origin bench-snapshot-update/${{ github.run_id }}
+          git checkout bench-snapshot-update/${{ github.run_id }}
+          gh pr create --title "Update benchmark snapshots" --body "Updated benchmark snapshots" --base trunk --head bench-snapshot-update/${{ github.run_id }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

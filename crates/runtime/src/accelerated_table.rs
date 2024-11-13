@@ -33,6 +33,7 @@ use data_components::cdc::ChangesStream;
 use data_components::delete::get_deletion_provider;
 use datafusion::catalog::Session;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
+use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::{Operator, TableProviderFilterPushDown};
 use datafusion::physical_plan::union::UnionExec;
 use datafusion::physical_plan::{collect, ExecutionPlan};
@@ -171,6 +172,21 @@ pub struct AcceleratedTable {
     refresher: Arc<refresh::Refresher>,
     disable_query_push_down: bool,
     synchronized_with: Option<SynchronizedTable>,
+}
+
+impl std::fmt::Debug for AcceleratedTable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AcceleratedTable")
+            .field("dataset_name", &self.dataset_name)
+            .field("accelerator", &self.accelerator)
+            .field("federated", &self.federated)
+            .field("zero_results_action", &self.zero_results_action)
+            .field("ready_state", &self.ready_state)
+            .field("refresh_params", &self.refresh_params)
+            .field("disable_query_push_down", &self.disable_query_push_down)
+            .field("synchronized_with", &self.synchronized_with)
+            .finish_non_exhaustive()
+    }
 }
 
 fn validate_refresh_data_window(
@@ -713,7 +729,7 @@ impl TableProvider for AcceleratedTable {
         &self,
         state: &dyn Session,
         input: Arc<dyn ExecutionPlan>,
-        overwrite: bool,
+        overwrite: InsertOp,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
         // Duplicate the input into two streams
         let tee_input: Arc<dyn ExecutionPlan> = Arc::new(TeeExec::new(input, 2));

@@ -17,12 +17,8 @@ limitations under the License.
 use super::{Acceleration, IndexType};
 use crate::component::dataset;
 use arrow::datatypes::SchemaRef;
-use datafusion::{
-    common::{Constraints, DFSchema},
-    sql::sqlparser::ast::TableConstraint,
-};
-use snafu::prelude::*;
-use std::{collections::HashMap, fmt::Display, sync::Arc};
+use datafusion::common::{Constraint, Constraints};
+use std::{collections::HashMap, fmt::Display};
 
 impl Acceleration {
     #[must_use]
@@ -62,27 +58,23 @@ impl Acceleration {
         Ok(())
     }
 
+    #[allow(clippy::needless_pass_by_value)]
     pub fn table_constraints(&self, schema: SchemaRef) -> dataset::Result<Option<Constraints>> {
         if self.indexes.is_empty() && self.primary_key.is_none() {
             return Ok(None);
         }
 
-        let mut table_constraints: Vec<TableConstraint> = Vec::new();
+        let mut table_constraints: Vec<Constraint> = Vec::new();
 
         for (column, index_type) in &self.indexes {
             match index_type {
                 IndexType::Enabled => {}
                 IndexType::Unique => {
-                    let tc = TableConstraint::Unique {
-                        columns: column.iter().map(Into::into).collect(),
-                        name: None,
-                        index_name: None,
-                        index_type_display:
-                            datafusion::sql::sqlparser::ast::KeyOrIndexDisplay::None,
-                        index_options: vec![],
-                        characteristics: None,
-                        index_type: None,
-                    };
+                    let index_indices: Vec<usize> = column
+                        .iter()
+                        .filter_map(|c| schema.index_of(c).ok())
+                        .collect();
+                    let tc = Constraint::Unique(index_indices);
 
                     table_constraints.push(tc);
                 }
@@ -90,27 +82,15 @@ impl Acceleration {
         }
 
         if let Some(primary_key) = &self.primary_key {
-            let tc = TableConstraint::PrimaryKey {
-                columns: primary_key.iter().map(Into::into).collect(),
-                name: None,
-                index_name: None,
-                index_options: vec![],
-                characteristics: None,
-                index_type: None,
-            };
+            let pk_indices: Vec<usize> = primary_key
+                .iter()
+                .filter_map(|c| schema.index_of(c).ok())
+                .collect();
+            let tc = Constraint::PrimaryKey(pk_indices);
 
             table_constraints.push(tc);
         }
 
-        Ok(Some(
-            Constraints::new_from_table_constraints(
-                &table_constraints,
-                &Arc::new(
-                    DFSchema::try_from(schema)
-                        .context(dataset::UnableToConvertSchemaRefToDFSchemaSnafu)?,
-                ),
-            )
-            .context(dataset::UnableToGetTableConstraintsSnafu)?,
-        ))
+        Ok(Some(Constraints::new_unverified(table_constraints)))
     }
 }

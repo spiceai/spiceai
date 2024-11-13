@@ -42,7 +42,7 @@ use std::{
 
 use crate::datafusion::query::Protocol;
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct BytesProcessedOptimizerRule {}
 
 /// Walk over the plan and insert a `BytesProcessedNode` as the parent of any `TableScans` and `FederationNodes`.
@@ -116,6 +116,7 @@ impl BytesProcessedOptimizerRule {
     }
 }
 
+#[derive(PartialOrd)]
 pub(crate) struct BytesProcessedNode {
     pub(super) input: LogicalPlan,
 }

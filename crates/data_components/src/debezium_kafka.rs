@@ -26,12 +26,11 @@ use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::{
     catalog::Session,
-    common::{Constraints, DFSchema},
+    common::{Constraint, Constraints, DFSchema},
     datasource::{TableProvider, TableType},
     error::Result as DataFusionResult,
     logical_expr::Expr,
     physical_plan::{empty::EmptyExec, ExecutionPlan},
-    sql::sqlparser::ast::{Ident, TableConstraint},
 };
 use futures::StreamExt;
 use std::{any::Any, sync::Arc};
@@ -43,27 +42,38 @@ pub struct DebeziumKafka {
     consumer: &'static KafkaConsumer,
 }
 
+impl std::fmt::Debug for DebeziumKafka {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DebeziumKafka")
+            .field("schema", &self.schema)
+            .field("primary_keys", &self.primary_keys)
+            .field("constraints", &self.constraints)
+            .finish_non_exhaustive()
+    }
+}
+
 impl DebeziumKafka {
     #[must_use]
     pub fn new(schema: SchemaRef, primary_keys: Vec<String>, consumer: KafkaConsumer) -> Self {
         let Ok(df_schema) = DFSchema::try_from(Arc::clone(&schema)) else {
             unreachable!("DFSchema::try_from is infallible as of DataFusion 38")
         };
-        let constraints = Constraints::new_from_table_constraints(
-            &[TableConstraint::PrimaryKey {
-                name: None,
-                index_name: None,
-                index_type: None,
-                columns: primary_keys
-                    .iter()
-                    .map(|col| Ident::new(col.clone()))
-                    .collect(),
-                index_options: vec![],
-                characteristics: None,
-            }],
-            &Arc::new(df_schema),
-        )
-        .ok();
+
+        // Get the indices of primary key columns in the schema
+        let pk_indices: Vec<usize> = primary_keys
+            .iter()
+            .filter_map(|pk| df_schema.index_of_column_by_name(None, pk))
+            .collect();
+
+        // Create constraints with the primary key indices
+        let constraints = if pk_indices.is_empty() {
+            None
+        } else {
+            Some(Constraints::new_unverified(vec![Constraint::PrimaryKey(
+                pk_indices,
+            )]))
+        };
+
         Self {
             schema,
             primary_keys,

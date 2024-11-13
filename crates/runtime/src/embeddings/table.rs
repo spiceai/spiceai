@@ -23,6 +23,7 @@ use async_trait::async_trait;
 use datafusion::catalog::Session;
 use datafusion::common::{project_schema, Constraints, Statistics};
 use datafusion::error::Result as DataFusionResult;
+use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::TableProviderFilterPushDown;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::{
@@ -58,6 +59,15 @@ pub struct EmbeddingTable {
     embedding_models: Arc<RwLock<EmbeddingModelStore>>,
 }
 
+impl std::fmt::Debug for EmbeddingTable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EmbeddingTable")
+            .field("base_table", &self.base_table)
+            .field("embedded_columns", &self.embedded_columns)
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Clone)]
 pub struct EmbeddingColumnConfig {
     /// The name of the embedding model to use for this column.
@@ -72,6 +82,16 @@ pub struct EmbeddingColumnConfig {
 
     // If None, either no chunking is needed, or [`in_base_table`] is true.
     pub chunker: Option<Arc<dyn Chunker>>,
+}
+
+impl std::fmt::Debug for EmbeddingColumnConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EmbeddingColumnConfig")
+            .field("model_name", &self.model_name)
+            .field("vector_size", &self.vector_size)
+            .field("in_base_table", &self.in_base_table)
+            .finish_non_exhaustive()
+    }
 }
 
 impl EmbeddingTable {
@@ -566,7 +586,7 @@ impl TableProvider for EmbeddingTable {
         &self,
         state: &dyn Session,
         input: Arc<dyn ExecutionPlan>,
-        overwrite: bool,
+        overwrite: InsertOp,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         self.base_table.insert_into(state, input, overwrite).await
     }

@@ -27,6 +27,7 @@ use datafusion::prelude::Expr;
 use std::sync::Arc;
 
 // https://docs.github.com/en/graphql/reference/objects#commit
+#[derive(Debug)]
 pub struct CommitsTableArgs {
     pub owner: String,
     pub repo: String,

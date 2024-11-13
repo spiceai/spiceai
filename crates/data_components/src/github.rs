@@ -52,6 +52,7 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+#[derive(Debug)]
 pub struct GithubFilesTableProvider {
     client: GithubRestClient,
     owner: Arc<str>,
@@ -165,6 +166,14 @@ impl TableProvider for GithubFilesTableProvider {
 pub struct GithubRestClient {
     client: reqwest::Client,
     token: Arc<dyn TokenProvider>,
+}
+
+impl std::fmt::Debug for GithubRestClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GithubRestClient")
+            .field("token", &self.token)
+            .finish_non_exhaustive()
+    }
 }
 
 static SPICE_USER_AGENT: &str = "spice";

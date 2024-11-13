@@ -50,6 +50,14 @@ pub struct SharepointTableProvider {
     include_file_content: bool,
 }
 
+impl std::fmt::Debug for SharepointTableProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SharepointTableProvider")
+            .field("include_file_content", &self.include_file_content)
+            .finish_non_exhaustive()
+    }
+}
+
 impl SharepointTableProvider {
     #[must_use]
     pub fn new(

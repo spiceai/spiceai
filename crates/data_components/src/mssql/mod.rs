@@ -74,6 +74,7 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+#[derive(Debug)]
 pub struct SqlServerTableProvider {
     conn: Arc<SqlServerConnectionPool>,
     schema: SchemaRef,

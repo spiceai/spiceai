@@ -39,6 +39,7 @@ use crate::{
     dataconnector::DataConnector,
 };
 
+#[derive(Debug)]
 pub enum FederatedTable {
     // To optimize the common case where the table provider is available immediately.
     Immediate(Arc<dyn TableProvider>),
@@ -48,12 +49,14 @@ pub enum FederatedTable {
     Deferred(DeferredTableProvider),
 }
 
+#[derive(Debug)]
 enum DeferredState {
     Waiting(oneshot::Receiver<Arc<dyn TableProvider>>),
     InProgress,
     Done(Arc<dyn TableProvider>),
 }
 
+#[derive(Debug)]
 pub struct DeferredTableProvider {
     state: Mutex<DeferredState>,
     schema: SchemaRef,

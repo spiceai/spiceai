@@ -24,7 +24,7 @@ use datafusion::{
     catalog::Session,
     datasource::{TableProvider, TableType},
     execution::{SendableRecordBatchStream, TaskContext},
-    logical_expr::Expr,
+    logical_expr::{dml::InsertOp, Expr},
     physical_plan::{
         empty::EmptyExec,
         insert::{DataSink, DataSinkExec},
@@ -140,7 +140,7 @@ impl TableProvider for SinkConnector {
         &self,
         _state: &dyn Session,
         input: Arc<dyn ExecutionPlan>,
-        _overwrite: bool,
+        _overwrite: InsertOp,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
         Ok(Arc::new(DataSinkExec::new(
             input,

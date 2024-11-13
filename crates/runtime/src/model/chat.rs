@@ -22,8 +22,8 @@ use async_openai::{
     },
 };
 use async_trait::async_trait;
-use futures::stream::StreamExt;
 use futures::Stream;
+use futures::{stream::StreamExt, TryStreamExt};
 use llms::openai::DEFAULT_LLM_MODEL;
 use llms::{
     anthropic::{Anthropic, AnthropicConfig},
@@ -59,7 +59,8 @@ pub async fn try_to_chat_model<S: ::std::hash::BuildHasher>(
     let model = construct_model(component, params)?;
 
     // Handle tool usage
-    let spice_tool_opt: Option<SpiceToolsOptions> = extract_secret!(params, "spice_tools")
+    let spice_tool_opt: Option<SpiceToolsOptions> = extract_secret!(params, "tools")
+        .or(extract_secret!(params, "spice_tools"))
         .map(|x| x.parse())
         .transpose()
         .map_err(|_| LlmError::UnsupportedSpiceToolUseParameterError {})?;
@@ -188,6 +189,7 @@ pub fn construct_model<S: ::std::hash::BuildHasher>(
         .map(|s| s.to_string());
     let wrapper = ChatWrapper::new(
         model,
+        component.name.as_str(),
         system_prompt,
         component.get_openai_request_overrides(),
     );
@@ -196,6 +198,7 @@ pub fn construct_model<S: ::std::hash::BuildHasher>(
 
 /// Wraps [`Chat`] models with additional handling specifically for the spice runtime (e.g. telemetry, injecting system prompts).
 pub struct ChatWrapper {
+    pub public_name: String,
     pub chat: Box<dyn Chat>,
     pub system_prompt: Option<String>,
     pub defaults: Vec<(String, serde_json::Value)>,
@@ -203,10 +206,12 @@ pub struct ChatWrapper {
 impl ChatWrapper {
     pub fn new(
         chat: Box<dyn Chat>,
+        public_name: &str,
         system_prompt: Option<String>,
         defaults: Vec<(String, serde_json::Value)>,
     ) -> Self {
         Self {
+            public_name: public_name.to_string(),
             chat,
             system_prompt,
             defaults,
@@ -357,8 +362,9 @@ impl Chat for ChatWrapper {
 
         match self.chat.chat_stream(req).instrument(span.clone()).await {
             Ok(resp) => {
+                let public_name = self.public_name.clone();
                 let stream_span = span.clone();
-                let logged_stream = resp.instrument(stream_span.clone()).inspect(move |item| {
+                let logged_stream = resp.map_ok(move |mut r| {r.model.clone_from(&public_name); r}).instrument(stream_span.clone()).inspect(move |item| {
                     if let Ok(item) = item {
 
                         // not incremental; provider only emits usage on last chunk.
@@ -389,7 +395,7 @@ impl Chat for ChatWrapper {
         }
 
         match self.chat.chat_request(req).instrument(span.clone()).await {
-            Ok(resp) => {
+            Ok(mut resp) => {
                 if let Some(usage) = resp.usage.clone() {
                     tracing::info!(target: "task_history", parent: &span, completion_tokens = %usage.completion_tokens, total_tokens = %usage.total_tokens, prompt_tokens = %usage.prompt_tokens, "labels");
                 };
@@ -400,6 +406,7 @@ impl Chat for ChatWrapper {
                     }
                     Err(e) => tracing::error!("Failed to serialize truncated output: {}", e),
                 }
+                resp.model.clone_from(&self.public_name);
                 Ok(resp)
             }
             Err(e) => {

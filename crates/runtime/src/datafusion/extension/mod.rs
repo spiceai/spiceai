@@ -28,7 +28,7 @@ use std::sync::Arc;
 
 pub mod bytes_processed;
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct SpiceQueryPlanner {}
 
 impl SpiceQueryPlanner {

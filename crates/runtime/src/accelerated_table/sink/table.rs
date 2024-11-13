@@ -17,8 +17,8 @@ limitations under the License.
 use std::{pin::Pin, sync::Arc};
 
 use datafusion::{
-    catalog::TableProvider, execution::RecordBatchStream, physical_plan::collect,
-    prelude::SessionContext,
+    catalog::TableProvider, execution::RecordBatchStream, logical_expr::dml::InsertOp,
+    physical_plan::collect, prelude::SessionContext,
 };
 use util::RetryError;
 
@@ -39,7 +39,7 @@ impl TableSink {
     pub async fn insert_into(
         &self,
         record_batch_stream: Pin<Box<dyn RecordBatchStream + Send>>,
-        overwrite: bool,
+        overwrite: InsertOp,
     ) -> Result<(), RetryError<crate::accelerated_table::Error>> {
         let ctx = SessionContext::new();
 

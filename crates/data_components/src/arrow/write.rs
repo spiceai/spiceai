@@ -20,6 +20,7 @@
 use datafusion::catalog::Session;
 // This is modified from the DataFusion `MemTable` to support overwrites. This file can be removed once that change is upstreamed.
 use datafusion::dataframe::DataFrame;
+use datafusion::logical_expr::dml::InsertOp;
 use std::any::Any;
 use std::collections::HashMap;
 use std::fmt::{self, Debug};
@@ -163,7 +164,7 @@ impl TableProvider for MemTable {
         &self,
         _state: &dyn Session,
         input: Arc<dyn ExecutionPlan>,
-        overwrite: bool,
+        overwrite: InsertOp,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         // Create a physical plan from the logical plan.
         // Check that the schema of the plan matches the schema of this table.
@@ -194,15 +195,14 @@ impl TableProvider for MemTable {
 struct MemSink {
     /// Target locations for writing data
     batches: Vec<PartitionData>,
-    overwrite: bool,
+    overwrite: InsertOp,
 }
 
-#[allow(clippy::missing_fields_in_debug)]
 impl Debug for MemSink {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("MemSink")
             .field("num_partitions", &self.batches.len())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -218,7 +218,7 @@ impl DisplayAs for MemSink {
 }
 
 impl MemSink {
-    fn new(batches: Vec<PartitionData>, overwrite: bool) -> Self {
+    fn new(batches: Vec<PartitionData>, overwrite: InsertOp) -> Self {
         Self { batches, overwrite }
     }
 }
@@ -260,7 +260,7 @@ impl DataSink for MemSink {
             futures::future::join_all(self.batches.iter().map(|target| target.write())).await;
 
         for (target, mut batches) in writable_targets.iter_mut().zip(new_batches.into_iter()) {
-            if self.overwrite {
+            if matches!(self.overwrite, InsertOp::Overwrite) {
                 target.clear();
             }
             target.append(&mut batches);

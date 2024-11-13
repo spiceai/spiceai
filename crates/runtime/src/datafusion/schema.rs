@@ -31,6 +31,7 @@ use snafu::prelude::*;
 
 // Copy of default MemorySchemaProvider that allows `register_table` to atomically overwrite any existing tables
 // https://github.com/apache/datafusion/blob/deebda78a34251b2bddf0c5f66edfaa112c4559b/datafusion/core/src/catalog/schema.rs#L84
+#[derive(Debug)]
 pub struct SpiceSchemaProvider {
     tables: DashMap<String, Arc<dyn TableProvider>>,
 }

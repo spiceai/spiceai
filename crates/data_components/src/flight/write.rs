@@ -21,7 +21,7 @@ use datafusion::{
     datasource::{TableProvider, TableType},
     error::DataFusionError,
     execution::{SendableRecordBatchStream, TaskContext},
-    logical_expr::Expr,
+    logical_expr::{dml::InsertOp, Expr},
     physical_plan::{
         insert::{DataSink, DataSinkExec},
         metrics::MetricsSet,
@@ -42,6 +42,7 @@ pub enum Error {
     UnableToPublishData { source: flight_client::Error },
 }
 
+#[derive(Debug)]
 pub struct FlightTableWriter {
     read_provider: Arc<dyn TableProvider>,
     table_reference: TableReference,
@@ -92,7 +93,7 @@ impl TableProvider for FlightTableWriter {
         &self,
         _state: &dyn Session,
         input: Arc<dyn ExecutionPlan>,
-        overwrite: bool,
+        overwrite: InsertOp,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
         Ok(Arc::new(DataSinkExec::new(
             input,
@@ -111,7 +112,7 @@ impl TableProvider for FlightTableWriter {
 struct FlightDataSink {
     flight_client: FlightClient,
     table_reference: TableReference,
-    _overwrite: bool,
+    _overwrite: InsertOp,
 }
 
 #[async_trait]
@@ -148,7 +149,11 @@ impl DataSink for FlightDataSink {
 }
 
 impl FlightDataSink {
-    fn new(flight_client: FlightClient, table_reference: TableReference, overwrite: bool) -> Self {
+    fn new(
+        flight_client: FlightClient,
+        table_reference: TableReference,
+        overwrite: InsertOp,
+    ) -> Self {
         Self {
             flight_client,
             table_reference,

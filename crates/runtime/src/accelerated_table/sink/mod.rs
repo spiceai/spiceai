@@ -14,7 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use datafusion::{catalog::TableProvider, physical_plan::RecordBatchStream};
+use datafusion::{
+    catalog::TableProvider, logical_expr::dml::InsertOp, physical_plan::RecordBatchStream,
+};
 use multi::MultiSink;
 use std::{pin::Pin, sync::Arc};
 use table::TableSink;
@@ -57,7 +59,7 @@ impl AccelerationSink {
     pub async fn insert_into(
         &self,
         record_batch_stream: Pin<Box<dyn RecordBatchStream + Send>>,
-        overwrite: bool,
+        overwrite: InsertOp,
     ) -> Result<(), RetryError<crate::accelerated_table::Error>> {
         match self {
             AccelerationSink::Table(sink) => sink.insert_into(record_batch_stream, overwrite).await,

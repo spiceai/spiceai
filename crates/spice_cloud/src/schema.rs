@@ -24,6 +24,7 @@ use runtime::{
 use std::{any::Any, collections::HashMap, sync::Arc};
 use tracing::instrument;
 
+#[derive(Debug)]
 pub struct SpiceAISchemaProvider {
     tables: HashMap<String, Arc<dyn TableProvider>>,
 }
