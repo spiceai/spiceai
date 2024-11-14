@@ -351,7 +351,7 @@ jobs:
         if: github.event.inputs.update_snapshots == 'always'
         run: |
           git config --global user.name 'Spice Benchmark Snapshot Update Bot'
-          git config --global user.email 'bench-snapshot-update-bot@spice.ai'
+          git config --global user.email 'spiceaibot@spice.ai'
           git checkout -b bench-snapshot-update/${{ github.run_id }}
           git add '*.snap'
           if git diff --cached --quiet; then
@@ -430,7 +430,7 @@ jobs:
       - name: Create PR
         run: |
           git config --global user.name 'Spice Benchmark Snapshot Update Bot'
-          git config --global user.email 'bench-snapshot-update-bot@spice.ai'
+          git config --global user.email 'spiceaibot@spice.ai'
           git fetch origin bench-snapshot-update/${{ github.run_id }}
           git checkout bench-snapshot-update/${{ github.run_id }}
           gh pr create --title "Update benchmark snapshots" --body "Updated benchmark snapshots" --base trunk --head bench-snapshot-update/${{ github.run_id }}
