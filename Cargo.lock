@@ -2201,7 +2201,7 @@ dependencies = [
  "gemm",
  "half",
  "memmap2",
- "metal",
+ "metal 0.27.0",
  "num-traits",
  "num_cpus",
  "rand 0.8.5",
@@ -2216,16 +2216,17 @@ dependencies = [
 [[package]]
 name = "candle-core"
 version = "0.7.2"
-source = "git+https://github.com/EricLBuehler/candle.git?rev=20a57c4#20a57c4bcf300e4bc6c1e48f7f3702668ae8cb80"
+source = "git+https://github.com/EricLBuehler/candle.git?rev=2e17ebd#2e17ebd84ccc75ac61c0c24ed9ea9fd1f33baee1"
 dependencies = [
  "byteorder",
- "candle-kernels 0.7.2 (git+https://github.com/EricLBuehler/candle.git?rev=20a57c4)",
- "candle-metal-kernels 0.7.2 (git+https://github.com/EricLBuehler/candle.git?rev=20a57c4)",
+ "candle-kernels 0.7.2 (git+https://github.com/EricLBuehler/candle.git?rev=2e17ebd)",
+ "candle-metal-kernels 0.7.2 (git+https://github.com/EricLBuehler/candle.git?rev=2e17ebd)",
  "cudarc 0.12.1",
+ "float8",
  "gemm",
  "half",
  "memmap2",
- "metal",
+ "metal 0.27.0",
  "num-traits",
  "num_cpus",
  "rand 0.8.5",
@@ -2233,6 +2234,9 @@ dependencies = [
  "rayon",
  "safetensors",
  "thiserror",
+ "ug",
+ "ug-cuda",
+ "ug-metal",
  "yoke",
  "zip 1.1.4",
 ]
@@ -2259,7 +2263,7 @@ dependencies = [
 [[package]]
 name = "candle-kernels"
 version = "0.7.2"
-source = "git+https://github.com/EricLBuehler/candle.git?rev=20a57c4#20a57c4bcf300e4bc6c1e48f7f3702668ae8cb80"
+source = "git+https://github.com/EricLBuehler/candle.git?rev=2e17ebd#2e17ebd84ccc75ac61c0c24ed9ea9fd1f33baee1"
 dependencies = [
  "bindgen_cuda 0.1.5",
 ]
@@ -2282,7 +2286,7 @@ version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "166a92826d615d98b205e346e52128fa0439f2ab3302587403fdc558b4219e19"
 dependencies = [
- "metal",
+ "metal 0.27.0",
  "once_cell",
  "thiserror",
  "tracing",
@@ -2291,9 +2295,9 @@ dependencies = [
 [[package]]
 name = "candle-metal-kernels"
 version = "0.7.2"
-source = "git+https://github.com/EricLBuehler/candle.git?rev=20a57c4#20a57c4bcf300e4bc6c1e48f7f3702668ae8cb80"
+source = "git+https://github.com/EricLBuehler/candle.git?rev=2e17ebd#2e17ebd84ccc75ac61c0c24ed9ea9fd1f33baee1"
 dependencies = [
- "metal",
+ "metal 0.27.0",
  "once_cell",
  "thiserror",
  "tracing",
@@ -2308,7 +2312,7 @@ dependencies = [
  "candle-core 0.7.2 (registry+https://github.com/rust-lang/crates.io-index)",
  "candle-metal-kernels 0.7.2 (registry+https://github.com/rust-lang/crates.io-index)",
  "half",
- "metal",
+ "metal 0.27.0",
  "num-traits",
  "rayon",
  "safetensors",
@@ -2319,12 +2323,12 @@ dependencies = [
 [[package]]
 name = "candle-nn"
 version = "0.7.2"
-source = "git+https://github.com/EricLBuehler/candle.git?rev=20a57c4#20a57c4bcf300e4bc6c1e48f7f3702668ae8cb80"
+source = "git+https://github.com/EricLBuehler/candle.git?rev=2e17ebd#2e17ebd84ccc75ac61c0c24ed9ea9fd1f33baee1"
 dependencies = [
- "candle-core 0.7.2 (git+https://github.com/EricLBuehler/candle.git?rev=20a57c4)",
- "candle-metal-kernels 0.7.2 (git+https://github.com/EricLBuehler/candle.git?rev=20a57c4)",
+ "candle-core 0.7.2 (git+https://github.com/EricLBuehler/candle.git?rev=2e17ebd)",
+ "candle-metal-kernels 0.7.2 (git+https://github.com/EricLBuehler/candle.git?rev=2e17ebd)",
  "half",
- "metal",
+ "metal 0.27.0",
  "num-traits",
  "rayon",
  "safetensors",
@@ -2534,6 +2538,7 @@ dependencies = [
  "anstyle",
  "clap_lex",
  "strsim 0.11.1",
+ "terminal_size",
 ]
 
 [[package]]
@@ -4303,6 +4308,19 @@ dependencies = [
  "tonic",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "float8"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c7c3475274d374d263c4c40c43ad854c5bdf733c7db775bbd3c1ca2ad7427978"
+dependencies = [
+ "cudarc 0.12.1",
+ "half",
+ "num-traits",
+ "rand 0.8.5",
+ "rand_distr",
 ]
 
 [[package]]
@@ -6460,7 +6478,7 @@ dependencies = [
  "text-embeddings-core",
  "text-splitter",
  "tiktoken-rs",
- "tokenizers 0.20.3",
+ "tokenizers",
  "tokio",
  "tracing",
  "tracing-futures",
@@ -6736,6 +6754,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "metal"
+version = "0.29.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7ecfd3296f8c56b7c1f6fbac3c71cefa9d78ce009850c45000015f206dc7fa21"
+dependencies = [
+ "bitflags 2.6.0",
+ "block",
+ "core-graphics-types",
+ "foreign-types 0.5.0",
+ "log",
+ "objc",
+ "paste",
+]
+
+[[package]]
 name = "metrics"
 version = "0.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6830,11 +6863,11 @@ checksum = "c9be0862c1b3f26a88803c4a49de6889c10e608b3ee9344e6ef5b45fb37ad3d1"
 
 [[package]]
 name = "mistralrs"
-version = "0.3.1"
-source = "git+https://github.com/spiceai/mistral.rs?rev=c43f27decbeef1267a2685c6f0126766fbc0ee87#c43f27decbeef1267a2685c6f0126766fbc0ee87"
+version = "0.3.2"
+source = "git+https://github.com/spiceai/mistral.rs?rev=5fe3fe33494b858537a050377b64cb4fba8edb37#5fe3fe33494b858537a050377b64cb4fba8edb37"
 dependencies = [
  "anyhow",
- "candle-core 0.7.2 (git+https://github.com/EricLBuehler/candle.git?rev=20a57c4)",
+ "candle-core 0.7.2 (git+https://github.com/EricLBuehler/candle.git?rev=2e17ebd)",
  "either",
  "futures",
  "image 0.25.5",
@@ -6849,8 +6882,8 @@ dependencies = [
 
 [[package]]
 name = "mistralrs-core"
-version = "0.3.1"
-source = "git+https://github.com/spiceai/mistral.rs?rev=c43f27decbeef1267a2685c6f0126766fbc0ee87#c43f27decbeef1267a2685c6f0126766fbc0ee87"
+version = "0.3.2"
+source = "git+https://github.com/spiceai/mistral.rs?rev=5fe3fe33494b858537a050377b64cb4fba8edb37#5fe3fe33494b858537a050377b64cb4fba8edb37"
 dependencies = [
  "akin",
  "anyhow",
@@ -6861,8 +6894,8 @@ dependencies = [
  "buildstructor",
  "bytemuck",
  "bytemuck_derive",
- "candle-core 0.7.2 (git+https://github.com/EricLBuehler/candle.git?rev=20a57c4)",
- "candle-nn 0.7.2 (git+https://github.com/EricLBuehler/candle.git?rev=20a57c4)",
+ "candle-core 0.7.2 (git+https://github.com/EricLBuehler/candle.git?rev=2e17ebd)",
+ "candle-nn 0.7.2 (git+https://github.com/EricLBuehler/candle.git?rev=2e17ebd)",
  "cfgrammar",
  "chrono",
  "clap",
@@ -6871,6 +6904,7 @@ dependencies = [
  "derive_more",
  "dirs",
  "either",
+ "float8",
  "futures",
  "galil-seiferas",
  "half",
@@ -6903,7 +6937,7 @@ dependencies = [
  "strum 0.26.3",
  "sysinfo",
  "thiserror",
- "tokenizers 0.19.1",
+ "tokenizers",
  "tokio",
  "tokio-rayon",
  "toml",
@@ -6917,26 +6951,29 @@ dependencies = [
 
 [[package]]
 name = "mistralrs-paged-attn"
-version = "0.3.1"
-source = "git+https://github.com/spiceai/mistral.rs?rev=c43f27decbeef1267a2685c6f0126766fbc0ee87#c43f27decbeef1267a2685c6f0126766fbc0ee87"
+version = "0.3.2"
+source = "git+https://github.com/spiceai/mistral.rs?rev=5fe3fe33494b858537a050377b64cb4fba8edb37#5fe3fe33494b858537a050377b64cb4fba8edb37"
 dependencies = [
  "anyhow",
  "bindgen_cuda 0.1.6",
- "candle-core 0.7.2 (git+https://github.com/EricLBuehler/candle.git?rev=20a57c4)",
+ "candle-core 0.7.2 (git+https://github.com/EricLBuehler/candle.git?rev=2e17ebd)",
+ "float8",
  "half",
 ]
 
 [[package]]
 name = "mistralrs-quant"
-version = "0.3.1"
-source = "git+https://github.com/spiceai/mistral.rs?rev=c43f27decbeef1267a2685c6f0126766fbc0ee87#c43f27decbeef1267a2685c6f0126766fbc0ee87"
+version = "0.3.2"
+source = "git+https://github.com/spiceai/mistral.rs?rev=5fe3fe33494b858537a050377b64cb4fba8edb37#5fe3fe33494b858537a050377b64cb4fba8edb37"
 dependencies = [
  "bindgen_cuda 0.1.5",
  "byteorder",
- "candle-core 0.7.2 (git+https://github.com/EricLBuehler/candle.git?rev=20a57c4)",
- "candle-nn 0.7.2 (git+https://github.com/EricLBuehler/candle.git?rev=20a57c4)",
+ "candle-core 0.7.2 (git+https://github.com/EricLBuehler/candle.git?rev=2e17ebd)",
+ "candle-nn 0.7.2 (git+https://github.com/EricLBuehler/candle.git?rev=2e17ebd)",
+ "float8",
  "half",
  "lazy_static",
+ "once_cell",
  "paste",
  "rayon",
  "serde",
@@ -6945,10 +6982,10 @@ dependencies = [
 
 [[package]]
 name = "mistralrs-vision"
-version = "0.3.1"
-source = "git+https://github.com/spiceai/mistral.rs?rev=c43f27decbeef1267a2685c6f0126766fbc0ee87#c43f27decbeef1267a2685c6f0126766fbc0ee87"
+version = "0.3.2"
+source = "git+https://github.com/spiceai/mistral.rs?rev=5fe3fe33494b858537a050377b64cb4fba8edb37#5fe3fe33494b858537a050377b64cb4fba8edb37"
 dependencies = [
- "candle-core 0.7.2 (git+https://github.com/EricLBuehler/candle.git?rev=20a57c4)",
+ "candle-core 0.7.2 (git+https://github.com/EricLBuehler/candle.git?rev=2e17ebd)",
  "image 0.25.5",
 ]
 
@@ -10934,10 +10971,22 @@ dependencies = [
 ]
 
 [[package]]
-name = "text-embeddings-backend"
-version = "1.4.0"
-source = "git+https://github.com/spiceai/text-embeddings-inference.git?rev=afbb039cc50354e9c591d9126d08c1647429151d#afbb039cc50354e9c591d9126d08c1647429151d"
+name = "terminal_size"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4f599bd7ca042cfdf8f4512b277c02ba102247820f9d9d4a9f521f496751a6ef"
 dependencies = [
+ "rustix 0.38.39",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "text-embeddings-backend"
+version = "1.5.0"
+source = "git+https://github.com/spiceai/text-embeddings-inference.git?rev=b3925b2f97fcd2bfab9551b432ab659c48e5586b#b3925b2f97fcd2bfab9551b432ab659c48e5586b"
+dependencies = [
+ "hf-hub",
+ "serde_json",
  "text-embeddings-backend-candle",
  "text-embeddings-backend-core",
  "tokio",
@@ -10946,8 +10995,8 @@ dependencies = [
 
 [[package]]
 name = "text-embeddings-backend-candle"
-version = "1.4.0"
-source = "git+https://github.com/spiceai/text-embeddings-inference.git?rev=afbb039cc50354e9c591d9126d08c1647429151d#afbb039cc50354e9c591d9126d08c1647429151d"
+version = "1.5.0"
+source = "git+https://github.com/spiceai/text-embeddings-inference.git?rev=b3925b2f97fcd2bfab9551b432ab659c48e5586b#b3925b2f97fcd2bfab9551b432ab659c48e5586b"
 dependencies = [
  "anyhow",
  "candle-core 0.7.2 (registry+https://github.com/rust-lang/crates.io-index)",
@@ -10963,14 +11012,14 @@ dependencies = [
  "serde_json",
  "text-embeddings-backend-core",
  "thiserror",
- "tokenizers 0.20.3",
+ "tokenizers",
  "tracing",
 ]
 
 [[package]]
 name = "text-embeddings-backend-core"
-version = "1.4.0"
-source = "git+https://github.com/spiceai/text-embeddings-inference.git?rev=afbb039cc50354e9c591d9126d08c1647429151d#afbb039cc50354e9c591d9126d08c1647429151d"
+version = "1.5.0"
+source = "git+https://github.com/spiceai/text-embeddings-inference.git?rev=b3925b2f97fcd2bfab9551b432ab659c48e5586b#b3925b2f97fcd2bfab9551b432ab659c48e5586b"
 dependencies = [
  "nohash-hasher",
  "thiserror",
@@ -10978,8 +11027,8 @@ dependencies = [
 
 [[package]]
 name = "text-embeddings-core"
-version = "1.4.0"
-source = "git+https://github.com/spiceai/text-embeddings-inference.git?rev=afbb039cc50354e9c591d9126d08c1647429151d#afbb039cc50354e9c591d9126d08c1647429151d"
+version = "1.5.0"
+source = "git+https://github.com/spiceai/text-embeddings-inference.git?rev=b3925b2f97fcd2bfab9551b432ab659c48e5586b#b3925b2f97fcd2bfab9551b432ab659c48e5586b"
 dependencies = [
  "async-channel 2.3.1",
  "hf-hub",
@@ -10987,7 +11036,7 @@ dependencies = [
  "serde_json",
  "text-embeddings-backend",
  "thiserror",
- "tokenizers 0.20.3",
+ "tokenizers",
  "tokio",
  "tracing",
 ]
@@ -11008,7 +11057,7 @@ dependencies = [
  "strum 0.26.3",
  "thiserror",
  "tiktoken-rs",
- "tokenizers 0.20.3",
+ "tokenizers",
  "unicode-segmentation",
 ]
 
@@ -11175,38 +11224,6 @@ name = "tinyvec_macros"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
-
-[[package]]
-name = "tokenizers"
-version = "0.19.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e500fad1dd3af3d626327e6a3fe5050e664a6eaa4708b8ca92f1794aaf73e6fd"
-dependencies = [
- "aho-corasick",
- "derive_builder",
- "esaxx-rs",
- "getrandom 0.2.15",
- "indicatif",
- "itertools 0.12.1",
- "lazy_static",
- "log",
- "macro_rules_attribute",
- "monostate",
- "onig",
- "paste",
- "rand 0.8.5",
- "rayon",
- "rayon-cond",
- "regex",
- "regex-syntax 0.8.5",
- "serde",
- "serde_json",
- "spm_precompiled",
- "thiserror",
- "unicode-normalization-alignments",
- "unicode-segmentation",
- "unicode_categories",
-]
 
 [[package]]
 name = "tokenizers"
@@ -11935,6 +11952,48 @@ dependencies = [
  "memoffset 0.9.1",
  "tempfile",
  "winapi",
+]
+
+[[package]]
+name = "ug"
+version = "0.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c4eef2ebfc18c67a6dbcacd9d8a4d85e0568cc58c82515552382312c2730ea13"
+dependencies = [
+ "half",
+ "num",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "ug-cuda"
+version = "0.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1c4dcab280ad0ef3957e153a82dcad608c954d02cf253b695322f502d1f8902e"
+dependencies = [
+ "cudarc 0.12.1",
+ "half",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "ug",
+]
+
+[[package]]
+name = "ug-metal"
+version = "0.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7e4ed1df2c20a1a138f993041f650cc84ff27aaefb4342b7f986e77d00e80799"
+dependencies = [
+ "half",
+ "metal 0.29.0",
+ "objc",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "ug",
 ]
 
 [[package]]
