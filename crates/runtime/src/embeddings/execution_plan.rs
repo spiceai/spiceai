@@ -16,7 +16,7 @@ limitations under the License.
 
 use arrow::array::{
     Array, ArrayRef, FixedSizeListArray, Float32Array, Int32Array, ListArray, RecordBatch,
-    StringArray,
+    StringArray, StringViewArray,
 };
 use arrow::buffer::OffsetBuffer;
 use arrow::datatypes::{DataType, Field, SchemaRef};
@@ -270,20 +270,29 @@ pub(crate) async fn compute_additional_embedding_columns(
             continue;
         };
 
-        let Some(arr) = raw_data.as_any().downcast_ref::<StringArray>() else {
-            tracing::debug!("When embedding col='{col}', column is not a StringArray");
-            continue;
-        };
+        let arr_iter: Box<dyn Iterator<Item = Option<&str>> + Send> =
+            if let Some(arr) = raw_data.as_any().downcast_ref::<StringArray>() {
+                Box::new(arr.iter())
+            } else if let Some(arr) = raw_data.as_any().downcast_ref::<StringViewArray>() {
+                Box::new(arr.iter())
+            } else {
+                tracing::debug!(
+                    "Expected StringArray or StringViewArray for column '{}', but got {}",
+                    col,
+                    raw_data.data_type()
+                );
+                continue;
+            };
 
         let list_array = if let Some(chunker) = chunker_opt {
             let (vectors, offsets) =
-                get_vectors_with_chunker(arr, Arc::clone(chunker), &**model).await?;
+                get_vectors_with_chunker(arr_iter, Arc::clone(chunker), &**model).await?;
             tracing::trace!("Successfully embedded column '{col}' with chunking");
             embed_arrays.insert(offset_col!(col), Arc::new(offsets) as ArrayRef);
 
             Arc::new(vectors) as ArrayRef
         } else {
-            let fixed_size_array = get_vectors(arr, &**model).await?;
+            let fixed_size_array = get_vectors(arr_iter, &**model).await?;
             tracing::trace!("Successfully embedded column '{col}'");
             Arc::new(fixed_size_array) as ArrayRef
         };
@@ -306,14 +315,11 @@ pub(crate) async fn compute_additional_embedding_columns(
 ///     [`StringArray`]        [`FixedSizeListArray`]
 /// ```
 async fn get_vectors(
-    arr: &StringArray,
+    arr: impl Iterator<Item = Option<&str>>,
     model: &dyn Embed,
 ) -> Result<FixedSizeListArray, Box<dyn std::error::Error + Send + Sync>> {
     let field = Arc::new(Field::new("item", DataType::Float32, false));
-    let column: Vec<String> = arr
-        .iter()
-        .filter_map(|s| s.map(ToString::to_string))
-        .collect();
+    let column: Vec<String> = arr.filter_map(|s| s.map(ToString::to_string)).collect();
     let embedded_data = model.embed(EmbeddingInput::StringArray(column)).await?;
     let vector_length = embedded_data.first().map(Vec::len).unwrap_or_default();
     let processed = embedded_data.iter().flatten().copied().collect_vec();
@@ -347,13 +353,12 @@ async fn get_vectors(
 ///                          +-------------------------------+
 /// ```
 async fn get_vectors_with_chunker(
-    arr: &StringArray,
+    arr: impl Iterator<Item = Option<&str>>,
     chunker: Arc<dyn Chunker>,
     model: &dyn Embed,
 ) -> Result<(ListArray, ListArray), Box<dyn std::error::Error + Send + Sync>> {
     // Iterate over (chunks per row, (starting_offset into row, chunk))
     let (chunks_per_row, chunks_in_row): (Vec<_>, Vec<_>) = arr
-        .iter()
         .filter_map(|s| match s {
             // TODO: filter_map doesn't handle nulls
             Some(s) => {
