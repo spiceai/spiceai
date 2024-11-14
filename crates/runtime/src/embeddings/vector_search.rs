@@ -17,7 +17,7 @@ limitations under the License.
 use std::{collections::HashMap, fmt::Display, sync::Arc};
 
 use app::App;
-use arrow::array::{RecordBatch, StringArray};
+use arrow::array::{RecordBatch, StringArray, StringViewArray};
 use arrow::error::ArrowError;
 use arrow::util::pretty::pretty_format_batches;
 use arrow_schema::{Schema, SchemaRef};
@@ -345,7 +345,13 @@ impl VectorSearchTableResult {
         let result = embedding_records
             .iter()
             .flat_map(|v| {
-                if let Some(col) = v.column(0).as_any().downcast_ref::<StringArray>() {
+                let embedded_column = v.column(0);
+                if let Some(col) = embedded_column.as_any().downcast_ref::<StringArray>() {
+                    col.iter()
+                        .map(|v| v.unwrap_or_default().to_string())
+                        .collect::<Vec<String>>()
+                } else if let Some(col) = embedded_column.as_any().downcast_ref::<StringViewArray>()
+                {
                     col.iter()
                         .map(|v| v.unwrap_or_default().to_string())
                         .collect::<Vec<String>>()
