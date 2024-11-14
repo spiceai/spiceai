@@ -17,7 +17,7 @@ limitations under the License.
 use std::{collections::HashMap, fmt::Display, sync::Arc};
 
 use app::App;
-use arrow::array::{ArrayRef, RecordBatch, StringArray};
+use arrow::array::{ArrayRef, RecordBatch, StringArray, StringViewArray};
 use arrow::error::ArrowError;
 use async_openai::types::EmbeddingInput;
 use datafusion::common::utils::quote_identifier;
@@ -287,7 +287,12 @@ pub fn table_to_matches(
         .embedded_column
         .iter()
         .flat_map(|v| {
-            if let Some(col) = v.column(0).as_any().downcast_ref::<StringArray>() {
+            let embedded_column = v.column(0);
+            if let Some(col) = embedded_column.as_any().downcast_ref::<StringArray>() {
+                col.iter()
+                    .map(|v| v.unwrap_or_default().to_string())
+                    .collect::<Vec<String>>()
+            } else if let Some(col) = embedded_column.as_any().downcast_ref::<StringViewArray>() {
                 col.iter()
                     .map(|v| v.unwrap_or_default().to_string())
                     .collect::<Vec<String>>()
