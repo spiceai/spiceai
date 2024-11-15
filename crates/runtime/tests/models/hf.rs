@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use app::AppBuilder;
 use async_openai::types::{
@@ -34,6 +34,7 @@ use spicepod::component::{
 };
 
 use llms::chat::Chat;
+use tokio::time::sleep;
 
 use crate::{
     init_tracing, init_tracing_with_task_history,
@@ -140,6 +141,8 @@ async fn huggingface_test_nsql() -> Result<(), anyhow::Error> {
 
     runtime_ready_check(&rt).await;
 
+    // Test1: NSQL request to get the number of records in the taxi_trips dataset with sample_data_enabled=false
+
     let task_start_time = std::time::SystemTime::now();
 
     let response = send_nsql_request(
@@ -156,8 +159,9 @@ async fn huggingface_test_nsql() -> Result<(), anyhow::Error> {
         "Expected a single record containing the value 10"
     );
 
+    sleep(Duration::from_secs(3)).await;
+
     let tasks = get_executed_tasks(&rt, task_start_time.into()).await?;
-    println!("Tasks: {:#?}", tasks);
 
     assert!(
         tasks.iter().any(|t| { t.0 == "tool_use::table_schema" }),
@@ -173,6 +177,47 @@ async fn huggingface_test_nsql() -> Result<(), anyhow::Error> {
         "nsql_table_schema_task",
         pretty_json_str(&table_schema_task.1)?
     );
+
+    // Test2: NSQL request to get the number of records in the taxi_trips dataset with sample_data_enabled=true
+
+    let task_start_time = std::time::SystemTime::now();
+
+    let response = send_nsql_request(
+        http_base_url.as_str(),
+        "how many records in taxi_trips dataset?",
+        Some("hf_model"),
+        Some(true),
+        None,
+    )
+    .await?;
+
+    assert!(
+        json_is_single_row_with_value(&response, 10),
+        "Expected a single record containing the value 10"
+    );
+
+    sleep(Duration::from_secs(3)).await;
+
+    let tasks = get_executed_tasks(&rt, task_start_time.into()).await?;
+
+    assert!(
+        tasks.iter().any(|t| { t.0 == "tool_use::sample_data" }),
+        "Expected 'tool_use::sample_data' task to be executed"
+    );
+
+    let sample_data_task = tasks
+        .iter()
+        .find(|t| t.0 == "tool_use::sample_data")
+        .expect("tool_use::sample_data task to be executed");
+
+    insta::assert_snapshot!("nsql_sample_data_task", sample_data_task.1);
+
+    let sql_query_task = tasks
+        .iter()
+        .find(|t| t.0 == "sql_query")
+        .expect("sql_query task to be executed");
+
+    insta::assert_snapshot!("nsql_sample_data_task_sql_query", sql_query_task.1);
 
     Ok(())
 }
