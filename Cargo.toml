@@ -66,7 +66,7 @@ datafusion-execution = "43"
 datafusion-expr = "43"
 datafusion-federation = "0.1"
 datafusion-federation-sql = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "5af0df83c2cd1d3f82f293b066b401a4dfd4064b" }
-datafusion-functions-json = { git = "https://github.com/spiceai/datafusion-functions-json.git", rev = "eb734ebdf806449e79318f4bec540b0138df98af" }
+datafusion-functions-json = "0.43"
 datafusion-table-providers = "0.1"
 dotenvy = "0.15"
 duckdb = "1.1.1"

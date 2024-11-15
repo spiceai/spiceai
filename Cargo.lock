@@ -3341,8 +3341,9 @@ dependencies = [
 
 [[package]]
 name = "datafusion-functions-json"
-version = "0.42.0"
-source = "git+https://github.com/spiceai/datafusion-functions-json.git?rev=eb734ebdf806449e79318f4bec540b0138df98af#eb734ebdf806449e79318f4bec540b0138df98af"
+version = "0.43.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "744cf7ae121977c453586f3f098239e50da6b0cfcf2de3ccb9338a4896f97dc0"
 dependencies = [
  "datafusion",
  "jiter",
