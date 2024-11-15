@@ -344,18 +344,26 @@ jobs:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_S3_ATHENA_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_S3_ATHENA_SECRET_ACCESS_KEY }}
 
+      - name: Remove spice_bench file
+        run: |
+          rm -f spice_bench
+
       - name: Upload benchmark snapshots to branch
-        if: github.event.inputs.update_snapshots == 'always' && (github.event.inputs.selected_benchmark == matrix.name && (github.event.inputs.bench_name == matrix.bench || github.event.inputs.bench_name == 'all')) || github.event.inputs.run_all == 'true' || github.event_name == 'schedule'
+        if: github.event.inputs.update_snapshots == 'always'
         run: |
           git config --global user.name 'Spice Benchmark Snapshot Update Bot'
-          git config --global user.email 'bench-snapshot-update-bot@spice.ai'
+          git config --global user.email 'spiceaibot@spice.ai'
           git checkout -b bench-snapshot-update/${{ github.run_id }}
           git add '*.snap'
-          git commit -m "Update benchmark snapshots for ${{ matrix.name }} ${{ matrix.bench }}"
-          if git ls-remote --exit-code --heads origin bench-snapshot-update/${{ github.run_id }}; then
-            git pull --rebase origin bench-snapshot-update/${{ github.run_id }}
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "Update benchmark snapshots for ${{ matrix.name }} ${{ matrix.bench }}"
+            if git ls-remote --exit-code --heads origin bench-snapshot-update/${{ github.run_id }}; then
+              git pull --rebase origin bench-snapshot-update/${{ github.run_id }}
+            fi
+            git push origin bench-snapshot-update/${{ github.run_id }}
           fi
-          git push origin bench-snapshot-update/${{ github.run_id }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -423,7 +431,7 @@ jobs:
       - name: Create PR
         run: |
           git config --global user.name 'Spice Benchmark Snapshot Update Bot'
-          git config --global user.email 'bench-snapshot-update-bot@spice.ai'
+          git config --global user.email 'spiceaibot@spice.ai'
           git fetch origin bench-snapshot-update/${{ github.run_id }}
           git checkout bench-snapshot-update/${{ github.run_id }}
           gh pr create --title "Update benchmark snapshots" --body "Updated benchmark snapshots" --base trunk --head bench-snapshot-update/${{ github.run_id }}
