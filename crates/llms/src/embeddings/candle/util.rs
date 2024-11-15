@@ -24,7 +24,10 @@ use crate::embeddings::{
     candle::ModelConfig, Error, FailedToInstantiateEmbeddingModelSnafu, Result,
 };
 use async_openai::types::EmbeddingInput;
-use hf_hub::{api::sync::ApiBuilder, Repo, RepoType};
+use hf_hub::{
+    api::sync::{ApiBuilder, ApiRepo},
+    Repo, RepoType,
+};
 use serde::Deserialize;
 use snafu::ResultExt;
 use tei_backend::Pool;
@@ -87,12 +90,22 @@ pub(crate) fn inputs_from_openai(input: &EmbeddingInput) -> Vec<EncodingInput> {
     }
 }
 
-/// For a given `HuggingFace` repo, download the needed files to create a `CandleEmbedding`.
-pub(crate) fn download_hf_artifacts(
+/// Construct a `Tokenizer` from the `tokenizer.json` in a `HuggingFace` repo.
+pub fn tokenizer_from_hf(
     model_id: &str,
     revision: Option<&str>,
     hf_token: Option<String>,
-) -> Result<PathBuf> {
+) -> Result<Tokenizer> {
+    let api_repo = get_api(model_id, revision, hf_token)?;
+    let tokenizer_file = api_repo
+        .get("tokenizer.json")
+        .boxed()
+        .context(FailedToInstantiateEmbeddingModelSnafu)?;
+
+    Tokenizer::from_file(tokenizer_file).context(FailedToInstantiateEmbeddingModelSnafu)
+}
+
+fn get_api(model_id: &str, revision: Option<&str>, hf_token: Option<String>) -> Result<ApiRepo> {
     let api = ApiBuilder::new()
         .with_progress(false)
         .with_token(hf_token)
@@ -107,19 +120,31 @@ pub(crate) fn download_hf_artifacts(
     };
     let api_repo = api.repo(repo.clone());
 
-    tracing::trace!("Downloading 'config.json' for {}", repo.url());
+    Ok(api_repo)
+}
+
+/// For a given `HuggingFace` repo, download the needed files to create a `CandleEmbedding`.
+pub(crate) fn download_hf_artifacts(
+    model_id: &str,
+    revision: Option<&str>,
+    hf_token: Option<String>,
+) -> Result<PathBuf> {
+    let api_repo = get_api(model_id, revision, hf_token)?;
+    let repo_url = api_repo.url("");
+
+    tracing::trace!("Downloading 'config.json' for {}", repo_url);
     api_repo
         .get("config.json")
         .boxed()
         .context(FailedToInstantiateEmbeddingModelSnafu)?;
 
-    tracing::trace!("Downloading 'tokenizer.json' for {}", repo.url());
+    tracing::trace!("Downloading 'tokenizer.json' for {}", repo_url);
     api_repo
         .get("tokenizer.json")
         .boxed()
         .context(FailedToInstantiateEmbeddingModelSnafu)?;
 
-    tracing::trace!("Downloading 'model.safetensors' for {}", repo.url());
+    tracing::trace!("Downloading 'model.safetensors' for {}", repo_url);
     let model = if let Ok(p) = api_repo.get("model.safetensors") {
         p
     } else {
@@ -131,7 +156,7 @@ pub(crate) fn download_hf_artifacts(
         p
     };
 
-    tracing::trace!("Downloading '1_Pooling/config.json' for {}", repo.url());
+    tracing::trace!("Downloading '1_Pooling/config.json' for {}", repo_url);
     if let Err(e) = api_repo.get("1_Pooling/config.json") {
         // May not be an issue, will be checked later.
         tracing::trace!(

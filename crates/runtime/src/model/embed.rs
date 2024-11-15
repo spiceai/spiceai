@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 use llms::embeddings::{candle::tei::TeiEmbed, Embed, Error as EmbedError};
+use llms::openai::embed::OpenaiEmbed;
 use llms::openai::DEFAULT_EMBEDDING_MODEL;
 use secrecy::{ExposeSecret, Secret, SecretString};
 use spicepod::component::{embeddings::EmbeddingPrefix, model::ModelFileType};
@@ -22,6 +23,13 @@ use std::path::Path;
 use std::result::Result;
 
 pub type EmbeddingModelStore = HashMap<String, Box<dyn Embed>>;
+
+/// Extract a secret from a hashmap of secrets, if it exists.
+macro_rules! extract_secret {
+    ($params:expr, $key:expr) => {
+        $params.get($key).map(Secret::expose_secret).cloned()
+    };
+}
 
 pub fn try_to_embedding<S: ::std::hash::BuildHasher>(
     component: &spicepod::component::embeddings::Embeddings,
@@ -42,9 +50,9 @@ pub fn try_to_embedding<S: ::std::hash::BuildHasher>(
     match prefix {
         EmbeddingPrefix::OpenAi => {
             // If parameter is from secret store, it will have `openai_` prefix
-            Ok(Box::new(llms::openai::Openai::new(
+            let mut embed = OpenaiEmbed::new(llms::openai::Openai::new(
                 model_id.unwrap_or(DEFAULT_EMBEDDING_MODEL.to_string()),
-                params.get("endpoint").map(Secret::expose_secret).cloned(),
+                extract_secret!(params, "endpoint"),
                 params
                     .get("api_key")
                     .or(params.get("openai_api_key"))
@@ -60,7 +68,20 @@ pub fn try_to_embedding<S: ::std::hash::BuildHasher>(
                     .or(params.get("openai_project_id"))
                     .map(Secret::expose_secret)
                     .cloned(),
-            )))
+            ));
+
+            // For OpenAI compatible embedding models, we allow users to
+            // specific the tokenizer being used, so that the model can chunk data properly.
+            if let Some(tokenizer_file) = component.find_any_file_path(ModelFileType::Tokenizer) {
+                embed = embed.try_with_tokenizer_file(tokenizer_file)?;
+            }
+            if let Some(tokenizer_hf_model_id) = extract_secret!(params, "hf_tokenizer_from") {
+                let hf_token = extract_secret!(params, "hf_token");
+                embed =
+                    embed.try_with_hf_tokenizer(tokenizer_hf_model_id.as_str(), None, hf_token)?;
+            }
+
+            Ok(Box::new(embed))
         }
         EmbeddingPrefix::File => {
             let weights_path = model_id
@@ -91,8 +112,8 @@ pub fn try_to_embedding<S: ::std::hash::BuildHasher>(
             )?))
         }
         EmbeddingPrefix::HuggingFace => {
-            let hf_token = params.get("hf_token").map(Secret::expose_secret).cloned();
-            let pooling = params.get("pooling").map(Secret::expose_secret).cloned();
+            let hf_token = extract_secret!(params, "hf_token");
+            let pooling = extract_secret!(params, "pooling");
 
             if let Some(id) = model_id {
                 Ok(Box::new(TeiEmbed::from_hf(&id, None, hf_token, pooling)?))
