@@ -208,6 +208,9 @@ fn normalize_embeddings_response(mut json: Value) -> String {
                 if let Some(embedding_array) = embedding.as_array_mut() {
                     let num_elements = embedding_array.len();
                     *embedding = json!(format!("array_{}_items", num_elements));
+                } else if let Some(embedding_str) = embedding.as_str() {
+                    *embedding = json!(format!("str_len_{}", embedding_str.len()));
+                    
                 }
             }
         }

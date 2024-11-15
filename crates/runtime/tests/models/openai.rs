@@ -236,10 +236,18 @@ async fn openai_test_embeddings() -> Result<(), anyhow::Error> {
                 "The food was delicious".to_string(),
                 "and the waiter...".to_string(),
             ]),
-            // Some("base64"), Error: 'When encoding_format is base64, use Embeddings::create_base64'
             None,
             Some("test_user_id"),
             Some(256),
+        ),
+        (
+            EmbeddingInput::StringArray(vec![
+                "The food was delicious".to_string(),
+                "and the waiter...".to_string(),
+            ]),
+            Some("base64"),
+            None,
+            Some(128),
         ),
     ];
 
