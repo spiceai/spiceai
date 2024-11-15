@@ -11,7 +11,7 @@ All criteria must be met for the accelerator to be considered [RC](../definition
 | Accelerator | Beta Quality | DRI Sign-off |
 | ----------- | ------------ | ------------ |
 | Arrow       | ✅           | @sgrebnov    |
-| DuckDB      | ❌           |              |
+| DuckDB      | ✅           | @peasee      |
 | SQLite      | ❌           |              |
 | PostgreSQL  | ❌           |              |
 
