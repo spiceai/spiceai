@@ -119,7 +119,7 @@ pub(crate) fn get_postgres_params(is_acc: bool, bench_name: &str) -> Params {
         (false, "tpcds") => std::env::var("PG_TPCDS_BENCHMARK_PG_DBNAME").unwrap_or_default(),
         _ => panic!("Only tpcds or tpch benchmark suites are supported"),
     };
-    let pg_port = std::env::var("PG_BENCHMARK_PG_PORT").unwrap_or_default();
+    let pg_port = std::env::var("PG_BENCHMARK_PG_PORT").unwrap_or_else(|_| "5432".to_string());
 
     let pg_sslmode = std::env::var("PG_BENCHMARK_PG_SSLMODE").unwrap_or_default();
     Params::from_string_map(
