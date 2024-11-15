@@ -36,12 +36,13 @@ use spicepod::component::{
 use llms::chat::Chat;
 
 use crate::{
-    init_tracing,
+    init_tracing, init_tracing_with_task_history,
     models::{
-        create_api_bindings_config, get_taxi_trips_dataset, get_tpcds_dataset,
+        create_api_bindings_config, get_executed_tasks, get_taxi_trips_dataset, get_tpcds_dataset,
         json_is_single_row_with_value, normalize_chat_completion_response,
-        normalize_embeddings_response, normalize_search_response, send_chat_completions_request,
-        send_embeddings_request, send_nsql_request, send_search_request,
+        normalize_embeddings_response, normalize_search_response, pretty_json_str,
+        send_chat_completions_request, send_embeddings_request, send_nsql_request,
+        send_search_request,
     },
     utils::runtime_ready_check,
 };
@@ -122,6 +123,8 @@ async fn huggingface_test_nsql() -> Result<(), anyhow::Error> {
 
     let rt = Arc::new(Runtime::builder().with_app(app).build().await);
 
+    let _tracing = init_tracing_with_task_history(None, &rt);
+
     let rt_ref_copy = Arc::clone(&rt);
     tokio::spawn(async move {
         Box::pin(rt_ref_copy.start_servers(api_config, None, EndpointAuth::no_auth())).await
@@ -137,6 +140,8 @@ async fn huggingface_test_nsql() -> Result<(), anyhow::Error> {
 
     runtime_ready_check(&rt).await;
 
+    let task_start_time = std::time::SystemTime::now();
+
     let response = send_nsql_request(
         http_base_url.as_str(),
         "how many records in taxi_trips dataset?",
@@ -149,6 +154,24 @@ async fn huggingface_test_nsql() -> Result<(), anyhow::Error> {
     assert!(
         json_is_single_row_with_value(&response, 10),
         "Expected a single record containing the value 10"
+    );
+
+    let tasks = get_executed_tasks(&rt, task_start_time.into()).await?;
+    println!("Tasks: {:#?}", tasks);
+
+    assert!(
+        tasks.iter().any(|t| { t.0 == "tool_use::table_schema" }),
+        "Expected 'tool_use::table_schema' task to be executed"
+    );
+
+    let table_schema_task = tasks
+        .iter()
+        .find(|t| t.0 == "tool_use::table_schema")
+        .expect("tool_use::table_schema task to be executed");
+
+    insta::assert_snapshot!(
+        "nsql_table_schema_task",
+        pretty_json_str(&table_schema_task.1)?
     );
 
     Ok(())
