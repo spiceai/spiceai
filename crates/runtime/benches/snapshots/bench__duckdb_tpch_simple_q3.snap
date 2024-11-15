@@ -3,17 +3,17 @@ source: crates/runtime/benches/bench.rs
 expression: records_pretty
 snapshot_kind: text
 ---
-+---------------------------------------------+-----------+
-| l_comment                                   | l_partkey |
-+---------------------------------------------+-----------+
-| ve the furiously                            | 187316    |
-| equests cajole. furiously fina              | 175800    |
-| s the ironic accounts. unusual              | 175866    |
-| l accounts. slyly ironi                     | 194318    |
-| ts. bold, expr                              | 70430     |
-| f the furiously even foxes. carefully ironi | 15023     |
-| Tiresias use slyly                          | 40952     |
-| fily regular dolphins. b                    | 110402    |
-| ally after the even instructi               | 162154    |
-| ly slyly e                                  | 64621     |
-+---------------------------------------------+-----------+
++--------------------------------------------+-----------+
+| l_comment                                  | l_partkey |
++--------------------------------------------+-----------+
+| posits haggle carefully over the           | 193938    |
+|  requests. car                             | 100251    |
+| sts wake blithely regular pin              | 41884     |
+| s haggle fluffily. slyly pending accounts  | 160302    |
+| ounts. furiously exp                       | 131804    |
+| luffily bold                               | 134751    |
+| ructions haggle regularly about the c      | 87908     |
+| e furiously                                | 5         |
+| azzle. slyly pendin                        | 164386    |
+| ckly alongsi                               | 145332    |
++--------------------------------------------+-----------+
