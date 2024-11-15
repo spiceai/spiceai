@@ -331,7 +331,7 @@ async fn huggingface_test_chat_messages() -> Result<(), anyhow::Error> {
         c.message.content = Some("__placeholder__".to_string());
     });
 
-    insta::assert_snapshot!("chat_1_choices", format!("{:?}", response.choices));
+    insta::assert_snapshot!("chat_1_response_choices", format!("{:?}", response.choices));
 
     Ok(())
 }

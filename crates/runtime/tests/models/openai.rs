@@ -34,8 +34,8 @@ use crate::{
         create_api_bindings_config, get_executed_tasks, get_params_with_secrets,
         get_taxi_trips_dataset, get_tpcds_dataset, json_is_single_row_with_value,
         normalize_chat_completion_response, normalize_embeddings_response,
-        normalize_search_response, send_chat_completions_request, send_nsql_request,
-        send_search_request,
+        normalize_search_response, pretty_json_str, send_chat_completions_request,
+        send_nsql_request, send_search_request,
     },
     utils::{runtime_ready_check, verify_env_secret_exists},
 };
@@ -330,8 +330,21 @@ async fn openai_test_chat_messages() -> Result<(), anyhow::Error> {
         .await
         .map_err(anyhow::Error::msg)?;
 
+    let mut ds_tpcds_item = get_tpcds_dataset("item");
+    ds_tpcds_item.embeddings = vec![ColumnEmbeddingConfig {
+        column: "i_item_desc".to_string(),
+        model: "openai_embeddings".to_string(),
+        primary_keys: Some(vec!["i_item_sk".to_string()]),
+        chunking: None,
+    }];
+
     let app = AppBuilder::new("text-to-sql")
         .with_dataset(get_taxi_trips_dataset())
+        .with_dataset(ds_tpcds_item)
+        .with_embedding(get_openai_embeddings(
+            Some("text-embedding-3-small"),
+            "openai_embeddings",
+        ))
         .build();
 
     let rt = Arc::new(Runtime::builder().with_app(app).build().await);
@@ -356,6 +369,8 @@ async fn openai_test_chat_messages() -> Result<(), anyhow::Error> {
 
     let tool_model = try_to_chat_model(&model_with_tools, &model_secrets, Arc::clone(&rt)).await?;
 
+    // Test 1: Chat completion related to performing SQL query
+
     let req = CreateChatCompletionRequestArgs::default()
                 .messages(vec![ChatCompletionRequestSystemMessageArgs::default()
                     .content("You are an assistant that responds to queries by providing only the requested data values without extra explanation.".to_string())
@@ -369,7 +384,10 @@ async fn openai_test_chat_messages() -> Result<(), anyhow::Error> {
     let task_start_time = std::time::SystemTime::now();
     let response = tool_model.chat_request(req).await?;
 
-    insta::assert_snapshot!("chat_1_choices", format!("{:?}", response.choices));
+    insta::assert_snapshot!(
+        "chat_1_response_choices",
+        format!("{:#?}", response.choices)
+    );
 
     let tasks = get_executed_tasks(&rt, task_start_time.into()).await?;
 
@@ -381,6 +399,10 @@ async fn openai_test_chat_messages() -> Result<(), anyhow::Error> {
         tasks.iter().any(|t| { t.0 == "tool_use::sql" }),
         "Expected 'tool_use::sql' task to be executed"
     );
+    assert!(
+        tasks.iter().any(|t| { t.0 == "sql_query" }),
+        "Expected 'sql_query' task to be executed"
+    );
 
     let ai_completion_task = tasks
         .iter()
@@ -390,7 +412,53 @@ async fn openai_test_chat_messages() -> Result<(), anyhow::Error> {
     // ai_completion input message is deterministic - based on available tools, app configuration, and the input message
     insta::assert_snapshot!(
         "chat_1_ai_completion_input",
-        format!("{:?}", ai_completion_task.1)
+        pretty_json_str(&ai_completion_task.1)?
+    );
+
+    // Test 2: Chat completion related to searching for items (similirity search)
+
+    let req = CreateChatCompletionRequestArgs::default()
+                .messages(vec![ChatCompletionRequestSystemMessageArgs::default()
+                    .content("You are an assistant that responds to queries by providing only the requested data values without extra explanation.".to_string())
+                    .build()?
+                    .into(),ChatCompletionRequestUserMessageArgs::default()
+                    .content("Find information about vehicles and journalists".to_string())
+                    .build()?
+                    .into()])
+                .build()?;
+
+    let task_start_time = std::time::SystemTime::now();
+    let mut response = tool_model.chat_request(req).await?;
+
+    // Verify model correctly found records in the dataset
+    assert!(response.choices[0]
+        .message
+        .content
+        .clone()
+        .unwrap_or_default()
+        .contains("there just big vehicles. Journalists"));
+
+    // response contains distance metrics that can vary so we replace content with a placeholder for snapshotting
+    response.choices.iter_mut().for_each(|c| {
+        c.message.content = Some("__placeholder__".to_string());
+    });
+
+    insta::assert_snapshot!(
+        "chat_2_response_choices",
+        format!("{:#?}", response.choices)
+    );
+
+    let tasks = get_executed_tasks(&rt, task_start_time.into()).await?;
+
+    let document_similarity_task = tasks
+        .iter()
+        .find(|t| t.0 == "tool_use::document_similarity")
+        .expect("document_similarity task to be executed");
+
+    // ai_completion input message is deterministic - based on available tools, app configuration, and the input message
+    insta::assert_snapshot!(
+        "chat_2_document_similarity_input",
+        pretty_json_str(&document_similarity_task.1)?
     );
 
     Ok(())
