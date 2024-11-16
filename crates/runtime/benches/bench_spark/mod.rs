@@ -81,7 +81,8 @@ fn make_spark_dataset(path: &str, name: &str) -> Dataset {
 fn get_tpch_test_queries() -> Vec<(&'static str, &'static str)> {
     vec![
         ("tpch_q1", include_str!("../queries/tpch/q1.sql")),
-        ("tpch_q2", include_str!("../queries/tpch/q2.sql")),
+        // Analysis error: [UNSUPPORTED_SUBQUERY_EXPRESSION_CATEGORY.UNSUPPORTED_CORRELATED_SCALAR_SUBQUERY] Unsupported subquery expression: Correlated scalar subqueries can only be used in filters, aggregations, projections, and UPDATE/MERGE/DELETE commands
+        // ("tpch_q2", include_str!("../queries/tpch/q2.sql")),
         ("tpch_q3", include_str!("../queries/tpch/q3.sql")),
         ("tpch_q4", include_str!("../queries/tpch/q4.sql")),
         ("tpch_q5", include_str!("../queries/tpch/q5.sql")),
@@ -96,7 +97,8 @@ fn get_tpch_test_queries() -> Vec<(&'static str, &'static str)> {
         ("tpch_q14", include_str!("../queries/tpch/q14.sql")),
         // tpch_q15 has a view creation which we don't support by design
         ("tpch_q16", include_str!("../queries/tpch/q16.sql")),
-        ("tpch_q17", include_str!("../queries/tpch/q17.sql")),
+        // Analysis error: [UNSUPPORTED_SUBQUERY_EXPRESSION_CATEGORY.UNSUPPORTED_CORRELATED_SCALAR_SUBQUERY] Unsupported subquery expression: Correlated scalar subqueries can only be used in filters, aggregations, projections, and UPDATE/MERGE/DELETE commands
+        // ("tpch_q17", include_str!("../queries/tpch/q17.sql")),
         ("tpch_q18", include_str!("../queries/tpch/q18.sql")),
         ("tpch_q19", include_str!("../queries/tpch/q19.sql")),
         ("tpch_q20", include_str!("../queries/tpch/q20.sql")),

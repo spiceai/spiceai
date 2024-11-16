@@ -125,7 +125,7 @@ Currently supported data stores for local materialization/acceleration. More com
 | Name       | Description                     | Status            | Engine Modes     |
 | ---------- | ------------------------------- | ----------------- | ---------------- |
 | `arrow`    | In-Memory Arrow Records         | Release Candidate | `memory`         |
-| `duckdb`   | Embedded [DuckDB][duckdb]       | Beta              | `memory`, `file` |
+| `duckdb`   | Embedded [DuckDB][duckdb]       | Release Candidate | `memory`, `file` |
 | `postgres` | Attached [PostgreSQL][postgres] | Beta              |                  |
 | `sqlite`   | Embedded [SQLite][sqlite]       | Beta              | `memory`, `file` |
 

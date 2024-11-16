@@ -66,7 +66,7 @@ datafusion-execution = "43"
 datafusion-expr = "43"
 datafusion-federation = "0.1"
 datafusion-federation-sql = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "5af0df83c2cd1d3f82f293b066b401a4dfd4064b" }
-datafusion-functions-json = { git = "https://github.com/spiceai/datafusion-functions-json.git", rev = "eb734ebdf806449e79318f4bec540b0138df98af" }
+datafusion-functions-json = "0.43"
 datafusion-table-providers = "0.1"
 dotenvy = "0.15"
 duckdb = "1.1.1"
@@ -138,15 +138,16 @@ uuid = "1.9.1"
 x509-certificate = "0.23.1"
 
 [patch.crates-io]
-datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "e8e0f5bd4d5413d8fba0e48a39656bccd5be96fd" }
-datafusion-common = { git = "https://github.com/spiceai/datafusion.git", rev = "e8e0f5bd4d5413d8fba0e48a39656bccd5be96fd" }
-datafusion-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "e8e0f5bd4d5413d8fba0e48a39656bccd5be96fd" }
-datafusion-execution = { git = "https://github.com/spiceai/datafusion.git", rev = "e8e0f5bd4d5413d8fba0e48a39656bccd5be96fd" }
+datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "2b93a308f65df1ae0cd8f3f8194b9b60201a500f" }
+datafusion-common = { git = "https://github.com/spiceai/datafusion.git", rev = "2b93a308f65df1ae0cd8f3f8194b9b60201a500f" }
+datafusion-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "2b93a308f65df1ae0cd8f3f8194b9b60201a500f" }
+datafusion-execution = { git = "https://github.com/spiceai/datafusion.git", rev = "2b93a308f65df1ae0cd8f3f8194b9b60201a500f" }
+
 
 object_store = { git = "https://github.com/spiceai/arrow-rs.git", rev = "1f37d9eda6da17b7644115f82d209c00c9566733" }
 
 datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "5af0df83c2cd1d3f82f293b066b401a4dfd4064b" }
-datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "2ef1f891705cad8c165996f08905bcad10e224d6" }
+datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "c0fa84c54808e04ef001056796967bea1e24c0ae" }
 
 duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "d6f8c3e0dc1ba073a86756eba4dacf044dfa892d" }
 

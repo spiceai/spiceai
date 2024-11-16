@@ -336,7 +336,10 @@ fn make_dataset(path: &str, name: &str, bench_name: &str) -> Dataset {
                 std::env::var("CLICKBENCH_S3_SECRET").unwrap_or_default(),
             ),
         ],
-        _ => vec![("file_format".to_string(), "parquet".to_string())],
+        _ => vec![
+            ("file_format".to_string(), "parquet".to_string()),
+            ("client_timeout".to_string(), "2m".to_string()),
+        ],
     };
 
     dataset.params = Some(Params::from_string_map(params.into_iter().collect()));
