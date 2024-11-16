@@ -34,7 +34,6 @@ use spicepod::component::{
 };
 
 use llms::chat::Chat;
-use tokio::time::sleep;
 
 use crate::{
     init_tracing, init_tracing_with_task_history,
@@ -47,6 +46,15 @@ use crate::{
     },
     utils::runtime_ready_check,
 };
+
+use std::sync::Mutex;
+use lazy_static::lazy_static;
+
+lazy_static! {
+    // Mistral loads and initializes models sequentially, so we use Mutext to control LLMs initialization.
+    // This also prevents unpredicted behavior when we are attempting to load the same model multiple times in parallel.
+    static ref LOCAL_LLM_INIT_MUTEX: Mutex<()> = Mutex::new(());
+}
 
 const HF_TEST_MODEL: &str = "microsoft/Phi-3-mini-4k-instruct";
 const HF_TEST_MODEL_TYPE: &str = "phi3";
@@ -131,6 +139,8 @@ async fn huggingface_test_nsql() -> Result<(), anyhow::Error> {
         Box::pin(rt_ref_copy.start_servers(api_config, None, EndpointAuth::no_auth())).await
     });
 
+    let llm_init_lock = LOCAL_LLM_INIT_MUTEX.lock().expect("to lock mutex");
+
     tokio::select! {
         // increased timeout to download and load huggingface model
         () = tokio::time::sleep(std::time::Duration::from_secs(300)) => {
@@ -138,6 +148,8 @@ async fn huggingface_test_nsql() -> Result<(), anyhow::Error> {
         }
         () = rt.load_components() => {}
     }
+
+    drop(llm_init_lock);
 
     runtime_ready_check(&rt).await;
 
@@ -159,7 +171,7 @@ async fn huggingface_test_nsql() -> Result<(), anyhow::Error> {
         "Expected a single record containing the value 10"
     );
 
-    sleep(Duration::from_secs(3)).await;
+    // sleep(Duration::from_secs(3)).await;
 
     let tasks = get_executed_tasks(&rt, task_start_time.into()).await?;
 
@@ -196,7 +208,7 @@ async fn huggingface_test_nsql() -> Result<(), anyhow::Error> {
         "Expected a single record containing the value 10"
     );
 
-    sleep(Duration::from_secs(3)).await;
+    // sleep(Duration::from_secs(3)).await;
 
     let tasks = get_executed_tasks(&rt, task_start_time.into()).await?;
 
@@ -325,6 +337,8 @@ async fn huggingface_test_chat_completion() -> Result<(), anyhow::Error> {
         Box::pin(rt_ref_copy.start_servers(api_config, None, EndpointAuth::no_auth())).await
     });
 
+    let llm_init_lock = LOCAL_LLM_INIT_MUTEX.lock().expect("to lock mutex");
+
     tokio::select! {
         // increased timeout to download and load huggingface model
         () = tokio::time::sleep(std::time::Duration::from_secs(300)) => {
@@ -332,6 +346,8 @@ async fn huggingface_test_chat_completion() -> Result<(), anyhow::Error> {
         }
         () = rt.load_components() => {}
     }
+
+    drop(llm_init_lock);
 
     let response = send_chat_completions_request(
         http_base_url.as_str(),
@@ -367,12 +383,17 @@ async fn huggingface_test_chat_messages() -> Result<(), anyhow::Error> {
 
     let rt = Arc::new(Runtime::builder().with_app(app).build().await);
 
+    let llm_init_lock = LOCAL_LLM_INIT_MUTEX.lock().expect("to lock mutex");
+
     tokio::select! {
-        () = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+        // increased timeout to download and load huggingface model
+        () = tokio::time::sleep(std::time::Duration::from_secs(300)) => {
             return Err(anyhow::anyhow!("Timed out waiting for components to load"));
         }
         () = rt.load_components() => {}
     }
+
+    drop(llm_init_lock);
 
     let tool_model = Box::new(ToolUsingChat::new(
         Arc::clone(&model),
