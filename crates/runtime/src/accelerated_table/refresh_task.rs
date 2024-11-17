@@ -701,7 +701,7 @@ impl RefreshTask {
                     labels.push(KeyValue::new("sql", sql.to_string()));
                 };
 
-                metrics::LAST_REFRESH_TIME.record(now.as_secs_f64(), &labels);
+                metrics::LAST_REFRESH_TIME_MS.record(now.as_secs_f64() * 1000.0, &labels);
             }
         }
     }
