@@ -37,6 +37,7 @@ pub(crate) async fn handle(
     flight_svc: &Service,
     request: Request<Streaming<FlightData>>,
 ) -> Result<Response<<Service as FlightService>::DoExchangeStream>, Status> {
+    let _start = metrics::track_flight_request("do_exchange", None);
     let mut streaming_request = request.into_inner();
     let req = streaming_request.next().await;
     let Some(subscription_request) = req else {

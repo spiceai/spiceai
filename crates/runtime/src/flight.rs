@@ -20,7 +20,6 @@ use crate::datafusion::query::{self, Protocol, QueryBuilder};
 use crate::datafusion::DataFusion;
 use crate::dataupdate::DataUpdate;
 use crate::metrics as runtime_metrics;
-use crate::timing::TimeMeasurement;
 use crate::tls::TlsConfig;
 use arrow::array::RecordBatch;
 use arrow::datatypes::Schema;
@@ -34,6 +33,7 @@ use datafusion::sql::sqlparser::parser::ParserError;
 use datafusion::sql::TableReference;
 use futures::stream::{self, BoxStream, StreamExt};
 use futures::{Stream, TryStreamExt};
+use metrics::track_flight_request;
 use runtime_auth::{layer::flight::BasicAuthLayer, FlightBasicAuth};
 use secrecy::ExposeSecret;
 use snafu::prelude::*;
@@ -81,7 +81,6 @@ impl FlightService for Service {
         &self,
         request: Request<Streaming<HandshakeRequest>>,
     ) -> Result<Response<Self::HandshakeStream>, Status> {
-        metrics::HANDSHAKE_REQUESTS.add(1, &[]);
         handshake::handle(request.metadata(), self.basic_auth.as_ref())
     }
 
@@ -89,7 +88,7 @@ impl FlightService for Service {
         &self,
         _request: Request<Criteria>,
     ) -> Result<Response<Self::ListFlightsStream>, Status> {
-        metrics::LIST_FLIGHTS_REQUESTS.add(1, &[]);
+        let _start = track_flight_request("list_flights", None);
         tracing::trace!("list_flights - unimplemented");
         Err(Status::unimplemented("Not yet implemented"))
     }
@@ -98,8 +97,6 @@ impl FlightService for Service {
         &self,
         request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
-        let _guard = TimeMeasurement::new(&metrics::GET_FLIGHT_INFO_REQUEST_DURATION_MS, vec![]);
-        metrics::GET_FLIGHT_INFO_REQUESTS.add(1, &[]);
         Box::pin(get_flight_info::handle(self, request)).await
     }
 
@@ -107,6 +104,7 @@ impl FlightService for Service {
         &self,
         _request: Request<FlightDescriptor>,
     ) -> Result<Response<PollInfo>, Status> {
+        let _start = track_flight_request("poll_flight_info", None);
         Err(Status::unimplemented("Not yet implemented"))
     }
 
@@ -114,7 +112,6 @@ impl FlightService for Service {
         &self,
         request: Request<FlightDescriptor>,
     ) -> Result<Response<SchemaResult>, Status> {
-        metrics::GET_SCHEMA_REQUESTS.add(1, &[]);
         get_schema::handle(self, request).await
     }
 
@@ -122,7 +119,6 @@ impl FlightService for Service {
         &self,
         request: Request<Ticket>,
     ) -> Result<Response<Self::DoGetStream>, Status> {
-        metrics::DO_GET_REQUESTS.add(1, &[]);
         Box::pin(do_get::handle(self, request)).await
     }
 
@@ -130,7 +126,6 @@ impl FlightService for Service {
         &self,
         request: Request<Streaming<FlightData>>,
     ) -> Result<Response<Self::DoPutStream>, Status> {
-        metrics::DO_PUT_REQUESTS.add(1, &[]);
         do_put::handle(self, request).await
     }
 
@@ -138,7 +133,6 @@ impl FlightService for Service {
         &self,
         request: Request<Streaming<FlightData>>,
     ) -> Result<Response<Self::DoExchangeStream>, Status> {
-        metrics::DO_EXCHANGE_REQUESTS.add(1, &[]);
         do_exchange::handle(self, request).await
     }
 
@@ -146,7 +140,6 @@ impl FlightService for Service {
         &self,
         request: Request<Action>,
     ) -> Result<Response<Self::DoActionStream>, Status> {
-        metrics::DO_ACTION_REQUESTS.add(1, &[]);
         Box::pin(actions::do_action(self, request)).await
     }
 
@@ -154,7 +147,6 @@ impl FlightService for Service {
         &self,
         _request: Request<arrow_flight::Empty>,
     ) -> Result<Response<Self::ListActionsStream>, Status> {
-        metrics::LIST_ACTIONS_REQUESTS.add(1, &[]);
         Ok(actions::list())
     }
 }

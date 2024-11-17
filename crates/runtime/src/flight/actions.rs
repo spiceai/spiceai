@@ -16,13 +16,12 @@ limitations under the License.
 
 use std::fmt::{self, Display, Formatter};
 
-use opentelemetry::KeyValue;
 use prost::Message;
 use tonic::{Request, Response, Status};
 
 use crate::{
     flight::{flightsql::prepared_statement_query, metrics, to_tonic_err, Service},
-    timing::{TimeMeasurement, TimedStream},
+    timing::TimedStream,
 };
 
 use arrow_flight::{
@@ -62,6 +61,7 @@ impl Display for ActionType {
 }
 
 pub(crate) fn list() -> Response<<Service as FlightService>::ListActionsStream> {
+    let start = metrics::track_flight_request("list_actions", None);
     tracing::trace!("list_actions");
     let create_prepared_statement_action_type = FlightActionType {
         r#type: ActionType::CreatePreparedStatement.to_string(),
@@ -82,9 +82,7 @@ pub(crate) fn list() -> Response<<Service as FlightService>::ListActionsStream> 
         Ok(close_prepared_statement_action_type),
     ];
 
-    let output = TimedStream::new(futures::stream::iter(actions), || {
-        TimeMeasurement::new(&metrics::LIST_ACTIONS_DURATION_MS, vec![])
-    });
+    let output = TimedStream::new(futures::stream::iter(actions), || start);
 
     Response::new(Box::pin(output) as <Service as FlightService>::ListActionsStream)
 }
@@ -96,10 +94,7 @@ pub(crate) async fn do_action(
     let action_type = ActionType::from_str(request.get_ref().r#type.as_str());
 
     let action_type_str = action_type.as_str().to_string();
-    let start = TimeMeasurement::new(
-        &metrics::DO_ACTION_DURATION_MS,
-        vec![KeyValue::new("action_type", action_type_str)],
-    );
+    let start = metrics::track_flight_request("do_action", Some(&action_type_str));
 
     let stream = match action_type {
         ActionType::CreatePreparedStatement => {

@@ -23,7 +23,7 @@ use arrow_flight::{
 use prost::Message;
 use tonic::{Request, Response, Status};
 
-use crate::datafusion::query::Protocol;
+use crate::{datafusion::query::Protocol, flight::metrics};
 
 use super::{flightsql, to_tonic_err, Service};
 
@@ -60,7 +60,10 @@ pub(crate) async fn handle(
         Command::CommandGetPrimaryKeys(token) => Ok(flightsql::get_primary_keys::get_flight_info(
             &token, request,
         )),
-        _ => Err(Status::unimplemented("Not yet implemented")),
+        _ => {
+            let _start = metrics::track_flight_request("get_flight_info", None);
+            Err(Status::unimplemented("Not yet implemented"))
+        }
     }
 }
 
@@ -69,6 +72,7 @@ async fn get_flight_info_simple(
     request: Request<FlightDescriptor>,
 ) -> Result<Response<FlightInfo>, Status> {
     tracing::trace!("get_flight_info_simple: {request:?}");
+    let _start = metrics::track_flight_request("get_flight_info", Some("sql_query"));
 
     let fd = request.into_inner();
 
