@@ -48,10 +48,10 @@ use crate::{
 };
 
 use lazy_static::lazy_static;
-use std::sync::Mutex;
+use tokio::sync::Mutex;
 
 lazy_static! {
-    // Mistral loads and initializes models sequentially, so we use Mutext to control LLMs initialization.
+    // Mistral loads and initializes models sequentially, so Mutex is used to control LLMs initialization.
     // This also prevents unpredicted behavior when we are attempting to load the same model multiple times in parallel.
     static ref LOCAL_LLM_INIT_MUTEX: Mutex<()> = Mutex::new(());
 }
@@ -139,7 +139,7 @@ async fn huggingface_test_nsql() -> Result<(), anyhow::Error> {
         Box::pin(rt_ref_copy.start_servers(api_config, None, EndpointAuth::no_auth())).await
     });
 
-    let llm_init_lock = LOCAL_LLM_INIT_MUTEX.lock().expect("to lock mutex");
+    let llm_init_lock = LOCAL_LLM_INIT_MUTEX.lock().await;
 
     tokio::select! {
         // increased timeout to download and load huggingface model
@@ -153,7 +153,7 @@ async fn huggingface_test_nsql() -> Result<(), anyhow::Error> {
 
     runtime_ready_check(&rt).await;
 
-    tracing::info!("/v1/nsql: get number of records in the taxi_trips dataset with 'sample_data_enabled:false'");
+    tracing::info!("/v1/nsql: Verify nsql request");
     let task_start_time = std::time::SystemTime::now();
 
     let response = send_nsql_request(
@@ -175,22 +175,17 @@ async fn huggingface_test_nsql() -> Result<(), anyhow::Error> {
 
     let tasks = get_executed_tasks(&rt, task_start_time.into()).await?;
 
-    assert!(
-        tasks.iter().any(|t| { t.0 == "tool_use::table_schema" }),
-        "Expected 'tool_use::table_schema' task to be executed"
-    );
-
     let table_schema_task = tasks
         .iter()
         .find(|t| t.0 == "tool_use::table_schema")
-        .expect("tool_use::table_schema task to be executed");
+        .expect("Expected 'tool_use::table_schema' task to be executed");
 
     insta::assert_snapshot!(
         "nsql_table_schema_task",
         pretty_json_str(&table_schema_task.1)?
     );
 
-    tracing::info!("/v1/nsql: get number of records in the taxi_trips dataset with 'sample_data_enabled:true'");
+    tracing::info!("/v1/nsql: Verify nsql request with 'sample_data_enabled:true'");
 
     let task_start_time = std::time::SystemTime::now();
 
@@ -226,6 +221,28 @@ async fn huggingface_test_nsql() -> Result<(), anyhow::Error> {
         .expect("Expected 'sql_query' task to be executed");
 
     insta::assert_snapshot!("nsql_sample_data_task_sql_query", sql_query_task.1);
+
+    tracing::info!("/v1/nsql: Ensure error when invalid dataset name is provided");
+    assert!(send_nsql_request(
+        http_base_url.as_str(),
+        "how many records in taxi_trips dataset?",
+        Some("hf_model"),
+        Some(false),
+        Some(vec!["dataset_not_in_spice".to_string()]),
+    )
+    .await
+    .is_err());
+
+    tracing::info!("/v1/nsql: Ensure error when invalid model name is provided");
+    assert!(send_nsql_request(
+        http_base_url.as_str(),
+        "how many records in taxi_trips dataset?",
+        Some("model_not_in_spice"),
+        Some(false),
+        None,
+    )
+    .await
+    .is_err());
 
     Ok(())
 }
@@ -333,7 +350,7 @@ async fn huggingface_test_chat_completion() -> Result<(), anyhow::Error> {
         Box::pin(rt_ref_copy.start_servers(api_config, None, EndpointAuth::no_auth())).await
     });
 
-    let llm_init_lock = LOCAL_LLM_INIT_MUTEX.lock().expect("to lock mutex");
+    let llm_init_lock = LOCAL_LLM_INIT_MUTEX.lock().await;
 
     tokio::select! {
         // increased timeout to download and load huggingface model
@@ -379,7 +396,7 @@ async fn huggingface_test_chat_messages() -> Result<(), anyhow::Error> {
 
     let rt = Arc::new(Runtime::builder().with_app(app).build().await);
 
-    let llm_init_lock = LOCAL_LLM_INIT_MUTEX.lock().expect("to lock mutex");
+    let llm_init_lock = LOCAL_LLM_INIT_MUTEX.lock().await;
 
     tokio::select! {
         // increased timeout to download and load huggingface model

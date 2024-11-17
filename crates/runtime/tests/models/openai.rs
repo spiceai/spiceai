@@ -61,6 +61,8 @@ async fn openai_test_nsql() -> Result<(), anyhow::Error> {
 
     let rt = Arc::new(Runtime::builder().with_app(app).build().await);
 
+    let (_tracing, trace_provider) = init_tracing_with_task_history(None, &rt);
+
     let rt_ref_copy = Arc::clone(&rt);
     tokio::spawn(async move {
         Box::pin(rt_ref_copy.start_servers(api_config, None, EndpointAuth::no_auth())).await
@@ -77,7 +79,9 @@ async fn openai_test_nsql() -> Result<(), anyhow::Error> {
 
     // example responses for the test query: '[{"count(*)":10}]', '[{"record_count":10}]'
 
-    tracing::info!("/v1/nsql: Ensure default request succeeds");
+    tracing::info!("/v1/nsql: Verify default nsql request");
+    let task_start_time = std::time::SystemTime::now();
+
     let response = send_nsql_request(
         http_base_url.as_str(),
         "how many records in taxi_trips dataset?",
@@ -90,6 +94,21 @@ async fn openai_test_nsql() -> Result<(), anyhow::Error> {
     assert!(
         json_is_single_row_with_value(&response, 10),
         "Expected a single record containing the value 10"
+    );
+
+    // ensure all spans are exported into task_history
+    let _ = trace_provider.force_flush();
+
+    let tasks = get_executed_tasks(&rt, task_start_time.into()).await?;
+
+    let table_schema_task = tasks
+        .iter()
+        .find(|t| t.0 == "tool_use::table_schema")
+        .expect("Expected 'tool_use::table_schema' task to be executed");
+
+    insta::assert_snapshot!(
+        "nsql_table_schema_task",
+        pretty_json_str(&table_schema_task.1)?
     );
 
     tracing::info!("/v1/nsql: Ensure model selection works");
@@ -107,27 +126,42 @@ async fn openai_test_nsql() -> Result<(), anyhow::Error> {
         "Expected a single record containing the value 10"
     );
 
-    tracing::info!("/v1/nsql: Ensure error when invalid dataset name is provided");
-    assert!(send_nsql_request(
+    tracing::info!("/v1/nsql: Verify nsql request with 'sample_data_enabled:true'");
+
+    let task_start_time = std::time::SystemTime::now();
+
+    let response = send_nsql_request(
         http_base_url.as_str(),
         "how many records in taxi_trips dataset?",
         Some("nql"),
-        Some(false),
-        Some(vec!["dataset_not_in_spice".to_string()]),
-    )
-    .await
-    .is_err());
-
-    tracing::info!("/v1/nsql: Ensure error when invalid model name is provided");
-    assert!(send_nsql_request(
-        http_base_url.as_str(),
-        "how many records in taxi_trips dataset?",
-        Some("model_not_in_spice"),
-        Some(false),
+        Some(true),
         None,
     )
-    .await
-    .is_err());
+    .await?;
+
+    assert!(
+        json_is_single_row_with_value(&response, 10),
+        "Expected a single record containing the value 10"
+    );
+
+    // ensure all spans are exported into task_history
+    let _ = trace_provider.force_flush();
+
+    let tasks = get_executed_tasks(&rt, task_start_time.into()).await?;
+
+    let sample_data_task = tasks
+        .iter()
+        .find(|t| t.0 == "tool_use::sample_data")
+        .expect("Expected 'tool_use::sample_data' task to be executed");
+
+    insta::assert_snapshot!("nsql_sample_data_task", sample_data_task.1);
+
+    let sql_query_task = tasks
+        .iter()
+        .find(|t| t.0 == "sql_query")
+        .expect("Expected 'sql_query' task to be executed");
+
+    insta::assert_snapshot!("nsql_sample_data_task_sql_query", sql_query_task.1);
 
     Ok(())
 }
@@ -331,6 +365,7 @@ async fn openai_test_chat_completion() -> Result<(), anyhow::Error> {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn openai_test_chat_messages() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(None);
 

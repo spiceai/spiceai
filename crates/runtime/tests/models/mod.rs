@@ -197,7 +197,7 @@ fn normalize_search_response(mut json: Value) -> String {
         *duration = json!("duration_ms_val");
     }
 
-    serde_json::to_string_pretty(&json).expect("convert json to string")
+    serde_json::to_string_pretty(&json).unwrap_or_default()
 }
 
 /// Normalizes embeddings response for consistent snapshot testing by replacing actual embedding arrays with a placeholder,
@@ -210,13 +210,12 @@ fn normalize_embeddings_response(mut json: Value) -> String {
                     *embedding = json!(format!("array_{}_items", num_elements));
                 } else if let Some(embedding_str) = embedding.as_str() {
                     *embedding = json!(format!("str_len_{}", embedding_str.len()));
-                    
                 }
             }
         }
     }
 
-    serde_json::to_string_pretty(&json).expect("convert json to string")
+    serde_json::to_string_pretty(&json).unwrap_or_default()
 }
 
 /// Normalizes chat completion response for consistent snapshot testing by replacing dynamic values
@@ -259,7 +258,7 @@ fn normalize_chat_completion_response(mut json: Value, normalize_message_content
         *id = json!("id_val");
     }
 
-    serde_json::to_string_pretty(&json).expect("convert json to string")
+    serde_json::to_string_pretty(&json).unwrap_or_default()
 }
 
 async fn send_embeddings_request(
