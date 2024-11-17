@@ -178,7 +178,7 @@ async fn openai_test_search() -> Result<(), anyhow::Error> {
     tracing::info!("/v1/search: Ensure simple search request succeeds");
     let response = send_search_request(
         http_base_url.as_str(),
-        "vehicles and journalists",
+        "new patient",
         Some(2),
         Some(vec!["item".to_string()]),
         None,
@@ -357,7 +357,7 @@ async fn openai_test_chat_messages() -> Result<(), anyhow::Error> {
 
     let rt = Arc::new(Runtime::builder().with_app(app).build().await);
 
-    let _tracing = init_tracing_with_task_history(None, &rt);
+    let (_tracing, trace_provider) = init_tracing_with_task_history(None, &rt);
 
     tokio::select! {
         () = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
@@ -396,6 +396,8 @@ async fn openai_test_chat_messages() -> Result<(), anyhow::Error> {
         "chat_1_response_choices",
         format!("{:#?}", response.choices)
     );
+
+    let _ = trace_provider.force_flush();
 
     let tasks = get_executed_tasks(&rt, task_start_time.into()).await?;
 
@@ -455,6 +457,9 @@ async fn openai_test_chat_messages() -> Result<(), anyhow::Error> {
         "chat_2_response_choices",
         format!("{:#?}", response.choices)
     );
+
+    // ensure all spans are exported into task_history
+    let _ = trace_provider.force_flush();
 
     let tasks = get_executed_tasks(&rt, task_start_time.into()).await?;
 

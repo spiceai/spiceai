@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 
 use app::AppBuilder;
 use async_openai::types::{
@@ -47,8 +47,8 @@ use crate::{
     utils::runtime_ready_check,
 };
 
-use std::sync::Mutex;
 use lazy_static::lazy_static;
+use std::sync::Mutex;
 
 lazy_static! {
     // Mistral loads and initializes models sequentially, so we use Mutext to control LLMs initialization.
@@ -132,7 +132,7 @@ async fn huggingface_test_nsql() -> Result<(), anyhow::Error> {
 
     let rt = Arc::new(Runtime::builder().with_app(app).build().await);
 
-    let _tracing = init_tracing_with_task_history(None, &rt);
+    let (_tracing, trace_provider) = init_tracing_with_task_history(None, &rt);
 
     let rt_ref_copy = Arc::clone(&rt);
     tokio::spawn(async move {
@@ -153,8 +153,7 @@ async fn huggingface_test_nsql() -> Result<(), anyhow::Error> {
 
     runtime_ready_check(&rt).await;
 
-    // Test1: NSQL request to get the number of records in the taxi_trips dataset with sample_data_enabled=false
-
+    tracing::info!("/v1/nsql: get number of records in the taxi_trips dataset with 'sample_data_enabled:false'");
     let task_start_time = std::time::SystemTime::now();
 
     let response = send_nsql_request(
@@ -171,7 +170,8 @@ async fn huggingface_test_nsql() -> Result<(), anyhow::Error> {
         "Expected a single record containing the value 10"
     );
 
-    // sleep(Duration::from_secs(3)).await;
+    // ensure all spans are exported into task_history
+    let _ = trace_provider.force_flush();
 
     let tasks = get_executed_tasks(&rt, task_start_time.into()).await?;
 
@@ -190,7 +190,7 @@ async fn huggingface_test_nsql() -> Result<(), anyhow::Error> {
         pretty_json_str(&table_schema_task.1)?
     );
 
-    // Test2: NSQL request to get the number of records in the taxi_trips dataset with sample_data_enabled=true
+    tracing::info!("/v1/nsql: get number of records in the taxi_trips dataset with 'sample_data_enabled:true'");
 
     let task_start_time = std::time::SystemTime::now();
 
@@ -208,26 +208,22 @@ async fn huggingface_test_nsql() -> Result<(), anyhow::Error> {
         "Expected a single record containing the value 10"
     );
 
-    // sleep(Duration::from_secs(3)).await;
+    // ensure all spans are exported into task_history
+    let _ = trace_provider.force_flush();
 
     let tasks = get_executed_tasks(&rt, task_start_time.into()).await?;
-
-    assert!(
-        tasks.iter().any(|t| { t.0 == "tool_use::sample_data" }),
-        "Expected 'tool_use::sample_data' task to be executed"
-    );
 
     let sample_data_task = tasks
         .iter()
         .find(|t| t.0 == "tool_use::sample_data")
-        .expect("tool_use::sample_data task to be executed");
+        .expect("Expected 'tool_use::sample_data' task to be executed");
 
     insta::assert_snapshot!("nsql_sample_data_task", sample_data_task.1);
 
     let sql_query_task = tasks
         .iter()
         .find(|t| t.0 == "sql_query")
-        .expect("sql_query task to be executed");
+        .expect("Expected 'sql_query' task to be executed");
 
     insta::assert_snapshot!("nsql_sample_data_task_sql_query", sql_query_task.1);
 
