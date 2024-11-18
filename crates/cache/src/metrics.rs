@@ -53,9 +53,9 @@ pub(crate) static HITS: LazyLock<Counter<u64>> = LazyLock::new(|| {
         .init()
 });
 
-pub(crate) static ITEMS: LazyLock<Counter<u64>> = LazyLock::new(|| {
+pub(crate) static ITEMS: LazyLock<Gauge<u64>> = LazyLock::new(|| {
     METER
-        .u64_counter("results_cache_items")
-        .with_description("Number of items in the cache.")
+        .u64_gauge("results_cache_items_count")
+        .with_description("Number of items currently in the cache.")
         .init()
 });

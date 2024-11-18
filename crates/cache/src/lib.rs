@@ -169,7 +169,7 @@ impl QueryResultsCacheProvider {
             self.metrics_reported_last_time
                 .store(now_seconds, Ordering::Relaxed);
             metrics::SIZE_BYTES.record(self.size(), &[]);
-            metrics::ITEMS.add(self.item_count(), &[]);
+            metrics::ITEMS.record(self.item_count(), &[]);
         }
     }
 
