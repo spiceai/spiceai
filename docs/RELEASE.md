@@ -19,7 +19,7 @@ The `trunk` branch serves as the primary development branch containing the lates
 
 ### Pre-releases (Release Candidates)
 
-Pre-releases follow the format `X.Y.0-rc.N` where `N` is the RC number (e.g., `1.0.0-rc.1`).
+Pre-releases follow the format `vX.Y.0-rc.N` where `N` is the RC number (e.g., `v1.0.0-rc.1`).
 
 1. Create/use the corresponding minor release branch (e.g., `release-1.0` for `1.0.0-rc.1`)
 2. The latest release branch should always be fast-forwarded from `trunk`.
