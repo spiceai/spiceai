@@ -3017,19 +3017,6 @@ dependencies = [
 
 [[package]]
 name = "dashmap"
-version = "5.5.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "978747c1d849a7d2ee5e8adc0159961c48fb7e5db2f06af6723b80123bb53856"
-dependencies = [
- "cfg-if",
- "hashbrown 0.14.5",
- "lock_api",
- "once_cell",
- "parking_lot_core 0.9.10",
-]
-
-[[package]]
-name = "dashmap"
 version = "6.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5041cc499144891f3790297212f32a74fb938e5136a14943f338ef9e0ae276cf"
@@ -3113,7 +3100,7 @@ dependencies = [
  "bytes",
  "bzip2",
  "chrono",
- "dashmap 6.1.0",
+ "dashmap",
  "datafusion-catalog",
  "datafusion-common",
  "datafusion-common-runtime",
@@ -3208,7 +3195,7 @@ source = "git+https://github.com/spiceai/datafusion.git?rev=2b93a308f65df1ae0cd8
 dependencies = [
  "arrow",
  "chrono",
- "dashmap 6.1.0",
+ "dashmap",
  "datafusion-common",
  "datafusion-expr",
  "futures",
@@ -6301,7 +6288,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4979f22fdb869068da03c9f7528f8297c6fd2606bc3a4affe42e6a823fdb8da4"
 dependencies = [
  "cfg-if",
- "windows-targets 0.52.6",
+ "windows-targets 0.48.5",
 ]
 
 [[package]]
@@ -9504,7 +9491,7 @@ dependencies = [
  "clap",
  "clickhouse-rs",
  "csv",
- "dashmap 5.5.3",
+ "dashmap",
  "data_components",
  "datafusion",
  "datafusion-federation",
