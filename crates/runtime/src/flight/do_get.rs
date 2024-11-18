@@ -76,7 +76,7 @@ async fn do_get_simple(
     flight_svc: &Service,
     request: Request<Ticket>,
 ) -> Result<Response<<Service as FlightService>::DoGetStream>, Status> {
-    let start = metrics::track_flight_request("get_get", Some("sql_query"));
+    let start = metrics::track_flight_request("do_get", Some("sql_query"));
     let datafusion = Arc::clone(&flight_svc.datafusion);
     let ticket = request.into_inner();
     tracing::trace!("do_get_simple: {ticket:?}");
