@@ -403,26 +403,19 @@ async fn openai_test_chat_messages() -> Result<(), anyhow::Error> {
 
     runtime_ready_check(&rt).await;
 
-    let mut model_with_tools = get_openai_model("gpt-4o-mini", "openai_model");
-    model_with_tools
-        .params
-        .insert("tools".to_string(), "auto".into());
-
-    let model_secrets = get_params_with_secrets(&model_with_tools.params, &rt).await;
-    let tool_model = try_to_chat_model(&model_with_tools, &model_secrets, Arc::clone(&rt)).await?;
-
-    verify_sql_query_chat_completion(&*tool_model, &rt, &trace_provider).await?;
-    verify_similarity_search_chat_completion(&*tool_model, &rt, &trace_provider).await?;
+    verify_sql_query_chat_completion(Arc::clone(&rt), &trace_provider).await?;
+    verify_similarity_search_chat_completion(Arc::clone(&rt), &trace_provider).await?;
 
     Ok(())
 }
 
 /// Verifies that the model correctly uses the SQL tool to process user query and return the result
 async fn verify_sql_query_chat_completion(
-    model: &dyn Chat,
-    rt: &Runtime,
+    rt: Arc<Runtime>,
     trace_provider: &TracerProvider,
 ) -> Result<(), anyhow::Error> {
+    let model =
+        get_openai_chat_model(Arc::clone(&rt), "gpt-4o-mini", "openai_model", "auto").await?;
     let req = CreateChatCompletionRequestArgs::default()
             .messages(vec![ChatCompletionRequestSystemMessageArgs::default()
                 .content("You are an assistant that responds to queries by providing only the requested data values without extra explanation.".to_string())
@@ -443,7 +436,7 @@ async fn verify_sql_query_chat_completion(
 
     let _ = trace_provider.force_flush();
 
-    let tasks = get_executed_tasks(rt, task_start_time.into()).await?;
+    let tasks = get_executed_tasks(&rt, task_start_time.into()).await?;
 
     assert!(
         tasks.iter().any(|t| { t.0 == "tool_use::list_datasets" }),
@@ -477,10 +470,11 @@ async fn verify_sql_query_chat_completion(
 
 /// Verifies that the model correctly uses similirity search tool to process user query and return the result
 async fn verify_similarity_search_chat_completion(
-    model: &dyn Chat,
-    rt: &Runtime,
+    rt: Arc<Runtime>,
     trace_provider: &TracerProvider,
 ) -> Result<(), anyhow::Error> {
+    let model =
+        get_openai_chat_model(Arc::clone(&rt), "gpt-4o-mini", "openai_model", "auto").await?;
     let req = CreateChatCompletionRequestArgs::default()
                 .messages(vec![ChatCompletionRequestSystemMessageArgs::default()
                     .content("You are an assistant that responds to queries by providing only the requested data values without extra explanation.".to_string())
@@ -515,7 +509,7 @@ async fn verify_similarity_search_chat_completion(
     // ensure all spans are exported into task_history
     let _ = trace_provider.force_flush();
 
-    let tasks = get_executed_tasks(rt, task_start_time.into()).await?;
+    let tasks = get_executed_tasks(&rt, task_start_time.into()).await?;
 
     let document_similarity_task = tasks
         .iter()
@@ -540,6 +534,23 @@ fn get_openai_model(model: impl Into<String>, name: impl Into<String>) -> Model 
         "${ secrets:SPICE_OPENAI_API_KEY }".into(),
     );
     model
+}
+
+async fn get_openai_chat_model(
+    rt: Arc<Runtime>,
+    model: impl Into<String>,
+    name: impl Into<String>,
+    tools: impl Into<String>,
+) -> Result<Box<dyn Chat>, anyhow::Error> {
+    let mut model_with_tools = get_openai_model(model, name);
+    model_with_tools
+        .params
+        .insert("tools".to_string(), tools.into().into());
+
+    let model_secrets = get_params_with_secrets(&model_with_tools.params, &rt).await;
+    try_to_chat_model(&model_with_tools, &model_secrets, rt)
+        .await
+        .map_err(anyhow::Error::from)
 }
 
 fn get_openai_embeddings(model: Option<impl Into<String>>, name: impl Into<String>) -> Embeddings {
