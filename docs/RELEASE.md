@@ -24,7 +24,7 @@ Pre-releases follow the format `vX.Y.0-rc.N` where `N` is the RC number (e.g., `
 1. Create/use the corresponding minor release branch (e.g., `release-1.0` for `v1.0.0-rc.1`)
 2. The latest release branch should always be fast-forwarded from `trunk`.
 3. Older release branches should have changes cherry-picked from `trunk` as needed.
-4. Update version number in `version.txt` and `Cargo.toml` to include the new RC version (e.g., `1.0.0-rc.1`). For the latest release branch, this is done in trunk and fast-forwarded to the release branch. Older release branches should have the version number updated directly.
+4. Update version number in `version.txt` and `Cargo.toml` to include the new RC version (e.g., `v1.0.0-rc.1`). For the latest release branch, this is done in trunk and fast-forwarded to the release branch. Older release branches should have the version number updated directly.
 5. All RC releases for a given version (`X.Y.0`) happen on the same branch.
 
 Example:
