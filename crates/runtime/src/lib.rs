@@ -717,7 +717,8 @@ impl Runtime {
 
             self.status
                 .update_dataset(&ds.name, status::ComponentStatus::Initializing);
-            let future = Box::pin(self.load_dataset(ds.clone()));
+            let future: Pin<Box<dyn Future<Output = ()> + Send>> =
+                Box::pin(self.load_dataset(ds.clone()));
             dataset_futures.insert(ds.name.clone(), future);
         }
 
@@ -730,16 +731,20 @@ impl Runtime {
             let path = ds.path();
             let path_table_ref = TableReference::parse_str(&path);
 
-            // Find the parent dataset's future
-            let parent_future = dataset_futures.get(&path_table_ref).cloned();
-
-            let localpod_future = match parent_future {
+            // Find and remove the parent dataset's future
+            match dataset_futures.remove(&path_table_ref) {
                 Some(parent_future) => {
+                    let ds_clone = Arc::clone(&ds);
+
                     // Chain the localpod dataset load after its parent
-                    Box::pin(async move {
+                    let chained_future = Box::pin(async move {
                         parent_future.await;
-                        self.load_dataset(ds).await;
+                        self.load_dataset(ds_clone).await;
                     })
+                        as Pin<Box<dyn Future<Output = ()> + Send>>;
+
+                    // Replace parent future with the chained future
+                    dataset_futures.insert(ds.name.clone(), chained_future);
                 }
                 None => {
                     // If parent doesn't exist, create a future that will fail
@@ -753,8 +758,6 @@ impl Runtime {
                     continue;
                 }
             };
-
-            dataset_futures.insert(ds.name.clone(), localpod_future);
         }
 
         // Execute all futures
@@ -825,7 +828,11 @@ impl Runtime {
                     self.status
                         .update_dataset(ds_name, status::ComponentStatus::Error);
                     metrics::datasets::LOAD_ERROR.add(1, &[]);
-                    warn_spaced!(spaced_tracer, "{} {err}", ds_name.table());
+                    warn_spaced!(
+                        spaced_tracer,
+                        "Error initializing dataset {}. {err}",
+                        ds_name.table()
+                    );
                     return Err(RetryError::transient(err));
                 }
             };
@@ -1158,9 +1165,9 @@ impl Runtime {
                     }
                 }
 
-                if (self
+                if self
                     .register_loaded_dataset(Arc::clone(&ds), Arc::clone(&connector), None)
-                    .await)
+                    .await
                     .is_err()
                 {
                     self.status
