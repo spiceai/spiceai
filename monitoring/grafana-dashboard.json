@@ -1952,9 +1952,9 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "flight_request_duration_ms_summary{quantile=~\"${percentile}\",pod=~\"${pods}\",path=\"do_put\"}",
+          "expr": "flight_request_duration_ms_summary{quantile=~\"${percentile}\",pod=~\"${pods}\",method=\"do_put\"}",
           "instant": false,
-          "legendFormat": "{{method}}",
+          "legendFormat": "{{command}}",
           "range": true,
           "refId": "A"
         }
@@ -2045,9 +2045,9 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "(flight_requests{pod=~\"${pods}\",path=\"do_put\"} - (flight_requests{pod=~\"${pods}\",path=\"do_put\"} offset $__rate_interval)) > 0",
+          "expr": "(flight_requests{pod=~\"${pods}\",method=\"do_put\"} - (flight_requests{pod=~\"${pods}\",method=\"do_put\"} offset $__rate_interval)) > 0",
           "instant": false,
-          "legendFormat": "{{method}}",
+          "legendFormat": "{{command}}",
           "range": true,
           "refId": "A"
         }
@@ -2140,9 +2140,9 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "flight_request_duration_ms_summary{quantile=~\"${percentile}\",pod=~\"${pods}\", path=\"do_get\"} unless flight_request_duration_ms_summary == 0",
+          "expr": "flight_request_duration_ms_summary{quantile=~\"${percentile}\",pod=~\"${pods}\",method=\"do_get\"} unless flight_request_duration_ms_summary == 0",
           "instant": false,
-          "legendFormat": "{{method}}",
+          "legendFormat": "{{command}}",
           "range": true,
           "refId": "A"
         }
@@ -2233,9 +2233,9 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "(flight_requests{pod=~\"${pods}\", path=\"do_get\"} - (flight_requests{pod=~\"${pods}\", path=\"do_get\"} offset $__rate_interval)) > 0",
+          "expr": "(flight_requests{pod=~\"${pods}\",method=\"do_get\"} - (flight_requests{pod=~\"${pods}\",method=\"do_get\"} offset $__rate_interval)) > 0",
           "instant": false,
-          "legendFormat": "{{method}}",
+          "legendFormat": "{{command}}",
           "range": true,
           "refId": "A"
         }
@@ -2328,9 +2328,9 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "flight_request_duration_ms_summary{quantile=~\"${percentile}\",pod=~\"${pods}\",path=\"get_flight_info\" } unless flight_request_duration_ms_summary == 0",
+          "expr": "flight_request_duration_ms_summary{quantile=~\"${percentile}\",pod=~\"${pods}\",method=\"get_flight_info\" } unless flight_request_duration_ms_summary == 0",
           "instant": false,
-          "legendFormat": "{{method}}",
+          "legendFormat": "{{command}}",
           "range": true,
           "refId": "A"
         }
@@ -2423,9 +2423,9 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "(flight_requests{pod=~\"${pods}\",path=\"get_flight_info\"} - (flight_requests{pod=~\"${pods}\",path=\"get_flight_info\"} offset $__rate_interval)) > 0",
+          "expr": "(flight_requests{pod=~\"${pods}\",method=\"get_flight_info\"} - (flight_requests{pod=~\"${pods}\",method=\"get_flight_info\"} offset $__rate_interval)) > 0",
           "instant": false,
-          "legendFormat": "{{method}}",
+          "legendFormat": "{{command}}",
           "range": true,
           "refId": "A"
         }
@@ -2520,7 +2520,7 @@
           "editorMode": "code",
           "expr": "increase(flight_requests[$__rate_interval])",
           "instant": false,
-          "legendFormat": "{{path}}/{{method}}",
+          "legendFormat": "{{method}}/{{command}}",
           "range": true,
           "refId": "A"
         }
