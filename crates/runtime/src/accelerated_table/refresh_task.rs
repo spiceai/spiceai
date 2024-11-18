@@ -139,7 +139,7 @@ impl RefreshTask {
             match self.run_once(&refresh).await {
                 Ok(()) => Ok(()),
                 Err(e) => {
-                    for label_set in self.get_dataset_label_sets().await {
+                    for label_set in self.get_dataset_label_sets(&refresh.mode).await {
                         metrics::REFRESH_ERRORS.add(1, &label_set);
                     }
                     Err(e)
@@ -165,11 +165,10 @@ impl RefreshTask {
                 RefreshMode::Disabled => {
                     unreachable!("Refresh cannot be called when acceleration is disabled")
                 }
-                RefreshMode::Full => &metrics::LOAD_DURATION_MS,
-                RefreshMode::Append => &metrics::APPEND_DURATION_MS,
+                RefreshMode::Full | RefreshMode::Append => &metrics::REFRESH_DURATION_MS,
                 RefreshMode::Changes => unreachable!("changes are handled upstream"),
             },
-            self.get_dataset_label_sets().await,
+            self.get_dataset_label_sets(&refresh.mode).await,
         );
 
         let start_time = SystemTime::now();
@@ -672,11 +671,21 @@ impl RefreshTask {
         dataset_names
     }
 
-    async fn get_dataset_label_sets(&self) -> Vec<Vec<KeyValue>> {
+    async fn get_dataset_label_sets(&self, mode: &RefreshMode) -> Vec<Vec<KeyValue>> {
         let dataset_names = self.get_dataset_names().await;
         dataset_names
             .into_iter()
-            .map(|name| vec![KeyValue::new("dataset", name.to_string())])
+            .map(|name| {
+                let mut label_set = vec![KeyValue::new("dataset", name.to_string())];
+                match mode {
+                    RefreshMode::Full => label_set.push(KeyValue::new("mode", "full".to_string())),
+                    RefreshMode::Append => {
+                        label_set.push(KeyValue::new("mode", "append".to_string()));
+                    }
+                    _ => (),
+                }
+                label_set
+            })
             .collect()
     }
 

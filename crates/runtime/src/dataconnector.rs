@@ -324,6 +324,7 @@ pub async fn register_all() {
         unity_catalog::UnityCatalogFactory::new_arc(),
     )
     .await;
+    register_connector_factory("localpod", localpod::LocalPodFactory::new_arc()).await;
 }
 
 pub trait DataConnectorFactory: Send + Sync {
