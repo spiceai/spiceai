@@ -6,7 +6,7 @@ Spice.ai releases once per week.
 
 ### Branch Structure
 
-The `trunk` branch serves as the primary development branch containing the latest code. Changes to release branches must originate from `trunk` through cherry-picking when direct fast-forwarding isn't possible. Release branches accept only version number updates as direct commits.
+The `trunk` branch serves as the primary development branch containing the latest code. Changes to release branches must originate from `trunk` through cherry-picking when direct fast-forwarding isn't possible. Release branches accept only version number updates as direct commits. The release DRI is responsible for all required changes being present on the release branch.
 
 ### Major and Minor Releases
 
