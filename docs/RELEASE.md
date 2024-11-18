@@ -34,7 +34,7 @@ Example:
 
 ### Patch Releases
 
-For version `X.Y.Z`:
+For version `vX.Y.Z`:
 
 1. Use existing minor release branch (`release-X.Y`)
 2. Cherry-pick required fixes from `trunk`. No new features are allowed in patch releases, only bug/security fixes.
