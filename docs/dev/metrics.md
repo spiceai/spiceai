@@ -11,7 +11,7 @@
   - Metric domain or namespace:  refers to a logical grouping or category that organizes related metrics. It typically indicates the component, system, or protocol that the metric belongs to and helps avoid naming conflicts and provides context for interpreting the metric.
 - Label (or Dimension): Key-value pairs that provide additional context to a metric.
 - Counter-Based Metrics: Metrics that represent a cumulative count of events or occurrences.
-- UpDownCounter-Based Metrics: Counter-Based Metrics that can increase or decrease over time, unlike regular counters which only increase. They are used for values that fluctuate, such as current active connections or in-progress operations.
+- Gauge-Based Metrics: Counter-Based Metrics that can increase or decrease over time, unlike regular counters which only increase. They are used for values that fluctuate, such as current active connections or in-progress operations.
 - Unit-Based Metrics: Metrics that represent a specific unit of measurement, like duration or data size.
 
 ## Metric Naming Template
