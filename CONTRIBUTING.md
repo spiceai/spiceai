@@ -42,6 +42,7 @@ This section describes the guidelines for contributing code / docs to Spice.ai.
 - [Principles](/docs/PRINCIPLES.md)
 - [Style Guide](/docs/dev/style_guide.md)
 - [Error Handling](/docs/dev/error_handling.md)
+- [Metrics Naming](/docs/dev/metrics.md)
 
 ### Pull Requests
 

@@ -23,7 +23,7 @@ use arrow_ipc::writer::IpcWriteOptions;
 use datafusion::sql::TableReference;
 use tonic::{Request, Response, Status};
 
-use crate::datafusion::query::Protocol;
+use crate::{datafusion::query::Protocol, flight::metrics};
 
 use super::{to_tonic_err, Service};
 
@@ -31,6 +31,7 @@ pub(crate) async fn handle(
     flight_svc: &Service,
     request: Request<FlightDescriptor>,
 ) -> Result<Response<SchemaResult>, Status> {
+    let _start = metrics::track_flight_request("get_schema", None);
     tracing::trace!("get_schema: {request:?}");
 
     let fd = request.into_inner();
