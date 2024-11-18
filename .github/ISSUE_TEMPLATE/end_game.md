@@ -29,7 +29,7 @@ assignees: ''
 
 ## Release Checklist
 
-- [ ] Create the release branch (`release-vX.Y`) from `trunk` one day before the scheduled release (if not already created).
+- [ ] Create the release branch (`release-X.Y`) from `trunk` one day before the scheduled release (if not already created).
   - See [docs/RELEASE.md](https://github.com/spiceai/spiceai/blob/trunk/docs/RELEASE.md) for more details.
 - [ ] All features/bugfixes to be included in the release have been fast-forwarded/cherry-picked to the release branch.
 - [ ] Full test pass and update if necessary over README.md
