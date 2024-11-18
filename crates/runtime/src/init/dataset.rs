@@ -67,7 +67,7 @@ impl Runtime {
             self.status
                 .update_dataset(&ds.name, status::ComponentStatus::Initializing);
             let future: Pin<Box<dyn Future<Output = ()> + Send>> =
-                Box::pin(self.load_dataset(ds.clone()));
+                Box::pin(self.load_dataset(Arc::clone(&ds)));
             dataset_futures.insert(ds.name.clone(), future);
         }
 
@@ -93,11 +93,13 @@ impl Runtime {
                 // Replace parent future with the chained future
                 dataset_futures.insert(ds.name.clone(), chained_future);
             } else {
-                // If parent doesn't exist, create a future that will fail
+                // Parent doesn't exist, provide an error message to the user
                 tracing::error!(
-                    "Parent dataset {} not found for localpod dataset {}",
+                    "Failed to load localpod dataset '{}': Parent dataset '{}' doesn't exist. \
+                    Ensure the '{}' dataset is configured in the Spicepod.",
+                    ds.name,
                     path_table_ref,
-                    ds.name
+                    path_table_ref
                 );
                 self.status
                     .update_dataset(&ds.name, status::ComponentStatus::Error);
