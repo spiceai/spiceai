@@ -189,7 +189,7 @@ impl Secrets {
             match store.get_secret(key).await {
                 Ok(Some(secret)) => secret.expose_secret().to_string(),
                 Ok(None) => {
-                    tracing::error!("Key {key} not found in secret: {store_name}");
+                    tracing::error!("Key {key} not found in secret store: {store_name}");
                     return None;
                 }
                 Err(e) => {
