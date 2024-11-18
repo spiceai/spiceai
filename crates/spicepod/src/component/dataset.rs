@@ -62,6 +62,18 @@ pub enum InvalidTypeAction {
     Ignore,
 }
 
+/// Controls when the dataset is marked ready for queries.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ReadyState {
+    /// The table is ready once the initial load completes.
+    #[default]
+    OnLoad,
+    /// The table is ready immediately on registration, with fallback to federated table for queries until the initial load completes.
+    OnRegistration,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 #[serde(deny_unknown_fields)]
@@ -108,6 +120,9 @@ pub struct Dataset {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub invalid_type_action: Option<InvalidTypeAction>,
+
+    #[serde(default)]
+    pub ready_state: ReadyState,
 }
 
 impl Nameable for Dataset {
@@ -135,6 +150,7 @@ impl Dataset {
             embeddings: Vec::default(),
             depends_on: Vec::default(),
             invalid_type_action: None,
+            ready_state: ReadyState::default(),
         }
     }
 }
@@ -157,6 +173,7 @@ impl WithDependsOn<Dataset> for Dataset {
             embeddings: self.embeddings.clone(),
             depends_on: depends_on.to_vec(),
             invalid_type_action: self.invalid_type_action,
+            ready_state: self.ready_state,
         }
     }
 }
@@ -168,6 +185,8 @@ pub mod acceleration {
     use std::{collections::HashMap, fmt::Display};
 
     use crate::component::params::Params;
+
+    use super::ReadyState;
 
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
     #[cfg_attr(feature = "schemars", derive(JsonSchema))]
@@ -215,18 +234,6 @@ pub mod acceleration {
                 ZeroResultsAction::UseSource => write!(f, "use_source"),
             }
         }
-    }
-
-    /// Controls when the table is marked ready for queries.
-    #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
-    #[cfg_attr(feature = "schemars", derive(JsonSchema))]
-    #[serde(rename_all = "snake_case")]
-    pub enum ReadyState {
-        /// The table is ready once the initial load completes.
-        #[default]
-        OnLoad,
-        /// The table is ready immediately on registration, with fallback to federated table for queries until the initial load completes.
-        OnRegistration,
     }
 
     #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
@@ -322,7 +329,8 @@ pub mod acceleration {
         pub on_zero_results: ZeroResultsAction,
 
         #[serde(default)]
-        pub ready_state: ReadyState,
+        #[deprecated(since = "1.0.0-rc.1", note = "Use `dataset.ready_state` instead.")]
+        pub ready_state: Option<ReadyState>,
 
         #[serde(default, skip_serializing_if = "HashMap::is_empty")]
         pub indexes: HashMap<String, IndexType>,
@@ -344,6 +352,7 @@ pub mod acceleration {
     }
 
     impl Default for Acceleration {
+        #[allow(deprecated)]
         fn default() -> Self {
             Self {
                 enabled: true,
@@ -363,7 +372,7 @@ pub mod acceleration {
                 retention_check_interval: None,
                 retention_check_enabled: false,
                 on_zero_results: ZeroResultsAction::ReturnEmpty,
-                ready_state: ReadyState::OnLoad,
+                ready_state: None,
                 indexes: HashMap::default(),
                 primary_key: None,
                 on_conflict: HashMap::default(),

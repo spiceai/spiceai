@@ -17,17 +17,59 @@ limitations under the License.
 //! Data connector that reads from datasets already registered in the current Spicepod.
 
 use std::any::Any;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use datafusion::catalog::TableProvider;
 use datafusion::sql::TableReference;
 
-use crate::component::dataset::Dataset;
 use crate::datafusion::DataFusion;
 use crate::DataConnector;
+use crate::{component::dataset::Dataset, parameters::ParameterSpec};
+
+use super::{DataConnectorFactory, DataConnectorParams};
 
 pub const LOCALPOD_DATACONNECTOR: &str = "localpod";
+
+#[derive(Default, Copy, Clone)]
+pub struct LocalPodFactory {}
+
+impl LocalPodFactory {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {}
+    }
+
+    #[must_use]
+    pub fn new_arc() -> Arc<dyn DataConnectorFactory> {
+        Arc::new(Self {}) as Arc<dyn DataConnectorFactory>
+    }
+}
+
+impl DataConnectorFactory for LocalPodFactory {
+    fn create(
+        &self,
+        _params: DataConnectorParams,
+    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
+        Box::pin(async move {
+            Err(Box::new(super::DataConnectorError::Internal {
+                dataconnector: LOCALPOD_DATACONNECTOR.to_string(),
+                code: "LPF-Create".to_string(), // LocalPodFactory - Create
+                source: "Unexpected error. Localpod connector should not be created directly from the factory.".into(),
+            }) as Box<dyn std::error::Error + Send + Sync>)
+        })
+    }
+
+    fn prefix(&self) -> &'static str {
+        "localpod"
+    }
+
+    fn parameters(&self) -> &'static [ParameterSpec] {
+        &[]
+    }
+}
 
 #[derive(Clone)]
 pub struct LocalPodConnector {
