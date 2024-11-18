@@ -73,9 +73,19 @@ pub fn try_to_embedding<S: ::std::hash::BuildHasher>(
             // For OpenAI compatible embedding models, we allow users to
             // specific the tokenizer being used, so that the model can chunk data properly.
             if let Some(tokenizer_file) = component.find_any_file_path(ModelFileType::Tokenizer) {
+                tracing::debug!(
+                    "Embedding model {} will use tokenizer from local file: {}.",
+                    component.name,
+                    tokenizer_file
+                );
                 embed = embed.try_with_tokenizer_file(tokenizer_file)?;
             }
             if let Some(tokenizer_hf_model_id) = extract_secret!(params, "hf_tokenizer_from") {
+                tracing::debug!(
+                    "Embedding model {} will use tokenizer from huggingface repo: {}.",
+                    component.name,
+                    tokenizer_hf_model_id
+                );
                 let hf_token = extract_secret!(params, "hf_token");
                 embed =
                     embed.try_with_hf_tokenizer(tokenizer_hf_model_id.as_str(), None, hf_token)?;
