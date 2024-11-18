@@ -28,7 +28,6 @@ import (
 	"github.com/spiceai/spiceai/bin/spice/pkg/constants"
 	"github.com/spiceai/spiceai/bin/spice/pkg/context"
 	"github.com/spiceai/spiceai/bin/spice/pkg/github"
-	"github.com/spiceai/spiceai/bin/spice/pkg/runtime"
 	"github.com/spiceai/spiceai/bin/spice/pkg/util"
 	"github.com/spiceai/spiceai/bin/spice/pkg/version"
 )
@@ -40,6 +39,12 @@ var upgradeCmd = &cobra.Command{
 spice upgrade
 `,
 	Run: func(cmd *cobra.Command, args []string) {
+		force, err := cmd.Flags().GetBool("force")
+		if err != nil {
+			slog.Error("getting force flag", "error", err)
+			return
+		}
+
 		slog.Info("Checking for latest Spice CLI release...")
 		release, err := github.GetLatestCliRelease()
 		if err != nil {
@@ -55,7 +60,13 @@ spice upgrade
 		}
 		cliVersion := version.Version()
 
-		if cliVersion == release.TagName {
+		runtimeUpgradeRequired, err := rtcontext.IsRuntimeUpgradeAvailable()
+		if err != nil {
+			slog.Error("checking for runtime upgrade", "error", err)
+			return
+		}
+
+		if cliVersion == release.TagName && runtimeUpgradeRequired != "" && !force {
 			slog.Info(fmt.Sprintf("Using the latest version %s. No upgrade required.", release.TagName))
 			return
 		}
@@ -121,18 +132,17 @@ spice upgrade
 			flavor = "ai"
 		}
 
-		upgraded, err := runtime.EnsureInstalled(flavor, true)
+		err = rtcontext.InstallOrUpgradeRuntime(flavor)
 		if err != nil {
-			slog.Error("upgrading the spice runtime", "error", err)
-			return
+			slog.Error("installing runtime", "error", err)
+			os.Exit(1)
 		}
 
-		if upgraded {
-			slog.Info(fmt.Sprintf("Spice runtime upgraded to %s successfully.", release.TagName))
-		}
+		slog.Info(fmt.Sprintf("Spice runtime upgraded to %s successfully.", release.TagName))
 	},
 }
 
 func init() {
+	upgradeCmd.Flags().BoolP("force", "f", false, "Force upgrade to the latest released version")
 	RootCmd.AddCommand(upgradeCmd)
 }

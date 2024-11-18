@@ -17,8 +17,8 @@ limitations under the License.
 use std::time::SystemTime;
 use std::{any::Any, sync::Arc, time::Duration};
 
-use crate::component::dataset::acceleration::{ReadyState, RefreshMode, ZeroResultsAction};
-use crate::component::dataset::TimeFormat;
+use crate::component::dataset::acceleration::{RefreshMode, ZeroResultsAction};
+use crate::component::dataset::{ReadyState, TimeFormat};
 use crate::dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint;
 use crate::datafusion::error::SpiceExternalError;
 use crate::datafusion::SPICE_RUNTIME_SCHEMA;
