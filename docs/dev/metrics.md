@@ -77,7 +77,7 @@ The following guidelines apply the above principles, focusing on Developer Exper
 
 7. **Counter Naming Conventions**: Avoid `_total` suffix in counter names e.g., `flight_requests` instead of `flight_requests_total`.   - **Why**: Standardized counter naming aligns with Prometheus conventions, reducing confusion and supporting Developer Experience by avoiding unnecessary naming variation.
 
-8. **UpDownCounter Naming**: Use `_count` suffix and pluralization only when recording discrete instances of countable items, e.g., `db_client_active_connections_count`.
+8. **Gauge Naming**: Use `_count` suffix and pluralization only when recording discrete instances of countable items, e.g., `db_client_active_connections_count`.
    - **Why**: Clearly distinguishing counter-based metrics improves interpretability, which enhances the Developer Experience by making data analysis more intuitive.
 
 9. **Include Units in Name for Unit-Based Metrics**: Specify the unit (e.g., `_ms` for milliseconds, `_bytes` for data size) within metric names where applicable. Units should adhere to UCUM standards for consistent scientific notation where applicable. The `_bytes` suffix is chosen in favor of the UCUM-recommended `By` as it is more intuitive and readable, prioritizing the Developer Experience (DX) principle.
