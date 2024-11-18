@@ -80,7 +80,7 @@ The following guidelines apply the above principles, focusing on Developer Exper
 8. **UpDownCounter Naming**: Use `_count` suffix and pluralization only when recording discrete instances of countable items, e.g., `db_client_active_connections_count`.
    - **Why**: Clearly distinguishing counter-based metrics improves interpretability, which enhances the Developer Experience by making data analysis more intuitive.
 
-9. **Include Units in Name for Unit-Based Metrics**: Specify the unit (e.g., `_ms` for milliseconds, `_bytes` for data size) within metric names where applicable. Units should adhere to UCUM standards for consistent scientific notation.
+9. **Include Units in Name for Unit-Based Metrics**: Specify the unit (e.g., `_ms` for milliseconds, `_bytes` for data size) within metric names where applicable. Units should adhere to UCUM standards for consistent scientific notation where applicable. The `_bytes` suffix is chosen in favor of the UCUM-recommended `By` as it is more intuitive and readable, prioritizing the Developer Experience (DX) principle.
    - **Why**: Including UCUM-adherent units in names prevents confusion over metric scale, especially when integrating with external tools, and reinforces Clarity and Developer Experience by providing universally understood units.
 
 10. **Use Default Units for Common Metrics**:
