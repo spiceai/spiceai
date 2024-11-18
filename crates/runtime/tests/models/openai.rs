@@ -14,14 +14,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::sync::Arc;
-
 use app::AppBuilder;
 use async_openai::types::{
     ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestUserMessageArgs,
     CreateChatCompletionRequestArgs, EmbeddingInput,
 };
+use std::sync::Arc;
 
+use llms::chat::Chat;
+use opentelemetry_sdk::trace::TracerProvider;
 use runtime::{auth::EndpointAuth, model::try_to_chat_model, Runtime};
 use spicepod::component::{
     embeddings::{ColumnEmbeddingConfig, Embeddings},
@@ -365,7 +366,6 @@ async fn openai_test_chat_completion() -> Result<(), anyhow::Error> {
 }
 
 #[tokio::test]
-#[allow(clippy::too_many_lines)]
 async fn openai_test_chat_messages() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(None);
 
@@ -409,23 +409,32 @@ async fn openai_test_chat_messages() -> Result<(), anyhow::Error> {
         .insert("tools".to_string(), "auto".into());
 
     let model_secrets = get_params_with_secrets(&model_with_tools.params, &rt).await;
-
     let tool_model = try_to_chat_model(&model_with_tools, &model_secrets, Arc::clone(&rt)).await?;
 
-    // Test 1: Chat completion related to performing SQL query
+    verify_sql_query_chat_completion(&*tool_model, &rt, &trace_provider).await?;
+    verify_similarity_search_chat_completion(&*tool_model, &rt, &trace_provider).await?;
 
+    Ok(())
+}
+
+/// Verifies that the model correctly uses the SQL tool to process user query and return the result
+async fn verify_sql_query_chat_completion(
+    model: &dyn Chat,
+    rt: &Runtime,
+    trace_provider: &TracerProvider,
+) -> Result<(), anyhow::Error> {
     let req = CreateChatCompletionRequestArgs::default()
-                .messages(vec![ChatCompletionRequestSystemMessageArgs::default()
-                    .content("You are an assistant that responds to queries by providing only the requested data values without extra explanation.".to_string())
-                    .build()?
-                    .into(),ChatCompletionRequestUserMessageArgs::default()
-                    .content("Provide the total number of records in the taxi trips dataset. If known, return a single numeric value.".to_string())
-                    .build()?
-                    .into()])
-                .build()?;
+            .messages(vec![ChatCompletionRequestSystemMessageArgs::default()
+                .content("You are an assistant that responds to queries by providing only the requested data values without extra explanation.".to_string())
+                .build()?
+                .into(),ChatCompletionRequestUserMessageArgs::default()
+                .content("Provide the total number of records in the taxi trips dataset. If known, return a single numeric value.".to_string())
+                .build()?
+                .into()])
+            .build()?;
 
     let task_start_time = std::time::SystemTime::now();
-    let response = tool_model.chat_request(req).await?;
+    let response = model.chat_request(req).await?;
 
     insta::assert_snapshot!(
         "chat_1_response_choices",
@@ -434,7 +443,7 @@ async fn openai_test_chat_messages() -> Result<(), anyhow::Error> {
 
     let _ = trace_provider.force_flush();
 
-    let tasks = get_executed_tasks(&rt, task_start_time.into()).await?;
+    let tasks = get_executed_tasks(rt, task_start_time.into()).await?;
 
     assert!(
         tasks.iter().any(|t| { t.0 == "tool_use::list_datasets" }),
@@ -449,10 +458,13 @@ async fn openai_test_chat_messages() -> Result<(), anyhow::Error> {
         "Expected 'sql_query' task to be executed"
     );
 
-    let ai_completion_task = tasks
-        .iter()
-        .find(|t| t.0 == "ai_completion")
-        .expect("ai_completion task to be executed");
+    let ai_completion_task =
+        tasks
+            .iter()
+            .find(|t| t.0 == "ai_completion")
+            .ok_or(anyhow::anyhow!(
+                "Expected 'ai_completion' task to be executed"
+            ))?;
 
     // ai_completion input message is deterministic - based on available tools, app configuration, and the input message
     insta::assert_snapshot!(
@@ -460,8 +472,15 @@ async fn openai_test_chat_messages() -> Result<(), anyhow::Error> {
         pretty_json_str(&ai_completion_task.1)?
     );
 
-    // Test 2: Chat completion related to searching for items (similirity search)
+    Ok(())
+}
 
+/// Verifies that the model correctly uses similirity search tool to process user query and return the result
+async fn verify_similarity_search_chat_completion(
+    model: &dyn Chat,
+    rt: &Runtime,
+    trace_provider: &TracerProvider,
+) -> Result<(), anyhow::Error> {
     let req = CreateChatCompletionRequestArgs::default()
                 .messages(vec![ChatCompletionRequestSystemMessageArgs::default()
                     .content("You are an assistant that responds to queries by providing only the requested data values without extra explanation.".to_string())
@@ -473,7 +492,7 @@ async fn openai_test_chat_messages() -> Result<(), anyhow::Error> {
                 .build()?;
 
     let task_start_time = std::time::SystemTime::now();
-    let mut response = tool_model.chat_request(req).await?;
+    let mut response = model.chat_request(req).await?;
 
     // Verify model correctly found records in the dataset
     assert!(response.choices[0]
@@ -496,12 +515,14 @@ async fn openai_test_chat_messages() -> Result<(), anyhow::Error> {
     // ensure all spans are exported into task_history
     let _ = trace_provider.force_flush();
 
-    let tasks = get_executed_tasks(&rt, task_start_time.into()).await?;
+    let tasks = get_executed_tasks(rt, task_start_time.into()).await?;
 
     let document_similarity_task = tasks
         .iter()
         .find(|t| t.0 == "tool_use::document_similarity")
-        .expect("document_similarity task to be executed");
+        .ok_or(anyhow::anyhow!(
+            "Expected 'document_similarity' task to be executed"
+        ))?;
 
     // ai_completion input message is deterministic - based on available tools, app configuration, and the input message
     insta::assert_snapshot!(
