@@ -29,7 +29,7 @@ Pre-releases follow the format `vX.Y.0-rc.N` where `N` is the RC number (e.g., `
 
 Example:
 
-- RC releases for `1.0.0` (e.g., `1.0.0-rc.1`, `1.0.0-rc.2`, etc.) → `release-1.0` branch.
+- RC releases for `v1.0.0` (e.g., `v1.0.0-rc.1`, `v1.0.0-rc.2`, etc.) → `release-1.0` branch.
 - If `release-1.1` exists, changes to `release-1.0` must be cherry-picked from `trunk`.
 
 ### Patch Releases
