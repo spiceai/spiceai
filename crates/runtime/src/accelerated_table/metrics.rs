@@ -21,35 +21,27 @@ use opentelemetry::{
     metrics::{Counter, Gauge, Histogram, Meter},
 };
 
-static METER: LazyLock<Meter> = LazyLock::new(|| global::meter("datasets_acceleration"));
+static METER: LazyLock<Meter> = LazyLock::new(|| global::meter("dataset_acceleration"));
 
 pub(crate) static REFRESH_ERRORS: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
-        .u64_counter("datasets_acceleration_refresh_errors")
+        .u64_counter("dataset_acceleration_refresh_errors")
         .with_description("Number of errors refreshing the dataset.")
         .init()
 });
 
 pub(crate) static LAST_REFRESH_TIME_MS: LazyLock<Gauge<f64>> = LazyLock::new(|| {
     METER
-        .f64_gauge("datasets_acceleration_last_refresh_time_ms")
+        .f64_gauge("dataset_acceleration_last_refresh_time_ms")
         .with_description("Unix timestamp in seconds when the last refresh completed.")
         .with_unit("ms")
         .init()
 });
 
-pub(crate) static LOAD_DURATION_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| {
+pub(crate) static REFRESH_DURATION_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| {
     METER
-        .f64_histogram("datasets_acceleration_load_duration_ms")
-        .with_description("Duration in milliseconds to load a full refresh acceleration.")
-        .with_unit("ms")
-        .init()
-});
-
-pub(crate) static APPEND_DURATION_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| {
-    METER
-        .f64_histogram("datasets_acceleration_append_duration_ms")
-        .with_description("Duration in milliseconds to append to an acceleration.")
+        .f64_histogram("dataset_acceleration_refresh_duration_ms")
+        .with_description("Duration in milliseconds to load a full or appended refresh data.")
         .with_unit("ms")
         .init()
 });
