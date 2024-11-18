@@ -1497,36 +1497,6 @@ dependencies = [
 
 [[package]]
 name = "azure_core"
-version = "0.20.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "34ce3de4b65b1ee2667c81d1fc692949049502a4cf9c38118d811d6d79a7eaef"
-dependencies = [
- "async-trait",
- "base64 0.22.1",
- "bytes",
- "dyn-clone",
- "futures",
- "getrandom 0.2.15",
- "hmac",
- "http-types",
- "once_cell",
- "paste",
- "pin-project",
- "quick-xml 0.31.0",
- "rand 0.8.5",
- "reqwest 0.12.9",
- "rustc_version",
- "serde",
- "serde_json",
- "sha2",
- "time",
- "tracing",
- "url",
- "uuid 1.11.0",
-]
-
-[[package]]
-name = "azure_core"
 version = "0.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7b552ad43a45a746461ec3d3a51dfb6466b4759209414b439c165eb6a6b7729e"
@@ -1557,25 +1527,6 @@ dependencies = [
 
 [[package]]
 name = "azure_storage"
-version = "0.20.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9713002fc30956a9f4061cdbc2e912ff739c6160e138ad3b6d992b3bcedccc6d"
-dependencies = [
- "RustyXML",
- "async-lock 3.4.0",
- "async-trait",
- "azure_core 0.20.0",
- "bytes",
- "serde",
- "serde_derive",
- "time",
- "tracing",
- "url",
- "uuid 1.11.0",
-]
-
-[[package]]
-name = "azure_storage"
 version = "0.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "59f838159f4d29cb400a14d9d757578ba495ae64feb07a7516bf9e4415127126"
@@ -1583,7 +1534,7 @@ dependencies = [
  "RustyXML",
  "async-lock 3.4.0",
  "async-trait",
- "azure_core 0.21.0",
+ "azure_core",
  "bytes",
  "serde",
  "serde_derive",
@@ -1595,13 +1546,13 @@ dependencies = [
 
 [[package]]
 name = "azure_storage_blobs"
-version = "0.20.0"
+version = "0.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c5b3a31dd8f920739437b827d0c9f9a4011eb3f06f79a121764aa11af6c51ee2"
+checksum = "97e83c3636ae86d9a6a7962b2112e3b19eb3903915c50ce06ff54ff0a2e6a7e4"
 dependencies = [
  "RustyXML",
- "azure_core 0.20.0",
- "azure_storage 0.20.0",
+ "azure_core",
+ "azure_storage",
  "azure_svc_blobstorage",
  "bytes",
  "futures",
@@ -1616,11 +1567,11 @@ dependencies = [
 
 [[package]]
 name = "azure_svc_blobstorage"
-version = "0.20.0"
+version = "0.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0ef37ba6180df451042f1c277d4d0898e2447f0a5d5072e0ff11ee6ea5e7ef38"
+checksum = "4e6c6f20c5611b885ba94c7bae5e02849a267381aecb8aee577e8c35ff4064c6"
 dependencies = [
- "azure_core 0.20.0",
+ "azure_core",
  "bytes",
  "futures",
  "log",
@@ -9493,8 +9444,8 @@ dependencies = [
  "aws-sdk-sts",
  "axum",
  "axum-extra",
- "azure_core 0.21.0",
- "azure_storage 0.21.0",
+ "azure_core",
+ "azure_storage",
  "azure_storage_blobs",
  "base64 0.22.1",
  "bollard",
