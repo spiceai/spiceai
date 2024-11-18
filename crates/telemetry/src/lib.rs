@@ -81,9 +81,9 @@ pub fn track_query_duration(duration: Duration, dimensions: &[KeyValue]) {
     QUERY_DURATION.record(duration.as_secs_f64() * 1000.0, dimensions);
 }
 
-static QUERY_EXECUTION_DURATION: LazyLock<Histogram<f64>> = LazyLock::new(|| {
+static QUERY_EXECUTION_DURATION_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| {
     METER
-        .f64_histogram("query_execution_duration")
+        .f64_histogram("query_execution_duration_ms")
         .with_description(
             "The total amount of time spent only executing queries. This is 0 for cached queries.",
         )
@@ -92,7 +92,7 @@ static QUERY_EXECUTION_DURATION: LazyLock<Histogram<f64>> = LazyLock::new(|| {
 });
 
 pub fn track_query_execution_duration(duration: Duration, dimensions: &[KeyValue]) {
-    QUERY_EXECUTION_DURATION.record(duration.as_secs_f64() * 1000.0, dimensions);
+    QUERY_EXECUTION_DURATION_MS.record(duration.as_secs_f64() * 1000.0, dimensions);
 }
 
 fn create_dimensions(protocol: Arc<str>) -> [KeyValue; 1] {

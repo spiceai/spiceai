@@ -1,6 +1,7 @@
 ---
 source: crates/runtime/benches/bench.rs
 description: "Query: select\n    n_name,\n    sum(l_extendedprice * (1 - l_discount)) as revenue\nfrom\n    customer,\n    orders,\n    lineitem,\n    supplier,\n    nation,\n    region\nwhere\n        c_custkey = o_custkey\n  and l_orderkey = o_orderkey\n  and l_suppkey = s_suppkey\n  and c_nationkey = s_nationkey\n  and s_nationkey = n_nationkey\n  and n_regionkey = r_regionkey\n  and r_name = 'ASIA'\n  and o_orderdate >= date '1994-01-01'\n  and o_orderdate < date '1995-01-01'\ngroup by\n    n_name\norder by\n    revenue desc;"
+snapshot_kind: text
 ---
 +---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
 | plan_type     | plan                                                                                                                                                                                                          |
@@ -32,8 +33,8 @@ description: "Query: select\n    n_name,\n    sum(l_extendedprice * (1 - l_disco
 |               |                 TableScan: nation projection=[n_nationkey, n_name, n_regionkey]                                                                                                                               |
 |               |           Projection: region.r_regionkey                                                                                                                                                                      |
 |               |             BytesProcessedNode                                                                                                                                                                                |
-|               |               Filter: region.r_name = Utf8("ASIA")                                                                                                                                                            |
-|               |                 TableScan: region projection=[r_regionkey, r_name], partial_filters=[region.r_name = Utf8("ASIA")]                                                                                            |
+|               |               Filter: region.r_name = Utf8View("ASIA")                                                                                                                                                        |
+|               |                 TableScan: region projection=[r_regionkey, r_name], partial_filters=[region.r_name = Utf8View("ASIA")]                                                                                        |
 | physical_plan | SortPreservingMergeExec: [revenue@1 DESC]                                                                                                                                                                     |
 |               |   SortExec: expr=[revenue@1 DESC], preserve_partitioning=[true]                                                                                                                                               |
 |               |     ProjectionExec: expr=[n_name@0 as n_name, sum(lineitem.l_extendedprice * Int64(1) - lineitem.l_discount)@1 as revenue]                                                                                    |

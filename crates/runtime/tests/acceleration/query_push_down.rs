@@ -229,6 +229,16 @@ CREATE TABLE test (
     ];
     assert_batches_eq!(expected_plan, &plan_results);
 
+    let _ = rt
+        .datafusion()
+        .ctx
+        .sql("SELECT COUNT(1) FROM non_federated_abc")
+        .await
+        .expect("sql working")
+        .collect()
+        .await
+        .expect("collect working");
+
     let plan_results = rt
         .datafusion()
         .ctx

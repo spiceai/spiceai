@@ -21,6 +21,7 @@ use arrow::{
 };
 use arrow_schema::SchemaRef;
 use async_stream::stream;
+use datafusion::logical_expr::dml::InsertOp;
 use datafusion_table_providers::util::retriable_error::{
     check_and_mark_retriable_error, is_retriable_error,
 };
@@ -210,7 +211,11 @@ impl RefreshTask {
     ) -> Result<(), RetryError<super::Error>> {
         let dataset_name = self.dataset_name.clone();
 
-        let overwrite = data_update.update_type == UpdateType::Overwrite;
+        let overwrite = if data_update.update_type == UpdateType::Overwrite {
+            InsertOp::Overwrite
+        } else {
+            InsertOp::Append
+        };
 
         let schema = Arc::clone(&data_update.schema);
 
@@ -696,7 +701,7 @@ impl RefreshTask {
                     labels.push(KeyValue::new("sql", sql.to_string()));
                 };
 
-                metrics::LAST_REFRESH_TIME.record(now.as_secs_f64(), &labels);
+                metrics::LAST_REFRESH_TIME_MS.record(now.as_secs_f64() * 1000.0, &labels);
             }
         }
     }

@@ -1,6 +1,7 @@
 ---
 source: crates/runtime/benches/bench.rs
 description: "Query: select\n    s_name,\n    count(*) as numwait\nfrom\n    supplier,\n    lineitem l1,\n    orders,\n    nation\nwhere\n        s_suppkey = l1.l_suppkey\n  and o_orderkey = l1.l_orderkey\n  and o_orderstatus = 'F'\n  and l1.l_receiptdate > l1.l_commitdate\n  and exists (\n        select\n            *\n        from\n            lineitem l2\n        where\n                l2.l_orderkey = l1.l_orderkey\n          and l2.l_suppkey <> l1.l_suppkey\n    )\n  and not exists (\n        select\n            *\n        from\n            lineitem l3\n        where\n                l3.l_orderkey = l1.l_orderkey\n          and l3.l_suppkey <> l1.l_suppkey\n          and l3.l_receiptdate > l3.l_commitdate\n    )\n  and s_nationkey = n_nationkey\n  and n_name = 'SAUDI ARABIA'\ngroup by\n    s_name\norder by\n    numwait desc,\n    s_name;"
+snapshot_kind: text
 ---
 +---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
 | plan_type     | plan                                                                                                                                                                                          |
@@ -26,12 +27,12 @@ description: "Query: select\n    s_name,\n    count(*) as numwait\nfrom\n    sup
 |               |                                 TableScan: lineitem projection=[l_orderkey, l_suppkey, l_commitdate, l_receiptdate], partial_filters=[lineitem.l_receiptdate > lineitem.l_commitdate]         |
 |               |                     Projection: orders.o_orderkey                                                                                                                                             |
 |               |                       BytesProcessedNode                                                                                                                                                      |
-|               |                         Filter: orders.o_orderstatus = Utf8("F")                                                                                                                              |
-|               |                           TableScan: orders projection=[o_orderkey, o_orderstatus], partial_filters=[orders.o_orderstatus = Utf8("F")]                                                        |
+|               |                         Filter: orders.o_orderstatus = Utf8View("F")                                                                                                                          |
+|               |                           TableScan: orders projection=[o_orderkey, o_orderstatus], partial_filters=[orders.o_orderstatus = Utf8View("F")]                                                    |
 |               |                 Projection: nation.n_nationkey                                                                                                                                                |
 |               |                   BytesProcessedNode                                                                                                                                                          |
-|               |                     Filter: nation.n_name = Utf8("SAUDI ARABIA")                                                                                                                              |
-|               |                       TableScan: nation projection=[n_nationkey, n_name], partial_filters=[nation.n_name = Utf8("SAUDI ARABIA")]                                                              |
+|               |                     Filter: nation.n_name = Utf8View("SAUDI ARABIA")                                                                                                                          |
+|               |                       TableScan: nation projection=[n_nationkey, n_name], partial_filters=[nation.n_name = Utf8View("SAUDI ARABIA")]                                                          |
 |               |             SubqueryAlias: __correlated_sq_1                                                                                                                                                  |
 |               |               SubqueryAlias: l2                                                                                                                                                               |
 |               |                 BytesProcessedNode                                                                                                                                                            |
@@ -42,8 +43,8 @@ description: "Query: select\n    s_name,\n    count(*) as numwait\nfrom\n    sup
 |               |                 BytesProcessedNode                                                                                                                                                            |
 |               |                   Filter: lineitem.l_receiptdate > lineitem.l_commitdate                                                                                                                      |
 |               |                     TableScan: lineitem projection=[l_orderkey, l_suppkey, l_commitdate, l_receiptdate], partial_filters=[lineitem.l_receiptdate > lineitem.l_commitdate]                     |
-| physical_plan | SortPreservingMergeExec: [numwait@1 DESC,s_name@0 ASC NULLS LAST]                                                                                                                             |
-|               |   SortExec: expr=[numwait@1 DESC,s_name@0 ASC NULLS LAST], preserve_partitioning=[true]                                                                                                       |
+| physical_plan | SortPreservingMergeExec: [numwait@1 DESC, s_name@0 ASC NULLS LAST]                                                                                                                            |
+|               |   SortExec: expr=[numwait@1 DESC, s_name@0 ASC NULLS LAST], preserve_partitioning=[true]                                                                                                      |
 |               |     ProjectionExec: expr=[s_name@0 as s_name, count(*)@1 as numwait]                                                                                                                          |
 |               |       AggregateExec: mode=FinalPartitioned, gby=[s_name@0 as s_name], aggr=[count(*)]                                                                                                         |
 |               |         CoalesceBatchesExec: target_batch_size=8192                                                                                                                                           |

@@ -12,7 +12,7 @@ use datafusion::{
     datasource::{TableProvider, TableType},
     error::{DataFusionError, Result as DataFusionResult},
     execution::{SendableRecordBatchStream, TaskContext},
-    logical_expr::{Expr, LogicalPlan},
+    logical_expr::{dml::InsertOp, Expr, LogicalPlan},
     physical_expr::EquivalenceProperties,
     physical_plan::{
         stream::RecordBatchStreamAdapter, DisplayAs, DisplayFormatType, ExecutionMode,
@@ -57,10 +57,9 @@ impl DeletionExec {
     }
 }
 
-#[allow(clippy::missing_fields_in_debug)]
 impl std::fmt::Debug for DeletionExec {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DeleteExec").finish()
+        f.debug_struct("DeleteExec").finish_non_exhaustive()
     }
 }
 
@@ -131,6 +130,7 @@ impl ExecutionPlan for DeletionExec {
     }
 }
 
+#[derive(Debug)]
 pub struct DeletionTableProviderAdapter {
     source: Arc<dyn DeletionTableProvider>,
 }
@@ -190,7 +190,7 @@ impl TableProvider for DeletionTableProviderAdapter {
         &self,
         state: &dyn Session,
         input: Arc<dyn ExecutionPlan>,
-        overwrite: bool,
+        overwrite: InsertOp,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         self.source.insert_into(state, input, overwrite).await
     }

@@ -27,6 +27,7 @@ use datafusion::{logical_expr::TableProviderFilterPushDown, prelude::Expr};
 use std::sync::Arc;
 
 // https://docs.github.com/en/graphql/reference/objects#repository
+#[derive(Debug)]
 pub struct IssuesTableArgs {
     pub owner: String,
     pub repo: String,

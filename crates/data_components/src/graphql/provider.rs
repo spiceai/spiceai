@@ -106,6 +106,17 @@ pub struct GraphQLTableProvider {
     context: Option<Arc<dyn GraphQLContext>>,
 }
 
+impl std::fmt::Debug for GraphQLTableProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GraphQLTableProvider")
+            .field("base_query", &self.base_query)
+            .field("gql_schema", &self.gql_schema)
+            .field("table_schema", &self.table_schema)
+            .field("context", &self.context)
+            .finish_non_exhaustive()
+    }
+}
+
 #[async_trait]
 impl TableProvider for GraphQLTableProvider {
     fn as_any(&self) -> &dyn Any {

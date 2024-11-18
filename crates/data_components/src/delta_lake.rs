@@ -88,6 +88,7 @@ impl Read for DeltaTableFactory {
     }
 }
 
+#[derive(Debug)]
 pub struct DeltaTable {
     table: Table,
     engine: Arc<DefaultEngine<TokioBackgroundExecutor>>,

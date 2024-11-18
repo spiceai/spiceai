@@ -127,6 +127,7 @@ impl Read for FlightSQLFactory {
     }
 }
 
+#[derive(Debug)]
 pub struct FlightSQLTable {
     name: &'static str,
     join_push_down_context: String,

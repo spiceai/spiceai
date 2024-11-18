@@ -1,6 +1,7 @@
 ---
 source: crates/runtime/benches/bench.rs
 description: "Query: select\n    c_name,\n    c_custkey,\n    o_orderkey,\n    o_orderdate,\n    o_totalprice,\n    sum(l_quantity)\nfrom\n    customer,\n    orders,\n    lineitem\nwhere\n        o_orderkey in (\n        select\n            l_orderkey\n        from\n            lineitem\n        group by\n            l_orderkey having\n                sum(l_quantity) > 300\n    )\n  and c_custkey = o_custkey\n  and o_orderkey = l_orderkey\ngroup by\n    c_name,\n    c_custkey,\n    o_orderkey,\n    o_orderdate,\n    o_totalprice\norder by\n    o_totalprice desc,\n    o_orderdate;"
+snapshot_kind: text
 ---
 +---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
 | plan_type     | plan                                                                                                                                                                                                                    |
@@ -24,8 +25,8 @@ description: "Query: select\n    c_name,\n    c_custkey,\n    o_orderkey,\n    o
 |               |             Aggregate: groupBy=[[lineitem.l_orderkey]], aggr=[[sum(lineitem.l_quantity)]]                                                                                                                               |
 |               |               BytesProcessedNode                                                                                                                                                                                        |
 |               |                 TableScan: lineitem projection=[l_orderkey, l_quantity]                                                                                                                                                 |
-| physical_plan | SortPreservingMergeExec: [o_totalprice@4 DESC,o_orderdate@3 ASC NULLS LAST]                                                                                                                                             |
-|               |   SortExec: expr=[o_totalprice@4 DESC,o_orderdate@3 ASC NULLS LAST], preserve_partitioning=[true]                                                                                                                       |
+| physical_plan | SortPreservingMergeExec: [o_totalprice@4 DESC, o_orderdate@3 ASC NULLS LAST]                                                                                                                                            |
+|               |   SortExec: expr=[o_totalprice@4 DESC, o_orderdate@3 ASC NULLS LAST], preserve_partitioning=[true]                                                                                                                      |
 |               |     AggregateExec: mode=FinalPartitioned, gby=[c_name@0 as c_name, c_custkey@1 as c_custkey, o_orderkey@2 as o_orderkey, o_orderdate@3 as o_orderdate, o_totalprice@4 as o_totalprice], aggr=[sum(lineitem.l_quantity)] |
 |               |       CoalesceBatchesExec: target_batch_size=8192                                                                                                                                                                       |
 |               |         RepartitionExec: partitioning=Hash([c_name@0, c_custkey@1, o_orderkey@2, o_orderdate@3, o_totalprice@4], 4), input_partitions=4                                                                                 |

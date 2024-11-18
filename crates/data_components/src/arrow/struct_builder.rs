@@ -32,14 +32,13 @@ pub struct StructBuilder {
     null_buffer_builder: NullBufferBuilder,
 }
 
-#[allow(clippy::missing_fields_in_debug)]
 impl std::fmt::Debug for StructBuilder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StructBuilder")
             .field("fields", &self.fields)
             .field("bitmap_builder", &self.null_buffer_builder)
             .field("len", &self.len())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 

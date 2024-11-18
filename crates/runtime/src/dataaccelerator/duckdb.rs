@@ -318,7 +318,7 @@ mod tests {
     use datafusion::{
         common::{Constraints, TableReference, ToDFSchema},
         execution::context::SessionContext,
-        logical_expr::{cast, col, lit, CreateExternalTable},
+        logical_expr::{cast, col, dml::InsertOp, lit, CreateExternalTable},
         physical_plan::collect,
         scalar::ScalarValue,
     };
@@ -364,6 +364,7 @@ mod tests {
             options: HashMap::new(),
             constraints: Constraints::empty(),
             column_defaults: HashMap::default(),
+            temporary: false,
         };
         let duckdb_accelerator = DuckDBAccelerator::new();
         let ctx = SessionContext::new();
@@ -401,7 +402,11 @@ mod tests {
         let exec = Arc::new(MockExec::new(vec![Ok(data)], schema));
 
         let insertion = table
-            .insert_into(&ctx.state(), Arc::<MockExec>::clone(&exec), false)
+            .insert_into(
+                &ctx.state(),
+                Arc::<MockExec>::clone(&exec),
+                InsertOp::Append,
+            )
             .await
             .expect("insertion should be successful");
 
@@ -458,7 +463,11 @@ mod tests {
         assert_eq!(actual, &expected);
 
         let insertion = table
-            .insert_into(&ctx.state(), Arc::<MockExec>::clone(&exec), false)
+            .insert_into(
+                &ctx.state(),
+                Arc::<MockExec>::clone(&exec),
+                InsertOp::Append,
+            )
             .await
             .expect("insertion should be successful");
 
@@ -492,7 +501,7 @@ mod tests {
         assert_eq!(actual, &expected);
 
         let insertion = table
-            .insert_into(&ctx.state(), exec, false)
+            .insert_into(&ctx.state(), exec, InsertOp::Append)
             .await
             .expect("insertion should be successful");
 

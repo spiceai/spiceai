@@ -21,7 +21,7 @@ use crate::{
         builtin::{
             sample::{
                 distinct::DistinctColumnsParams, random::RandomSampleParams, tool::SampleDataTool,
-                SampleTableParams,
+                SampleTableMethod, SampleTableParams,
             },
             table_schema::{TableSchemaTool, TableSchemaToolParams},
         },
@@ -46,6 +46,8 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::Span;
 use tracing_futures::Instrument;
+
+use super::accept_header_types;
 
 fn clean_model_based_sql(input: &str) -> String {
     let no_dashes = match input.strip_prefix("--") {
@@ -82,11 +84,12 @@ async fn sample_messages(
                 limit: 3,
             }),
         ] {
+            let method = SampleTableMethod::from(&params);
             let msgs = create_tool_use_messages(
                 Arc::clone(&rt),
-                &SampleDataTool::new((&params).into()),
-                "id",
-                params,
+                &SampleDataTool::new(method.clone()),
+                format!("sample-{method:?}").as_str(),
+                &params,
             )
             .instrument(Span::current())
             .await?;
@@ -119,6 +122,13 @@ fn default_model() -> String {
     "nql".to_string()
 }
 
+/// Checks if the request is asking to only generate SQL.
+fn return_sql_only(accept: &Option<TypedHeader<Accept>>) -> bool {
+    accept
+        .as_ref()
+        .is_some_and(|a| accept_header_types(a).contains(&"application/sql".to_string()))
+}
+
 pub(crate) async fn post(
     Extension(df): Extension<Arc<DataFusion>>,
     Extension(rt): Extension<Arc<Runtime>>,
@@ -139,7 +149,7 @@ pub(crate) async fn post(
         Arc::clone(&rt),
         &TableSchemaTool::default(),
         "schemas-nsql",
-        TableSchemaToolParams::new(tables.iter().map(ToString::to_string).collect::<Vec<_>>()),
+        &TableSchemaToolParams::new(tables.iter().map(ToString::to_string).collect::<Vec<_>>()),
     )
     .instrument(span.clone())
     .await
@@ -200,6 +210,12 @@ pub(crate) async fn post(
     match sql_gen.parse_response(resp) {
         Ok(Some(model_sql_query)) => {
             let cleaned_query = clean_model_based_sql(&model_sql_query);
+
+            if return_sql_only(&accept) {
+                tracing::trace!("Not running query, requested SQL only:\n{cleaned_query}");
+                return (StatusCode::OK, cleaned_query).into_response();
+            }
+
             tracing::trace!("Running query:\n{cleaned_query}");
             sql_to_http_response(
                 Arc::clone(&df),

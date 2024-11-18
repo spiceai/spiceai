@@ -241,5 +241,3 @@ if [ "$bench" = "tpcds" ]; then
     done
   fi
 fi
-
-spiced

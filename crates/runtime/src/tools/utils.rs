@@ -40,10 +40,10 @@ pub async fn create_tool_use_messages(
     rt: Arc<Runtime>,
     tool: &dyn SpiceModelTool,
     id: &str,
-    params: impl serde::Serialize,
+    params: &impl serde::Serialize,
 ) -> Result<Vec<ChatCompletionRequestMessage>, OpenAIError> {
     let arg =
-        serde_json::to_string(&params).map_err(|e| OpenAIError::InvalidArgument(e.to_string()))?;
+        serde_json::to_string(params).map_err(|e| OpenAIError::InvalidArgument(e.to_string()))?;
 
     let resp = tool
         .call(arg.as_str(), rt)

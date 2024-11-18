@@ -23,6 +23,14 @@ use cache::QueryResultsCacheProvider;
 use datafusion::{
     catalog_common::{CatalogProvider, MemoryCatalogProvider},
     execution::SessionStateBuilder,
+    optimizer::{
+        analyzer::{
+            count_wildcard_rule::CountWildcardRule, expand_wildcard_rule::ExpandWildcardRule,
+            inline_table_scan::InlineTableScan, resolve_grouping_function::ResolveGroupingFunction,
+            type_coercion::TypeCoercion,
+        },
+        AnalyzerRule,
+    },
     prelude::{SessionConfig, SessionContext},
 };
 use datafusion_federation::FederationAnalyzerRule;
@@ -58,6 +66,14 @@ impl DataFusionBuilder {
             .execution
             .listing_table_ignore_subdirectory = false;
 
+        // There are some unidentified bugs in DataFusion that cause schema checks to fail for aggregate functions.
+        // Spice is affected by this - skip the check until all bugs are fixed.
+        // Tracking issue: https://github.com/apache/datafusion/issues/12733
+        df_config
+            .options_mut()
+            .execution
+            .skip_physical_aggregate_schema_check = true;
+
         Self {
             config: df_config,
             status,
@@ -83,6 +99,7 @@ impl DataFusionBuilder {
             .with_default_features()
             .with_query_planner(Arc::new(SpiceQueryPlanner::new()))
             .with_runtime_env(default_runtime_env())
+            .with_analyzer_rules(get_analyzer_rules())
             .build();
 
         if let Err(e) = datafusion_functions_json::register_all(&mut state) {
@@ -90,7 +107,6 @@ impl DataFusionBuilder {
         };
 
         let ctx = SessionContext::new_with_state(state);
-        ctx.add_analyzer_rule(Arc::new(FederationAnalyzerRule::new()));
         ctx.add_optimizer_rule(Arc::new(BytesProcessedOptimizerRule::new()));
         ctx.register_udf(embeddings::cosine_distance::CosineDistance::new().into());
         ctx.register_udf(crate::datafusion::udf::Greatest::new().into());
@@ -130,6 +146,54 @@ impl DataFusionBuilder {
             cache_provider: RwLock::new(self.cache_provider),
             pending_sink_tables: TokioRwLock::new(Vec::new()),
             accelerated_tables: TokioRwLock::new(HashSet::new()),
+        }
+    }
+}
+
+/// Spice customizes the order of the analyzer rules, since some of them are only relevant when `DataFusion` is executing the query,
+/// as opposed to when underlying federated query engines will execute the query.
+///
+/// This list should be kept in sync with the default rules in `Analyzer::new()`, but with the federation analyzer rule added.
+fn get_analyzer_rules() -> Vec<Arc<dyn AnalyzerRule + Send + Sync>> {
+    vec![
+        Arc::new(InlineTableScan::new()),
+        Arc::new(ExpandWildcardRule::new()),
+        Arc::new(FederationAnalyzerRule::new()),
+        // The rest of these rules are run after the federation analyzer since they only affect internal DataFusion execution.
+        Arc::new(ResolveGroupingFunction::new()),
+        Arc::new(TypeCoercion::new()),
+        Arc::new(CountWildcardRule::new()),
+    ]
+}
+
+#[cfg(test)]
+mod tests {
+    use datafusion::optimizer::Analyzer;
+
+    /// Verifies that the default analyzer rules are in the expected order.
+    ///
+    /// If this test fails, `DataFusion` has modified the default analyzer rules and `get_analyzer_rules()` should be updated.
+    #[test]
+    fn test_verify_default_analyzer_rules() {
+        let default_rules = Analyzer::new().rules;
+        assert_eq!(
+            default_rules.len(),
+            5,
+            "Default analyzer rules have changed"
+        );
+        let expected_rule_names = vec![
+            "inline_table_scan",
+            "expand_wildcard_rule",
+            "resolve_grouping_function",
+            "type_coercion",
+            "count_wildcard_rule",
+        ];
+        for (rule, expected_name) in default_rules.iter().zip(expected_rule_names.into_iter()) {
+            assert_eq!(
+                expected_name,
+                rule.name(),
+                "Default analyzer rule order has changed"
+            );
         }
     }
 }

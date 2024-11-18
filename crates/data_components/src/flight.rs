@@ -161,6 +161,18 @@ pub struct FlightTable {
     table_reference: TableReference,
 }
 
+impl std::fmt::Debug for FlightTable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FlightTable")
+            .field("name", &self.name)
+            .field("join_push_down_context", &self.join_push_down_context)
+            .field("client", &self.client)
+            .field("schema", &self.schema)
+            .field("table_reference", &self.table_reference)
+            .finish_non_exhaustive()
+    }
+}
+
 #[allow(clippy::needless_pass_by_value)]
 impl FlightTable {
     pub async fn create(

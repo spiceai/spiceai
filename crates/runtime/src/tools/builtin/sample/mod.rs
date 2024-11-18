@@ -76,6 +76,21 @@ impl SampleTableMethod {
             }
         }
     }
+
+    /// For the given method, attempt to parse the arguments into the appropriate [`SampleTableParams`].
+    pub fn parse_args(&self, args: &str) -> Result<SampleTableParams, serde_json::Error> {
+        match self {
+            SampleTableMethod::DistinctColumns => Ok(SampleTableParams::DistinctColumns(
+                serde_json::from_str(args)?,
+            )),
+            SampleTableMethod::RandomSample => {
+                Ok(SampleTableParams::RandomSample(serde_json::from_str(args)?))
+            }
+            SampleTableMethod::TopNSample => {
+                Ok(SampleTableParams::TopNSample(serde_json::from_str(args)?))
+            }
+        }
+    }
 }
 
 /// The unique parameters for sampling data for a given [`SampleTableMethod`] tool.

@@ -7,7 +7,7 @@ use datafusion::{
     common::Constraints,
     datasource::{TableProvider, TableType},
     error::Result as DataFusionResult,
-    logical_expr::LogicalPlan,
+    logical_expr::{dml::InsertOp, LogicalPlan},
     physical_plan::ExecutionPlan,
     prelude::Expr,
 };
@@ -17,7 +17,7 @@ use datafusion_federation::{
 
 use crate::delete::DeletionTableProvider;
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct PolyTableProvider {
     write: Arc<dyn TableProvider>,
     delete: Arc<dyn DeletionTableProvider>,
@@ -112,7 +112,7 @@ impl TableProvider for PolyTableProvider {
         &self,
         state: &dyn Session,
         input: Arc<dyn ExecutionPlan>,
-        overwrite: bool,
+        overwrite: InsertOp,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         self.write.insert_into(state, input, overwrite).await
     }

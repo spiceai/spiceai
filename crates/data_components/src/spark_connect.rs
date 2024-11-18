@@ -146,6 +146,7 @@ async fn get_table_provider(
     }))
 }
 
+#[derive(Debug)]
 struct SparkConnectTableProvider {
     table_reference: TableReference,
     dataframe: DataFrame,

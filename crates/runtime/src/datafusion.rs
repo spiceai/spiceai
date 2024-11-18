@@ -45,6 +45,7 @@ use datafusion::catalog::SchemaProvider;
 use datafusion::datasource::{TableProvider, ViewTable};
 use datafusion::error::DataFusionError;
 use datafusion::execution::context::SessionContext;
+use datafusion::logical_expr::dml::InsertOp;
 use datafusion::physical_plan::collect;
 use datafusion::sql::parser::DFParser;
 use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
@@ -535,7 +536,11 @@ impl DataFusion {
         )
         .context(SchemaMismatchSnafu)?;
 
-        let overwrite = data_update.update_type == UpdateType::Overwrite;
+        let overwrite = if data_update.update_type == UpdateType::Overwrite {
+            InsertOp::Overwrite
+        } else {
+            InsertOp::Append
+        };
 
         let streaming_update = StreamingDataUpdate::try_from(data_update)
             .context(UnableToCreateStreamingUpdateSnafu)?;

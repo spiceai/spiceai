@@ -27,7 +27,7 @@ use tonic::{Request, Response, Status};
 use crate::{
     datafusion::query::Protocol,
     flight::{metrics, to_tonic_err, util::attach_cache_metadata, Service},
-    timing::{TimeMeasurement, TimedStream},
+    timing::TimedStream,
 };
 
 /// Create a prepared statement from given SQL statement.
@@ -58,8 +58,9 @@ pub(crate) async fn get_flight_info(
     handle: sql::CommandPreparedStatementQuery,
     request: Request<FlightDescriptor>,
 ) -> Result<Response<FlightInfo>, Status> {
-    tracing::trace!("get_flight_info: {handle:?}");
+    let _start = metrics::track_flight_request("get_flight_info", Some("prepared_statement_query"));
 
+    tracing::trace!("get_flight_info: {handle:?}");
     let sql = match std::str::from_utf8(&handle.prepared_statement_handle) {
         Ok(sql) => sql,
         Err(e) => {
@@ -95,14 +96,11 @@ pub(crate) async fn do_get(
     flight_svc: &Service,
     query: sql::CommandPreparedStatementQuery,
 ) -> Result<Response<<Service as FlightService>::DoGetStream>, Status> {
+    let start = metrics::track_flight_request("do_get", Some("prepared_statement_query"));
     let datafusion = Arc::clone(&flight_svc.datafusion);
     tracing::trace!("do_get: {query:?}");
     match std::str::from_utf8(&query.prepared_statement_handle) {
         Ok(sql) => {
-            let start = TimeMeasurement::new(
-                &metrics::flightsql::DO_GET_PREPARED_STATEMENT_QUERY_DURATION_MS,
-                vec![],
-            );
             let (output, from_cache) = Box::pin(Service::sql_to_flight_stream(
                 datafusion,
                 sql,

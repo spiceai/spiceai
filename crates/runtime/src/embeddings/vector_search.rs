@@ -17,8 +17,10 @@ limitations under the License.
 use std::{collections::HashMap, fmt::Display, sync::Arc};
 
 use app::App;
-use arrow::array::{ArrayRef, RecordBatch, StringArray};
+use arrow::array::{RecordBatch, StringArray, StringViewArray};
 use arrow::error::ArrowError;
+use arrow::util::pretty::pretty_format_batches;
+use arrow_schema::{Schema, SchemaRef};
 use async_openai::types::EmbeddingInput;
 use datafusion::common::utils::quote_identifier;
 use datafusion::sql::sqlparser::ast::Expr;
@@ -232,12 +234,174 @@ pub type ModelKey = String;
 
 #[derive(Debug, Default)]
 pub struct VectorSearchTableResult {
-    pub primary_key: Vec<RecordBatch>,
+    pub data: Vec<RecordBatch>,
 
+    pub primary_keys: Vec<String>,
     // original data, not the embedding vector.
-    pub embedded_column: Vec<RecordBatch>,
-    pub additional_columns: Vec<RecordBatch>,
-    pub distances: Vec<ArrayRef>,
+    pub embedding_column: String,
+    pub additional_columns: Vec<String>,
+}
+
+impl VectorSearchTableResult {
+    /// Return the underlying [`RecordBatch`]s as a pretty formatted table.
+    pub fn to_pretty(&self) -> Result<impl Display, ArrowError> {
+        pretty_format_batches(&self.data)
+    }
+
+    /// Return the primary keys of the [`VectorSearch::individual_search`] as an array of JSON objects.
+    ///
+    /// Each element is a mapping of the primary key column to its value.
+    pub fn primary_keys_json(&self) -> Result<Vec<HashMap<String, serde_json::Value>>> {
+        let primary_key_projection = get_projection(&self.schema(), &self.primary_keys);
+        let primary_keys_records = self
+            .data
+            .iter()
+            .map(|s| s.project(&primary_key_projection))
+            .collect::<std::result::Result<Vec<_>, ArrowError>>()
+            .context(RecordProcessingSnafu)?;
+
+        if primary_keys_records
+            .first()
+            .is_some_and(|p| p.num_rows() > 0)
+        {
+            let pk_str = write_to_json_string(&primary_keys_records).context(FormattingSnafu)?;
+            serde_json::from_str(&pk_str)
+                .boxed()
+                .context(FormattingSnafu)
+        } else {
+            Ok(vec![])
+        }
+    }
+
+    /// Return the additional columns of the [`VectorSearch::individual_search`] as an array of JSON objects.
+    ///
+    /// Each element is a mapping of the additional column name to its value.
+    pub fn addition_columns_json(&self) -> Result<Vec<HashMap<String, serde_json::Value>>> {
+        let additional_columns_projection =
+            get_projection(&self.schema(), &self.additional_columns);
+        let additional_columns_records = self
+            .data
+            .iter()
+            .map(|s| s.project(&additional_columns_projection))
+            .collect::<std::result::Result<Vec<_>, ArrowError>>()
+            .context(RecordProcessingSnafu)?;
+
+        if additional_columns_records
+            .first()
+            .is_some_and(|p| p.num_rows() > 0)
+        {
+            let additional_str =
+                write_to_json_string(&additional_columns_records).context(FormattingSnafu)?;
+            serde_json::from_str(additional_str.as_str())
+                .boxed()
+                .context(FormattingSnafu)
+        } else {
+            Ok(vec![])
+        }
+    }
+
+    /// Return the distance of each search result.
+    pub fn distance_values(&self) -> Result<Vec<f64>> {
+        let Some(distances) = self
+            .data
+            .iter()
+            .map(|s| s.column_by_name(VECTOR_DISTANCE_COLUMN_NAME).cloned())
+            .collect::<Option<Vec<_>>>()
+        else {
+            return Err(Error::EmbeddingError {
+                source: "No distances returned".into(),
+            });
+        };
+
+        let distances: Option<Vec<_>> = distances
+            .iter()
+            .flat_map(|v| {
+                if let Some(col) = v.as_any().downcast_ref::<arrow::array::Float64Array>() {
+                    col.iter().collect::<Vec<Option<f64>>>()
+                } else {
+                    vec![]
+                }
+            })
+            .collect();
+        let Some(distances) = distances else {
+            return Err(Error::EmbeddingError {
+                source: "Empty embedding distances returned unexpectedly".into(),
+            });
+        };
+
+        Ok(distances)
+    }
+
+    /// Return the input column that was embedded.
+    pub fn embedding_columns_list(&self) -> Result<Vec<String>> {
+        let embedding_projection = get_projection(&self.schema(), &[self.embedding_column.clone()]);
+        let embedding_records = self
+            .data
+            .iter()
+            .map(|s| s.project(&embedding_projection))
+            .collect::<std::result::Result<Vec<_>, ArrowError>>()
+            .context(RecordProcessingSnafu)?;
+
+        let result = embedding_records
+            .iter()
+            .flat_map(|v| {
+                let embedded_column = v.column(0);
+                if let Some(col) = embedded_column.as_any().downcast_ref::<StringArray>() {
+                    col.iter()
+                        .map(|v| v.unwrap_or_default().to_string())
+                        .collect::<Vec<String>>()
+                } else if let Some(col) = embedded_column.as_any().downcast_ref::<StringViewArray>()
+                {
+                    col.iter()
+                        .map(|v| v.unwrap_or_default().to_string())
+                        .collect::<Vec<String>>()
+                } else {
+                    vec![]
+                }
+            })
+            .collect();
+
+        Ok(result)
+    }
+
+    /// Retuns the Schema of the full underlying data.
+    pub fn schema(&self) -> SchemaRef {
+        self.data
+            .first()
+            .map_or(Schema::empty().into(), RecordBatch::schema)
+    }
+
+    pub fn to_matches(&self, table: &TableReference) -> Result<Vec<Match>> {
+        // Early exit on no data.
+        if !self.data.first().is_some_and(|d| d.num_rows() > 0) {
+            return Ok(vec![]);
+        }
+
+        let primary_keys_json = self.primary_keys_json()?;
+        let additional_columns_json = self.addition_columns_json()?;
+        let values = self.embedding_columns_list()?;
+        let distances = self.distance_values()?;
+
+        values
+            .iter()
+            .enumerate()
+            .map(|(i, value)| {
+                let Some(distance) = distances.get(i) else {
+                    return Err(Error::EmbeddingError {
+                        source: format!("No distance returned for {i}th result").into(),
+                    });
+                };
+
+                Ok(Match {
+                    value: value.clone(),
+                    score: 1.0 - *distance,
+                    dataset: table.to_string(),
+                    primary_key: primary_keys_json.get(i).cloned().unwrap_or_default(),
+                    metadata: additional_columns_json.get(i).cloned().unwrap_or_default(),
+                })
+            })
+            .collect::<Result<Vec<Match>>>()
+    }
 }
 
 pub type VectorSearchResult = HashMap<TableReference, VectorSearchTableResult>;
@@ -256,89 +420,10 @@ pub struct Match {
     metadata: HashMap<String, serde_json::Value>,
 }
 
-pub fn table_to_matches(
-    tbl: &TableReference,
-    result: &VectorSearchTableResult,
-) -> Result<Vec<Match>> {
-    let pks: Vec<HashMap<String, serde_json::Value>> =
-        if result.primary_key.first().is_some_and(|p| p.num_rows() > 0) {
-            let pk_str = write_to_json_string(&result.primary_key).context(FormattingSnafu)?;
-            serde_json::from_str(&pk_str)
-                .boxed()
-                .context(FormattingSnafu)?
-        } else {
-            vec![]
-        };
-
-    let add_cols: Vec<HashMap<String, serde_json::Value>> = if result
-        .additional_columns
-        .first()
-        .is_some_and(|p| p.num_rows() > 0)
-    {
-        let col_str = write_to_json_string(&result.additional_columns).context(FormattingSnafu)?;
-        serde_json::from_str(&col_str)
-            .boxed()
-            .context(FormattingSnafu)?
-    } else {
-        vec![]
-    };
-
-    let values: Vec<String> = result
-        .embedded_column
-        .iter()
-        .flat_map(|v| {
-            if let Some(col) = v.column(0).as_any().downcast_ref::<StringArray>() {
-                col.iter()
-                    .map(|v| v.unwrap_or_default().to_string())
-                    .collect::<Vec<String>>()
-            } else {
-                vec![]
-            }
-        })
-        .collect();
-
-    let distances: Option<Vec<_>> = result
-        .distances
-        .iter()
-        .flat_map(|v| {
-            if let Some(col) = v.as_any().downcast_ref::<arrow::array::Float64Array>() {
-                col.iter().collect::<Vec<Option<f64>>>()
-            } else {
-                vec![]
-            }
-        })
-        .collect();
-    let Some(distances) = distances else {
-        return Err(Error::EmbeddingError {
-            source: "Empty embedding distances returned unexpectedly".into(),
-        });
-    };
-
-    values
-        .iter()
-        .enumerate()
-        .map(|(i, value)| {
-            let Some(distance) = distances.get(i) else {
-                return Err(Error::EmbeddingError {
-                    source: format!("No distance returned for {i}th result").into(),
-                });
-            };
-
-            Ok(Match {
-                value: value.clone(),
-                score: 1.0 - *distance,
-                dataset: tbl.to_string(),
-                primary_key: pks.get(i).cloned().unwrap_or_default(),
-                metadata: add_cols.get(i).cloned().unwrap_or_default(),
-            })
-        })
-        .collect::<Result<Vec<Match>>>()
-}
-
 pub fn to_matches(result: &VectorSearchResult) -> Result<Vec<Match>> {
     let output = result
         .iter()
-        .map(|(a, b)| table_to_matches(a, b))
+        .map(|(a, b)| b.to_matches(a))
         .collect::<Result<Vec<_>>>()?;
 
     Ok(output.into_iter().flatten().collect_vec())
@@ -480,14 +565,6 @@ impl VectorSearch {
             .boxed()
             .context(DataFusionSnafu)?;
 
-        let Some(first) = batches.first() else {
-            tracing::trace!("No results returned");
-            return Ok(VectorSearchTableResult::default());
-        };
-
-        let primary_key_projection = get_projection(first, primary_keys);
-        let additional_columns_projection = get_projection(first, additional_columns);
-
         let embedding_column = if is_chunked {
             format!(
                 "{embed_col}_chunk",
@@ -496,39 +573,12 @@ impl VectorSearch {
         } else {
             quote_identifier(embedding_column).to_string()
         };
-        let embedding_projection = get_projection(first, &[embedding_column]);
-
-        let primary_keys_records = batches
-            .iter()
-            .map(|s| s.project(&primary_key_projection))
-            .collect::<std::result::Result<Vec<_>, ArrowError>>()
-            .context(RecordProcessingSnafu)?;
-        let embedding_records = batches
-            .iter()
-            .map(|s| s.project(&embedding_projection))
-            .collect::<std::result::Result<Vec<_>, ArrowError>>()
-            .context(RecordProcessingSnafu)?;
-        let additional_columns_records = batches
-            .iter()
-            .map(|s| s.project(&additional_columns_projection))
-            .collect::<std::result::Result<Vec<_>, ArrowError>>()
-            .context(RecordProcessingSnafu)?;
-
-        let Some(distances) = batches
-            .iter()
-            .map(|s| s.column_by_name(VECTOR_DISTANCE_COLUMN_NAME).cloned())
-            .collect::<Option<Vec<_>>>()
-        else {
-            return Err(Error::EmbeddingError {
-                source: "No distances returned".into(),
-            });
-        };
 
         Ok(VectorSearchTableResult {
-            primary_key: primary_keys_records,
-            embedded_column: embedding_records,
-            additional_columns: additional_columns_records,
-            distances,
+            data: batches,
+            primary_keys: primary_keys.to_vec(),
+            additional_columns: additional_columns.to_vec(),
+            embedding_column,
         })
     }
 
@@ -799,12 +849,11 @@ impl VectorSearch {
 }
 
 /// Convert a list of column names to a list of column indices. If a column name is not found in the schema, it is ignored.
-fn get_projection(batch: &RecordBatch, column_names: &[String]) -> Vec<usize> {
+fn get_projection(schema: &SchemaRef, column_names: &[String]) -> Vec<usize> {
     column_names
         .iter()
         .filter_map(|name| {
-            batch
-                .schema()
+            schema
                 .index_of(quote_identifier(name).to_string().as_str())
                 .ok()
         })

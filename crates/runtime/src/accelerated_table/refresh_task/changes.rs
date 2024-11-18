@@ -22,6 +22,7 @@ use arrow::datatypes::DataType;
 use cache::QueryResultsCacheProvider;
 use data_components::cdc::{ChangeBatch, ChangeOperation, ChangesStream};
 use data_components::delete::get_deletion_provider;
+use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::lit;
 use datafusion::logical_expr::{col, Expr};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -188,7 +189,7 @@ impl RefreshTask {
                         .insert_into(
                             &session_state,
                             Arc::new(StreamingDataUpdateExecutionPlan::new(record_batch_stream)),
-                            false,
+                            InsertOp::Append,
                         )
                         .await
                         .context(crate::accelerated_table::FailedToWriteDataSnafu)?;

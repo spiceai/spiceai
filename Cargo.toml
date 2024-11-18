@@ -44,7 +44,7 @@ arrow-buffer = "53"
 arrow-flight = "53"
 # Use published version once https://github.com/apache/arrow-rs/pull/6606 is released
 arrow-ipc = "53"
-arrow-json = { git = "https://github.com/spiceai/arrow-rs.git", rev = "6013498d7d4d59f7b16d0e28b3e0b379732fbf07" }
+arrow-json = { git = "https://github.com/spiceai/arrow-rs.git", rev = "63d05723107d6dc5f08acc5461417ee42937adcc" }
 arrow-odbc = "11.2.0"
 arrow-schema = "53"
 async-openai = { git = "https://github.com/spiceai/async-openai", rev = "c01795447374ab8608682955a2fe91216bfd9db6" }
@@ -60,13 +60,13 @@ clickhouse-rs = { git = "https://github.com/spiceai/clickhouse-rs.git", tag = "0
     "tokio_io",
     "tls",
 ] }
-datafusion = "42"
-datafusion-common = "42"
-datafusion-execution = "42"
-datafusion-expr = "42"
+datafusion = "43"
+datafusion-common = "43"
+datafusion-execution = "43"
+datafusion-expr = "43"
 datafusion-federation = "0.1"
-datafusion-federation-sql = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "914bd0836baa6990c5d03f977e5e87fe5eeaf4d6" }
-datafusion-functions-json = "0.42"
+datafusion-federation-sql = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "5af0df83c2cd1d3f82f293b066b401a4dfd4064b" }
+datafusion-functions-json = "0.43"
 datafusion-table-providers = "0.1"
 dotenvy = "0.15"
 duckdb = "1.1.1"
@@ -138,15 +138,18 @@ uuid = "1.9.1"
 x509-certificate = "0.23.1"
 
 [patch.crates-io]
-datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "fef553e324cde43d7fbe78d9220f929c5ade7ab3" }
-datafusion-common = { git = "https://github.com/spiceai/datafusion.git", rev = "fef553e324cde43d7fbe78d9220f929c5ade7ab3" }
-datafusion-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "fef553e324cde43d7fbe78d9220f929c5ade7ab3" }
-datafusion-execution = { git = "https://github.com/spiceai/datafusion.git", rev = "fef553e324cde43d7fbe78d9220f929c5ade7ab3" }
+datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "2b93a308f65df1ae0cd8f3f8194b9b60201a500f" }
+datafusion-common = { git = "https://github.com/spiceai/datafusion.git", rev = "2b93a308f65df1ae0cd8f3f8194b9b60201a500f" }
+datafusion-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "2b93a308f65df1ae0cd8f3f8194b9b60201a500f" }
+datafusion-execution = { git = "https://github.com/spiceai/datafusion.git", rev = "2b93a308f65df1ae0cd8f3f8194b9b60201a500f" }
+
 
 object_store = { git = "https://github.com/spiceai/arrow-rs.git", rev = "1f37d9eda6da17b7644115f82d209c00c9566733" }
 
-datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "914bd0836baa6990c5d03f977e5e87fe5eeaf4d6" }
-datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "ae939912178a09c18ef31aa6379a4bd1fcbb2a4e" }
+datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "5af0df83c2cd1d3f82f293b066b401a4dfd4064b" }
+datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "c0fa84c54808e04ef001056796967bea1e24c0ae" }
+
+duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "d6f8c3e0dc1ba073a86756eba4dacf044dfa892d" }
 
 arrow-odbc = { git = "https://github.com/spiceai/arrow-odbc.git", rev = "dfb1e03a5f0702c1a318db5abf40e762d6b2bcc2" }
 odbc-api = { git = "https://github.com/spiceai/odbc-api.git", rev = "9807702dafdd8679d6bcecb0730b17e55c13e2e1" }
@@ -158,5 +161,3 @@ dotenvy = { git = "https://github.com/spiceai/dotenvy.git", rev = "e5cef1871b080
 
 # Required until next release with opentelemetry 0.26 support: https://github.com/open-telemetry/opentelemetry-rust/pull/2183
 opentelemetry-prometheus = { git = "https://github.com/open-telemetry/opentelemetry-rust.git", rev = "e91138351a689cd21923c15eb48f5fbc95ded807" }
-
-duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "6e7097758320a49f25f578dd54175145a4014582" }

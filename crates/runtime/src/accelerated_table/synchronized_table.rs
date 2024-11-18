@@ -30,6 +30,16 @@ pub struct SynchronizedTable {
     refresher: Arc<Refresher>,
 }
 
+impl std::fmt::Debug for SynchronizedTable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SynchronizedTable")
+            .field("parent_dataset_name", &self.parent_dataset_name)
+            .field("child_dataset_name", &self.child_dataset_name)
+            .field("child_accelerator", &self.child_accelerator)
+            .finish_non_exhaustive()
+    }
+}
+
 impl SynchronizedTable {
     pub fn from(
         accelerated_table: &AcceleratedTable,

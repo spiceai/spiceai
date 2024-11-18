@@ -1,0 +1,19 @@
+---
+source: crates/runtime/benches/bench.rs
+expression: records_pretty
+snapshot_kind: text
+---
++--------------------------------------------+-----------+
+| l_comment                                  | l_partkey |
++--------------------------------------------+-----------+
+| accounts detect quickly dogged             | 167828    |
+|  special grouches sleep quickly instructio | 37435     |
+|  special accounts sleep                    | 42134     |
+| ress packages haggle ideas. blithely spec  | 3037      |
+| eposits nag special ideas. furiousl        | 139247    |
+| t thinly above the ironic,                 | 4660      |
+| ep carefully regular accounts. ironic      | 117961    |
+| e carefully blithely bold dolp             | 168569    |
+| ithely regula                              | 157238    |
+| leep slyly                                 | 141233    |
++--------------------------------------------+-----------+

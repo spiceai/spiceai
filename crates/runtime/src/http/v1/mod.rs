@@ -66,13 +66,17 @@ pub enum ArrowFormat {
     Plain,
 }
 
+/// Gets all possible media types from a `Accept` header.
+pub(crate) fn accept_header_types(accept: &TypedHeader<Accept>) -> Vec<String> {
+    accept.0.media_types().map(ToString::to_string).collect()
+}
+
 impl ArrowFormat {
     pub fn from_accept_header(accept: &Option<TypedHeader<Accept>>) -> ArrowFormat {
         accept.as_ref().map_or(ArrowFormat::default(), |header| {
-            header
-                .0
-                .media_types()
-                .find_map(|h| match h.to_string().as_str() {
+            accept_header_types(header)
+                .iter()
+                .find_map(|h| match h.as_str() {
                     "application/json" => Some(ArrowFormat::Json),
                     "text/csv" => Some(ArrowFormat::Csv),
                     "text/plain" => Some(ArrowFormat::Plain),

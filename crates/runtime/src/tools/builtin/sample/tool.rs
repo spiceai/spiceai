@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 use crate::{
-    datafusion::DataFusion,
     tools::{utils::parameters, SpiceModelTool},
     Runtime,
 };
@@ -28,7 +27,7 @@ use tracing_futures::Instrument;
 
 use super::{
     distinct::DistinctColumnsParams, RandomSampleParams, SampleFrom, SampleTableMethod,
-    SampleTableParams, TopSamplesParams,
+    TopSamplesParams,
 };
 
 /// A tool to sample data from a table in a variety of ways. How data is sampled is determined by
@@ -56,27 +55,6 @@ impl SampleDataTool {
         self.name = name.map(ToString::to_string);
         self.description = description.map(ToString::to_string);
         self
-    }
-
-    pub async fn call_with(
-        &self,
-        params: &SampleTableParams,
-        df: Arc<DataFusion>,
-    ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
-        if SampleTableMethod::from(params) != self.method {
-            return Err(format!("Invalid parameters for {} tool.", self.method.name()).into());
-        };
-
-        let span: Span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::sample_data", tool = self.name(), input = format!("{params}"), sample_method = self.method.name());
-
-        async {
-            let batch = params.sample(df).await?;
-            let serial = pretty_format_batches(&[batch]).boxed()?;
-
-            Ok(Value::String(format!("{serial}")))
-        }
-        .instrument(span.clone())
-        .await
     }
 }
 
@@ -109,10 +87,16 @@ impl SpiceModelTool for SampleDataTool {
         arg: &str,
         rt: Arc<Runtime>,
     ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
-        self.call_with(
-            &serde_json::from_str::<SampleTableParams>(arg)?,
-            rt.datafusion(),
-        )
+        let params = self.method.parse_args(arg).boxed()?;
+        let span: Span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::sample_data", tool = self.name(), input = format!("{params}"), sample_method = self.method.name());
+
+        async {
+            let batch = params.sample(rt.datafusion()).await?;
+            let serial = pretty_format_batches(&[batch]).boxed()?;
+
+            Ok(Value::String(format!("{serial}")))
+        }
+        .instrument(span.clone())
         .await
     }
 }

@@ -26,6 +26,7 @@ use datafusion::{
     catalog::TableProvider,
     error::DataFusionError,
     execution::{RecordBatchStream, SessionState},
+    logical_expr::dml::InsertOp,
     physical_plan::collect,
     prelude::SessionContext,
 };
@@ -68,7 +69,7 @@ impl MultiSink {
         provider: Arc<dyn TableProvider>,
         ctx_state: SessionState,
         stream: RecordBatchBroadcastStream,
-        overwrite: bool,
+        overwrite: InsertOp,
     ) -> Result<(), RetryError<crate::accelerated_table::Error>> {
         let insertion_plan = provider
             .insert_into(
@@ -95,7 +96,7 @@ impl MultiSink {
         rx: broadcast::Receiver<RecordBatch>,
         schema: SchemaRef,
         parent_complete_tx: watch::Sender<bool>,
-        overwrite: bool,
+        overwrite: InsertOp,
     ) -> Result<(), RetryError<crate::accelerated_table::Error>> {
         let stream = RecordBatchBroadcastStream::new(rx, schema, StreamType::parent());
 
@@ -111,7 +112,7 @@ impl MultiSink {
         schema: SchemaRef,
         barrier: Arc<Barrier>,
         parent_complete_rx: watch::Receiver<bool>,
-        overwrite: bool,
+        overwrite: InsertOp,
     ) -> Result<(), RetryError<crate::accelerated_table::Error>> {
         let stream = RecordBatchBroadcastStream::new(
             rx,
@@ -125,7 +126,7 @@ impl MultiSink {
     pub async fn insert_into(
         &self,
         record_batch_stream: Pin<Box<dyn RecordBatchStream + Send>>,
-        overwrite: bool,
+        overwrite: InsertOp,
     ) -> Result<(), RetryError<crate::accelerated_table::Error>> {
         let schema = record_batch_stream.schema();
         let (tx, _) = broadcast::channel::<RecordBatch>(32);

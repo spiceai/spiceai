@@ -25,10 +25,10 @@ use tonic::{
 };
 use uuid::Uuid;
 
-use crate::timing::{TimeMeasurement, TimedStream};
+use crate::timing::TimedStream;
 use runtime_auth::layer::flight as flight_auth;
 
-use super::metrics;
+use super::metrics::track_flight_request;
 
 type HandshakeResponseStream =
     Pin<Box<dyn Stream<Item = Result<HandshakeResponse, Status>> + Send>>;
@@ -37,6 +37,8 @@ pub(crate) fn handle(
     metadata: &MetadataMap,
     basic_auth: Option<&Arc<dyn FlightBasicAuth + Send + Sync>>,
 ) -> Result<Response<HandshakeResponseStream>, Status> {
+    let start = track_flight_request("handshake", None);
+
     let token = match flight_auth::validate_basic_auth_handshake(metadata, basic_auth)? {
         Some(token) => token,
         None => Uuid::new_v4().to_string(),
@@ -46,9 +48,7 @@ pub(crate) fn handle(
         payload: token.as_bytes().to_vec().into(),
     };
     let result = Ok(result);
-    let output = TimedStream::new(futures::stream::iter(vec![result]), || {
-        TimeMeasurement::new(&metrics::HANDSHAKE_REQUEST_DURATION_MS, vec![])
-    });
+    let output = TimedStream::new(futures::stream::iter(vec![result]), || start);
     let str = format!("Bearer {token}");
     let mut resp: Response<HandshakeResponseStream> = Response::new(Box::pin(output));
     let md = MetadataValue::try_from(str)

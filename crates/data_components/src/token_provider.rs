@@ -1,3 +1,4 @@
+use std::fmt::Debug;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -14,12 +15,20 @@ pub enum Error {
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[async_trait]
-pub trait TokenProvider: Send + Sync {
+pub trait TokenProvider: Send + Sync + Debug {
     async fn get_token(&self) -> Result<String>;
 }
 
 pub struct StaticTokenProvider {
     token: Arc<str>,
+}
+
+impl std::fmt::Debug for StaticTokenProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StaticTokenProvider")
+            .field("token.len()", &self.token.len())
+            .finish()
+    }
 }
 
 impl StaticTokenProvider {

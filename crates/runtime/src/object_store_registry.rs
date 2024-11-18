@@ -443,7 +443,7 @@ impl ObjectStoreRegistry for SpiceObjectStoreRegistry {
 // RuntimeEnv::default()
 pub(crate) fn default_runtime_env() -> Arc<RuntimeEnv> {
     Arc::new(
-        RuntimeEnv::new(
+        RuntimeEnv::try_new(
             RuntimeConfig::default()
                 .with_object_store_registry(Arc::new(SpiceObjectStoreRegistry::default())),
         )
