@@ -107,7 +107,7 @@ impl Runtime {
             };
         }
 
-        // Execute all futures
+        // Load datasets in parallel
         if let Some(parallel_num) = app.runtime.num_of_parallel_loading_at_start_up {
             let stream =
                 futures::stream::iter(dataset_futures.into_values()).buffer_unordered(parallel_num);
@@ -190,11 +190,7 @@ impl Runtime {
                     self.status
                         .update_dataset(ds_name, status::ComponentStatus::Error);
                     metrics::datasets::LOAD_ERROR.add(1, &[]);
-                    warn_spaced!(
-                        spaced_tracer,
-                        "Error initializing dataset {}. {err}",
-                        ds_name.table()
-                    );
+                    warn_spaced!(spaced_tracer, "{} {err}", ds_name.table());
                     return Err(RetryError::transient(err));
                 }
             };
