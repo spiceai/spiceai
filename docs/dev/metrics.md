@@ -23,7 +23,7 @@
     - **Metric**: Specific metric name, e.g., `request_duration`, `hits`
     - **Unit**: Unit of measurement, e.g., `ms` for milliseconds, using UCUM standard units where applicable. 
 
-- Note: <metric_plural> includes the `_count` suffix when used for UpDownCounters to record discrete instances of countable items, e.g. `db_client_active_connections_count`.
+- Note: <metric_plural> includes the `_count` suffix when used for Gauges to record discrete instances of countable items, e.g. `db_client_active_connections_count`.
 
 ## Principles
 
