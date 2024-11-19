@@ -13,14 +13,6 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-
-use app::AppBuilder;
-use async_openai::types::{
-    ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestUserMessageArgs,
-    CreateChatCompletionRequestArgs, EmbeddingInput,
-};
-use std::sync::Arc;
-
 use crate::{
     init_tracing, init_tracing_with_task_history,
     models::{
@@ -32,14 +24,22 @@ use crate::{
     },
     utils::{runtime_ready_check, verify_env_secret_exists},
 };
+use app::AppBuilder;
+use async_openai::types::{
+    ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestUserMessageArgs,
+    CreateChatCompletionRequestArgs, EmbeddingInput,
+};
 use chrono::{DateTime, Utc};
 use llms::chat::Chat;
 use opentelemetry_sdk::trace::TracerProvider;
+use reqwest::Client;
 use runtime::{auth::EndpointAuth, model::try_to_chat_model, Runtime};
+use serde_json::json;
 use spicepod::component::{
     embeddings::{ColumnEmbeddingConfig, Embeddings},
     model::Model,
 };
+use std::sync::Arc;
 
 use super::send_embeddings_request;
 
@@ -77,102 +77,55 @@ async fn openai_test_nsql() -> Result<(), anyhow::Error> {
     }
 
     runtime_ready_check(&rt).await;
-
-    // example responses for the test query: '[{"count(*)":10}]', '[{"record_count":10}]'
-
-    ////////////////////////////////////////////////////////////////////////////////
-    ////////////////////////////////////////////////////////////////////////////////
-    ////////////////////////////////////////////////////////////////////////////////
-    async fn basic(base_url: &str, trace_provider: &TracerProvider) -> Result<(), anyhow::Error> {
-        tracing::info!("/v1/nsql: Verify default nsql request");
-        let task_start_time = std::time::SystemTime::now();
-
-        let response = send_nsql_request(
-            base_url,
-            "how many records (as 'total_records') are in taxi_trips dataset?",
-            None,
-            Some(false),
-            None,
-        )
-        .await?;
-
-        insta::assert_snapshot!(
-            "basic_response",
-            serde_json::to_string_pretty(&response).expect("failed to format JSON response")
-        );
-
-        // ensure all spans are exported into task_history
-        let _ = trace_provider.force_flush();
-
-        insta::assert_snapshot!(
-            "basic_tasks",
-            serde_json::to_string_pretty(
-                &http_sql(
-                    base_url,
-                    &format!(
-                        r#"SELECT task, input
-                    FROM runtime.task_history
-                    WHERE start_time >= '{}' and task!='ai_completion'
-                    ORDER BY start_time, task;
-                "#,
-                        Into::<DateTime<Utc>>::into(task_start_time).to_rfc3339()
-                    ),
-                )
-                .await
-                .expect("Failed to execute HTTP SQL query")
-            )
-            .expect("failed to format JSON response")
-        );
-        Ok(())
+    struct TestCase {
+        name: &'static str,
+        body: serde_json::Value,
     }
-    basic(http_base_url.as_str(), &trace_provider).await?;
+    let test_cases = [
+        TestCase {
+            name: "basic",
+            body: json!({
+                "query": "how many records (as 'total_records') are in taxi_trips dataset?",
+                "sample_data_enabled": false,
+            }),
+        },
+        TestCase {
+            name: "with_model",
+            body: json!({
+                "query": "how many records (as 'total_records') are in taxi_trips dataset?",
+                "model": "nql-2",
+                "sample_data_enabled": false,
+            }),
+        },
+        TestCase {
+            name: "with_sample_data_enabled",
+            body: json!({
+                "query": "how many records (as 'total_records') are in taxi_trips dataset?",
+                "model": "nql",
+                "sample_data_enabled": true,
+            }),
+        },
+    ];
 
-    ////////////////////////////////////////////////////////////////////////////////
-    ////////////////////////////////////////////////////////////////////////////////
-    ////////////////////////////////////////////////////////////////////////////////
-
-    async fn with_model(base_url: &str) -> Result<(), anyhow::Error> {
-        tracing::info!("/v1/nsql: Verify nsql request with model selection");
-        let response = send_nsql_request(
-            base_url,
-            "how many records (as 'total_records') are in taxi_trips dataset?",
-            Some("nql-2"),
-            Some(false),
-            None,
-        )
-        .await?;
-
-        insta::assert_snapshot!(
-            "with_model_response",
-            serde_json::to_string_pretty(&response).expect("failed to format JSON response")
-        );
-
-        Ok(())
-    };
-    with_model(http_base_url.as_str()).await?;
-
-    ////////////////////////////////////////////////////////////////////////////////
-    ////////////////////////////////////////////////////////////////////////////////
-    ////////////////////////////////////////////////////////////////////////////////
-
-    async fn with_sample_data_enabled(
+    async fn run_test(
         base_url: &str,
+        ts: &TestCase,
         trace_provider: &TracerProvider,
     ) -> Result<(), anyhow::Error> {
-        tracing::info!("/v1/nsql: Verify nsql request with 'sample_data_enabled:true'");
-
+        tracing::info!("Running test cases {}", ts.name);
         let task_start_time = std::time::SystemTime::now();
+        let response = Client::new()
+            .post(format!("{base_url}/v1/nsql"))
+            .header("Content-Type", "application/json")
+            .json(&ts.body)
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<serde_json::Value>()
+            .await?;
 
-        let response = send_nsql_request(
-            base_url,
-            "how many records (as 'total_records') are in taxi_trips dataset?",
-            Some("nql"),
-            Some(true),
-            None,
-        )
-        .await?;
         insta::assert_snapshot!(
-            "with_sample_data_enabled_response",
+            format!("{}_response", ts.name),
             serde_json::to_string_pretty(&response).expect("failed to format JSON response")
         );
 
@@ -180,7 +133,7 @@ async fn openai_test_nsql() -> Result<(), anyhow::Error> {
         let _ = trace_provider.force_flush();
 
         insta::assert_snapshot!(
-            "with_sample_data_enabled_tasks",
+            format!("{}_tasks", ts.name),
             serde_json::to_string_pretty(
                 &http_sql(
                     base_url,
@@ -201,7 +154,9 @@ async fn openai_test_nsql() -> Result<(), anyhow::Error> {
 
         Ok(())
     }
-    with_sample_data_enabled(http_base_url.as_str(), &trace_provider).await?;
+    for ts in test_cases {
+        run_test(http_base_url.as_str(), &ts, &trace_provider).await?;
+    }
 
     Ok(())
 }
