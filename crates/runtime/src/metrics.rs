@@ -269,7 +269,7 @@ pub(crate) mod telemetry {
         TELEMETRY_METER
             .u64_counter("query_processed_bytes")
             .with_description("Number of bytes processed by the runtime.")
-            .with_unit("bytes")
+            .with_unit("By")
             .init()
     });
 
@@ -284,7 +284,7 @@ pub(crate) mod telemetry {
         TELEMETRY_METER
             .u64_counter("query_returned_bytes")
             .with_description("Number of bytes returned to query clients.")
-            .with_unit("bytes")
+            .with_unit("By")
             .init()
     });
 

@@ -5,12 +5,12 @@ expression: normalize_embeddings_response(response)
 {
   "data": [
     {
-      "embedding": "array_256_items",
+      "embedding": "str_len_684",
       "index": 0,
       "object": "embedding"
     },
     {
-      "embedding": "array_256_items",
+      "embedding": "str_len_684",
       "index": 1,
       "object": "embedding"
     }

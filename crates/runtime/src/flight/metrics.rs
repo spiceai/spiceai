@@ -36,11 +36,11 @@ pub(crate) static FLIGHT_REQUEST_DURATION_MS: LazyLock<Histogram<f64>> = LazyLoc
         .init()
 });
 
-pub fn track_flight_request(path: &str, method: Option<&str>) -> TimeMeasurement {
-    let mut dimensions = vec![KeyValue::new("path", path.to_string())];
+pub fn track_flight_request(method: &str, command: Option<&str>) -> TimeMeasurement {
+    let mut dimensions = vec![KeyValue::new("method", method.to_string())];
 
-    if let Some(method) = method {
-        dimensions.push(KeyValue::new("method", method.to_string()));
+    if let Some(method) = command {
+        dimensions.push(KeyValue::new("command", method.to_string()));
     }
     FLIGHT_REQUESTS.add(1, dimensions.as_slice());
     TimeMeasurement::new(&FLIGHT_REQUEST_DURATION_MS, dimensions.as_slice())

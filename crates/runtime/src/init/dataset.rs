@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::sync::Arc;
+use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc};
 
 use crate::{
     accelerated_table::AcceleratedTable,
@@ -53,31 +53,67 @@ impl Runtime {
         let valid_datasets = Self::get_valid_datasets(app, LogErrors(true));
         let initialized_datasets = self.initialize_accelerators(&valid_datasets).await;
 
-        // Separate datasets into localpod and non-localpod
-        let (localpod_datasets, non_localpod_datasets): (Vec<_>, Vec<_>) = initialized_datasets
-            .into_iter()
-            .partition(|ds| ds.source() == LOCALPOD_DATACONNECTOR);
-        let mut futures = vec![];
+        // Create a map of dataset names to their futures
+        let mut dataset_futures = HashMap::new();
+        let mut localpod_datasets = Vec::new();
 
-        // Load non-localpod datasets first in parallel
-        for ds in non_localpod_datasets {
+        // First create futures for non-localpod datasets
+        for ds in initialized_datasets {
+            if ds.source() == LOCALPOD_DATACONNECTOR {
+                localpod_datasets.push(ds);
+                continue;
+            }
+
             self.status
                 .update_dataset(&ds.name, status::ComponentStatus::Initializing);
-            futures.push(self.load_dataset(ds));
+            let future: Pin<Box<dyn Future<Output = ()> + Send>> =
+                Box::pin(self.load_dataset(Arc::clone(&ds)));
+            dataset_futures.insert(ds.name.clone(), future);
         }
 
-        if let Some(parallel_num) = app.runtime.num_of_parallel_loading_at_start_up {
-            let stream = futures::stream::iter(futures).buffer_unordered(parallel_num);
-            let _ = stream.collect::<Vec<_>>().await;
-        } else {
-            let _ = join_all(futures).await;
-        }
-
-        // Load localpod datasets
+        // For each localpod dataset, chain it after its parent's future
         for ds in localpod_datasets {
             self.status
                 .update_dataset(&ds.name, status::ComponentStatus::Initializing);
-            self.load_dataset(ds).await;
+
+            // Get the parent dataset path from the localpod dataset
+            let path = ds.path();
+            let path_table_ref = TableReference::parse_str(&path);
+
+            // Find and remove the parent dataset's future
+            if let Some(parent_future) = dataset_futures.remove(&path_table_ref) {
+                let ds_clone = Arc::clone(&ds);
+
+                // Chain the localpod dataset load after its parent
+                let chained_future = Box::pin(async move {
+                    parent_future.await;
+                    self.load_dataset(ds_clone).await;
+                }) as Pin<Box<dyn Future<Output = ()> + Send>>;
+
+                // Replace parent future with the chained future
+                dataset_futures.insert(ds.name.clone(), chained_future);
+            } else {
+                // Parent doesn't exist, provide an error message to the user
+                tracing::error!(
+                    "Failed to load localpod dataset '{}': Parent dataset '{}' doesn't exist. \
+                    Ensure the '{}' dataset is configured in the Spicepod.",
+                    ds.name,
+                    path_table_ref,
+                    path_table_ref
+                );
+                self.status
+                    .update_dataset(&ds.name, status::ComponentStatus::Error);
+                continue;
+            };
+        }
+
+        // Load datasets in parallel
+        if let Some(parallel_num) = app.runtime.num_of_parallel_loading_at_start_up {
+            let stream =
+                futures::stream::iter(dataset_futures.into_values()).buffer_unordered(parallel_num);
+            let _ = stream.collect::<Vec<_>>().await;
+        } else {
+            let _ = join_all(dataset_futures.into_values()).await;
         }
 
         // After all datasets have loaded, load the views.

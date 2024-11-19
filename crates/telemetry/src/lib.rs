@@ -31,7 +31,7 @@ mod meter;
 
 static QUERY_COUNT: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
-        .u64_counter("query_count")
+        .u64_counter("query_invocations")
         .with_description("Number of queries run.")
         .with_unit("queries")
         .init()
@@ -43,9 +43,9 @@ pub fn track_query_count() {
 
 static BYTES_PROCESSED: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
-        .u64_counter("bytes_processed")
+        .u64_counter("query_processed_bytes")
         .with_description("Number of bytes processed by the runtime.")
-        .with_unit("bytes")
+        .with_unit("By")
         .init()
 });
 
@@ -56,9 +56,9 @@ pub fn track_bytes_processed(bytes: u64, protocol: Arc<str>) {
 
 static BYTES_RETURNED: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
-        .u64_counter("bytes_returned")
+        .u64_counter("query_returned_bytes")
         .with_description("Number of bytes returned to query clients.")
-        .with_unit("bytes")
+        .with_unit("By")
         .init()
 });
 
@@ -67,7 +67,7 @@ pub fn track_bytes_returned(bytes: u64, protocol: Arc<str>) {
     BYTES_RETURNED.add(bytes, &dimensions);
 }
 
-static QUERY_DURATION: LazyLock<Histogram<f64>> = LazyLock::new(|| {
+static QUERY_DURATION_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| {
     METER
         .f64_histogram("query_duration_ms")
         .with_description(
@@ -78,7 +78,7 @@ static QUERY_DURATION: LazyLock<Histogram<f64>> = LazyLock::new(|| {
 });
 
 pub fn track_query_duration(duration: Duration, dimensions: &[KeyValue]) {
-    QUERY_DURATION.record(duration.as_secs_f64() * 1000.0, dimensions);
+    QUERY_DURATION_MS.record(duration.as_secs_f64() * 1000.0, dimensions);
 }
 
 static QUERY_EXECUTION_DURATION_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| {

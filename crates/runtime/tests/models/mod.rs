@@ -197,7 +197,7 @@ fn normalize_search_response(mut json: Value) -> String {
         *duration = json!("duration_ms_val");
     }
 
-    json.to_string()
+    serde_json::to_string_pretty(&json).unwrap_or_default()
 }
 
 /// Normalizes embeddings response for consistent snapshot testing by replacing actual embedding arrays with a placeholder,
@@ -208,12 +208,14 @@ fn normalize_embeddings_response(mut json: Value) -> String {
                 if let Some(embedding_array) = embedding.as_array_mut() {
                     let num_elements = embedding_array.len();
                     *embedding = json!(format!("array_{}_items", num_elements));
+                } else if let Some(embedding_str) = embedding.as_str() {
+                    *embedding = json!(format!("str_len_{}", embedding_str.len()));
                 }
             }
         }
     }
 
-    json.to_string()
+    serde_json::to_string_pretty(&json).unwrap_or_default()
 }
 
 /// Normalizes chat completion response for consistent snapshot testing by replacing dynamic values
@@ -256,7 +258,7 @@ fn normalize_chat_completion_response(mut json: Value, normalize_message_content
         *id = json!("id_val");
     }
 
-    json.to_string()
+    serde_json::to_string_pretty(&json).unwrap_or_default()
 }
 
 async fn send_embeddings_request(
@@ -386,4 +388,9 @@ async fn get_params_with_secrets(
         .collect::<HashMap<_, _>>();
 
     rt.get_params_with_secrets(&params).await
+}
+
+fn pretty_json_str(json_str: &str) -> Result<String, serde_json::Error> {
+    let json: Value = serde_json::from_str(json_str)?;
+    serde_json::to_string_pretty(&json)
 }

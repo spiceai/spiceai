@@ -1,0 +1,13 @@
+---
+source: crates/runtime/tests/models/openai.rs
+expression: sql_query_task.1
+---
+SELECT "VendorID" FROM (
+                SELECT "VendorID", 1 as priority
+                FROM (SELECT DISTINCT "VendorID" FROM spice.public.taxi_trips)
+                UNION ALL
+                SELECT "VendorID", 2 as priority
+                FROM spice.public.taxi_trips
+            ) combined
+            ORDER BY priority, "VendorID"
+            LIMIT 3
