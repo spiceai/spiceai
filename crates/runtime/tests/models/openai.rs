@@ -184,8 +184,9 @@ async fn openai_test_search() -> Result<(), anyhow::Error> {
     }];
 
     let app = AppBuilder::new("search_app")
+        // taxi_trips dataset is used to test search when there is a dataset w/o embeddings
+        .with_dataset(get_taxi_trips_dataset())
         .with_dataset(ds_tpcds_item)
-        // test default embeddings model
         .with_embedding(get_openai_embeddings(
             Option::<String>::None,
             "openai_embeddings",
@@ -222,6 +223,19 @@ async fn openai_test_search() -> Result<(), anyhow::Error> {
     .await?;
 
     insta::assert_snapshot!(format!("search_1"), normalize_search_response(response));
+
+    tracing::info!("/v1/search: Ensure search request across all datasets succeeds");
+    let response = send_search_request(
+        http_base_url.as_str(),
+        "new patient",
+        Some(2),
+        None,
+        None,
+        None,
+    )
+    .await?;
+
+    insta::assert_snapshot!(format!("search_2"), normalize_search_response(response));
 
     Ok(())
 }
