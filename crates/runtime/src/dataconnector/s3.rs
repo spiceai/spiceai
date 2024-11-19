@@ -52,6 +52,11 @@ pub enum Error {
         "The 's3_key' parameter cannot be set unless the `s3_auth` parameter is set to 'key'."
     ))]
     InvalidKeyAuthCombination,
+
+    #[snafu(display(
+        "The 's3_endpoint' parameter must be a HTTP/S URL, but '{endpoint}' was provided."
+    ))]
+    InvalidEndpoint { endpoint: String },
 }
 
 pub struct S3 {
@@ -117,6 +122,15 @@ impl DataConnectorFactory for S3Factory {
         }
 
         Box::pin(async move {
+            if let Some(endpoint) = params.parameters.get("endpoint").expose().ok() {
+                if !(endpoint.starts_with("https://") || endpoint.starts_with("http://")) {
+                    return Err(Box::new(Error::InvalidEndpoint {
+                        endpoint: endpoint.to_string(),
+                    })
+                        as Box<dyn std::error::Error + Send + Sync>);
+                }
+            }
+
             if let Some(auth) = params.parameters.get("auth").expose().ok() {
                 if auth != "public" && auth != "iam_role" && auth != "key" {
                     return Err(Box::new(Error::UnsupportedAuthenticationMethod {
