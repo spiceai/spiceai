@@ -1,0 +1,106 @@
+---
+source: crates/runtime/tests/models/openai.rs
+expression: "serde_json::to_string_pretty(&http_sql(base_url,\n&format!(r#\"SELECT task, input\n                    FROM runtime.task_history\n                    WHERE start_time >= '{}' and task!='ai_completion'\n                    ORDER BY start_time, task;\n                \"#,\nInto::<DateTime<Utc>>::into(task_start_time).to_rfc3339()),).await.expect(\"Failed to execute HTTP SQL query\")).expect(\"failed to format JSON response\")"
+---
+[
+  {
+    "input": "how many records (as 'total_records') are in taxi_trips dataset?",
+    "task": "nsql"
+  },
+  {
+    "input": "{\"tables\":[\"spice.public.taxi_trips\"],\"output\":\"full\"}",
+    "task": "tool_use::table_schema"
+  },
+  {
+    "input": "DistinctColumns({\"dataset\":\"spice.public.taxi_trips\",\"limit\":3,\"cols\":null})",
+    "task": "tool_use::sample_data"
+  },
+  {
+    "input": "SELECT \"VendorID\" FROM (\n                SELECT \"VendorID\", 1 as priority\n                FROM (SELECT DISTINCT \"VendorID\" FROM spice.public.taxi_trips)\n                UNION ALL\n                SELECT \"VendorID\", 2 as priority\n                FROM spice.public.taxi_trips\n            ) combined\n            ORDER BY priority, \"VendorID\"\n            LIMIT 3",
+    "task": "sql_query"
+  },
+  {
+    "input": "SELECT tpep_pickup_datetime FROM (\n                SELECT tpep_pickup_datetime, 1 as priority\n                FROM (SELECT DISTINCT tpep_pickup_datetime FROM spice.public.taxi_trips)\n                UNION ALL\n                SELECT tpep_pickup_datetime, 2 as priority\n                FROM spice.public.taxi_trips\n            ) combined\n            ORDER BY priority, tpep_pickup_datetime\n            LIMIT 3",
+    "task": "sql_query"
+  },
+  {
+    "input": "SELECT tpep_dropoff_datetime FROM (\n                SELECT tpep_dropoff_datetime, 1 as priority\n                FROM (SELECT DISTINCT tpep_dropoff_datetime FROM spice.public.taxi_trips)\n                UNION ALL\n                SELECT tpep_dropoff_datetime, 2 as priority\n                FROM spice.public.taxi_trips\n            ) combined\n            ORDER BY priority, tpep_dropoff_datetime\n            LIMIT 3",
+    "task": "sql_query"
+  },
+  {
+    "input": "SELECT passenger_count FROM (\n                SELECT passenger_count, 1 as priority\n                FROM (SELECT DISTINCT passenger_count FROM spice.public.taxi_trips)\n                UNION ALL\n                SELECT passenger_count, 2 as priority\n                FROM spice.public.taxi_trips\n            ) combined\n            ORDER BY priority, passenger_count\n            LIMIT 3",
+    "task": "sql_query"
+  },
+  {
+    "input": "SELECT trip_distance FROM (\n                SELECT trip_distance, 1 as priority\n                FROM (SELECT DISTINCT trip_distance FROM spice.public.taxi_trips)\n                UNION ALL\n                SELECT trip_distance, 2 as priority\n                FROM spice.public.taxi_trips\n            ) combined\n            ORDER BY priority, trip_distance\n            LIMIT 3",
+    "task": "sql_query"
+  },
+  {
+    "input": "SELECT \"RatecodeID\" FROM (\n                SELECT \"RatecodeID\", 1 as priority\n                FROM (SELECT DISTINCT \"RatecodeID\" FROM spice.public.taxi_trips)\n                UNION ALL\n                SELECT \"RatecodeID\", 2 as priority\n                FROM spice.public.taxi_trips\n            ) combined\n            ORDER BY priority, \"RatecodeID\"\n            LIMIT 3",
+    "task": "sql_query"
+  },
+  {
+    "input": "SELECT store_and_fwd_flag FROM (\n                SELECT store_and_fwd_flag, 1 as priority\n                FROM (SELECT DISTINCT store_and_fwd_flag FROM spice.public.taxi_trips)\n                UNION ALL\n                SELECT store_and_fwd_flag, 2 as priority\n                FROM spice.public.taxi_trips\n            ) combined\n            ORDER BY priority, store_and_fwd_flag\n            LIMIT 3",
+    "task": "sql_query"
+  },
+  {
+    "input": "SELECT \"PULocationID\" FROM (\n                SELECT \"PULocationID\", 1 as priority\n                FROM (SELECT DISTINCT \"PULocationID\" FROM spice.public.taxi_trips)\n                UNION ALL\n                SELECT \"PULocationID\", 2 as priority\n                FROM spice.public.taxi_trips\n            ) combined\n            ORDER BY priority, \"PULocationID\"\n            LIMIT 3",
+    "task": "sql_query"
+  },
+  {
+    "input": "SELECT \"DOLocationID\" FROM (\n                SELECT \"DOLocationID\", 1 as priority\n                FROM (SELECT DISTINCT \"DOLocationID\" FROM spice.public.taxi_trips)\n                UNION ALL\n                SELECT \"DOLocationID\", 2 as priority\n                FROM spice.public.taxi_trips\n            ) combined\n            ORDER BY priority, \"DOLocationID\"\n            LIMIT 3",
+    "task": "sql_query"
+  },
+  {
+    "input": "SELECT payment_type FROM (\n                SELECT payment_type, 1 as priority\n                FROM (SELECT DISTINCT payment_type FROM spice.public.taxi_trips)\n                UNION ALL\n                SELECT payment_type, 2 as priority\n                FROM spice.public.taxi_trips\n            ) combined\n            ORDER BY priority, payment_type\n            LIMIT 3",
+    "task": "sql_query"
+  },
+  {
+    "input": "SELECT fare_amount FROM (\n                SELECT fare_amount, 1 as priority\n                FROM (SELECT DISTINCT fare_amount FROM spice.public.taxi_trips)\n                UNION ALL\n                SELECT fare_amount, 2 as priority\n                FROM spice.public.taxi_trips\n            ) combined\n            ORDER BY priority, fare_amount\n            LIMIT 3",
+    "task": "sql_query"
+  },
+  {
+    "input": "SELECT extra FROM (\n                SELECT extra, 1 as priority\n                FROM (SELECT DISTINCT extra FROM spice.public.taxi_trips)\n                UNION ALL\n                SELECT extra, 2 as priority\n                FROM spice.public.taxi_trips\n            ) combined\n            ORDER BY priority, extra\n            LIMIT 3",
+    "task": "sql_query"
+  },
+  {
+    "input": "SELECT mta_tax FROM (\n                SELECT mta_tax, 1 as priority\n                FROM (SELECT DISTINCT mta_tax FROM spice.public.taxi_trips)\n                UNION ALL\n                SELECT mta_tax, 2 as priority\n                FROM spice.public.taxi_trips\n            ) combined\n            ORDER BY priority, mta_tax\n            LIMIT 3",
+    "task": "sql_query"
+  },
+  {
+    "input": "SELECT tip_amount FROM (\n                SELECT tip_amount, 1 as priority\n                FROM (SELECT DISTINCT tip_amount FROM spice.public.taxi_trips)\n                UNION ALL\n                SELECT tip_amount, 2 as priority\n                FROM spice.public.taxi_trips\n            ) combined\n            ORDER BY priority, tip_amount\n            LIMIT 3",
+    "task": "sql_query"
+  },
+  {
+    "input": "SELECT tolls_amount FROM (\n                SELECT tolls_amount, 1 as priority\n                FROM (SELECT DISTINCT tolls_amount FROM spice.public.taxi_trips)\n                UNION ALL\n                SELECT tolls_amount, 2 as priority\n                FROM spice.public.taxi_trips\n            ) combined\n            ORDER BY priority, tolls_amount\n            LIMIT 3",
+    "task": "sql_query"
+  },
+  {
+    "input": "SELECT improvement_surcharge FROM (\n                SELECT improvement_surcharge, 1 as priority\n                FROM (SELECT DISTINCT improvement_surcharge FROM spice.public.taxi_trips)\n                UNION ALL\n                SELECT improvement_surcharge, 2 as priority\n                FROM spice.public.taxi_trips\n            ) combined\n            ORDER BY priority, improvement_surcharge\n            LIMIT 3",
+    "task": "sql_query"
+  },
+  {
+    "input": "SELECT total_amount FROM (\n                SELECT total_amount, 1 as priority\n                FROM (SELECT DISTINCT total_amount FROM spice.public.taxi_trips)\n                UNION ALL\n                SELECT total_amount, 2 as priority\n                FROM spice.public.taxi_trips\n            ) combined\n            ORDER BY priority, total_amount\n            LIMIT 3",
+    "task": "sql_query"
+  },
+  {
+    "input": "SELECT congestion_surcharge FROM (\n                SELECT congestion_surcharge, 1 as priority\n                FROM (SELECT DISTINCT congestion_surcharge FROM spice.public.taxi_trips)\n                UNION ALL\n                SELECT congestion_surcharge, 2 as priority\n                FROM spice.public.taxi_trips\n            ) combined\n            ORDER BY priority, congestion_surcharge\n            LIMIT 3",
+    "task": "sql_query"
+  },
+  {
+    "input": "SELECT \"Airport_fee\" FROM (\n                SELECT \"Airport_fee\", 1 as priority\n                FROM (SELECT DISTINCT \"Airport_fee\" FROM spice.public.taxi_trips)\n                UNION ALL\n                SELECT \"Airport_fee\", 2 as priority\n                FROM spice.public.taxi_trips\n            ) combined\n            ORDER BY priority, \"Airport_fee\"\n            LIMIT 3",
+    "task": "sql_query"
+  },
+  {
+    "input": "RandomSample({\"dataset\":\"spice.public.taxi_trips\",\"limit\":3})",
+    "task": "tool_use::sample_data"
+  },
+  {
+    "input": "SELECT * FROM spice.public.taxi_trips LIMIT 3",
+    "task": "sql_query"
+  },
+  {
+    "input": "SELECT COUNT(*) AS \"total_records\" FROM \"spice\".\"public\".\"taxi_trips\"",
+    "task": "sql_query"
+  }
+]

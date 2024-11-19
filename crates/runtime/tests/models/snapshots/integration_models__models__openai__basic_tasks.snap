@@ -1,0 +1,18 @@
+---
+source: crates/runtime/tests/models/openai.rs
+expression: "serde_json::to_string_pretty(&http_sql(base_url,\n&format!(r#\"SELECT task, input\n                    FROM runtime.task_history\n                    WHERE start_time >= '{}' and task!='ai_completion'\n                    ORDER BY start_time, task;\n                \"#,\nInto::<DateTime<Utc>>::into(task_start_time).to_rfc3339()),).await.expect(\"Failed to execute HTTP SQL query\")).expect(\"failed to format JSON response\")"
+---
+[
+  {
+    "input": "how many records (as 'total_records') are in taxi_trips dataset?",
+    "task": "nsql"
+  },
+  {
+    "input": "{\"tables\":[\"spice.public.taxi_trips\"],\"output\":\"full\"}",
+    "task": "tool_use::table_schema"
+  },
+  {
+    "input": "SELECT COUNT(*) AS \"total_records\" FROM \"spice\".\"public\".\"taxi_trips\"",
+    "task": "sql_query"
+  }
+]

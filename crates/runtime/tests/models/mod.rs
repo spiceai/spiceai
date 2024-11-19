@@ -332,6 +332,19 @@ async fn send_chat_completions_request(
     Ok(response)
 }
 
+/// Sends a SQL query to the runtime and returns a JSON response.
+async fn http_sql(base_url: &str, sql: &str) -> Result<Value, reqwest::Error> {
+    Client::new()
+        .post(format!("{base_url}/v1/sql"))
+        .header("Accept", "application/json")
+        .body(sql.to_string())
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<Value>()
+        .await
+}
+
 /// Retrieves executed tasks from the task history since the given timestamp.
 async fn get_executed_tasks(
     rt: &Runtime,

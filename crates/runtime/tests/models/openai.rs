@@ -21,24 +21,24 @@ use async_openai::types::{
 };
 use std::sync::Arc;
 
+use crate::{
+    init_tracing, init_tracing_with_task_history,
+    models::{
+        create_api_bindings_config, get_executed_tasks, get_params_with_secrets,
+        get_taxi_trips_dataset, get_tpcds_dataset, http_sql, json_is_single_row_with_value,
+        normalize_chat_completion_response, normalize_embeddings_response,
+        normalize_search_response, pretty_json_str, send_chat_completions_request,
+        send_nsql_request, send_search_request,
+    },
+    utils::{runtime_ready_check, verify_env_secret_exists},
+};
+use chrono::{DateTime, Utc};
 use llms::chat::Chat;
 use opentelemetry_sdk::trace::TracerProvider;
 use runtime::{auth::EndpointAuth, model::try_to_chat_model, Runtime};
 use spicepod::component::{
     embeddings::{ColumnEmbeddingConfig, Embeddings},
     model::Model,
-};
-
-use crate::{
-    init_tracing, init_tracing_with_task_history,
-    models::{
-        create_api_bindings_config, get_executed_tasks, get_params_with_secrets,
-        get_taxi_trips_dataset, get_tpcds_dataset, json_is_single_row_with_value,
-        normalize_chat_completion_response, normalize_embeddings_response,
-        normalize_search_response, pretty_json_str, send_chat_completions_request,
-        send_nsql_request, send_search_request,
-    },
-    utils::{runtime_ready_check, verify_env_secret_exists},
 };
 
 use super::send_embeddings_request;
@@ -80,89 +80,128 @@ async fn openai_test_nsql() -> Result<(), anyhow::Error> {
 
     // example responses for the test query: '[{"count(*)":10}]', '[{"record_count":10}]'
 
-    tracing::info!("/v1/nsql: Verify default nsql request");
-    let task_start_time = std::time::SystemTime::now();
+    ////////////////////////////////////////////////////////////////////////////////
+    ////////////////////////////////////////////////////////////////////////////////
+    ////////////////////////////////////////////////////////////////////////////////
+    async fn basic(base_url: &str, trace_provider: &TracerProvider) -> Result<(), anyhow::Error> {
+        tracing::info!("/v1/nsql: Verify default nsql request");
+        let task_start_time = std::time::SystemTime::now();
 
-    let response = send_nsql_request(
-        http_base_url.as_str(),
-        "how many records in taxi_trips dataset?",
-        None,
-        Some(false),
-        None,
-    )
-    .await?;
+        let response = send_nsql_request(
+            base_url,
+            "how many records (as 'total_records') are in taxi_trips dataset?",
+            None,
+            Some(false),
+            None,
+        )
+        .await?;
 
-    assert!(
-        json_is_single_row_with_value(&response, 10),
-        "Expected a single record containing the value 10"
-    );
+        insta::assert_snapshot!(
+            "basic_response",
+            serde_json::to_string_pretty(&response).expect("failed to format JSON response")
+        );
 
-    // ensure all spans are exported into task_history
-    let _ = trace_provider.force_flush();
+        // ensure all spans are exported into task_history
+        let _ = trace_provider.force_flush();
 
-    let tasks = get_executed_tasks(&rt, task_start_time.into()).await?;
+        insta::assert_snapshot!(
+            "basic_tasks",
+            serde_json::to_string_pretty(
+                &http_sql(
+                    base_url,
+                    &format!(
+                        r#"SELECT task, input
+                    FROM runtime.task_history
+                    WHERE start_time >= '{}' and task!='ai_completion'
+                    ORDER BY start_time, task;
+                "#,
+                        Into::<DateTime<Utc>>::into(task_start_time).to_rfc3339()
+                    ),
+                )
+                .await
+                .expect("Failed to execute HTTP SQL query")
+            )
+            .expect("failed to format JSON response")
+        );
+        Ok(())
+    }
+    basic(http_base_url.as_str(), &trace_provider).await?;
 
-    let table_schema_task = tasks
-        .iter()
-        .find(|t| t.0 == "tool_use::table_schema")
-        .expect("Expected 'tool_use::table_schema' task to be executed");
+    ////////////////////////////////////////////////////////////////////////////////
+    ////////////////////////////////////////////////////////////////////////////////
+    ////////////////////////////////////////////////////////////////////////////////
 
-    insta::assert_snapshot!(
-        "nsql_table_schema_task",
-        pretty_json_str(&table_schema_task.1)?
-    );
+    async fn with_model(base_url: &str) -> Result<(), anyhow::Error> {
+        tracing::info!("/v1/nsql: Verify nsql request with model selection");
+        let response = send_nsql_request(
+            base_url,
+            "how many records (as 'total_records') are in taxi_trips dataset?",
+            Some("nql-2"),
+            Some(false),
+            None,
+        )
+        .await?;
 
-    tracing::info!("/v1/nsql: Ensure model selection works");
-    let response = send_nsql_request(
-        http_base_url.as_str(),
-        "how many records in taxi_trips dataset?",
-        Some("nql-2"),
-        Some(false),
-        None,
-    )
-    .await?;
+        insta::assert_snapshot!(
+            "with_model_response",
+            serde_json::to_string_pretty(&response).expect("failed to format JSON response")
+        );
 
-    assert!(
-        json_is_single_row_with_value(&response, 10),
-        "Expected a single record containing the value 10"
-    );
+        Ok(())
+    };
+    with_model(http_base_url.as_str()).await?;
 
-    tracing::info!("/v1/nsql: Verify nsql request with 'sample_data_enabled:true'");
+    ////////////////////////////////////////////////////////////////////////////////
+    ////////////////////////////////////////////////////////////////////////////////
+    ////////////////////////////////////////////////////////////////////////////////
 
-    let task_start_time = std::time::SystemTime::now();
+    async fn with_sample_data_enabled(
+        base_url: &str,
+        trace_provider: &TracerProvider,
+    ) -> Result<(), anyhow::Error> {
+        tracing::info!("/v1/nsql: Verify nsql request with 'sample_data_enabled:true'");
 
-    let response = send_nsql_request(
-        http_base_url.as_str(),
-        "how many records in taxi_trips dataset?",
-        Some("nql"),
-        Some(true),
-        None,
-    )
-    .await?;
+        let task_start_time = std::time::SystemTime::now();
 
-    assert!(
-        json_is_single_row_with_value(&response, 10),
-        "Expected a single record containing the value 10"
-    );
+        let response = send_nsql_request(
+            base_url,
+            "how many records (as 'total_records') are in taxi_trips dataset?",
+            Some("nql"),
+            Some(true),
+            None,
+        )
+        .await?;
+        insta::assert_snapshot!(
+            "with_sample_data_enabled_response",
+            serde_json::to_string_pretty(&response).expect("failed to format JSON response")
+        );
 
-    // ensure all spans are exported into task_history
-    let _ = trace_provider.force_flush();
+        // ensure all spans are exported into task_history
+        let _ = trace_provider.force_flush();
 
-    let tasks = get_executed_tasks(&rt, task_start_time.into()).await?;
+        insta::assert_snapshot!(
+            "with_sample_data_enabled_tasks",
+            serde_json::to_string_pretty(
+                &http_sql(
+                    base_url,
+                    &format!(
+                        r#"SELECT task, input
+                    FROM runtime.task_history
+                    WHERE start_time >= '{}' and task!='ai_completion'
+                    ORDER BY start_time, task;
+                "#,
+                        Into::<DateTime<Utc>>::into(task_start_time).to_rfc3339()
+                    ),
+                )
+                .await
+                .expect("Failed to execute HTTP SQL query")
+            )
+            .expect("failed to format JSON response")
+        );
 
-    let sample_data_task = tasks
-        .iter()
-        .find(|t| t.0 == "tool_use::sample_data")
-        .expect("Expected 'tool_use::sample_data' task to be executed");
-
-    insta::assert_snapshot!("nsql_sample_data_task", sample_data_task.1);
-
-    let sql_query_task = tasks
-        .iter()
-        .find(|t| t.0 == "sql_query")
-        .expect("Expected 'sql_query' task to be executed");
-
-    insta::assert_snapshot!("nsql_sample_data_task_sql_query", sql_query_task.1);
+        Ok(())
+    }
+    with_sample_data_enabled(http_base_url.as_str(), &trace_provider).await?;
 
     Ok(())
 }
