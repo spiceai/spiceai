@@ -123,7 +123,7 @@ dependencies = [
  "ndk-context",
  "ndk-sys",
  "num_enum 0.7.3",
- "thiserror",
+ "thiserror 1.0.68",
 ]
 
 [[package]]
@@ -465,7 +465,7 @@ dependencies = [
  "chrono",
  "log",
  "odbc-api",
- "thiserror",
+ "thiserror 1.0.68",
 ]
 
 [[package]]
@@ -591,7 +591,7 @@ dependencies = [
  "nom",
  "num-traits",
  "rusticata-macros",
- "thiserror",
+ "thiserror 1.0.68",
  "time",
 ]
 
@@ -749,7 +749,7 @@ dependencies = [
  "serde_urlencoded",
  "static_assertions_next",
  "tempfile",
- "thiserror",
+ "thiserror 1.0.68",
 ]
 
 [[package]]
@@ -784,7 +784,7 @@ dependencies = [
  "quote",
  "strum 0.26.3",
  "syn 2.0.87",
- "thiserror",
+ "thiserror 1.0.68",
 ]
 
 [[package]]
@@ -888,7 +888,7 @@ dependencies = [
  "secrecy",
  "serde",
  "serde_json",
- "thiserror",
+ "thiserror 1.0.68",
  "tokio",
  "tokio-stream",
  "tokio-util",
@@ -1923,9 +1923,9 @@ dependencies = [
 
 [[package]]
 name = "bollard"
-version = "0.17.1"
+version = "0.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d41711ad46fda47cd701f6908e59d1bd6b9a2b7464c0d0aeab95c6d37096ff8a"
+checksum = "a2b63bbe2a4db01f82f388bee3b1bed3ea9c4cc5f1f4f1fa7a4a171f1ddb2cf1"
 dependencies = [
  "base64 0.22.1",
  "bollard-stubs",
@@ -1946,7 +1946,7 @@ dependencies = [
  "serde_json",
  "serde_repr",
  "serde_urlencoded",
- "thiserror",
+ "thiserror 2.0.3",
  "tokio",
  "tokio-util",
  "tower-service",
@@ -1956,9 +1956,9 @@ dependencies = [
 
 [[package]]
 name = "bollard-stubs"
-version = "1.45.0-rc.26.0.1"
+version = "1.46.0-rc.27.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6d7c5415e3a6bc6d3e99eff6268e488fd4ee25e7b28c10f08fa6760bd9de16e4"
+checksum = "3a79775fcd9a02681f9508cd6e44f2164db81c29506063b5904757dd82879d96"
 dependencies = [
  "serde",
  "serde_repr",
@@ -2040,7 +2040,7 @@ dependencies = [
  "quote",
  "str_inflector",
  "syn 2.0.87",
- "thiserror",
+ "thiserror 1.0.68",
  "try_match",
 ]
 
@@ -2185,7 +2185,7 @@ dependencies = [
  "polling 3.7.4",
  "rustix 0.38.39",
  "slab",
- "thiserror",
+ "thiserror 1.0.68",
 ]
 
 [[package]]
@@ -2208,7 +2208,7 @@ dependencies = [
  "rand_distr",
  "rayon",
  "safetensors",
- "thiserror",
+ "thiserror 1.0.68",
  "yoke",
  "zip 1.1.4",
 ]
@@ -2233,7 +2233,7 @@ dependencies = [
  "rand_distr",
  "rayon",
  "safetensors",
- "thiserror",
+ "thiserror 1.0.68",
  "ug",
  "ug-cuda",
  "ug-metal",
@@ -2288,7 +2288,7 @@ checksum = "166a92826d615d98b205e346e52128fa0439f2ab3302587403fdc558b4219e19"
 dependencies = [
  "metal 0.27.0",
  "once_cell",
- "thiserror",
+ "thiserror 1.0.68",
  "tracing",
 ]
 
@@ -2299,7 +2299,7 @@ source = "git+https://github.com/EricLBuehler/candle.git?rev=2e17ebd#2e17ebd84cc
 dependencies = [
  "metal 0.27.0",
  "once_cell",
- "thiserror",
+ "thiserror 1.0.68",
  "tracing",
 ]
 
@@ -2317,7 +2317,7 @@ dependencies = [
  "rayon",
  "safetensors",
  "serde",
- "thiserror",
+ "thiserror 1.0.68",
 ]
 
 [[package]]
@@ -2333,7 +2333,7 @@ dependencies = [
  "rayon",
  "safetensors",
  "serde",
- "thiserror",
+ "thiserror 1.0.68",
 ]
 
 [[package]]
@@ -2582,7 +2582,7 @@ dependencies = [
  "native-tls",
  "percent-encoding",
  "pin-project",
- "thiserror",
+ "thiserror 1.0.68",
  "tokio",
  "tokio-native-tls",
  "url",
@@ -3619,7 +3619,7 @@ dependencies = [
  "serde",
  "serde_json",
  "strum 0.26.3",
- "thiserror",
+ "thiserror 1.0.68",
  "tokio",
  "tracing",
  "url",
@@ -3877,7 +3877,7 @@ dependencies = [
  "image 0.24.9",
  "serde",
  "serde_json",
- "thiserror",
+ "thiserror 1.0.68",
  "xml-rs",
  "zip 0.6.6",
 ]
@@ -4887,7 +4887,7 @@ dependencies = [
  "ring",
  "serde",
  "serde_json",
- "thiserror",
+ "thiserror 1.0.68",
  "tokio",
  "url",
  "uuid 1.11.0",
@@ -4913,7 +4913,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_urlencoded",
- "thiserror",
+ "thiserror 1.0.68",
  "tokio",
  "tower 0.4.13",
  "url",
@@ -4971,7 +4971,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d2ebc8013b4426d5b81a4364c419a95ed0b404af2b82e2457de52d9348f0e474"
 dependencies = [
  "combine 3.8.1",
- "thiserror",
+ "thiserror 1.0.68",
 ]
 
 [[package]]
@@ -5053,7 +5053,7 @@ dependencies = [
  "pest_derive",
  "serde",
  "serde_json",
- "thiserror",
+ "thiserror 1.0.68",
 ]
 
 [[package]]
@@ -5137,7 +5137,7 @@ dependencies = [
  "regex",
  "roxmltree",
  "socket2 0.5.7",
- "thiserror",
+ "thiserror 1.0.68",
  "tokio",
  "url",
  "uuid 1.11.0",
@@ -5156,7 +5156,7 @@ dependencies = [
  "futures",
  "hdfs-native",
  "object_store",
- "thiserror",
+ "thiserror 1.0.68",
  "tokio",
 ]
 
@@ -5241,7 +5241,7 @@ dependencies = [
  "reqwest 0.11.27",
  "serde",
  "serde_json",
- "thiserror",
+ "thiserror 1.0.68",
  "tokio",
  "ureq",
 ]
@@ -6010,7 +6010,7 @@ dependencies = [
  "combine 4.6.7",
  "jni-sys",
  "log",
- "thiserror",
+ "thiserror 1.0.68",
  "walkdir",
  "windows-sys 0.45.0",
 ]
@@ -6924,7 +6924,7 @@ dependencies = [
  "serde_yaml",
  "strum 0.26.3",
  "sysinfo",
- "thiserror",
+ "thiserror 1.0.68",
  "tokenizers",
  "tokio",
  "tokio-rayon",
@@ -7018,7 +7018,7 @@ dependencies = [
  "rustc_version",
  "smallvec",
  "tagptr",
- "thiserror",
+ "thiserror 1.0.68",
  "triomphe",
  "uuid 1.11.0",
 ]
@@ -7082,7 +7082,7 @@ dependencies = [
  "quote",
  "syn 2.0.87",
  "termcolor",
- "thiserror",
+ "thiserror 1.0.68",
 ]
 
 [[package]]
@@ -7108,7 +7108,7 @@ dependencies = [
  "serde",
  "serde_json",
  "socket2 0.5.7",
- "thiserror",
+ "thiserror 1.0.68",
  "tokio",
  "tokio-native-tls",
  "tokio-util",
@@ -7150,7 +7150,7 @@ dependencies = [
  "sha2",
  "smallvec",
  "subprocess",
- "thiserror",
+ "thiserror 1.0.68",
  "time",
  "uuid 1.11.0",
  "zstd",
@@ -7213,7 +7213,7 @@ dependencies = [
  "ndk-sys",
  "num_enum 0.7.3",
  "raw-window-handle",
- "thiserror",
+ "thiserror 1.0.68",
 ]
 
 [[package]]
@@ -7771,7 +7771,7 @@ dependencies = [
  "atoi",
  "log",
  "odbc-sys",
- "thiserror",
+ "thiserror 1.0.68",
  "widestring",
  "winit",
 ]
@@ -7884,7 +7884,7 @@ dependencies = [
  "js-sys",
  "once_cell",
  "pin-project-lite",
- "thiserror",
+ "thiserror 1.0.68",
 ]
 
 [[package]]
@@ -7949,7 +7949,7 @@ dependencies = [
  "reqwest 0.12.9",
  "serde",
  "serde_json",
- "thiserror",
+ "thiserror 1.0.68",
  "typed-builder",
 ]
 
@@ -7969,7 +7969,7 @@ dependencies = [
  "percent-encoding",
  "rand 0.8.5",
  "serde_json",
- "thiserror",
+ "thiserror 1.0.68",
  "tokio",
  "tokio-stream",
 ]
@@ -8199,7 +8199,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "879952a81a83930934cbf1786752d6dedc3b1f29e8f8fb2ad1d0a36f377cf442"
 dependencies = [
  "memchr",
- "thiserror",
+ "thiserror 1.0.68",
  "ucd-trie",
 ]
 
@@ -8581,7 +8581,7 @@ dependencies = [
  "memchr",
  "parking_lot 0.12.3",
  "protobuf",
- "thiserror",
+ "thiserror 1.0.68",
 ]
 
 [[package]]
@@ -8830,7 +8830,7 @@ dependencies = [
  "rustc-hash 2.0.0",
  "rustls 0.23.16",
  "socket2 0.5.7",
- "thiserror",
+ "thiserror 1.0.68",
  "tokio",
  "tracing",
 ]
@@ -8847,7 +8847,7 @@ dependencies = [
  "rustc-hash 2.0.0",
  "rustls 0.23.16",
  "slab",
- "thiserror",
+ "thiserror 1.0.68",
  "tinyvec",
  "tracing",
 ]
@@ -9132,7 +9132,7 @@ checksum = "ba009ff324d1fc1b900bd1fdb31564febe58a8ccc8a6fdbb93b543d33b13ca43"
 dependencies = [
  "getrandom 0.2.15",
  "libredox",
- "thiserror",
+ "thiserror 1.0.68",
 ]
 
 [[package]]
@@ -9312,7 +9312,7 @@ dependencies = [
  "nom",
  "pin-project-lite",
  "reqwest 0.12.9",
- "thiserror",
+ "thiserror 1.0.68",
 ]
 
 [[package]]
@@ -9326,7 +9326,7 @@ dependencies = [
  "http 1.1.0",
  "reqwest 0.12.9",
  "serde",
- "thiserror",
+ "thiserror 1.0.68",
  "tower-service",
 ]
 
@@ -9978,7 +9978,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.87",
- "thiserror",
+ "thiserror 1.0.68",
 ]
 
 [[package]]
@@ -10142,7 +10142,7 @@ checksum = "c7715380eec75f029a4ef7de39a9200e0a63823176b759d055b613f5a87df6a6"
 dependencies = [
  "percent-encoding",
  "serde",
- "thiserror",
+ "thiserror 1.0.68",
 ]
 
 [[package]]
@@ -10310,7 +10310,7 @@ checksum = "adc4e5204eb1910f40f9cfa375f6f05b68c3abac4b6fd879c8ff5e7ae8a0a085"
 dependencies = [
  "num-bigint",
  "num-traits",
- "thiserror",
+ "thiserror 1.0.68",
  "time",
 ]
 
@@ -10410,7 +10410,7 @@ dependencies = [
  "serde",
  "serde_json",
  "snowflake-jwt",
- "thiserror",
+ "thiserror 1.0.68",
  "tokio",
  "url",
  "uuid 1.11.0",
@@ -10427,7 +10427,7 @@ dependencies = [
  "rsa",
  "serde",
  "sha2",
- "thiserror",
+ "thiserror 1.0.68",
  "time",
 ]
 
@@ -10764,7 +10764,7 @@ dependencies = [
  "lazy-regex",
  "log",
  "pin-project",
- "thiserror",
+ "thiserror 1.0.68",
 ]
 
 [[package]]
@@ -10837,7 +10837,7 @@ dependencies = [
  "byteorder",
  "enum-as-inner",
  "libc",
- "thiserror",
+ "thiserror 1.0.68",
  "walkdir",
 ]
 
@@ -11000,7 +11000,7 @@ dependencies = [
  "serde",
  "serde_json",
  "text-embeddings-backend-core",
- "thiserror",
+ "thiserror 1.0.68",
  "tokenizers",
  "tracing",
 ]
@@ -11011,7 +11011,7 @@ version = "1.5.0"
 source = "git+https://github.com/spiceai/text-embeddings-inference.git?rev=b3925b2f97fcd2bfab9551b432ab659c48e5586b#b3925b2f97fcd2bfab9551b432ab659c48e5586b"
 dependencies = [
  "nohash-hasher",
- "thiserror",
+ "thiserror 1.0.68",
 ]
 
 [[package]]
@@ -11024,7 +11024,7 @@ dependencies = [
  "metrics",
  "serde_json",
  "text-embeddings-backend",
- "thiserror",
+ "thiserror 1.0.68",
  "tokenizers",
  "tokio",
  "tracing",
@@ -11044,7 +11044,7 @@ dependencies = [
  "pulldown-cmark",
  "regex",
  "strum 0.26.3",
- "thiserror",
+ "thiserror 1.0.68",
  "tiktoken-rs",
  "tokenizers",
  "unicode-segmentation",
@@ -11056,7 +11056,16 @@ version = "1.0.68"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "02dd99dc800bbb97186339685293e1cc5d9df1f8fae2d0aecd9ff1c77efea892"
 dependencies = [
- "thiserror-impl",
+ "thiserror-impl 1.0.68",
+]
+
+[[package]]
+name = "thiserror"
+version = "2.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c006c85c7651b3cf2ada4584faa36773bd07bac24acfb39f3c431b36d7e667aa"
+dependencies = [
+ "thiserror-impl 2.0.3",
 ]
 
 [[package]]
@@ -11064,6 +11073,17 @@ name = "thiserror-impl"
 version = "1.0.68"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a7c61ec9a6f64d2793d8a45faba21efbe3ced62a886d44c36a009b2b519b4c7e"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.87",
+]
+
+[[package]]
+name = "thiserror-impl"
+version = "2.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f077553d607adc1caf65430528a576c757a71ed73944b66ebb58ef2bbd243568"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -11112,7 +11132,7 @@ dependencies = [
  "pretty-hex",
  "rustls-native-certs 0.6.3",
  "rustls-pemfile 1.0.4",
- "thiserror",
+ "thiserror 1.0.68",
  "tokio-rustls 0.24.1",
  "tokio-util",
  "tracing",
@@ -11240,7 +11260,7 @@ dependencies = [
  "serde",
  "serde_json",
  "spm_precompiled",
- "thiserror",
+ "thiserror 1.0.68",
  "unicode-normalization-alignments",
  "unicode-segmentation",
  "unicode_categories",
@@ -11817,7 +11837,7 @@ dependencies = [
  "once_cell",
  "rand 0.8.5",
  "smallvec",
- "thiserror",
+ "thiserror 1.0.68",
  "tinyvec",
  "tokio",
  "tracing",
@@ -11839,7 +11859,7 @@ dependencies = [
  "rand 0.8.5",
  "resolv-conf",
  "smallvec",
- "thiserror",
+ "thiserror 1.0.68",
  "tokio",
  "tracing",
  "trust-dns-proto",
@@ -11885,7 +11905,7 @@ dependencies = [
  "log",
  "rand 0.8.5",
  "sha1",
- "thiserror",
+ "thiserror 1.0.68",
  "utf-8",
 ]
 
@@ -11953,7 +11973,7 @@ dependencies = [
  "num",
  "serde",
  "serde_json",
- "thiserror",
+ "thiserror 1.0.68",
 ]
 
 [[package]]
@@ -11966,7 +11986,7 @@ dependencies = [
  "half",
  "serde",
  "serde_json",
- "thiserror",
+ "thiserror 1.0.68",
  "ug",
 ]
 
@@ -11981,7 +12001,7 @@ dependencies = [
  "objc",
  "serde",
  "serde_json",
- "thiserror",
+ "thiserror 1.0.68",
  "ug",
 ]
 
@@ -12865,7 +12885,7 @@ dependencies = [
  "ring",
  "signature",
  "spki",
- "thiserror",
+ "thiserror 1.0.68",
  "zeroize",
 ]
 
@@ -12882,7 +12902,7 @@ dependencies = [
  "nom",
  "oid-registry",
  "rusticata-macros",
- "thiserror",
+ "thiserror 1.0.68",
  "time",
 ]
 
@@ -13151,7 +13171,7 @@ dependencies = [
  "displaydoc",
  "indexmap 2.6.0",
  "num_enum 0.7.3",
- "thiserror",
+ "thiserror 1.0.68",
 ]
 
 [[package]]
