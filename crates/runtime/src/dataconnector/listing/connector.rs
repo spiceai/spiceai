@@ -17,6 +17,7 @@ limitations under the License.
 use crate::accelerated_table::AcceleratedTable;
 use crate::component::dataset::Dataset;
 use crate::dataconnector::DataConnector;
+use crate::dataconnector::DataConnectorError;
 use crate::dataconnector::DataConnectorResult;
 use crate::parameters::Parameters;
 use async_trait::async_trait;
@@ -34,9 +35,11 @@ use datafusion::datasource::listing::{
 use datafusion::datasource::TableProvider;
 use datafusion::execution::config::SessionConfig;
 use datafusion::execution::context::SessionContext;
+use futures::TryStreamExt;
 use object_store::ObjectStore;
 use snafu::prelude::*;
 use std::any::Any;
+use std::collections::HashSet;
 use std::fmt::Display;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -319,6 +322,16 @@ impl<T: ListingTableConnector + Display> DataConnector for T {
                 })?)
             }
             Some(file_format) => {
+                let object_store = self.get_object_store(dataset)?;
+                check_for_files_and_extensions(
+                    format!("{self}"),
+                    &extension,
+                    table_path.clone(),
+                    &ctx,
+                    &object_store,
+                )
+                .await?;
+
                 let mut options = ListingOptions::new(file_format).with_file_extension(&extension);
 
                 let resolved_schema = options
@@ -385,6 +398,65 @@ impl<T: ListingTableConnector + Display> DataConnector for T {
         ListingTableConnector::on_accelerated_table_registration(self, dataset, accelerated_table)
             .await
     }
+}
+
+async fn check_for_files_and_extensions(
+    dataconnector: String,
+    extension: &str,
+    table_path: ListingTableUrl,
+    ctx: &SessionContext,
+    object_store: &Arc<dyn ObjectStore>,
+) -> DataConnectorResult<()> {
+    let files: Vec<_> = table_path
+        .list_all_files(&ctx.state(), object_store, "")
+        .await
+        .map_err(|err| DataConnectorError::UnableToConnectInternal {
+            dataconnector: dataconnector.clone(),
+            source: err.into(),
+        })?
+        .try_collect()
+        .await
+        .map_err(|err| DataConnectorError::UnableToConnectInternal {
+            dataconnector: dataconnector.clone(),
+            source: err.into(),
+        })?;
+
+    if files.is_empty() {
+        return Err(DataConnectorError::InvalidConfigurationNoSource {
+            dataconnector: dataconnector.clone(),
+            message:
+                // Url could contain access keys from e.g. S3, so we don't want to log it.
+                "Failed to find any files at the specified path. Check the path and try again."
+                    .to_string(),
+        });
+    }
+
+    let extensions = files
+        .iter()
+        .filter_map(|file| file.location.extension().map(|e| format!(".{e}")))
+        .collect::<HashSet<_>>();
+
+    if !extensions.contains(extension) {
+        if extensions.is_empty() {
+            return Err(DataConnectorError::InvalidConfigurationNoSource {
+                dataconnector: dataconnector.clone(),
+                message: format!("Failed to find any files matching the extension '{extension}'.\nSpice could not find any files with extensions at the specified path. Check the path and try again."),
+            });
+        }
+
+        let display_extensions = extensions
+            .iter()
+            .map(|e| format!("'{e}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        return Err(DataConnectorError::InvalidConfigurationNoSource {
+            dataconnector: dataconnector.clone(),
+            message: format!("Failed to find any files matching the extension '{extension}'.\nIs your `file_format` parameter correct? Spice found the following file extensions: {display_extensions}.\nFor further information, visit: https://docs.spiceai.org/components/data-connectors#object-store-file-formats")
+        });
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
