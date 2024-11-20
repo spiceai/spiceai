@@ -20,12 +20,13 @@ use crate::Runtime;
 
 use axum::routing::patch;
 use opentelemetry::KeyValue;
+use spicepod::component::runtime::CorsConfig;
 use std::sync::Arc;
 
 use axum::{
     body::Body,
     extract::MatchedPath,
-    http::Request,
+    http::{HeaderValue, Method, Request},
     middleware::{self, Next},
     response::IntoResponse,
     routing::{get, post, Router},
@@ -33,6 +34,7 @@ use axum::{
 };
 use runtime_auth::layer::http::AuthLayer;
 use tokio::time::Instant;
+use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 
 use super::{metrics, v1};
 
@@ -41,6 +43,7 @@ pub(crate) fn routes(
     config: Arc<config::Config>,
     vector_search: Arc<vector_search::VectorSearch>,
     auth_layer: Option<AuthLayer>,
+    cors_config: &CorsConfig,
 ) -> Router {
     let mut authenticated_router = Router::new()
         .route("/v1/sql", post(v1::query::post))
@@ -96,6 +99,7 @@ pub(crate) fn routes(
     unauthenticated_router
         .merge(authenticated_router)
         .route_layer(middleware::from_fn(track_metrics))
+        .layer(cors_layer(cors_config))
 }
 
 async fn track_metrics(req: Request<Body>, next: Next) -> impl IntoResponse {
@@ -122,4 +126,27 @@ async fn track_metrics(req: Request<Body>, next: Next) -> impl IntoResponse {
     metrics::REQUESTS_DURATION_MS.record(latency_ms, &labels);
 
     response
+}
+
+fn cors_layer(cors_config: &CorsConfig) -> CorsLayer {
+    // By default, the layer is disabled unless .allow* methods are called.
+    let cors = CorsLayer::new();
+
+    if !cors_config.enabled {
+        return cors;
+    }
+
+    let allowed_origins: AllowOrigin = if cors_config.allowed_origins.contains(&"*".to_string()) {
+        Any.into()
+    } else {
+        cors_config
+            .allowed_origins
+            .iter()
+            .filter_map(|o| HeaderValue::try_from(o).ok())
+            .collect::<Vec<HeaderValue>>()
+            .into()
+    };
+
+    cors.allow_methods([Method::GET, Method::POST, Method::PATCH])
+        .allow_origin(allowed_origins)
 }
