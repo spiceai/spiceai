@@ -216,7 +216,7 @@ pub struct ApiKeyAuth {
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct CorsConfig {
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub enabled: bool,
     #[serde(default = "default_allowed_origins")]
     pub allowed_origins: Vec<String>,
@@ -229,7 +229,7 @@ fn default_allowed_origins() -> Vec<String> {
 impl Default for CorsConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: false,
             allowed_origins: default_allowed_origins(),
         }
     }

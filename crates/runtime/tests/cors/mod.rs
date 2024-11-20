@@ -28,7 +28,7 @@ use spicepod::component::runtime::CorsConfig;
 const LOCALHOST: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
 
 #[tokio::test]
-async fn test_default_cors_endpoints() -> Result<(), anyhow::Error> {
+async fn test_enabled_cors_endpoints() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
     let span = tracing::info_span!("test_cors_endpoints");
     let _span_guard = span.enter();
@@ -48,7 +48,17 @@ async fn test_default_cors_endpoints() -> Result<(), anyhow::Error> {
         .with_flight_bind_address(SocketAddr::new(LOCALHOST, flight_port))
         .with_open_telemetry_bind_address(SocketAddr::new(LOCALHOST, otel_port));
 
-    let rt = Runtime::builder().build().await;
+    let rt = Runtime::builder()
+        .with_app(
+            AppBuilder::new("test")
+                .with_cors_config(CorsConfig {
+                    enabled: true,
+                    allowed_origins: vec!["*".to_string()],
+                })
+                .build(),
+        )
+        .build()
+        .await;
 
     // Start the servers
     tokio::spawn(async move {
@@ -104,15 +114,9 @@ async fn test_disabled_cors_endpoints() -> Result<(), anyhow::Error> {
         .with_flight_bind_address(SocketAddr::new(LOCALHOST, flight_port))
         .with_open_telemetry_bind_address(SocketAddr::new(LOCALHOST, otel_port));
 
+    // Default cors config is disabled
     let rt = Runtime::builder()
-        .with_app(
-            AppBuilder::new("test")
-                .with_cors_config(CorsConfig {
-                    enabled: false,
-                    allowed_origins: vec![],
-                })
-                .build(),
-        )
+        .with_app(AppBuilder::new("test").build())
         .build()
         .await;
 
