@@ -401,7 +401,7 @@ impl<T: ListingTableConnector + Display> DataConnector for T {
 }
 
 /// Lists the available files for a ListingTableConnector/ObjectStore
-/// Infers if the file_format specified is valid, based on the existence of files with the required extension
+/// Infers if the `file_format` specified is valid, based on the existence of files with the required extension
 ///
 /// # Errors
 ///
