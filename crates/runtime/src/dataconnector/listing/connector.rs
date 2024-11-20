@@ -33,6 +33,7 @@ use datafusion::datasource::listing::{
     ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
 };
 use datafusion::datasource::TableProvider;
+use datafusion::error::DataFusionError;
 use datafusion::execution::config::SessionConfig;
 use datafusion::execution::context::SessionContext;
 use futures::TryStreamExt;
@@ -259,6 +260,16 @@ pub trait ListingTableConnector: DataConnector {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Ok(())
     }
+
+    fn handle_object_store_error(&self, error: object_store::Error) -> DataConnectorError
+    where
+        Self: Display,
+    {
+        crate::dataconnector::DataConnectorError::UnableToConnectInternal {
+            dataconnector: format!("{self}"),
+            source: error.into(),
+        }
+    }
 }
 
 #[async_trait]
@@ -337,9 +348,14 @@ impl<T: ListingTableConnector + Display> DataConnector for T {
                 let resolved_schema = options
                     .infer_schema(&ctx.state(), &table_path)
                     .await
-                    .boxed()
-                    .context(crate::dataconnector::UnableToConnectInternalSnafu {
-                        dataconnector: format!("{self}"),
+                    .map_err(|e| match e {
+                        DataFusionError::ObjectStore(object_store_error) => {
+                            self.handle_object_store_error(object_store_error)
+                        }
+                        e => crate::dataconnector::DataConnectorError::UnableToConnectInternal {
+                            dataconnector: format!("{self}"),
+                            source: e.into(),
+                        },
                     })?;
 
                 // If we should infer partitions and the path is a folder, infer the partitions from the folder structure.

@@ -16,8 +16,8 @@ limitations under the License.
 
 use super::{
     listing::{self, ListingTableConnector},
-    DataConnector, DataConnectorFactory, DataConnectorParams, DataConnectorResult, ParameterSpec,
-    Parameters,
+    DataConnector, DataConnectorError, DataConnectorFactory, DataConnectorParams,
+    DataConnectorResult, ParameterSpec, Parameters,
 };
 
 use crate::component::dataset::Dataset;
@@ -30,6 +30,42 @@ use std::pin::Pin;
 use std::string::String;
 use std::sync::Arc;
 use url::Url;
+
+// https://docs.aws.amazon.com/general/latest/gr/rande.html
+pub const AWS_REGIONS: [&str; 32] = [
+    "us-east-1",
+    "us-east-2",
+    "us-west-1",
+    "us-west-2",
+    "af-south-1",
+    "ap-east-1",
+    "ap-south-1",
+    "ap-south-2",
+    "ap-northeast-1",
+    "ap-northeast-2",
+    "ap-northeast-3",
+    "ap-southeast-1",
+    "ap-southeast-2",
+    "ap-southeast-3",
+    "ap-southeast-4",
+    "ap-southeast-5",
+    "ca-central-1",
+    "ca-west-1",
+    "eu-central-1",
+    "eu-central-2",
+    "eu-west-1",
+    "eu-west-2",
+    "eu-west-3",
+    "eu-south-1",
+    "eu-south-2",
+    "eu-north-1",
+    "sa-east-1",
+    "il-central-1",
+    "me-south-1",
+    "me-central-1",
+    "us-gov-east-1",
+    "us-gov-west-1",
+];
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -57,6 +93,21 @@ pub enum Error {
         "The 's3_endpoint' parameter must be a HTTP/S URL, but '{endpoint}' was provided.\nFor further information, visit: https://docs.spiceai.org/components/data-connectors/s3#params"
     ))]
     InvalidEndpoint { endpoint: String },
+
+    #[snafu(display(
+        "The 's3_region' parameter must be a valid AWS region code, but '{region}' was provided.\nFor further information, visit: https://docs.spiceai.org/components/data-connectors/s3#params"
+    ))]
+    InvalidRegion { region: String },
+
+    #[snafu(display(
+        "The `s3_region` parameter requires a lowercase AWS region code, but '{region}' was provided.\nSpice will automatically convert the region code to lowercase.\nFor further information, visit: https://docs.spiceai.org/components/data-connectors/s3#params"
+    ))]
+    InvalidRegionCorrected { region: String },
+
+    #[snafu(display("Failed to authenticate using an IAM role.\nAre you sure you're running in an environment with an IAM role?\n{source}\nFor further information, visit: https://docs.spiceai.org/components/data-connectors/s3#auth"))]
+    InvalidIAMRoleAuthentication {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 }
 
 pub struct S3 {
@@ -128,6 +179,29 @@ impl DataConnectorFactory for S3Factory {
                         endpoint: endpoint.to_string(),
                     })
                         as Box<dyn std::error::Error + Send + Sync>);
+                }
+            }
+
+            if let Some(region) = params.parameters.get("region").expose().ok() {
+                if AWS_REGIONS.contains(&region.to_lowercase().as_str())
+                    && !AWS_REGIONS.contains(&region)
+                {
+                    tracing::warn!(
+                        "{}",
+                        Error::InvalidRegionCorrected {
+                            region: region.to_string()
+                        }
+                    );
+                    params
+                        .parameters
+                        .insert("region".to_string(), region.to_lowercase().into());
+                } else if !AWS_REGIONS.contains(&region) {
+                    tracing::warn!(
+                        "{}",
+                        Error::InvalidRegion {
+                            region: region.to_string(),
+                        }
+                    );
                 }
             }
 
@@ -222,5 +296,30 @@ impl ListingTableConnector for S3 {
         )));
 
         Ok(s3_url)
+    }
+
+    fn handle_object_store_error(&self, error: object_store::Error) -> DataConnectorError {
+        match error {
+            object_store::Error::Generic { source, .. } => {
+                if self.params.get("auth").expose().ok() == Some("iam_role") {
+                    let err = Error::InvalidIAMRoleAuthentication { source };
+
+                    DataConnectorError::InvalidConfiguration {
+                        dataconnector: format!("{self}"),
+                        message: format!("{err}"),
+                        source: err.into(),
+                    }
+                } else {
+                    DataConnectorError::UnableToConnectInternal {
+                        dataconnector: format!("{self}"),
+                        source,
+                    }
+                }
+            }
+            error => DataConnectorError::UnableToConnectInternal {
+                dataconnector: format!("{self}"),
+                source: error.into(),
+            },
+        }
     }
 }

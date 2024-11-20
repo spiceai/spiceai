@@ -46,6 +46,9 @@ pub struct Runtime {
 
     #[serde(default)]
     pub auth: Option<Auth>,
+
+    #[serde(default)]
+    pub cors: CorsConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -207,4 +210,27 @@ pub struct ApiKeyAuth {
     #[serde(default = "default_true")]
     pub enabled: bool,
     pub keys: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct CorsConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_allowed_origins")]
+    pub allowed_origins: Vec<String>,
+}
+
+fn default_allowed_origins() -> Vec<String> {
+    vec!["*".to_string()]
+}
+
+impl Default for CorsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            allowed_origins: default_allowed_origins(),
+        }
+    }
 }
