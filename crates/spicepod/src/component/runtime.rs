@@ -28,7 +28,7 @@ const TASK_HISTORY_RETENTION_MINIMUM: u64 = 60; // 1 minute
 pub struct Runtime {
     #[serde(default)]
     pub results_cache: ResultsCache,
-    pub num_of_parallel_loading_at_start_up: Option<usize>,
+    pub dataset_load_parallelism: Option<usize>,
 
     /// If set, the runtime will configure all endpoints to use TLS
     pub tls: Option<TlsConfig>,

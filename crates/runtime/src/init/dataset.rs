@@ -52,8 +52,7 @@ impl Runtime {
         };
 
         // Control the number of parallel dataset loads
-        let semaphore = if let Some(parallel_num) = app.runtime.num_of_parallel_loading_at_start_up
-        {
+        let semaphore = if let Some(parallel_num) = app.runtime.dataset_load_parallelism {
             Arc::new(Semaphore::new(parallel_num))
         } else {
             Arc::new(Semaphore::new(Semaphore::MAX_PERMITS))
@@ -127,12 +126,13 @@ impl Runtime {
 
         let mut spawned_tasks = vec![];
 
-        for (_, dataset_load_future) in dataset_futures {
+        for (ds, dataset_load_future) in dataset_futures {
             let semaphore = Arc::clone(&semaphore);
             let handle = tokio::spawn(async move {
                 let Ok(_guard) = semaphore.acquire().await else {
                     unreachable!("Semaphore is never closed.");
                 };
+                tracing::info!("Initializing dataset {ds}");
                 dataset_load_future.await;
             });
             spawned_tasks.push(handle);
