@@ -99,6 +99,11 @@ pub enum Error {
     ))]
     InvalidRegion { region: String },
 
+    #[snafu(display(
+        "The `s3_region` parameter requires a lowercase AWS region code, but '{region}' was provided.\nSpice will automatically convert the region code to lowercase.\nFor further information, visit: https://docs.spiceai.org/components/data-connectors/s3#params"
+    ))]
+    InvalidRegionCorrected { region: String },
+
     #[snafu(display("Failed to authenticate using an IAM role.\nAre you sure you're running in an environment with an IAM role?\n{source}\nFor further information, visit: https://docs.spiceai.org/components/data-connectors/s3#auth"))]
     InvalidIAMRoleAuthentication {
         source: Box<dyn std::error::Error + Send + Sync>,
@@ -178,11 +183,25 @@ impl DataConnectorFactory for S3Factory {
             }
 
             if let Some(region) = params.parameters.get("region").expose().ok() {
-                if !AWS_REGIONS.contains(&region) {
-                    return Err(Box::new(Error::InvalidRegion {
-                        region: region.to_string(),
-                    })
-                        as Box<dyn std::error::Error + Send + Sync>);
+                if AWS_REGIONS.contains(&region.to_lowercase().as_str())
+                    && !AWS_REGIONS.contains(&region)
+                {
+                    tracing::warn!(
+                        "{}",
+                        Error::InvalidRegionCorrected {
+                            region: region.to_string()
+                        }
+                    );
+                    params
+                        .parameters
+                        .insert("region".to_string(), region.to_lowercase().into());
+                } else if !AWS_REGIONS.contains(&region) {
+                    tracing::warn!(
+                        "{}",
+                        Error::InvalidRegion {
+                            region: region.to_string(),
+                        }
+                    );
                 }
             }
 
