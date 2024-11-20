@@ -461,7 +461,7 @@ impl Runtime {
         });
 
         let datasets = tokio::spawn({
-            let self_clone = self.clone();
+            let self_clone = Arc::new(self.clone());
             async move {
                 self_clone.load_datasets().await;
             }
