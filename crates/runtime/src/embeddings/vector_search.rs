@@ -51,6 +51,12 @@ pub enum Error {
     #[snafu(display("Data sources [{}] does not exist", data_source.iter().map(TableReference::to_quoted_string).join(", ")))]
     DataSourcesNotFound { data_source: Vec<TableReference> },
 
+    #[snafu(display("Failed to retrive table {} data source", data_source.to_quoted_string()))]
+    DataSourceNotFound { data_source: TableReference },
+
+    #[snafu(display("There are no tables with embeddings ready for search"))]
+    NoTablesWithEmbeddingsFound {},
+
     #[snafu(display("Vector search cannot be run on {}.", data_source.to_quoted_string()))]
     CannotVectorSearchDataset { data_source: TableReference },
 
@@ -597,12 +603,7 @@ impl VectorSearch {
         };
 
         if tables.is_empty() {
-            return Err(Error::DataSourcesNotFound {
-                data_source: data_source_opt
-                    .as_ref()
-                    .map(|ts| ts.iter().map(TableReference::from).collect())
-                    .unwrap_or_default(),
-            });
+            return Err(Error::NoTablesWithEmbeddingsFound {});
         }
 
         let span = match Span::current() {
@@ -700,8 +701,8 @@ impl VectorSearch {
                 .df
                 .get_table(&t)
                 .await
-                .context(DataSourcesNotFoundSnafu {
-                    data_source: vec![t.clone()],
+                .context(DataSourceNotFoundSnafu {
+                    data_source: t.clone(),
                 })?;
             if get_embedding_table(&table_provider).await.is_some() {
                 tables_with_embeddings.push(t);
