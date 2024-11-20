@@ -507,7 +507,6 @@ impl Runtime {
 
         params_with_secrets
     }
-
 }
 
 #[must_use]
