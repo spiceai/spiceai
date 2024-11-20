@@ -1484,7 +1484,7 @@ impl Runtime {
             ],
         );
 
-        tracing::info!("Loading model [{}] from {}...", m.name, m.from);
+        tracing::info!("Loading model [{}] from {}.", m.name, m.from);
 
         // TODO: Have downstream code using model parameters to accept `Hashmap<String, Value>`.
         // This will require handling secrets with `Value` type.
