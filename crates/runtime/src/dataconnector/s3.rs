@@ -33,10 +33,10 @@ use url::Url;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("The S3 authentication method was set to `key`, but no AWS access secret was provided for credentials.\nSpecify an access secret with the `s3_secret` parameter.\nFor futher information, visit: https://docs.spiceai.org/components/data-connectors/s3#auth"))]
+    #[snafu(display("The S3 authentication method was set to `key`, but no AWS access secret was provided for credentials.\nSpecify an access secret with the `s3_secret` parameter.\nFor further information, visit: https://docs.spiceai.org/components/data-connectors/s3#auth"))]
     NoAccessSecret,
 
-    #[snafu(display("The S3 authentication method was set to `key`, but no AWS access key was provided for credentials.\nSpecify an access key with the `s3_key` parameter.\nFor futher information, visit: https://docs.spiceai.org/components/data-connectors/s3#auth"))]
+    #[snafu(display("The S3 authentication method was set to `key`, but no AWS access key was provided for credentials.\nSpecify an access key with the `s3_key` parameter.\nFor further information, visit: https://docs.spiceai.org/components/data-connectors/s3#auth"))]
     NoAccessKey,
 
     #[snafu(display("Unable to parse URL {url}: {source}"))]
@@ -45,11 +45,11 @@ pub enum Error {
         source: url::ParseError,
     },
 
-    #[snafu(display("The S3 authentication method '{method}' is not supported.\nUpdate the `s3_auth` parameter to use the supported `s3_auth` modes of 'public' (i.e. no auth), 'iam_role', or 'key'.\nFor futher information, visit: https://docs.spiceai.org/components/data-connectors/s3#auth"))]
+    #[snafu(display("The S3 authentication method '{method}' is not supported.\nUpdate the `s3_auth` parameter to use the supported `s3_auth` modes of 'public' (i.e. no auth), 'iam_role', or 'key'.\nFor further information, visit: https://docs.spiceai.org/components/data-connectors/s3#auth"))]
     UnsupportedAuthenticationMethod { method: String },
 
     #[snafu(display(
-        "The '{parameter}' parameter cannot be set unless the `s3_auth` parameter is set to '{auth}'.\nFor futher information, visit: https://docs.spiceai.org/components/data-connectors/s3#auth"
+        "The '{parameter}' parameter cannot be set unless the `s3_auth` parameter is set to '{auth}'.\nFor further information, visit: https://docs.spiceai.org/components/data-connectors/s3#auth"
     ))]
     InvalidAuthParameterCombination { parameter: String, auth: String },
 
