@@ -111,14 +111,11 @@ impl MistralLlama {
             .extension()
             .and_then(|e| e.to_str())
             .unwrap_or_default();
+
         let pipeline = match extension {
             "ggml" => Self::load_ggml_pipeline(paths, &device, &model_id, chat_template_literal)?,
             "gguf" => Self::load_gguf_pipeline(paths, &device, &model_id, chat_template_literal)?,
-            _ => {
-                return Err(ChatError::FailedToLoadModel {
-                    source: format!("Unknown model type: {extension}").into(),
-                })
-            }
+            _ => Self::load_default_pipeline(paths, &device, &model_id, chat_template_literal)?,
         };
 
         Ok(Self::from_pipeline(pipeline))
@@ -152,6 +149,33 @@ impl MistralLlama {
             None,
             None,
         ))
+    }
+
+    fn load_default_pipeline(
+        paths: Box<dyn ModelPaths>,
+        device: &Device,
+        model_id: &str,
+        chat_template_literal: Option<&str>,
+    ) -> Result<Arc<tokio::sync::Mutex<dyn Pipeline + Sync + Send>>> {
+        let model_parts: Vec<&str> = model_id.split(':').collect();
+        NormalLoaderBuilder::new(
+            mistralrs::NormalSpecificConfig::default(),
+            chat_template_literal.map(ToString::to_string),
+            None,
+            model_parts.first().map(ToString::to_string),
+        )
+        .build(None) // Infer loader type
+        .map_err(|e| ChatError::FailedToLoadModel { source: e.into() })?
+        .load_model_from_path(
+            &paths,
+            &ModelDType::Auto,
+            device,
+            false,
+            DeviceMapMetadata::dummy(),
+            None,
+            None,
+        )
+        .map_err(|e| ChatError::FailedToLoadModel { source: e.into() })
     }
 
     fn load_gguf_pipeline(
