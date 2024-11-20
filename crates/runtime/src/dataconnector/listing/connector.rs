@@ -400,6 +400,13 @@ impl<T: ListingTableConnector + Display> DataConnector for T {
     }
 }
 
+/// Lists the available files for a ListingTableConnector/ObjectStore
+/// Infers if the file_format specified is valid, based on the existence of files with the required extension
+///
+/// # Errors
+///
+/// - If no files are found at the specified path
+/// - If no files with the specified extension are found
 async fn check_for_files_and_extensions(
     dataconnector: String,
     extension: &str,
