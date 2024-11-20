@@ -745,7 +745,7 @@ impl DataFusion {
 
         accelerated_table_builder.zero_results_action(acceleration_settings.on_zero_results);
 
-        accelerated_table_builder.ready_state(acceleration_settings.ready_state);
+        accelerated_table_builder.ready_state(dataset.ready_state);
 
         accelerated_table_builder.cache_provider(self.cache_provider());
 

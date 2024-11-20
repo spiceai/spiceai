@@ -1,0 +1,11 @@
+---
+source: crates/runtime/tests/models/openai.rs
+expression: pretty_json_str(&document_similarity_task.1)?
+---
+{
+  "datasets": [
+    "spice.public.item"
+  ],
+  "limit": 5,
+  "text": "vehicles"
+}

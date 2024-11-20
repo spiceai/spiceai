@@ -27,7 +27,7 @@ use spicepod::{
         embeddings::Embeddings,
         extension::Extension,
         model::Model,
-        runtime::{ResultsCache, Runtime, TlsConfig},
+        runtime::{CorsConfig, ResultsCache, Runtime, TlsConfig},
         secret::Secret,
         tool::Tool,
         view::View,
@@ -213,6 +213,12 @@ impl AppBuilder {
     #[must_use]
     pub fn with_runtime_params(mut self, params: HashMap<String, String>) -> AppBuilder {
         self.runtime.params = params;
+        self
+    }
+
+    #[must_use]
+    pub fn with_cors_config(mut self, cors_config: CorsConfig) -> AppBuilder {
+        self.runtime.cors = cors_config;
         self
     }
 

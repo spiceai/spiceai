@@ -27,13 +27,14 @@ use tonic::{Request, Response, Status};
 
 use crate::{
     flight::{metrics, record_batches_to_flight_stream, Service},
-    timing::{TimeMeasurement, TimedStream},
+    timing::TimedStream,
 };
 
 pub(crate) fn get_flight_info(
     query: &sql::CommandGetPrimaryKeys,
     request: Request<FlightDescriptor>,
 ) -> Response<FlightInfo> {
+    let _start = metrics::track_flight_request("get_flight_info", Some("get_primary_keys"));
     let fd = request.into_inner();
     tracing::trace!("get_flight_info: {query:?}");
     Response::new(FlightInfo {
@@ -59,10 +60,7 @@ pub(crate) fn do_get(
     _flight_svc: &Service,
     query: &sql::CommandGetPrimaryKeys,
 ) -> Result<Response<<Service as FlightService>::DoGetStream>, Status> {
-    let start = TimeMeasurement::new(
-        &metrics::flightsql::DO_GET_GET_PRIMARY_KEYS_DURATION_MS,
-        vec![],
-    );
+    let start = metrics::track_flight_request("do_get", Some("get_primary_keys"));
     tracing::trace!("do_get_get_primary_keys: {query:?}");
 
     let schema = Arc::new(Schema::new(vec![

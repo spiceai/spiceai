@@ -146,6 +146,12 @@ spice search --cloud
 				slog.Error("reading response from spiced", "error", err)
 				continue
 			}
+
+			if response.StatusCode != 200 {
+				slog.Error("search failed", "error", raw)
+				continue
+			}
+
 			var searchResponse SearchResponse = SearchResponse{}
 			err = json.Unmarshal([]byte(raw), &searchResponse)
 			if err != nil {

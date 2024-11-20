@@ -92,7 +92,7 @@
           },
           "editorMode": "code",
           "exemplar": false,
-          "expr": "sum(spiced_runtime_flight_server_start)",
+          "expr": "sum(runtime_flight_server_started)",
           "instant": true,
           "legendFormat": "__auto",
           "range": false,
@@ -206,7 +206,7 @@
           "disableTextWrap": false,
           "editorMode": "code",
           "exemplar": false,
-          "expr": "(sum by(pod) (count_over_time(spiced_runtime_flight_server_start[$__range])) * 10000) / $__range_ms * 100",
+          "expr": "(sum by(pod) (count_over_time(runtime_flight_server_started[$__range])) * 10000) / $__range_ms * 100",
           "fullMetaSearch": false,
           "includeNullMetadata": true,
           "instant": true,
@@ -326,7 +326,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "datasets_count{pod=~\"${pods}\"}",
+          "expr": "dataset_active_count{pod=~\"${pods}\"}",
           "instant": false,
           "legendFormat": "{{pod}}",
           "range": true,
@@ -420,7 +420,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "models_count{pod=~\"${pods}\"}",
+          "expr": "model_active_count{pod=~\"${pods}\"}",
           "instant": false,
           "legendFormat": "{{pod}}",
           "range": true,
@@ -665,7 +665,7 @@
               }
             ]
           },
-          "unit": "s"
+          "unit": "ms"
         },
         "overrides": []
       },
@@ -699,7 +699,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "time()-datasets_acceleration_last_refresh_time{pod=~\"${pods}\",dataset!~\"runtime.*\"}",
+          "expr": "1000*time()-dataset_acceleration_last_refresh_time_ms{pod=~\"${pods}\",dataset!~\"runtime.*\"}",
           "instant": false,
           "legendFormat": "{{dataset}}",
           "range": true,
@@ -793,7 +793,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "sum by (dataset) ((datasets_acceleration_refresh_errors{pod=~\"${pods}\"}) - (datasets_acceleration_refresh_errors{pod=~\"${pods}\"} offset $__rate_interval)>0)\n",
+          "expr": "sum by (dataset) ((dataset_acceleration_refresh_errors{pod=~\"${pods}\"}) - (dataset_acceleration_refresh_errors{pod=~\"${pods}\"} offset $__rate_interval)>0)\n",
           "instant": false,
           "legendFormat": "__auto",
           "range": true,
@@ -847,7 +847,7 @@
               }
             ]
           },
-          "unit": "s"
+          "unit": "ms"
         },
         "overrides": []
       },
@@ -881,7 +881,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "sgn(datasets_unavailable_time{pod=~\"${pods}\"})*(time()-datasets_unavailable_time{pod=~\"${pods}\"})",
+          "expr": "sgn(dataset_unavailable_time_ms{pod=~\"${pods}\"})*(time()-dataset_unavailable_time_ms{pod=~\"${pods}\"})",
           "instant": false,
           "legendFormat": "{{dataset}}",
           "range": true,
@@ -1003,7 +1003,7 @@
           },
           "disableTextWrap": false,
           "editorMode": "code",
-          "expr": "100*sum(increase(results_cache_hit_count{pod=~\"${pods}\"}[$__rate_interval]))/sum(increase(results_cache_request_count{pod=~\"${pods}\"}[$__rate_interval]))",
+          "expr": "100*sum(increase(results_cache_hits{pod=~\"${pods}\"}[$__rate_interval]))/sum(increase(results_cache_requests{pod=~\"${pods}\"}[$__rate_interval]))",
           "fullMetaSearch": false,
           "hide": false,
           "includeNullMetadata": true,
@@ -1020,7 +1020,7 @@
           },
           "disableTextWrap": false,
           "editorMode": "code",
-          "expr": "100*(1-sum(increase(results_cache_hit_count{pod=~\"${pods}\"}[$__rate_interval]))/sum(increase(results_cache_request_count{pod=~\"${pods}\"}[$__rate_interval])))",
+          "expr": "100*(1-sum(increase(results_cache_hits{pod=~\"${pods}\"}[$__rate_interval]))/sum(increase(results_cache_requests{pod=~\"${pods}\"}[$__rate_interval])))",
           "fullMetaSearch": false,
           "hide": false,
           "includeNullMetadata": true,
@@ -1122,7 +1122,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "sum(increase(results_cache_request_count{pod=~\"${pods}\"}[$__rate_interval])) > 0",
+          "expr": "sum(increase(results_cache_request{pod=~\"${pods}\"}[$__rate_interval])) > 0",
           "hide": false,
           "instant": false,
           "legendFormat": "Requests",
@@ -1135,7 +1135,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "sum(increase(results_cache_hit_count{pod=~\"${pods}\"}[$__rate_interval])) > 0",
+          "expr": "sum(increase(results_cache_hits{pod=~\"${pods}\"}[$__rate_interval])) > 0",
           "instant": false,
           "legendFormat": "Hits",
           "range": true,
@@ -1229,7 +1229,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "increase(results_cache_item_count{pod=~\"${pods}\"}[$__rate_interval])",
+          "expr": "results_cache_items_count{pod=~\"${pods}\"}",
           "instant": false,
           "legendFormat": "{{pod}}",
           "range": true,
@@ -1328,7 +1328,7 @@
           },
           "disableTextWrap": false,
           "editorMode": "code",
-          "expr": "results_cache_max_size{pod=~\"${pods}\"}",
+          "expr": "results_cache_max_size_bytes{pod=~\"${pods}\"}",
           "fullMetaSearch": false,
           "includeNullMetadata": true,
           "instant": false,
@@ -1343,7 +1343,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "results_cache_size{pod=~\"${pods}\"}",
+          "expr": "results_cache_size_bytes{pod=~\"${pods}\"}",
           "hide": false,
           "instant": false,
           "legendFormat": "Used {{pod}}",
@@ -1654,7 +1654,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "datasets_acceleration_load_duration_ms_summary{quantile=~\"${percentile}\", pod=~\"${pods}\"} unless load_dataset == 0",
+          "expr": "dataset_acceleration_refresh_duration_ms_summary{quantile=~\"${percentile}\", pod=~\"${pods}\"} unless load_dataset == 0",
           "instant": false,
           "legendFormat": "{{dataset}} (P{{quantile}})",
           "range": true,
@@ -1748,7 +1748,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "1000*models_load_duration_ms_summary{quantile=~\"${percentile}\", pod=~\"${pods}\"} unless models_load_duration_ms == 0",
+          "expr": "1000*model_load_duration_ms_summary{quantile=~\"${percentile}\", pod=~\"${pods}\"} unless model_load_duration_ms == 0",
           "instant": false,
           "legendFormat": "{{model}} (P{{quantile}})",
           "range": true,
@@ -1843,14 +1843,14 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "secrets_stores_load_duration_ms_summary{quantile=~\"${percentile}\", pod=~\"${pods}\"} unless secrets_stores_load_duration_ms_summary == 0",
+          "expr": "secrets_store_load_duration_ms_summary{quantile=~\"${percentile}\", pod=~\"${pods}\"} unless secrets_store_load_duration_ms_summary == 0",
           "instant": false,
           "legendFormat": "P{{quantile}}",
           "range": true,
           "refId": "A"
         }
       ],
-      "title": "Load Secrets (ns)",
+      "title": "Secrets Load Duration",
       "type": "timeseries"
     },
     {
@@ -1952,9 +1952,9 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "flight_do_put_duration_ms_summary{quantile=~\"${percentile}\",pod=~\"${pods}\"}",
+          "expr": "flight_request_duration_ms_summary{quantile=~\"${percentile}\",pod=~\"${pods}\",method=\"do_put\"}",
           "instant": false,
-          "legendFormat": "{{path}}",
+          "legendFormat": "{{command}}",
           "range": true,
           "refId": "A"
         }
@@ -2045,9 +2045,9 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "(flight_do_put_duration_ms_count{pod=~\"${pods}\"} - (flight_do_put_duration_ms_count{pod=~\"${pods}\"} offset $__rate_interval)) > 0",
+          "expr": "(flight_requests{pod=~\"${pods}\",method=\"do_put\"} - (flight_requests{pod=~\"${pods}\",method=\"do_put\"} offset $__rate_interval)) > 0",
           "instant": false,
-          "legendFormat": "{{path}}",
+          "legendFormat": "{{command}}",
           "range": true,
           "refId": "A"
         }
@@ -2140,24 +2140,11 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "flight_do_get_get_tables_duration_ms_summary{quantile=~\"${percentile}\",pod=~\"${pods}\"} unless flight_do_get_get_tables_duration_ms_summary == 0",
+          "expr": "flight_request_duration_ms_summary{quantile=~\"${percentile}\",pod=~\"${pods}\",method=\"do_get\"} unless flight_request_duration_ms_summary == 0",
           "instant": false,
-          "legendFormat": "CommandGetTables",
+          "legendFormat": "{{command}}",
           "range": true,
           "refId": "A"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "editorMode": "code",
-          "expr": "flight_do_get_statement_query_duration_ms_summary{quantile=~\"${percentile}\",pod=~\"${pods}\"} unless flight_do_get_statement_query_duration_ms_summary == 0",
-          "hide": false,
-          "instant": false,
-          "legendFormat": "CommandStatementQuery",
-          "range": true,
-          "refId": "B"
         }
       ],
       "title": "do_get Flight Duration",
@@ -2216,8 +2203,7 @@
                 "value": 80
               }
             ]
-          },
-          "unit": "ms"
+          }
         },
         "overrides": []
       },
@@ -2247,24 +2233,11 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "(flight_do_get_get_tables_duration_ms_count{pod=~\"${pods}\"} - (flight_do_get_get_tables_duration_ms_count{pod=~\"${pods}\"} offset $__rate_interval)) > 0",
+          "expr": "(flight_requests{pod=~\"${pods}\",method=\"do_get\"} - (flight_requests{pod=~\"${pods}\",method=\"do_get\"} offset $__rate_interval)) > 0",
           "instant": false,
-          "legendFormat": "CommandGetTables",
+          "legendFormat": "{{command}}",
           "range": true,
           "refId": "A"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "editorMode": "code",
-          "expr": "(flight_do_get_statement_query_duration_ms_count{pod=~\"${pods}\"} - (flight_do_get_statement_query_duration_ms_count{pod=~\"${pods}\"} offset $__rate_interval)) > 0",
-          "hide": false,
-          "instant": false,
-          "legendFormat": "CommandStatementQuery",
-          "range": true,
-          "refId": "B"
         }
       ],
       "title": "do_get Flight Count",
@@ -2355,9 +2328,9 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "flight_get_flight_info_request_duration_ms_summary{quantile=~\"${percentile}\",pod=~\"${pods}\"} unless flight_get_flight_info_request_duration_ms_summary == 0",
+          "expr": "flight_request_duration_ms_summary{quantile=~\"${percentile}\",pod=~\"${pods}\",method=\"get_flight_info\" } unless flight_request_duration_ms_summary == 0",
           "instant": false,
-          "legendFormat": "{{path}}",
+          "legendFormat": "{{command}}",
           "range": true,
           "refId": "A"
         }
@@ -2450,9 +2423,9 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "(flight_get_flight_info_request_duration_ms_count{pod=~\"${pods}\"} - (flight_get_flight_info_request_duration_ms_count{pod=~\"${pods}\"} offset $__rate_interval)) > 0\n",
+          "expr": "(flight_requests{pod=~\"${pods}\",method=\"get_flight_info\"} - (flight_requests{pod=~\"${pods}\",method=\"get_flight_info\"} offset $__rate_interval)) > 0",
           "instant": false,
-          "legendFormat": "{{path}}",
+          "legendFormat": "{{command}}",
           "range": true,
           "refId": "A"
         }
@@ -2545,118 +2518,14 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "increase(flight_handshake_requests[$__rate_interval])",
+          "expr": "increase(flight_requests[$__rate_interval])",
           "instant": false,
-          "legendFormat": "Handshake",
+          "legendFormat": "{{method}}/{{command}}",
           "range": true,
           "refId": "A"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "editorMode": "code",
-          "expr": "increase(flight_list_flights_requests[$__rate_interval])",
-          "hide": false,
-          "instant": false,
-          "legendFormat": "List Flights",
-          "range": true,
-          "refId": "B"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "editorMode": "code",
-          "expr": "increase(flight_get_flight_info_requests[$__rate_interval])",
-          "hide": false,
-          "instant": false,
-          "legendFormat": "Get Flight Info",
-          "range": true,
-          "refId": "C"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "editorMode": "code",
-          "expr": "increase(flight_get_schema_requests[$__rate_interval])",
-          "hide": false,
-          "instant": false,
-          "legendFormat": "Get Schema",
-          "range": true,
-          "refId": "D"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "editorMode": "code",
-          "expr": "increase(flight_do_get_requests[$__rate_interval])",
-          "hide": false,
-          "instant": false,
-          "legendFormat": "Do Get",
-          "range": true,
-          "refId": "E"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "editorMode": "code",
-          "expr": "increase(flight_do_put_requests[$__rate_interval])",
-          "hide": false,
-          "instant": false,
-          "legendFormat": "Do Put",
-          "range": true,
-          "refId": "F"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "editorMode": "code",
-          "expr": "increase(flight_do_exchange_requests[$__rate_interval])",
-          "hide": false,
-          "instant": false,
-          "legendFormat": "Do Exchange",
-          "range": true,
-          "refId": "G"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "editorMode": "code",
-          "expr": "increase(flight_do_action_requests[$__rate_interval])",
-          "hide": false,
-          "instant": false,
-          "legendFormat": "Do Action",
-          "range": true,
-          "refId": "H"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "editorMode": "code",
-          "expr": "increase(flight_list_actions_requests[$__rate_interval])",
-          "hide": false,
-          "instant": false,
-          "legendFormat": "List Actions",
-          "range": true,
-          "refId": "I"
         }
       ],
-      "title": "FlightSQL Operations",
+      "title": "Flight Operations",
       "type": "timeseries"
     }
   ],
@@ -2680,7 +2549,7 @@
           "type": "prometheus",
           "uid": "prometheus"
         },
-        "definition": "label_values(spiced_runtime_flight_server_start,pod)",
+        "definition": "label_values(runtime_flight_server_started,pod)",
         "hide": 0,
         "includeAll": true,
         "label": "Pods",
@@ -2688,7 +2557,7 @@
         "name": "pods",
         "options": [],
         "query": {
-          "query": "label_values(spiced_runtime_flight_server_start,pod)",
+          "query": "label_values(runtime_flight_server_started,pod)",
           "refId": "PrometheusVariableQueryEditor-VariableQuery"
         },
         "refresh": 1,

@@ -38,7 +38,10 @@ fn init_tracing(default_level: Option<&str>) -> DefaultGuard {
     tracing::subscriber::set_default(subscriber)
 }
 
-fn init_tracing_with_task_history(default_level: Option<&str>, rt: &Runtime) -> DefaultGuard {
+fn init_tracing_with_task_history(
+    default_level: Option<&str>,
+    rt: &Runtime,
+) -> (DefaultGuard, TracerProvider) {
     let filter = match (default_level, std::env::var("SPICED_LOG").ok()) {
         (_, Some(log)) => EnvFilter::new(log),
         (Some(level), None) => EnvFilter::new(level),
@@ -69,5 +72,7 @@ fn init_tracing_with_task_history(default_level: Option<&str>, rt: &Runtime) -> 
         .with(fmt_layer)
         .with(task_history_layer);
 
-    tracing::subscriber::set_default(subscriber)
+    let guard = tracing::subscriber::set_default(subscriber);
+
+    (guard, provider)
 }

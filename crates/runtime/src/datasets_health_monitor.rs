@@ -313,16 +313,17 @@ fn report_dataset_unavailable_time(dataset_name: &String, last_available_time: O
     let labels = vec![KeyValue::new("dataset", dataset_name.to_string())];
 
     match last_available_time {
-        Some(last_available_time) => metrics::datasets::UNAVAILABLE_TIME.record(
+        Some(last_available_time) => metrics::datasets::UNAVAILABLE_TIME_MS.record(
             last_available_time
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
-                .as_secs_f64(),
+                .as_secs_f64()
+                * 1000.0,
             &labels,
         ),
         None => {
             // use 0 to indicate that the dataset is available; otherwise, the dataset will be shown as unavailable indefinitely
-            metrics::datasets::UNAVAILABLE_TIME.record(0.0, &labels);
+            metrics::datasets::UNAVAILABLE_TIME_MS.record(0.0, &labels);
         }
     }
 }
