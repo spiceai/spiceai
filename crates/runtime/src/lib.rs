@@ -16,7 +16,6 @@ limitations under the License.
 #![allow(clippy::missing_errors_doc)]
 
 use std::net::SocketAddr;
-use std::pin::Pin;
 use std::{collections::HashMap, sync::Arc};
 
 use crate::auth::EndpointAuth;
@@ -28,8 +27,6 @@ use builder::RuntimeBuilder;
 use config::Config;
 use datasets_health_monitor::DatasetsHealthMonitor;
 use extension::ExtensionFactory;
-use futures::future::join_all;
-use futures::Future;
 use model::{EmbeddingModelStore, LLMModelStore};
 use model_components::model::Model;
 pub use notify::Error as NotifyError;
