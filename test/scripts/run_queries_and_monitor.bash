@@ -50,7 +50,7 @@ while true; do
     RESPONSE=$(curl -s http://localhost:8090/v1/ready)
     RCODE=$?
 
-    if [[ "$RESPONSE" == "Ready" ]]; then
+    if [[ "$RESPONSE" == "ready" ]]; then
         echo "Datasets loaded!"
         break
     fi
