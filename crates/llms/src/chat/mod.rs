@@ -591,10 +591,7 @@ pub fn create_local_model(
             .map(|p| PathBuf::from_str(p))
             .collect::<Result<Vec<_>, _>>()
             .boxed()
-            .map_err(|e| {
-                println!("meeep");
-                Error::FailedToLoadModel { source: e }
-            })?
+            .map_err(|e| Error::FailedToLoadModel { source: e })?
             .as_slice(),
         config.map(Path::new),
         tokenizer.map(Path::new),
