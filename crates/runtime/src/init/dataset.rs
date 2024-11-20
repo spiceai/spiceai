@@ -65,8 +65,6 @@ impl Runtime {
         let mut dataset_futures = HashMap::new();
         let mut localpod_datasets = Vec::new();
 
-        let cloned_self = Arc::new(self.clone());
-
         // First create futures for non-localpod datasets
         for ds in initialized_datasets {
             if ds.source() == LOCALPOD_DATACONNECTOR {
@@ -74,16 +72,13 @@ impl Runtime {
                 continue;
             }
 
-            let cloned_self = Arc::clone(&cloned_self);
-            cloned_self
-                .status
+            self.status
                 .update_dataset(&ds.name, status::ComponentStatus::Initializing);
             let ds_clone = Arc::clone(&ds);
-            let future: Pin<Box<dyn Future<Output = ()> + Send>> = Box::pin(async move {
-                let cloned_self = Arc::clone(&cloned_self);
-                cloned_self.load_dataset(ds_clone).await;
-            })
-                as Pin<Box<dyn Future<Output = ()> + Send>>;
+            let cloned_self = self.clone();
+            let future: Pin<Box<dyn Future<Output = ()> + Send>> =
+                Box::pin(async move { cloned_self.load_dataset(ds_clone).await })
+                    as Pin<Box<dyn Future<Output = ()> + Send>>;
             dataset_futures.insert(ds.name.clone(), future);
         }
 
