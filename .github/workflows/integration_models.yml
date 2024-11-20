@@ -1,0 +1,93 @@
+---
+name: integration tests (models)
+
+on:
+  pull_request:
+    branches:
+      - trunk
+      - release-*
+      - feature-*
+    paths-ignore:
+      - 'docs/**'
+      - 'README.md'
+      - 'version.txt'
+      - 'acknowledgements.md'
+
+  workflow_dispatch:
+
+concurrency:
+  # Allow only one workflow per any non-trunk branch.
+  group: ${{ github.workflow }}-${{ github.ref_name }}-${{ github.ref_name == 'trunk' && github.sha || 'any-sha' }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build Test Binary
+    runs-on: spiceai-runners
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+        with:
+          os: 'linux'
+
+      - name: Set up make
+        uses: ./.github/actions/setup-make
+
+      - name: Set up cc
+        uses: ./.github/actions/setup-cc
+
+      # Build the test binary without running tests
+      - name: Build AI integration test binary
+        run: |
+          TEST_BINARY_PATH=$(cargo test -p runtime --test integration_models --features models --no-run --message-format=json | jq -r 'select(.reason == "compiler-artifact" and (.target.kind | contains(["test"])) and .executable != null) | .executable')
+          cp $TEST_BINARY_PATH ./ai_integration_test
+
+      # Upload the test binary as an artifact
+      - name: Upload test binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-integration-test-binary
+          path: ./ai_integration_test
+          retention-days: 1
+
+  test:
+    name: AI Integration Tests
+    needs: build
+    permissions: read-all
+    runs-on: ubuntu-latest-16-cores
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+        with:
+          os: 'linux'
+
+      # Download the test binary artifact
+      - name: Download test binary
+        uses: actions/download-artifact@v4
+        with:
+          name: ai-integration-test-binary
+          path: ./integration_test
+
+      - name: Mark test binary as executable
+        run: |
+          ls -l ./integration_test
+          chmod +x ./integration_test/ai_integration_test
+
+      - name: Set up Open.ai API Key
+        run: |
+          echo 'SPICE_OPENAI_API_KEY="${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}"' > .env
+
+      - name: Run integration test
+        env:
+          SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
+        run: |
+          if [ -n "$SPICE_SECRET_OPENAI_API_KEY" ]; then
+            INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" ./integration_test/ai_integration_test --nocapture --skip huggingface_test
+          else
+            echo "Error: SPICE_SECRET_OPENAI_API_KEY is not defined."
+            exit 1
+          fi
