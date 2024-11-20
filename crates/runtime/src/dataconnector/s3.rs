@@ -52,6 +52,11 @@ pub enum Error {
         "The '{parameter}' parameter cannot be set unless the `s3_auth` parameter is set to '{auth}'.\nFor futher information, visit: https://docs.spiceai.org/components/data-connectors/s3#auth"
     ))]
     InvalidAuthParameterCombination { parameter: String, auth: String },
+
+    #[snafu(display(
+        "The 's3_endpoint' parameter must be a HTTP/S URL, but '{endpoint}' was provided.\nFor further information, visit: https://docs.spiceai.org/components/data-connectors/s3#params"
+    ))]
+    InvalidEndpoint { endpoint: String },
 }
 
 pub struct S3 {
@@ -117,6 +122,15 @@ impl DataConnectorFactory for S3Factory {
         }
 
         Box::pin(async move {
+            if let Some(endpoint) = params.parameters.get("endpoint").expose().ok() {
+                if !(endpoint.starts_with("https://") || endpoint.starts_with("http://")) {
+                    return Err(Box::new(Error::InvalidEndpoint {
+                        endpoint: endpoint.to_string(),
+                    })
+                        as Box<dyn std::error::Error + Send + Sync>);
+                }
+            }
+
             match params.parameters.get("auth").expose().ok() {
                 None | Some("public" | "iam_role") => {
                     if matches!(params.parameters.get("key"), ParamLookup::Present(_)) {

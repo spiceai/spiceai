@@ -29,7 +29,9 @@ assignees: ''
 
 ## Release Checklist
 
-- [ ] All features/bugfixes to be included in the release have been merged to trunk
+- [ ] Create the release branch (`release-X.Y`) from `trunk` one day before the scheduled release (if not already created).
+  - See [docs/RELEASE.md](https://github.com/spiceai/spiceai/blob/trunk/docs/RELEASE.md) for more details.
+- [ ] All features/bugfixes to be included in the release have been fast-forwarded/cherry-picked to the release branch.
 - [ ] Full test pass and update if necessary over README.md
 - [ ] Full test pass and update if necessary over Docs
 - [ ] Full test pass and update if necessary over existing and new Samples
@@ -112,8 +114,7 @@ assignees: ''
 - [ ] Ensure [E2E Test CI](https://github.com/spiceai/spiceai/actions/workflows/e2e_test_ci.yml) is green on the trunk branch.
 - [ ] QA DRI sign-off
 - [ ] Docs DRI sign-off
-- [ ] Create a new branch `release-v[semver]` for the release from trunk. E.g. `release-v0.17.0-beta`
-- [ ] Release the new version by creating a `pre-release` [GitHub Release](https://github.com/spiceai/spiceai/releases/new) with the tag from the release branch. E.g. `v0.17.0-beta`. Leave the release note empty; the automation will fill it in from the checked in release note.
+- [ ] Release the new version by creating a `pre-release` [GitHub Release](https://github.com/spiceai/spiceai/releases/new) with the tag from the release branch. E.g. `v1.0.0-rc.1`. Leave the release note empty; the automation will fill it in from the checked in release note.
 - [ ] Release any docs updates by creating a `v[semver]` tag.
       **Note**: Docs should be released only after the [binaries have finished building](https://github.com/spiceai/spiceai/actions/workflows/build_and_release.yml).
 - [ ] Trigger algolia search crawler [workflow](https://github.com/spiceai/docs/actions/workflows/trigger_search_reindex.yml), to reindex updated docs.
@@ -122,7 +123,7 @@ assignees: ''
 - [ ] Final test pass on released binaries
 - [ ] Run [Generate Spicepod JSON schema](https://github.com/spiceai/spiceai/actions/workflows/generate_json_schema.yml)
 - [ ] Run [E2E Test Release Installation](https://github.com/spiceai/spiceai/actions/workflows/e2e_test_release_install.yml)
-- [ ] Update `version.txt` and version in `Cargo.toml` to the next release version.
+- [ ] Update `version.txt` and version in `Cargo.toml` to the next scheduled release version.
 - [ ] Update versions in [brew taps](https://github.com/spiceai/homebrew-spiceai).
       **Note**: Ensure that the Homebrew taps are updated only after the [binaries have finished building](https://github.com/spiceai/spiceai/actions/workflows/build_and_release.yml).
 - [ ] Remove the released version from the [ROADMAP](https://github.com/spiceai/spiceai/blob/trunk/docs/ROADMAP.md)
