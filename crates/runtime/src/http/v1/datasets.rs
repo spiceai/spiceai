@@ -79,7 +79,15 @@ pub(crate) async fn get(
     Query(filter): Query<DatasetFilter>,
     Query(params): Query<DatasetQueryParams>,
 ) -> Response {
-    let app_lock = app.read().await;
+    let app_lock = tokio::select! {
+        lock = app.read() => lock,
+        () = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+            return (
+                status::StatusCode::REQUEST_TIMEOUT,
+                "timeout".to_string()
+            ).into_response();
+        }
+    };
     let Some(readable_app) = app_lock.as_ref() else {
         return (
             status::StatusCode::INTERNAL_SERVER_ERROR,
@@ -144,7 +152,15 @@ pub(crate) async fn refresh(
     // This means malformed Json, etc, will simply return None
     // To get around this, we would need to implement a custom extractor
 ) -> Response {
-    let app_lock = app.read().await;
+    let app_lock = tokio::select! {
+        lock = app.read() => lock,
+        () = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+            return (
+                status::StatusCode::REQUEST_TIMEOUT,
+                "timeout".to_string()
+            ).into_response();
+        }
+    };
     let Some(readable_app) = &*app_lock else {
         return (status::StatusCode::INTERNAL_SERVER_ERROR).into_response();
     };
@@ -205,7 +221,15 @@ pub(crate) async fn acceleration(
     Path(dataset_name): Path<String>,
     Json(payload): Json<AccelerationRequest>,
 ) -> Response {
-    let app_lock = app.read().await;
+    let app_lock = tokio::select! {
+        lock = app.read() => lock,
+        () = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+            return (
+                status::StatusCode::REQUEST_TIMEOUT,
+                "timeout".to_string()
+            ).into_response();
+        }
+    };
     let Some(readable_app) = &*app_lock else {
         return (status::StatusCode::INTERNAL_SERVER_ERROR).into_response();
     };

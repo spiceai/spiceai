@@ -41,6 +41,7 @@ use datafusion::sql::TableReference;
 use futures::{future::join_all, StreamExt};
 use opentelemetry::KeyValue;
 use snafu::prelude::*;
+use tokio::sync::Semaphore;
 use util::{fibonacci_backoff::FibonacciBackoffBuilder, retry, RetryError};
 
 impl Runtime {
@@ -48,6 +49,13 @@ impl Runtime {
         let app_lock = self.app.read().await;
         let Some(app) = app_lock.as_ref() else {
             return;
+        };
+
+        // Control the number of parallel dataset loads
+        let semaphore = if let Some(parallel_num) = app.runtime.dataset_load_parallelism {
+            Arc::new(Semaphore::new(parallel_num))
+        } else {
+            Arc::new(Semaphore::new(Semaphore::MAX_PERMITS))
         };
 
         let valid_datasets = Self::get_valid_datasets(app, LogErrors(true));
@@ -66,8 +74,11 @@ impl Runtime {
 
             self.status
                 .update_dataset(&ds.name, status::ComponentStatus::Initializing);
+            let ds_clone = Arc::clone(&ds);
+            let cloned_self = self.clone();
             let future: Pin<Box<dyn Future<Output = ()> + Send>> =
-                Box::pin(self.load_dataset(Arc::clone(&ds)));
+                Box::pin(async move { cloned_self.load_dataset(ds_clone).await })
+                    as Pin<Box<dyn Future<Output = ()> + Send>>;
             dataset_futures.insert(ds.name.clone(), future);
         }
 
@@ -84,10 +95,11 @@ impl Runtime {
             if let Some(parent_future) = dataset_futures.remove(&path_table_ref) {
                 let ds_clone = Arc::clone(&ds);
 
+                let cloned_self = self.clone();
                 // Chain the localpod dataset load after its parent
                 let chained_future = Box::pin(async move {
                     parent_future.await;
-                    self.load_dataset(ds_clone).await;
+                    cloned_self.load_dataset(ds_clone).await;
                 }) as Pin<Box<dyn Future<Output = ()> + Send>>;
 
                 // Replace parent future with the chained future
@@ -107,14 +119,21 @@ impl Runtime {
             };
         }
 
-        // Load datasets in parallel
-        if let Some(parallel_num) = app.runtime.num_of_parallel_loading_at_start_up {
-            let stream =
-                futures::stream::iter(dataset_futures.into_values()).buffer_unordered(parallel_num);
-            let _ = stream.collect::<Vec<_>>().await;
-        } else {
-            let _ = join_all(dataset_futures.into_values()).await;
+        let mut spawned_tasks = vec![];
+
+        for (ds, dataset_load_future) in dataset_futures {
+            let semaphore = Arc::clone(&semaphore);
+            let handle = tokio::spawn(async move {
+                let Ok(_guard) = semaphore.acquire().await else {
+                    unreachable!("Semaphore is never closed.");
+                };
+                tracing::info!("Initializing dataset {ds}");
+                dataset_load_future.await;
+            });
+            spawned_tasks.push(handle);
         }
+
+        let _ = join_all(spawned_tasks).await;
 
         // After all datasets have loaded, load the views.
         self.load_views(app);

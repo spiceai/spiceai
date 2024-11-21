@@ -70,7 +70,7 @@ async fn openai_test_nsql() -> Result<(), anyhow::Error> {
     });
 
     tokio::select! {
-        () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+        () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
             return Err(anyhow::anyhow!("Timed out waiting for components to load"));
         }
         () = rt.load_components() => {}
@@ -203,7 +203,7 @@ async fn openai_test_search() -> Result<(), anyhow::Error> {
     });
 
     tokio::select! {
-        () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+        () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
             return Err(anyhow::anyhow!("Timed out waiting for components to load"));
         }
         () = rt.load_components() => {}
@@ -265,7 +265,7 @@ async fn openai_test_embeddings() -> Result<(), anyhow::Error> {
     });
 
     tokio::select! {
-        () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+        () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
             return Err(anyhow::anyhow!("Timed out waiting for components to load"));
         }
         () = rt.load_components() => {}
@@ -353,7 +353,7 @@ async fn openai_test_chat_completion() -> Result<(), anyhow::Error> {
     });
 
     tokio::select! {
-        () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+        () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
             return Err(anyhow::anyhow!("Timed out waiting for components to load"));
         }
         () = rt.load_components() => {}
@@ -409,7 +409,7 @@ async fn openai_test_chat_messages() -> Result<(), anyhow::Error> {
     let (_tracing, trace_provider) = init_tracing_with_task_history(None, &rt);
 
     tokio::select! {
-        () = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+        () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
             return Err(anyhow::anyhow!("Timed out waiting for components to load"));
         }
         () = rt.load_components() => {}

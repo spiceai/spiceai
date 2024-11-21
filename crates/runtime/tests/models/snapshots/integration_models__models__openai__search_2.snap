@@ -1,0 +1,25 @@
+---
+source: crates/runtime/tests/models/openai.rs
+expression: normalize_search_response(response)
+---
+{
+  "duration_ms": "duration_ms_val",
+  "matches": [
+    {
+      "dataset": "spice.public.item",
+      "primary_key": {
+        "i_item_sk": 19
+      },
+      "score": "score_val",
+      "value": "Patient"
+    },
+    {
+      "dataset": "spice.public.item",
+      "primary_key": {
+        "i_item_sk": 7
+      },
+      "score": "score_val",
+      "value": "New"
+    }
+  ]
+}

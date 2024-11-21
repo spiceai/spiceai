@@ -16,10 +16,7 @@ limitations under the License.
 
 use std::{borrow::Cow, sync::Arc};
 
-use app::{
-    spicepod::component::runtime::{TaskHistoryCapturedOutput, TracingConfig},
-    App,
-};
+use app::{spicepod::component::runtime::TracingConfig, App};
 use futures::future::BoxFuture;
 use opentelemetry::global::Error as OtelError;
 use opentelemetry::trace::TraceError;
@@ -125,11 +122,11 @@ where
     let trace_config = Config::default().with_resource(Resource::empty());
     let app_name = app.as_ref().map(|app| app.name.clone());
 
-    let captured_output = if let Some(app) = app.as_ref() {
-        app.runtime.task_history.get_captured_output()?
-    } else {
-        TaskHistoryCapturedOutput::Truncated
-    };
+    let captured_output = app
+        .as_ref()
+        .map(|app| app.runtime.task_history.get_captured_output())
+        .transpose()?
+        .unwrap_or_default();
 
     let mut exporters: Vec<Box<dyn SpanExporter>> = vec![Box::new(
         task_history::otel_exporter::TaskHistoryExporter::new(df, captured_output),
