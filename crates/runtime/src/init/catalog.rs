@@ -21,7 +21,6 @@ use crate::{
     dataconnector::{DataConnector, DataConnectorParamsBuilder},
     metrics, status, warn_spaced, DataConnectorDoesntSupportCatalogsSnafu, LogErrors, Result,
     Runtime, UnableToInitializeDataConnectorSnafu, UnableToLoadCatalogConnectorSnafu,
-    UnableToLoadDatasetConnectorSnafu,
 };
 use app::App;
 use futures::future::join_all;
@@ -65,7 +64,7 @@ impl Runtime {
             };
 
             if let Err(err) = self.register_catalog(catalog, connector).await {
-                tracing::error!("Unable to register catalog {}: {err}", &catalog.name);
+                tracing::error!("{err}");
                 return Err(RetryError::transient(err));
             };
 
@@ -87,21 +86,20 @@ impl Runtime {
             .await
             .context(UnableToInitializeDataConnectorSnafu)?;
 
-        let data_connector: Arc<dyn DataConnector> =
-            match self.get_dataconnector_from_source(&source, params).await {
-                Ok(data_connector) => data_connector,
-                Err(err) => {
-                    let catalog_name = &catalog.name;
-                    self.status
-                        .update_catalog(catalog_name, status::ComponentStatus::Error);
-                    metrics::catalogs::LOAD_ERROR.add(1, &[]);
-                    warn_spaced!(spaced_tracer, "{} {err}", catalog_name);
-                    return UnableToLoadDatasetConnectorSnafu {
-                        dataset: catalog_name.clone(),
-                    }
-                    .fail();
-                }
-            };
+        let data_connector: Arc<dyn DataConnector> = match self
+            .get_dataconnector_from_source(&source, params)
+            .await
+        {
+            Ok(data_connector) => data_connector,
+            Err(err) => {
+                let catalog_name = &catalog.name;
+                self.status
+                    .update_catalog(catalog_name, status::ComponentStatus::Error);
+                metrics::catalogs::LOAD_ERROR.add(1, &[]);
+                warn_spaced!(spaced_tracer, "{} {err}", catalog_name);
+                return Err(crate::Error::UnableToInitializeDataConnector { source: err.into() });
+            }
+        };
 
         Ok(data_connector)
     }
@@ -144,9 +142,7 @@ impl Runtime {
                 dataconnector: catalog.provider.clone(),
             })?
             .boxed()
-            .context(UnableToLoadCatalogConnectorSnafu {
-                catalog: catalog.name.clone(),
-            })?;
+            .context(UnableToInitializeDataConnectorSnafu)?;
         let num_schemas = catalog_provider
             .schema_names()
             .iter()

@@ -173,25 +173,24 @@ impl Runtime {
             .await
             .context(UnableToInitializeDataConnectorSnafu)?;
 
-        let data_connector: Arc<dyn DataConnector> =
-            match self.get_dataconnector_from_source(&source, params).await {
-                Ok(data_connector) => data_connector,
-                Err(err) => {
-                    let ds_name = &ds.name;
-                    self.status
-                        .update_dataset(ds_name, status::ComponentStatus::Error);
-                    metrics::datasets::LOAD_ERROR.add(1, &[]);
-                    warn_spaced!(
-                        spaced_tracer,
-                        "Error initializing dataset {}. {err}",
-                        ds_name.table()
-                    );
-                    return UnableToLoadDatasetConnectorSnafu {
-                        dataset: ds.name.clone(),
-                    }
-                    .fail();
-                }
-            };
+        let data_connector: Arc<dyn DataConnector> = match self
+            .get_dataconnector_from_source(&source, params)
+            .await
+        {
+            Ok(data_connector) => data_connector,
+            Err(err) => {
+                let ds_name = &ds.name;
+                self.status
+                    .update_dataset(ds_name, status::ComponentStatus::Error);
+                metrics::datasets::LOAD_ERROR.add(1, &[]);
+                warn_spaced!(
+                    spaced_tracer,
+                    "Error initializing dataset {}. {err}",
+                    ds_name.table()
+                );
+                return Err(crate::Error::UnableToInitializeDataConnector { source: err.into() });
+            }
+        };
 
         Ok(data_connector)
     }
