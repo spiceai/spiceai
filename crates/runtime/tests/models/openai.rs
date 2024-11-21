@@ -130,10 +130,7 @@ async fn openai_test_nsql() -> Result<(), anyhow::Error> {
             headers,
         )
         .await
-        .map_err(|e| {
-            tracing::error!("Failed to execute HTTP POST: {}", e);
-            anyhow::anyhow!("Failed to execute HTTP POST")
-        })?;
+        .map_err(|e| anyhow::anyhow!("Failed to execute HTTP POST: {}", e))?;
         insta::assert_snapshot!(format!("nsql_{}_response", ts.name), &response);
 
         // ensure all spans are exported into task_history
@@ -142,7 +139,6 @@ async fn openai_test_nsql() -> Result<(), anyhow::Error> {
         // Check task_history table for expected rows.
         let mut headers = HeaderMap::new();
         headers.insert(ACCEPT, HeaderValue::from_static("text/plain"));
-        // headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         insta::assert_snapshot!(
             format!("nsql_{}_tasks", ts.name),
             &http_post(
@@ -258,15 +254,10 @@ async fn openai_test_search() -> Result<(), anyhow::Error> {
             headers,
         )
         .await
-        .map_err(|e| {
-            tracing::error!("Failed to execute HTTP POST: {}", e);
-            anyhow::anyhow!("Failed to execute HTTP POST")
-        })?;
+        .map_err(|e| anyhow::anyhow!("Failed to execute HTTP POST: {}", e))?;
 
-        let v = serde_json::from_str(&response).map_err(|e| {
-            tracing::error!("Failed to parse HTTP response: {}", e);
-            anyhow::anyhow!("Failed to parse HTTP response")
-        })?;
+        let v = serde_json::from_str(&response)
+            .map_err(|e| anyhow::anyhow!("Failed to parse HTTP response: {}", e))?;
 
         insta::assert_snapshot!(
             format!("search_{}_response", ts.name),
