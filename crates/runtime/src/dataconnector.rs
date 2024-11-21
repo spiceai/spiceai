@@ -543,8 +543,12 @@ impl DataConnectorParamsBuilder {
         runtime: &Runtime,
     ) -> Result<DataConnectorParams, Box<dyn std::error::Error + Send + Sync>> {
         match &self.component {
-            ConnectorComponent::Catalog(_) => {
-                todo!();
+            ConnectorComponent::Catalog(catalog) => {
+                let secrets = runtime.secrets();
+                let params = runtime.get_params_with_secrets(&catalog.params).await;
+                let params = self.without_runtime(params, secrets).await?;
+
+                Ok(params)
             }
             ConnectorComponent::Dataset(dataset) => {
                 let secrets = runtime.secrets();
@@ -563,38 +567,30 @@ impl DataConnectorParamsBuilder {
         params: HashMap<String, SecretString>,
         secrets: Arc<RwLock<Secrets>>,
     ) -> Result<DataConnectorParams, Box<dyn std::error::Error + Send + Sync>> {
-        match &self.component {
-            ConnectorComponent::Catalog(_) => {
-                todo!();
-            }
-            ConnectorComponent::Dataset(_) => {
-                let name = self.connector.to_string();
-                let guard = DATA_CONNECTOR_FACTORY_REGISTRY.lock().await;
+        let name = self.connector.to_string();
+        let guard = DATA_CONNECTOR_FACTORY_REGISTRY.lock().await;
 
-                let connector_factory = guard.get(&name);
+        let connector_factory = guard.get(&name);
 
-                let factory =
-                    connector_factory.ok_or(DataConnectorError::InvalidConnectorType {
-                        dataconnector: name.clone(),
-                        connector_component: self.component.clone(),
-                    })?;
+        let factory = connector_factory.ok_or(DataConnectorError::InvalidConnectorType {
+            dataconnector: name.clone(),
+            connector_component: self.component.clone(),
+        })?;
 
-                let parameters = Parameters::try_new(
-                    &format!("connector {name}"),
-                    params.into_iter().collect(),
-                    factory.prefix(),
-                    secrets,
-                    factory.parameters(),
-                )
-                .await?;
+        let parameters = Parameters::try_new(
+            &format!("connector {name}"),
+            params.into_iter().collect(),
+            factory.prefix(),
+            secrets,
+            factory.parameters(),
+        )
+        .await?;
 
-                Ok(DataConnectorParams {
-                    parameters,
-                    metadata: HashMap::new(),
-                    invalid_type_action: None,
-                    component: self.component.clone(),
-                })
-            }
-        }
+        Ok(DataConnectorParams {
+            parameters,
+            metadata: HashMap::new(),
+            invalid_type_action: None,
+            component: self.component.clone(),
+        })
     }
 }
