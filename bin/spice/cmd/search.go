@@ -13,7 +13,6 @@ import (
 
 	"github.com/peterh/liner"
 	"github.com/spf13/cobra"
-	"github.com/spiceai/spiceai/bin/spice/pkg/api"
 	"github.com/spiceai/spiceai/bin/spice/pkg/context"
 	"github.com/spiceai/spiceai/bin/spice/pkg/util"
 )
@@ -24,7 +23,7 @@ const (
 
 type SearchRequest struct {
 	Text              string   `json:"text"`
-	Datasets          []string `json:"datasets"`
+	Datasets          []string `json:"datasets,omitempty"`
 	Limit             uint     `json:"limit"`
 	AdditionalColumns []string `json:"additional_columns,omitempty"`
 	Where             string   `json:"where,omitempty"`
@@ -58,20 +57,6 @@ spice search --cloud
 		rtcontext := context.NewContext().WithCloud(cloud)
 
 		rtcontext.RequireModelsFlavor(cmd)
-
-		datasets, err := api.GetDatasetsWithStatus(rtcontext)
-		if err != nil {
-			slog.Error("could not list datasets", "error", err)
-		}
-
-		searchDatasets := make([]string, 0)
-		for _, dataset := range datasets {
-			if dataset.Status != api.Ready.String() && dataset.Status != api.Refreshing.String() {
-				slog.Warn(fmt.Sprintf("Dataset %s is not ready (%s) and will not be included in search.", dataset.Name, dataset.Status))
-				continue
-			}
-			searchDatasets = append(searchDatasets, dataset.Name)
-		}
 
 		httpEndpoint, err := cmd.Flags().GetString("http-endpoint")
 		if err != nil {
@@ -123,7 +108,7 @@ spice search --cloud
 				defer close(out)
 				response, err := sendSearchRequest(rtcontext, &SearchRequest{
 					Text:     message,
-					Datasets: searchDatasets,
+					Datasets: nil, // search across all datasets containing embeddings
 					Limit:    limit,
 				})
 				if err != nil {

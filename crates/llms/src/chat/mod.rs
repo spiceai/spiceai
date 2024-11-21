@@ -24,6 +24,8 @@ use rand::{thread_rng, Rng};
 use secrecy::Secret;
 use serde::{Deserialize, Serialize};
 use snafu::{ResultExt, Snafu};
+use std::path::PathBuf;
+use std::str::FromStr;
 use std::{path::Path, pin::Pin};
 use tracing_futures::Instrument;
 
@@ -577,14 +579,20 @@ pub fn create_hf_model(
 
 #[allow(unused_variables)]
 pub fn create_local_model(
-    model_weights: &str,
+    model_weights: &[String],
     config: Option<&str>,
     tokenizer: Option<&str>,
     tokenizer_config: Option<&str>,
     chat_template_literal: Option<&str>,
 ) -> Result<Box<dyn Chat>> {
     mistral::MistralLlama::from(
-        Path::new(&model_weights),
+        model_weights
+            .iter()
+            .map(|p| PathBuf::from_str(p))
+            .collect::<Result<Vec<_>, _>>()
+            .boxed()
+            .map_err(|e| Error::FailedToLoadModel { source: e })?
+            .as_slice(),
         config.map(Path::new),
         tokenizer.map(Path::new),
         tokenizer_config.map(Path::new),
