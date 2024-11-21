@@ -336,7 +336,7 @@ async fn send_chat_completions_request(
     Ok(response)
 }
 
-/// Sends a SQL query to the runtime and returns a human-readable response.
+/// Generic function to send a POST request, returning the response as a String.
 async fn http_post(
     url: &str,
     body: &str,
@@ -356,6 +356,7 @@ async fn http_post(
         .boxed()
 }
 
+/// Returns a human-readable representation of the SQL query result against a [`Runtime`].
 async fn sql_to_display(
     rt: &Arc<Runtime>,
     query: &str,
