@@ -23,7 +23,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use app::spicepod::component::runtime::TelemetryConfig;
+use app::spicepod::component::runtime::{Runtime as SpicepodRuntime, TelemetryConfig};
 use app::{App, AppBuilder};
 use clap::{ArgAction, Parser};
 use flightrepl::ReplConfig;
@@ -37,6 +37,7 @@ use runtime::datafusion::DataFusion;
 use runtime::podswatcher::PodsWatcher;
 use runtime::spice_metrics;
 use runtime::{auth::EndpointAuth, extension::ExtensionFactory, Runtime};
+use serde_yaml::Value;
 use snafu::prelude::*;
 use spice_cloud::SpiceExtensionFactory;
 use spiced_tracing::LogVerbosity;
@@ -146,6 +147,10 @@ pub struct Args {
     /// Enable very verbose logging. In conjunction with `verbose` can be set via -vv or --very-verbose.
     #[arg(long)]
     pub very_verbose: bool,
+
+    /// Overrides for the runtime configuration (--set key1.subkey=value1)
+    #[arg(long, action = ArgAction::Append, value_parser = parse_set_string)]
+    pub set: Vec<(String, String)>,
 }
 
 pub async fn run(args: Args) -> Result<()> {
@@ -155,7 +160,10 @@ pub async fn run(args: Args) -> Result<()> {
     let app: Option<Arc<App>> = match AppBuilder::build_from_filesystem_path(current_dir.clone())
         .context(UnableToConstructSpiceAppSnafu)
     {
-        Ok(app) => Some(Arc::new(app)),
+        Ok(mut app) => {
+            app.runtime = apply_overrides(app.runtime, &args.set);
+            Some(Arc::new(app))
+        }
         Err(e) => {
             let subscriber = tracing_subscriber::FmtSubscriber::builder()
                 .with_ansi(true)
@@ -292,4 +300,86 @@ async fn start_anonymous_telemetry(
         #[cfg(feature = "anonymous_telemetry")]
         telemetry::anonymous::start(spicepod_name.map_or_else(|| "unknown", String::as_str)).await;
     }
+}
+
+fn parse_set_string(s: &str) -> Result<(String, String), String> {
+    let parts: Vec<&str> = s.split('=').collect();
+    if parts.len() != 2 {
+        return Err("Invalid set format. Use key=value".into());
+    }
+
+    Ok((parts[0].to_string(), parts[1].to_string()))
+}
+
+fn apply_overrides(
+    runtime_config: SpicepodRuntime,
+    overrides: &Vec<(String, String)>,
+) -> SpicepodRuntime {
+    if overrides.is_empty() {
+        return runtime_config;
+    }
+
+    let rt_clone = runtime_config.clone();
+    let mut yaml = match serde_yaml::to_value(runtime_config) {
+        Ok(yaml) => yaml,
+        Err(e) => {
+            tracing::debug!("Failed to convert runtime config to YAML: {e}");
+            return rt_clone;
+        }
+    };
+
+    for (path, value) in overrides {
+        match apply_override(&mut yaml, path, Value::String(value.to_string())) {
+            Ok(()) => (),
+            Err(e) => {
+                tracing::debug!("Failed to apply override {path}={value}: {e}");
+                return rt_clone;
+            }
+        };
+    }
+
+    match serde_yaml::from_value(yaml) {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            tracing::debug!("Failed to apply overrides: {e}");
+            rt_clone
+        }
+    }
+}
+
+fn apply_override(
+    yaml: &mut Value,
+    path: &str,
+    value: Value,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let parts: Vec<&str> = path.split('.').collect();
+    let mut current = yaml;
+
+    let parts_len = parts.len();
+    for (i, part) in parts.into_iter().enumerate() {
+        if i == parts_len - 1 {
+            match current {
+                Value::Mapping(map) => {
+                    map.insert(Value::String(part.to_string()), value);
+                    return Ok(());
+                }
+                _ => return Err("Path leads to non-mapping value".into()),
+            }
+        }
+
+        match current {
+            Value::Mapping(map) => {
+                if !map.contains_key(&Value::String(part.to_string())) {
+                    map.insert(
+                        Value::String(part.to_string()),
+                        Value::Mapping(serde_yaml::Mapping::new()),
+                    );
+                }
+                current = map.get_mut(&Value::String(part.to_string())).unwrap();
+            }
+            _ => return Err("Path leads through non-mapping value".into()),
+        }
+    }
+
+    Ok(())
 }
