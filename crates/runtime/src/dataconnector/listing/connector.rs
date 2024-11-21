@@ -610,7 +610,7 @@ mod tests {
             Ok(_) => panic!("Unexpected success"),
             Err(e) => assert_eq!(
                 e.to_string(),
-                "Invalid configuration for TestConnector. Missing required file_format parameter."
+                "Cannot setup the dataset test (TestConnector) with an invalid configuration.\nThe required 'file_format' parameter is missing.\nEnsure the parameter is provided, and try again."
             ),
         }
     }
