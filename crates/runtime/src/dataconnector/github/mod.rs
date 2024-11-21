@@ -188,7 +188,7 @@ impl Github {
         let Some(tree_sha) = tree_sha.filter(|s| !s.is_empty()) else {
             return Err(DataConnectorError::UnableToGetReadProvider {
                 dataconnector: "github".to_string(),
-                source: format!("The branch or tag name is required in the dataset 'from' and must be in the format'github.com/{owner}/{repo}/files/<BRANCH_NAME>'.\nFor further information, visit: https://docs.spiceai.org/components/data-connectors/github#querying-github-files").into(),
+                source: format!("The branch or tag name is required in the dataset 'from' and must be in the format 'github.com/{owner}/{repo}/files/<BRANCH_NAME>'.\nFor further information, visit: https://docs.spiceai.org/components/data-connectors/github#querying-github-files").into(),
                 connector_component: ConnectorComponent::from(dataset),
             });
         };

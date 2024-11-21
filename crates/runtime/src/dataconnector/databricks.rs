@@ -142,7 +142,7 @@ impl Databricks {
         let token = self.params.get("token").ok_or_else(|p| {
             super::DataConnectorError::InvalidConfigurationNoSource {
                 dataconnector: "databricks".into(),
-                message: format!("Missing required parameter: {}.\nFor further information, visit: https://docs.spiceai.org/components/catalogs/databricks#params", p.0),
+                message: format!("A required parameter was missing: {}.\nFor further information, visit: https://docs.spiceai.org/components/catalogs/databricks#params", p.0),
                 connector_component: ConnectorComponent::from(catalog)
             }
         })?;
