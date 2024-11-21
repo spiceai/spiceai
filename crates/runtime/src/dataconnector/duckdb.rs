@@ -32,8 +32,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use super::{
-    AnyErrorResult, DataConnector, DataConnectorError, DataConnectorFactory, DataConnectorParams,
-    ParameterSpec,
+    AnyErrorResult, ConnectorComponent, DataConnector, DataConnectorError, DataConnectorFactory,
+    DataConnectorParams, ParameterSpec,
 };
 
 #[derive(Debug, Snafu)]
@@ -53,15 +53,20 @@ pub struct DuckDB {
 
 impl DuckDB {
     pub(crate) fn create_in_memory(
-        invalid_type_action: InvalidTypeAction,
+        params: &DataConnectorParams,
     ) -> AnyErrorResult<DuckDBTableFactory> {
         let pool = Arc::new(
             DuckDbConnectionPool::new_memory()
                 .map_err(|source| DataConnectorError::UnableToConnectInternal {
                     dataconnector: "duckdb".to_string(),
+                    connector_component: params.component.clone(),
                     source,
                 })?
-                .with_invalid_type_action(invalid_type_action),
+                .with_invalid_type_action(
+                    params
+                        .invalid_type_action
+                        .unwrap_or(InvalidTypeAction::Error),
+                ),
         );
 
         Ok(DuckDBTableFactory::new(pool))
@@ -69,15 +74,20 @@ impl DuckDB {
 
     pub(crate) fn create_file(
         path: &str,
-        invalid_type_action: InvalidTypeAction,
+        params: &DataConnectorParams,
     ) -> AnyErrorResult<DuckDBTableFactory> {
         let pool = Arc::new(
             DuckDbConnectionPool::new_file(path, &AccessMode::ReadOnly)
                 .map_err(|source| DataConnectorError::UnableToConnectInternal {
                     dataconnector: "duckdb".to_string(),
+                    connector_component: params.component.clone(),
                     source,
                 })?
-                .with_invalid_type_action(invalid_type_action),
+                .with_invalid_type_action(
+                    params
+                        .invalid_type_action
+                        .unwrap_or(InvalidTypeAction::Error),
+                ),
         );
 
         Ok(DuckDBTableFactory::new(pool))
@@ -107,16 +117,12 @@ impl DataConnectorFactory for DuckDBFactory {
         params: DataConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
-            let invalid_type_action = params
-                .invalid_type_action
-                .unwrap_or(InvalidTypeAction::Error);
-
-            let duckdb_factory = if let Some(db_path) = params.parameters.get("open").expose().ok()
-            {
-                DuckDB::create_file(db_path, invalid_type_action)?
-            } else {
-                DuckDB::create_in_memory(invalid_type_action)?
-            };
+            let duckdb_factory =
+                if let Some(db_path) = params.parameters.clone().get("open").expose().ok() {
+                    DuckDB::create_file(db_path, &params)?
+                } else {
+                    DuckDB::create_in_memory(&params)?
+                };
 
             Ok(Arc::new(DuckDB { duckdb_factory }) as Arc<dyn DataConnector>)
         })
@@ -151,6 +157,7 @@ impl DataConnector for DuckDB {
             return Err(DataConnectorError::UnableToGetReadProvider {
                 dataconnector: "duckdb".to_string(),
                 source: Box::new(Error::MissingDuckDBFile {}),
+                connector_component: ConnectorComponent::from(dataset),
             });
         }
 
@@ -159,6 +166,7 @@ impl DataConnector for DuckDB {
                 .await
                 .context(super::UnableToGetReadProviderSnafu {
                     dataconnector: "duckdb",
+                    connector_component: ConnectorComponent::from(dataset),
                 })?,
         )
     }

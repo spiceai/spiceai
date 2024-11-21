@@ -33,7 +33,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use super::{
-    DataConnector, DataConnectorError, DataConnectorFactory, DataConnectorParams, ParameterSpec,
+    ConnectorComponent, DataConnector, DataConnectorError, DataConnectorFactory,
+    DataConnectorParams, ParameterSpec,
 };
 
 #[derive(Debug, Snafu)]
@@ -91,6 +92,7 @@ impl DataConnectorFactory for MySQLFactory {
                         return Err(
                             DataConnectorError::UnableToConnectInvalidUsernameOrPassword {
                                 dataconnector: "mysql".to_string(),
+                                connector_component: params.component.clone(),
                             }
                             .into(),
                         )
@@ -103,6 +105,7 @@ impl DataConnectorFactory for MySQLFactory {
                     } => {
                         return Err(DataConnectorError::UnableToConnectInvalidHostOrPort {
                             dataconnector: "mysql".to_string(),
+                            connector_component: params.component.clone(),
                             host,
                             port: format!("{port}"),
                         }
@@ -112,6 +115,7 @@ impl DataConnectorFactory for MySQLFactory {
                     _ => {
                         return Err(DataConnectorError::UnableToConnectInternal {
                             dataconnector: "mysql".to_string(),
+                            connector_component: params.component.clone(),
                             source: Box::new(error),
                         }
                         .into())
@@ -149,7 +153,8 @@ impl DataConnector for MySQL {
             .map_err(|e| super::DataConnectorError::InvalidConfiguration {
                 dataconnector: "mysql".to_string(),
                 source: e,
-                message: format!("Invalid table '{}' in dataset path", dataset.path()),
+                message: format!("The specified table name in dataset path is invalid '{}'.\nEnsure the table name uses valid characters for a MySQL table name and try again.", dataset.path()),
+                connector_component: ConnectorComponent::from(dataset),
             })?;
 
         match Read::table_provider(&self.mysql_factory, tbl, dataset.schema()).await {
@@ -163,7 +168,7 @@ impl DataConnector for MySQL {
                     {
                         return Err(DataConnectorError::InvalidTableName {
                             dataconnector: "mysql".to_string(),
-                            dataset_name: dataset.name.to_string(),
+                            connector_component: ConnectorComponent::from(dataset),
                             table_name: table_name.clone(),
                         });
                     }
@@ -171,6 +176,7 @@ impl DataConnector for MySQL {
 
                 return Err(DataConnectorError::UnableToGetReadProvider {
                     dataconnector: "mysql".to_string(),
+                    connector_component: ConnectorComponent::from(dataset),
                     source: e,
                 });
             }

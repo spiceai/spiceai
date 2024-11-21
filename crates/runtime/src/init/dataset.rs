@@ -23,7 +23,7 @@ use crate::{
     dataconnector::{
         self,
         localpod::{LocalPodConnector, LOCALPOD_DATACONNECTOR},
-        DataConnector, DataConnectorParams,
+        DataConnector, DataConnectorParams, DataConnectorParamsBuilder,
     },
     embeddings::connector::EmbeddingConnector,
     federated_table::FederatedTable,
@@ -168,7 +168,8 @@ impl Runtime {
         let spaced_tracer = Arc::clone(&self.spaced_tracer);
 
         let source = ds.source();
-        let params = DataConnectorParams::from_dataset(self, Arc::clone(&ds))
+        let params = DataConnectorParamsBuilder::new(source.clone().into(), (&ds).into())
+            .with_runtime(self)
             .await
             .context(UnableToInitializeDataConnectorSnafu)?;
 

@@ -34,6 +34,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use url::Url;
 
+use super::ConnectorComponent;
 use super::DataConnectorParams;
 use super::{DataConnector, DataConnectorError, DataConnectorFactory, Parameters};
 use crate::parameters::{ParamLookup, ParameterSpec};
@@ -148,6 +149,7 @@ impl DataConnectorFactory for ClickhouseFactory {
                     Error::InvalidUsernameOrPasswordError { .. } => Err(
                         DataConnectorError::UnableToConnectInvalidUsernameOrPassword {
                             dataconnector: "clickhouse".to_string(),
+                            connector_component: params.component,
                         }
                         .into(),
                     ),
@@ -157,6 +159,7 @@ impl DataConnectorFactory for ClickhouseFactory {
                         source: _,
                     } => Err(DataConnectorError::UnableToConnectInvalidHostOrPort {
                         dataconnector: "clickhouse".to_string(),
+                        connector_component: params.component,
                         host,
                         port,
                     }
@@ -164,11 +167,13 @@ impl DataConnectorFactory for ClickhouseFactory {
                     Error::ConnectionTlsError { source: _ } => {
                         Err(DataConnectorError::UnableToConnectTlsError {
                             dataconnector: "clickhouse".to_string(),
+                            connector_component: params.component,
                         }
                         .into())
                     }
                     _ => Err(DataConnectorError::UnableToConnectInternal {
                         dataconnector: "clickhouse".to_string(),
+                        connector_component: params.component,
                         source: Box::new(e),
                     }
                     .into()),
@@ -204,6 +209,7 @@ impl DataConnector for Clickhouse {
         .await
         .context(super::UnableToGetReadProviderSnafu {
             dataconnector: "clickhouse",
+            connector_component: ConnectorComponent::from(dataset),
         })?)
     }
 }

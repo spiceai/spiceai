@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use crate::{
     component::catalog::Catalog,
-    dataconnector::{DataConnector, DataConnectorParams},
+    dataconnector::{DataConnector, DataConnectorParams, DataConnectorParamsBuilder},
     metrics, status, warn_spaced, DataConnectorDoesntSupportCatalogsSnafu, LogErrors, Result,
     Runtime, UnableToInitializeDataConnectorSnafu, UnableToLoadCatalogConnectorSnafu,
     UnableToLoadDatasetConnectorSnafu,
@@ -81,11 +81,12 @@ impl Runtime {
         let spaced_tracer = Arc::clone(&self.spaced_tracer);
         let catalog = catalog.clone();
 
-        let source = catalog.provider;
-        let params = catalog.params.clone();
-        let params = DataConnectorParams::from_params(self, &source, params)
+        let source = catalog.provider.clone();
+        let params = DataConnectorParamsBuilder::new(source.clone().into(), (&catalog).into())
+            .with_runtime(self)
             .await
             .context(UnableToInitializeDataConnectorSnafu)?;
+
         let data_connector: Arc<dyn DataConnector> =
             match self.get_dataconnector_from_source(&source, params).await {
                 Ok(data_connector) => data_connector,
