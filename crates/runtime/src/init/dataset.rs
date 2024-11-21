@@ -51,6 +51,11 @@ impl Runtime {
         };
 
         let valid_datasets = Self::get_valid_datasets(app, LogErrors(true));
+
+        if valid_datasets.is_empty() {
+            tracing::warn!("No datasets were found in the spicepod");
+        }
+
         let initialized_datasets = self.initialize_accelerators(&valid_datasets).await;
 
         // Create a map of dataset names to their futures
