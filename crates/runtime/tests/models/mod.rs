@@ -342,10 +342,6 @@ async fn http_post(
     body: &str,
     headers: HeaderMap,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    println!(
-        "Sending POST request to {}...{:?}....{:?}.",
-        url, headers, body
-    );
     Client::new()
         .post(url)
         .headers(headers)

@@ -112,7 +112,7 @@ async fn openai_test_nsql() -> Result<(), anyhow::Error> {
         },
     ];
 
-    async fn run_test(
+    async fn run_nsql_test(
         base_url: &str,
         ts: &TestCase,
         trace_provider: &TracerProvider,
@@ -165,7 +165,7 @@ async fn openai_test_nsql() -> Result<(), anyhow::Error> {
     }
 
     for ts in test_cases {
-        run_test(http_base_url.as_str(), &ts, &trace_provider).await?;
+        run_nsql_test(http_base_url.as_str(), &ts, &trace_provider).await?;
     }
 
     Ok(())
@@ -240,7 +240,7 @@ async fn openai_test_search() -> Result<(), anyhow::Error> {
         },
     ];
 
-    async fn run_test(
+    async fn run_search_test(
         base_url: &str,
         ts: &TestCase,
         trace_provider: &TracerProvider,
@@ -276,7 +276,7 @@ async fn openai_test_search() -> Result<(), anyhow::Error> {
     }
 
     for ts in test_cases {
-        run_test(http_base_url.as_str(), &ts, &trace_provider).await?;
+        run_search_test(http_base_url.as_str(), &ts, &trace_provider).await?;
     }
     Ok(())
 }
