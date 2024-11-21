@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use super::ConnectorComponent;
 use super::DataConnector;
 use super::DataConnectorFactory;
 use super::DataConnectorParams;
@@ -130,6 +131,7 @@ impl DataConnector for Snowflake {
                 .await
                 .context(super::UnableToGetReadProviderSnafu {
                     dataconnector: "snowflake",
+                    connector_component: ConnectorComponent::from(dataset),
                 })?,
         )
     }

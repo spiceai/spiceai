@@ -25,7 +25,10 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use super::{DataConnector, DataConnectorFactory, DataConnectorParams, ParameterSpec, Parameters};
+use super::{
+    ConnectorComponent, DataConnector, DataConnectorFactory, DataConnectorParams, ParameterSpec,
+    Parameters,
+};
 
 pub struct DeltaLake {
     delta_table_factory: DeltaTableFactory,
@@ -135,6 +138,7 @@ impl DataConnector for DeltaLake {
         .await
         .context(super::UnableToGetReadProviderSnafu {
             dataconnector: "delta_lake",
+            connector_component: ConnectorComponent::from(dataset),
         })?)
     }
 }

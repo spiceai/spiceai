@@ -29,7 +29,7 @@ use crate::datafusion::DataFusion;
 use crate::DataConnector;
 use crate::{component::dataset::Dataset, parameters::ParameterSpec};
 
-use super::{DataConnectorFactory, DataConnectorParams};
+use super::{ConnectorComponent, DataConnectorFactory, DataConnectorParams};
 
 pub const LOCALPOD_DATACONNECTOR: &str = "localpod";
 
@@ -51,13 +51,14 @@ impl LocalPodFactory {
 impl DataConnectorFactory for LocalPodFactory {
     fn create(
         &self,
-        _params: DataConnectorParams,
+        params: DataConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             Err(Box::new(super::DataConnectorError::Internal {
                 dataconnector: LOCALPOD_DATACONNECTOR.to_string(),
                 code: "LPF-Create".to_string(), // LocalPodFactory - Create
                 source: "Unexpected error. Localpod connector should not be created directly from the factory.".into(),
+                connector_component: params.component.clone()
             }) as Box<dyn std::error::Error + Send + Sync>)
         })
     }
@@ -98,8 +99,8 @@ impl DataConnector for LocalPodConnector {
         self.datafusion.get_table(&path_table_ref).await.ok_or(
             super::DataConnectorError::InvalidTableName {
                 dataconnector: LOCALPOD_DATACONNECTOR.to_string(),
-                dataset_name: dataset.name.to_string(),
                 table_name: path_table_ref.to_string(),
+                connector_component: ConnectorComponent::from(dataset),
             },
         )
     }
