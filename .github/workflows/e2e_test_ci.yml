@@ -164,6 +164,7 @@ jobs:
     needs:
       - build
       - setup-matrix
+    timeout-minutes: 5
 
     strategy:
       matrix:
@@ -233,6 +234,7 @@ jobs:
     needs:
       - build
       - setup-matrix
+    timeout-minutes: 5
 
     strategy:
       matrix:
@@ -297,6 +299,7 @@ jobs:
     needs:
       - build
       - setup-matrix
+    timeout-minutes: 5
 
     strategy:
       matrix:
@@ -387,6 +390,7 @@ jobs:
     needs:
       - build
       - setup-matrix
+    timeout-minutes: 5
 
     strategy:
       matrix:
@@ -519,6 +523,7 @@ jobs:
     needs:
       - build
       - setup-matrix
+    timeout-minutes: 5
 
     strategy:
       fail-fast: false
@@ -673,6 +678,7 @@ jobs:
     needs:
       - build
       - setup-matrix
+    timeout-minutes: 5
 
     strategy:
       matrix:
@@ -773,6 +779,7 @@ jobs:
     needs:
       - build
       - setup-matrix
+    timeout-minutes: 5
 
     strategy:
       matrix:
@@ -853,6 +860,7 @@ jobs:
     needs:
       - build
       - setup-matrix
+    timeout-minutes: 5
 
     strategy:
       fail-fast: false
@@ -997,6 +1005,7 @@ jobs:
     needs:
       - build
       - setup-matrix
+    timeout-minutes: 5
 
     strategy:
       matrix:
@@ -1114,6 +1123,7 @@ jobs:
     needs:
       - build
       - setup-matrix
+    timeout-minutes: 5
 
     strategy:
       matrix:
@@ -1248,6 +1258,7 @@ jobs:
     needs:
       - build
       - setup-matrix
+    timeout-minutes: 5
 
     strategy:
       matrix:

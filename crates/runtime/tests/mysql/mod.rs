@@ -18,6 +18,7 @@ use std::sync::Arc;
 
 use common::{get_mysql_conn, make_mysql_dataset, start_mysql_docker_container};
 use mysql_async::prelude::Queryable;
+use util::{fibonacci_backoff::FibonacciBackoffBuilder, retry, RetryError};
 
 use crate::init_tracing;
 
@@ -179,8 +180,15 @@ async fn mysql_integration_test() -> Result<(), String> {
             e.to_string()
         })?;
     tracing::debug!("Container started");
-    init_mysql_db(MYSQL_PORT).await.map_err(|e| {
-        tracing::error!("init_mysql_db: {e}");
+    let retry_strategy = FibonacciBackoffBuilder::new().max_retries(Some(10)).build();
+    retry(retry_strategy, || async {
+        init_mysql_db(MYSQL_PORT)
+            .await
+            .map_err(RetryError::transient)
+    })
+    .await
+    .map_err(|e| {
+        tracing::error!("Failed to initialize MySQL database: {e}");
         e.to_string()
     })?;
     let app = AppBuilder::new("mysql_integration_test")

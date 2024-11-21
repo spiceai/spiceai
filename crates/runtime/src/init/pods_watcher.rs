@@ -31,6 +31,7 @@ impl Runtime {
             if let Some(current_app) = app_lock.as_mut() {
                 let new_app = Arc::new(new_app);
                 if *current_app == new_app {
+                    drop(app_lock);
                     continue;
                 }
 
@@ -46,6 +47,7 @@ impl Runtime {
             } else {
                 *app_lock = Some(Arc::new(new_app));
             }
+            drop(app_lock);
         }
 
         Ok(())

@@ -16,8 +16,8 @@ limitations under the License.
 
 use super::{
     listing::{self, ListingTableConnector},
-    DataConnector, DataConnectorError, DataConnectorFactory, DataConnectorParams,
-    DataConnectorResult, ParameterSpec, Parameters,
+    ConnectorComponent, DataConnector, DataConnectorError, DataConnectorFactory,
+    DataConnectorParams, DataConnectorResult, ParameterSpec, Parameters,
 };
 
 use crate::component::dataset::Dataset;
@@ -279,7 +279,8 @@ impl ListingTableConnector for S3 {
                 .boxed()
                 .context(super::InvalidConfigurationSnafu {
                     dataconnector: format!("{self}"),
-                    message: format!("{} is not a valid URL", dataset.from),
+                    message: format!("The specified URL is not valid: {}.\nEnsure the URL is valid and try again.\nFor further information, visit: https://docs.spiceai.org/components/data-connectors/s3#from", dataset.from),
+                    connector_component: ConnectorComponent::from(dataset)
                 })?;
 
         s3_url.set_fragment(Some(&listing::build_fragments(
@@ -298,7 +299,11 @@ impl ListingTableConnector for S3 {
         Ok(s3_url)
     }
 
-    fn handle_object_store_error(&self, error: object_store::Error) -> DataConnectorError {
+    fn handle_object_store_error(
+        &self,
+        dataset: &Dataset,
+        error: object_store::Error,
+    ) -> DataConnectorError {
         match error {
             object_store::Error::Generic { source, .. } => {
                 if self.params.get("auth").expose().ok() == Some("iam_role") {
@@ -307,17 +312,20 @@ impl ListingTableConnector for S3 {
                     DataConnectorError::InvalidConfiguration {
                         dataconnector: format!("{self}"),
                         message: format!("{err}"),
+                        connector_component: ConnectorComponent::from(dataset),
                         source: err.into(),
                     }
                 } else {
                     DataConnectorError::UnableToConnectInternal {
                         dataconnector: format!("{self}"),
+                        connector_component: ConnectorComponent::from(dataset),
                         source,
                     }
                 }
             }
             error => DataConnectorError::UnableToConnectInternal {
                 dataconnector: format!("{self}"),
+                connector_component: ConnectorComponent::from(dataset),
                 source: error.into(),
             },
         }

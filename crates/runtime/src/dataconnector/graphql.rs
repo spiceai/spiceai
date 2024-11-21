@@ -27,8 +27,8 @@ use std::{any::Any, future::Future, pin::Pin, sync::Arc};
 use url::Url;
 
 use super::{
-    DataConnector, DataConnectorError, DataConnectorFactory, DataConnectorParams,
-    InvalidConfigurationSnafu, ParameterSpec, Parameters,
+    ConnectorComponent, DataConnector, DataConnectorError, DataConnectorFactory,
+    DataConnectorParams, InvalidConfigurationSnafu, ParameterSpec, Parameters,
 };
 
 pub struct GraphQL {
@@ -126,7 +126,8 @@ impl GraphQL {
         let endpoint = Url::parse(&dataset.path()).map_err(Into::into).context(
             super::InvalidConfigurationSnafu {
                 dataconnector: "graphql",
-                message: "Invalid URL in dataset `from` definition",
+                message: "The specified URL in the dataset 'from' is not valid. Ensure the URL is valid and try again.\nFor further information, visit: https://docs.spiceai.org/components/data-connectors/graphql",
+                connector_component: ConnectorComponent::from(dataset),
             },
         )?;
 
@@ -142,14 +143,15 @@ impl GraphQL {
             .boxed()
             .context(InvalidConfigurationSnafu {
                 dataconnector: "graphql",
-                message: "`unnest_depth` must be a positive integer",
+                message: "The `unnest_depth` parameter must be a positive integer.\nFor further information, visit: https://docs.spiceai.org/components/data-connectors/graphql#configuration",
+                connector_component: ConnectorComponent::from(dataset),
             })?;
 
         let client = default_spice_client("application/json")
             .boxed()
-            .map_err(|e| DataConnectorError::InvalidConfiguration {
+            .map_err(|e| DataConnectorError::InternalWithSource {
                 dataconnector: "graphql".to_string(),
-                message: "could not configure client".to_string(),
+                connector_component: ConnectorComponent::from(dataset),
                 source: e,
             })?;
 
@@ -166,6 +168,7 @@ impl GraphQL {
         .boxed()
         .context(super::InternalWithSourceSnafu {
             dataconnector: "graphql".to_string(),
+            connector_component: ConnectorComponent::from(dataset),
         })
     }
 }
@@ -185,7 +188,8 @@ impl DataConnector for GraphQL {
         let query = self.params.get("query").expose().ok_or_else(|p| {
             super::InvalidConfigurationNoSourceSnafu {
                 dataconnector: "graphql",
-                message: format!("`{}` not found in params", p.0),
+                message: format!("A required parameter was missing: `{}`.\nFor further information, visit: https://docs.spiceai.org/components/data-connectors/graphql#configuration", p.0),
+                connector_component: ConnectorComponent::from(dataset),
             }
             .build()
         })?;
@@ -197,6 +201,7 @@ impl DataConnector for GraphQL {
                 .map_err(Into::into)
                 .context(super::InternalWithSourceSnafu {
                     dataconnector: "graphql".to_string(),
+                    connector_component: ConnectorComponent::from(dataset),
                 })?,
         ))
     }

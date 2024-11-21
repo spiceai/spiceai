@@ -60,10 +60,9 @@ impl EmbeddingConnector {
         if !cfg!(feature = "models") {
             return Err(DataConnectorError::InvalidConfigurationNoSource {
                 dataconnector: dataset.source(),
-                message: format!(
-                "Dataset '{}' expects to use an embedding model, but the runtime is not built with model support. {ENABLE_MODEL_SUPPORT_MESSAGE}",
-                dataset.name
-            )});
+                message: format!("The dataset is configured with an embedding model, but the runtime is not built with model support.\n{ENABLE_MODEL_SUPPORT_MESSAGE}"),
+                connector_component: dataset.into()
+            });
         }
 
         // Add in embedding columns from `dataset.columns.embeddings`.
@@ -96,10 +95,9 @@ impl EmbeddingConnector {
             if !self.embedding_models.read().await.contains_key(model) {
                 return Err(DataConnectorError::InvalidConfigurationNoSource {
                     dataconnector: "EmbeddingConnector".to_string(),
-                    message: format!(
-                    "Dataset '{}' expects to use embedding model '{model}' to embed column '{column}', but the model '{model}' is not defined in Spicepod (as an 'embeddings').",
-                    dataset.name
-                )});
+                    message: format!("The dataset is configured with an embedding model '{model}' to embed column '{column}', but the model '{model}' is not defined in Spicepod (as an 'embeddings').\nFor further information, visit: https://docs.spiceai.org/components/embeddings"),
+                    connector_component: dataset.into()
+                });
             }
         }
 
