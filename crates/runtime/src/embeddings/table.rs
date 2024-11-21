@@ -397,7 +397,7 @@ impl EmbeddingTable {
                         cfg.vector_size,
                         false,
                     ),
-                    false,
+                    true,
                 )),
                 Arc::new(Field::new_list(
                     offset_col!(field.name()),
@@ -407,7 +407,7 @@ impl EmbeddingTable {
                         2,
                         false,
                     ),
-                    false,
+                    true,
                 )),
             ]
         } else {
@@ -415,7 +415,7 @@ impl EmbeddingTable {
                 embedding_col!(field.name()),
                 Field::new("item", DataType::Float32, false),
                 cfg.vector_size,
-                false,
+                true,
             ))]
         }
     }

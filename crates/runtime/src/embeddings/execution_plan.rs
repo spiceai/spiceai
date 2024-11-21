@@ -322,7 +322,7 @@ async fn get_vectors(
     // Filter out nulls or empty strings before caling [`Embed::embed`].
     let (null_pairs, values): (Vec<_>, Vec<_>) = arr
         .enumerate()
-        .partition(|(_, o)| o.is_none() || o.is_some_and(|v| !v.is_empty()));
+        .partition(|(_, o)| o.is_none() || o.is_some_and(|v| v.is_empty()));
     let nulls: Vec<usize> = null_pairs.into_iter().map(|(i, _)| i).collect();
 
     let column: Vec<String> = values
