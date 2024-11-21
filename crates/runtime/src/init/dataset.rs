@@ -61,7 +61,10 @@ impl Runtime {
         let valid_datasets = Self::get_valid_datasets(app, LogErrors(true));
 
         if valid_datasets.is_empty() {
-            tracing::warn!("No datasets were found in the spicepod");
+            tracing::info!(
+                "No datasets were configured in the Spicepod. If this is unexpected, check your Spicepod configuration."
+            );
+            return;
         }
 
         let initialized_datasets = self.initialize_accelerators(&valid_datasets).await;
