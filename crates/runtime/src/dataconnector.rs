@@ -543,7 +543,7 @@ impl DataConnectorParamsBuilder {
         runtime: &Runtime,
     ) -> Result<DataConnectorParams, Box<dyn std::error::Error + Send + Sync>> {
         match &self.component {
-            ConnectorComponent::Catalog(catalog) => {
+            ConnectorComponent::Catalog(_) => {
                 todo!();
             }
             ConnectorComponent::Dataset(dataset) => {
@@ -564,7 +564,7 @@ impl DataConnectorParamsBuilder {
         secrets: Arc<RwLock<Secrets>>,
     ) -> Result<DataConnectorParams, Box<dyn std::error::Error + Send + Sync>> {
         match &self.component {
-            ConnectorComponent::Catalog(catalog) => {
+            ConnectorComponent::Catalog(_) => {
                 todo!();
             }
             ConnectorComponent::Dataset(_) => {

@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use crate::{
     component::catalog::Catalog,
-    dataconnector::{DataConnector, DataConnectorParams, DataConnectorParamsBuilder},
+    dataconnector::{DataConnector, DataConnectorParamsBuilder},
     metrics, status, warn_spaced, DataConnectorDoesntSupportCatalogsSnafu, LogErrors, Result,
     Runtime, UnableToInitializeDataConnectorSnafu, UnableToLoadCatalogConnectorSnafu,
     UnableToLoadDatasetConnectorSnafu,
