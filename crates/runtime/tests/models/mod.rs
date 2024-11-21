@@ -14,22 +14,26 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{
-    collections::HashMap,
-    net::{IpAddr, Ipv4Addr, SocketAddr},
+use arrow::{
+    array::{RecordBatch, StringArray},
+    util::pretty::pretty_format_batches,
 };
-
-use arrow::array::StringArray;
 use async_openai::types::EmbeddingInput;
 use chrono::{DateTime, Utc};
 use futures::TryStreamExt;
 use rand::Rng;
-use reqwest::Client;
+use reqwest::{header::HeaderMap, Client};
 use runtime::{config::Config, datafusion::query::Protocol, Runtime};
 use secrecy::SecretString;
+use snafu::ResultExt;
 use spicepod::component::{
     dataset::{acceleration::Acceleration, Dataset},
     params::Params,
+};
+use std::sync::Arc;
+use std::{
+    collections::HashMap,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
 };
 
 use serde_json::{json, Value};
@@ -332,17 +336,46 @@ async fn send_chat_completions_request(
     Ok(response)
 }
 
-/// Sends a SQL query to the runtime and returns a JSON response.
-async fn http_sql(base_url: &str, sql: &str) -> Result<Value, reqwest::Error> {
+/// Sends a SQL query to the runtime and returns a human-readable response.
+async fn http_post(
+    url: &str,
+    body: &str,
+    headers: HeaderMap,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    println!(
+        "Sending POST request to {}...{:?}....{:?}.",
+        url, headers, body
+    );
     Client::new()
-        .post(format!("{base_url}/v1/sql"))
-        .header("Accept", "application/json")
-        .body(sql.to_string())
+        .post(url)
+        .headers(headers)
+        .body(body.to_string())
         .send()
-        .await?
-        .error_for_status()?
-        .json::<Value>()
         .await
+        .boxed()?
+        .error_for_status()
+        .boxed()?
+        .text()
+        .await
+        .boxed()
+}
+
+async fn sql_to_display(
+    rt: &Arc<Runtime>,
+    query: &str,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let data = rt
+        .datafusion()
+        .query_builder(&query, Protocol::Internal)
+        .build()
+        .run()
+        .await
+        .boxed()?
+        .data
+        .try_collect::<Vec<_>>()
+        .await
+        .boxed()?;
+    pretty_format_batches(&data).map(|d| format!("{d}")).boxed()
 }
 
 /// Retrieves executed tasks from the task history since the given timestamp.

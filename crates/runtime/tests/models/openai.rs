@@ -13,11 +13,12 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+use crate::models::sql_to_display;
 use crate::{
     init_tracing, init_tracing_with_task_history,
     models::{
         create_api_bindings_config, get_executed_tasks, get_params_with_secrets,
-        get_taxi_trips_dataset, get_tpcds_dataset, http_sql, json_is_single_row_with_value,
+        get_taxi_trips_dataset, get_tpcds_dataset, http_post, json_is_single_row_with_value,
         normalize_chat_completion_response, normalize_embeddings_response,
         normalize_search_response, pretty_json_str, send_chat_completions_request,
         send_nsql_request, send_search_request,
@@ -30,9 +31,13 @@ use async_openai::types::{
     CreateChatCompletionRequestArgs, EmbeddingInput,
 };
 use chrono::{DateTime, Utc};
+use jsonpath::Selector;
 use llms::chat::Chat;
 use opentelemetry_sdk::trace::TracerProvider;
-use reqwest::Client;
+use reqwest::{
+    header::{HeaderMap, HeaderValue, ACCEPT, CONTENT_TYPE},
+    Client,
+};
 use runtime::{auth::EndpointAuth, model::try_to_chat_model, Runtime};
 use serde_json::json;
 use spicepod::component::{
@@ -114,46 +119,51 @@ async fn openai_test_nsql() -> Result<(), anyhow::Error> {
     ) -> Result<(), anyhow::Error> {
         tracing::info!("Running test cases {}", ts.name);
         let task_start_time = std::time::SystemTime::now();
-        let response = Client::new()
-            .post(format!("{base_url}/v1/nsql"))
-            .header("Content-Type", "application/json")
-            .json(&ts.body)
-            .send()
-            .await?
-            .error_for_status()?
-            .json::<serde_json::Value>()
-            .await?;
 
-        insta::assert_snapshot!(
-            format!("{}_response", ts.name),
-            serde_json::to_string_pretty(&response).expect("failed to format JSON response")
-        );
+        // Call /v1/nsql, check response
+        let mut headers = HeaderMap::new();
+        headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        let response = http_post(
+            format!("{base_url}/v1/nsql").as_str(),
+            &ts.body.to_string(),
+            headers,
+        )
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to execute HTTP POST: {}", e);
+            anyhow::anyhow!("Failed to execute HTTP POST")
+        })?;
+        insta::assert_snapshot!(format!("nsql_{}_response", ts.name), &response);
 
         // ensure all spans are exported into task_history
         let _ = trace_provider.force_flush();
 
+        // Check task_history table for expected rows.
+        let mut headers = HeaderMap::new();
+        headers.insert(ACCEPT, HeaderValue::from_static("text/plain"));
+        // headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         insta::assert_snapshot!(
-            format!("{}_tasks", ts.name),
-            serde_json::to_string_pretty(
-                &http_sql(
-                    base_url,
-                    &format!(
-                        r#"SELECT task, input
+            format!("nsql_{}_tasks", ts.name),
+            &http_post(
+                &format!("{base_url}/v1/sql"),
+                &format!(
+                    r#"SELECT task, input
                     FROM runtime.task_history
                     WHERE start_time >= '{}' and task!='ai_completion'
                     ORDER BY start_time, task;
                 "#,
-                        Into::<DateTime<Utc>>::into(task_start_time).to_rfc3339()
-                    ),
-                )
-                .await
-                .expect("Failed to execute HTTP SQL query")
+                    Into::<DateTime<Utc>>::into(task_start_time).to_rfc3339()
+                ),
+                headers
             )
-            .expect("failed to format JSON response")
+            .await
+            .expect("Failed to execute HTTP SQL query")
         );
 
         Ok(())
     }
+
     for ts in test_cases {
         run_test(http_base_url.as_str(), &ts, &trace_provider).await?;
     }
@@ -191,6 +201,8 @@ async fn openai_test_search() -> Result<(), anyhow::Error> {
     let http_base_url = format!("http://{}", api_config.http_bind_address);
     let rt = Arc::new(Runtime::builder().with_app(app).build().await);
 
+    let (_tracing, trace_provider) = init_tracing_with_task_history(None, &rt);
+
     let rt_ref_copy = Arc::clone(&rt);
     tokio::spawn(async move {
         Box::pin(rt_ref_copy.start_servers(api_config, None, EndpointAuth::no_auth())).await
@@ -205,32 +217,67 @@ async fn openai_test_search() -> Result<(), anyhow::Error> {
 
     runtime_ready_check(&rt).await;
 
-    tracing::info!("/v1/search: Ensure simple search request succeeds");
-    let response = send_search_request(
-        http_base_url.as_str(),
-        "new patient",
-        Some(2),
-        Some(vec!["item".to_string()]),
-        None,
-        Some(vec!["i_color".to_string(), "i_item_id".to_string()]),
-    )
-    .await?;
+    struct TestCase {
+        name: &'static str,
+        body: serde_json::Value,
+    }
+    let test_cases = [
+        TestCase {
+            name: "basic",
+            body: json!({
+                "text": "new patient",
+                "limit": 2,
+                "datasets": ["item"],
+                "additional_columns": ["i_color", "i_item_id"],
+            }),
+        },
+        TestCase {
+            name: "all_datasets",
+            body: json!({
+                "text": "new patient",
+                "limit": 2,
+            }),
+        },
+    ];
 
-    insta::assert_snapshot!(format!("search_1"), normalize_search_response(response));
+    async fn run_test(
+        base_url: &str,
+        ts: &TestCase,
+        trace_provider: &TracerProvider,
+    ) -> Result<(), anyhow::Error> {
+        tracing::info!("Running test cases {}", ts.name);
+        let task_start_time = std::time::SystemTime::now();
 
-    tracing::info!("/v1/search: Ensure search request across all datasets succeeds");
-    let response = send_search_request(
-        http_base_url.as_str(),
-        "new patient",
-        Some(2),
-        None,
-        None,
-        None,
-    )
-    .await?;
+        // Call /v1/search, check response
+        let mut headers = HeaderMap::new();
+        headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        let response = http_post(
+            &format!("{base_url}/v1/search").to_string(),
+            &ts.body.to_string(),
+            headers,
+        )
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to execute HTTP POST: {}", e);
+            anyhow::anyhow!("Failed to execute HTTP POST")
+        })?;
 
-    insta::assert_snapshot!(format!("search_2"), normalize_search_response(response));
+        let v = serde_json::from_str(&response).map_err(|e| {
+            tracing::error!("Failed to parse HTTP response: {}", e);
+            anyhow::anyhow!("Failed to parse HTTP response")
+        })?;
 
+        insta::assert_snapshot!(
+            format!("search_{}_response", ts.name),
+            normalize_search_response(v)
+        );
+        Ok(())
+    }
+
+    for ts in test_cases {
+        run_test(http_base_url.as_str(), &ts, &trace_provider).await?;
+    }
     Ok(())
 }
 
@@ -267,36 +314,49 @@ async fn openai_test_embeddings() -> Result<(), anyhow::Error> {
 
     runtime_ready_check(&rt).await;
 
+    pub struct EmbeddingTestCase {
+        pub input: EmbeddingInput,
+        pub encoding_format: Option<&'static str>,
+        pub user: Option<&'static str>,
+        pub dimensions: Option<u32>,
+    }
+
     let embeddins_test = vec![
-        (
-            EmbeddingInput::String("The food was delicious and the waiter...".to_string()),
-            Some("float"),
-            None,
-            None,
-        ),
-        (
-            EmbeddingInput::StringArray(vec![
+        EmbeddingTestCase {
+            input: EmbeddingInput::String("The food was delicious and the waiter...".to_string()),
+            encoding_format: Some("float"),
+            user: None,
+            dimensions: None,
+        },
+        EmbeddingTestCase {
+            input: EmbeddingInput::StringArray(vec![
                 "The food was delicious".to_string(),
                 "and the waiter...".to_string(),
             ]),
-            None,
-            Some("test_user_id"),
-            Some(256),
-        ),
-        (
-            EmbeddingInput::StringArray(vec![
+            encoding_format: None,
+            user: Some("test_user_id"),
+            dimensions: Some(256),
+        },
+        EmbeddingTestCase {
+            input: EmbeddingInput::StringArray(vec![
                 "The food was delicious".to_string(),
                 "and the waiter...".to_string(),
             ]),
-            Some("base64"),
-            None,
-            Some(128),
-        ),
+            encoding_format: Some("base64"),
+            user: Some("test_user_id"),
+            dimensions: Some(128),
+        },
     ];
 
     let mut test_id = 0;
 
-    for (input, encoding_format, user, dimensions) in embeddins_test {
+    for EmbeddingTestCase {
+        input,
+        encoding_format,
+        user,
+        dimensions,
+    } in embeddins_test
+    {
         test_id += 1;
         let response = send_embeddings_request(
             http_base_url.as_str(),
@@ -444,33 +504,41 @@ async fn verify_sql_query_chat_completion(
 
     let _ = trace_provider.force_flush();
 
-    let tasks = get_executed_tasks(&rt, task_start_time.into()).await?;
-
-    assert!(
-        tasks.iter().any(|t| { t.0 == "tool_use::list_datasets" }),
-        "Expected 'tool_use::list_datasets' task to be executed"
+    /// Verify Task History
+    insta::assert_snapshot!(
+        "chat_2_sql_tasks",
+        &sql_to_display(
+            &rt,
+            &format!(
+                r#"SELECT input
+                FROM runtime.task_history
+                WHERE start_time >= '{}' 
+                AND task in ('list_datasets', 'sql', 'sql_query')
+                ORDER BY start_time, task;
+            "#,
+                Into::<DateTime<Utc>>::into(task_start_time).to_rfc3339()
+            )
+        )
+        .await
+        .expect("Failed to execute HTTP SQL query")
     );
-    assert!(
-        tasks.iter().any(|t| { t.0 == "tool_use::sql" }),
-        "Expected 'tool_use::sql' task to be executed"
-    );
-    assert!(
-        tasks.iter().any(|t| { t.0 == "sql_query" }),
-        "Expected 'sql_query' task to be executed"
-    );
 
-    let ai_completion_task =
-        tasks
-            .iter()
-            .find(|t| t.0 == "ai_completion")
-            .ok_or(anyhow::anyhow!(
-                "Expected 'ai_completion' task to be executed"
-            ))?;
-
-    // ai_completion input message is deterministic - based on available tools, app configuration, and the input message
     insta::assert_snapshot!(
         "chat_1_ai_completion_input",
-        pretty_json_str(&ai_completion_task.1)?
+        &sql_to_display(
+            &rt,
+            &format!(
+                r#"SELECT input
+                FROM runtime.task_history
+                WHERE start_time >= '{}' 
+                AND task='ai_completion';
+            "#,
+                Into::<DateTime<Utc>>::into(task_start_time).to_rfc3339()
+            )
+            .as_str()
+        )
+        .await
+        .expect("Failed to execute HTTP SQL query")
     );
 
     Ok(())
@@ -483,53 +551,52 @@ async fn verify_similarity_search_chat_completion(
 ) -> Result<(), anyhow::Error> {
     let model =
         get_openai_chat_model(Arc::clone(&rt), "gpt-4o-mini", "openai_model", "auto").await?;
+
     let req = CreateChatCompletionRequestArgs::default()
-                .messages(vec![ChatCompletionRequestSystemMessageArgs::default()
-                    .content("You are an assistant that responds to queries by providing only the requested data values without extra explanation.".to_string())
-                    .build()?
-                    .into(),ChatCompletionRequestUserMessageArgs::default()
-                    .content("Find information about vehicles and journalists".to_string())
-                    .build()?
-                    .into()])
-                .build()?;
+        .messages(vec![ChatCompletionRequestSystemMessageArgs::default()
+            .content("You are an assistant that responds to queries by providing only the requested data values without extra explanation.".to_string())
+            .build()?
+            .into(),ChatCompletionRequestUserMessageArgs::default()
+            .content("Find information about vehicles and journalists".to_string())
+            .build()?
+            .into()])
+        .build()?;
 
     let task_start_time = std::time::SystemTime::now();
     let mut response = model.chat_request(req).await?;
 
-    // Verify model correctly found records in the dataset
-    assert!(response.choices[0]
-        .message
-        .content
-        .clone()
-        .unwrap_or_default()
-        .contains("there just big vehicles. Journalists"));
-
-    // response contains distance metrics that can vary so we replace content with a placeholder for snapshotting
-    response.choices.iter_mut().for_each(|c| {
-        c.message.content = Some("__placeholder__".to_string());
-    });
+    /// Verify Response
+    let resp_value =
+        serde_json::to_value(&response).expect("Failed to serialize response.choices: {}");
+    let selector = Selector::new(
+        ".choices[].message.content[?(@.contains(\"there just big vehicles. Journalists\"))]",
+    )
+    .expect("Failed to create JSONPath selector");
 
     insta::assert_snapshot!(
-        "chat_2_response_choices",
-        format!("{:#?}", response.choices)
+        "chat_2_response",
+        format!("{:#?}", selector.find(&resp_value).collect::<Vec<_>>())
     );
 
     // ensure all spans are exported into task_history
     let _ = trace_provider.force_flush();
 
-    let tasks = get_executed_tasks(&rt, task_start_time.into()).await?;
-
-    let document_similarity_task = tasks
-        .iter()
-        .find(|t| t.0 == "tool_use::document_similarity")
-        .ok_or(anyhow::anyhow!(
-            "Expected 'document_similarity' task to be executed"
-        ))?;
-
-    // ai_completion input message is deterministic - based on available tools, app configuration, and the input message
+    /// Verify Task History
     insta::assert_snapshot!(
-        "chat_2_document_similarity_input",
-        pretty_json_str(&document_similarity_task.1)?
+        "chat_2_document_similarity_tasks",
+        &sql_to_display(
+            &rt,
+            format!(
+                r#"SELECT input
+                FROM runtime.task_history
+                WHERE start_time >= '{}' and task='document_similarity';
+            "#,
+                Into::<DateTime<Utc>>::into(task_start_time).to_rfc3339()
+            )
+            .as_str()
+        )
+        .await
+        .expect("Failed to execute HTTP SQL query")
     );
 
     Ok(())
