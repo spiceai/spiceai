@@ -443,6 +443,8 @@ async fn get_vectors_with_chunker(
                 .values()
                 .append_nulls(vector_length as usize);
             chunks_builder.values().append_nulls(vector_length as usize);
+            vectors_builder.append(true);
+            chunks_builder.append(true);
             continue;
         }
 
@@ -463,6 +465,8 @@ async fn get_vectors_with_chunker(
         }
 
         curr += chunkz_in_row;
+        vectors_builder.append(true);
+        chunks_builder.append(true);
     }
 
     // These are offsets for both the vectors and the content offsets.
