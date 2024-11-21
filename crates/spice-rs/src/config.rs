@@ -56,7 +56,7 @@ pub(crate) fn get_user_agent() -> String {
         .to_string();
 
     format!(
-        "spice-rs {} ({os_type}/{os_release} {os_arch})",
+        "spice-rs/{} ({os_type}/{os_release} {os_arch})",
         env!("CARGO_PKG_VERSION")
     )
 }
@@ -68,7 +68,7 @@ mod test {
     #[test]
     fn test_get_user_agent() {
         let matching_regex = regex::Regex::new(
-            r"spice-rs \d+\.\d+\.\d+ \((Linux|Windows|Darwin)/[\d\w\.\-\_]+ (x86_64|aarch64|i386)\)",
+            r"spice-rs/\d+\.\d+\.\d+ \((Linux|Windows|Darwin)/[\d\w\.\-\_]+ (x86_64|aarch64|i386)\)",
         )
         .expect("regex should be constructed");
 

@@ -41,7 +41,7 @@ pub struct SpiceClient {
 }
 
 impl SpiceClient {
-    /// Creates a new `SpiceClient` with the given API key.
+    /// Creates a new `SpiceClient` with the given API key and default user agent.
     /// ```
     /// use spiceai::Client;
     ///
@@ -58,8 +58,12 @@ impl SpiceClient {
         let config = SpiceClientConfig::load_from_default().await?;
 
         Ok(Self {
-            flight: SqlFlightClient::new(config.flight_channel, Some(api_key.to_string())),
-            firecache: SqlFlightClient::new(config.firecache_channel, Some(api_key.to_string())),
+            flight: SqlFlightClient::new(config.flight_channel, Some(api_key.to_string()), None),
+            firecache: SqlFlightClient::new(
+                config.firecache_channel,
+                Some(api_key.to_string()),
+                None,
+            ),
         })
     }
 
@@ -141,6 +145,7 @@ impl SpiceClient {
 ///
 pub struct SpiceClientBuilder {
     api_key: Option<String>,
+    user_agent: Option<String>,
     firecache_url: Option<String>,
     flight_url: Option<String>,
 }
@@ -156,6 +161,7 @@ impl SpiceClientBuilder {
     pub fn new() -> Self {
         Self {
             api_key: None,
+            user_agent: None,
             firecache_url: None,
             flight_url: None,
         }
@@ -165,6 +171,13 @@ impl SpiceClientBuilder {
     #[must_use]
     pub fn api_key(mut self, api_key: &str) -> Self {
         self.api_key = Some(api_key.to_string());
+        self
+    }
+
+    /// Configures the `SpiceClient` to use the given custom user agent.
+    #[must_use]
+    pub fn user_agent(mut self, user_agent: &str) -> Self {
+        self.user_agent = Some(user_agent.to_string());
         self
     }
 
@@ -208,8 +221,16 @@ impl SpiceClientBuilder {
         };
 
         Ok(SpiceClient {
-            flight: SqlFlightClient::new(flight_channel, self.api_key.clone()),
-            firecache: SqlFlightClient::new(firecache_channel, self.api_key.clone()),
+            flight: SqlFlightClient::new(
+                flight_channel,
+                self.api_key.clone(),
+                self.user_agent.clone(),
+            ),
+            firecache: SqlFlightClient::new(
+                firecache_channel,
+                self.api_key.clone(),
+                self.user_agent.clone(),
+            ),
         })
     }
 }
