@@ -177,13 +177,6 @@ pub enum DataConnectorError {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Failed to read secrets while setting up the {connector_component} ({dataconnector}).\n{source}"))]
-    UnableToReadDatasetSecrets {
-        dataconnector: String,
-        connector_component: ConnectorComponent,
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-
     #[snafu(display("Cannot setup the {connector_component} ({dataconnector}) with an invalid configuration.\n{message}"))]
     InvalidConfiguration {
         dataconnector: String,
