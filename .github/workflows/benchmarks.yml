@@ -99,10 +99,10 @@ jobs:
       mysql_tpch:
         image: ${{ matrix.cmd == '-c mysql' && 'ghcr.io/spiceai/spice-mysql-bench:latest' || '' }}
         options: >-
-          --health-cmd="mysqladmin ping -uroot -proot --silent"
-          --health-interval 10s
+          --health-cmd="mysqladmin ping -uroot -proot -e 'USE tpch_sf1;' --silent"
+          --health-interval 60s
           --health-timeout 5s
-          --health-retries 5
+          --health-retries 20
         ports:
           - 3306:3306
         env:
@@ -111,10 +111,10 @@ jobs:
         image: ${{ matrix.cmd == '-c mysql -b tpcds' && 'ghcr.io/spiceai/spice-mysql-tpcds-bench:latest' || '' }}
         options: >-
           --shm-size=10gb
-          --health-cmd="mysqladmin ping -uroot -proot --silent"
-          --health-interval 10s
+          --health-cmd="mysqladmin ping -uroot -proot -e 'USE tpcds_sf1;' --silent"
+          --health-interval 60s
           --health-timeout 5s
-          --health-retries 5
+          --health-retries 20
         ports:
           - 3306:3306
         env:
