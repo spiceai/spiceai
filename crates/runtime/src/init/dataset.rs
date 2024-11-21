@@ -62,7 +62,7 @@ impl Runtime {
 
         if valid_datasets.is_empty() {
             tracing::info!(
-                "No datasets were configured in the Spicepod. If this is unexpected, check your Spicepod configuration."
+                "No datasets were configured. If this is unexpected, check the Spicepod configuration."
             );
             return;
         }
