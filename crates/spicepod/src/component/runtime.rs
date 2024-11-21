@@ -117,7 +117,7 @@ pub struct TelemetryConfig {
 pub struct TaskHistory {
     #[serde(default = "default_true")]
     pub enabled: bool,
-    #[serde(default = "default_truncated")]
+    #[serde(default = "default_none")]
     pub captured_output: Arc<str>,
     #[serde(default = "default_retention_period")]
     pub retention_period: Arc<str>,
@@ -125,8 +125,8 @@ pub struct TaskHistory {
     pub retention_check_interval: Arc<str>,
 }
 
-fn default_truncated() -> Arc<str> {
-    "truncated".into()
+fn default_none() -> Arc<str> {
+    "none".into()
 }
 
 fn default_retention_period() -> Arc<str> {
@@ -141,15 +141,16 @@ impl Default for TaskHistory {
     fn default() -> Self {
         Self {
             enabled: true,
-            captured_output: "truncated".into(),
-            retention_period: "8h".into(),
-            retention_check_interval: "15m".into(),
+            captured_output: default_none(),
+            retention_period: default_retention_period(),
+            retention_check_interval: default_retention_check_interval(),
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub enum TaskHistoryCapturedOutput {
+    #[default]
     None,
     Truncated,
 }

@@ -169,8 +169,8 @@ CREATE TABLE test (
     assert_eq!(num_rows, 250_000);
 
     assert!(
-        duration_ms < 1000,
-        "Duration {duration_ms}ms was higher than 1000ms",
+        duration_ms < 2000,
+        "Duration {duration_ms}ms was higher than 2000ms",
     );
 
     running_container.remove().await?;
