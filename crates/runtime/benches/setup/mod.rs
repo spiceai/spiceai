@@ -74,7 +74,7 @@ pub(crate) async fn setup_benchmark(
         .await;
 
     tokio::select! {
-        () = tokio::time::sleep(std::time::Duration::from_secs(15 * 60)) => { // Databricks can take awhile to start up
+        () = tokio::time::sleep(std::time::Duration::from_secs(20 * 60)) => { // Databricks can take awhile to start up
             panic!("Timed out waiting for datasets to load in setup_benchmark()");
         }
         () = rt.load_components() => {}
