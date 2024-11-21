@@ -1,0 +1,115 @@
+#!/usr/bin/expect -f
+
+# Runtime response timeout
+set timeout 15:
+
+spawn spice chat
+
+proc verify_datasets_access {} {
+    global timeout
+
+    set taxi_trips_available 0
+    set gh_issues_available 0
+    set catalog_page_available 0
+
+    send "What datasets you have access to\r"
+
+    expect {
+        "spice.public.taxi_trips" {
+            set taxi_trips_available 1
+            exp_continue
+
+        }
+        "spice.public.issues" {
+            set gh_issues_available 1
+            exp_continue
+        }
+        "spice.public.catalog_page" {
+            set catalog_page_available 1
+            exp_continue
+        }
+        " ERROR " {
+            # allow stream to complete
+            sleep 2
+            send_user "Error detected\n"
+            exit 1
+        }
+        "chat> " {
+            # end of model response
+        }
+        timeout {
+            send_user "Timeout waiting for expected response\n"
+            exit 1
+        }
+    }
+
+    if { $taxi_trips_available == 1 && $gh_issues_available == 1 && $catalog_page_available == 1 } {
+        send_user "Model confirmed access to all datasets\n"
+    } else {
+        send_user "Model does not returned expected response\n"
+        exit 1
+    }
+}
+
+proc verify_num_issues {} {
+    global timeout
+
+    send "How many issues stored in database?\r"
+
+    expect {
+        " ERROR " {
+            # allow stream to complete
+            sleep 2
+            send_user "Error detected\n"
+            exit 1
+        }
+        "chat> " {
+            # end of model response
+        }
+        timeout {
+            send_user "Timeout waiting for expected response\n"
+            exit 1
+        }
+    }
+
+    send_user "Model returned expected response\n"
+}
+
+proc verify_catalog_page {} {
+    global timeout
+
+    send "find top 3 exclusive deals in catalog pages\r"
+
+    expect {
+        " ERROR " {
+            # allow stream to complete
+            sleep 2
+            send_user "Error detected\n"
+            exit 1
+        }
+        "chat> " {
+            # end of model response
+        }
+        timeout {
+            send_user "Timeout waiting for expected response\n"
+            exit 1
+        }
+    }
+
+    send_user "Model returned expected response\n"
+}
+
+expect "chat>"
+
+verify_datasets_access
+sleep 1
+
+verify_num_issues
+sleep 1
+
+verify_catalog_page
+
+# Signal to exit (Ctrl+C)
+send \x03
+
+exit 0

@@ -17,9 +17,10 @@ limitations under the License.
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::Arc,
+    time::Duration,
 };
 
-use crate::init_tracing;
+use crate::{init_tracing, utils::wait_until_true};
 use app::AppBuilder;
 use rand::Rng;
 use runtime::{auth::EndpointAuth, config::Config, Runtime};
@@ -65,11 +66,18 @@ async fn test_enabled_cors_endpoints() -> Result<(), anyhow::Error> {
         Box::pin(Arc::new(rt).start_servers(api_config, None, EndpointAuth::no_auth())).await
     });
 
+    let http_client = reqwest::Client::builder().build()?;
+
     // Wait for the servers to start
     tracing::info!("Waiting for servers to start...");
-    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-
-    let http_client = reqwest::Client::builder().build()?;
+    wait_until_true(Duration::from_secs(10), || async {
+        http_client
+            .get(format!("http://localhost:{http_port}/health"))
+            .send()
+            .await
+            .is_ok()
+    })
+    .await;
 
     let http_url = format!("http://127.0.0.1:{http_port}/health");
     let request_builder = http_client.request(http::Method::OPTIONS, &http_url);
@@ -125,11 +133,18 @@ async fn test_disabled_cors_endpoints() -> Result<(), anyhow::Error> {
         Box::pin(Arc::new(rt).start_servers(api_config, None, EndpointAuth::no_auth())).await
     });
 
+    let http_client = reqwest::Client::builder().build()?;
+
     // Wait for the servers to start
     tracing::info!("Waiting for servers to start...");
-    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-
-    let http_client = reqwest::Client::builder().build()?;
+    wait_until_true(Duration::from_secs(10), || async {
+        http_client
+            .get(format!("http://localhost:{http_port}/health"))
+            .send()
+            .await
+            .is_ok()
+    })
+    .await;
 
     let http_url = format!("http://127.0.0.1:{http_port}/health");
     let request_builder = http_client.request(http::Method::OPTIONS, &http_url);

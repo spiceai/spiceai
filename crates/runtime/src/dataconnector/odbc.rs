@@ -31,7 +31,9 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use super::{DataConnector, DataConnectorFactory, DataConnectorParams, ParameterSpec};
+use super::{
+    ConnectorComponent, DataConnector, DataConnectorFactory, DataConnectorParams, ParameterSpec,
+};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -243,6 +245,7 @@ where
                 .await
                 .context(super::UnableToGetReadProviderSnafu {
                     dataconnector: "odbc",
+                    connector_component: ConnectorComponent::from(dataset),
                 })?,
         )
     }

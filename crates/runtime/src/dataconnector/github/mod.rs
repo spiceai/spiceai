@@ -53,8 +53,8 @@ use std::{any::Any, future::Future, pin::Pin, str::FromStr, sync::Arc};
 use url::Url;
 
 use super::{
-    graphql::default_spice_client, DataConnector, DataConnectorError, DataConnectorFactory,
-    DataConnectorParams, ParameterSpec, Parameters,
+    graphql::default_spice_client, ConnectorComponent, DataConnector, DataConnectorError,
+    DataConnectorFactory, DataConnectorParams, ParameterSpec, Parameters,
 };
 
 mod commits;
@@ -99,6 +99,7 @@ impl GitHubTableGraphQLParams {
 
 pub trait GitHubTableArgs: Send + Sync {
     fn get_graphql_values(&self) -> GitHubTableGraphQLParams;
+    fn get_component(&self) -> ConnectorComponent;
 }
 
 impl Github {
@@ -138,6 +139,7 @@ impl Github {
         let client = self.create_graphql_client(&table_args).context(
             super::UnableToGetReadProviderSnafu {
                 dataconnector: "github".to_string(),
+                connector_component: table_args.get_component(),
             },
         )?;
 
@@ -157,6 +159,7 @@ impl Github {
                 .boxed()
                 .context(super::UnableToGetReadProviderSnafu {
                     dataconnector: "github".to_string(),
+                    connector_component: table_args.get_component(),
                 })?,
         ))
     }
@@ -185,7 +188,8 @@ impl Github {
         let Some(tree_sha) = tree_sha.filter(|s| !s.is_empty()) else {
             return Err(DataConnectorError::UnableToGetReadProvider {
                 dataconnector: "github".to_string(),
-                source: format!("Branch or tag name is required in dataset definition; must be 'github.com/{owner}/{repo}/files/BRANCH_NAME'").into(),
+                source: format!("The branch or tag name is required in the dataset 'from' and must be in the format 'github.com/{owner}/{repo}/files/<BRANCH_NAME>'.\nFor further information, visit: https://docs.spiceai.org/components/data-connectors/github#querying-github-files").into(),
+                connector_component: ConnectorComponent::from(dataset),
             });
         };
 
@@ -193,10 +197,11 @@ impl Github {
             .create_rest_client()
             .context(super::UnableToGetReadProviderSnafu {
                 dataconnector: "github".to_string(),
+                connector_component: ConnectorComponent::from(dataset),
             })?;
 
         let include = match self.params.get("include").expose().ok() {
-            Some(pattern) => Some(parse_globs(pattern)?),
+            Some(pattern) => Some(parse_globs(&ConnectorComponent::from(dataset), pattern)?),
             None => None,
         };
 
@@ -213,6 +218,7 @@ impl Github {
             .boxed()
             .context(super::UnableToGetReadProviderSnafu {
                 dataconnector: "github".to_string(),
+                connector_component: ConnectorComponent::from(dataset),
             })?,
         ))
     }
@@ -336,16 +342,13 @@ pub(crate) enum GitHubQueryMode {
 }
 
 impl std::str::FromStr for GitHubQueryMode {
-    type Err = DataConnectorError;
+    type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "auto" => Ok(Self::Auto),
             "search" => Ok(Self::Search),
-            s => Err(DataConnectorError::UnableToGetReadProvider {
-                dataconnector: "github".to_string(),
-                source: format!("Invalid value for 'github_query_mode' parameter: {s}").into(),
-            }),
+            s => Err(s.to_string()),
         }
     }
 }
@@ -368,7 +371,13 @@ impl DataConnector for Github {
             .get("github_query_mode")
             .map_or("auto", |v| v);
 
-        let query_mode = GitHubQueryMode::from_str(query_mode)?;
+        let query_mode = GitHubQueryMode::from_str(query_mode).map_err(|e| {
+            DataConnectorError::UnableToGetReadProvider {
+                dataconnector: "github".to_string(),
+                connector_component: ConnectorComponent::from(dataset),
+                source: format!("Invalid query mode: {e}.\nEnsure a valid query mode is used, and try again.\nFor further information, visit: https://docs.spiceai.org/components/data-connectors/github#common-parameters").into(),
+            }
+        })?;
 
         match (parts.next(), parts.next(), parts.next(), parts.next()) {
             (Some("github.com"), Some(owner), Some(repo), Some("pulls")) => {
@@ -376,6 +385,7 @@ impl DataConnector for Github {
                     owner: owner.to_string(),
                     repo: repo.to_string(),
                     query_mode,
+                    component: ConnectorComponent::from(dataset),
                 });
                 self.create_gql_table_provider(
                     Arc::clone(&table_args) as Arc<dyn GitHubTableArgs>,
@@ -387,6 +397,7 @@ impl DataConnector for Github {
                 let table_args = Arc::new(CommitsTableArgs {
                     owner: owner.to_string(),
                     repo: repo.to_string(),
+                    component: ConnectorComponent::from(dataset),
                 });
                 self.create_gql_table_provider(
                     Arc::clone(&table_args) as Arc<dyn GitHubTableArgs>,
@@ -399,6 +410,7 @@ impl DataConnector for Github {
                     owner: owner.to_string(),
                     repo: repo.to_string(),
                     query_mode,
+                    component: ConnectorComponent::from(dataset),
                 });
                 self.create_gql_table_provider(
                     Arc::clone(&table_args) as Arc<dyn GitHubTableArgs>,
@@ -410,6 +422,7 @@ impl DataConnector for Github {
                 let table_args = Arc::new(StargazersTableArgs {
                     owner: owner.to_string(),
                     repo: repo.to_string(),
+                    component: ConnectorComponent::from(dataset),
                 });
                 self.create_gql_table_provider(table_args, None).await
             }
@@ -420,22 +433,28 @@ impl DataConnector for Github {
             (Some("github.com"), Some(_), Some(_), Some(invalid_table)) => {
                 Err(DataConnectorError::UnableToGetReadProvider {
                     dataconnector: "github".to_string(),
-                    source: format!("Invalid Github table type: {invalid_table}").into(),
+                    source: format!("Invalid GitHub table type: {invalid_table}.\nEnsure a valid table type is used, and try again.\nFor further information, visit: https://docs.spiceai.org/components/data-connectors/github#common-configuration").into(),
+                    connector_component: ConnectorComponent::from(dataset),
                 })
             }
             (_, Some(owner), Some(repo), _) => Err(DataConnectorError::UnableToGetReadProvider {
                 dataconnector: "github".to_string(),
-                source: format!("`from` must start with 'github.com/{owner}/{repo}'").into(),
+                connector_component: ConnectorComponent::from(dataset),
+                source: format!("The dataset `from` must start with 'github.com/{owner}/{repo}'.\nFor further information, visit: https://docs.spiceai.org/components/data-connectors/github#common-configuration").into(),
             }),
             _ => Err(DataConnectorError::UnableToGetReadProvider {
                 dataconnector: "github".to_string(),
-                source: "Invalid Github dataset path".into(),
+                connector_component: ConnectorComponent::from(dataset),
+                source: "Invalid GitHub path provided in the dataset 'from'.\nFor further information, visit: https://docs.spiceai.org/components/data-connectors/github#common-configuration".into(),
             }),
         }
     }
 }
 
-pub fn parse_globs(input: &str) -> super::DataConnectorResult<Arc<GlobSet>> {
+pub fn parse_globs(
+    component: &ConnectorComponent,
+    input: &str,
+) -> super::DataConnectorResult<Arc<GlobSet>> {
     let patterns: Vec<&str> = input.split(&[',', ';'][..]).collect();
     let mut builder = GlobSetBuilder::new();
 
@@ -443,14 +462,20 @@ pub fn parse_globs(input: &str) -> super::DataConnectorResult<Arc<GlobSet>> {
         let trimmed_pattern = pattern.trim();
         if !trimmed_pattern.is_empty() {
             builder.add(
-                Glob::new(trimmed_pattern).context(super::InvalidGlobPatternSnafu { pattern })?,
+                Glob::new(trimmed_pattern).context(super::InvalidGlobPatternSnafu {
+                    pattern,
+                    dataconnector: "github".to_string(),
+                    connector_component: component.clone(),
+                })?,
             );
         }
     }
 
-    let glob_set = builder
-        .build()
-        .context(super::InvalidGlobPatternSnafu { pattern: input })?;
+    let glob_set = builder.build().context(super::InvalidGlobPatternSnafu {
+        pattern: input,
+        dataconnector: "github".to_string(),
+        connector_component: component.clone(),
+    })?;
     Ok(Arc::new(glob_set))
 }
 

@@ -39,6 +39,7 @@ use runtime::{
 use spicepod::component::dataset::acceleration::Acceleration;
 use tokio::time;
 use tracing::instrument;
+use util::{fibonacci_backoff::FibonacciBackoffBuilder, retry, RetryError};
 
 const MYSQL_DOCKER_CONTAINER: &str = "runtime-integration-test-refresh-retry-mysql";
 const MYSQL_PORT: u16 = 13307;
@@ -80,8 +81,13 @@ async fn prepare_test_environment() -> Result<RunningContainer<'static>, String>
             e.to_string()
         })?;
     tracing::debug!("Container started");
-    init_mysql_db().await.map_err(|e| {
-        tracing::error!("init_mysql_db: {e}");
+    let retry_strategy = FibonacciBackoffBuilder::new().max_retries(Some(10)).build();
+    retry(retry_strategy, || async {
+        init_mysql_db().await.map_err(RetryError::transient)
+    })
+    .await
+    .map_err(|e| {
+        tracing::error!("Failed to initialize MySQL database: {e}");
         e.to_string()
     })?;
 

@@ -78,6 +78,7 @@ where
         auth_provider.map(AuthLayer::new),
         &cors_config,
     );
+    drop(app);
 
     let listener = TcpListener::bind(&bind_address)
         .await
