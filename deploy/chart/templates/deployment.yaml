@@ -8,7 +8,9 @@ metadata:
   name: {{ template "spiceai.fullname" .  }}
   namespace: {{ template "spiceai.namespace" . }}
 spec:
+  {{- if .Values.replicaCount }}
   replicas: {{ .Values.replicaCount }}
+  {{- end }}
   selector:
     matchLabels:
       {{- include "spiceai.selectorLabels" . | indent 6 }}

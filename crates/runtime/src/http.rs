@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{fmt::Debug, sync::Arc};
+use std::{borrow::Cow, fmt::Debug, sync::Arc};
 
 use axum::Router;
 use hyper_util::{
@@ -24,6 +24,7 @@ use hyper_util::{
 };
 use runtime_auth::{layer::http::AuthLayer, HttpAuth};
 use snafu::prelude::*;
+use spicepod::component::runtime::CorsConfig;
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
 use tokio_rustls::TlsAcceptor;
 
@@ -65,7 +66,18 @@ where
         Arc::clone(&rt.embeds),
         parse_explicit_primary_keys(Arc::clone(&rt.app)).await,
     ));
-    let routes = routes::routes(&rt, config, vsearch, auth_provider.map(AuthLayer::new));
+    let app = rt.app.as_ref().read().await;
+    let cors_config: Cow<'_, CorsConfig> = match app.as_ref() {
+        Some(app) => Cow::Borrowed(&app.runtime.cors),
+        None => Cow::Owned(CorsConfig::default()),
+    };
+    let routes = routes::routes(
+        &rt,
+        config,
+        vsearch,
+        auth_provider.map(AuthLayer::new),
+        &cors_config,
+    );
 
     let listener = TcpListener::bind(&bind_address)
         .await

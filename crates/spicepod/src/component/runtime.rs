@@ -28,7 +28,7 @@ const TASK_HISTORY_RETENTION_MINIMUM: u64 = 60; // 1 minute
 pub struct Runtime {
     #[serde(default)]
     pub results_cache: ResultsCache,
-    pub num_of_parallel_loading_at_start_up: Option<usize>,
+    pub dataset_load_parallelism: Option<usize>,
 
     /// If set, the runtime will configure all endpoints to use TLS
     pub tls: Option<TlsConfig>,
@@ -46,6 +46,9 @@ pub struct Runtime {
 
     #[serde(default)]
     pub auth: Option<Auth>,
+
+    #[serde(default)]
+    pub cors: CorsConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -114,7 +117,7 @@ pub struct TelemetryConfig {
 pub struct TaskHistory {
     #[serde(default = "default_true")]
     pub enabled: bool,
-    #[serde(default = "default_truncated")]
+    #[serde(default = "default_none")]
     pub captured_output: Arc<str>,
     #[serde(default = "default_retention_period")]
     pub retention_period: Arc<str>,
@@ -122,8 +125,8 @@ pub struct TaskHistory {
     pub retention_check_interval: Arc<str>,
 }
 
-fn default_truncated() -> Arc<str> {
-    "truncated".into()
+fn default_none() -> Arc<str> {
+    "none".into()
 }
 
 fn default_retention_period() -> Arc<str> {
@@ -138,15 +141,16 @@ impl Default for TaskHistory {
     fn default() -> Self {
         Self {
             enabled: true,
-            captured_output: "truncated".into(),
-            retention_period: "8h".into(),
-            retention_check_interval: "15m".into(),
+            captured_output: default_none(),
+            retention_period: default_retention_period(),
+            retention_check_interval: default_retention_check_interval(),
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub enum TaskHistoryCapturedOutput {
+    #[default]
     None,
     Truncated,
 }
@@ -207,4 +211,27 @@ pub struct ApiKeyAuth {
     #[serde(default = "default_true")]
     pub enabled: bool,
     pub keys: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct CorsConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_allowed_origins")]
+    pub allowed_origins: Vec<String>,
+}
+
+fn default_allowed_origins() -> Vec<String> {
+    vec!["*".to_string()]
+}
+
+impl Default for CorsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            allowed_origins: default_allowed_origins(),
+        }
+    }
 }

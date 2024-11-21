@@ -43,7 +43,7 @@ use snafu::ResultExt;
 use std::{
     collections::HashMap,
     num::NonZeroUsize,
-    path::Path,
+    path::{Path, PathBuf},
     pin::Pin,
     str::FromStr,
     sync::{
@@ -67,16 +67,18 @@ fn to_openai_response(
 
 impl MistralLlama {
     pub fn from(
-        model_weights: &Path,
+        model_weights: &[PathBuf],
         config: Option<&Path>,
         tokenizer: Option<&Path>,
         tokenizer_config: Option<&Path>,
         chat_template_literal: Option<&str>,
     ) -> Result<Self> {
-        if !model_weights.exists() {
-            return Err(ChatError::LocalModelNotFound {
-                expected_path: model_weights.to_string_lossy().to_string(),
-            });
+        for weight in model_weights {
+            if !weight.exists() {
+                return Err(ChatError::LocalModelNotFound {
+                    expected_path: weight.to_string_lossy().to_string(),
+                });
+            }
         }
 
         if let Some(config) = config {
@@ -104,21 +106,25 @@ impl MistralLlama {
         }
 
         let paths = Self::create_paths(model_weights, config, tokenizer, tokenizer_config);
-        let model_id = model_weights.to_string_lossy().to_string();
+        let model_id = model_weights
+            .first()
+            .map(|w| w.to_string_lossy().to_string())
+            .unwrap_or_default();
         let device = Self::get_device();
 
         let extension = model_weights
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or_default();
+            .first()
+            .and_then(|p| p.as_path().extension())
+            .and_then(|e| e.to_str());
+
         let pipeline = match extension {
-            "ggml" => Self::load_ggml_pipeline(paths, &device, &model_id, chat_template_literal)?,
-            "gguf" => Self::load_gguf_pipeline(paths, &device, &model_id, chat_template_literal)?,
-            _ => {
-                return Err(ChatError::FailedToLoadModel {
-                    source: format!("Unknown model type: {extension}").into(),
-                })
+            Some("ggml") => {
+                Self::load_ggml_pipeline(paths, &device, &model_id, chat_template_literal)?
             }
+            Some("gguf") => {
+                Self::load_gguf_pipeline(paths, &device, &model_id, chat_template_literal)?
+            }
+            _ => Self::load_default_pipeline(paths, &device, &model_id, chat_template_literal)?,
         };
 
         Ok(Self::from_pipeline(pipeline))
@@ -132,7 +138,7 @@ impl MistralLlama {
     /// `tokenizer_config`: e.g. `tokenizer_config.json`. Not needed for GGUF.
     ///
     fn create_paths(
-        model_weights: &Path,
+        model_weights: &[PathBuf],
         config: Option<&Path>,
         tokenizer: Option<&Path>,
         tokenizer_config: Option<&Path>,
@@ -141,7 +147,7 @@ impl MistralLlama {
             tokenizer.map(Into::into).unwrap_or_default(),
             config.map(Into::into).unwrap_or_default(),
             tokenizer_config.map(Into::into),
-            vec![model_weights.into()],
+            model_weights.iter().map(Into::into).collect(),
             None,
             None,
             None,
@@ -152,6 +158,33 @@ impl MistralLlama {
             None,
             None,
         ))
+    }
+
+    fn load_default_pipeline(
+        paths: Box<dyn ModelPaths>,
+        device: &Device,
+        model_id: &str,
+        chat_template_literal: Option<&str>,
+    ) -> Result<Arc<tokio::sync::Mutex<dyn Pipeline + Sync + Send>>> {
+        let model_parts: Vec<&str> = model_id.split(':').collect();
+        NormalLoaderBuilder::new(
+            mistralrs::NormalSpecificConfig::default(),
+            chat_template_literal.map(ToString::to_string),
+            None,
+            model_parts.first().map(ToString::to_string),
+        )
+        .build(None) // Infer loader type
+        .map_err(|e| ChatError::FailedToLoadModel { source: e.into() })?
+        .load_model_from_path(
+            &paths,
+            &ModelDType::Auto,
+            device,
+            false,
+            DeviceMapMetadata::dummy(),
+            None,
+            None,
+        )
+        .map_err(|e| ChatError::FailedToLoadModel { source: e.into() })
     }
 
     fn load_gguf_pipeline(

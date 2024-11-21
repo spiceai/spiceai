@@ -16,7 +16,6 @@ limitations under the License.
 #![allow(clippy::missing_errors_doc)]
 
 use std::net::SocketAddr;
-use std::pin::Pin;
 use std::{collections::HashMap, sync::Arc};
 
 use crate::auth::EndpointAuth;
@@ -28,8 +27,6 @@ use builder::RuntimeBuilder;
 use config::Config;
 use datasets_health_monitor::DatasetsHealthMonitor;
 use extension::ExtensionFactory;
-use futures::future::join_all;
-use futures::Future;
 use model::{EmbeddingModelStore, LLMModelStore};
 use model_components::model::Model;
 pub use notify::Error as NotifyError;
@@ -443,22 +440,53 @@ impl Runtime {
     pub async fn load_components(&self) {
         self.start_extensions().await;
 
-        self.load_embeddings().await; // Must be loaded before datasets
+        // Must be loaded before datasets
+        self.load_embeddings().await;
 
-        let mut futures: Vec<Pin<Box<dyn Future<Output = ()>>>> = vec![
-            Box::pin(async {
-                if let Err(err) = self.init_task_history().await {
+        // Spawn each component load in its own task to run in parallel
+        let task_history = tokio::spawn({
+            let self_clone = self.clone();
+            async move {
+                if let Err(err) = self_clone.init_task_history().await {
                     tracing::warn!("Creating internal task history table: {err}");
-                };
-            }),
-            Box::pin(self.init_results_cache()),
-            Box::pin(self.load_datasets()),
-            Box::pin(self.load_catalogs()),
-        ];
+                }
+            }
+        });
 
-        futures.push(Box::pin(self.load_models()));
+        let results_cache = tokio::spawn({
+            let self_clone = self.clone();
+            async move {
+                self_clone.init_results_cache().await;
+            }
+        });
 
-        join_all(futures).await;
+        let datasets = tokio::spawn({
+            let self_clone = Arc::new(self.clone());
+            async move {
+                self_clone.load_datasets().await;
+            }
+        });
+
+        let catalogs = tokio::spawn({
+            let self_clone = self.clone();
+            async move {
+                self_clone.load_catalogs().await;
+            }
+        });
+
+        let models = tokio::spawn({
+            let self_clone = self.clone();
+            async move {
+                self_clone.load_models().await;
+            }
+        });
+
+        // Wait for all tasks to complete
+        let load_result = tokio::try_join!(task_history, results_cache, datasets, catalogs, models);
+
+        if let Err(err) = load_result {
+            tracing::error!("Could not start the Spice runtime: {err}");
+        }
     }
 
     pub async fn get_params_with_secrets(

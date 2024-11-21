@@ -25,7 +25,7 @@ use axum::{
 
 pub(crate) async fn get(Extension(status): Extension<Arc<RuntimeStatus>>) -> Response {
     if status.is_ready() {
-        return (status::StatusCode::OK, "Ready").into_response();
+        return (status::StatusCode::OK, "ready").into_response();
     }
-    (status::StatusCode::SERVICE_UNAVAILABLE, "Not Ready").into_response()
+    (status::StatusCode::SERVICE_UNAVAILABLE, "not ready").into_response()
 }
