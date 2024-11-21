@@ -15,11 +15,11 @@ limitations under the License.
 */
 
 use arrow::array::{
-    Array, ArrayRef, FixedSizeListArray, Float32Array, Int32Array, ListArray, RecordBatch,
-    StringArray, StringViewArray,
+    Array, ArrayRef, FixedSizeListArray, FixedSizeListBuilder, ListArray, PrimitiveBuilder,
+    RecordBatch, StringArray, StringViewArray,
 };
 use arrow::buffer::OffsetBuffer;
-use arrow::datatypes::{DataType, Field, SchemaRef};
+use arrow::datatypes::{DataType, Field, Float32Type, Int32Type, SchemaRef};
 
 use arrow::error::ArrowError;
 use async_openai::types::EmbeddingInput;
@@ -314,24 +314,46 @@ pub(crate) async fn compute_additional_embedding_columns(
 /// +---------------------+      +-------------+
 ///     [`StringArray`]        [`FixedSizeListArray`]
 /// ```
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 async fn get_vectors(
     arr: impl Iterator<Item = Option<&str>>,
     model: &dyn Embed,
 ) -> Result<FixedSizeListArray, Box<dyn std::error::Error + Send + Sync>> {
-    let field = Arc::new(Field::new("item", DataType::Float32, false));
-    let column: Vec<String> = arr.filter_map(|s| s.map(ToString::to_string)).collect();
+    // Filter out nulls or empty strings before caling [`Embed::embed`].
+    let (null_pairs, values): (Vec<_>, Vec<_>) = arr
+        .enumerate()
+        .partition(|(_, o)| o.is_none() || o.is_some_and(|v| !v.is_empty()));
+    let nulls: Vec<usize> = null_pairs.into_iter().map(|(i, _)| i).collect();
+
+    let column: Vec<String> = values
+        .iter()
+        .filter_map(|(_, s)| s.map(ToString::to_string))
+        .collect();
+
     let embedded_data = model.embed(EmbeddingInput::StringArray(column)).await?;
     let vector_length = embedded_data.first().map(Vec::len).unwrap_or_default();
-    let processed = embedded_data.iter().flatten().copied().collect_vec();
 
-    let values = Float32Array::try_new(processed.into(), None)?;
-    FixedSizeListArray::try_new(
-        Arc::clone(&field),
-        i32::try_from(vector_length)?,
-        Arc::new(values),
-        None,
-    )
-    .boxed()
+    // Add back nulls into the ordering of embedding data.
+    let mut builder = FixedSizeListBuilder::with_capacity(
+        PrimitiveBuilder::<Float32Type>::with_capacity(
+            (embedded_data.len() + nulls.len()) * vector_length,
+        ),
+        vector_length as i32,
+        embedded_data.len() + nulls.len(),
+    );
+
+    let mut i: usize = 0;
+    for vector in embedded_data {
+        let null_input = nulls.first().is_some_and(|&idx| idx == i);
+        if null_input {
+            builder.values().append_nulls(vector_length);
+        } else {
+            builder.values().append_slice(&vector);
+            i += 1;
+        }
+        builder.append(null_input);
+    }
+    Ok(builder.finish())
 }
 
 /// Embed a [`StringArray`] using the provided [`Embed`] model and [`Chunker`]. The output is a [`ListArray`],
@@ -352,6 +374,7 @@ async fn get_vectors(
 ///                          | [[0, 10], [10, 21]]           |
 ///                          +-------------------------------+
 /// ```
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 async fn get_vectors_with_chunker(
     arr: impl Iterator<Item = Option<&str>>,
     chunker: Arc<dyn Chunker>,
@@ -359,16 +382,17 @@ async fn get_vectors_with_chunker(
 ) -> Result<(ListArray, ListArray), Box<dyn std::error::Error + Send + Sync>> {
     // Iterate over (chunks per row, (starting_offset into row, chunk))
     let (chunks_per_row, chunks_in_row): (Vec<_>, Vec<_>) = arr
-        .filter_map(|s| match s {
-            // TODO: filter_map doesn't handle nulls
-            Some(s) => {
+        // TODO: filter_map doesn't handle nulls
+        .map(|s| match s {
+            Some(s) if !s.is_empty() => {
                 let chunks = chunker
                     .chunk_indices(s)
                     .map(|(idx, s)| (idx, s.to_string()))
                     .collect_vec();
-                Some((chunks.len(), chunks))
+                (chunks.len(), chunks)
             }
-            None => None,
+            // None, or empty string.
+            _ => (0, vec![]),
         })
         .unzip();
 
@@ -379,17 +403,30 @@ async fn get_vectors_with_chunker(
         .await
         .boxed()?;
 
-    // `model.size()` is a `u32` for for compatibility with `FixedSizeList(FieldRef, i32)`.
     #[allow(clippy::cast_sign_loss)]
-    let vector_length = model.size() as usize;
+    let vector_length = model.size();
 
-    let mut values = Float32Array::builder(embedded_data.len() * vector_length);
-    let mut chunk_values = Int32Array::builder(embedded_data.len() * 2);
+    let capacity = chunks_per_row.iter().sum();
+    #[allow(clippy::cast_sign_loss)]
+    let mut vectors_builder = FixedSizeListBuilder::with_capacity(
+        PrimitiveBuilder::<Float32Type>::with_capacity(capacity * (vector_length as usize)),
+        vector_length,
+        capacity,
+    );
+
+    let mut chunks_builder = FixedSizeListBuilder::with_capacity(
+        PrimitiveBuilder::<Int32Type>::with_capacity(capacity),
+        2,
+        capacity,
+    );
 
     let mut lengths = Vec::with_capacity(chunks_per_row.len());
     let mut curr = 0;
-
-    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        clippy::cast_sign_loss
+    )]
     for chunkz_in_row in chunks_per_row {
         lengths.push(chunkz_in_row);
 
@@ -399,11 +436,19 @@ async fn get_vectors_with_chunker(
             .flatten()
             .copied()
             .collect_vec();
-        values.append_slice(&inner); // I believe this is a clone under the hood.
 
-        // Create flattened version of [(start, end), (start, end), ...]
+        // Handling Nulls
+        if chunkz_in_row == 0 {
+            vectors_builder
+                .values()
+                .append_nulls(vector_length as usize);
+            chunks_builder.values().append_nulls(vector_length as usize);
+            continue;
+        }
+
+        vectors_builder.values().append_slice(&inner); // I believe this is a clone under the hood.
+
         // Explicitly find `end` to handle when chunks have overlap.
-        let mut inner_offsets = Vec::with_capacity(2 * chunkz_in_row);
         for i in 0..chunkz_in_row {
             let start = chunk_offsets[curr + i];
             let end = start
@@ -412,66 +457,43 @@ async fn get_vectors_with_chunker(
                     .get(curr + i)
                     .map(String::len)
                     .unwrap_or_default();
-            inner_offsets.push(start as i32);
-            inner_offsets.push(end as i32);
+
+            chunks_builder.values().append_value(start as i32);
+            chunks_builder.values().append_value(end as i32);
         }
-        chunk_values.append_slice(inner_offsets.as_slice());
 
         curr += chunkz_in_row;
     }
 
-    // These are offsets for both the vectors and the content offsets
+    // These are offsets for both the vectors and the content offsets.
+    // They tell the [`ListArray`] how many vectors/offsets are for each row of the input table.
     let offsets = OffsetBuffer::<i32>::from_lengths(lengths.into_iter());
 
-    let vectors = {
-        let scalar_field = Arc::new(Field::new("item", DataType::Float32, false));
+    let vectors = ListArray::try_new(
+        Arc::new(Field::new_fixed_size_list(
+            "item",
+            Arc::new(Field::new("item", DataType::Float32, false)),
+            vector_length,
+            false,
+        )),
+        offsets.clone(),
+        Arc::new(vectors_builder.finish()),
+        None,
+    )
+    .boxed()?;
 
-        // Inner FixedSizeListArray
-        let fixed_size_list_array = FixedSizeListArray::try_new(
-            Arc::clone(&scalar_field),
-            i32::try_from(vector_length).boxed()?,
-            Arc::new(values.finish()),
-            None,
-        )
-        .boxed()?;
-
-        ListArray::try_new(
-            Arc::new(Field::new_fixed_size_list(
-                "item",
-                Arc::clone(&scalar_field),
-                i32::try_from(vector_length).boxed()?,
-                false,
-            )),
-            offsets.clone(),
-            Arc::new(fixed_size_list_array),
-            None,
-        )
-        .boxed()?
-    };
-
-    let content_offsets = {
-        let scalar_field = Arc::new(Field::new("item", DataType::Int32, false));
-        let fixed_size_list_array = FixedSizeListArray::try_new(
-            Arc::clone(&scalar_field),
+    let content_offsets = ListArray::try_new(
+        Arc::new(Field::new_fixed_size_list(
+            "item",
+            Arc::new(Field::new("item", DataType::Int32, false)),
             2,
-            Arc::new(chunk_values.finish()),
-            None,
-        )
-        .boxed()?;
-
-        ListArray::try_new(
-            Arc::new(Field::new_fixed_size_list(
-                "item",
-                Arc::clone(&scalar_field),
-                2,
-                false,
-            )),
-            offsets,
-            Arc::new(fixed_size_list_array),
-            None,
-        )
-        .boxed()?
-    };
+            false,
+        )),
+        offsets,
+        Arc::new(chunks_builder.finish()),
+        None,
+    )
+    .boxed()?;
 
     Ok((vectors, content_offsets))
 }
