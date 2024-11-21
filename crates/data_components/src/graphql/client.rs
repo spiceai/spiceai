@@ -32,6 +32,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use snafu::ResultExt;
 use std::{cmp::min, fmt::Display, io::Cursor, sync::Arc};
+use tokio::sync::RwLock;
 
 use url::Url;
 
@@ -607,6 +608,7 @@ pub struct GraphQLClient {
     unnest_parameters: UnnestParameters,
     auth: Option<Auth>,
     schema: Option<SchemaRef>,
+    rate_limiter: Option<Arc<RwLock<RateLimiter>>>,
 }
 
 #[derive(Clone)]
@@ -677,6 +679,7 @@ impl GraphQLClient {
         pass: Option<String>,
         unnest_depth: usize,
         schema: Option<SchemaRef>,
+        rate_limiter: Option<Arc<RwLock<RateLimiter>>>,
     ) -> Result<Self> {
         let auth = match (token, user, pass) {
             (None, Some(user), pass) => Some(Auth::Basic(user, pass)),
@@ -698,6 +701,7 @@ impl GraphQLClient {
             unnest_parameters,
             auth,
             schema,
+            rate_limiter,
         })
     }
 
@@ -718,6 +722,12 @@ impl GraphQLClient {
 
         let response = request.send().await.context(ReqwestInternalSnafu)?;
         let response_headers = response.headers().clone();
+
+        // Update rate limiter with response headers
+        if let Some(rate_limiter) = &self.rate_limiter {
+            let mut rate_limiter = rate_limiter.write().await;
+            rate_limiter.update_from_headers(&response_headers).await;
+        }
 
         let status = response.status();
         let response: serde_json::Value = response.json().await.context(ReqwestInternalSnafu)?;
@@ -793,6 +803,12 @@ impl GraphQLClient {
         limit: Option<usize>,
         error_checker: Option<ErrorChecker>,
     ) -> Result<Vec<Vec<RecordBatch>>> {
+        // Check rate limit before starting pagination
+        if let Some(rate_limiter) = &self.rate_limiter {
+            let mut rate_limiter = rate_limiter.write().await;
+            rate_limiter.check_rate_limit().await?;
+        }
+
         let mut result = self
             .execute(
                 query,
@@ -810,6 +826,12 @@ impl GraphQLClient {
         }
 
         while let Some(next_cursor_val) = result.cursor {
+            // Check rate limit before each page request
+            if let Some(rate_limiter) = &self.rate_limiter {
+                let mut rate_limiter = rate_limiter.write().await;
+                rate_limiter.check_rate_limit().await?;
+            }
+
             if let Some(p) = query.pagination_parameters.as_ref() {
                 if limit.is_some() {
                     limit = Some(p.reduce_limit(result.record_count));
@@ -869,7 +891,7 @@ async fn request_with_auth(request_builder: RequestBuilder, auth: &Option<Auth>)
 }
 
 fn handle_http_error(status: StatusCode, response: &Value) -> Result<()> {
-    if status.is_client_error() | status.is_server_error() {
+    if (status.is_client_error() | status.is_server_error()) {
         let message = [
             &response["message"],
             &response["error"]["message"],

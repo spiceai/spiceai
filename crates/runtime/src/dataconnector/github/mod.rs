@@ -61,6 +61,7 @@ mod commits;
 mod github_app_token_provider;
 mod issues;
 mod pull_requests;
+mod rate_limit;
 mod stargazers;
 
 pub struct Github {
@@ -127,6 +128,7 @@ impl Github {
         .with_token_provider(token)
         .with_json_pointer(gql_client_params.json_pointer)
         .with_schema(gql_client_params.schema)
+        .with_rate_limiter(Some(Arc::new(RwLock::new(RateLimiter::new()))))
         .build(client)
         .boxed()
     }
