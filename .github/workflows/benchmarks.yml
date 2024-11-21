@@ -124,7 +124,7 @@ jobs:
         options: >-
           --shm-size=2gb
           --health-cmd="test -f /var/lib/postgresql/data/data_loading_complete"
-          --health-interval 10s
+          --health-interval 30s
           --health-timeout 5s
           --health-retries 5
         ports:
@@ -136,7 +136,7 @@ jobs:
         options: >-
           --shm-size=2gb
           --health-cmd="test -f /var/lib/postgresql/data/data_loading_complete"
-          --health-interval 10s
+          --health-interval 30s
           --health-timeout 5s
           --health-retries 5
         ports:
