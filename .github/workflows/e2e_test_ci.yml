@@ -275,7 +275,7 @@ jobs:
         working-directory: test_app
         timeout-minutes: 1
         run: |
-          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "Ready" ]]; do sleep 1; done
+          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
 
       - name: Verify dataset
         uses: ./.github/actions/verify-dataset
@@ -367,7 +367,7 @@ jobs:
         working-directory: test_app
         timeout-minutes: 1
         run: |
-          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "Ready" ]]; do sleep 1; done
+          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
 
       - name: Verify dataset
         uses: ./.github/actions/verify-dataset
@@ -499,7 +499,7 @@ jobs:
         working-directory: test_app
         timeout-minutes: 1
         run: |
-          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "Ready" ]]; do sleep 1; done
+          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
 
       - name: Verify dataset
         uses: ./.github/actions/verify-dataset
@@ -653,7 +653,7 @@ jobs:
         working-directory: test_app
         timeout-minutes: 1
         run: |
-          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "Ready" ]]; do sleep 1; done
+          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
 
       - name: Verify dataset
         uses: ./.github/actions/verify-dataset
@@ -751,7 +751,7 @@ jobs:
         working-directory: test_app
         timeout-minutes: 1
         run: |
-          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "Ready" ]]; do sleep 1; done
+          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
 
       - name: Verify dataset
         uses: ./.github/actions/verify-dataset
@@ -833,7 +833,7 @@ jobs:
         working-directory: duckdb-app
         timeout-minutes: 1
         run: |
-          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "Ready" ]]; do sleep 1; done
+          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
 
       - name: Verify dataset
         uses: ./.github/actions/verify-dataset
@@ -944,7 +944,7 @@ jobs:
         working-directory: test_app
         timeout-minutes: 1
         run: |
-          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "Ready" ]]; do sleep 1; done
+          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
 
       - name: Manually refresh dataset (no params)
         working-directory: test_app
@@ -1050,7 +1050,7 @@ jobs:
         working-directory: test_app
         timeout-minutes: 1
         run: |
-          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "Ready" ]]; do sleep 1; done
+          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
 
       - name: Run SQL query and check Miss cache header
         working-directory: test_app
@@ -1203,7 +1203,7 @@ jobs:
         working-directory: test_app
         timeout-minutes: 1
         run: |
-          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "Ready" ]]; do sleep 1; done
+          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
 
       - name: Run test query (issues)
         uses: ./.github/actions/run-query
@@ -1326,7 +1326,7 @@ jobs:
         working-directory: test_app
         timeout-minutes: 1
         run: |
-          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "Ready" ]]; do sleep 1; done
+          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
 
       - name: Verify dataset
         uses: ./.github/actions/verify-dataset

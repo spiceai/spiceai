@@ -22,15 +22,18 @@ use tonic::{Request, Response, Status};
 
 use crate::{
     flight::{metrics, record_batches_to_flight_stream, to_tonic_err, Service},
-    timing::{TimeMeasurement, TimedStream},
+    timing::TimedStream,
 };
 
 pub(crate) fn get_flight_info(
     query: &sql::CommandGetTables,
     request: Request<FlightDescriptor>,
 ) -> Response<FlightInfo> {
+    let _start = metrics::track_flight_request("get_flight_info", Some("get_tables"));
+
     let fd = request.into_inner();
     tracing::trace!("get_flight_info: {query:?}");
+
     Response::new(FlightInfo {
         flight_descriptor: Some(fd.clone()),
         endpoint: vec![FlightEndpoint {
@@ -45,7 +48,7 @@ pub(crate) async fn do_get(
     flight_svc: &Service,
     query: sql::CommandGetTables,
 ) -> Result<Response<<Service as FlightService>::DoGetStream>, Status> {
-    let start = TimeMeasurement::new(&metrics::flightsql::DO_GET_GET_TABLES_DURATION_MS, vec![]);
+    let start = metrics::track_flight_request("do_get", Some("get_tables"));
     let catalog = &query.catalog;
     tracing::trace!("do_get_tables: {query:?}");
     let filtered_catalogs = match catalog {

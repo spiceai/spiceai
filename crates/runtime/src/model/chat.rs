@@ -113,13 +113,13 @@ pub fn construct_model<S: ::std::hash::BuildHasher>(
             llms::chat::create_hf_model(&id, &model_type, hf_token)
         }
         ModelSource::File => {
-            let weights_path = model_id
-                .clone()
-                .or(component.find_any_file_path(ModelFileType::Weights))
-                .ok_or(LlmError::FailedToLoadModel {
+            let model_weights = component.find_all_file_path(ModelFileType::Weights);
+            if model_weights.is_empty() {
+                return Err(LlmError::FailedToLoadModel {
                     source: "No 'weights_path' parameter provided".into(),
-                })?
-                .clone();
+                });
+            }
+
             let tokenizer_path = component.find_any_file_path(ModelFileType::Tokenizer);
             let tokenizer_config_path =
                 component.find_any_file_path(ModelFileType::TokenizerConfig);
@@ -129,7 +129,7 @@ pub fn construct_model<S: ::std::hash::BuildHasher>(
                 .map(|s| s.expose_secret().as_str());
 
             llms::chat::create_local_model(
-                &weights_path,
+                model_weights.as_slice(),
                 config_path.as_deref(),
                 tokenizer_path.as_deref(),
                 tokenizer_config_path.as_deref(),

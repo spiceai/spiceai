@@ -28,6 +28,7 @@ use tracing_subscriber::EnvFilter;
 mod abfs;
 mod acceleration;
 mod catalog;
+mod cors;
 #[cfg(feature = "delta_lake")]
 mod delta_lake;
 mod docker;

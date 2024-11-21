@@ -1,5 +1,271 @@
 ---
 source: crates/runtime/tests/models/openai.rs
-expression: "format!(\"{:?}\", ai_completion_task.1)"
+expression: pretty_json_str(&ai_completion_task.1)?
 ---
-"{\"messages\":[{\"role\":\"assistant\",\"tool_calls\":[{\"id\":\"initial_list_datasets\",\"type\":\"function\",\"function\":{\"name\":\"list_datasets\",\"arguments\":\"\"}}]},{\"role\":\"tool\",\"content\":\"[{\\\"can_search_documents\\\":false,\\\"description\\\":null,\\\"metadata\\\":{},\\\"table\\\":\\\"spice.public.taxi_trips\\\"}]\",\"tool_call_id\":\"initial_list_datasets\"},{\"role\":\"system\",\"content\":\"You are an assistant that responds to queries by providing only the requested data values without extra explanation.\"},{\"role\":\"user\",\"content\":\"Provide the total number of records in the taxi trips dataset. If known, return a single numeric value.\"}],\"model\":\"\",\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"document_similarity\",\"description\":\"Search and retrieve documents from available datasets\",\"parameters\":{\"$schema\":\"http://json-schema.org/draft-07/schema#\",\"properties\":{\"additional_columns\":{\"default\":[],\"description\":\"Additional columns to return from the dataset.\",\"items\":{\"type\":\"string\"},\"type\":\"array\"},\"datasets\":{\"default\":null,\"description\":\"The datasets to search for similarity. If None, search across all datasets. For available datasets, use the `list_datasets` tool and ensure `can_search_documents==true`.\",\"items\":{\"type\":\"string\"},\"type\":[\"array\",\"null\"]},\"limit\":{\"default\":null,\"description\":\"Number of documents to return for each dataset\",\"format\":\"uint\",\"minimum\":0.0,\"type\":[\"integer\",\"null\"]},\"text\":{\"description\":\"The text to search documents for similarity\",\"type\":\"string\"},\"where\":{\"default\":null,\"description\":\"An SQL filter predicate to apply. Format: 'WHERE `where_cond`'.\",\"type\":[\"string\",\"null\"]}},\"required\":[\"text\"],\"title\":\"SearchRequestJson\",\"type\":\"object\"}}},{\"type\":\"function\",\"function\":{\"name\":\"get_readiness\",\"description\":\"Retrieves the readiness status of all runtime components including registered datasets, models, and embeddings.\"}},{\"type\":\"function\",\"function\":{\"name\":\"list_datasets\",\"description\":\"List all SQL tables available.\"}},{\"type\":\"function\",\"function\":{\"name\":\"random_sample\",\"description\":\"Sample random rows from a table.\",\"parameters\":{\"$schema\":\"http://json-schema.org/draft-07/schema#\",\"properties\":{\"dataset\":{\"description\":\"The SQL dataset to sample data from.\",\"type\":\"string\"},\"limit\":{\"description\":\"The number of rows, each with distinct values per column, to sample.\",\"format\":\"uint\",\"minimum\":0.0,\"type\":\"integer\"}},\"required\":[\"dataset\",\"limit\"],\"title\":\"RandomSampleParams\",\"type\":\"object\"}}},{\"type\":\"function\",\"function\":{\"name\":\"sample_distinct_columns\",\"description\":\"Generate synthetic data by sampling distinct column values from a table.\",\"parameters\":{\"$schema\":\"http://json-schema.org/draft-07/schema#\",\"properties\":{\"cols\":{\"description\":\"The columns to sample distinct values from. If None, all columns are sampled.\",\"items\":{\"type\":\"string\"},\"type\":[\"array\",\"null\"]},\"dataset\":{\"description\":\"The SQL dataset to sample data from.\",\"type\":\"string\"},\"limit\":{\"description\":\"The number of rows, each with distinct values per column, to sample.\",\"format\":\"uint\",\"minimum\":0.0,\"type\":\"integer\"}},\"required\":[\"dataset\",\"limit\"],\"title\":\"DistinctColumnsParams\",\"type\":\"object\"}}},{\"type\":\"function\",\"function\":{\"name\":\"sql\",\"description\":\"Run an SQL query on the data source\",\"parameters\":{\"$schema\":\"http://json-schema.org/draft-07/schema#\",\"properties\":{\"query\":{\"description\":\"The SQL query to run. Double quote all select columns and never select columns ending in '_embedding'. The `table_catalog` is 'spice'. Always use it in the query\",\"type\":\"string\"}},\"required\":[\"query\"],\"title\":\"SqlToolParams\",\"type\":\"object\"}}},{\"type\":\"function\",\"function\":{\"name\":\"table_schema\",\"description\":\"Retrieve the schema of all available SQL tables\",\"parameters\":{\"$schema\":\"http://json-schema.org/draft-07/schema#\",\"definitions\":{\"OutputType\":{\"enum\":[\"full\",\"minimal\"],\"type\":\"string\"}},\"properties\":{\"output\":{\"allOf\":[{\"$ref\":\"#/definitions/OutputType\"}],\"default\":\"full\",\"description\":\"If `full` return metadata and semantic details about the columns.\"},\"tables\":{\"description\":\"Which subset of tables to return results for. Default to all tables.\",\"items\":{\"type\":\"string\"},\"type\":\"array\"}},\"required\":[\"tables\"],\"title\":\"TableSchemaToolParams\",\"type\":\"object\"}}},{\"type\":\"function\",\"function\":{\"name\":\"top_n_sample\",\"description\":\"Sample the top N rows from a table based on a specified ordering\",\"parameters\":{\"$schema\":\"http://json-schema.org/draft-07/schema#\",\"properties\":{\"dataset\":{\"description\":\"The SQL dataset to sample data from.\",\"type\":\"string\"},\"limit\":{\"description\":\"The number of rows, each with distinct values per column, to sample.\",\"format\":\"uint\",\"minimum\":0.0,\"type\":\"integer\"},\"order_by\":{\"description\":\"How to order the samples before retrieving the top N.\",\"type\":\"string\"}},\"required\":[\"dataset\",\"limit\",\"order_by\"],\"title\":\"TopSamplesParams\",\"type\":\"object\"}}}]}"
+{
+  "messages": [
+    {
+      "role": "assistant",
+      "tool_calls": [
+        {
+          "function": {
+            "arguments": "",
+            "name": "list_datasets"
+          },
+          "id": "initial_list_datasets",
+          "type": "function"
+        }
+      ]
+    },
+    {
+      "content": "[{\"can_search_documents\":false,\"description\":null,\"metadata\":{},\"table\":\"spice.public.taxi_trips\"},{\"can_search_documents\":true,\"description\":null,\"metadata\":{},\"table\":\"spice.public.item\"}]",
+      "role": "tool",
+      "tool_call_id": "initial_list_datasets"
+    },
+    {
+      "content": "You are an assistant that responds to queries by providing only the requested data values without extra explanation.",
+      "role": "system"
+    },
+    {
+      "content": "Provide the total number of records in the taxi trips dataset. If known, return a single numeric value.",
+      "role": "user"
+    }
+  ],
+  "model": "",
+  "tools": [
+    {
+      "function": {
+        "description": "Search and retrieve documents from available datasets",
+        "name": "document_similarity",
+        "parameters": {
+          "$schema": "http://json-schema.org/draft-07/schema#",
+          "properties": {
+            "additional_columns": {
+              "default": [],
+              "description": "Additional columns to return from the dataset.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "datasets": {
+              "default": null,
+              "description": "The datasets to search for similarity. If None, search across all datasets. For available datasets, use the `list_datasets` tool and ensure `can_search_documents==true`.",
+              "items": {
+                "type": "string"
+              },
+              "type": [
+                "array",
+                "null"
+              ]
+            },
+            "limit": {
+              "default": null,
+              "description": "Number of documents to return for each dataset",
+              "format": "uint",
+              "minimum": 0.0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "text": {
+              "description": "The text to search documents for similarity",
+              "type": "string"
+            },
+            "where": {
+              "default": null,
+              "description": "An SQL filter predicate to apply. Format: 'WHERE `where_cond`'.",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "text"
+          ],
+          "title": "SearchRequestJson",
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "Retrieves the readiness status of all runtime components including registered datasets, models, and embeddings.",
+        "name": "get_readiness"
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "List all SQL tables available.",
+        "name": "list_datasets"
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "Sample random rows from a table.",
+        "name": "random_sample",
+        "parameters": {
+          "$schema": "http://json-schema.org/draft-07/schema#",
+          "properties": {
+            "dataset": {
+              "description": "The SQL dataset to sample data from.",
+              "type": "string"
+            },
+            "limit": {
+              "description": "The number of rows, each with distinct values per column, to sample.",
+              "format": "uint",
+              "minimum": 0.0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "dataset",
+            "limit"
+          ],
+          "title": "RandomSampleParams",
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "Generate synthetic data by sampling distinct column values from a table.",
+        "name": "sample_distinct_columns",
+        "parameters": {
+          "$schema": "http://json-schema.org/draft-07/schema#",
+          "properties": {
+            "cols": {
+              "description": "The columns to sample distinct values from. If None, all columns are sampled.",
+              "items": {
+                "type": "string"
+              },
+              "type": [
+                "array",
+                "null"
+              ]
+            },
+            "dataset": {
+              "description": "The SQL dataset to sample data from.",
+              "type": "string"
+            },
+            "limit": {
+              "description": "The number of rows, each with distinct values per column, to sample.",
+              "format": "uint",
+              "minimum": 0.0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "dataset",
+            "limit"
+          ],
+          "title": "DistinctColumnsParams",
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "Run an SQL query on the data source",
+        "name": "sql",
+        "parameters": {
+          "$schema": "http://json-schema.org/draft-07/schema#",
+          "properties": {
+            "query": {
+              "description": "The SQL query to run. Double quote all select columns and never select columns ending in '_embedding'. The `table_catalog` is 'spice'. Always use it in the query",
+              "type": "string"
+            }
+          },
+          "required": [
+            "query"
+          ],
+          "title": "SqlToolParams",
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "Retrieve the schema of all available SQL tables",
+        "name": "table_schema",
+        "parameters": {
+          "$schema": "http://json-schema.org/draft-07/schema#",
+          "definitions": {
+            "OutputType": {
+              "enum": [
+                "full",
+                "minimal"
+              ],
+              "type": "string"
+            }
+          },
+          "properties": {
+            "output": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/OutputType"
+                }
+              ],
+              "default": "full",
+              "description": "If `full` return metadata and semantic details about the columns."
+            },
+            "tables": {
+              "description": "Which subset of tables to return results for. Default to all tables.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "tables"
+          ],
+          "title": "TableSchemaToolParams",
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "Sample the top N rows from a table based on a specified ordering",
+        "name": "top_n_sample",
+        "parameters": {
+          "$schema": "http://json-schema.org/draft-07/schema#",
+          "properties": {
+            "dataset": {
+              "description": "The SQL dataset to sample data from.",
+              "type": "string"
+            },
+            "limit": {
+              "description": "The number of rows, each with distinct values per column, to sample.",
+              "format": "uint",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "order_by": {
+              "description": "How to order the samples before retrieving the top N.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "dataset",
+            "limit",
+            "order_by"
+          ],
+          "title": "TopSamplesParams",
+          "type": "object"
+        }
+      },
+      "type": "function"
+    }
+  ]
+}

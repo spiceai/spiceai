@@ -124,7 +124,7 @@ impl QueryResultsCacheProvider {
             ignore_schemas,
         };
 
-        metrics::MAX_SIZE.record(cache_max_size, &[]);
+        metrics::MAX_SIZE_BYTES.record(cache_max_size, &[]);
 
         Ok(cache_provider)
     }
@@ -133,10 +133,10 @@ impl QueryResultsCacheProvider {
     ///
     /// Will return `Err` if method fails to access the cache
     pub async fn get(&self, plan: &LogicalPlan) -> Result<Option<CachedQueryResult>> {
-        metrics::REQUEST_COUNT.add(1, &[]);
+        metrics::REQUESTS.add(1, &[]);
         match self.cache.get(plan).await {
             Ok(Some(cached_result)) => {
-                metrics::HIT_COUNT.add(1, &[]);
+                metrics::HITS.add(1, &[]);
                 Ok(Some(cached_result))
             }
             Ok(None) => Ok(None),
@@ -168,8 +168,8 @@ impl QueryResultsCacheProvider {
         if now_seconds - self.metrics_reported_last_time.load(Ordering::Relaxed) >= 5 {
             self.metrics_reported_last_time
                 .store(now_seconds, Ordering::Relaxed);
-            metrics::SIZE.record(self.size(), &[]);
-            metrics::ITEM_COUNT.add(self.item_count(), &[]);
+            metrics::SIZE_BYTES.record(self.size(), &[]);
+            metrics::ITEMS.record(self.item_count(), &[]);
         }
     }
 

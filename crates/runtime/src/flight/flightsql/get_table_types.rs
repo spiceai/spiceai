@@ -29,13 +29,14 @@ use crate::{
     flight::{
         flightsql::get_tables, metrics, record_batches_to_flight_stream, to_tonic_err, Service,
     },
-    timing::{TimeMeasurement, TimedStream},
+    timing::TimedStream,
 };
 
 pub(crate) fn get_flight_info(
     query: sql::CommandGetTableTypes,
     request: Request<FlightDescriptor>,
 ) -> Response<FlightInfo> {
+    let _start = metrics::track_flight_request("get_flight_info", Some("get_table_types"));
     let fd = request.into_inner();
     tracing::trace!("get_flight_info: {query:?}");
     Response::new(FlightInfo {
@@ -51,7 +52,7 @@ pub(crate) fn get_flight_info(
 pub(crate) fn do_get(
     query: sql::CommandGetTableTypes,
 ) -> Result<Response<<Service as FlightService>::DoGetStream>, Status> {
-    let start = TimeMeasurement::new(&metrics::flightsql::DO_GET_TABLE_TYPES_DURATION_MS, vec![]);
+    let start = metrics::track_flight_request("do_get", Some("get_table_types"));
     tracing::trace!("do_get_table_types: {query:?}");
 
     let schema = Schema::new(vec![Field::new("table_type", DataType::Utf8, false)]);

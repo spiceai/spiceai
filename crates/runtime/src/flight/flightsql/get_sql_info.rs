@@ -38,7 +38,7 @@ use tonic::{Request, Response, Status};
 
 use crate::{
     flight::{metrics, to_tonic_err, Service},
-    timing::{TimeMeasurement, TimedStream},
+    timing::TimedStream,
 };
 
 /// Get a `FlightInfo` for retrieving `SqlInfo`.
@@ -46,7 +46,9 @@ pub(crate) fn get_flight_info(
     query: &sql::CommandGetSqlInfo,
     request: Request<FlightDescriptor>,
 ) -> Result<Response<FlightInfo>, Status> {
-    tracing::trace!("get_flight_info_sql_info: query={query:?}");
+    let _start = metrics::track_flight_request("get_flight_info", Some("get_sql_info"));
+
+    tracing::trace!("get_flight_info_get_sql_info: query={query:?}");
     let builder = query.clone().into_builder(get_sql_info_data());
     let record_batch = builder.build().map_err(to_tonic_err)?;
 
@@ -72,7 +74,7 @@ pub(crate) fn do_get(
     query: sql::CommandGetSqlInfo,
 ) -> Result<Response<<Service as FlightService>::DoGetStream>, Status> {
     tracing::trace!("do_get_sql_info: {query:?}");
-    let start = TimeMeasurement::new(&metrics::flightsql::DO_GET_GET_SQL_INFO_DURATION_MS, vec![]);
+    let start = metrics::track_flight_request("do_get", Some("get_sql_info"));
     let builder = query.into_builder(get_sql_info_data());
     let record_batch = builder.build().map_err(to_tonic_err)?;
 

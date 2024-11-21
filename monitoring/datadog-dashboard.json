@@ -19,7 +19,7 @@
               {
                 "name": "query1",
                 "data_source": "metrics",
-                "query": "sum:spice.datasets_count{$host} by {host}"
+                "query": "sum:spice.dataset_active_count{$host} by {host}"
               }
             ],
             "response_format": "timeseries",
@@ -52,7 +52,7 @@
               {
                 "data_source": "metrics",
                 "name": "query1",
-                "query": "sum:spice.datasets_load_error{$host} by {host}.as_count()"
+                "query": "sum:spice.dataset_load_errors{$host} by {host}.as_count()"
               }
             ],
             "response_format": "timeseries",
