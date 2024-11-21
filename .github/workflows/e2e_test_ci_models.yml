@@ -122,7 +122,7 @@ jobs:
 
   test_openai_model:
     name: 'openai model (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
-    timeout-minutes: 10
+    timeout-minutes: 5
     runs-on: ${{ matrix.target.runner }}
     needs:
       - build
