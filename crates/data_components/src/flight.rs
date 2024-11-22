@@ -47,7 +47,7 @@ pub mod write;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Unable to generate SQL: {source}"))]
+    #[snafu(display("Query execution failed: {source}\nReport a bug to request support: https://github.com/spiceai/spiceai/issues"))]
     UnableToGenerateSQL { source: expr::Error },
 
     #[snafu(display("Unable to query Arrow Flight: {source}"))]
@@ -59,19 +59,8 @@ pub enum Error {
         table: String,
     },
 
-    #[snafu(display("Unable to query Arrow Flight: {source}"))]
+    #[snafu(display("Query execution failed: {source}\nVerify the configuration and try again."))]
     ArrowFlight { source: FlightError },
-
-    #[snafu(display("Unable to retrieve schema"))]
-    UnableToRetrieveSchema,
-
-    #[snafu(display("{source}"))]
-    UnableToDecodeFlightData {
-        source: arrow_flight::error::FlightError,
-    },
-
-    #[snafu(display("Unable to subscribe to data from the Arrow Flight endpoint: {source}"))]
-    UnableToSubscribeToFlightData { source: flight_client::Error },
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;

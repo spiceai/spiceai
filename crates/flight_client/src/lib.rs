@@ -42,40 +42,46 @@ pub mod tls;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Unable to connect to server: {source}"))]
+    #[snafu(display(
+        "Unable to connect to server: {source}\nEnsure the flight endpoint is valid and reachable."
+    ))]
     UnableToConnectToServer { source: tls::Error },
 
-    #[snafu(display("Invalid metadata value: {source}"))]
+    #[snafu(display("Authentication failed: {source}\nEnsure the credentials are valid."))]
     InvalidMetadata {
         source: tonic::metadata::errors::InvalidMetadataValue,
     },
 
-    #[snafu(display("Unable to perform handshake: {source}"))]
+    #[snafu(display(
+        "Unable to perform handshake with flight endpoint: {source}\nVerify the configuration and try again."
+    ))]
     UnableToPerformHandshake { source: tonic::Status },
 
-    #[snafu(display("Unable to convert metadata to string: {source}"))]
+    #[snafu(display(
+        "An unexpected error occurred. Report a bug to request support: https://github.com/spiceai/spiceai/issues"
+    ))]
     UnableToConvertMetadataToString {
         source: tonic::metadata::errors::ToStrError,
     },
 
-    #[snafu(display("Unable to convert schema from response: {source}"))]
+    #[snafu(display("Unable to get schema: {source}\n Report a bug to request support: https://github.com/spiceai/spiceai/issues"))]
     UnableToConvertSchema { source: arrow::error::ArrowError },
 
-    #[snafu(display("Unable to query: {source}"))]
+    #[snafu(display("Query execution failed: {source}"))]
     UnableToQuery {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Unable to publish: {source}"))]
+    #[snafu(display("Unable to publish data to flight endpoint: {source}\n Verify the configuration and try again"))]
     UnableToPublish { source: tonic::Status },
 
-    #[snafu(display("Unauthorized"))]
+    #[snafu(display("Unauthorized. Verify the credentials."))]
     Unauthorized {},
 
-    #[snafu(display("Permission denied"))]
+    #[snafu(display("Permission denied. Ensure the credentials have the required permissions."))]
     PermissionDenied {},
 
-    #[snafu(display("No endpoints found"))]
+    #[snafu(display("No endpoints found. Ensure the endpoint is configured"))]
     NoEndpointsFound,
 }
 
