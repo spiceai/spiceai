@@ -69,17 +69,17 @@ pub const AWS_REGIONS: [&str; 32] = [
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("The S3 authentication method was set to `key`, but no AWS access secret was provided for credentials.\nSpecify an access secret with the `s3_secret` parameter.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/s3#auth"))]
+    #[snafu(display("S3 auth method 'key' requires an AWS access secret.\nSpecify an access secret with the `s3_secret` parameter.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/s3#auth"))]
     NoAccessSecret,
 
-    #[snafu(display("The S3 authentication method was set to `key`, but no AWS access key was provided for credentials.\nSpecify an access key with the `s3_key` parameter.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/s3#auth"))]
+    #[snafu(display("S3 auth method 'key' requires an AWS access key.\nSpecify an access key with the `s3_key` parameter.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/s3#auth"))]
     NoAccessKey,
 
-    #[snafu(display("The S3 authentication method '{method}' is not supported.\nUpdate the `s3_auth` parameter to use the supported `s3_auth` modes of 'public' (i.e. no auth), 'iam_role', or 'key'.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/s3#auth"))]
+    #[snafu(display("Unsupported S3 auth method '{method}'.\nUse 'public', 'iam_role', or 'key' for `s3_auth` parameter.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/s3#auth"))]
     UnsupportedAuthenticationMethod { method: String },
 
     #[snafu(display(
-        "The '{parameter}' parameter cannot be set unless the `s3_auth` parameter is set to '{auth}'.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/s3#auth"
+        "The '{parameter}' parameter requires 's3_auth' set to '{auth}'.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/s3#auth"
     ))]
     InvalidAuthParameterCombination { parameter: String, auth: String },
 
@@ -98,7 +98,7 @@ pub enum Error {
     ))]
     InvalidRegionCorrected { region: String },
 
-    #[snafu(display("Failed to authenticate using an IAM role.\nAre you sure you're running in an environment with an IAM role?\n{source}\nFor details, visit: https://docs.spiceai.org/components/data-connectors/s3#auth"))]
+    #[snafu(display("IAM role authentication failed.\nAre you sure you're running in an environment with an IAM role?\n{source}\nFor details, visit: https://docs.spiceai.org/components/data-connectors/s3#auth"))]
     InvalidIAMRoleAuthentication {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
