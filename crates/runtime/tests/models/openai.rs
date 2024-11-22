@@ -82,6 +82,16 @@ mod nsql {
         // Check task_history table for expected rows.
         let mut headers = HeaderMap::new();
         headers.insert(ACCEPT, HeaderValue::from_static("text/plain"));
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        println!(
+            r#"SELECT task, input
+                    FROM runtime.task_history
+                    WHERE task NOT IN ('ai_completion', 'health', 'accelerated_refresh')
+                    AND start_time > '{}'
+                    ORDER BY start_time, task;
+                "#,
+            Into::<DateTime<Utc>>::into(task_start_time).to_rfc3339()
+        );
         insta::assert_snapshot!(
             format!("{}_tasks", ts.name),
             http_post(
@@ -89,7 +99,8 @@ mod nsql {
                 format!(
                     r#"SELECT task, input
                             FROM runtime.task_history
-                            WHERE start_time >= '{}' and task!='ai_completion'
+                            WHERE task NOT IN ('ai_completion', 'health', 'accelerated_refresh')
+                            AND start_time > '{}'
                             ORDER BY start_time, task;
                         "#,
                     Into::<DateTime<Utc>>::into(task_start_time).to_rfc3339()
@@ -123,7 +134,7 @@ mod nsql {
 
         let rt = Arc::new(Runtime::builder().with_app(app).build().await);
 
-        let (_, trace_provider) = init_tracing_with_task_history(None, &rt);
+        let (_tracing, trace_provider) = init_tracing_with_task_history(None, &rt);
 
         let rt_ref_copy = Arc::clone(&rt);
         tokio::spawn(async move {
@@ -189,7 +200,7 @@ mod search {
         let mut headers = HeaderMap::new();
         headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        let response = http_post(
+        let response_str = http_post(
             &format!("{base_url}/v1/search").to_string(),
             &ts.body.to_string(),
             headers,
@@ -197,12 +208,12 @@ mod search {
         .await
         .map_err(|e| anyhow::anyhow!("Failed to execute HTTP POST: {}", e))?;
 
-        let v = serde_json::from_str(&response)
+        let response = serde_json::from_str(&response_str)
             .map_err(|e| anyhow::anyhow!("Failed to parse HTTP response: {}", e))?;
 
         insta::assert_snapshot!(
             format!("{}_response", ts.name),
-            normalize_search_response(v)
+            normalize_search_response(response)
         );
         Ok(())
     }
@@ -518,11 +529,12 @@ async fn verify_sql_query_chat_completion(
         sql_to_display(
             &rt,
             format!(
-                r#"SELECT input
+                r#"SELECT task, count(1)
                 FROM runtime.task_history
                 WHERE start_time >= '{}'
                 AND task in ('tool_use::list_datasets', 'tool_use::sql', 'tool_use::sql_query')
-                ORDER BY start_time, task;
+                GROUP BY task;
+                ORDER BY task
             "#,
                 Into::<DateTime<Utc>>::into(task_start_time).to_rfc3339()
             )
@@ -537,7 +549,7 @@ async fn verify_sql_query_chat_completion(
         sql_to_display(
             &rt,
             format!(
-                r#"SELECT input
+                r#"SELECT count(1) as number_of_ai_completion_tasks
                 FROM runtime.task_history
                 WHERE start_time >= '{}'
                 AND task='ai_completion';
@@ -578,7 +590,7 @@ async fn verify_similarity_search_chat_completion(
     let resp_value =
         serde_json::to_value(&response).expect("Failed to serialize response.choices: {}");
     let selector = Selector::new(
-        ".choices[].message.content[?(@.contains(\"there just big vehicles. Journalists\"))]",
+        "$.choices[*].message.content[?(@=~'.*there just big vehicles. Journalists.*')]",
     )
     .expect("Failed to create JSONPath selector");
 

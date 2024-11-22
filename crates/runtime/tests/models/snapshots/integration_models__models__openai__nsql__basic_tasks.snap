@@ -1,0 +1,12 @@
+---
+source: crates/runtime/tests/models/openai.rs
+expression: "http_post(format!(\"{base_url}/v1/sql\").as_str(),\nformat!(r#\"SELECT task, input\n                            FROM runtime.task_history\n                            WHERE task NOT IN ('ai_completion', 'health', 'accelerated_refresh')\n                            AND start_time > '{}'\n                            ORDER BY start_time, task;\n                        \"#,\nInto::<DateTime<Utc>>::into(task_start_time).to_rfc3339()).as_str(),\nheaders).await.expect(\"Failed to execute HTTP SQL query\")"
+snapshot_kind: text
+---
++------------------------+-----------------------------------------------------------------------+
+| task                   | input                                                                 |
++------------------------+-----------------------------------------------------------------------+
+| nsql                   | how many records (as 'total_records') are in taxi_trips dataset?      |
+| tool_use::table_schema | {"tables":["spice.public.taxi_trips"],"output":"full"}                |
+| sql_query              | SELECT COUNT(*) AS "total_records" FROM "spice"."public"."taxi_trips" |
++------------------------+-----------------------------------------------------------------------+

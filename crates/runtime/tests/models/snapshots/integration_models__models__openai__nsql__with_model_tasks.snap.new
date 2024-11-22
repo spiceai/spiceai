@@ -1,8 +1,0 @@
----
-source: crates/runtime/tests/models/openai.rs
-assertion_line: 85
-expression: "http_post(format!(\"{base_url}/v1/sql\").as_str(),\nformat!(r#\"SELECT task, input\n                            FROM runtime.task_history\n                            WHERE start_time >= '{}' and task!='ai_completion'\n                            ORDER BY start_time, task;\n                        \"#,\nInto::<DateTime<Utc>>::into(task_start_time).to_rfc3339()).as_str(),\nheaders).await.expect(\"Failed to execute HTTP SQL query\")"
-snapshot_kind: text
----
-++
-++
