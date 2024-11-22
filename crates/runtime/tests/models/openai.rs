@@ -357,8 +357,6 @@ mod embeddings {
             },
         ];
 
-        let mut test_id = 0;
-
         for EmbeddingTestCase {
             input,
             encoding_format,
