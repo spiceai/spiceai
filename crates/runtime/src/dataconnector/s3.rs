@@ -79,17 +79,17 @@ pub enum Error {
     UnsupportedAuthenticationMethod { method: String },
 
     #[snafu(display(
-        "The '{parameter}' parameter requires 's3_auth' set to '{auth}'.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/s3#auth"
+        "The '{parameter}' parameter requires `s3_auth` set to '{auth}'.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/s3#auth"
     ))]
     InvalidAuthParameterCombination { parameter: String, auth: String },
 
     #[snafu(display(
-        "The 's3_endpoint' parameter must be a HTTP/S URL, but '{endpoint}' was provided.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/s3#params"
+        "The `s3_endpoint` parameter must be a HTTP/S URL, but '{endpoint}' was provided.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/s3#params"
     ))]
     InvalidEndpoint { endpoint: String },
 
     #[snafu(display(
-        "The 's3_region' parameter must be a valid AWS region code, but '{region}' was provided.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/s3#params"
+        "The `s3_region` parameter must be a valid AWS region code, but '{region}' was provided.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/s3#params"
     ))]
     InvalidRegion { region: String },
 
