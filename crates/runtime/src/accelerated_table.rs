@@ -68,7 +68,7 @@ mod synchronized_table;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Failed to get data from connector.\n{source}"))]
+    #[snafu(display("Failed to get data from the connector.\n{source}"))]
     UnableToGetDataFromConnector { source: DataFusionError },
 
     #[snafu(display("Failed to refresh the dataset.\n{source}"))]

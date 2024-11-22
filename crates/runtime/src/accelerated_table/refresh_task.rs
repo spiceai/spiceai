@@ -266,7 +266,7 @@ impl RefreshTask {
         let sink = &*sink_lock;
 
         if let Err(e) = sink.insert_into(record_batch_stream, overwrite).await {
-            tracing::warn!("Failed to update dataset {dataset_name}: {e}");
+            tracing::warn!("Failed to update the dataset {dataset_name}.\n{e}");
             self.mark_dataset_status(sql, status::ComponentStatus::Error)
                 .await;
             return Err(e);
