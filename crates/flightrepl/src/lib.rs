@@ -49,7 +49,7 @@ use tonic::{Code, IntoRequest, Status};
 
 mod config;
 
-#[derive(Parser)]
+#[derive(Parser, Debug)]
 #[clap(about = "Spice.ai SQL REPL")]
 pub struct ReplConfig {
     #[arg(
