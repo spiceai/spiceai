@@ -322,7 +322,7 @@ async fn get_vectors(
     // Filter out nulls or empty strings before caling [`Embed::embed`].
     let (null_pairs, values): (Vec<_>, Vec<_>) = arr
         .enumerate()
-        .partition(|(_, o)| o.is_none() || o.is_some_and(|v| v.is_empty()));
+        .partition(|(_, o)| o.is_none() || o.is_some_and(str::is_empty));
     let nulls: Vec<usize> = null_pairs.into_iter().map(|(i, _)| i).collect();
 
     let column: Vec<String> = values
@@ -340,7 +340,8 @@ async fn get_vectors(
         ),
         vector_length as i32,
         embedded_data.len() + nulls.len(),
-    );
+    )
+    .with_field(Arc::new(Field::new("item", DataType::Float32, false)));
 
     let mut i: usize = 0;
     for vector in embedded_data {
@@ -407,18 +408,21 @@ async fn get_vectors_with_chunker(
     let vector_length = model.size();
 
     let capacity = chunks_per_row.iter().sum();
+
     #[allow(clippy::cast_sign_loss)]
     let mut vectors_builder = FixedSizeListBuilder::with_capacity(
         PrimitiveBuilder::<Float32Type>::with_capacity(capacity * (vector_length as usize)),
         vector_length,
         capacity,
-    );
+    )
+    .with_field(Arc::new(Field::new("item", DataType::Float32, false)));
 
     let mut chunks_builder = FixedSizeListBuilder::with_capacity(
         PrimitiveBuilder::<Int32Type>::with_capacity(capacity),
         2,
         capacity,
-    );
+    )
+    .with_field(Arc::new(Field::new("item", DataType::Int32, false)));
 
     let mut lengths = Vec::with_capacity(chunks_per_row.len());
     let mut curr = 0;
@@ -428,27 +432,13 @@ async fn get_vectors_with_chunker(
         clippy::cast_sign_loss
     )]
     for chunkz_in_row in chunks_per_row {
-        lengths.push(chunkz_in_row);
-
         // Get the actual vectors
-        let inner = embedded_data.as_slice()[curr..curr + chunkz_in_row]
-            .iter()
-            .flatten()
-            .copied()
-            .collect_vec();
-
-        // Handling Nulls
-        if chunkz_in_row == 0 {
-            vectors_builder
-                .values()
-                .append_nulls(vector_length as usize);
-            chunks_builder.values().append_nulls(vector_length as usize);
-            vectors_builder.append(true);
-            chunks_builder.append(true);
-            continue;
+        for i in curr..curr + chunkz_in_row {
+            if let Some(v) = embedded_data.get(i) {
+                vectors_builder.values().append_slice(v); // I believe this is a clone under the hood.
+                vectors_builder.append(true);
+            }
         }
-
-        vectors_builder.values().append_slice(&inner); // I believe this is a clone under the hood.
 
         // Explicitly find `end` to handle when chunks have overlap.
         for i in 0..chunkz_in_row {
@@ -462,11 +452,10 @@ async fn get_vectors_with_chunker(
 
             chunks_builder.values().append_value(start as i32);
             chunks_builder.values().append_value(end as i32);
+            chunks_builder.append(true);
         }
-
         curr += chunkz_in_row;
-        vectors_builder.append(true);
-        chunks_builder.append(true);
+        lengths.push(chunkz_in_row);
     }
 
     // These are offsets for both the vectors and the content offsets.
