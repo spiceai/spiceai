@@ -153,7 +153,7 @@ pub enum Error {
         source: DataFusionError,
     },
 
-    #[snafu(display("Cannot refresh {table_name}: {source}"))]
+    #[snafu(display("Failed to refresh the dataset {table_name}.\n{source}"))]
     UnableToTriggerRefresh {
         table_name: String,
         source: crate::accelerated_table::Error,
