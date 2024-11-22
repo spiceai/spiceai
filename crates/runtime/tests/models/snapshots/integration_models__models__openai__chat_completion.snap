@@ -10,7 +10,7 @@ snapshot_kind: text
       "index": 0,
       "logprobs": null,
       "message": {
-        "content": "The total number of records in the taxi trips dataset is not directly accessible.",
+        "content": "10",
         "function_call": null,
         "refusal": null,
         "role": "assistant",
