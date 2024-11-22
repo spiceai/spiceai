@@ -54,7 +54,7 @@ pub enum Error {
     #[snafu(display("Failed to get recently access datasets.\n{source}"))]
     UnableToGetRecentlyAccessedDatasets { source: DataFusionError },
 
-    #[snafu(display("Spice received an unexpected data type from a `task_history` query: {data_type}\nThis is likely a bug in Spice, which you can report here: https://github.com/spiceai/spiceai/issues"))]
+    #[snafu(display("Spice received an unexpected data type from a `task_history` query: {data_type}\nThis is likely a bug in Spice, which can be reported here: https://github.com/spiceai/spiceai/issues"))]
     UnexpectedDataType {
         data_type: arrow::datatypes::DataType,
     },

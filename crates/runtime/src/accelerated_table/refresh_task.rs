@@ -593,7 +593,7 @@ impl RefreshTask {
             .clone()
             .context(super::FailedToFindLatestTimestampSnafu {
             reason:
-                "Failed to get the latest timestamp.\nYou must specify a `time_column` parameter.",
+                "Failed to get the latest timestamp.\nThe `time_column` parameter must be specified.",
         })?;
 
         let df = self
@@ -625,7 +625,7 @@ impl RefreshTask {
         let schema = &self.accelerator.schema();
         let Ok(accelerated_field) = schema.field_with_name(&column) else {
             return Err(super::Error::FailedToFindLatestTimestamp {
-                reason: "Failed to get the latest timestamp.\nYou must specify a `time_column` parameter."
+                reason: "Failed to get the latest timestamp.\nThe `time_column` parameter must be specified."
                     .to_string(),
             });
         };

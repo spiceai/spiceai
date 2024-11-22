@@ -97,7 +97,7 @@ pub enum Error {
     ))]
     RefreshNotSupportedForChildTable { parent_dataset: TableReference },
 
-    #[snafu(display("Failed to find latest timestamp in accelerated table.\nIs your 'time_column' parameter correct?"))]
+    #[snafu(display("Failed to find latest timestamp in accelerated table.\nIs the 'time_column' parameter correct?"))]
     FailedToQueryLatestTimestamp {
         source: datafusion::error::DataFusionError,
     },
@@ -116,13 +116,13 @@ pub enum Error {
     #[snafu(display("The accelerated table does not support delete operations.\nUse a different acceleration engine which supports delete operations.\nFor further information, visit: https://docs.spiceai.org/components/data-accelerators"))]
     AcceleratedTableDoesntSupportDelete {},
 
-    #[snafu(display("Expected the schema to have field '{field_name}', but it did not.\nSpice found the schema: {schema}\nIs your primary key configuration correct?"))]
+    #[snafu(display("Expected the schema to have field '{field_name}', but it did not.\nSpice found the schema: {schema}\nIs the primary key configuration correct?"))]
     PrimaryKeyExpectedSchemaToHaveField {
         field_name: String,
         schema: SchemaRef,
     },
 
-    #[snafu(display("Expected the field in schema '{field_name}' to have type '{expected_data_type}', but it did not.\nSpice found the schema: {schema}\nIs your primary key configuration correct?"))]
+    #[snafu(display("Expected the field in schema '{field_name}' to have type '{expected_data_type}', but it did not.\nSpice found the schema: {schema}\nIs the primary key configuration correct?"))]
     PrimaryKeyArrayDataTypeMismatch {
         field_name: String,
         expected_data_type: String,
@@ -148,7 +148,7 @@ pub enum AcceleratedTableBuilderError {
     #[snafu(display("An append stream is required when `refresh_mode` is set to `append` without a `time_column`.\nFor further information, visit: https://docs.spiceai.org/components/data-accelerators/data-refresh#append"))]
     AppendStreamRequired,
 
-    #[snafu(display("A synchronized accelerated table requires full refresh mode.\nSet your `refresh_mode` to 'full', and try again."))]
+    #[snafu(display("A synchronized accelerated table requires full refresh mode.\nSet `refresh_mode` to 'full', and try again."))]
     SynchronizedAcceleratedTableRequiresFullRefresh,
 }
 
