@@ -85,20 +85,7 @@ pub async fn try_to_chat_model<S: ::std::hash::BuildHasher>(
         )),
         Some(_) | None => model,
     };
-
-    // Handle runtime wrapping
-    let system_prompt = component
-        .params
-        .get("system_prompt")
-        .cloned()
-        .map(|s| s.to_string());
-    let wrapper = ChatWrapper::new(
-        tool_model,
-        component.name.as_str(),
-        system_prompt,
-        component.get_openai_request_overrides(),
-    );
-    Ok(Box::new(wrapper))
+    Ok(tool_model)
 }
 
 pub fn construct_model<S: ::std::hash::BuildHasher>(
@@ -113,7 +100,7 @@ pub fn construct_model<S: ::std::hash::BuildHasher>(
         )
         .into(),
     })?;
-    match prefix {
+    let model = match prefix {
         ModelSource::HuggingFace => {
             let Some(id) = model_id else {
                 return Err(LlmError::FailedToLoadModel {
@@ -192,7 +179,21 @@ pub fn construct_model<S: ::std::hash::BuildHasher>(
                 project_id,
             )) as Box<dyn Chat>)
         }
-    }
+    }?;
+
+    // Handle runtime wrapping
+    let system_prompt = component
+        .params
+        .get("system_prompt")
+        .cloned()
+        .map(|s| s.to_string());
+    let wrapper = ChatWrapper::new(
+        model,
+        component.name.as_str(),
+        system_prompt,
+        component.get_openai_request_overrides(),
+    );
+    Ok(Box::new(wrapper))
 }
 
 /// Wraps [`Chat`] models with additional handling specifically for the spice runtime (e.g. telemetry, injecting system prompts).
@@ -352,18 +353,18 @@ impl Chat for ChatWrapper {
         &self,
         req: CreateChatCompletionRequest,
     ) -> Result<ChatCompletionResponseStream, OpenAIError> {
-        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "ai_completion", stream=true, model = %req.model, input = %serde_json::to_string(&req).unwrap_or_default(), "labels");
+        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "ai_completion", stream=true, model = %req.model, input = %serde_json::to_string(&req).unwrap_or_default());
         let req = self.prepare_req(req)?;
 
         if let Some(metadata) = &req.metadata {
-            tracing::info!(target: "task_history", metadata = %metadata, "labels");
+            tracing::info!(target: "task_history", metadata = %metadata);
         }
 
         match self.chat.chat_stream(req).instrument(span.clone()).await {
             Ok(resp) => {
                 let public_name = self.public_name.clone();
                 let stream_span = span.clone();
-                let logged_stream = resp.map_ok(move |mut r| {r.model.clone_from(&public_name); r}).instrument(stream_span.clone()).inspect(move |item| {
+                let logged_stream = resp.map_ok(move |mut r| {r.model.clone_from(&public_name); r}).inspect(move |item| {
                     if let Ok(item) = item {
 
                         // not incremental; provider only emits usage on last chunk.
@@ -371,7 +372,7 @@ impl Chat for ChatWrapper {
                             tracing::info!(target: "task_history", parent: &stream_span.clone(), completion_tokens = %usage.completion_tokens, total_tokens = %usage.total_tokens, prompt_tokens = %usage.prompt_tokens, "labels");
                         }
                     }
-                });
+                }).instrument(span.clone());
                 Ok(Box::pin(logged_stream))
             }
             Err(e) => {
