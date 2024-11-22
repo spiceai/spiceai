@@ -85,7 +85,20 @@ pub async fn try_to_chat_model<S: ::std::hash::BuildHasher>(
         )),
         Some(_) | None => model,
     };
-    Ok(tool_model)
+
+    // Handle runtime wrapping
+    let system_prompt = component
+        .params
+        .get("system_prompt")
+        .cloned()
+        .map(|s| s.to_string());
+    let wrapper = ChatWrapper::new(
+        tool_model,
+        component.name.as_str(),
+        system_prompt,
+        component.get_openai_request_overrides(),
+    );
+    Ok(Box::new(wrapper))
 }
 
 pub fn construct_model<S: ::std::hash::BuildHasher>(
@@ -100,7 +113,7 @@ pub fn construct_model<S: ::std::hash::BuildHasher>(
         )
         .into(),
     })?;
-    let model = match prefix {
+    match prefix {
         ModelSource::HuggingFace => {
             let Some(id) = model_id else {
                 return Err(LlmError::FailedToLoadModel {
@@ -179,21 +192,7 @@ pub fn construct_model<S: ::std::hash::BuildHasher>(
                 project_id,
             )) as Box<dyn Chat>)
         }
-    }?;
-
-    // Handle runtime wrapping
-    let system_prompt = component
-        .params
-        .get("system_prompt")
-        .cloned()
-        .map(|s| s.to_string());
-    let wrapper = ChatWrapper::new(
-        model,
-        component.name.as_str(),
-        system_prompt,
-        component.get_openai_request_overrides(),
-    );
-    Ok(Box::new(wrapper))
+    }
 }
 
 /// Wraps [`Chat`] models with additional handling specifically for the spice runtime (e.g. telemetry, injecting system prompts).
@@ -380,6 +379,10 @@ impl Chat for ChatWrapper {
                 Err(e)
             }
         }
+    }
+
+    async fn health(&self) -> ChatResult<()> {
+        self.chat.health().await
     }
 
     /// Unlike [`ChatWrapper::chat_stream`], this method will instrument the `captured_output` for the model output.

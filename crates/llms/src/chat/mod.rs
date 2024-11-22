@@ -411,7 +411,8 @@ pub trait Chat: Sync + Send {
 
         if let Err(e) = self
             .chat_request(CreateChatCompletionRequest {
-                max_completion_tokens: None,
+                // Cannot be set too low. Some providers will error if it cannot complete in < `max_completion_tokens`.
+                max_completion_tokens: Some(100),
                 messages: vec![ChatCompletionRequestMessage::User(
                     ChatCompletionRequestUserMessage {
                         name: None,
