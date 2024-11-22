@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use core::time;
-use std::{sync::Arc, time::Duration};
+use std::{convert::Infallible, sync::Arc, time::Duration};
 
 use async_openai::types::{ChatCompletionResponseStream, CreateChatCompletionRequest};
 use async_stream::stream;
@@ -101,11 +101,13 @@ fn create_sse_response(
                         }
                     }
 
-                    yield Ok::<_, axum::Error>(Event::default().json_data(resp).unwrap_or_else(|e| {
+                    yield Ok::<Event, Infallible>(Event::default().json_data(resp).unwrap_or_else(|e| {
+                        tracing::error!("Failed to serialize chat completion message: {e}");
                         to_openai_error_event(e.to_string())
                     }));
                 },
                 Err(e) => {
+                    tracing::error!("Error encountered in chat completion stream: {e}");
                     yield Ok(to_openai_error_event(e.to_string()));
                     break;
                 }
