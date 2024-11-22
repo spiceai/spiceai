@@ -14,10 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use arrow::{
-    array::{RecordBatch, StringArray},
-    util::pretty::pretty_format_batches,
-};
+use arrow::{array::StringArray, util::pretty::pretty_format_batches};
 use async_openai::types::EmbeddingInput;
 use chrono::{DateTime, Utc};
 use futures::TryStreamExt;
@@ -363,7 +360,7 @@ async fn sql_to_display(
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let data = rt
         .datafusion()
-        .query_builder(&query, Protocol::Internal)
+        .query_builder(query, Protocol::Internal)
         .build()
         .run()
         .await

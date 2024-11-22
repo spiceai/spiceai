@@ -364,7 +364,8 @@ impl Chat for ChatWrapper {
             Ok(resp) => {
                 let public_name = self.public_name.clone();
                 let stream_span = span.clone();
-                let logged_stream = resp.map_ok(move |mut r| {r.model.clone_from(&public_name); r}).instrument(stream_span.clone()).inspect(move |item| {
+                let logged_stream = resp.instrument(stream_span.clone()).inspect(move |item| {
+                // let logged_stream = resp.map_ok(move |mut r| {r.model.clone_from(&public_name); r}).instrument(stream_span.clone()).inspect(move |item| {
                     if let Ok(item) = item {
 
                         // not incremental; provider only emits usage on last chunk.
