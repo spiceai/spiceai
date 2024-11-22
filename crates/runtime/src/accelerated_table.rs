@@ -68,21 +68,17 @@ mod synchronized_table;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Failed to get data from the connector.\n{source}"))]
+    #[snafu(display("Failed to get data from the connector.\n{source}\nEnsure the dataset configuration is valid, and try again."))]
     UnableToGetDataFromConnector { source: DataFusionError },
 
-    #[snafu(display("Failed to refresh the dataset.\n{source}"))]
+    #[snafu(display("Failed to get data from the connector.\n{source}\nEnsure the dataset configuration is valid, and try again."))]
     FailedToRefreshDataset { source: DataFusionError },
 
-    #[snafu(display("Failed to read from the dataset.\n{source}"))]
-    UnableToScanTableProvider {
-        source: datafusion::error::DataFusionError,
-    },
+    #[snafu(display("Failed to get data from the connector.\n{source}\nEnsure the dataset configuration is valid, and try again."))]
+    UnableToScanTableProvider { source: DataFusionError },
 
-    #[snafu(display("Failed to create an in-memory table from a data update.\n{source}"))]
-    UnableToCreateMemTableFromUpdate {
-        source: datafusion::error::DataFusionError,
-    },
+    #[snafu(display("Failed to get data from the connector.\n{source}\nEnsure the dataset configuration is valid, and try again."))]
+    UnableToCreateMemTableFromUpdate { source: DataFusionError },
 
     #[snafu(display("Failed to refresh the dataset.\n{source}"))]
     FailedToTriggerRefresh {
@@ -98,9 +94,7 @@ pub enum Error {
     RefreshNotSupportedForChildTable { parent_dataset: TableReference },
 
     #[snafu(display("Failed to find latest timestamp in accelerated table.\nIs the 'time_column' parameter correct?"))]
-    FailedToQueryLatestTimestamp {
-        source: datafusion::error::DataFusionError,
-    },
+    FailedToQueryLatestTimestamp { source: DataFusionError },
 
     #[snafu(display("{reason}"))]
     FailedToFindLatestTimestamp { reason: String },
@@ -109,9 +103,7 @@ pub enum Error {
     FailedToFilterUpdates { source: ArrowError },
 
     #[snafu(display("Failed to write data into accelerated table.\n{source}"))]
-    FailedToWriteData {
-        source: datafusion::error::DataFusionError,
-    },
+    FailedToWriteData { source: DataFusionError },
 
     #[snafu(display("The accelerated table does not support delete operations.\nUse a different acceleration engine which supports delete operations.\nFor further information, visit: https://docs.spiceai.org/components/data-accelerators"))]
     AcceleratedTableDoesntSupportDelete {},
