@@ -84,7 +84,7 @@ pub enum Error {
         source: datafusion::error::DataFusionError,
     },
 
-    #[snafu(display("Failed to trigger a table refresh.\n{source}"))]
+    #[snafu(display("Failed to refresh the dataset.\n{source}"))]
     FailedToTriggerRefresh {
         source: tokio::sync::mpsc::error::SendError<Option<RefreshOverrides>>,
     },
