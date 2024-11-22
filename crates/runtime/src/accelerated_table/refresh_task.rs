@@ -613,7 +613,7 @@ impl RefreshTask {
             .as_any()
             .downcast_ref::<TimestampNanosecondArray>()
             .context(super::FailedToFindLatestTimestampSnafu {
-                reason: "Failed to get the latest timestamp during incremental appending.\nFailed to convert the value of the time column to a timestamp. Are you sure the column is a timestamp?",
+                reason: "Failed to get the latest timestamp during incremental appending.\nFailed to convert the value of the time column to a timestamp. Verify the column is a timestamp.",
             })?;
 
         if array.is_empty() {
