@@ -314,7 +314,7 @@ async fn update_dataset_availability_info(
             report_dataset_unavailable_time(dataset_name, None);
         }
         AvailabilityVerificationResult::Unavailable(last_available_time, err) => {
-            tracing::warn!("Failed to verify the dataset {dataset_name} was available\n{err}\n");
+            tracing::warn!("Failed to verify the dataset {dataset_name} was available.\n{err}\n");
             report_dataset_unavailable_time(dataset_name, Some(last_available_time));
         }
     }

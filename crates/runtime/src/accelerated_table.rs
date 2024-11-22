@@ -89,7 +89,7 @@ pub enum Error {
         source: tokio::sync::mpsc::error::SendError<Option<RefreshOverrides>>,
     },
 
-    #[snafu(display("Manual refresh is not supported for `append` mode.\nUse a different acceleration mode to use manual refresh."))]
+    #[snafu(display("Manual refresh is not supported for `append` mode.\nOnly `full` refresh mode supports manual refreshes."))]
     ManualRefreshIsNotSupported {},
 
     #[snafu(display(
