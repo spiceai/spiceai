@@ -50,7 +50,7 @@ pub enum Error {
         source: tonic::metadata::errors::InvalidMetadataValue,
     },
 
-    #[snafu(display("Unable to perform handshake: {source}"))]
+    #[snafu(display("Failed to connect to the Flight server.\n{source}"))]
     UnableToPerformHandshake { source: tonic::Status },
 
     #[snafu(display("Unable to convert metadata to string: {source}"))]
