@@ -28,6 +28,7 @@ use axum::{
     Extension, Json,
 };
 use futures::StreamExt;
+use serde::Serialize;
 use tokio::sync::RwLock;
 use tracing::{Instrument, Span};
 
@@ -99,14 +100,13 @@ fn create_sse_response(
                             chat_output.push_str(intermediate_chat_output);
                         }
                     }
-                    let y = Event::default();
-                    match y.json_data(resp).map_err(axum::Error::new) {
-                        Ok(a) => yield Ok(a),
-                        Err(e) => yield Err(e),
-                    }
+
+                    yield Ok::<_, axum::Error>(Event::default().json_data(resp).unwrap_or_else(|e| {
+                        to_openai_error_event(e.to_string())
+                    }));
                 },
                 Err(e) => {
-                    yield Err(axum::Error::new(e.to_string()));
+                    yield Ok(to_openai_error_event(e.to_string()));
                     break;
                 }
             }
@@ -116,4 +116,36 @@ fn create_sse_response(
     }))
     .keep_alive(KeepAlive::new().interval(keep_alive_interval))
     .into_response()
+}
+
+/// Create an [`Event`] that corresponds to an `OpenAI` error event.
+///
+/// `https://platform.openai.com/docs/api-reference/realtime-server-events/error`
+fn to_openai_error_event(err: impl Into<String>) -> Event {
+    Event::default()
+        .event("error")
+        .json_data(OpenaiErrorEvent::new(err))
+        .unwrap_or_default()
+}
+
+#[derive(Serialize)]
+pub struct ApiError {
+    message: String,
+}
+
+#[derive(Serialize)]
+pub struct OpenaiErrorEvent {
+    r#type: String,
+    error: ApiError,
+}
+
+impl OpenaiErrorEvent {
+    pub fn new(err: impl Into<String>) -> Self {
+        Self {
+            r#type: "error".to_string(),
+            error: ApiError {
+                message: err.into(),
+            },
+        }
+    }
 }

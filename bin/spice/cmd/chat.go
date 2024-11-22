@@ -59,6 +59,14 @@ type ChatCompletion struct {
 	Usage             interface{} `json:"usage"`
 }
 
+type OpenAIError struct {
+	Message string `json:"message"`
+}
+
+type OpenAIErrorResponse struct {
+	Error OpenAIError `json:"error"`
+}
+
 var chatCmd = &cobra.Command{
 	Use:   "chat",
 	Short: "Chat with the Spice.ai LLM agent",
@@ -170,6 +178,19 @@ spice chat --model <model> --cloud
 
 			for scanner.Scan() {
 				chunk := scanner.Text()
+
+				errorEvent, err := maybeErrorEvent(chunk, scanner)
+
+				if err != nil {
+					slog.Error("failed to decode error event", "error", err)
+					continue
+				}
+
+				if errorEvent != nil {
+					slog.Error("chat request failed", "error", errorEvent.Message)
+					break
+				}
+
 				if !strings.HasPrefix(chunk, "data: ") {
 					continue
 				}
@@ -196,12 +217,18 @@ spice chat --model <model> --cloud
 				responseMessage = responseMessage + token
 			}
 
+			if err := scanner.Err(); err != nil {
+				slog.Error("error occurred while processing the input stream", "error", err)
+			}
+
 			if !doneLoading {
 				done <- true
 				doneLoading = true
 			}
 
-			messages = append(messages, Message{Role: "assistant", Content: responseMessage})
+			if responseMessage != "" {
+				messages = append(messages, Message{Role: "assistant", Content: responseMessage})
+			}
 			cmd.Print("\n\n")
 		}
 	},
@@ -227,6 +254,24 @@ func sendChatRequest(rtcontext *context.RuntimeContext, body *ChatRequestBody) (
 	}
 
 	return response, nil
+}
+
+func maybeErrorEvent(chunk string, scanner *bufio.Scanner) (*OpenAIError, error) {
+	if strings.HasPrefix(chunk, "event: error") {
+		scanner.Scan() // read line with error message
+		errorMessage := scanner.Text()
+		errorMessage = strings.TrimPrefix(errorMessage, "data: ")
+
+		var errorResponse OpenAIErrorResponse = OpenAIErrorResponse{}
+		err := json.Unmarshal([]byte(errorMessage), &errorResponse)
+		if err != nil {
+			return nil, fmt.Errorf("failed to unmarshal: %w", err)
+		}
+
+		return &errorResponse.Error, nil
+	}
+
+	return nil, nil
 }
 
 func init() {
