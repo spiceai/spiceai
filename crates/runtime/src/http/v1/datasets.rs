@@ -68,6 +68,8 @@ pub(crate) struct DatasetResponseItem {
     pub name: String,
     pub replication_enabled: bool,
     pub acceleration_enabled: bool,
+    #[cfg(feature = "models")]
+    pub vector_search_enabled: bool,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<ComponentStatus>,
@@ -112,6 +114,8 @@ pub(crate) async fn get(
             name: d.name.to_quoted_string(),
             replication_enabled: d.replication.as_ref().is_some_and(|f| f.enabled),
             acceleration_enabled: d.acceleration.as_ref().is_some_and(|f| f.enabled),
+            #[cfg(feature = "models")]
+            vector_search_enabled: d.has_embeddings(),
             status: if params.status {
                 Some(dataset_status(&df, d))
             } else {
