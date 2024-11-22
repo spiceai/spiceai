@@ -41,19 +41,13 @@ use super::{
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Missing required parameter: {parameter}"))]
+    #[snafu(display("Missing required parameter: {parameter}. Specify a value.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/databricks#parameters"))]
     MissingParameter { parameter: String },
 
-    #[snafu(display("databricks_use_ssl value {value} is invalid, please use true or false"))]
+    #[snafu(display("Invalid `databricks_use_ssl` value: '{value}'. Use 'true' or 'false'.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/databricks#parameters"))]
     InvalidUsessl { value: String },
 
-    #[snafu(display("Endpoint {endpoint} is invalid: {source}"))]
-    InvalidEndpoint {
-        endpoint: String,
-        source: ns_lookup::Error,
-    },
-
-    #[snafu(display("{source}"))]
+    #[snafu(display("Failed to connect to Databricks Spark: {source}\nVerify Databricks Connector configurations and try again\nFor details, visit: https://docs.spiceai.org/components/data-connectors/databricks#parameters"))]
     UnableToConstructDatabricksSpark {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
