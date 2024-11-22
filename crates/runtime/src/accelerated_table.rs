@@ -116,14 +116,14 @@ pub enum Error {
     #[snafu(display("The accelerated table does not support delete operations.\nUse a different acceleration engine which supports delete operations.\nFor further information, visit: https://docs.spiceai.org/components/data-accelerators"))]
     AcceleratedTableDoesntSupportDelete {},
 
-    #[snafu(display("Expected the schema to have field '{field_name}', but it did not.\nFound the schema: {schema}"))]
-    ExpectedSchemaToHaveField {
+    #[snafu(display("Expected the schema to have field '{field_name}', but it did not.\nSpice found the schema: {schema}\nIs your primary key configuration correct?"))]
+    PrimaryKeyExpectedSchemaToHaveField {
         field_name: String,
         schema: SchemaRef,
     },
 
-    #[snafu(display("Expected the field in schema '{field_name}' to have type '{expected_data_type}', but it did not.\nFound the schema: {schema}"))]
-    ArrayDataTypeMismatch {
+    #[snafu(display("Expected the field in schema '{field_name}' to have type '{expected_data_type}', but it did not.\nSpice found the schema: {schema}\nIs your primary key configuration correct?"))]
+    PrimaryKeyArrayDataTypeMismatch {
         field_name: String,
         expected_data_type: String,
         schema: SchemaRef,
