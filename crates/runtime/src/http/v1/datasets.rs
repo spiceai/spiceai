@@ -339,9 +339,9 @@ fn dataset_properties(ds: &Dataset) -> Vec<Property> {
     properties.push(Property {
         name: "vector_search".to_string(),
         value: if ds.has_embeddings() {
-            Some(serde_json::Value::String("available".to_string()))
+            Some(serde_json::Value::String("supported".to_string()))
         } else {
-            Some(serde_json::Value::String("unavailable".to_string()))
+            Some(serde_json::Value::String("unsupported".to_string()))
         },
     });
 
