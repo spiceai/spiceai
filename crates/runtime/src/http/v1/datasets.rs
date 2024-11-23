@@ -68,11 +68,19 @@ pub(crate) struct DatasetResponseItem {
     pub name: String,
     pub replication_enabled: bool,
     pub acceleration_enabled: bool,
-    #[cfg(feature = "models")]
-    pub vector_search_enabled: bool,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<ComponentStatus>,
+
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub properties: Vec<Property>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct Property {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<serde_json::Value>, // support any valid JSON type (String, Int, Object, etc)
 }
 
 pub(crate) async fn get(
@@ -114,8 +122,7 @@ pub(crate) async fn get(
             name: d.name.to_quoted_string(),
             replication_enabled: d.replication.as_ref().is_some_and(|f| f.enabled),
             acceleration_enabled: d.acceleration.as_ref().is_some_and(|f| f.enabled),
-            #[cfg(feature = "models")]
-            vector_search_enabled: d.has_embeddings(),
+            properties: dataset_properties(d),
             status: if params.status {
                 Some(dataset_status(&df, d))
             } else {
@@ -323,4 +330,20 @@ pub(crate) async fn sample(
         Ok(body) => (StatusCode::OK, body).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
+}
+
+fn dataset_properties(ds: &Dataset) -> Vec<Property> {
+    let mut properties = vec![];
+
+    #[cfg(feature = "models")]
+    properties.push(Property {
+        name: "vector_search".to_string(),
+        value: if ds.has_embeddings() {
+            Some(serde_json::Value::String("available".to_string()))
+        } else {
+            Some(serde_json::Value::String("unavailable".to_string()))
+        },
+    });
+
+    properties
 }
