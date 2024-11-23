@@ -54,7 +54,7 @@ impl Default for SqlTool {
     fn default() -> Self {
         Self::new(
             "sql",
-            Some("Run an SQL query on the data source".to_string()),
+            Some(r#"Run an SQL query on the data source. Columns with capitals must be quoted. When needed quote each part of catalog.schema.table: "catalog"."schema"."table". Avoid 'SELECT *', and columns with `_offset` or `_embedding` suffix."#.to_string()),
         )
     }
 }

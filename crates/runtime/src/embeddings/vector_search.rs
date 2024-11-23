@@ -420,13 +420,21 @@ pub struct Match {
     metadata: HashMap<String, serde_json::Value>,
 }
 
-pub fn to_matches(result: &VectorSearchResult) -> Result<Vec<Match>> {
+pub fn to_matches_sorted(result: &VectorSearchResult) -> Result<Vec<Match>> {
     let output = result
         .iter()
         .map(|(a, b)| b.to_matches(a))
         .collect::<Result<Vec<_>>>()?;
 
-    Ok(output.into_iter().flatten().collect_vec())
+    let mut matches: Vec<_> = output.into_iter().flatten().collect();
+    // Sort by score in descending order
+    matches.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    Ok(matches)
 }
 
 impl VectorSearch {

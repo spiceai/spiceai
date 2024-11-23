@@ -41,7 +41,9 @@ pub enum Error {
     #[snafu(display("Unable to create DuckDB connection pool: {source}"))]
     UnableToCreateDuckDBConnectionPool { source: DbConnectionPoolError },
 
-    #[snafu(display("Missing required parameter: open"))]
+    #[snafu(display(
+        "Missing required parameter: open\nSpecify a DuckDB file with the `open` parameter"
+    ))]
     MissingDuckDBFile,
 }
 
