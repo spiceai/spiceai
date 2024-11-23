@@ -86,7 +86,7 @@ Related reading:
         Cannot setup the dataset taxi_trips (s3) with an invalid configuration.
         Failed to find any files matching the extension '.csv'.
         Is your `file_format` parameter correct? Spice found the following file extensions: '.parquet'.
-        For further information, visit: <https://docs.spiceai.org/components/data-connectors#object-store-file-formats>
+        For details, visit: <https://docs.spiceai.org/components/data-connectors#object-store-file-formats>
     ```
 
     *Bad:*
@@ -130,7 +130,7 @@ Related reading:
         Cannot setup the dataset taxi_trips (s3) with an invalid configuration.
         Failed to find any files matching the extension '.csv'.
         Is your `file_format` parameter correct? Spice found the following file extensions: '.parquet'.
-        For further information, visit: <https://docs.spiceai.org/components/data-connectors#object-store-file-formats>
+        For details, visit: <https://docs.spiceai.org/components/data-connectors#object-store-file-formats>
     ```
 
     *Bad:*

@@ -205,7 +205,7 @@ impl DataConnector for Debezium {
             dataset.is_accelerated(),
             super::InvalidConfigurationNoSourceSnafu {
                 dataconnector: "debezium",
-                message: "The Debezium data connector only works with accelerated datasets.\nFor further information, visit: https://docs.spiceai.org/components/data-connectors/debezium",
+                message: "The Debezium data connector only works with accelerated datasets.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/debezium",
                 connector_component: ConnectorComponent::from(dataset),
             }
         );
@@ -217,7 +217,7 @@ impl DataConnector for Debezium {
             super::InvalidConfigurationNoSourceSnafu {
                 dataconnector: "debezium",
                 message:
-                    "The Debezium data connector only works with non-Arrow acceleration engines.\nFor further information, visit: https://docs.spiceai.org/components/data-connectors/debezium",
+                    "The Debezium data connector only works with non-Arrow acceleration engines.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/debezium",
                 connector_component: ConnectorComponent::from(dataset),
             }
         );
@@ -225,7 +225,7 @@ impl DataConnector for Debezium {
             self.resolve_refresh_mode(acceleration.refresh_mode) == RefreshMode::Changes,
             super::InvalidConfigurationNoSourceSnafu {
                 dataconnector: "debezium",
-                message: "The Debezium data connector only works with 'changes' refresh mode.\nFor further information, visit: https://docs.spiceai.org/components/data-connectors/debezium",
+                message: "The Debezium data connector only works with 'changes' refresh mode.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/debezium",
                 connector_component: ConnectorComponent::from(dataset),
             }
         );

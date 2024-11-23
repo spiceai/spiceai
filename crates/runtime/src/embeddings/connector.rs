@@ -95,7 +95,7 @@ impl EmbeddingConnector {
             if !self.embedding_models.read().await.contains_key(model) {
                 return Err(DataConnectorError::InvalidConfigurationNoSource {
                     dataconnector: "EmbeddingConnector".to_string(),
-                    message: format!("The dataset is configured with an embedding model '{model}' to embed column '{column}', but the model '{model}' is not defined in Spicepod (as an 'embeddings').\nFor further information, visit: https://docs.spiceai.org/components/embeddings"),
+                    message: format!("The dataset is configured with an embedding model '{model}' to embed column '{column}', but the model '{model}' is not defined in Spicepod (as an 'embeddings').\nFor details, visit: https://docs.spiceai.org/components/embeddings"),
                     connector_component: dataset.into()
                 });
             }

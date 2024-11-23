@@ -69,6 +69,7 @@ pub const AWS_REGIONS: [&str; 32] = [
 
 #[derive(Debug, Snafu)]
 pub enum Error {
+<<<<<<< Updated upstream
     #[snafu(display("S3 auth method 'key' requires an AWS access secret.\nSpecify an access secret with the `s3_secret` parameter.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/s3#auth"))]
     NoAccessSecret,
 
@@ -80,16 +81,43 @@ pub enum Error {
 
     #[snafu(display(
         "The '{parameter}' parameter requires `s3_auth` set to '{auth}'.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/s3#auth"
+=======
+    #[snafu(display("The S3 authentication method was set to `key`, but no AWS access secret was provided for credentials.\nSpecify an access secret with the `s3_secret` parameter.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/s3#auth"))]
+    NoAccessSecret,
+
+    #[snafu(display("The S3 authentication method was set to `key`, but no AWS access key was provided for credentials.\nSpecify an access key with the `s3_key` parameter.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/s3#auth"))]
+    NoAccessKey,
+
+    #[snafu(display("Unable to parse URL {url}: {source}"))]
+    UnableToParseURL {
+        url: String,
+        source: url::ParseError,
+    },
+
+    #[snafu(display("The S3 authentication method '{method}' is not supported.\nUpdate the `s3_auth` parameter to use the supported `s3_auth` modes of 'public' (i.e. no auth), 'iam_role', or 'key'.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/s3#auth"))]
+    UnsupportedAuthenticationMethod { method: String },
+
+    #[snafu(display(
+        "The '{parameter}' parameter cannot be set unless the `s3_auth` parameter is set to '{auth}'.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/s3#auth"
+>>>>>>> Stashed changes
     ))]
     InvalidAuthParameterCombination { parameter: String, auth: String },
 
     #[snafu(display(
+<<<<<<< Updated upstream
         "The `s3_endpoint` parameter must be a HTTP/S URL, but '{endpoint}' was provided.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/s3#params"
+=======
+        "The 's3_endpoint' parameter must be a HTTP/S URL, but '{endpoint}' was provided.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/s3#params"
+>>>>>>> Stashed changes
     ))]
     InvalidEndpoint { endpoint: String },
 
     #[snafu(display(
+<<<<<<< Updated upstream
         "The `s3_region` parameter must be a valid AWS region code, but '{region}' was provided.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/s3#params"
+=======
+        "The 's3_region' parameter must be a valid AWS region code, but '{region}' was provided.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/s3#params"
+>>>>>>> Stashed changes
     ))]
     InvalidRegion { region: String },
 
@@ -98,7 +126,11 @@ pub enum Error {
     ))]
     InvalidRegionCorrected { region: String },
 
+<<<<<<< Updated upstream
     #[snafu(display("IAM role authentication failed.\nAre you sure you're running in an environment with an IAM role?\n{source}\nFor details, visit: https://docs.spiceai.org/components/data-connectors/s3#auth"))]
+=======
+    #[snafu(display("Failed to authenticate using an IAM role.\nAre you sure you're running in an environment with an IAM role?\n{source}\nFor details, visit: https://docs.spiceai.org/components/data-connectors/s3#auth"))]
+>>>>>>> Stashed changes
     InvalidIAMRoleAuthentication {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
