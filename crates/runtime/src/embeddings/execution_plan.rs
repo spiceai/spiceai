@@ -355,7 +355,6 @@ async fn get_vectors(
     let embedded_data = model.embed(EmbeddingInput::StringArray(column)).await?;
     let vector_length = embedded_data.first().map(Vec::len).unwrap_or_default();
 
-    // Add back nulls into the ordering of embedding data.
     let mut builder = FixedSizeListBuilder::with_capacity(
         PrimitiveBuilder::<Float32Type>::with_capacity(
             (embedded_data.len() + nulls.len()) * vector_length,
@@ -370,6 +369,8 @@ async fn get_vectors(
 
     // Index into `nulls` array. Value at i'th position is index into output order that should be nulled.
     let mut null_ptr = 0;
+
+    // Reconstruct correct output order by adding back nulls based on original indexes of nulls.
     for vector in embedded_data {
         // Keep inserting nulls until we reach the next non-null value.
         while nulls.get(null_ptr).is_some_and(|&idx| idx == output_ptr) {
@@ -490,7 +491,7 @@ async fn get_vectors_with_chunker(
     }
 
     // These are offsets for both the vectors and the content offsets.
-    // They tell the [`ListArray`] how many vectors/offsets are for each row of the input table.
+    // They tell the [`ListArray`] how many vectors/offsets are in each row of the input/output table.
     let offsets = OffsetBuffer::<i32>::from_lengths(lengths.into_iter());
 
     let vectors = ListArray::try_new(
