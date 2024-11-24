@@ -1,6 +1,7 @@
 ---
 source: crates/runtime/tests/models/openai.rs
 expression: pretty_json_str(&ai_completion_task.1)?
+snapshot_kind: text
 ---
 {
   "messages": [
@@ -173,7 +174,7 @@ expression: pretty_json_str(&ai_completion_task.1)?
     },
     {
       "function": {
-        "description": "Run an SQL query on the data source",
+        "description": "Run an SQL query on the data source. Columns with capitals must be quoted. When needed quote each part of catalog.schema.table: \"catalog\".\"schema\".\"table\". Avoid 'SELECT *', and columns with `_offset` or `_embedding` suffix.",
         "name": "sql",
         "parameters": {
           "$schema": "http://json-schema.org/draft-07/schema#",

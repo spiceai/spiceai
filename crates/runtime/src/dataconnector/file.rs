@@ -16,6 +16,7 @@ limitations under the License.
 
 use crate::accelerated_table::AcceleratedTable;
 use crate::component::dataset::Dataset;
+use crate::dataconnector::ConnectorComponent;
 use async_trait::async_trait;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use snafu::prelude::*;
@@ -114,7 +115,7 @@ impl ListingTableConnector for File {
     ///   1. Relative paths
     ///   2. Datasets prefixed with `file://` (not just `file:/`). This is to mirror the UX of [`Url::parse`].
     fn get_object_store_url(&self, dataset: &Dataset) -> DataConnectorResult<Url> {
-        let path = get_path(dataset)?.to_string_lossy().into_owned();
+        let path = get_path(dataset).to_string_lossy().into_owned();
 
         // Convert relative path to absolute path
         let url_str = if path.starts_with('/') {
@@ -123,8 +124,9 @@ impl ListingTableConnector for File {
             let absolute_path = env::current_dir()
                 .boxed()
                 .context(InvalidConfigurationSnafu {
-                    dataconnector: "File".to_string(),
-                    message: "could not determine directory for relative file".to_string(),
+                    dataconnector: "file".to_string(),
+                    message: "Could not identify current directory for a relative file path. Does the running user have the right filesystem permissions?".to_string(),
+                    connector_component: ConnectorComponent::from(dataset),
                 })?
                 .join(path)
                 .to_string_lossy()
@@ -136,8 +138,9 @@ impl ListingTableConnector for File {
         Url::parse(&url_str)
             .boxed()
             .context(InvalidConfigurationSnafu {
-                dataconnector: "File".to_string(),
-                message: "Invalid URL".to_string(),
+                dataconnector: "file".to_string(),
+                message: "The specified file path created an invalid URL. Check your file path and try again.\nFor further information, visit: https://docs.spiceai.org/components/data-connectors/file".to_string(),
+                connector_component: ConnectorComponent::from(dataset),
             })
     }
 
@@ -164,7 +167,7 @@ impl ListingTableConnector for File {
             return Ok(());
         }
 
-        let path = get_path(dataset)?;
+        let path = get_path(dataset);
         let (tx, mut rx) = mpsc::channel(100);
         let Some(refresh_trigger) = accelerated_table.refresh_trigger().cloned() else {
             return Ok(());
@@ -222,53 +225,38 @@ impl ListingTableConnector for File {
 
         accelerated_table.handlers.push(watcher_task);
 
-        tracing::info!("Watching changes to {}", get_path(dataset)?.display());
+        tracing::info!("Watching changes to {}", get_path(dataset).display());
 
         Ok(())
     }
 }
 
-fn get_path(dataset: &Dataset) -> DataConnectorResult<PathBuf> {
+fn get_path(dataset: &Dataset) -> PathBuf {
     let clean_from = dataset.from.replace("file://", "file:/");
 
     let Some(path) = clean_from.strip_prefix("file:") else {
-        // Should be unreachable
-        return Err(super::DataConnectorError::InvalidConfigurationNoSource {
-            dataconnector: "File".to_string(),
-            message: "'dataset.from' must start with 'file:'".to_string(),
-        });
+        unreachable!("The 'from' parameter must start with 'file:'.");
     };
 
-    Ok(PathBuf::from(path))
+    PathBuf::from(path)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::component::dataset::Dataset;
-    use crate::dataconnector::DataConnectorError;
 
     #[test]
     fn test_get_path() {
         let test_cases = vec![
-            (
-                "file:/path/to/file.csv",
-                Ok(PathBuf::from("/path/to/file.csv")),
-            ),
+            ("file:/path/to/file.csv", PathBuf::from("/path/to/file.csv")),
             (
                 "file://path/to/file.csv",
-                Ok(PathBuf::from("/path/to/file.csv")),
+                PathBuf::from("/path/to/file.csv"),
             ),
             (
                 "file:relative/path/to/file.csv",
-                Ok(PathBuf::from("relative/path/to/file.csv")),
-            ),
-            (
-                "http://example.com/file.csv",
-                Err(DataConnectorError::InvalidConfigurationNoSource {
-                    dataconnector: "File".to_string(),
-                    message: "'dataset.from' must start with 'file:'".to_string(),
-                }),
+                PathBuf::from("relative/path/to/file.csv"),
             ),
         ];
 
@@ -276,36 +264,15 @@ mod tests {
             let dataset = Dataset::try_new(input.to_string(), "foo").expect("valid dataset");
 
             let result = get_path(&dataset);
-
-            match (result, expected) {
-                (Ok(path), Ok(expected_path)) => {
-                    assert_eq!(path, expected_path, "Failed for input: {input}");
-                }
-                (Err(error), Err(expected_error)) => {
-                    assert_eq!(
-                        error.to_string(),
-                        expected_error.to_string(),
-                        "Failed for input: {input}"
-                    );
-                }
-                _ => panic!("Unexpected result for input: {input}"),
-            }
+            assert_eq!(result, expected, "Failed for input: {input}");
         }
     }
 
     #[test]
+    #[should_panic(expected = "The 'from' parameter must start with 'file:'.")]
     fn test_get_path_empty_input() {
         let dataset = Dataset::try_new(String::new(), "foo").expect("valid dataset");
 
-        let result = get_path(&dataset);
-        assert!(result.is_err());
-        assert_eq!(
-            result.expect_err("should error").to_string(),
-            DataConnectorError::InvalidConfigurationNoSource {
-                dataconnector: "File".to_string(),
-                message: "'dataset.from' must start with 'file:'".to_string(),
-            }
-            .to_string()
-        );
+        get_path(&dataset);
     }
 }

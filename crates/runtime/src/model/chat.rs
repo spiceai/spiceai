@@ -353,18 +353,18 @@ impl Chat for ChatWrapper {
         &self,
         req: CreateChatCompletionRequest,
     ) -> Result<ChatCompletionResponseStream, OpenAIError> {
-        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "ai_completion", stream=true, model = %req.model, input = %serde_json::to_string(&req).unwrap_or_default(), "labels");
+        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "ai_completion", stream=true, model = %req.model, input = %serde_json::to_string(&req).unwrap_or_default());
         let req = self.prepare_req(req)?;
 
         if let Some(metadata) = &req.metadata {
-            tracing::info!(target: "task_history", metadata = %metadata, "labels");
+            tracing::info!(target: "task_history", metadata = %metadata);
         }
 
         match self.chat.chat_stream(req).instrument(span.clone()).await {
             Ok(resp) => {
                 let public_name = self.public_name.clone();
                 let stream_span = span.clone();
-                let logged_stream = resp.map_ok(move |mut r| {r.model.clone_from(&public_name); r}).instrument(stream_span.clone()).inspect(move |item| {
+                let logged_stream = resp.map_ok(move |mut r| {r.model.clone_from(&public_name); r}).inspect(move |item| {
                     if let Ok(item) = item {
 
                         // not incremental; provider only emits usage on last chunk.
@@ -372,7 +372,7 @@ impl Chat for ChatWrapper {
                             tracing::info!(target: "task_history", parent: &stream_span.clone(), completion_tokens = %usage.completion_tokens, total_tokens = %usage.total_tokens, prompt_tokens = %usage.prompt_tokens, "labels");
                         }
                     }
-                });
+                }).instrument(span.clone());
                 Ok(Box::pin(logged_stream))
             }
             Err(e) => {
@@ -380,6 +380,10 @@ impl Chat for ChatWrapper {
                 Err(e)
             }
         }
+    }
+
+    async fn health(&self) -> ChatResult<()> {
+        self.chat.health().await
     }
 
     /// Unlike [`ChatWrapper::chat_stream`], this method will instrument the `captured_output` for the model output.

@@ -17,9 +17,10 @@ limitations under the License.
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::Arc,
+    time::Duration,
 };
 
-use crate::init_tracing;
+use crate::{init_tracing, utils::wait_until_true};
 use rand::Rng;
 use runtime::{auth::EndpointAuth, config::Config, Runtime};
 use runtime_auth::{api_key::ApiKeyAuth, HttpAuth};
@@ -71,11 +72,18 @@ async fn test_http_auth() -> Result<(), anyhow::Error> {
         .await
     });
 
+    let http_client = reqwest::Client::builder().build()?;
+
     // Wait for the servers to start
     tracing::info!("Waiting for servers to start...");
-    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-
-    let http_client = reqwest::Client::builder().build()?;
+    wait_until_true(Duration::from_secs(10), || async {
+        http_client
+            .get(format!("http://localhost:{http_port}/health"))
+            .send()
+            .await
+            .is_ok()
+    })
+    .await;
 
     // HTTP is not authenticated
     let http_url = format!("http://127.0.0.1:{http_port}/health");

@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 use crate::embeddings::vector_search::{
-    to_matches, Match, SearchRequest, SearchRequestJson, VectorSearch,
+    to_matches_sorted, Match, SearchRequest, SearchRequestJson, VectorSearch,
 };
 use axum::{
     http::StatusCode,
@@ -56,7 +56,7 @@ pub(crate) async fn post(
     };
 
     match vs.search(&search_request).await {
-        Ok(resp) => match to_matches(&resp) {
+        Ok(resp) => match to_matches_sorted(&resp) {
             Ok(m) => (
                 StatusCode::OK,
                 Json(SearchResponse {

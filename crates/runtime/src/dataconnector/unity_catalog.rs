@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use super::ConnectorComponent;
 use super::DataConnector;
 use super::DataConnectorFactory;
 use super::DataConnectorParams;
@@ -152,11 +153,12 @@ impl DataConnector for UnityCatalog {
 
     async fn read_provider(
         &self,
-        _dataset: &Dataset,
+        dataset: &Dataset,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
         Err(super::DataConnectorError::UnableToGetReadProvider {
             dataconnector: "unity_catalog".to_string(),
-            source: "Unity Catalog only support catalogs, not individual datasets.".into(),
+            source: "The Unity Catalog only supports catalogs, not individual datasets.\nSetup a Unity Catalog instead: https://docs.spiceai.org/components/catalogs/unity-catalog".into(),
+            connector_component: ConnectorComponent::from(dataset)
         })
     }
 
@@ -169,7 +171,8 @@ impl DataConnector for UnityCatalog {
             return Some(Err(
                 super::DataConnectorError::InvalidConfigurationNoSource {
                     dataconnector: "unity_catalog".into(),
-                    message: "Catalog ID is required for Unity Catalog".into(),
+                    message: "A Catalog Path is required for Unity Catalog.\nFor further information, visit: https://docs.spiceai.org/components/catalogs/unity-catalog#from".into(),
+                    connector_component: ConnectorComponent::from(catalog),
                 },
             ));
         };
@@ -179,6 +182,7 @@ impl DataConnector for UnityCatalog {
         let (endpoint, catalog_id) = match UnityCatalogClient::parse_catalog_url(&catalog_id)
             .map_err(|e| super::DataConnectorError::InvalidConfiguration {
                 dataconnector: "unity_catalog".to_string(),
+                connector_component: ConnectorComponent::from(catalog),
                 message: e.to_string(),
                 source: Box::new(e),
             }) {
@@ -218,6 +222,7 @@ impl DataConnector for UnityCatalog {
             Err(e) => {
                 return Some(Err(super::DataConnectorError::UnableToGetCatalogProvider {
                     dataconnector: "unity_catalog".to_string(),
+                    connector_component: ConnectorComponent::from(catalog),
                     source: Box::new(e),
                 }))
             }

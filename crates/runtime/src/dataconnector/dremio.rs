@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use super::ConnectorComponent;
 use super::DataConnector;
 use super::DataConnectorFactory;
 use super::DataConnectorParams;
@@ -184,13 +185,14 @@ impl DataConnector for Dremio {
                     tracing::debug!("{e}");
                     return Err(DataConnectorError::UnableToGetSchema {
                         dataconnector: "dremio".to_string(),
-                        dataset_name: dataset.name.to_string(),
                         table_name: table.clone(),
+                        connector_component: ConnectorComponent::from(dataset),
                     });
                 }
 
                 return Err(DataConnectorError::UnableToGetReadProvider {
                     dataconnector: "dremio".to_string(),
+                    connector_component: ConnectorComponent::from(dataset),
                     source: e,
                 });
             }
@@ -209,6 +211,7 @@ impl DataConnector for Dremio {
         .await
         .context(super::UnableToGetReadWriteProviderSnafu {
             dataconnector: "dremio",
+            connector_component: ConnectorComponent::from(dataset),
         });
 
         Some(read_write_result)

@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use super::ConnectorComponent;
 use super::DataConnector;
 use super::DataConnectorError;
 use super::DataConnectorFactory;
@@ -210,6 +211,7 @@ impl DataConnector for SpiceAI {
                     .boxed()
                     .context(UnableToGetReadProviderSnafu {
                         dataconnector: "spice.ai",
+                        connector_component: ConnectorComponent::from(dataset),
                     })?,
                 ));
             }
@@ -232,13 +234,14 @@ impl DataConnector for SpiceAI {
                     tracing::debug!("{e}");
                     return Err(DataConnectorError::UnableToGetSchema {
                         dataconnector: "spice.ai".to_string(),
-                        dataset_name: dataset.name.to_string(),
+                        connector_component: ConnectorComponent::from(dataset),
                         table_name: table.clone(),
                     });
                 }
 
                 return Err(DataConnectorError::UnableToGetReadProvider {
                     dataconnector: "spice.ai".to_string(),
+                    connector_component: ConnectorComponent::from(dataset),
                     source: e,
                 });
             }
@@ -257,6 +260,7 @@ impl DataConnector for SpiceAI {
         .await
         .context(super::UnableToGetReadWriteProviderSnafu {
             dataconnector: "spice.ai",
+            connector_component: ConnectorComponent::from(dataset),
         });
 
         Some(read_write_result)
@@ -303,7 +307,8 @@ impl DataConnector for SpiceAI {
             return Some(Err(
                 super::DataConnectorError::InvalidConfigurationNoSource {
                     dataconnector: "spice.ai".into(),
-                    message: "Catalog ID is not supported for SpiceAI data connector".into(),
+                    message: "A Catalog Name is not supported for the Spice.ai catalog connector.\nRemove the Catalog Name, and use only 'spice.ai' in the 'from' parameter.\nFor further information, visit: https://docs.spiceai.org/components/catalogs/spiceai#from".into(),
+                    connector_component: ConnectorComponent::from(catalog),
                 },
             ));
         }

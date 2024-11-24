@@ -33,8 +33,8 @@ use std::sync::Arc;
 use url::Url;
 
 use super::{
-    DataConnector, DataConnectorFactory, DataConnectorParams, DataConnectorResult, ParameterSpec,
-    Parameters, UnableToGetReadProviderSnafu,
+    ConnectorComponent, DataConnector, DataConnectorFactory, DataConnectorParams,
+    DataConnectorResult, ParameterSpec, Parameters, UnableToGetReadProviderSnafu,
 };
 
 #[derive(Debug, Snafu)]
@@ -176,6 +176,7 @@ impl DataConnector for Sharepoint {
             .boxed()
             .context(UnableToGetReadProviderSnafu {
                 dataconnector: "sharepoint",
+                connector_component: ConnectorComponent::from(dataset),
             })?;
         Ok(Arc::new(SharepointTableProvider::new(
             client,
@@ -197,6 +198,7 @@ impl DataConnector for Sharepoint {
             .boxed()
             .context(UnableToGetReadProviderSnafu {
                 dataconnector: "sharepoint",
+                connector_component: ConnectorComponent::from(dataset),
             }) {
             Ok(client) => Some(Ok(Arc::new(SharepointTableProvider::new(
                 client,

@@ -17,9 +17,10 @@ limitations under the License.
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::Arc,
+    time::Duration,
 };
 
-use crate::init_tracing;
+use crate::{init_tracing, utils::wait_until_true};
 use arrow_flight::{
     flight_service_client::FlightServiceClient,
     sql::{CommandStatementQuery, ProstMessageExt},
@@ -33,6 +34,7 @@ use tonic_health::pb::health_client::HealthClient;
 
 const LOCALHOST: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
 
+#[allow(clippy::too_many_lines)]
 #[tokio::test]
 async fn test_tls_endpoints() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
@@ -79,10 +81,6 @@ async fn test_tls_endpoints() -> Result<(), anyhow::Error> {
         .await
     });
 
-    // Wait for the servers to start
-    tracing::info!("Waiting for servers to start...");
-    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-
     // Connect to the servers with TLS
     let root_cert_bytes = include_bytes!("../../../../test/tls/spiced_root_cert.pem").to_vec();
     let root_cert_reqwest =
@@ -92,6 +90,17 @@ async fn test_tls_endpoints() -> Result<(), anyhow::Error> {
         .tls_built_in_root_certs(false)
         .add_root_certificate(root_cert_reqwest)
         .build()?;
+
+    // Wait for the servers to start
+    tracing::info!("Waiting for servers to start...");
+    wait_until_true(Duration::from_secs(10), || async {
+        http_client
+            .get(format!("https://127.0.0.1:{http_port}/health"))
+            .send()
+            .await
+            .is_ok()
+    })
+    .await;
 
     // HTTP
     let http_url = format!("https://127.0.0.1:{http_port}/health");

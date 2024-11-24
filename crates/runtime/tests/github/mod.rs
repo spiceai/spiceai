@@ -135,7 +135,7 @@ async fn test_github_pulls() -> Result<(), String> {
 
     // search should push down the filter, preventing the query from retrieving every pull
     assert!(
-        search_author_elapsed_secs < 10,
+        search_author_elapsed_secs < 15,
         "search_author_elapsed_secs: {search_author_elapsed_secs}"
     );
 

@@ -17,6 +17,7 @@ limitations under the License.
 use crate::component::dataset::acceleration::{Engine, RefreshMode};
 use crate::component::dataset::Dataset;
 use crate::dataaccelerator::spice_sys::debezium_kafka::DebeziumKafkaSys;
+use crate::dataconnector::ConnectorComponent;
 use crate::federated_table::FederatedTable;
 use arrow::datatypes::SchemaRef;
 use async_stream::stream;
@@ -204,7 +205,8 @@ impl DataConnector for Debezium {
             dataset.is_accelerated(),
             super::InvalidConfigurationNoSourceSnafu {
                 dataconnector: "debezium",
-                message: "The Debezium data connector only works with accelerated datasets.",
+                message: "The Debezium data connector only works with accelerated datasets.\nFor further information, visit: https://docs.spiceai.org/components/data-connectors/debezium",
+                connector_component: ConnectorComponent::from(dataset),
             }
         );
         let Some(ref acceleration) = dataset.acceleration else {
@@ -215,14 +217,16 @@ impl DataConnector for Debezium {
             super::InvalidConfigurationNoSourceSnafu {
                 dataconnector: "debezium",
                 message:
-                    "The Debezium data connector only works with non-Arrow acceleration engines.",
+                    "The Debezium data connector only works with non-Arrow acceleration engines.\nFor further information, visit: https://docs.spiceai.org/components/data-connectors/debezium",
+                connector_component: ConnectorComponent::from(dataset),
             }
         );
         ensure!(
             self.resolve_refresh_mode(acceleration.refresh_mode) == RefreshMode::Changes,
             super::InvalidConfigurationNoSourceSnafu {
                 dataconnector: "debezium",
-                message: "The Debezium data connector only works with 'changes' refresh mode.",
+                message: "The Debezium data connector only works with 'changes' refresh mode.\nFor further information, visit: https://docs.spiceai.org/components/data-connectors/debezium",
+                connector_component: ConnectorComponent::from(dataset),
             }
         );
 
@@ -246,13 +250,15 @@ impl DataConnector for Debezium {
                 .boxed()
                 .context(super::UnableToGetReadProviderSnafu {
                     dataconnector: "debezium",
+                    connector_component: ConnectorComponent::from(dataset),
                 })?;
 
                 ensure!(
                     topic == metadata.topic,
                     super::InvalidConfigurationNoSourceSnafu {
                         dataconnector: "debezium",
-                        message: format!("The topic has changed from {} to {topic} for dataset {dataset_name}. The existing accelerator data may be out of date.", metadata.topic),
+                        message: format!("The topic has changed from {} to {topic}. The existing accelerator data may be out of date.", metadata.topic), // TODO: what action can a user take from this error?
+                connector_component: ConnectorComponent::from(dataset),
                     }
                 );
 
@@ -262,11 +268,13 @@ impl DataConnector for Debezium {
                 .boxed()
                 .context(super::UnableToGetReadProviderSnafu {
                     dataconnector: "debezium",
+                    connector_component: ConnectorComponent::from(dataset),
                 })?;
 
                 kafka_consumer.subscribe(&topic).boxed().context(
                     super::UnableToGetReadProviderSnafu {
                         dataconnector: "debezium",
+                        connector_component: ConnectorComponent::from(dataset),
                     },
                 )?;
 
@@ -335,6 +343,7 @@ async fn get_metadata_from_kafka(
         .boxed()
         .context(super::UnableToGetReadProviderSnafu {
             dataconnector: "debezium",
+            connector_component: ConnectorComponent::from(dataset),
         })?;
 
     kafka_consumer
@@ -342,6 +351,7 @@ async fn get_metadata_from_kafka(
         .boxed()
         .context(super::UnableToGetReadProviderSnafu {
             dataconnector: "debezium",
+            connector_component: ConnectorComponent::from(dataset),
         })?;
 
     let msg = match kafka_consumer
@@ -352,12 +362,14 @@ async fn get_metadata_from_kafka(
         Ok(None) => {
             return Err(super::DataConnectorError::UnableToGetReadProvider {
                 dataconnector: "debezium".to_string(),
-                source: "No message received from Kafka".into(),
+                source: "No message received from Kafka.".into(), // TODO: what action can a user take from this error?
+                connector_component: ConnectorComponent::from(dataset),
             });
         }
         Err(e) => {
             return Err(e).boxed().context(super::UnableToGetReadProviderSnafu {
                 dataconnector: "debezium",
+                connector_component: ConnectorComponent::from(dataset),
             });
         }
     };
@@ -367,7 +379,8 @@ async fn get_metadata_from_kafka(
     let Some(schema_fields) = msg.value().get_schema_fields() else {
         return Err(super::DataConnectorError::UnableToGetReadProvider {
             dataconnector: "debezium".to_string(),
-            source: "Could not get Arrow schema from Debezium message".into(),
+            source: "Could not get Arrow schema from Debezium message".into(), // TODO: what action can a user take from this error?
+            connector_component: ConnectorComponent::from(dataset),
         });
     };
 
@@ -375,6 +388,7 @@ async fn get_metadata_from_kafka(
         .boxed()
         .context(super::UnableToGetReadProviderSnafu {
             dataconnector: "debezium",
+            connector_component: ConnectorComponent::from(dataset),
         })?;
 
     let metadata = DebeziumKafkaMetadata {
@@ -389,6 +403,7 @@ async fn get_metadata_from_kafka(
             .await
             .context(super::UnableToGetReadProviderSnafu {
                 dataconnector: "debezium",
+                connector_component: ConnectorComponent::from(dataset),
             })?;
     }
 
@@ -398,6 +413,7 @@ async fn get_metadata_from_kafka(
         .boxed()
         .context(super::UnableToGetReadProviderSnafu {
             dataconnector: "debezium",
+            connector_component: ConnectorComponent::from(dataset),
         })?;
 
     Ok((kafka_consumer, metadata, Arc::new(schema)))
