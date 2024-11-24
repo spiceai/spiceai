@@ -525,7 +525,7 @@ async fn verify_sql_query_chat_completion(
 
     // Verify Task History
     insta::assert_snapshot!(
-        "chat_2_sql_tasks",
+        "chat_1_sql_tasks",
         sql_to_display(
             &rt,
             format!(
@@ -533,8 +533,8 @@ async fn verify_sql_query_chat_completion(
                 FROM runtime.task_history
                 WHERE start_time >= '{}'
                 AND task in ('tool_use::list_datasets', 'tool_use::sql', 'tool_use::sql_query')
-                GROUP BY task;
-                ORDER BY task
+                GROUP BY task
+                ORDER BY task;
             "#,
                 Into::<DateTime<Utc>>::into(task_start_time).to_rfc3339()
             )
