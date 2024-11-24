@@ -13,7 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use crate::{
     accelerated_table::refresh::RefreshOverrides,
@@ -37,6 +37,7 @@ use datafusion::sql::TableReference;
 use headers_accept::Accept;
 use http::StatusCode;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tokio::sync::RwLock;
 use tract_core::tract_data::itertools::Itertools;
 
@@ -72,8 +73,8 @@ pub(crate) struct DatasetResponseItem {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<ComponentStatus>,
 
-    #[serde(skip_serializing_if = "Vec::is_empty", default)]
-    pub properties: Vec<Property>,
+    #[serde(skip_serializing_if = "HashMap::is_empty", default)]
+    pub properties: HashMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -332,18 +333,18 @@ pub(crate) async fn sample(
     }
 }
 
-fn dataset_properties(ds: &Dataset) -> Vec<Property> {
-    let mut properties = vec![];
+fn dataset_properties(ds: &Dataset) -> HashMap<String, Value> {
+    let mut properties = HashMap::new();
 
     #[cfg(feature = "models")]
-    properties.push(Property {
-        key: "vector_search".to_string(),
-        value: if ds.has_embeddings() {
-            Some(serde_json::Value::String("supported".to_string()))
+    properties.insert(
+        "vector_search".to_string(),
+        if ds.has_embeddings() {
+            Value::String("supported".to_string())
         } else {
-            Some(serde_json::Value::String("unsupported".to_string()))
+            Value::String("unsupported".to_string())
         },
-    });
+    );
 
     properties
 }
