@@ -78,7 +78,7 @@ pub(crate) struct DatasetResponseItem {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct Property {
-    pub name: String,
+    pub key: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub value: Option<serde_json::Value>, // support any valid JSON type (String, Int, Object, etc)
 }
@@ -337,7 +337,7 @@ fn dataset_properties(ds: &Dataset) -> Vec<Property> {
 
     #[cfg(feature = "models")]
     properties.push(Property {
-        name: "vector_search".to_string(),
+        key: "vector_search".to_string(),
         value: if ds.has_embeddings() {
             Some(serde_json::Value::String("supported".to_string()))
         } else {
