@@ -379,6 +379,11 @@ impl Chat for ToolUsingChat {
     fn as_sql(&self) -> Option<&dyn SqlGeneration> {
         self.inner_chat.as_sql()
     }
+
+    /// Override health endpoint to 1. avoid passing tools in request, 2. pre-calling `list_datasets` in [`ToolUsingChat::prepare_req`].
+    async fn health(&self) -> ChatResult<()> {
+        self.inner_chat.health().await
+    }
 }
 
 /// Create a new [`CreateChatCompletionRequest`] with new messages.

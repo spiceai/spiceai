@@ -23,7 +23,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use app::spicepod::component::runtime::TelemetryConfig;
+use app::spicepod::component::runtime::{Runtime as SpicepodRuntime, TelemetryConfig};
 use app::{App, AppBuilder};
 use clap::{ArgAction, Parser};
 use flightrepl::ReplConfig;
@@ -37,6 +37,7 @@ use runtime::datafusion::DataFusion;
 use runtime::podswatcher::PodsWatcher;
 use runtime::spice_metrics;
 use runtime::{auth::EndpointAuth, extension::ExtensionFactory, Runtime};
+use serde_yaml::Value;
 use snafu::prelude::*;
 use spice_cloud::SpiceExtensionFactory;
 use spiced_tracing::LogVerbosity;
@@ -84,11 +85,23 @@ pub enum Error {
 
     #[snafu(display("Generic Error: {reason}"))]
     GenericError { reason: String },
+
+    #[snafu(display("Failed to apply the runtime overrides from `--set-runtime`.\n{reason}"))]
+    FailedToApplyOverridesGeneric { reason: String },
+
+    #[snafu(display(
+        "Failed to apply the runtime override from `--set-runtime {path}={value}`.\n{reason}"
+    ))]
+    FailedToApplyOverride {
+        path: String,
+        value: String,
+        reason: String,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-#[derive(Parser)]
+#[derive(Parser, Debug)]
 #[clap(about = "Spice.ai OSS Runtime")]
 #[clap(rename_all = "kebab-case")]
 #[allow(clippy::struct_excessive_bools)]
@@ -146,6 +159,10 @@ pub struct Args {
     /// Enable very verbose logging. In conjunction with `verbose` can be set via -vv or --very-verbose.
     #[arg(long)]
     pub very_verbose: bool,
+
+    /// Overrides for the runtime configuration (--set-runtime key1.subkey=value1)
+    #[arg(long, action = ArgAction::Append, value_parser = parse_set_string)]
+    pub set_runtime: Vec<(String, String)>,
 }
 
 pub async fn run(args: Args) -> Result<()> {
@@ -155,12 +172,12 @@ pub async fn run(args: Args) -> Result<()> {
     let app: Option<Arc<App>> = match AppBuilder::build_from_filesystem_path(current_dir.clone())
         .context(UnableToConstructSpiceAppSnafu)
     {
-        Ok(app) => Some(Arc::new(app)),
+        Ok(mut app) => {
+            app.runtime = apply_overrides(app.runtime, &args.set_runtime)?;
+            Some(Arc::new(app))
+        }
         Err(e) => {
-            let subscriber = tracing_subscriber::FmtSubscriber::builder()
-                .with_ansi(true)
-                .finish();
-            subscriber::with_default(subscriber, || {
+            in_tracing_context(|| {
                 tracing::error!("{e}");
             });
             None
@@ -292,4 +309,122 @@ async fn start_anonymous_telemetry(
         #[cfg(feature = "anonymous_telemetry")]
         telemetry::anonymous::start(spicepod_name.map_or_else(|| "unknown", String::as_str)).await;
     }
+}
+
+fn parse_set_string(s: &str) -> Result<(String, String), String> {
+    let parts: Vec<&str> = s.split('=').collect();
+    if parts.len() != 2 {
+        return Err("Invalid set format. Use key=value".into());
+    }
+
+    Ok((parts[0].to_string(), parts[1].to_string()))
+}
+
+fn apply_overrides(
+    runtime_config: SpicepodRuntime,
+    overrides: &Vec<(String, String)>,
+) -> Result<SpicepodRuntime> {
+    if overrides.is_empty() {
+        return Ok(runtime_config);
+    }
+
+    let mut yaml = match serde_yaml::to_value(runtime_config) {
+        Ok(yaml) => yaml,
+        Err(e) => {
+            return FailedToApplyOverridesGenericSnafu {
+                reason: format!("Runtime configuration is invalid YAML.\n{e}"),
+            }
+            .fail();
+        }
+    };
+
+    for (path, value) in overrides {
+        let yaml_value =
+            serde_yaml::from_str(value).unwrap_or_else(|_| Value::String(value.to_string()));
+        match apply_override(&mut yaml, path, yaml_value) {
+            Ok(()) => (),
+            Err(e) => {
+                return FailedToApplyOverrideSnafu {
+                    path: path.clone(),
+                    value: value.clone(),
+                    reason: format!("{e}"),
+                }
+                .fail();
+            }
+        };
+    }
+
+    match serde_yaml::from_value(yaml) {
+        Ok(runtime) => Ok(runtime),
+        Err(e) => {
+            FailedToApplyOverridesGenericSnafu {
+                reason: format!(
+                    "The runtime configuration after applying the overrides from `--set-runtime` is invalid.\n{e}"
+                ),
+            }
+            .fail()
+        }
+    }
+}
+
+fn apply_override(
+    yaml: &mut Value,
+    path: &str,
+    value: Value,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let parts: Vec<&str> = path.split('.').collect();
+    let mut current = yaml;
+
+    let parts_len = parts.len();
+    for (i, part) in parts.into_iter().enumerate() {
+        if i == parts_len - 1 {
+            match current {
+                Value::Mapping(map) => {
+                    map.insert(Value::String(part.to_string()), value);
+                    return Ok(());
+                }
+                Value::Null => {
+                    let mut new_map = serde_yaml::Mapping::new();
+                    new_map.insert(Value::String(part.to_string()), value);
+                    *current = Value::Mapping(new_map);
+                    return Ok(());
+                }
+                _ => {
+                    return Err(format!(
+                        "Unable to apply override for {path}. Validate the override is correct and try again.",
+                    )
+                    .into())
+                }
+            }
+        }
+
+        match current {
+            Value::Mapping(map) => {
+                if !map.contains_key(Value::String(part.to_string())) {
+                    map.insert(
+                        Value::String(part.to_string()),
+                        Value::Mapping(serde_yaml::Mapping::new()),
+                    );
+                }
+                let key = Value::String(part.to_string());
+                let Some(new_current) = map.get_mut(&key) else {
+                    unreachable!("The key was inserted above if it was missing");
+                };
+                current = new_current;
+            }
+            _ => return Err(format!("Unable to apply override for {path}. Validate the override is correct and try again.").into()),
+        }
+    }
+
+    Ok(())
+}
+
+pub fn in_tracing_context<F, R>(f: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    let subscriber = tracing_subscriber::FmtSubscriber::builder()
+        .with_ansi(true)
+        .finish();
+    subscriber::with_default(subscriber, f)
 }
