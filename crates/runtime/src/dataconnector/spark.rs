@@ -28,8 +28,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use super::{
-    DataConnector, DataConnectorError, DataConnectorFactory, DataConnectorParams, ParameterSpec,
-    Parameters,
+    ConnectorComponent, DataConnector, DataConnectorError, DataConnectorFactory,
+    DataConnectorParams, ParameterSpec, Parameters,
 };
 
 #[derive(Debug, Snafu)]
@@ -106,6 +106,7 @@ impl DataConnectorFactory for SparkFactory {
                         source: _,
                     } => Err(DataConnectorError::InvalidConfiguration {
                         dataconnector: "spark".to_string(),
+                        connector_component: params.component.clone(),
                         message: e.to_string(),
                         source: e.into(),
                     }
@@ -113,6 +114,7 @@ impl DataConnectorFactory for SparkFactory {
                     Error::UnableToConstructSparkConnect { source } => {
                         Err(DataConnectorError::UnableToConnectInternal {
                             dataconnector: "spark".to_string(),
+                            connector_component: params.component.clone(),
                             source,
                         }
                         .into())
@@ -148,6 +150,7 @@ impl DataConnector for Spark {
             .await
             .context(super::UnableToGetReadProviderSnafu {
                 dataconnector: "spark",
+                connector_component: ConnectorComponent::from(dataset),
             })?)
     }
 }

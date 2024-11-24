@@ -1,0 +1,76 @@
+version: v1beta1
+kind: Spicepod
+name: ai-test-spicepod
+
+datasets:
+  - from: s3://spiceai-demo-datasets/taxi_trips/2024/
+    name: taxi_trips
+    description: taxi trips in s3
+    params:
+      file_format: parquet
+
+  - from: github:github.com/spiceai/spiceai/issues
+    name: issues
+    description: GitHub Issues for the Spice.ai project (github.com/spiceai/spiceai)
+    metadata:
+      instructions: Always provide reference links. Use the primary key as `issue_id` to generate reference links.
+      reference_url_template: https://github.com/spiceai/spiceai/issues/<issue_id>
+    params:
+      github_token: ${secrets:GITHUB_TOKEN}
+      github_query_mode: "search"
+    acceleration:
+      enabled: true
+      refresh_retry_max_attempts: 3
+      refresh_sql: "SELECT * FROM issues WHERE created_at='2024-11-09T22:47:45'"
+    embeddings:
+      - column: body
+        use: openai_embeddings
+        column_pk:
+          - id
+    
+  - from: s3://spiceai-public-datasets/tpcds/catalog_page/
+    name: catalog_page
+    description: Represents an e-commerce platform's catalog page metadata
+    params:
+      file_format: parquet
+    acceleration:
+      enabled: true
+      refresh_sql: SELECT * FROM catalog_page limit 1;
+    embeddings:
+      - column: cp_description
+        column_pk:
+          - cp_catalog_page_sk
+        use: openai_embeddings
+    
+models:
+  - from: openai:gpt-4o-mini
+    name: openai-gpt
+    params:
+      spice_tools: auto
+      openai_api_key: ${ secrets:SPICE_OPENAI_API_KEY }
+      system_prompt: |
+        Use the SQL tool when:
+          1. The query involves precise numerical data, statistics, or aggregations
+          2. The user asks for specific counts, sums, averages, or other calculations
+          3. The query requires joining or comparing data from multiple related tables
+
+        Use the document search when:
+          1. The query is about unstructured text information, such as policies, reports, or articles
+          2. The user is looking for qualitative information or explanations
+          3. The query requires understanding context or interpreting written content
+
+        General guidelines:
+          1. If a query could be answered by either tool, prefer SQL for more precise, quantitative answers
+
+        Instructions for Responses: 
+          - Do not include any private metadata provided to the model as context such as \"reference_url_template\" or \"instructions\" in your responses.
+
+embeddings:
+  - from: openai
+    name: openai_embeddings
+    params:
+      openai_api_key: ${ secrets:SPICE_OPENAI_API_KEY }
+    metadata: {}
+  - from: huggingface:huggingface.co/sentence-transformers/all-MiniLM-L6-v2
+    name: hf_minilm
+    metadata: {}

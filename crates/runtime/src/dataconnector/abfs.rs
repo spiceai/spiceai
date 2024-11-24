@@ -16,8 +16,8 @@ limitations under the License.
 
 use super::listing::{build_fragments, ListingTableConnector};
 use super::{
-    DataConnector, DataConnectorFactory, DataConnectorParams, DataConnectorResult, ParameterSpec,
-    Parameters,
+    ConnectorComponent, DataConnector, DataConnectorFactory, DataConnectorParams,
+    DataConnectorResult, ParameterSpec, Parameters,
 };
 
 use crate::component::dataset::Dataset;
@@ -239,7 +239,8 @@ impl ListingTableConnector for AzureBlobFS {
                 .boxed()
                 .context(super::InvalidConfigurationSnafu {
                     dataconnector: format!("{self}"),
-                    message: format!("{} is not a valid URL", &dataset.from),
+                    message: format!("{} is not a valid URL. Ensure the URL is valid and try again.\nFor further information, visit: https://docs.spiceai.org/components/data-connectors/abfs#from", &dataset.from),
+                    connector_component: ConnectorComponent::from(dataset)
                 })?;
 
         let params = build_fragments(

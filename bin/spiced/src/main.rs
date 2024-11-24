@@ -66,7 +66,9 @@ fn main() {
     }
 
     if let Err(err) = tokio_runtime.block_on(start_runtime(args)) {
-        eprintln!("Spice Runtime error: {err}");
+        spiced::in_tracing_context(|| {
+            tracing::error!("{err}");
+        });
     }
 
     global::shutdown_tracer_provider();

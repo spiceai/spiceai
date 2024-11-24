@@ -1,0 +1,41 @@
+#!/usr/bin/expect -f
+
+# spiced runtime response timeout
+set timeout 5:
+
+spawn spice search
+
+proc perform_search {search_term expected_term} {
+    global timeout
+
+    send "$search_term\r"
+
+    expect {
+        -re $expected_term {
+            # allow stream to complete
+            sleep 2
+            send_user "Search returned expected result\n"
+        }
+        # if there is ERROR message before the expected term, then search failed
+        " ERROR " {
+            # allow stream to complete
+            sleep 2
+            send_user "Error detected\n"
+            exit 1
+        }
+        timeout {
+            send_user "Timeout waiting for expected response\n"
+            exit 1
+        }
+    }
+}
+expect "search>"
+perform_search "Spice runtime error" {Rank 1,.*spice\.public\.issues}
+
+expect "search>"
+perform_search "friends" {Rank 1,.*spice\.public\.catalog_page}
+
+# Signal to exit (Ctrl+C)
+send \x03
+
+exit 0

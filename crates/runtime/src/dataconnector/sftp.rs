@@ -22,11 +22,11 @@ use std::pin::Pin;
 use std::sync::Arc;
 use url::Url;
 
-use super::DataConnectorParams;
 use super::{
     listing::{self, ListingTableConnector},
     DataConnector, DataConnectorFactory, DataConnectorResult, ParameterSpec, Parameters,
 };
+use super::{ConnectorComponent, DataConnectorParams};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -123,7 +123,8 @@ impl ListingTableConnector for SFTP {
                 .boxed()
                 .context(super::InvalidConfigurationSnafu {
                     dataconnector: format!("{self}"),
-                    message: format!("{} is not a valid URL", dataset.from),
+                    message: format!("The specified URL is not valid: {}.\nEnsure the URL is valid and try again.\nFor further information, visit: https://docs.spiceai.org/components/data-connectors/ftp", dataset.from),
+                    connector_component: ConnectorComponent::from(dataset)
                 })?;
 
         ftp_url.set_fragment(Some(&listing::build_fragments(

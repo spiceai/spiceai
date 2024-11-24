@@ -29,8 +29,8 @@ use std::{any::Any, future::Future};
 use tiberius::{Config, EncryptionLevel};
 
 use super::{
-    DataConnector, DataConnectorFactory, DataConnectorParams, DataConnectorResult, ParameterSpec,
-    Parameters, UnableToGetReadProviderSnafu,
+    ConnectorComponent, DataConnector, DataConnectorFactory, DataConnectorParams,
+    DataConnectorResult, ParameterSpec, Parameters, UnableToGetReadProviderSnafu,
 };
 
 #[derive(Debug, Snafu)]
@@ -199,6 +199,7 @@ impl DataConnector for SqlServer {
             .boxed()
             .context(UnableToGetReadProviderSnafu {
                 dataconnector: "mssql",
+                connector_component: ConnectorComponent::from(dataset),
             })?;
 
         Ok(Arc::new(provider))

@@ -92,17 +92,17 @@ jobs:
 
   run-database-bench:
     name: Run ${{ matrix.name }} ${{ matrix.bench }} Benchmark
-    runs-on: ubuntu-latest
+    runs-on: spiceai-runners
     needs: build-database-bench-binary
 
     services:
       mysql_tpch:
         image: ${{ matrix.cmd == '-c mysql' && 'ghcr.io/spiceai/spice-mysql-bench:latest' || '' }}
         options: >-
-          --health-cmd="mysqladmin ping -uroot -proot --silent"
-          --health-interval 10s
+          --health-cmd="mysqladmin ping -uroot -proot -P 3306 --silent"
+          --health-interval 60s
           --health-timeout 5s
-          --health-retries 5
+          --health-retries 20
         ports:
           - 3306:3306
         env:
@@ -111,10 +111,10 @@ jobs:
         image: ${{ matrix.cmd == '-c mysql -b tpcds' && 'ghcr.io/spiceai/spice-mysql-tpcds-bench:latest' || '' }}
         options: >-
           --shm-size=10gb
-          --health-cmd="mysqladmin ping -uroot -proot --silent"
-          --health-interval 10s
+          --health-cmd="mysqladmin ping -uroot -proot -P 3306 --silent"
+          --health-interval 60s
           --health-timeout 5s
-          --health-retries 5
+          --health-retries 20
         ports:
           - 3306:3306
         env:
@@ -124,7 +124,7 @@ jobs:
         options: >-
           --shm-size=2gb
           --health-cmd="test -f /var/lib/postgresql/data/data_loading_complete"
-          --health-interval 10s
+          --health-interval 30s
           --health-timeout 5s
           --health-retries 5
         ports:
@@ -136,7 +136,7 @@ jobs:
         options: >-
           --shm-size=2gb
           --health-cmd="test -f /var/lib/postgresql/data/data_loading_complete"
-          --health-interval 10s
+          --health-interval 30s
           --health-timeout 5s
           --health-retries 5
         ports:
@@ -158,6 +158,7 @@ jobs:
 
     strategy:
       fail-fast: false
+      max-parallel: 10
       matrix:
         include:
           - cmd: '-c spice.ai'
@@ -244,20 +245,14 @@ jobs:
         if: (github.event.inputs.selected_benchmark == matrix.name && (github.event.inputs.bench_name == matrix.bench || github.event.inputs.bench_name == 'all')) || github.event.inputs.run_all == 'true' || github.event_name == 'schedule'
         uses: actions/checkout@v4
 
+      - name: Install required packages
+        if: (github.event.inputs.selected_benchmark == matrix.name && (github.event.inputs.bench_name == matrix.bench || github.event.inputs.bench_name == 'all')) || github.event.inputs.run_all == 'true' || github.event_name == 'schedule'
+        run: sudo apt-get update && sudo apt-get install -y unixodbc-dev unixodbc wget
+
       - name: Set up Spice.ai API Key
         if: (github.event.inputs.selected_benchmark == matrix.name && (github.event.inputs.bench_name == matrix.bench || github.event.inputs.bench_name == 'all')) || github.event.inputs.run_all == 'true' || github.event_name == 'schedule'
         run: |
           echo 'SPICEAI_API_KEY="${{ secrets.SPICE_SECRET_SPICEAI_BENCHMARK_KEY }}"' > .env
-
-      - name: Increase swapfile
-        run: |
-          df -h
-          sudo swapoff -a
-          sudo fallocate -l 10G /swapfile
-          sudo chmod 600 /swapfile
-          sudo mkswap /swapfile
-          sudo swapon /swapfile
-          sudo swapon --show
 
       - name: Download benchmark binary
         if: (github.event.inputs.selected_benchmark == matrix.name && (github.event.inputs.bench_name == matrix.bench || github.event.inputs.bench_name == 'all')) || github.event.inputs.run_all == 'true' || github.event_name == 'schedule'
