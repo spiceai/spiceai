@@ -314,6 +314,29 @@ pub(crate) async fn compute_additional_embedding_columns(
 /// +---------------------+      +-------------+
 ///     [`StringArray`]        [`FixedSizeListArray`]
 /// ```
+///
+/// Elements of `arr` that are `Some("")` or `None` should not be passed into
+/// [`Embed`]. This means that `arr` must be partitioned, then reconstructed
+/// after the non empty/null inputs are embedded.
+///
+/// ```text
+///                                     +- Embedding Model -+
+/// +---------------------+             |                   v
+/// | "Hello"             |      +--------------+    +------------+
+/// | None                | ---> | "Hello"      |    | [0.1, 1.2] |
+/// | ""                  |      | "Valid text" |    | [0.8, 0.9] |
+/// | "Valid text"        |      +--------------+    +------------+
+/// +---------------------+                             |  |
+///    [`StringArray`]                                  |  |
+///                   +------------+                    |  |
+///                   | [0.1, 0.2] | <------------------+  |
+///                   | None       |                       |
+///                   | None       |                       |
+///                   | [0.8, 0.9] | <---------------------+
+///                   +------------+
+///
+///                 [`FixedSizeListArray`]
+/// ```
 #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 async fn get_vectors(
     arr: impl Iterator<Item = Option<&str>>,
@@ -324,7 +347,6 @@ async fn get_vectors(
         .enumerate()
         .partition(|(_, o)| o.is_none() || o.is_some_and(str::is_empty));
     let nulls: Vec<usize> = null_pairs.into_iter().map(|(i, _)| i).collect();
-
     let column: Vec<String> = values
         .iter()
         .filter_map(|(_, s)| s.map(ToString::to_string))
@@ -343,16 +365,23 @@ async fn get_vectors(
     )
     .with_field(Arc::new(Field::new("item", DataType::Float32, false)));
 
-    let mut i: usize = 0;
+    // Current index into offset of the outputted [`FixedSizeList`].
+    let mut output_ptr: usize = 0;
+
+    // Index into `nulls` array. Value at i'th position is index into output order that should be nulled.
+    let mut null_ptr = 0;
     for vector in embedded_data {
-        let null_input = nulls.first().is_some_and(|&idx| idx == i);
-        if null_input {
+        // Keep inserting nulls until we reach the next non-null value.
+        while nulls.get(null_ptr).is_some_and(|&idx| idx == output_ptr) {
             builder.values().append_nulls(vector_length);
-        } else {
-            builder.values().append_slice(&vector);
-            i += 1;
+            null_ptr += 1;
+            output_ptr += 1;
+            builder.append(false);
         }
-        builder.append(null_input);
+
+        builder.values().append_slice(&vector);
+        output_ptr += 1;
+        builder.append(true);
     }
     Ok(builder.finish())
 }
@@ -366,12 +395,14 @@ async fn get_vectors(
 /// +---------------------+  +-------------------------------+  +--------------------------------------+
 /// | "Hello, World!"     |  | ["Hello, ", ", World!"]       |  | [[0.1, 1.2], [0.3, 0.4]]             |
 /// | "How are you doing?"|  | ["How ", "are you ", "doing?"]|  | [[0.5, 0.6], [0.7, 0.8], [0.9, 1.0]] |
+/// | ""                  |  | []                            |  | []                                   |
 /// | "I'm doing well."   |  | ["I'm doing ", "doing well."] |  | [[1.1, 1.2], [1.3, 1.4]]             |
 /// +---------------------+  +-------------------------------+  +--------------------------------------+
 ///     [`StringArray`]                     +                             [`ListArray`]
 ///                          +-------------------------------+
 ///                          | [[0, 7], [7, 15]              |
 ///                          | [[0, 4], [4, 12], [12, 18]]   |
+///                          | []                            |
 ///                          | [[0, 10], [10, 21]]           |
 ///                          +-------------------------------+
 /// ```
