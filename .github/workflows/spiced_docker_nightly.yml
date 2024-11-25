@@ -60,7 +60,7 @@ jobs:
         id: set_version
         run: |
           commit_hash=$(git rev-parse --short HEAD)
-          version="nightly-$(date +%Y%m%d)-${commit_hash}"
+          version="$(date +%Y%m%d)-${commit_hash}"
           echo "rel_version=${version}" >> $GITHUB_OUTPUT
           echo "Preparing to publish nightly build with version: \"${version}\""
 
