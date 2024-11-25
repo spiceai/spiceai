@@ -126,7 +126,7 @@ impl GraphQL {
         let endpoint = Url::parse(&dataset.path()).map_err(Into::into).context(
             super::InvalidConfigurationSnafu {
                 dataconnector: "graphql",
-                message: "The specified URL in the dataset 'from' is not valid. Ensure the URL is valid and try again.\nFor further information, visit: https://docs.spiceai.org/components/data-connectors/graphql",
+                message: "The specified URL in the dataset 'from' is not valid. Ensure the URL is valid and try again.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/graphql",
                 connector_component: ConnectorComponent::from(dataset),
             },
         )?;
@@ -143,7 +143,7 @@ impl GraphQL {
             .boxed()
             .context(InvalidConfigurationSnafu {
                 dataconnector: "graphql",
-                message: "The `unnest_depth` parameter must be a positive integer.\nFor further information, visit: https://docs.spiceai.org/components/data-connectors/graphql#configuration",
+                message: "The `unnest_depth` parameter must be a positive integer.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/graphql#configuration",
                 connector_component: ConnectorComponent::from(dataset),
             })?;
 
@@ -188,7 +188,7 @@ impl DataConnector for GraphQL {
         let query = self.params.get("query").expose().ok_or_else(|p| {
             super::InvalidConfigurationNoSourceSnafu {
                 dataconnector: "graphql",
-                message: format!("A required parameter was missing: `{}`.\nFor further information, visit: https://docs.spiceai.org/components/data-connectors/graphql#configuration", p.0),
+                message: format!("A required parameter was missing: `{}`.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/graphql#configuration", p.0),
                 connector_component: ConnectorComponent::from(dataset),
             }
             .build()

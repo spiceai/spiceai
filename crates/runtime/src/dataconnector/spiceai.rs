@@ -307,7 +307,7 @@ impl DataConnector for SpiceAI {
             return Some(Err(
                 super::DataConnectorError::InvalidConfigurationNoSource {
                     dataconnector: "spice.ai".into(),
-                    message: "A Catalog Name is not supported for the Spice.ai catalog connector.\nRemove the Catalog Name, and use only 'spice.ai' in the 'from' parameter.\nFor further information, visit: https://docs.spiceai.org/components/catalogs/spiceai#from".into(),
+                    message: "A Catalog Name is not supported for the Spice.ai catalog connector.\nRemove the Catalog Name, and use only 'spice.ai' in the 'from' parameter.\nFor details, visit: https://docs.spiceai.org/components/catalogs/spiceai#from".into(),
                     connector_component: ConnectorComponent::from(catalog),
                 },
             ));

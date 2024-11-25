@@ -266,7 +266,7 @@ impl RefreshTask {
         let sink = &*sink_lock;
 
         if let Err(e) = sink.insert_into(record_batch_stream, overwrite).await {
-            tracing::warn!("Failed to update dataset {dataset_name}: {e}");
+            tracing::warn!("Failed to update the dataset {dataset_name}.\n{e}");
             self.mark_dataset_status(sql, status::ComponentStatus::Error)
                 .await;
             return Err(e);
@@ -588,13 +588,13 @@ impl RefreshTask {
             .validate_time_format(self.dataset_name.to_string(), &self.accelerator.schema())
             .context(super::InvalidTimeColumnTimeFormatSnafu)?;
 
-        let column =
-            refresh
-                .time_column
-                .clone()
-                .context(super::FailedToFindLatestTimestampSnafu {
-                    reason: "Failed to get latest timestamp due to time column not specified",
-                })?;
+        let column = refresh
+            .time_column
+            .clone()
+            .context(super::FailedToFindLatestTimestampSnafu {
+            reason:
+                "Failed to get the latest timestamp.\nThe `time_column` parameter must be specified.",
+        })?;
 
         let df = self
             .max_timestamp_df(ctx, &column, refresh.sql.as_deref())
@@ -613,7 +613,7 @@ impl RefreshTask {
             .as_any()
             .downcast_ref::<TimestampNanosecondArray>()
             .context(super::FailedToFindLatestTimestampSnafu {
-                reason: "Failed to get latest timestamp during incremental appending process due to time column is unable to cast to timestamp",
+                reason: "Failed to get the latest timestamp during incremental appending.\nFailed to convert the value of the time column to a timestamp. Verify the column is a timestamp.",
             })?;
 
         if array.is_empty() {
@@ -625,7 +625,7 @@ impl RefreshTask {
         let schema = &self.accelerator.schema();
         let Ok(accelerated_field) = schema.field_with_name(&column) else {
             return Err(super::Error::FailedToFindLatestTimestamp {
-                reason: "Failed to get latest timestamp due to time column not specified"
+                reason: "Failed to get the latest timestamp.\nThe `time_column` parameter must be specified."
                     .to_string(),
             });
         };
