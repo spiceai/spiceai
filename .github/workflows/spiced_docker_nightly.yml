@@ -2,7 +2,7 @@ name: spiced_docker_nightly
 
 on:
   schedule:
-    - cron: "0 2 * * *" # Runs the workflow at 2:00 AM UTC every day
+    - cron: "0 9 * * *" # Runs the workflow at 9:00 AM UTC (1AM PT) every day
 
   workflow_dispatch:
     inputs:
