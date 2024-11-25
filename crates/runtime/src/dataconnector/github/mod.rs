@@ -47,6 +47,7 @@ use graphql_parser::query::{
 use issues::IssuesTableArgs;
 use lazy_static::lazy_static;
 use pull_requests::PullRequestTableArgs;
+use rate_limit::GitHubRateLimiter;
 use snafu::ResultExt;
 use stargazers::StargazersTableArgs;
 use std::collections::HashMap;
@@ -62,6 +63,7 @@ mod commits;
 mod github_app_token_provider;
 mod issues;
 mod pull_requests;
+mod rate_limit;
 mod stargazers;
 
 pub struct Github {
@@ -128,6 +130,7 @@ impl Github {
         .with_token_provider(token)
         .with_json_pointer(gql_client_params.json_pointer)
         .with_schema(gql_client_params.schema)
+        .with_rate_limiter(Some(Arc::new(GitHubRateLimiter::new())))
         .build(client)
         .boxed()
     }

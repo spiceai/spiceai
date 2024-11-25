@@ -138,6 +138,7 @@ jsonpath-rust = "0.7.3"
 opentelemetry_sdk = { workspace = true, features = ["rt-tokio-current-thread"] }
 scopeguard = "1.2.0"
 spice-cloud = { path = "../spice_cloud" }
+tokio = { workspace = true, features = ["time", "test-util"] }
 tracing-opentelemetry.workspace = true
 tracing-subscriber.workspace = true
 

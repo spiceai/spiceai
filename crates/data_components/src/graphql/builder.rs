@@ -16,7 +16,7 @@ limitations under the License.
 
 use crate::token_provider::TokenProvider;
 
-use super::{client::GraphQLClient, Result};
+use super::{client::GraphQLClient, rate_limit::RateLimiter, Result};
 use arrow::datatypes::SchemaRef;
 use std::sync::Arc;
 
@@ -30,6 +30,7 @@ pub struct GraphQLClientBuilder {
     user: Option<String>,
     pass: Option<String>,
     schema: Option<SchemaRef>,
+    rate_limiter: Option<Arc<dyn RateLimiter>>,
 }
 
 impl GraphQLClientBuilder {
@@ -43,6 +44,7 @@ impl GraphQLClientBuilder {
             user: None,
             pass: None,
             schema: None,
+            rate_limiter: None,
         }
     }
 
@@ -76,6 +78,12 @@ impl GraphQLClientBuilder {
         self
     }
 
+    #[must_use]
+    pub fn with_rate_limiter(mut self, rate_limiter: Option<Arc<dyn RateLimiter>>) -> Self {
+        self.rate_limiter = rate_limiter;
+        self
+    }
+
     pub fn build(self, client: reqwest::Client) -> Result<GraphQLClient> {
         GraphQLClient::new(
             client,
@@ -86,6 +94,7 @@ impl GraphQLClientBuilder {
             self.pass,
             self.unnest_depth,
             self.schema,
+            self.rate_limiter,
         )
     }
 }
