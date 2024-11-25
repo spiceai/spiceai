@@ -14,22 +14,23 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{
-    collections::HashMap,
-    net::{IpAddr, Ipv4Addr, SocketAddr},
-};
-
-use arrow::array::StringArray;
+use arrow::{array::StringArray, util::pretty::pretty_format_batches};
 use async_openai::types::EmbeddingInput;
 use chrono::{DateTime, Utc};
 use futures::TryStreamExt;
 use rand::Rng;
-use reqwest::Client;
+use reqwest::{header::HeaderMap, Client};
 use runtime::{config::Config, datafusion::query::Protocol, Runtime};
 use secrecy::SecretString;
+use snafu::ResultExt;
 use spicepod::component::{
     dataset::{acceleration::Acceleration, Dataset},
     params::Params,
+};
+use std::sync::Arc;
+use std::{
+    collections::HashMap,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
 };
 
 use serde_json::{json, Value};
@@ -330,6 +331,45 @@ async fn send_chat_completions_request(
         .await?;
 
     Ok(response)
+}
+
+/// Generic function to send a POST request, returning the response as a String.
+async fn http_post(
+    url: &str,
+    body: &str,
+    headers: HeaderMap,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    Client::new()
+        .post(url)
+        .headers(headers)
+        .body(body.to_string())
+        .send()
+        .await
+        .boxed()?
+        .error_for_status()
+        .boxed()?
+        .text()
+        .await
+        .boxed()
+}
+
+/// Returns a human-readable representation of the SQL query result against a [`Runtime`].
+async fn sql_to_display(
+    rt: &Arc<Runtime>,
+    query: &str,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let data = rt
+        .datafusion()
+        .query_builder(query, Protocol::Internal)
+        .build()
+        .run()
+        .await
+        .boxed()?
+        .data
+        .try_collect::<Vec<_>>()
+        .await
+        .boxed()?;
+    pretty_format_batches(&data).map(|d| format!("{d}")).boxed()
 }
 
 /// Retrieves executed tasks from the task history since the given timestamp.

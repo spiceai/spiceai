@@ -1,5 +1,0 @@
----
-source: crates/runtime/tests/models/hf.rs
-expression: "format!(\"{:?}\", response.choices)"
----
-[ChatChoice { index: 0, message: ChatCompletionResponseMessage { content: Some("__placeholder__"), refusal: None, tool_calls: Some([]), role: Assistant, function_call: None }, finish_reason: Some(Stop), logprobs: None }]

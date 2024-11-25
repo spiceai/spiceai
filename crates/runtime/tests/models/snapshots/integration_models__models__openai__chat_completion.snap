@@ -1,6 +1,7 @@
 ---
 source: crates/runtime/tests/models/openai.rs
 expression: "normalize_chat_completion_response(response, false)"
+snapshot_kind: text
 ---
 {
   "choices": [
