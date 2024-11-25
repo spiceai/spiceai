@@ -21,8 +21,9 @@ use async_trait::async_trait;
 use chrono::{offset::LocalResult, SecondsFormat, TimeZone, Utc};
 use commits::CommitsTableArgs;
 use data_components::{
-    github::{GithubFilesTableProvider, GithubRestClient},
+    github::{self, GithubFilesTableProvider, GithubRestClient},
     graphql::{
+        self,
         builder::GraphQLClientBuilder,
         client::{GraphQLClient, GraphQLQuery, PaginationParameters},
         provider::GraphQLTableProviderBuilder,
@@ -156,10 +157,20 @@ impl Github {
             provider_builder
                 .build(table_args.get_graphql_values().query.as_ref())
                 .await
-                .boxed()
-                .context(super::UnableToGetReadProviderSnafu {
-                    dataconnector: "github".to_string(),
-                    connector_component: table_args.get_component(),
+                .map_err(|e| {
+                    if matches!(e, graphql::Error::RateLimited { .. }) {
+                        DataConnectorError::RateLimited {
+                            dataconnector: "github".to_string(),
+                            connector_component: table_args.get_component(),
+                            source: e.into(),
+                        }
+                    } else {
+                        DataConnectorError::UnableToGetReadProvider {
+                            dataconnector: "github".to_string(),
+                            connector_component: table_args.get_component(),
+                            source: e.into(),
+                        }
+                    }
                 })?,
         ))
     }
@@ -215,10 +226,20 @@ impl Github {
                 dataset.is_accelerated(),
             )
             .await
-            .boxed()
-            .context(super::UnableToGetReadProviderSnafu {
-                dataconnector: "github".to_string(),
-                connector_component: ConnectorComponent::from(dataset),
+            .map_err(|e| {
+                if matches!(e, github::Error::RateLimited { .. }) {
+                    DataConnectorError::RateLimited {
+                        dataconnector: "github".to_string(),
+                        connector_component: ConnectorComponent::from(dataset),
+                        source: e.into(),
+                    }
+                } else {
+                    DataConnectorError::UnableToGetReadProvider {
+                        dataconnector: "github".to_string(),
+                        connector_component: ConnectorComponent::from(dataset),
+                        source: e.into(),
+                    }
+                }
             })?,
         ))
     }

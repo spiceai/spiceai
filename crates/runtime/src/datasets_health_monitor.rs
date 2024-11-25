@@ -31,7 +31,7 @@ use tracing_futures::Instrument;
 
 use crate::{
     component::dataset::Dataset,
-    datafusion::{query::Protocol, DataFusion},
+    datafusion::{error::find_datafusion_root, query::Protocol, DataFusion},
     metrics,
 };
 
@@ -153,6 +153,7 @@ impl DatasetsHealthMonitor {
             .ctx
             .table_provider(table_ref)
             .await
+            .map_err(find_datafusion_root)
             .context(UnableToGetTableSnafu)?;
 
         Ok(table)
@@ -180,6 +181,7 @@ AND labels.error_code IS NULL"
             .data
             .try_collect::<Vec<RecordBatch>>()
             .await
+            .map_err(find_datafusion_root)
             .context(UnableToGetRecentlyAccessedDatasetsSnafu)?;
 
         let mut datasets_with_recent_activity_set: HashSet<String> = HashSet::new();
@@ -362,11 +364,17 @@ async fn test_connectivity(
 ) -> std::result::Result<(), DataFusionError> {
     let plan = table_provider
         .scan(&df.ctx.state(), None, &[], Some(1))
-        .await?;
+        .await
+        .map_err(find_datafusion_root)?;
 
-    let stream = plan.execute(0, df.ctx.state().task_ctx())?;
+    let stream = plan
+        .execute(0, df.ctx.state().task_ctx())
+        .map_err(find_datafusion_root)?;
 
-    stream.try_collect::<Vec<RecordBatch>>().await?;
+    stream
+        .try_collect::<Vec<RecordBatch>>()
+        .await
+        .map_err(find_datafusion_root)?;
 
     Ok(())
 }
