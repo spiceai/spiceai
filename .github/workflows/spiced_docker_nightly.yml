@@ -167,6 +167,7 @@ jobs:
         run: |
           ls -l /tmp
           ls -l /tmp/images-amd64
+          ls -l /tmp/images-arm64
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
