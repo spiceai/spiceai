@@ -51,8 +51,8 @@ pub enum Error {
     #[snafu(display("Data sources [{}] does not exist", data_source.iter().map(TableReference::to_quoted_string).join(", ")))]
     DataSourcesNotFound { data_source: Vec<TableReference> },
 
-    #[snafu(display("Failed to retrive table {} data source", data_source.to_quoted_string()))]
-    DataSourceNotFound { data_source: TableReference },
+    #[snafu(display("Failed to find table '{}'. An internal error occurred during vector search.\nPlease report a bug on GitHub: https://github.com/spiceai/spiceai/issues", table.to_quoted_string()))]
+    DataSourceNotFound { table: TableReference },
 
     #[snafu(display("There are no tables with embeddings ready for search"))]
     NoTablesWithEmbeddingsFound {},
@@ -709,9 +709,8 @@ impl VectorSearch {
                 .df
                 .get_table(&t)
                 .await
-                .context(DataSourceNotFoundSnafu {
-                    data_source: t.clone(),
-                })?;
+                // we should not fail here, as we are iterating over the tables that we know exist
+                .context(DataSourceNotFoundSnafu { table: t.clone() })?;
             if get_embedding_table(&table_provider).await.is_some() {
                 tables_with_embeddings.push(t);
             }
