@@ -532,6 +532,7 @@ async fn get_vectors_with_chunker(
     Ok((vectors, content_offsets))
 }
 
+#[allow(clippy::float_cmp)]
 #[cfg(test)]
 mod tests {
 
