@@ -43,7 +43,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Unable to get table: {source}"))]
+    #[snafu(display("Failed to read the table.\n{source}"))]
     UnableToGetTable { source: DataFusionError },
 
     #[snafu(display("{source}"))]
@@ -51,11 +51,13 @@ pub enum Error {
         source: crate::datafusion::query::Error,
     },
 
-    #[snafu(display("Unable to get recently access datasets: {source}"))]
+    #[snafu(display("Failed to get recently access datasets.\n{source}"))]
     UnableToGetRecentlyAccessedDatasets { source: DataFusionError },
 
-    #[snafu(display("Unexpected data type from task_history query result"))]
-    UnexpectedDataType,
+    #[snafu(display("Spice received an unexpected data type from a `task_history` query: {data_type}\nThis is likely a bug in Spice, which can be reported here: https://github.com/spiceai/spiceai/issues"))]
+    UnexpectedDataType {
+        data_type: arrow::datatypes::DataType,
+    },
 }
 
 #[derive(Clone)]
@@ -191,7 +193,11 @@ AND labels.error_code IS NULL"
                 arrow::datatypes::DataType::LargeUtf8 => {
                     column.as_string::<i64>().into_iter().flatten().collect()
                 }
-                _ => return UnexpectedDataTypeSnafu.fail(),
+                dt => {
+                    return Err(Error::UnexpectedDataType {
+                        data_type: dt.clone(),
+                    })
+                }
             };
 
             for dataset in datasets {
@@ -258,10 +264,15 @@ AND labels.error_code IS NULL"
                                 {
                                     Ok(()) => AvailabilityVerificationResult::Available,
                                     Err(err) => {
-                                        tracing::error!(target: "task_history", parent: &span, "{err}");
+                                        let err_message = match err.find_root() {
+                                            DataFusionError::Execution(e) => e.to_string(),
+                                            _ => err.to_string(),
+                                        };
+
+                                        tracing::error!(target: "task_history", parent: &span, "{err_message}");
                                         AvailabilityVerificationResult::Unavailable(
                                         item.last_available_time,
-                                        err.to_string(),
+                                        err_message,
                                     )},
                                 };
 
@@ -303,7 +314,7 @@ async fn update_dataset_availability_info(
             report_dataset_unavailable_time(dataset_name, None);
         }
         AvailabilityVerificationResult::Unavailable(last_available_time, err) => {
-            tracing::warn!("Availability verification for dataset {dataset_name} failed: {err}");
+            tracing::warn!("Failed to verify the dataset {dataset_name} was available.\n{err}\n");
             report_dataset_unavailable_time(dataset_name, Some(last_available_time));
         }
     }

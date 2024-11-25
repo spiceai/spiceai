@@ -192,7 +192,7 @@ pub enum DataConnectorError {
         message: String,
     },
 
-    #[snafu(display("Cannot setup the {connector_component} ({dataconnector}).\nThe connector '{dataconnector}' is not a valid connector.\nFor further information, visit: https://docs.spiceai.org/components/data-connectors"))]
+    #[snafu(display("Cannot setup the {connector_component} ({dataconnector}).\nThe connector '{dataconnector}' is not a valid connector.\nFor details, visit: https://docs.spiceai.org/components/data-connectors"))]
     InvalidConnectorType {
         dataconnector: String,
         connector_component: ConnectorComponent,

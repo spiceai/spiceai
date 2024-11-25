@@ -38,8 +38,8 @@ use llms::chat::LlmRuntime;
 use prost::Message;
 use reqwest::Client;
 use rustyline::error::ReadlineError;
-use rustyline::validate::{ValidationContext, ValidationResult, Validator};
-use rustyline::{Completer, ConditionalEventHandler, Helper, Highlighter, Hinter, KeyEvent};
+use rustyline::history::FileHistory;
+use rustyline::{ConditionalEventHandler, KeyEvent};
 use rustyline::{Editor, EventHandler, Modifiers};
 use serde_json::json;
 use tonic::metadata::errors::InvalidMetadataValue;
@@ -103,23 +103,7 @@ async fn send_nsql_request(
         .await
 }
 
-#[derive(Completer, Helper, Highlighter, Hinter)]
-struct ReplHelper;
-
 const SPECIAL_COMMANDS: [&str; 6] = [".exit", "exit", "quit", "q", ".error", "help"];
-
-impl Validator for ReplHelper {
-    fn validate(&self, ctx: &mut ValidationContext) -> rustyline::Result<ValidationResult> {
-        let input = ctx.input();
-        if SPECIAL_COMMANDS.contains(&input.to_ascii_lowercase().trim())
-            || input.trim().ends_with(';')
-        {
-            Ok(ValidationResult::Valid(None))
-        } else {
-            Ok(ValidationResult::Incomplete)
-        }
-    }
-}
 
 #[derive(Clone)]
 struct KeyEventHandler;
@@ -179,8 +163,7 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
         .max_decoding_message_size(500 * 1024 * 1024)
         .max_encoding_message_size(500 * 1024 * 1024);
 
-    let mut rl = Editor::new()?;
-    let helper = ReplHelper {};
+    let mut rl: Editor<(), FileHistory> = Editor::new()?;
     let key_handler = Box::new(KeyEventHandler {});
     rl.bind_sequence(KeyEvent::ctrl('C'), EventHandler::Conditional(key_handler));
     rl.bind_sequence(KeyEvent::ctrl('D'), rustyline::Cmd::EndOfFile);
@@ -188,30 +171,51 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
         KeyEvent::new('\t', Modifiers::NONE),
         rustyline::Cmd::Insert(1, "\t".to_string()),
     );
-    rl.set_helper(Some(helper));
     println!("Welcome to the Spice.ai SQL REPL! Type 'help' for help.\n");
     println!("show tables; -- list available tables");
 
     let mut last_error: Option<Status> = None;
     let prompt_color = Colour::Fixed(8);
-    let prompt = prompt_color.paint("sql> ").to_string();
 
-    loop {
-        let line_result = rl.readline(&prompt);
-        let line = match line_result {
-            Ok(line) => line,
-            Err(ReadlineError::Interrupted) => {
-                // User canceled the current query
-                continue;
-            }
-            Err(ReadlineError::Eof) => {
+    'outer: loop {
+        let mut first_line = true;
+        let mut prompt = prompt_color.paint("sql> ").to_string();
+        let mut line = String::new();
+        loop {
+            let line_result = rl.readline(&prompt);
+            let newline = match line_result {
+                Ok(line) => line,
+                Err(ReadlineError::Interrupted) => {
+                    // User canceled the current query
+                    continue 'outer;
+                }
+                Err(ReadlineError::Eof) => {
+                    if line.is_empty() {
+                        break 'outer;
+                    }
+
+                    continue 'outer;
+                }
+                Err(err) => {
+                    println!("Error reading line: {err}");
+                    continue 'outer;
+                }
+            };
+
+            line.push_str(format!("{newline}\n").as_str());
+
+            if SPECIAL_COMMANDS.contains(&line.to_ascii_lowercase().trim())
+                || line.trim().ends_with(';')
+            {
+                line = line.trim().to_string();
                 break;
             }
-            Err(err) => {
-                println!("Error reading line: {err}");
-                continue;
+
+            if first_line {
+                prompt = prompt_color.paint("  -> ").to_string();
+                first_line = false;
             }
-        };
+        }
 
         let line = line.trim();
         if line.is_empty() {

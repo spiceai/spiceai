@@ -50,7 +50,7 @@ use tokio::sync::{oneshot, RwLock};
 macro_rules! extract_primary_key {
     ($key_col:expr, $key:expr, $data_schema:expr, $array_type:ty, $data_type_str:expr) => {{
         let key_col = $key_col.as_any().downcast_ref::<$array_type>().context(
-            crate::accelerated_table::ArrayDataTypeMismatchSnafu {
+            crate::accelerated_table::PrimaryKeyArrayDataTypeMismatchSnafu {
                 field_name: $key.to_string(),
                 expected_data_type: $data_type_str.to_string(),
                 schema: Arc::clone(&$data_schema),
@@ -241,7 +241,7 @@ impl RefreshTask {
     ) -> crate::accelerated_table::Result<(String, Expr)> {
         let data_schema = data.schema();
         let (primary_key_idx, field) = data_schema.column_with_name(key).ok_or_else(|| {
-            crate::accelerated_table::ExpectedSchemaToHaveFieldSnafu {
+            crate::accelerated_table::PrimaryKeyExpectedSchemaToHaveFieldSnafu {
                 field_name: key.to_string(),
                 schema: Arc::clone(&data_schema),
             }
