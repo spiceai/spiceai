@@ -6262,6 +6262,7 @@ checksum = "643cb0b8d4fcc284004d5fd0d67ccf61dfffadb7f75e1e71bc420f4688a3a704"
 name = "llms"
 version = "1.0.0-rc.1"
 dependencies = [
+ "anyhow",
  "async-openai",
  "async-stream",
  "async-trait",
@@ -6270,8 +6271,11 @@ dependencies = [
  "hf-hub",
  "indexmap 2.6.0",
  "insta",
+ "jsonpath-rust",
+ "lazy_static",
  "mistralrs",
  "mistralrs-core",
+ "paste",
  "pulldown-cmark",
  "rand 0.8.5",
  "regex",
@@ -6293,6 +6297,8 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-futures",
+ "tracing-opentelemetry",
+ "tracing-subscriber",
 ]
 
 [[package]]

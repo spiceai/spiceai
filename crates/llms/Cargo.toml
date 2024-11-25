@@ -54,6 +54,15 @@ either = "1.13.0"
 indexmap = "2.3.0"
 tempfile = "3.13.0"
 
+[dev-dependencies]
+anyhow = "1.0.86"
+insta.workspace = true
+jsonpath-rust = "0.7.3"
+lazy_static.workspace = true
+paste = "1.0.15"
+tracing-opentelemetry.workspace = true
+tracing-subscriber.workspace = true
+
 [features]
 cuda = [
     "tei_backend/cuda",

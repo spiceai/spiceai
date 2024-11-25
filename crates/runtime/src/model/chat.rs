@@ -156,12 +156,11 @@ pub fn construct_model<S: ::std::hash::BuildHasher>(
                 .with_auth_token(auth_token)
                 .with_base_url(api_base);
 
-            let anthropic =
-                Anthropic::new(cfg, model_id.as_deref(), &component.name).map_err(|_| {
-                    LlmError::FailedToLoadModel {
-                        source: format!("Unknown anthropic model: {:?}", model_id.clone()).into(),
-                    }
-                })?;
+            let anthropic = Anthropic::new(cfg, model_id.as_deref()).map_err(|_| {
+                LlmError::FailedToLoadModel {
+                    source: format!("Unknown anthropic model: {:?}", model_id.clone()).into(),
+                }
+            })?;
 
             Ok(Box::new(anthropic) as Box<dyn Chat>)
         }
