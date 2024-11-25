@@ -17,9 +17,18 @@ limitations under the License.
 package api
 
 type Dataset struct {
-	From                string `json:"from,omitempty" csv:"from" yaml:"from,omitempty"`
-	Name                string `json:"name,omitempty" csv:"name" yaml:"name,omitempty"`
-	ReplicationEnabled  bool   `json:"replication_enabled,omitempty" csv:"replication_enabled" yaml:"replication_enabled,omitempty"`
-	AccelerationEnabled bool   `json:"acceleration_enabled,omitempty" csv:"acceleration_enabled" yaml:"acceleration_enabled,omitempty"`
-	Status              string `json:"status,omitempty" csv:"status,omitempty" yaml:"status,omitempty"`
+	From                string                 `json:"from,omitempty" csv:"from" yaml:"from,omitempty"`
+	Name                string                 `json:"name,omitempty" csv:"name" yaml:"name,omitempty"`
+	ReplicationEnabled  bool                   `json:"replication_enabled,omitempty" csv:"replication_enabled" yaml:"replication_enabled,omitempty"`
+	AccelerationEnabled bool                   `json:"acceleration_enabled,omitempty" csv:"acceleration_enabled" yaml:"acceleration_enabled,omitempty"`
+	Status              string                 `json:"status,omitempty" csv:"status,omitempty" yaml:"status,omitempty"`
+	Properties          map[string]interface{} `json:"properties,omitempty"`
+}
+
+func (ds *Dataset) GetPropertyValue(key string) (interface{}, bool) {
+	if ds.Properties == nil {
+		return nil, false
+	}
+	value, ok := ds.Properties[key]
+	return value, ok
 }

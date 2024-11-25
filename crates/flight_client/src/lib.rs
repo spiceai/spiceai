@@ -34,16 +34,92 @@ use bytes::Bytes;
 use futures::StreamExt;
 use futures::{ready, stream, TryStreamExt};
 use snafu::prelude::*;
+use std::error::Error as StdError;
 use tonic::transport::Channel;
 use tonic::IntoRequest;
 use tonic::IntoStreamingRequest;
 
 pub mod tls;
 
+#[derive(Debug)]
+pub struct TonicStatusError(tonic::Status);
+
+impl From<tonic::Status> for TonicStatusError {
+    fn from(status: tonic::Status) -> Self {
+        TonicStatusError(status)
+    }
+}
+
+impl std::fmt::Display for TonicStatusError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let code = TonicStatusCode::from(self.0.code());
+        let message = TonicStatusMessage::from(self.0.message());
+        let source = self.0.source();
+
+        match (source, message.clone()) {
+            (Some(source), TonicStatusMessage::TransportError) => write!(f, "{message}\n{source}"),
+            (None, TonicStatusMessage::TransportError) => write!(f, "{message}"),
+            (None, TonicStatusMessage::Unmatched(message)) => write!(f, "{code}.\n{message}"),
+            (Some(source), TonicStatusMessage::Unmatched(message)) => {
+                write!(f, "{code}.\n{message}\n{source}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for TonicStatusError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.0.source()
+    }
+}
+
+#[derive(Debug)]
+pub struct TonicStatusCode(tonic::Code);
+
+impl From<tonic::Code> for TonicStatusCode {
+    fn from(code: tonic::Code) -> Self {
+        TonicStatusCode(code)
+    }
+}
+
+impl std::fmt::Display for TonicStatusCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            tonic::Code::Unknown => write!(f, "An unknown error occurred"),
+            tonic::Code::Internal => write!(f, "An internal error occurred"),
+            _ => write!(f, "{}", self.0),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum TonicStatusMessage {
+    TransportError,
+    Unmatched(String),
+}
+
+impl From<&str> for TonicStatusMessage {
+    fn from(message: &str) -> Self {
+        match message {
+            "transport error" => TonicStatusMessage::TransportError,
+            _ => TonicStatusMessage::Unmatched(message.to_string()),
+        }
+    }
+}
+
+impl std::fmt::Display for TonicStatusMessage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TonicStatusMessage::TransportError => write!(f, "A network error occurred. Check the network connection/server configuration, and try again."),
+            TonicStatusMessage::Unmatched(message) => write!(f, "{message}")
+        }
+    }
+}
+
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "Unable to connect to server.\n{source}\nEnsure the flight endpoint is valid and reachable."
+        "Unable to connect to server: TLS error.\n{source}\nEnsure the flight endpoint is valid and reachable."
     ))]
     UnableToConnectToServer { source: tls::Error },
 
@@ -81,7 +157,9 @@ pub enum Error {
     #[snafu(display("Permission denied. Ensure the credentials have the required permissions."))]
     PermissionDenied {},
 
-    #[snafu(display("No endpoints found. Ensure the endpoint is configured"))]
+    #[snafu(display(
+        "No endpoints found. Ensure the endpoint is configured and the server is running."
+    ))]
     NoEndpointsFound,
 }
 
@@ -412,7 +490,7 @@ impl FlightClient {
             Ok(resp) => resp,
             Err(e) => match e.code() {
                 tonic::Code::PermissionDenied => PermissionDeniedSnafu.fail(),
-                _ => return Err(e).context(UnableToPublishSnafu),
+                _ => return Err(TonicStatusError::from(e)).context(UnableToPublishSnafu),
             }?,
         };
 
@@ -444,6 +522,7 @@ impl FlightClient {
             .clone()
             .handshake(req)
             .await
+            .map_err(TonicStatusError::from)
             .context(UnableToPerformHandshakeSnafu)?;
         let mut token: Option<String> = None;
         if let Some(auth) = resp.metadata().get("authorization") {

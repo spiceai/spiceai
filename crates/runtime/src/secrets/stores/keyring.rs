@@ -51,34 +51,44 @@ impl KeyringSecretStore {
 impl SecretStore for KeyringSecretStore {
     #[must_use]
     async fn get_secret(&self, key: &str) -> crate::secrets::AnyErrorResult<Option<SecretString>> {
-        // First try looking for `spice_my_key` and then `my_key`
+        // Try with prefixed key first
         let prefixed_key = format!("{KEYRING_SECRET_PREFIX}{key}");
-        let entry = match Entry::new(&prefixed_key, "spiced") {
-            Ok(entry) => entry,
-            Err(keyring::Error::NoEntry) => match Entry::new(key, "spiced") {
-                Ok(entry) => entry,
-                Err(keyring::Error::NoEntry) => {
-                    return Ok(None);
-                }
-                Err(err) => {
-                    return Err(Box::new(Error::UnableToGetSecret { source: err }));
-                }
-            },
-            Err(err) => {
-                return Err(Box::new(Error::UnableToGetSecret { source: err }));
-            }
-        };
 
-        let secret = match entry.get_password() {
-            Ok(secret) => SecretString::new(secret),
-            Err(keyring::Error::NoEntry) => {
-                return Ok(None);
+        // Try prefixed key
+        match (
+            Entry::new(&prefixed_key, "spiced"),
+            Entry::new(key, "spiced"),
+        ) {
+            (Ok(prefixed_entry), Ok(fallback_entry)) => {
+                // Try getting password with prefixed key first
+                match prefixed_entry.get_password() {
+                    Ok(secret) => return Ok(Some(SecretString::new(secret))),
+                    Err(keyring::Error::NoEntry) => {
+                        // Prefixed key failed, try fallback
+                        match fallback_entry.get_password() {
+                            Ok(secret) => Ok(Some(SecretString::new(secret))),
+                            Err(keyring::Error::NoEntry) => Ok(None),
+                            Err(err) => {
+                                Err(Box::new(Error::UnableToGetSecretValue { source: err }))
+                            }
+                        }
+                    }
+                    Err(err) => Err(Box::new(Error::UnableToGetSecretValue { source: err })),
+                }
             }
-            Err(err) => {
-                return Err(Box::new(Error::UnableToGetSecretValue { source: err }));
+            (Err(keyring::Error::NoEntry), Ok(fallback_entry)) => {
+                // Prefixed entry creation failed, try fallback
+                match fallback_entry.get_password() {
+                    Ok(secret) => Ok(Some(SecretString::new(secret))),
+                    Err(keyring::Error::NoEntry) => Ok(None),
+                    Err(err) => Err(Box::new(Error::UnableToGetSecretValue { source: err })),
+                }
             }
-        };
-
-        Ok(Some(secret))
+            (Err(err), _) if !matches!(err, keyring::Error::NoEntry) => {
+                Err(Box::new(Error::UnableToGetSecret { source: err }))
+            }
+            (_, Err(err)) => Err(Box::new(Error::UnableToGetSecret { source: err })),
+            _ => Ok(None),
+        }
     }
 }

@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::token_provider::TokenProvider;
+use crate::{rate_limit::RateLimiter, token_provider::TokenProvider};
 
 use super::{ArrowInternalSnafu, Error, ErrorChecker, ReqwestInternalSnafu, Result};
 use arrow::{
@@ -607,6 +607,7 @@ pub struct GraphQLClient {
     unnest_parameters: UnnestParameters,
     auth: Option<Auth>,
     schema: Option<SchemaRef>,
+    rate_limiter: Option<Arc<dyn RateLimiter>>,
 }
 
 #[derive(Clone)]
@@ -677,6 +678,7 @@ impl GraphQLClient {
         pass: Option<String>,
         unnest_depth: usize,
         schema: Option<SchemaRef>,
+        rate_limiter: Option<Arc<dyn RateLimiter>>,
     ) -> Result<Self> {
         let auth = match (token, user, pass) {
             (None, Some(user), pass) => Some(Auth::Basic(user, pass)),
@@ -698,6 +700,7 @@ impl GraphQLClient {
             unnest_parameters,
             auth,
             schema,
+            rate_limiter,
         })
     }
 
@@ -709,6 +712,16 @@ impl GraphQLClient {
         cursor: Option<String>,
         error_checker: Option<ErrorChecker>,
     ) -> Result<GraphQLQueryResult> {
+        // Check rate limit before executing the query
+        if let Some(rate_limiter) = &self.rate_limiter {
+            rate_limiter
+                .check_rate_limit()
+                .await
+                .map_err(|e| Error::RateLimited {
+                    message: format!("{e}"),
+                })?;
+        }
+
         let query_string = query.to_string(limit, cursor);
 
         let body = format!(r#"{{"query": {}}}"#, json!(query_string));
@@ -718,6 +731,11 @@ impl GraphQLClient {
 
         let response = request.send().await.context(ReqwestInternalSnafu)?;
         let response_headers = response.headers().clone();
+
+        // Update rate limiter with response headers
+        if let Some(rate_limiter) = &self.rate_limiter {
+            rate_limiter.update_from_headers(&response_headers).await;
+        }
 
         let status = response.status();
         let response: serde_json::Value = response.json().await.context(ReqwestInternalSnafu)?;

@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::dataconnector::ConnectorComponent;
+use crate::{dataconnector::ConnectorComponent, datafusion::error::find_datafusion_root};
 
 use super::{
     commits_inject_parameters, filter_pushdown, inject_parameters, GitHubTableArgs,
@@ -50,6 +50,7 @@ impl GraphQLContext for CommitsTableArgs {
         query: &mut GraphQLQuery<'_>,
     ) -> Result<(), datafusion::error::DataFusionError> {
         inject_parameters("history", commits_inject_parameters, filters, query)
+            .map_err(find_datafusion_root)
     }
 
     fn error_checker(&self) -> Option<ErrorChecker> {

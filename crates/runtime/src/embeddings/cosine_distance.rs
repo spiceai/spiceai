@@ -21,7 +21,9 @@ use std::sync::Arc;
 macro_rules! downcast_arg {
     ($ARG:expr, $ARRAY_TYPE:ident) => {{
         $ARG.as_any().downcast_ref::<$ARRAY_TYPE>().ok_or_else(|| {
-            DataFusionError::Internal(format!("could not cast to {}", type_name::<$ARRAY_TYPE>()))
+            DataFusionError::External(
+                format!("could not cast to {}", type_name::<$ARRAY_TYPE>()).into(),
+            )
         })?
     }};
 }

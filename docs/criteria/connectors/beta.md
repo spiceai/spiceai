@@ -79,6 +79,10 @@ Documentation criteria should be re-checked on every release, to ensure the docu
 - [ ] The connector has an easy to follow quickstart.
 - [ ] The connector status is updated in the table of connectors in [spiceai/docs](https://github.com/spiceai/docs).
 
+#### UX
+
+- [ ] All of the connector's error messages follow the [error handling guidelines](../../dev/error_handling.md)
+
 #### Testing
 
 - [ ] Integration tests to cover simple use cases based on the connector type, e.g. a Spicepod sourcing a file from an FTP server, reading latest GitHub issues, etc.

@@ -50,7 +50,7 @@ arrow-schema = "53"
 async-openai = { git = "https://github.com/spiceai/async-openai", rev = "c01795447374ab8608682955a2fe91216bfd9db6" }
 async-stream = "0.3.5"
 async-trait = "0.1.83"
-axum = { version = "0.7.7", features = ["macros"] }
+axum = { version = "0.7.9", features = ["macros"] }
 base64 = "0.22.1"
 bb8 = "0.8"
 bb8-postgres = "0.8"

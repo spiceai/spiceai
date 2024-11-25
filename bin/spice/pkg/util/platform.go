@@ -16,8 +16,70 @@ limitations under the License.
 
 package util
 
-import "runtime"
+import (
+	"fmt"
+	"runtime"
+	"strings"
+
+	"github.com/spiceai/spiceai/bin/spice/pkg/version"
+)
 
 func IsWindows() bool {
 	return runtime.GOOS == "windows"
+}
+
+func GetSpiceUserAgent(client string) string {
+	// get OS type, release and machine type
+	// get Go version for SDK version
+
+	if client == "" {
+		client = "spice"
+	}
+
+	osType := runtime.GOOS
+	switch osType {
+	case "darwin":
+		osType = "Darwin"
+	case "linux":
+		osType = "Linux"
+	case "windows":
+		osType = "Windows"
+	case "freebsd":
+		osType = "FreeBSD"
+	case "openbsd":
+		osType = "OpenBSD"
+	case "android":
+		osType = "Android"
+	case "ios":
+		osType = "iOS"
+	}
+
+	osMachine := runtime.GOARCH
+	switch osMachine {
+	case "amd64":
+		osMachine = "x86_64"
+	case "386":
+		osMachine = "i386"
+	case "arm64":
+		osMachine = "aarch64"
+	}
+
+	osVersion := GetOSRelease()
+
+	userAgent := fmt.Sprintf("%s/%s (%s/%s %s)", client, version.Version(), osType, osVersion, osMachine)
+
+	// strip any non-printable ASCII characters
+	return RemoveNonPrintableASCII(userAgent)
+}
+
+func RemoveNonPrintableASCII(str string) string {
+	var builder strings.Builder
+
+	for _, ch := range str {
+		if ch >= 32 && ch <= 126 { // printable ASCII characters range from 32 to 126
+			builder.WriteRune(ch)
+		}
+	}
+
+	return builder.String()
 }

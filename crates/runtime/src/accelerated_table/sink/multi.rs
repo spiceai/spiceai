@@ -38,6 +38,7 @@ use util::RetryError;
 
 use crate::{
     accelerated_table::{refresh_task::retry_from_df_error, synchronized_table::SynchronizedTable},
+    datafusion::error::find_datafusion_root,
     dataupdate::StreamingDataUpdateExecutionPlan,
 };
 
@@ -80,7 +81,7 @@ impl MultiSink {
             .await
             .map_err(|e| {
                 RetryError::permanent(crate::accelerated_table::Error::FailedToWriteData {
-                    source: e,
+                    source: find_datafusion_root(e),
                 })
             })?;
 

@@ -1,5 +1,0 @@
----
-source: crates/runtime/tests/models/openai.rs
-expression: sample_data_task.1
----
-DistinctColumns({"dataset":"spice.public.taxi_trips","limit":3,"cols":null})

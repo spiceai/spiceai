@@ -60,6 +60,7 @@ pub mod sqlite;
 pub mod unity_catalog;
 
 pub mod github;
+pub mod rate_limit;
 
 pub mod cdc;
 pub mod delete;
