@@ -57,18 +57,18 @@ static TEST_CASES: LazyLock<Vec<TestCase>> = LazyLock::new(|| {
                 "messages": [
                     {
                         "role": "user",
-                        "content": "Say Hi"
+                        "content": "Say Hello"
                     }
                 ]
             }),
             vec![
                 (
                     "message_keys",
-                    "$.choices[*].message['role', 'tool_calls', 'refusal', 'function_calls']"
+                    "$.choices[*].message['role', 'tool_calls', 'refusal']"
                 ),
                 (
                     "replied_appropriately",
-                    "$.choices[*].message[?(@.content ~= 'Hi')].length()"
+                    "$.choices[*].message[?(@.content ~= 'Hello')].length()"
                 )
             ]
         ),
@@ -114,7 +114,7 @@ static TEST_CASES: LazyLock<Vec<TestCase>> = LazyLock::new(|| {
                     "type": "function",
                     "function": {
                       "name": "get_current_weather",
-                      "description": "Get the current weather in a given location",
+                      "description": "Get the current weather in a given location, in Celsius",
                       "parameters": {
                         "type": "object",
                         "properties": {
@@ -151,10 +151,13 @@ static TEST_CASES: LazyLock<Vec<TestCase>> = LazyLock::new(|| {
 /// Model instantiations to test.
 #[allow(clippy::expect_used)]
 static TEST_MODELS: LazyLock<Vec<(&'static str, Arc<dyn Chat>)>> = LazyLock::new(|| {
-    vec![(
-        "anthropic",
-        create::create_anthropic(None).expect("failed to create anthropic model"),
-    )]
+    vec![
+        (
+            "anthropic",
+            create::create_anthropic(None).expect("failed to create anthropic model"),
+        ),
+        ("openai", create::create_openai("gpt-4o")),
+    ]
 });
 
 /// A mapping of model names (in [`TEST_MODELS`]) and test names (in [`TEST_CASES`]) to skip.
@@ -176,6 +179,7 @@ async fn run_test_case(
         .await
         .expect(format!("For test {test_name}/{model_name}, chat_request failed").as_str());
 
+    tracing::trace!("Response for {test_name}/{model_name}: {actual_resp:?}");
     // Convert to [`serde_json::Value`] for JSONPath testing.
     let resp_value = serde_json::to_value(&actual_resp).expect(
         format!("For test {test_name}/{model_name}, failed to serialize response to JSON").as_str(),
@@ -195,6 +199,9 @@ async fn run_test_case(
 #[tokio::test]
 #[allow(clippy::expect_used, clippy::expect_fun_call)]
 async fn run_all_tests() {
+    // Set ENV variables before we lazy load `TEST_MODELS`.
+    let _ = dotenvy::from_filename(".env").expect("failed to load .env file");
+
     for ts in TEST_CASES.iter() {
         for (model_name, model) in TEST_MODELS.iter() {
             if crate::llms::TEST_DENY_LIST

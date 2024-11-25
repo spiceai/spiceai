@@ -20,7 +20,13 @@ use async_openai::error::OpenAIError;
 use llms::{
     anthropic::{Anthropic, AnthropicConfig},
     chat::Chat,
+    openai::Openai,
 };
+
+pub(crate) fn create_openai(model_id: &str) -> Arc<dyn Chat> {
+    let api_key = std::env::var("SPICE_OPENAI_API_KEY").ok();
+    Arc::new(Openai::new(model_id.to_string(), None, api_key, None, None))
+}
 
 pub(crate) fn create_anthropic(model_id: Option<&str>) -> Result<Arc<dyn Chat>, OpenAIError> {
     let cfg = AnthropicConfig::default()

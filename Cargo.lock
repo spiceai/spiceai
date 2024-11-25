@@ -6266,6 +6266,7 @@ dependencies = [
  "async-openai",
  "async-stream",
  "async-trait",
+ "dotenvy",
  "either",
  "futures",
  "hf-hub",

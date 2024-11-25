@@ -56,6 +56,7 @@ tempfile = "3.13.0"
 
 [dev-dependencies]
 anyhow = "1.0.86"
+dotenvy.workspace = true
 insta.workspace = true
 jsonpath-rust = "0.7.3"
 lazy_static.workspace = true
