@@ -192,7 +192,7 @@ jobs:
         run: |
           echo "REL_VERSION=${REL_VERSION}"
           echo "PUBLISH=${PUBLISH}"
-          variants=("default" "odbc" "models")
+          variants=("models") # we might need to include other variants in future
           for variant in "${variants[@]}"; do
             suffix=""
             if [ "$variant" != "default" ]; then
