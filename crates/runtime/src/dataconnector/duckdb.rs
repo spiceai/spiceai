@@ -38,7 +38,7 @@ use super::{
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Unable to create DuckDB connection pool: {source}"))]
+    #[snafu(display("Unable to create DuckDB connection pool.\n{source}"))]
     UnableToCreateDuckDBConnectionPool { source: DbConnectionPoolError },
 
     #[snafu(display(
