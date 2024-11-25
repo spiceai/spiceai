@@ -122,10 +122,8 @@ impl GitHubRateLimiter {
 #[async_trait]
 impl RateLimiter for GitHubRateLimiter {
     async fn update_from_headers(&self, headers: &HeaderMap) {
-        tracing::debug!("GitHub rate limit headers: {:?}", headers);
         if let Some(rate_limit) = RateLimitInfo::from_headers(headers) {
             let mut api_limit = self.api_limit.write().await;
-            tracing::debug!("GitHub rate limit: {:?}", rate_limit);
             *api_limit = Some(rate_limit);
         }
     }
@@ -134,10 +132,8 @@ impl RateLimiter for GitHubRateLimiter {
         // Check if we're rate limited based on the previous API response headers
         let api_limit_guard = self.api_limit.read().await;
         if let Some(api_limit) = &*api_limit_guard {
-            tracing::debug!("GitHub rate limit: {:?}", api_limit);
             match api_limit {
                 RateLimitInfo::Secondary(secondary) => {
-                    tracing::debug!("GitHub rate limit retry-after: {}", secondary.retry_after);
                     let now = Utc::now();
                     let wait_duration = (secondary.retry_after - now)
                         .to_std()
@@ -154,10 +150,8 @@ impl RateLimiter for GitHubRateLimiter {
                 RateLimitInfo::Primary(primary) => {
                     // GitHub GraphQL requests consume more than 1 rate-limit unit, so add some buffer to ensure the proper handling
                     if primary.remaining <= 5 {
-                        tracing::debug!("GitHub rate limit exceeded");
                         let now = Utc::now();
                         if now < primary.reset_time {
-                            tracing::debug!("GitHub rate limit reset time: {}", primary.reset_time);
                             let wait_duration = (primary.reset_time - now)
                                 .to_std()
                                 .unwrap_or(Duration::from_secs(1));
