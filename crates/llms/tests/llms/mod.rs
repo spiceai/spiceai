@@ -156,7 +156,7 @@ static TEST_MODELS: LazyLock<Vec<(&'static str, Arc<dyn Chat>)>> = LazyLock::new
             "anthropic",
             create::create_anthropic(None).expect("failed to create anthropic model"),
         ),
-        ("openai", create::create_openai("gpt-4o")),
+        ("openai", create::create_openai("gpt-4o-mini")),
     ]
 });
 
