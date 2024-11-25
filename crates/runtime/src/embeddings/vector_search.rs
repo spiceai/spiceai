@@ -548,11 +548,14 @@ impl VectorSearch {
             )
         } else {
             format!(
-                "SELECT
-                    {projection_str},
-                    cosine_distance({embedding_column}_embedding, {embedding:?}) as {VECTOR_DISTANCE_COLUMN_NAME}
-                FROM {tbl}
-                {where_str}
+                "SELECT * FROM (
+                    SELECT
+                        {projection_str},
+                        cosine_distance({embedding_column}_embedding, {embedding:?}) as {VECTOR_DISTANCE_COLUMN_NAME}
+                    FROM {tbl}
+                    {where_str}
+                ) subq
+                WHERE {VECTOR_DISTANCE_COLUMN_NAME} IS NOT NULL
                 ORDER BY {VECTOR_DISTANCE_COLUMN_NAME} ASC
                 LIMIT {n}", projection_str=projection.iter().join(", ")
             )
