@@ -123,7 +123,7 @@ impl ListingTableConnector for SFTP {
                 .boxed()
                 .context(super::InvalidConfigurationSnafu {
                     dataconnector: format!("{self}"),
-                    message: format!("The specified URL is not valid: {}.\nEnsure the URL is valid and try again.\nFor further information, visit: https://docs.spiceai.org/components/data-connectors/ftp", dataset.from),
+                    message: format!("The specified URL is not valid: {}.\nEnsure the URL is valid and try again.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/ftp", dataset.from),
                     connector_component: ConnectorComponent::from(dataset)
                 })?;
 

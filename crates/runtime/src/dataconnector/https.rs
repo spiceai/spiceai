@@ -110,7 +110,7 @@ impl ListingTableConnector for Https {
         let mut u = Url::parse(&dataset.from).boxed().map_err(|e| {
             DataConnectorError::InvalidConfiguration {
                 dataconnector: "https".to_string(),
-                message: "The specified URL in the dataset 'from' is not valid. Ensure the URL is valid and try again.\nFor further information, visit: https://docs.spiceai.org/components/data-connectors/https".to_string(),
+                message: "The specified URL in the dataset 'from' is not valid. Ensure the URL is valid and try again.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/https".to_string(),
                 connector_component: ConnectorComponent::from(dataset),
                 source: e,
             }
@@ -122,7 +122,7 @@ impl ListingTableConnector for Https {
                 Err(e) => {
                     return Err(DataConnectorError::InvalidConfiguration {
                         dataconnector: "https".to_string(),
-                        message: "The specified `https_port` parameter was invalid. Specify a valid port number and try again.\nFor further information, visit: https://docs.spiceai.org/components/data-connectors/https#parameters".to_string(),
+                        message: "The specified `https_port` parameter was invalid. Specify a valid port number and try again.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/https#parameters".to_string(),
                         connector_component: ConnectorComponent::from(dataset),
                         source: Box::new(e),
                     });

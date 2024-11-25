@@ -29,6 +29,8 @@ use datafusion::physical_plan::{
 use futures::{StreamExt, TryStreamExt};
 use tokio::sync::Mutex;
 
+use crate::datafusion::error::find_datafusion_root;
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum UpdateType {
     Append,
@@ -68,7 +70,11 @@ impl StreamingDataUpdate {
     }
 
     pub async fn collect_data(self) -> Result<DataUpdate, DataFusionError> {
-        let data = self.data.try_collect::<Vec<_>>().await?;
+        let data = self
+            .data
+            .try_collect::<Vec<_>>()
+            .await
+            .map_err(find_datafusion_root)?;
         Ok(DataUpdate {
             schema: self.schema,
             data,
@@ -82,11 +88,10 @@ impl TryFrom<DataUpdate> for StreamingDataUpdate {
 
     fn try_from(data_update: DataUpdate) -> std::result::Result<Self, Self::Error> {
         let schema = Arc::clone(&data_update.schema);
-        let data = Box::pin(MemoryStream::try_new(
-            data_update.data,
-            data_update.schema,
-            None,
-        )?) as SendableRecordBatchStream;
+        let data = Box::pin(
+            MemoryStream::try_new(data_update.data, data_update.schema, None)
+                .map_err(find_datafusion_root)?,
+        ) as SendableRecordBatchStream;
         Ok(Self {
             schema,
             data,
