@@ -5,6 +5,11 @@ on:
   #   - cron: "0 2 * * *" # Runs the workflow at 2:00 AM UTC every day
 
   workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish the Docker images to the registry
+        required: false
+        default: "false"
 
 jobs:
   check_commits:
@@ -37,8 +42,29 @@ jobs:
           echo "has_new_commits=true" >> $GITHUB_OUTPUT
         shell: bash
 
-  build-arm64:
+  setup:
     needs: check_commits
+    if: needs.check_commits.outputs.has_new_commits == 'true'
+
+    runs-on: ubuntu-latest
+    outputs:
+      rel_version: ${{ steps.set_version.outputs.rel_version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set Nightly REL_VERSION from current timestamp
+        run: python3 ./.github/scripts/get_release_version.py
+
+      - name: Add REL_VERSION to output
+        id: set_version
+        run: |
+          commit_hash=$(git rev-parse --short HEAD)
+          version="nightly-$(date +%Y%m%d)-${commit_hash}"
+          echo "rel_version=${version}" >> $GITHUB_OUTPUT
+          echo "Preparing to publish nightly build with version: `${version}`"
+
+  build-arm64:
+    needs: [check_commits, setup]
     if: needs.check_commits.outputs.has_new_commits == 'true'
 
     runs-on: hosted-linux-arm-runner-16-cores
@@ -81,7 +107,7 @@ jobs:
           cache-from: type=gha,scope=build-arm64
           cache-to: type=gha,scope=build-arm64,mode=max
           build-args: |
-            REL_VERSION=nightly
+            REL_VERSION=${{ needs.setup.outputs.rel_version }}
             CARGO_FEATURES=release,models
 
       - name: Upload ARM64 artifacts
@@ -91,7 +117,7 @@ jobs:
           path: /tmp/image-arm64-*.tar
 
   build-amd64:
-    needs: check_commits
+    needs: [check_commits, setup]
     if: needs.check_commits.outputs.has_new_commits == 'true'
 
     runs-on: spiceai-runners
@@ -115,7 +141,7 @@ jobs:
           cache-from: type=gha,scope=build-amd64
           cache-to: type=gha,scope=build-amd64,mode=max
           build-args: |
-            REL_VERSION=nightly
+            REL_VERSION=${{ needs.setup.outputs.rel_version }}
             CARGO_FEATURES=release,models
 
       - name: Upload AMD64 artifacts
@@ -124,77 +150,85 @@ jobs:
           name: images-amd64
           path: /tmp/image-amd64-*.tar
 
-  # publish:
-  #   needs: [check_commits, build-amd64]
-  #   if: needs.check_commits.outputs.has_new_commits == 'true'
+  publish:
+    needs: [check_commits, setup, build-amd64, build-arm64]
+    if: needs.check_commits.outputs.has_new_commits == 'true' && (github.event_name == 'schedule' || inputs.publish == 'true')
 
-  #   runs-on: ubuntu-latest
-  #   steps:
-  #     - name: Download all artifacts
-  #       uses: actions/download-artifact@v4
-  #       with:
-  #         path: /tmp
-  #         pattern: images-*
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp
+          pattern: images-*
 
-  #     - name: Verify artifacts
-  #       run: |
-  #         ls -l /tmp
-  #         ls -l /tmp/images-amd64
+      - name: Verify artifacts
+        run: |
+          ls -l /tmp
+          ls -l /tmp/images-amd64
 
-  #     - name: Set up Docker Buildx
-  #       uses: docker/setup-buildx-action@v3
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
-  #     - name: Start local registry
-  #       run: |
-  #         docker run -d -p 5000:5000 --restart=always --name registry registry:2
+      - name: Start local registry
+        run: |
+          docker run -d -p 5000:5000 --restart=always --name registry registry:2
 
-  #     - name: Login to GitHub Package Registry
-  #       if: startsWith(github.ref, 'refs/tags/v') || inputs.publish == 'true'
-  #       uses: docker/login-action@v3
-  #       with:
-  #         registry: ghcr.io
-  #         username: ${{ github.repository_owner }}
-  #         password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Login to GitHub Package Registry
+        if: github.event_name == 'schedule' || inputs.publish == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-  #     - name: Import images and create manifests
-  #       env:
-  #         REL_VERSION: nightly
-  #         PUBLISH: ${{ startsWith(github.ref, 'refs/tags/v') || inputs.publish == 'true' }}
-  #       run: |
-  #         echo "REL_VERSION=${REL_VERSION}"
-  #         echo "PUBLISH=${PUBLISH}"
-  #         variants=("default" "odbc" "models")
-  #         for variant in "${variants[@]}"; do
-  #           suffix=""
-  #           if [ "$variant" != "default" ]; then
-  #             suffix="-${variant}"
-  #           fi
+      - name: Import images and create manifests
+        env:
+          REL_VERSION: ${{ needs.setup.outputs.rel_version }}
+          PUBLISH: ${{ github.event_name == 'schedule' || inputs.publish == 'true' }}
+        run: |
+          echo "REL_VERSION=${REL_VERSION}"
+          echo "PUBLISH=${PUBLISH}"
+          variants=("default" "odbc" "models")
+          for variant in "${variants[@]}"; do
+            suffix=""
+            if [ "$variant" != "default" ]; then
+              suffix="-${variant}"
+            fi
 
-  #           # Load both architecture images
-  #           echo "Loading AMD64 image"
-  #           docker load -i /tmp/images-amd64/image-amd64-${variant}.tar
+            # Load both architecture images
+            echo "Loading AMD64 image"
+            docker load -i /tmp/images-amd64/image-amd64-${variant}.tar
 
-  #           # Push images to local registry
-  #           echo "Pushing images to local registry"
-  #           docker push localhost:5000/spiceai:${variant}-amd64
+            # Push images to local registry
+            echo "Pushing images to local registry"
+            docker push localhost:5000/spiceai:${variant}-amd64
 
-  #           if [[ "${PUBLISH}" == "true" ]]; then
-  #             # Push to GitHub Container Registry
-  #             echo "Pushing to GHCR"
-  #             docker buildx imagetools create \
-  #               -t ghcr.io/spiceai/spiceai:${REL_VERSION}${suffix} \
-  #               -t ghcr.io/spiceai/spiceai:latest${suffix} \
-  #               localhost:5000/spiceai:${variant}-amd64
+            if [[ "${PUBLISH}" == "true" ]]; then
+              # Push to GitHub Container Registry
+              echo "Pushing to GHCR"
+              docker buildx imagetools create \
+                -t ghcr.io/spiceai/spiceai-nightly:${REL_VERSION}${suffix} \
+                -t ghcr.io/spiceai/spiceai-nightly:latest${suffix} \
+                localhost:5000/spiceai:${variant}-amd64
 
-  #             echo "Verifying GHCR image:"
-  #             docker buildx imagetools inspect ghcr.io/spiceai/spiceai:${REL_VERSION}${suffix}
-  #           else
-  #             echo "Skipping push for non-tag build"
-  #             echo "Creating local manifest for testing:"
-  #             docker buildx imagetools create \
-  #               -t localhost:5000/spiceai:latest${suffix} \
-  #               localhost:5000/spiceai:${variant}-amd64
+              echo "Verifying GHCR image:"
+              docker buildx imagetools inspect ghcr.io/spiceai/spiceai-nightly:${REL_VERSION}${suffix}
+            else
+              echo "Skipping push for non-tag build"
+              echo "Creating local manifest for testing:"
+              docker buildx imagetools create \
+                -t localhost:5000/spiceai:latest${suffix} \
+                localhost:5000/spiceai:${variant}-amd64
 
-  #             docker buildx imagetools inspect localhost:5000/spiceai:latest${suffix}
-  #           fi
-  #         done
+              docker buildx imagetools inspect localhost:5000/spiceai:latest${suffix}
+            fi
+          done
+
+      - name: Update nightly tag
+        if: github.event_name == 'schedule' || inputs.publish == 'true'
+        run: |
+          git tag -f nightly
+          git push origin nightly --force
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
