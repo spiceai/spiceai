@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use super::Error;
 use async_trait::async_trait;
 use reqwest::header::HeaderMap;
 use std::fmt::Debug;
@@ -22,5 +23,5 @@ use std::fmt::Debug;
 pub trait RateLimiter: Debug + Send + Sync {
     async fn update_from_headers(&self, headers: &HeaderMap);
 
-    async fn check_rate_limit(&self) -> Result<(), String>;
+    async fn check_rate_limit(&self) -> Result<(), Error>;
 }

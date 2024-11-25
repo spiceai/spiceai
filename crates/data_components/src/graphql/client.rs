@@ -34,7 +34,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use snafu::ResultExt;
 use std::{cmp::min, fmt::Display, io::Cursor, sync::Arc};
-use tokio::sync::RwLock;
 
 use url::Url;
 
@@ -715,6 +714,11 @@ impl GraphQLClient {
         cursor: Option<String>,
         error_checker: Option<ErrorChecker>,
     ) -> Result<GraphQLQueryResult> {
+        // Check rate limit before executing the query
+        if let Some(rate_limiter) = &self.rate_limiter {
+            rate_limiter.check_rate_limit().await?;
+        }
+
         let query_string = query.to_string(limit, cursor);
 
         let body = format!(r#"{{"query": {}}}"#, json!(query_string));
@@ -804,11 +808,6 @@ impl GraphQLClient {
         limit: Option<usize>,
         error_checker: Option<ErrorChecker>,
     ) -> Result<Vec<Vec<RecordBatch>>> {
-        // Check rate limit before starting pagination
-        if let Some(rate_limiter) = &self.rate_limiter {
-            rate_limiter.check_rate_limit().await?;
-        }
-
         let mut result = self
             .execute(
                 query,
@@ -826,11 +825,6 @@ impl GraphQLClient {
         }
 
         while let Some(next_cursor_val) = result.cursor {
-            // Check rate limit before each page request
-            if let Some(rate_limiter) = &self.rate_limiter {
-                rate_limiter.check_rate_limit().await?;
-            }
-
             if let Some(p) = query.pagination_parameters.as_ref() {
                 if limit.is_some() {
                     limit = Some(p.reduce_limit(result.record_count));

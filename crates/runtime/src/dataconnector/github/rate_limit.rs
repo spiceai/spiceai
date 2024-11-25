@@ -1,16 +1,12 @@
-use chrono::{DateTime, TimeZone, Utc};
+use chrono::{DateTime, MappedLocalTime, TimeZone, Utc};
 use reqwest::header::HeaderMap;
-use std::{
-    sync::Arc,
-    time::{Duration, SystemTime},
-};
+use std::{sync::Arc, time::Duration};
 use tokio::sync::RwLock;
 
 #[derive(Debug)]
 pub struct RateLimiter {
     // Track API response headers rate limits
     api_limit: Arc<RwLock<Option<RateLimitInfo>>>,
-    start_time: SystemTime,
 }
 
 #[derive(Debug, Clone)]
@@ -55,7 +51,10 @@ impl RateLimitInfo {
             .ok()?
             .to_string();
 
-        let reset_time = Utc.timestamp_opt(reset, 0).unwrap();
+        let reset_time = match Utc.timestamp_opt(reset, 0) {
+            MappedLocalTime::Single(t) => t,
+            _ => unreachable!("timestamp_opt should never fail for Utc"),
+        };
 
         Some(Self {
             limit,
@@ -71,7 +70,6 @@ impl RateLimiter {
     pub fn new() -> Self {
         Self {
             api_limit: Arc::new(RwLock::new(None)),
-            start_time: SystemTime::now(),
         }
     }
 
@@ -83,38 +81,20 @@ impl RateLimiter {
     }
 
     pub async fn check_rate_limit(&self) -> Result<(), String> {
-        // First check our internal hourly limit
-        if let Ok(elapsed) = self.start_time.elapsed() {
-            if elapsed >= Duration::from_secs(3600) {
-                // Reset counter if an hour has passed
-                self.requests_made = 0;
-                self.start_time = SystemTime::now();
-            } else if self.requests_made >= GITHUB_MAX_REQUESTS_PER_HOUR {
-                // Calculate time to wait until the hour is up
-                let wait_time = Duration::from_secs(3600) - elapsed;
-                warn!(
-                    "Internal rate limit reached ({}/{}). Waiting for {} seconds.",
-                    self.requests_made,
-                    GITHUB_MAX_REQUESTS_PER_HOUR,
-                    wait_time.as_secs()
-                );
-                tokio::time::sleep(wait_time).await;
-                self.requests_made = 0;
-                self.start_time = SystemTime::now();
-            }
-        }
-
-        // Then check GitHub's rate limit from API responses
-        if let Some(api_limit) = self.api_limit.read().await.clone() {
+        // Check if we're rate limited based on the previous API response headers
+        let api_limit_guard = self.api_limit.read().await;
+        if let Some(api_limit) = &*api_limit_guard {
             if api_limit.remaining <= 0 {
                 let now = Utc::now();
                 if now < api_limit.reset_time {
                     let wait_duration = (api_limit.reset_time - now)
                         .to_std()
                         .unwrap_or(Duration::from_secs(1));
-                    warn!(
-                        "GitHub API rate limit exceeded. Waiting for {} seconds until {}. Limit: {}, Used: {}, Resource: {}",
-                        wait_duration.as_secs(),
+                    let wait_duration_secs = wait_duration.as_secs();
+                    tracing::warn!(
+                        "GitHub API rate limit exceeded. Waiting for {} second{} until {}. Limit: {}, Used: {}, Resource: {}",
+                        wait_duration_secs,
+                        if wait_duration_secs == 1 { "" } else { "s" },
                         api_limit.reset_time,
                         api_limit.limit,
                         api_limit.used,
@@ -123,14 +103,16 @@ impl RateLimiter {
                     tokio::time::sleep(wait_duration).await;
                 }
             } else {
-                debug!(
+                tracing::debug!(
                     "GitHub API rate limit status: {}/{} remaining. Reset at {}. Resource: {}",
-                    api_limit.remaining, api_limit.limit, api_limit.reset_time, api_limit.resource
+                    api_limit.remaining,
+                    api_limit.limit,
+                    api_limit.reset_time,
+                    api_limit.resource
                 );
             }
         }
 
-        self.requests_made += 1;
         Ok(())
     }
 }
