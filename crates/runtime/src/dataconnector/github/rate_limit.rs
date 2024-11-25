@@ -99,9 +99,7 @@ impl RateLimitInfo {
             .ok()?
             .to_string();
 
-        let MappedLocalTime::Single(reset_time) = Utc.timestamp_opt(reset, 0) else {
-            unreachable!("timestamp_opt should never fail for Utc")
-        };
+        let reset_time = Utc.timestamp_opt(reset, 0).single()?;
 
         Some(PrimaryRateLimitInfo {
             limit,
@@ -216,20 +214,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_rate_limiter_api_limits() {
-        tokio::time::pause();
         let rate_limiter = GitHubRateLimiter::new();
+
+        let wait_duration = Duration::seconds(2);
+        let reset_time = Utc::now() + wait_duration;
 
         // Set up API headers indicating rate limit exceeded
         let headers = create_test_headers(HashMap::from([
             ("x-ratelimit-limit", s("5000")),
             ("x-ratelimit-remaining", s("0")),
             ("x-ratelimit-used", s("5000")),
-            (
-                "x-ratelimit-reset",
-                (Utc::now() + Duration::milliseconds(200))
-                    .timestamp()
-                    .to_string(),
-            ),
+            ("x-ratelimit-reset", reset_time.timestamp().to_string()),
             ("x-ratelimit-resource", s("graphql")),
         ]));
 
@@ -242,8 +237,11 @@ mod tests {
             .expect("rate limit check failed");
         let elapsed = start.elapsed();
 
-        // Should have waited at least until reset time
-        assert!(elapsed.as_millis() >= 100);
+        assert!(
+            elapsed.as_millis() >= 1000,
+            "Expected to wait at least 1000ms, but only waited {}ms",
+            elapsed.as_millis()
+        );
     }
 
     #[tokio::test]
@@ -273,5 +271,102 @@ mod tests {
         let elapsed = start.elapsed();
 
         assert!(elapsed.as_millis() < 100);
+    }
+
+    #[tokio::test]
+    async fn test_secondary_rate_limit() {
+        let rate_limiter = GitHubRateLimiter::new();
+
+        // Set up headers indicating secondary rate limit
+        let headers = create_test_headers(HashMap::from([
+            ("retry-after", s("2")), // 2 second retry-after
+        ]));
+
+        rate_limiter.update_from_headers(&headers).await;
+
+        let start = tokio::time::Instant::now();
+        rate_limiter
+            .check_rate_limit()
+            .await
+            .expect("rate limit check failed");
+        let elapsed = start.elapsed();
+
+        // Should have waited at least until retry-after time
+        assert!(elapsed.as_millis() >= 1900); // slightly less than 2000 to account for timing variations
+    }
+
+    #[test]
+    fn test_secondary_rate_limit_parsing() {
+        let headers = create_test_headers(HashMap::from([("retry-after", s("30"))]));
+
+        let rate_limit = RateLimitInfo::from_headers(&headers);
+        match rate_limit {
+            Some(RateLimitInfo::Secondary(info)) => {
+                let expected_retry_after = Utc::now() + Duration::seconds(30);
+                // Allow for small timing differences during test execution
+                let difference = (info.retry_after - expected_retry_after)
+                    .abs()
+                    .num_seconds();
+                assert!(
+                    difference <= 1,
+                    "Retry-after time should be approximately 30 seconds from now"
+                );
+            }
+            _ => panic!("Expected Secondary rate limit info"),
+        }
+    }
+
+    #[test]
+    fn test_rate_limit_header_precedence() {
+        // Test that primary rate limit is preferred when both types of headers are present
+        let headers = create_test_headers(HashMap::from([
+            ("x-ratelimit-limit", s("5000")),
+            ("x-ratelimit-remaining", s("4999")),
+            ("x-ratelimit-used", s("1")),
+            (
+                "x-ratelimit-reset",
+                (Utc::now() + Duration::hours(1)).timestamp().to_string(),
+            ),
+            ("x-ratelimit-resource", s("graphql")),
+            ("retry-after", s("30")), // This should be ignored when primary headers are present
+        ]));
+
+        let rate_limit = RateLimitInfo::from_headers(&headers);
+        match rate_limit {
+            Some(RateLimitInfo::Primary(_)) => (),
+            _ => panic!("Expected Primary rate limit info when both header types are present"),
+        }
+    }
+
+    #[test]
+    fn test_primary_rate_limit_parsing() {
+        let now = Utc::now();
+        let reset_time = now + Duration::hours(1);
+
+        let headers = create_test_headers(HashMap::from([
+            ("x-ratelimit-limit", s("5000")),
+            ("x-ratelimit-remaining", s("4990")),
+            ("x-ratelimit-used", s("10")),
+            ("x-ratelimit-reset", reset_time.timestamp().to_string()),
+            ("x-ratelimit-resource", s("graphql")),
+        ]));
+
+        let rate_limit = RateLimitInfo::from_headers(&headers);
+        match rate_limit {
+            Some(RateLimitInfo::Primary(info)) => {
+                assert_eq!(info.limit, 5000);
+                assert_eq!(info.remaining, 4990);
+                assert_eq!(info.used, 10);
+                assert_eq!(info.resource, "graphql");
+
+                // Allow for small timing differences during test execution
+                let difference = (info.reset_time - reset_time).abs().num_seconds();
+                assert!(
+                    difference <= 1,
+                    "Reset time should match the provided timestamp"
+                );
+            }
+            _ => panic!("Expected Primary rate limit info"),
+        }
     }
 }
