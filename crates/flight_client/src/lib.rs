@@ -131,7 +131,7 @@ pub enum Error {
     #[snafu(display(
         "Failed to connect to Flight server: Handshake failed.\n{source}\nVerify the configuration and try again."
     ))]
-    UnableToPerformHandshake { source: tonic::Status },
+    UnableToPerformHandshake { source: TonicStatusError },
 
     #[snafu(display(
         "An unexpected error occurred. Report a bug to request support: https://github.com/spiceai/spiceai/issues"
@@ -149,7 +149,7 @@ pub enum Error {
     },
 
     #[snafu(display("Failed to publish data to flight endpoint.\n{source}\nVerify the configuration and try again"))]
-    UnableToPublish { source: tonic::Status },
+    UnableToPublish { source: TonicStatusError },
 
     #[snafu(display("Unauthorized. Verify the credentials."))]
     Unauthorized {},
