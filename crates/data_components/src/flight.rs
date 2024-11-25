@@ -47,19 +47,21 @@ pub mod write;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Query execution failed: {source}\nReport a bug to request support: https://github.com/spiceai/spiceai/issues"))]
+    #[snafu(display("Query execution failed.\n{source}\nReport a bug to request support: https://github.com/spiceai/spiceai/issues"))]
     UnableToGenerateSQL { source: expr::Error },
 
-    #[snafu(display("Unable to query Arrow Flight: {source}"))]
+    #[snafu(display("Unable to query Arrow Flight.\n{source}"))]
     Flight { source: flight_client::Error },
 
-    #[snafu(display("Unable to get schema from Arrow Flight for table {table}: {source}"))]
+    #[snafu(display("Unable to get schema from Arrow Flight for table {table}.\n{source}"))]
     UnableToGetSchema {
         source: flight_client::Error,
         table: String,
     },
 
-    #[snafu(display("Query execution failed: {source}\nVerify the configuration and try again."))]
+    #[snafu(display(
+        "Query execution failed.\n{source}\nVerify the configuration and try again."
+    ))]
     ArrowFlight { source: FlightError },
 }
 

@@ -63,16 +63,16 @@ pub enum Error {
     #[snafu(display("Missing required parameter: {parameter}. Specify a value.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/spiceai#configuration"))]
     MissingRequiredParameter { parameter: String },
 
-    #[snafu(display(r#"Failed to connect to SpiceAI endpoint "{endpoint}": {source}\nEnsure the endpoint is valid and reachable"#))]
+    #[snafu(display(r#"Failed to connect to SpiceAI endpoint "{endpoint}".\n{source}\nEnsure the endpoint is valid and reachable"#))]
     UnableToVerifyEndpointConnection {
         source: ns_lookup::Error,
         endpoint: String,
     },
 
-    #[snafu(display("Unable to create flight client: {source}"))]
+    #[snafu(display("Unable to create flight client.\n{source}"))]
     UnableToCreateFlightClient { source: flight_client::Error },
 
-    #[snafu(display("Unable to get append stream schema: {source}"))]
+    #[snafu(display("Unable to get append stream schema.\n{source}"))]
     UnableToGetAppendSchema { source: flight_client::Error },
 }
 

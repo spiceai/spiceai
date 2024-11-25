@@ -143,7 +143,7 @@ pub enum Error {
     #[snafu(display("Unable to get schema.\n{source}\nReport a bug to request support: https://github.com/spiceai/spiceai/issues"))]
     UnableToConvertSchema { source: arrow::error::ArrowError },
 
-    #[snafu(display("Query execution failed: {source}"))]
+    #[snafu(display("Query execution failed.\n{source}"))]
     UnableToQuery {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
