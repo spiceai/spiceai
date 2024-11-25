@@ -118,9 +118,6 @@ pub enum Error {
     #[snafu(display("Table {table_name} is expected to provide metadata, but the underlying provider does not support this."))]
     MetadataProviderNotImplemented { table_name: String },
 
-    #[snafu(display("Unable to register table: {source}"))]
-    UnableToRegisterTable { source: crate::dataconnector::Error },
-
     #[snafu(display("Unable to register table in DataFusion: {source}"))]
     UnableToRegisterTableToDataFusion { source: DataFusionError },
 

@@ -32,7 +32,7 @@ use tracing::{Instrument, Span};
 use util::fibonacci_backoff::FibonacciBackoffBuilder;
 use util::{retry, RetryError};
 
-use crate::datafusion::error::{get_spice_df_error, SpiceExternalError};
+use crate::datafusion::error::{find_datafusion_root, get_spice_df_error, SpiceExternalError};
 use crate::datafusion::schema::BaseSchema;
 use crate::federated_table::FederatedTable;
 use crate::timing::MultiTimeMeasurement;
@@ -717,6 +717,10 @@ impl RefreshTask {
 
     async fn log_refresh_error(&self, error: &super::Error, refresh_sql: Option<&str>) {
         if let super::Error::UnableToGetDataFromConnector { source } = error {
+            // let Some(datafusion_error) = downcast_boxed_datafusion_error(source) else {
+            //     return;
+            // };
+
             if let Some(SpiceExternalError::AccelerationNotReady { dataset_name }) =
                 get_spice_df_error(source)
             {
@@ -804,9 +808,13 @@ fn filter_records(
 
 pub(crate) fn retry_from_df_error(error: DataFusionError) -> RetryError<super::Error> {
     if is_retriable_error(&error) {
-        return RetryError::transient(super::Error::UnableToGetDataFromConnector { source: error });
+        return RetryError::transient(super::Error::UnableToGetDataFromConnector {
+            source: find_datafusion_root(error),
+        });
     }
-    RetryError::permanent(super::Error::FailedToRefreshDataset { source: error })
+    RetryError::permanent(super::Error::FailedToRefreshDataset {
+        source: find_datafusion_root(error),
+    })
 }
 
 fn inner_err_from_retry(error: RetryError<super::Error>) -> super::Error {

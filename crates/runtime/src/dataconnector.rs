@@ -95,39 +95,6 @@ pub mod spiceai;
 pub mod unity_catalog;
 
 #[derive(Debug, Snafu)]
-pub enum Error {
-    #[snafu(display("Unable to scan table provider: {source}"))]
-    UnableToScanTableProvider {
-        source: datafusion::error::DataFusionError,
-    },
-
-    #[snafu(display("Unable to construct logical plan builder: {source}"))]
-    UnableToConstructLogicalPlanBuilder {
-        source: datafusion::error::DataFusionError,
-    },
-
-    #[snafu(display("Unable to build logical plan: {source}"))]
-    UnableToBuildLogicalPlan {
-        source: datafusion::error::DataFusionError,
-    },
-
-    #[snafu(display("Unable to register table provider: {source}"))]
-    UnableToRegisterTableProvider {
-        source: datafusion::error::DataFusionError,
-    },
-
-    #[snafu(display("Unable to create data frame: {source}"))]
-    UnableToCreateDataFrame {
-        source: datafusion::error::DataFusionError,
-    },
-
-    #[snafu(display("Unable to filter data frame: {source}"))]
-    UnableToFilterDataFrame {
-        source: datafusion::error::DataFusionError,
-    },
-}
-
-#[derive(Debug, Snafu)]
 pub enum DataConnectorError {
     #[snafu(display("Cannot connect to the {connector_component} ({dataconnector}).\n{source}"))]
     UnableToConnectInternal {
@@ -250,7 +217,7 @@ pub enum DataConnectorError {
     },
 }
 
-pub type Result<T, E = Error> = std::result::Result<T, E>;
+pub type Result<T, E = DataConnectorError> = std::result::Result<T, E>;
 pub type AnyErrorResult<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 pub type DataConnectorResult<T> = std::result::Result<T, DataConnectorError>;
 
