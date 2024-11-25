@@ -26,7 +26,6 @@ use snafu::Snafu;
 pub mod builder;
 pub mod client;
 pub mod provider;
-pub mod rate_limit;
 
 #[derive(Debug, Snafu)]
 pub enum Error {

@@ -14,9 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::token_provider::TokenProvider;
+use crate::{rate_limit::RateLimiter, token_provider::TokenProvider};
 
-use super::{client::GraphQLClient, rate_limit::RateLimiter, Result};
+use super::{client::GraphQLClient, Result};
 use arrow::datatypes::SchemaRef;
 use std::sync::Arc;
 

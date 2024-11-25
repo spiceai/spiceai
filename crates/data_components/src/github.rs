@@ -19,7 +19,9 @@ use globset::GlobSet;
 use serde_json::Value;
 use snafu::{ResultExt, Snafu};
 
-use crate::{arrow::write::MemTable, graphql, token_provider::TokenProvider};
+use crate::{
+    arrow::write::MemTable, graphql, rate_limit::RateLimiter, token_provider::TokenProvider,
+};
 use arrow::{
     array::{ArrayRef, Int64Builder, RecordBatch, StringBuilder},
     datatypes::{DataType, Field, Schema, SchemaRef},
@@ -166,6 +168,7 @@ impl TableProvider for GithubFilesTableProvider {
 pub struct GithubRestClient {
     client: reqwest::Client,
     token: Arc<dyn TokenProvider>,
+    rate_limiter: Arc<dyn RateLimiter>,
 }
 
 impl std::fmt::Debug for GithubRestClient {
@@ -181,9 +184,13 @@ const NUM_FILE_CONTENT_DOWNLOAD_WORKERS: usize = 10;
 
 impl GithubRestClient {
     #[must_use]
-    pub fn new(token: Arc<dyn TokenProvider>) -> Self {
+    pub fn new(token: Arc<dyn TokenProvider>, rate_limiter: Arc<dyn RateLimiter>) -> Self {
         let client = reqwest::Client::new();
-        GithubRestClient { client, token }
+        GithubRestClient {
+            client,
+            token,
+            rate_limiter,
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -275,6 +282,8 @@ impl GithubRestClient {
         repo: &str,
         tree_sha: &str,
     ) -> Result<GitTree, Box<dyn std::error::Error + Send + Sync>> {
+        self.rate_limiter.check_rate_limit().await?;
+
         let endpoint = format!(
             "https://api.github.com/repos/{owner}/{repo}/git/trees/{tree_sha}?recursive=true"
         );
@@ -305,6 +314,10 @@ impl GithubRestClient {
         let response_headers = response.headers().clone();
         let response_status = response.status().as_u16();
         let response: Value = response.json().await?;
+
+        self.rate_limiter
+            .update_from_headers(&response_headers)
+            .await;
 
         error_checker(&response_headers, &response).map_err(|e| {
             if let graphql::Error::RateLimited { message } = e {
@@ -350,6 +363,8 @@ impl GithubRestClient {
         tree_sha: &str,
         path: &str,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        self.rate_limiter.check_rate_limit().await?;
+
         let download_url = get_download_url(owner, repo, tree_sha, path);
 
         let mut headers = HeaderMap::new();
@@ -367,6 +382,11 @@ impl GithubRestClient {
             .headers(headers)
             .send()
             .await?;
+
+        self.rate_limiter
+            .update_from_headers(response.headers())
+            .await;
+
         if response.status().is_success() {
             let content = response.text().await?;
             Ok(content)

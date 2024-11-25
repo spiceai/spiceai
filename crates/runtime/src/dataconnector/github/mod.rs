@@ -29,6 +29,7 @@ use data_components::{
         provider::GraphQLTableProviderBuilder,
         FilterPushdownResult, GraphQLContext,
     },
+    rate_limit::RateLimiter,
     token_provider::{StaticTokenProvider, TokenProvider},
 };
 use datafusion::{
@@ -69,6 +70,7 @@ mod stargazers;
 pub struct Github {
     params: Parameters,
     token: Option<Arc<dyn TokenProvider>>,
+    rate_limiter: Arc<GitHubRateLimiter>,
 }
 
 pub struct GitHubTableGraphQLParams {
@@ -130,7 +132,7 @@ impl Github {
         .with_token_provider(token)
         .with_json_pointer(gql_client_params.json_pointer)
         .with_schema(gql_client_params.schema)
-        .with_rate_limiter(Some(Arc::new(GitHubRateLimiter::new())))
+        .with_rate_limiter(Some(Arc::clone(&self.rate_limiter) as Arc<dyn RateLimiter>))
         .build(client)
         .boxed()
     }
@@ -187,7 +189,10 @@ impl Github {
             .map(|token| Arc::clone(token) as Arc<dyn TokenProvider>);
 
         match token {
-            Some(token) => Ok(GithubRestClient::new(token)),
+            Some(token) => Ok(GithubRestClient::new(
+                token,
+                Arc::clone(&self.rate_limiter) as Arc<dyn RateLimiter>,
+            )),
             None => Err("Github token not provided".into()),
         }
     }
@@ -346,6 +351,7 @@ impl DataConnectorFactory for GithubFactory {
             Ok(Arc::new(Github {
                 params: params.parameters,
                 token: token_provider,
+                rate_limiter: Arc::new(GitHubRateLimiter::new()),
             }) as Arc<dyn DataConnector>)
         })
     }

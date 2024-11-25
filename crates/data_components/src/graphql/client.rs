@@ -14,11 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::token_provider::TokenProvider;
+use crate::{rate_limit::RateLimiter, token_provider::TokenProvider};
 
-use super::{
-    rate_limit::RateLimiter, ArrowInternalSnafu, Error, ErrorChecker, ReqwestInternalSnafu, Result,
-};
+use super::{ArrowInternalSnafu, Error, ErrorChecker, ReqwestInternalSnafu, Result};
 use arrow::{
     array::RecordBatch,
     datatypes::SchemaRef,
@@ -716,7 +714,12 @@ impl GraphQLClient {
     ) -> Result<GraphQLQueryResult> {
         // Check rate limit before executing the query
         if let Some(rate_limiter) = &self.rate_limiter {
-            rate_limiter.check_rate_limit().await?;
+            rate_limiter
+                .check_rate_limit()
+                .await
+                .map_err(|e| Error::RateLimited {
+                    message: format!("{e}"),
+                })?;
         }
 
         let query_string = query.to_string(limit, cursor);
