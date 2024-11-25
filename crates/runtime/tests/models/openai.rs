@@ -14,315 +14,389 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+#![allow(clippy::expect_used)]
+use crate::models::sql_to_display;
+use crate::{
+    init_tracing, init_tracing_with_task_history,
+    models::{
+        create_api_bindings_config, get_params_with_secrets, get_taxi_trips_dataset,
+        get_tpcds_dataset, http_post, normalize_chat_completion_response,
+        normalize_embeddings_response, normalize_search_response, send_chat_completions_request,
+    },
+    utils::{runtime_ready_check, verify_env_secret_exists},
+};
 use app::AppBuilder;
 use async_openai::types::{
     ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestUserMessageArgs,
     CreateChatCompletionRequestArgs, EmbeddingInput,
 };
-use std::sync::Arc;
-
+use chrono::{DateTime, Utc};
+use jsonpath_rust::JsonPath;
 use llms::chat::Chat;
 use opentelemetry_sdk::trace::TracerProvider;
+use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, CONTENT_TYPE};
 use runtime::{auth::EndpointAuth, model::try_to_chat_model, Runtime};
+use serde_json::json;
 use spicepod::component::{
     embeddings::{ColumnEmbeddingConfig, Embeddings},
     model::Model,
 };
-
-use crate::{
-    init_tracing, init_tracing_with_task_history,
-    models::{
-        create_api_bindings_config, get_executed_tasks, get_params_with_secrets,
-        get_taxi_trips_dataset, get_tpcds_dataset, json_is_single_row_with_value,
-        normalize_chat_completion_response, normalize_embeddings_response,
-        normalize_search_response, pretty_json_str, send_chat_completions_request,
-        send_nsql_request, send_search_request,
-    },
-    utils::{runtime_ready_check, verify_env_secret_exists},
-};
+use std::str::FromStr;
+use std::sync::Arc;
 
 use super::send_embeddings_request;
 
-#[tokio::test]
-async fn openai_test_nsql() -> Result<(), anyhow::Error> {
-    let _tracing = init_tracing(None);
+#[allow(clippy::expect_used)]
+mod nsql {
 
-    verify_env_secret_exists("SPICE_OPENAI_API_KEY")
-        .await
-        .map_err(anyhow::Error::msg)?;
+    use super::*;
 
-    let app = AppBuilder::new("text-to-sql")
-        .with_dataset(get_taxi_trips_dataset())
-        .with_model(get_openai_model("gpt-4o-mini", "nql"))
-        .with_model(get_openai_model("gpt-4o-mini", "nql-2"))
-        .build();
-
-    let api_config = create_api_bindings_config();
-    let http_base_url = format!("http://{}", api_config.http_bind_address);
-
-    let rt = Arc::new(Runtime::builder().with_app(app).build().await);
-
-    let (_tracing, trace_provider) = init_tracing_with_task_history(None, &rt);
-
-    let rt_ref_copy = Arc::clone(&rt);
-    tokio::spawn(async move {
-        Box::pin(rt_ref_copy.start_servers(api_config, None, EndpointAuth::no_auth())).await
-    });
-
-    tokio::select! {
-        () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
-            return Err(anyhow::anyhow!("Timed out waiting for components to load"));
-        }
-        () = rt.load_components() => {}
+    struct TestCase {
+        name: &'static str,
+        body: serde_json::Value,
     }
 
-    runtime_ready_check(&rt).await;
+    async fn run_nsql_test(
+        base_url: &str,
+        ts: &TestCase,
+        trace_provider: &TracerProvider,
+    ) -> Result<(), anyhow::Error> {
+        tracing::info!("Running test cases {}", ts.name);
+        let task_start_time = std::time::SystemTime::now();
 
-    // example responses for the test query: '[{"count(*)":10}]', '[{"record_count":10}]'
+        // Call /v1/nsql, check response
+        let mut headers = HeaderMap::new();
+        headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        let response = http_post(
+            format!("{base_url}/v1/nsql").as_str(),
+            &ts.body.to_string(),
+            headers,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to execute HTTP POST: {}", e))?;
+        insta::assert_snapshot!(format!("{}_response", ts.name), &response);
 
-    tracing::info!("/v1/nsql: Verify default nsql request");
-    let task_start_time = std::time::SystemTime::now();
+        // ensure all spans are exported into task_history
+        let _ = trace_provider.force_flush();
 
-    let response = send_nsql_request(
-        http_base_url.as_str(),
-        "how many records in taxi_trips dataset?",
-        None,
-        Some(false),
-        None,
-    )
-    .await?;
+        // Check task_history table for expected rows.
+        let mut headers = HeaderMap::new();
+        headers.insert(ACCEPT, HeaderValue::from_static("text/plain"));
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        println!(
+            r#"SELECT task, input
+                    FROM runtime.task_history
+                    WHERE task NOT IN ('ai_completion', 'health', 'accelerated_refresh')
+                    AND start_time > '{}'
+                    ORDER BY start_time, task;
+                "#,
+            Into::<DateTime<Utc>>::into(task_start_time).to_rfc3339()
+        );
+        insta::assert_snapshot!(
+            format!("{}_tasks", ts.name),
+            http_post(
+                format!("{base_url}/v1/sql").as_str(),
+                format!(
+                    r#"SELECT task, input
+                            FROM runtime.task_history
+                            WHERE task NOT IN ('ai_completion', 'health', 'accelerated_refresh')
+                            AND start_time > '{}'
+                            ORDER BY start_time, task;
+                        "#,
+                    Into::<DateTime<Utc>>::into(task_start_time).to_rfc3339()
+                )
+                .as_str(),
+                headers
+            )
+            .await
+            .expect("Failed to execute HTTP SQL query")
+        );
 
-    assert!(
-        json_is_single_row_with_value(&response, 10),
-        "Expected a single record containing the value 10"
-    );
+        Ok(())
+    }
 
-    // ensure all spans are exported into task_history
-    let _ = trace_provider.force_flush();
+    #[tokio::test]
+    async fn openai_test_nsql() -> Result<(), anyhow::Error> {
+        let _tracing = init_tracing(None);
 
-    let tasks = get_executed_tasks(&rt, task_start_time.into()).await?;
+        verify_env_secret_exists("SPICE_OPENAI_API_KEY")
+            .await
+            .map_err(anyhow::Error::msg)?;
 
-    let table_schema_task = tasks
-        .iter()
-        .find(|t| t.0 == "tool_use::table_schema")
-        .expect("Expected 'tool_use::table_schema' task to be executed");
+        let app = AppBuilder::new("text-to-sql")
+            .with_dataset(get_taxi_trips_dataset())
+            .with_model(get_openai_model("gpt-4o-mini", "nql"))
+            .with_model(get_openai_model("gpt-4o-mini", "nql-2"))
+            .build();
 
-    insta::assert_snapshot!(
-        "nsql_table_schema_task",
-        pretty_json_str(&table_schema_task.1)?
-    );
+        let api_config = create_api_bindings_config();
+        let http_base_url = format!("http://{}", api_config.http_bind_address);
 
-    tracing::info!("/v1/nsql: Ensure model selection works");
-    let response = send_nsql_request(
-        http_base_url.as_str(),
-        "how many records in taxi_trips dataset?",
-        Some("nql-2"),
-        Some(false),
-        None,
-    )
-    .await?;
+        let rt = Arc::new(Runtime::builder().with_app(app).build().await);
 
-    assert!(
-        json_is_single_row_with_value(&response, 10),
-        "Expected a single record containing the value 10"
-    );
+        let (_tracing, trace_provider) = init_tracing_with_task_history(None, &rt);
 
-    tracing::info!("/v1/nsql: Verify nsql request with 'sample_data_enabled:true'");
+        let rt_ref_copy = Arc::clone(&rt);
+        tokio::spawn(async move {
+            Box::pin(rt_ref_copy.start_servers(api_config, None, EndpointAuth::no_auth())).await
+        });
 
-    let task_start_time = std::time::SystemTime::now();
+        tokio::select! {
+            () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                return Err(anyhow::anyhow!("Timed out waiting for components to load"));
+            }
+            () = rt.load_components() => {}
+        }
 
-    let response = send_nsql_request(
-        http_base_url.as_str(),
-        "how many records in taxi_trips dataset?",
-        Some("nql"),
-        Some(true),
-        None,
-    )
-    .await?;
+        runtime_ready_check(&rt).await;
 
-    assert!(
-        json_is_single_row_with_value(&response, 10),
-        "Expected a single record containing the value 10"
-    );
+        let test_cases = [
+            TestCase {
+                name: "basic",
+                body: json!({
+                    "query": "how many records (as 'total_records') are in taxi_trips dataset?",
+                    "sample_data_enabled": false,
+                }),
+            },
+            TestCase {
+                name: "with_model",
+                body: json!({
+                    "query": "how many records (as 'total_records') are in taxi_trips dataset?",
+                    "model": "nql-2",
+                    "sample_data_enabled": false,
+                }),
+            },
+            TestCase {
+                name: "with_sample_data_enabled",
+                body: json!({
+                    "query": "how many records (as 'total_records') are in taxi_trips dataset?",
+                    "model": "nql",
+                    "sample_data_enabled": true,
+                }),
+            },
+        ];
 
-    // ensure all spans are exported into task_history
-    let _ = trace_provider.force_flush();
+        for ts in test_cases {
+            run_nsql_test(http_base_url.as_str(), &ts, &trace_provider).await?;
+        }
 
-    let tasks = get_executed_tasks(&rt, task_start_time.into()).await?;
-
-    let sample_data_task = tasks
-        .iter()
-        .find(|t| t.0 == "tool_use::sample_data")
-        .expect("Expected 'tool_use::sample_data' task to be executed");
-
-    insta::assert_snapshot!("nsql_sample_data_task", sample_data_task.1);
-
-    let sql_query_task = tasks
-        .iter()
-        .find(|t| t.0 == "sql_query")
-        .expect("Expected 'sql_query' task to be executed");
-
-    insta::assert_snapshot!("nsql_sample_data_task_sql_query", sql_query_task.1);
-
-    Ok(())
+        Ok(())
+    }
 }
 
-#[tokio::test]
-async fn openai_test_search() -> Result<(), anyhow::Error> {
-    let _tracing = init_tracing(None);
+#[allow(clippy::expect_used)]
+mod search {
 
-    verify_env_secret_exists("SPICE_OPENAI_API_KEY")
-        .await
-        .map_err(anyhow::Error::msg)?;
-
-    let mut ds_tpcds_item = get_tpcds_dataset("item");
-    ds_tpcds_item.embeddings = vec![ColumnEmbeddingConfig {
-        column: "i_item_desc".to_string(),
-        model: "openai_embeddings".to_string(),
-        primary_keys: Some(vec!["i_item_sk".to_string()]),
-        chunking: None,
-    }];
-
-    let app = AppBuilder::new("search_app")
-        // taxi_trips dataset is used to test search when there is a dataset w/o embeddings
-        .with_dataset(get_taxi_trips_dataset())
-        .with_dataset(ds_tpcds_item)
-        .with_embedding(get_openai_embeddings(
-            Option::<String>::None,
-            "openai_embeddings",
-        ))
-        .build();
-
-    let api_config = create_api_bindings_config();
-    let http_base_url = format!("http://{}", api_config.http_bind_address);
-    let rt = Arc::new(Runtime::builder().with_app(app).build().await);
-
-    let rt_ref_copy = Arc::clone(&rt);
-    tokio::spawn(async move {
-        Box::pin(rt_ref_copy.start_servers(api_config, None, EndpointAuth::no_auth())).await
-    });
-
-    tokio::select! {
-        () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
-            return Err(anyhow::anyhow!("Timed out waiting for components to load"));
-        }
-        () = rt.load_components() => {}
+    use super::*;
+    struct TestCase {
+        name: &'static str,
+        body: serde_json::Value,
     }
 
-    runtime_ready_check(&rt).await;
+    async fn run_search_test(base_url: &str, ts: &TestCase) -> Result<(), anyhow::Error> {
+        tracing::info!("Running test cases {}", ts.name);
 
-    tracing::info!("/v1/search: Ensure simple search request succeeds");
-    let response = send_search_request(
-        http_base_url.as_str(),
-        "new patient",
-        Some(2),
-        Some(vec!["item".to_string()]),
-        None,
-        Some(vec!["i_color".to_string(), "i_item_id".to_string()]),
-    )
-    .await?;
+        // Call /v1/search, check response
+        let mut headers = HeaderMap::new();
+        headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        let response_str = http_post(
+            &format!("{base_url}/v1/search").to_string(),
+            &ts.body.to_string(),
+            headers,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to execute HTTP POST: {}", e))?;
 
-    insta::assert_snapshot!(format!("search_1"), normalize_search_response(response));
+        let response = serde_json::from_str(&response_str)
+            .map_err(|e| anyhow::anyhow!("Failed to parse HTTP response: {}", e))?;
 
-    tracing::info!("/v1/search: Ensure search request across all datasets succeeds");
-    let response = send_search_request(
-        http_base_url.as_str(),
-        "new patient",
-        Some(2),
-        None,
-        None,
-        None,
-    )
-    .await?;
+        insta::assert_snapshot!(
+            format!("{}_response", ts.name),
+            normalize_search_response(response)
+        );
+        Ok(())
+    }
 
-    insta::assert_snapshot!(format!("search_2"), normalize_search_response(response));
+    #[tokio::test]
+    async fn openai_test_search() -> Result<(), anyhow::Error> {
+        let _tracing = init_tracing(None);
 
-    Ok(())
+        verify_env_secret_exists("SPICE_OPENAI_API_KEY")
+            .await
+            .map_err(anyhow::Error::msg)?;
+
+        let mut ds_tpcds_item = get_tpcds_dataset("item");
+        ds_tpcds_item.embeddings = vec![ColumnEmbeddingConfig {
+            column: "i_item_desc".to_string(),
+            model: "openai_embeddings".to_string(),
+            primary_keys: Some(vec!["i_item_sk".to_string()]),
+            chunking: None,
+        }];
+
+        let app = AppBuilder::new("search_app")
+            // taxi_trips dataset is used to test search when there is a dataset w/o embeddings
+            .with_dataset(get_taxi_trips_dataset())
+            .with_dataset(ds_tpcds_item)
+            .with_embedding(get_openai_embeddings(
+                Option::<String>::None,
+                "openai_embeddings",
+            ))
+            .build();
+
+        let api_config = create_api_bindings_config();
+        let http_base_url = format!("http://{}", api_config.http_bind_address);
+        let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+
+        let _ = init_tracing_with_task_history(None, &rt);
+
+        let rt_ref_copy = Arc::clone(&rt);
+        tokio::spawn(async move {
+            Box::pin(rt_ref_copy.start_servers(api_config, None, EndpointAuth::no_auth())).await
+        });
+
+        tokio::select! {
+            () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                return Err(anyhow::anyhow!("Timed out waiting for components to load"));
+            }
+            () = rt.load_components() => {}
+        }
+
+        runtime_ready_check(&rt).await;
+
+        let test_cases = [
+            TestCase {
+                name: "basic",
+                body: json!({
+                    "text": "new patient",
+                    "limit": 2,
+                    "datasets": ["item"],
+                    "additional_columns": ["i_color", "i_item_id"],
+                }),
+            },
+            TestCase {
+                name: "all_datasets",
+                body: json!({
+                    "text": "new patient",
+                    "limit": 2,
+                }),
+            },
+        ];
+
+        for ts in test_cases {
+            run_search_test(http_base_url.as_str(), &ts).await?;
+        }
+        Ok(())
+    }
 }
 
-#[tokio::test]
-async fn openai_test_embeddings() -> Result<(), anyhow::Error> {
-    let _tracing = init_tracing(None);
+#[allow(clippy::expect_used)]
+mod embeddings {
 
-    verify_env_secret_exists("SPICE_OPENAI_API_KEY")
-        .await
-        .map_err(anyhow::Error::msg)?;
+    use super::*;
 
-    let app = AppBuilder::new("search_app")
-        .with_embedding(get_openai_embeddings(
-            Some("text-embedding-3-small"),
-            "openai_embeddings",
-        ))
-        .build();
-
-    let api_config = create_api_bindings_config();
-    let http_base_url = format!("http://{}", api_config.http_bind_address);
-    let rt = Arc::new(Runtime::builder().with_app(app).build().await);
-
-    let rt_ref_copy = Arc::clone(&rt);
-    tokio::spawn(async move {
-        Box::pin(rt_ref_copy.start_servers(api_config, None, EndpointAuth::no_auth())).await
-    });
-
-    tokio::select! {
-        () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
-            return Err(anyhow::anyhow!("Timed out waiting for components to load"));
-        }
-        () = rt.load_components() => {}
+    struct EmbeddingTestCase {
+        pub input: EmbeddingInput,
+        pub encoding_format: Option<&'static str>,
+        pub user: Option<&'static str>,
+        pub dimensions: Option<u32>,
+        pub test_id: &'static str,
     }
 
-    runtime_ready_check(&rt).await;
+    #[tokio::test]
+    async fn openai_test_embeddings() -> Result<(), anyhow::Error> {
+        let _tracing = init_tracing(None);
 
-    let embeddins_test = vec![
-        (
-            EmbeddingInput::String("The food was delicious and the waiter...".to_string()),
-            Some("float"),
-            None,
-            None,
-        ),
-        (
-            EmbeddingInput::StringArray(vec![
-                "The food was delicious".to_string(),
-                "and the waiter...".to_string(),
-            ]),
-            None,
-            Some("test_user_id"),
-            Some(256),
-        ),
-        (
-            EmbeddingInput::StringArray(vec![
-                "The food was delicious".to_string(),
-                "and the waiter...".to_string(),
-            ]),
-            Some("base64"),
-            None,
-            Some(128),
-        ),
-    ];
+        verify_env_secret_exists("SPICE_OPENAI_API_KEY")
+            .await
+            .map_err(anyhow::Error::msg)?;
 
-    let mut test_id = 0;
+        let app = AppBuilder::new("search_app")
+            .with_embedding(get_openai_embeddings(
+                Some("text-embedding-3-small"),
+                "openai_embeddings",
+            ))
+            .build();
 
-    for (input, encoding_format, user, dimensions) in embeddins_test {
-        test_id += 1;
-        let response = send_embeddings_request(
-            http_base_url.as_str(),
-            "openai_embeddings",
+        let api_config = create_api_bindings_config();
+        let http_base_url = format!("http://{}", api_config.http_bind_address);
+        let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+
+        let rt_ref_copy = Arc::clone(&rt);
+        tokio::spawn(async move {
+            Box::pin(rt_ref_copy.start_servers(api_config, None, EndpointAuth::no_auth())).await
+        });
+
+        tokio::select! {
+            () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                return Err(anyhow::anyhow!("Timed out waiting for components to load"));
+            }
+            () = rt.load_components() => {}
+        }
+
+        runtime_ready_check(&rt).await;
+
+        let embeddins_test = vec![
+            EmbeddingTestCase {
+                input: EmbeddingInput::String(
+                    "The food was delicious and the waiter...".to_string(),
+                ),
+                encoding_format: Some("float"),
+                user: None,
+                dimensions: None,
+                test_id: "basic",
+            },
+            EmbeddingTestCase {
+                input: EmbeddingInput::StringArray(vec![
+                    "The food was delicious".to_string(),
+                    "and the waiter...".to_string(),
+                ]),
+                encoding_format: None,
+                user: Some("test_user_id"),
+                dimensions: Some(256),
+                test_id: "multiple_inputs",
+            },
+            EmbeddingTestCase {
+                input: EmbeddingInput::StringArray(vec![
+                    "The food was delicious".to_string(),
+                    "and the waiter...".to_string(),
+                ]),
+                encoding_format: Some("base64"),
+                user: Some("test_user_id"),
+                dimensions: Some(128),
+                test_id: "base64_format",
+            },
+        ];
+
+        for EmbeddingTestCase {
             input,
             encoding_format,
             user,
             dimensions,
-        )
-        .await?;
+            test_id,
+        } in embeddins_test
+        {
+            let response = send_embeddings_request(
+                http_base_url.as_str(),
+                "openai_embeddings",
+                input,
+                encoding_format,
+                user,
+                dimensions,
+            )
+            .await?;
 
-        insta::assert_snapshot!(
-            format!("embeddings_{}", test_id),
-            // OpenAI's embeddings response is not deterministic (values vary for the same input, model version, and parameters) so
-            // we normalize the response before snapshotting
-            normalize_embeddings_response(response)
-        );
+            insta::assert_snapshot!(
+                test_id,
+                // OpenAI's embeddings response is not deterministic (values vary for the same input, model version, and parameters) so
+                // we normalize the response before snapshotting
+                normalize_embeddings_response(response)
+            );
+        }
+
+        Ok(())
     }
-
-    Ok(())
 }
 
 #[tokio::test]
@@ -450,33 +524,45 @@ async fn verify_sql_query_chat_completion(
 
     let _ = trace_provider.force_flush();
 
-    let tasks = get_executed_tasks(&rt, task_start_time.into()).await?;
-
-    assert!(
-        tasks.iter().any(|t| { t.0 == "tool_use::list_datasets" }),
-        "Expected 'tool_use::list_datasets' task to be executed"
+    // Verify Task History
+    insta::assert_snapshot!(
+        "chat_1_sql_tasks",
+        sql_to_display(
+            &rt,
+            format!(
+                r#"SELECT task, count(1)
+                FROM runtime.task_history
+                WHERE start_time >= '{}'
+                AND task in ('tool_use::list_datasets', 'tool_use::sql', 'tool_use::sql_query')
+                GROUP BY task
+                ORDER BY task;
+            "#,
+                Into::<DateTime<Utc>>::into(task_start_time).to_rfc3339()
+            )
+            .as_str()
+        )
+        .await
+        .expect("Failed to execute HTTP SQL query")
     );
-    assert!(
-        tasks.iter().any(|t| { t.0 == "tool_use::sql" }),
-        "Expected 'tool_use::sql' task to be executed"
-    );
-    assert!(
-        tasks.iter().any(|t| { t.0 == "sql_query" }),
-        "Expected 'sql_query' task to be executed"
-    );
 
-    let ai_completion_task =
-        tasks
-            .iter()
-            .find(|t| t.0 == "ai_completion")
-            .ok_or(anyhow::anyhow!(
-                "Expected 'ai_completion' task to be executed"
-            ))?;
-
-    // ai_completion input message is deterministic - based on available tools, app configuration, and the input message
     insta::assert_snapshot!(
         "chat_1_ai_completion_input",
-        pretty_json_str(&ai_completion_task.1)?
+        sql_to_display(
+            &rt,
+            format!(
+                r#"SELECT input
+                FROM runtime.task_history
+                WHERE start_time >= '{}'
+                AND task='ai_completion'
+                ORDER BY start_time
+                LIMIT 1;
+            "#,
+                Into::<DateTime<Utc>>::into(task_start_time).to_rfc3339()
+            )
+            .as_str()
+        )
+        .await
+        .expect("Failed to execute HTTP SQL query")
     );
 
     Ok(())
@@ -489,53 +575,53 @@ async fn verify_similarity_search_chat_completion(
 ) -> Result<(), anyhow::Error> {
     let model =
         get_openai_chat_model(Arc::clone(&rt), "gpt-4o-mini", "openai_model", "auto").await?;
+
     let req = CreateChatCompletionRequestArgs::default()
-                .messages(vec![ChatCompletionRequestSystemMessageArgs::default()
-                    .content("You are an assistant that responds to queries by providing only the requested data values without extra explanation.".to_string())
-                    .build()?
-                    .into(),ChatCompletionRequestUserMessageArgs::default()
-                    .content("Find information about vehicles and journalists".to_string())
-                    .build()?
-                    .into()])
-                .build()?;
+        .messages(vec![ChatCompletionRequestSystemMessageArgs::default()
+            .content("You are an assistant that responds to queries by providing only the requested data values without extra explanation.".to_string())
+            .build()?
+            .into(),ChatCompletionRequestUserMessageArgs::default()
+            .content("Find information about vehicles and journalists".to_string())
+            .build()?
+            .into()])
+        .build()?;
 
     let task_start_time = std::time::SystemTime::now();
-    let mut response = model.chat_request(req).await?;
+    let response = model.chat_request(req).await?;
 
-    // Verify model correctly found records in the dataset
-    assert!(response.choices[0]
-        .message
-        .content
-        .clone()
-        .unwrap_or_default()
-        .contains("there just big vehicles. Journalists"));
-
-    // response contains distance metrics that can vary so we replace content with a placeholder for snapshotting
-    response.choices.iter_mut().for_each(|c| {
-        c.message.content = Some("__placeholder__".to_string());
-    });
+    // Verify Response
+    let resp_value =
+        serde_json::to_value(&response).expect("Failed to serialize response.choices: {}");
+    let selector = JsonPath::from_str(
+        "$.choices[*].message[?(@.content~='.*there just big vehicles. Journalists.*')].length()",
+    )
+    .expect("Failed to create JSONPath selector");
 
     insta::assert_snapshot!(
-        "chat_2_response_choices",
-        format!("{:#?}", response.choices)
+        "chat_2_response",
+        serde_json::to_string_pretty(&selector.find(&resp_value))
+            .expect("Failed to serialize response.choices")
     );
 
     // ensure all spans are exported into task_history
     let _ = trace_provider.force_flush();
 
-    let tasks = get_executed_tasks(&rt, task_start_time.into()).await?;
-
-    let document_similarity_task = tasks
-        .iter()
-        .find(|t| t.0 == "tool_use::document_similarity")
-        .ok_or(anyhow::anyhow!(
-            "Expected 'document_similarity' task to be executed"
-        ))?;
-
-    // ai_completion input message is deterministic - based on available tools, app configuration, and the input message
+    // Verify Task History
     insta::assert_snapshot!(
-        "chat_2_document_similarity_input",
-        pretty_json_str(&document_similarity_task.1)?
+        "chat_2_document_similarity_tasks",
+        sql_to_display(
+            &rt,
+            format!(
+                r#"SELECT input
+                FROM runtime.task_history
+                WHERE start_time >= '{}' and task='tool_use::document_similarity';
+            "#,
+                Into::<DateTime<Utc>>::into(task_start_time).to_rfc3339()
+            )
+            .as_str()
+        )
+        .await
+        .expect("Failed to execute HTTP SQL query")
     );
 
     Ok(())

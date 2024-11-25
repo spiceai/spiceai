@@ -156,7 +156,7 @@ impl Dataset {
 
     #[must_use]
     pub fn has_embeddings(&self) -> bool {
-        self.embeddings.is_empty() || self.columns.iter().any(|c| !c.embeddings.is_empty())
+        !self.embeddings.is_empty() || self.columns.iter().any(|c| !c.embeddings.is_empty())
     }
 }
 
@@ -543,7 +543,7 @@ pub mod column {
             match serde_yaml::from_str::<ColumnLevelEmbeddingConfig>(
                 r"
                 from: foo
-                row_id: 
+                row_id:
                   - foo: bar
             ",
             ) {

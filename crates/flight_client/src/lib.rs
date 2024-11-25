@@ -34,48 +34,124 @@ use bytes::Bytes;
 use futures::StreamExt;
 use futures::{ready, stream, TryStreamExt};
 use snafu::prelude::*;
+use std::error::Error as StdError;
 use tonic::transport::Channel;
 use tonic::IntoRequest;
 use tonic::IntoStreamingRequest;
 
 pub mod tls;
 
+#[derive(Debug)]
+pub struct TonicStatusError(tonic::Status);
+
+impl From<tonic::Status> for TonicStatusError {
+    fn from(status: tonic::Status) -> Self {
+        TonicStatusError(status)
+    }
+}
+
+impl std::fmt::Display for TonicStatusError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let code = TonicStatusCode::from(self.0.code());
+        let message = TonicStatusMessage::from(self.0.message());
+        let source = self.0.source();
+
+        match (source, message.clone()) {
+            (Some(source), TonicStatusMessage::TransportError) => write!(f, "{message}\n{source}"),
+            (None, TonicStatusMessage::TransportError) => write!(f, "{message}"),
+            (None, TonicStatusMessage::Unmatched(message)) => write!(f, "{code}.\n{message}"),
+            (Some(source), TonicStatusMessage::Unmatched(message)) => {
+                write!(f, "{code}.\n{message}\n{source}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for TonicStatusError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.0.source()
+    }
+}
+
+#[derive(Debug)]
+pub struct TonicStatusCode(tonic::Code);
+
+impl From<tonic::Code> for TonicStatusCode {
+    fn from(code: tonic::Code) -> Self {
+        TonicStatusCode(code)
+    }
+}
+
+impl std::fmt::Display for TonicStatusCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            tonic::Code::Unknown => write!(f, "An unknown error occurred"),
+            tonic::Code::Internal => write!(f, "An internal error occurred"),
+            _ => write!(f, "{}", self.0),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum TonicStatusMessage {
+    TransportError,
+    Unmatched(String),
+}
+
+impl From<&str> for TonicStatusMessage {
+    fn from(message: &str) -> Self {
+        match message {
+            "transport error" => TonicStatusMessage::TransportError,
+            _ => TonicStatusMessage::Unmatched(message.to_string()),
+        }
+    }
+}
+
+impl std::fmt::Display for TonicStatusMessage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TonicStatusMessage::TransportError => write!(f, "A network error occurred. Check the network connection/server configuration, and try again."),
+            TonicStatusMessage::Unmatched(message) => write!(f, "{message}")
+        }
+    }
+}
+
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Unable to connect to server: {source}"))]
+    #[snafu(display("Failed to connect to the Flight server. A TLS error occurred.\n{source}"))]
     UnableToConnectToServer { source: tls::Error },
 
-    #[snafu(display("Invalid metadata value: {source}"))]
+    #[snafu(display("Failed to execute query. Invalid metadata value.\n{source}"))]
     InvalidMetadata {
         source: tonic::metadata::errors::InvalidMetadataValue,
     },
 
     #[snafu(display("Failed to connect to the Flight server.\n{source}"))]
-    UnableToPerformHandshake { source: tonic::Status },
+    UnableToPerformHandshake { source: TonicStatusError },
 
-    #[snafu(display("Unable to convert metadata to string: {source}"))]
+    #[snafu(display("Failed to convert metadata to string.\n{source}"))]
     UnableToConvertMetadataToString {
         source: tonic::metadata::errors::ToStrError,
     },
 
-    #[snafu(display("Unable to convert schema from response: {source}"))]
+    #[snafu(display("Failed to convert schema from response.\n{source}"))]
     UnableToConvertSchema { source: arrow::error::ArrowError },
 
-    #[snafu(display("Unable to query: {source}"))]
+    #[snafu(display("Failed to execute query.\n{source}"))]
     UnableToQuery {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Unable to publish: {source}"))]
-    UnableToPublish { source: tonic::Status },
+    #[snafu(display("Failed to write data.\n{source}"))]
+    UnableToPublish { source: TonicStatusError },
 
-    #[snafu(display("Unauthorized"))]
+    #[snafu(display("Failed to execute query. Authorization failed.\nEnsure that the username and password are correctly configured, and have the necessary permissions."))]
     Unauthorized {},
 
-    #[snafu(display("Permission denied"))]
+    #[snafu(display("Failed to execute query. Permission denied.\nEnsure that the username and password are correctly configured, and have the necessary permissions."))]
     PermissionDenied {},
 
-    #[snafu(display("No endpoints found"))]
+    #[snafu(display("Failed to execute query. No endpoints found.\nEnsure that the server is running and the endpoint is correctly configured."))]
     NoEndpointsFound,
 }
 
@@ -406,7 +482,7 @@ impl FlightClient {
             Ok(resp) => resp,
             Err(e) => match e.code() {
                 tonic::Code::PermissionDenied => PermissionDeniedSnafu.fail(),
-                _ => return Err(e).context(UnableToPublishSnafu),
+                _ => return Err(TonicStatusError::from(e)).context(UnableToPublishSnafu),
             }?,
         };
 
@@ -438,6 +514,7 @@ impl FlightClient {
             .clone()
             .handshake(req)
             .await
+            .map_err(TonicStatusError::from)
             .context(UnableToPerformHandshakeSnafu)?;
         let mut token: Option<String> = None;
         if let Some(auth) = resp.metadata().get("authorization") {

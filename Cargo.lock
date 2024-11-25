@@ -5997,6 +5997,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "jsonpath-rust"
+version = "0.7.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "69a61b87f6a55cc6c28fed5739dd36b9642321ce63e4a5e4a4715d69106f4a10"
+dependencies = [
+ "pest",
+ "pest_derive",
+ "regex",
+ "serde_json",
+ "thiserror 1.0.68",
+]
+
+[[package]]
 name = "jsonwebtoken"
 version = "9.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9468,6 +9481,7 @@ dependencies = [
  "indexmap 2.6.0",
  "insta",
  "itertools 0.13.0",
+ "jsonpath-rust",
  "jsonwebtoken",
  "keyring",
  "lazy_static",

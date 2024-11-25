@@ -1,0 +1,11 @@
+---
+source: crates/runtime/tests/models/openai.rs
+expression: "sql_to_display(&rt,\nformat!(r#\"SELECT input\n                FROM runtime.task_history\n                WHERE start_time >= '{}' and task='tool_use::document_similarity';\n            \"#,\nInto::<DateTime<Utc>>::into(task_start_time).to_rfc3339()).as_str()).await.expect(\"Failed to execute HTTP SQL query\")"
+snapshot_kind: text
+---
++------------------------------------------------------------------------+
+| input                                                                  |
++------------------------------------------------------------------------+
+| {"text": "vehicles", "datasets": ["spice.public.item"], "limit": 5}    |
+| {"text": "journalists", "datasets": ["spice.public.item"], "limit": 5} |
++------------------------------------------------------------------------+
