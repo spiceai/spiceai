@@ -342,7 +342,7 @@ async fn get_vectors(
     arr: impl Iterator<Item = Option<&str>>,
     model: &dyn Embed,
 ) -> Result<FixedSizeListArray, Box<dyn std::error::Error + Send + Sync>> {
-    // Filter out nulls or empty strings before caling [`Embed::embed`].
+    // Filter out nulls or empty strings before calling [`Embed::embed`].
     let (null_pairs, values): (Vec<_>, Vec<_>) = arr
         .enumerate()
         .partition(|(_, o)| o.is_none() || o.is_some_and(str::is_empty));
