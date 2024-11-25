@@ -15,12 +15,14 @@ limitations under the License.
 */
 use async_openai::types::{CreateChatCompletionRequest, CreateChatCompletionResponse};
 use jsonpath_rust::JsonPath;
-use lazy_static::lazy_static;
 use llms::chat::Chat;
 use serde_json::json;
-use std::{str::FromStr, sync::Arc};
+use std::{
+    str::FromStr,
+    sync::{Arc, LazyLock},
+};
 
-mod anthropic;
+mod create;
 
 #[derive(Clone)]
 pub struct TestCase {
@@ -45,30 +47,118 @@ macro_rules! test_case {
     };
 }
 
-lazy_static! {
-    /// Test case parameters (for [`run_test_case`]) to run for each model.
-    static ref TEST_CASES: Vec<TestCase> = vec![
-        test_case!("basic", json!({
-            "model": "not_needed",
-            "messages": [
-                {
-                    "role": "user",
-                    "content": "Say Hi"
-                }
+/// Test case parameters (for [`run_test_case`]) to run for each model.
+static TEST_CASES: LazyLock<Vec<TestCase>> = LazyLock::new(|| {
+    vec![
+        test_case!(
+            "basic",
+            json!({
+                "model": "not_needed",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "Say Hi"
+                    }
+                ]
+            }),
+            vec![
+                (
+                    "message_keys",
+                    "$.choices[*].message['role', 'tool_calls', 'refusal', 'function_calls']"
+                ),
+                (
+                    "replied_appropriately",
+                    "$.choices[*].message[?(@.content ~= 'Hi')].length()"
+                )
             ]
-        }), vec![
-            ("message_keys", "$.choices[*].message['role', 'tool_calls', 'refusal', 'function_calls']"),
-            ("replied_appropriately", "$.choices[*].message[?(@.content ~= 'Hi')].length()")
-        ]),
-    ];
+        ),
+        test_case!(
+            "system_prompt",
+            json!({
+                "model": "not_needed",
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": "Repeat back any user message."
+                    },
+                    {
+                        "role": "user",
+                        "content": "Hi"
+                    }
+                ]
+            }),
+            vec![
+                (
+                    "assistant_response",
+                    "$.choices[*].message[?(@.role == 'assistant' && @.content ~= 'Hi')].length()"
+                ),
+                (
+                    "replied_appropriately",
+                    "$.choices[*].message[?(@.content ~= 'Hi')].length()"
+                )
+            ]
+        ),
+        test_case!(
+            "tool_use",
+            json!({
+                "model": "not_needed",
+                "messages": [
+                    {
+                      "role": "user",
+                      "content": "What'\''s the weather like in Boston today?"
+                    }
+                ],
+                "tool_choice": {"type": "function", "function": {"name": "get_current_weather"}},
+                "tools": [
+                  {
+                    "type": "function",
+                    "function": {
+                      "name": "get_current_weather",
+                      "description": "Get the current weather in a given location",
+                      "parameters": {
+                        "type": "object",
+                        "properties": {
+                          "location": {
+                            "type": "string",
+                            "description": "The city and state, e.g. San Francisco, CA"
+                          },
+                          "unit": {
+                            "type": "string",
+                            "enum": ["celsius", "fahrenheit"]
+                          }
+                        },
+                        "required": ["location"]
+                      }
+                    }
+                  }
+                ]
+            }),
+            vec![
+                ("finish_reason", "$.choices[0].finish_reason"),
+                (
+                    "tool_choice",
+                    "$.choices[0].message.tool_calls[0].function.name"
+                ),
+                (
+                    "valid_function_args",
+                    "$.choices[0].message.tool_calls[0].function.arguments"
+                )
+            ]
+        ),
+    ]
+});
 
-    /// Model instantiations to test.
-    static ref TEST_MODELS: Vec<(&'static str, Arc<dyn Chat>)> =
-        vec![("anthropic", anthropic::create_chat(None).expect("failed to create anthropic model"))];
+/// Model instantiations to test.
+static TEST_MODELS: LazyLock<Vec<(&'static str, Arc<dyn Chat>)>> = LazyLock::new(|| {
+    vec![(
+        "anthropic",
+        create::create_anthropic(None).expect("failed to create anthropic model"),
+    )]
+});
 
-    /// A mapping of model names (in [`TEST_MODELS`]) and test names (in [`TEST_CASES`]) to skip.
-    static ref TEST_DENY_LIST: Vec<(&'static str, &'static str)> = vec![("anthropic", "advanced")];
-}
+/// A mapping of model names (in [`TEST_MODELS`]) and test names (in [`TEST_CASES`]) to skip.
+static TEST_DENY_LIST: LazyLock<Vec<(&'static str, &'static str)>> =
+    LazyLock::new(|| vec![("anthropic", "placeholder")]);
 
 /// Run a single [`TestCase`] for a model.
 #[allow(clippy::expect_used, clippy::expect_fun_call)]
@@ -78,7 +168,7 @@ async fn run_test_case(
     model: Arc<dyn Chat>,
 ) -> Result<(), anyhow::Error> {
     let test_name = test.name;
-    println!("Running test {test_name}/{model_name} with {:?}", test.req);
+    tracing::info!("Running test {test_name}/{model_name} with {:?}", test.req);
 
     let actual_resp = model
         .chat_request(test.req.clone())

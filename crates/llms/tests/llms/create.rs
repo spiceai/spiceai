@@ -22,11 +22,10 @@ use llms::{
     chat::Chat,
 };
 
-pub(crate) fn create_chat(model_id: Option<&str>) -> Result<Arc<dyn Chat>, OpenAIError> {
+pub(crate) fn create_anthropic(model_id: Option<&str>) -> Result<Arc<dyn Chat>, OpenAIError> {
     let cfg = AnthropicConfig::default()
         .with_api_key(std::env::var("SPICE_ANTHROPIC_API_KEY").ok())
         .with_auth_token(std::env::var("SPICE_ANTHROPIC_AUTH_TOKEN").ok());
-    println!("AnthropicConfig: {cfg:?}");
     let model = Anthropic::new(cfg, model_id)?;
 
     Ok(Arc::new(model))
