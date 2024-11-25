@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 /*
 Copyright 2024 The Spice.ai OSS Authors
 
@@ -16,10 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 use async_openai::types::{CreateChatCompletionRequest, CreateChatCompletionResponse};
+use jsonpath_rust::JsonPath;
 use lazy_static::lazy_static;
 use llms::chat::Chat;
-use paste::paste;
 use serde_json::json;
+use std::{str::FromStr, sync::Arc};
 
 mod anthropic;
 
@@ -27,50 +26,21 @@ mod anthropic;
 pub struct TestCase {
     pub name: &'static str,
     pub req: CreateChatCompletionRequest,
-    pub res: CreateChatCompletionResponse,
+
+    /// Maps (id, `JSONPath` selector), where the selector is into the [`CreateChatCompletionResponse`].
+    /// This is used in snapshot testing to assert certain properties of the response.
+    pub json_path: Vec<(&'static str, &'static str)>,
 }
 /// Creates [`TestCase`] instances from request/response that JSON serialize to
 /// [`CreateChatCompletionRequest`] and [`CreateChatCompletionResponse`].
 #[macro_export]
 macro_rules! test_case {
-    ($name:expr, $req:expr, $res:expr) => {
+    ($name:expr, $req:expr, $jsonpaths:expr) => {
         TestCase {
             name: $name,
             req: serde_json::from_value($req)
                 .expect(&format!("Failed to parse request in test case '{}'", $name)),
-            res: serde_json::from_value($res).expect(&format!(
-                "Failed to parse response in test case '{}'",
-                $name
-            )),
-        }
-    };
-}
-
-// You could also make a more explicit version that lets you specify the sources:
-#[macro_export]
-macro_rules! generate_model_tests_from {
-    ($cases:expr, $models:expr, $deny_list:expr) => {
-        paste::paste! {
-            // Generate individual tests for each combination
-            for test_case in $cases.iter() {
-                for (model_name, model) in $models.iter() {
-                    #[tokio::test]
-                    async fn [<test_ $model_name _ $test_case.name>]() -> Result<(), Error> {
-                        if !$deny_list.iter().any(|(m, t)| *m == model_name && *t == test_case.name) {
-                            run_test_case(
-                                test_case.name,
-                                test_case.clone(),
-                                model_name,
-                                model.clone()
-                            ).await?;
-                            Ok(())
-                        } else {
-                            println!("Test {}/{} skipped (in deny list)", model_name, test_case.name);
-                            Ok(())
-                        }
-                    }
-                }
-            }
+            json_path: $jsonpaths,
         }
     };
 }
@@ -78,8 +48,18 @@ macro_rules! generate_model_tests_from {
 lazy_static! {
     /// Test case parameters (for [`run_test_case`]) to run for each model.
     static ref TEST_CASES: Vec<TestCase> = vec![
-        test_case!("basic", json!({"x": 1}), json!({"y": 2})),
-        test_case!("advanced", json!({"x": 2}), json!({"y": 3})),
+        test_case!("basic", json!({
+            "model": "not_needed",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "Say Hi"
+                }
+            ]
+        }), vec![
+            ("message_keys", "$.choices[*].message['role', 'tool_calls', 'refusal', 'function_calls']"),
+            ("replied_appropriately", "$.choices[*].message[?(@.content ~= 'Hi')].length()")
+        ]),
     ];
 
     /// Model instantiations to test.
@@ -91,22 +71,51 @@ lazy_static! {
 }
 
 /// Run a single [`TestCase`] for a model.
-fn run_test_case(
-    test_name: &'static str,
-    test: TestCase,
+#[allow(clippy::expect_used, clippy::expect_fun_call)]
+async fn run_test_case(
+    test: &TestCase,
     model_name: &'static str,
     model: Arc<dyn Chat>,
 ) -> Result<(), anyhow::Error> {
-    println!(
-        "Running test {}/{}. Request: {:?}, Expected response: {:?}",
-        model_name, test_name, test.req, test.res
+    let test_name = test.name;
+    println!("Running test {test_name}/{model_name} with {:?}", test.req);
+
+    let actual_resp = model
+        .chat_request(test.req.clone())
+        .await
+        .expect(format!("For test {test_name}/{model_name}, chat_request failed").as_str());
+
+    // Convert to [`serde_json::Value`] for JSONPath testing.
+    let resp_value = serde_json::to_value(&actual_resp).expect(
+        format!("For test {test_name}/{model_name}, failed to serialize response to JSON").as_str(),
     );
+    for (id, json_ptr) in &test.json_path {
+        let resp_ptr = JsonPath::from_str(json_ptr)
+            .expect(format!("For test {test_name}, invalid JSONPath selector for id={id}").as_str())
+            .find(&resp_value);
+        insta::assert_snapshot!(
+            format!("{test_name}_{model_name}_{id}"),
+            serde_json::to_string_pretty(&resp_ptr).expect("Failed to serialize snapshot")
+        );
+    }
     Ok(())
 }
 
-// Usage with explicit sources:
-#[cfg(test)]
-mod tests {
-
-    generate_model_tests_from!(TEST_CASES, TEST_MODELS, TEST_DENY_LIST);
+#[tokio::test]
+#[allow(clippy::expect_used, clippy::expect_fun_call)]
+async fn run_all_tests() {
+    for ts in TEST_CASES.iter() {
+        for (model_name, model) in TEST_MODELS.iter() {
+            if crate::llms::TEST_DENY_LIST
+                .iter()
+                .any(|(m, t)| m == model_name && *t == ts.name)
+            {
+                tracing::info!("Skipping test {model_name}/{}", ts.name);
+                continue;
+            }
+            run_test_case(ts, model_name, Arc::clone(model))
+                .await
+                .expect(format!("Failed to run test {model_name}/{}", ts.name).as_str());
+        }
+    }
 }

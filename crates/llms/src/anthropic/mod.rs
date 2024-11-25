@@ -54,7 +54,7 @@ impl Anthropic {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct AnthropicConfig {
     pub auth: Option<AnthropicAuthMechanism>,
     pub base_url: String,
@@ -120,7 +120,7 @@ impl AnthropicConfig {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum AnthropicAuthMechanism {
     ApiKey(Secret<String>),
     AuthToken(Secret<String>),
