@@ -54,7 +54,7 @@ pub enum Error {
     #[snafu(display("Failed to find table '{}'. An internal error occurred during vector search.\nPlease report a bug on GitHub: https://github.com/spiceai/spiceai/issues", table.to_quoted_string()))]
     DataSourceNotFound { table: TableReference },
 
-    #[snafu(display("There are no tables with embeddings ready for search"))]
+    #[snafu(display("Vector search failed: No tables with embeddings are available. Ensure embeddings are configured and try again."))]
     NoTablesWithEmbeddingsFound {},
 
     #[snafu(display("Vector search cannot be run on {}.", data_source.to_quoted_string()))]
