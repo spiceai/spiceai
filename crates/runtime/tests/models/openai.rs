@@ -31,7 +31,7 @@ use async_openai::types::{
     CreateChatCompletionRequestArgs, EmbeddingInput,
 };
 use chrono::{DateTime, Utc};
-use jsonpath::Selector;
+use jsonpath_rust::JsonPath;
 use llms::chat::Chat;
 use opentelemetry_sdk::trace::TracerProvider;
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, CONTENT_TYPE};
@@ -41,6 +41,7 @@ use spicepod::component::{
     embeddings::{ColumnEmbeddingConfig, Embeddings},
     model::Model,
 };
+use std::str::FromStr;
 use std::sync::Arc;
 
 use super::send_embeddings_request;
@@ -549,10 +550,12 @@ async fn verify_sql_query_chat_completion(
         sql_to_display(
             &rt,
             format!(
-                r#"SELECT count(1) as number_of_ai_completion_tasks
+                r#"SELECT input
                 FROM runtime.task_history
                 WHERE start_time >= '{}'
-                AND task='ai_completion';
+                AND task='ai_completion'
+                ORDER BY start_time
+                LIMIT 1;
             "#,
                 Into::<DateTime<Utc>>::into(task_start_time).to_rfc3339()
             )
@@ -589,14 +592,15 @@ async fn verify_similarity_search_chat_completion(
     // Verify Response
     let resp_value =
         serde_json::to_value(&response).expect("Failed to serialize response.choices: {}");
-    let selector = Selector::new(
-        "$.choices[*].message.content[?(@=~'.*there just big vehicles. Journalists.*')]",
+    let selector = JsonPath::from_str(
+        "$.choices[*].message[?(@.content~='.*there just big vehicles. Journalists.*')].length()",
     )
     .expect("Failed to create JSONPath selector");
 
     insta::assert_snapshot!(
         "chat_2_response",
-        format!("{:#?}", selector.find(&resp_value).collect::<Vec<_>>())
+        serde_json::to_string_pretty(&selector.find(&resp_value))
+            .expect("Failed to serialize response.choices")
     );
 
     // ensure all spans are exported into task_history
@@ -610,7 +614,7 @@ async fn verify_similarity_search_chat_completion(
             format!(
                 r#"SELECT input
                 FROM runtime.task_history
-                WHERE start_time >= '{}' and task='document_similarity';
+                WHERE start_time >= '{}' and task='tool_use::document_similarity';
             "#,
                 Into::<DateTime<Utc>>::into(task_start_time).to_rfc3339()
             )
