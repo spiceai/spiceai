@@ -69,10 +69,10 @@ pub enum Error {
         endpoint: String,
     },
 
-    #[snafu(display("Unable to create flight client.\n{source}"))]
+    #[snafu(display("Failed to create flight client.\n{source}"))]
     UnableToCreateFlightClient { source: flight_client::Error },
 
-    #[snafu(display("Unable to get append stream schema.\n{source}"))]
+    #[snafu(display("Failed to get append stream schema.\n{source}"))]
     UnableToGetAppendSchema { source: flight_client::Error },
 }
 

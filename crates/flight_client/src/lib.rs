@@ -119,7 +119,7 @@ impl std::fmt::Display for TonicStatusMessage {
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "Unable to connect to server: TLS error.\n{source}\nEnsure the flight endpoint is valid and reachable."
+        "Failed to connect to server: TLS error.\n{source}\nEnsure the flight endpoint is valid and reachable."
     ))]
     UnableToConnectToServer { source: tls::Error },
 
@@ -140,7 +140,7 @@ pub enum Error {
         source: tonic::metadata::errors::ToStrError,
     },
 
-    #[snafu(display("Unable to get schema.\n{source}\nReport a bug to request support: https://github.com/spiceai/spiceai/issues"))]
+    #[snafu(display("Failed to get schema.\n{source}\nReport a bug to request support: https://github.com/spiceai/spiceai/issues"))]
     UnableToConvertSchema { source: arrow::error::ArrowError },
 
     #[snafu(display("Query execution failed.\n{source}"))]
@@ -148,7 +148,7 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Unable to publish data to flight endpoint.\n{source}\nVerify the configuration and try again"))]
+    #[snafu(display("Failed to publish data to flight endpoint.\n{source}\nVerify the configuration and try again"))]
     UnableToPublish { source: tonic::Status },
 
     #[snafu(display("Unauthorized. Verify the credentials."))]
