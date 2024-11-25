@@ -16,9 +16,7 @@ limitations under the License.
 
 use crate::{rate_limit::RateLimiter, token_provider::TokenProvider};
 
-use super::{
-    rate_limit::RateLimiter, ArrowInternalSnafu, Error, ErrorChecker, ReqwestInternalSnafu, Result,
-};
+use super::{ArrowInternalSnafu, Error, ErrorChecker, ReqwestInternalSnafu, Result};
 use arrow::{
     array::RecordBatch,
     datatypes::SchemaRef,
