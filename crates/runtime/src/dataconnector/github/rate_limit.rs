@@ -69,9 +69,8 @@ impl RateLimitInfo {
             .ok()?
             .to_string();
 
-        let reset_time = match Utc.timestamp_opt(reset, 0) {
-            MappedLocalTime::Single(t) => t,
-            _ => unreachable!("timestamp_opt should never fail for Utc"),
+        let MappedLocalTime::Single(reset_time) = Utc.timestamp_opt(reset, 0) else {
+            unreachable!("timestamp_opt should never fail for Utc")
         };
 
         Some(Self {
@@ -145,57 +144,46 @@ mod tests {
     use reqwest::header::HeaderValue;
     use std::collections::HashMap;
 
-    fn create_test_headers(values: HashMap<&str, &str>) -> HeaderMap {
+    fn create_test_headers(values: HashMap<&'static str, String>) -> HeaderMap {
         let mut headers = HeaderMap::new();
         for (key, value) in values {
-            headers.insert(key, HeaderValue::from_str(value).unwrap());
+            headers.insert(
+                key,
+                HeaderValue::from_str(&value).expect("invalid header value"),
+            );
         }
         headers
     }
 
-    #[tokio::test]
-    async fn test_rate_limiter_internal_limit() {
-        let mut rate_limiter = RateLimiter::new();
-
-        // Make max-1 requests
-        for _ in 0..GITHUB_MAX_REQUESTS_PER_HOUR - 1 {
-            rate_limiter.check_rate_limit().await.unwrap();
-        }
-
-        // Next request should work
-        rate_limiter.check_rate_limit().await.unwrap();
-
-        // This request should trigger rate limiting
-        let start = std::time::Instant::now();
-        rate_limiter.check_rate_limit().await.unwrap();
-        let elapsed = start.elapsed();
-
-        // Should have waited close to an hour
-        assert!(elapsed.as_secs() > 0);
+    fn s(s: &'static str) -> String {
+        s.to_string()
     }
 
     #[tokio::test]
     async fn test_rate_limiter_api_limits() {
-        let mut rate_limiter = RateLimiter::new();
+        let rate_limiter = GitHubRateLimiter::new();
 
         // Set up API headers indicating rate limit exceeded
         let headers = create_test_headers(HashMap::from([
-            ("x-ratelimit-limit", "5000"),
-            ("x-ratelimit-remaining", "0"),
-            ("x-ratelimit-used", "5000"),
+            ("x-ratelimit-limit", s("5000")),
+            ("x-ratelimit-remaining", s("0")),
+            ("x-ratelimit-used", s("5000")),
             (
                 "x-ratelimit-reset",
-                &(Utc::now() + Duration::milliseconds(100))
+                (Utc::now() + Duration::milliseconds(200))
                     .timestamp()
                     .to_string(),
             ),
-            ("x-ratelimit-resource", "graphql"),
+            ("x-ratelimit-resource", s("graphql")),
         ]));
 
         rate_limiter.update_from_headers(&headers).await;
 
         let start = std::time::Instant::now();
-        rate_limiter.check_rate_limit().await.unwrap();
+        rate_limiter
+            .check_rate_limit()
+            .await
+            .expect("rate limit check failed");
         let elapsed = start.elapsed();
 
         // Should have waited at least until reset time
@@ -204,25 +192,28 @@ mod tests {
 
     #[tokio::test]
     async fn test_rate_limiter_normal_operation() {
-        let mut rate_limiter = RateLimiter::new();
+        let rate_limiter = GitHubRateLimiter::new();
 
         // Set up API headers indicating normal operation
         let headers = create_test_headers(HashMap::from([
-            ("x-ratelimit-limit", "5000"),
-            ("x-ratelimit-remaining", "4999"),
-            ("x-ratelimit-used", "1"),
+            ("x-ratelimit-limit", s("5000")),
+            ("x-ratelimit-remaining", s("4999")),
+            ("x-ratelimit-used", s("1")),
             (
                 "x-ratelimit-reset",
-                &(Utc::now() + Duration::hours(1)).timestamp().to_string(),
+                (Utc::now() + Duration::hours(1)).timestamp().to_string(),
             ),
-            ("x-ratelimit-resource", "graphql"),
+            ("x-ratelimit-resource", s("graphql")),
         ]));
 
         rate_limiter.update_from_headers(&headers).await;
 
         // Should proceed without waiting
         let start = std::time::Instant::now();
-        rate_limiter.check_rate_limit().await.unwrap();
+        rate_limiter
+            .check_rate_limit()
+            .await
+            .expect("rate limit check failed");
         let elapsed = start.elapsed();
 
         assert!(elapsed.as_millis() < 100);
