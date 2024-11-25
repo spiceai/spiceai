@@ -384,6 +384,15 @@ async fn get_vectors(
         output_ptr += 1;
         builder.append(true);
     }
+
+    // Handle any trailing nulls/empty strings.
+    while nulls.get(null_ptr).is_some_and(|&idx| idx == output_ptr) {
+        builder.values().append_nulls(vector_length);
+        null_ptr += 1;
+        output_ptr += 1;
+        builder.append(false);
+    }
+
     Ok(builder.finish())
 }
 
@@ -521,4 +530,108 @@ async fn get_vectors_with_chunker(
     .boxed()?;
 
     Ok((vectors, content_offsets))
+}
+
+#[cfg(test)]
+mod tests {
+
+    use crate::embeddings::execution_plan::get_vectors;
+    use arrow::{
+        array::{Array, AsArray},
+        datatypes::Float32Type,
+    };
+    use async_openai::types::EmbeddingInput;
+    use async_trait::async_trait;
+    use llms::embeddings::{self, Embed};
+    use std::collections::HashMap;
+
+    #[derive(Default)]
+    pub(crate) struct MockEmbedder {
+        pub map: HashMap<String, Vec<f32>>,
+    }
+
+    impl MockEmbedder {
+        pub fn with_pair(mut self, input: &'static str, output: Vec<f32>) -> Self {
+            self.map.insert(input.to_string(), output);
+            self
+        }
+    }
+
+    #[async_trait]
+    impl Embed for MockEmbedder {
+        fn size(&self) -> i32 {
+            -1
+        }
+
+        async fn embed(&self, input: EmbeddingInput) -> Result<Vec<Vec<f32>>, embeddings::Error> {
+            match input {
+                EmbeddingInput::String(s) => {
+                    let v = self.map.get(&s).cloned().unwrap_or_default();
+                    Ok(vec![v])
+                }
+                EmbeddingInput::StringArray(arr) => {
+                    let v = arr
+                        .iter()
+                        .map(|s| self.map.get(s).cloned().unwrap_or_default())
+                        .collect();
+                    Ok(v)
+                }
+                _ => Err(embeddings::Error::FailedToCreateEmbedding {
+                    source: Box::<dyn std::error::Error + Send + Sync>::from(
+                        "Unsupported input type",
+                    ),
+                }),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_vectors_basic() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let fixed_size_array = get_vectors(
+            vec![Some("hello"), Some("world")].into_iter(),
+            &MockEmbedder::default()
+                .with_pair("hello", vec![0.1, 0.2])
+                .with_pair("world", vec![0.3, 0.4]),
+        )
+        .await?;
+
+        let values = fixed_size_array.values().as_primitive::<Float32Type>();
+
+        assert_eq!(fixed_size_array.len(), 2);
+        assert_eq!(values.value(0), 0.1);
+        assert_eq!(values.value(1), 0.2);
+        assert_eq!(values.value(2), 0.3);
+        assert_eq!(values.value(3), 0.4);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_vectors_with_nulls_and_empty(
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let result = get_vectors(
+            vec![None, Some("world"), Some(""), Some("hello"), None].into_iter(),
+            &MockEmbedder::default()
+                .with_pair("hello", vec![0.1, 0.2])
+                .with_pair("world", vec![0.3, 0.4]),
+        )
+        .await?;
+
+        assert_eq!(result.len(), 5);
+
+        assert!(result.is_null(0));
+        assert!(!result.is_null(1));
+        assert!(result.is_null(2));
+        assert!(!result.is_null(3));
+        assert!(result.is_null(4));
+
+        let values = result.values().as_primitive::<Float32Type>();
+        assert_eq!(values.len(), 10);
+        assert_eq!(values.value(2), 0.3);
+        assert_eq!(values.value(3), 0.4);
+        assert_eq!(values.value(6), 0.1);
+        assert_eq!(values.value(7), 0.2);
+
+        Ok(())
+    }
 }
