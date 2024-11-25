@@ -16,7 +16,9 @@ limitations under the License.
 
 use crate::accelerated_table::AcceleratedTable;
 use crate::component::dataset::Dataset;
+use crate::dataconnector::ConnectorComponent;
 use crate::dataconnector::DataConnector;
+use crate::dataconnector::DataConnectorError;
 use crate::dataconnector::DataConnectorResult;
 use crate::parameters::Parameters;
 use async_trait::async_trait;
@@ -32,11 +34,14 @@ use datafusion::datasource::listing::{
     ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
 };
 use datafusion::datasource::TableProvider;
+use datafusion::error::DataFusionError;
 use datafusion::execution::config::SessionConfig;
 use datafusion::execution::context::SessionContext;
+use futures::TryStreamExt;
 use object_store::ObjectStore;
 use snafu::prelude::*;
 use std::any::Any;
+use std::collections::HashSet;
 use std::fmt::Display;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -73,6 +78,7 @@ pub trait ListingTableConnector: DataConnector {
         let listing_store_url = ListingTableUrl::parse(store_url.clone()).boxed().context(
             crate::dataconnector::UnableToConnectInternalSnafu {
                 dataconnector: format!("{self}"),
+                connector_component: ConnectorComponent::from(dataset),
             },
         )?;
         Self::get_session_context()
@@ -81,6 +87,7 @@ pub trait ListingTableConnector: DataConnector {
             .boxed()
             .context(crate::dataconnector::UnableToConnectInternalSnafu {
                 dataconnector: format!("{self}"),
+                connector_component: ConnectorComponent::from(dataset),
             })
     }
 
@@ -99,9 +106,10 @@ pub trait ListingTableConnector: DataConnector {
             .context(crate::dataconnector::InvalidConfigurationSnafu {
             dataconnector: format!("{self}"),
             message: format!(
-                "Invalid extension ({extension}) for source ({})",
+                "Invalid file extension ({extension}) for source ({})",
                 dataset.name
             ),
+            connector_component: ConnectorComponent::from(dataset),
         })?;
         Ok(table as Arc<dyn TableProvider>)
     }
@@ -134,12 +142,12 @@ pub trait ListingTableConnector: DataConnector {
 
         match params.get("file_format").expose().ok() {
             Some("csv") => Ok((
-                Some(self.get_csv_format(params)?),
+                Some(self.get_csv_format(dataset, params)?),
                 extension.unwrap_or(".csv".to_string()),
             )),
             Some("parquet") => Ok((
                 Some(Arc::new(
-                    ParquetFormat::default().with_options(self.get_table_parquet_options()?),
+                    ParquetFormat::default().with_options(self.get_table_parquet_options(dataset)?),
                 )),
                 extension.unwrap_or(".parquet".to_string()),
             )),
@@ -148,7 +156,7 @@ pub trait ListingTableConnector: DataConnector {
                 if let Some(ext) = std::path::Path::new(dataset.path().as_str()).extension() {
                     if ext.eq_ignore_ascii_case("csv") {
                         return Ok((
-                            Some(self.get_csv_format(params)?),
+                            Some(self.get_csv_format(dataset, params)?),
                             extension.unwrap_or(".csv".to_string()),
                         ));
                     }
@@ -156,7 +164,7 @@ pub trait ListingTableConnector: DataConnector {
                         return Ok((
                             Some(Arc::new(
                                 ParquetFormat::default()
-                                    .with_options(self.get_table_parquet_options()?),
+                                    .with_options(self.get_table_parquet_options(dataset)?),
                             )),
                             extension.unwrap_or(".parquet".to_string()),
                         ));
@@ -166,7 +174,8 @@ pub trait ListingTableConnector: DataConnector {
                 Err(
                     crate::dataconnector::DataConnectorError::InvalidConfiguration {
                         dataconnector: format!("{self}"),
-                        message: "Missing required file_format parameter.".to_string(),
+                        message: "The required 'file_format' parameter is missing.\nEnsure the parameter is provided, and try again.".to_string(),
+                        connector_component: ConnectorComponent::from(dataset),
                         source: "Missing file format".into(),
                     },
                 )
@@ -174,7 +183,11 @@ pub trait ListingTableConnector: DataConnector {
         }
     }
 
-    fn get_csv_format(&self, params: &Parameters) -> DataConnectorResult<Arc<CsvFormat>>
+    fn get_csv_format(
+        &self,
+        dataset: &Dataset,
+        params: &Parameters,
+    ) -> DataConnectorResult<Arc<CsvFormat>>
     where
         Self: Display,
     {
@@ -222,12 +235,16 @@ pub trait ListingTableConnector: DataConnector {
                         .context(crate::dataconnector::InvalidConfigurationSnafu {
                             dataconnector: format!("{self}"),
                             message: format!("Invalid CSV compression_type: {compression_type}, supported types are: GZIP, BZIP2, XZ, ZSTD, UNCOMPRESSED"),
+                            connector_component: ConnectorComponent::from(dataset)
                         })?,
                 ),
         ))
     }
 
-    fn get_table_parquet_options(&self) -> DataConnectorResult<TableParquetOptions>
+    fn get_table_parquet_options(
+        &self,
+        dataset: &Dataset,
+    ) -> DataConnectorResult<TableParquetOptions>
     where
         Self: Display,
     {
@@ -237,6 +254,7 @@ pub trait ListingTableConnector: DataConnector {
             .map_err(
                 |e| crate::dataconnector::DataConnectorError::UnableToConnectInternal {
                     dataconnector: format!("{self}"),
+                    connector_component: ConnectorComponent::from(dataset),
                     source: Box::new(e),
                 },
             )?;
@@ -255,6 +273,21 @@ pub trait ListingTableConnector: DataConnector {
         _accelerated_table: &mut AcceleratedTable,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Ok(())
+    }
+
+    fn handle_object_store_error(
+        &self,
+        dataset: &Dataset,
+        error: object_store::Error,
+    ) -> DataConnectorError
+    where
+        Self: Display,
+    {
+        crate::dataconnector::DataConnectorError::UnableToConnectInternal {
+            dataconnector: format!("{self}"),
+            connector_component: ConnectorComponent::from(dataset),
+            source: error.into(),
+        }
     }
 }
 
@@ -289,6 +322,7 @@ impl<T: ListingTableConnector + Display> DataConnector for T {
         let table_path = ListingTableUrl::parse(url.clone()).boxed().context(
             crate::dataconnector::InternalSnafu {
                 dataconnector: format!("{self}"),
+                connector_component: ConnectorComponent::from(dataset),
                 code: "LTC-RP-LTUP".to_string(), // ListingTableConnector-ReadProvider-ListingTableUrlParse
             },
         )?;
@@ -312,21 +346,39 @@ impl<T: ListingTableConnector + Display> DataConnector for T {
                 )
                 .context(crate::dataconnector::InvalidConfigurationSnafu {
                     dataconnector: format!("{self}"),
+                    connector_component: ConnectorComponent::from(dataset),
                     message: format!(
-                        "Invalid extension ({extension}) for source ({})",
+                        "Invalid file extension ({extension}) for source ({})",
                         dataset.name
                     ),
                 })?)
             }
             Some(file_format) => {
+                let object_store = self.get_object_store(dataset)?;
+                check_for_files_and_extensions(
+                    format!("{self}"),
+                    dataset,
+                    &extension,
+                    table_path.clone(),
+                    &ctx,
+                    &object_store,
+                )
+                .await?;
+
                 let mut options = ListingOptions::new(file_format).with_file_extension(&extension);
 
                 let resolved_schema = options
                     .infer_schema(&ctx.state(), &table_path)
                     .await
-                    .boxed()
-                    .context(crate::dataconnector::UnableToConnectInternalSnafu {
-                        dataconnector: format!("{self}"),
+                    .map_err(|e| match e {
+                        DataFusionError::ObjectStore(object_store_error) => {
+                            self.handle_object_store_error(dataset, object_store_error)
+                        }
+                        e => crate::dataconnector::DataConnectorError::UnableToConnectInternal {
+                            dataconnector: format!("{self}"),
+                            connector_component: ConnectorComponent::from(dataset),
+                            source: e.into(),
+                        },
                     })?;
 
                 // If we should infer partitions and the path is a folder, infer the partitions from the folder structure.
@@ -362,6 +414,7 @@ impl<T: ListingTableConnector + Display> DataConnector for T {
                 let table = ListingTable::try_new(config).boxed().context(
                     crate::dataconnector::InternalSnafu {
                         dataconnector: format!("{self}"),
+                        connector_component: ConnectorComponent::from(dataset),
                         code: "LTC-RP-LTTN".to_string(), // ListingTableConnector-ReadProvider-ListingTableTryNew
                     },
                 )?;
@@ -385,6 +438,78 @@ impl<T: ListingTableConnector + Display> DataConnector for T {
         ListingTableConnector::on_accelerated_table_registration(self, dataset, accelerated_table)
             .await
     }
+}
+
+/// Lists the available files for a ListingTableConnector/ObjectStore
+/// Infers if the `file_format` specified is valid, based on the existence of files with the required extension
+///
+/// # Errors
+///
+/// - If no files are found at the specified path
+/// - If no files with the specified extension are found
+async fn check_for_files_and_extensions(
+    dataconnector: String,
+    dataset: &Dataset,
+    extension: &str,
+    table_path: ListingTableUrl,
+    ctx: &SessionContext,
+    object_store: &Arc<dyn ObjectStore>,
+) -> DataConnectorResult<()> {
+    let files: Vec<_> = table_path
+        .list_all_files(&ctx.state(), object_store, "")
+        .await
+        .map_err(|err| DataConnectorError::UnableToConnectInternal {
+            dataconnector: dataconnector.clone(),
+            connector_component: ConnectorComponent::from(dataset),
+            source: err.into(),
+        })?
+        .try_collect()
+        .await
+        .map_err(|err| DataConnectorError::UnableToConnectInternal {
+            dataconnector: dataconnector.clone(),
+            connector_component: ConnectorComponent::from(dataset),
+            source: err.into(),
+        })?;
+
+    if files.is_empty() {
+        return Err(DataConnectorError::InvalidConfigurationNoSource {
+            dataconnector: dataconnector.clone(),
+            connector_component: ConnectorComponent::from(dataset),
+            message:
+                // Url could contain access keys from e.g. S3, so we don't want to log it.
+                "Failed to find any files at the specified path. Check the path and try again."
+                    .to_string(),
+        });
+    }
+
+    let extensions = files
+        .iter()
+        .filter_map(|file| file.location.extension().map(|e| format!(".{e}")))
+        .collect::<HashSet<_>>();
+
+    if !extensions.contains(extension) {
+        if extensions.is_empty() {
+            return Err(DataConnectorError::InvalidConfigurationNoSource {
+                dataconnector: dataconnector.clone(),
+            connector_component: ConnectorComponent::from(dataset),
+                message: format!("Failed to find any files matching the extension '{extension}'.\nSpice could not find any files with extensions at the specified path. Check the path and try again."),
+            });
+        }
+
+        let display_extensions = extensions
+            .iter()
+            .map(|e| format!("'{e}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        return Err(DataConnectorError::InvalidConfigurationNoSource {
+            dataconnector: dataconnector.clone(),
+            connector_component: ConnectorComponent::from(dataset),
+            message: format!("Failed to find any files matching the extension '{extension}'.\nIs your `file_format` parameter correct? Spice found the following file extensions: {display_extensions}.\nFor details, visit: https://docs.spiceai.org/components/data-connectors#object-store-file-formats")
+        });
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -442,11 +567,12 @@ mod tests {
             &self.params
         }
 
-        fn get_object_store_url(&self, _dataset: &Dataset) -> DataConnectorResult<Url> {
+        fn get_object_store_url(&self, dataset: &Dataset) -> DataConnectorResult<Url> {
             Url::parse("test")
                 .boxed()
                 .context(crate::dataconnector::InvalidConfigurationSnafu {
                     dataconnector: format!("{self}"),
+                    connector_component: ConnectorComponent::from(dataset),
                     message: "Invalid URL".to_string(),
                 })
         }
@@ -484,7 +610,7 @@ mod tests {
             Ok(_) => panic!("Unexpected success"),
             Err(e) => assert_eq!(
                 e.to_string(),
-                "Invalid configuration for TestConnector. Missing required file_format parameter."
+                "Cannot setup the dataset test (TestConnector) with an invalid configuration.\nThe required 'file_format' parameter is missing.\nEnsure the parameter is provided, and try again."
             ),
         }
     }

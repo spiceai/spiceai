@@ -148,6 +148,34 @@ impl From<InvalidTypeAction> for datafusion_table_providers::InvalidTypeAction {
     }
 }
 
+/// Controls when the table is marked ready for queries.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum ReadyState {
+    /// The table is ready once the initial load completes.
+    #[default]
+    OnLoad,
+    /// The table is ready immediately, with fallback to federated table for queries until the initial load completes.
+    OnRegistration,
+}
+
+impl From<spicepod_dataset::ReadyState> for ReadyState {
+    fn from(ready_state: spicepod_dataset::ReadyState) -> Self {
+        match ready_state {
+            spicepod_dataset::ReadyState::OnLoad => ReadyState::OnLoad,
+            spicepod_dataset::ReadyState::OnRegistration => ReadyState::OnRegistration,
+        }
+    }
+}
+
+impl Display for ReadyState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ReadyState::OnLoad => write!(f, "on_load"),
+            ReadyState::OnRegistration => write!(f, "on_registration"),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Dataset {
     pub from: String,
@@ -165,6 +193,7 @@ pub struct Dataset {
     pub app: Option<Arc<App>>,
     schema: Option<SchemaRef>,
     pub invalid_type_action: Option<InvalidTypeAction>,
+    pub ready_state: ReadyState,
 }
 
 // Implement a custom PartialEq for Dataset to ignore the app field
@@ -191,6 +220,18 @@ impl TryFrom<spicepod_dataset::Dataset> for Dataset {
     type Error = crate::Error;
 
     fn try_from(dataset: spicepod_dataset::Dataset) -> std::result::Result<Self, Self::Error> {
+        #[allow(deprecated)]
+        let ready_state = match dataset.acceleration.as_ref().map(|a| a.ready_state) {
+            Some(Some(ready_state)) => {
+                tracing::warn!(
+                    "{}: `dataset.acceleration.ready_state` is deprecated, use `dataset.ready_state` instead.",
+                    dataset.name
+                );
+                ReadyState::from(ready_state)
+            }
+            _ => ReadyState::from(dataset.ready_state),
+        };
+
         let acceleration = dataset
             .acceleration
             .map(acceleration::Acceleration::try_from)
@@ -226,6 +267,7 @@ impl TryFrom<spicepod_dataset::Dataset> for Dataset {
             schema: None,
             app: None,
             invalid_type_action: dataset.invalid_type_action.map(InvalidTypeAction::from),
+            ready_state,
         })
     }
 }
@@ -248,6 +290,7 @@ impl Dataset {
             schema: None,
             app: None,
             invalid_type_action: None,
+            ready_state: ReadyState::default(),
         })
     }
 

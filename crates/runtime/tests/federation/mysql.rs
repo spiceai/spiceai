@@ -30,6 +30,7 @@ use datafusion_table_providers::sql::arrow_sql_gen::statement::{
 use mysql_async::{prelude::Queryable, Params, Row};
 use runtime::Runtime;
 use tracing::instrument;
+use util::{fibonacci_backoff::FibonacciBackoffBuilder, retry, RetryError};
 
 const MYSQL_DOCKER_CONTAINER: &str = "runtime-integration-test-federation-mysql";
 const MYSQL_PORT: u16 = 13306;
@@ -72,8 +73,15 @@ async fn mysql_federation_push_down() -> Result<(), String> {
             e.to_string()
         })?;
     tracing::debug!("Container started");
-    init_mysql_db(MYSQL_PORT).await.map_err(|e| {
-        tracing::error!("init_mysql_db: {e}");
+    let retry_strategy = FibonacciBackoffBuilder::new().max_retries(Some(10)).build();
+    retry(retry_strategy, || async {
+        init_mysql_db(MYSQL_PORT)
+            .await
+            .map_err(RetryError::transient)
+    })
+    .await
+    .map_err(|e| {
+        tracing::error!("Failed to initialize MySQL database: {e}");
         e.to_string()
     })?;
     let app = AppBuilder::new("mysql_federation_push_down")
@@ -157,8 +165,15 @@ async fn mysql_federation_inner_join_with_acc() -> Result<(), String> {
         e.to_string()
     })?;
     tracing::debug!("Container started");
-    init_mysql_db(mysql_port).await.map_err(|e| {
-        tracing::error!("init_mysql_db: {e}");
+    let retry_strategy = FibonacciBackoffBuilder::new().max_retries(Some(10)).build();
+    retry(retry_strategy, || async {
+        init_mysql_db(mysql_port)
+            .await
+            .map_err(RetryError::transient)
+    })
+    .await
+    .map_err(|e| {
+        tracing::error!("Failed to initialize MySQL database: {e}");
         e.to_string()
     })?;
     let app = AppBuilder::new("mysql_federation_inner_join_with_accelerated_dataset")

@@ -32,7 +32,7 @@ use tracing::{Instrument, Span};
 use util::fibonacci_backoff::FibonacciBackoffBuilder;
 use util::{retry, RetryError};
 
-use crate::datafusion::error::{get_spice_df_error, SpiceExternalError};
+use crate::datafusion::error::{find_datafusion_root, get_spice_df_error, SpiceExternalError};
 use crate::datafusion::schema::BaseSchema;
 use crate::federated_table::FederatedTable;
 use crate::timing::MultiTimeMeasurement;
@@ -139,7 +139,7 @@ impl RefreshTask {
             match self.run_once(&refresh).await {
                 Ok(()) => Ok(()),
                 Err(e) => {
-                    for label_set in self.get_dataset_label_sets().await {
+                    for label_set in self.get_dataset_label_sets(&refresh.mode).await {
                         metrics::REFRESH_ERRORS.add(1, &label_set);
                     }
                     Err(e)
@@ -165,11 +165,10 @@ impl RefreshTask {
                 RefreshMode::Disabled => {
                     unreachable!("Refresh cannot be called when acceleration is disabled")
                 }
-                RefreshMode::Full => &metrics::LOAD_DURATION_MS,
-                RefreshMode::Append => &metrics::APPEND_DURATION_MS,
+                RefreshMode::Full | RefreshMode::Append => &metrics::REFRESH_DURATION_MS,
                 RefreshMode::Changes => unreachable!("changes are handled upstream"),
             },
-            self.get_dataset_label_sets().await,
+            self.get_dataset_label_sets(&refresh.mode).await,
         );
 
         let start_time = SystemTime::now();
@@ -267,7 +266,7 @@ impl RefreshTask {
         let sink = &*sink_lock;
 
         if let Err(e) = sink.insert_into(record_batch_stream, overwrite).await {
-            tracing::warn!("Failed to update dataset {dataset_name}: {e}");
+            tracing::warn!("Failed to update the dataset {dataset_name}.\n{e}");
             self.mark_dataset_status(sql, status::ComponentStatus::Error)
                 .await;
             return Err(e);
@@ -339,6 +338,7 @@ impl RefreshTask {
         };
 
         let streaming_update = StreamingDataUpdate::try_from(data_update)
+            .map_err(find_datafusion_root)
             .context(UnableToCreateMemTableFromUpdateSnafu)?;
 
         self.write_streaming_data_update(start_time, streaming_update, sql.as_deref())
@@ -554,11 +554,14 @@ impl RefreshTask {
                 refresh.sql.as_deref(),
             )
             .await
+            .map_err(find_datafusion_root)
             .context(super::UnableToScanTableProviderSnafu)?
             .filter(filter_converter.convert(value, Operator::Gt))
+            .map_err(find_datafusion_root)
             .context(super::UnableToScanTableProviderSnafu)?
             .collect()
             .await
+            .map_err(find_datafusion_root)
             .context(super::UnableToScanTableProviderSnafu)?;
 
         let filter_schema = BaseSchema::get_schema(&federated_provider);
@@ -589,21 +592,23 @@ impl RefreshTask {
             .validate_time_format(self.dataset_name.to_string(), &self.accelerator.schema())
             .context(super::InvalidTimeColumnTimeFormatSnafu)?;
 
-        let column =
-            refresh
-                .time_column
-                .clone()
-                .context(super::FailedToFindLatestTimestampSnafu {
-                    reason: "Failed to get latest timestamp due to time column not specified",
-                })?;
+        let column = refresh
+            .time_column
+            .clone()
+            .context(super::FailedToFindLatestTimestampSnafu {
+            reason:
+                "Failed to get the latest timestamp.\nThe `time_column` parameter must be specified.",
+        })?;
 
         let df = self
             .max_timestamp_df(ctx, &column, refresh.sql.as_deref())
             .await
+            .map_err(find_datafusion_root)
             .context(super::UnableToScanTableProviderSnafu)?;
         let result = &df
             .collect()
             .await
+            .map_err(find_datafusion_root)
             .context(super::FailedToQueryLatestTimestampSnafu)?;
 
         let Some(result) = result.first() else {
@@ -614,7 +619,7 @@ impl RefreshTask {
             .as_any()
             .downcast_ref::<TimestampNanosecondArray>()
             .context(super::FailedToFindLatestTimestampSnafu {
-                reason: "Failed to get latest timestamp during incremental appending process due to time column is unable to cast to timestamp",
+                reason: "Failed to get the latest timestamp during incremental appending.\nFailed to convert the value of the time column to a timestamp. Verify the column is a timestamp.",
             })?;
 
         if array.is_empty() {
@@ -626,7 +631,7 @@ impl RefreshTask {
         let schema = &self.accelerator.schema();
         let Ok(accelerated_field) = schema.field_with_name(&column) else {
             return Err(super::Error::FailedToFindLatestTimestamp {
-                reason: "Failed to get latest timestamp due to time column not specified"
+                reason: "Failed to get the latest timestamp.\nThe `time_column` parameter must be specified."
                     .to_string(),
             });
         };
@@ -672,11 +677,21 @@ impl RefreshTask {
         dataset_names
     }
 
-    async fn get_dataset_label_sets(&self) -> Vec<Vec<KeyValue>> {
+    async fn get_dataset_label_sets(&self, mode: &RefreshMode) -> Vec<Vec<KeyValue>> {
         let dataset_names = self.get_dataset_names().await;
         dataset_names
             .into_iter()
-            .map(|name| vec![KeyValue::new("dataset", name.to_string())])
+            .map(|name| {
+                let mut label_set = vec![KeyValue::new("dataset", name.to_string())];
+                match mode {
+                    RefreshMode::Full => label_set.push(KeyValue::new("mode", "full".to_string())),
+                    RefreshMode::Append => {
+                        label_set.push(KeyValue::new("mode", "append".to_string()));
+                    }
+                    _ => (),
+                }
+                label_set
+            })
             .collect()
     }
 
@@ -701,7 +716,7 @@ impl RefreshTask {
                     labels.push(KeyValue::new("sql", sql.to_string()));
                 };
 
-                metrics::LAST_REFRESH_TIME.record(now.as_secs_f64(), &labels);
+                metrics::LAST_REFRESH_TIME_MS.record(now.as_secs_f64() * 1000.0, &labels);
             }
         }
     }
@@ -795,9 +810,13 @@ fn filter_records(
 
 pub(crate) fn retry_from_df_error(error: DataFusionError) -> RetryError<super::Error> {
     if is_retriable_error(&error) {
-        return RetryError::transient(super::Error::UnableToGetDataFromConnector { source: error });
+        return RetryError::transient(super::Error::UnableToGetDataFromConnector {
+            source: find_datafusion_root(error),
+        });
     }
-    RetryError::permanent(super::Error::FailedToRefreshDataset { source: error })
+    RetryError::permanent(super::Error::FailedToRefreshDataset {
+        source: find_datafusion_root(error),
+    })
 }
 
 fn inner_err_from_retry(error: RetryError<super::Error>) -> super::Error {

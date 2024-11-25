@@ -20,13 +20,12 @@ use arrow_flight::{flight_service_server::FlightService, FlightData, PutResult};
 use arrow_ipc::convert::try_schema_from_flatbuffer_bytes;
 use datafusion::sql::TableReference;
 use futures::stream;
-use opentelemetry::KeyValue;
 use tokio::sync::{broadcast::Sender, RwLock};
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::{
     dataupdate::{DataUpdate, UpdateType},
-    timing::{TimeMeasurement, TimedStream},
+    timing::TimedStream,
 };
 
 use super::{metrics, Service};
@@ -48,22 +47,25 @@ pub(crate) async fn handle(
     flight_svc: &Service,
     request: Request<Streaming<FlightData>>,
 ) -> Result<Response<<Service as FlightService>::DoPutStream>, Status> {
-    let mut duration_metric = TimeMeasurement::new(&metrics::DO_PUT_DURATION_MS, vec![]);
     let mut streaming_flight = request.into_inner();
 
     let Ok(Some(message)) = streaming_flight.message().await else {
+        let _start = metrics::track_flight_request("do_put", None);
         return Err(Status::invalid_argument("No flight data provided"));
     };
     let Some(fd) = &message.flight_descriptor else {
+        let _start = metrics::track_flight_request("do_put", None);
         return Err(Status::invalid_argument("No flight descriptor provided"));
     };
     if fd.path.is_empty() {
+        let _start = metrics::track_flight_request("do_put", None);
         return Err(Status::invalid_argument("No path provided"));
     };
 
     let path = TableReference::parse_str(&fd.path.join("."));
 
-    duration_metric.with_labels(vec![KeyValue::new("path", path.to_string())]);
+    // Initializing tracking here so that both counter and duration have consistent path dimensions
+    let start = metrics::track_flight_request("do_put", Some(&path.to_string()));
 
     if !flight_svc.datafusion.is_writable(&path) {
         return Err(Status::invalid_argument(format!(
@@ -145,7 +147,7 @@ pub(crate) async fn handle(
         }
     });
 
-    let timed_stream = TimedStream::new(response_stream, move || duration_metric);
+    let timed_stream = TimedStream::new(response_stream, move || start);
 
     Ok(Response::new(Box::pin(timed_stream)))
 }

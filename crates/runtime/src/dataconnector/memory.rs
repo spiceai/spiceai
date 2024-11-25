@@ -26,7 +26,8 @@ use datafusion::datasource::TableProvider;
 use futures::Future;
 
 use super::{
-    DataConnector, DataConnectorError, DataConnectorFactory, DataConnectorParams, ParameterSpec,
+    ConnectorComponent, DataConnector, DataConnectorError, DataConnectorFactory,
+    DataConnectorParams, ParameterSpec,
 };
 
 /// A connector that wraps a [`MemTable`] initialised without data, that can be
@@ -89,6 +90,7 @@ impl DataConnector for MemoryConnector {
         let Some(schema) = Self::schema_from_path(path.as_str()) else {
             return Err(DataConnectorError::UnableToGetReadProvider {
                 dataconnector: "memory".to_string(),
+                connector_component: ConnectorComponent::from(dataset),
                 source: Box::<dyn std::error::Error + Send + Sync>::from(format!(
                     "Invalid path: {path}"
                 )),
@@ -97,6 +99,7 @@ impl DataConnector for MemoryConnector {
         let table = MemTable::try_new(schema, vec![]).boxed().map_err(|e| {
             DataConnectorError::UnableToGetReadProvider {
                 dataconnector: "memory".to_string(),
+                connector_component: ConnectorComponent::from(dataset),
                 source: e,
             }
         })?;
@@ -112,6 +115,7 @@ impl DataConnector for MemoryConnector {
         let Some(schema) = Self::schema_from_path(path.as_str()) else {
             return Some(Err(DataConnectorError::UnableToGetReadProvider {
                 dataconnector: "memory".to_string(),
+                connector_component: ConnectorComponent::from(dataset),
                 source: Box::<dyn std::error::Error + Send + Sync>::from(format!(
                     "Invalid path: {path}"
                 )),
@@ -122,6 +126,7 @@ impl DataConnector for MemoryConnector {
             Ok(table) => Some(Ok(Arc::new(table) as Arc<dyn TableProvider>)),
             Err(e) => Some(Err(DataConnectorError::UnableToGetReadWriteProvider {
                 dataconnector: "memory".to_string(),
+                connector_component: ConnectorComponent::from(dataset),
                 source: Box::<dyn std::error::Error + Send + Sync>::from(e.message().to_string()),
             })),
         }

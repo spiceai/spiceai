@@ -18,7 +18,7 @@ use crate::{get_test_datafusion, init_tracing, postgres::common, utils::runtime_
 use app::AppBuilder;
 use datafusion::assert_batches_eq;
 use rand::Rng;
-use runtime::{status, Runtime};
+use runtime::{datafusion::error::find_datafusion_root, status, Runtime};
 use spicepod::component::{
     dataset::{
         acceleration::{Acceleration, Mode, OnConflictBehavior, RefreshMode},
@@ -292,7 +292,13 @@ async fn get_query_result(
     rt: &Arc<Runtime>,
     sql: &str,
 ) -> Result<Vec<arrow::array::RecordBatch>, datafusion::error::DataFusionError> {
-    rt.datafusion().ctx.sql(sql).await?.collect().await
+    rt.datafusion()
+        .ctx
+        .sql(sql)
+        .await
+        .map_err(find_datafusion_root)?
+        .collect()
+        .await
 }
 
 fn create_postgres_test_dataset(

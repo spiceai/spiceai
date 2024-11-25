@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::{dataconnector::ConnectorComponent, datafusion::error::find_datafusion_root};
+
 use super::{
     commits_inject_parameters, filter_pushdown, inject_parameters, GitHubTableArgs,
     GitHubTableGraphQLParams,
@@ -31,6 +33,7 @@ use std::sync::Arc;
 pub struct CommitsTableArgs {
     pub owner: String,
     pub repo: String,
+    pub component: ConnectorComponent,
 }
 
 impl GraphQLContext for CommitsTableArgs {
@@ -47,6 +50,7 @@ impl GraphQLContext for CommitsTableArgs {
         query: &mut GraphQLQuery<'_>,
     ) -> Result<(), datafusion::error::DataFusionError> {
         inject_parameters("history", commits_inject_parameters, filters, query)
+            .map_err(find_datafusion_root)
     }
 
     fn error_checker(&self) -> Option<ErrorChecker> {
@@ -55,6 +59,10 @@ impl GraphQLContext for CommitsTableArgs {
 }
 
 impl GitHubTableArgs for CommitsTableArgs {
+    fn get_component(&self) -> ConnectorComponent {
+        self.component.clone()
+    }
+
     fn get_graphql_values(&self) -> GitHubTableGraphQLParams {
         let query = format!(
             r#"{{

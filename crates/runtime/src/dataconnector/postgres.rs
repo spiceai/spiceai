@@ -31,7 +31,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use super::{
-    DataConnector, DataConnectorError, DataConnectorFactory, DataConnectorParams, ParameterSpec,
+    ConnectorComponent, DataConnector, DataConnectorError, DataConnectorFactory,
+    DataConnectorParams, ParameterSpec,
 };
 
 #[derive(Debug, Snafu)]
@@ -88,6 +89,7 @@ impl DataConnectorFactory for PostgresFactory {
                     postgrespool::Error::InvalidUsernameOrPassword { .. } => Err(
                         DataConnectorError::UnableToConnectInvalidUsernameOrPassword {
                             dataconnector: "postgres".to_string(),
+                            connector_component: params.component.clone(),
                         }
                         .into(),
                     ),
@@ -98,6 +100,7 @@ impl DataConnectorFactory for PostgresFactory {
                         source: _,
                     } => Err(DataConnectorError::UnableToConnectInvalidHostOrPort {
                         dataconnector: "postgres".to_string(),
+                        connector_component: params.component.clone(),
                         host,
                         port: format!("{port}"),
                     }
@@ -105,6 +108,7 @@ impl DataConnectorFactory for PostgresFactory {
 
                     _ => Err(DataConnectorError::UnableToConnectInternal {
                         dataconnector: "postgres".to_string(),
+                        connector_component: params.component.clone(),
                         source: Box::new(e),
                     }
                     .into()),
@@ -149,7 +153,7 @@ impl DataConnector for Postgres {
                     {
                         return Err(DataConnectorError::InvalidTableName {
                             dataconnector: "postgres".to_string(),
-                            dataset_name: dataset.name.to_string(),
+                            connector_component: ConnectorComponent::from(dataset),
                             table_name: table_name.clone(),
                         });
                     }
@@ -157,6 +161,7 @@ impl DataConnector for Postgres {
 
                 return Err(DataConnectorError::UnableToGetReadProvider {
                     dataconnector: "postgres".to_string(),
+                    connector_component: ConnectorComponent::from(dataset),
                     source: e,
                 });
             }

@@ -147,16 +147,76 @@ impl Model {
 
     #[must_use]
     pub fn get_all_file_paths(&self) -> Vec<String> {
-        self.files.iter().map(|f| f.path.clone()).collect()
+        self.get_all_files()
+            .iter()
+            .map(|f| f.path.clone())
+            .collect()
     }
 
     /// Finds at most one model file with the given [`ModelFileType`].
     #[must_use]
     pub fn find_any_file_path(&self, file_type: ModelFileType) -> Option<String> {
-        self.files
+        self.get_all_files()
             .iter()
             .find(|f| f.file_type() == Some(file_type))
             .map(|f| f.path.clone())
+    }
+
+    /// Finds all models with a given [`ModelFileType`].
+    #[must_use]
+    pub fn find_all_file_path(&self, file_type: ModelFileType) -> Vec<String> {
+        self.get_all_files()
+            .iter()
+            .filter(|f| f.file_type() == Some(file_type))
+            .map(|f| f.path.clone())
+            .collect()
+    }
+
+    /// Get all files for the model component, if a [`ModelFile`] is a directory, include all files in the directory too.
+    fn get_all_files(&self) -> Vec<ModelFile> {
+        let mut component_files = self.files.clone();
+
+        // If `from:file:...` then add the model_id as a possible source of files.
+        if matches!(
+            ModelSource::try_from(self.from.as_str()),
+            Ok(ModelSource::File)
+        ) {
+            if let Some(id) = self.get_model_id() {
+                component_files.push(ModelFile {
+                    path: id,
+                    name: Some("from_id".to_string()),
+                    r#type: Some(ModelFileType::Weights),
+                });
+            }
+        }
+        component_files
+            .iter()
+            .flat_map(|f| {
+                if Path::new(&f.path).is_dir() {
+                    tracing::debug!("Loading model files from: '{}'.", f.path);
+
+                    if let Ok(read_dir) = Path::new(&f.path).read_dir() {
+                        read_dir
+                            .filter_map(|a| {
+                                if let Ok(r) = a {
+                                    r.path().to_str().map(|s| ModelFile {
+                                        path: s.to_string(),
+                                        name: None,
+                                        r#type: determine_type_from_path(s),
+                                    })
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect()
+                    } else {
+                        vec![]
+                    }
+                } else {
+                    vec![f.clone()]
+                }
+            })
+            .collect()
     }
 
     #[must_use]
@@ -220,23 +280,13 @@ impl Model {
             return Some(ModelType::Ml);
         };
 
+        let files = self.get_all_files();
+
         // TODO: Need to scan filenames from HF for [`ModelSource::HuggingFace`]. Below is a hack
         // to determine if it's an LLM from HF by check if an ML files are set manually.
-        let no_ml_files = self.files.iter().all(|f| !is_ml_file(Path::new(&f.path)));
+        let no_ml_files = files.iter().all(|f| !is_ml_file(Path::new(&f.path)));
         if source == ModelSource::HuggingFace && no_ml_files {
             return Some(ModelType::Llm);
-        }
-        let mut files = self.files.clone();
-
-        // For [`ModelSource::File`], The model id is a weights file.
-        if source == ModelSource::File {
-            if let Some(id) = self.get_model_id() {
-                files.push(ModelFile {
-                    path: id,
-                    name: Some("from_id".to_string()),
-                    r#type: Some(ModelFileType::Weights),
-                });
-            }
         }
 
         let is_llm = files.iter().any(|f| {

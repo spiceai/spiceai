@@ -354,7 +354,8 @@ impl ParameterSpec {
 pub enum ParameterType {
     /// A parameter which tells Spice how to connect to the underlying data source.
     ///
-    /// These parameters are automatically prefixed with the data connector's prefix.
+    /// These parameters are automatically prefixed with the data connector's prefix (from
+    /// [`crate::dataconnector::DataConnectorFactory::prefix`]).
     ///
     /// # Examples
     ///
@@ -364,7 +365,8 @@ pub enum ParameterType {
 
     /// A parameter which tells Spice how to connect to the underlying data accelerator.
     ///
-    /// These parameters are automatically prefixed with the data accelerator's prefix.
+    /// These parameters are automatically prefixed with the data accelerator's prefix (from
+    /// [`crate::dataaccelerator::DataAccelerator::prefix`]).
     ///
     /// # Examples
     ///

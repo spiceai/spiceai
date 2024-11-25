@@ -16,8 +16,8 @@ limitations under the License.
 
 use super::listing::{build_fragments, ListingTableConnector};
 use super::{
-    DataConnector, DataConnectorFactory, DataConnectorParams, DataConnectorResult, ParameterSpec,
-    Parameters,
+    ConnectorComponent, DataConnector, DataConnectorFactory, DataConnectorParams,
+    DataConnectorResult, ParameterSpec, Parameters,
 };
 
 use crate::component::dataset::Dataset;
@@ -41,6 +41,11 @@ pub enum Error {
         "Provide only one of the following: access key, bearer token, or client credentials. Use skip_signature to disable all authentication."
     ))]
     InvalidKeyAuthCombination,
+
+    #[snafu(display(
+        "The 'abfs_endpoint' parameter must be a HTTP/S URL, but '{endpoint}' was provided."
+    ))]
+    InvalidEndpoint { endpoint: String },
 }
 
 pub struct AzureBlobFS {
@@ -162,6 +167,15 @@ impl DataConnectorFactory for AzureBlobFSFactory {
         }
 
         Box::pin(async move {
+            if let Some(endpoint) = params.parameters.get("endpoint").expose().ok() {
+                if !(endpoint.starts_with("https://") || endpoint.starts_with("http://")) {
+                    return Err(Box::new(Error::InvalidEndpoint {
+                        endpoint: endpoint.to_string(),
+                    })
+                        as Box<dyn std::error::Error + Send + Sync>);
+                }
+            }
+
             let access_key = params.parameters.get("access_key").expose().ok();
             let bearer_token = params.parameters.get("bearer_token").expose().ok();
             let sas_string = params.parameters.get("sas_string").expose().ok();
@@ -225,7 +239,8 @@ impl ListingTableConnector for AzureBlobFS {
                 .boxed()
                 .context(super::InvalidConfigurationSnafu {
                     dataconnector: format!("{self}"),
-                    message: format!("{} is not a valid URL", &dataset.from),
+                    message: format!("{} is not a valid URL. Ensure the URL is valid and try again.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/abfs#from", &dataset.from),
+                    connector_component: ConnectorComponent::from(dataset)
                 })?;
 
         let params = build_fragments(

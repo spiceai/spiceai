@@ -40,8 +40,8 @@ text-splitter = { version = "0.18.1", features = [
 ] }
 tiktoken-rs = "0.6.0"
 
-mistralrs = { git = "https://github.com/spiceai/mistral.rs", rev = "5fe3fe33494b858537a050377b64cb4fba8edb37", optional = true }
-mistralrs-core = { git = "https://github.com/spiceai/mistral.rs", rev = "5fe3fe33494b858537a050377b64cb4fba8edb37", optional = true, package = "mistralrs-core" }
+mistralrs = { git = "https://github.com/spiceai/mistral.rs", rev = "d70715944e30f335eb59e1a712962b86d7a5d026", optional = true }
+mistralrs-core = { git = "https://github.com/spiceai/mistral.rs", rev = "d70715944e30f335eb59e1a712962b86d7a5d026", optional = true, package = "mistralrs-core" }
 rand = "0.8.5"
 tei_backend = { package = "text-embeddings-backend", git = "https://github.com/spiceai/text-embeddings-inference.git", rev = "b3925b2f97fcd2bfab9551b432ab659c48e5586b", features = [
     "candle",

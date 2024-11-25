@@ -52,14 +52,8 @@ use crate::Read;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("An error occured with Delta Table: {source}"))]
+    #[snafu(display("Delta Lake Table connection failed: {source}\nVerify Delta Lake Connector configuration and try again.\nFor details, visit https://docs.spiceai.org/components/data-connectors/delta-lake#configuration"))]
     DeltaTableError { source: delta_kernel::Error },
-
-    #[snafu(display("An error occured with handling Arrow data: {source}"))]
-    ArrowError { source: arrow::error::ArrowError },
-
-    #[snafu(display("An error occured with handling partition columns: {message}"))]
-    PartitionColumnMismatchError { message: String },
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;

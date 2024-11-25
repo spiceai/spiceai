@@ -94,34 +94,6 @@ impl Display for ZeroResultsAction {
     }
 }
 
-/// Controls when the table is marked ready for queries.
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
-pub enum ReadyState {
-    /// The table is ready once the initial load completes.
-    #[default]
-    OnLoad,
-    /// The table is ready immediately, with fallback to federated table for queries until the initial load completes.
-    OnRegistration,
-}
-
-impl From<spicepod_acceleration::ReadyState> for ReadyState {
-    fn from(ready_state: spicepod_acceleration::ReadyState) -> Self {
-        match ready_state {
-            spicepod_acceleration::ReadyState::OnLoad => ReadyState::OnLoad,
-            spicepod_acceleration::ReadyState::OnRegistration => ReadyState::OnRegistration,
-        }
-    }
-}
-
-impl Display for ReadyState {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ReadyState::OnLoad => write!(f, "on_load"),
-            ReadyState::OnRegistration => write!(f, "on_registration"),
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
 pub enum Engine {
     #[default]
@@ -272,8 +244,6 @@ pub struct Acceleration {
 
     pub on_zero_results: ZeroResultsAction,
 
-    pub ready_state: ReadyState,
-
     pub indexes: HashMap<ColumnReference, IndexType>,
 
     pub primary_key: Option<ColumnReference>,
@@ -391,7 +361,6 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
             retention_check_enabled: acceleration.retention_check_enabled,
             disable_query_push_down,
             on_zero_results: ZeroResultsAction::from(acceleration.on_zero_results),
-            ready_state: ReadyState::from(acceleration.ready_state),
             indexes,
             primary_key,
             on_conflict,
@@ -419,7 +388,6 @@ impl Default for Acceleration {
             retention_check_interval: None,
             retention_check_enabled: false,
             on_zero_results: ZeroResultsAction::ReturnEmpty,
-            ready_state: ReadyState::OnLoad,
             indexes: HashMap::default(),
             primary_key: None,
             on_conflict: HashMap::default(),

@@ -631,7 +631,7 @@ async fn notify_refresh_done(
         labels.push(KeyValue::new("sql", sql.to_string()));
     };
 
-    metrics::LAST_REFRESH_TIME.record(now.as_secs_f64(), &labels);
+    metrics::LAST_REFRESH_TIME_MS.record(now.as_secs_f64() * 1000.0, &labels);
 }
 
 #[cfg(test)]
@@ -773,7 +773,10 @@ mod tests {
         ) -> bool {
             for _attempt in 0..max_attempts {
                 let metrics = registry.gather();
-                if let Some(metric) = metrics.iter().find(|m| m.get_name() == "datasets_status") {
+                if let Some(metric) = metrics
+                    .iter()
+                    .find(|m| m.get_name() == "dataset_load_state")
+                {
                     if metric.get_field_type() == MetricType::GAUGE {
                         let value = metric.get_metric()[0].get_gauge().get_value();
                         if value.is_eq(f64::from(desired as i32)) {

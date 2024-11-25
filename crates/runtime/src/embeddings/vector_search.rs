@@ -420,13 +420,21 @@ pub struct Match {
     metadata: HashMap<String, serde_json::Value>,
 }
 
-pub fn to_matches(result: &VectorSearchResult) -> Result<Vec<Match>> {
+pub fn to_matches_sorted(result: &VectorSearchResult) -> Result<Vec<Match>> {
     let output = result
         .iter()
         .map(|(a, b)| b.to_matches(a))
         .collect::<Result<Vec<_>>>()?;
 
-    Ok(output.into_iter().flatten().collect_vec())
+    let mut matches: Vec<_> = output.into_iter().flatten().collect();
+    // Sort by score in descending order
+    matches.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    Ok(matches)
 }
 
 impl VectorSearch {
@@ -591,16 +599,10 @@ impl VectorSearch {
             additional_columns,
         } = req;
 
-        let tables = data_source_opt
-            .as_ref()
-            .map(|ts| {
-                ts.iter()
-                    .map(TableReference::from)
-                    .filter(|t| self.df.table_exists(t.clone()))
-                    .collect()
-            })
-            .clone()
-            .unwrap_or(self.df.get_user_table_names());
+        let tables = match data_source_opt {
+            Some(ts) => ts.iter().map(TableReference::from).collect(),
+            None => self.user_tables_with_embeddings().await?,
+        };
 
         if tables.is_empty() {
             return Err(Error::DataSourcesNotFound {
@@ -695,6 +697,25 @@ impl VectorSearch {
                 Err(e)
             }
         }
+    }
+
+    pub async fn user_tables_with_embeddings(&self) -> Result<Vec<TableReference>> {
+        let tables = self.df.get_user_table_names();
+        let mut tables_with_embeddings = Vec::new();
+
+        for t in tables {
+            let table_provider = self
+                .df
+                .get_table(&t)
+                .await
+                .context(DataSourcesNotFoundSnafu {
+                    data_source: vec![t.clone()],
+                })?;
+            if get_embedding_table(&table_provider).await.is_some() {
+                tables_with_embeddings.push(t);
+            }
+        }
+        Ok(tables_with_embeddings)
     }
 
     /// For the data sources that assumedly exist in the [`DataFusion`] instance, find the embedding models used in each data source.
