@@ -50,7 +50,7 @@ type RuntimeContext struct {
 	isCloud         bool
 	httpClient      *http.Client
 	apiKey          string
-	userAgent	    string
+	userAgent       string
 }
 
 func NewContext() *RuntimeContext {
@@ -339,7 +339,6 @@ func (c *RuntimeContext) SetUserAgentClient(client string) {
 func (c *RuntimeContext) GetHeaders() http.Header {
 	headers := make(http.Header)
 	headers.Set("Content-Type", "application/json")
-
 
 	if c.isCloud {
 		apiKey := os.Getenv("SPICE_API_KEY")
