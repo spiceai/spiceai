@@ -139,6 +139,7 @@ spice-cloud = { path = "../spice_cloud" }
 tracing-subscriber.workspace = true
 tracing-opentelemetry.workspace = true
 opentelemetry_sdk = { workspace = true, features = ["rt-tokio-current-thread"] }
+tokio = { workspace = true, features = ["time", "test-util"] }
 
 [features]
 aws-secrets-manager = [

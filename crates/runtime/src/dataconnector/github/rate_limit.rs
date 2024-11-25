@@ -28,7 +28,14 @@ pub struct GitHubRateLimiter {
 }
 
 #[derive(Debug, Clone)]
-pub struct RateLimitInfo {
+pub enum RateLimitInfo {
+    Primary(PrimaryRateLimitInfo),
+    Secondary(SecondaryRateLimitInfo),
+}
+
+// A primary rate limit that is indicated by x-ratelimit headers
+#[derive(Debug, Clone)]
+pub struct PrimaryRateLimitInfo {
     pub limit: i32,
     pub remaining: i32,
     pub used: i32,
@@ -36,9 +43,32 @@ pub struct RateLimitInfo {
     pub resource: String,
 }
 
+// A secondary rate limit that is indicated by a retry-after header
+#[derive(Debug, Clone)]
+pub struct SecondaryRateLimitInfo {
+    pub retry_after: DateTime<Utc>,
+}
+
 // See https://docs.github.com/en/graphql/overview/rate-limits-and-node-limits-for-the-graphql-api#checking-the-status-of-your-primary-rate-limit
 impl RateLimitInfo {
     pub fn from_headers(headers: &HeaderMap) -> Option<Self> {
+        let primary = Self::primary_rate_limit_from_headers(headers).map(RateLimitInfo::Primary);
+
+        primary.or_else(|| {
+            Self::secondary_rate_limit_from_headers(headers).map(RateLimitInfo::Secondary)
+        })
+    }
+
+    fn secondary_rate_limit_from_headers(headers: &HeaderMap) -> Option<SecondaryRateLimitInfo> {
+        headers
+            .get("retry-after")
+            .and_then(|h| h.to_str().ok().map(|s| s.parse::<u64>().ok()))
+            .flatten()
+            .map(|secs| Utc::now() + Duration::from_secs(secs))
+            .map(|retry_after| SecondaryRateLimitInfo { retry_after })
+    }
+
+    fn primary_rate_limit_from_headers(headers: &HeaderMap) -> Option<PrimaryRateLimitInfo> {
         let limit = headers
             .get("x-ratelimit-limit")?
             .to_str()
@@ -73,7 +103,7 @@ impl RateLimitInfo {
             unreachable!("timestamp_opt should never fail for Utc")
         };
 
-        Some(Self {
+        Some(PrimaryRateLimitInfo {
             limit,
             remaining,
             used,
@@ -94,8 +124,10 @@ impl GitHubRateLimiter {
 #[async_trait]
 impl RateLimiter for GitHubRateLimiter {
     async fn update_from_headers(&self, headers: &HeaderMap) {
+        tracing::debug!("GitHub rate limit headers: {:?}", headers);
         if let Some(rate_limit) = RateLimitInfo::from_headers(headers) {
             let mut api_limit = self.api_limit.write().await;
+            tracing::debug!("GitHub rate limit: {:?}", rate_limit);
             *api_limit = Some(rate_limit);
         }
     }
@@ -104,32 +136,55 @@ impl RateLimiter for GitHubRateLimiter {
         // Check if we're rate limited based on the previous API response headers
         let api_limit_guard = self.api_limit.read().await;
         if let Some(api_limit) = &*api_limit_guard {
-            if api_limit.remaining <= 0 {
-                let now = Utc::now();
-                if now < api_limit.reset_time {
-                    let wait_duration = (api_limit.reset_time - now)
+            tracing::debug!("GitHub rate limit: {:?}", api_limit);
+            match api_limit {
+                RateLimitInfo::Secondary(secondary) => {
+                    tracing::debug!("GitHub rate limit retry-after: {}", secondary.retry_after);
+                    let now = Utc::now();
+                    let wait_duration = (secondary.retry_after - now)
                         .to_std()
                         .unwrap_or(Duration::from_secs(1));
                     let wait_duration_secs = wait_duration.as_secs();
                     tracing::warn!(
-                        "GitHub API rate limit exceeded. Waiting for {} second{} until {}. Limit: {}, Used: {}, Resource: {}",
-                        wait_duration_secs,
-                        if wait_duration_secs == 1 { "" } else { "s" },
-                        api_limit.reset_time,
-                        api_limit.limit,
-                        api_limit.used,
-                        api_limit.resource
+                    "GitHub API secondary rate limit exceeded. Waiting for {} second{} until {}.",
+                    wait_duration_secs,
+                    if wait_duration_secs == 1 { "" } else { "s" },
+                        secondary.retry_after
                     );
                     tokio::time::sleep(wait_duration).await;
                 }
-            } else {
-                tracing::debug!(
-                    "GitHub API rate limit status: {}/{} remaining. Reset at {}. Resource: {}",
-                    api_limit.remaining,
-                    api_limit.limit,
-                    api_limit.reset_time,
-                    api_limit.resource
-                );
+                RateLimitInfo::Primary(primary) => {
+                    // GitHub GraphQL requests consume more than 1 rate-limit unit, so add some buffer to ensure the proper handling
+                    if primary.remaining <= 5 {
+                        tracing::debug!("GitHub rate limit exceeded");
+                        let now = Utc::now();
+                        if now < primary.reset_time {
+                            tracing::debug!("GitHub rate limit reset time: {}", primary.reset_time);
+                            let wait_duration = (primary.reset_time - now)
+                                .to_std()
+                                .unwrap_or(Duration::from_secs(1));
+                            let wait_duration_secs = wait_duration.as_secs();
+                            tracing::warn!(
+                                "GitHub API rate limit exceeded. Waiting for {} second{} until {}. Limit: {}, Used: {}, Resource: {}",
+                                wait_duration_secs,
+                                if wait_duration_secs == 1 { "" } else { "s" },
+                                primary.reset_time,
+                                primary.limit,
+                                primary.used,
+                                primary.resource
+                            );
+                            tokio::time::sleep(wait_duration).await;
+                        }
+                    } else {
+                        tracing::debug!(
+                            "GitHub API rate limit status: {}/{} remaining. Reset at {}. Resource: {}",
+                            primary.remaining,
+                            primary.limit,
+                            primary.reset_time,
+                            primary.resource
+                        );
+                    }
+                }
             }
         }
 
@@ -161,6 +216,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_rate_limiter_api_limits() {
+        tokio::time::pause();
         let rate_limiter = GitHubRateLimiter::new();
 
         // Set up API headers indicating rate limit exceeded
@@ -179,7 +235,7 @@ mod tests {
 
         rate_limiter.update_from_headers(&headers).await;
 
-        let start = std::time::Instant::now();
+        let start = tokio::time::Instant::now();
         rate_limiter
             .check_rate_limit()
             .await
