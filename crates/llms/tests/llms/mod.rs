@@ -149,6 +149,7 @@ static TEST_CASES: LazyLock<Vec<TestCase>> = LazyLock::new(|| {
 });
 
 /// Model instantiations to test.
+#[allow(clippy::expect_used)]
 static TEST_MODELS: LazyLock<Vec<(&'static str, Arc<dyn Chat>)>> = LazyLock::new(|| {
     vec![(
         "anthropic",
