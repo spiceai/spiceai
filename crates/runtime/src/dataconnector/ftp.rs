@@ -114,7 +114,7 @@ impl ListingTableConnector for FTP {
                 .boxed()
                 .context(super::InvalidConfigurationSnafu {
                     dataconnector: format!("{self}"),
-                    message: format!("{} is not a valid URL. Ensure the URL is valid and try again.\nFor further information, visit: https://docs.spiceai.org/components/data-connectors/ftp", dataset.from),
+                    message: format!("{} is not a valid URL. Ensure the URL is valid and try again.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/ftp", dataset.from),
                     connector_component: ConnectorComponent::from(dataset),
                 })?;
 

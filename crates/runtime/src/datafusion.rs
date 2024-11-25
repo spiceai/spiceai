@@ -151,9 +151,9 @@ pub enum Error {
         source: DataFusionError,
     },
 
-    #[snafu(display("Cannot refresh {table_name}: {source}"))]
+    #[snafu(display("Failed to refresh the dataset {dataset_name}.\n{source}"))]
     UnableToTriggerRefresh {
-        table_name: String,
+        dataset_name: String,
         source: crate::accelerated_table::Error,
     },
 
@@ -203,8 +203,11 @@ pub enum Error {
     #[snafu(display("Unable to retrieve underlying table provider from federation"))]
     UnableToRetrieveTableFromFederation { table_name: String },
 
-    #[snafu(display("Unable to build accelerated table: {source}"))]
+    #[snafu(display(
+        "Failed to create an accelerated table for the dataset {dataset_name}.\n{source}"
+    ))]
     UnableToBuildAcceleratedTable {
+        dataset_name: String,
         source: AcceleratedTableBuilderError,
     },
 }
@@ -795,7 +798,9 @@ impl DataFusion {
         accelerated_table_builder
             .build()
             .await
-            .context(UnableToBuildAcceleratedTableSnafu)
+            .context(UnableToBuildAcceleratedTableSnafu {
+                dataset_name: dataset.name.to_string(),
+            })
     }
 
     /// Attempt to synchronize refreshes with the parent table for localpod accelerated tables.
@@ -900,7 +905,7 @@ impl DataFusion {
         if let Some(accelerated_table) = table.as_any().downcast_ref::<AcceleratedTable>() {
             return accelerated_table.trigger_refresh(overrides).await.context(
                 UnableToTriggerRefreshSnafu {
-                    table_name: dataset_name.to_string(),
+                    dataset_name: dataset_name.to_string(),
                 },
             );
         }
@@ -929,7 +934,7 @@ impl DataFusion {
                 .update_refresh_sql(refresh_sql)
                 .await
                 .context(UnableToTriggerRefreshSnafu {
-                    table_name: dataset_name.to_string(),
+                    dataset_name: dataset_name.to_string(),
                 })?;
         }
 
