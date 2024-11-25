@@ -43,17 +43,17 @@ pub mod tls;
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "Unable to connect to server: {source}\nEnsure the flight endpoint is valid and reachable."
+        "Unable to connect to server.\n{source}\nEnsure the flight endpoint is valid and reachable."
     ))]
     UnableToConnectToServer { source: tls::Error },
 
-    #[snafu(display("Authentication failed: {source}\nEnsure the credentials are valid."))]
+    #[snafu(display("Authentication failed.\n{source}\nEnsure the credentials are valid."))]
     InvalidMetadata {
         source: tonic::metadata::errors::InvalidMetadataValue,
     },
 
     #[snafu(display(
-        "Unable to perform handshake with flight endpoint: {source}\nVerify the configuration and try again."
+        "Failed to connect to Flight server: Handshake failed.\n{source}\nVerify the configuration and try again."
     ))]
     UnableToPerformHandshake { source: tonic::Status },
 
@@ -64,7 +64,7 @@ pub enum Error {
         source: tonic::metadata::errors::ToStrError,
     },
 
-    #[snafu(display("Unable to get schema: {source}\n Report a bug to request support: https://github.com/spiceai/spiceai/issues"))]
+    #[snafu(display("Unable to get schema.\n{source}\nReport a bug to request support: https://github.com/spiceai/spiceai/issues"))]
     UnableToConvertSchema { source: arrow::error::ArrowError },
 
     #[snafu(display("Query execution failed: {source}"))]
@@ -72,7 +72,7 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Unable to publish data to flight endpoint: {source}\n Verify the configuration and try again"))]
+    #[snafu(display("Unable to publish data to flight endpoint.\n{source}\nVerify the configuration and try again"))]
     UnableToPublish { source: tonic::Status },
 
     #[snafu(display("Unauthorized. Verify the credentials."))]
