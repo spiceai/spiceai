@@ -5,16 +5,11 @@ use std::{
     time::{Duration, SystemTime},
 };
 use tokio::sync::RwLock;
-use tracing::{debug, warn};
-
-const GITHUB_MAX_REQUESTS_PER_HOUR: u32 = 5000;
 
 #[derive(Debug)]
 pub struct RateLimiter {
     // Track API response headers rate limits
     api_limit: Arc<RwLock<Option<RateLimitInfo>>>,
-    // Track our own rate limiting
-    requests_made: u32,
     start_time: SystemTime,
 }
 
@@ -76,7 +71,6 @@ impl RateLimiter {
     pub fn new() -> Self {
         Self {
             api_limit: Arc::new(RwLock::new(None)),
-            requests_made: 0,
             start_time: SystemTime::now(),
         }
     }
@@ -88,7 +82,7 @@ impl RateLimiter {
         }
     }
 
-    pub async fn check_rate_limit(&mut self) -> Result<(), String> {
+    pub async fn check_rate_limit(&self) -> Result<(), String> {
         // First check our internal hourly limit
         if let Ok(elapsed) = self.start_time.elapsed() {
             if elapsed >= Duration::from_secs(3600) {

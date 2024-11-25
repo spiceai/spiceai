@@ -86,6 +86,7 @@ impl GraphQLClientBuilder {
             self.pass,
             self.unnest_depth,
             self.schema,
+            None,
         )
     }
 }

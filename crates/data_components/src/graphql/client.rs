@@ -16,7 +16,9 @@ limitations under the License.
 
 use crate::token_provider::TokenProvider;
 
-use super::{ArrowInternalSnafu, Error, ErrorChecker, ReqwestInternalSnafu, Result};
+use super::{
+    rate_limit::RateLimiter, ArrowInternalSnafu, Error, ErrorChecker, ReqwestInternalSnafu, Result,
+};
 use arrow::{
     array::RecordBatch,
     datatypes::SchemaRef,
@@ -608,7 +610,7 @@ pub struct GraphQLClient {
     unnest_parameters: UnnestParameters,
     auth: Option<Auth>,
     schema: Option<SchemaRef>,
-    rate_limiter: Option<Arc<RwLock<RateLimiter>>>,
+    rate_limiter: Option<Arc<dyn RateLimiter>>,
 }
 
 #[derive(Clone)]
@@ -679,7 +681,7 @@ impl GraphQLClient {
         pass: Option<String>,
         unnest_depth: usize,
         schema: Option<SchemaRef>,
-        rate_limiter: Option<Arc<RwLock<RateLimiter>>>,
+        rate_limiter: Option<Arc<dyn RateLimiter>>,
     ) -> Result<Self> {
         let auth = match (token, user, pass) {
             (None, Some(user), pass) => Some(Auth::Basic(user, pass)),
@@ -725,7 +727,6 @@ impl GraphQLClient {
 
         // Update rate limiter with response headers
         if let Some(rate_limiter) = &self.rate_limiter {
-            let mut rate_limiter = rate_limiter.write().await;
             rate_limiter.update_from_headers(&response_headers).await;
         }
 
@@ -805,7 +806,6 @@ impl GraphQLClient {
     ) -> Result<Vec<Vec<RecordBatch>>> {
         // Check rate limit before starting pagination
         if let Some(rate_limiter) = &self.rate_limiter {
-            let mut rate_limiter = rate_limiter.write().await;
             rate_limiter.check_rate_limit().await?;
         }
 
@@ -828,7 +828,6 @@ impl GraphQLClient {
         while let Some(next_cursor_val) = result.cursor {
             // Check rate limit before each page request
             if let Some(rate_limiter) = &self.rate_limiter {
-                let mut rate_limiter = rate_limiter.write().await;
                 rate_limiter.check_rate_limit().await?;
             }
 
@@ -891,7 +890,7 @@ async fn request_with_auth(request_builder: RequestBuilder, auth: &Option<Auth>)
 }
 
 fn handle_http_error(status: StatusCode, response: &Value) -> Result<()> {
-    if (status.is_client_error() | status.is_server_error()) {
+    if status.is_client_error() | status.is_server_error() {
         let message = [
             &response["message"],
             &response["error"]["message"],
