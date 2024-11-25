@@ -29,6 +29,6 @@ func (ds *Dataset) GetPropertyValue(key string) (interface{}, bool) {
 	if ds.Properties == nil {
 		return nil, false
 	}
-	value, exists := ds.Properties[key]
-	return value, exists
+	value, ok := ds.Properties[key]
+	return value, ok
 }
