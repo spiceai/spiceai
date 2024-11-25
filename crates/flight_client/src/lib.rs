@@ -110,7 +110,7 @@ impl From<&str> for TonicStatusMessage {
 impl std::fmt::Display for TonicStatusMessage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            TonicStatusMessage::TransportError => write!(f, "A network error occurred. Check the network connection, server configuration, and try again."),
+            TonicStatusMessage::TransportError => write!(f, "A network error occurred. Check the network connection/server configuration, and try again."),
             TonicStatusMessage::Unmatched(message) => write!(f, "{message}")
         }
     }
@@ -145,7 +145,7 @@ pub enum Error {
     #[snafu(display("Failed to write data.\n{source}"))]
     UnableToPublish { source: TonicStatusError },
 
-    #[snafu(display("Failed to execute query. Authentication failed.\nEnsure that the username and password are correctly configured, and have the necessary permissions."))]
+    #[snafu(display("Failed to execute query. Authorization failed.\nEnsure that the username and password are correctly configured, and have the necessary permissions."))]
     Unauthorized {},
 
     #[snafu(display("Failed to execute query. Permission denied.\nEnsure that the username and password are correctly configured, and have the necessary permissions."))]
