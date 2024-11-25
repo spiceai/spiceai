@@ -64,7 +64,7 @@ jobs:
           commit_hash=$(git rev-parse --short HEAD)
           version="nightly-$(date +%Y%m%d)-${commit_hash}"
           echo "rel_version=${version}" >> $GITHUB_OUTPUT
-          echo "Preparing to publish nightly build with version: `${version}`"
+          echo "Preparing to publish nightly build with version: \"${version}\""
 
   build-arm64:
     needs: [check_commits, setup]
