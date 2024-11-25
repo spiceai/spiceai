@@ -83,6 +83,7 @@ impl Runtime {
         let params_with_secrets = self.get_params_with_secrets(&in_embed.params).await;
 
         let l = try_to_embedding(in_embed, &params_with_secrets)
+            .await
             .boxed()
             .context(UnableToInitializeEmbeddingModelSnafu)?;
         l.health()

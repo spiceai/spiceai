@@ -14,13 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
-use std::path::Path;
+use bytes::Bytes;
 use std::sync::Arc;
 
 use crate::chunking::{
     ArcSizer, Chunker, ChunkingConfig, RecursiveSplittingChunker, TokenizerWrapper,
 };
-use crate::embeddings::candle::tokenizer_from_hf;
+
 use crate::embeddings::{Embed, Error as EmbedError, Result as EmbedResult};
 use async_openai::error::OpenAIError;
 use async_openai::types::{
@@ -64,9 +64,9 @@ impl OpenaiEmbed {
         self
     }
 
-    pub fn try_with_tokenizer_file(mut self, file: impl AsRef<Path>) -> Result<Self, EmbedError> {
-        let tokenizer = Tokenizer::from_file(file)
-            .map_err(|e| EmbedError::FailedToCreateChunker { source: e })?;
+    pub fn try_with_tokenizer_bytes(mut self, bytz: &Bytes) -> Result<Self, EmbedError> {
+        let tokenizer = Tokenizer::from_bytes(bytz)
+            .map_err(|e| EmbedError::FailedToCreateTokenizer { source: e })?;
 
         self = self.with_tokenizer(Arc::new(tokenizer));
         Ok(self)

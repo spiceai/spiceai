@@ -6393,6 +6393,7 @@ dependencies = [
  "async-openai",
  "async-stream",
  "async-trait",
+ "bytes",
  "either",
  "futures",
  "hf-hub",

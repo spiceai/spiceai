@@ -21,7 +21,6 @@ use serde::Deserialize;
 
 pub mod tei;
 mod util;
-pub use util::tokenizer_from_hf;
 
 /// Important fields from a model's `config.json`
 #[derive(Debug, Deserialize)]

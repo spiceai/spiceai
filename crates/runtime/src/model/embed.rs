@@ -1,3 +1,4 @@
+use bytes::Bytes;
 /*
 Copyright 2024 The Spice.ai OSS Authors
 
@@ -17,10 +18,12 @@ use llms::embeddings::{candle::tei::TeiEmbed, Embed, Error as EmbedError};
 use llms::openai::embed::OpenaiEmbed;
 use llms::openai::DEFAULT_EMBEDDING_MODEL;
 use secrecy::{ExposeSecret, Secret, SecretString};
+use snafu::ResultExt;
 use spicepod::component::{embeddings::EmbeddingPrefix, model::ModelFileType};
 use std::collections::HashMap;
 use std::path::Path;
 use std::result::Result;
+use url::Url;
 
 pub type EmbeddingModelStore = HashMap<String, Box<dyn Embed>>;
 
@@ -31,7 +34,14 @@ macro_rules! extract_secret {
     };
 }
 
-pub fn try_to_embedding<S: ::std::hash::BuildHasher>(
+/// For an [`object_store`] compatible url, fetch the bytes of the file.
+async fn get_bytes_for_file(url: &str) -> Result<Bytes, Box<dyn std::error::Error + Send + Sync>> {
+    let url = Url::parse(url).boxed()?;
+    let (store, path) = object_store::parse_url(&url).boxed()?;
+    store.get(&path).await.boxed()?.bytes().await.boxed()
+}
+
+pub async fn try_to_embedding<S: ::std::hash::BuildHasher>(
     component: &spicepod::component::embeddings::Embeddings,
     params: &HashMap<String, SecretString, S>,
 ) -> Result<Box<dyn Embed>, EmbedError> {
@@ -78,7 +88,11 @@ pub fn try_to_embedding<S: ::std::hash::BuildHasher>(
                     component.name,
                     tokenizer_file
                 );
-                embed = embed.try_with_tokenizer_file(tokenizer_file)?;
+                let bytz = get_bytes_for_file(tokenizer_file.as_str())
+                    .await
+                    .map_err(|source| EmbedError::FailedToCreateTokenizer { source })?;
+
+                embed = embed.try_with_tokenizer_bytes(&bytz)?;
             }
             Ok(Box::new(embed))
         }
