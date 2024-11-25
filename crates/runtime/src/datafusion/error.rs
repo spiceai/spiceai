@@ -16,7 +16,7 @@ limitations under the License.
 
 //! Spice specific errors that are returned as part of `DataFusionError::External`.
 
-use std::{any::Any, borrow::Cow, error::Error, fmt::Display, ops::Deref, sync::Arc};
+use std::{fmt::Display, sync::Arc};
 
 use arrow_schema::ArrowError;
 use datafusion::error::DataFusionError;
@@ -78,19 +78,42 @@ pub fn get_spice_df_error(e: &DataFusionError) -> Option<&SpiceExternalError> {
 pub fn find_datafusion_root(e: DataFusionError) -> DataFusionError {
     let mut last_error = e;
 
+    tracing::debug!("Finding root of DataFusionError: {:?}", last_error);
+
     loop {
         match last_error {
             DataFusionError::External(err) => match err.downcast::<DataFusionError>() {
                 Ok(inner) => last_error = *inner,
-                Err(err) => return DataFusionError::External(err),
+                Err(err) => match err.downcast::<Arc<DataFusionError>>() {
+                    Ok(inner) => {
+                        tracing::debug!("Found Arc<DataFusionError> in External: {:?}", inner);
+                        return DataFusionError::External(inner);
+                    }
+                    Err(err) => return DataFusionError::External(err),
+                },
             },
             DataFusionError::Context(_, err) => last_error = *err,
             DataFusionError::ArrowError(ArrowError::ExternalError(err), message) => {
                 match err.downcast::<DataFusionError>() {
                     Ok(inner) => last_error = *inner,
-                    Err(err) => {
-                        return DataFusionError::ArrowError(ArrowError::ExternalError(err), message)
-                    }
+                    Err(err) => match err.downcast::<Arc<DataFusionError>>() {
+                        Ok(inner) => {
+                            tracing::debug!(
+                                "Found Arc<DataFusionError> in ArrowError: {:?}",
+                                inner
+                            );
+                            return DataFusionError::ArrowError(
+                                ArrowError::ExternalError(inner),
+                                message,
+                            );
+                        }
+                        Err(err) => {
+                            return DataFusionError::ArrowError(
+                                ArrowError::ExternalError(err),
+                                message,
+                            )
+                        }
+                    },
                 }
             }
             _ => return last_error,

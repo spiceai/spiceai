@@ -47,7 +47,7 @@ mod tracker;
 use async_stream::stream;
 use futures::StreamExt;
 
-use super::SPICE_RUNTIME_SCHEMA;
+use super::{error::find_datafusion_root, SPICE_RUNTIME_SCHEMA};
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -151,6 +151,7 @@ impl Query {
             let plan = match session.create_logical_plan(&ctx.sql).await {
                 Ok(plan) => plan,
                 Err(e) => {
+                    let e = find_datafusion_root(e);
                     let error_code = ErrorCode::from(&e);
                     handle_error!(tracker, error_code, e, UnableToExecuteQuery)
                 }
@@ -178,6 +179,7 @@ impl Query {
                     ) {
                         Ok(stream) => stream,
                         Err(e) => {
+                            let e = find_datafusion_root(e);
                             handle_error!(
                                 tracker,
                                 ErrorCode::InternalError,
@@ -204,6 +206,7 @@ impl Query {
             if let Err(e) =
                 RESTRICTED_SQL_OPTIONS.with(|sql_options| sql_options.verify_plan(&plan))
             {
+                let e = find_datafusion_root(e);
                 handle_error!(
                     tracker,
                     ErrorCode::QueryPlanningError,
@@ -244,6 +247,7 @@ impl Query {
             let res_stream: SendableRecordBatchStream = match df.execute_stream().await {
                 Ok(stream) => stream,
                 Err(e) => {
+                    let e = find_datafusion_root(e);
                     let error_code = ErrorCode::from(&e);
                     handle_error!(tracker, error_code, e, UnableToExecuteQuery)
                 }
@@ -297,6 +301,7 @@ impl Query {
         let plan = match session.create_logical_plan(&self.sql).await {
             Ok(plan) => plan,
             Err(e) => {
+                let e = find_datafusion_root(e);
                 self.handle_schema_error(&e);
                 return Err(e);
             }
@@ -304,6 +309,7 @@ impl Query {
 
         // Verify the plan against the restricted options
         if let Err(e) = RESTRICTED_SQL_OPTIONS.with(|sql_options| sql_options.verify_plan(&plan)) {
+            let e = find_datafusion_root(e);
             self.handle_schema_error(&e);
             return Err(e);
         }
@@ -344,7 +350,7 @@ fn attach_query_tracker_to_stream(
     let inner_span = span.clone();
     let updated_stream = stream! {
         while let Some(batch_result) = stream.next().await {
-
+            let batch_result = batch_result.map_err(find_datafusion_root);
             match &batch_result {
                 Ok(batch) => {
                     // Create a truncated output for the query history table on first batch.

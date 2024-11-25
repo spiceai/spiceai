@@ -338,6 +338,7 @@ impl RefreshTask {
         };
 
         let streaming_update = StreamingDataUpdate::try_from(data_update)
+            .map_err(find_datafusion_root)
             .context(UnableToCreateMemTableFromUpdateSnafu)?;
 
         self.write_streaming_data_update(start_time, streaming_update, sql.as_deref())
@@ -553,11 +554,14 @@ impl RefreshTask {
                 refresh.sql.as_deref(),
             )
             .await
+            .map_err(find_datafusion_root)
             .context(super::UnableToScanTableProviderSnafu)?
             .filter(filter_converter.convert(value, Operator::Gt))
+            .map_err(find_datafusion_root)
             .context(super::UnableToScanTableProviderSnafu)?
             .collect()
             .await
+            .map_err(find_datafusion_root)
             .context(super::UnableToScanTableProviderSnafu)?;
 
         let filter_schema = BaseSchema::get_schema(&federated_provider);
@@ -599,10 +603,12 @@ impl RefreshTask {
         let df = self
             .max_timestamp_df(ctx, &column, refresh.sql.as_deref())
             .await
+            .map_err(find_datafusion_root)
             .context(super::UnableToScanTableProviderSnafu)?;
         let result = &df
             .collect()
             .await
+            .map_err(find_datafusion_root)
             .context(super::FailedToQueryLatestTimestampSnafu)?;
 
         let Some(result) = result.first() else {

@@ -18,6 +18,7 @@ use crate::accelerated_table::AcceleratedTable;
 use crate::component::catalog::Catalog;
 use crate::component::dataset::acceleration::RefreshMode;
 use crate::component::dataset::Dataset;
+use crate::datafusion::error::find_datafusion_root;
 use crate::federated_table::FederatedTable;
 use crate::parameters::ParameterSpec;
 use crate::parameters::Parameters;
@@ -425,22 +426,26 @@ pub async fn get_data(
     let mut df = match sql {
         None => {
             let table_source = Arc::new(DefaultTableSource::new(Arc::clone(&table_provider)));
-            let logical_plan =
-                LogicalPlanBuilder::scan(table_name.clone(), table_source, None)?.build()?;
+            let logical_plan = LogicalPlanBuilder::scan(table_name.clone(), table_source, None)
+                .map_err(find_datafusion_root)?
+                .build()
+                .map_err(find_datafusion_root)?;
 
             DataFrame::new(ctx.state(), logical_plan)
         }
-        Some(sql) => ctx.sql(&sql).await?,
+        Some(sql) => ctx.sql(&sql).await.map_err(find_datafusion_root)?,
     };
 
     for filter in filters {
-        df = df.filter(filter)?;
+        df = df.filter(filter).map_err(find_datafusion_root)?;
     }
 
-    let sql = Unparser::default().plan_to_sql(df.logical_plan())?;
+    let sql = Unparser::default()
+        .plan_to_sql(df.logical_plan())
+        .map_err(find_datafusion_root)?;
     tracing::info!(target: "task_history", sql = %sql, "labels");
 
-    let record_batch_stream = df.execute_stream().await?;
+    let record_batch_stream = df.execute_stream().await.map_err(find_datafusion_root)?;
     Ok((table_provider.schema(), record_batch_stream))
 }
 
