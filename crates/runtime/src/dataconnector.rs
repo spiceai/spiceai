@@ -145,6 +145,15 @@ pub enum DataConnectorError {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
+    #[snafu(display(
+        "The {connector_component} ({dataconnector}) has been rate limited.\n{source}"
+    ))]
+    RateLimited {
+        dataconnector: String,
+        connector_component: ConnectorComponent,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
     #[snafu(display("Cannot setup the {connector_component} ({dataconnector}) with an invalid configuration.\n{message}"))]
     InvalidConfiguration {
         dataconnector: String,
