@@ -119,7 +119,7 @@ tower-http.workspace = true
 tracing.workspace = true
 tracing-futures.workspace = true
 tract-core = "0.21.0"
-url = "2.5.0"
+url = "2.5.4"
 util = { path = "../util" }
 uuid = { workspace = true, features = ["v7"] }
 x509-certificate.workspace = true
