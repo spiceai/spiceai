@@ -254,8 +254,8 @@ pub(crate) mod telemetry {
 
     static QUERY_COUNT: LazyLock<Counter<u64>> = LazyLock::new(|| {
         TELEMETRY_METER
-            .u64_counter("query_invocations")
-            .with_description("Number of queries run.")
+            .u64_counter("query_executions")
+            .with_description("Number of query executions.")
             .with_unit("queries")
             .init()
     });

@@ -9,6 +9,8 @@ use datafusion::{
     scalar::ScalarValue,
 };
 
+use super::error::find_datafusion_root;
+
 pub static SUPPORTED_COMPARISON_TYPES: &[DataType] = &[
     DataType::Null,
     DataType::Boolean,
@@ -166,35 +168,38 @@ fn accumulator_min_max(
         &DataType,
     ) -> Result<Box<dyn Accumulator>, datafusion::error::DataFusionError>,
 ) -> Result<ColumnarValue, datafusion::error::DataFusionError> {
-    let return_type = udf.return_type(
-        &args
-            .iter()
-            .map(ColumnarValue::data_type)
-            .collect::<Vec<_>>(),
-    )?;
+    let return_type = udf
+        .return_type(
+            &args
+                .iter()
+                .map(ColumnarValue::data_type)
+                .collect::<Vec<_>>(),
+        )
+        .map_err(find_datafusion_root)?;
 
     let columns = args
         .iter()
         .map(|arg| arg.cast_to(&return_type, None))
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(find_datafusion_root)?;
 
-    let arrays = ColumnarValue::values_to_arrays(&columns)?;
+    let arrays = ColumnarValue::values_to_arrays(&columns).map_err(find_datafusion_root)?;
     let size = arrays.first().map_or(0, |x| x.len());
 
     let mut values = vec![];
     for i in 0..(size) {
-        let mut acc = create_accumulator(&return_type)?;
+        let mut acc = create_accumulator(&return_type).map_err(find_datafusion_root)?;
         let slices = arrays.iter().map(|arr| arr.slice(i, 1)).collect::<Vec<_>>();
         for slice in slices {
-            acc.update_batch(&[slice])?;
+            acc.update_batch(&[slice]).map_err(find_datafusion_root)?;
         }
 
-        values.push(acc.evaluate()?);
+        values.push(acc.evaluate().map_err(find_datafusion_root)?);
     }
 
-    Ok(ColumnarValue::from(ScalarValue::iter_to_array(
-        values.into_iter(),
-    )?))
+    Ok(ColumnarValue::from(
+        ScalarValue::iter_to_array(values.into_iter()).map_err(find_datafusion_root)?,
+    ))
 }
 
 #[cfg(test)]

@@ -109,7 +109,7 @@ pub async fn get_dataset_elements(
             table: TableReference::parse_str(&d.name)
                 .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
                 .to_string(),
-            can_search_documents: !d.embeddings.is_empty(),
+            can_search_documents: d.has_embeddings(),
             description: d.description.clone(),
             metadata: d.metadata.clone(),
         })

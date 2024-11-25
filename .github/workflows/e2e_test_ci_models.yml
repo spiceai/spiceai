@@ -1,0 +1,196 @@
+name: E2E Test CI (models)
+
+on:
+  push:
+    branches:
+      - trunk
+      - release-*
+    paths-ignore:
+      - 'docs/**'
+      - 'README.md'
+      - 'version.txt'
+      - 'acknowledgements.md'
+
+  workflow_dispatch:
+
+concurrency:
+  # Allow only one workflow per any non-trunk branch.
+  group: ${{ github.workflow }}-${{ github.ref_name }}-${{ github.ref_name == 'trunk' && github.sha || 'any-sha' }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build ${{ matrix.target.name }} binaries
+    timeout-minutes: 30
+    runs-on: ${{ matrix.target.builder }}
+    env:
+      GOVER: 1.22.0
+      GOOS: ${{ matrix.target.target_os }}
+      GOARCH: ${{ matrix.target.target_arch_go }}
+    strategy:
+      matrix:
+        target:
+          - name: "Linux x64"
+            builder: "spiceai-runners"
+            target_os: "linux"
+            target_arch: "x86_64"
+          - name: "macOS aarch64 (Apple Silicon)"
+            builder: "macos-14"
+            target_os: "darwin"
+            target_arch: "aarch64"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set REL_VERSION from version.txt
+        run: python3 ./.github/scripts/get_release_version.py
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GOVER }}
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+        with:
+          os: ${{ matrix.target.target_os }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/trunk' }}
+
+      - name: Set up make
+        if: matrix.target.target_os == 'linux'
+        uses: ./.github/actions/setup-make
+
+      - name: Set up cc
+        if: matrix.target.target_os == 'linux'
+        uses: ./.github/actions/setup-cc
+
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build spiced
+        run: |
+          make -C bin/spiced SPICED_NON_DEFAULT_FEATURES="models"
+
+      - name: Update build cache (macOS)
+        if: matrix.target.target_os == 'darwin'
+        run: |
+          if [ -d /Users/spiceai/build/target ]; then
+            rsync -av target/ /Users/spiceai/build/target/
+          fi
+
+      - name: Update build cache (Linux)
+        if: matrix.target.target_os == 'linux'
+        run: |
+          if [ -d /home/spiceai/build/target ]; then
+            rsync -av target/ /home/spiceai/build/target/
+          fi
+
+      - name: Update build cache (Windows)
+        if: matrix.target.target_os == 'windows'
+        run: |
+          if (Test-Path C:/spiceai/build/target) {
+            Copy-Item -Recurse -Force target/* C:/spiceai/build/target
+          }
+
+      - name: Build spice
+        run: make -C bin/spice
+
+      - name: make spiced executable
+        if: matrix.target.target_os != 'windows'
+        run: |
+          mv target/release/spiced spiced
+          chmod +x spiced
+
+      - name: make spice executable
+        if: matrix.target.target_os != 'windows'
+        run: |
+          mv target/release/spice spice
+          chmod +x spice
+
+      - name: Save spice artifact
+        uses: actions/upload-artifact@v4
+        if: matrix.target.target_os != 'windows'
+        with:
+          name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
+          path: |
+            spice
+            spiced
+
+  test_openai_model:
+    name: 'openai model (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
+    timeout-minutes: 5
+    runs-on: ${{ matrix.target.runner }}
+    needs:
+      - build
+    strategy:
+      matrix:
+        target:
+          - name: "Linux x64"
+            runner: "spiceai-runners"
+            target_os: "linux"
+            target_arch: "x86_64"
+          - name: "macOS aarch64 (Apple Silicon)"
+            runner: "macos-14"
+            target_os: "darwin"
+            target_arch: "aarch64"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
+        uses: actions/download-artifact@v4
+        with:
+          name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
+          path: ./build
+
+      - name: Install spice
+        uses: ./.github/actions/install-spice
+        with:
+          build-path: ./build
+
+      - name: Init spice app
+        run: |
+          cp ./test/models/spicepod.yml ./spicepod.yaml
+          cat ./spicepod.yaml
+
+      - name: Start spice runtime
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SPICE_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
+        run: |
+          spice run &> spice.log &
+
+      - name: Wait for Spice runtime is ready
+        timeout-minutes: 1
+        run: |
+          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
+      
+      - name: Install expect (linux)
+        if: matrix.target.target_os == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y expect
+
+      - name: Install expect (macOS)
+        if: matrix.target.target_os == 'darwin'
+        run: |
+          brew install expect
+
+      - name: Test vector search
+        run: |
+          ./test/models/search_01.exp
+
+      - name: Test chat
+        run: |
+          ./test/models/chat_01.exp
+
+      - name: Stop spice and check logs
+        if: always()
+        run: |
+          killall spice || true
+          cat spice.log
+
+  

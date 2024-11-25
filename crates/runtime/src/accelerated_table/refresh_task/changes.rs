@@ -16,6 +16,7 @@ limitations under the License.
 
 use super::RefreshTask;
 use crate::accelerated_table::refresh::Refresh;
+use crate::datafusion::error::find_datafusion_root;
 use crate::{dataupdate::StreamingDataUpdateExecutionPlan, status};
 use arrow::array::{Int32Array, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::DataType;
@@ -50,7 +51,7 @@ use tokio::sync::{oneshot, RwLock};
 macro_rules! extract_primary_key {
     ($key_col:expr, $key:expr, $data_schema:expr, $array_type:ty, $data_type_str:expr) => {{
         let key_col = $key_col.as_any().downcast_ref::<$array_type>().context(
-            crate::accelerated_table::ArrayDataTypeMismatchSnafu {
+            crate::accelerated_table::PrimaryKeyArrayDataTypeMismatchSnafu {
                 field_name: $key.to_string(),
                 expected_data_type: $data_type_str.to_string(),
                 schema: Arc::clone(&$data_schema),
@@ -158,10 +159,12 @@ impl RefreshTask {
                     let delete_plan = deletion_provider
                         .delete_from(&session_state, &delete_where_exprs)
                         .await
+                        .map_err(find_datafusion_root)
                         .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
 
                     collect(delete_plan, ctx.task_ctx())
                         .await
+                        .map_err(find_datafusion_root)
                         .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
                 }
                 ChangeOperation::Create | ChangeOperation::Update | ChangeOperation::Read => {
@@ -192,10 +195,12 @@ impl RefreshTask {
                             InsertOp::Append,
                         )
                         .await
+                        .map_err(find_datafusion_root)
                         .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
 
                     collect(insert_plan, ctx.task_ctx())
                         .await
+                        .map_err(find_datafusion_root)
                         .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
                 }
                 _ => {
@@ -241,7 +246,7 @@ impl RefreshTask {
     ) -> crate::accelerated_table::Result<(String, Expr)> {
         let data_schema = data.schema();
         let (primary_key_idx, field) = data_schema.column_with_name(key).ok_or_else(|| {
-            crate::accelerated_table::ExpectedSchemaToHaveFieldSnafu {
+            crate::accelerated_table::PrimaryKeyExpectedSchemaToHaveFieldSnafu {
                 field_name: key.to_string(),
                 schema: Arc::clone(&data_schema),
             }

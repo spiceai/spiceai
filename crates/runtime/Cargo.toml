@@ -134,11 +134,12 @@ azure_storage_blobs = "0.21.0"
 bollard = "0.18.0"
 flightrepl = { path = "../flightrepl" }
 insta.workspace = true
+jsonpath-rust = "0.7.3"
+opentelemetry_sdk = { workspace = true, features = ["rt-tokio-current-thread"] }
 scopeguard = "1.2.0"
 spice-cloud = { path = "../spice_cloud" }
-tracing-subscriber.workspace = true
 tracing-opentelemetry.workspace = true
-opentelemetry_sdk = { workspace = true, features = ["rt-tokio-current-thread"] }
+tracing-subscriber.workspace = true
 
 [features]
 aws-secrets-manager = [

@@ -14,7 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::{DataConnector, DataConnectorFactory, DataConnectorParams, ParameterSpec};
+use super::{
+    ConnectorComponent, DataConnector, DataConnectorFactory, DataConnectorParams, ParameterSpec,
+};
 use crate::component::dataset::Dataset;
 use arrow_flight::sql::client::FlightSqlServiceClient;
 use async_trait::async_trait;
@@ -126,6 +128,7 @@ impl DataConnector for FlightSQL {
         .await
         .context(super::UnableToGetReadProviderSnafu {
             dataconnector: "flightsql",
+            connector_component: ConnectorComponent::from(dataset),
         })?)
     }
 }

@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::{dataconnector::ConnectorComponent, datafusion::error::find_datafusion_root};
+
 use super::{
     filter_pushdown, inject_parameters, search_inject_parameters, GitHubQueryMode, GitHubTableArgs,
     GitHubTableGraphQLParams,
@@ -32,6 +34,7 @@ pub struct PullRequestTableArgs {
     pub owner: String,
     pub repo: String,
     pub query_mode: GitHubQueryMode,
+    pub component: ConnectorComponent,
 }
 
 impl GraphQLContext for PullRequestTableArgs {
@@ -60,6 +63,7 @@ impl GraphQLContext for PullRequestTableArgs {
         }
 
         inject_parameters("search", search_inject_parameters, filters, query)
+            .map_err(find_datafusion_root)
     }
 
     fn error_checker(&self) -> Option<ErrorChecker> {
@@ -68,6 +72,10 @@ impl GraphQLContext for PullRequestTableArgs {
 }
 
 impl GitHubTableArgs for PullRequestTableArgs {
+    fn get_component(&self) -> ConnectorComponent {
+        self.component.clone()
+    }
+
     fn get_graphql_values(&self) -> GitHubTableGraphQLParams {
         let query = match self.query_mode {
             GitHubQueryMode::Search => {

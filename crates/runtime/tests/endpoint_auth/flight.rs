@@ -17,9 +17,10 @@ limitations under the License.
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::Arc,
+    time::Duration,
 };
 
-use crate::init_tracing;
+use crate::{init_tracing, utils::wait_until_true};
 use arrow_flight::{error::FlightError, flight_service_client::FlightServiceClient};
 use rand::Rng;
 use runtime::{auth::EndpointAuth, config::Config, Runtime};
@@ -71,7 +72,12 @@ async fn test_flight_auth() -> Result<(), anyhow::Error> {
 
     // Wait for the servers to start
     tracing::info!("Waiting for servers to start...");
-    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    wait_until_true(Duration::from_secs(10), || async {
+        reqwest::get(format!("http://localhost:{http_port}/health"))
+            .await
+            .is_ok()
+    })
+    .await;
 
     let channel = Channel::from_shared(format!("http://localhost:{flight_port}"))?
         .connect()
