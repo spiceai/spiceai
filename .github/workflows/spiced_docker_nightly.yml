@@ -3,6 +3,9 @@ name: spiced_docker_nightly
 on:
   # schedule:
   #   - cron: "0 2 * * *" # Runs the workflow at 2:00 AM UTC every day
+  push:
+    branches:
+      - evgenii/nightly-release-workflow
 
   workflow_dispatch:
     inputs:
