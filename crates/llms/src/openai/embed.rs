@@ -71,20 +71,6 @@ impl OpenaiEmbed {
         self = self.with_tokenizer(Arc::new(tokenizer));
         Ok(self)
     }
-
-    pub fn try_with_hf_tokenizer(
-        mut self,
-        model_id: &str,
-        revision: Option<&str>,
-        hf_token: Option<String>,
-    ) -> Result<Self, EmbedError> {
-        let tokenizer = tokenizer_from_hf(model_id, revision, hf_token)
-            .boxed()
-            .map_err(|e| EmbedError::FailedToCreateChunker { source: e })?;
-
-        self = self.with_tokenizer(Arc::new(tokenizer));
-        Ok(self)
-    }
 }
 
 #[async_trait]

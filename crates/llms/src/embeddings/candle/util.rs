@@ -90,21 +90,6 @@ pub(crate) fn inputs_from_openai(input: &EmbeddingInput) -> Vec<EncodingInput> {
     }
 }
 
-/// Construct a `Tokenizer` from the `tokenizer.json` in a `HuggingFace` repo.
-pub fn tokenizer_from_hf(
-    model_id: &str,
-    revision: Option<&str>,
-    hf_token: Option<String>,
-) -> Result<Tokenizer> {
-    let api_repo = get_api(model_id, revision, hf_token)?;
-    let tokenizer_file = api_repo
-        .get("tokenizer.json")
-        .boxed()
-        .context(FailedToInstantiateEmbeddingModelSnafu)?;
-
-    Tokenizer::from_file(tokenizer_file).context(FailedToInstantiateEmbeddingModelSnafu)
-}
-
 fn get_api(model_id: &str, revision: Option<&str>, hf_token: Option<String>) -> Result<ApiRepo> {
     let api = ApiBuilder::new()
         .with_progress(false)
