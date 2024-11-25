@@ -1,10 +1,28 @@
+/*
+Copyright 2024 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+use async_trait::async_trait;
 use chrono::{DateTime, MappedLocalTime, TimeZone, Utc};
+use data_components::graphql::rate_limit::RateLimiter;
 use reqwest::header::HeaderMap;
 use std::{sync::Arc, time::Duration};
 use tokio::sync::RwLock;
 
 #[derive(Debug)]
-pub struct RateLimiter {
+pub struct GitHubRateLimiter {
     // Track API response headers rate limits
     api_limit: Arc<RwLock<Option<RateLimitInfo>>>,
 }
@@ -66,21 +84,24 @@ impl RateLimitInfo {
     }
 }
 
-impl RateLimiter {
+impl GitHubRateLimiter {
     pub fn new() -> Self {
         Self {
             api_limit: Arc::new(RwLock::new(None)),
         }
     }
+}
 
-    pub async fn update_from_headers(&self, headers: &HeaderMap) {
+#[async_trait]
+impl RateLimiter for GitHubRateLimiter {
+    async fn update_from_headers(&self, headers: &HeaderMap) {
         if let Some(rate_limit) = RateLimitInfo::from_headers(headers) {
             let mut api_limit = self.api_limit.write().await;
             *api_limit = Some(rate_limit);
         }
     }
 
-    pub async fn check_rate_limit(&self) -> Result<(), String> {
+    async fn check_rate_limit(&self) -> Result<(), data_components::graphql::Error> {
         // Check if we're rate limited based on the previous API response headers
         let api_limit_guard = self.api_limit.read().await;
         if let Some(api_limit) = &*api_limit_guard {
