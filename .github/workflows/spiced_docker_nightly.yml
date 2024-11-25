@@ -215,7 +215,7 @@ jobs:
               docker buildx imagetools create \
                 -t ghcr.io/spiceai/spiceai-nightly:${REL_VERSION}${suffix} \
                 -t ghcr.io/spiceai/spiceai-nightly:latest${suffix} \
-                localhost:5000/spiceai:${variant}-amd64
+                localhost:5000/spiceai:${variant}-amd64 \
                 localhost:5000/spiceai:${variant}-arm64
 
               echo "Verifying GHCR image:"
@@ -225,7 +225,7 @@ jobs:
               echo "Creating local manifest for testing:"
               docker buildx imagetools create \
                 -t localhost:5000/spiceai:latest${suffix} \
-                localhost:5000/spiceai:${variant}-amd64
+                localhost:5000/spiceai:${variant}-amd64 \
                 localhost:5000/spiceai:${variant}-arm64
 
               docker buildx imagetools inspect localhost:5000/spiceai:latest${suffix}
