@@ -723,10 +723,6 @@ impl RefreshTask {
 
     async fn log_refresh_error(&self, error: &super::Error, refresh_sql: Option<&str>) {
         if let super::Error::UnableToGetDataFromConnector { source } = error {
-            // let Some(datafusion_error) = downcast_boxed_datafusion_error(source) else {
-            //     return;
-            // };
-
             if let Some(SpiceExternalError::AccelerationNotReady { dataset_name }) =
                 get_spice_df_error(source)
             {
