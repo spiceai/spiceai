@@ -232,6 +232,9 @@ jobs:
           done
 
       - uses: actions/checkout@v4
+        if: github.event_name == 'schedule' || inputs.publish
+        with:
+          fetch-depth: 0
 
       - name: Update nightly tag
         if: github.event_name == 'schedule' || inputs.publish
