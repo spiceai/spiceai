@@ -108,6 +108,28 @@ fn get_api(model_id: &str, revision: Option<&str>, hf_token: Option<String>) -> 
     Ok(api_repo)
 }
 
+pub fn download_hf_file(
+    org_id: &str,
+    repo_id: &str,
+    revision: Option<&str>,
+    file: &str,
+    hf_token: Option<String>,
+) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
+    let api = ApiBuilder::new()
+        .with_progress(false)
+        .with_token(hf_token)
+        .build()
+        .boxed()?;
+
+    let model_id = format!("{org_id}/{repo_id}").to_string();
+    let repo = if let Some(revision) = revision {
+        Repo::with_revision(model_id, RepoType::Model, revision.to_string())
+    } else {
+        Repo::new(model_id, RepoType::Model)
+    };
+    api.repo(repo).get(file).boxed()
+}
+
 /// For a given `HuggingFace` repo, download the needed files to create a `CandleEmbedding`.
 pub(crate) fn download_hf_artifacts(
     model_id: &str,

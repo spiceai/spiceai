@@ -21,6 +21,7 @@ use serde::Deserialize;
 
 pub mod tei;
 mod util;
+pub use util::download_hf_file;
 
 /// Important fields from a model's `config.json`
 #[derive(Debug, Deserialize)]

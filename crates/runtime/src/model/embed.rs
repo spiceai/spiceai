@@ -1,4 +1,6 @@
 use bytes::Bytes;
+use itertools::Itertools;
+use llms::embeddings::candle::download_hf_file;
 /*
 Copyright 2024 The Spice.ai OSS Authors
 
@@ -34,11 +36,27 @@ macro_rules! extract_secret {
     };
 }
 
-/// For an [`object_store`] compatible url, fetch the bytes of the file.
+/// Retrieves [`Bytes`] for a file/url path.
+///
+/// Supports:
+///   - [`object_store`] compatible URLs.
+///   - Huggingface URLs, e.g. `<https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/blob/main/tokenizer.json>`.
+///   -
 async fn get_bytes_for_file(url: &str) -> Result<Bytes, Box<dyn std::error::Error + Send + Sync>> {
-    let url = Url::parse(url).boxed()?;
-    let (store, path) = object_store::parse_url(&url).boxed()?;
-    store.get(&path).await.boxed()?.bytes().await.boxed()
+    if let [org, model, "blob", branch, file] = url.split('/').collect_vec().as_slice() {
+        if let Ok(Some(path)) = download_hf_file(org, model, Some(branch), file, None)
+            .map(|s| s.to_str().map(ToString::to_string))
+        {
+            return Box::pin(get_bytes_for_file(path.as_str())).await;
+        };
+        Err(Box::<dyn std::error::Error + Send + Sync>::from(format!(
+            "Downloaded HF url: {url}, but failed to get local path"
+        )))
+    } else {
+        let url = Url::parse(url).boxed()?;
+        let (store, path) = object_store::parse_url(&url).boxed()?;
+        store.get(&path).await.boxed()?.bytes().await.boxed()
+    }
 }
 
 pub async fn try_to_embedding<S: ::std::hash::BuildHasher>(
