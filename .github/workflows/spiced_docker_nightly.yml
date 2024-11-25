@@ -226,6 +226,8 @@ jobs:
             fi
           done
 
+      - uses: actions/checkout@v4
+
       - name: Update nightly tag
         if: github.event_name == 'schedule' || inputs.publish
         run: |
