@@ -32,7 +32,7 @@ use tracing::{Instrument, Span};
 use util::fibonacci_backoff::FibonacciBackoffBuilder;
 use util::{retry, RetryError};
 
-use crate::datafusion::error::{get_spice_df_error, SpiceExternalError};
+use crate::datafusion::error::{find_datafusion_root, get_spice_df_error, SpiceExternalError};
 use crate::datafusion::schema::BaseSchema;
 use crate::federated_table::FederatedTable;
 use crate::timing::MultiTimeMeasurement;
@@ -338,6 +338,7 @@ impl RefreshTask {
         };
 
         let streaming_update = StreamingDataUpdate::try_from(data_update)
+            .map_err(find_datafusion_root)
             .context(UnableToCreateMemTableFromUpdateSnafu)?;
 
         self.write_streaming_data_update(start_time, streaming_update, sql.as_deref())
@@ -553,11 +554,14 @@ impl RefreshTask {
                 refresh.sql.as_deref(),
             )
             .await
+            .map_err(find_datafusion_root)
             .context(super::UnableToScanTableProviderSnafu)?
             .filter(filter_converter.convert(value, Operator::Gt))
+            .map_err(find_datafusion_root)
             .context(super::UnableToScanTableProviderSnafu)?
             .collect()
             .await
+            .map_err(find_datafusion_root)
             .context(super::UnableToScanTableProviderSnafu)?;
 
         let filter_schema = BaseSchema::get_schema(&federated_provider);
@@ -599,10 +603,12 @@ impl RefreshTask {
         let df = self
             .max_timestamp_df(ctx, &column, refresh.sql.as_deref())
             .await
+            .map_err(find_datafusion_root)
             .context(super::UnableToScanTableProviderSnafu)?;
         let result = &df
             .collect()
             .await
+            .map_err(find_datafusion_root)
             .context(super::FailedToQueryLatestTimestampSnafu)?;
 
         let Some(result) = result.first() else {
@@ -804,9 +810,13 @@ fn filter_records(
 
 pub(crate) fn retry_from_df_error(error: DataFusionError) -> RetryError<super::Error> {
     if is_retriable_error(&error) {
-        return RetryError::transient(super::Error::UnableToGetDataFromConnector { source: error });
+        return RetryError::transient(super::Error::UnableToGetDataFromConnector {
+            source: find_datafusion_root(error),
+        });
     }
-    RetryError::permanent(super::Error::FailedToRefreshDataset { source: error })
+    RetryError::permanent(super::Error::FailedToRefreshDataset {
+        source: find_datafusion_root(error),
+    })
 }
 
 fn inner_err_from_retry(error: RetryError<super::Error>) -> super::Error {

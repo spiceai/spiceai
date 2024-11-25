@@ -16,6 +16,7 @@ limitations under the License.
 
 use super::RefreshTask;
 use crate::accelerated_table::refresh::Refresh;
+use crate::datafusion::error::find_datafusion_root;
 use crate::{dataupdate::StreamingDataUpdateExecutionPlan, status};
 use arrow::array::{Int32Array, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::DataType;
@@ -158,10 +159,12 @@ impl RefreshTask {
                     let delete_plan = deletion_provider
                         .delete_from(&session_state, &delete_where_exprs)
                         .await
+                        .map_err(find_datafusion_root)
                         .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
 
                     collect(delete_plan, ctx.task_ctx())
                         .await
+                        .map_err(find_datafusion_root)
                         .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
                 }
                 ChangeOperation::Create | ChangeOperation::Update | ChangeOperation::Read => {
@@ -192,10 +195,12 @@ impl RefreshTask {
                             InsertOp::Append,
                         )
                         .await
+                        .map_err(find_datafusion_root)
                         .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
 
                     collect(insert_plan, ctx.task_ctx())
                         .await
+                        .map_err(find_datafusion_root)
                         .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
                 }
                 _ => {
