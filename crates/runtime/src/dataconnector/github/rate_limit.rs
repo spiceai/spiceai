@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use async_trait::async_trait;
-use chrono::{DateTime, MappedLocalTime, TimeZone, Utc};
+use chrono::{DateTime, TimeZone, Utc};
 use data_components::graphql::rate_limit::RateLimiter;
 use reqwest::header::HeaderMap;
 use std::{sync::Arc, time::Duration};
