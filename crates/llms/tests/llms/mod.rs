@@ -13,7 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use async_openai::types::{CreateChatCompletionRequest, CreateChatCompletionResponse};
+use async_openai::types::CreateChatCompletionRequest;
 use jsonpath_rust::JsonPath;
 use llms::chat::Chat;
 use serde_json::json;
