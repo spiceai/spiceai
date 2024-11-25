@@ -187,7 +187,7 @@ fn to_sendable_stream(
                         }
                         Err(e) => {
                             tracing::debug!("Error when getting embedding columns: {:?}", e);
-                            yield Err(DataFusionError::Internal(e.to_string()));
+                            yield Err(DataFusionError::External(e.to_string().into()));
 
                         },
                     };

@@ -171,7 +171,7 @@ impl DataConnector for UnityCatalog {
             return Some(Err(
                 super::DataConnectorError::InvalidConfigurationNoSource {
                     dataconnector: "unity_catalog".into(),
-                    message: "A Catalog Path is required for Unity Catalog.\nFor further information, visit: https://docs.spiceai.org/components/catalogs/unity-catalog#from".into(),
+                    message: "A Catalog Path is required for Unity Catalog.\nFor details, visit: https://docs.spiceai.org/components/catalogs/unity-catalog#from".into(),
                     connector_component: ConnectorComponent::from(catalog),
                 },
             ));

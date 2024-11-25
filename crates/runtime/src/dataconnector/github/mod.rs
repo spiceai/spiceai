@@ -21,8 +21,9 @@ use async_trait::async_trait;
 use chrono::{offset::LocalResult, SecondsFormat, TimeZone, Utc};
 use commits::CommitsTableArgs;
 use data_components::{
-    github::{GithubFilesTableProvider, GithubRestClient},
+    github::{self, GithubFilesTableProvider, GithubRestClient},
     graphql::{
+        self,
         builder::GraphQLClientBuilder,
         client::{GraphQLClient, GraphQLQuery, PaginationParameters},
         provider::GraphQLTableProviderBuilder,
@@ -156,10 +157,20 @@ impl Github {
             provider_builder
                 .build(table_args.get_graphql_values().query.as_ref())
                 .await
-                .boxed()
-                .context(super::UnableToGetReadProviderSnafu {
-                    dataconnector: "github".to_string(),
-                    connector_component: table_args.get_component(),
+                .map_err(|e| {
+                    if matches!(e, graphql::Error::RateLimited { .. }) {
+                        DataConnectorError::RateLimited {
+                            dataconnector: "github".to_string(),
+                            connector_component: table_args.get_component(),
+                            source: e.into(),
+                        }
+                    } else {
+                        DataConnectorError::UnableToGetReadProvider {
+                            dataconnector: "github".to_string(),
+                            connector_component: table_args.get_component(),
+                            source: e.into(),
+                        }
+                    }
                 })?,
         ))
     }
@@ -188,7 +199,7 @@ impl Github {
         let Some(tree_sha) = tree_sha.filter(|s| !s.is_empty()) else {
             return Err(DataConnectorError::UnableToGetReadProvider {
                 dataconnector: "github".to_string(),
-                source: format!("The branch or tag name is required in the dataset 'from' and must be in the format 'github.com/{owner}/{repo}/files/<BRANCH_NAME>'.\nFor further information, visit: https://docs.spiceai.org/components/data-connectors/github#querying-github-files").into(),
+                source: format!("The branch or tag name is required in the dataset 'from' and must be in the format 'github.com/{owner}/{repo}/files/<BRANCH_NAME>'.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/github#querying-github-files").into(),
                 connector_component: ConnectorComponent::from(dataset),
             });
         };
@@ -215,10 +226,20 @@ impl Github {
                 dataset.is_accelerated(),
             )
             .await
-            .boxed()
-            .context(super::UnableToGetReadProviderSnafu {
-                dataconnector: "github".to_string(),
-                connector_component: ConnectorComponent::from(dataset),
+            .map_err(|e| {
+                if matches!(e, github::Error::RateLimited { .. }) {
+                    DataConnectorError::RateLimited {
+                        dataconnector: "github".to_string(),
+                        connector_component: ConnectorComponent::from(dataset),
+                        source: e.into(),
+                    }
+                } else {
+                    DataConnectorError::UnableToGetReadProvider {
+                        dataconnector: "github".to_string(),
+                        connector_component: ConnectorComponent::from(dataset),
+                        source: e.into(),
+                    }
+                }
             })?,
         ))
     }
@@ -375,7 +396,7 @@ impl DataConnector for Github {
             DataConnectorError::UnableToGetReadProvider {
                 dataconnector: "github".to_string(),
                 connector_component: ConnectorComponent::from(dataset),
-                source: format!("Invalid query mode: {e}.\nEnsure a valid query mode is used, and try again.\nFor further information, visit: https://docs.spiceai.org/components/data-connectors/github#common-parameters").into(),
+                source: format!("Invalid query mode: {e}.\nEnsure a valid query mode is used, and try again.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/github#common-parameters").into(),
             }
         })?;
 
@@ -433,19 +454,19 @@ impl DataConnector for Github {
             (Some("github.com"), Some(_), Some(_), Some(invalid_table)) => {
                 Err(DataConnectorError::UnableToGetReadProvider {
                     dataconnector: "github".to_string(),
-                    source: format!("Invalid GitHub table type: {invalid_table}.\nEnsure a valid table type is used, and try again.\nFor further information, visit: https://docs.spiceai.org/components/data-connectors/github#common-configuration").into(),
+                    source: format!("Invalid GitHub table type: {invalid_table}.\nEnsure a valid table type is used, and try again.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/github#common-configuration").into(),
                     connector_component: ConnectorComponent::from(dataset),
                 })
             }
             (_, Some(owner), Some(repo), _) => Err(DataConnectorError::UnableToGetReadProvider {
                 dataconnector: "github".to_string(),
                 connector_component: ConnectorComponent::from(dataset),
-                source: format!("The dataset `from` must start with 'github.com/{owner}/{repo}'.\nFor further information, visit: https://docs.spiceai.org/components/data-connectors/github#common-configuration").into(),
+                source: format!("The dataset `from` must start with 'github.com/{owner}/{repo}'.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/github#common-configuration").into(),
             }),
             _ => Err(DataConnectorError::UnableToGetReadProvider {
                 dataconnector: "github".to_string(),
                 connector_component: ConnectorComponent::from(dataset),
-                source: "Invalid GitHub path provided in the dataset 'from'.\nFor further information, visit: https://docs.spiceai.org/components/data-connectors/github#common-configuration".into(),
+                source: "Invalid GitHub path provided in the dataset 'from'.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/github#common-configuration".into(),
             }),
         }
     }

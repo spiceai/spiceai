@@ -16,8 +16,9 @@ limitations under the License.
 
 //! Spice specific errors that are returned as part of `DataFusionError::External`.
 
-use std::fmt::Display;
+use std::{fmt::Display, sync::Arc};
 
+use arrow_schema::ArrowError;
 use datafusion::error::DataFusionError;
 use datafusion_table_providers::util::retriable_error::RetriableError;
 
@@ -66,5 +67,56 @@ pub fn get_spice_df_error(e: &DataFusionError) -> Option<&SpiceExternalError> {
             }
         }
         _ => None,
+    }
+}
+
+/// Finds the root `DataFusionError` if multiple errors are nested, maintaining ownership of the `DataFusionError`.
+/// We implement a custom matcher because we need to retain ownership of the `DataFusionError`, but `DataFusionError::find_root()` returns a reference.
+///
+/// This function does not unnest `Box<Arc<DataFusionError>>` because it cannot take ownership of the inner `DataFusionError`.
+#[must_use]
+pub fn find_datafusion_root(e: DataFusionError) -> DataFusionError {
+    let mut last_error = e;
+
+    tracing::debug!("Finding root of DataFusionError: {:?}", last_error);
+
+    loop {
+        match last_error {
+            DataFusionError::External(err) => match err.downcast::<DataFusionError>() {
+                Ok(inner) => last_error = *inner,
+                Err(err) => match err.downcast::<Arc<DataFusionError>>() {
+                    Ok(inner) => {
+                        tracing::debug!("Found Arc<DataFusionError> in External: {:?}", inner);
+                        return DataFusionError::External(inner);
+                    }
+                    Err(err) => return DataFusionError::External(err),
+                },
+            },
+            DataFusionError::Context(_, err) => last_error = *err,
+            DataFusionError::ArrowError(ArrowError::ExternalError(err), message) => {
+                match err.downcast::<DataFusionError>() {
+                    Ok(inner) => last_error = *inner,
+                    Err(err) => match err.downcast::<Arc<DataFusionError>>() {
+                        Ok(inner) => {
+                            tracing::debug!(
+                                "Found Arc<DataFusionError> in ArrowError: {:?}",
+                                inner
+                            );
+                            return DataFusionError::ArrowError(
+                                ArrowError::ExternalError(inner),
+                                message,
+                            );
+                        }
+                        Err(err) => {
+                            return DataFusionError::ArrowError(
+                                ArrowError::ExternalError(err),
+                                message,
+                            )
+                        }
+                    },
+                }
+            }
+            _ => return last_error,
+        }
     }
 }
