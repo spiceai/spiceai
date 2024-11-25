@@ -57,7 +57,7 @@ pub enum Error {
     #[snafu(display("{message}"))]
     RateLimited { message: String },
 
-    #[snafu(display("Query response transformation failed: {source}"))]
+    #[snafu(display("Query response transformation failed.\n{source}"))]
     ResultTransformError {
         source: Box<dyn std::error::Error + Send + Sync>,
     },

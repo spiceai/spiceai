@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 #![allow(clippy::expect_used)]
+use super::send_embeddings_request;
 use crate::models::sql_to_display;
 use crate::{
     init_tracing, init_tracing_with_task_history,
@@ -43,8 +44,6 @@ use spicepod::component::{
 };
 use std::str::FromStr;
 use std::sync::Arc;
-
-use super::send_embeddings_request;
 
 #[allow(clippy::expect_used)]
 mod nsql {

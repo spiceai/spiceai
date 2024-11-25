@@ -6,7 +6,7 @@ use snafu::prelude::*;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Unable to get token: {source}"))]
+    #[snafu(display("Failed to get token.\n{source}"))]
     UnableToGetToken {
         source: Box<dyn std::error::Error + Send + Sync>,
     },

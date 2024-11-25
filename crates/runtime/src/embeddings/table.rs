@@ -415,7 +415,7 @@ impl EmbeddingTable {
                 embedding_col!(field.name()),
                 Field::new("item", DataType::Float32, false),
                 cfg.vector_size,
-                false,
+                true,
             ))]
         }
     }

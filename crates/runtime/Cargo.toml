@@ -63,7 +63,7 @@ hyper-util = { version = "0.1.6", features = ["service"] }
 indexmap = "2"
 itertools.workspace = true
 jsonwebtoken = "9.3.0"
-keyring = { version = "2.3.2", optional = true }
+keyring = { version = "3.6.1", features = ["apple-native", "windows-native", "linux-native"], optional = true }
 lazy_static.workspace = true
 llms = { path = "../llms" }
 logos = "0.14.0"
