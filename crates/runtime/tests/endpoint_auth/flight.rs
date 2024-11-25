@@ -89,12 +89,18 @@ async fn test_flight_auth() -> Result<(), anyhow::Error> {
         client.clone(),
         "SELECT 1",
         Some(&"valid".to_string()),
-        "test_flight_auth/1.0",
+        &format!("test_flight_auth/{}", env!("CARGO_PKG_VERSION")),
     )
     .await;
     assert!(result.is_ok());
 
-    let Err(e) = flightrepl::get_records(client, "SELECT 1", None, "test_flight_auth/1.0").await
+    let Err(e) = flightrepl::get_records(
+        client,
+        "SELECT 1",
+        None,
+        &format!("test_flight_auth/{}", env!("CARGO_PKG_VERSION")),
+    )
+    .await
     else {
         panic!("expected error");
     };
