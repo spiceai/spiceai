@@ -50,14 +50,14 @@ static TEST_MODELS: LazyLock<Vec<ModelDef>> = LazyLock::new(|| {
         ),
         ("openai", Box::new(|| create::create_openai("gpt-4o-mini"))),
         (
-            "hf/phi3",
+            "hf_phi3",
             Box::new(|| {
                 create::create_hf("microsoft/Phi-3-mini-4k-instruct")
                     .expect("failed to create 'microsoft/Phi-3-mini-4k-instruct' from HF")
             }),
         ),
         (
-            "local/phi3",
+            "local_phi3",
             Box::new(|| {
                 create::create_local("microsoft/Phi-3-mini-4k-instruct")
                     .expect("failed to create 'microsoft/Phi-3-mini-4k-instruct' from local system")
@@ -79,7 +79,7 @@ static TEST_MODELS: LazyLock<Vec<ModelDef>> = LazyLock::new(|| {
 
 /// A mapping of model names (in [`TEST_MODELS`]) and test names (in [`TEST_CASES`]) to skip.
 static TEST_DENY_LIST: LazyLock<Vec<(&'static str, &'static str)>> =
-    LazyLock::new(|| vec![("hf/phi3", "tool_use"), ("local/phi3", "tool_use")]);
+    LazyLock::new(|| vec![("hf_phi3", "tool_use"), ("local_phi3", "tool_use")]);
 
 static TEST_CASES: LazyLock<Vec<TestCase>> = LazyLock::new(|| {
     vec![
@@ -105,99 +105,180 @@ static TEST_CASES: LazyLock<Vec<TestCase>> = LazyLock::new(|| {
                 )
             ]
         ),
-        // ... other test cases ...
+        test_case!(
+            "system_prompt",
+            json!({
+                "model": "not_needed",
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": "Repeat back any user message."
+                    },
+                    {
+                        "role": "user",
+                        "content": "Hi"
+                    }
+                ]
+            }),
+            vec![
+                (
+                    "assistant_response",
+                    "$.choices[*].message[?(@.role == 'assistant' && @.content ~= 'Hi')].length()"
+                ),
+                (
+                    "replied_appropriately",
+                    "$.choices[*].message[?(@.content ~= 'Hi')].length()"
+                )
+            ]
+        ),
+        test_case!(
+            "tool_use",
+            json!({
+                "model": "not_needed",
+                "messages": [
+                    {
+                      "role": "user",
+                      "content": "What'\''s the weather like in Boston today?"
+                    }
+                ],
+                "tool_choice": {"type": "function", "function": {"name": "get_current_weather"}},
+                "tools": [
+                  {
+                    "type": "function",
+                    "function": {
+                      "name": "get_current_weather",
+                      "description": "Get the current weather in a given location, in Celsius",
+                      "parameters": {
+                        "type": "object",
+                        "properties": {
+                          "location": {
+                            "type": "string",
+                            "description": "The city and state, e.g. San Francisco, CA"
+                          },
+                          "unit": {
+                            "type": "string",
+                            "enum": ["celsius", "fahrenheit"]
+                          }
+                        },
+                        "required": ["location"]
+                      }
+                    }
+                  }
+                ]
+            }),
+            vec![
+                ("finish_reason", "$.choices[0].finish_reason"),
+                (
+                    "tool_choice",
+                    "$.choices[0].message.tool_calls[0].function.name"
+                ),
+                (
+                    "valid_function_args",
+                    "$.choices[0].message.tool_calls[0].function.arguments"
+                )
+            ]
+        ),
     ]
 });
+
+#[allow(clippy::expect_fun_call)]
+async fn run_single_test(
+    test: &TestCase,
+    model_name: &str,
+    model: Arc<Box<dyn Chat>>,
+) -> Result<(), anyhow::Error> {
+    tracing::info!(
+        "Running test {}/{} with {:?}",
+        test.name,
+        model_name,
+        test.req
+    );
+
+    let actual_resp = model.chat_request(test.req.clone()).await.expect(&format!(
+        "For test {}/{}, chat_request failed",
+        test.name, model_name
+    ));
+
+    let resp_value =
+        serde_json::to_value(&actual_resp).expect("failed to serialize response to JSON");
+
+    for (id, json_ptr) in &test.json_path {
+        let resp_ptr = JsonPath::from_str(json_ptr)
+            .expect("invalid JSONPath selector")
+            .find(&resp_value);
+        insta::assert_snapshot!(
+            format!("{}_{model_name}_{id}", test.name),
+            serde_json::to_string_pretty(&resp_ptr).expect("Failed to serialize snapshot")
+        );
+    }
+    Ok(())
+}
 
 // Macro to create test module and functions
 #[macro_export]
 macro_rules! generate_model_tests {
     () => {
-        mod model_tests {
-            use super::*;
+        macro_rules! test_model_case {
+            ($model_name_expr:expr, $test_case_expr:expr) => {
+                paste::paste! {
+                    #[tokio::test]
+                    async fn [<test_ $model_name_expr _ $test_case_expr>]() {
+                        let model_name = stringify!($model_name_expr);
+                        let test_case = stringify!($test_case_expr);
+                        println!("Running test {}/{}", model_name, test_case);
 
-            // Generate a test function for each model/test combination
-            macro_rules! test_model_case {
-                ($model_name_expr:expr, $test_case_expr:expr) => {
-                    paste::paste! {
-                        #[tokio::test]
-                        async fn [<test_ $model_name_expr _ $test_case_expr>]() {
-                            let model_name = stringify!($model_name_expr);
-                            let test_case = stringify!($test_case_expr);
-                            println!("Running test {}/{}", model_name, test_case);
+                        let _ = dotenvy::from_filename(".env").expect("failed to load .env file");
+                        init_tracing(None);
 
-                            let _ = dotenvy::from_filename(".env").expect("failed to load .env file");
-                            init_tracing(None);
-
-                            if TEST_DENY_LIST
-                                .iter()
-                                .any(|(m, t)| *m == model_name && *t == test_case)
-                            {
-                                return;
-                            }
-
-                            // Get test case
-                            let test = TEST_CASES
-                                .iter()
-                                .find(|t| t.name == test_case)
-                                .expect("test case not found");
-
-                            let (_, model) = TEST_MODELS
-                                .iter()
-                                .find(|(name, _)| *name == model_name)
-                                .expect("model not found");
-
-                            // Run test
-                            run_single_test(test, model_name, Arc::clone(model)).await
-                                .expect("test failed");
+                        if TEST_DENY_LIST
+                            .iter()
+                            .any(|(m, t)| *m == model_name && *t == test_case)
+                        {
+                            return;
                         }
+
+                        // Get test case
+                        let test = TEST_CASES
+                            .iter()
+                            .find(|t| t.name == test_case)
+                            .expect("test case not found");
+
+                        if TEST_ARGS.skip_model(model_name) {
+                            tracing::debug!("Skipping test {}/{}", model_name, test_case);
+                            return;
+                        }
+
+                        let (_, model) = TEST_MODELS
+                            .iter()
+                            .find(|(name, _)| *name == model_name)
+                            .expect(&format!("model {model_name} not found"));
+
+                        // Run test
+                        run_single_test(test, model_name, Arc::clone(model)).await
+                            .expect("test failed");
                     }
-                };
-            }
-
-            test_model_case!(anthropic, basic);
-            test_model_case!(openai, basic);
-            // test_model_case!(hf_phi3, basic);
-            // test_model_case!(local_phi3, basic);
+                }
+            };
         }
 
-        async fn run_single_test(
-            test: &TestCase,
-            model_name: &str,
-            model: Arc<Box<dyn Chat>>,
-        ) -> Result<(), anyhow::Error> {
-            tracing::info!(
-                "Running test {}/{} with {:?}",
-                test.name,
-                model_name,
-                test.req
-            );
+        test_model_case!(anthropic, basic);
+        test_model_case!(openai, basic);
+        test_model_case!(hf_phi3, basic);
+        test_model_case!(local_phi3, basic);
 
-            let actual_resp = model.chat_request(test.req.clone()).await.expect(&format!(
-                "For test {}/{}, chat_request failed",
-                test.name, model_name
-            ));
+        test_model_case!(anthropic, system_prompt);
+        test_model_case!(openai, system_prompt);
+        test_model_case!(hf_phi3, system_prompt);
+        test_model_case!(local_phi3, system_prompt);
 
-            let resp_value =
-                serde_json::to_value(&actual_resp).expect("failed to serialize response to JSON");
-
-            for (id, json_ptr) in &test.json_path {
-                let resp_ptr = JsonPath::from_str(json_ptr)
-                    .expect("invalid JSONPath selector")
-                    .find(&resp_value);
-                insta::assert_snapshot!(
-                    format!("{}_{model_name}_{id}", test.name),
-                    serde_json::to_string_pretty(&resp_ptr).expect("Failed to serialize snapshot")
-                );
-            }
-            Ok(())
-        }
+        test_model_case!(anthropic, tool_use);
+        test_model_case!(openai, tool_use);
+        test_model_case!(hf_phi3, tool_use);
+        test_model_case!(local_phi3, tool_use);
     };
 }
-
-generate_model_tests!();
-
-// #[cfg(test)]
-// mod tests {
-//     use super::*;
-// }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    generate_model_tests!();
+}
