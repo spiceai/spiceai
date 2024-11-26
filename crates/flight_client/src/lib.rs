@@ -151,7 +151,7 @@ pub enum Error {
     #[snafu(display("Failed to publish data to flight endpoint.\n{source}"))]
     UnableToPublish { source: TonicStatusError },
 
-    #[snafu(display("Unauthorized. Verify the credentials."))]
+    #[snafu(display("Unauthorized. Verify the credentials are configured correctly."))]
     Unauthorized {},
 
     #[snafu(display("Permission denied. Ensure the credentials have the required permissions."))]
