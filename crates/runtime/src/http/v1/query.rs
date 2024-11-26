@@ -26,7 +26,6 @@ use headers_accept::Accept;
 use http::HeaderMap;
 
 use crate::datafusion::DataFusion;
-use crate::metrics::telemetry::UserAgentCollectionState;
 
 use super::{sql_to_http_response, ArrowFormat};
 

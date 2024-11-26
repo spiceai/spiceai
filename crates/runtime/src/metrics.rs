@@ -243,12 +243,15 @@ pub(crate) mod tools {
 }
 
 pub(crate) mod telemetry {
-    use std::time::Duration;
+    use std::{sync::Arc, time::Duration};
 
+    use http::HeaderMap;
     use opentelemetry::{metrics::Histogram, KeyValue};
-    use util::user_agent::SpiceUserAgent;
 
-    use crate::datafusion::query::Protocol;
+    use crate::{
+        datafusion::query::Protocol,
+        http::user_agent::{self, UserAgent},
+    };
 
     use super::{global, Counter, LazyLock, Meter};
 
@@ -328,21 +331,9 @@ pub(crate) mod telemetry {
     }
 
     #[derive(Clone, Debug)]
-    pub enum UserAgentCollectionState {
-        Enabled,
-        Disabled,
-    }
-
-    impl UserAgentCollectionState {
-        pub fn is_enabled(&self) -> bool {
-            matches!(self, UserAgentCollectionState::Enabled)
-        }
-    }
-
-    #[derive(Clone, Debug)]
     pub struct TelemetryContext {
         pub protocol: Protocol,
-        pub user_agent: Option<SpiceUserAgent>,
+        pub user_agent: UserAgent,
     }
 
     impl TelemetryContext {
@@ -350,46 +341,55 @@ pub(crate) mod telemetry {
         pub fn new() -> Self {
             Self {
                 protocol: Protocol::Internal,
-                user_agent: Some(SpiceUserAgent::default()),
+                user_agent: UserAgent::Absent,
             }
         }
 
         #[must_use]
-        pub fn to_dimensions(&self) -> Vec<KeyValue> {
+        pub fn from_headers(protocol: Protocol, headers: &HeaderMap) -> Self {
+            Self {
+                protocol,
+                user_agent: UserAgent::from_headers(headers),
+            }
+        }
+
+        #[must_use]
+        pub fn to_dimensions(self) -> Vec<KeyValue> {
             let mut labels = vec![KeyValue::new("protocol", self.protocol.as_arc_str())];
 
-            if let Some(user_agent) = &self.user_agent {
-                labels.push(KeyValue::new("user_agent", user_agent.to_string()));
+            let add_platform_labels = |mut labels: Vec<KeyValue>| {
+                labels.push(KeyValue::new("platform", user_agent::PLATFORM_NAME));
                 labels.push(KeyValue::new(
-                    "client.name",
-                    user_agent.client_name.to_string(),
+                    "platform_version",
+                    user_agent::PLATFORM_VERSION,
                 ));
                 labels.push(KeyValue::new(
-                    "client.version",
-                    user_agent.client_version.to_string(),
+                    "platform_system",
+                    user_agent::PLATFORM_SYSTEM.to_string(),
                 ));
+            };
 
-                if let Some(client_system) = &user_agent.client_system {
-                    labels.push(KeyValue::new("client.system", client_system.to_string()));
+            match self.user_agent {
+                UserAgent::Absent => (),
+                UserAgent::Raw(raw) => {
+                    labels.push(KeyValue::new("user_agent", UserAgent::Raw(raw).to_string()));
+                    add_platform_labels(labels);
                 }
-                if let Some(platform_name) = &user_agent.platform_name {
-                    labels.push(KeyValue::new("platform.name", platform_name.to_string()));
-                }
-                if let Some(platform_version) = &user_agent.platform_version {
+                UserAgent::Parsed(parsed) => {
+                    labels.push(KeyValue::new("client", Arc::clone(&parsed.client_name)));
                     labels.push(KeyValue::new(
-                        "platform.version",
-                        platform_version.to_string(),
+                        "client_version",
+                        Arc::clone(&parsed.client_version),
                     ));
-                }
-                if let Some(platform_system) = &user_agent.platform_system {
-                    labels.push(KeyValue::new(
-                        "platform.system",
-                        platform_system.to_string(),
-                    ));
-                }
 
-                for (key, value) in &user_agent.extensions {
-                    labels.push(KeyValue::new(key.to_string(), value.to_string()));
+                    if let Some(client_system) = &parsed.client_system {
+                        labels.push(KeyValue::new("client_system", Arc::clone(client_system)));
+                    }
+                    labels.push(KeyValue::new(
+                        "user_agent",
+                        UserAgent::Parsed(parsed).to_string(),
+                    ));
+                    add_platform_labels(labels);
                 }
             }
 

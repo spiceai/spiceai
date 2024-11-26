@@ -197,10 +197,7 @@ pub async fn run(args: Args) -> Result<()> {
     let app_name = app.as_ref().map(|app| app.name.clone());
     let spicepod_tls_config = runtime_config.and_then(|rt| rt.tls.clone());
     let tracing_config = runtime_config.and_then(|rt| rt.tracing.clone());
-    let telemetry_config = runtime_config.and_then(|rt| rt.telemetry.clone());
-    let user_agent_collection_enabled = telemetry_config
-        .as_ref()
-        .map_or(true, TelemetryConfig::user_agent_collection_enabled);
+    let telemetry_config = runtime_config.map(|rt| rt.telemetry.clone());
 
     let mut builder = Runtime::builder()
         .with_app_opt(app.clone())
@@ -250,13 +247,7 @@ pub async fn run(args: Args) -> Result<()> {
         None => EndpointAuth::no_auth(),
     };
     let server_thread = tokio::spawn(async move {
-        Box::pin(Arc::new(cloned_rt).start_servers(
-            args.runtime,
-            tls_config,
-            endpoint_auth,
-            user_agent_collection_enabled,
-        ))
-        .await
+        Box::pin(Arc::new(cloned_rt).start_servers(args.runtime, tls_config, endpoint_auth)).await
     });
 
     tokio::select! {

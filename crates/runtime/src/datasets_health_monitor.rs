@@ -28,7 +28,6 @@ use opentelemetry::KeyValue;
 use snafu::{ResultExt, Snafu};
 use tokio::sync::Mutex;
 use tracing_futures::Instrument;
-use util::user_agent::SpiceUserAgent;
 
 use crate::{
     component::dataset::Dataset,

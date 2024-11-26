@@ -38,6 +38,7 @@ use crate::{
 
 mod metrics;
 mod routes;
+pub mod user_agent;
 mod v1;
 
 #[derive(Debug, Snafu)]
@@ -57,7 +58,6 @@ pub(crate) async fn start<A>(
     config: Arc<config::Config>,
     tls_config: Option<Arc<TlsConfig>>,
     auth_provider: Option<Arc<dyn HttpAuth + Send + Sync>>,
-    user_agent_collection_state: Arc<UserAgentCollectionState>,
 ) -> Result<()>
 where
     A: ToSocketAddrs + Debug,
@@ -78,7 +78,6 @@ where
         vsearch,
         auth_provider.map(AuthLayer::new),
         &cors_config,
-        user_agent_collection_state,
     );
     drop(app);
 

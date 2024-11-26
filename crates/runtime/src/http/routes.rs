@@ -20,11 +20,12 @@ use crate::metrics::telemetry::TelemetryContext;
 use crate::Runtime;
 use crate::{config, metrics::telemetry::UserAgentCollectionState};
 
+use app::App;
 use axum::routing::patch;
 use opentelemetry::KeyValue;
-use spicepod::component::runtime::CorsConfig;
+use spicepod::component::runtime::{CorsConfig, UserAgentCollection};
 use std::sync::Arc;
-use util::user_agent::SpiceUserAgent;
+use tokio::sync::RwLock;
 
 use axum::{
     body::Body,
@@ -39,6 +40,7 @@ use runtime_auth::layer::http::AuthLayer;
 use tokio::time::Instant;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 
+use super::user_agent::UserAgent;
 use super::{metrics, v1};
 
 pub(crate) fn routes(
@@ -47,7 +49,6 @@ pub(crate) fn routes(
     vector_search: Arc<vector_search::VectorSearch>,
     auth_layer: Option<AuthLayer>,
     cors_config: &CorsConfig,
-    user_agent_collection_state: Arc<UserAgentCollectionState>,
 ) -> Router {
     let mut authenticated_router = Router::new()
         .route("/v1/sql", post(v1::query::post))
@@ -86,7 +87,6 @@ pub(crate) fn routes(
         .layer(Extension(Arc::clone(&rt.app)))
         .layer(Extension(Arc::clone(&rt.df)))
         .layer(Extension(Arc::clone(rt)))
-        .layer(Extension(user_agent_collection_state))
         .layer(Extension(rt.metrics_endpoint))
         .layer(Extension(config));
 
@@ -108,16 +108,23 @@ pub(crate) fn routes(
 }
 
 async fn track_metrics(
-    Extension(user_agent_collection_state): Extension<Arc<UserAgentCollectionState>>,
+    Extension(app): Extension<Arc<RwLock<Option<Arc<App>>>>>,
     headers: http::HeaderMap,
-    req: Request<Body>,
+    mut req: Request<Body>,
     next: Next,
 ) -> impl IntoResponse {
-    let user_agent = headers
-        .get("user-agent")
-        .map(|ua| ua.to_str().unwrap_or_default())
-        .unwrap_or_default()
-        .to_string();
+    let app_lock = app.read().await;
+    let user_agent_collection = app_lock
+        .as_ref()
+        .map_or(UserAgentCollection::default(), |app| {
+            app.user_agent_collection()
+        });
+    let user_agent = match user_agent_collection {
+        UserAgentCollection::Full => Arc::new(UserAgent::from_headers(&headers)),
+        UserAgentCollection::Disabled => Arc::new(UserAgent::Absent),
+    };
+
+    req.extensions_mut().insert(Arc::clone(&user_agent));
 
     let start = Instant::now();
     let path = if let Some(matched_path) = req.extensions().get::<MatchedPath>() {
@@ -138,14 +145,16 @@ async fn track_metrics(
         KeyValue::new("status", status),
     ];
 
-    if user_agent_collection_state.is_enabled() {
-        let user_agent: SpiceUserAgent = user_agent.try_into().unwrap_or_default();
-        let telemetry_context = TelemetryContext {
-            protocol: Protocol::Http,
-            user_agent: Some(user_agent),
-        };
-        labels.extend(telemetry_context.to_dimensions());
-    }
+    let user_agent: UserAgent =
+        Arc::into_inner(user_agent).unwrap_or_else(|| match user_agent_collection {
+            UserAgentCollection::Full => UserAgent::from_headers(&headers),
+            UserAgentCollection::Disabled => UserAgent::Absent,
+        });
+    let telemetry_context = TelemetryContext {
+        protocol: Protocol::Http,
+        user_agent,
+    };
+    labels.extend(telemetry_context.to_dimensions());
 
     metrics::REQUESTS_TOTAL.add(1, &labels);
     metrics::REQUESTS_DURATION_MS.record(latency_ms, &labels);

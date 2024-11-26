@@ -16,7 +16,7 @@ limitations under the License.
 
 #![allow(clippy::missing_errors_doc)]
 
-use std::{collections::HashMap, fmt::Display, path::PathBuf, str::FromStr, sync::Arc};
+use std::{collections::HashMap, path::PathBuf};
 
 use snafu::prelude::*;
 pub use spicepod;
@@ -34,6 +34,8 @@ use spicepod::{
     },
     Spicepod,
 };
+
+pub mod runtime;
 
 #[derive(Debug, PartialEq)]
 pub struct App {
@@ -61,28 +63,6 @@ pub struct App {
 }
 
 impl App {
-    /// Get a parameter from the app's runtime params, with a default value if the parameter is not set or is not valid.
-    ///
-    /// Returns `default_value` if the parameter is not set or is not valid.
-    ///
-    /// If the parameter is set but is not valid, logs a warning and returns `default_value`.
-    #[must_use]
-    pub fn get_runtime_param<T>(app: &Option<Arc<Self>>, param: &str, default_value: T) -> T
-    where
-        T: Display + FromStr,
-    {
-        let Some(value) = app.as_ref().and_then(|app| app.runtime.params.get(param)) else {
-            return default_value;
-        };
-
-        if let Ok(parsed_value) = value.parse::<T>() {
-            parsed_value
-        } else {
-            eprintln!("runtime.params.{param} is not valid, defaulting to {default_value}");
-            default_value
-        }
-    }
-
     /// Retrieve all dataset names that are of a specific connector type.
     #[must_use]
     pub fn datasets_of_connector_type(&self, prefix: &str) -> Vec<String> {
@@ -328,46 +308,5 @@ impl AppBuilder {
             spicepods,
             runtime,
         })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::collections::HashMap;
-
-    fn create_app_with_params(params: HashMap<String, String>) -> Arc<App> {
-        Arc::new(AppBuilder::new("test").with_runtime_params(params).build())
-    }
-
-    #[test]
-    fn test_get_runtime_param() {
-        // Test case 1: Parameter is not set
-        let app = Some(create_app_with_params(HashMap::new()));
-        assert!(App::get_runtime_param(&app, "test_param", true));
-        assert!(!App::get_runtime_param(&app, "test_param", false));
-
-        // Test case 2: Parameter is set to "true"
-        let mut params = HashMap::new();
-        params.insert("test_param".to_string(), "true".to_string());
-        let app = Some(create_app_with_params(params));
-        assert!(App::get_runtime_param(&app, "test_param", false));
-
-        // Test case 3: Parameter is set to "false"
-        let mut params = HashMap::new();
-        params.insert("test_param".to_string(), "false".to_string());
-        let app = Some(create_app_with_params(params));
-        assert!(!App::get_runtime_param(&app, "test_param", true));
-
-        // Test case 4: Parameter is set to an invalid boolean value
-        let mut params = HashMap::new();
-        params.insert("test_param".to_string(), "not_a_bool".to_string());
-        let app = Some(create_app_with_params(params));
-        assert!(App::get_runtime_param(&app, "test_param", true));
-        assert!(!App::get_runtime_param(&app, "test_param", false));
-
-        // Test case 5: App is None
-        assert!(App::get_runtime_param(&None, "test_param", true));
-        assert!(!App::get_runtime_param(&None, "test_param", false));
     }
 }

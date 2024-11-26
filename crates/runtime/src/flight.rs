@@ -20,8 +20,9 @@ use crate::datafusion::query::{self, QueryBuilder};
 use crate::datafusion::DataFusion;
 use crate::dataupdate::DataUpdate;
 use crate::metrics as runtime_metrics;
-use crate::metrics::telemetry::{TelemetryContext, UserAgentCollectionState};
+use crate::metrics::telemetry::TelemetryContext;
 use crate::tls::TlsConfig;
+use app::App;
 use arrow::array::RecordBatch;
 use arrow::datatypes::Schema;
 use arrow::ipc::writer::{DictionaryTracker, IpcDataGenerator};
@@ -63,10 +64,10 @@ use arrow_flight::{
 };
 
 pub struct Service {
+    app: Option<Arc<App>>,
     datafusion: Arc<DataFusion>,
     channel_map: Arc<RwLock<HashMap<TableReference, Arc<Sender<DataUpdate>>>>>,
     basic_auth: Option<Arc<dyn FlightBasicAuth + Send + Sync>>,
-    user_agent_collection_state: Arc<UserAgentCollectionState>,
 }
 
 #[tonic::async_trait]
@@ -324,16 +325,16 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub async fn start(
     bind_address: std::net::SocketAddr,
+    app: Option<Arc<App>>,
     df: Arc<DataFusion>,
     tls_config: Option<Arc<TlsConfig>>,
     endpoint_auth: EndpointAuth,
-    user_agent_collection_state: Arc<UserAgentCollectionState>,
 ) -> Result<()> {
     let service = Service {
+        app,
         datafusion: Arc::clone(&df),
         channel_map: Arc::new(RwLock::new(HashMap::new())),
         basic_auth: endpoint_auth.flight_basic_auth.as_ref().map(Arc::clone),
-        user_agent_collection_state,
     };
     let svc = FlightServiceServer::new(service);
 

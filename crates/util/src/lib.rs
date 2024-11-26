@@ -20,7 +20,6 @@ use std::{
 };
 
 pub mod fibonacci_backoff;
-pub mod user_agent;
 pub use backoff::future::retry;
 pub use backoff::Error as RetryError;
 
