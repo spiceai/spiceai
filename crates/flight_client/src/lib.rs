@@ -128,9 +128,7 @@ pub enum Error {
         source: tonic::metadata::errors::InvalidMetadataValue,
     },
 
-    #[snafu(display(
-        "Failed to connect to Flight server: Handshake failed.\n{source}"
-    ))]
+    #[snafu(display("Failed to connect to Flight server: Handshake failed.\n{source}"))]
     UnableToPerformHandshake { source: TonicStatusError },
 
     #[snafu(display(
