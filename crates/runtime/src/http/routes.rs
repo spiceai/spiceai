@@ -147,6 +147,12 @@ fn cors_layer(cors_config: &CorsConfig) -> CorsLayer {
             .into()
     };
 
+    tracing::info!(
+        target: "runtime::http",
+        "CORS (Cross-Origin Resource Sharing) enabled on HTTP endpoint for allowed origins: {:?}",
+        cors_config.allowed_origins
+    );
+
     cors.allow_methods([Method::GET, Method::POST, Method::PATCH])
         .allow_origin(allowed_origins)
 }
