@@ -14,7 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::HashMap, path::Path, sync::Arc};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use async_openai::{
     error::{ApiError, OpenAIError},
@@ -70,15 +74,15 @@ impl TeiEmbed {
             .to_string();
 
         // `text-embeddings-inference` expects the model artifacts to to be in a single folder with specific filenames.
-        let files: HashMap<String, &Path> = vec![
-            (model_filename, model_path),
-            ("config.json".to_string(), config_path),
-            ("tokenizer.json".to_string(), tokenizer_path),
+        let files: HashMap<String, PathBuf> = vec![
+            (model_filename, model_path.to_path_buf()),
+            ("config.json".to_string(), config_path.to_path_buf()),
+            ("tokenizer.json".to_string(), tokenizer_path.to_path_buf()),
         ]
         .into_iter()
         .collect();
 
-        let model_root = link_files_into_tmp_dir(files)?;
+        let model_root = link_files_into_tmp_dir(files, None)?;
         tracing::trace!(
             "Embedding model has files linked at location={:?}",
             model_root

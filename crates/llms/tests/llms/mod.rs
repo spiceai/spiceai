@@ -22,7 +22,7 @@ use std::{
     sync::{Arc, LazyLock},
 };
 
-use crate::{TestArgs, TEST_ARGS};
+use crate::{init_tracing, TEST_ARGS};
 
 mod create;
 
@@ -150,10 +150,14 @@ static TEST_CASES: LazyLock<Vec<TestCase>> = LazyLock::new(|| {
     ]
 });
 
-/// Model instantiations to test.
+/// For a given mode name, a function that instantiates the model..
+type ModelFn<'a> = (&'a str, Box<dyn Fn() -> Arc<Box<dyn Chat>>>);
+
+/// A given model to test.
+type ModelDef<'a> = (&'a str, Arc<Box<dyn Chat>>);
 #[allow(clippy::expect_used)]
-static TEST_MODELS: LazyLock<Vec<(&'static str, Arc<Box<dyn Chat>>)>> = LazyLock::new(|| {
-    let model_creators: [(&str, Box<dyn Fn() -> Arc<Box<dyn Chat>>>); 3] = [
+static TEST_MODELS: LazyLock<Vec<ModelDef>> = LazyLock::new(|| {
+    let model_creators: [ModelFn; 4] = [
         (
             "anthropic",
             Box::new(|| create::create_anthropic(None).expect("failed to create anthropic model")),
@@ -163,6 +167,13 @@ static TEST_MODELS: LazyLock<Vec<(&'static str, Arc<Box<dyn Chat>>)>> = LazyLock
             "hf/phi3",
             Box::new(|| {
                 create::create_hf("microsoft/Phi-3-mini-4k-instruct")
+                    .expect("failed to create 'microsoft/Phi-3-mini-4k-instruct' from HF")
+            }),
+        ),
+        (
+            "local/phi3",
+            Box::new(|| {
+                create::create_local("microsoft/Phi-3-mini-4k-instruct")
                     .expect("failed to create 'microsoft/Phi-3-mini-4k-instruct' from HF")
             }),
         ),
@@ -182,7 +193,7 @@ static TEST_MODELS: LazyLock<Vec<(&'static str, Arc<Box<dyn Chat>>)>> = LazyLock
 
 /// A mapping of model names (in [`TEST_MODELS`]) and test names (in [`TEST_CASES`]) to skip.
 static TEST_DENY_LIST: LazyLock<Vec<(&'static str, &'static str)>> =
-    LazyLock::new(|| vec![("hf/phi3", "tool_use")]);
+    LazyLock::new(|| vec![("hf/phi3", "tool_use"), ("local/phi3", "tool_use")]);
 
 /// Run a single [`TestCase`] for a model.
 #[allow(clippy::expect_used, clippy::expect_fun_call)]
@@ -221,6 +232,7 @@ async fn run_test_case(
 async fn run_all_tests() {
     // Set ENV variables before we lazy load `TEST_MODELS`.
     let _ = dotenvy::from_filename(".env").expect("failed to load .env file");
+    init_tracing(None);
 
     for ts in TEST_CASES.iter() {
         for (model_name, model) in TEST_MODELS.iter() {

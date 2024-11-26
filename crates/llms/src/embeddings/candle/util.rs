@@ -164,29 +164,38 @@ pub(crate) fn download_hf_artifacts(
 ///
 /// ```
 ///
-pub(crate) fn link_files_into_tmp_dir(files: HashMap<String, &Path>) -> Result<PathBuf> {
-    let temp_dir = tempdir()
-        .boxed()
-        .context(FailedToInstantiateEmbeddingModelSnafu)?;
+#[allow(clippy::implicit_hasher)]
+pub fn link_files_into_tmp_dir(
+    files: HashMap<String, PathBuf>,
+    temp_dir_opt: Option<PathBuf>,
+) -> Result<PathBuf> {
+    let temp_dir = if let Some(temp_dir) = temp_dir_opt {
+        temp_dir
+    } else {
+        let temp_dir = tempdir()
+            .boxed()
+            .context(FailedToInstantiateEmbeddingModelSnafu)?;
+        temp_dir.into_path()
+    };
 
     for (name, file) in files {
-        let Ok(abs_path) = path::absolute(file) else {
+        let Ok(abs_path) = path::absolute(&file) else {
             return Err(Error::FailedToCreateEmbedding {
                 source: format!(
                     "Failed to get absolute path of provided file: {}",
-                    file.as_os_str().to_string_lossy()
+                    file.to_string_lossy()
                 )
                 .into(),
             });
         };
 
         // Hard link so windows can handle it without developer mode.
-        std::fs::hard_link(abs_path, temp_dir.path().join(name))
+        std::fs::hard_link(abs_path, temp_dir.join(name))
             .boxed()
             .context(FailedToInstantiateEmbeddingModelSnafu)?;
     }
 
-    Ok(temp_dir.into_path())
+    Ok(temp_dir)
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]

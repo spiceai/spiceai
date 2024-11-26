@@ -18,6 +18,8 @@ pub mod llms;
 
 use std::{collections::HashSet, sync::LazyLock};
 
+use tracing_subscriber::EnvFilter;
+
 static TEST_ARGS: LazyLock<TestArgs> = LazyLock::new(|| {
     let args = TestArgs::from_env();
     args.validate();
@@ -70,4 +72,18 @@ impl TestArgs {
             tracing::warn!("Model allowlist and skiplist have overlapping models: {overlap:?}");
         }
     }
+}
+
+fn init_tracing(default_level: Option<&str>) -> tracing::subscriber::DefaultGuard {
+    let filter = match (default_level, std::env::var("SPICED_LOG").ok()) {
+        (_, Some(log)) => EnvFilter::new(log),
+        (Some(level), None) => EnvFilter::new(level),
+        _ => EnvFilter::new("llms=TRACE,DEBUG"),
+    };
+
+    let subscriber = tracing_subscriber::FmtSubscriber::builder()
+        .with_env_filter(filter)
+        .with_ansi(true)
+        .finish();
+    tracing::subscriber::set_default(subscriber)
 }
