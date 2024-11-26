@@ -76,6 +76,7 @@ jobs:
           echo 'SPICE_OPENAI_API_KEY="${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}"' > .env
           echo 'SPICE_ANTHROPIC_API_KEY="${{ secrets.SPICE_SECRET_ANTHROPIC_API_KEY }}"' >> .env
 
+        # Don't run local models in the integration test yet.
       - name: Run integration test
         env:
           SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
@@ -89,4 +90,5 @@ jobs:
             echo "Error: Anthropic API key is not defined."
             exit 1
           fi
+          export MODEL_SKIPLIST="hf/phi3,local/phi3"
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" ./integration_test/llms_integration_test --nocapture

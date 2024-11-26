@@ -21,6 +21,7 @@ use serde::Deserialize;
 
 pub mod tei;
 mod util;
+pub use util::link_files_into_tmp_dir;
 
 /// Important fields from a model's `config.json`
 #[derive(Debug, Deserialize)]
