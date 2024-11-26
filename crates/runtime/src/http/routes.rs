@@ -128,7 +128,7 @@ async fn track_metrics(
     };
     let method = req.method().clone();
 
-    let response = request_context
+    request_context
         .scope(async move { next.run(req).await })
         .await;
 
@@ -141,7 +141,7 @@ async fn track_metrics(
         KeyValue::new("status", status),
     ];
 
-    labels.extend(request_dimensions);
+    labels.extend(request_dimensions.iter());
 
     metrics::REQUESTS_TOTAL.add(1, &labels);
     metrics::REQUESTS_DURATION_MS.record(latency_ms, &labels);
