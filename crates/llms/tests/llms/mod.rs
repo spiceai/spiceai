@@ -174,7 +174,7 @@ static TEST_MODELS: LazyLock<Vec<ModelDef>> = LazyLock::new(|| {
             "local/phi3",
             Box::new(|| {
                 create::create_local("microsoft/Phi-3-mini-4k-instruct")
-                    .expect("failed to create 'microsoft/Phi-3-mini-4k-instruct' from HF")
+                    .expect("failed to create 'microsoft/Phi-3-mini-4k-instruct' from local system")
             }),
         ),
     ];
