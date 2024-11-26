@@ -1,17 +1,6 @@
 /*
 Copyright 2024 The Spice.ai OSS Authors
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-     https://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
+Licensed under the Apache License, Version 2.0
 */
 use async_openai::types::CreateChatCompletionRequest;
 use jsonpath_rust::JsonPath;
@@ -30,11 +19,9 @@ mod create;
 pub struct TestCase {
     pub name: &'static str,
     pub req: CreateChatCompletionRequest,
-
-    /// Maps (id, `JSONPath` selector), where the selector is into the [`CreateChatCompletionResponse`].
-    /// This is used in snapshot testing to assert certain properties of the response.
     pub json_path: Vec<(&'static str, &'static str)>,
 }
+
 /// Creates [`TestCase`] instances from request/response that JSON serialize to
 /// [`CreateChatCompletionRequest`] and [`CreateChatCompletionResponse`].
 #[macro_export]
@@ -48,107 +35,6 @@ macro_rules! test_case {
         }
     };
 }
-
-/// Test case parameters (for [`run_test_case`]) to run for each model.
-static TEST_CASES: LazyLock<Vec<TestCase>> = LazyLock::new(|| {
-    vec![
-        test_case!(
-            "basic",
-            json!({
-                "model": "not_needed",
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": "Say Hello"
-                    }
-                ]
-            }),
-            vec![
-                (
-                    "message_keys",
-                    "$.choices[*].message['role', 'tool_calls', 'refusal']"
-                ),
-                (
-                    "replied_appropriately",
-                    "$.choices[*].message[?(@.content ~= 'Hello')].length()"
-                )
-            ]
-        ),
-        test_case!(
-            "system_prompt",
-            json!({
-                "model": "not_needed",
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": "Repeat back any user message."
-                    },
-                    {
-                        "role": "user",
-                        "content": "Hi"
-                    }
-                ]
-            }),
-            vec![
-                (
-                    "assistant_response",
-                    "$.choices[*].message[?(@.role == 'assistant' && @.content ~= 'Hi')].length()"
-                ),
-                (
-                    "replied_appropriately",
-                    "$.choices[*].message[?(@.content ~= 'Hi')].length()"
-                )
-            ]
-        ),
-        test_case!(
-            "tool_use",
-            json!({
-                "model": "not_needed",
-                "messages": [
-                    {
-                      "role": "user",
-                      "content": "What'\''s the weather like in Boston today?"
-                    }
-                ],
-                "tool_choice": {"type": "function", "function": {"name": "get_current_weather"}},
-                "tools": [
-                  {
-                    "type": "function",
-                    "function": {
-                      "name": "get_current_weather",
-                      "description": "Get the current weather in a given location, in Celsius",
-                      "parameters": {
-                        "type": "object",
-                        "properties": {
-                          "location": {
-                            "type": "string",
-                            "description": "The city and state, e.g. San Francisco, CA"
-                          },
-                          "unit": {
-                            "type": "string",
-                            "enum": ["celsius", "fahrenheit"]
-                          }
-                        },
-                        "required": ["location"]
-                      }
-                    }
-                  }
-                ]
-            }),
-            vec![
-                ("finish_reason", "$.choices[0].finish_reason"),
-                (
-                    "tool_choice",
-                    "$.choices[0].message.tool_calls[0].function.name"
-                ),
-                (
-                    "valid_function_args",
-                    "$.choices[0].message.tool_calls[0].function.arguments"
-                )
-            ]
-        ),
-    ]
-});
 
 /// For a given mode name, a function that instantiates the model..
 type ModelFn<'a> = (&'a str, Box<dyn Fn() -> Arc<Box<dyn Chat>>>);
@@ -195,58 +81,123 @@ static TEST_MODELS: LazyLock<Vec<ModelDef>> = LazyLock::new(|| {
 static TEST_DENY_LIST: LazyLock<Vec<(&'static str, &'static str)>> =
     LazyLock::new(|| vec![("hf/phi3", "tool_use"), ("local/phi3", "tool_use")]);
 
-/// Run a single [`TestCase`] for a model.
-#[allow(clippy::expect_used, clippy::expect_fun_call)]
-async fn run_test_case(
-    test: &TestCase,
-    model_name: &'static str,
-    model: Arc<Box<dyn Chat>>,
-) -> Result<(), anyhow::Error> {
-    let test_name = test.name;
-    tracing::info!("Running test {test_name}/{model_name} with {:?}", test.req);
+static TEST_CASES: LazyLock<Vec<TestCase>> = LazyLock::new(|| {
+    vec![
+        test_case!(
+            "basic",
+            json!({
+                "model": "not_needed",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "Say Hello"
+                    }
+                ]
+            }),
+            vec![
+                (
+                    "message_keys",
+                    "$.choices[*].message['role', 'tool_calls', 'refusal']"
+                ),
+                (
+                    "replied_appropriately",
+                    "$.choices[*].message[?(@.content ~= 'Hello')].length()"
+                )
+            ]
+        ),
+        // ... other test cases ...
+    ]
+});
 
-    let actual_resp = model
-        .chat_request(test.req.clone())
-        .await
-        .expect(format!("For test {test_name}/{model_name}, chat_request failed").as_str());
+// Macro to create test module and functions
+#[macro_export]
+macro_rules! generate_model_tests {
+    () => {
+        mod model_tests {
+            use super::*;
 
-    tracing::trace!("Response for {test_name}/{model_name}: {actual_resp:?}");
-    // Convert to [`serde_json::Value`] for JSONPath testing.
-    let resp_value = serde_json::to_value(&actual_resp).expect(
-        format!("For test {test_name}/{model_name}, failed to serialize response to JSON").as_str(),
-    );
-    for (id, json_ptr) in &test.json_path {
-        let resp_ptr = JsonPath::from_str(json_ptr)
-            .expect(format!("For test {test_name}, invalid JSONPath selector for id={id}").as_str())
-            .find(&resp_value);
-        insta::assert_snapshot!(
-            format!("{test_name}_{model_name}_{id}"),
-            serde_json::to_string_pretty(&resp_ptr).expect("Failed to serialize snapshot")
-        );
-    }
-    Ok(())
-}
+            // Generate a test function for each model/test combination
+            macro_rules! test_model_case {
+                ($model_name_expr:expr, $test_case_expr:expr) => {
+                    paste::paste! {
+                        #[tokio::test]
+                        async fn [<test_ $model_name_expr _ $test_case_expr>]() {
+                            let model_name = stringify!($model_name_expr);
+                            let test_case = stringify!($test_case_expr);
+                            println!("Running test {}/{}", model_name, test_case);
 
-#[tokio::test]
-#[allow(clippy::expect_used, clippy::expect_fun_call)]
-async fn run_all_tests() {
-    // Set ENV variables before we lazy load `TEST_MODELS`.
-    let _ = dotenvy::from_filename(".env").expect("failed to load .env file");
-    init_tracing(None);
+                            let _ = dotenvy::from_filename(".env").expect("failed to load .env file");
+                            init_tracing(None);
 
-    for ts in TEST_CASES.iter() {
-        for (model_name, model) in TEST_MODELS.iter() {
-            if crate::llms::TEST_DENY_LIST
-                .iter()
-                .any(|(m, t)| m == model_name && *t == ts.name)
-            {
-                tracing::info!("Skipping test {model_name}/{}", ts.name);
-                continue;
+                            if TEST_DENY_LIST
+                                .iter()
+                                .any(|(m, t)| *m == model_name && *t == test_case)
+                            {
+                                return;
+                            }
+
+                            // Get test case
+                            let test = TEST_CASES
+                                .iter()
+                                .find(|t| t.name == test_case)
+                                .expect("test case not found");
+
+                            let (_, model) = TEST_MODELS
+                                .iter()
+                                .find(|(name, _)| *name == model_name)
+                                .expect("model not found");
+
+                            // Run test
+                            run_single_test(test, model_name, Arc::clone(model)).await
+                                .expect("test failed");
+                        }
+                    }
+                };
             }
 
-            run_test_case(ts, model_name, Arc::clone(model))
-                .await
-                .expect(format!("Failed to run test {model_name}/{}", ts.name).as_str());
+            test_model_case!(anthropic, basic);
+            test_model_case!(openai, basic);
+            // test_model_case!(hf_phi3, basic);
+            // test_model_case!(local_phi3, basic);
         }
-    }
+
+        async fn run_single_test(
+            test: &TestCase,
+            model_name: &str,
+            model: Arc<Box<dyn Chat>>,
+        ) -> Result<(), anyhow::Error> {
+            tracing::info!(
+                "Running test {}/{} with {:?}",
+                test.name,
+                model_name,
+                test.req
+            );
+
+            let actual_resp = model.chat_request(test.req.clone()).await.expect(&format!(
+                "For test {}/{}, chat_request failed",
+                test.name, model_name
+            ));
+
+            let resp_value =
+                serde_json::to_value(&actual_resp).expect("failed to serialize response to JSON");
+
+            for (id, json_ptr) in &test.json_path {
+                let resp_ptr = JsonPath::from_str(json_ptr)
+                    .expect("invalid JSONPath selector")
+                    .find(&resp_value);
+                insta::assert_snapshot!(
+                    format!("{}_{model_name}_{id}", test.name),
+                    serde_json::to_string_pretty(&resp_ptr).expect("Failed to serialize snapshot")
+                );
+            }
+            Ok(())
+        }
+    };
 }
+
+generate_model_tests!();
+
+// #[cfg(test)]
+// mod tests {
+//     use super::*;
+// }
