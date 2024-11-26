@@ -18,6 +18,9 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 - Dremio data connector (Release Candidate)
 - MS SQL data connector (Beta)
 - File data connector (Beta)
+- S3 data connector Iceberg support (Beta)
+- AI Evals (AI-as-a-Judge)
+  - [#3320](https://github.com/spiceai/spiceai/issues/3320)
 
 ## v1.0-rc.3 (Dec 2024)
 
@@ -25,6 +28,9 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 - MS SQL data connector (Release Candidate)
 - File data connector (Release Candidate)
 - Data Accelerators: SQLite & PostgreSQL (Release Candidate)
+- DynamoDB data connector (Alpha)
+- [#3318](https://github.com/spiceai/spiceai/issues/3318)
+- [#3018](https://github.com/spiceai/spiceai/issues/3018)
 
 ## v1.0-stable (Jan 2025)
 
@@ -107,9 +113,17 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 | `groq`        | Beta   |
 | `grok`        | Alpha  |
 
-## v1.1
+## v1.1 (Feb 2025)
 
 - Bugfixes
+- Enterprise Search improvements
+  - [#3006](https://github.com/spiceai/spiceai/issues/3006)
+  - [#3016](https://github.com/spiceai/spiceai/issues/3016)
+  - [#3015](https://github.com/spiceai/spiceai/issues/3015)
+
+## v1.2 (Mar 2025)
+
+## v1.3 (April 2025)
 
 ## v2 (2025)
 
@@ -124,19 +138,18 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 
 ## Features being considered
 
-- S3 data connector Iceberg support
 - Data Connectors
   - MotherDuck
   - BigQuery
   - Kafka
   - Google Docs
 - Catalog Providers
-  - Iceberg Catalogs
+
   - AWS Glue
+
 - APIs
   - GraphQL API
   - Key/Value API
     - SlateDB data accelerator
     - RocksDB data accelerator
-    - DynamoDB data connector
   - PostgreSQL API
