@@ -73,6 +73,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Add nightly postfix to version in Cargo.toml
+        env:
+          REL_VERSION: ${{ needs.setup.outputs.rel_version }}
+        run: |
+          current_version=$(grep '^version =' Cargo.toml | sed -E 's/version = "(.*)"/\1/')
+          base_version=$(echo $current_version | sed -E 's/([0-9]+\.[0-9]+\.[0-9]+).*/\1/')
+          new_version="${base_version}-nightly-$REL_VERSION"
+          sed -i '' "s/^version = \".*\"/version = \"${new_version}\"/" Cargo.toml
+          grep '^version =' Cargo.toml
+
       - name: Install docker
         run: |
           sudo apt-get update
@@ -124,6 +134,16 @@ jobs:
     runs-on: spiceai-runners
     steps:
       - uses: actions/checkout@v4
+
+      - name: Add nightly postfix to version in Cargo.toml
+        env:
+          REL_VERSION: ${{ needs.setup.outputs.rel_version }}
+        run: |
+          current_version=$(grep '^version =' Cargo.toml | sed -E 's/version = "(.*)"/\1/')
+          base_version=$(echo $current_version | sed -E 's/([0-9]+\.[0-9]+\.[0-9]+).*/\1/')
+          new_version="${base_version}-nightly-$REL_VERSION"
+          sed -i '' "s/^version = \".*\"/version = \"${new_version}\"/" Cargo.toml
+          grep '^version =' Cargo.toml
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
