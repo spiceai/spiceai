@@ -115,7 +115,7 @@ async fn run_test(app: App) -> Result<String, anyhow::Error> {
 
     let rt_clone = Arc::clone(&rt);
     tokio::spawn(async move {
-        Box::pin(rt_clone.start_servers(api_config, None, EndpointAuth::no_auth(), true)).await
+        Box::pin(rt_clone.start_servers(api_config, None, EndpointAuth::no_auth())).await
     });
 
     // We don't really care about the result, just that the query ran successfully

@@ -66,7 +66,6 @@ async fn test_flight_auth() -> Result<(), anyhow::Error> {
             api_config,
             None,
             EndpointAuth::default().with_flight_basic_auth(api_key_auth),
-            false,
         ))
         .await
     });

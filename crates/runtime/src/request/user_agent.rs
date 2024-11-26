@@ -125,11 +125,6 @@ impl Parsed {
             }
         }
 
-        // Verify that there are no more parts
-        if parts.next().is_some() {
-            return None;
-        }
-
         Some(Self {
             client_name: Arc::from(name),
             client_version: Arc::from(version),

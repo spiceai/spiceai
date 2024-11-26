@@ -63,7 +63,7 @@ async fn test_enabled_cors_endpoints() -> Result<(), anyhow::Error> {
 
     // Start the servers
     tokio::spawn(async move {
-        Box::pin(Arc::new(rt).start_servers(api_config, None, EndpointAuth::no_auth(), false)).await
+        Box::pin(Arc::new(rt).start_servers(api_config, None, EndpointAuth::no_auth())).await
     });
 
     let http_client = reqwest::Client::builder().build()?;
@@ -130,7 +130,7 @@ async fn test_disabled_cors_endpoints() -> Result<(), anyhow::Error> {
 
     // Start the servers
     tokio::spawn(async move {
-        Box::pin(Arc::new(rt).start_servers(api_config, None, EndpointAuth::no_auth(), false)).await
+        Box::pin(Arc::new(rt).start_servers(api_config, None, EndpointAuth::no_auth())).await
     });
 
     let http_client = reqwest::Client::builder().build()?;

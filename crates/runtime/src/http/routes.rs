@@ -14,16 +14,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::datafusion::query::Protocol;
 use crate::embeddings::vector_search;
-use crate::metrics::telemetry::TelemetryContext;
+use crate::request::Protocol;
 use crate::Runtime;
-use crate::{config, metrics::telemetry::UserAgentCollectionState};
+use crate::{config, request::RequestContext};
 
 use app::App;
 use axum::routing::patch;
 use opentelemetry::KeyValue;
-use spicepod::component::runtime::{CorsConfig, UserAgentCollection};
+use spicepod::component::runtime::CorsConfig;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -40,7 +39,6 @@ use runtime_auth::layer::http::AuthLayer;
 use tokio::time::Instant;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 
-use super::user_agent::UserAgent;
 use super::{metrics, v1};
 
 pub(crate) fn routes(
@@ -114,17 +112,13 @@ async fn track_metrics(
     next: Next,
 ) -> impl IntoResponse {
     let app_lock = app.read().await;
-    let user_agent_collection = app_lock
-        .as_ref()
-        .map_or(UserAgentCollection::default(), |app| {
-            app.user_agent_collection()
-        });
-    let user_agent = match user_agent_collection {
-        UserAgentCollection::Full => Arc::new(UserAgent::from_headers(&headers)),
-        UserAgentCollection::Disabled => Arc::new(UserAgent::Absent),
-    };
+    let request_context = Arc::new(
+        RequestContext::builder(Protocol::Http)
+            .with_app_opt(app_lock.as_ref().map(Arc::clone))
+            .build(),
+    );
 
-    req.extensions_mut().insert(Arc::clone(&user_agent));
+    let request_dimensions = request_context.to_dimensions();
 
     let start = Instant::now();
     let path = if let Some(matched_path) = req.extensions().get::<MatchedPath>() {
@@ -134,7 +128,9 @@ async fn track_metrics(
     };
     let method = req.method().clone();
 
-    let response = next.run(req).await;
+    let response = request_context
+        .scope(async move { next.run(req).await })
+        .await;
 
     let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
     let status = response.status().as_u16().to_string();
@@ -145,16 +141,7 @@ async fn track_metrics(
         KeyValue::new("status", status),
     ];
 
-    let user_agent: UserAgent =
-        Arc::into_inner(user_agent).unwrap_or_else(|| match user_agent_collection {
-            UserAgentCollection::Full => UserAgent::from_headers(&headers),
-            UserAgentCollection::Disabled => UserAgent::Absent,
-        });
-    let telemetry_context = TelemetryContext {
-        protocol: Protocol::Http,
-        user_agent,
-    };
-    labels.extend(telemetry_context.to_dimensions());
+    labels.extend(request_dimensions);
 
     metrics::REQUESTS_TOTAL.add(1, &labels);
     metrics::REQUESTS_DURATION_MS.record(latency_ms, &labels);

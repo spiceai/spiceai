@@ -86,7 +86,7 @@ async fn huggingface_test_search() -> Result<(), anyhow::Error> {
 
     let rt_ref_copy = Arc::clone(&rt);
     tokio::spawn(async move {
-        Box::pin(rt_ref_copy.start_servers(api_config, None, EndpointAuth::no_auth(), false)).await
+        Box::pin(rt_ref_copy.start_servers(api_config, None, EndpointAuth::no_auth())).await
     });
 
     tokio::select! {
@@ -136,7 +136,7 @@ async fn huggingface_test_nsql() -> Result<(), anyhow::Error> {
 
     let rt_ref_copy = Arc::clone(&rt);
     tokio::spawn(async move {
-        Box::pin(rt_ref_copy.start_servers(api_config, None, EndpointAuth::no_auth(), false)).await
+        Box::pin(rt_ref_copy.start_servers(api_config, None, EndpointAuth::no_auth())).await
     });
 
     let llm_init_lock = LOCAL_LLM_INIT_MUTEX.lock().await;
@@ -266,7 +266,7 @@ async fn huggingface_test_embeddings() -> Result<(), anyhow::Error> {
 
     let rt_ref_copy = Arc::clone(&rt);
     tokio::spawn(async move {
-        Box::pin(rt_ref_copy.start_servers(api_config, None, EndpointAuth::no_auth(), false)).await
+        Box::pin(rt_ref_copy.start_servers(api_config, None, EndpointAuth::no_auth())).await
     });
 
     tokio::select! {
@@ -347,7 +347,7 @@ async fn huggingface_test_chat_completion() -> Result<(), anyhow::Error> {
 
     let rt_ref_copy = Arc::clone(&rt);
     tokio::spawn(async move {
-        Box::pin(rt_ref_copy.start_servers(api_config, None, EndpointAuth::no_auth(), false)).await
+        Box::pin(rt_ref_copy.start_servers(api_config, None, EndpointAuth::no_auth())).await
     });
 
     let llm_init_lock = LOCAL_LLM_INIT_MUTEX.lock().await;

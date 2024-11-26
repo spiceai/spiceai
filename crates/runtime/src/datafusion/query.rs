@@ -69,42 +69,6 @@ pub enum Error {
     SchemaMismatch { source: arrow_tools::schema::Error },
 }
 
-#[derive(Debug, Copy, Clone)]
-pub enum Protocol {
-    Http,
-    Flight,
-    FlightSQL,
-    Internal,
-}
-
-static HTTP: LazyLock<Arc<str>> = LazyLock::new(|| "http".into());
-static FLIGHT: LazyLock<Arc<str>> = LazyLock::new(|| "flight".into());
-static FLIGHTSQL: LazyLock<Arc<str>> = LazyLock::new(|| "flightsql".into());
-static INTERNAL: LazyLock<Arc<str>> = LazyLock::new(|| "internal".into());
-
-impl Protocol {
-    #[must_use]
-    pub fn as_arc_str(&self) -> Arc<str> {
-        match self {
-            Protocol::Http => Arc::clone(&HTTP),
-            Protocol::Flight => Arc::clone(&FLIGHT),
-            Protocol::FlightSQL => Arc::clone(&FLIGHTSQL),
-            Protocol::Internal => Arc::clone(&INTERNAL),
-        }
-    }
-}
-
-impl std::fmt::Display for Protocol {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Protocol::Http => write!(f, "http"),
-            Protocol::Flight => write!(f, "flight"),
-            Protocol::FlightSQL => write!(f, "flightsql"),
-            Protocol::Internal => write!(f, "internal"),
-        }
-    }
-}
-
 // There is no need to have a synchronized SQLOptions across all threads, each thread can have its own instance.
 thread_local! {
     static RESTRICTED_SQL_OPTIONS: LazyCell<SQLOptions> = LazyCell::new(|| {

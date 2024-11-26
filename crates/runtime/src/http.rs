@@ -31,14 +31,13 @@ use tokio_rustls::TlsAcceptor;
 use crate::{
     config,
     embeddings::vector_search::{self, parse_explicit_primary_keys},
-    metrics::{self as runtime_metrics, telemetry::UserAgentCollectionState},
+    metrics::{self as runtime_metrics},
     tls::TlsConfig,
     Runtime,
 };
 
 mod metrics;
 mod routes;
-pub mod user_agent;
 mod v1;
 
 #[derive(Debug, Snafu)]

@@ -13,14 +13,12 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use crate::datafusion::{query::Protocol, SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
-use crate::metrics::telemetry::TelemetryContext;
+use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
 use arrow::record_batch::RecordBatch;
 use futures::TryStreamExt;
 use model_components::model::{Error as ModelError, Model};
 use std::result::Result;
 use std::sync::Arc;
-use util::user_agent::SpiceUserAgent;
 
 mod chat;
 mod embed;
@@ -35,15 +33,6 @@ use crate::DataFusion;
 pub static ENABLE_MODEL_SUPPORT_MESSAGE: &str = "To enable model support, either: \n  1) `spice install ai` \n  2) Build spiced binary with flag `--features models`.";
 
 pub async fn run(m: &Model, df: Arc<DataFusion>) -> Result<RecordBatch, ModelError> {
-    let telemetry_context = TelemetryContext {
-        protocol: Protocol::Internal,
-        user_agent: Some(
-            SpiceUserAgent::default()
-                .with_client_name("model_run")
-                .with_client_version_from_cargo(),
-        ),
-    };
-
     match df
         .query_builder(
             &(format!(
@@ -51,7 +40,6 @@ pub async fn run(m: &Model, df: Arc<DataFusion>) -> Result<RecordBatch, ModelErr
                 m.model.datasets[0]
             )),
         )
-        .with_telemetry_context(telemetry_context)
         .build()
         .run()
         .await

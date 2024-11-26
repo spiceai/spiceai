@@ -245,13 +245,9 @@ pub(crate) mod tools {
 pub(crate) mod telemetry {
     use std::{sync::Arc, time::Duration};
 
-    use http::HeaderMap;
     use opentelemetry::{metrics::Histogram, KeyValue};
 
-    use crate::{
-        datafusion::query::Protocol,
-        http::user_agent::{self, UserAgent},
-    };
+    use crate::request::Protocol;
 
     use super::{global, Counter, LazyLock, Meter};
 
@@ -266,7 +262,7 @@ pub(crate) mod telemetry {
             .init()
     });
 
-    pub fn track_query_count(telemetry_context: &TelemetryContext) {
+    pub fn track_query_count(telemetry_context: &RequestContext) {
         let dimensions = telemetry_context.to_dimensions();
         telemetry::track_query_count(&dimensions);
         QUERY_COUNT.add(1, &dimensions);
@@ -280,7 +276,7 @@ pub(crate) mod telemetry {
             .init()
     });
 
-    pub fn track_bytes_processed(bytes: u64, telemetry_context: &TelemetryContext) {
+    pub fn track_bytes_processed(bytes: u64, telemetry_context: &RequestContext) {
         let dimensions = telemetry_context.to_dimensions();
         telemetry::track_bytes_processed(bytes, &dimensions);
         BYTES_PROCESSED.add(bytes, &dimensions);
@@ -294,7 +290,7 @@ pub(crate) mod telemetry {
             .init()
     });
 
-    pub fn track_bytes_returned(bytes: u64, telemetry_context: &TelemetryContext) {
+    pub fn track_bytes_returned(bytes: u64, telemetry_context: &RequestContext) {
         let dimensions = telemetry_context.to_dimensions();
         telemetry::track_bytes_returned(bytes, &dimensions);
         BYTES_RETURNED.add(bytes, &dimensions);
@@ -329,79 +325,4 @@ pub(crate) mod telemetry {
         telemetry::track_query_execution_duration(duration, dimensions);
         QUERY_EXECUTION_DURATION_MS.record(duration.as_secs_f64() * 1000.0, dimensions);
     }
-
-    #[derive(Clone, Debug)]
-    pub struct TelemetryContext {
-        pub protocol: Protocol,
-        pub user_agent: UserAgent,
-    }
-
-    impl TelemetryContext {
-        #[must_use]
-        pub fn new() -> Self {
-            Self {
-                protocol: Protocol::Internal,
-                user_agent: UserAgent::Absent,
-            }
-        }
-
-        #[must_use]
-        pub fn from_headers(protocol: Protocol, headers: &HeaderMap) -> Self {
-            Self {
-                protocol,
-                user_agent: UserAgent::from_headers(headers),
-            }
-        }
-
-        #[must_use]
-        pub fn to_dimensions(self) -> Vec<KeyValue> {
-            let mut labels = vec![KeyValue::new("protocol", self.protocol.as_arc_str())];
-
-            let add_platform_labels = |mut labels: Vec<KeyValue>| {
-                labels.push(KeyValue::new("platform", user_agent::PLATFORM_NAME));
-                labels.push(KeyValue::new(
-                    "platform_version",
-                    user_agent::PLATFORM_VERSION,
-                ));
-                labels.push(KeyValue::new(
-                    "platform_system",
-                    user_agent::PLATFORM_SYSTEM.to_string(),
-                ));
-            };
-
-            match self.user_agent {
-                UserAgent::Absent => (),
-                UserAgent::Raw(raw) => {
-                    labels.push(KeyValue::new("user_agent", UserAgent::Raw(raw).to_string()));
-                    add_platform_labels(labels);
-                }
-                UserAgent::Parsed(parsed) => {
-                    labels.push(KeyValue::new("client", Arc::clone(&parsed.client_name)));
-                    labels.push(KeyValue::new(
-                        "client_version",
-                        Arc::clone(&parsed.client_version),
-                    ));
-
-                    if let Some(client_system) = &parsed.client_system {
-                        labels.push(KeyValue::new("client_system", Arc::clone(client_system)));
-                    }
-                    labels.push(KeyValue::new(
-                        "user_agent",
-                        UserAgent::Parsed(parsed).to_string(),
-                    ));
-                    add_platform_labels(labels);
-                }
-            }
-
-            labels
-        }
-    }
-
-    impl Default for TelemetryContext {
-        fn default() -> Self {
-            Self::new()
-        }
-    }
 }
-
-pub use telemetry::TelemetryContext;
