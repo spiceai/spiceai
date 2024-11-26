@@ -148,7 +148,7 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Failed to publish data to flight endpoint.\n{source}\nVerify the configuration and try again"))]
+    #[snafu(display("Failed to publish data to flight endpoint.\n{source}"))]
     UnableToPublish { source: TonicStatusError },
 
     #[snafu(display("Unauthorized. Verify the credentials."))]
