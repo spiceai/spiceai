@@ -666,7 +666,15 @@ impl TableProvider for AcceleratedTable {
         &self,
         filters: &[&Expr],
     ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
-        Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
+        match self.zero_results_action {
+            // Filter pushdown for all accelerators are currently exact
+            ZeroResultsAction::ReturnEmpty => {
+                Ok(vec![TableProviderFilterPushDown::Exact; filters.len()])
+            }
+            ZeroResultsAction::UseSource => {
+                Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
+            }
+        }
     }
 
     async fn scan(
