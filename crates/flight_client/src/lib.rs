@@ -118,40 +118,46 @@ impl std::fmt::Display for TonicStatusMessage {
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Failed to connect to the Flight server. A TLS error occurred.\n{source}"))]
+    #[snafu(display(
+        "Failed to connect to server: TLS error.\n{source}\nEnsure the flight endpoint is valid and reachable."
+    ))]
     UnableToConnectToServer { source: tls::Error },
 
-    #[snafu(display("Failed to execute query. Invalid metadata value.\n{source}"))]
+    #[snafu(display("Authentication failed.\n{source}\nEnsure the credentials are valid."))]
     InvalidMetadata {
         source: tonic::metadata::errors::InvalidMetadataValue,
     },
 
-    #[snafu(display("Failed to connect to the Flight server.\n{source}"))]
+    #[snafu(display("Failed to connect to Flight server: Handshake failed.\n{source}"))]
     UnableToPerformHandshake { source: TonicStatusError },
 
-    #[snafu(display("Failed to convert metadata to string.\n{source}"))]
+    #[snafu(display(
+        "An unexpected error occurred. Report a bug to request support: https://github.com/spiceai/spiceai/issues"
+    ))]
     UnableToConvertMetadataToString {
         source: tonic::metadata::errors::ToStrError,
     },
 
-    #[snafu(display("Failed to convert schema from response.\n{source}"))]
+    #[snafu(display("Failed to get schema.\n{source}\nReport a bug to request support: https://github.com/spiceai/spiceai/issues"))]
     UnableToConvertSchema { source: arrow::error::ArrowError },
 
-    #[snafu(display("Failed to execute query.\n{source}"))]
+    #[snafu(display("Query execution failed.\n{source}"))]
     UnableToQuery {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Failed to write data.\n{source}"))]
+    #[snafu(display("Failed to publish data to flight endpoint.\n{source}"))]
     UnableToPublish { source: TonicStatusError },
 
-    #[snafu(display("Failed to execute query. Authorization failed.\nEnsure that the username and password are correctly configured, and have the necessary permissions."))]
+    #[snafu(display("Unauthorized. Verify the credentials are configured correctly."))]
     Unauthorized {},
 
-    #[snafu(display("Failed to execute query. Permission denied.\nEnsure that the username and password are correctly configured, and have the necessary permissions."))]
+    #[snafu(display("Permission denied. Ensure the credentials have the required permissions."))]
     PermissionDenied {},
 
-    #[snafu(display("Failed to execute query. No endpoints found.\nEnsure that the server is running and the endpoint is correctly configured."))]
+    #[snafu(display(
+        "No endpoints found. Ensure the endpoint is configured and the server is running."
+    ))]
     NoEndpointsFound,
 }
 

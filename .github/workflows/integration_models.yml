@@ -7,10 +7,10 @@ on:
       - trunk
       - release-*
     paths-ignore:
-      - 'docs/**'
-      - 'README.md'
-      - 'version.txt'
-      - 'acknowledgements.md'
+      - "docs/**"
+      - "README.md"
+      - "version.txt"
+      - "acknowledgements.md"
 
   workflow_dispatch:
 
@@ -29,7 +29,7 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
         with:
-          os: 'linux'
+          os: "linux"
 
       - name: Set up make
         uses: ./.github/actions/setup-make
@@ -62,7 +62,7 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
         with:
-          os: 'linux'
+          os: "linux"
 
       # Download the test binary artifact
       - name: Download test binary
@@ -84,9 +84,8 @@ jobs:
         env:
           SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
         run: |
-          if [ -n "$SPICE_SECRET_OPENAI_API_KEY" ]; then
-            INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" ./integration_test/ai_integration_test --nocapture --skip huggingface_test
-          else
-            echo "Error: SPICE_SECRET_OPENAI_API_KEY is not defined."
+          if [ -z "$SPICE_SECRET_OPENAI_API_KEY" ] ; then
+            echo "Error: OpenAI API key is not defined."
             exit 1
           fi
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" ./integration_test/ai_integration_test --nocapture
