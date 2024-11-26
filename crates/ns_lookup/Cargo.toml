@@ -12,4 +12,4 @@ version.workspace = true
 snafu.workspace = true
 tracing.workspace = true
 trust-dns-resolver = "0.23.2"
-url = "2.5.3"
+url = "2.5.4"

@@ -1,0 +1,6 @@
+---
+source: crates/runtime/tests/models/openai.rs
+expression: "&response"
+snapshot_kind: text
+---
+[{"total_records":10}]

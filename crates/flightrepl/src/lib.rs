@@ -79,6 +79,9 @@ pub struct ReplConfig {
     /// The API key to use for authentication
     #[arg(long, value_name = "API_KEY", help_heading = "SQL REPL")]
     pub api_key: Option<String>,
+
+    #[arg(long, value_name = "USER_AGENT", help_heading = "SQL REPL")]
+    pub user_agent: Option<String>,
 }
 
 const NQL_LINE_PREFIX: &str = "nql ";
@@ -88,11 +91,12 @@ async fn send_nsql_request(
     base_url: String,
     query: String,
     runtime: LlmRuntime,
+    user_agent: &str,
 ) -> Result<String, reqwest::Error> {
     client
         .post(format!("{base_url}/v1/nsql"))
         .header("Content-Type", "application/json")
-        .header("X-Spice-User-Agent", get_user_agent())
+        .header("User-Agent", user_agent)
         .json(&json!({
             "query": query,
             "model": runtime,
@@ -157,6 +161,8 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
             "Unable to connect to spiced at {repl_flight_endpoint}. Is it running?"
         ))
     })?;
+
+    let user_agent = repl_config.user_agent.unwrap_or_else(get_user_agent);
 
     // The encoder/decoder size is limited to 500MB.
     let client = FlightServiceClient::new(channel)
@@ -245,13 +251,14 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
                 continue;
             }
             "show tables" | "show tables;" => {
-                "select table_catalog, table_schema, table_name, table_type from information_schema.tables where table_schema != 'information_schema'"
+                "select table_catalog, table_schema, table_name, table_type from information_schema.tables where table_schema != 'information_schema';"
             }
             line if line.to_lowercase().starts_with(NQL_LINE_PREFIX) => {
                 let _ = rl.add_history_entry(line);
                 get_and_display_nql_records(
                     repl_config.http_endpoint.clone(),
-                     line.strip_prefix(NQL_LINE_PREFIX).unwrap_or(line).to_string()
+                     line.strip_prefix(NQL_LINE_PREFIX).unwrap_or(line).to_string(),
+                    &user_agent
                 ).await.map_err(|e| format!("Error occured on NQL request: {e}"))?;
                 continue;
             }
@@ -261,7 +268,14 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
         let _ = rl.add_history_entry(line);
 
         let start_time = Instant::now();
-        match get_records(client.clone(), line, repl_config.api_key.as_ref()).await {
+        match get_records(
+            client.clone(),
+            line,
+            repl_config.api_key.as_ref(),
+            &user_agent,
+        )
+        .await
+        {
             Ok((_, 0, from_cache)) => {
                 println!("No results{}.", if from_cache { " (cached)" } else { "" });
             }
@@ -294,6 +308,7 @@ pub async fn get_records(
     mut client: FlightServiceClient<Channel>,
     line: &str,
     api_key: Option<&String>,
+    user_agent: &str,
 ) -> Result<(Vec<RecordBatch>, usize, bool), FlightError> {
     let sql_command = CommandStatementQuery {
         query: line.to_string(),
@@ -314,9 +329,9 @@ pub async fn get_records(
         return Err(FlightError::Tonic(Status::internal("No ticket")));
     };
     let mut request = add_api_key(ticket.into_request(), api_key);
-    let user_agent_key = AsciiMetadataKey::from_str("x-spice-user-agent")
+    let user_agent_key = AsciiMetadataKey::from_str("User-Agent")
         .map_err(|e| FlightError::ExternalError(e.into()))?;
-    let user_agent_value = get_user_agent()
+    let user_agent_value = user_agent
         .parse()
         .map_err(|e: InvalidMetadataValue| FlightError::ExternalError(e.into()))?;
 
@@ -409,10 +424,18 @@ async fn display_records(
 async fn get_and_display_nql_records(
     endpoint: String,
     query: String,
+    user_agent: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let start_time = Instant::now();
 
-    let resp = send_nsql_request(&Client::new(), endpoint, query, LlmRuntime::Openai).await?;
+    let resp = send_nsql_request(
+        &Client::new(),
+        endpoint,
+        query,
+        LlmRuntime::Openai,
+        user_agent,
+    )
+    .await?;
 
     let jsonl_resp = json_array_to_jsonl(&resp)?;
 

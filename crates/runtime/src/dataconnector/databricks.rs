@@ -47,7 +47,7 @@ pub enum Error {
     #[snafu(display("Invalid `databricks_use_ssl` value: '{value}'. Use 'true' or 'false'.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/databricks#parameters"))]
     InvalidUsessl { value: String },
 
-    #[snafu(display("Failed to connect to Databricks Spark: {source}\nVerify Databricks Connector configurations and try again\nFor details, visit: https://docs.spiceai.org/components/data-connectors/databricks#parameters"))]
+    #[snafu(display("Failed to connect to Databricks Spark.\n{source}\nVerify the connector configuration, and try again.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/databricks#parameters"))]
     UnableToConstructDatabricksSpark {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
