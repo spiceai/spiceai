@@ -129,7 +129,7 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Failed to connect to Flight server: Handshake failed.\n{source}\nVerify the configuration and try again."
+        "Failed to connect to Flight server: Handshake failed.\n{source}"
     ))]
     UnableToPerformHandshake { source: TonicStatusError },
 
