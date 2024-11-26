@@ -19,20 +19,38 @@ use std::sync::Arc;
 use async_openai::error::OpenAIError;
 use llms::{
     anthropic::{Anthropic, AnthropicConfig},
-    chat::Chat,
+    chat::{create_hf_model, Chat, Error as ChatError},
     openai::Openai,
 };
+use secrecy::Secret;
 
-pub(crate) fn create_openai(model_id: &str) -> Arc<dyn Chat> {
+pub(crate) fn create_openai(model_id: &str) -> Arc<Box<dyn Chat>> {
     let api_key = std::env::var("SPICE_OPENAI_API_KEY").ok();
-    Arc::new(Openai::new(model_id.to_string(), None, api_key, None, None))
+    Arc::new(Box::new(Openai::new(
+        model_id.to_string(),
+        None,
+        api_key,
+        None,
+        None,
+    )))
 }
 
-pub(crate) fn create_anthropic(model_id: Option<&str>) -> Result<Arc<dyn Chat>, OpenAIError> {
+pub(crate) fn create_anthropic(model_id: Option<&str>) -> Result<Arc<Box<dyn Chat>>, OpenAIError> {
     let cfg = AnthropicConfig::default()
         .with_api_key(std::env::var("SPICE_ANTHROPIC_API_KEY").ok())
         .with_auth_token(std::env::var("SPICE_ANTHROPIC_AUTH_TOKEN").ok());
     let model = Anthropic::new(cfg, model_id)?;
 
-    Ok(Arc::new(model))
+    Ok(Arc::new(Box::new(model)))
+}
+
+pub(crate) fn create_hf(model_id: &str) -> Result<Arc<Box<dyn Chat>>, ChatError> {
+    let hf_token = std::env::var("HF_TOKEN").ok().map(Secret::new);
+    let model_type = None;
+
+    Ok(Arc::new(create_hf_model(
+        model_id,
+        &model_type,
+        hf_token.as_ref(),
+    )?))
 }

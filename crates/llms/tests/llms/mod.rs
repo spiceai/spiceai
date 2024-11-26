@@ -22,6 +22,8 @@ use std::{
     sync::{Arc, LazyLock},
 };
 
+use crate::{TestArgs, TEST_ARGS};
+
 mod create;
 
 #[derive(Clone)]
@@ -150,26 +152,44 @@ static TEST_CASES: LazyLock<Vec<TestCase>> = LazyLock::new(|| {
 
 /// Model instantiations to test.
 #[allow(clippy::expect_used)]
-static TEST_MODELS: LazyLock<Vec<(&'static str, Arc<dyn Chat>)>> = LazyLock::new(|| {
-    vec![
+static TEST_MODELS: LazyLock<Vec<(&'static str, Arc<Box<dyn Chat>>)>> = LazyLock::new(|| {
+    let model_creators: [(&str, Box<dyn Fn() -> Arc<Box<dyn Chat>>>); 3] = [
         (
             "anthropic",
-            create::create_anthropic(None).expect("failed to create anthropic model"),
+            Box::new(|| create::create_anthropic(None).expect("failed to create anthropic model")),
         ),
-        ("openai", create::create_openai("gpt-4o-mini")),
-    ]
+        ("openai", Box::new(|| create::create_openai("gpt-4o-mini"))),
+        (
+            "hf/phi3",
+            Box::new(|| {
+                create::create_hf("microsoft/Phi-3-mini-4k-instruct")
+                    .expect("failed to create 'microsoft/Phi-3-mini-4k-instruct' from HF")
+            }),
+        ),
+    ];
+
+    model_creators
+        .iter()
+        .filter_map(|(name, creator)| {
+            if TEST_ARGS.skip_model(name) {
+                None
+            } else {
+                Some((*name, creator()))
+            }
+        })
+        .collect()
 });
 
 /// A mapping of model names (in [`TEST_MODELS`]) and test names (in [`TEST_CASES`]) to skip.
 static TEST_DENY_LIST: LazyLock<Vec<(&'static str, &'static str)>> =
-    LazyLock::new(|| vec![("anthropic", "placeholder")]);
+    LazyLock::new(|| vec![("hf/phi3", "tool_use")]);
 
 /// Run a single [`TestCase`] for a model.
 #[allow(clippy::expect_used, clippy::expect_fun_call)]
 async fn run_test_case(
     test: &TestCase,
     model_name: &'static str,
-    model: Arc<dyn Chat>,
+    model: Arc<Box<dyn Chat>>,
 ) -> Result<(), anyhow::Error> {
     let test_name = test.name;
     tracing::info!("Running test {test_name}/{model_name} with {:?}", test.req);
