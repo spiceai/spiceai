@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use std::error::Error;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -41,7 +42,8 @@ use rustyline::history::FileHistory;
 use rustyline::{ConditionalEventHandler, KeyEvent};
 use rustyline::{Editor, EventHandler, Modifiers};
 use serde_json::json;
-use tonic::metadata::{Ascii, MetadataValue};
+use tonic::metadata::errors::InvalidMetadataValue;
+use tonic::metadata::{Ascii, AsciiMetadataKey, MetadataValue};
 use tonic::transport::{Channel, ClientTlsConfig};
 use tonic::{Code, IntoRequest, Status};
 
@@ -162,8 +164,6 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
             "Unable to connect to spiced at {repl_flight_endpoint}. Is it running?"
         ))
     })?;
-
-    let user_agent = repl_config.user_agent.unwrap_or_else(get_user_agent);
 
     // The encoder/decoder size is limited to 500MB.
     let client = FlightServiceClient::new(channel)
