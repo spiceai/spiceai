@@ -26,6 +26,7 @@ use llms::{
 use secrecy::Secret;
 use std::{
     collections::HashMap,
+    fs,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -100,18 +101,30 @@ fn download_hf_model_artifacts(
     let mut weights = vec![];
     for sibling in api_repo.info()?.siblings {
         if !(sibling.rfilename.ends_with(".py") || sibling.rfilename.ends_with(".md")) {
-            let path = api_repo.download(sibling.rfilename.as_str())?;
-            if path_is_weights(&path) {
-                weights.push(path.to_string_lossy().to_string());
-            }
+            let path = api_repo.get(sibling.rfilename.as_str())?;
+
+            // `abs_path` will have symlinks and relative paths resolved, but will have a hash for a filename. This is fine after its symlinked in `link_files_into_tmp_dir`.
+            // use `path` to get the original filename.
+            let abs_path = fs::canonicalize(path.clone())?;
+
             if let Some(filename) = path.file_name() {
-                files.insert(filename.to_string_lossy().to_string(), path);
+                files.insert(filename.to_string_lossy().to_string(), abs_path);
+                if path_is_weights(&path) {
+                    weights.push(filename.to_string_lossy().to_string());
+                }
             }
         }
     }
 
-    let dir = link_files_into_tmp_dir(files, None).context("Failed to link files into tmp dir")?;
-    Ok((dir, weights))
+    let dir = link_files_into_tmp_dir(files.clone(), None)
+        .context("Failed to link files into tmp dir")?;
+    Ok((
+        dir.clone(),
+        weights // Reconstruct absolute model weights path based in the tmp dir.
+            .iter()
+            .map(|w| dir.join(w).display().to_string())
+            .collect(),
+    ))
 }
 
 /// Attempts to figure out if a given path is a model weights file.
@@ -131,7 +144,7 @@ fn path_is_weights(p: &Path) -> bool {
         .map(str::to_lowercase);
 
     // Common model weight file extensions
-    let weight_extensions = ["bin", "pt", "gguf", "safetensors", "pth", "ckpt", "model"];
+    let weight_extensions = ["bin", "pt", "gguf", "safetensors", "pth", "ckpt"];
 
     // Common weight file patterns
     let weight_patterns = [
@@ -152,9 +165,7 @@ fn path_is_weights(p: &Path) -> bool {
             // Check if filename contains common weight file patterns
             let has_weight_pattern = weight_patterns.iter().any(|pattern| name.contains(pattern));
 
-            // File size heuristic could be added here if needed
-
-            has_weight_extension || has_weight_pattern
+            has_weight_extension && has_weight_pattern
         }
         _ => false,
     }

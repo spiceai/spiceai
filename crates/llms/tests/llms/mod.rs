@@ -243,6 +243,7 @@ async fn run_all_tests() {
                 tracing::info!("Skipping test {model_name}/{}", ts.name);
                 continue;
             }
+
             run_test_case(ts, model_name, Arc::clone(model))
                 .await
                 .expect(format!("Failed to run test {model_name}/{}", ts.name).as_str());
