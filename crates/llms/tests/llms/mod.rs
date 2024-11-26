@@ -1,7 +1,19 @@
 /*
 Copyright 2024 The Spice.ai OSS Authors
-Licensed under the Apache License, Version 2.0
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
 */
+
 use async_openai::types::CreateChatCompletionRequest;
 use jsonpath_rust::JsonPath;
 use llms::chat::Chat;
@@ -19,6 +31,9 @@ mod create;
 pub struct TestCase {
     pub name: &'static str,
     pub req: CreateChatCompletionRequest,
+
+    /// Maps (id, `JSONPath` selector), where the selector is into the [`CreateChatCompletionResponse`].
+    /// This is used in snapshot testing to assert certain properties of the response.
     pub json_path: Vec<(&'static str, &'static str)>,
 }
 
@@ -187,17 +202,13 @@ async fn run_single_test(
     model_name: &str,
     model: Arc<Box<dyn Chat>>,
 ) -> Result<(), anyhow::Error> {
-    tracing::info!(
-        "Running test {}/{} with {:?}",
-        test.name,
-        model_name,
-        test.req
-    );
+    let test_name = test.name;
+    tracing::info!("Running test {test_name}/{model_name} with {:?}", test.req);
 
     let actual_resp = model.chat_request(test.req.clone()).await.expect(&format!(
-        "For test {}/{}, chat_request failed",
-        test.name, model_name
+        "For test {test_name}/{model_name}, chat_request failed"
     ));
+    tracing::trace!("Response for {test_name}/{model_name}: {actual_resp:?}");
 
     let resp_value =
         serde_json::to_value(&actual_resp).expect("failed to serialize response to JSON");
@@ -225,7 +236,6 @@ macro_rules! generate_model_tests {
                     async fn [<test_ $model_name_expr _ $test_case_expr>]() {
                         let model_name = stringify!($model_name_expr);
                         let test_case = stringify!($test_case_expr);
-                        println!("Running test {}/{}", model_name, test_case);
 
                         let _ = dotenvy::from_filename(".env").expect("failed to load .env file");
                         init_tracing(None);
@@ -244,7 +254,7 @@ macro_rules! generate_model_tests {
                             .expect("test case not found");
 
                         if TEST_ARGS.skip_model(model_name) {
-                            tracing::debug!("Skipping test {}/{}", model_name, test_case);
+                            tracing::debug!("Skipping test {model_name}/{test_case}");
                             return;
                         }
 
@@ -253,7 +263,6 @@ macro_rules! generate_model_tests {
                             .find(|(name, _)| *name == model_name)
                             .expect(&format!("model {model_name} not found"));
 
-                        // Run test
                         run_single_test(test, model_name, Arc::clone(model)).await
                             .expect("test failed");
                     }
