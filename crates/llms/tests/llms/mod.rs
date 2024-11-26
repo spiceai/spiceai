@@ -218,7 +218,7 @@ async fn run_single_test(
             .expect("invalid JSONPath selector")
             .find(&resp_value);
         insta::assert_snapshot!(
-            format!("{}_{model_name}_{id}", test.name),
+            format!("{test_name}_{model_name}_{id}"),
             serde_json::to_string_pretty(&resp_ptr).expect("Failed to serialize snapshot")
         );
     }
