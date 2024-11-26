@@ -251,7 +251,6 @@ pub fn transform_stream(
     stream: Pin<
         Box<dyn Stream<Item = Result<MessageCreateStreamResponse, AnthropicStreamError>> + Send>,
     >,
-    model: String,
 ) -> ChatCompletionResponseStream {
     // As mentioned above, only first tool packet has tool metadata.
     // Format:
@@ -263,6 +262,7 @@ pub fn transform_stream(
     #[derive(Clone, Default)]
     struct StreamState {
         id: Option<String>,
+        model: Option<String>,
         role: Option<MessageRole>,
         usage: Option<CompletionUsage>,
         tool_id_to_content_block: HashMap<u32, ContentBlockToolUse>,
@@ -283,7 +283,6 @@ pub fn transform_stream(
         })
         .then(move |item| {
             let inner_state = Arc::clone(&state);
-            let model = model.clone();
 
             async move {
                 let mut state = inner_state.lock().await;
@@ -295,6 +294,7 @@ pub fn transform_stream(
                                 id: inner_id,
                                 role: inner_role,
                                 usage: inner_usage,
+                                model,
                                 ..
                             },
                     }) => {
@@ -305,9 +305,10 @@ pub fn transform_stream(
                             completion_tokens: inner_usage.output_tokens,
                             total_tokens: inner_usage.input_tokens + inner_usage.output_tokens,
                         });
+                        state.model = Some(model);
                         create_stream_response(
                             &state.id.clone().unwrap_or_default(),
-                            &model,
+                            &state.model.clone().unwrap_or_default(),
                             None,
                             None,
                         )
@@ -322,7 +323,7 @@ pub fn transform_stream(
                         };
                         create_stream_response(
                             &state.id.clone().unwrap_or_default(),
-                            &model,
+                            &state.model.clone().unwrap_or_default(),
                             None,
                             Some(ChatChoiceStream {
                                 index: 0,
@@ -338,7 +339,7 @@ pub fn transform_stream(
 
                         create_stream_response(
                             &state.id.clone().unwrap_or_default(),
-                            &model,
+                            &state.model.clone().unwrap_or_default(),
                             None,
                             Some(ChatChoiceStream {
                                 index: 0,
@@ -363,7 +364,7 @@ pub fn transform_stream(
                         }
                         create_stream_response(
                             &state.id.clone().unwrap_or_default(),
-                            &model,
+                            &state.model.clone().unwrap_or_default(),
                             state.usage.clone(),
                             Some(ChatChoiceStream {
                                 index: 0,

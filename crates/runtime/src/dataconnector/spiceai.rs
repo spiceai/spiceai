@@ -57,25 +57,22 @@ use tonic::metadata::MetadataMap;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Unable to parse SpiceAI dataset path: {dataset_path}"))]
+    #[snafu(display("Invalid dataset path: {dataset_path}\nEnsure the path is valid"))]
     UnableToParseDatasetPath { dataset_path: String },
 
-    #[snafu(display("Unable to publish data to SpiceAI: {source}"))]
-    UnableToPublishData { source: flight_client::Error },
-
-    #[snafu(display("Missing required parameter: {parameter}"))]
+    #[snafu(display("Missing required parameter: {parameter}. Specify a value.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/spiceai#configuration"))]
     MissingRequiredParameter { parameter: String },
 
-    #[snafu(display(r#"Unable to connect to endpoint "{endpoint}": {source}"#))]
+    #[snafu(display(r#"Failed to connect to SpiceAI endpoint "{endpoint}".\n{source}\nEnsure the endpoint is valid and reachable"#))]
     UnableToVerifyEndpointConnection {
         source: ns_lookup::Error,
         endpoint: String,
     },
 
-    #[snafu(display("Unable to create flight client: {source}"))]
+    #[snafu(display("Failed to create flight client.\n{source}"))]
     UnableToCreateFlightClient { source: flight_client::Error },
 
-    #[snafu(display("Unable to get append stream schema: {source}"))]
+    #[snafu(display("Failed to get append stream schema.\n{source}"))]
     UnableToGetAppendSchema { source: flight_client::Error },
 }
 
@@ -307,7 +304,7 @@ impl DataConnector for SpiceAI {
             return Some(Err(
                 super::DataConnectorError::InvalidConfigurationNoSource {
                     dataconnector: "spice.ai".into(),
-                    message: "A Catalog Name is not supported for the Spice.ai catalog connector.\nRemove the Catalog Name, and use only 'spice.ai' in the 'from' parameter.\nFor further information, visit: https://docs.spiceai.org/components/catalogs/spiceai#from".into(),
+                    message: "A Catalog Name is not supported for the Spice.ai catalog connector.\nRemove the Catalog Name, and use only 'spice.ai' in the 'from' parameter.\nFor details, visit: https://docs.spiceai.org/components/catalogs/spiceai#from".into(),
                     connector_component: ConnectorComponent::from(catalog),
                 },
             ));

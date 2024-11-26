@@ -23,7 +23,7 @@ use datafusion::{
 use util::RetryError;
 
 use crate::{
-    accelerated_table::refresh_task::retry_from_df_error,
+    accelerated_table::refresh_task::retry_from_df_error, datafusion::error::find_datafusion_root,
     dataupdate::StreamingDataUpdateExecutionPlan,
 };
 
@@ -56,7 +56,9 @@ impl TableSink {
             Err(e) => {
                 // Should not retry if we are unable to create execution plan to insert data
                 return Err(RetryError::permanent(
-                    crate::accelerated_table::Error::FailedToWriteData { source: e },
+                    crate::accelerated_table::Error::FailedToWriteData {
+                        source: find_datafusion_root(e),
+                    },
                 ));
             }
         };

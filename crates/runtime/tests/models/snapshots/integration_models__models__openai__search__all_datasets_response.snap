@@ -1,16 +1,13 @@
 ---
 source: crates/runtime/tests/models/openai.rs
-expression: normalize_search_response(response)
+expression: normalize_search_response(v)
+snapshot_kind: text
 ---
 {
   "duration_ms": "duration_ms_val",
   "matches": [
     {
-      "dataset": "item",
-      "metadata": {
-        "i_color": "smoke",
-        "i_item_id": "AAAAAAAADBAAAAAA"
-      },
+      "dataset": "spice.public.item",
       "primary_key": {
         "i_item_sk": 19
       },
@@ -18,11 +15,7 @@ expression: normalize_search_response(response)
       "value": "Patient"
     },
     {
-      "dataset": "item",
-      "metadata": {
-        "i_color": "spring",
-        "i_item_id": "AAAAAAAAHAAAAAAA"
-      },
+      "dataset": "spice.public.item",
       "primary_key": {
         "i_item_sk": 7
       },

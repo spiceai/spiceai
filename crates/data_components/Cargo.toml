@@ -42,7 +42,7 @@ graph-rs-sdk = {workspace = true, optional=true}
 graphql-parser.workspace = true
 http = {version= "1.1.0", optional=true}
 object_store = { workspace = true }
-rdkafka = { version = "0.36.2", features = ["ssl-vendored"], optional = true }
+rdkafka = { version = "0.37.0", features = ["ssl-vendored"], optional = true }
 regex = "1.10.4"
 reqwest.workspace = true
 rusqlite = { workspace = true, optional = true }
@@ -62,7 +62,7 @@ tokio.workspace = true
 tokio-util = { workspace = true, optional = true }
 tonic = { workspace = true, optional = true }
 tracing.workspace = true
-url = "2.5.3"
+url = "2.5.4"
 uuid.workspace = true
 
 [target.'cfg(windows)'.dependencies]

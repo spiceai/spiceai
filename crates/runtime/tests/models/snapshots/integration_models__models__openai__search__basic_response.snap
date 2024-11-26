@@ -1,6 +1,7 @@
 ---
-source: crates/runtime/tests/models/hf.rs
-expression: normalize_search_response(response)
+source: crates/runtime/tests/models/openai.rs
+expression: normalize_search_response(v)
+snapshot_kind: text
 ---
 {
   "duration_ms": "duration_ms_val",

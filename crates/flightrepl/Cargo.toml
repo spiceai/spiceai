@@ -20,7 +20,7 @@ prost = { version = "0.13.1", default-features = false, features = [
   "prost-derive",
 ] }
 reqwest.workspace = true
-rustyline = { version="14.0.0", features=["custom-bindings", "with-dirs", "with-file-history", "derive"] }
+rustyline = { version="15.0.0", features=["custom-bindings", "with-dirs", "with-file-history", "derive"] }
 serde_json.workspace = true
 tonic = { workspace = true, features = ["transport", "tls", "tls-roots"] }
 

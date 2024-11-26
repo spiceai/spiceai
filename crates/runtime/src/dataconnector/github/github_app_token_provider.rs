@@ -11,22 +11,26 @@ use tokio::sync::RwLock;
 
 #[derive(Debug, Snafu)]
 pub enum GitHubAppError {
-    #[snafu(display("Invalid private key"))]
+    #[snafu(display("Invalid private key. Verify the GitHub private key parameter."))]
     InvalidPrivateKey { source: jsonwebtoken::errors::Error },
 
-    #[snafu(display("Unable to get system time"))]
+    #[snafu(display("Failed to get system time.\nVerify your system time."))]
     UnableToGetSystemTime { source: std::time::SystemTimeError },
 
-    #[snafu(display("Invalid system time"))]
+    #[snafu(display("Invalid system time.\nVerify your system time."))]
     InvalidSystemTime { source: std::num::TryFromIntError },
 
-    #[snafu(display("Unable to generate JWT"))]
+    #[snafu(display(
+        "Failed to generate JWT\nVerify the GitHub Connector configuration and try again. For details, visit: https://docs.spiceai.org/components/data-connectors/github#common-configuration"
+    ))]
     UnableToGenerateJWT { source: jsonwebtoken::errors::Error },
 
-    #[snafu(display("Unable to get GitHub installation access token"))]
+    #[snafu(display(
+        "Failed to get GitHub installation access token\nVerify the GitHub Connector configuration and try again. For details, visit: https://docs.spiceai.org/components/data-connectors/github#common-configuration"
+    ))]
     UnableToGetGitHubInstallationAccessToken { source: reqwest::Error },
 
-    #[snafu(display("Unable to get GitHub installation access token body"))]
+    #[snafu(display("Failed to get GitHub installation access token body.\nVerify the GitHub Connector configuration and try again. For details, visit: https://docs.spiceai.org/components/data-connectors/github#common-configuration"))]
     UnableToGetGitHubInstallationAccessTokenBody { source: reqwest::Error },
 }
 

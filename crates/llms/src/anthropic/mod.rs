@@ -29,9 +29,6 @@ pub use types::AnthropicModelVariant;
 pub struct Anthropic {
     client: Client<AnthropicConfig>,
     model: AnthropicModelVariant,
-
-    // The name of the model as known in the spice runtime (not the anthropic model).
-    name: String,
 }
 
 static ANTHROPIC_API_BASE: &str = "https://api.anthropic.com/v1";
@@ -40,21 +37,16 @@ static ANTHROPIC_API_VERSION: &str = "2023-06-01";
 static DUMMY_API_KEY: LazyLock<Secret<String>> = LazyLock::new(|| Secret::new(String::new()));
 
 impl Anthropic {
-    pub fn new(
-        config: AnthropicConfig,
-        model: Option<&str>,
-        name: &str,
-    ) -> Result<Self, OpenAIError> {
+    pub fn new(config: AnthropicConfig, model: Option<&str>) -> Result<Self, OpenAIError> {
         let variant = validate_model_variant(model.unwrap_or(DEFAULT_ANTHROPIC_MODEL))?;
         Ok(Self {
             client: Client::<AnthropicConfig>::with_config(config),
             model: variant,
-            name: name.to_string(),
         })
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct AnthropicConfig {
     pub auth: Option<AnthropicAuthMechanism>,
     pub base_url: String,
@@ -120,7 +112,7 @@ impl AnthropicConfig {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum AnthropicAuthMechanism {
     ApiKey(Secret<String>),
     AuthToken(Secret<String>),

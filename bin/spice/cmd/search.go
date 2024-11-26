@@ -13,6 +13,7 @@ import (
 
 	"github.com/peterh/liner"
 	"github.com/spf13/cobra"
+	"github.com/spiceai/spiceai/bin/spice/pkg/api"
 	"github.com/spiceai/spiceai/bin/spice/pkg/context"
 	"github.com/spiceai/spiceai/bin/spice/pkg/util"
 )
@@ -57,6 +58,21 @@ spice search --cloud
 		rtcontext := context.NewContext().WithCloud(cloud)
 
 		rtcontext.RequireModelsFlavor(cmd)
+
+		datasets, err := api.GetDatasetsWithStatus(rtcontext)
+		if err != nil {
+			slog.Error("could not list datasets", "error", err)
+		}
+
+		for _, dataset := range datasets {
+			if dataset.Status != api.Ready.String() && dataset.Status != api.Refreshing.String() {
+				// warn only if vector_search is supported by the dataset
+				prop_val, _ := dataset.GetPropertyValue("vector_search")
+				if prop_val == "supported" {
+					slog.Warn(fmt.Sprintf("Dataset %s is not ready (%s) and will be excluded from the search.", dataset.Name, dataset.Status))
+				}
+			}
+		}
 
 		httpEndpoint, err := cmd.Flags().GetString("http-endpoint")
 		if err != nil {

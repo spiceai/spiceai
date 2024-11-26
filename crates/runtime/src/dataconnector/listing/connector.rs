@@ -505,7 +505,7 @@ async fn check_for_files_and_extensions(
         return Err(DataConnectorError::InvalidConfigurationNoSource {
             dataconnector: dataconnector.clone(),
             connector_component: ConnectorComponent::from(dataset),
-            message: format!("Failed to find any files matching the extension '{extension}'.\nIs your `file_format` parameter correct? Spice found the following file extensions: {display_extensions}.\nFor further information, visit: https://docs.spiceai.org/components/data-connectors#object-store-file-formats")
+            message: format!("Failed to find any files matching the extension '{extension}'.\nIs your `file_format` parameter correct? Spice found the following file extensions: {display_extensions}.\nFor details, visit: https://docs.spiceai.org/components/data-connectors#object-store-file-formats")
         });
     }
 

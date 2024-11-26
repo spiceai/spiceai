@@ -22,7 +22,6 @@ use datafusion::sql::TableReference;
 use datafusion_table_providers::duckdb::DuckDBTableFactory;
 use datafusion_table_providers::sql::db_connection_pool::dbconnection::duckdbconn::is_table_function;
 use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
-use datafusion_table_providers::sql::db_connection_pool::Error as DbConnectionPoolError;
 use datafusion_table_providers::InvalidTypeAction;
 use duckdb::AccessMode;
 use snafu::prelude::*;
@@ -38,10 +37,9 @@ use super::{
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Unable to create DuckDB connection pool: {source}"))]
-    UnableToCreateDuckDBConnectionPool { source: DbConnectionPoolError },
-
-    #[snafu(display("Missing required parameter: open"))]
+    #[snafu(display(
+        "Missing required parameter: open\nSpecify a DuckDB file with the `open` parameter"
+    ))]
     MissingDuckDBFile,
 }
 

@@ -127,6 +127,7 @@ jobs:
     needs:
       - build
     strategy:
+      fail-fast: false
       matrix:
         target:
           - name: "Linux x64"

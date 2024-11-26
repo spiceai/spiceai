@@ -53,6 +53,12 @@ pub enum Error {
     #[snafu(display("Data sources [{}] does not exist", data_source.iter().map(TableReference::to_quoted_string).join(", ")))]
     DataSourcesNotFound { data_source: Vec<TableReference> },
 
+    #[snafu(display("Failed to find table '{}'. An internal error occurred during vector search.\nPlease report a bug on GitHub: https://github.com/spiceai/spiceai/issues", table.to_quoted_string()))]
+    DataSourceNotFound { table: TableReference },
+
+    #[snafu(display("Vector search failed: No tables with embeddings are available. Ensure embeddings are configured and try again."))]
+    NoTablesWithEmbeddingsFound {},
+
     #[snafu(display("Vector search cannot be run on {}.", data_source.to_quoted_string()))]
     CannotVectorSearchDataset { data_source: TableReference },
 
@@ -550,11 +556,14 @@ impl VectorSearch {
             )
         } else {
             format!(
-                "SELECT
-                    {projection_str},
-                    cosine_distance({embedding_column}_embedding, {embedding:?}) as {VECTOR_DISTANCE_COLUMN_NAME}
-                FROM {tbl}
-                {where_str}
+                "SELECT * FROM (
+                    SELECT
+                        {projection_str},
+                        cosine_distance({embedding_column}_embedding, {embedding:?}) as {VECTOR_DISTANCE_COLUMN_NAME}
+                    FROM {tbl}
+                    {where_str}
+                ) subq
+                WHERE {VECTOR_DISTANCE_COLUMN_NAME} IS NOT NULL
                 ORDER BY {VECTOR_DISTANCE_COLUMN_NAME} ASC
                 LIMIT {n}", projection_str=projection.iter().join(", ")
             )
@@ -616,12 +625,7 @@ impl VectorSearch {
         };
 
         if tables.is_empty() {
-            return Err(Error::DataSourcesNotFound {
-                data_source: data_source_opt
-                    .as_ref()
-                    .map(|ts| ts.iter().map(TableReference::from).collect())
-                    .unwrap_or_default(),
-            });
+            return Err(Error::NoTablesWithEmbeddingsFound {});
         }
 
         let span = match Span::current() {
@@ -719,9 +723,8 @@ impl VectorSearch {
                 .df
                 .get_table(&t)
                 .await
-                .context(DataSourcesNotFoundSnafu {
-                    data_source: vec![t.clone()],
-                })?;
+                // we should not fail here, as we are iterating over the tables that we know exist
+                .context(DataSourceNotFoundSnafu { table: t.clone() })?;
             if get_embedding_table(&table_provider).await.is_some() {
                 tables_with_embeddings.push(t);
             }

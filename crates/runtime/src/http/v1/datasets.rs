@@ -13,7 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use crate::{
     accelerated_table::refresh::RefreshOverrides,
@@ -37,6 +37,7 @@ use datafusion::sql::TableReference;
 use headers_accept::Accept;
 use http::StatusCode;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tokio::sync::RwLock;
 use tract_core::tract_data::itertools::Itertools;
 
@@ -71,6 +72,16 @@ pub(crate) struct DatasetResponseItem {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<ComponentStatus>,
+
+    #[serde(skip_serializing_if = "HashMap::is_empty", default)]
+    pub properties: HashMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct Property {
+    pub key: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<serde_json::Value>, // support any valid JSON type (String, Int, Object, etc)
 }
 
 pub(crate) async fn get(
@@ -112,6 +123,7 @@ pub(crate) async fn get(
             name: d.name.to_quoted_string(),
             replication_enabled: d.replication.as_ref().is_some_and(|f| f.enabled),
             acceleration_enabled: d.acceleration.as_ref().is_some_and(|f| f.enabled),
+            properties: dataset_properties(d),
             status: if params.status {
                 Some(dataset_status(&df, d))
             } else {
@@ -319,4 +331,20 @@ pub(crate) async fn sample(
         Ok(body) => (StatusCode::OK, body).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
+}
+
+fn dataset_properties(ds: &Dataset) -> HashMap<String, Value> {
+    let mut properties = HashMap::new();
+
+    #[cfg(feature = "models")]
+    properties.insert(
+        "vector_search".to_string(),
+        if ds.has_embeddings() {
+            Value::String("supported".to_string())
+        } else {
+            Value::String("unsupported".to_string())
+        },
+    );
+
+    properties
 }

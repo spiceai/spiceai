@@ -16,6 +16,7 @@ limitations under the License.
 
 use super::RefreshTask;
 use crate::accelerated_table::refresh::Refresh;
+use crate::datafusion::error::find_datafusion_root;
 use crate::dataupdate::{DataUpdate, UpdateType};
 use crate::status;
 use async_stream::stream;
@@ -98,6 +99,7 @@ impl RefreshTask {
             let plan = federated
                 .scan(&ctx.state(), None, &[], None)
                 .await
+            .map_err(find_datafusion_root)
                 .context(crate::accelerated_table::UnableToScanTableProviderSnafu {})?;
 
             if plan.output_partitioning().partition_count() > 1 {
@@ -111,6 +113,7 @@ impl RefreshTask {
 
             let mut stream = plan
                 .execute(0, ctx.task_ctx())
+            .map_err(find_datafusion_root)
                 .context(crate::accelerated_table::UnableToScanTableProviderSnafu {})?;
             loop {
                 match stream.next().await {
@@ -123,7 +126,7 @@ impl RefreshTask {
                     }
                     Some(Err(e)) => {
                         tracing::error!("Error reading data for dataset {dataset_name}: {e}");
-                        yield Err(crate::accelerated_table::Error::UnableToScanTableProvider { source: e });
+                        yield Err(crate::accelerated_table::Error::UnableToScanTableProvider { source: find_datafusion_root(e) });
                     }
                     None => {
                         tracing::warn!("Append stream ended for dataset {dataset_name}");

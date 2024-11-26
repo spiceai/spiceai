@@ -37,8 +37,8 @@ use llms::chat::LlmRuntime;
 use prost::Message;
 use reqwest::Client;
 use rustyline::error::ReadlineError;
-use rustyline::validate::{ValidationContext, ValidationResult, Validator};
-use rustyline::{Completer, ConditionalEventHandler, Helper, Highlighter, Hinter, KeyEvent};
+use rustyline::history::FileHistory;
+use rustyline::{ConditionalEventHandler, KeyEvent};
 use rustyline::{Editor, EventHandler, Modifiers};
 use serde_json::json;
 use tonic::metadata::{Ascii, MetadataValue};
@@ -105,23 +105,7 @@ async fn send_nsql_request(
         .await
 }
 
-#[derive(Completer, Helper, Highlighter, Hinter)]
-struct ReplHelper;
-
 const SPECIAL_COMMANDS: [&str; 6] = [".exit", "exit", "quit", "q", ".error", "help"];
-
-impl Validator for ReplHelper {
-    fn validate(&self, ctx: &mut ValidationContext) -> rustyline::Result<ValidationResult> {
-        let input = ctx.input();
-        if SPECIAL_COMMANDS.contains(&input.to_ascii_lowercase().trim())
-            || input.trim().ends_with(';')
-        {
-            Ok(ValidationResult::Valid(None))
-        } else {
-            Ok(ValidationResult::Incomplete)
-        }
-    }
-}
 
 #[derive(Clone)]
 struct KeyEventHandler;
@@ -179,13 +163,14 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
         ))
     })?;
 
+    let user_agent = repl_config.user_agent.unwrap_or_else(get_user_agent);
+
     // The encoder/decoder size is limited to 500MB.
     let client = FlightServiceClient::new(channel)
         .max_decoding_message_size(500 * 1024 * 1024)
         .max_encoding_message_size(500 * 1024 * 1024);
 
-    let mut rl = Editor::new()?;
-    let helper = ReplHelper {};
+    let mut rl: Editor<(), FileHistory> = Editor::new()?;
     let key_handler = Box::new(KeyEventHandler {});
     rl.bind_sequence(KeyEvent::ctrl('C'), EventHandler::Conditional(key_handler));
     rl.bind_sequence(KeyEvent::ctrl('D'), rustyline::Cmd::EndOfFile);
@@ -193,30 +178,51 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
         KeyEvent::new('\t', Modifiers::NONE),
         rustyline::Cmd::Insert(1, "\t".to_string()),
     );
-    rl.set_helper(Some(helper));
     println!("Welcome to the Spice.ai SQL REPL! Type 'help' for help.\n");
     println!("show tables; -- list available tables");
 
     let mut last_error: Option<Status> = None;
     let prompt_color = Colour::Fixed(8);
-    let prompt = prompt_color.paint("sql> ").to_string();
 
-    loop {
-        let line_result = rl.readline(&prompt);
-        let line = match line_result {
-            Ok(line) => line,
-            Err(ReadlineError::Interrupted) => {
-                // User canceled the current query
-                continue;
-            }
-            Err(ReadlineError::Eof) => {
+    'outer: loop {
+        let mut first_line = true;
+        let mut prompt = prompt_color.paint("sql> ").to_string();
+        let mut line = String::new();
+        loop {
+            let line_result = rl.readline(&prompt);
+            let newline = match line_result {
+                Ok(line) => line,
+                Err(ReadlineError::Interrupted) => {
+                    // User canceled the current query
+                    continue 'outer;
+                }
+                Err(ReadlineError::Eof) => {
+                    if line.is_empty() {
+                        break 'outer;
+                    }
+
+                    continue 'outer;
+                }
+                Err(err) => {
+                    println!("Error reading line: {err}");
+                    continue 'outer;
+                }
+            };
+
+            line.push_str(format!("{newline}\n").as_str());
+
+            if SPECIAL_COMMANDS.contains(&line.to_ascii_lowercase().trim())
+                || line.trim().ends_with(';')
+            {
+                line = line.trim().to_string();
                 break;
             }
-            Err(err) => {
-                println!("Error reading line: {err}");
-                continue;
+
+            if first_line {
+                prompt = prompt_color.paint("  -> ").to_string();
+                first_line = false;
             }
-        };
+        }
 
         let line = line.trim();
         if line.is_empty() {
@@ -263,7 +269,14 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
         let _ = rl.add_history_entry(line);
 
         let start_time = Instant::now();
-        match get_records(client.clone(), line, repl_config.api_key.as_ref()).await {
+        match get_records(
+            client.clone(),
+            line,
+            repl_config.api_key.as_ref(),
+            &user_agent,
+        )
+        .await
+        {
             Ok((_, 0, from_cache)) => {
                 println!("No results{}.", if from_cache { " (cached)" } else { "" });
             }
@@ -296,6 +309,7 @@ pub async fn get_records(
     mut client: FlightServiceClient<Channel>,
     line: &str,
     api_key: Option<&String>,
+    user_agent: &str,
 ) -> Result<(Vec<RecordBatch>, usize, bool), FlightError> {
     let sql_command = CommandStatementQuery {
         query: line.to_string(),
@@ -314,7 +328,16 @@ pub async fn get_records(
     let Some(ticket) = endpoint.ticket else {
         return Err(FlightError::Tonic(Status::internal("No ticket")));
     };
-    let request = add_api_key(ticket.into_request(), api_key);
+    let mut request = add_api_key(ticket.into_request(), api_key);
+    let user_agent_key = AsciiMetadataKey::from_str("User-Agent")
+        .map_err(|e| FlightError::ExternalError(e.into()))?;
+    let user_agent_value = user_agent
+        .parse()
+        .map_err(|e: InvalidMetadataValue| FlightError::ExternalError(e.into()))?;
+
+    request
+        .metadata_mut()
+        .insert(user_agent_key, user_agent_value);
 
     let response = client.do_get(request).await?;
     let from_cache = response

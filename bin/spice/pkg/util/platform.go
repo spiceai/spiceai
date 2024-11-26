@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"runtime"
 	"strings"
+
 	"github.com/spiceai/spiceai/bin/spice/pkg/version"
 )
 

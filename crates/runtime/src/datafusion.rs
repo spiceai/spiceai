@@ -52,6 +52,7 @@ use datafusion::sql::parser::DFParser;
 use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 use datafusion::sql::{sqlparser, TableReference};
 use datafusion_federation::FederatedTableProviderAdaptor;
+use error::find_datafusion_root;
 use itertools::Itertools;
 use query::QueryBuilder;
 use snafu::prelude::*;
@@ -119,9 +120,6 @@ pub enum Error {
     #[snafu(display("Table {table_name} is expected to provide metadata, but the underlying provider does not support this."))]
     MetadataProviderNotImplemented { table_name: String },
 
-    #[snafu(display("Unable to register table: {source}"))]
-    UnableToRegisterTable { source: crate::dataconnector::Error },
-
     #[snafu(display("Unable to register table in DataFusion: {source}"))]
     UnableToRegisterTableToDataFusion { source: DataFusionError },
 
@@ -154,9 +152,9 @@ pub enum Error {
         source: DataFusionError,
     },
 
-    #[snafu(display("Cannot refresh {table_name}: {source}"))]
+    #[snafu(display("Failed to refresh the dataset {dataset_name}.\n{source}"))]
     UnableToTriggerRefresh {
-        table_name: String,
+        dataset_name: String,
         source: crate::accelerated_table::Error,
     },
 
@@ -206,8 +204,11 @@ pub enum Error {
     #[snafu(display("Unable to retrieve underlying table provider from federation"))]
     UnableToRetrieveTableFromFederation { table_name: String },
 
-    #[snafu(display("Unable to build accelerated table: {source}"))]
+    #[snafu(display(
+        "Failed to create an accelerated table for the dataset {dataset_name}.\n{source}"
+    ))]
     UnableToBuildAcceleratedTable {
+        dataset_name: String,
         source: AcceleratedTableBuilderError,
     },
 }
@@ -329,6 +330,7 @@ impl DataFusion {
         if let Some(runtime_schema) = self.runtime_schema() {
             runtime_schema
                 .register_table(table_name.table().to_string(), table)
+                .map_err(find_datafusion_root)
                 .context(UnableToRegisterTableToDataFusionSchemaSnafu { schema: "runtime" })?;
 
             self.data_writers
@@ -370,9 +372,11 @@ impl DataFusion {
                             Arc::new(
                                 Arc::new(accelerated_table)
                                     .create_federated_table_provider()
+                                    .map_err(find_datafusion_root)
                                     .context(UnableToRegisterTableToDataFusionSnafu)?,
                             ),
                         )
+                        .map_err(find_datafusion_root)
                         .context(UnableToRegisterTableToDataFusionSnafu)?;
                 } else if source.as_any().downcast_ref::<SinkConnector>().is_some() {
                     // Sink connectors don't know their schema until the first data is received. Park this registration until the schema is known via the first write.
@@ -438,6 +442,7 @@ impl DataFusion {
                 let table_provider = schema
                     .table(table_name)
                     .await
+                    .map_err(find_datafusion_root)
                     .context(UnableToGetTableSnafu)?
                     .ok_or_else(|| {
                         TableMissingSnafu {
@@ -457,6 +462,7 @@ impl DataFusion {
             .ctx
             .table_provider(TableReference::bare(table_name.to_string()))
             .await
+            .map_err(find_datafusion_root)
             .context(UnableToGetTableSnafu)?;
 
         Ok(table_provider)
@@ -549,6 +555,7 @@ impl DataFusion {
         };
 
         let streaming_update = StreamingDataUpdate::try_from(data_update)
+            .map_err(find_datafusion_root)
             .context(UnableToCreateStreamingUpdateSnafu)?;
 
         let insert_plan = table_provider
@@ -558,15 +565,17 @@ impl DataFusion {
                 overwrite,
             )
             .await
+            .map_err(find_datafusion_root)
             .context(UnableToPlanTableInsertSnafu {
                 table_name: table_reference.to_string(),
             })?;
 
-        let _ = collect(insert_plan, self.ctx.task_ctx()).await.context(
-            UnableToExecuteTableInsertSnafu {
+        let _ = collect(insert_plan, self.ctx.task_ctx())
+            .await
+            .map_err(find_datafusion_root)
+            .context(UnableToExecuteTableInsertSnafu {
                 table_name: table_reference.to_string(),
-            },
-        )?;
+            })?;
 
         self.runtime_status
             .update_dataset(&table_reference, status::ComponentStatus::Ready);
@@ -579,6 +588,7 @@ impl DataFusion {
             .ctx
             .table(dataset)
             .await
+            .map_err(find_datafusion_root)
             .context(UnableToGetTableSnafu)?;
         Ok(Schema::from(data_frame.schema()))
     }
@@ -794,7 +804,9 @@ impl DataFusion {
         accelerated_table_builder
             .build()
             .await
-            .context(UnableToBuildAcceleratedTableSnafu)
+            .context(UnableToBuildAcceleratedTableSnafu {
+                dataset_name: dataset.name.to_string(),
+            })
     }
 
     /// Attempt to synchronize refreshes with the parent table for localpod accelerated tables.
@@ -872,9 +884,11 @@ impl DataFusion {
                 Arc::new(
                     Arc::new(accelerated_table)
                         .create_federated_table_provider()
+                        .map_err(find_datafusion_root)
                         .context(UnableToRegisterTableToDataFusionSnafu)?,
                 ),
             )
+            .map_err(find_datafusion_root)
             .context(UnableToRegisterTableToDataFusionSnafu)?;
 
         self.register_metadata_table(&dataset, Arc::clone(&source))
@@ -897,7 +911,7 @@ impl DataFusion {
         if let Some(accelerated_table) = table.as_any().downcast_ref::<AcceleratedTable>() {
             return accelerated_table.trigger_refresh(overrides).await.context(
                 UnableToTriggerRefreshSnafu {
-                    table_name: dataset_name.to_string(),
+                    dataset_name: dataset_name.to_string(),
                 },
             );
         }
@@ -926,7 +940,7 @@ impl DataFusion {
                 .update_refresh_sql(refresh_sql)
                 .await
                 .context(UnableToTriggerRefreshSnafu {
-                    table_name: dataset_name.to_string(),
+                    dataset_name: dataset_name.to_string(),
                 })?;
         }
 
@@ -941,6 +955,7 @@ impl DataFusion {
             .ctx
             .table_provider(dataset_name)
             .await
+            .map_err(find_datafusion_root)
             .context(UnableToGetTableSnafu)?;
         if let Some(adaptor) = table
             .as_any()
@@ -992,6 +1007,7 @@ impl DataFusion {
 
         self.ctx
             .register_table(dataset.name.clone(), source_table_provider)
+            .map_err(find_datafusion_root)
             .context(UnableToRegisterTableToDataFusionSnafu)?;
 
         Ok(())
@@ -1015,6 +1031,7 @@ impl DataFusion {
                     TableReference::partial(SPICE_METADATA_SCHEMA, dataset.name.to_string()),
                     table,
                 )
+                .map_err(find_datafusion_root)
                 .context(UnableToRegisterTableToDataFusionSnafu)?;
         };
         Ok(())
