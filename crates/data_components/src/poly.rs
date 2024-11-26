@@ -98,6 +98,13 @@ impl TableProvider for PolyTableProvider {
         self.write.get_column_default(column)
     }
 
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
+        self.fed.supports_filters_pushdown(filters)
+    }
+
     async fn scan(
         &self,
         state: &dyn Session,
