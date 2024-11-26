@@ -127,22 +127,22 @@ static TEST_CASES: LazyLock<Vec<TestCase>> = LazyLock::new(|| {
                 "messages": [
                     {
                         "role": "system",
-                        "content": "Repeat back any user message."
+                        "content": "Quote back the exact message from the user"
                     },
                     {
                         "role": "user",
-                        "content": "Hi"
+                        "content": "pong"
                     }
                 ]
             }),
             vec![
                 (
                     "assistant_response",
-                    "$.choices[*].message[?(@.role == 'assistant' && @.content ~= 'Hi')].length()"
+                    "$.choices[*].message[?(@.role == 'assistant' && @.content ~= 'pong')].length()"
                 ),
                 (
                     "replied_appropriately",
-                    "$.choices[*].message[?(@.content ~= 'Hi')].length()"
+                    "$.choices[*].message[?(@.content ~= 'pong')].length()"
                 )
             ]
         ),
