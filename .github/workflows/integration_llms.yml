@@ -71,7 +71,7 @@ jobs:
         run: |
           chmod +x ./integration_test/llms_integration_test
 
-      - name: Set up Open.ai API Key
+      - name: Set up .env file
         run: |
           echo 'SPICE_OPENAI_API_KEY="${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}"' > .env
           echo 'SPICE_ANTHROPIC_API_KEY="${{ secrets.SPICE_SECRET_ANTHROPIC_API_KEY }}"' >> .env
