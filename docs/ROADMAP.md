@@ -8,34 +8,18 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 
 - See [Bugs](https://github.com/spiceai/spiceai/labels/bug). Feel free to file a new Issue if you see a bug and let us know on Discord.
 
-## [v1.0-rc.1 (Nov 2024)](https://github.com/spiceai/spiceai/milestone/45)
-
-- Bugfixes and performance improvements
-- Data Accelerators: Arrow & DuckDB (Release Candidate)
-- DuckDB data connector (Release Candidate)
-- S3 data connector (Release Candidate)
-- PostgreSQL data connector (Release Candidate)
-- MySQL data connector (Release Candidate)
-- GitHub data connector (Release Candidate)
-
-## [v1.0-rc.2 (Nov 2024)](https://github.com/spiceai/spiceai/milestone/48)
+## [v1.0-rc.2 (Dec 2024)](https://github.com/spiceai/spiceai/milestone/48)
 
 - Bugfixes and performance improvements
 - GraphQL data connector (Release Candidate)
 - Databricks DeltaLake data connector (Release Candidate)
 - Spice.ai Cloud Platform data connector (Release Candidate)
 - ODBC Data Connector - Athena, Databricks, MySQL (Release Candidate)
-- Dremio data connector (Beta)
-
-## v1.0-rc.3 (Dec 2024)
-
-- Bugfixes and performance improvements
-- DuckDB data connector (Release Candidate)
 - Dremio data connector (Release Candidate)
 - MS SQL data connector (Beta)
 - File data connector (Beta)
 
-## v1.0-rc.4 (Dec 2024)
+## v1.0-rc.3 (Dec 2024)
 
 - Bugfixes and performance improvements
 - MS SQL data connector (Release Candidate)
