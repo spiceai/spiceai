@@ -43,19 +43,23 @@ macro_rules! extract_secret {
 ///   - Huggingface URLs, e.g. `<https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/blob/main/tokenizer.json>`.
 ///   -
 async fn get_bytes_for_file(url: &str) -> Result<Bytes, Box<dyn std::error::Error + Send + Sync>> {
-    if let [org, model, "blob", branch, file] = url.split('/').collect_vec().as_slice() {
-        if let Ok(Some(path)) = download_hf_file(org, model, Some(branch), file, None)
-            .map(|s| s.to_str().map(ToString::to_string))
-        {
-            return Box::pin(get_bytes_for_file(path.as_str())).await;
-        };
-        Err(Box::<dyn std::error::Error + Send + Sync>::from(format!(
-            "Downloaded HF url: {url}, but failed to get local path"
-        )))
-    } else {
-        let url = Url::parse(url).boxed()?;
-        let (store, path) = object_store::parse_url(&url).boxed()?;
-        store.get(&path).await.boxed()?.bytes().await.boxed()
+    // hf://[<repo_type_prefix>]<repo_id>[@<revision>]/<path/in/repo>
+    match url.split('/').collect_vec().as_slice() {
+        ["https://huggingface.co/", repo_id, "blob", branch, file] | ["hf://", _] => {
+            if let Ok(Some(path)) = download_hf_file(repo_id, Some(branch), None, file, None)
+                .map(|s| s.to_str().map(ToString::to_string))
+            {
+                return Box::pin(get_bytes_for_file(path.as_str())).await;
+            };
+            Err(Box::<dyn std::error::Error + Send + Sync>::from(format!(
+                "Downloaded HF url: {url}, but failed to get local path"
+            )))
+        }
+        _ => {
+            let url = Url::parse(url).boxed()?;
+            let (store, path) = object_store::parse_url(&url).boxed()?;
+            store.get(&path).await.boxed()?.bytes().await.boxed()
+        }
     }
 }
 

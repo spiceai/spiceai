@@ -109,9 +109,9 @@ fn get_api(model_id: &str, revision: Option<&str>, hf_token: Option<String>) -> 
 }
 
 pub fn download_hf_file(
-    org_id: &str,
     repo_id: &str,
     revision: Option<&str>,
+    repo_type_opt: Option<RepoType>,
     file: &str,
     hf_token: Option<String>,
 ) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
@@ -121,11 +121,12 @@ pub fn download_hf_file(
         .build()
         .boxed()?;
 
-    let model_id = format!("{org_id}/{repo_id}").to_string();
+    let repo_type = repo_type_opt.unwrap_or(RepoType::Model);
+
     let repo = if let Some(revision) = revision {
-        Repo::with_revision(model_id, RepoType::Model, revision.to_string())
+        Repo::with_revision(repo_id.to_string(), repo_type, revision.to_string())
     } else {
-        Repo::new(model_id, RepoType::Model)
+        Repo::new(repo_id.to_string(), repo_type)
     };
     api.repo(repo).get(file).boxed()
 }
