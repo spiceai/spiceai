@@ -19,9 +19,8 @@ use app::{App, AppBuilder};
 use datafusion::prelude::SessionContext;
 use futures::Future;
 use runtime::{
-    datafusion::{query::Protocol, DataFusion},
+    datafusion::DataFusion,
     dataupdate::DataUpdate,
-    metrics::TelemetryContext,
     status::{self, RuntimeStatus},
     Runtime,
 };
@@ -32,7 +31,6 @@ use spicepod::component::dataset::{
 };
 use std::{collections::HashMap, process::Command, sync::Arc, time::Duration};
 use tracing_subscriber::EnvFilter;
-use util::user_agent::SpiceUserAgent;
 
 /// The number of times to run each query in the benchmark.
 const ITERATIONS: i32 = 5;
@@ -40,11 +38,8 @@ const ITERATIONS: i32 = 5;
 /// Gets a test `DataFusion` to make test results reproducible across all machines.
 ///
 /// 1) Sets the number of `target_partitions` to 4, by default its the number of CPU cores available.
-fn get_test_datafusion(
-    status: Arc<RuntimeStatus>,
-    telemetry_context: TelemetryContext,
-) -> Arc<DataFusion> {
-    let mut df = DataFusion::builder(status, Some(telemetry_context)).build();
+fn get_test_datafusion(status: Arc<RuntimeStatus>) -> Arc<DataFusion> {
+    let mut df = DataFusion::builder(status).build();
 
     // Set the target partitions to 3 to make RepartitionExec show consistent partitioning across machines with different CPU counts.
     let mut new_state = df.ctx.state();
@@ -68,27 +63,12 @@ pub(crate) async fn setup_benchmark(
 ) -> Result<(BenchmarkResultsBuilder, Runtime), String> {
     init_tracing();
 
-    let acceleration_type = acceleration.as_ref().map_or("none".to_string(), |a| {
-        a.engine.clone().unwrap_or("none".to_string())
-    });
     let app = build_app(upload_results_dataset, connector, acceleration, bench_name)?;
-
-    let telemetry_context = TelemetryContext {
-        protocol: Protocol::Internal,
-        user_agent: Some(
-            SpiceUserAgent::default()
-                .with_client_name("spicebench")
-                .with_client_version_from_cargo()
-                .with_extension("benchmark_name", bench_name)
-                .with_extension("connector", connector)
-                .with_extension("acceleration", &acceleration_type),
-        ),
-    };
 
     let status = status::RuntimeStatus::new();
     let rt = Runtime::builder()
         .with_app(app)
-        .with_datafusion(get_test_datafusion(Arc::clone(&status), telemetry_context))
+        .with_datafusion(get_test_datafusion(Arc::clone(&status)))
         .with_runtime_status(status)
         .build()
         .await;

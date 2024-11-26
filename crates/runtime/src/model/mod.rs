@@ -39,7 +39,7 @@ pub async fn run(m: &Model, df: Arc<DataFusion>) -> Result<RecordBatch, ModelErr
         protocol: Protocol::Internal,
         user_agent: Some(
             SpiceUserAgent::default()
-                .with_client_name("model")
+                .with_client_name("model_run")
                 .with_client_version_from_cargo(),
         ),
     };
@@ -50,8 +50,8 @@ pub async fn run(m: &Model, df: Arc<DataFusion>) -> Result<RecordBatch, ModelErr
                 "select * from {SPICE_DEFAULT_CATALOG}.{SPICE_DEFAULT_SCHEMA}.{} order by ts asc",
                 m.model.datasets[0]
             )),
-            Some(telemetry_context),
         )
+        .with_telemetry_context(telemetry_context)
         .build()
         .run()
         .await

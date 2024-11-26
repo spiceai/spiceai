@@ -95,7 +95,8 @@ impl SpiceModelTool for SqlTool {
 
             let query_result = rt
                 .datafusion()
-                .query_builder(&req.query, Some(telemetry_context))
+                .query_builder(&req.query)
+                .with_telemetry_context(telemetry_context)
                 .build()
                 .run()
                 .await

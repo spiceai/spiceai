@@ -24,8 +24,7 @@ use crate::{
     datafusion::DataFusion,
     datasets_health_monitor::DatasetsHealthMonitor,
     extension::{Extension, ExtensionFactory},
-    metrics::{self, telemetry::TelemetryContext},
-    podswatcher,
+    metrics, podswatcher,
     secrets::{self, Secrets},
     status,
     timing::TimeMeasurement,
@@ -42,7 +41,6 @@ pub struct RuntimeBuilder {
     prometheus_registry: Option<prometheus::Registry>,
     datafusion: Option<Arc<DataFusion>>,
     runtime_status: Option<Arc<status::RuntimeStatus>>,
-    default_telemetry_context: Option<TelemetryContext>,
 }
 
 impl RuntimeBuilder {
@@ -57,7 +55,6 @@ impl RuntimeBuilder {
             datafusion: None,
             autoload_extensions: HashMap::new(),
             runtime_status: None,
-            default_telemetry_context: None,
         }
     }
 
@@ -125,14 +122,6 @@ impl RuntimeBuilder {
         self
     }
 
-    pub fn with_default_telemetry_context(
-        mut self,
-        default_telemetry_context: TelemetryContext,
-    ) -> Self {
-        self.default_telemetry_context = Some(default_telemetry_context);
-        self
-    }
-
     pub async fn build(self) -> Runtime {
         dataconnector::register_all().await;
         dataaccelerator::register_all().await;
@@ -146,9 +135,7 @@ impl RuntimeBuilder {
 
         let df = match self.datafusion {
             Some(df) => df,
-            None => Arc::new(
-                DataFusion::builder(Arc::clone(&status), self.default_telemetry_context).build(),
-            ),
+            None => Arc::new(DataFusion::builder(Arc::clone(&status)).build()),
         };
 
         let datasets_health_monitor = if self.datasets_health_monitor_enabled {

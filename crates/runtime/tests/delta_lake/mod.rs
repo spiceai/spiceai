@@ -1,9 +1,10 @@
-use std::{fs::File, io::Write, sync::Arc};
-
+use crate::RecordBatch;
 use app::AppBuilder;
 use datafusion::assert_batches_eq;
+use futures::TryStreamExt;
 use runtime::Runtime;
 use spicepod::component::dataset::{acceleration::Acceleration, Dataset};
+use std::{fs::File, io::Write, sync::Arc};
 
 pub fn make_delta_lake_dataset(path: &str, name: &str, accelerated: bool) -> Dataset {
     let mut dataset = Dataset::new(format!("delta_lake:{path}"), name.to_string());
@@ -70,13 +71,18 @@ async fn query_delta_lake_with_partitions() -> Result<(), String> {
     }
 
     let query = "SELECT * from test order by n_nationkey";
-    let data = rt
+    let query_result = rt
         .datafusion()
-        .ctx
-        .sql(query)
+        .query_builder(query)
+        .with_telemetry_context(crate::get_telemetry_context("delta_lake_partition_test"))
+        .build()
+        .run()
         .await
-        .map_err(|e| format!("query `{query}` to plan: {e}"))?
-        .collect()
+        .map_err(|e| format!("query `{query}` to plan: {e}"))?;
+
+    let data = query_result
+        .data
+        .try_collect::<Vec<RecordBatch>>()
         .await
         .map_err(|e| format!("query `{query}` to results: {e}"))?;
 

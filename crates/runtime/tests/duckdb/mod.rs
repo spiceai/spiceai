@@ -14,13 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::init_tracing;
+use crate::{init_tracing, RecordBatch};
 use app::AppBuilder;
 use datafusion::assert_batches_eq;
-use runtime::{datafusion::query::Protocol, metrics::TelemetryContext, Runtime};
+use futures::TryStreamExt;
+use runtime::Runtime;
 use scopeguard::defer;
 use spicepod::component::dataset::Dataset;
-use util::user_agent::SpiceUserAgent;
 
 fn make_duckdb_dataset(ds_name: &str, fn_name: &str, path_str: &str) -> Dataset {
     let mut dataset = Dataset::new(
@@ -78,20 +78,7 @@ async fn duckdb_from_functions() -> Result<(), String> {
         ))
         .build();
 
-    let telemetry_context = TelemetryContext {
-        protocol: Protocol::Internal,
-        user_agent: Some(
-            SpiceUserAgent::default()
-                .with_client_name("integration")
-                .with_client_version_from_cargo(),
-        ),
-    };
-
-    let rt = Runtime::builder()
-        .with_app(app)
-        .with_default_telemetry_context(telemetry_context)
-        .build()
-        .await;
+    let rt = Runtime::builder().with_app(app).build().await;
 
     // Set a timeout for the test
     tokio::select! {
@@ -120,13 +107,17 @@ async fn duckdb_from_functions() -> Result<(), String> {
     ];
 
     for (ds_name, query) in queries {
-        let data = rt
+        let query_result = rt
             .datafusion()
-            .ctx
-            .sql(&query)
+            .query_builder(&query)
+            .with_telemetry_context(crate::get_telemetry_context(&format!("duckdb_{ds_name}")))
+            .build()
+            .run()
             .await
-            .map_err(|e| format!("{ds_name}: query `{query}` to plan: {e}"))?
-            .collect()
+            .map_err(|e| format!("query `{query}` to plan: {e}"))?;
+        let data = query_result
+            .data
+            .try_collect::<Vec<RecordBatch>>()
             .await
             .map_err(|e| format!("{ds_name}: query `{query}` to results: {e}"))?;
 

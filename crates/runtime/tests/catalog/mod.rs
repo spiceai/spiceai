@@ -59,7 +59,8 @@ async fn spiceai_integration_test_catalog() -> Result<(), anyhow::Error> {
 
     let mut result = rt
         .datafusion()
-        .query_builder("SELECT * FROM spiceai.eth.recent_blocks LIMIT 10", None)
+        .query_builder("SELECT * FROM spiceai.eth.recent_blocks LIMIT 10")
+        .with_telemetry_context(crate::get_telemetry_context("spiceai_catalog_test"))
         .build()
         .run()
         .await?;
@@ -118,8 +119,8 @@ async fn spiceai_integration_test_catalog_include() -> Result<(), anyhow::Error>
              WHERE table_schema != 'information_schema' 
                AND table_catalog = 'spiceai' 
              ORDER BY table_name",
-            None,
         )
+        .with_telemetry_context(crate::get_telemetry_context("spiceai_catalog_test"))
         .build()
         .run()
         .await?;

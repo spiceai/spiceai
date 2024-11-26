@@ -145,7 +145,8 @@ CREATE TABLE test (
         wait_until_true(Duration::from_secs(30), || async {
             let mut query_result = rt
                 .datafusion()
-                .query_builder("SELECT * FROM abc LIMIT 1", None)
+                .query_builder("SELECT * FROM abc LIMIT 1")
+                .with_telemetry_context(crate::get_telemetry_context("acceleration_federation"))
                 .build()
                 .run()
                 .await
@@ -163,7 +164,8 @@ CREATE TABLE test (
         wait_until_true(Duration::from_secs(30), || async {
             let mut query_result = match rt
                 .datafusion()
-                .query_builder("SELECT * FROM non_federated_abc LIMIT 1", None)
+                .query_builder("SELECT * FROM non_federated_abc LIMIT 1")
+                .with_telemetry_context(crate::get_telemetry_context("acceleration_federation"))
                 .build()
                 .run()
                 .await

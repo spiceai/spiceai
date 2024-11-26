@@ -121,7 +121,8 @@ async fn run_test(app: App) -> Result<String, anyhow::Error> {
     // We don't really care about the result, just that the query ran successfully
     let mut query_result = rt
         .datafusion()
-        .query_builder("SELECT * FROM taxi_trips LIMIT 10", None)
+        .query_builder("SELECT * FROM taxi_trips LIMIT 10")
+        .with_telemetry_context(crate::get_telemetry_context("user_agent_metrics"))
         .build()
         .run()
         .await

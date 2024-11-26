@@ -189,7 +189,6 @@ mod nsql {
 
 #[allow(clippy::expect_used)]
 mod search {
-
     use super::*;
     struct TestCase {
         name: &'static str,
@@ -295,9 +294,7 @@ mod search {
 
 #[allow(clippy::expect_used)]
 mod embeddings {
-
     use super::*;
-
     struct EmbeddingTestCase {
         pub input: EmbeddingInput,
         pub encoding_format: Option<&'static str>,

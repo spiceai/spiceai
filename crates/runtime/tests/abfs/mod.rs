@@ -14,15 +14,17 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::sync::Arc;
+use crate::RecordBatch;
 
 use anyhow::anyhow;
 use app::AppBuilder;
 use azure_storage_blobs::prelude::*;
 use bollard::secret::HealthConfig;
 use datafusion::assert_batches_eq;
+use futures::TryStreamExt;
 use runtime::{status, Runtime};
 use spicepod::component::{dataset::Dataset, params::Params as DatasetParams};
+use std::sync::Arc;
 use tracing::instrument;
 
 use crate::{
@@ -167,15 +169,21 @@ async fn run_queries() -> Result<(), anyhow::Error> {
 
     for (dataset_name, query) in queries {
         tracing::info!("Running query: {}", dataset_name);
-        let data = rt
+
+        let query_result = rt
             .datafusion()
-            .ctx
-            .sql(&query)
+            .query_builder(&query)
+            .with_telemetry_context(crate::get_telemetry_context("abfs"))
+            .build()
+            .run()
             .await
-            .map_err(|e| anyhow!(format!("query `{query}` to plan: {e}")))?
-            .collect()
+            .map_err(|e| anyhow!(format!("query `{query}` to plan: {e}")))?;
+
+        let data = query_result
+            .data
+            .try_collect::<Vec<RecordBatch>>()
             .await
-            .map_err(|e| anyhow!(format!("query `{query}` to results: {e}")))?;
+            .map_err(|e| anyhow!(format!("query `{query}` to collect: {e}")))?;
 
         assert_batches_eq!(&expected_results, &data);
     }

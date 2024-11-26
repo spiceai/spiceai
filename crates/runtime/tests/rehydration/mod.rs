@@ -246,7 +246,10 @@ fn resolve_local_db_file_path(
 async fn run_query(query: &str, rt: &Runtime) -> Result<Vec<RecordBatch>, anyhow::Error> {
     let query_result = rt
         .datafusion()
-        .query_builder(query, None)
+        .query_builder(query)
+        .with_telemetry_context(crate::get_telemetry_context(
+            "test_spill_to_disk_and_rehydration",
+        ))
         .build()
         .run()
         .await

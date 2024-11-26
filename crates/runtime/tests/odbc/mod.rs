@@ -15,12 +15,13 @@ limitations under the License.
 */
 
 use app::AppBuilder;
+use futures::TryStreamExt;
 use runtime::Runtime;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::instrument;
 
-use crate::{init_tracing, utils::wait_until_true};
+use crate::{init_tracing, utils::wait_until_true, RecordBatch};
 
 use std::collections::HashMap;
 
@@ -88,23 +89,22 @@ async fn databricks_odbc() -> Result<(), String> {
         () = rt.load_components() => {}
     }
 
-    let result = rt
+    let query_result = rt
         .datafusion()
-        .ctx
-        .sql("SELECT * FROM line LIMIT 10")
+        .query_builder("SELECT * FROM line LIMIT 10")
+        .with_telemetry_context(crate::get_telemetry_context("databricks_odbc"))
+        .build()
+        .run()
         .await
-        .expect("SQL is used")
-        .collect()
+        .expect("SQL is used");
+
+    let results = query_result
+        .data
+        .try_collect::<Vec<crate::RecordBatch>>()
         .await
         .expect("Query return result");
 
-    let mut num_rows = 0;
-
-    for i in result {
-        num_rows += i.num_rows();
-    }
-
-    assert_eq!(10, num_rows);
+    assert_eq!(10, results.iter().map(RecordBatch::num_rows).sum::<usize>());
 
     Ok(())
 }
@@ -147,23 +147,23 @@ async fn databricks_odbc_with_acceleration() -> Result<(), String> {
 
         assert!(
             wait_until_true(Duration::from_secs(10), || async {
-                let result = rt
+                let query_result = rt
                     .datafusion()
-                    .ctx
-                    .sql("SELECT * FROM line LIMIT 10")
-                    .await
-                    .expect("SQL is used")
-                    .collect()
+                    .query_builder("SELECT * FROM line LIMIT 10")
+                    .with_telemetry_context(crate::get_telemetry_context(&format!(
+                        "databricks_odbc_{engine}"
+                    )))
+                    .build()
+                    .run()
                     .await
                     .expect("Query return result");
+                let data = query_result
+                    .data
+                    .try_collect::<Vec<RecordBatch>>()
+                    .await
+                    .expect("Query collect result");
 
-                let mut num_rows = 0;
-
-                for i in result {
-                    num_rows += i.num_rows();
-                }
-
-                10 == num_rows
+                10 == data.iter().map(RecordBatch::num_rows).sum::<usize>()
             })
             .await,
             "Expected 10 rows returned for engine {engine}"

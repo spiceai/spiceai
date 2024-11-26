@@ -378,12 +378,7 @@ async fn get_executed_tasks(
     since: DateTime<Utc>,
 ) -> Result<Vec<(String, String)>, anyhow::Error> {
     let query = format!("SELECT task, input FROM runtime.task_history WHERE start_time >= '{}' ORDER BY start_time, task;", since.to_rfc3339());
-    let query_result = rt
-        .datafusion()
-        .query_builder(&query, None)
-        .build()
-        .run()
-        .await?;
+    let query_result = rt.datafusion().query_builder(&query).build().run().await?;
     let data = query_result.data.try_collect::<Vec<_>>().await?;
 
     let mut tasks = Vec::new();

@@ -36,10 +36,14 @@ use clap::Parser;
 use datafusion::datasource::provider_as_source;
 use datafusion::logical_expr::{LogicalPlanBuilder, UNNAMED_TABLE};
 use datafusion::{dataframe::DataFrame, datasource::MemTable, execution::context::SessionContext};
+use futures::TryStreamExt;
 use results::BenchmarkResultsBuilder;
+use runtime::datafusion::query::Protocol;
+use runtime::metrics::TelemetryContext;
 use runtime::{dataupdate::DataUpdate, Runtime};
 use spicepod::component::dataset::acceleration::{self, Acceleration, Mode};
 use spicepod::component::params::Params;
+use util::user_agent::SpiceUserAgent;
 
 mod results;
 mod setup;
@@ -447,13 +451,28 @@ async fn run_query(
     query_name: &str,
     query: &str,
 ) -> Result<Vec<RecordBatch>, String> {
-    let res = rt
+    let telemetry_context = TelemetryContext {
+        protocol: Protocol::Internal,
+        user_agent: Some(
+            SpiceUserAgent::default()
+                .with_client_name("spicebench")
+                .with_client_version_from_cargo()
+                .with_extension("test_name", query_name),
+        ),
+    };
+
+    let query_result = rt
         .datafusion()
-        .ctx
-        .sql(query)
+        .query_builder(query)
+        .with_telemetry_context(telemetry_context)
+        .build()
+        .run()
         .await
-        .map_err(|e| format!("query `{connector}` `{query_name}` to plan: {e}"))?
-        .collect()
+        .map_err(|e| format!("query `{connector}` `{query_name}` to plan: {e}"))?;
+
+    let res = query_result
+        .data
+        .try_collect::<Vec<RecordBatch>>()
         .await
         .map_err(|e| format!("query `{connector}` `{query_name}` to results: {e}"))?;
 

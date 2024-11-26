@@ -182,7 +182,8 @@ AND NOW() < end_time + INTERVAL '{DATASET_UNAVAILABLE_THRESHOLD_MINUTES}' MINUTE
 AND labels.error_code IS NULL"
         );
         let query_result = df
-            .query_builder(&query, Some(telemetry_context))
+            .query_builder(&query)
+            .with_telemetry_context(telemetry_context)
             .build()
             .run()
             .await
@@ -419,7 +420,7 @@ mod test {
     }
 
     fn create_test_datafusion() -> Arc<DataFusion> {
-        let df = Arc::new(DataFusion::builder(RuntimeStatus::new(), None).build());
+        let df = Arc::new(DataFusion::builder(RuntimeStatus::new()).build());
 
         let catalog = df.ctx.catalog("spice").expect("default catalog is spice");
 

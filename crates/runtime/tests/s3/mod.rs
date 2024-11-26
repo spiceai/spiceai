@@ -80,7 +80,8 @@ async fn s3_federation() -> Result<(), anyhow::Error> {
 
     let mut query_result = rt
         .datafusion()
-        .query_builder("SELECT * FROM taxi_trips LIMIT 10", None)
+        .query_builder("SELECT * FROM taxi_trips LIMIT 10")
+        .with_telemetry_context(crate::get_telemetry_context("s3_federation"))
         .build()
         .run()
         .await
@@ -124,7 +125,8 @@ async fn s3_hive_partitioning() -> Result<(), anyhow::Error> {
 
     let mut query_result = rt
         .datafusion()
-        .query_builder("SELECT * FROM hive_data ORDER BY id", None)
+        .query_builder("SELECT * FROM hive_data ORDER BY id")
+        .with_telemetry_context(crate::get_telemetry_context("s3_hive_partitioning"))
         .build()
         .run()
         .await
@@ -140,7 +142,8 @@ async fn s3_hive_partitioning() -> Result<(), anyhow::Error> {
 
     query_result = rt
         .datafusion()
-        .query_builder("SELECT * FROM hive_data_no_infer ORDER BY id", None)
+        .query_builder("SELECT * FROM hive_data_no_infer ORDER BY id")
+        .with_telemetry_context(crate::get_telemetry_context("s3_hive_partitioning"))
         .build()
         .run()
         .await

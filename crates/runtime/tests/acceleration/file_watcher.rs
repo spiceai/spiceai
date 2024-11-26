@@ -98,7 +98,8 @@ async fn test_file_watcher() -> Result<(), anyhow::Error> {
 
     let result: Vec<RecordBatch> = rt
         .datafusion()
-        .query_builder("SELECT * FROM names ORDER BY id", None)
+        .query_builder("SELECT * FROM names ORDER BY id")
+        .with_telemetry_context(crate::get_telemetry_context("test_file_watcher"))
         .build()
         .run()
         .await
@@ -126,7 +127,8 @@ async fn test_file_watcher() -> Result<(), anyhow::Error> {
 
     let result: Vec<RecordBatch> = rt
         .datafusion()
-        .query_builder("SELECT * FROM names ORDER BY id", None)
+        .query_builder("SELECT * FROM names ORDER BY id")
+        .with_telemetry_context(crate::get_telemetry_context("test_file_watcher"))
         .build()
         .run()
         .await

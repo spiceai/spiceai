@@ -135,7 +135,9 @@ pub async fn sql_to_http_response(
         user_agent,
     };
 
-    let query = QueryBuilder::new(sql, Arc::clone(&df), Some(telemetry_context)).build();
+    let query = QueryBuilder::new(sql, Arc::clone(&df))
+        .with_telemetry_context(telemetry_context)
+        .build();
 
     let (data, is_data_from_cache) = match query.run().await {
         Ok(query_result) => match query_result.data.try_collect::<Vec<RecordBatch>>().await {

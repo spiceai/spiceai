@@ -144,7 +144,8 @@ async fn spiceai_integration_test_refresh_sql_override_append() -> Result<(), an
 
     let query = rt
         .datafusion()
-        .query_builder("SELECT * FROM nation WHERE n_regionkey = 0", None)
+        .query_builder("SELECT * FROM nation WHERE n_regionkey = 0")
+        .with_telemetry_context(crate::get_telemetry_context("refresh_sql_override_append"))
         .build()
         .run()
         .await?;
@@ -171,7 +172,8 @@ async fn spiceai_integration_test_refresh_sql_override_append() -> Result<(), an
         wait_until_true(Duration::from_secs(10), || async {
             let Ok(query) = rt
                 .datafusion()
-                .query_builder("SELECT * FROM nation WHERE n_regionkey = 0", None)
+                .query_builder("SELECT * FROM nation WHERE n_regionkey = 0")
+                .with_telemetry_context(crate::get_telemetry_context("refresh_sql_override_append"))
                 .build()
                 .run()
                 .await
@@ -191,10 +193,8 @@ async fn spiceai_integration_test_refresh_sql_override_append() -> Result<(), an
 
     let query = rt
         .datafusion()
-        .query_builder(
-            "SELECT * FROM nation WHERE n_regionkey = 0 ORDER BY n_nationkey DESC",
-            None,
-        )
+        .query_builder("SELECT * FROM nation WHERE n_regionkey = 0 ORDER BY n_nationkey DESC")
+        .with_telemetry_context(crate::get_telemetry_context("refresh_sql_override_append"))
         .build()
         .run()
         .await?;

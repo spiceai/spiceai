@@ -82,7 +82,9 @@ async fn execute_query_and_check_cache_status(
     query: &str,
     expected_cache_status: Option<bool>,
 ) -> Result<Vec<RecordBatch>, String> {
-    let query = QueryBuilder::new(query, rt.datafusion(), None).build();
+    let query = QueryBuilder::new(query, rt.datafusion())
+        .with_telemetry_context(crate::get_telemetry_context("results_cache"))
+        .build();
 
     let query_result = query
         .run()

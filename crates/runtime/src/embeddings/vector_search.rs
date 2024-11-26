@@ -581,7 +581,8 @@ impl VectorSearch {
 
         let batches: Vec<RecordBatch> = self
             .df
-            .query_builder(&query, Some(telemetry_context))
+            .query_builder(&query)
+            .with_telemetry_context(telemetry_context)
             .build()
             .run()
             .await

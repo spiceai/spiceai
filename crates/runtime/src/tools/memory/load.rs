@@ -106,8 +106,8 @@ impl SpiceModelTool for LoadMemoryTool {
                         "SELECT value FROM {table_name} WHERE created_at > (NOW() - INTERVAL '{}' SECOND);",
                         last_interval.as_secs()
                     ),
-                    Some(telemetry_context),
                 )
+                .with_telemetry_context(telemetry_context)
                 .build()
                 .run()
                 .await

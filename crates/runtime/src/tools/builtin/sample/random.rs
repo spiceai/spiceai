@@ -64,14 +64,12 @@ impl SampleFrom for RandomSampleParams {
         };
 
         let batches = df
-            .query_builder(
-                &format!(
-                    "SELECT * FROM {tbl} LIMIT {limit}",
-                    limit = self.limit,
-                    tbl = self.tbl,
-                ),
-                Some(telemetry_context),
-            )
+            .query_builder(&format!(
+                "SELECT * FROM {tbl} LIMIT {limit}",
+                limit = self.limit,
+                tbl = self.tbl,
+            ))
+            .with_telemetry_context(telemetry_context)
             .build()
             .run()
             .await

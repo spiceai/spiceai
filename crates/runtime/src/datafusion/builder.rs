@@ -36,10 +36,7 @@ use datafusion::{
 use datafusion_federation::FederationAnalyzerRule;
 use tokio::sync::RwLock as TokioRwLock;
 
-use crate::{
-    embeddings, metrics::telemetry::TelemetryContext, object_store_registry::default_runtime_env,
-    status,
-};
+use crate::{embeddings, object_store_registry::default_runtime_env, status};
 
 use super::{
     extension::{bytes_processed::BytesProcessedOptimizerRule, SpiceQueryPlanner},
@@ -52,15 +49,11 @@ pub struct DataFusionBuilder {
     config: SessionConfig,
     status: Arc<status::RuntimeStatus>,
     cache_provider: Option<Arc<QueryResultsCacheProvider>>,
-    default_telemetry_context: TelemetryContext,
 }
 
 impl DataFusionBuilder {
     #[must_use]
-    pub fn new(
-        status: Arc<status::RuntimeStatus>,
-        default_telemetry_context: TelemetryContext,
-    ) -> Self {
+    pub fn new(status: Arc<status::RuntimeStatus>) -> Self {
         let mut df_config = SessionConfig::new()
             .with_information_schema(true)
             .with_create_default_catalog_and_schema(false);
@@ -81,13 +74,10 @@ impl DataFusionBuilder {
             .execution
             .skip_physical_aggregate_schema_check = true;
 
-        df_config.set_extension(Arc::new(default_telemetry_context.clone()));
-
         Self {
             config: df_config,
             status,
             cache_provider: None,
-            default_telemetry_context,
         }
     }
 
@@ -156,7 +146,6 @@ impl DataFusionBuilder {
             cache_provider: RwLock::new(self.cache_provider),
             pending_sink_tables: TokioRwLock::new(Vec::new()),
             accelerated_tables: TokioRwLock::new(HashSet::new()),
-            default_telemetry_context: self.default_telemetry_context,
         }
     }
 }

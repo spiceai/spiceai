@@ -21,6 +21,7 @@ use datafusion::{
     execution::context::SessionContext,
     parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder,
 };
+use futures::TryStreamExt;
 
 use runtime::{
     datafusion::{query::Protocol, DataFusion},
@@ -67,16 +68,7 @@ mod rehydration;
 ///
 /// 1) Sets the number of `target_partitions` to 3, by default its the number of CPU cores available.
 fn get_test_datafusion(status: Arc<status::RuntimeStatus>) -> Arc<DataFusion> {
-    let telemetry_context = TelemetryContext {
-        protocol: Protocol::Internal,
-        user_agent: Some(
-            SpiceUserAgent::default()
-                .with_client_name("integration")
-                .with_client_version_from_cargo(),
-        ),
-    };
-
-    let mut df = DataFusion::builder(status, Some(telemetry_context)).build();
+    let mut df = DataFusion::builder(status).build();
 
     // Set the target partitions to 3 to make RepartitionExec show consistent partitioning across machines with different CPU counts.
     let mut new_state = df.ctx.state();
@@ -108,6 +100,18 @@ fn init_tracing(default_level: Option<&str>) -> DefaultGuard {
     tracing::subscriber::set_default(subscriber)
 }
 
+fn get_telemetry_context(test_name: &str) -> TelemetryContext {
+    TelemetryContext {
+        protocol: Protocol::Internal,
+        user_agent: Some(
+            SpiceUserAgent::default()
+                .with_client_name("integration-test")
+                .with_client_version_from_cargo()
+                .with_extension("test_name", test_name),
+        ),
+    }
+}
+
 async fn get_tpch_lineitem() -> Result<Vec<RecordBatch>, anyhow::Error> {
     let lineitem_parquet_bytes =
         reqwest::get("https://public-data.spiceai.org/tpch_lineitem.parquet")
@@ -134,13 +138,18 @@ where
     F: FnOnce(Vec<RecordBatch>),
 {
     // Check the plan
-    let plan_results = rt
+    let query_results = rt
         .datafusion()
-        .ctx
-        .sql(&format!("EXPLAIN {query}"))
+        .query_builder(&format!("EXPLAIN {query}"))
+        .with_telemetry_context(get_telemetry_context(snapshot_name))
+        .build()
+        .run()
         .await
-        .map_err(|e| format!("query `{query}` to plan: {e}"))?
-        .collect()
+        .map_err(|e| format!("query `{query}` to plan: {e}"))?;
+
+    let plan_results: Vec<RecordBatch> = query_results
+        .data
+        .try_collect::<Vec<RecordBatch>>()
         .await
         .map_err(|e| format!("query `{query}` to results: {e}"))?;
 
