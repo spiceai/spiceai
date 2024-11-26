@@ -52,7 +52,7 @@ use crate::Read;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Delta Lake Table connection failed: {source}\nVerify Delta Lake Connector configuration and try again.\nFor details, visit https://docs.spiceai.org/components/data-connectors/delta-lake#configuration"))]
+    #[snafu(display("Delta Lake Table connection failed.\n{source}\nVerify Delta Lake Connector configuration and try again.\nFor details, visit https://docs.spiceai.org/components/data-connectors/delta-lake#configuration"))]
     DeltaTableError { source: delta_kernel::Error },
 }
 
