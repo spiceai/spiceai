@@ -82,7 +82,7 @@ impl TeiEmbed {
         .into_iter()
         .collect();
 
-        let model_root = link_files_into_tmp_dir(files, None)?;
+        let model_root = link_files_into_tmp_dir(files)?;
         tracing::trace!(
             "Embedding model has files linked at location={:?}",
             model_root

@@ -165,18 +165,11 @@ pub(crate) fn download_hf_artifacts(
 /// ```
 ///
 #[allow(clippy::implicit_hasher)]
-pub fn link_files_into_tmp_dir(
-    files: HashMap<String, PathBuf>,
-    temp_dir_opt: Option<PathBuf>,
-) -> Result<PathBuf> {
-    let temp_dir = if let Some(temp_dir) = temp_dir_opt {
-        temp_dir
-    } else {
-        let temp_dir = tempdir()
-            .boxed()
-            .context(FailedToInstantiateEmbeddingModelSnafu)?;
-        temp_dir.into_path()
-    };
+pub fn link_files_into_tmp_dir(files: HashMap<String, PathBuf>) -> Result<PathBuf> {
+    let temp_dir = tempdir()
+        .boxed()
+        .context(FailedToInstantiateEmbeddingModelSnafu)?
+        .into_path();
 
     for (name, file) in files {
         let Ok(abs_path) = path::absolute(&file) else {

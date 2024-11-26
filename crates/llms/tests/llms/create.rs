@@ -116,8 +116,8 @@ fn download_hf_model_artifacts(
         }
     }
 
-    let dir = link_files_into_tmp_dir(files.clone(), None)
-        .context("Failed to link files into tmp dir")?;
+    let dir =
+        link_files_into_tmp_dir(files.clone()).context("Failed to link files into tmp dir")?;
     Ok((
         dir.clone(),
         weights // Reconstruct absolute model weights path based in the tmp dir.
