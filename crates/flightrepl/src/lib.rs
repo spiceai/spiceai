@@ -475,40 +475,55 @@ fn display_grpc_error(err: &Status) {
         Code::Ok => return,
         Code::Unknown | Code::Internal | Code::DataLoss | Code::FailedPrecondition => (
             "Internal Error",
-            "An unexpected internal error occurred. Execute '.error' for details.",
+            "An unexpected internal error occurred. Execute '.error' for details.".to_string(),
         ),
         Code::InvalidArgument | Code::AlreadyExists | Code::NotFound | Code::Unavailable => {
-            let message = err.message().split('\n').next().unwrap_or(err.message());
+            let mut lines = err.message().split('\n');
+            let first_line = lines.next().unwrap_or_default();
+            let has_more_lines = lines.next().is_some();
+
+            let message = if has_more_lines {
+                format!("{first_line} Execute '.error' for details.")
+            } else {
+                first_line.to_string()
+            };
+
             ("Query Error", message)
         }
         Code::Cancelled => (
             "Cancelled",
-            "The operation was cancelled before completion.",
+            "The operation was cancelled before completion.".to_string(),
         ),
-        Code::Aborted => ("Aborted", "The operation was aborted before completion."),
+        Code::Aborted => (
+            "Aborted",
+            "The operation was aborted before completion.".to_string(),
+        ),
         Code::DeadlineExceeded => (
             "Timeout Error",
-            "The operation could not complete within the allowed time limit.",
+            "The operation could not complete within the allowed time limit.".to_string(),
         ),
         Code::Unauthenticated => (
             "Authentication Error",
-            "Access denied. Invalid credentials.",
+            "Access denied. Invalid credentials.".to_string(),
         ),
         Code::PermissionDenied => (
             "Authorization Error",
-            "Access denied. Insufficient permisions to complete the request.",
+            "Access denied. Insufficient permisions to complete the request.".to_string(),
         ),
         Code::ResourceExhausted => (
             "Resource Limit Exceeded",
-            "The operation could not be completed because the server resources are exhausted.",
+            "The operation could not be completed because the server resources are exhausted."
+                .to_string(),
         ),
         Code::Unimplemented => (
             "Unsupported Operation",
-            "The query could not be completed because the requested operation is not supported.",
+            "The query could not be completed because the requested operation is not supported."
+                .to_string(),
         ),
         Code::OutOfRange => (
             "Result Limit Exceeded",
-            "The query result exceeds allowable limits. Consider using a `limit` clause.",
+            "The query result exceeds allowable limits. Consider using a `limit` clause."
+                .to_string(),
         ),
     };
 
