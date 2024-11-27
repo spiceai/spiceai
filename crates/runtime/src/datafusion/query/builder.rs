@@ -21,34 +21,26 @@ use uuid::Uuid;
 
 use crate::datafusion::DataFusion;
 
-use super::{tracker::QueryTracker, Protocol, Query};
+use super::{tracker::QueryTracker, Query};
 
 pub struct QueryBuilder<'a> {
     df: Arc<DataFusion>,
     sql: &'a str,
     query_id: Uuid,
-    protocol: Protocol,
 }
 
 impl<'a> QueryBuilder<'a> {
-    pub fn new(sql: &'a str, df: Arc<DataFusion>, protocol: Protocol) -> Self {
+    pub fn new(sql: &'a str, df: Arc<DataFusion>) -> Self {
         Self {
             df,
             sql,
             query_id: Uuid::new_v4(),
-            protocol,
         }
     }
 
     #[must_use]
     pub fn query_id(mut self, query_id: Uuid) -> Self {
         self.query_id = query_id;
-        self
-    }
-
-    #[must_use]
-    pub fn protocol(mut self, protocol: Protocol) -> Self {
-        self.protocol = protocol;
         self
     }
 
@@ -70,7 +62,6 @@ impl<'a> QueryBuilder<'a> {
                 query_duration_timer: Instant::now(),
                 query_execution_duration_timer: Instant::now(),
                 datasets: Arc::new(HashSet::default()),
-                protocol: self.protocol,
             },
         }
     }

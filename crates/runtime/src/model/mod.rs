@@ -13,7 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use crate::datafusion::{query::Protocol, SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
+use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
 use arrow::record_batch::RecordBatch;
 use futures::TryStreamExt;
 use model_components::model::{Error as ModelError, Model};
@@ -39,7 +39,6 @@ pub async fn run(m: &Model, df: Arc<DataFusion>) -> Result<RecordBatch, ModelErr
                 "select * from {SPICE_DEFAULT_CATALOG}.{SPICE_DEFAULT_SCHEMA}.{} order by ts asc",
                 m.model.datasets[0]
             )),
-            Protocol::Internal,
         )
         .build()
         .run()

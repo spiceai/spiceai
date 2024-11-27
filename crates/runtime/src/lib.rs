@@ -69,6 +69,7 @@ pub mod objectstore;
 mod opentelemetry;
 mod parameters;
 pub mod podswatcher;
+pub mod request;
 pub mod secrets;
 pub mod spice_metrics;
 pub mod status;
