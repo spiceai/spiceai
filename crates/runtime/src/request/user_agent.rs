@@ -22,10 +22,10 @@ use std::{
 
 use http::{header::USER_AGENT, HeaderMap};
 
-pub static PLATFORM_VERSION: &str = env!("CARGO_PKG_VERSION");
-pub static PLATFORM_NAME: &str = "spiced";
-pub static PLATFORM_SYSTEM: LazyLock<Arc<str>> =
-    LazyLock::new(|| Arc::from(get_platform_os_string()));
+pub static RUNTIME_VERSION: &str = env!("CARGO_PKG_VERSION");
+pub static RUNTIME_NAME: &str = "spiced";
+pub static RUNTIME_SYSTEM: LazyLock<Arc<str>> =
+    LazyLock::new(|| Arc::from(get_runtime_os_string()));
 
 /// `UserAgent` represents the client making a request to Spice and the platform Spice is running on.
 ///
@@ -50,6 +50,7 @@ impl Deref for Raw {
     }
 }
 
+/// TODO: Parsed should keep any remaining product identifiers other than the primary.
 #[derive(Debug, Eq, PartialEq, Clone)]
 pub struct Parsed {
     pub client_name: Arc<str>,
@@ -96,11 +97,11 @@ impl fmt::Display for UserAgent {
             }
         }
 
-        // Then write the platform part of the user agent string
+        // Then write the runtime part of the user agent string
         write!(
             f,
-            "{PLATFORM_NAME}/{PLATFORM_VERSION} ({})",
-            PLATFORM_SYSTEM.as_ref()
+            "{RUNTIME_NAME}/{RUNTIME_VERSION} ({})",
+            RUNTIME_SYSTEM.as_ref()
         )?;
 
         Ok(())
@@ -185,7 +186,7 @@ fn get_os_version_internal() -> Result<String, GenericError> {
 }
 
 #[must_use]
-fn get_platform_os_string() -> String {
+fn get_runtime_os_string() -> String {
     let os_type = os_type();
     let os_version = get_os_version_internal()
         .unwrap_or_else(|_| "unknown".to_string())

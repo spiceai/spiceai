@@ -145,11 +145,11 @@ impl RequestContextBuilder {
     pub fn build(self) -> RequestContext {
         let mut dimensions = vec![];
 
-        let add_platform_dimensions = |dimensions: &mut Vec<KeyValue>| {
-            dimensions.push(KeyValue::new("platform", super::PLATFORM_NAME));
-            dimensions.push(KeyValue::new("platform_version", super::PLATFORM_VERSION));
+        let add_runtime_dimensions = |dimensions: &mut Vec<KeyValue>| {
+            dimensions.push(KeyValue::new("runtime", super::PLATFORM_NAME));
+            dimensions.push(KeyValue::new("runtime_version", super::PLATFORM_VERSION));
             dimensions.push(KeyValue::new(
-                "platform_system",
+                "runtime_system",
                 super::PLATFORM_SYSTEM.to_string(),
             ));
         };
