@@ -474,6 +474,11 @@ fn json_array_to_jsonl(json_array_str: &str) -> Result<String, Box<dyn std::erro
     Ok(jsonl_str)
 }
 
+/// Returns a boolean indicating if a message needs truncation, from a given input of lines.
+fn lines_need_truncation(lines: &[&str]) -> bool {
+    lines.iter().any(|line| line.len() > 120)
+}
+
 fn display_grpc_error(err: &Status) {
     let (error_type, user_err_msg) = match err.code() {
         Code::Ok => return,
@@ -482,14 +487,9 @@ fn display_grpc_error(err: &Status) {
             "An unexpected internal error occurred. Execute '.error' for details.".to_string(),
         ),
         Code::InvalidArgument | Code::AlreadyExists | Code::NotFound | Code::Unavailable => {
-            // let message = err.message().split('\n').next().unwrap_or(err.message());
             let message = err.message();
             let lines = message.split('\n').collect::<Vec<_>>();
-            let truncate = !lines
-                .iter()
-                .filter(|line| line.len() > 120)
-                .collect::<Vec<_>>()
-                .is_empty();
+            let truncate = lines_need_truncation(&lines);
 
             let first_line = lines.first().unwrap_or(&message);
             match (truncate, lines.len() > 1) {
