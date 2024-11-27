@@ -82,7 +82,11 @@ jobs:
           NIGHTLY_LABEL: ${{ needs.setup.outputs.nightly_label }}
         run: |
           current_version=$(grep '^version =' Cargo.toml | sed -E 's/version = "(.*)"/\1/')
-          new_version="${current_version}.$NIGHTLY_LABEL"
+          if [[ "$current_version" =~ -[a-zA-Z0-9]+(\.[0-9]+)*$ ]]; then
+            new_version="${current_version}.$NIGHTLY_LABEL"
+          else
+            new_version="${current_version}-$NIGHTLY_LABEL"
+          fi
           sed -i "s/^version = \".*\"/version = \"${new_version}\"/" Cargo.toml
           grep '^version =' Cargo.toml
 
@@ -143,7 +147,11 @@ jobs:
           NIGHTLY_LABEL: ${{ needs.setup.outputs.nightly_label }}
         run: |
           current_version=$(grep '^version =' Cargo.toml | sed -E 's/version = "(.*)"/\1/')
-          new_version="${current_version}.$NIGHTLY_LABEL"
+          if [[ "$current_version" =~ -[a-zA-Z0-9]+(\.[0-9]+)*$ ]]; then
+            new_version="${current_version}.$NIGHTLY_LABEL"
+          else
+            new_version="${current_version}-$NIGHTLY_LABEL"
+          fi
           sed -i "s/^version = \".*\"/version = \"${new_version}\"/" Cargo.toml
           grep '^version =' Cargo.toml
 
