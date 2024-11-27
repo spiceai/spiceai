@@ -157,9 +157,6 @@ async fn databricks_odbc_with_acceleration() -> Result<(), String> {
                         let query_result = rt
                             .datafusion()
                             .query_builder("SELECT * FROM line LIMIT 10")
-                            .with_telemetry_context(crate::get_telemetry_context(&format!(
-                                "databricks_odbc_{engine}"
-                            )))
                             .build()
                             .run()
                             .await
