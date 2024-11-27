@@ -33,6 +33,7 @@ use datafusion::dataframe::DataFrame;
 use datafusion::datasource::{provider_as_source, MemTable};
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::{LogicalPlanBuilder, UNNAMED_TABLE};
+use flight_client::TonicStatusError;
 use futures::{StreamExt, TryStreamExt};
 use llms::chat::LlmRuntime;
 use prost::Message;
@@ -231,7 +232,10 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
             ".exit" | "exit" | "quit" | "q" => break,
             ".error" => {
                 match last_error {
-                    Some(ref err) => println!("{err:?}"),
+                    Some(ref err) => {
+                        let err = TonicStatusError::from(err.clone());
+                        println!("{err}");
+                    },
                     None => println!("No error to display"),
                 }
                 continue;
@@ -470,6 +474,11 @@ fn json_array_to_jsonl(json_array_str: &str) -> Result<String, Box<dyn std::erro
     Ok(jsonl_str)
 }
 
+/// Returns a boolean indicating if a message needs truncation, from a given input of lines.
+fn lines_need_truncation(lines: &[&str]) -> bool {
+    lines.iter().any(|line| line.len() > 120)
+}
+
 fn display_grpc_error(err: &Status) {
     let (error_type, user_err_msg) = match err.code() {
         Code::Ok => return,
@@ -478,17 +487,22 @@ fn display_grpc_error(err: &Status) {
             "An unexpected internal error occurred. Execute '.error' for details.".to_string(),
         ),
         Code::InvalidArgument | Code::AlreadyExists | Code::NotFound | Code::Unavailable => {
-            let mut lines = err.message().split('\n');
-            let first_line = lines.next().unwrap_or_default();
-            let has_more_lines = lines.next().is_some();
+            let message = err.message();
+            let lines = message.split('\n').collect::<Vec<_>>();
+            let truncate = lines_need_truncation(&lines);
 
-            let message = if has_more_lines {
-                format!("{first_line} Execute '.error' for details.")
-            } else {
-                first_line.to_string()
-            };
-
-            ("Query Error", message)
+            let first_line = lines.first().unwrap_or(&message);
+            match (truncate, lines.len() > 1) {
+                (true, true) => {
+                    // truncating due to length, and multiple error lines
+                    ("Query Error", format!("{first_line}\nThis error message has been truncated.\nFor the full error message, execute `.error`."))
+                }
+                (true, false) => {
+                    // truncating due to length, but only one line
+                    ("Query Error", "Failed to execute query.\nThis error message has been truncated.\nFor the full error message, execute `.error`.".to_string())
+                }
+                _ => ("Query Error", message.to_string()),
+            }
         }
         Code::Cancelled => (
             "Cancelled",
@@ -527,5 +541,8 @@ fn display_grpc_error(err: &Status) {
         ),
     };
 
-    println!("{} {user_err_msg}", Colour::Red.paint(error_type));
+    println!(
+        "{} {user_err_msg}",
+        Colour::Red.paint(format!("{error_type}:"))
+    );
 }

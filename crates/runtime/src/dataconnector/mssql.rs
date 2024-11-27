@@ -22,7 +22,6 @@ use data_components::mssql::{
 };
 use datafusion::datasource::TableProvider;
 use snafu::{ResultExt, Snafu};
-use std::num::ParseIntError;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::{any::Any, future::Future};
@@ -35,17 +34,20 @@ use super::{
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Missing required parameter: '{parameter}'"))]
+    #[snafu(display("Missing required parameter: '{parameter}'. Specify a value.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/mssql#configuration"))]
     MissingParameter { parameter: String },
 
-    #[snafu(display("Unable to create MS SQL Server connection pool: {source}"))]
+    #[snafu(display("Failed to connect to the MS SQL Server.\nVerify your connection configuration, and try again.\n{source}"))]
     UnableToCreateConnectionPool { source: mssql::Error },
 
-    #[snafu(display("Invalid connection string: {source}"))]
+    #[snafu(display("Invalid connection string.\nVerify the connection string is valid, and try again.\n{source}"))]
     InvalidConnectionStringError { source: tiberius::error::Error },
 
-    #[snafu(display("Invalid paramer '{parameter}': {reason}"))]
-    InvalidParamValueError { parameter: String, reason: String },
+    #[snafu(display("Invalid value provided for the 'port' parameter: {port}.\nSpecify a valid port, and try again.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/mssql#configuration"))]
+    FailedToParsePort { port: String },
+
+    #[snafu(display("Invalid value provided for parameter '{parameter}'\nSpecify a valid value, and try again.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/mssql#configuration"))]
+    InvalidParameterValue { parameter: String },
 }
 
 const PARAMETERS: &[ParameterSpec] = &[
@@ -91,10 +93,9 @@ impl SqlServer {
             );
 
             if let Some(port_str) = params.get("port").expose().ok() {
-                let port = port_str.parse::<u16>().map_err(|e: ParseIntError| {
-                    InvalidParamValueSnafu {
-                        parameter: "port".to_string(),
-                        reason: e.to_string(),
+                let port = port_str.parse::<u16>().map_err(|_| {
+                    FailedToParsePortSnafu {
+                        port: port_str.to_string(),
                     }
                     .build()
                 })?;
@@ -113,9 +114,8 @@ impl SqlServer {
                     "false" | "disable" => {
                         config.encryption(EncryptionLevel::Off);
                     }
-                    _ => InvalidParamValueSnafu {
+                    _ => InvalidParameterValueSnafu {
                         parameter: "encrypt",
-                        reason: format!("unknown value '{val}'"),
                     }
                     .fail()?,
                 }
@@ -129,9 +129,8 @@ impl SqlServer {
                         config.trust_cert();
                     }
                     "false" => (),
-                    _ => InvalidParamValueSnafu {
+                    _ => InvalidParameterValueSnafu {
                         parameter: "trust_server_certificate",
-                        reason: format!("unknown value '{val}'"),
                     }
                     .fail()?,
                 }

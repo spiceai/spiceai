@@ -41,16 +41,16 @@ use std::sync::Arc;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Missing required parameter: {parameter}"))]
+    #[snafu(display("Missing required parameter: {parameter}. Specify a value.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/dremio#configuration"))]
     MissingParameter { parameter: String },
 
-    #[snafu(display(r#"Unable to connect to endpoint "{endpoint}": {source}"#))]
+    #[snafu(display("Failed to connect to endpoint '{endpoint}'.\nVerify the endpoint is valid/online, and try again.\n{source}"))]
     UnableToVerifyEndpointConnection {
         source: ns_lookup::Error,
         endpoint: Arc<str>,
     },
 
-    #[snafu(display("Unable to create flight client: {source}"))]
+    #[snafu(display("Failed to connect to Dremio over Flight.\nVerify your connection configuration, and try again.\n{source}"))]
     UnableToCreateFlightClient { source: flight_client::Error },
 }
 
