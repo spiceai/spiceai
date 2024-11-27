@@ -9353,6 +9353,7 @@ dependencies = [
  "url",
  "util",
  "uuid 1.11.0",
+ "winver",
  "x509-certificate",
 ]
 

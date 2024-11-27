@@ -192,3 +192,6 @@ sqlite = [
 [[bench]]
 harness = false
 name = "bench"
+
+[target.'cfg(windows)'.dependencies]
+winver = "1.0.0"
