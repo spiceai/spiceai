@@ -25,6 +25,7 @@ use ::datafusion::sql::{sqlparser, TableReference};
 use app::App;
 use builder::RuntimeBuilder;
 use config::Config;
+use dataconnector::ConnectorComponent;
 use datasets_health_monitor::DatasetsHealthMonitor;
 use extension::ExtensionFactory;
 use model::{EmbeddingModelStore, LLMModelStore};
@@ -147,9 +148,10 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Unable to attach data connector {data_connector}: {source}"))]
+    #[snafu(display("Failed to setup the {connector_component} ({data_connector}).\n{source}"))]
     UnableToAttachDataConnector {
         source: datafusion::Error,
+        connector_component: ConnectorComponent,
         data_connector: String,
     },
 

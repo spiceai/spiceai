@@ -23,7 +23,7 @@ use crate::{
     dataconnector::{
         self,
         localpod::{LocalPodConnector, LOCALPOD_DATACONNECTOR},
-        DataConnector, DataConnectorParams, DataConnectorParamsBuilder,
+        ConnectorComponent, DataConnector, DataConnectorParams, DataConnectorParamsBuilder,
     },
     embeddings::connector::EmbeddingConnector,
     federated_table::FederatedTable,
@@ -336,6 +336,7 @@ impl Runtime {
                 metrics::datasets::LOAD_ERROR.add(1, &[]);
                 if let Error::UnableToAttachDataConnector {
                     source: crate::datafusion::Error::RefreshSql { source },
+                    connector_component: _,
                     data_connector: _,
                 } = &err
                 {
@@ -525,7 +526,7 @@ impl Runtime {
             let ds_name: TableReference = ds.name.clone();
             self.df
                 .register_table(
-                    ds,
+                    Arc::clone(&ds),
                     crate::datafusion::Table::Federated {
                         data_connector,
                         federated_read_table,
@@ -534,6 +535,7 @@ impl Runtime {
                 .await
                 .context(UnableToAttachDataConnectorSnafu {
                     data_connector: source,
+                    connector_component: ConnectorComponent::from(&ds),
                 })?;
 
             self.status
@@ -565,7 +567,7 @@ impl Runtime {
             .update_dataset(&ds.name, status::ComponentStatus::Refreshing);
         self.df
             .register_table(
-                ds,
+                Arc::clone(&ds),
                 crate::datafusion::Table::Accelerated {
                     source: data_connector,
                     federated_read_table,
@@ -576,6 +578,7 @@ impl Runtime {
             .await
             .context(UnableToAttachDataConnectorSnafu {
                 data_connector: source,
+                connector_component: ConnectorComponent::from(&ds),
             })
     }
 
