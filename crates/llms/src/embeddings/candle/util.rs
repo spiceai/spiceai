@@ -111,17 +111,21 @@ fn get_api(model_id: &str, revision: Option<&str>, hf_token: Option<String>) -> 
 pub fn download_hf_file(
     repo_id: &str,
     revision: Option<&str>,
-    repo_type_opt: Option<RepoType>,
+    repo_type_opt: Option<&str>,
     file: &str,
-    hf_token: Option<String>,
+    hf_token: Option<&str>,
 ) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
     let api = ApiBuilder::new()
         .with_progress(false)
-        .with_token(hf_token)
+        .with_token(hf_token.map(ToString::to_string))
         .build()
         .boxed()?;
 
-    let repo_type = repo_type_opt.unwrap_or(RepoType::Model);
+    let repo_type = match repo_type_opt {
+        Some("datasets") => RepoType::Dataset,
+        Some("spaces") => RepoType::Space,
+        _ => RepoType::Model,
+    };
 
     let repo = if let Some(revision) = revision {
         Repo::with_revision(repo_id.to_string(), repo_type, revision.to_string())

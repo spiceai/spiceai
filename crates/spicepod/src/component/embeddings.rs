@@ -86,10 +86,17 @@ impl Embeddings {
     /// Finds at most one model file with the given [`ModelFileType`].
     #[must_use]
     pub fn find_any_file_path(&self, file_type: ModelFileType) -> Option<String> {
+        self.find_any_file(file_type)
+            .map(|model_file| model_file.path)
+    }
+
+    /// Finds at most one model file with the given [`ModelFileType`].
+    #[must_use]
+    pub fn find_any_file(&self, file_type: ModelFileType) -> Option<ModelFile> {
         self.files
             .iter()
             .find(|f| f.file_type() == Some(file_type))
-            .map(|f| f.path.clone())
+            .cloned()
     }
 
     /// Get the model id from the `from` field. The model id is the part of the `from` field after the prefix.
