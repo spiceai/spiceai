@@ -165,6 +165,6 @@ fn trace_query(
         .map(ToString::to_string)
         .collect::<Vec<String>>()
         .join(",");
-    tracing::info!(target: "task_history", protocol = ?request_context.protocol, datasets = datasets_str, "labels");
+    tracing::info!(target: "task_history", protocol = ?request_context.protocol(), datasets = datasets_str, "labels");
     tracing::info!(target: "task_history", captured_output = %captured_output);
 }

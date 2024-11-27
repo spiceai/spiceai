@@ -23,15 +23,9 @@ use arrow_flight::{
 };
 use prost::Message;
 use tonic::{Request, Response, Status};
-use util::user_agent::SpiceUserAgent;
 
 use crate::{
-    datafusion::query::Protocol,
-    flight::{
-        metrics,
-        util::{attach_cache_metadata, extract_flight_user_agent},
-    },
-    metrics::telemetry::TelemetryContext,
+    flight::{metrics, util::attach_cache_metadata},
     timing::TimedStream,
 };
 
@@ -41,46 +35,37 @@ pub(crate) async fn handle(
     flight_svc: &Service,
     request: Request<Ticket>,
 ) -> Result<Response<<Service as FlightService>::DoGetStream>, Status> {
-    let user_agent = if flight_svc.user_agent_collection_state.is_enabled() {
-        Some(extract_flight_user_agent(&request))
-    } else {
-        None
-    };
-
     let msg: Any = match Message::decode(&*request.get_ref().ticket) {
         Ok(msg) => msg,
-        Err(_) => return Box::pin(do_get_simple(flight_svc, request, user_agent)).await,
+        Err(_) => return Box::pin(do_get_simple(flight_svc, request)).await,
     };
 
     match Command::try_from(msg).map_err(to_tonic_err)? {
         Command::CommandStatementQuery(command) => {
-            Box::pin(flightsql::statement_query::do_get(
-                flight_svc, command, user_agent,
-            ))
-            .await
+            Box::pin(flightsql::statement_query::do_get(flight_svc, command)).await
         }
         Command::CommandPreparedStatementQuery(command) => {
             Box::pin(flightsql::prepared_statement_query::do_get(
-                flight_svc, command, user_agent,
+                flight_svc, command,
             ))
             .await
         }
         Command::CommandGetCatalogs(command) => {
-            flightsql::get_catalogs::do_get(flight_svc, command)
+            flightsql::get_catalogs::do_get(flight_svc, command).await
         }
         Command::CommandGetDbSchemas(command) => {
-            flightsql::get_schemas::do_get(flight_svc, command)
+            flightsql::get_schemas::do_get(flight_svc, command).await
         }
         Command::CommandGetTables(command) => {
             flightsql::get_tables::do_get(flight_svc, command).await
         }
         Command::CommandGetPrimaryKeys(command) => {
-            flightsql::get_primary_keys::do_get(flight_svc, &command)
+            flightsql::get_primary_keys::do_get(flight_svc, &command).await
         }
-        Command::CommandGetTableTypes(command) => flightsql::get_table_types::do_get(command),
-        Command::CommandGetSqlInfo(command) => flightsql::get_sql_info::do_get(command),
+        Command::CommandGetTableTypes(command) => flightsql::get_table_types::do_get(command).await,
+        Command::CommandGetSqlInfo(command) => flightsql::get_sql_info::do_get(command).await,
         _ => {
-            let _start = metrics::track_flight_request("do_get", None);
+            let _start = metrics::track_flight_request("do_get", None).await;
             Err(Status::unimplemented("Not yet implemented"))
         }
     }
@@ -89,25 +74,15 @@ pub(crate) async fn handle(
 async fn do_get_simple(
     flight_svc: &Service,
     request: Request<Ticket>,
-    user_agent: Option<SpiceUserAgent>,
 ) -> Result<Response<<Service as FlightService>::DoGetStream>, Status> {
-    let telemetry_context = TelemetryContext {
-        protocol: Protocol::Flight,
-        user_agent,
-    };
-
-    let start = metrics::track_flight_request("do_get", Some("sql_query"));
+    let start = metrics::track_flight_request("do_get", Some("sql_query")).await;
     let datafusion = Arc::clone(&flight_svc.datafusion);
     let ticket = request.into_inner();
     tracing::trace!("do_get_simple: {ticket:?}");
     match std::str::from_utf8(&ticket.ticket) {
         Ok(sql) => {
-            let (output, from_cache) = Box::pin(Service::sql_to_flight_stream(
-                datafusion,
-                sql,
-                telemetry_context,
-            ))
-            .await?;
+            let (output, from_cache) =
+                Box::pin(Service::sql_to_flight_stream(datafusion, sql)).await?;
 
             let timed_output = TimedStream::new(output, move || start);
 

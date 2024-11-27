@@ -142,7 +142,7 @@ async fn track_metrics(
         KeyValue::new("status", status),
     ];
 
-    labels.extend(request_dimensions.into_iter().cloned());
+    labels.extend(request_dimensions.into_iter());
 
     metrics::REQUESTS_TOTAL.add(1, &labels);
     metrics::REQUESTS_DURATION_MS.record(latency_ms, &labels);

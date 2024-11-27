@@ -22,24 +22,17 @@ use arrow_flight::{
 };
 use prost::Message;
 use tonic::{Request, Response, Status};
-use util::user_agent::SpiceUserAgent;
 
-use crate::{datafusion::query::Protocol, flight::metrics, metrics::telemetry::TelemetryContext};
+use crate::flight::metrics;
 
-use super::{flightsql, to_tonic_err, util::extract_flight_user_agent, Service};
+use super::{flightsql, to_tonic_err, Service};
 
 pub(crate) async fn handle(
     flight_svc: &Service,
     request: Request<FlightDescriptor>,
 ) -> Result<Response<FlightInfo>, Status> {
-    let user_agent = if flight_svc.user_agent_collection_state.is_enabled() {
-        Some(extract_flight_user_agent(&request))
-    } else {
-        None
-    };
-
     let Ok(message) = Any::decode(&*request.get_ref().cmd) else {
-        return get_flight_info_simple(flight_svc, request, user_agent).await;
+        return get_flight_info_simple(flight_svc, request).await;
     };
 
     match Command::try_from(message).map_err(to_tonic_err)? {
@@ -47,31 +40,28 @@ pub(crate) async fn handle(
             flightsql::statement_query::get_flight_info(flight_svc, token, request).await
         }
         Command::CommandPreparedStatementQuery(handle) => {
-            flightsql::prepared_statement_query::get_flight_info(
-                flight_svc, handle, request, user_agent,
-            )
-            .await
+            flightsql::prepared_statement_query::get_flight_info(flight_svc, handle, request).await
         }
         Command::CommandGetCatalogs(token) => {
-            Ok(flightsql::get_catalogs::get_flight_info(token, request))
+            Ok(flightsql::get_catalogs::get_flight_info(token, request).await)
         }
         Command::CommandGetDbSchemas(token) => {
-            Ok(flightsql::get_schemas::get_flight_info(&token, request))
+            Ok(flightsql::get_schemas::get_flight_info(&token, request).await)
         }
         Command::CommandGetTables(token) => {
-            Ok(flightsql::get_tables::get_flight_info(&token, request))
+            Ok(flightsql::get_tables::get_flight_info(&token, request).await)
         }
         Command::CommandGetSqlInfo(token) => {
-            flightsql::get_sql_info::get_flight_info(&token, request)
+            flightsql::get_sql_info::get_flight_info(&token, request).await
         }
         Command::CommandGetTableTypes(token) => {
-            Ok(flightsql::get_table_types::get_flight_info(token, request))
+            Ok(flightsql::get_table_types::get_flight_info(token, request).await)
         }
-        Command::CommandGetPrimaryKeys(token) => Ok(flightsql::get_primary_keys::get_flight_info(
-            &token, request,
-        )),
+        Command::CommandGetPrimaryKeys(token) => {
+            Ok(flightsql::get_primary_keys::get_flight_info(&token, request).await)
+        }
         _ => {
-            let _start = metrics::track_flight_request("get_flight_info", None);
+            let _start = metrics::track_flight_request("get_flight_info", None).await;
             Err(Status::unimplemented("Not yet implemented"))
         }
     }
@@ -80,23 +70,16 @@ pub(crate) async fn handle(
 async fn get_flight_info_simple(
     flight_svc: &Service,
     request: Request<FlightDescriptor>,
-    user_agent: Option<SpiceUserAgent>,
 ) -> Result<Response<FlightInfo>, Status> {
-    let telemetry_context = TelemetryContext {
-        protocol: Protocol::Flight,
-        user_agent,
-    };
-
     tracing::trace!("get_flight_info_simple: {request:?}");
-    let _start = metrics::track_flight_request("get_flight_info", Some("sql_query"));
+    let _start = metrics::track_flight_request("get_flight_info", Some("sql_query")).await;
 
     let fd = request.into_inner();
 
     let sql: &str = std::str::from_utf8(&fd.cmd).map_err(to_tonic_err)?;
-    let arrow_schema =
-        Service::get_arrow_schema(Arc::clone(&flight_svc.datafusion), sql, telemetry_context)
-            .await
-            .map_err(to_tonic_err)?;
+    let arrow_schema = Service::get_arrow_schema(Arc::clone(&flight_svc.datafusion), sql)
+        .await
+        .map_err(to_tonic_err)?;
 
     let info = FlightInfo {
         flight_descriptor: Some(fd.clone()),

@@ -17,10 +17,13 @@ limitations under the License.
 use arrow_flight::flight_service_server::FlightService;
 use tonic::{
     metadata::{Ascii, MetadataValue},
-    Request, Response,
+    Response,
 };
 
-use crate::flight::Service;
+use crate::{
+    flight::Service,
+    request::{AsyncMarker, Protocol, RequestContext},
+};
 
 pub fn attach_cache_metadata(
     response: &mut Response<<Service as FlightService>::DoGetStream>,
@@ -43,23 +46,7 @@ pub fn attach_cache_metadata(
     }
 }
 
-pub fn extract_flight_user_agent<T>(request: &Request<T>) -> SpiceUserAgent {
-    let user_agent_string = request
-        .metadata()
-        .get("user-agent")
-        .map(|ua| ua.to_str().unwrap_or(""))
-        .unwrap_or_default()
-        .to_string();
-
-    let mut user_agent = SpiceUserAgent::try_from(user_agent_string).unwrap_or_else(|_| {
-        SpiceUserAgent::default()
-            .with_client_name("Flight")
-            .with_client_version("1.0")
-            .with_client_system("gRPC")
-    });
-
-    if user_agent.client_system.is_none() {
-        user_agent = user_agent.with_client_system("gRPC");
-    }
-    user_agent
+pub(crate) async fn set_flightsql_protocol() {
+    let request_context = RequestContext::current(AsyncMarker::new().await);
+    request_context.update_protocol(Protocol::FlightSQL);
 }

@@ -23,11 +23,7 @@ use arrow_ipc::writer::IpcWriteOptions;
 use datafusion::sql::TableReference;
 use tonic::{Request, Response, Status};
 
-use crate::{
-    datafusion::query::Protocol,
-    flight::{metrics, util::extract_flight_user_agent},
-    metrics::telemetry::TelemetryContext,
-};
+use crate::flight::metrics;
 
 use super::{to_tonic_err, Service};
 
@@ -35,16 +31,7 @@ pub(crate) async fn handle(
     flight_svc: &Service,
     request: Request<FlightDescriptor>,
 ) -> Result<Response<SchemaResult>, Status> {
-    let user_agent = if flight_svc.user_agent_collection_state.is_enabled() {
-        Some(extract_flight_user_agent(&request))
-    } else {
-        None
-    };
-    let telemetry_context = TelemetryContext {
-        protocol: Protocol::Flight,
-        user_agent,
-    };
-    let _start = metrics::track_flight_request("get_schema", None);
+    let _start = metrics::track_flight_request("get_schema", None).await;
     tracing::trace!("get_schema: {request:?}");
 
     let fd = request.into_inner();
@@ -52,13 +39,9 @@ pub(crate) async fn handle(
     match fd.r#type {
         x if x == DescriptorType::Cmd as i32 => {
             let sql: &str = std::str::from_utf8(&fd.cmd).map_err(to_tonic_err)?;
-            let arrow_schema = Service::get_arrow_schema(
-                Arc::clone(&flight_svc.datafusion),
-                sql,
-                telemetry_context,
-            )
-            .await
-            .map_err(to_tonic_err)?;
+            let arrow_schema = Service::get_arrow_schema(Arc::clone(&flight_svc.datafusion), sql)
+                .await
+                .map_err(to_tonic_err)?;
             let options = IpcWriteOptions::default();
             let IpcMessage(schema) = SchemaAsIpc::new(&arrow_schema, &options)
                 .try_into()

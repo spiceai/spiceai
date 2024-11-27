@@ -60,8 +60,8 @@ impl Display for ActionType {
     }
 }
 
-pub(crate) fn list() -> Response<<Service as FlightService>::ListActionsStream> {
-    let start = metrics::track_flight_request("list_actions", None);
+pub(crate) async fn list() -> Response<<Service as FlightService>::ListActionsStream> {
+    let start = metrics::track_flight_request("list_actions", None).await;
     tracing::trace!("list_actions");
     let create_prepared_statement_action_type = FlightActionType {
         r#type: ActionType::CreatePreparedStatement.to_string(),
@@ -91,17 +91,10 @@ pub(crate) async fn do_action(
     flight_svc: &Service,
     request: Request<Action>,
 ) -> Result<Response<<Service as FlightService>::DoActionStream>, Status> {
-    let user_agent = request
-        .metadata()
-        .get("user-agent")
-        .map(|ua| ua.to_str().unwrap_or(""))
-        .unwrap_or_default()
-        .to_string();
-
     let action_type = ActionType::from_str(request.get_ref().r#type.as_str());
 
     let action_type_str = action_type.as_str().to_string();
-    let start = metrics::track_flight_request("do_action", Some(&action_type_str));
+    let start = metrics::track_flight_request("do_action", Some(&action_type_str)).await;
 
     let stream = match action_type {
         ActionType::CreatePreparedStatement => {
@@ -114,10 +107,9 @@ pub(crate) async fn do_action(
                         "Unable to unpack ActionCreatePreparedStatementRequest.",
                     )
                 })?;
-            let stmt = prepared_statement_query::do_action_create_prepared_statement(
-                flight_svc, cmd, user_agent,
-            )
-            .await?;
+            let stmt =
+                prepared_statement_query::do_action_create_prepared_statement(flight_svc, cmd)
+                    .await?;
             futures::stream::iter(vec![Ok(arrow_flight::Result {
                 body: stmt.as_any().encode_to_vec().into(),
             })])

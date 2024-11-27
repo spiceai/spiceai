@@ -35,6 +35,7 @@ use datafusion::sql::TableReference;
 use futures::stream::{self, BoxStream, StreamExt};
 use futures::{Stream, TryStreamExt};
 use metrics::track_flight_request;
+use middleware::RequestContextLayer;
 use runtime_auth::{layer::flight::BasicAuthLayer, FlightBasicAuth};
 use secrecy::ExposeSecret;
 use snafu::prelude::*;
@@ -54,6 +55,7 @@ mod get_flight_info;
 mod get_schema;
 mod handshake;
 mod metrics;
+mod middleware;
 mod util;
 
 use arrow_flight::{
@@ -63,7 +65,6 @@ use arrow_flight::{
 };
 
 pub struct Service {
-    app: Option<Arc<App>>,
     datafusion: Arc<DataFusion>,
     channel_map: Arc<RwLock<HashMap<TableReference, Arc<Sender<DataUpdate>>>>>,
     basic_auth: Option<Arc<dyn FlightBasicAuth + Send + Sync>>,
@@ -83,14 +84,14 @@ impl FlightService for Service {
         &self,
         request: Request<Streaming<HandshakeRequest>>,
     ) -> Result<Response<Self::HandshakeStream>, Status> {
-        handshake::handle(request.metadata(), self.basic_auth.as_ref())
+        handshake::handle(request.metadata(), self.basic_auth.as_ref()).await
     }
 
     async fn list_flights(
         &self,
         _request: Request<Criteria>,
     ) -> Result<Response<Self::ListFlightsStream>, Status> {
-        let _start = track_flight_request("list_flights", None);
+        let _start = track_flight_request("list_flights", None).await;
         tracing::trace!("list_flights - unimplemented");
         Err(Status::unimplemented("Not yet implemented"))
     }
@@ -106,7 +107,7 @@ impl FlightService for Service {
         &self,
         _request: Request<FlightDescriptor>,
     ) -> Result<Response<PollInfo>, Status> {
-        let _start = track_flight_request("poll_flight_info", None);
+        let _start = track_flight_request("poll_flight_info", None).await;
         Err(Status::unimplemented("Not yet implemented"))
     }
 
@@ -149,7 +150,7 @@ impl FlightService for Service {
         &self,
         _request: Request<arrow_flight::Empty>,
     ) -> Result<Response<Self::ListActionsStream>, Status> {
-        Ok(actions::list())
+        Ok(actions::list().await)
     }
 }
 
@@ -321,7 +322,6 @@ pub async fn start(
     endpoint_auth: EndpointAuth,
 ) -> Result<()> {
     let service = Service {
-        app,
         datafusion: Arc::clone(&df),
         channel_map: Arc::new(RwLock::new(HashMap::new())),
         basic_auth: endpoint_auth.flight_basic_auth.as_ref().map(Arc::clone),
@@ -349,6 +349,7 @@ pub async fn start(
 
     server
         .layer(auth_layer)
+        .layer(RequestContextLayer::new(app))
         .add_service(svc)
         .serve(bind_address)
         .await

@@ -96,7 +96,7 @@ impl Query {
     #[allow(clippy::too_many_lines)]
     pub async fn run(self) -> Result<QueryResult> {
         let request_context = RequestContext::current(AsyncMarker::new().await);
-        crate::metrics::telemetry::track_query_count(request_context.to_dimensions());
+        crate::metrics::telemetry::track_query_count(&request_context.to_dimensions());
 
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "sql_query", input = %self.sql, runtime_query = false);
         let inner_span = span.clone();
@@ -388,7 +388,7 @@ fn attach_query_tracker_to_stream(
             }
         }
 
-        crate::metrics::telemetry::track_bytes_returned(num_output_bytes, request_context.to_dimensions());
+        crate::metrics::telemetry::track_bytes_returned(num_output_bytes, &request_context.to_dimensions());
 
         tracker
             .schema(schema_copy)

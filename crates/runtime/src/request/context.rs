@@ -17,7 +17,7 @@ limitations under the License.
 use std::{
     future::Future,
     marker::PhantomData,
-    sync::{Arc, LazyLock},
+    sync::{atomic::AtomicU8, Arc, LazyLock},
 };
 
 use app::App;
@@ -28,7 +28,8 @@ use spicepod::component::runtime::UserAgentCollection;
 use super::{Protocol, UserAgent};
 
 pub struct RequestContext {
-    pub(crate) protocol: Protocol,
+    // Use an AtomicU8 to allow updating the protocol without locking
+    protocol: AtomicU8,
     dimensions: Vec<KeyValue>,
 }
 
@@ -90,8 +91,20 @@ impl RequestContext {
     }
 
     #[must_use]
-    pub fn to_dimensions(&self) -> &[KeyValue] {
-        &self.dimensions
+    pub fn to_dimensions(&self) -> Vec<KeyValue> {
+        let mut dimensions = vec![KeyValue::new("protocol", self.protocol.as_str())];
+        dimensions.extend(self.dimensions.into_iter().cloned());
+        dimensions
+    }
+
+    #[must_use]
+    pub fn protocol(&self) -> Protocol {
+        Protocol::from(self.protocol.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    pub fn update_protocol(&self, protocol: Protocol) {
+        self.protocol
+            .store(protocol as u8, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -130,7 +143,7 @@ impl RequestContextBuilder {
     }
 
     pub fn build(self) -> RequestContext {
-        let mut dimensions = vec![KeyValue::new("protocol", self.protocol.as_arc_str())];
+        let mut dimensions = vec![];
 
         let add_platform_dimensions = |dimensions: &mut Vec<KeyValue>| {
             dimensions.push(KeyValue::new("platform", super::PLATFORM_NAME));
@@ -166,7 +179,7 @@ impl RequestContextBuilder {
         }
 
         RequestContext {
-            protocol: self.protocol,
+            protocol: AtomicU8::new(self.protocol as u8),
             dimensions,
         }
     }

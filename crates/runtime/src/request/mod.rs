@@ -14,35 +14,56 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::sync::{Arc, LazyLock};
-
 mod context;
 mod user_agent;
+
+use std::sync::atomic::AtomicU8;
 
 pub use context::*;
 pub use user_agent::*;
 
 #[derive(Debug, Copy, Clone)]
+#[repr(u8)]
 pub enum Protocol {
-    Http,
-    Flight,
-    FlightSQL,
-    Internal,
+    Invalid = 0,
+    Http = 1,
+    Flight = 2,
+    FlightSQL = 3,
+    Internal = 4,
 }
 
-static HTTP: LazyLock<Arc<str>> = LazyLock::new(|| "http".into());
-static FLIGHT: LazyLock<Arc<str>> = LazyLock::new(|| "flight".into());
-static FLIGHTSQL: LazyLock<Arc<str>> = LazyLock::new(|| "flightsql".into());
-static INTERNAL: LazyLock<Arc<str>> = LazyLock::new(|| "internal".into());
+static HTTP: &str = "http";
+static FLIGHT: &str = "flight";
+static FLIGHTSQL: &str = "flightsql";
+static INTERNAL: &str = "internal";
 
 impl Protocol {
     #[must_use]
-    pub fn as_arc_str(&self) -> Arc<str> {
+    pub fn as_str(&self) -> &'static str {
         match self {
-            Protocol::Http => Arc::clone(&HTTP),
-            Protocol::Flight => Arc::clone(&FLIGHT),
-            Protocol::FlightSQL => Arc::clone(&FLIGHTSQL),
-            Protocol::Internal => Arc::clone(&INTERNAL),
+            Protocol::Http => HTTP,
+            Protocol::Flight => FLIGHT,
+            Protocol::FlightSQL => FLIGHTSQL,
+            Protocol::Internal => INTERNAL,
+            Protocol::Invalid => unreachable!(),
+        }
+    }
+}
+
+impl From<AtomicU8> for Protocol {
+    fn from(value: AtomicU8) -> Self {
+        Protocol::from(value.load(std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
+impl From<u8> for Protocol {
+    fn from(value: u8) -> Self {
+        match value {
+            1 => Protocol::Http,
+            2 => Protocol::Flight,
+            3 => Protocol::FlightSQL,
+            4 => Protocol::Internal,
+            _ => Protocol::Invalid,
         }
     }
 }
@@ -50,10 +71,11 @@ impl Protocol {
 impl std::fmt::Display for Protocol {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Protocol::Http => write!(f, "http"),
-            Protocol::Flight => write!(f, "flight"),
-            Protocol::FlightSQL => write!(f, "flightsql"),
-            Protocol::Internal => write!(f, "internal"),
+            Protocol::Http => write!(f, "{HTTP}"),
+            Protocol::Flight => write!(f, "{FLIGHT}"),
+            Protocol::FlightSQL => write!(f, "{FLIGHTSQL}"),
+            Protocol::Internal => write!(f, "{INTERNAL}"),
+            Protocol::Invalid => unreachable!(),
         }
     }
 }
