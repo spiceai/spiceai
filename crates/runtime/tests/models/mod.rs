@@ -360,7 +360,7 @@ async fn sql_to_display(
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let data = rt
         .datafusion()
-        .query_builder(query, Protocol::Internal)
+        .query_builder(query)
         .build()
         .run()
         .await

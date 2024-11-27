@@ -23,7 +23,7 @@ use app::AppBuilder;
 use datafusion::{assert_batches_eq, error::DataFusionError};
 use futures::TryStreamExt;
 use rand::Rng;
-use runtime::{datafusion::error::find_datafusion_root, status, Runtime};
+use runtime::{status, Runtime};
 use spicepod::component::{
     dataset::{
         acceleration::{Acceleration, Mode, OnConflictBehavior, RefreshMode},

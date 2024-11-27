@@ -44,7 +44,7 @@ use crate::{
         send_chat_completions_request, send_embeddings_request, send_nsql_request,
         send_search_request,
     },
-    utils::runtime_ready_check,
+    utils::{runtime_ready_check, test_request_context},
 };
 
 use lazy_static::lazy_static;

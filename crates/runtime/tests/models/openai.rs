@@ -24,7 +24,7 @@ use crate::{
         get_tpcds_dataset, http_post, normalize_chat_completion_response,
         normalize_embeddings_response, normalize_search_response, send_chat_completions_request,
     },
-    utils::{runtime_ready_check, verify_env_secret_exists},
+    utils::{runtime_ready_check, test_request_context, verify_env_secret_exists},
 };
 use app::AppBuilder;
 use async_openai::types::{
@@ -37,7 +37,6 @@ use llms::chat::Chat;
 use opentelemetry_sdk::trace::TracerProvider;
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, CONTENT_TYPE};
 use runtime::datafusion::query::Protocol;
-use runtime::metrics::TelemetryContext;
 use runtime::{auth::EndpointAuth, model::try_to_chat_model, Runtime};
 use serde_json::json;
 use spicepod::component::{
@@ -46,7 +45,6 @@ use spicepod::component::{
 };
 use std::str::FromStr;
 use std::sync::Arc;
-use util::user_agent::SpiceUserAgent;
 
 #[allow(clippy::expect_used)]
 mod nsql {
@@ -435,7 +433,7 @@ async fn openai_test_chat_completion() -> Result<(), anyhow::Error> {
 
         let rt_ref_copy = Arc::clone(&rt);
         tokio::spawn(async move {
-            Box::pin(rt_ref_copy.start_servers(api_config, None, EndpointAuth::no_auth(), false)).await
+            Box::pin(rt_ref_copy.start_servers(api_config, None, EndpointAuth::no_auth())).await
         });
 
         tokio::select! {
