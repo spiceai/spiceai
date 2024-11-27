@@ -28,41 +28,45 @@ use crate::dbconnection::snowflakeconn::SnowflakeConnection;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Missing required secret: {name}"))]
+    #[snafu(display("Missing required secret: {name}. Specify a value.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/snowflake#auth"))]
     MissingRequiredSecret { name: String },
 
-    #[snafu(display("Unable to connect to Snowflake: {source}"))]
+    #[snafu(display("Failed to connect to Snowflake.\nVerify your Snowflake configuration, and try again.\n{source}"))]
     UnableToConnect {
         source: snowflake_api::SnowflakeApiError,
     },
 
-    #[snafu(display("Snowflake authentication failed with error: {source}"))]
+    #[snafu(display(
+        "Failed to authenticate with Snowflake.\nVerify your credentials, and try again.\n{source}"
+    ))]
     UnableToAuthenticate {
         source: snowflake_api::SnowflakeApiError,
     },
 
-    #[snafu(display("Snowflake authentication failed. Validate account and warehouse parameters using the SnowSQL tool."))]
+    #[snafu(display("Failed to authenticate with Snowflake.\nVerify your credentials and warehouse parameters using the SnowSQL tool: https://docs.snowflake.com/en/user-guide/snowsql"))]
     UnableToAuthenticateGeneric {},
 
-    #[snafu(display("Error reading private key file {file_path}: {source}."))]
+    #[snafu(display("Failed to read private key file {file_path}.\nVerify the key file exists with the necessary permissions, and try again.\n{source}"))]
     ErrorReadingPrivateKeyFile {
         source: std::io::Error,
         file_path: String,
     },
 
-    #[snafu(display("Parameter {param_key} has invalid value: {param_value}"))]
+    #[snafu(display("Invalid value for parameter '{param_key}': {param_value}.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/snowflake#parameters"))]
     InvalidParameterValue {
         param_key: String,
         param_value: String,
     },
 
-    #[snafu(display("Unable to parse private key file: {source}"))]
+    #[snafu(display("Failed to parse private key file.\nVerify the file is a private key file, and try again.\n{source}"))]
     UnableToParsePrivateKey { source: pkcs8::der::Error },
 
-    #[snafu(display("Unable to decrypt private key file: {source}. Is the passphrase correct?"))]
+    #[snafu(display(
+        "Unable to decrypt private key file.\nVerify the passphrase, and try again.\n{source}"
+    ))]
     UnableToDecryptPrivateKey { source: pkcs8::Error },
 
-    #[snafu(display("Failed to save decrypted private key content as PEM: {source}"))]
+    #[snafu(display("Failed to save decrypted private key content as PEM.\nVerify filesystem permissions, and try again.\n{source}"))]
     FailedToCreatePem { source: pkcs8::der::Error },
 }
 
