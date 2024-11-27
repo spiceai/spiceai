@@ -137,6 +137,7 @@ async fn get_accelerator(rt: &Runtime, table_name: &str) -> Result<Arc<dyn Table
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn mysql_refresh_retries() -> Result<(), String> {
     test_request_context()
         .scope(async {

@@ -22,7 +22,7 @@ use futures::TryStreamExt;
 use runtime::{datafusion::query::QueryBuilder, status, Runtime};
 use spicepod::component::{dataset::Dataset, params::Params, runtime::ResultsCache};
 
-use crate::{get_test_datafusion, init_tracing};
+use crate::{get_test_datafusion, init_tracing, utils::test_request_context};
 
 fn make_s3_tpch_dataset(name: &str) -> Dataset {
     let mut test_dataset = Dataset::new(
@@ -86,9 +86,7 @@ async fn execute_query_and_check_cache_status(
     query: &str,
     expected_cache_status: Option<bool>,
 ) -> Result<Vec<RecordBatch>, String> {
-    let query = QueryBuilder::new(query, rt.datafusion())
-        .with_telemetry_context(crate::get_telemetry_context("results_cache"))
-        .build();
+    let query = QueryBuilder::new(query, rt.datafusion()).build();
 
     let query_result = query
         .run()

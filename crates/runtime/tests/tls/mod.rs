@@ -113,7 +113,7 @@ async fn test_tls_endpoints() -> Result<(), anyhow::Error> {
             .send()
             .await
             .expect("valid response");
-        assert!(response.status().is_success());
+        assert!(response.status().is_success(), "HTTP health check failed: {}", response.status());
         tracing::info!("HTTP health check passed");
 
         // METRICS

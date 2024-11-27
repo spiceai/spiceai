@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+#![allow(clippy::large_futures)]
+
 use std::sync::Arc;
 
 use arrow::{array::RecordBatch, util::display::FormatOptions};
@@ -23,14 +25,9 @@ use datafusion::{
 };
 use futures::TryStreamExt;
 
-use runtime::{
-    datafusion::{query::Protocol, DataFusion},
-    metrics::TelemetryContext,
-    status, Runtime,
-};
+use runtime::{datafusion::DataFusion, status, Runtime};
 use tracing::subscriber::DefaultGuard;
 use tracing_subscriber::EnvFilter;
-use util::user_agent::SpiceUserAgent;
 mod abfs;
 mod acceleration;
 mod catalog;
@@ -100,18 +97,6 @@ fn init_tracing(default_level: Option<&str>) -> DefaultGuard {
     tracing::subscriber::set_default(subscriber)
 }
 
-fn get_telemetry_context(test_name: &str) -> TelemetryContext {
-    TelemetryContext {
-        protocol: Protocol::Internal,
-        user_agent: Some(
-            SpiceUserAgent::default()
-                .with_client_name("integration-test")
-                .with_client_version_from_cargo()
-                .with_extension("test_name", test_name),
-        ),
-    }
-}
-
 async fn get_tpch_lineitem() -> Result<Vec<RecordBatch>, anyhow::Error> {
     let lineitem_parquet_bytes =
         reqwest::get("https://public-data.spiceai.org/tpch_lineitem.parquet")
@@ -141,7 +126,6 @@ where
     let query_results = rt
         .datafusion()
         .query_builder(&format!("EXPLAIN {query}"))
-        .with_telemetry_context(get_telemetry_context(snapshot_name))
         .build()
         .run()
         .await

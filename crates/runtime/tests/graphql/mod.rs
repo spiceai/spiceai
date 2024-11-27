@@ -28,6 +28,7 @@ use runtime::{status, Runtime};
 use spicepod::component::{dataset::Dataset, params::Params as DatasetParams};
 use tokio::net::TcpListener;
 
+use crate::utils::test_request_context;
 use crate::{get_test_datafusion, init_tracing, run_query_and_check_results, ValidateFn};
 
 type ServiceSchema = Schema<QueryRoot, EmptyMutation, EmptySubscription>;

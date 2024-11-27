@@ -31,8 +31,9 @@ use spicepod::component::dataset::{
 
 use crate::{
     get_test_datafusion, init_tracing, run_query_and_check_results,
-    run_query_and_check_results_with_plan_checks, utils::runtime_ready_check, PlanCheckFn,
-    ValidateFn,
+    run_query_and_check_results_with_plan_checks,
+    utils::{runtime_ready_check, test_request_context},
+    PlanCheckFn, ValidateFn,
 };
 
 fn make_sqlite_decimal_dataset(mode: Mode) -> Dataset {

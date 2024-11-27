@@ -21,6 +21,7 @@ use mysql_async::prelude::Queryable;
 use util::{fibonacci_backoff::FibonacciBackoffBuilder, retry, RetryError};
 
 use crate::init_tracing;
+use crate::utils::test_request_context;
 
 pub mod common;
 

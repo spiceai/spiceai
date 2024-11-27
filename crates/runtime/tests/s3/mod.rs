@@ -21,7 +21,7 @@ use futures::StreamExt;
 use runtime::{status, Runtime};
 use spicepod::component::{dataset::Dataset, params::Params};
 
-use crate::{get_test_datafusion, init_tracing};
+use crate::{get_test_datafusion, init_tracing, utils::test_request_context};
 
 pub fn get_s3_dataset() -> Dataset {
     let mut dataset = Dataset::new("s3://spiceai-demo-datasets/taxi_trips/2024/", "taxi_trips");
@@ -83,7 +83,6 @@ async fn s3_federation() -> Result<(), anyhow::Error> {
             let mut query_result = rt
                 .datafusion()
                 .query_builder("SELECT * FROM taxi_trips LIMIT 10")
-                .with_telemetry_context(crate::get_telemetry_context("s3_federation"))
                 .build()
                 .run()
                 .await
@@ -132,7 +131,6 @@ async fn s3_hive_partitioning() -> Result<(), anyhow::Error> {
             let mut query_result = rt
                 .datafusion()
                 .query_builder("SELECT * FROM hive_data ORDER BY id")
-                .with_telemetry_context(crate::get_telemetry_context("s3_hive_partitioning"))
                 .build()
                 .run()
                 .await
@@ -149,7 +147,6 @@ async fn s3_hive_partitioning() -> Result<(), anyhow::Error> {
             query_result = rt
                 .datafusion()
                 .query_builder("SELECT * FROM hive_data_no_infer ORDER BY id")
-                .with_telemetry_context(crate::get_telemetry_context("s3_hive_partitioning"))
                 .build()
                 .run()
                 .await
