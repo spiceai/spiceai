@@ -44,7 +44,7 @@ use crate::{
         send_chat_completions_request, send_embeddings_request, send_nsql_request,
         send_search_request,
     },
-    utils::runtime_ready_check,
+    utils::{runtime_ready_check, test_request_context},
 };
 
 use lazy_static::lazy_static;
@@ -63,379 +63,397 @@ const HF_TEST_MODEL_TYPE: &str = "phi3";
 async fn huggingface_test_search() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(None);
 
-    let mut ds_tpcds_item = get_tpcds_dataset("item");
-    ds_tpcds_item.embeddings = vec![ColumnEmbeddingConfig {
-        column: "i_item_desc".to_string(),
-        model: "hf_minilm".to_string(),
-        primary_keys: Some(vec!["i_item_sk".to_string()]),
-        chunking: None,
-    }];
+    test_request_context()
+        .scope(async {
+            let mut ds_tpcds_item = get_tpcds_dataset("item");
+            ds_tpcds_item.embeddings = vec![ColumnEmbeddingConfig {
+                column: "i_item_desc".to_string(),
+                model: "hf_minilm".to_string(),
+                primary_keys: Some(vec!["i_item_sk".to_string()]),
+                chunking: None,
+            }];
 
-    let app = AppBuilder::new("text-to-sql")
-        .with_dataset(ds_tpcds_item)
-        .with_embedding(get_huggingface_embeddings(
-            "sentence-transformers/all-MiniLM-L6-v2",
-            "hf_minilm",
-        ))
-        .build();
+            let app = AppBuilder::new("text-to-sql")
+                .with_dataset(ds_tpcds_item)
+                .with_embedding(get_huggingface_embeddings(
+                    "sentence-transformers/all-MiniLM-L6-v2",
+                    "hf_minilm",
+                ))
+                .build();
 
-    let api_config = create_api_bindings_config();
-    let http_base_url = format!("http://{}", api_config.http_bind_address);
+            let api_config = create_api_bindings_config();
+            let http_base_url = format!("http://{}", api_config.http_bind_address);
 
-    let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
 
-    let rt_ref_copy = Arc::clone(&rt);
-    tokio::spawn(async move {
-        Box::pin(rt_ref_copy.start_servers(api_config, None, EndpointAuth::no_auth())).await
-    });
+            let rt_ref_copy = Arc::clone(&rt);
+            tokio::spawn(async move {
+                Box::pin(rt_ref_copy.start_servers(api_config, None, EndpointAuth::no_auth())).await
+            });
 
-    tokio::select! {
-        () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
-            return Err(anyhow::anyhow!("Timed out waiting for components to load"));
-        }
-        () = rt.load_components() => {}
-    }
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for components to load"));
+                }
+                () = rt.load_components() => {}
+            }
 
-    runtime_ready_check(&rt).await;
+            runtime_ready_check(&rt).await;
 
-    tracing::info!("/v1/search: Ensure simple search request succeeds");
-    let response = send_search_request(
-        http_base_url.as_str(),
-        "new patient",
-        Some(2),
-        Some(vec!["item".to_string()]),
-        None,
-        Some(vec!["i_color".to_string(), "i_item_id".to_string()]),
-    )
-    .await?;
+            tracing::info!("/v1/search: Ensure simple search request succeeds");
+            let response = send_search_request(
+                http_base_url.as_str(),
+                "new patient",
+                Some(2),
+                Some(vec!["item".to_string()]),
+                None,
+                Some(vec!["i_color".to_string(), "i_item_id".to_string()]),
+            )
+            .await?;
 
-    insta::assert_snapshot!(format!("search_1"), normalize_search_response(response));
+            insta::assert_snapshot!(format!("search_1"), normalize_search_response(response));
 
-    Ok(())
+            Ok(())
+        })
+        .await
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn huggingface_test_nsql() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(None);
 
-    let app = AppBuilder::new("text-to-sql")
-        .with_dataset(get_taxi_trips_dataset())
-        .with_model(get_huggingface_model(
-            HF_TEST_MODEL,
-            HF_TEST_MODEL_TYPE,
-            "hf_model",
-        ))
-        .build();
+    test_request_context()
+        .scope(async {
+            let app = AppBuilder::new("text-to-sql")
+                .with_dataset(get_taxi_trips_dataset())
+                .with_model(get_huggingface_model(
+                    HF_TEST_MODEL,
+                    HF_TEST_MODEL_TYPE,
+                    "hf_model",
+                ))
+                .build();
 
-    let api_config = create_api_bindings_config();
-    let http_base_url = format!("http://{}", api_config.http_bind_address);
+            let api_config = create_api_bindings_config();
+            let http_base_url = format!("http://{}", api_config.http_bind_address);
 
-    let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
 
-    let (_tracing, trace_provider) = init_tracing_with_task_history(None, &rt);
+            let (_tracing, trace_provider) = init_tracing_with_task_history(None, &rt);
 
-    let rt_ref_copy = Arc::clone(&rt);
-    tokio::spawn(async move {
-        Box::pin(rt_ref_copy.start_servers(api_config, None, EndpointAuth::no_auth())).await
-    });
+            let rt_ref_copy = Arc::clone(&rt);
+            tokio::spawn(async move {
+                Box::pin(rt_ref_copy.start_servers(api_config, None, EndpointAuth::no_auth())).await
+            });
 
-    let llm_init_lock = LOCAL_LLM_INIT_MUTEX.lock().await;
+            let llm_init_lock = LOCAL_LLM_INIT_MUTEX.lock().await;
 
-    tokio::select! {
-        // increased timeout to download and load huggingface model
-        () = tokio::time::sleep(std::time::Duration::from_secs(300)) => {
-            return Err(anyhow::anyhow!("Timed out waiting for components to load"));
-        }
-        () = rt.load_components() => {}
-    }
+            tokio::select! {
+                // increased timeout to download and load huggingface model
+                () = tokio::time::sleep(std::time::Duration::from_secs(300)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for components to load"));
+                }
+                () = rt.load_components() => {}
+            }
 
-    drop(llm_init_lock);
+            drop(llm_init_lock);
 
-    runtime_ready_check(&rt).await;
+            runtime_ready_check(&rt).await;
 
-    tracing::info!("/v1/nsql: Verify nsql request");
-    let task_start_time = std::time::SystemTime::now();
+            tracing::info!("/v1/nsql: Verify nsql request");
+            let task_start_time = std::time::SystemTime::now();
 
-    let response = send_nsql_request(
-        http_base_url.as_str(),
-        "how many records in taxi_trips dataset?",
-        Some("hf_model"),
-        Some(false),
-        None,
-    )
-    .await?;
+            let response = send_nsql_request(
+                http_base_url.as_str(),
+                "how many records in taxi_trips dataset?",
+                Some("hf_model"),
+                Some(false),
+                None,
+            )
+            .await?;
 
-    assert!(
-        json_is_single_row_with_value(&response, 10),
-        "Expected a single record containing the value 10"
-    );
+            assert!(
+                json_is_single_row_with_value(&response, 10),
+                "Expected a single record containing the value 10"
+            );
 
-    // ensure all spans are exported into task_history
-    let _ = trace_provider.force_flush();
+            // ensure all spans are exported into task_history
+            let _ = trace_provider.force_flush();
 
-    let tasks = get_executed_tasks(&rt, task_start_time.into()).await?;
+            let tasks = get_executed_tasks(&rt, task_start_time.into()).await?;
 
-    let table_schema_task = tasks
-        .iter()
-        .find(|t| t.0 == "tool_use::table_schema")
-        .expect("Expected 'tool_use::table_schema' task to be executed");
+            let table_schema_task = tasks
+                .iter()
+                .find(|t| t.0 == "tool_use::table_schema")
+                .expect("Expected 'tool_use::table_schema' task to be executed");
 
-    insta::assert_snapshot!(
-        "nsql_table_schema_task",
-        pretty_json_str(&table_schema_task.1)?
-    );
+            insta::assert_snapshot!(
+                "nsql_table_schema_task",
+                pretty_json_str(&table_schema_task.1)?
+            );
 
-    tracing::info!("/v1/nsql: Verify nsql request with 'sample_data_enabled:true'");
+            tracing::info!("/v1/nsql: Verify nsql request with 'sample_data_enabled:true'");
 
-    let task_start_time = std::time::SystemTime::now();
+            let task_start_time = std::time::SystemTime::now();
 
-    let response = send_nsql_request(
-        http_base_url.as_str(),
-        "how many records in taxi_trips dataset?",
-        Some("hf_model"),
-        Some(true),
-        None,
-    )
-    .await?;
+            let response = send_nsql_request(
+                http_base_url.as_str(),
+                "how many records in taxi_trips dataset?",
+                Some("hf_model"),
+                Some(true),
+                None,
+            )
+            .await?;
 
-    assert!(
-        json_is_single_row_with_value(&response, 10),
-        "Expected a single record containing the value 10"
-    );
+            assert!(
+                json_is_single_row_with_value(&response, 10),
+                "Expected a single record containing the value 10"
+            );
 
-    // ensure all spans are exported into task_history
-    let _ = trace_provider.force_flush();
+            // ensure all spans are exported into task_history
+            let _ = trace_provider.force_flush();
 
-    let tasks = get_executed_tasks(&rt, task_start_time.into()).await?;
+            let tasks = get_executed_tasks(&rt, task_start_time.into()).await?;
 
-    let sample_data_task = tasks
-        .iter()
-        .find(|t| t.0 == "tool_use::sample_data")
-        .expect("Expected 'tool_use::sample_data' task to be executed");
+            let sample_data_task = tasks
+                .iter()
+                .find(|t| t.0 == "tool_use::sample_data")
+                .expect("Expected 'tool_use::sample_data' task to be executed");
 
-    insta::assert_snapshot!("nsql_sample_data_task", sample_data_task.1);
+            insta::assert_snapshot!("nsql_sample_data_task", sample_data_task.1);
 
-    let sql_query_task = tasks
-        .iter()
-        .find(|t| t.0 == "sql_query")
-        .expect("Expected 'sql_query' task to be executed");
+            let sql_query_task = tasks
+                .iter()
+                .find(|t| t.0 == "sql_query")
+                .expect("Expected 'sql_query' task to be executed");
 
-    insta::assert_snapshot!("nsql_sample_data_task_sql_query", sql_query_task.1);
+            insta::assert_snapshot!("nsql_sample_data_task_sql_query", sql_query_task.1);
 
-    tracing::info!("/v1/nsql: Ensure error when invalid dataset name is provided");
-    assert!(send_nsql_request(
-        http_base_url.as_str(),
-        "how many records in taxi_trips dataset?",
-        Some("hf_model"),
-        Some(false),
-        Some(vec!["dataset_not_in_spice".to_string()]),
-    )
-    .await
-    .is_err());
+            tracing::info!("/v1/nsql: Ensure error when invalid dataset name is provided");
+            assert!(send_nsql_request(
+                http_base_url.as_str(),
+                "how many records in taxi_trips dataset?",
+                Some("hf_model"),
+                Some(false),
+                Some(vec!["dataset_not_in_spice".to_string()]),
+            )
+            .await
+            .is_err());
 
-    tracing::info!("/v1/nsql: Ensure error when invalid model name is provided");
-    assert!(send_nsql_request(
-        http_base_url.as_str(),
-        "how many records in taxi_trips dataset?",
-        Some("model_not_in_spice"),
-        Some(false),
-        None,
-    )
-    .await
-    .is_err());
+            tracing::info!("/v1/nsql: Ensure error when invalid model name is provided");
+            assert!(send_nsql_request(
+                http_base_url.as_str(),
+                "how many records in taxi_trips dataset?",
+                Some("model_not_in_spice"),
+                Some(false),
+                None,
+            )
+            .await
+            .is_err());
 
-    Ok(())
+            Ok(())
+        })
+        .await
 }
 
 #[tokio::test]
 async fn huggingface_test_embeddings() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(None);
 
-    let app = AppBuilder::new("text-to-sql")
-        .with_embedding(get_huggingface_embeddings(
-            "sentence-transformers/all-MiniLM-L6-v2",
-            "hf_minilm",
-        ))
-        .with_embedding(get_huggingface_embeddings("intfloat/e5-small-v2", "hf_e5"))
-        .build();
+    test_request_context()
+        .scope(async {
+            let app = AppBuilder::new("text-to-sql")
+                .with_embedding(get_huggingface_embeddings(
+                    "sentence-transformers/all-MiniLM-L6-v2",
+                    "hf_minilm",
+                ))
+                .with_embedding(get_huggingface_embeddings("intfloat/e5-small-v2", "hf_e5"))
+                .build();
 
-    let api_config = create_api_bindings_config();
-    let http_base_url = format!("http://{}", api_config.http_bind_address);
+            let api_config = create_api_bindings_config();
+            let http_base_url = format!("http://{}", api_config.http_bind_address);
 
-    let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
 
-    let rt_ref_copy = Arc::clone(&rt);
-    tokio::spawn(async move {
-        Box::pin(rt_ref_copy.start_servers(api_config, None, EndpointAuth::no_auth())).await
-    });
+            let rt_ref_copy = Arc::clone(&rt);
+            tokio::spawn(async move {
+                Box::pin(rt_ref_copy.start_servers(api_config, None, EndpointAuth::no_auth())).await
+            });
 
-    tokio::select! {
-        () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
-            return Err(anyhow::anyhow!("Timed out waiting for components to load"));
-        }
-        () = rt.load_components() => {}
-    }
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for components to load"));
+                }
+                () = rt.load_components() => {}
+            }
 
-    runtime_ready_check(&rt).await;
+            runtime_ready_check(&rt).await;
 
-    let embeddins_test = vec![
-        (
-            "hf_minilm",
-            EmbeddingInput::String("The food was delicious and the waiter...".to_string()),
-            Some("float"),
-            None,
-        ),
-        (
-            "hf_minilm",
-            EmbeddingInput::StringArray(vec![
-                "The food was delicious".to_string(),
-                "and the waiter...".to_string(),
-            ]),
-            None, // `base64` paramerter is not supported when using local model
-            Some(256),
-        ),
-        (
-            "hf_e5",
-            EmbeddingInput::String("The food was delicious and the waiter...".to_string()),
-            None,
-            Some(384),
-        ),
-    ];
+            let embeddins_test = vec![
+                (
+                    "hf_minilm",
+                    EmbeddingInput::String("The food was delicious and the waiter...".to_string()),
+                    Some("float"),
+                    None,
+                ),
+                (
+                    "hf_minilm",
+                    EmbeddingInput::StringArray(vec![
+                        "The food was delicious".to_string(),
+                        "and the waiter...".to_string(),
+                    ]),
+                    None, // `base64` paramerter is not supported when using local model
+                    Some(256),
+                ),
+                (
+                    "hf_e5",
+                    EmbeddingInput::String("The food was delicious and the waiter...".to_string()),
+                    None,
+                    Some(384),
+                ),
+            ];
 
-    let mut test_id = 0;
+            let mut test_id = 0;
 
-    for (model, input, encoding_format, dimensions) in embeddins_test {
-        test_id += 1;
-        let response = send_embeddings_request(
-            http_base_url.as_str(),
-            model,
-            input,
-            encoding_format,
-            None, // `user` parameter is not supported when using local model
-            dimensions,
-        )
-        .await?;
+            for (model, input, encoding_format, dimensions) in embeddins_test {
+                test_id += 1;
+                let response = send_embeddings_request(
+                    http_base_url.as_str(),
+                    model,
+                    input,
+                    encoding_format,
+                    None, // `user` parameter is not supported when using local model
+                    dimensions,
+                )
+                .await?;
 
-        insta::assert_snapshot!(
-            format!("embeddings_{}", test_id),
-            // Embeddingsare are not deterministic (values vary for the same input, model version, and parameters) so
-            // we normalize the response before snapshotting
-            normalize_embeddings_response(response)
-        );
-    }
+                insta::assert_snapshot!(
+                    format!("embeddings_{}", test_id),
+                    // Embeddingsare are not deterministic (values vary for the same input, model version, and parameters) so
+                    // we normalize the response before snapshotting
+                    normalize_embeddings_response(response)
+                );
+            }
 
-    Ok(())
+            Ok(())
+        })
+        .await
 }
 
 #[tokio::test]
 async fn huggingface_test_chat_completion() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(None);
 
-    let mut model_with_tools = get_huggingface_model(HF_TEST_MODEL, HF_TEST_MODEL_TYPE, "hf_model");
-    model_with_tools
-        .params
-        .insert("tools".to_string(), "auto".into());
+    test_request_context().scope(async {
+        let mut model_with_tools = get_huggingface_model(HF_TEST_MODEL, HF_TEST_MODEL_TYPE, "hf_model");
+        model_with_tools
+            .params
+            .insert("tools".to_string(), "auto".into());
 
-    let app = AppBuilder::new("text-to-sql")
-        .with_dataset(get_taxi_trips_dataset())
-        .with_model(model_with_tools)
-        .build();
+        let app = AppBuilder::new("text-to-sql")
+            .with_dataset(get_taxi_trips_dataset())
+            .with_model(model_with_tools)
+            .build();
 
-    let api_config = create_api_bindings_config();
-    let http_base_url = format!("http://{}", api_config.http_bind_address);
-    let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+        let api_config = create_api_bindings_config();
+        let http_base_url = format!("http://{}", api_config.http_bind_address);
+        let rt = Arc::new(Runtime::builder().with_app(app).build().await);
 
-    let rt_ref_copy = Arc::clone(&rt);
-    tokio::spawn(async move {
-        Box::pin(rt_ref_copy.start_servers(api_config, None, EndpointAuth::no_auth())).await
-    });
+        let rt_ref_copy = Arc::clone(&rt);
+        tokio::spawn(async move {
+            Box::pin(rt_ref_copy.start_servers(api_config, None, EndpointAuth::no_auth())).await
+        });
 
-    let llm_init_lock = LOCAL_LLM_INIT_MUTEX.lock().await;
+        let llm_init_lock = LOCAL_LLM_INIT_MUTEX.lock().await;
 
-    tokio::select! {
-        // increased timeout to download and load huggingface model
-        () = tokio::time::sleep(std::time::Duration::from_secs(300)) => {
-            return Err(anyhow::anyhow!("Timed out waiting for components to load"));
+        tokio::select! {
+            // increased timeout to download and load huggingface model
+            () = tokio::time::sleep(std::time::Duration::from_secs(300)) => {
+                return Err(anyhow::anyhow!("Timed out waiting for components to load"));
+            }
+            () = rt.load_components() => {}
         }
-        () = rt.load_components() => {}
-    }
 
-    drop(llm_init_lock);
+        drop(llm_init_lock);
 
-    let response = send_chat_completions_request(
-        http_base_url.as_str(),
-        vec![
-            ("system".to_string(), "You are an assistant that responds to queries by providing only the requested data values without extra explanation.".to_string()),
-            ("user".to_string(), "Provide the total number of records in the taxi_trips dataset. If known, return a single numeric value.".to_string()),
-        ],
-        "hf_model",
-        false,
-    ).await?;
+        let response = send_chat_completions_request(
+            http_base_url.as_str(),
+            vec![
+                ("system".to_string(), "You are an assistant that responds to queries by providing only the requested data values without extra explanation.".to_string()),
+                ("user".to_string(), "Provide the total number of records in the taxi_trips dataset. If known, return a single numeric value.".to_string()),
+            ],
+            "hf_model",
+            false,
+        ).await?;
 
-    // Message content verification is disabled due to issue below: model does not use tools and can't provide the expected response.
-    // https://github.com/spiceai/spiceai/issues/3426
-    insta::assert_snapshot!(
-        "chat_completion",
-        normalize_chat_completion_response(response, true)
-    );
+        // Message content verification is disabled due to issue below: model does not use tools and can't provide the expected response.
+        // https://github.com/spiceai/spiceai/issues/3426
+        insta::assert_snapshot!(
+            "chat_completion",
+            normalize_chat_completion_response(response, true)
+        );
 
-    Ok(())
+        Ok(())
+    }).await
 }
 
 #[tokio::test]
 async fn huggingface_test_chat_messages() -> Result<(), anyhow::Error> {
-    let model = Arc::new(create_hf_model(
-        HF_TEST_MODEL,
+    test_request_context().scope(async {
+        let model = Arc::new(create_hf_model(
+            HF_TEST_MODEL,
         &Some(HF_TEST_MODEL_TYPE.to_string()),
-        None,
-    )?);
+            None,
+        )?);
 
-    let app = AppBuilder::new("ai-app")
+        let app = AppBuilder::new("ai-app")
         .with_dataset(get_taxi_trips_dataset())
         .build();
 
-    let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+        let rt = Arc::new(Runtime::builder().with_app(app).build().await);
 
-    let llm_init_lock = LOCAL_LLM_INIT_MUTEX.lock().await;
+        let llm_init_lock = LOCAL_LLM_INIT_MUTEX.lock().await;
 
-    tokio::select! {
-        // increased timeout to download and load huggingface model
-        () = tokio::time::sleep(std::time::Duration::from_secs(300)) => {
-            return Err(anyhow::anyhow!("Timed out waiting for components to load"));
+        tokio::select! {
+            // increased timeout to download and load huggingface model
+            () = tokio::time::sleep(std::time::Duration::from_secs(300)) => {
+                return Err(anyhow::anyhow!("Timed out waiting for components to load"));
+            }
+            () = rt.load_components() => {}
         }
-        () = rt.load_components() => {}
-    }
 
-    drop(llm_init_lock);
+        drop(llm_init_lock);
 
-    let tool_model = Box::new(ToolUsingChat::new(
-        Arc::clone(&model),
-        Arc::clone(&rt),
-        get_tools(Arc::clone(&rt), &SpiceToolsOptions::Auto).await,
-        Some(10),
-    ));
+        let tool_model = Box::new(ToolUsingChat::new(
+            Arc::clone(&model),
+            Arc::clone(&rt),
+            get_tools(Arc::clone(&rt), &SpiceToolsOptions::Auto).await,
+            Some(10),
+        ));
 
-    let req = CreateChatCompletionRequestArgs::default()
-        .messages(vec![ChatCompletionRequestSystemMessageArgs::default()
-            .content("You are an assistant that responds to queries by providing only the requested data values without extra explanation.".to_string())
-            .build()?
-            .into(),ChatCompletionRequestUserMessageArgs::default()
-            .content("Provide the total number of records in the taxi trips dataset. If known, return a single numeric value.".to_string())
-            .build()?
-            .into()])
-        .build()?;
+        let req = CreateChatCompletionRequestArgs::default()
+            .messages(vec![ChatCompletionRequestSystemMessageArgs::default()
+                .content("You are an assistant that responds to queries by providing only the requested data values without extra explanation.".to_string())
+                .build()?
+                .into(),ChatCompletionRequestUserMessageArgs::default()
+                .content("Provide the total number of records in the taxi trips dataset. If known, return a single numeric value.".to_string())
+                .build()?
+                .into()])
+            .build()?;
 
-    let mut response = tool_model.chat_request(req).await?;
+        let mut response = tool_model.chat_request(req).await?;
 
-    // Message content verification is disabled due to issue below: model does not use tools and can't provide the expected response.
-    // https://github.com/spiceai/spiceai/issues/3426
-    response.choices.iter_mut().for_each(|c| {
-        c.message.content = Some("__placeholder__".to_string());
-    });
+        // Message content verification is disabled due to issue below: model does not use tools and can't provide the expected response.
+        // https://github.com/spiceai/spiceai/issues/3426
+        response.choices.iter_mut().for_each(|c| {
+            c.message.content = Some("__placeholder__".to_string());
+        });
 
-    insta::assert_snapshot!("chat_1_response_choices", format!("{:?}", response.choices));
+        insta::assert_snapshot!("chat_1_response_choices", format!("{:?}", response.choices));
 
-    Ok(())
+        Ok(())
+    })
+    .await
 }
 
 fn get_huggingface_model(
