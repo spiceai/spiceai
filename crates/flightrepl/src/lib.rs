@@ -33,6 +33,7 @@ use datafusion::dataframe::DataFrame;
 use datafusion::datasource::{provider_as_source, MemTable};
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::{LogicalPlanBuilder, UNNAMED_TABLE};
+use flight_client::TonicStatusError;
 use futures::{StreamExt, TryStreamExt};
 use llms::chat::LlmRuntime;
 use prost::Message;
@@ -231,7 +232,10 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
             ".exit" | "exit" | "quit" | "q" => break,
             ".error" => {
                 match last_error {
-                    Some(ref err) => println!("{err:?}"),
+                    Some(ref err) => {
+                        let err = TonicStatusError::from(err.clone());
+                        println!("{err}");
+                    },
                     None => println!("No error to display"),
                 }
                 continue;
@@ -470,47 +474,75 @@ fn json_array_to_jsonl(json_array_str: &str) -> Result<String, Box<dyn std::erro
     Ok(jsonl_str)
 }
 
+/// Returns a boolean indicating if a message needs truncation, from a given input of lines.
+fn lines_need_truncation(lines: &[&str]) -> bool {
+    lines.iter().any(|line| line.len() > 120)
+}
+
 fn display_grpc_error(err: &Status) {
     let (error_type, user_err_msg) = match err.code() {
         Code::Ok => return,
         Code::Unknown | Code::Internal | Code::DataLoss | Code::FailedPrecondition => (
             "Internal Error",
-            "An unexpected internal error occurred. Execute '.error' for details.",
+            "An unexpected internal error occurred. Execute '.error' for details.".to_string(),
         ),
         Code::InvalidArgument | Code::AlreadyExists | Code::NotFound | Code::Unavailable => {
-            let message = err.message().split('\n').next().unwrap_or(err.message());
-            ("Query Error", message)
+            let message = err.message();
+            let lines = message.split('\n').collect::<Vec<_>>();
+            let truncate = lines_need_truncation(&lines);
+
+            let first_line = lines.first().unwrap_or(&message);
+            match (truncate, lines.len() > 1) {
+                (true, true) => {
+                    // truncating due to length, and multiple error lines
+                    ("Query Error", format!("{first_line}\nThis error message has been truncated.\nFor the full error message, execute `.error`."))
+                }
+                (true, false) => {
+                    // truncating due to length, but only one line
+                    ("Query Error", "Failed to execute query.\nThis error message has been truncated.\nFor the full error message, execute `.error`.".to_string())
+                }
+                _ => ("Query Error", message.to_string()),
+            }
         }
         Code::Cancelled => (
             "Cancelled",
-            "The operation was cancelled before completion.",
+            "The operation was cancelled before completion.".to_string(),
         ),
-        Code::Aborted => ("Aborted", "The operation was aborted before completion."),
+        Code::Aborted => (
+            "Aborted",
+            "The operation was aborted before completion.".to_string(),
+        ),
         Code::DeadlineExceeded => (
             "Timeout Error",
-            "The operation could not complete within the allowed time limit.",
+            "The operation could not complete within the allowed time limit.".to_string(),
         ),
         Code::Unauthenticated => (
             "Authentication Error",
-            "Access denied. Invalid credentials.",
+            "Access denied. Invalid credentials.".to_string(),
         ),
         Code::PermissionDenied => (
             "Authorization Error",
-            "Access denied. Insufficient permisions to complete the request.",
+            "Access denied. Insufficient permisions to complete the request.".to_string(),
         ),
         Code::ResourceExhausted => (
             "Resource Limit Exceeded",
-            "The operation could not be completed because the server resources are exhausted.",
+            "The operation could not be completed because the server resources are exhausted."
+                .to_string(),
         ),
         Code::Unimplemented => (
             "Unsupported Operation",
-            "The query could not be completed because the requested operation is not supported.",
+            "The query could not be completed because the requested operation is not supported."
+                .to_string(),
         ),
         Code::OutOfRange => (
             "Result Limit Exceeded",
-            "The query result exceeds allowable limits. Consider using a `limit` clause.",
+            "The query result exceeds allowable limits. Consider using a `limit` clause."
+                .to_string(),
         ),
     };
 
-    println!("{} {user_err_msg}", Colour::Red.paint(error_type));
+    println!(
+        "{} {user_err_msg}",
+        Colour::Red.paint(format!("{error_type}:"))
+    );
 }

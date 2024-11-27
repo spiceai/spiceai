@@ -24,15 +24,15 @@ snapshot_kind: text
 |               |                           Projection: lineitem.l_orderkey, lineitem.l_suppkey                                                                                                                 |
 |               |                             BytesProcessedNode                                                                                                                                                |
 |               |                               Filter: lineitem.l_receiptdate > lineitem.l_commitdate                                                                                                          |
-|               |                                 TableScan: lineitem projection=[l_orderkey, l_suppkey, l_commitdate, l_receiptdate], partial_filters=[lineitem.l_receiptdate > lineitem.l_commitdate]         |
+|               |                                 TableScan: lineitem projection=[l_orderkey, l_suppkey, l_commitdate, l_receiptdate]                                                                           |
 |               |                     Projection: orders.o_orderkey                                                                                                                                             |
 |               |                       BytesProcessedNode                                                                                                                                                      |
 |               |                         Filter: orders.o_orderstatus = Utf8View("F")                                                                                                                          |
-|               |                           TableScan: orders projection=[o_orderkey, o_orderstatus], partial_filters=[orders.o_orderstatus = Utf8View("F")]                                                    |
+|               |                           TableScan: orders projection=[o_orderkey, o_orderstatus]                                                                                                            |
 |               |                 Projection: nation.n_nationkey                                                                                                                                                |
 |               |                   BytesProcessedNode                                                                                                                                                          |
 |               |                     Filter: nation.n_name = Utf8View("SAUDI ARABIA")                                                                                                                          |
-|               |                       TableScan: nation projection=[n_nationkey, n_name], partial_filters=[nation.n_name = Utf8View("SAUDI ARABIA")]                                                          |
+|               |                       TableScan: nation projection=[n_nationkey, n_name]                                                                                                                      |
 |               |             SubqueryAlias: __correlated_sq_1                                                                                                                                                  |
 |               |               SubqueryAlias: l2                                                                                                                                                               |
 |               |                 BytesProcessedNode                                                                                                                                                            |
@@ -42,7 +42,7 @@ snapshot_kind: text
 |               |               Projection: lineitem.l_orderkey, lineitem.l_suppkey                                                                                                                             |
 |               |                 BytesProcessedNode                                                                                                                                                            |
 |               |                   Filter: lineitem.l_receiptdate > lineitem.l_commitdate                                                                                                                      |
-|               |                     TableScan: lineitem projection=[l_orderkey, l_suppkey, l_commitdate, l_receiptdate], partial_filters=[lineitem.l_receiptdate > lineitem.l_commitdate]                     |
+|               |                     TableScan: lineitem projection=[l_orderkey, l_suppkey, l_commitdate, l_receiptdate]                                                                                       |
 | physical_plan | SortPreservingMergeExec: [numwait@1 DESC, s_name@0 ASC NULLS LAST]                                                                                                                            |
 |               |   SortExec: expr=[numwait@1 DESC, s_name@0 ASC NULLS LAST], preserve_partitioning=[true]                                                                                                      |
 |               |     ProjectionExec: expr=[s_name@0 as s_name, count(*)@1 as numwait]                                                                                                                          |

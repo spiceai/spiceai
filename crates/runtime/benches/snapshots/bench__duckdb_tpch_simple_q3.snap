@@ -3,17 +3,17 @@ source: crates/runtime/benches/bench.rs
 expression: records_pretty
 snapshot_kind: text
 ---
-+--------------------------------------------+-----------+
-| l_comment                                  | l_partkey |
-+--------------------------------------------+-----------+
-| posits haggle carefully over the           | 193938    |
-|  requests. car                             | 100251    |
-| sts wake blithely regular pin              | 41884     |
-| s haggle fluffily. slyly pending accounts  | 160302    |
-| ounts. furiously exp                       | 131804    |
-| luffily bold                               | 134751    |
-| ructions haggle regularly about the c      | 87908     |
-| e furiously                                | 5         |
-| azzle. slyly pendin                        | 164386    |
-| ckly alongsi                               | 145332    |
-+--------------------------------------------+-----------+
++----------------------------------+-----------+
+| l_comment                        | l_partkey |
++----------------------------------+-----------+
+| avely outside the a              | 82430     |
+| ithely final excu                | 175931    |
+|  quickly regular pl              | 87375     |
+| structions sleep blithely even,  | 70020     |
+| eans nag careful                 | 92488     |
+| uests affix across t             | 51519     |
+|  express deposits. special pe    | 50645     |
+| uriously acros                   | 161751    |
+| bove the unusual reques          | 183057    |
+| y deposits. f                    | 145148    |
++----------------------------------+-----------+
