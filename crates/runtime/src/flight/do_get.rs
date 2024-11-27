@@ -25,7 +25,6 @@ use prost::Message;
 use tonic::{Request, Response, Status};
 
 use crate::{
-    datafusion::query::Protocol,
     flight::{metrics, util::attach_cache_metadata},
     timing::TimedStream,
 };
@@ -52,21 +51,21 @@ pub(crate) async fn handle(
             .await
         }
         Command::CommandGetCatalogs(command) => {
-            flightsql::get_catalogs::do_get(flight_svc, command)
+            flightsql::get_catalogs::do_get(flight_svc, command).await
         }
         Command::CommandGetDbSchemas(command) => {
-            flightsql::get_schemas::do_get(flight_svc, command)
+            flightsql::get_schemas::do_get(flight_svc, command).await
         }
         Command::CommandGetTables(command) => {
             flightsql::get_tables::do_get(flight_svc, command).await
         }
         Command::CommandGetPrimaryKeys(command) => {
-            flightsql::get_primary_keys::do_get(flight_svc, &command)
+            flightsql::get_primary_keys::do_get(flight_svc, &command).await
         }
-        Command::CommandGetTableTypes(command) => flightsql::get_table_types::do_get(command),
-        Command::CommandGetSqlInfo(command) => flightsql::get_sql_info::do_get(command),
+        Command::CommandGetTableTypes(command) => flightsql::get_table_types::do_get(command).await,
+        Command::CommandGetSqlInfo(command) => flightsql::get_sql_info::do_get(command).await,
         _ => {
-            let _start = metrics::track_flight_request("do_get", None);
+            let _start = metrics::track_flight_request("do_get", None).await;
             Err(Status::unimplemented("Not yet implemented"))
         }
     }
@@ -76,18 +75,14 @@ async fn do_get_simple(
     flight_svc: &Service,
     request: Request<Ticket>,
 ) -> Result<Response<<Service as FlightService>::DoGetStream>, Status> {
-    let start = metrics::track_flight_request("do_get", Some("sql_query"));
+    let start = metrics::track_flight_request("do_get", Some("sql_query")).await;
     let datafusion = Arc::clone(&flight_svc.datafusion);
     let ticket = request.into_inner();
     tracing::trace!("do_get_simple: {ticket:?}");
     match std::str::from_utf8(&ticket.ticket) {
         Ok(sql) => {
-            let (output, from_cache) = Box::pin(Service::sql_to_flight_stream(
-                datafusion,
-                sql,
-                Protocol::Flight,
-            ))
-            .await?;
+            let (output, from_cache) =
+                Box::pin(Service::sql_to_flight_stream(datafusion, sql)).await?;
 
             let timed_output = TimedStream::new(output, move || start);
 

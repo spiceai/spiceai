@@ -14,9 +14,27 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{future::Future, time::Duration};
+use std::{
+    future::Future,
+    sync::{Arc, LazyLock},
+    time::Duration,
+};
 
-use runtime::Runtime;
+use runtime::{
+    request::{Protocol, RequestContext, UserAgent},
+    Runtime,
+};
+
+pub(crate) static TEST_REQUEST_CONTEXT: LazyLock<Arc<RequestContext>> = LazyLock::new(|| {
+    Arc::new(
+        RequestContext::builder(Protocol::Internal)
+            .with_user_agent(UserAgent::from_ua_str(&format!(
+                "spiceci/{}",
+                env!("CARGO_PKG_VERSION")
+            )))
+            .build(),
+    )
+});
 
 pub(crate) async fn runtime_ready_check(rt: &Runtime) {
     assert!(wait_until_true(Duration::from_secs(30), || async { rt.status().is_ready() }).await);
@@ -56,4 +74,8 @@ pub(crate) async fn verify_env_secret_exists(secret_name: &str) -> Result<(), St
         .ok_or_else(|| format!("Secret {secret_name} not found"))?;
 
     Ok(())
+}
+
+pub(crate) fn test_request_context() -> Arc<RequestContext> {
+    Arc::clone(&TEST_REQUEST_CONTEXT)
 }

@@ -60,8 +60,8 @@ impl Display for ActionType {
     }
 }
 
-pub(crate) fn list() -> Response<<Service as FlightService>::ListActionsStream> {
-    let start = metrics::track_flight_request("list_actions", None);
+pub(crate) async fn list() -> Response<<Service as FlightService>::ListActionsStream> {
+    let start = metrics::track_flight_request("list_actions", None).await;
     tracing::trace!("list_actions");
     let create_prepared_statement_action_type = FlightActionType {
         r#type: ActionType::CreatePreparedStatement.to_string(),
@@ -94,7 +94,7 @@ pub(crate) async fn do_action(
     let action_type = ActionType::from_str(request.get_ref().r#type.as_str());
 
     let action_type_str = action_type.as_str().to_string();
-    let start = metrics::track_flight_request("do_action", Some(&action_type_str));
+    let start = metrics::track_flight_request("do_action", Some(&action_type_str)).await;
 
     let stream = match action_type {
         ActionType::CreatePreparedStatement => {

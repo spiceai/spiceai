@@ -32,18 +32,21 @@ use url::Url;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Unable to parse URL {url}: {source}"))]
+    #[snafu(display(
+        "The specified URL is not valid: {url}.\nEnsure the URL is valid and try again.\n{source}"
+    ))]
     UnableToParseURL {
         url: String,
         source: url::ParseError,
     },
+
     #[snafu(display(
-        "Provide only one of the following: access key, bearer token, or client credentials. Use skip_signature to disable all authentication."
+        "Multiple authentication methods were provided.\nSpecify only one of the following: access key, bearer token, or client credentials.\nUse skip_signature to disable all authentication."
     ))]
     InvalidKeyAuthCombination,
 
     #[snafu(display(
-        "The 'abfs_endpoint' parameter must be a HTTP/S URL, but '{endpoint}' was provided."
+        "The 'abfs_endpoint' parameter must be a HTTP/S URL, but '{endpoint}' was provided.\nSpecify a valid HTTP/S URL."
     ))]
     InvalidEndpoint { endpoint: String },
 }

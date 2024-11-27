@@ -14,9 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::init_tracing;
+use crate::{init_tracing, utils::test_request_context, RecordBatch};
 use app::AppBuilder;
 use datafusion::assert_batches_eq;
+use futures::TryStreamExt;
 use runtime::Runtime;
 use scopeguard::defer;
 use spicepod::component::dataset::Dataset;
@@ -37,19 +38,24 @@ fn make_test_query(table_name: &str) -> String {
 #[tokio::test]
 async fn duckdb_from_functions() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
-    let sample_csv_contents = include_str!("../test_data/taxi_sample.csv");
-    let sample_json_contents = include_str!("../test_data/taxi_sample.json");
-    // Write the sample file to a temporary directory
-    let temp_dir = std::env::temp_dir().join("spiced_test_data");
-    std::fs::create_dir_all(&temp_dir).expect("failed to create temp dir");
-    let sample_csv_path = temp_dir.join("taxi_sample.csv");
-    std::fs::write(&sample_csv_path, sample_csv_contents).expect("failed to write sample file");
-    let sample_json_path = temp_dir.join("taxi_sample.json");
-    std::fs::write(&sample_json_path, sample_json_contents).expect("failed to write sample file");
-    defer! {
-        std::fs::remove_dir_all(&temp_dir).expect("failed to remove temp dir");
-    }
-    let app = AppBuilder::new("duckdb_function_test")
+
+    test_request_context()
+        .scope(async {
+            let sample_csv_contents = include_str!("../test_data/taxi_sample.csv");
+            let sample_json_contents = include_str!("../test_data/taxi_sample.json");
+            // Write the sample file to a temporary directory
+            let temp_dir = std::env::temp_dir().join("spiced_test_data");
+            std::fs::create_dir_all(&temp_dir).expect("failed to create temp dir");
+            let sample_csv_path = temp_dir.join("taxi_sample.csv");
+            std::fs::write(&sample_csv_path, sample_csv_contents)
+                .expect("failed to write sample file");
+            let sample_json_path = temp_dir.join("taxi_sample.json");
+            std::fs::write(&sample_json_path, sample_json_contents)
+                .expect("failed to write sample file");
+            defer! {
+                std::fs::remove_dir_all(&temp_dir).expect("failed to remove temp dir");
+            }
+            let app = AppBuilder::new("duckdb_function_test")
         .with_dataset(make_duckdb_dataset(
             "csv_remote",
             "csv",
@@ -77,47 +83,52 @@ async fn duckdb_from_functions() -> Result<(), String> {
         ))
         .build();
 
-    let rt = Runtime::builder().with_app(app).build().await;
+            let rt = Runtime::builder().with_app(app).build().await;
 
-    // Set a timeout for the test
-    tokio::select! {
-        () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
-            return Err("Timed out waiting for datasets to load".to_string());
-        }
-        () = rt.load_components() => {}
-    }
+            // Set a timeout for the test
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+                    return Err("Timed out waiting for datasets to load".to_string());
+                }
+                () = rt.load_components() => {}
+            }
 
-    let queries = vec![
-        ("csv_remote", make_test_query("csv_remote")),
-        ("csv_local", make_test_query("csv_local")),
-        ("parquet_remote", make_test_query("parquet_remote")),
-        //("parquet_local", make_test_query("parquet_local")),
-        ("json_remote", make_test_query("json_remote")),
-        ("json_local", make_test_query("json_local")),
-    ];
+            let queries = vec![
+                ("csv_remote", make_test_query("csv_remote")),
+                ("csv_local", make_test_query("csv_local")),
+                ("parquet_remote", make_test_query("parquet_remote")),
+                //("parquet_local", make_test_query("parquet_local")),
+                ("json_remote", make_test_query("json_remote")),
+                ("json_local", make_test_query("json_local")),
+            ];
 
-    let expected_results = [
-        "+----------+",
-        "| VendorID |",
-        "+----------+",
-        "| 2        |",
-        "| 1        |",
-        "+----------+",
-    ];
+            let expected_results = [
+                "+----------+",
+                "| VendorID |",
+                "+----------+",
+                "| 2        |",
+                "| 1        |",
+                "+----------+",
+            ];
 
-    for (ds_name, query) in queries {
-        let data = rt
-            .datafusion()
-            .ctx
-            .sql(&query)
-            .await
-            .map_err(|e| format!("{ds_name}: query `{query}` to plan: {e}"))?
-            .collect()
-            .await
-            .map_err(|e| format!("{ds_name}: query `{query}` to results: {e}"))?;
+            for (ds_name, query) in queries {
+                let query_result = rt
+                    .datafusion()
+                    .query_builder(&query)
+                    .build()
+                    .run()
+                    .await
+                    .map_err(|e| format!("query `{query}` to plan: {e}"))?;
+                let data = query_result
+                    .data
+                    .try_collect::<Vec<RecordBatch>>()
+                    .await
+                    .map_err(|e| format!("{ds_name}: query `{query}` to results: {e}"))?;
 
-        assert_batches_eq!(expected_results, &data);
-    }
+                assert_batches_eq!(expected_results, &data);
+            }
 
-    Ok(())
+            Ok(())
+        })
+        .await
 }
