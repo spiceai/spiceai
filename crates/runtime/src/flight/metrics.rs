@@ -22,7 +22,10 @@ use opentelemetry::{
     KeyValue,
 };
 
-use crate::timing::TimeMeasurement;
+use crate::{
+    request::{AsyncMarker, RequestContext},
+    timing::TimeMeasurement,
+};
 
 static METER: LazyLock<Meter> = LazyLock::new(|| global::meter("flight"));
 
@@ -36,12 +39,17 @@ pub(crate) static FLIGHT_REQUEST_DURATION_MS: LazyLock<Histogram<f64>> = LazyLoc
         .init()
 });
 
-pub fn track_flight_request(method: &str, command: Option<&str>) -> TimeMeasurement {
+pub async fn track_flight_request(method: &str, command: Option<&str>) -> TimeMeasurement {
+    let request_context = RequestContext::current(AsyncMarker::new().await);
+
     let mut dimensions = vec![KeyValue::new("method", method.to_string())];
 
     if let Some(method) = command {
         dimensions.push(KeyValue::new("command", method.to_string()));
     }
+
+    dimensions.extend(request_context.to_dimensions().into_iter());
+
     FLIGHT_REQUESTS.add(1, dimensions.as_slice());
     TimeMeasurement::new(&FLIGHT_REQUEST_DURATION_MS, dimensions.as_slice())
 }

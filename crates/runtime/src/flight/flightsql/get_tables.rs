@@ -21,15 +21,19 @@ use datafusion::datasource::TableType;
 use tonic::{Request, Response, Status};
 
 use crate::{
-    flight::{metrics, record_batches_to_flight_stream, to_tonic_err, Service},
+    flight::{
+        metrics, record_batches_to_flight_stream, to_tonic_err, util::set_flightsql_protocol,
+        Service,
+    },
     timing::TimedStream,
 };
 
-pub(crate) fn get_flight_info(
+pub(crate) async fn get_flight_info(
     query: &sql::CommandGetTables,
     request: Request<FlightDescriptor>,
 ) -> Response<FlightInfo> {
-    let _start = metrics::track_flight_request("get_flight_info", Some("get_tables"));
+    let _start = metrics::track_flight_request("get_flight_info", Some("get_tables")).await;
+    set_flightsql_protocol().await;
 
     let fd = request.into_inner();
     tracing::trace!("get_flight_info: {query:?}");
@@ -48,7 +52,9 @@ pub(crate) async fn do_get(
     flight_svc: &Service,
     query: sql::CommandGetTables,
 ) -> Result<Response<<Service as FlightService>::DoGetStream>, Status> {
-    let start = metrics::track_flight_request("do_get", Some("get_tables"));
+    let start = metrics::track_flight_request("do_get", Some("get_tables")).await;
+    set_flightsql_protocol().await;
+
     let catalog = &query.catalog;
     tracing::trace!("do_get_tables: {query:?}");
     let filtered_catalogs = match catalog {
