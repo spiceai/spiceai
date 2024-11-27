@@ -198,7 +198,7 @@ pub enum Error {
     InvalidTimeColumnTimeFormat { source: refresh::Error },
 
     #[snafu(display(
-         "Acceleration mode `append` requires `time_column` parameter for source {from}.\nConfigure `time_column` parameter with a valid value.\nFor details, visit: https://docs.spiceai.org/reference/spicepod/datasets#time_column"
+         "Acceleration mode `append` requires `time_column` parameter for source {from}.\nConfigure `time_column` parameter and try again.\nFor details, visit: https://docs.spiceai.org/reference/spicepod/datasets#time_column"
     ))]
     UnsupportedAppendAcceleration { from: String },
 
