@@ -470,8 +470,11 @@ jobs:
           MODE=$(echo '${{ matrix.acceleration.mode }}')
 
           if [[ -n "$ENGINE" ]]; then
+            echo "    time_column: timestamp_column" >> spicepod.yaml
             echo "    acceleration:" >> spicepod.yaml
             echo "      enabled: true" >> spicepod.yaml
+            echo "      refresh_mode: append" >> spicepod.yaml
+            echo "      refresh_check_interval: 2s" >> spicepod.yaml
             echo "      engine: $ENGINE" >> spicepod.yaml
             if [[ -n "$MODE" ]]; then
               echo "      mode: $MODE" >> spicepod.yaml
@@ -516,6 +519,10 @@ jobs:
         run: |
           killall spice || true
           cat spice.log
+          if grep -iE "(failed|error)" spice.log; then
+            echo "Failures detected in spice.log"
+            exit 1
+          fi
 
   test_quickstart_data_mysql:
     name: 'Test MySQL quickstart (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }}; acceleration: ${{ matrix.acceleration.engine }})'
@@ -625,9 +632,12 @@ jobs:
           MODE=$(echo '${{ matrix.acceleration.mode }}')
 
           if [[ -n "$ENGINE" ]]; then
+            echo "    time_column: col_timestamp" >> spicepod.yaml
             echo "    acceleration:" >> spicepod.yaml
             echo "      enabled: true" >> spicepod.yaml
             echo "      engine: $ENGINE" >> spicepod.yaml
+            echo "      refresh_mode: append" >> spicepod.yaml
+            echo "      refresh_check_interval: 2s" >> spicepod.yaml
             if [[ -n "$MODE" ]]; then
               echo "      mode: $MODE" >> spicepod.yaml
            fi
@@ -671,6 +681,10 @@ jobs:
         run: |
           killall spice || true
           cat spice.log
+          if grep -iE "(failed|error)" spice.log; then
+            echo "Failures detected in spice.log"
+            exit 1
+          fi
 
   test_quickstart_clickhouse:
     name: 'Test Clickhouse quickstart (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
@@ -1321,8 +1335,11 @@ jobs:
           echo "      mssql_password: 1StrongPwd!!" >> spicepod.yaml
           echo "      mssql_encrypt: false" >> spicepod.yaml
           echo "      mssql_trust_server_certificate: true" >> spicepod.yaml
+          echo "    time_column: col_datetime" >> spicepod.yaml
           echo "    acceleration:" >> spicepod.yaml
           echo "      enabled: true" >> spicepod.yaml
+          echo "      refresh_mode: append" >> spicepod.yaml
+          echo "      refresh_check_interval: 2s" >> spicepod.yaml
 
           cat spicepod.yaml
 
@@ -1356,3 +1373,7 @@ jobs:
         run: |
           killall spice || true
           cat spice.log
+          if grep -iE "(failed|error)" spice.log; then
+            echo "Failures detected in spice.log"
+            exit 1
+          fi
