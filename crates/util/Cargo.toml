@@ -14,6 +14,3 @@ humantime = "2.1.0"
 rand = "0.8.5"
 tokio = { workspace = true }
 tracing = { workspace = true }
-
-[target.'cfg(windows)'.dependencies]
-winver = "1.0.0"
