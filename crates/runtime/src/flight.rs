@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use crate::auth::EndpointAuth;
-use crate::datafusion::error::SpiceExternalError;
+use crate::datafusion::error::{find_datafusion_root, SpiceExternalError};
 use crate::datafusion::query::{self, Protocol, QueryBuilder};
 use crate::datafusion::DataFusion;
 use crate::dataupdate::DataUpdate;
@@ -207,19 +207,10 @@ impl Service {
                             flights.push(flight_batch.into());
                             Ok(flights)
                         }
-                        Err(e) => match e {
-                            DataFusionError::External(e) => {
-                                if let Some(execution_error) =
-                                    e.to_string().strip_prefix("Execution error: ")
-                                {
-                                    return Err(Status::invalid_argument(
-                                        execution_error.to_string(),
-                                    ));
-                                }
-                                Err(Status::invalid_argument(e.to_string()))
-                            }
-                            _ => Err(Status::invalid_argument(e.to_string())),
-                        },
+                        Err(e) => {
+                            let e = find_datafusion_root(e);
+                            Err(handle_datafusion_error(e))
+                        }
                     }
                 }
             })

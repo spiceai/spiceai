@@ -4109,6 +4109,7 @@ dependencies = [
  "arrow-json 53.1.0",
  "clap",
  "datafusion",
+ "flight_client",
  "futures",
  "llms",
  "prost 0.13.3",
