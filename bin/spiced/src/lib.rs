@@ -197,7 +197,7 @@ pub async fn run(args: Args) -> Result<()> {
     let app_name = app.as_ref().map(|app| app.name.clone());
     let spicepod_tls_config = runtime_config.and_then(|rt| rt.tls.clone());
     let tracing_config = runtime_config.and_then(|rt| rt.tracing.clone());
-    let telemetry_config = runtime_config.and_then(|rt| rt.telemetry.clone());
+    let telemetry_config = runtime_config.map(|rt| rt.telemetry.clone());
 
     let mut builder = Runtime::builder()
         .with_app_opt(app.clone())

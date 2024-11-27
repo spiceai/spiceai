@@ -15,11 +15,11 @@ limitations under the License.
 */
 
 use arrow::array::{
-    Array, ArrayRef, FixedSizeListArray, Float32Array, Int32Array, ListArray, RecordBatch,
-    StringArray, StringViewArray,
+    Array, ArrayRef, FixedSizeListArray, FixedSizeListBuilder, ListArray, PrimitiveBuilder,
+    RecordBatch, StringArray, StringViewArray,
 };
 use arrow::buffer::OffsetBuffer;
-use arrow::datatypes::{DataType, Field, SchemaRef};
+use arrow::datatypes::{DataType, Field, Float32Type, Int32Type, SchemaRef};
 
 use arrow::error::ArrowError;
 use async_openai::types::EmbeddingInput;
@@ -314,24 +314,86 @@ pub(crate) async fn compute_additional_embedding_columns(
 /// +---------------------+      +-------------+
 ///     [`StringArray`]        [`FixedSizeListArray`]
 /// ```
+///
+/// Elements of `arr` that are `Some("")` or `None` should not be passed into
+/// [`Embed`]. This means that `arr` must be partitioned, then reconstructed
+/// after the non empty/null inputs are embedded.
+///
+/// ```text
+///                                     +- Embedding Model -+
+/// +---------------------+             |                   v
+/// | "Hello"             |      +--------------+    +------------+
+/// | None                | ---> | "Hello"      |    | [0.1, 1.2] |
+/// | ""                  |      | "Valid text" |    | [0.8, 0.9] |
+/// | "Valid text"        |      +--------------+    +------------+
+/// +---------------------+                             |  |
+///    [`StringArray`]                                  |  |
+///                   +------------+                    |  |
+///                   | [0.1, 0.2] | <------------------+  |
+///                   | None       |                       |
+///                   | None       |                       |
+///                   | [0.8, 0.9] | <---------------------+
+///                   +------------+
+///
+///                 [`FixedSizeListArray`]
+/// ```
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 async fn get_vectors(
     arr: impl Iterator<Item = Option<&str>>,
     model: &dyn Embed,
 ) -> Result<FixedSizeListArray, Box<dyn std::error::Error + Send + Sync>> {
-    let field = Arc::new(Field::new("item", DataType::Float32, false));
-    let column: Vec<String> = arr.filter_map(|s| s.map(ToString::to_string)).collect();
+    // Filter out nulls or empty strings before calling [`Embed::embed`].
+    let (null_pairs, values): (Vec<_>, Vec<_>) = arr
+        .enumerate()
+        .partition(|(_, o)| o.is_none() || o.is_some_and(str::is_empty));
+    let nulls: Vec<usize> = null_pairs.into_iter().map(|(i, _)| i).collect();
+    let column: Vec<String> = values
+        .iter()
+        .filter_map(|(_, s)| s.map(ToString::to_string))
+        .collect();
+
     let embedded_data = model.embed(EmbeddingInput::StringArray(column)).await?;
     let vector_length = embedded_data.first().map(Vec::len).unwrap_or_default();
-    let processed = embedded_data.iter().flatten().copied().collect_vec();
 
-    let values = Float32Array::try_new(processed.into(), None)?;
-    FixedSizeListArray::try_new(
-        Arc::clone(&field),
-        i32::try_from(vector_length)?,
-        Arc::new(values),
-        None,
+    let mut builder = FixedSizeListBuilder::with_capacity(
+        PrimitiveBuilder::<Float32Type>::with_capacity(
+            (embedded_data.len() + nulls.len()) * vector_length,
+        ),
+        vector_length as i32,
+        embedded_data.len() + nulls.len(),
     )
-    .boxed()
+    .with_field(Arc::new(Field::new("item", DataType::Float32, false)));
+
+    // Current index into offset of the outputted [`FixedSizeList`].
+    let mut output_ptr: usize = 0;
+
+    // Index into `nulls` array. Value at i'th position is index into output order that should be nulled.
+    let mut null_ptr = 0;
+
+    // Reconstruct correct output order by adding back nulls based on original indexes of nulls.
+    for vector in embedded_data {
+        // Keep inserting nulls until we reach the next non-null value.
+        while nulls.get(null_ptr).is_some_and(|&idx| idx == output_ptr) {
+            builder.values().append_nulls(vector_length);
+            null_ptr += 1;
+            output_ptr += 1;
+            builder.append(false);
+        }
+
+        builder.values().append_slice(&vector);
+        output_ptr += 1;
+        builder.append(true);
+    }
+
+    // Handle any trailing nulls/empty strings.
+    while nulls.get(null_ptr).is_some_and(|&idx| idx == output_ptr) {
+        builder.values().append_nulls(vector_length);
+        null_ptr += 1;
+        output_ptr += 1;
+        builder.append(false);
+    }
+
+    Ok(builder.finish())
 }
 
 /// Embed a [`StringArray`] using the provided [`Embed`] model and [`Chunker`]. The output is a [`ListArray`],
@@ -343,15 +405,18 @@ async fn get_vectors(
 /// +---------------------+  +-------------------------------+  +--------------------------------------+
 /// | "Hello, World!"     |  | ["Hello, ", ", World!"]       |  | [[0.1, 1.2], [0.3, 0.4]]             |
 /// | "How are you doing?"|  | ["How ", "are you ", "doing?"]|  | [[0.5, 0.6], [0.7, 0.8], [0.9, 1.0]] |
+/// | ""                  |  | []                            |  | []                                   |
 /// | "I'm doing well."   |  | ["I'm doing ", "doing well."] |  | [[1.1, 1.2], [1.3, 1.4]]             |
 /// +---------------------+  +-------------------------------+  +--------------------------------------+
 ///     [`StringArray`]                     +                             [`ListArray`]
 ///                          +-------------------------------+
 ///                          | [[0, 7], [7, 15]              |
 ///                          | [[0, 4], [4, 12], [12, 18]]   |
+///                          | []                            |
 ///                          | [[0, 10], [10, 21]]           |
 ///                          +-------------------------------+
 /// ```
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 async fn get_vectors_with_chunker(
     arr: impl Iterator<Item = Option<&str>>,
     chunker: Arc<dyn Chunker>,
@@ -359,16 +424,17 @@ async fn get_vectors_with_chunker(
 ) -> Result<(ListArray, ListArray), Box<dyn std::error::Error + Send + Sync>> {
     // Iterate over (chunks per row, (starting_offset into row, chunk))
     let (chunks_per_row, chunks_in_row): (Vec<_>, Vec<_>) = arr
-        .filter_map(|s| match s {
-            // TODO: filter_map doesn't handle nulls
-            Some(s) => {
+        // TODO: filter_map doesn't handle nulls
+        .map(|s| match s {
+            Some(s) if !s.is_empty() => {
                 let chunks = chunker
                     .chunk_indices(s)
                     .map(|(idx, s)| (idx, s.to_string()))
                     .collect_vec();
-                Some((chunks.len(), chunks))
+                (chunks.len(), chunks)
             }
-            None => None,
+            // None, or empty string.
+            _ => (0, vec![]),
         })
         .unzip();
 
@@ -379,31 +445,43 @@ async fn get_vectors_with_chunker(
         .await
         .boxed()?;
 
-    // `model.size()` is a `u32` for for compatibility with `FixedSizeList(FieldRef, i32)`.
     #[allow(clippy::cast_sign_loss)]
-    let vector_length = model.size() as usize;
+    let vector_length = model.size();
 
-    let mut values = Float32Array::builder(embedded_data.len() * vector_length);
-    let mut chunk_values = Int32Array::builder(embedded_data.len() * 2);
+    let capacity = chunks_per_row.iter().sum();
+
+    #[allow(clippy::cast_sign_loss)]
+    let mut vectors_builder = FixedSizeListBuilder::with_capacity(
+        PrimitiveBuilder::<Float32Type>::with_capacity(capacity * (vector_length as usize)),
+        vector_length,
+        capacity,
+    )
+    .with_field(Arc::new(Field::new("item", DataType::Float32, false)));
+
+    let mut chunks_builder = FixedSizeListBuilder::with_capacity(
+        PrimitiveBuilder::<Int32Type>::with_capacity(capacity),
+        2,
+        capacity,
+    )
+    .with_field(Arc::new(Field::new("item", DataType::Int32, false)));
 
     let mut lengths = Vec::with_capacity(chunks_per_row.len());
     let mut curr = 0;
-
-    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        clippy::cast_sign_loss
+    )]
     for chunkz_in_row in chunks_per_row {
-        lengths.push(chunkz_in_row);
-
         // Get the actual vectors
-        let inner = embedded_data.as_slice()[curr..curr + chunkz_in_row]
-            .iter()
-            .flatten()
-            .copied()
-            .collect_vec();
-        values.append_slice(&inner); // I believe this is a clone under the hood.
+        for i in curr..curr + chunkz_in_row {
+            if let Some(v) = embedded_data.get(i) {
+                vectors_builder.values().append_slice(v); // I believe this is a clone under the hood.
+                vectors_builder.append(true);
+            }
+        }
 
-        // Create flattened version of [(start, end), (start, end), ...]
         // Explicitly find `end` to handle when chunks have overlap.
-        let mut inner_offsets = Vec::with_capacity(2 * chunkz_in_row);
         for i in 0..chunkz_in_row {
             let start = chunk_offsets[curr + i];
             let end = start
@@ -412,66 +490,149 @@ async fn get_vectors_with_chunker(
                     .get(curr + i)
                     .map(String::len)
                     .unwrap_or_default();
-            inner_offsets.push(start as i32);
-            inner_offsets.push(end as i32);
-        }
-        chunk_values.append_slice(inner_offsets.as_slice());
 
+            chunks_builder.values().append_value(start as i32);
+            chunks_builder.values().append_value(end as i32);
+            chunks_builder.append(true);
+        }
         curr += chunkz_in_row;
+        lengths.push(chunkz_in_row);
     }
 
-    // These are offsets for both the vectors and the content offsets
+    // These are offsets for both the vectors and the content offsets.
+    // They tell the [`ListArray`] how many vectors/offsets are in each row of the input/output table.
     let offsets = OffsetBuffer::<i32>::from_lengths(lengths.into_iter());
 
-    let vectors = {
-        let scalar_field = Arc::new(Field::new("item", DataType::Float32, false));
+    let vectors = ListArray::try_new(
+        Arc::new(Field::new_fixed_size_list(
+            "item",
+            Arc::new(Field::new("item", DataType::Float32, false)),
+            vector_length,
+            false,
+        )),
+        offsets.clone(),
+        Arc::new(vectors_builder.finish()),
+        None,
+    )
+    .boxed()?;
 
-        // Inner FixedSizeListArray
-        let fixed_size_list_array = FixedSizeListArray::try_new(
-            Arc::clone(&scalar_field),
-            i32::try_from(vector_length).boxed()?,
-            Arc::new(values.finish()),
-            None,
-        )
-        .boxed()?;
-
-        ListArray::try_new(
-            Arc::new(Field::new_fixed_size_list(
-                "item",
-                Arc::clone(&scalar_field),
-                i32::try_from(vector_length).boxed()?,
-                false,
-            )),
-            offsets.clone(),
-            Arc::new(fixed_size_list_array),
-            None,
-        )
-        .boxed()?
-    };
-
-    let content_offsets = {
-        let scalar_field = Arc::new(Field::new("item", DataType::Int32, false));
-        let fixed_size_list_array = FixedSizeListArray::try_new(
-            Arc::clone(&scalar_field),
+    let content_offsets = ListArray::try_new(
+        Arc::new(Field::new_fixed_size_list(
+            "item",
+            Arc::new(Field::new("item", DataType::Int32, false)),
             2,
-            Arc::new(chunk_values.finish()),
-            None,
-        )
-        .boxed()?;
-
-        ListArray::try_new(
-            Arc::new(Field::new_fixed_size_list(
-                "item",
-                Arc::clone(&scalar_field),
-                2,
-                false,
-            )),
-            offsets,
-            Arc::new(fixed_size_list_array),
-            None,
-        )
-        .boxed()?
-    };
+            false,
+        )),
+        offsets,
+        Arc::new(chunks_builder.finish()),
+        None,
+    )
+    .boxed()?;
 
     Ok((vectors, content_offsets))
+}
+
+#[allow(clippy::float_cmp)]
+#[cfg(test)]
+mod tests {
+
+    use crate::embeddings::execution_plan::get_vectors;
+    use arrow::{
+        array::{Array, AsArray},
+        datatypes::Float32Type,
+    };
+    use async_openai::types::EmbeddingInput;
+    use async_trait::async_trait;
+    use llms::embeddings::{self, Embed};
+    use std::collections::HashMap;
+
+    #[derive(Default)]
+    pub(crate) struct MockEmbedder {
+        pub map: HashMap<String, Vec<f32>>,
+    }
+
+    impl MockEmbedder {
+        pub fn with_pair(mut self, input: &'static str, output: Vec<f32>) -> Self {
+            self.map.insert(input.to_string(), output);
+            self
+        }
+    }
+
+    #[async_trait]
+    impl Embed for MockEmbedder {
+        fn size(&self) -> i32 {
+            -1
+        }
+
+        async fn embed(&self, input: EmbeddingInput) -> Result<Vec<Vec<f32>>, embeddings::Error> {
+            match input {
+                EmbeddingInput::String(s) => {
+                    let v = self.map.get(&s).cloned().unwrap_or_default();
+                    Ok(vec![v])
+                }
+                EmbeddingInput::StringArray(arr) => {
+                    let v = arr
+                        .iter()
+                        .map(|s| self.map.get(s).cloned().unwrap_or_default())
+                        .collect();
+                    Ok(v)
+                }
+                _ => Err(embeddings::Error::FailedToCreateEmbedding {
+                    source: Box::<dyn std::error::Error + Send + Sync>::from(
+                        "Unsupported input type",
+                    ),
+                }),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_vectors_basic() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let fixed_size_array = get_vectors(
+            vec![Some("hello"), Some("world")].into_iter(),
+            &MockEmbedder::default()
+                .with_pair("hello", vec![0.1, 0.2])
+                .with_pair("world", vec![0.3, 0.4]),
+        )
+        .await?;
+
+        let values = fixed_size_array.values().as_primitive::<Float32Type>();
+
+        assert_eq!(fixed_size_array.len(), 2);
+        assert_eq!(values.value(0), 0.1);
+        assert_eq!(values.value(1), 0.2);
+        assert_eq!(values.value(2), 0.3);
+        assert_eq!(values.value(3), 0.4);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_vectors_with_nulls_and_empty(
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let result = get_vectors(
+            vec![None, Some("world"), Some(""), Some("hello"), None].into_iter(),
+            &MockEmbedder::default()
+                .with_pair("hello", vec![0.1, 0.2])
+                .with_pair("world", vec![0.3, 0.4]),
+        )
+        .await?;
+
+        assert_eq!(result.len(), 5);
+
+        assert!(result.is_null(0));
+        assert!(!result.is_null(1));
+        assert!(result.is_null(2));
+        assert!(!result.is_null(3));
+        assert!(result.is_null(4));
+
+        let values = result.values().as_primitive::<Float32Type>();
+        assert_eq!(values.len(), 10);
+        assert_eq!(values.value(2), 0.3);
+        assert_eq!(values.value(3), 0.4);
+        assert_eq!(values.value(6), 0.1);
+        assert_eq!(values.value(7), 0.2);
+
+        Ok(())
+    }
 }

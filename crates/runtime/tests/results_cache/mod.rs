@@ -14,16 +14,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::sync::Arc;
+
 use app::AppBuilder;
 use arrow::array::RecordBatch;
 use futures::TryStreamExt;
-use runtime::{
-    datafusion::query::{Protocol, QueryBuilder},
-    Runtime,
-};
+use runtime::{datafusion::query::QueryBuilder, status, Runtime};
 use spicepod::component::{dataset::Dataset, params::Params, runtime::ResultsCache};
 
-use crate::init_tracing;
+use crate::{get_test_datafusion, init_tracing, utils::test_request_context};
 
 fn make_s3_tpch_dataset(name: &str) -> Dataset {
     let mut test_dataset = Dataset::new(
@@ -43,32 +42,43 @@ fn make_s3_tpch_dataset(name: &str) -> Dataset {
 async fn results_cache_system_queries() -> Result<(), String> {
     let _tracing = init_tracing(None);
 
-    let results_cache = ResultsCache {
-        item_ttl: Some("60s".to_string()),
-        ..Default::default()
-    };
+    test_request_context()
+        .scope(async {
+            let results_cache = ResultsCache {
+                item_ttl: Some("60s".to_string()),
+                ..Default::default()
+            };
 
-    let app = AppBuilder::new("cache_test")
-        .with_results_cache(results_cache)
-        .with_dataset(make_s3_tpch_dataset("customer"))
-        .build();
+            let app = AppBuilder::new("cache_test")
+                .with_results_cache(results_cache)
+                .with_dataset(make_s3_tpch_dataset("customer"))
+                .build();
 
-    let rt = Runtime::builder().with_app(app).build().await;
+            let status = status::RuntimeStatus::new();
+            let df = get_test_datafusion(Arc::clone(&status));
 
-    rt.load_components().await;
+            let rt = Runtime::builder()
+                .with_app(app)
+                .with_datafusion(df)
+                .build()
+                .await;
 
-    assert!(
-        execute_query_and_check_cache_status(&rt, "show tables", None)
-            .await
-            .is_ok()
-    );
-    assert!(
-        execute_query_and_check_cache_status(&rt, "describe customer", None)
-            .await
-            .is_ok()
-    );
+            rt.load_components().await;
 
-    Ok(())
+            assert!(
+                execute_query_and_check_cache_status(&rt, "show tables", None)
+                    .await
+                    .is_ok()
+            );
+            assert!(
+                execute_query_and_check_cache_status(&rt, "describe customer", None)
+                    .await
+                    .is_ok()
+            );
+
+            Ok(())
+        })
+        .await
 }
 
 async fn execute_query_and_check_cache_status(
@@ -76,7 +86,7 @@ async fn execute_query_and_check_cache_status(
     query: &str,
     expected_cache_status: Option<bool>,
 ) -> Result<Vec<RecordBatch>, String> {
-    let query = QueryBuilder::new(query, rt.datafusion(), Protocol::Http).build();
+    let query = QueryBuilder::new(query, rt.datafusion()).build();
 
     let query_result = query
         .run()

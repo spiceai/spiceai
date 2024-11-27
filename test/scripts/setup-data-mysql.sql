@@ -44,7 +44,9 @@ INSERT INTO test_mysql_table (
   col_char,
   col_set,
   col_json
-) VALUES (
+) VALUES 
+-- First test row
+(
   1,
   1,
   1,
@@ -64,29 +66,9 @@ INSERT INTO test_mysql_table (
   'USA',
   'apple,banana',
   '{"name": "John", "age": 30, "is_active": true, "balance": 1234.56}'
-);
-
-INSERT INTO test_mysql_table (
-  col_bit,
-  col_tiny,
-  col_short,
-  col_long,
-  col_longlong,
-  col_float,
-  col_double,
-  col_timestamp,
-  col_date,
-  col_time,
-  col_blob,
-  col_varchar,
-  col_string,
-  col_var_string,
-  col_decimal,
-  col_unsigned_int,
-  col_char,
-  col_set,
-  col_json
-) VALUES (
+), 
+-- Second test row with NULLs
+(
   NULL,
   NULL,
   NULL,
@@ -106,4 +88,26 @@ INSERT INTO test_mysql_table (
   NULL,
   NULL,
   NULL
+),
+-- Third test row
+(
+  0,
+  -5,
+  32767,
+  -2147483648,
+  9223372036854775807,
+  3.14,
+  2.71828,
+  '2029-01-01 00:00:00',
+  '2029-01-01',
+  '23:59:59',
+  'binary_blob_test',
+  'varchar_value',
+  'longer_text_string_example',
+  'short_var',
+  99.99,
+  12345,
+  'CAN',
+  'cherry',
+  '{"product": "Laptop", "price": 999.99, "in_stock": false}'
 );

@@ -1,18 +1,19 @@
 ---
 source: crates/runtime/benches/bench.rs
 expression: records_pretty
+snapshot_kind: text
 ---
 +----------------------+------------------+------------+-----------+
 | w_warehouse_name     | i_item_id        | inv_before | inv_after |
 +----------------------+------------------+------------+-----------+
-| Bad cards must make. | AAAAAAAAAABDAAAA | 2535       | 2048      |
-| Bad cards must make. | AAAAAAAAAALAAAAA | 1971       | 1642      |
-| Bad cards must make. | AAAAAAAAACGCAAAA | 1766       | 1221      |
-| Bad cards must make. | AAAAAAAAACHCAAAA | 3100       | 2071      |
-| Bad cards must make. | AAAAAAAAACKCAAAA | 2548       | 1767      |
+| Bad cards must make. | AAAAAAAAABBDAAAA | 1480       | 2780      |
 | Bad cards must make. | AAAAAAAAACLDAAAA | 1663       | 2144      |
 | Bad cards must make. | AAAAAAAAACOBAAAA | 1202       | 1558      |
-| Bad cards must make. | AAAAAAAAADGBAAAA | 2119       | 2044      |
 | Bad cards must make. | AAAAAAAAADKBAAAA | 2404       | 2414      |
-| Bad cards must make. | AAAAAAAAAEADAAAA | 2589       | 2544      |
+| Bad cards must make. | AAAAAAAAAFDCAAAA | 2331       | 2523      |
+| Bad cards must make. | AAAAAAAAAHDEAAAA | 2456       | 2620      |
+| Bad cards must make. | AAAAAAAAAHHAAAAA | 1901       | 1973      |
+| Bad cards must make. | AAAAAAAAAIECAAAA | 2282       | 2837      |
+| Bad cards must make. | AAAAAAAAALCEAAAA | 2138       | 2731      |
+| Bad cards must make. | AAAAAAAAAMBEAAAA | 1736       | 2501      |
 +----------------------+------------------+------------+-----------+

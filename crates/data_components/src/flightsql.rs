@@ -54,26 +54,35 @@ pub mod federation;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Unable to connect to FlightSQL Server"))]
+    #[snafu(display("Failed to connect to the Flight server.\n{source}\nVerify configuration and try again. For details, visit https://docs.spiceai.org/components/data-connectors/flightsql#params"))]
     UnableToConnectToServer { source: tonic::transport::Error },
 
-    #[snafu(display("Unable to generate SQL: {source}"))]
+    #[snafu(display("Failed to create SQL query (flightsql).\n{source}\nAn unexpected error occurred. Please report a bug on GitHub: https://github.com/spiceai/spiceai/issues"))]
     UnableToGenerateSQL { source: expr::Error },
 
-    #[snafu(display("Unable to query FlightSQL: {source}"))]
-    Flight { source: flight_client::Error },
+    #[snafu(display("Query execution failed (flightsql).\n{source}"))]
+    UnableToQueryArrowFlight { source: FlightError },
 
-    #[snafu(display("Unable to query FlightSQL: {source}"))]
-    ArrowFlight { source: FlightError },
+    #[snafu(display("Failed to retrieve table {table_name} schema (flightsql).\n{source}\nAn internal error occurred. Please report a bug on GitHub: https://github.com/spiceai/spiceai/issues"))]
+    UnableToRetrieveSchemaFromIpcMessage {
+        source: arrow::error::ArrowError,
+        table_name: String,
+    },
 
-    #[snafu(display("Unable to retrieve schema: {source}"))]
-    UnableToRetrieveSchemaArrow { source: arrow::error::ArrowError },
+    #[snafu(display("Failed to detect table '{table_name}' schema (flightsql).\n{source}\nVerify the connection and try again. If the issue persists, please report a bug on GitHub: https://github.com/spiceai/spiceai/issues"))]
+    UnableToRetrieveSchemaArrow {
+        source: arrow::error::ArrowError,
+        table_name: String,
+    },
 
-    #[snafu(display("Unable to retrieve schema: {source}"))]
-    UnableToRetrieveSchemaFlight { source: FlightError },
+    #[snafu(display("Failed to detect table '{table_name}' schema (flightsql).\n{source}\nVerify the connection and try again. If the issue persists, please report a bug on GitHub: https://github.com/spiceai/spiceai/issues"))]
+    UnableToRetrieveSchemaFlight {
+        source: FlightError,
+        table_name: String,
+    },
 
-    #[snafu(display("Unable to retrieve schema"))]
-    UnableToRetrieveSchema,
+    #[snafu(display("Failed to detect table '{table_name}' schema (flightsql).\nEnsure the table exists and try again."))]
+    UnableToRetrieveSchema { table_name: String },
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -235,9 +244,11 @@ impl FlightSQLTable {
         match possible_schema_bytz.len() {
             1 => {
                 if let Some(bytz) = possible_schema_bytz.first() {
-                    match Schema::try_from(IpcMessage(Bytes::copy_from_slice(bytz)))
-                        .context(UnableToRetrieveSchemaArrowSnafu)
-                    {
+                    match Schema::try_from(IpcMessage(Bytes::copy_from_slice(bytz))).context(
+                        UnableToRetrieveSchemaFromIpcMessageSnafu {
+                            table_name: table_reference.to_string(),
+                        },
+                    ) {
                         Ok(schema) => Some(Arc::new(schema)),
                         Err(e) => {
                             tracing::error!(
@@ -280,21 +291,27 @@ impl FlightSQLTable {
                 .collect(),
             })
             .await
-            .context(UnableToRetrieveSchemaArrowSnafu)?;
+            .context(UnableToRetrieveSchemaArrowSnafu {
+                table_name: table_reference.to_string(),
+            })?;
 
         for tkt in flight_info
             .endpoint
             .iter()
             .filter_map(|ep| ep.ticket.as_ref())
         {
-            let stream = client
-                .do_get(tkt.clone())
-                .await
-                .context(UnableToRetrieveSchemaArrowSnafu)?;
-            let batch = stream
-                .try_collect::<Vec<_>>()
-                .await
-                .context(UnableToRetrieveSchemaFlightSnafu)?;
+            let stream =
+                client
+                    .do_get(tkt.clone())
+                    .await
+                    .context(UnableToRetrieveSchemaArrowSnafu {
+                        table_name: table_reference.to_string(),
+                    })?;
+            let batch = stream.try_collect::<Vec<_>>().await.context(
+                UnableToRetrieveSchemaFlightSnafu {
+                    table_name: table_reference.to_string(),
+                },
+            )?;
 
             // Schema: https://github.com/apache/arrow/blob/44edc27e549d82db930421b0d4c76098941afd71/format/FlightSql.proto#L1182-L1190
             if let Some(schema) = Self::get_table_schema_if_present(batch, table_reference.clone())
@@ -303,7 +320,10 @@ impl FlightSQLTable {
             };
         }
 
-        UnableToRetrieveSchemaSnafu.fail()
+        UnableToRetrieveSchemaSnafu {
+            table_name: table_reference.to_string(),
+        }
+        .fail()
     }
 
     fn create_physical_plan(
@@ -513,11 +533,11 @@ fn query_to_stream(
                             while let Some(batch) = flight_stream.next().await {
                                 match batch {
                                     Ok(batch) => yield Ok(batch),
-                                    Err(error) => yield Err(to_execution_error(Error::ArrowFlight { source: error }))
+                                    Err(error) => yield Err(to_execution_error(Error::UnableToQueryArrowFlight { source: error }))
                                 }
                             }
                         },
-                        Err(error) => yield Err(to_execution_error(Error::ArrowFlight { source: error.into()} ))
+                        Err(error) => yield Err(to_execution_error(Error::UnableToQueryArrowFlight { source: error.into()} ))
                 };
             }
         };

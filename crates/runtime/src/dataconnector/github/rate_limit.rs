@@ -16,7 +16,7 @@ limitations under the License.
 
 use async_trait::async_trait;
 use chrono::{DateTime, TimeZone, Utc};
-use data_components::graphql::rate_limit::RateLimiter;
+use data_components::rate_limit::RateLimiter;
 use reqwest::header::HeaderMap;
 use std::{sync::Arc, time::Duration};
 use tokio::sync::RwLock;
@@ -128,7 +128,7 @@ impl RateLimiter for GitHubRateLimiter {
         }
     }
 
-    async fn check_rate_limit(&self) -> Result<(), data_components::graphql::Error> {
+    async fn check_rate_limit(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Check if we're rate limited based on the previous API response headers
         let api_limit_guard = self.api_limit.read().await;
         if let Some(api_limit) = &*api_limit_guard {

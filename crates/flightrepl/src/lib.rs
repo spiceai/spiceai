@@ -33,6 +33,7 @@ use datafusion::dataframe::DataFrame;
 use datafusion::datasource::{provider_as_source, MemTable};
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::{LogicalPlanBuilder, UNNAMED_TABLE};
+use flight_client::TonicStatusError;
 use futures::{StreamExt, TryStreamExt};
 use llms::chat::LlmRuntime;
 use prost::Message;
@@ -79,6 +80,9 @@ pub struct ReplConfig {
     /// The API key to use for authentication
     #[arg(long, value_name = "API_KEY", help_heading = "SQL REPL")]
     pub api_key: Option<String>,
+
+    #[arg(long, value_name = "USER_AGENT", help_heading = "SQL REPL")]
+    pub user_agent: Option<String>,
 }
 
 const NQL_LINE_PREFIX: &str = "nql ";
@@ -88,11 +92,12 @@ async fn send_nsql_request(
     base_url: String,
     query: String,
     runtime: LlmRuntime,
+    user_agent: &str,
 ) -> Result<String, reqwest::Error> {
     client
         .post(format!("{base_url}/v1/nsql"))
         .header("Content-Type", "application/json")
-        .header("X-Spice-User-Agent", get_user_agent())
+        .header("User-Agent", user_agent)
         .json(&json!({
             "query": query,
             "model": runtime,
@@ -134,6 +139,7 @@ impl ConditionalEventHandler for KeyEventHandler {
 #[allow(clippy::missing_errors_doc)]
 pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Error>> {
     let mut repl_flight_endpoint = repl_config.repl_flight_endpoint;
+    let user_agent = repl_config.user_agent.unwrap_or_else(get_user_agent);
     let channel = if let Some(tls_root_certificate_file) = repl_config.tls_root_certificate_file {
         let tls_root_certificate = std::fs::read(tls_root_certificate_file)?;
         let tls_root_certificate = tonic::transport::Certificate::from_pem(tls_root_certificate);
@@ -142,11 +148,13 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
             repl_flight_endpoint = "https://localhost:50051".to_string();
         }
         Channel::from_shared(repl_flight_endpoint.clone())?
+            .user_agent(user_agent.clone())?
             .tls_config(client_tls_config)?
             .connect()
             .await
     } else {
         Channel::from_shared(repl_flight_endpoint.clone())?
+            .user_agent(user_agent.clone())?
             .connect()
             .await
     };
@@ -225,7 +233,10 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
             ".exit" | "exit" | "quit" | "q" => break,
             ".error" => {
                 match last_error {
-                    Some(ref err) => println!("{err:?}"),
+                    Some(ref err) => {
+                        let err = TonicStatusError::from(err.clone());
+                        println!("{err}");
+                    },
                     None => println!("No error to display"),
                 }
                 continue;
@@ -245,13 +256,14 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
                 continue;
             }
             "show tables" | "show tables;" => {
-                "select table_catalog, table_schema, table_name, table_type from information_schema.tables where table_schema != 'information_schema'"
+                "select table_catalog, table_schema, table_name, table_type from information_schema.tables where table_schema != 'information_schema';"
             }
             line if line.to_lowercase().starts_with(NQL_LINE_PREFIX) => {
                 let _ = rl.add_history_entry(line);
                 get_and_display_nql_records(
                     repl_config.http_endpoint.clone(),
-                     line.strip_prefix(NQL_LINE_PREFIX).unwrap_or(line).to_string()
+                     line.strip_prefix(NQL_LINE_PREFIX).unwrap_or(line).to_string(),
+                    &user_agent
                 ).await.map_err(|e| format!("Error occured on NQL request: {e}"))?;
                 continue;
             }
@@ -261,7 +273,14 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
         let _ = rl.add_history_entry(line);
 
         let start_time = Instant::now();
-        match get_records(client.clone(), line, repl_config.api_key.as_ref()).await {
+        match get_records(
+            client.clone(),
+            line,
+            repl_config.api_key.as_ref(),
+            &user_agent,
+        )
+        .await
+        {
             Ok((_, 0, from_cache)) => {
                 println!("No results{}.", if from_cache { " (cached)" } else { "" });
             }
@@ -294,6 +313,7 @@ pub async fn get_records(
     mut client: FlightServiceClient<Channel>,
     line: &str,
     api_key: Option<&String>,
+    user_agent: &str,
 ) -> Result<(Vec<RecordBatch>, usize, bool), FlightError> {
     let sql_command = CommandStatementQuery {
         query: line.to_string(),
@@ -314,9 +334,9 @@ pub async fn get_records(
         return Err(FlightError::Tonic(Status::internal("No ticket")));
     };
     let mut request = add_api_key(ticket.into_request(), api_key);
-    let user_agent_key = AsciiMetadataKey::from_str("x-spice-user-agent")
+    let user_agent_key = AsciiMetadataKey::from_str("User-Agent")
         .map_err(|e| FlightError::ExternalError(e.into()))?;
-    let user_agent_value = get_user_agent()
+    let user_agent_value = user_agent
         .parse()
         .map_err(|e: InvalidMetadataValue| FlightError::ExternalError(e.into()))?;
 
@@ -409,10 +429,18 @@ async fn display_records(
 async fn get_and_display_nql_records(
     endpoint: String,
     query: String,
+    user_agent: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let start_time = Instant::now();
 
-    let resp = send_nsql_request(&Client::new(), endpoint, query, LlmRuntime::Openai).await?;
+    let resp = send_nsql_request(
+        &Client::new(),
+        endpoint,
+        query,
+        LlmRuntime::Openai,
+        user_agent,
+    )
+    .await?;
 
     let jsonl_resp = json_array_to_jsonl(&resp)?;
 
@@ -447,47 +475,75 @@ fn json_array_to_jsonl(json_array_str: &str) -> Result<String, Box<dyn std::erro
     Ok(jsonl_str)
 }
 
+/// Returns a boolean indicating if a message needs truncation, from a given input of lines.
+fn lines_need_truncation(lines: &[&str]) -> bool {
+    lines.iter().any(|line| line.len() > 120)
+}
+
 fn display_grpc_error(err: &Status) {
     let (error_type, user_err_msg) = match err.code() {
         Code::Ok => return,
         Code::Unknown | Code::Internal | Code::DataLoss | Code::FailedPrecondition => (
             "Internal Error",
-            "An unexpected internal error occurred. Execute '.error' for details.",
+            "An unexpected internal error occurred. Execute '.error' for details.".to_string(),
         ),
         Code::InvalidArgument | Code::AlreadyExists | Code::NotFound | Code::Unavailable => {
-            let message = err.message().split('\n').next().unwrap_or(err.message());
-            ("Query Error", message)
+            let message = err.message();
+            let lines = message.split('\n').collect::<Vec<_>>();
+            let truncate = lines_need_truncation(&lines);
+
+            let first_line = lines.first().unwrap_or(&message);
+            match (truncate, lines.len() > 1) {
+                (true, true) => {
+                    // truncating due to length, and multiple error lines
+                    ("Query Error", format!("{first_line}\nThis error message has been truncated.\nFor the full error message, execute `.error`."))
+                }
+                (true, false) => {
+                    // truncating due to length, but only one line
+                    ("Query Error", "Failed to execute query.\nThis error message has been truncated.\nFor the full error message, execute `.error`.".to_string())
+                }
+                _ => ("Query Error", message.to_string()),
+            }
         }
         Code::Cancelled => (
             "Cancelled",
-            "The operation was cancelled before completion.",
+            "The operation was cancelled before completion.".to_string(),
         ),
-        Code::Aborted => ("Aborted", "The operation was aborted before completion."),
+        Code::Aborted => (
+            "Aborted",
+            "The operation was aborted before completion.".to_string(),
+        ),
         Code::DeadlineExceeded => (
             "Timeout Error",
-            "The operation could not complete within the allowed time limit.",
+            "The operation could not complete within the allowed time limit.".to_string(),
         ),
         Code::Unauthenticated => (
             "Authentication Error",
-            "Access denied. Invalid credentials.",
+            "Access denied. Invalid credentials.".to_string(),
         ),
         Code::PermissionDenied => (
             "Authorization Error",
-            "Access denied. Insufficient permisions to complete the request.",
+            "Access denied. Insufficient permisions to complete the request.".to_string(),
         ),
         Code::ResourceExhausted => (
             "Resource Limit Exceeded",
-            "The operation could not be completed because the server resources are exhausted.",
+            "The operation could not be completed because the server resources are exhausted."
+                .to_string(),
         ),
         Code::Unimplemented => (
             "Unsupported Operation",
-            "The query could not be completed because the requested operation is not supported.",
+            "The query could not be completed because the requested operation is not supported."
+                .to_string(),
         ),
         Code::OutOfRange => (
             "Result Limit Exceeded",
-            "The query result exceeds allowable limits. Consider using a `limit` clause.",
+            "The query result exceeds allowable limits. Consider using a `limit` clause."
+                .to_string(),
         ),
     };
 
-    println!("{} {user_err_msg}", Colour::Red.paint(error_type));
+    println!(
+        "{} {user_err_msg}",
+        Colour::Red.paint(format!("{error_type}:"))
+    );
 }

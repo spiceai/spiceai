@@ -65,7 +65,7 @@ impl Chat for Anthropic {
             >,
         > = self.client.post_stream("/messages", anth_req).await;
 
-        Ok(transform_stream(stream, self.name.to_string()))
+        Ok(transform_stream(stream))
     }
 
     async fn chat_request(
@@ -76,9 +76,7 @@ impl Chat for Anthropic {
 
         let inner_resp: MessageCreateResponse = self.client.post("/messages", anth_req).await?;
 
-        let mut resp = CreateChatCompletionResponse::try_from(inner_resp)?;
-        resp.model = self.name.to_string();
-        Ok(resp)
+        CreateChatCompletionResponse::try_from(inner_resp)
     }
 }
 

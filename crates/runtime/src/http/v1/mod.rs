@@ -13,6 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+
 pub mod catalogs;
 pub mod chat;
 pub mod datasets;
@@ -31,7 +32,8 @@ use std::sync::Arc;
 
 use crate::{
     component::dataset::Dataset,
-    datafusion::query::{Protocol, QueryBuilder},
+    datafusion::{query::QueryBuilder, DataFusion},
+    status::ComponentStatus,
 };
 use arrow::{array::RecordBatch, util::pretty::pretty_format_batches};
 use axum::{
@@ -43,8 +45,6 @@ use csv::Writer;
 use headers_accept::Accept;
 use serde::{Deserialize, Serialize};
 use snafu::ResultExt;
-
-use crate::{datafusion::DataFusion, status::ComponentStatus};
 
 use futures::TryStreamExt;
 
@@ -106,9 +106,7 @@ fn dataset_status(df: &DataFusion, ds: &Dataset) -> ComponentStatus {
 
 // Runs query and converts query results to HTTP response (as JSON).
 pub async fn sql_to_http_response(df: Arc<DataFusion>, sql: &str, format: ArrowFormat) -> Response {
-    let query = QueryBuilder::new(sql, Arc::clone(&df), Protocol::Http)
-        .protocol(Protocol::Http)
-        .build();
+    let query = QueryBuilder::new(sql, Arc::clone(&df)).build();
 
     let (data, is_data_from_cache) = match query.run().await {
         Ok(query_result) => match query_result.data.try_collect::<Vec<RecordBatch>>().await {

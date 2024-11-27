@@ -7,7 +7,7 @@ use datafusion::{
     common::Constraints,
     datasource::{TableProvider, TableType},
     error::Result as DataFusionResult,
-    logical_expr::{dml::InsertOp, LogicalPlan},
+    logical_expr::{dml::InsertOp, LogicalPlan, TableProviderFilterPushDown},
     physical_plan::ExecutionPlan,
     prelude::Expr,
 };
@@ -96,6 +96,13 @@ impl TableProvider for PolyTableProvider {
     }
     fn get_column_default(&self, column: &str) -> Option<&Expr> {
         self.write.get_column_default(column)
+    }
+
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
+        self.fed.supports_filters_pushdown(filters)
     }
 
     async fn scan(

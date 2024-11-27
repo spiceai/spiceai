@@ -20,7 +20,7 @@ use std::{
 };
 
 use super::SampleFrom;
-use crate::datafusion::{query::Protocol, DataFusion};
+use crate::datafusion::DataFusion;
 use arrow::{array::RecordBatch, compute::concat_batches};
 use futures::TryStreamExt;
 use schemars::JsonSchema;
@@ -60,14 +60,11 @@ impl SampleFrom for TopSamplesParams {
         };
 
         let batches = df
-            .query_builder(
-                &format!(
-                    "SELECT * FROM {tbl} ORDER BY {order_by} LIMIT {limit}",
-                    limit = self.limit,
-                    tbl = self.tbl,
-                ),
-                Protocol::Internal,
-            )
+            .query_builder(&format!(
+                "SELECT * FROM {tbl} ORDER BY {order_by} LIMIT {limit}",
+                limit = self.limit,
+                tbl = self.tbl,
+            ))
             .build()
             .run()
             .await
