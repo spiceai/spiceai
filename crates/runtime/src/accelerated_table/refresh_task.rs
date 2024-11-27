@@ -506,7 +506,6 @@ impl RefreshTask {
         &self,
         ctx: SessionContext,
         column: &str,
-        sql: Option<&str>,
     ) -> Result<DataFrame, DataFusionError> {
         let expr = cast(
             col(format!(r#""{column}""#)),
@@ -514,17 +513,13 @@ impl RefreshTask {
         )
         .alias("a");
 
-        self.accelerator_df(&ctx, sql)?
+        self.accelerator_df(&ctx)?
             .select(vec![expr])?
             .sort(vec![col("a").sort(false, false)])?
             .limit(0, Some(1))
     }
 
-    fn accelerator_df(
-        &self,
-        ctx: &SessionContext,
-        _sql_opt: Option<&str>,
-    ) -> Result<DataFrame, DataFusionError> {
+    fn accelerator_df(&self, ctx: &SessionContext) -> Result<DataFrame, DataFusionError> {
         // Records in the accelerator table are already filtered so we don't need to apply refresh SQL
         ctx.read_table(Arc::new(EnsureSchema::new(Arc::clone(&self.accelerator))))
     }
@@ -545,10 +540,7 @@ impl RefreshTask {
         let federated_provider = self.federated.table_provider().await;
 
         let existing_records = self
-            .accelerator_df(
-                &self.refresh_df_context(Arc::clone(&federated_provider)),
-                refresh.sql.as_deref(),
-            )
+            .accelerator_df(&self.refresh_df_context(Arc::clone(&federated_provider)))
             .map_err(find_datafusion_root)
             .context(super::UnableToScanTableProviderSnafu)?
             .filter(filter_converter.convert(value, Operator::Gt))
@@ -596,7 +588,7 @@ impl RefreshTask {
         })?;
 
         let df = self
-            .max_timestamp_df(ctx, &column, refresh.sql.as_deref())
+            .max_timestamp_df(ctx, &column)
             .map_err(find_datafusion_root)
             .context(super::UnableToScanTableProviderSnafu)?;
         let result = &df
