@@ -502,7 +502,7 @@ impl RefreshTask {
     }
 
     #[allow(clippy::needless_pass_by_value)]
-    async fn max_timestamp_df(
+    fn max_timestamp_df(
         &self,
         ctx: SessionContext,
         column: &str,
@@ -514,23 +514,19 @@ impl RefreshTask {
         )
         .alias("a");
 
-        self.accelerator_df(ctx, sql)
-            .await?
+        self.accelerator_df(&ctx, sql)?
             .select(vec![expr])?
             .sort(vec![col("a").sort(false, false)])?
             .limit(0, Some(1))
     }
 
-    async fn accelerator_df(
+    fn accelerator_df(
         &self,
-        ctx: SessionContext,
-        sql_opt: Option<&str>,
+        ctx: &SessionContext,
+        _sql_opt: Option<&str>,
     ) -> Result<DataFrame, DataFusionError> {
-        if let Some(sql) = sql_opt {
-            ctx.sql(sql).await
-        } else {
-            ctx.read_table(Arc::new(EnsureSchema::new(Arc::clone(&self.accelerator))))
-        }
+        // Records in the accelerator table are already filtered so we don't need to apply refresh SQL
+        ctx.read_table(Arc::new(EnsureSchema::new(Arc::clone(&self.accelerator))))
     }
 
     #[allow(clippy::cast_possible_truncation)]
@@ -550,10 +546,9 @@ impl RefreshTask {
 
         let existing_records = self
             .accelerator_df(
-                self.refresh_df_context(Arc::clone(&federated_provider)),
+                &self.refresh_df_context(Arc::clone(&federated_provider)),
                 refresh.sql.as_deref(),
             )
-            .await
             .map_err(find_datafusion_root)
             .context(super::UnableToScanTableProviderSnafu)?
             .filter(filter_converter.convert(value, Operator::Gt))
@@ -602,7 +597,6 @@ impl RefreshTask {
 
         let df = self
             .max_timestamp_df(ctx, &column, refresh.sql.as_deref())
-            .await
             .map_err(find_datafusion_root)
             .context(super::UnableToScanTableProviderSnafu)?;
         let result = &df

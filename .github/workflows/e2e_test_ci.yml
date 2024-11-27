@@ -475,6 +475,7 @@ jobs:
             echo "      enabled: true" >> spicepod.yaml
             echo "      refresh_mode: append" >> spicepod.yaml
             echo "      refresh_check_interval: 2s" >> spicepod.yaml
+            echo "      refresh_sql: SELECT * FROM test_postgresql_table" >> spicepod.yaml
             echo "      engine: $ENGINE" >> spicepod.yaml
             if [[ -n "$MODE" ]]; then
               echo "      mode: $MODE" >> spicepod.yaml
@@ -638,6 +639,7 @@ jobs:
             echo "      engine: $ENGINE" >> spicepod.yaml
             echo "      refresh_mode: append" >> spicepod.yaml
             echo "      refresh_check_interval: 2s" >> spicepod.yaml
+            echo "      refresh_sql: SELECT * FROM test_mysql_table" >> spicepod.yaml
             if [[ -n "$MODE" ]]; then
               echo "      mode: $MODE" >> spicepod.yaml
            fi
@@ -1340,6 +1342,7 @@ jobs:
           echo "      enabled: true" >> spicepod.yaml
           echo "      refresh_mode: append" >> spicepod.yaml
           echo "      refresh_check_interval: 2s" >> spicepod.yaml
+          echo "      refresh_sql: SELECT * FROM test_mssql_table" >> spicepod.yaml
 
           cat spicepod.yaml
 
