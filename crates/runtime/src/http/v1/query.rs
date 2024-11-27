@@ -23,7 +23,6 @@ use axum::{
 };
 use axum_extra::TypedHeader;
 use headers_accept::Accept;
-use http::HeaderMap;
 
 use crate::datafusion::DataFusion;
 
@@ -31,23 +30,9 @@ use super::{sql_to_http_response, ArrowFormat};
 
 pub(crate) async fn post(
     Extension(df): Extension<Arc<DataFusion>>,
-    Extension(user_agent_collection_state): Extension<Arc<UserAgentCollectionState>>,
     accept: Option<TypedHeader<Accept>>,
-    headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let user_agent = if user_agent_collection_state.is_enabled() {
-        Some(
-            headers
-                .get("user-agent")
-                .map(|ua| ua.to_str().unwrap_or_default())
-                .unwrap_or_default()
-                .to_string(),
-        )
-    } else {
-        None
-    };
-
     let query = match String::from_utf8(body.to_vec()) {
         Ok(query) => query,
         Err(e) => {
@@ -56,11 +41,5 @@ pub(crate) async fn post(
         }
     };
 
-    sql_to_http_response(
-        df,
-        &query,
-        ArrowFormat::from_accept_header(&accept),
-        user_agent,
-    )
-    .await
+    sql_to_http_response(df, &query, ArrowFormat::from_accept_header(&accept)).await
 }

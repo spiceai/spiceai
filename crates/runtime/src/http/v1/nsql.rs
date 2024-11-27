@@ -16,7 +16,6 @@ limitations under the License.
 use crate::{
     datafusion::DataFusion,
     http::v1::{sql_to_http_response, ArrowFormat},
-    metrics::telemetry::UserAgentCollectionState,
     model::LLMModelStore,
     tools::{
         builtin::{
@@ -40,7 +39,6 @@ use axum_extra::TypedHeader;
 use datafusion::sql::TableReference;
 use headers_accept::Accept;
 
-use http::HeaderMap;
 use itertools::Itertools;
 use llms::chat::nsql::default::DefaultSqlGeneration;
 use serde::{Deserialize, Serialize};
@@ -136,23 +134,9 @@ pub(crate) async fn post(
     Extension(df): Extension<Arc<DataFusion>>,
     Extension(rt): Extension<Arc<Runtime>>,
     Extension(llms): Extension<Arc<RwLock<LLMModelStore>>>,
-    Extension(user_agent_collection_state): Extension<Arc<UserAgentCollectionState>>,
     accept: Option<TypedHeader<Accept>>,
-    headers: HeaderMap,
     Json(payload): Json<Request>,
 ) -> Response {
-    let user_agent = if user_agent_collection_state.is_enabled() {
-        Some(
-            headers
-                .get("user-agent")
-                .map(|ua| ua.to_str().unwrap_or_default())
-                .unwrap_or_default()
-                .to_string(),
-        )
-    } else {
-        None
-    };
-
     let span = tracing::span!(target: "task_history", tracing::Level::INFO, "nsql", input = %payload.query, model = %payload.model, "labels");
 
     // Default to all available tables if specific table(s) are not provided.
@@ -238,7 +222,6 @@ pub(crate) async fn post(
                 Arc::clone(&df),
                 &cleaned_query,
                 ArrowFormat::from_accept_header(&accept),
-                user_agent,
             )
             .instrument(span.clone())
             .await

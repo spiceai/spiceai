@@ -16,6 +16,7 @@ limitations under the License.
 
 use std::{
     future::Future,
+    marker::PhantomData,
     sync::{Arc, LazyLock},
 };
 
@@ -27,6 +28,7 @@ use spicepod::component::runtime::UserAgentCollection;
 use super::{Protocol, UserAgent};
 
 pub struct RequestContext {
+    pub(crate) protocol: Protocol,
     dimensions: Vec<KeyValue>,
 }
 
@@ -38,13 +40,41 @@ tokio::task_local! {
 static INTERNAL_REQUEST_CONTEXT: LazyLock<Arc<RequestContext>> =
     LazyLock::new(|| Arc::new(RequestContext::builder(Protocol::Internal).build()));
 
+pub struct AsyncMarker(PhantomData<()>);
+
+impl AsyncMarker {
+    // This can only be called in async contexts due to .await
+    pub async fn new() -> Self {
+        AsyncMarker(PhantomData)
+    }
+}
+
 impl RequestContext {
     pub fn builder(protocol: Protocol) -> RequestContextBuilder {
         RequestContextBuilder::new(protocol)
     }
 
     /// Returns the current request context, or an internal context if this is called outside of a request.
-    pub fn current() -> Arc<Self> {
+    ///
+    /// The `AsyncMarker` is required because this function MUST only be called from asynchronous code.
+    ///
+    /// Usage:
+    /// ```rust,no_run
+    /// let ctx = RequestContext::current(AsyncMarker::new().await);
+    /// ```
+    ///
+    /// Additionally, the request context is lost on tokio::spawn - to keep the context across a spawned task boundary,
+    /// wrap the asynchronous code in a `scope` call.
+    ///
+    /// ```rust,no_run
+    /// let ctx = RequestContext::current(AsyncMarker::new().await);
+    /// tokio::spawn(
+    ///     ctx.scope(async move {
+    ///             // ...
+    ///         })
+    /// );
+    /// ```
+    pub fn current(_marker: AsyncMarker) -> Arc<Self> {
         REQUEST_CONTEXT
             .try_with(|ctx| Arc::clone(ctx))
             .ok()
@@ -52,9 +82,9 @@ impl RequestContext {
     }
 
     /// Runs the provided future with the current request context.
-    pub async fn scope<F>(self: Arc<Self>, f: F)
+    pub async fn scope<F>(self: Arc<Self>, f: F) -> F::Output
     where
-        F: Future<Output = ()>,
+        F: Future,
     {
         REQUEST_CONTEXT.scope(self, f).await
     }
@@ -80,8 +110,8 @@ impl RequestContextBuilder {
         }
     }
 
-    pub fn with_app_opt(mut self, app: Arc<App>) -> Self {
-        self.app = Some(app);
+    pub fn with_app_opt(mut self, app: Option<Arc<App>>) -> Self {
+        self.app = app;
         self
     }
 
@@ -135,6 +165,9 @@ impl RequestContextBuilder {
             }
         }
 
-        RequestContext { dimensions }
+        RequestContext {
+            protocol: self.protocol,
+            dimensions,
+        }
     }
 }

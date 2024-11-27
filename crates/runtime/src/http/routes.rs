@@ -108,13 +108,14 @@ pub(crate) fn routes(
 async fn track_metrics(
     Extension(app): Extension<Arc<RwLock<Option<Arc<App>>>>>,
     headers: http::HeaderMap,
-    mut req: Request<Body>,
+    req: Request<Body>,
     next: Next,
 ) -> impl IntoResponse {
     let app_lock = app.read().await;
     let request_context = Arc::new(
         RequestContext::builder(Protocol::Http)
             .with_app_opt(app_lock.as_ref().map(Arc::clone))
+            .from_headers(&headers)
             .build(),
     );
 
@@ -128,7 +129,7 @@ async fn track_metrics(
     };
     let method = req.method().clone();
 
-    request_context
+    let response = Arc::clone(&request_context)
         .scope(async move { next.run(req).await })
         .await;
 
@@ -141,7 +142,7 @@ async fn track_metrics(
         KeyValue::new("status", status),
     ];
 
-    labels.extend(request_dimensions.iter());
+    labels.extend(request_dimensions.into_iter().cloned());
 
     metrics::REQUESTS_TOTAL.add(1, &labels);
     metrics::REQUESTS_DURATION_MS.record(latency_ms, &labels);

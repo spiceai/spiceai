@@ -21,7 +21,7 @@ use datafusion::sql::TableReference;
 use opentelemetry::KeyValue;
 use tokio::time::Instant;
 
-use crate::metrics::telemetry::TelemetryContext;
+use crate::request::RequestContext;
 
 use super::{error_code::ErrorCode, metrics};
 
@@ -37,18 +37,22 @@ pub(crate) struct QueryTracker {
     pub(crate) query_duration_timer: Instant,
     pub(crate) query_execution_duration_timer: Instant,
     pub(crate) datasets: Arc<HashSet<TableReference>>,
-    pub(crate) telemetry_context: Arc<TelemetryContext>,
 }
 
 impl QueryTracker {
-    pub fn finish_with_error(mut self, error_message: String, error_code: ErrorCode) {
+    pub fn finish_with_error(
+        mut self,
+        request_context: &RequestContext,
+        error_message: String,
+        error_code: ErrorCode,
+    ) {
         tracing::debug!("Query finished with error: {error_message}; code: {error_code}",);
         self.error_message = Some(error_message);
         self.error_code = Some(error_code);
-        self.finish(&Arc::from(""));
+        self.finish(request_context, &Arc::from(""));
     }
 
-    pub fn finish(mut self, captured_output: &Arc<str>) {
+    pub fn finish(mut self, request_context: &RequestContext, captured_output: &Arc<str>) {
         let query_duration = self.query_duration_timer.elapsed();
         let query_execution_duration = self.query_execution_duration_timer.elapsed();
 
@@ -87,7 +91,7 @@ impl QueryTracker {
             ),
         ];
 
-        labels.extend(self.telemetry_context.to_dimensions());
+        labels.extend(request_context.to_dimensions().into_iter().cloned());
 
         crate::metrics::telemetry::track_query_duration(query_duration, &labels);
         crate::metrics::telemetry::track_query_execution_duration(
@@ -100,7 +104,7 @@ impl QueryTracker {
             metrics::FAILURES.add(1, &labels);
         }
 
-        trace_query(&self, captured_output);
+        trace_query(request_context, &self, captured_output);
     }
 
     #[must_use]
@@ -128,7 +132,11 @@ impl QueryTracker {
     }
 }
 
-fn trace_query(query_tracker: &QueryTracker, captured_output: &str) {
+fn trace_query(
+    request_context: &RequestContext,
+    query_tracker: &QueryTracker,
+    captured_output: &str,
+) {
     if let Some(error_code) = &query_tracker.error_code {
         tracing::info!(target: "task_history", error_code = %error_code, "labels");
     }
@@ -157,6 +165,6 @@ fn trace_query(query_tracker: &QueryTracker, captured_output: &str) {
         .map(ToString::to_string)
         .collect::<Vec<String>>()
         .join(",");
-    tracing::info!(target: "task_history", protocol = ?query_tracker.telemetry_context.protocol, datasets = datasets_str, "labels");
+    tracing::info!(target: "task_history", protocol = ?request_context.protocol, datasets = datasets_str, "labels");
     tracing::info!(target: "task_history", captured_output = %captured_output);
 }

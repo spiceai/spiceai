@@ -19,7 +19,7 @@ use std::{collections::HashSet, sync::Arc};
 use tokio::time::Instant;
 use uuid::Uuid;
 
-use crate::{datafusion::DataFusion, metrics::telemetry::TelemetryContext};
+use crate::datafusion::DataFusion;
 
 use super::{tracker::QueryTracker, Query};
 
@@ -27,7 +27,6 @@ pub struct QueryBuilder<'a> {
     df: Arc<DataFusion>,
     sql: &'a str,
     query_id: Uuid,
-    telemetry_context: Option<TelemetryContext>,
 }
 
 impl<'a> QueryBuilder<'a> {
@@ -36,7 +35,6 @@ impl<'a> QueryBuilder<'a> {
             df,
             sql,
             query_id: Uuid::new_v4(),
-            telemetry_context: None,
         }
     }
 
@@ -47,15 +45,8 @@ impl<'a> QueryBuilder<'a> {
     }
 
     #[must_use]
-    pub fn with_telemetry_context(mut self, telemetry_context: TelemetryContext) -> Self {
-        self.telemetry_context = Some(telemetry_context);
-        self
-    }
-
-    #[must_use]
     pub fn build(self) -> Query {
         let sql: Arc<str> = self.sql.into();
-        let telemetry_context = self.telemetry_context.unwrap_or_default();
         Query {
             df: Arc::clone(&self.df),
             sql: Arc::clone(&sql),
@@ -71,7 +62,6 @@ impl<'a> QueryBuilder<'a> {
                 query_duration_timer: Instant::now(),
                 query_execution_duration_timer: Instant::now(),
                 datasets: Arc::new(HashSet::default()),
-                telemetry_context: Arc::new(telemetry_context),
             },
         }
     }

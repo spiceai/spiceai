@@ -41,7 +41,7 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 use tracing::{Instrument, Span};
 
-use crate::request::RequestContext;
+use crate::request::{AsyncMarker, RequestContext};
 use crate::tools::builtin::list_datasets::ListDatasetsTool;
 use crate::tools::SpiceModelTool;
 use crate::Runtime;
@@ -336,7 +336,7 @@ impl ToolUsingChat {
 
         Ok(make_a_stream(
             Span::current(),
-            RequestContext::current(),
+            RequestContext::current(AsyncMarker::new().await),
             Self::new(
                 Arc::clone(&self.inner_chat),
                 Arc::clone(&self.rt),

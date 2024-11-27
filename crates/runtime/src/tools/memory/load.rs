@@ -23,11 +23,8 @@ use serde_json::{json, Value};
 use snafu::ResultExt;
 use std::sync::Arc;
 use tracing_futures::Instrument;
-use util::user_agent::SpiceUserAgent;
 
 use crate::{
-    datafusion::query::Protocol,
-    metrics::telemetry::TelemetryContext,
     tools::{utils::parameters, SpiceModelTool},
     Runtime,
 };
@@ -83,15 +80,6 @@ impl SpiceModelTool for LoadMemoryTool {
         arg: &str,
         rt: Arc<Runtime>,
     ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
-        let telemetry_context = TelemetryContext {
-            protocol: Protocol::Internal,
-            user_agent: Some(
-                SpiceUserAgent::default()
-                    .with_client_name("load_memory")
-                    .with_client_version_from_cargo(),
-            ),
-        };
-
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::load_memory", tool = self.name(), input = arg);
 
         let table_name = memory_table_name(&rt).await?;
@@ -107,7 +95,6 @@ impl SpiceModelTool for LoadMemoryTool {
                         last_interval.as_secs()
                     ),
                 )
-                .with_telemetry_context(telemetry_context)
                 .build()
                 .run()
                 .await

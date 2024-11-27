@@ -20,14 +20,12 @@ use std::{
 };
 
 use super::SampleFrom;
-use crate::datafusion::{query::Protocol, DataFusion};
-use crate::metrics::telemetry::TelemetryContext;
+use crate::datafusion::DataFusion;
 use arrow::{array::RecordBatch, compute::concat_batches};
 use futures::TryStreamExt;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use snafu::ResultExt;
-use util::user_agent::SpiceUserAgent;
 
 #[derive(Debug, Clone, JsonSchema, Serialize, Deserialize)]
 pub struct TopSamplesParams {
@@ -61,22 +59,12 @@ impl SampleFrom for TopSamplesParams {
             self.order_by.clone()
         };
 
-        let telemetry_context = TelemetryContext {
-            protocol: Protocol::Internal,
-            user_agent: Some(
-                SpiceUserAgent::default()
-                    .with_client_name("tool_top_samples")
-                    .with_client_version_from_cargo(),
-            ),
-        };
-
         let batches = df
             .query_builder(&format!(
                 "SELECT * FROM {tbl} ORDER BY {order_by} LIMIT {limit}",
                 limit = self.limit,
                 tbl = self.tbl,
             ))
-            .with_telemetry_context(telemetry_context)
             .build()
             .run()
             .await

@@ -243,11 +243,9 @@ pub(crate) mod tools {
 }
 
 pub(crate) mod telemetry {
-    use std::{sync::Arc, time::Duration};
+    use std::time::Duration;
 
     use opentelemetry::{metrics::Histogram, KeyValue};
-
-    use crate::request::Protocol;
 
     use super::{global, Counter, LazyLock, Meter};
 
@@ -262,10 +260,9 @@ pub(crate) mod telemetry {
             .init()
     });
 
-    pub fn track_query_count(telemetry_context: &RequestContext) {
-        let dimensions = telemetry_context.to_dimensions();
-        telemetry::track_query_count(&dimensions);
-        QUERY_COUNT.add(1, &dimensions);
+    pub fn track_query_count(dimensions: &[KeyValue]) {
+        telemetry::track_query_count(dimensions);
+        QUERY_COUNT.add(1, dimensions);
     }
 
     static BYTES_PROCESSED: LazyLock<Counter<u64>> = LazyLock::new(|| {
@@ -276,10 +273,9 @@ pub(crate) mod telemetry {
             .init()
     });
 
-    pub fn track_bytes_processed(bytes: u64, telemetry_context: &RequestContext) {
-        let dimensions = telemetry_context.to_dimensions();
-        telemetry::track_bytes_processed(bytes, &dimensions);
-        BYTES_PROCESSED.add(bytes, &dimensions);
+    pub fn track_bytes_processed(bytes: u64, dimensions: &[KeyValue]) {
+        telemetry::track_bytes_processed(bytes, dimensions);
+        BYTES_PROCESSED.add(bytes, dimensions);
     }
 
     static BYTES_RETURNED: LazyLock<Counter<u64>> = LazyLock::new(|| {
@@ -290,10 +286,9 @@ pub(crate) mod telemetry {
             .init()
     });
 
-    pub fn track_bytes_returned(bytes: u64, telemetry_context: &RequestContext) {
-        let dimensions = telemetry_context.to_dimensions();
-        telemetry::track_bytes_returned(bytes, &dimensions);
-        BYTES_RETURNED.add(bytes, &dimensions);
+    pub fn track_bytes_returned(bytes: u64, dimensions: &[KeyValue]) {
+        telemetry::track_bytes_returned(bytes, dimensions);
+        BYTES_RETURNED.add(bytes, dimensions);
     }
 
     static QUERY_DURATION_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| {

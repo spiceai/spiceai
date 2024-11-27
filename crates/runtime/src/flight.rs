@@ -20,7 +20,6 @@ use crate::datafusion::query::{self, QueryBuilder};
 use crate::datafusion::DataFusion;
 use crate::dataupdate::DataUpdate;
 use crate::metrics as runtime_metrics;
-use crate::metrics::telemetry::TelemetryContext;
 use crate::tls::TlsConfig;
 use app::App;
 use arrow::array::RecordBatch;
@@ -155,14 +154,8 @@ impl FlightService for Service {
 }
 
 impl Service {
-    async fn get_arrow_schema(
-        datafusion: Arc<DataFusion>,
-        sql: &str,
-        telemetry_context: TelemetryContext,
-    ) -> Result<Schema, Status> {
-        let query = QueryBuilder::new(sql, datafusion)
-            .with_telemetry_context(telemetry_context)
-            .build();
+    async fn get_arrow_schema(datafusion: Arc<DataFusion>, sql: &str) -> Result<Schema, Status> {
+        let query = QueryBuilder::new(sql, datafusion).build();
 
         let schema = query.get_schema().await.map_err(handle_datafusion_error)?;
         Ok(schema)
@@ -180,11 +173,8 @@ impl Service {
     async fn sql_to_flight_stream(
         datafusion: Arc<DataFusion>,
         sql: &str,
-        telemetry_context: TelemetryContext,
     ) -> Result<(BoxStream<'static, Result<FlightData, Status>>, Option<bool>), Status> {
-        let query = QueryBuilder::new(sql, Arc::clone(&datafusion))
-            .with_telemetry_context(telemetry_context)
-            .build();
+        let query = QueryBuilder::new(sql, Arc::clone(&datafusion)).build();
 
         let query_result = query.run().await.map_err(handle_query_error)?;
 

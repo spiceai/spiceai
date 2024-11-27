@@ -21,14 +21,12 @@ use std::{
     sync::Arc,
 };
 
-use crate::datafusion::{query::Protocol, DataFusion};
-use crate::metrics::telemetry::TelemetryContext;
+use crate::datafusion::DataFusion;
 use arrow::compute::concat;
 use futures::TryStreamExt;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use snafu::ResultExt;
-use util::user_agent::SpiceUserAgent;
 
 use super::SampleFrom;
 
@@ -101,22 +99,7 @@ impl DistinctColumnsParams {
         df: Arc<DataFusion>,
         query: &str,
     ) -> Result<ArrayRef, Box<dyn std::error::Error + Send + Sync>> {
-        let telemetry_context = TelemetryContext {
-            protocol: Protocol::Internal,
-            user_agent: Some(
-                SpiceUserAgent::default()
-                    .with_client_name("tool_distinct")
-                    .with_client_version_from_cargo(),
-            ),
-        };
-
-        let result = df
-            .query_builder(query)
-            .with_telemetry_context(telemetry_context)
-            .build()
-            .run()
-            .await
-            .boxed()?;
+        let result = df.query_builder(query).build().run().await.boxed()?;
 
         let column = result
             .data

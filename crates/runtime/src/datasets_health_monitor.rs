@@ -31,8 +31,8 @@ use tracing_futures::Instrument;
 
 use crate::{
     component::dataset::Dataset,
-    datafusion::{error::find_datafusion_root, query::Protocol, DataFusion},
-    metrics::{self, telemetry::TelemetryContext},
+    datafusion::{error::find_datafusion_root, DataFusion},
+    metrics,
 };
 
 const DATASETS_AVAILABILITY_CHECK_INTERVAL_SECONDS: u64 = 60; // every minute
@@ -163,15 +163,6 @@ impl DatasetsHealthMonitor {
     pub async fn get_recently_accessed_datasets(
         df: Arc<DataFusion>,
     ) -> Result<Arc<HashSet<String>>> {
-        let telemetry_context = TelemetryContext {
-            protocol: Protocol::Internal,
-            user_agent: Some(
-                SpiceUserAgent::default()
-                    .with_client_name("datasets_health_monitor")
-                    .with_client_version_from_cargo(),
-            ),
-        };
-
         let query = format!(
             "
 SELECT labels.datasets AS datasets
@@ -182,7 +173,6 @@ AND labels.error_code IS NULL"
         );
         let query_result = df
             .query_builder(&query)
-            .with_telemetry_context(telemetry_context)
             .build()
             .run()
             .await

@@ -40,7 +40,7 @@ use std::{
     sync::Arc,
 };
 
-use crate::metrics::telemetry::TelemetryContext;
+use crate::request::RequestContext;
 
 #[derive(Debug, Default)]
 pub struct BytesProcessedOptimizerRule {}
@@ -274,10 +274,11 @@ impl ExecutionPlan for BytesProcessedExec {
         let mut stream = self.input_exec.execute(partition, Arc::clone(&context))?;
         let schema = stream.schema();
 
-        let telemetry_context = context
-            .session_config()
-            .get_extension::<TelemetryContext>()
-            .map_or_else(|| Arc::new(TelemetryContext::new()), |x| Arc::clone(&x));
+        let Some(request_context) = context.session_config().get_extension::<RequestContext>()
+        else {
+            // This should never happen if all queries are run through the query builder, so if it does its a bug we need to catch in development.
+            panic!("The request context was not provided to BytesProcessedExec, please file a bug at https://github.com/spiceai/spiceai/issues")
+        };
 
         let bytes_processed_stream = stream! {
             let mut bytes_processed = 0u64;
@@ -292,7 +293,10 @@ impl ExecutionPlan for BytesProcessedExec {
                     }
                 }
             }
-            crate::metrics::telemetry::track_bytes_processed(bytes_processed, &telemetry_context);
+            crate::metrics::telemetry::track_bytes_processed(
+                bytes_processed,
+                &request_context.to_dimensions(),
+            );
         };
 
         let stream_adapter = RecordBatchStreamAdapter::new(schema, bytes_processed_stream);

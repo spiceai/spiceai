@@ -13,6 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+
 pub mod catalogs;
 pub mod chat;
 pub mod datasets;
@@ -29,10 +30,10 @@ pub mod tools;
 
 use std::sync::Arc;
 
-use crate::metrics::telemetry::TelemetryContext;
 use crate::{
     component::dataset::Dataset,
-    datafusion::query::{Protocol, QueryBuilder},
+    datafusion::{query::QueryBuilder, DataFusion},
+    status::ComponentStatus,
 };
 use arrow::{array::RecordBatch, util::pretty::pretty_format_batches};
 use axum::{
@@ -44,9 +45,6 @@ use csv::Writer;
 use headers_accept::Accept;
 use serde::{Deserialize, Serialize};
 use snafu::ResultExt;
-use util::user_agent::SpiceUserAgent;
-
-use crate::{datafusion::DataFusion, status::ComponentStatus};
 
 use futures::TryStreamExt;
 
@@ -107,37 +105,8 @@ fn dataset_status(df: &DataFusion, ds: &Dataset) -> ComponentStatus {
 }
 
 // Runs query and converts query results to HTTP response (as JSON).
-pub async fn sql_to_http_response(
-    df: Arc<DataFusion>,
-    sql: &str,
-    format: ArrowFormat,
-    user_agent: Option<String>,
-) -> Response {
-    let user_agent = if let Some(user_agent) = user_agent {
-        let mut ua = if let Ok(spice_user_agent) = SpiceUserAgent::try_from(user_agent) {
-            spice_user_agent
-        } else {
-            SpiceUserAgent::default()
-                .with_client_name("HTTP")
-                .with_client_version("1.0")
-                .with_client_system("HTTP")
-        };
-
-        if ua.client_system.is_none() {
-            ua = ua.with_client_system("HTTP");
-        }
-        Some(ua)
-    } else {
-        None
-    };
-    let telemetry_context = TelemetryContext {
-        protocol: Protocol::Http,
-        user_agent,
-    };
-
-    let query = QueryBuilder::new(sql, Arc::clone(&df))
-        .with_telemetry_context(telemetry_context)
-        .build();
+pub async fn sql_to_http_response(df: Arc<DataFusion>, sql: &str, format: ArrowFormat) -> Response {
+    let query = QueryBuilder::new(sql, Arc::clone(&df)).build();
 
     let (data, is_data_from_cache) = match query.run().await {
         Ok(query_result) => match query_result.data.try_collect::<Vec<RecordBatch>>().await {

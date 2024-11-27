@@ -19,7 +19,6 @@ use tonic::{
     metadata::{Ascii, MetadataValue},
     Request, Response,
 };
-use util::user_agent::SpiceUserAgent;
 
 use crate::flight::Service;
 
