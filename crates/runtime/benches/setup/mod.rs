@@ -24,10 +24,13 @@ use runtime::{
     status::{self, RuntimeStatus},
     Runtime,
 };
-use spicepod::component::dataset::{
-    acceleration::{Acceleration, IndexType},
-    replication::Replication,
-    Dataset, Mode,
+use spicepod::component::{
+    dataset::{
+        acceleration::{Acceleration, IndexType},
+        replication::Replication,
+        Dataset, Mode,
+    },
+    runtime::ResultsCache,
 };
 use std::{collections::HashMap, process::Command, sync::Arc, time::Duration};
 use tracing_subscriber::EnvFilter;
@@ -128,7 +131,13 @@ fn build_app(
     acceleration: Option<Acceleration>,
     bench_name: &str,
 ) -> Result<App, String> {
-    let mut app_builder = AppBuilder::new("runtime_benchmark_test");
+    let mut app_builder =
+        AppBuilder::new("runtime_benchmark_test").with_results_cache(ResultsCache {
+            enabled: false,
+            cache_max_size: None,
+            item_ttl: None,
+            eviction_policy: None,
+        });
 
     app_builder = match connector {
         "spice.ai" => Ok(crate::bench_spicecloud::build_app(app_builder)),
