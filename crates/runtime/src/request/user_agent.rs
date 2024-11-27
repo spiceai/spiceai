@@ -50,12 +50,12 @@ impl Deref for Raw {
     }
 }
 
-/// TODO: Parsed should keep any remaining product identifiers other than the primary.
 #[derive(Debug, Eq, PartialEq, Clone)]
 pub struct Parsed {
     pub client_name: Arc<str>,
     pub client_version: Arc<str>,
     pub client_system: Option<Arc<str>>,
+    pub raw_user_agent: Arc<str>,
 }
 
 #[derive(Debug, Eq, PartialEq, Clone)]
@@ -68,13 +68,11 @@ pub struct Platform {
 impl UserAgent {
     #[must_use]
     pub fn from_headers(headers: &HeaderMap) -> Self {
-        let user_agent = match headers.get(USER_AGENT) {
-            Some(user_agent) => user_agent,
-            None => return Self::Absent,
+        let Some(user_agent) = headers.get(USER_AGENT) else {
+            return Self::Absent;
         };
-        let user_agent_str = match user_agent.to_str() {
-            Ok(user_agent_str) => user_agent_str,
-            Err(_) => return Self::Absent,
+        let Ok(user_agent_str) = user_agent.to_str() else {
+            return Self::Absent;
         };
         match Parsed::try_from(user_agent_str) {
             Some(parsed) => Self::Parsed(parsed),
@@ -90,10 +88,7 @@ impl fmt::Display for UserAgent {
             UserAgent::Absent => (),
             UserAgent::Raw(raw) => write!(f, "{} ", raw.0)?,
             UserAgent::Parsed(parsed) => {
-                write!(f, "{}/{} ", parsed.client_name, parsed.client_version)?;
-                if let Some(client_system) = &parsed.client_system {
-                    write!(f, "({client_system}) ")?;
-                }
+                write!(f, "{} ", parsed.raw_user_agent)?;
             }
         }
 
@@ -110,19 +105,23 @@ impl fmt::Display for UserAgent {
 
 impl Parsed {
     fn try_from(s: &str) -> Option<Self> {
-        let mut parts = s.split_whitespace();
-
-        // Get the first part which should be "name/version"
-        let name_version = parts.next()?;
-
+        // First try to find the name/version part which must come first
+        let s = s.trim();
+        let (name_version, rest) = s.split_once(' ').unwrap_or((s, ""));
         let (name, version) = name_version.split_once('/')?;
 
-        // Check for optional system info in parentheses
+        if name.is_empty() || version.is_empty() {
+            return None;
+        }
+
+        // Look for system info in parentheses in the rest of the string
         let mut system = None;
-        if let Some(next_part) = parts.next() {
-            if next_part.starts_with('(') && next_part.ends_with(')') {
-                // Strip the parentheses and convert to Arc<str>
-                system = Some(Arc::from(&next_part[1..next_part.len() - 1]));
+        if !rest.is_empty() {
+            let rest = rest.trim();
+            if rest.starts_with('(') {
+                if let Some(end_paren) = find_matching_parenthesis(rest) {
+                    system = Some(Arc::from(&rest[1..end_paren]));
+                }
             }
         }
 
@@ -130,8 +129,28 @@ impl Parsed {
             client_name: Arc::from(name),
             client_version: Arc::from(version),
             client_system: system,
+            raw_user_agent: Arc::from(s),
         })
     }
+}
+
+fn find_matching_parenthesis(s: &str) -> Option<usize> {
+    let mut depth = 0;
+    let chars: Vec<_> = s.chars().collect();
+
+    for (i, &c) in chars.iter().enumerate() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 #[must_use]
@@ -227,7 +246,7 @@ mod tests {
         );
         match UserAgent::from_headers(&headers) {
             UserAgent::Raw(raw) => assert_eq!(&*raw, "Some Random User Agent String"),
-            other => panic!("Expected Raw, got {:?}", other),
+            other => panic!("Expected Raw, got {other:?}"),
         }
     }
 
@@ -247,7 +266,7 @@ mod tests {
                     "Darwin/21.6.0 arm64"
                 );
             }
-            other => panic!("Expected Parsed, got {:?}", other),
+            other => panic!("Expected Parsed, got {other:?}"),
         }
     }
 
@@ -272,12 +291,44 @@ mod tests {
             "system-info"
         );
 
+        // Test system info with spaces
+        let result = Parsed::try_from("name/1.0.0 (Darwin/21.6.0 arm64)");
+        assert!(result.is_some());
+        let parsed = result.expect("Should parse");
+        assert_eq!(&*parsed.client_name, "name");
+        assert_eq!(&*parsed.client_version, "1.0.0");
+        assert_eq!(
+            &*parsed.client_system.expect("Should have system info"),
+            "Darwin/21.6.0 arm64"
+        );
+
+        // Test with additional products after comment
+        let result = Parsed::try_from("name/1.0.0 (system-info) other/2.0 extra/3.0");
+        assert!(result.is_some());
+        let parsed = result.expect("Should parse");
+        assert_eq!(&*parsed.client_name, "name");
+        assert_eq!(&*parsed.client_version, "1.0.0");
+        assert_eq!(
+            &*parsed.client_system.expect("Should have system info"),
+            "system-info"
+        );
+
+        // Test with nested parentheses in comment
+        let result = Parsed::try_from("browser/1.0 (OS/2 (IBM)) other/2.0");
+        assert!(result.is_some());
+        let parsed = result.expect("Should parse");
+        assert_eq!(&*parsed.client_name, "browser");
+        assert_eq!(&*parsed.client_version, "1.0");
+        assert_eq!(
+            &*parsed.client_system.expect("Should have system info"),
+            "OS/2 (IBM)"
+        );
+
         // Test invalid formats
         assert!(Parsed::try_from("").is_none());
         assert!(Parsed::try_from("name").is_none());
         assert!(Parsed::try_from("name/").is_none());
         assert!(Parsed::try_from("/version").is_none());
-        assert!(Parsed::try_from("name/version extra stuff").is_none());
     }
 
     #[test]
@@ -285,16 +336,19 @@ mod tests {
         // Test Absent
         assert_eq!(
             UserAgent::Absent.to_string(),
-            format!("{PLATFORM_NAME}/{PLATFORM_VERSION} ({})", *PLATFORM_SYSTEM)
+            format!(
+                "{RUNTIME_NAME}/{RUNTIME_VERSION} ({})",
+                RUNTIME_SYSTEM.as_ref()
+            )
         );
 
         // Test Raw
-        let raw = UserAgent::Raw(Arc::from("raw-agent"));
+        let raw = UserAgent::Raw(Raw(Arc::from("raw-agent")));
         assert_eq!(
             raw.to_string(),
             format!(
-                "raw-agent {PLATFORM_NAME}/{PLATFORM_VERSION} ({})",
-                *PLATFORM_SYSTEM
+                "raw-agent {RUNTIME_NAME}/{RUNTIME_VERSION} ({})",
+                RUNTIME_SYSTEM.as_ref()
             )
         );
 
@@ -303,12 +357,13 @@ mod tests {
             client_name: Arc::from("client"),
             client_version: Arc::from("1.0"),
             client_system: None,
+            raw_user_agent: Arc::from("client/1.0"),
         });
         assert_eq!(
             parsed.to_string(),
             format!(
-                "client/1.0 {PLATFORM_NAME}/{PLATFORM_VERSION} ({})",
-                *PLATFORM_SYSTEM
+                "client/1.0 {RUNTIME_NAME}/{RUNTIME_VERSION} ({})",
+                RUNTIME_SYSTEM.as_ref()
             )
         );
 
@@ -317,12 +372,13 @@ mod tests {
             client_name: Arc::from("client"),
             client_version: Arc::from("1.0"),
             client_system: Some(Arc::from("test-system")),
+            raw_user_agent: Arc::from("client/1.0 (test-system)"),
         });
         assert_eq!(
             parsed.to_string(),
             format!(
-                "client/1.0 (test-system) {PLATFORM_NAME}/{PLATFORM_VERSION} ({})",
-                *PLATFORM_SYSTEM
+                "client/1.0 (test-system) {RUNTIME_NAME}/{RUNTIME_VERSION} ({})",
+                RUNTIME_SYSTEM.as_ref()
             )
         );
     }
@@ -342,8 +398,8 @@ mod tests {
     }
 
     #[test]
-    fn test_get_platform_os_string() {
-        let result = get_platform_os_string();
+    fn test_get_runtime_os_string() {
+        let result = get_runtime_os_string();
         assert!(!result.is_empty());
 
         // Should contain OS type
@@ -356,5 +412,58 @@ mod tests {
         let parts: Vec<&str> = result.split_whitespace().collect();
         assert_eq!(parts.len(), 2);
         assert!(parts[0].contains('/'));
+    }
+
+    #[test]
+    fn test_parsed_with_multiple_products() {
+        // Test with multiple products
+        let ua = "spicecli/1.0.0 (Darwin/21.6.0) curl/7.64.1 (x86_64) python-requests/2.31.0";
+        let result = Parsed::try_from(ua);
+        assert!(result.is_some());
+        let parsed = result.expect("Should parse");
+
+        // Check primary product
+        assert_eq!(&*parsed.client_name, "spicecli");
+        assert_eq!(&*parsed.client_version, "1.0.0");
+        assert_eq!(
+            &*parsed.client_system.expect("Should have system info"),
+            "Darwin/21.6.0"
+        );
+    }
+
+    #[test]
+    fn test_parsed_with_nested_comments() {
+        let ua = "browser/1.0 (OS/2 (IBM)) other/2.0";
+        let result = Parsed::try_from(ua);
+        assert!(result.is_some());
+        let parsed = result.expect("Should parse");
+
+        assert_eq!(&*parsed.client_name, "browser");
+        assert_eq!(&*parsed.client_version, "1.0");
+        assert_eq!(
+            &*parsed.client_system.expect("Should have system info"),
+            "OS/2 (IBM)"
+        );
+    }
+
+    #[test]
+    fn test_parsed_with_invalid_nested_comments() {
+        // Test with unmatched opening parenthesis
+        let ua = "browser/1.0 (OS/2 (IBM) other/2.0";
+        let result = Parsed::try_from(ua);
+        assert!(result.is_some());
+        let parsed = result.expect("Should parse");
+        assert_eq!(&*parsed.client_name, "browser");
+        assert_eq!(&*parsed.client_version, "1.0");
+        assert_eq!(parsed.client_system, None);
+
+        // Test with unmatched closing parenthesis
+        let ua = "browser/1.0 (OS/2 IBM)) other/2.0";
+        let result = Parsed::try_from(ua);
+        assert!(result.is_some());
+        let parsed = result.expect("Should parse");
+        assert_eq!(&*parsed.client_name, "browser");
+        assert_eq!(&*parsed.client_version, "1.0");
+        assert_eq!(parsed.client_system, Some(Arc::from("OS/2 IBM")));
     }
 }

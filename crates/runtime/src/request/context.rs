@@ -41,16 +41,24 @@ tokio::task_local! {
 static INTERNAL_REQUEST_CONTEXT: LazyLock<Arc<RequestContext>> =
     LazyLock::new(|| Arc::new(RequestContext::builder(Protocol::Internal).build()));
 
-pub struct AsyncMarker(PhantomData<()>);
+#[derive(Copy, Clone)]
+pub struct AsyncMarker {
+    marker: PhantomData<()>,
+}
 
 impl AsyncMarker {
     // This can only be called in async contexts due to .await
+    #[must_use]
+    #[allow(clippy::unused_async)]
     pub async fn new() -> Self {
-        AsyncMarker(PhantomData)
+        AsyncMarker {
+            marker: PhantomData,
+        }
     }
 }
 
 impl RequestContext {
+    #[must_use]
     pub fn builder(protocol: Protocol) -> RequestContextBuilder {
         RequestContextBuilder::new(protocol)
     }
@@ -64,7 +72,7 @@ impl RequestContext {
     /// let ctx = RequestContext::current(AsyncMarker::new().await);
     /// ```
     ///
-    /// Additionally, the request context is lost on tokio::spawn - to keep the context across a spawned task boundary,
+    /// Additionally, the request context is lost on `tokio::spawn` - to keep the context across a spawned task boundary,
     /// wrap the asynchronous code in a `scope` call.
     ///
     /// ```rust,no_run
@@ -75,9 +83,10 @@ impl RequestContext {
     ///         })
     /// );
     /// ```
+    #[must_use]
     pub fn current(_marker: AsyncMarker) -> Arc<Self> {
         REQUEST_CONTEXT
-            .try_with(|ctx| Arc::clone(ctx))
+            .try_with(Arc::clone)
             .ok()
             .unwrap_or_else(|| Arc::clone(&INTERNAL_REQUEST_CONTEXT))
     }
@@ -115,6 +124,7 @@ pub struct RequestContextBuilder {
 }
 
 impl RequestContextBuilder {
+    #[must_use]
     pub fn new(protocol: Protocol) -> Self {
         Self {
             protocol,
@@ -123,11 +133,13 @@ impl RequestContextBuilder {
         }
     }
 
+    #[must_use]
     pub fn with_app_opt(mut self, app: Option<Arc<App>>) -> Self {
         self.app = app;
         self
     }
 
+    #[must_use]
     pub fn from_headers(mut self, headers: &HeaderMap) -> Self {
         let user_agent_collection = self
             .app
@@ -142,6 +154,7 @@ impl RequestContextBuilder {
         self
     }
 
+    #[must_use]
     pub fn build(self) -> RequestContext {
         let mut dimensions = vec![];
 
