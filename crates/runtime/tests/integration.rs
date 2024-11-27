@@ -41,7 +41,6 @@ mod endpoint_auth;
 mod federation;
 mod github;
 mod graphql;
-mod metrics;
 #[cfg(feature = "mysql")]
 mod mysql;
 #[cfg(feature = "odbc")]
