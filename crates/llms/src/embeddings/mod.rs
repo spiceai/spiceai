@@ -49,6 +49,11 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
+    #[snafu(display("Failed to create tokenizer: {source}"))]
+    FailedToCreateTokenizer {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
     #[snafu(display("Failed to instantiate embedding model: {source}"))]
     FailedToInstantiateEmbeddingModel {
         source: Box<dyn std::error::Error + Send + Sync>,
