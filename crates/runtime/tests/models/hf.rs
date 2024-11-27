@@ -119,6 +119,7 @@ async fn huggingface_test_search() -> Result<(), anyhow::Error> {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn huggingface_test_nsql() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(None);
 

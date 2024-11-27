@@ -20,7 +20,7 @@ use chrono::{DateTime, Utc};
 use futures::TryStreamExt;
 use rand::Rng;
 use reqwest::{header::HeaderMap, Client};
-use runtime::{config::Config, datafusion::query::Protocol, Runtime};
+use runtime::{config::Config, Runtime};
 use secrecy::SecretString;
 use snafu::ResultExt;
 use spicepod::component::{

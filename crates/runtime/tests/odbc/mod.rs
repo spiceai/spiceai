@@ -21,7 +21,11 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::instrument;
 
-use crate::{init_tracing, utils::wait_until_true, RecordBatch};
+use crate::{
+    init_tracing,
+    utils::{test_request_context, wait_until_true},
+    RecordBatch,
+};
 
 use std::collections::HashMap;
 

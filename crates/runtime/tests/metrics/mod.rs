@@ -188,7 +188,7 @@ async fn test_disabled_user_agent() -> Result<(), anyhow::Error> {
             .build(),
     );
 
-    let response_text = run_test(app).await?;
+    let response_text = request_context.scope(run_test(app)).await?;
 
     assert!(!response_text.contains("client=\"spiceci\""));
 

@@ -36,7 +36,6 @@ use jsonpath_rust::JsonPath;
 use llms::chat::Chat;
 use opentelemetry_sdk::trace::TracerProvider;
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, CONTENT_TYPE};
-use runtime::datafusion::query::Protocol;
 use runtime::{auth::EndpointAuth, model::try_to_chat_model, Runtime};
 use serde_json::json;
 use spicepod::component::{
