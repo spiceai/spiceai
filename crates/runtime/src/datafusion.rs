@@ -53,7 +53,7 @@ use datafusion::sql::{sqlparser, TableReference};
 use datafusion_federation::FederatedTableProviderAdaptor;
 use error::find_datafusion_root;
 use itertools::Itertools;
-use query::{Protocol, QueryBuilder};
+use query::QueryBuilder;
 use snafu::prelude::*;
 use tokio::spawn;
 use tokio::sync::oneshot;
@@ -198,7 +198,7 @@ pub enum Error {
     InvalidTimeColumnTimeFormat { source: refresh::Error },
 
     #[snafu(display(
-         "Acceleration mode `append` requires `time_column` parameter for source {from}.\nConfigure `time_column` parameter with a valid value.\nFor details, visit: https://docs.spiceai.org/reference/spicepod/datasets#time_column"
+         "Acceleration mode `append` requires `time_column` parameter for source {from}.\nConfigure `time_column` parameter and try again.\nFor details, visit: https://docs.spiceai.org/reference/spicepod/datasets#time_column"
     ))]
     AppendRequiresTimeColumn { from: String },
 
@@ -1178,11 +1178,7 @@ impl DataFusion {
             .table_names())
     }
 
-    pub fn query_builder<'a>(
-        self: &Arc<Self>,
-        sql: &'a str,
-        protocol: Protocol,
-    ) -> QueryBuilder<'a> {
-        QueryBuilder::new(sql, Arc::clone(self), protocol)
+    pub fn query_builder<'a>(self: &Arc<Self>, sql: &'a str) -> QueryBuilder<'a> {
+        QueryBuilder::new(sql, Arc::clone(self))
     }
 }

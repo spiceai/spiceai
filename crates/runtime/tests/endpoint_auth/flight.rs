@@ -20,7 +20,10 @@ use std::{
     time::Duration,
 };
 
-use crate::{init_tracing, utils::wait_until_true};
+use crate::{
+    init_tracing,
+    utils::{test_request_context, wait_until_true},
+};
 use arrow_flight::{error::FlightError, flight_service_client::FlightServiceClient};
 use rand::Rng;
 use runtime::{auth::EndpointAuth, config::Config, Runtime};
@@ -32,84 +35,87 @@ const LOCALHOST: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
 #[tokio::test]
 async fn test_flight_auth() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
-    let span = tracing::info_span!("test_flight_auth");
-    let _span_guard = span.enter();
 
-    let mut rng = rand::thread_rng();
-    let http_port: u16 = rng.gen_range(50000..60000);
-    let flight_port: u16 = http_port + 1;
-    let otel_port: u16 = http_port + 2;
-    let metrics_port: u16 = http_port + 3;
+    test_request_context().scope(async {
+        let span = tracing::info_span!("test_flight_auth");
+        let _span_guard = span.enter();
 
-    tracing::debug!(
-        "Ports: http: {http_port}, flight: {flight_port}, otel: {otel_port}, metrics: {metrics_port}"
-    );
+        let mut rng = rand::thread_rng();
+        let http_port: u16 = rng.gen_range(50000..60000);
+        let flight_port: u16 = http_port + 1;
+        let otel_port: u16 = http_port + 2;
+        let metrics_port: u16 = http_port + 3;
 
-    let api_config = Config::new()
-        .with_http_bind_address(SocketAddr::new(LOCALHOST, http_port))
-        .with_flight_bind_address(SocketAddr::new(LOCALHOST, flight_port))
-        .with_open_telemetry_bind_address(SocketAddr::new(LOCALHOST, otel_port));
+        tracing::debug!(
+            "Ports: http: {http_port}, flight: {flight_port}, otel: {otel_port}, metrics: {metrics_port}"
+        );
 
-    let registry = prometheus::Registry::new();
+        let api_config = Config::new()
+            .with_http_bind_address(SocketAddr::new(LOCALHOST, http_port))
+            .with_flight_bind_address(SocketAddr::new(LOCALHOST, flight_port))
+            .with_open_telemetry_bind_address(SocketAddr::new(LOCALHOST, otel_port));
 
-    let rt = Runtime::builder()
-        .with_metrics_server(SocketAddr::new(LOCALHOST, metrics_port), registry)
-        .build()
+        let registry = prometheus::Registry::new();
+
+        let rt = Runtime::builder()
+            .with_metrics_server(SocketAddr::new(LOCALHOST, metrics_port), registry)
+            .build()
+            .await;
+
+        let api_key_auth = Arc::new(ApiKeyAuth::new(vec!["valid".to_string()]))
+            as Arc<dyn FlightBasicAuth + Send + Sync>;
+
+        // Start the servers
+        tokio::spawn(async move {
+            Box::pin(Arc::new(rt).start_servers(
+                api_config,
+                None,
+                EndpointAuth::default().with_flight_basic_auth(api_key_auth),
+            ))
+            .await
+        });
+
+        // Wait for the servers to start
+        tracing::info!("Waiting for servers to start...");
+        wait_until_true(Duration::from_secs(10), || async {
+            reqwest::get(format!("http://localhost:{http_port}/health"))
+                .await
+                .is_ok()
+        })
         .await;
 
-    let api_key_auth = Arc::new(ApiKeyAuth::new(vec!["valid".to_string()]))
-        as Arc<dyn FlightBasicAuth + Send + Sync>;
-
-    // Start the servers
-    tokio::spawn(async move {
-        Box::pin(Arc::new(rt).start_servers(
-            api_config,
-            None,
-            EndpointAuth::default().with_flight_basic_auth(api_key_auth),
-        ))
-        .await
-    });
-
-    // Wait for the servers to start
-    tracing::info!("Waiting for servers to start...");
-    wait_until_true(Duration::from_secs(10), || async {
-        reqwest::get(format!("http://localhost:{http_port}/health"))
+        let channel = Channel::from_shared(format!("http://localhost:{flight_port}"))?
+            .connect()
             .await
-            .is_ok()
-    })
-    .await;
+            .expect("to connect to flight endpoint");
+        let client = FlightServiceClient::new(channel);
 
-    let channel = Channel::from_shared(format!("http://localhost:{flight_port}"))?
-        .connect()
+        let result = flightrepl::get_records(
+            client.clone(),
+            "SELECT 1",
+            Some(&"valid".to_string()),
+            &format!("spiceci/{}", env!("CARGO_PKG_VERSION")),
+        )
+        .await;
+        assert!(result.is_ok());
+
+        let Err(e) = flightrepl::get_records(
+            client,
+            "SELECT 1",
+            None,
+            &format!("spiceci/{}", env!("CARGO_PKG_VERSION")),
+        )
         .await
-        .expect("to connect to flight endpoint");
-    let client = FlightServiceClient::new(channel);
-
-    let result = flightrepl::get_records(
-        client.clone(),
-        "SELECT 1",
-        Some(&"valid".to_string()),
-        &format!("test_flight_auth/{}", env!("CARGO_PKG_VERSION")),
-    )
-    .await;
-    assert!(result.is_ok());
-
-    let Err(e) = flightrepl::get_records(
-        client,
-        "SELECT 1",
-        None,
-        &format!("test_flight_auth/{}", env!("CARGO_PKG_VERSION")),
-    )
-    .await
-    else {
-        panic!("expected error");
-    };
-    match e {
-        FlightError::Tonic(status) => {
-            assert_eq!(status.code(), tonic::Code::Unauthenticated);
+        else {
+            panic!("expected error");
+        };
+        match e {
+            FlightError::Tonic(status) => {
+                assert_eq!(status.code(), tonic::Code::Unauthenticated);
+            }
+            _ => panic!("expected tonic error"),
         }
-        _ => panic!("expected tonic error"),
-    }
 
-    Ok(())
+        Ok(())
+    }).await
 }

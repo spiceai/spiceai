@@ -14,9 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
+use bytes::Bytes;
 use std::sync::Arc;
 
-use crate::chunking::{Chunker, ChunkingConfig, RecursiveSplittingChunker};
+use crate::chunking::{
+    ArcSizer, Chunker, ChunkingConfig, RecursiveSplittingChunker, TokenizerWrapper,
+};
+
 use crate::embeddings::{Embed, Error as EmbedError, Result as EmbedResult};
 use async_openai::error::OpenAIError;
 use async_openai::types::{
@@ -26,6 +30,8 @@ use async_openai::types::{
 use async_trait::async_trait;
 use futures::future::try_join_all;
 use snafu::ResultExt;
+use text_splitter::ChunkSizer;
+use tokenizers::Tokenizer;
 
 use super::Openai;
 
@@ -33,16 +39,50 @@ pub(crate) const TEXT_EMBED_3_SMALL: &str = "text-embedding-3-small";
 
 pub const DEFAULT_EMBEDDING_MODEL: &str = TEXT_EMBED_3_SMALL;
 
+/// Embedding implementation for `OpenAI` compatible embedding models.
+///
+/// For non-OpenAI models, a [`Tokenizer`] can be provided to correctly size
+/// chunks (instead of the default `OpenAI` BPE tokenizer).
+#[derive(Default)]
+pub struct OpenaiEmbed {
+    pub inner: Openai,
+    pub chunk_sizer: Option<Arc<dyn ChunkSizer + Send + Sync>>,
+}
+
+impl OpenaiEmbed {
+    #[must_use]
+    pub fn new(inner: Openai) -> Self {
+        Self {
+            inner,
+            chunk_sizer: None,
+        }
+    }
+
+    #[must_use]
+    fn with_tokenizer(mut self, tokenizer: Arc<Tokenizer>) -> Self {
+        self.chunk_sizer = Some(Arc::new(Into::<TokenizerWrapper>::into(tokenizer)));
+        self
+    }
+
+    pub fn try_with_tokenizer_bytes(mut self, bytz: &Bytes) -> Result<Self, EmbedError> {
+        let tokenizer = Tokenizer::from_bytes(bytz)
+            .map_err(|e| EmbedError::FailedToCreateTokenizer { source: e })?;
+
+        self = self.with_tokenizer(Arc::new(tokenizer));
+        Ok(self)
+    }
+}
+
 #[async_trait]
-impl Embed for Openai {
+impl Embed for OpenaiEmbed {
     async fn embed_request(
         &self,
         req: CreateEmbeddingRequest,
     ) -> Result<CreateEmbeddingResponse, OpenAIError> {
         let outer_model = req.model.clone();
         let mut inner_req = req.clone();
-        inner_req.model.clone_from(&self.model);
-        let mut resp = self.client.embeddings().create(inner_req).await?;
+        inner_req.model.clone_from(&self.inner.model);
+        let mut resp = self.inner.client.embeddings().create(inner_req).await?;
 
         resp.model = outer_model;
         Ok(resp)
@@ -67,7 +107,7 @@ impl Embed for Openai {
             .into_iter()
             .map(|batch| {
                 CreateEmbeddingRequestArgs::default()
-                    .model(self.model.clone())
+                    .model(self.inner.model.clone())
                     .input(batch)
                     .build()
                     .boxed()
@@ -78,7 +118,7 @@ impl Embed for Openai {
         let embed_futures: Vec<_> = request_batches_result?
             .into_iter()
             .map(|req| {
-                let local_client = self.client.clone();
+                let local_client = self.inner.client.clone();
                 async move {
                     let embedding: Vec<Vec<f32>> = local_client
                         .embeddings()
@@ -105,7 +145,7 @@ impl Embed for Openai {
     }
 
     fn size(&self) -> i32 {
-        match self.model.as_str() {
+        match self.inner.model.as_str() {
             "text-embedding-3-large" => 3_072,
             "text-embedding-3-small" | "text-embedding-ada-002" => 1_536,
             _ => -1, // unreachable. If not a valid model, it won't create embeddings.
@@ -113,9 +153,16 @@ impl Embed for Openai {
     }
 
     fn chunker(&self, cfg: &ChunkingConfig<'_>) -> EmbedResult<Arc<dyn Chunker>> {
-        Ok(Arc::new(
-            RecursiveSplittingChunker::for_openai_model(&self.model, cfg)
-                .map_err(|e| EmbedError::FailedToCreateChunker { source: e })?,
-        ))
+        match self.chunk_sizer {
+            Some(ref sizer) => Ok(Arc::new(
+                RecursiveSplittingChunker::try_new(cfg, Into::<ArcSizer>::into(Arc::clone(sizer)))
+                    .boxed()
+                    .map_err(|e| EmbedError::FailedToCreateChunker { source: e })?,
+            )),
+            None => Ok(Arc::new(
+                RecursiveSplittingChunker::for_openai_model(&self.inner.model, cfg)
+                    .map_err(|e| EmbedError::FailedToCreateChunker { source: e })?,
+            )),
+        }
     }
 }

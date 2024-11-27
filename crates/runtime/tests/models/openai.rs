@@ -24,7 +24,7 @@ use crate::{
         get_tpcds_dataset, http_post, normalize_chat_completion_response,
         normalize_embeddings_response, normalize_search_response, send_chat_completions_request,
     },
-    utils::{runtime_ready_check, verify_env_secret_exists},
+    utils::{runtime_ready_check, test_request_context, verify_env_secret_exists},
 };
 use app::AppBuilder;
 use async_openai::types::{
@@ -119,74 +119,75 @@ mod nsql {
     async fn openai_test_nsql() -> Result<(), anyhow::Error> {
         let _tracing = init_tracing(None);
 
-        verify_env_secret_exists("SPICE_OPENAI_API_KEY")
-            .await
-            .map_err(anyhow::Error::msg)?;
+        test_request_context().scope(async {
+            verify_env_secret_exists("SPICE_OPENAI_API_KEY")
+                .await
+                .map_err(anyhow::Error::msg)?;
 
-        let app = AppBuilder::new("text-to-sql")
-            .with_dataset(get_taxi_trips_dataset())
-            .with_model(get_openai_model("gpt-4o-mini", "nql"))
-            .with_model(get_openai_model("gpt-4o-mini", "nql-2"))
-            .build();
+            let app = AppBuilder::new("text-to-sql")
+                .with_dataset(get_taxi_trips_dataset())
+                .with_model(get_openai_model("gpt-4o-mini", "nql"))
+                .with_model(get_openai_model("gpt-4o-mini", "nql-2"))
+                .build();
 
-        let api_config = create_api_bindings_config();
-        let http_base_url = format!("http://{}", api_config.http_bind_address);
+            let api_config = create_api_bindings_config();
+            let http_base_url = format!("http://{}", api_config.http_bind_address);
 
-        let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
 
-        let (_tracing, trace_provider) = init_tracing_with_task_history(None, &rt);
+            let (_tracing, trace_provider) = init_tracing_with_task_history(None, &rt);
 
-        let rt_ref_copy = Arc::clone(&rt);
-        tokio::spawn(async move {
-            Box::pin(rt_ref_copy.start_servers(api_config, None, EndpointAuth::no_auth())).await
-        });
+            let rt_ref_copy = Arc::clone(&rt);
+            tokio::spawn(async move {
+                Box::pin(rt_ref_copy.start_servers(api_config, None, EndpointAuth::no_auth())).await
+            });
 
-        tokio::select! {
-            () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
-                return Err(anyhow::anyhow!("Timed out waiting for components to load"));
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for components to load"));
+                }
+                () = rt.load_components() => {}
             }
-            () = rt.load_components() => {}
-        }
 
-        runtime_ready_check(&rt).await;
+            runtime_ready_check(&rt).await;
 
-        let test_cases = [
-            TestCase {
-                name: "basic",
-                body: json!({
-                    "query": "how many records (as 'total_records') are in taxi_trips dataset?",
-                    "sample_data_enabled": false,
-                }),
-            },
-            TestCase {
-                name: "with_model",
-                body: json!({
-                    "query": "how many records (as 'total_records') are in taxi_trips dataset?",
-                    "model": "nql-2",
-                    "sample_data_enabled": false,
-                }),
-            },
-            TestCase {
-                name: "with_sample_data_enabled",
-                body: json!({
-                    "query": "how many records (as 'total_records') are in taxi_trips dataset?",
-                    "model": "nql",
-                    "sample_data_enabled": true,
-                }),
-            },
-        ];
+            let test_cases = [
+                TestCase {
+                    name: "basic",
+                    body: json!({
+                        "query": "how many records (as 'total_records') are in taxi_trips dataset?",
+                        "sample_data_enabled": false,
+                    }),
+                },
+                TestCase {
+                    name: "with_model",
+                    body: json!({
+                        "query": "how many records (as 'total_records') are in taxi_trips dataset?",
+                        "model": "nql-2",
+                        "sample_data_enabled": false,
+                    }),
+                },
+                TestCase {
+                    name: "with_sample_data_enabled",
+                    body: json!({
+                        "query": "how many records (as 'total_records') are in taxi_trips dataset?",
+                        "model": "nql",
+                        "sample_data_enabled": true,
+                    }),
+                },
+            ];
 
-        for ts in test_cases {
-            run_nsql_test(http_base_url.as_str(), &ts, &trace_provider).await?;
-        }
+            for ts in test_cases {
+                run_nsql_test(http_base_url.as_str(), &ts, &trace_provider).await?;
+            }
 
-        Ok(())
+            Ok(())
+        }).await
     }
 }
 
 #[allow(clippy::expect_used)]
 mod search {
-
     use super::*;
     struct TestCase {
         name: &'static str,
@@ -222,79 +223,82 @@ mod search {
     async fn openai_test_search() -> Result<(), anyhow::Error> {
         let _tracing = init_tracing(None);
 
-        verify_env_secret_exists("SPICE_OPENAI_API_KEY")
+        test_request_context()
+            .scope(async {
+                verify_env_secret_exists("SPICE_OPENAI_API_KEY")
+                    .await
+                    .map_err(anyhow::Error::msg)?;
+
+                let mut ds_tpcds_item = get_tpcds_dataset("item");
+                ds_tpcds_item.embeddings = vec![ColumnEmbeddingConfig {
+                    column: "i_item_desc".to_string(),
+                    model: "openai_embeddings".to_string(),
+                    primary_keys: Some(vec!["i_item_sk".to_string()]),
+                    chunking: None,
+                }];
+
+                let app = AppBuilder::new("search_app")
+                    // taxi_trips dataset is used to test search when there is a dataset w/o embeddings
+                    .with_dataset(get_taxi_trips_dataset())
+                    .with_dataset(ds_tpcds_item)
+                    .with_embedding(get_openai_embeddings(
+                        Option::<String>::None,
+                        "openai_embeddings",
+                    ))
+                    .build();
+
+                let api_config = create_api_bindings_config();
+                let http_base_url = format!("http://{}", api_config.http_bind_address);
+                let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+
+                let _ = init_tracing_with_task_history(None, &rt);
+
+                let rt_ref_copy = Arc::clone(&rt);
+                tokio::spawn(async move {
+                    Box::pin(rt_ref_copy.start_servers(api_config, None, EndpointAuth::no_auth()))
+                        .await
+                });
+
+                tokio::select! {
+                    () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                        return Err(anyhow::anyhow!("Timed out waiting for components to load"));
+                    }
+                    () = rt.load_components() => {}
+                }
+
+                runtime_ready_check(&rt).await;
+
+                let test_cases = [
+                    TestCase {
+                        name: "basic",
+                        body: json!({
+                            "text": "new patient",
+                            "limit": 2,
+                            "datasets": ["item"],
+                            "additional_columns": ["i_color", "i_item_id"],
+                        }),
+                    },
+                    TestCase {
+                        name: "all_datasets",
+                        body: json!({
+                            "text": "new patient",
+                            "limit": 2,
+                        }),
+                    },
+                ];
+
+                for ts in test_cases {
+                    run_search_test(http_base_url.as_str(), &ts).await?;
+                }
+                Ok(())
+            })
             .await
-            .map_err(anyhow::Error::msg)?;
-
-        let mut ds_tpcds_item = get_tpcds_dataset("item");
-        ds_tpcds_item.embeddings = vec![ColumnEmbeddingConfig {
-            column: "i_item_desc".to_string(),
-            model: "openai_embeddings".to_string(),
-            primary_keys: Some(vec!["i_item_sk".to_string()]),
-            chunking: None,
-        }];
-
-        let app = AppBuilder::new("search_app")
-            // taxi_trips dataset is used to test search when there is a dataset w/o embeddings
-            .with_dataset(get_taxi_trips_dataset())
-            .with_dataset(ds_tpcds_item)
-            .with_embedding(get_openai_embeddings(
-                Option::<String>::None,
-                "openai_embeddings",
-            ))
-            .build();
-
-        let api_config = create_api_bindings_config();
-        let http_base_url = format!("http://{}", api_config.http_bind_address);
-        let rt = Arc::new(Runtime::builder().with_app(app).build().await);
-
-        let _ = init_tracing_with_task_history(None, &rt);
-
-        let rt_ref_copy = Arc::clone(&rt);
-        tokio::spawn(async move {
-            Box::pin(rt_ref_copy.start_servers(api_config, None, EndpointAuth::no_auth())).await
-        });
-
-        tokio::select! {
-            () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
-                return Err(anyhow::anyhow!("Timed out waiting for components to load"));
-            }
-            () = rt.load_components() => {}
-        }
-
-        runtime_ready_check(&rt).await;
-
-        let test_cases = [
-            TestCase {
-                name: "basic",
-                body: json!({
-                    "text": "new patient",
-                    "limit": 2,
-                    "datasets": ["item"],
-                    "additional_columns": ["i_color", "i_item_id"],
-                }),
-            },
-            TestCase {
-                name: "all_datasets",
-                body: json!({
-                    "text": "new patient",
-                    "limit": 2,
-                }),
-            },
-        ];
-
-        for ts in test_cases {
-            run_search_test(http_base_url.as_str(), &ts).await?;
-        }
-        Ok(())
     }
 }
 
 #[allow(clippy::expect_used)]
 mod embeddings {
-
     use super::*;
-
     struct EmbeddingTestCase {
         pub input: EmbeddingInput,
         pub encoding_format: Option<&'static str>,
@@ -307,15 +311,119 @@ mod embeddings {
     async fn openai_test_embeddings() -> Result<(), anyhow::Error> {
         let _tracing = init_tracing(None);
 
+        test_request_context()
+            .scope(async {
+                verify_env_secret_exists("SPICE_OPENAI_API_KEY")
+                    .await
+                    .map_err(anyhow::Error::msg)?;
+
+                let app = AppBuilder::new("search_app")
+                    .with_embedding(get_openai_embeddings(
+                        Some("text-embedding-3-small"),
+                        "openai_embeddings",
+                    ))
+                    .build();
+
+                let api_config = create_api_bindings_config();
+                let http_base_url = format!("http://{}", api_config.http_bind_address);
+                let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+
+                let rt_ref_copy = Arc::clone(&rt);
+                tokio::spawn(async move {
+                    Box::pin(rt_ref_copy.start_servers(api_config, None, EndpointAuth::no_auth()))
+                        .await
+                });
+
+                tokio::select! {
+                    () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                        return Err(anyhow::anyhow!("Timed out waiting for components to load"));
+                    }
+                    () = rt.load_components() => {}
+                }
+
+                runtime_ready_check(&rt).await;
+
+                let embeddins_test = vec![
+                    EmbeddingTestCase {
+                        input: EmbeddingInput::String(
+                            "The food was delicious and the waiter...".to_string(),
+                        ),
+                        encoding_format: Some("float"),
+                        user: None,
+                        dimensions: None,
+                        test_id: "basic",
+                    },
+                    EmbeddingTestCase {
+                        input: EmbeddingInput::StringArray(vec![
+                            "The food was delicious".to_string(),
+                            "and the waiter...".to_string(),
+                        ]),
+                        encoding_format: None,
+                        user: Some("test_user_id"),
+                        dimensions: Some(256),
+                        test_id: "multiple_inputs",
+                    },
+                    EmbeddingTestCase {
+                        input: EmbeddingInput::StringArray(vec![
+                            "The food was delicious".to_string(),
+                            "and the waiter...".to_string(),
+                        ]),
+                        encoding_format: Some("base64"),
+                        user: Some("test_user_id"),
+                        dimensions: Some(128),
+                        test_id: "base64_format",
+                    },
+                ];
+
+                for EmbeddingTestCase {
+                    input,
+                    encoding_format,
+                    user,
+                    dimensions,
+                    test_id,
+                } in embeddins_test
+                {
+                    let response = send_embeddings_request(
+                        http_base_url.as_str(),
+                        "openai_embeddings",
+                        input,
+                        encoding_format,
+                        user,
+                        dimensions,
+                    )
+                    .await?;
+
+                    insta::assert_snapshot!(
+                        test_id,
+                        // OpenAI's embeddings response is not deterministic (values vary for the same input, model version, and parameters) so
+                        // we normalize the response before snapshotting
+                        normalize_embeddings_response(response)
+                    );
+                }
+
+                Ok(())
+            })
+            .await
+    }
+}
+
+#[tokio::test]
+async fn openai_test_chat_completion() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(None);
+
+    test_request_context().scope(async {
         verify_env_secret_exists("SPICE_OPENAI_API_KEY")
             .await
             .map_err(anyhow::Error::msg)?;
 
-        let app = AppBuilder::new("search_app")
-            .with_embedding(get_openai_embeddings(
-                Some("text-embedding-3-small"),
-                "openai_embeddings",
-            ))
+        let mut model_with_tools = get_openai_model("gpt-4o-mini", "openai_model");
+        model_with_tools
+            .params
+            .insert("tools".to_string(), "auto".into());
+
+        let app = AppBuilder::new("text-to-sql")
+            .with_dataset(get_taxi_trips_dataset())
+            .with_model(model_with_tools)
             .build();
 
         let api_config = create_api_bindings_config();
@@ -336,164 +444,71 @@ mod embeddings {
 
         runtime_ready_check(&rt).await;
 
-        let embeddins_test = vec![
-            EmbeddingTestCase {
-                input: EmbeddingInput::String(
-                    "The food was delicious and the waiter...".to_string(),
-                ),
-                encoding_format: Some("float"),
-                user: None,
-                dimensions: None,
-                test_id: "basic",
-            },
-            EmbeddingTestCase {
-                input: EmbeddingInput::StringArray(vec![
-                    "The food was delicious".to_string(),
-                    "and the waiter...".to_string(),
-                ]),
-                encoding_format: None,
-                user: Some("test_user_id"),
-                dimensions: Some(256),
-                test_id: "multiple_inputs",
-            },
-            EmbeddingTestCase {
-                input: EmbeddingInput::StringArray(vec![
-                    "The food was delicious".to_string(),
-                    "and the waiter...".to_string(),
-                ]),
-                encoding_format: Some("base64"),
-                user: Some("test_user_id"),
-                dimensions: Some(128),
-                test_id: "base64_format",
-            },
-        ];
+        let response = send_chat_completions_request(
+            http_base_url.as_str(),
+            vec![
+                ("system".to_string(), "You are an assistant that responds to queries by providing only the requested data values without extra explanation.".to_string()),
+                ("user".to_string(), "Provide the total number of records in the taxi trips dataset. If known, return a single numeric value.".to_string()),
+            ],
+            "openai_model",
+            false,
+        ).await?;
 
-        for EmbeddingTestCase {
-            input,
-            encoding_format,
-            user,
-            dimensions,
-            test_id,
-        } in embeddins_test
-        {
-            let response = send_embeddings_request(
-                http_base_url.as_str(),
-                "openai_embeddings",
-                input,
-                encoding_format,
-                user,
-                dimensions,
-            )
-            .await?;
-
-            insta::assert_snapshot!(
-                test_id,
-                // OpenAI's embeddings response is not deterministic (values vary for the same input, model version, and parameters) so
-                // we normalize the response before snapshotting
-                normalize_embeddings_response(response)
-            );
-        }
+        insta::assert_snapshot!(
+            "chat_completion",
+            normalize_chat_completion_response(response, false)
+        );
 
         Ok(())
-    }
-}
-
-#[tokio::test]
-async fn openai_test_chat_completion() -> Result<(), anyhow::Error> {
-    let _tracing = init_tracing(None);
-
-    verify_env_secret_exists("SPICE_OPENAI_API_KEY")
-        .await
-        .map_err(anyhow::Error::msg)?;
-
-    let mut model_with_tools = get_openai_model("gpt-4o-mini", "openai_model");
-    model_with_tools
-        .params
-        .insert("tools".to_string(), "auto".into());
-
-    let app = AppBuilder::new("text-to-sql")
-        .with_dataset(get_taxi_trips_dataset())
-        .with_model(model_with_tools)
-        .build();
-
-    let api_config = create_api_bindings_config();
-    let http_base_url = format!("http://{}", api_config.http_bind_address);
-    let rt = Arc::new(Runtime::builder().with_app(app).build().await);
-
-    let rt_ref_copy = Arc::clone(&rt);
-    tokio::spawn(async move {
-        Box::pin(rt_ref_copy.start_servers(api_config, None, EndpointAuth::no_auth())).await
-    });
-
-    tokio::select! {
-        () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
-            return Err(anyhow::anyhow!("Timed out waiting for components to load"));
-        }
-        () = rt.load_components() => {}
-    }
-
-    runtime_ready_check(&rt).await;
-
-    let response = send_chat_completions_request(
-        http_base_url.as_str(),
-        vec![
-            ("system".to_string(), "You are an assistant that responds to queries by providing only the requested data values without extra explanation.".to_string()),
-            ("user".to_string(), "Provide the total number of records in the taxi trips dataset. If known, return a single numeric value.".to_string()),
-        ],
-        "openai_model",
-        false,
-    ).await?;
-
-    insta::assert_snapshot!(
-        "chat_completion",
-        normalize_chat_completion_response(response, false)
-    );
-
-    Ok(())
+    }).await
 }
 
 #[tokio::test]
 async fn openai_test_chat_messages() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(None);
 
-    verify_env_secret_exists("SPICE_OPENAI_API_KEY")
+    test_request_context()
+        .scope(async {
+            verify_env_secret_exists("SPICE_OPENAI_API_KEY")
+                .await
+                .map_err(anyhow::Error::msg)?;
+
+            let mut ds_tpcds_item = get_tpcds_dataset("item");
+            ds_tpcds_item.embeddings = vec![ColumnEmbeddingConfig {
+                column: "i_item_desc".to_string(),
+                model: "openai_embeddings".to_string(),
+                primary_keys: Some(vec!["i_item_sk".to_string()]),
+                chunking: None,
+            }];
+
+            let app = AppBuilder::new("text-to-sql")
+                .with_dataset(get_taxi_trips_dataset())
+                .with_dataset(ds_tpcds_item)
+                .with_embedding(get_openai_embeddings(
+                    Some("text-embedding-3-small"),
+                    "openai_embeddings",
+                ))
+                .build();
+
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+
+            let (_tracing, trace_provider) = init_tracing_with_task_history(None, &rt);
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for components to load"));
+                }
+                () = rt.load_components() => {}
+            }
+
+            runtime_ready_check(&rt).await;
+
+            verify_sql_query_chat_completion(Arc::clone(&rt), &trace_provider).await?;
+            verify_similarity_search_chat_completion(Arc::clone(&rt), &trace_provider).await?;
+
+            Ok(())
+        })
         .await
-        .map_err(anyhow::Error::msg)?;
-
-    let mut ds_tpcds_item = get_tpcds_dataset("item");
-    ds_tpcds_item.embeddings = vec![ColumnEmbeddingConfig {
-        column: "i_item_desc".to_string(),
-        model: "openai_embeddings".to_string(),
-        primary_keys: Some(vec!["i_item_sk".to_string()]),
-        chunking: None,
-    }];
-
-    let app = AppBuilder::new("text-to-sql")
-        .with_dataset(get_taxi_trips_dataset())
-        .with_dataset(ds_tpcds_item)
-        .with_embedding(get_openai_embeddings(
-            Some("text-embedding-3-small"),
-            "openai_embeddings",
-        ))
-        .build();
-
-    let rt = Arc::new(Runtime::builder().with_app(app).build().await);
-
-    let (_tracing, trace_provider) = init_tracing_with_task_history(None, &rt);
-
-    tokio::select! {
-        () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
-            return Err(anyhow::anyhow!("Timed out waiting for components to load"));
-        }
-        () = rt.load_components() => {}
-    }
-
-    runtime_ready_check(&rt).await;
-
-    verify_sql_query_chat_completion(Arc::clone(&rt), &trace_provider).await?;
-    verify_similarity_search_chat_completion(Arc::clone(&rt), &trace_provider).await?;
-
-    Ok(())
 }
 
 /// Verifies that the model correctly uses the SQL tool to process user query and return the result

@@ -20,7 +20,7 @@ use chrono::{DateTime, Utc};
 use futures::TryStreamExt;
 use rand::Rng;
 use reqwest::{header::HeaderMap, Client};
-use runtime::{config::Config, datafusion::query::Protocol, Runtime};
+use runtime::{config::Config, Runtime};
 use secrecy::SecretString;
 use snafu::ResultExt;
 use spicepod::component::{
@@ -360,7 +360,7 @@ async fn sql_to_display(
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let data = rt
         .datafusion()
-        .query_builder(query, Protocol::Internal)
+        .query_builder(query)
         .build()
         .run()
         .await
@@ -378,12 +378,7 @@ async fn get_executed_tasks(
     since: DateTime<Utc>,
 ) -> Result<Vec<(String, String)>, anyhow::Error> {
     let query = format!("SELECT task, input FROM runtime.task_history WHERE start_time >= '{}' ORDER BY start_time, task;", since.to_rfc3339());
-    let query_result = rt
-        .datafusion()
-        .query_builder(&query, Protocol::Internal)
-        .build()
-        .run()
-        .await?;
+    let query_result = rt.datafusion().query_builder(&query).build().run().await?;
     let data = query_result.data.try_collect::<Vec<_>>().await?;
 
     let mut tasks = Vec::new();

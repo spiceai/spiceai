@@ -38,7 +38,7 @@ use tokio::sync::RwLock;
 use tracing::{Instrument, Span};
 
 use crate::accelerated_table::AcceleratedTable;
-use crate::datafusion::query::{write_to_json_string, Protocol};
+use crate::datafusion::query::write_to_json_string;
 use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
 use crate::{datafusion::DataFusion, model::EmbeddingModelStore};
 use crate::{embedding_col, offset_col};
@@ -570,7 +570,7 @@ impl VectorSearch {
 
         let batches: Vec<RecordBatch> = self
             .df
-            .query_builder(&query, Protocol::Internal)
+            .query_builder(&query)
             .build()
             .run()
             .await

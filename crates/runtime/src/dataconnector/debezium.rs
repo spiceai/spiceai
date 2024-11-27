@@ -40,13 +40,13 @@ use super::{DataConnector, DataConnectorFactory, DataConnectorParams, ParameterS
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Invalid value for debezium_transport. Valid values: 'kafka'"))]
-    InvalidTransport,
+    #[snafu(display("Invalid value for 'debezium_transport': {transport}.\nSupported values: 'kafka'\nFor details, visit: https://docs.spiceai.org/components/data-connectors/debezium#parameters"))]
+    InvalidTransport { transport: String },
 
-    #[snafu(display("Invalid value for debezium_message_format: Valid values: 'json'"))]
-    InvalidMessageFormat,
+    #[snafu(display("Invalid value for 'debezium_message_format': {format}.\nSupported values: 'json'\nFor details, visit: https://docs.spiceai.org/components/data-connectors/debezium#parameters"))]
+    InvalidMessageFormat { format: String },
 
-    #[snafu(display("Missing required parameter: debezium_kafka_bootstrap_servers"))]
+    #[snafu(display("Missing required parameter: 'debezium_kafka_bootstrap_servers'. Specify a value.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/debezium#parameters"))]
     MissingKafkaBootstrapServers,
 }
 
@@ -64,10 +64,16 @@ impl Debezium {
         let message_format = params.get("message_format").expose().ok().unwrap_or("json");
 
         if transport != "kafka" {
-            return InvalidTransportSnafu.fail();
+            return InvalidTransportSnafu {
+                transport: transport.to_string(),
+            }
+            .fail();
         }
         if message_format != "json" {
-            return InvalidMessageFormatSnafu.fail();
+            return InvalidMessageFormatSnafu {
+                format: message_format.to_string(),
+            }
+            .fail();
         }
 
         let kafka_config = KafkaConfig {

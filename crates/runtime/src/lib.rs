@@ -25,13 +25,14 @@ use ::datafusion::sql::{sqlparser, TableReference};
 use app::App;
 use builder::RuntimeBuilder;
 use config::Config;
+use dataconnector::ConnectorComponent;
 use datasets_health_monitor::DatasetsHealthMonitor;
 use extension::ExtensionFactory;
 use model::{EmbeddingModelStore, LLMModelStore};
 use model_components::model::Model;
 pub use notify::Error as NotifyError;
 use secrecy::SecretString;
-use secrets::ParamStr;
+use secrets::{ParamStr, Secrets};
 use snafu::prelude::*;
 use tls::TlsConfig;
 use tokio::sync::oneshot::error::RecvError;
@@ -68,6 +69,7 @@ pub mod objectstore;
 mod opentelemetry;
 mod parameters;
 pub mod podswatcher;
+pub mod request;
 pub mod secrets;
 pub mod spice_metrics;
 pub mod status;
@@ -146,9 +148,10 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Unable to attach data connector {data_connector}: {source}"))]
+    #[snafu(display("Failed to setup the {connector_component} ({data_connector}).\n{source}"))]
     UnableToAttachDataConnector {
         source: datafusion::Error,
+        connector_component: ConnectorComponent,
         data_connector: String,
     },
 
@@ -364,6 +367,7 @@ impl Runtime {
 
         let flight_server_future = tokio::spawn(flight::start(
             config.flight_bind_address,
+            self.app.read().await.as_ref().map(Arc::clone),
             Arc::clone(&self.df),
             tls_config.clone(),
             endpoint_auth.clone(),
@@ -494,19 +498,27 @@ impl Runtime {
         params: &HashMap<String, String>,
     ) -> HashMap<String, SecretString> {
         let shared_secrets = Arc::clone(&self.secrets);
-        let secrets = shared_secrets.read().await;
-
-        let mut params_with_secrets: HashMap<String, SecretString> = HashMap::new();
-
-        // Inject secrets from the user-supplied params.
-        // This will replace any instances of `${ store:key }` with the actual secret value.
-        for (k, v) in params {
-            let secret = secrets.inject_secrets(k, ParamStr(v)).await;
-            params_with_secrets.insert(k.clone(), secret);
-        }
-
-        params_with_secrets
+        get_params_with_secrets(shared_secrets, params).await
     }
+}
+
+#[allow(clippy::implicit_hasher)]
+pub async fn get_params_with_secrets(
+    secrets: Arc<RwLock<Secrets>>,
+    params: &HashMap<String, String>,
+) -> HashMap<String, SecretString> {
+    let secrets = secrets.read().await;
+
+    let mut params_with_secrets: HashMap<String, SecretString> = HashMap::new();
+
+    // Inject secrets from the user-supplied params.
+    // This will replace any instances of `${ store:key }` with the actual secret value.
+    for (k, v) in params {
+        let secret = secrets.inject_secrets(k, ParamStr(v)).await;
+        params_with_secrets.insert(k.clone(), secret);
+    }
+
+    params_with_secrets
 }
 
 #[must_use]

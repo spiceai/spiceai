@@ -26,15 +26,16 @@ use arrow_flight::{
 use tonic::{Request, Response, Status};
 
 use crate::{
-    flight::{metrics, record_batches_to_flight_stream, Service},
+    flight::{metrics, record_batches_to_flight_stream, util::set_flightsql_protocol, Service},
     timing::TimedStream,
 };
 
-pub(crate) fn get_flight_info(
+pub(crate) async fn get_flight_info(
     query: &sql::CommandGetPrimaryKeys,
     request: Request<FlightDescriptor>,
 ) -> Response<FlightInfo> {
-    let _start = metrics::track_flight_request("get_flight_info", Some("get_primary_keys"));
+    let _start = metrics::track_flight_request("get_flight_info", Some("get_primary_keys")).await;
+    set_flightsql_protocol().await;
     let fd = request.into_inner();
     tracing::trace!("get_flight_info: {query:?}");
     Response::new(FlightInfo {
@@ -56,11 +57,12 @@ pub(crate) fn get_flight_info(
 ///   `key_name`: utf8,
 ///   `key_sequence`: int32 not null
 #[allow(clippy::unnecessary_wraps)]
-pub(crate) fn do_get(
+pub(crate) async fn do_get(
     _flight_svc: &Service,
     query: &sql::CommandGetPrimaryKeys,
 ) -> Result<Response<<Service as FlightService>::DoGetStream>, Status> {
-    let start = metrics::track_flight_request("do_get", Some("get_primary_keys"));
+    let start = metrics::track_flight_request("do_get", Some("get_primary_keys")).await;
+    set_flightsql_protocol().await;
     tracing::trace!("do_get_get_primary_keys: {query:?}");
 
     let schema = Arc::new(Schema::new(vec![

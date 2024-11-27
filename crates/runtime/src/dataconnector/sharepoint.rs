@@ -39,12 +39,21 @@ use super::{
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Missing required parameter: {parameter}"))]
+    #[snafu(display("Missing required parameter: {parameter}. Specify a value.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/sharepoint#parameters"))]
     MissingParameter { parameter: String },
 
-    #[snafu(display("Invalid Sharepoint parameters: {source}"))]
-    InvalidParameters {
-        source: Box<dyn std::error::Error + Send + Sync>,
+    #[snafu(display("No authentication was specified.\nProvide either an 'auth_code' or 'client_secret'.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/sharepoint#parameters"))]
+    InvalidAuthentication,
+
+    #[snafu(display("Both `auth_code` and `client_secret` were specified.\nProvide only one of either an 'auth_code' or 'client_secret'.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/sharepoint#parameters"))]
+    DuplicateAuthentication,
+
+    #[snafu(display(
+        "The specified URL is not valid: {url}.\nEnsure the URL is valid and try again.\n{source}"
+    ))]
+    UnableToParseURL {
+        url: String,
+        source: url::ParseError,
     },
 
     #[snafu(display("Missing redirect url parameter: {url}"))]
@@ -79,12 +88,13 @@ impl Sharepoint {
                     .with_scope([".default"])
                     .build(),
             ),
-            (Some(_) | None, Some(auth_code)) => {
-                tracing::warn!("Both `params.client_secret` and `params.auth_code` are provided. Using `params.auth_code`.");
+            (None, Some(auth_code)) => {
                 // Must match the redirect URL used in `spice login sharepoint...`.
-                let redirect_url = Url::parse("http://localhost:8091")
-                    .boxed()
-                    .context(InvalidParametersSnafu)?;
+                let redirect_url =
+                    Url::parse("http://localhost:8091").context(UnableToParseURLSnafu {
+                        url: "http://localhost:8091".to_string(),
+                    })?;
+
                 GraphClient::from(&PublicClientApplication::from(
                     AuthorizationCodeCredential::new_with_redirect_uri(
                         tenant_id,
@@ -95,11 +105,8 @@ impl Sharepoint {
                     ),
                 ))
             }
-            (None, None) => {
-                return Err(Error::InvalidParameters {
-                    source: "either 'client_secret' or 'auth_code' must be provided".into(),
-                })
-            }
+            (Some(_), Some(_)) => return DuplicateAuthenticationSnafu.fail(),
+            (None, None) => return InvalidAuthenticationSnafu.fail(),
         };
 
         Ok(Sharepoint {

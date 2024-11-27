@@ -20,7 +20,10 @@ use tonic::{
     Response,
 };
 
-use crate::flight::Service;
+use crate::{
+    flight::Service,
+    request::{AsyncMarker, Protocol, RequestContext},
+};
 
 pub fn attach_cache_metadata(
     response: &mut Response<<Service as FlightService>::DoGetStream>,
@@ -41,4 +44,9 @@ pub fn attach_cache_metadata(
             }
         }
     }
+}
+
+pub(crate) async fn set_flightsql_protocol() {
+    let request_context = RequestContext::current(AsyncMarker::new().await);
+    request_context.update_protocol(Protocol::FlightSQL);
 }

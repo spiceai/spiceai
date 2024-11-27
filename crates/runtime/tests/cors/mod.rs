@@ -20,7 +20,10 @@ use std::{
     time::Duration,
 };
 
-use crate::{init_tracing, utils::wait_until_true};
+use crate::{
+    init_tracing,
+    utils::{test_request_context, wait_until_true},
+};
 use app::AppBuilder;
 use rand::Rng;
 use runtime::{auth::EndpointAuth, config::Config, Runtime};
@@ -31,137 +34,144 @@ const LOCALHOST: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
 #[tokio::test]
 async fn test_enabled_cors_endpoints() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
-    let span = tracing::info_span!("test_cors_endpoints");
-    let _span_guard = span.enter();
 
-    let mut rng = rand::thread_rng();
-    let http_port: u16 = rng.gen_range(50000..60000);
-    let flight_port: u16 = http_port + 1;
-    let otel_port: u16 = http_port + 2;
-    let metrics_port: u16 = http_port + 3;
+    test_request_context()
+        .scope(async {
+            let span = tracing::info_span!("test_cors_endpoints");
+            let _span_guard = span.enter();
 
-    tracing::debug!(
-        "CORS Ports: http: {http_port}, flight: {flight_port}, otel: {otel_port}, metrics: {metrics_port}"
-    );
+            let mut rng = rand::thread_rng();
+            let http_port: u16 = rng.gen_range(50000..60000);
+            let flight_port: u16 = http_port + 1;
+            let otel_port: u16 = http_port + 2;
+            let metrics_port: u16 = http_port + 3;
 
-    let api_config = Config::new()
-        .with_http_bind_address(SocketAddr::new(LOCALHOST, http_port))
-        .with_flight_bind_address(SocketAddr::new(LOCALHOST, flight_port))
-        .with_open_telemetry_bind_address(SocketAddr::new(LOCALHOST, otel_port));
+            tracing::debug!(
+                "CORS Ports: http: {http_port}, flight: {flight_port}, otel: {otel_port}, metrics: {metrics_port}"
+            );
 
-    let rt = Runtime::builder()
-        .with_app(
-            AppBuilder::new("test")
-                .with_cors_config(CorsConfig {
-                    enabled: true,
-                    allowed_origins: vec!["*".to_string()],
-                })
-                .build(),
-        )
-        .build()
-        .await;
+            let api_config = Config::new()
+                .with_http_bind_address(SocketAddr::new(LOCALHOST, http_port))
+                .with_flight_bind_address(SocketAddr::new(LOCALHOST, flight_port))
+                .with_open_telemetry_bind_address(SocketAddr::new(LOCALHOST, otel_port));
 
-    // Start the servers
-    tokio::spawn(async move {
-        Box::pin(Arc::new(rt).start_servers(api_config, None, EndpointAuth::no_auth())).await
-    });
+            let rt = Runtime::builder()
+                .with_app(
+                    AppBuilder::new("test")
+                        .with_cors_config(CorsConfig {
+                            enabled: true,
+                            allowed_origins: vec!["*".to_string()],
+                        })
+                        .build(),
+                )
+                .build()
+                .await;
 
-    let http_client = reqwest::Client::builder().build()?;
+            // Start the servers
+            tokio::spawn(async move {
+                Box::pin(Arc::new(rt).start_servers(api_config, None, EndpointAuth::no_auth())).await
+            });
 
-    // Wait for the servers to start
-    tracing::info!("Waiting for servers to start...");
-    wait_until_true(Duration::from_secs(10), || async {
-        http_client
-            .get(format!("http://localhost:{http_port}/health"))
-            .send()
-            .await
-            .is_ok()
-    })
-    .await;
+            let http_client = reqwest::Client::builder().build()?;
 
-    let http_url = format!("http://127.0.0.1:{http_port}/health");
-    let request_builder = http_client.request(http::Method::OPTIONS, &http_url);
-    let response = request_builder.send().await.expect("valid response");
-    assert!(response.status().is_success());
-    tracing::info!("HTTP health check passed");
+            // Wait for the servers to start
+            tracing::info!("Waiting for servers to start...");
+            wait_until_true(Duration::from_secs(10), || async {
+                http_client
+                    .get(format!("http://localhost:{http_port}/health"))
+                    .send()
+                    .await
+                    .is_ok()
+            })
+            .await;
 
-    // Verify that the CORS headers are set
-    let cors_origin_header = response
-        .headers()
-        .get("access-control-allow-origin")
-        .expect("cors header is present");
-    assert_eq!(cors_origin_header, "*");
+            let http_url = format!("http://127.0.0.1:{http_port}/health");
+            let request_builder = http_client.request(http::Method::OPTIONS, &http_url);
+            let response = request_builder.send().await.expect("valid response");
+            assert!(response.status().is_success());
+            tracing::info!("HTTP health check passed");
 
-    let cors_allow_methods_header = response
-        .headers()
-        .get("access-control-allow-methods")
-        .expect("cors header is present");
-    assert_eq!(cors_allow_methods_header, "GET,POST,PATCH");
+            // Verify that the CORS headers are set
+            let cors_origin_header = response
+                .headers()
+                .get("access-control-allow-origin")
+                .expect("cors header is present");
+            assert_eq!(cors_origin_header, "*");
 
-    Ok(())
+            let cors_allow_methods_header = response
+                .headers()
+                .get("access-control-allow-methods")
+                .expect("cors header is present");
+            assert_eq!(cors_allow_methods_header, "GET,POST,PATCH");
+
+            Ok(())
+        }).await
 }
 
 #[tokio::test]
 async fn test_disabled_cors_endpoints() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
-    let span = tracing::info_span!("test_disabled_cors_endpoints");
-    let _span_guard = span.enter();
 
-    let mut rng = rand::thread_rng();
-    let http_port: u16 = rng.gen_range(50000..60000);
-    let flight_port: u16 = http_port + 1;
-    let otel_port: u16 = http_port + 2;
-    let metrics_port: u16 = http_port + 3;
+    test_request_context().scope(async {
+        let span = tracing::info_span!("test_disabled_cors_endpoints");
+        let _span_guard = span.enter();
 
-    tracing::debug!(
-        "CORS Ports: http: {http_port}, flight: {flight_port}, otel: {otel_port}, metrics: {metrics_port}"
-    );
+        let mut rng = rand::thread_rng();
+        let http_port: u16 = rng.gen_range(50000..60000);
+        let flight_port: u16 = http_port + 1;
+        let otel_port: u16 = http_port + 2;
+        let metrics_port: u16 = http_port + 3;
 
-    let api_config = Config::new()
-        .with_http_bind_address(SocketAddr::new(LOCALHOST, http_port))
-        .with_flight_bind_address(SocketAddr::new(LOCALHOST, flight_port))
-        .with_open_telemetry_bind_address(SocketAddr::new(LOCALHOST, otel_port));
+        tracing::debug!(
+            "CORS Ports: http: {http_port}, flight: {flight_port}, otel: {otel_port}, metrics: {metrics_port}"
+        );
 
-    // Default cors config is disabled
-    let rt = Runtime::builder()
-        .with_app(AppBuilder::new("test").build())
-        .build()
+        let api_config = Config::new()
+            .with_http_bind_address(SocketAddr::new(LOCALHOST, http_port))
+            .with_flight_bind_address(SocketAddr::new(LOCALHOST, flight_port))
+            .with_open_telemetry_bind_address(SocketAddr::new(LOCALHOST, otel_port));
+
+        // Default cors config is disabled
+        let rt = Runtime::builder()
+            .with_app(AppBuilder::new("test").build())
+            .build()
+            .await;
+
+        // Start the servers
+        tokio::spawn(async move {
+            Box::pin(Arc::new(rt).start_servers(api_config, None, EndpointAuth::no_auth())).await
+        });
+
+        let http_client = reqwest::Client::builder().build()?;
+
+        // Wait for the servers to start
+        tracing::info!("Waiting for servers to start...");
+        wait_until_true(Duration::from_secs(10), || async {
+            http_client
+                .get(format!("http://localhost:{http_port}/health"))
+                .send()
+                .await
+                .is_ok()
+        })
         .await;
 
-    // Start the servers
-    tokio::spawn(async move {
-        Box::pin(Arc::new(rt).start_servers(api_config, None, EndpointAuth::no_auth())).await
-    });
+        let http_url = format!("http://127.0.0.1:{http_port}/health");
+        let request_builder = http_client.request(http::Method::OPTIONS, &http_url);
+        let response = request_builder.send().await.expect("valid response");
+        assert!(response.status().is_success());
+        tracing::info!("HTTP health check passed");
 
-    let http_client = reqwest::Client::builder().build()?;
+        // Verify that the CORS headers are set
+        assert!(response
+            .headers()
+            .get("access-control-allow-origin")
+            .is_none());
 
-    // Wait for the servers to start
-    tracing::info!("Waiting for servers to start...");
-    wait_until_true(Duration::from_secs(10), || async {
-        http_client
-            .get(format!("http://localhost:{http_port}/health"))
-            .send()
-            .await
-            .is_ok()
-    })
-    .await;
+        assert!(response
+            .headers()
+            .get("access-control-allow-methods")
+            .is_none());
 
-    let http_url = format!("http://127.0.0.1:{http_port}/health");
-    let request_builder = http_client.request(http::Method::OPTIONS, &http_url);
-    let response = request_builder.send().await.expect("valid response");
-    assert!(response.status().is_success());
-    tracing::info!("HTTP health check passed");
-
-    // Verify that the CORS headers are set
-    assert!(response
-        .headers()
-        .get("access-control-allow-origin")
-        .is_none());
-
-    assert!(response
-        .headers()
-        .get("access-control-allow-methods")
-        .is_none());
-
-    Ok(())
+        Ok(())
+    }).await
 }

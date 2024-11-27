@@ -16,6 +16,7 @@ snafu.workspace = true
 async-openai.workspace = true
 async-stream.workspace = true
 async-trait.workspace = true
+bytes = "1.6.0"
 futures = { workspace = true }
 hf-hub = { version = "0.3.0", features = ["tokio"] }
 insta = { workspace = true, features = ["filters"] }

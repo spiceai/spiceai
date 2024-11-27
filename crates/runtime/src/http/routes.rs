@@ -14,14 +14,17 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::config;
 use crate::embeddings::vector_search;
+use crate::request::Protocol;
 use crate::Runtime;
+use crate::{config, request::RequestContext};
 
+use app::App;
 use axum::routing::patch;
 use opentelemetry::KeyValue;
 use spicepod::component::runtime::CorsConfig;
 use std::sync::Arc;
+use tokio::sync::RwLock;
 
 use axum::{
     body::Body,
@@ -99,10 +102,26 @@ pub(crate) fn routes(
     unauthenticated_router
         .merge(authenticated_router)
         .route_layer(middleware::from_fn(track_metrics))
+        .layer(Extension(Arc::clone(&rt.app)))
         .layer(cors_layer(cors_config))
 }
 
-async fn track_metrics(req: Request<Body>, next: Next) -> impl IntoResponse {
+async fn track_metrics(
+    Extension(app): Extension<Arc<RwLock<Option<Arc<App>>>>>,
+    headers: http::HeaderMap,
+    req: Request<Body>,
+    next: Next,
+) -> impl IntoResponse {
+    let app_lock = app.read().await;
+    let request_context = Arc::new(
+        RequestContext::builder(Protocol::Http)
+            .with_app_opt(app_lock.as_ref().map(Arc::clone))
+            .from_headers(&headers)
+            .build(),
+    );
+
+    let request_dimensions = request_context.to_dimensions();
+
     let start = Instant::now();
     let path = if let Some(matched_path) = req.extensions().get::<MatchedPath>() {
         matched_path.as_str().to_owned()
@@ -111,16 +130,20 @@ async fn track_metrics(req: Request<Body>, next: Next) -> impl IntoResponse {
     };
     let method = req.method().clone();
 
-    let response = next.run(req).await;
+    let response = Arc::clone(&request_context)
+        .scope(async move { next.run(req).await })
+        .await;
 
     let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
     let status = response.status().as_u16().to_string();
 
-    let labels = [
+    let mut labels = vec![
         KeyValue::new("method", method.to_string()),
         KeyValue::new("path", path),
         KeyValue::new("status", status),
     ];
+
+    labels.extend(request_dimensions.into_iter());
 
     metrics::REQUESTS_TOTAL.add(1, &labels);
     metrics::REQUESTS_DURATION_MS.record(latency_ms, &labels);

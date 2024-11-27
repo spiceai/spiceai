@@ -21,6 +21,7 @@ use mysql_async::prelude::Queryable;
 use util::{fibonacci_backoff::FibonacciBackoffBuilder, retry, RetryError};
 
 use crate::init_tracing;
+use crate::utils::test_request_context;
 
 pub mod common;
 
@@ -173,83 +174,89 @@ CREATE TABLE test (
 async fn mysql_integration_test() -> Result<(), String> {
     type QueryTests<'a> = Vec<(&'a str, &'a str, Option<Box<ValidateFn>>)>;
     let _tracing = init_tracing(Some("integration=debug,info"));
-    let running_container = start_mysql_docker_container(MYSQL_DOCKER_CONTAINER, MYSQL_PORT)
-        .await
-        .map_err(|e| {
-            tracing::error!("start_mysql_docker_container: {e}");
-            e.to_string()
-        })?;
-    tracing::debug!("Container started");
-    let retry_strategy = FibonacciBackoffBuilder::new().max_retries(Some(10)).build();
-    retry(retry_strategy, || async {
-        init_mysql_db(MYSQL_PORT)
+
+    test_request_context()
+        .scope(async {
+            let running_container =
+                start_mysql_docker_container(MYSQL_DOCKER_CONTAINER, MYSQL_PORT)
+                    .await
+                    .map_err(|e| {
+                        tracing::error!("start_mysql_docker_container: {e}");
+                        e.to_string()
+                    })?;
+            tracing::debug!("Container started");
+            let retry_strategy = FibonacciBackoffBuilder::new().max_retries(Some(10)).build();
+            retry(retry_strategy, || async {
+                init_mysql_db(MYSQL_PORT)
+                    .await
+                    .map_err(RetryError::transient)
+            })
             .await
-            .map_err(RetryError::transient)
-    })
-    .await
-    .map_err(|e| {
-        tracing::error!("Failed to initialize MySQL database: {e}");
-        e.to_string()
-    })?;
-    let app = AppBuilder::new("mysql_integration_test")
-        .with_dataset(make_mysql_dataset("test", "test", MYSQL_PORT, false))
-        .build();
+            .map_err(|e| {
+                tracing::error!("Failed to initialize MySQL database: {e}");
+                e.to_string()
+            })?;
+            let app = AppBuilder::new("mysql_integration_test")
+                .with_dataset(make_mysql_dataset("test", "test", MYSQL_PORT, false))
+                .build();
 
-    let status = status::RuntimeStatus::new();
-    let df = get_test_datafusion(Arc::clone(&status));
+            let status = status::RuntimeStatus::new();
+            let df = get_test_datafusion(Arc::clone(&status));
 
-    let mut rt = Runtime::builder()
-        .with_app(app)
-        .with_datafusion(df)
-        .with_runtime_status(status)
-        .build()
-        .await;
+            let mut rt = Runtime::builder()
+                .with_app(app)
+                .with_datafusion(df)
+                .with_runtime_status(status)
+                .build()
+                .await;
 
-    // Set a timeout for the test
-    tokio::select! {
-        () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
-            return Err("Timed out waiting for datasets to load".to_string());
-        }
-        () = rt.load_components() => {}
-    }
-
-    let queries: QueryTests = vec![(
-        "SELECT * FROM test",
-        "select",
-        Some(Box::new(|result_batches| {
-            for batch in &result_batches {
-                assert_eq!(batch.num_columns(), 20, "num_cols: {}", batch.num_columns());
-                assert_eq!(batch.num_rows(), 2, "num_rows: {}", batch.num_rows());
+            // Set a timeout for the test
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+                    return Err("Timed out waiting for datasets to load".to_string());
+                }
+                () = rt.load_components() => {}
             }
 
-            // snapshot the values of the results
-            let results = arrow::util::pretty::pretty_format_batches(&result_batches)
-                .expect("should pretty print result batch");
-            insta::with_settings!({
-                description => format!("MySQL Integration Test Results"),
-                omit_expression => true,
-                snapshot_path => "../snapshots"
-            }, {
-                insta::assert_snapshot!(format!("mysql_integration_test_select"), results);
-            });
-        })),
-    )];
+            let queries: QueryTests = vec![(
+                "SELECT * FROM test",
+                "select",
+                Some(Box::new(|result_batches| {
+                    for batch in &result_batches {
+                        assert_eq!(batch.num_columns(), 20, "num_cols: {}", batch.num_columns());
+                        assert_eq!(batch.num_rows(), 2, "num_rows: {}", batch.num_rows());
+                    }
 
-    for (query, snapshot_suffix, validate_result) in queries {
-        run_query_and_check_results(
-            &mut rt,
-            &format!("mysql_integration_test_{snapshot_suffix}"),
-            query,
-            true,
-            validate_result,
-        )
-        .await?;
-    }
+                    // snapshot the values of the results
+                    let results = arrow::util::pretty::pretty_format_batches(&result_batches)
+                        .expect("should pretty print result batch");
+                    insta::with_settings!({
+                        description => format!("MySQL Integration Test Results"),
+                        omit_expression => true,
+                        snapshot_path => "../snapshots"
+                    }, {
+                        insta::assert_snapshot!(format!("mysql_integration_test_select"), results);
+                    });
+                })),
+            )];
 
-    running_container.remove().await.map_err(|e| {
-        tracing::error!("running_container.remove: {e}");
-        e.to_string()
-    })?;
+            for (query, snapshot_suffix, validate_result) in queries {
+                run_query_and_check_results(
+                    &mut rt,
+                    &format!("mysql_integration_test_{snapshot_suffix}"),
+                    query,
+                    true,
+                    validate_result,
+                )
+                .await?;
+            }
 
-    Ok(())
+            running_container.remove().await.map_err(|e| {
+                tracing::error!("running_container.remove: {e}");
+                e.to_string()
+            })?;
+
+            Ok(())
+        })
+        .await
 }

@@ -19,10 +19,7 @@ use opentelemetry::{
     metrics::{Counter, Histogram},
     KeyValue,
 };
-use std::{
-    sync::{Arc, LazyLock},
-    time::Duration,
-};
+use std::{sync::LazyLock, time::Duration};
 
 #[cfg(feature = "anonymous_telemetry")]
 pub mod anonymous;
@@ -37,8 +34,8 @@ static QUERY_COUNT: LazyLock<Counter<u64>> = LazyLock::new(|| {
         .init()
 });
 
-pub fn track_query_count() {
-    QUERY_COUNT.add(1, &[]);
+pub fn track_query_count(dimensions: &[KeyValue]) {
+    QUERY_COUNT.add(1, dimensions);
 }
 
 static BYTES_PROCESSED: LazyLock<Counter<u64>> = LazyLock::new(|| {
@@ -49,9 +46,8 @@ static BYTES_PROCESSED: LazyLock<Counter<u64>> = LazyLock::new(|| {
         .init()
 });
 
-pub fn track_bytes_processed(bytes: u64, protocol: Arc<str>) {
-    let dimensions = create_dimensions(protocol);
-    BYTES_PROCESSED.add(bytes, &dimensions);
+pub fn track_bytes_processed(bytes: u64, dimensions: &[KeyValue]) {
+    BYTES_PROCESSED.add(bytes, dimensions);
 }
 
 static BYTES_RETURNED: LazyLock<Counter<u64>> = LazyLock::new(|| {
@@ -62,9 +58,8 @@ static BYTES_RETURNED: LazyLock<Counter<u64>> = LazyLock::new(|| {
         .init()
 });
 
-pub fn track_bytes_returned(bytes: u64, protocol: Arc<str>) {
-    let dimensions = create_dimensions(protocol);
-    BYTES_RETURNED.add(bytes, &dimensions);
+pub fn track_bytes_returned(bytes: u64, dimensions: &[KeyValue]) {
+    BYTES_RETURNED.add(bytes, dimensions);
 }
 
 static QUERY_DURATION_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| {
@@ -93,8 +88,4 @@ static QUERY_EXECUTION_DURATION_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| 
 
 pub fn track_query_execution_duration(duration: Duration, dimensions: &[KeyValue]) {
     QUERY_EXECUTION_DURATION_MS.record(duration.as_secs_f64() * 1000.0, dimensions);
-}
-
-fn create_dimensions(protocol: Arc<str>) -> [KeyValue; 1] {
-    [KeyValue::new("protocol", protocol)]
 }
