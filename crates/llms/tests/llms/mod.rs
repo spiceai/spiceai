@@ -22,6 +22,8 @@ use std::{
     sync::{Arc, LazyLock},
 };
 
+use crate::{init_tracing, TEST_ARGS};
+
 mod create;
 
 #[derive(Clone)]
@@ -148,28 +150,57 @@ static TEST_CASES: LazyLock<Vec<TestCase>> = LazyLock::new(|| {
     ]
 });
 
-/// Model instantiations to test.
+/// For a given mode name, a function that instantiates the model..
+type ModelFn<'a> = (&'a str, Box<dyn Fn() -> Arc<Box<dyn Chat>>>);
+
+/// A given model to test.
+type ModelDef<'a> = (&'a str, Arc<Box<dyn Chat>>);
 #[allow(clippy::expect_used)]
-static TEST_MODELS: LazyLock<Vec<(&'static str, Arc<dyn Chat>)>> = LazyLock::new(|| {
-    vec![
+static TEST_MODELS: LazyLock<Vec<ModelDef>> = LazyLock::new(|| {
+    let model_creators: [ModelFn; 4] = [
         (
             "anthropic",
-            create::create_anthropic(None).expect("failed to create anthropic model"),
+            Box::new(|| create::create_anthropic(None).expect("failed to create anthropic model")),
         ),
-        ("openai", create::create_openai("gpt-4o-mini")),
-    ]
+        ("openai", Box::new(|| create::create_openai("gpt-4o-mini"))),
+        (
+            "hf/phi3",
+            Box::new(|| {
+                create::create_hf("microsoft/Phi-3-mini-4k-instruct")
+                    .expect("failed to create 'microsoft/Phi-3-mini-4k-instruct' from HF")
+            }),
+        ),
+        (
+            "local/phi3",
+            Box::new(|| {
+                create::create_local("microsoft/Phi-3-mini-4k-instruct")
+                    .expect("failed to create 'microsoft/Phi-3-mini-4k-instruct' from local system")
+            }),
+        ),
+    ];
+
+    model_creators
+        .iter()
+        .filter_map(|(name, creator)| {
+            if TEST_ARGS.skip_model(name) {
+                None
+            } else {
+                Some((*name, creator()))
+            }
+        })
+        .collect()
 });
 
 /// A mapping of model names (in [`TEST_MODELS`]) and test names (in [`TEST_CASES`]) to skip.
 static TEST_DENY_LIST: LazyLock<Vec<(&'static str, &'static str)>> =
-    LazyLock::new(|| vec![("anthropic", "placeholder")]);
+    LazyLock::new(|| vec![("hf/phi3", "tool_use"), ("local/phi3", "tool_use")]);
 
 /// Run a single [`TestCase`] for a model.
 #[allow(clippy::expect_used, clippy::expect_fun_call)]
 async fn run_test_case(
     test: &TestCase,
     model_name: &'static str,
-    model: Arc<dyn Chat>,
+    model: Arc<Box<dyn Chat>>,
 ) -> Result<(), anyhow::Error> {
     let test_name = test.name;
     tracing::info!("Running test {test_name}/{model_name} with {:?}", test.req);
@@ -201,6 +232,7 @@ async fn run_test_case(
 async fn run_all_tests() {
     // Set ENV variables before we lazy load `TEST_MODELS`.
     let _ = dotenvy::from_filename(".env").expect("failed to load .env file");
+    init_tracing(None);
 
     for ts in TEST_CASES.iter() {
         for (model_name, model) in TEST_MODELS.iter() {
@@ -211,6 +243,7 @@ async fn run_all_tests() {
                 tracing::info!("Skipping test {model_name}/{}", ts.name);
                 continue;
             }
+
             run_test_case(ts, model_name, Arc::clone(model))
                 .await
                 .expect(format!("Failed to run test {model_name}/{}", ts.name).as_str());
