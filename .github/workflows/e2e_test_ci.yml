@@ -474,7 +474,6 @@ jobs:
           if [[ -n "$ENGINE" ]]; then
             echo "    acceleration:" >> spicepod.yaml
             echo "      enabled: true" >> spicepod.yaml
-            echo "      refresh_sql: SELECT * FROM test_postgresql_table WHERE int2_column != 10" >> spicepod.yaml
             echo "      engine: $ENGINE" >> spicepod.yaml
             if [[ -n "$MODE" ]]; then
               echo "      mode: $MODE" >> spicepod.yaml
@@ -544,17 +543,17 @@ jobs:
         run: |
           while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
 
-      - name: Verify dataset (full refresh mode)
+      - name: Verify dataset1
         uses: ./.github/actions/verify-dataset
         with:
           name: test_postgresql_table
-          expected-rows-count: 2
+          expected-rows-count: 3
       
-      - name: Verify dataset (append refresh mode)
+      - name: Verify dataset2
         uses: ./.github/actions/verify-dataset
         with:
           name: test_postgresql_table2
-          expected-rows-count: 2
+          expected-rows-count: ${{ matrix.acceleration.engine != '' && 2 || 3 }}
 
       - name: Stop spice and check logs
         working-directory: test_app
@@ -680,7 +679,6 @@ jobs:
             echo "    acceleration:" >> spicepod.yaml
             echo "      enabled: true" >> spicepod.yaml
             echo "      engine: $ENGINE" >> spicepod.yaml
-            echo "      refresh_sql: SELECT * FROM test_mysql_table WHERE col_bit!=0" >> spicepod.yaml
             if [[ -n "$MODE" ]]; then
               echo "      mode: $MODE" >> spicepod.yaml
            fi
@@ -749,17 +747,17 @@ jobs:
         run: |
           while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
 
-      - name: Verify dataset (append refresh mode)
+      - name: Verify dataset1
         uses: ./.github/actions/verify-dataset
         with:
           name: test_mysql_table
-          expected-rows-count: 2
+          expected-rows-count: 3
 
-      - name: Verify dataset (full refresh mode)
+      - name: Verify dataset2
         uses: ./.github/actions/verify-dataset
         with:
           name: test_mysql_table2
-          expected-rows-count: 2
+          expected-rows-count: ${{ matrix.acceleration.engine != '' && 2 || 3 }}
 
       - name: Stop spice and check logs
         working-directory: test_app

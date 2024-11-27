@@ -75,7 +75,7 @@ INSERT INTO test_postgresql_table (
   NULL,
   NULL,
   NULL,
-  NULL,
+  CURRENT_TIMESTAMP - INTERVAL '2 day', 
   NULL,
   NULL,
   NULL,
