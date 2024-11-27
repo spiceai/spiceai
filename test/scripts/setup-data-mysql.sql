@@ -76,7 +76,7 @@ INSERT INTO test_mysql_table (
   NULL,
   NULL,
   NULL,
-  '2022-01-01 00:00:00',
+  NULL,
   NULL,
   NULL,
   NULL,
