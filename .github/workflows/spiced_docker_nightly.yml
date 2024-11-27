@@ -83,7 +83,7 @@ jobs:
         run: |
           current_version=$(grep '^version =' Cargo.toml | sed -E 's/version = "(.*)"/\1/')
           new_version="${current_version}.$NIGHTLY_LABEL"
-          sed -i '' "s/^version = \".*\"/version = \"${new_version}\"/" Cargo.toml
+          sed -i "s/^version = \".*\"/version = \"${new_version}\"/" Cargo.toml
           grep '^version =' Cargo.toml
 
       - name: Install docker
@@ -144,7 +144,7 @@ jobs:
         run: |
           current_version=$(grep '^version =' Cargo.toml | sed -E 's/version = "(.*)"/\1/')
           new_version="${current_version}.$NIGHTLY_LABEL"
-          sed -i '' "s/^version = \".*\"/version = \"${new_version}\"/" Cargo.toml
+          sed -i "s/^version = \".*\"/version = \"${new_version}\"/" Cargo.toml
           grep '^version =' Cargo.toml
 
       - name: Set up Docker Buildx
