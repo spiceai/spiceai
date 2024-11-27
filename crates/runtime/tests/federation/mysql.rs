@@ -66,86 +66,102 @@ async fn init_mysql_db(port: u16) -> Result<(), anyhow::Error> {
 async fn mysql_federation_push_down() -> Result<(), String> {
     type QueryTests<'a> = Vec<(&'a str, &'a str, Option<Box<ValidateFn>>)>;
     let _tracing = init_tracing(Some("integration=debug,info"));
-    let running_container = start_mysql_docker_container(MYSQL_DOCKER_CONTAINER, MYSQL_PORT)
-        .await
-        .map_err(|e| {
-            tracing::error!("start_mysql_docker_container: {e}");
-            e.to_string()
-        })?;
-    tracing::debug!("Container started");
-    let retry_strategy = FibonacciBackoffBuilder::new().max_retries(Some(10)).build();
-    retry(retry_strategy, || async {
-        init_mysql_db(MYSQL_PORT)
+
+    test_request_context()
+        .scope(async {
+            let running_container =
+                start_mysql_docker_container(MYSQL_DOCKER_CONTAINER, MYSQL_PORT)
+                    .await
+                    .map_err(|e| {
+                        tracing::error!("start_mysql_docker_container: {e}");
+                        e.to_string()
+                    })?;
+            tracing::debug!("Container started");
+            let retry_strategy = FibonacciBackoffBuilder::new().max_retries(Some(10)).build();
+            retry(retry_strategy, || async {
+                init_mysql_db(MYSQL_PORT)
+                    .await
+                    .map_err(RetryError::transient)
+            })
             .await
-            .map_err(RetryError::transient)
-    })
-    .await
-    .map_err(|e| {
-        tracing::error!("Failed to initialize MySQL database: {e}");
-        e.to_string()
-    })?;
-    let app = AppBuilder::new("mysql_federation_push_down")
-        .with_dataset(make_mysql_dataset("lineitem", "line", MYSQL_PORT, false))
-        .build();
+            .map_err(|e| {
+                tracing::error!("Failed to initialize MySQL database: {e}");
+                e.to_string()
+            })?;
+            let app = AppBuilder::new("mysql_federation_push_down")
+                .with_dataset(make_mysql_dataset("lineitem", "line", MYSQL_PORT, false))
+                .build();
 
-    let status = status::RuntimeStatus::new();
-    let df = get_test_datafusion(Arc::clone(&status));
+            let status = status::RuntimeStatus::new();
+            let df = get_test_datafusion(Arc::clone(&status));
 
-    let mut rt = Runtime::builder()
-        .with_app(app)
-        .with_datafusion(df)
-        .with_runtime_status(status)
-        .build()
-        .await;
+            let mut rt = Runtime::builder()
+                .with_app(app)
+                .with_datafusion(df)
+                .with_runtime_status(status)
+                .build()
+                .await;
 
-    // Set a timeout for the test
-    tokio::select! {
-        () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
-            return Err("Timed out waiting for datasets to load".to_string());
-        }
-        () = rt.load_components() => {}
-    }
-
-    let queries: QueryTests = vec![
-        (
-            "SELECT * FROM line LIMIT 10",
-            "select_limit_10",
-            Some(Box::new(|result_batches| {
-                for batch in result_batches {
-                    assert_eq!(batch.num_columns(), 16, "num_cols: {}", batch.num_columns());
-                    assert_eq!(batch.num_rows(), 10, "num_rows: {}", batch.num_rows());
+            // Set a timeout for the test
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+                    return Err("Timed out waiting for datasets to load".to_string());
                 }
-            })),
-        ),
-        (
-            "SELECT * FROM line ORDER BY line.l_orderkey DESC LIMIT 10",
-            "select_order_by_limit_10",
-            Some(Box::new(|result_batches| {
-                for batch in result_batches {
-                    assert_eq!(batch.num_columns(), 16, "num_cols: {}", batch.num_columns());
-                    assert_eq!(batch.num_rows(), 10, "num_rows: {}", batch.num_rows());
-                }
-            })),
-        ),
-    ];
+                () = rt.load_components() => {}
+            }
 
-    for (query, snapshot_suffix, validate_result) in queries {
-        run_query_and_check_results(
-            &mut rt,
-            &format!("mysql_federation_push_down_{snapshot_suffix}"),
-            query,
-            true,
-            validate_result,
-        )
-        .await?;
-    }
+            let queries: QueryTests = vec![
+                (
+                    "SELECT * FROM line LIMIT 10",
+                    "select_limit_10",
+                    Some(Box::new(|result_batches| {
+                        for batch in result_batches {
+                            assert_eq!(
+                                batch.num_columns(),
+                                16,
+                                "num_cols: {}",
+                                batch.num_columns()
+                            );
+                            assert_eq!(batch.num_rows(), 10, "num_rows: {}", batch.num_rows());
+                        }
+                    })),
+                ),
+                (
+                    "SELECT * FROM line ORDER BY line.l_orderkey DESC LIMIT 10",
+                    "select_order_by_limit_10",
+                    Some(Box::new(|result_batches| {
+                        for batch in result_batches {
+                            assert_eq!(
+                                batch.num_columns(),
+                                16,
+                                "num_cols: {}",
+                                batch.num_columns()
+                            );
+                            assert_eq!(batch.num_rows(), 10, "num_rows: {}", batch.num_rows());
+                        }
+                    })),
+                ),
+            ];
 
-    running_container.remove().await.map_err(|e| {
-        tracing::error!("running_container.remove: {e}");
-        e.to_string()
-    })?;
+            for (query, snapshot_suffix, validate_result) in queries {
+                run_query_and_check_results(
+                    &mut rt,
+                    &format!("mysql_federation_push_down_{snapshot_suffix}"),
+                    query,
+                    true,
+                    validate_result,
+                )
+                .await?;
+            }
 
-    Ok(())
+            running_container.remove().await.map_err(|e| {
+                tracing::error!("running_container.remove: {e}");
+                e.to_string()
+            })?;
+
+            Ok(())
+        })
+        .await
 }
 
 #[tokio::test]
@@ -155,91 +171,93 @@ async fn mysql_federation_inner_join_with_acc() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
     let mysql_port = 13308;
 
-    let running_container = start_mysql_docker_container(
-        "runtime-integration-test-federation-inner-join-mysql",
-        mysql_port,
-    )
-    .await
-    .map_err(|e| {
-        tracing::error!("start_mysql_docker_container: {e}");
-        e.to_string()
-    })?;
-    tracing::debug!("Container started");
-    let retry_strategy = FibonacciBackoffBuilder::new().max_retries(Some(10)).build();
-    retry(retry_strategy, || async {
-        init_mysql_db(mysql_port)
-            .await
-            .map_err(RetryError::transient)
-    })
-    .await
-    .map_err(|e| {
-        tracing::error!("Failed to initialize MySQL database: {e}");
-        e.to_string()
-    })?;
-    let app = AppBuilder::new("mysql_federation_inner_join_with_accelerated_dataset")
-        .with_dataset(make_mysql_dataset("lineitem", "line", mysql_port, false))
-        .with_dataset(make_mysql_dataset("lineitem", "acc_line", mysql_port, true))
-        .build();
-
-    let status = status::RuntimeStatus::new();
-    let df = get_test_datafusion(Arc::clone(&status));
-
-    let mut rt = Runtime::builder()
-        .with_app(app)
-        .with_datafusion(df)
-        .with_runtime_status(status)
-        .build()
-        .await;
-    // Set a timeout for the test
-    tokio::select! {
-        () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
-            return Err("Timed out waiting for datasets to load".to_string());
-        }
-        () = rt.load_components() => {}
-    }
-
-    runtime_ready_check(&rt).await;
-
-    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-
-    let queries: QueryTests = vec![
-        (
-            "SELECT * FROM line inner join acc_line on acc_line.l_orderkey = line.l_orderkey LIMIT 10",
-            "inner_join_0",
-            Some(Box::new(|result_batches| {
-                for batch in result_batches {
-                    assert_eq!(batch.num_columns(), 32, "num_cols: {}", batch.num_columns());
-                    assert_eq!(batch.num_rows(), 10, "num_rows: {}", batch.num_rows());
-                }
-            })),
-        ),
-        (
-            "SELECT line.* FROM line inner join acc_line on acc_line.l_orderkey = line.l_orderkey LIMIT 10",
-            "inner_join_1",
-            Some(Box::new(|result_batches| {
-                for batch in result_batches {
-                    assert_eq!(batch.num_columns(), 16, "num_cols: {}", batch.num_columns());
-                    assert_eq!(batch.num_rows(), 10, "num_rows: {}", batch.num_rows());
-                }
-            })),
-        ),
-    ];
-
-    for (query, snapshot_suffix, validate_result) in queries {
-        run_query_and_check_results(
-            &mut rt,
-            &format!("mysql_federation_inner_join_with_acc_{snapshot_suffix}"),
-            query,
-            true,
-            validate_result,
+    test_request_context().scope(async {
+        let running_container = start_mysql_docker_container(
+            "runtime-integration-test-federation-inner-join-mysql",
+            mysql_port,
         )
-        .await?;
-    }
+        .await
+        .map_err(|e| {
+            tracing::error!("start_mysql_docker_container: {e}");
+            e.to_string()
+        })?;
+        tracing::debug!("Container started");
+        let retry_strategy = FibonacciBackoffBuilder::new().max_retries(Some(10)).build();
+        retry(retry_strategy, || async {
+            init_mysql_db(mysql_port)
+                .await
+                .map_err(RetryError::transient)
+        })
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to initialize MySQL database: {e}");
+            e.to_string()
+        })?;
+        let app = AppBuilder::new("mysql_federation_inner_join_with_accelerated_dataset")
+            .with_dataset(make_mysql_dataset("lineitem", "line", mysql_port, false))
+            .with_dataset(make_mysql_dataset("lineitem", "acc_line", mysql_port, true))
+            .build();
 
-    running_container.remove().await.map_err(|e| {
-        tracing::error!("running_container.remove: {e}");
-        e.to_string()
-    })?;
+        let status = status::RuntimeStatus::new();
+        let df = get_test_datafusion(Arc::clone(&status));
 
-    Ok(())
+        let mut rt = Runtime::builder()
+            .with_app(app)
+            .with_datafusion(df)
+            .with_runtime_status(status)
+            .build()
+            .await;
+        // Set a timeout for the test
+        tokio::select! {
+            () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+                return Err("Timed out waiting for datasets to load".to_string());
+            }
+            () = rt.load_components() => {}
+        }
+
+        runtime_ready_check(&rt).await;
+
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+        let queries: QueryTests = vec![
+            (
+                "SELECT * FROM line inner join acc_line on acc_line.l_orderkey = line.l_orderkey LIMIT 10",
+                "inner_join_0",
+                Some(Box::new(|result_batches| {
+                    for batch in result_batches {
+                        assert_eq!(batch.num_columns(), 32, "num_cols: {}", batch.num_columns());
+                        assert_eq!(batch.num_rows(), 10, "num_rows: {}", batch.num_rows());
+                    }
+                })),
+            ),
+            (
+                "SELECT line.* FROM line inner join acc_line on acc_line.l_orderkey = line.l_orderkey LIMIT 10",
+                "inner_join_1",
+                Some(Box::new(|result_batches| {
+                    for batch in result_batches {
+                        assert_eq!(batch.num_columns(), 16, "num_cols: {}", batch.num_columns());
+                        assert_eq!(batch.num_rows(), 10, "num_rows: {}", batch.num_rows());
+                    }
+                })),
+            ),
+        ];
+
+        for (query, snapshot_suffix, validate_result) in queries {
+            run_query_and_check_results(
+                &mut rt,
+                &format!("mysql_federation_inner_join_with_acc_{snapshot_suffix}"),
+                query,
+                true,
+                validate_result,
+            )
+            .await?;
+        }
+
+        running_container.remove().await.map_err(|e| {
+            tracing::error!("running_container.remove: {e}");
+            e.to_string()
+        })?;
+
+        Ok(())
+    }).await
 }

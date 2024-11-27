@@ -31,7 +31,7 @@ use tracing_futures::Instrument;
 
 use crate::{
     component::dataset::Dataset,
-    datafusion::{error::find_datafusion_root, query::Protocol, DataFusion},
+    datafusion::{error::find_datafusion_root, DataFusion},
     metrics,
 };
 
@@ -172,7 +172,7 @@ AND NOW() < end_time + INTERVAL '{DATASET_UNAVAILABLE_THRESHOLD_MINUTES}' MINUTE
 AND labels.error_code IS NULL"
         );
         let query_result = df
-            .query_builder(&query, Protocol::Internal)
+            .query_builder(&query)
             .build()
             .run()
             .await

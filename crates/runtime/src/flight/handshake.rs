@@ -33,11 +33,11 @@ use super::metrics::track_flight_request;
 type HandshakeResponseStream =
     Pin<Box<dyn Stream<Item = Result<HandshakeResponse, Status>> + Send>>;
 
-pub(crate) fn handle(
+pub(crate) async fn handle(
     metadata: &MetadataMap,
     basic_auth: Option<&Arc<dyn FlightBasicAuth + Send + Sync>>,
 ) -> Result<Response<HandshakeResponseStream>, Status> {
-    let start = track_flight_request("handshake", None);
+    let start = track_flight_request("handshake", None).await;
 
     let token = match flight_auth::validate_basic_auth_handshake(metadata, basic_auth)? {
         Some(token) => token,

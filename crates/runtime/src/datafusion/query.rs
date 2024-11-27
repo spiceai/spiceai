@@ -14,10 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{
-    cell::LazyCell,
-    sync::{Arc, LazyLock},
-};
+use std::{cell::LazyCell, sync::Arc};
 
 use arrow::{
     array::RecordBatch,
@@ -47,6 +44,8 @@ mod tracker;
 use async_stream::stream;
 use futures::StreamExt;
 
+use crate::request::{AsyncMarker, RequestContext};
+
 use super::{error::find_datafusion_root, SPICE_RUNTIME_SCHEMA};
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -69,42 +68,6 @@ pub enum Error {
     SchemaMismatch { source: arrow_tools::schema::Error },
 }
 
-#[derive(Debug, Copy, Clone)]
-pub enum Protocol {
-    Http,
-    Flight,
-    FlightSQL,
-    Internal,
-}
-
-static HTTP: LazyLock<Arc<str>> = LazyLock::new(|| "http".into());
-static FLIGHT: LazyLock<Arc<str>> = LazyLock::new(|| "flight".into());
-static FLIGHTSQL: LazyLock<Arc<str>> = LazyLock::new(|| "flightsql".into());
-static INTERNAL: LazyLock<Arc<str>> = LazyLock::new(|| "internal".into());
-
-impl Protocol {
-    #[must_use]
-    pub fn as_arc_str(&self) -> Arc<str> {
-        match self {
-            Protocol::Http => Arc::clone(&HTTP),
-            Protocol::Flight => Arc::clone(&FLIGHT),
-            Protocol::FlightSQL => Arc::clone(&FLIGHTSQL),
-            Protocol::Internal => Arc::clone(&INTERNAL),
-        }
-    }
-}
-
-impl std::fmt::Display for Protocol {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Protocol::Http => write!(f, "http"),
-            Protocol::Flight => write!(f, "flight"),
-            Protocol::FlightSQL => write!(f, "flightsql"),
-            Protocol::Internal => write!(f, "internal"),
-        }
-    }
-}
-
 // There is no need to have a synchronized SQLOptions across all threads, each thread can have its own instance.
 thread_local! {
     static RESTRICTED_SQL_OPTIONS: LazyCell<SQLOptions> = LazyCell::new(|| {
@@ -122,9 +85,9 @@ pub struct Query {
 }
 
 macro_rules! handle_error {
-    ($self:expr, $error_code:expr, $error:expr, $target_error:ident) => {{
+    ($self:expr, $request_context:expr, $error_code:expr, $error:expr, $target_error:ident) => {{
         let snafu_error = Error::$target_error { source: $error };
-        $self.finish_with_error(snafu_error.to_string(), $error_code);
+        $self.finish_with_error($request_context, snafu_error.to_string(), $error_code);
         return Err(snafu_error);
     }};
 }
@@ -132,7 +95,8 @@ macro_rules! handle_error {
 impl Query {
     #[allow(clippy::too_many_lines)]
     pub async fn run(self) -> Result<QueryResult> {
-        crate::metrics::telemetry::track_query_count();
+        let request_context = RequestContext::current(AsyncMarker::new().await);
+        crate::metrics::telemetry::track_query_count(&request_context.to_dimensions());
 
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "sql_query", input = %self.sql, runtime_query = false);
         let inner_span = span.clone();
@@ -143,17 +107,23 @@ impl Query {
             let ctx = self;
             let mut tracker = ctx.tracker;
 
-            // Sets the protocol as an extension on DataFusion, to allow recovering it to track telemetry
+            // Sets the request context as an extension on DataFusion, to allow recovering it to track telemetry
             session
                 .config_mut()
-                .set_extension(Arc::new(tracker.protocol));
+                .set_extension(Arc::clone(&request_context));
 
             let plan = match session.create_logical_plan(&ctx.sql).await {
                 Ok(plan) => plan,
                 Err(e) => {
                     let e = find_datafusion_root(e);
                     let error_code = ErrorCode::from(&e);
-                    handle_error!(tracker, error_code, e, UnableToExecuteQuery)
+                    handle_error!(
+                        tracker,
+                        &request_context,
+                        error_code,
+                        e,
+                        UnableToExecuteQuery
+                    )
                 }
             };
 
@@ -165,7 +135,13 @@ impl Query {
                     Ok(Some(v)) => Some(v),
                     Ok(None) => None,
                     Err(e) => {
-                        handle_error!(tracker, ErrorCode::InternalError, e, FailedToAccessCache)
+                        handle_error!(
+                            tracker,
+                            &request_context,
+                            ErrorCode::InternalError,
+                            e,
+                            FailedToAccessCache
+                        )
                     }
                 } {
                     tracker = tracker
@@ -182,6 +158,7 @@ impl Query {
                             let e = find_datafusion_root(e);
                             handle_error!(
                                 tracker,
+                                &request_context,
                                 ErrorCode::InternalError,
                                 e,
                                 UnableToCreateMemoryStream
@@ -192,6 +169,7 @@ impl Query {
                     return Ok(QueryResult::new(
                         attach_query_tracker_to_stream(
                             inner_span,
+                            Arc::clone(&request_context),
                             tracker,
                             Box::pin(record_batch_stream),
                         ),
@@ -209,6 +187,7 @@ impl Query {
                 let e = find_datafusion_root(e);
                 handle_error!(
                     tracker,
+                    &request_context,
                     ErrorCode::QueryPlanningError,
                     e,
                     UnableToExecuteQuery
@@ -249,14 +228,26 @@ impl Query {
                 Err(e) => {
                     let e = find_datafusion_root(e);
                     let error_code = ErrorCode::from(&e);
-                    handle_error!(tracker, error_code, e, UnableToExecuteQuery)
+                    handle_error!(
+                        tracker,
+                        &request_context,
+                        error_code,
+                        e,
+                        UnableToExecuteQuery
+                    )
                 }
             };
 
             let res_schema = res_stream.schema();
 
             if let Err(e) = verify_schema(df_schema.fields(), res_schema.fields()) {
-                handle_error!(tracker, ErrorCode::InternalError, e, SchemaMismatch)
+                handle_error!(
+                    tracker,
+                    &request_context,
+                    ErrorCode::InternalError,
+                    e,
+                    SchemaMismatch
+                )
             };
 
             if plan_is_cache_enabled {
@@ -269,14 +260,24 @@ impl Query {
                     );
 
                     return Ok(QueryResult::new(
-                        attach_query_tracker_to_stream(inner_span, tracker, record_batch_stream),
+                        attach_query_tracker_to_stream(
+                            inner_span,
+                            Arc::clone(&request_context),
+                            tracker,
+                            record_batch_stream,
+                        ),
                         Some(false),
                     ));
                 }
             }
 
             Ok(QueryResult::new(
-                attach_query_tracker_to_stream(inner_span, tracker, res_stream),
+                attach_query_tracker_to_stream(
+                    inner_span,
+                    Arc::clone(&request_context),
+                    tracker,
+                    res_stream,
+                ),
                 None,
             ))
         }
@@ -292,17 +293,24 @@ impl Query {
         }
     }
 
-    pub fn finish_with_error(self, error_message: String, error_code: ErrorCode) {
-        self.tracker.finish_with_error(error_message, error_code);
+    pub fn finish_with_error(
+        self,
+        request_context: &RequestContext,
+        error_message: String,
+        error_code: ErrorCode,
+    ) {
+        self.tracker
+            .finish_with_error(request_context, error_message, error_code);
     }
 
     pub async fn get_schema(self) -> Result<Schema, DataFusionError> {
         let session = self.df.ctx.state();
+        let request_context = RequestContext::current(AsyncMarker::new().await);
         let plan = match session.create_logical_plan(&self.sql).await {
             Ok(plan) => plan,
             Err(e) => {
                 let e = find_datafusion_root(e);
-                self.handle_schema_error(&e);
+                self.handle_schema_error(&request_context, &e);
                 return Err(e);
             }
         };
@@ -310,18 +318,18 @@ impl Query {
         // Verify the plan against the restricted options
         if let Err(e) = RESTRICTED_SQL_OPTIONS.with(|sql_options| sql_options.verify_plan(&plan)) {
             let e = find_datafusion_root(e);
-            self.handle_schema_error(&e);
+            self.handle_schema_error(&request_context, &e);
             return Err(e);
         }
         Ok(plan.schema().as_arrow().clone())
     }
 
-    fn handle_schema_error(self, e: &DataFusionError) {
+    fn handle_schema_error(self, request_context: &RequestContext, e: &DataFusionError) {
         // If there is an error getting the schema, we still want to track it in task history
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "sql_query", input = %self.sql, runtime_query = false);
         let error_code = ErrorCode::from(e);
         span.in_scope(|| {
-            self.finish_with_error(e.to_string(), error_code);
+            self.finish_with_error(request_context, e.to_string(), error_code);
         });
     }
 }
@@ -336,7 +344,8 @@ impl Query {
 /// is finalized with error details, and further streaming is terminated.
 fn attach_query_tracker_to_stream(
     span: Span,
-    ctx: QueryTracker,
+    request_context: Arc<RequestContext>,
+    tracker: QueryTracker,
     mut stream: SendableRecordBatchStream,
 ) -> SendableRecordBatchStream {
     let schema = stream.schema();
@@ -364,10 +373,14 @@ fn attach_query_tracker_to_stream(
                     yield batch_result
                 }
                 Err(e) => {
-                    ctx
+                    tracker
                         .schema(schema_copy)
                         .rows_produced(num_records)
-                        .finish_with_error(e.to_string(), ErrorCode::QueryExecutionError);
+                        .finish_with_error(
+                            &request_context,
+                            e.to_string(),
+                            ErrorCode::QueryExecutionError,
+                        );
                     tracing::error!(target: "task_history", parent: &inner_span, "{e}");
                     yield batch_result;
                     return;
@@ -375,12 +388,12 @@ fn attach_query_tracker_to_stream(
             }
         }
 
-        crate::metrics::telemetry::track_bytes_returned(num_output_bytes, ctx.protocol.as_arc_str());
+        crate::metrics::telemetry::track_bytes_returned(num_output_bytes, &request_context.to_dimensions());
 
-        ctx
+        tracker
             .schema(schema_copy)
             .rows_produced(num_records)
-            .finish(&Arc::from(captured_output));
+            .finish(&request_context, &Arc::from(captured_output));
     };
 
     Box::pin(RecordBatchStreamAdapter::new(

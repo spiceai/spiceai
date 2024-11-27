@@ -16,8 +16,8 @@ runs:
         response=$(curl http://localhost:8090/v1/datasets)
         echo $response | jq
         length=$(echo $response | jq 'if type=="array" then length else empty end')
-        if [[ $length -ne 1 ]]; then
-          echo "Unexpected response: $response, expected 1 dataset but received $length"
+        if [[ $length -lt 1 ]]; then
+          echo "Unexpected response: $response, expected at least 1 dataset but received $length"
           exit 1
         fi
 

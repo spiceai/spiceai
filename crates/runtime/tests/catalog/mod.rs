@@ -14,12 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::{get_test_datafusion, init_tracing};
+use crate::{get_test_datafusion, init_tracing, utils::test_request_context};
 use app::AppBuilder;
 use arrow::array::RecordBatch;
 use datafusion::assert_batches_eq;
 use futures::StreamExt;
-use runtime::{datafusion::query::Protocol, extension::ExtensionFactory};
+use runtime::extension::ExtensionFactory;
 use runtime::{status, Runtime};
 use spice_cloud::SpiceExtensionFactory;
 use spicepod::component::catalog::Catalog;
@@ -32,50 +32,52 @@ async fn spiceai_integration_test_catalog() -> Result<(), anyhow::Error> {
         rustls::crypto::aws_lc_rs::default_provider(),
     );
     let _tracing = init_tracing(None);
-    let app = AppBuilder::new("spiceai_catalog_test")
-        .with_catalog(Catalog::new("spice.ai".to_string(), "spiceai".to_string()))
-        .build();
 
-    let status = status::RuntimeStatus::new();
-    let df = get_test_datafusion(Arc::clone(&status));
+    test_request_context()
+        .scope(async {
+            let app = AppBuilder::new("spiceai_catalog_test")
+                .with_catalog(Catalog::new("spice.ai".to_string(), "spiceai".to_string()))
+                .build();
 
-    let rt = Runtime::builder()
-        .with_app(app)
-        .with_datafusion(df)
-        .with_runtime_status(status)
-        .with_autoload_extensions(HashMap::from([(
-            "spice_cloud".to_string(),
-            Box::new(SpiceExtensionFactory::default()) as Box<dyn ExtensionFactory>,
-        )]))
-        .build()
-        .await;
+            let status = status::RuntimeStatus::new();
+            let df = get_test_datafusion(Arc::clone(&status));
 
-    tokio::select! {
-        () = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
-            panic!("Timeout waiting for components to load");
-        }
-        () = rt.load_components() => {}
-    }
+            let rt = Runtime::builder()
+                .with_app(app)
+                .with_datafusion(df)
+                .with_runtime_status(status)
+                .with_autoload_extensions(HashMap::from([(
+                    "spice_cloud".to_string(),
+                    Box::new(SpiceExtensionFactory::default()) as Box<dyn ExtensionFactory>,
+                )]))
+                .build()
+                .await;
 
-    let mut result = rt
-        .datafusion()
-        .query_builder(
-            "SELECT * FROM spiceai.eth.recent_blocks LIMIT 10",
-            Protocol::Internal,
-        )
-        .build()
-        .run()
-        .await?;
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+                    panic!("Timeout waiting for components to load");
+                }
+                () = rt.load_components() => {}
+            }
 
-    let mut results: Vec<RecordBatch> = vec![];
-    while let Some(batch) = result.data.next().await {
-        results.push(batch?);
-    }
+            let mut result = rt
+                .datafusion()
+                .query_builder("SELECT * FROM spiceai.eth.recent_blocks LIMIT 10")
+                .build()
+                .run()
+                .await?;
 
-    assert_eq!(results.len(), 1);
-    assert_eq!(results[0].num_rows(), 10);
+            let mut results: Vec<RecordBatch> = vec![];
+            while let Some(batch) = result.data.next().await {
+                results.push(batch?);
+            }
 
-    Ok(())
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].num_rows(), 10);
+
+            Ok(())
+        })
+        .await
 }
 
 #[tokio::test]
@@ -84,66 +86,70 @@ async fn spiceai_integration_test_catalog_include() -> Result<(), anyhow::Error>
         rustls::crypto::aws_lc_rs::default_provider(),
     );
     let _tracing = init_tracing(None);
-    let mut catalog = Catalog::new("spice.ai".to_string(), "spiceai".to_string());
-    catalog.include = vec![
-        "eth.recent_bl*".to_string(),
-        "eth.recent_transactions".to_string(),
-    ];
-    let app = AppBuilder::new("spiceai_catalog_test")
-        .with_catalog(catalog)
-        .build();
 
-    let status = status::RuntimeStatus::new();
-    let df = get_test_datafusion(Arc::clone(&status));
+    test_request_context()
+        .scope(async {
+            let mut catalog = Catalog::new("spice.ai".to_string(), "spiceai".to_string());
+            catalog.include = vec![
+                "eth.recent_bl*".to_string(),
+                "eth.recent_transactions".to_string(),
+            ];
+            let app = AppBuilder::new("spiceai_catalog_test")
+                .with_catalog(catalog)
+                .build();
 
-    let rt = Runtime::builder()
-        .with_app(app)
-        .with_datafusion(df)
-        .with_autoload_extensions(HashMap::from([(
-            "spice_cloud".to_string(),
-            Box::new(SpiceExtensionFactory::default()) as Box<dyn ExtensionFactory>,
-        )]))
-        .build()
-        .await;
+            let status = status::RuntimeStatus::new();
+            let df = get_test_datafusion(Arc::clone(&status));
 
-    tokio::select! {
-        () = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
-            panic!("Timeout waiting for components to load");
-        }
-        () = rt.load_components() => {}
-    }
+            let rt = Runtime::builder()
+                .with_app(app)
+                .with_datafusion(df)
+                .with_autoload_extensions(HashMap::from([(
+                    "spice_cloud".to_string(),
+                    Box::new(SpiceExtensionFactory::default()) as Box<dyn ExtensionFactory>,
+                )]))
+                .build()
+                .await;
 
-    let mut result = rt
-        .datafusion()
-        .query_builder(
-            "SELECT table_catalog, table_schema, table_name, table_type 
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+                    panic!("Timeout waiting for components to load");
+                }
+                () = rt.load_components() => {}
+            }
+
+            let mut result = rt
+                .datafusion()
+                .query_builder(
+                    "SELECT table_catalog, table_schema, table_name, table_type 
              FROM information_schema.tables 
              WHERE table_schema != 'information_schema' 
                AND table_catalog = 'spiceai' 
              ORDER BY table_name",
-            Protocol::Internal,
-        )
-        .build()
-        .run()
-        .await?;
+                )
+                .build()
+                .run()
+                .await?;
 
-    let mut results: Vec<RecordBatch> = vec![];
-    while let Some(batch) = result.data.next().await {
-        results.push(batch?);
-    }
+            let mut results: Vec<RecordBatch> = vec![];
+            while let Some(batch) = result.data.next().await {
+                results.push(batch?);
+            }
 
-    assert_eq!(results.len(), 1);
-    assert_batches_eq!(
-        &[
-            "+---------------+--------------+---------------------+------------+",
-            "| table_catalog | table_schema | table_name          | table_type |",
-            "+---------------+--------------+---------------------+------------+",
-            "| spiceai       | eth          | recent_blocks       | BASE TABLE |",
-            "| spiceai       | eth          | recent_transactions | BASE TABLE |",
-            "+---------------+--------------+---------------------+------------+",
-        ],
-        &results
-    );
+            assert_eq!(results.len(), 1);
+            assert_batches_eq!(
+                &[
+                    "+---------------+--------------+---------------------+------------+",
+                    "| table_catalog | table_schema | table_name          | table_type |",
+                    "+---------------+--------------+---------------------+------------+",
+                    "| spiceai       | eth          | recent_blocks       | BASE TABLE |",
+                    "| spiceai       | eth          | recent_transactions | BASE TABLE |",
+                    "+---------------+--------------+---------------------+------------+",
+                ],
+                &results
+            );
 
-    Ok(())
+            Ok(())
+        })
+        .await
 }

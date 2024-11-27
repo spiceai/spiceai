@@ -31,8 +31,9 @@ use spicepod::component::dataset::{
 
 use crate::{
     get_test_datafusion, init_tracing, run_query_and_check_results,
-    run_query_and_check_results_with_plan_checks, utils::runtime_ready_check, PlanCheckFn,
-    ValidateFn,
+    run_query_and_check_results_with_plan_checks,
+    utils::{runtime_ready_check, test_request_context},
+    PlanCheckFn, ValidateFn,
 };
 
 fn make_sqlite_decimal_dataset(mode: Mode) -> Dataset {
@@ -122,108 +123,128 @@ fn downcast_decimal_array(array: &ArrayRef) -> &Decimal128Array {
 async fn test_sqlite_decimal_memory() -> anyhow::Result<()> {
     let _tracing = init_tracing(None);
 
-    let app = AppBuilder::new("test_sqlite_decimal_memory")
-        .with_dataset(make_sqlite_decimal_dataset(Mode::Memory))
-        .build();
+    test_request_context()
+        .scope(async {
+            let app = AppBuilder::new("test_sqlite_decimal_memory")
+                .with_dataset(make_sqlite_decimal_dataset(Mode::Memory))
+                .build();
 
-    let status = status::RuntimeStatus::new();
-    let df = get_test_datafusion(Arc::clone(&status));
+            let status = status::RuntimeStatus::new();
+            let df = get_test_datafusion(Arc::clone(&status));
 
-    let mut rt = Runtime::builder()
-        .with_app(app)
-        .with_datafusion(df)
-        .with_runtime_status(status)
-        .build()
-        .await;
+            let mut rt = Runtime::builder()
+                .with_app(app)
+                .with_datafusion(df)
+                .with_runtime_status(status)
+                .build()
+                .await;
 
-    // Set a timeout for the test
-    tokio::select! {
-        () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
-            return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
-        }
-        () = rt.load_components() => {}
-    }
-
-    runtime_ready_check(&rt).await;
-
-    for (query, check_function, validate_result) in
-        decimal_queries("test_sqlite_decimal_memory", DecimalQuery::NonFederated)
-    {
-        match check_function {
-            CheckFunction::ValidateFullPlan(snapshot_name) => {
-                run_query_and_check_results(&mut rt, &snapshot_name, query, true, validate_result)
-                    .await
+            // Set a timeout for the test
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
+                }
+                () = rt.load_components() => {}
             }
-            CheckFunction::ValidateSubPlan(plan_checks) => {
-                run_query_and_check_results_with_plan_checks(
-                    &mut rt,
-                    query,
-                    plan_checks,
-                    validate_result,
-                )
-                .await
-            }
-        }
-        .expect("query to succeed");
-    }
 
-    Ok(())
+            runtime_ready_check(&rt).await;
+
+            for (query, check_function, validate_result) in
+                decimal_queries("test_sqlite_decimal_memory", DecimalQuery::NonFederated)
+            {
+                match check_function {
+                    CheckFunction::ValidateFullPlan(snapshot_name) => {
+                        run_query_and_check_results(
+                            &mut rt,
+                            &snapshot_name,
+                            query,
+                            true,
+                            validate_result,
+                        )
+                        .await
+                    }
+                    CheckFunction::ValidateSubPlan(plan_checks) => {
+                        run_query_and_check_results_with_plan_checks(
+                            &mut rt,
+                            query,
+                            plan_checks,
+                            validate_result,
+                        )
+                        .await
+                    }
+                }
+                .expect("query to succeed");
+            }
+
+            Ok(())
+        })
+        .await
 }
 
 #[tokio::test]
 async fn test_sqlite_decimal_file() -> anyhow::Result<()> {
     let _tracing = init_tracing(None);
 
-    let app = AppBuilder::new("test_sqlite_decimal_file")
-        .with_dataset(make_sqlite_decimal_dataset(Mode::File))
-        .build();
+    test_request_context()
+        .scope(async {
+            let app = AppBuilder::new("test_sqlite_decimal_file")
+                .with_dataset(make_sqlite_decimal_dataset(Mode::File))
+                .build();
 
-    let status = status::RuntimeStatus::new();
-    let df = get_test_datafusion(Arc::clone(&status));
+            let status = status::RuntimeStatus::new();
+            let df = get_test_datafusion(Arc::clone(&status));
 
-    let mut rt = Runtime::builder()
-        .with_app(app)
-        .with_datafusion(df)
-        .with_runtime_status(status)
-        .build()
-        .await;
+            let mut rt = Runtime::builder()
+                .with_app(app)
+                .with_datafusion(df)
+                .with_runtime_status(status)
+                .build()
+                .await;
 
-    // Set a timeout for the test
-    tokio::select! {
-        () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
-            return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
-        }
-        () = rt.load_components() => {}
-    }
-
-    runtime_ready_check(&rt).await;
-
-    for (query, check_function, validate_result) in
-        decimal_queries("test_sqlite_decimal_file", DecimalQuery::Federated)
-    {
-        match check_function {
-            CheckFunction::ValidateFullPlan(snapshot_name) => {
-                run_query_and_check_results(&mut rt, &snapshot_name, query, true, validate_result)
-                    .await
+            // Set a timeout for the test
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
+                }
+                () = rt.load_components() => {}
             }
-            CheckFunction::ValidateSubPlan(plan_checks) => {
-                run_query_and_check_results_with_plan_checks(
-                    &mut rt,
-                    query,
-                    plan_checks,
-                    validate_result,
-                )
-                .await
+
+            runtime_ready_check(&rt).await;
+
+            for (query, check_function, validate_result) in
+                decimal_queries("test_sqlite_decimal_file", DecimalQuery::Federated)
+            {
+                match check_function {
+                    CheckFunction::ValidateFullPlan(snapshot_name) => {
+                        run_query_and_check_results(
+                            &mut rt,
+                            &snapshot_name,
+                            query,
+                            true,
+                            validate_result,
+                        )
+                        .await
+                    }
+                    CheckFunction::ValidateSubPlan(plan_checks) => {
+                        run_query_and_check_results_with_plan_checks(
+                            &mut rt,
+                            query,
+                            plan_checks,
+                            validate_result,
+                        )
+                        .await
+                    }
+                }
+                .expect("query to succeed");
             }
-        }
-        .expect("query to succeed");
-    }
 
-    // Clean up files
-    let dir_path = "./.spice";
-    if std::path::Path::new(dir_path).exists() {
-        std::fs::remove_dir_all(dir_path).expect("Failed to remove directory");
-    }
+            // Clean up files
+            let dir_path = "./.spice";
+            if std::path::Path::new(dir_path).exists() {
+                std::fs::remove_dir_all(dir_path).expect("Failed to remove directory");
+            }
 
-    Ok(())
+            Ok(())
+        })
+        .await
 }

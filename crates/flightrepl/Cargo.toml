@@ -23,6 +23,7 @@ reqwest.workspace = true
 rustyline = { version="15.0.0", features=["custom-bindings", "with-dirs", "with-file-history", "derive"] }
 serde_json.workspace = true
 tonic = { workspace = true, features = ["transport", "tls", "tls-roots"] }
+flight_client = { path = "../flight_client" }
 
 [target.'cfg(windows)'.dependencies]
 winver = "1.0.0"

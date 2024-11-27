@@ -37,16 +37,17 @@ use prost::Message;
 use tonic::{Request, Response, Status};
 
 use crate::{
-    flight::{metrics, to_tonic_err, Service},
+    flight::{metrics, to_tonic_err, util::set_flightsql_protocol, Service},
     timing::TimedStream,
 };
 
 /// Get a `FlightInfo` for retrieving `SqlInfo`.
-pub(crate) fn get_flight_info(
+pub(crate) async fn get_flight_info(
     query: &sql::CommandGetSqlInfo,
     request: Request<FlightDescriptor>,
 ) -> Result<Response<FlightInfo>, Status> {
-    let _start = metrics::track_flight_request("get_flight_info", Some("get_sql_info"));
+    let _start = metrics::track_flight_request("get_flight_info", Some("get_sql_info")).await;
+    set_flightsql_protocol().await;
 
     tracing::trace!("get_flight_info_get_sql_info: query={query:?}");
     let builder = query.clone().into_builder(get_sql_info_data());
@@ -70,11 +71,13 @@ pub(crate) fn get_flight_info(
 }
 
 /// Get a `FlightDataStream` containing the list of `SqlInfo` results.
-pub(crate) fn do_get(
+pub(crate) async fn do_get(
     query: sql::CommandGetSqlInfo,
 ) -> Result<Response<<Service as FlightService>::DoGetStream>, Status> {
     tracing::trace!("do_get_sql_info: {query:?}");
-    let start = metrics::track_flight_request("do_get", Some("get_sql_info"));
+    let start = metrics::track_flight_request("do_get", Some("get_sql_info")).await;
+    set_flightsql_protocol().await;
+
     let builder = query.into_builder(get_sql_info_data());
     let record_batch = builder.build().map_err(to_tonic_err)?;
 

@@ -41,7 +41,9 @@ INSERT INTO test_postgresql_table (
   float4_array_column, 
   float8_array_column, 
   text_array_column
-) VALUES (
+) VALUES 
+-- First test row
+(
   1, 
   2, 
   3, 
@@ -60,7 +62,9 @@ INSERT INTO test_postgresql_table (
   ARRAY[7.0, 8.0], 
   ARRAY[9.0, 10.0], 
   ARRAY['test1', 'test2']
-), (
+), 
+-- Second test row with NULLs
+(
   NULL,
   NULL,
   NULL,
@@ -71,7 +75,7 @@ INSERT INTO test_postgresql_table (
   NULL,
   NULL,
   NULL,
-  NULL,
+  NULL, 
   NULL,
   NULL,
   NULL,
@@ -79,4 +83,25 @@ INSERT INTO test_postgresql_table (
   NULL,
   NULL,
   NULL
+),
+-- Third test row
+(
+  10, 
+  1000, 
+  100000, 
+  10.5, 
+  20.25, 
+  'row3_test', 
+  'row3_varchar', 
+  'row3_bpchar', 
+  false, 
+  123.45, 
+  CURRENT_TIMESTAMP - INTERVAL '1 day', 
+  CURRENT_DATE - INTERVAL '1 day', 
+  ARRAY[10, 20, 30], 
+  ARRAY[100, 200, 300], 
+  ARRAY[1000, 2000, 3000], 
+  ARRAY[10.1, 20.2, 30.3], 
+  ARRAY[100.1, 200.2, 300.3], 
+  ARRAY['value1', 'value2', 'value3']
 );
