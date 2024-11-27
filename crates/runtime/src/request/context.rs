@@ -146,11 +146,11 @@ impl RequestContextBuilder {
         let mut dimensions = vec![];
 
         let add_runtime_dimensions = |dimensions: &mut Vec<KeyValue>| {
-            dimensions.push(KeyValue::new("runtime", super::PLATFORM_NAME));
-            dimensions.push(KeyValue::new("runtime_version", super::PLATFORM_VERSION));
+            dimensions.push(KeyValue::new("runtime", super::RUNTIME_NAME));
+            dimensions.push(KeyValue::new("runtime_version", super::RUNTIME_VERSION));
             dimensions.push(KeyValue::new(
                 "runtime_system",
-                super::PLATFORM_SYSTEM.to_string(),
+                super::RUNTIME_SYSTEM.to_string(),
             ));
         };
 
@@ -158,7 +158,7 @@ impl RequestContextBuilder {
             UserAgent::Absent => (),
             UserAgent::Raw(raw) => {
                 dimensions.push(KeyValue::new("user_agent", UserAgent::Raw(raw).to_string()));
-                add_platform_dimensions(&mut dimensions);
+                add_runtime_dimensions(&mut dimensions);
             }
             UserAgent::Parsed(parsed) => {
                 dimensions.push(KeyValue::new("client", Arc::clone(&parsed.client_name)));
@@ -174,7 +174,7 @@ impl RequestContextBuilder {
                     "user_agent",
                     UserAgent::Parsed(parsed).to_string(),
                 ));
-                add_platform_dimensions(&mut dimensions);
+                add_runtime_dimensions(&mut dimensions);
             }
         }
 
