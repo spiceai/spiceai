@@ -74,9 +74,14 @@ impl UserAgent {
         let Ok(user_agent_str) = user_agent.to_str() else {
             return Self::Absent;
         };
-        match Parsed::try_from(user_agent_str) {
+        Self::from_ua_str(user_agent_str)
+    }
+
+    #[must_use]
+    pub fn from_ua_str(s: &str) -> Self {
+        match Parsed::try_from(s) {
             Some(parsed) => Self::Parsed(parsed),
-            None => Self::Raw(Raw(Arc::from(user_agent_str))),
+            None => Self::Raw(Raw(Arc::from(s))),
         }
     }
 }

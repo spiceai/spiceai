@@ -25,7 +25,12 @@ use opentelemetry_sdk::{
 use otel_arrow::OtelArrowExporter;
 use rand::Rng;
 use reqwest::Client;
-use runtime::{auth::EndpointAuth, config::Config, spice_metrics, status, Runtime};
+use runtime::{
+    auth::EndpointAuth,
+    config::Config,
+    request::{Protocol, RequestContext, UserAgent},
+    spice_metrics, status, Runtime,
+};
 use spicepod::component::{
     dataset::Dataset,
     params::Params,
@@ -37,7 +42,7 @@ use std::{
     time::Duration,
 };
 
-use crate::{get_test_datafusion, init_tracing};
+use crate::{get_test_datafusion, init_tracing, utils::test_request_context};
 
 const LOCALHOST: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
 
@@ -122,7 +127,6 @@ async fn run_test(app: App) -> Result<String, anyhow::Error> {
     let mut query_result = rt
         .datafusion()
         .query_builder("SELECT * FROM taxi_trips LIMIT 10")
-        .with_telemetry_context(crate::get_telemetry_context("user_agent_metrics"))
         .build()
         .run()
         .await
@@ -153,8 +157,8 @@ async fn user_agent_metrics() -> Result<(), anyhow::Error> {
         .with_dataset(get_s3_dataset())
         .build();
 
-    let response_text = run_test(app).await?;
-    assert!(response_text.contains("client_name=\"integration\""));
+    let response_text = test_request_context().scope(run_test(app)).await?;
+    assert!(response_text.contains("client=\"spiceci\""));
 
     Ok(())
 }
@@ -164,21 +168,29 @@ async fn test_disabled_user_agent() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
     let mut runtime = SpicepodRuntime::default();
-    runtime.telemetry = Some(TelemetryConfig {
+    runtime.telemetry = TelemetryConfig {
         enabled: true,
-        user_agent_collection: Some(
-            spicepod::component::runtime::UserAgentCollectionType::Disabled,
-        ),
-    });
+        user_agent_collection: spicepod::component::runtime::UserAgentCollection::Disabled,
+    };
 
     let app = AppBuilder::new("user_agent_metrics")
         .with_dataset(get_s3_dataset())
         .with_runtime(runtime)
         .build();
 
+    let request_context = Arc::new(
+        RequestContext::builder(Protocol::Internal)
+            .with_app_opt(Some(Arc::new(app.clone())))
+            .with_user_agent(UserAgent::from_ua_str(&format!(
+                "spiceci/{}",
+                env!("CARGO_PKG_VERSION")
+            )))
+            .build(),
+    );
+
     let response_text = run_test(app).await?;
 
-    assert!(!response_text.contains("client_name=\"integration\""));
+    assert!(!response_text.contains("client=\"spiceci\""));
 
     Ok(())
 }

@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::RecordBatch;
+use crate::{init_tracing, utils::test_request_context, RecordBatch};
 
 use anyhow::anyhow;
 use app::AppBuilder;
@@ -89,11 +89,11 @@ pub async fn prepare_container() -> Result<RunningContainer<'static>, anyhow::Er
 
 #[tokio::test]
 async fn test_spice_with_abfs() -> Result<(), anyhow::Error> {
-    //let _tracing = init_tracing(Some("trace"));
+    let _tracing = init_tracing(None);
     tracing::info!("Starting AzureBlobFS connector test");
     let azurite_container = prepare_container().await?;
 
-    let res = run_queries().await;
+    let res = test_request_context().scope(run_queries()).await;
     tracing::info!("Test completed");
     azurite_container.stop().await?;
     azurite_container.remove().await?;
@@ -173,7 +173,6 @@ async fn run_queries() -> Result<(), anyhow::Error> {
         let query_result = rt
             .datafusion()
             .query_builder(&query)
-            .with_telemetry_context(crate::get_telemetry_context("abfs"))
             .build()
             .run()
             .await

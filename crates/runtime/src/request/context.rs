@@ -155,6 +155,12 @@ impl RequestContextBuilder {
     }
 
     #[must_use]
+    pub fn with_user_agent(mut self, user_agent: UserAgent) -> Self {
+        self.user_agent = user_agent;
+        self
+    }
+
+    #[must_use]
     pub fn build(self) -> RequestContext {
         let mut dimensions = vec![];
 

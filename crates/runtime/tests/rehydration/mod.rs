@@ -21,7 +21,7 @@ use crate::{
     docker::RunningContainer,
     get_test_datafusion,
     mysql::common::{get_mysql_conn, make_mysql_dataset, start_mysql_docker_container},
-    utils::runtime_ready_check,
+    utils::{runtime_ready_check, test_request_context},
 };
 use std::sync::Arc;
 
@@ -56,45 +56,48 @@ mod sqlite;
 async fn spill_to_disk_and_rehydration() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
     let _guard = ACCELERATION_MUTEX.lock().await;
-    let running_container = prepare_test_environment()
-        .await
-        .map_err(|e| anyhow::anyhow!(e))?;
-    let running_container = Arc::new(running_container);
 
-    let config = vec![
-        #[cfg(feature = "duckdb")]
-        ("duckdb", None),
-        #[cfg(feature = "duckdb")]
-        ("duckdb", Some("./.spice/my_duckdb.db")),
-        #[cfg(feature = "sqlite")]
-        ("sqlite", None),
-        #[cfg(feature = "sqlite")]
-        ("sqlite", Some("./.spice/my_sqlite.db")),
-    ];
+    test_request_context().scope(async {
+        let running_container = prepare_test_environment()
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+        let running_container = Arc::new(running_container);
 
-    for (idx, (engine, db_file_path)) in config.into_iter().enumerate() {
-        tracing::info!("Testing spill-to-disk and rehydration with engine: {engine}, db_file_path: {db_file_path:?}");
+        let config = vec![
+            #[cfg(feature = "duckdb")]
+            ("duckdb", None),
+            #[cfg(feature = "duckdb")]
+            ("duckdb", Some("./.spice/my_duckdb.db")),
+            #[cfg(feature = "sqlite")]
+            ("sqlite", None),
+            #[cfg(feature = "sqlite")]
+            ("sqlite", Some("./.spice/my_sqlite.db")),
+        ];
 
-        if idx > 0 {
-            // Ensure the container is running as the tests manipulate it
-            running_container
-                .start()
-                .await
-                .map_err(|e| anyhow::anyhow!(e))?;
-            tokio::time::sleep(std::time::Duration::from_millis(5000)).await;
+        for (idx, (engine, db_file_path)) in config.into_iter().enumerate() {
+            tracing::info!("Testing spill-to-disk and rehydration with engine: {engine}, db_file_path: {db_file_path:?}");
+
+            if idx > 0 {
+                // Ensure the container is running as the tests manipulate it
+                running_container
+                    .start()
+                    .await
+                    .map_err(|e| anyhow::anyhow!(e))?;
+                tokio::time::sleep(std::time::Duration::from_millis(5000)).await;
+            }
+            execute_spill_to_disk_and_rehydration(Arc::clone(&running_container), engine, db_file_path)
+                .await?;
         }
-        execute_spill_to_disk_and_rehydration(Arc::clone(&running_container), engine, db_file_path)
-            .await?;
-    }
 
-    running_container
-        .remove()
-        .await
-        .map_err(|e| anyhow::anyhow!(e))?;
+        running_container
+            .remove()
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
 
-    tracing::info!("Spill-to-disk and rehydration tests passed!");
+        tracing::info!("Spill-to-disk and rehydration tests passed!");
 
-    Ok(())
+        Ok(())
+    }).await
 }
 
 /// Validates spill-to-disk and rehydration functionality by simulating runtime restarts
@@ -247,9 +250,6 @@ async fn run_query(query: &str, rt: &Runtime) -> Result<Vec<RecordBatch>, anyhow
     let query_result = rt
         .datafusion()
         .query_builder(query)
-        .with_telemetry_context(crate::get_telemetry_context(
-            "test_spill_to_disk_and_rehydration",
-        ))
         .build()
         .run()
         .await

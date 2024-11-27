@@ -27,7 +27,10 @@ use spicepod::component::dataset::{
 };
 use std::sync::Arc;
 
-use crate::{get_test_datafusion, init_tracing, utils::runtime_ready_check};
+use crate::{
+    get_test_datafusion, init_tracing,
+    utils::{runtime_ready_check, test_request_context},
+};
 
 use super::get_params;
 
@@ -50,96 +53,100 @@ async fn test_acceleration_duckdb_single_instance() -> Result<(), anyhow::Error>
     let _tracing = init_tracing(Some("integration=debug,info"));
     let _guard = super::ACCELERATION_MUTEX.lock().await;
 
-    let status = status::RuntimeStatus::new();
-    let df = get_test_datafusion(Arc::clone(&status));
+    test_request_context()
+        .scope(async {
+            let status = status::RuntimeStatus::new();
+            let df = get_test_datafusion(Arc::clone(&status));
 
-    let expected_path = "./single_duckdb.db";
-    let app = AppBuilder::new("test_acceleration_duckdb_single_instance")
-        .with_dataset(get_dataset(
-            "https://public-data.spiceai.org/decimal.parquet",
-            "decimal",
-            expected_path,
-        ))
-        .with_dataset(get_dataset(
-            "https://public-data.spiceai.org/eth.recent_logs.parquet",
-            "logs",
-            expected_path,
-        ))
-        .build();
+            let expected_path = "./single_duckdb.db";
+            let app = AppBuilder::new("test_acceleration_duckdb_single_instance")
+                .with_dataset(get_dataset(
+                    "https://public-data.spiceai.org/decimal.parquet",
+                    "decimal",
+                    expected_path,
+                ))
+                .with_dataset(get_dataset(
+                    "https://public-data.spiceai.org/eth.recent_logs.parquet",
+                    "logs",
+                    expected_path,
+                ))
+                .build();
 
-    let rt = Arc::new(
-        Runtime::builder()
-            .with_app(app)
-            .with_datafusion(df)
-            .with_runtime_status(status)
-            .build()
-            .await,
-    );
+            let rt = Arc::new(
+                Runtime::builder()
+                    .with_app(app)
+                    .with_datafusion(df)
+                    .with_runtime_status(status)
+                    .build()
+                    .await,
+            );
 
-    tokio::select! {
-        () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
-            return Err(anyhow::Error::msg("Timed out waiting for datasets to load"));
-        }
-        () = rt.load_components() => {}
-    }
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+                    return Err(anyhow::Error::msg("Timed out waiting for datasets to load"));
+                }
+                () = rt.load_components() => {}
+            }
 
-    runtime_ready_check(&rt).await;
+            runtime_ready_check(&rt).await;
 
-    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-    drop(rt);
-    runtime::dataaccelerator::clear_registry().await;
-    runtime::dataaccelerator::register_all().await;
-    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            drop(rt);
+            runtime::dataaccelerator::clear_registry().await;
+            runtime::dataaccelerator::register_all().await;
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
 
-    let pool =
-        DuckDbConnectionPool::new_file(expected_path, &AccessMode::ReadWrite).expect("valid path");
-    let conn_dyn = pool.connect().await.expect("valid connection");
-    let conn = conn_dyn.as_sync().expect("sync connection");
-    let result: Vec<RecordBatch> = conn
-        .query_arrow(
-            "SELECT dataset_name FROM spice_sys_dataset_checkpoint ORDER BY dataset_name",
-            &[],
-            None,
-        )
-        .expect("query executes")
-        .try_collect::<Vec<RecordBatch>>()
+            let pool = DuckDbConnectionPool::new_file(expected_path, &AccessMode::ReadWrite)
+                .expect("valid path");
+            let conn_dyn = pool.connect().await.expect("valid connection");
+            let conn = conn_dyn.as_sync().expect("sync connection");
+            let result: Vec<RecordBatch> = conn
+                .query_arrow(
+                    "SELECT dataset_name FROM spice_sys_dataset_checkpoint ORDER BY dataset_name",
+                    &[],
+                    None,
+                )
+                .expect("query executes")
+                .try_collect::<Vec<RecordBatch>>()
+                .await
+                .expect("collects results");
+
+            let pretty = arrow::util::pretty::pretty_format_batches(&result)
+                .map_err(|e| anyhow::Error::msg(e.to_string()))?;
+            insta::assert_snapshot!(pretty);
+
+            let persisted_records_decimal: Vec<RecordBatch> = conn
+                .query_arrow("SELECT * FROM decimal ORDER BY id", &[], None)
+                .expect("query executes")
+                .try_collect::<Vec<RecordBatch>>()
+                .await
+                .expect("collects results");
+
+            let persisted_records_decimal_pretty =
+                arrow::util::pretty::pretty_format_batches(&persisted_records_decimal)
+                    .map_err(|e| anyhow::Error::msg(e.to_string()))?;
+            insta::assert_snapshot!(persisted_records_decimal_pretty);
+
+            let persisted_records_logs: Vec<RecordBatch> = conn
+                .query_arrow(
+                    "SELECT * FROM logs ORDER BY transaction_hash, log_index LIMIT 10",
+                    &[],
+                    None,
+                )
+                .expect("query executes")
+                .try_collect::<Vec<RecordBatch>>()
+                .await
+                .expect("collects results");
+
+            let persisted_records_logs_pretty =
+                arrow::util::pretty::pretty_format_batches(&persisted_records_logs)
+                    .map_err(|e| anyhow::Error::msg(e.to_string()))?;
+            insta::assert_snapshot!(persisted_records_logs_pretty);
+
+            // Remove the file
+            std::fs::remove_file(expected_path).expect("remove file");
+
+            Ok(())
+        })
         .await
-        .expect("collects results");
-
-    let pretty = arrow::util::pretty::pretty_format_batches(&result)
-        .map_err(|e| anyhow::Error::msg(e.to_string()))?;
-    insta::assert_snapshot!(pretty);
-
-    let persisted_records_decimal: Vec<RecordBatch> = conn
-        .query_arrow("SELECT * FROM decimal ORDER BY id", &[], None)
-        .expect("query executes")
-        .try_collect::<Vec<RecordBatch>>()
-        .await
-        .expect("collects results");
-
-    let persisted_records_decimal_pretty =
-        arrow::util::pretty::pretty_format_batches(&persisted_records_decimal)
-            .map_err(|e| anyhow::Error::msg(e.to_string()))?;
-    insta::assert_snapshot!(persisted_records_decimal_pretty);
-
-    let persisted_records_logs: Vec<RecordBatch> = conn
-        .query_arrow(
-            "SELECT * FROM logs ORDER BY transaction_hash, log_index LIMIT 10",
-            &[],
-            None,
-        )
-        .expect("query executes")
-        .try_collect::<Vec<RecordBatch>>()
-        .await
-        .expect("collects results");
-
-    let persisted_records_logs_pretty =
-        arrow::util::pretty::pretty_format_batches(&persisted_records_logs)
-            .map_err(|e| anyhow::Error::msg(e.to_string()))?;
-    insta::assert_snapshot!(persisted_records_logs_pretty);
-
-    // Remove the file
-    std::fs::remove_file(expected_path).expect("remove file");
-
-    Ok(())
 }
