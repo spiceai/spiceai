@@ -84,7 +84,7 @@ INSERT INTO test_postgresql_table (
   NULL,
   NULL
 ),
--- Third dynamically generated test row with realistic values
+-- Third test row
 (
   10, 
   1000, 

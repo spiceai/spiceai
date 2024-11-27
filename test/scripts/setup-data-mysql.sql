@@ -89,7 +89,7 @@ INSERT INTO test_mysql_table (
   NULL,
   NULL
 ),
--- Third dynamically generated test row with realistic values
+-- Third test row
 (
   0,
   -5,
