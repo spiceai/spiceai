@@ -592,6 +592,12 @@ impl Runtime {
                     self.update_dataset(ds).await;
                 }
             } else {
+                if ds.is_file_accelerated() {
+                    let datasets = self.initialize_accelerators(&[Arc::clone(&ds)]).await;
+                    if datasets.is_empty() {
+                        return;
+                    }
+                }
                 self.status
                     .update_dataset(&ds.name, status::ComponentStatus::Initializing);
                 self.load_dataset(ds).await;
