@@ -25,8 +25,11 @@ use prost::Message;
 use tonic::{Request, Response, Status};
 
 use crate::{
-    datafusion::query::Protocol,
-    flight::{metrics, to_tonic_err, util::attach_cache_metadata, Service},
+    flight::{
+        metrics, to_tonic_err,
+        util::{attach_cache_metadata, set_flightsql_protocol},
+        Service,
+    },
     timing::TimedStream,
 };
 
@@ -36,13 +39,11 @@ pub(crate) async fn do_action_create_prepared_statement(
     statement: sql::ActionCreatePreparedStatementRequest,
 ) -> Result<sql::ActionCreatePreparedStatementResult, Status> {
     tracing::trace!("do_action_create_prepared_statement: {statement:?}");
-    let arrow_schema = Service::get_arrow_schema(
-        Arc::clone(&flight_svc.datafusion),
-        &statement.query,
-        Protocol::FlightSQL,
-    )
-    .await
-    .map_err(to_tonic_err)?;
+    set_flightsql_protocol().await;
+    let arrow_schema =
+        Service::get_arrow_schema(Arc::clone(&flight_svc.datafusion), &statement.query)
+            .await
+            .map_err(to_tonic_err)?;
 
     let schema_bytes = Service::serialize_schema(&arrow_schema)?;
 
@@ -58,7 +59,9 @@ pub(crate) async fn get_flight_info(
     handle: sql::CommandPreparedStatementQuery,
     request: Request<FlightDescriptor>,
 ) -> Result<Response<FlightInfo>, Status> {
-    let _start = metrics::track_flight_request("get_flight_info", Some("prepared_statement_query"));
+    let _start =
+        metrics::track_flight_request("get_flight_info", Some("prepared_statement_query")).await;
+    set_flightsql_protocol().await;
 
     tracing::trace!("get_flight_info: {handle:?}");
     let sql = match std::str::from_utf8(&handle.prepared_statement_handle) {
@@ -70,10 +73,9 @@ pub(crate) async fn get_flight_info(
         }
     };
 
-    let arrow_schema =
-        Service::get_arrow_schema(Arc::clone(&flight_svc.datafusion), sql, Protocol::FlightSQL)
-            .await
-            .map_err(to_tonic_err)?;
+    let arrow_schema = Service::get_arrow_schema(Arc::clone(&flight_svc.datafusion), sql)
+        .await
+        .map_err(to_tonic_err)?;
 
     tracing::trace!("get_flight_info_prepared_statement: arrow_schema={arrow_schema:?}");
 
@@ -96,17 +98,15 @@ pub(crate) async fn do_get(
     flight_svc: &Service,
     query: sql::CommandPreparedStatementQuery,
 ) -> Result<Response<<Service as FlightService>::DoGetStream>, Status> {
-    let start = metrics::track_flight_request("do_get", Some("prepared_statement_query"));
+    let start = metrics::track_flight_request("do_get", Some("prepared_statement_query")).await;
+    set_flightsql_protocol().await;
+
     let datafusion = Arc::clone(&flight_svc.datafusion);
     tracing::trace!("do_get: {query:?}");
     match std::str::from_utf8(&query.prepared_statement_handle) {
         Ok(sql) => {
-            let (output, from_cache) = Box::pin(Service::sql_to_flight_stream(
-                datafusion,
-                sql,
-                Protocol::FlightSQL,
-            ))
-            .await?;
+            let (output, from_cache) =
+                Box::pin(Service::sql_to_flight_stream(datafusion, sql)).await?;
             let timed_output = TimedStream::new(output, move || start);
 
             let mut response =

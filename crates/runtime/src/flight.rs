@@ -16,11 +16,12 @@ limitations under the License.
 
 use crate::auth::EndpointAuth;
 use crate::datafusion::error::{find_datafusion_root, SpiceExternalError};
-use crate::datafusion::query::{self, Protocol, QueryBuilder};
+use crate::datafusion::query::{self, QueryBuilder};
 use crate::datafusion::DataFusion;
 use crate::dataupdate::DataUpdate;
 use crate::metrics as runtime_metrics;
 use crate::tls::TlsConfig;
+use app::App;
 use arrow::array::RecordBatch;
 use arrow::datatypes::Schema;
 use arrow::ipc::writer::{DictionaryTracker, IpcDataGenerator};
@@ -34,6 +35,7 @@ use datafusion::sql::TableReference;
 use futures::stream::{self, BoxStream, StreamExt};
 use futures::{Stream, TryStreamExt};
 use metrics::track_flight_request;
+use middleware::RequestContextLayer;
 use runtime_auth::{layer::flight::BasicAuthLayer, FlightBasicAuth};
 use secrecy::ExposeSecret;
 use snafu::prelude::*;
@@ -53,6 +55,7 @@ mod get_flight_info;
 mod get_schema;
 mod handshake;
 mod metrics;
+mod middleware;
 mod util;
 
 use arrow_flight::{
@@ -81,14 +84,14 @@ impl FlightService for Service {
         &self,
         request: Request<Streaming<HandshakeRequest>>,
     ) -> Result<Response<Self::HandshakeStream>, Status> {
-        handshake::handle(request.metadata(), self.basic_auth.as_ref())
+        handshake::handle(request.metadata(), self.basic_auth.as_ref()).await
     }
 
     async fn list_flights(
         &self,
         _request: Request<Criteria>,
     ) -> Result<Response<Self::ListFlightsStream>, Status> {
-        let _start = track_flight_request("list_flights", None);
+        let _start = track_flight_request("list_flights", None).await;
         tracing::trace!("list_flights - unimplemented");
         Err(Status::unimplemented("Not yet implemented"))
     }
@@ -104,7 +107,7 @@ impl FlightService for Service {
         &self,
         _request: Request<FlightDescriptor>,
     ) -> Result<Response<PollInfo>, Status> {
-        let _start = track_flight_request("poll_flight_info", None);
+        let _start = track_flight_request("poll_flight_info", None).await;
         Err(Status::unimplemented("Not yet implemented"))
     }
 
@@ -147,17 +150,13 @@ impl FlightService for Service {
         &self,
         _request: Request<arrow_flight::Empty>,
     ) -> Result<Response<Self::ListActionsStream>, Status> {
-        Ok(actions::list())
+        Ok(actions::list().await)
     }
 }
 
 impl Service {
-    async fn get_arrow_schema(
-        datafusion: Arc<DataFusion>,
-        sql: &str,
-        protocol: Protocol,
-    ) -> Result<Schema, Status> {
-        let query = QueryBuilder::new(sql, datafusion, protocol).build();
+    async fn get_arrow_schema(datafusion: Arc<DataFusion>, sql: &str) -> Result<Schema, Status> {
+        let query = QueryBuilder::new(sql, datafusion).build();
 
         let schema = query.get_schema().await.map_err(handle_datafusion_error)?;
         Ok(schema)
@@ -175,11 +174,8 @@ impl Service {
     async fn sql_to_flight_stream(
         datafusion: Arc<DataFusion>,
         sql: &str,
-        protocol: Protocol,
     ) -> Result<(BoxStream<'static, Result<FlightData, Status>>, Option<bool>), Status> {
-        let query = QueryBuilder::new(sql, Arc::clone(&datafusion), protocol)
-            .protocol(protocol)
-            .build();
+        let query = QueryBuilder::new(sql, Arc::clone(&datafusion)).build();
 
         let query_result = query.run().await.map_err(handle_query_error)?;
 
@@ -311,6 +307,7 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub async fn start(
     bind_address: std::net::SocketAddr,
+    app: Option<Arc<App>>,
     df: Arc<DataFusion>,
     tls_config: Option<Arc<TlsConfig>>,
     endpoint_auth: EndpointAuth,
@@ -343,6 +340,7 @@ pub async fn start(
 
     server
         .layer(auth_layer)
+        .layer(RequestContextLayer::new(app))
         .add_service(svc)
         .serve(bind_address)
         .await

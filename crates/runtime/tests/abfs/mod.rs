@@ -14,16 +14,23 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::{init_tracing, utils::test_request_context, RecordBatch};
+
 use anyhow::anyhow;
 use app::AppBuilder;
 use azure_storage_blobs::prelude::*;
 use bollard::secret::HealthConfig;
 use datafusion::assert_batches_eq;
-use runtime::Runtime;
+use futures::TryStreamExt;
+use runtime::{status, Runtime};
 use spicepod::component::{dataset::Dataset, params::Params as DatasetParams};
+use std::sync::Arc;
 use tracing::instrument;
 
-use crate::docker::{ContainerRunnerBuilder, RunningContainer};
+use crate::{
+    docker::{ContainerRunnerBuilder, RunningContainer},
+    get_test_datafusion,
+};
 
 #[instrument]
 pub async fn start_azurite_docker_container() -> Result<RunningContainer<'static>, anyhow::Error> {
@@ -82,11 +89,11 @@ pub async fn prepare_container() -> Result<RunningContainer<'static>, anyhow::Er
 
 #[tokio::test]
 async fn test_spice_with_abfs() -> Result<(), anyhow::Error> {
-    //let _tracing = init_tracing(Some("trace"));
+    let _tracing = init_tracing(None);
     tracing::info!("Starting AzureBlobFS connector test");
     let azurite_container = prepare_container().await?;
 
-    let res = run_queries().await;
+    let res = test_request_context().scope(run_queries()).await;
     tracing::info!("Test completed");
     azurite_container.stop().await?;
     azurite_container.remove().await?;
@@ -129,7 +136,14 @@ async fn run_queries() -> Result<(), anyhow::Error> {
         .with_dataset(abfs_dataset)
         .build();
 
-    let rt = Runtime::builder().with_app(app).build().await;
+    let status = status::RuntimeStatus::new();
+    let df = get_test_datafusion(Arc::clone(&status));
+
+    let rt = Runtime::builder()
+        .with_app(app)
+        .with_datafusion(df)
+        .build()
+        .await;
 
     // Set a timeout for the test
     tokio::select! {
@@ -155,15 +169,20 @@ async fn run_queries() -> Result<(), anyhow::Error> {
 
     for (dataset_name, query) in queries {
         tracing::info!("Running query: {}", dataset_name);
-        let data = rt
+
+        let query_result = rt
             .datafusion()
-            .ctx
-            .sql(&query)
+            .query_builder(&query)
+            .build()
+            .run()
             .await
-            .map_err(|e| anyhow!(format!("query `{query}` to plan: {e}")))?
-            .collect()
+            .map_err(|e| anyhow!(format!("query `{query}` to plan: {e}")))?;
+
+        let data = query_result
+            .data
+            .try_collect::<Vec<RecordBatch>>()
             .await
-            .map_err(|e| anyhow!(format!("query `{query}` to results: {e}")))?;
+            .map_err(|e| anyhow!(format!("query `{query}` to collect: {e}")))?;
 
         assert_batches_eq!(&expected_results, &data);
     }

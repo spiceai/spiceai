@@ -41,6 +41,7 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 use tracing::{Instrument, Span};
 
+use crate::request::{AsyncMarker, RequestContext};
 use crate::tools::builtin::list_datasets::ListDatasetsTool;
 use crate::tools::SpiceModelTool;
 use crate::Runtime;
@@ -335,6 +336,7 @@ impl ToolUsingChat {
 
         Ok(make_a_stream(
             Span::current(),
+            RequestContext::current(AsyncMarker::new().await),
             Self::new(
                 Arc::clone(&self.inner_chat),
                 Arc::clone(&self.rt),
@@ -444,6 +446,7 @@ impl Stream for CustomStream {
 #[allow(clippy::too_many_lines)]
 fn make_a_stream(
     span: Span,
+    request_context: Arc<RequestContext>,
     model: ToolUsingChat,
     req: CreateChatCompletionRequest,
     mut s: ChatCompletionResponseStream,
@@ -452,177 +455,182 @@ fn make_a_stream(
     let sender_clone = sender.clone();
 
     tokio::spawn(
-        async move {
-            let tool_call_states: Arc<Mutex<HashMap<(i32, i32), ChatCompletionMessageToolCall>>> =
-                Arc::new(Mutex::new(HashMap::new()));
+        request_context
+            .scope(async move {
+                let tool_call_states: Arc<
+                    Mutex<HashMap<(i32, i32), ChatCompletionMessageToolCall>>,
+                > = Arc::new(Mutex::new(HashMap::new()));
 
-            let mut chat_output = String::new();
+                let mut chat_output = String::new();
 
-            while let Some(result) = s.next().await {
-                let response = match result {
-                    Ok(response) => response,
-                    Err(e) => {
-                        if let Err(e) = sender_clone.send(Err(e)).await {
-                            if !sender_clone.is_closed() {
-                                tracing::error!("Error sending error: {}", e);
+                while let Some(result) = s.next().await {
+                    let response = match result {
+                        Ok(response) => response,
+                        Err(e) => {
+                            if let Err(e) = sender_clone.send(Err(e)).await {
+                                if !sender_clone.is_closed() {
+                                    tracing::error!("Error sending error: {}", e);
+                                }
                             }
+                            return;
                         }
-                        return;
-                    }
-                };
-                let mut finished_choices: Vec<ChatChoiceStream> = vec![];
-                for chat_choice1 in &response.choices {
-                    let chat_choice = chat_choice1.clone();
+                    };
+                    let mut finished_choices: Vec<ChatChoiceStream> = vec![];
+                    for chat_choice1 in &response.choices {
+                        let chat_choice = chat_choice1.clone();
 
-                    // Appending the tool call chunks
-                    // TODO: only concatenate, spiced tools
-                    if let Some(ref tool_calls) = chat_choice.delta.tool_calls {
-                        for tool_call_chunk in tool_calls {
-                            let key = if let Ok(index) = chat_choice.index.try_into() {
-                                (index, tool_call_chunk.index)
-                            } else {
-                                tracing::error!(
-                                    "chat_choice.index value {} is too large to fit in an i32",
-                                    chat_choice.index
-                                );
-                                return;
-                            };
-
-                            let states = Arc::clone(&tool_call_states);
-                            let tool_call_data = tool_call_chunk.clone();
-
-                            let mut states_lock = match states.lock() {
-                                Ok(lock) => lock,
-                                Err(e) => {
-                                    tracing::error!("Failed to lock tool_call_states: {}", e);
+                        // Appending the tool call chunks
+                        // TODO: only concatenate, spiced tools
+                        if let Some(ref tool_calls) = chat_choice.delta.tool_calls {
+                            for tool_call_chunk in tool_calls {
+                                let key = if let Ok(index) = chat_choice.index.try_into() {
+                                    (index, tool_call_chunk.index)
+                                } else {
+                                    tracing::error!(
+                                        "chat_choice.index value {} is too large to fit in an i32",
+                                        chat_choice.index
+                                    );
                                     return;
-                                }
-                            };
+                                };
 
-                            let state = states_lock.entry(key).or_insert_with(|| {
-                                ChatCompletionMessageToolCall {
-                                    id: tool_call_data.id.clone().unwrap_or_default(),
-                                    r#type: ChatCompletionToolType::Function,
-                                    function: FunctionCall {
-                                        name: tool_call_data
-                                            .function
-                                            .as_ref()
-                                            .and_then(|f| f.name.clone())
-                                            .unwrap_or_default(),
-                                        arguments: String::new(),
-                                    },
-                                }
-                            });
+                                let states = Arc::clone(&tool_call_states);
+                                let tool_call_data = tool_call_chunk.clone();
 
-                            if let Some(arguments) = tool_call_chunk
-                                .function
-                                .as_ref()
-                                .and_then(|f| f.arguments.as_ref())
-                            {
-                                state.function.arguments.push_str(arguments);
-                            }
-                        }
-                    }
-                    if chat_choice.delta.content.is_some() {
-                        finished_choices.push(chat_choice.clone());
-                    }
-
-                    // If a tool has finished (i.e. we have all chunks), process them.
-                    if let Some(finish_reason) = &chat_choice.finish_reason {
-                        if matches!(finish_reason, FinishReason::ToolCalls) {
-                            let tool_call_states_clone = Arc::clone(&tool_call_states);
-
-                            let tool_calls_to_process = {
-                                match tool_call_states_clone.lock() {
-                                    Ok(states_lock) => states_lock
-                                        .iter()
-                                        .map(|(_key, tool_call)| tool_call.clone())
-                                        .collect::<Vec<_>>(),
+                                let mut states_lock = match states.lock() {
+                                    Ok(lock) => lock,
                                     Err(e) => {
                                         tracing::error!("Failed to lock tool_call_states: {}", e);
                                         return;
                                     }
-                                }
-                            };
+                                };
 
-                            let new_messages = match model
-                                .process_tool_calls_and_run_spice_tools(
-                                    req.messages.clone(),
-                                    tool_calls_to_process,
-                                )
-                                .await
-                            {
-                                Ok(Some(messages)) => messages,
-                                Ok(None) => {
-                                    // No spice tools within returned tools, so return as message in stream.
-                                    finished_choices.push(chat_choice);
-                                    continue;
-                                }
-                                Err(e) => {
-                                    if let Err(e) = sender_clone.send(Err(e)).await {
-                                        if !sender_clone.is_closed() {
-                                            tracing::error!("Error sending error: {}", e);
-                                        }
+                                let state = states_lock.entry(key).or_insert_with(|| {
+                                    ChatCompletionMessageToolCall {
+                                        id: tool_call_data.id.clone().unwrap_or_default(),
+                                        r#type: ChatCompletionToolType::Function,
+                                        function: FunctionCall {
+                                            name: tool_call_data
+                                                .function
+                                                .as_ref()
+                                                .and_then(|f| f.name.clone())
+                                                .unwrap_or_default(),
+                                            arguments: String::new(),
+                                        },
                                     }
-                                    return;
-                                }
-                            };
+                                });
 
-                            match model
-                                ._chat_stream(create_new_recursive_req(
-                                    &req,
-                                    new_messages,
-                                    &response.usage,
-                                ))
-                                .await
-                            {
-                                Ok(mut s) => {
-                                    while let Some(resp) = s.next().await {
-                                        // TODO check if this works for choices > 1.
-                                        if let Err(e) = sender_clone.send(resp).await {
-                                            if !sender_clone.is_closed() {
-                                                tracing::error!("Error sending error: {}", e);
-                                            }
+                                if let Some(arguments) = tool_call_chunk
+                                    .function
+                                    .as_ref()
+                                    .and_then(|f| f.arguments.as_ref())
+                                {
+                                    state.function.arguments.push_str(arguments);
+                                }
+                            }
+                        }
+                        if chat_choice.delta.content.is_some() {
+                            finished_choices.push(chat_choice.clone());
+                        }
+
+                        // If a tool has finished (i.e. we have all chunks), process them.
+                        if let Some(finish_reason) = &chat_choice.finish_reason {
+                            if matches!(finish_reason, FinishReason::ToolCalls) {
+                                let tool_call_states_clone = Arc::clone(&tool_call_states);
+
+                                let tool_calls_to_process = {
+                                    match tool_call_states_clone.lock() {
+                                        Ok(states_lock) => states_lock
+                                            .iter()
+                                            .map(|(_key, tool_call)| tool_call.clone())
+                                            .collect::<Vec<_>>(),
+                                        Err(e) => {
+                                            tracing::error!(
+                                                "Failed to lock tool_call_states: {}",
+                                                e
+                                            );
                                             return;
                                         }
                                     }
-                                }
-                                Err(e) => {
-                                    if let Err(e) = sender_clone.send(Err(e)).await {
-                                        if !sender_clone.is_closed() {
-                                            tracing::error!("Error sending error: {}", e);
+                                };
+
+                                let new_messages = match model
+                                    .process_tool_calls_and_run_spice_tools(
+                                        req.messages.clone(),
+                                        tool_calls_to_process,
+                                    )
+                                    .await
+                                {
+                                    Ok(Some(messages)) => messages,
+                                    Ok(None) => {
+                                        // No spice tools within returned tools, so return as message in stream.
+                                        finished_choices.push(chat_choice);
+                                        continue;
+                                    }
+                                    Err(e) => {
+                                        if let Err(e) = sender_clone.send(Err(e)).await {
+                                            if !sender_clone.is_closed() {
+                                                tracing::error!("Error sending error: {}", e);
+                                            }
+                                        }
+                                        return;
+                                    }
+                                };
+
+                                match model
+                                    ._chat_stream(create_new_recursive_req(
+                                        &req,
+                                        new_messages,
+                                        &response.usage,
+                                    ))
+                                    .await
+                                {
+                                    Ok(mut s) => {
+                                        while let Some(resp) = s.next().await {
+                                            // TODO check if this works for choices > 1.
+                                            if let Err(e) = sender_clone.send(resp).await {
+                                                if !sender_clone.is_closed() {
+                                                    tracing::error!("Error sending error: {}", e);
+                                                }
+                                                return;
+                                            }
                                         }
                                     }
-                                    return;
-                                }
-                            };
-                        } else if matches!(finish_reason, FinishReason::Stop)
-                            || matches!(finish_reason, FinishReason::Length)
-                        {
-                            // If complete, return to stream original.
-                            finished_choices.push(chat_choice.clone());
+                                    Err(e) => {
+                                        if let Err(e) = sender_clone.send(Err(e)).await {
+                                            if !sender_clone.is_closed() {
+                                                tracing::error!("Error sending error: {}", e);
+                                            }
+                                        }
+                                        return;
+                                    }
+                                };
+                            } else if matches!(finish_reason, FinishReason::Stop)
+                                || matches!(finish_reason, FinishReason::Length)
+                            {
+                                // If complete, return to stream original.
+                                finished_choices.push(chat_choice.clone());
+                            }
+                        }
+                    }
+
+                    if let Some(choice) = finished_choices.first() {
+                        if let Some(intermediate_chat_output) = &choice.delta.content {
+                            chat_output.push_str(intermediate_chat_output);
+                        }
+
+                        let mut resp2 = response.clone();
+                        resp2.choices = finished_choices;
+                        if let Err(e) = sender_clone.send(Ok(resp2)).await {
+                            if !sender_clone.is_closed() {
+                                tracing::error!("Error sending error: {}", e);
+                            }
                         }
                     }
                 }
 
-                if let Some(choice) = finished_choices.first() {
-                    if let Some(intermediate_chat_output) = &choice.delta.content {
-                        chat_output.push_str(intermediate_chat_output);
-                    }
-
-                    let mut resp2 = response.clone();
-                    resp2.choices = finished_choices;
-                    if let Err(e) = sender_clone.send(Ok(resp2)).await {
-                        if !sender_clone.is_closed() {
-                            tracing::error!("Error sending error: {}", e);
-                        }
-                    }
-                }
-            }
-
-            tracing::info!(target: "task_history", captured_output = %chat_output);
-        }
-        .instrument(span),
+                tracing::info!(target: "task_history", captured_output = %chat_output);
+            })
+            .instrument(span),
     );
     Box::pin(CustomStream { receiver }) as ChatCompletionResponseStream
 }

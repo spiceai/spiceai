@@ -22,14 +22,13 @@ use app::AppBuilder;
 use runtime::{
     accelerated_table::{refresh::RefreshOverrides, AcceleratedTable},
     component::dataset::acceleration::RefreshMode,
-    datafusion::query::Protocol,
-    Runtime,
+    status, Runtime,
 };
 use spicepod::component::dataset::{acceleration::Acceleration, Dataset};
 
 use crate::{
-    init_tracing,
-    utils::{runtime_ready_check, wait_until_true},
+    get_test_datafusion, init_tracing,
+    utils::{runtime_ready_check, test_request_context, wait_until_true},
 };
 
 fn make_spiceai_dataset(path: &str, name: &str, refresh_sql: String) -> Dataset {
@@ -47,61 +46,74 @@ async fn spiceai_integration_test_refresh_sql_pushdown() -> Result<(), String> {
     use runtime::accelerated_table::refresh_task::RefreshTask;
 
     let _tracing = init_tracing(None);
-    let app = AppBuilder::new("refresh_sql_pushdown")
-        .with_dataset(make_spiceai_dataset(
-            "eth.traces",
-            "traces",
-            "SELECT * FROM traces WHERE block_number = 0 AND trace_id = 'foobar'".to_string(),
-        ))
-        .build();
 
-    let rt = Runtime::builder().with_app(app).build().await;
+    test_request_context()
+        .scope(async {
+            let app = AppBuilder::new("refresh_sql_pushdown")
+                .with_dataset(make_spiceai_dataset(
+                    "eth.traces",
+                    "traces",
+                    "SELECT * FROM traces WHERE block_number = 0 AND trace_id = 'foobar'"
+                        .to_string(),
+                ))
+                .build();
 
-    rt.load_components().await;
+            let status = status::RuntimeStatus::new();
+            let df = get_test_datafusion(Arc::clone(&status));
 
-    let traces_table = rt
-        .datafusion()
-        .get_accelerated_table_provider("traces")
+            let rt = Runtime::builder()
+                .with_app(app)
+                .with_datafusion(df)
+                .build()
+                .await;
+
+            rt.load_components().await;
+
+            let traces_table = rt
+                .datafusion()
+                .get_accelerated_table_provider("traces")
+                .await
+                .map_err(|e| e.to_string())?;
+
+            let traces_accelerated_table = traces_table
+                .as_any()
+                .downcast_ref::<AcceleratedTable>()
+                .ok_or("traces table is not an AcceleratedTable")?;
+
+            let request = traces_accelerated_table
+                .refresh_params()
+                .read()
+                .await
+                .clone();
+
+            let refresh_task = Arc::new(RefreshTask::new(
+                rt.status(),
+                "traces".into(),
+                Arc::clone(&traces_accelerated_table.get_federated_table()),
+                traces_table,
+            ));
+
+            // If the refresh SQL filters aren't being pushed down, this will timeout
+            let data_update = tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(15)) => {
+                    return Err("Timed out waiting for datasets to load".to_string());
+                }
+                res = refresh_task.get_full_or_incremental_append_update(&request, None) => {
+                    res.map_err(|e| e.to_string())?
+                }
+            };
+
+            let data_update = data_update
+                .collect_data()
+                .await
+                .expect("should convert to DataUpdate");
+
+            assert_eq!(data_update.data.len(), 1);
+            assert_eq!(data_update.data[0].num_rows(), 0);
+
+            Ok(())
+        })
         .await
-        .map_err(|e| e.to_string())?;
-
-    let traces_accelerated_table = traces_table
-        .as_any()
-        .downcast_ref::<AcceleratedTable>()
-        .ok_or("traces table is not an AcceleratedTable")?;
-
-    let request = traces_accelerated_table
-        .refresh_params()
-        .read()
-        .await
-        .clone();
-
-    let refresh_task = Arc::new(RefreshTask::new(
-        rt.status(),
-        "traces".into(),
-        Arc::clone(&traces_accelerated_table.get_federated_table()),
-        traces_table,
-    ));
-
-    // If the refresh SQL filters aren't being pushed down, this will timeout
-    let data_update = tokio::select! {
-        () = tokio::time::sleep(std::time::Duration::from_secs(15)) => {
-            return Err("Timed out waiting for datasets to load".to_string());
-        }
-        res = refresh_task.get_full_or_incremental_append_update(&request, None) => {
-            res.map_err(|e| e.to_string())?
-        }
-    };
-
-    let data_update = data_update
-        .collect_data()
-        .await
-        .expect("should convert to DataUpdate");
-
-    assert_eq!(data_update.data.len(), 1);
-    assert_eq!(data_update.data[0].num_rows(), 0);
-
-    Ok(())
 }
 
 #[tokio::test]
@@ -110,91 +122,98 @@ async fn spiceai_integration_test_refresh_sql_override_append() -> Result<(), an
         rustls::crypto::aws_lc_rs::default_provider(),
     );
     let _tracing = init_tracing(None);
-    let app = AppBuilder::new("refresh_sql_override_append")
-        .with_dataset(make_spiceai_dataset(
-            "tpch.nation",
-            "nation",
-            "SELECT * FROM nation WHERE n_regionkey != 0".to_string(),
-        ))
-        .build();
 
-    let rt = Runtime::builder().with_app(app).build().await;
+    test_request_context()
+        .scope(async {
+            let app = AppBuilder::new("refresh_sql_override_append")
+                .with_dataset(make_spiceai_dataset(
+                    "tpch.nation",
+                    "nation",
+                    "SELECT * FROM nation WHERE n_regionkey != 0".to_string(),
+                ))
+                .build();
 
-    tokio::select! {
-        () = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
-            panic!("Timeout waiting for components to load");
-        }
-        () = rt.load_components() => {}
-    }
+            let status = status::RuntimeStatus::new();
+            let df = get_test_datafusion(Arc::clone(&status));
 
-    runtime_ready_check(&rt).await;
+            let rt = Runtime::builder()
+                .with_app(app)
+                .with_datafusion(df)
+                .with_runtime_status(status)
+                .build()
+                .await;
 
-    let query = rt
-        .datafusion()
-        .query_builder(
-            "SELECT * FROM nation WHERE n_regionkey = 0",
-            Protocol::Internal,
-        )
-        .build()
-        .run()
-        .await?;
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+                    panic!("Timeout waiting for components to load");
+                }
+                () = rt.load_components() => {}
+            }
 
-    let results: Vec<RecordBatch> = query.data.try_collect::<Vec<RecordBatch>>().await?;
-    assert_eq!(
-        results.len(),
-        0,
-        "Expected refresh SQL to filter out all rows for n_regionkey = 0"
-    );
+            runtime_ready_check(&rt).await;
 
-    rt.datafusion()
-        .refresh_table(
-            "nation",
-            Some(RefreshOverrides {
-                sql: Some("SELECT * FROM nation WHERE n_regionkey = 0".to_string()),
-                mode: Some(RefreshMode::Append),
-                max_jitter: None,
-            }),
-        )
-        .await?;
+            let query = rt
+                .datafusion()
+                .query_builder("SELECT * FROM nation WHERE n_regionkey = 0")
+                .build()
+                .run()
+                .await?;
 
-    assert!(
-        wait_until_true(Duration::from_secs(10), || async {
-            let Ok(query) = rt
+            let results: Vec<RecordBatch> = query.data.try_collect::<Vec<RecordBatch>>().await?;
+            assert_eq!(
+                results.len(),
+                0,
+                "Expected refresh SQL to filter out all rows for n_regionkey = 0"
+            );
+
+            rt.datafusion()
+                .refresh_table(
+                    "nation",
+                    Some(RefreshOverrides {
+                        sql: Some("SELECT * FROM nation WHERE n_regionkey = 0".to_string()),
+                        mode: Some(RefreshMode::Append),
+                        max_jitter: None,
+                    }),
+                )
+                .await?;
+
+            assert!(
+                wait_until_true(Duration::from_secs(10), || async {
+                    let Ok(query) = rt
+                        .datafusion()
+                        .query_builder("SELECT * FROM nation WHERE n_regionkey = 0")
+                        .build()
+                        .run()
+                        .await
+                    else {
+                        return false;
+                    };
+
+                    let results: Vec<RecordBatch> =
+                        match query.data.try_collect::<Vec<RecordBatch>>().await {
+                            Ok(results) => results,
+                            Err(_) => return false,
+                        };
+                    !results.is_empty()
+                })
+                .await
+            );
+
+            let query = rt
                 .datafusion()
                 .query_builder(
-                    "SELECT * FROM nation WHERE n_regionkey = 0",
-                    Protocol::Internal,
+                    "SELECT * FROM nation WHERE n_regionkey = 0 ORDER BY n_nationkey DESC",
                 )
                 .build()
                 .run()
-                .await
-            else {
-                return false;
-            };
+                .await?;
 
-            let results: Vec<RecordBatch> = match query.data.try_collect::<Vec<RecordBatch>>().await
-            {
-                Ok(results) => results,
-                Err(_) => return false,
-            };
-            !results.is_empty()
+            let results: Vec<RecordBatch> = query.data.try_collect::<Vec<RecordBatch>>().await?;
+            let results_str =
+                arrow::util::pretty::pretty_format_batches(&results).expect("pretty batches");
+            insta::assert_snapshot!(results_str);
+
+            Ok(())
         })
         .await
-    );
-
-    let query = rt
-        .datafusion()
-        .query_builder(
-            "SELECT * FROM nation WHERE n_regionkey = 0 ORDER BY n_nationkey DESC",
-            Protocol::Internal,
-        )
-        .build()
-        .run()
-        .await?;
-
-    let results: Vec<RecordBatch> = query.data.try_collect::<Vec<RecordBatch>>().await?;
-    let results_str = arrow::util::pretty::pretty_format_batches(&results).expect("pretty batches");
-    insta::assert_snapshot!(results_str);
-
-    Ok(())
 }

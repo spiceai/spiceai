@@ -36,7 +36,9 @@ use clap::Parser;
 use datafusion::datasource::provider_as_source;
 use datafusion::logical_expr::{LogicalPlanBuilder, UNNAMED_TABLE};
 use datafusion::{dataframe::DataFrame, datasource::MemTable, execution::context::SessionContext};
+use futures::TryStreamExt;
 use results::BenchmarkResultsBuilder;
+use runtime::request::{Protocol, RequestContext, UserAgent};
 use runtime::{dataupdate::DataUpdate, Runtime};
 use spicepod::component::dataset::acceleration::{self, Acceleration, Mode};
 use spicepod::component::params::Params;
@@ -93,6 +95,19 @@ async fn main() -> Result<(), String> {
         rustls::crypto::aws_lc_rs::default_provider(),
     );
 
+    let request_context = Arc::new(
+        RequestContext::builder(Protocol::Internal)
+            .with_user_agent(UserAgent::from_ua_str(&format!(
+                "spicebench/{}",
+                env!("CARGO_PKG_VERSION")
+            )))
+            .build(),
+    );
+
+    Box::pin(request_context.scope(bench_main())).await
+}
+
+async fn bench_main() -> Result<(), String> {
     let mut upload_results_dataset: Option<String> = None;
     if let Ok(env_var) = std::env::var("UPLOAD_RESULTS_DATASET") {
         println!("UPLOAD_RESULTS_DATASET: {env_var}");
@@ -447,13 +462,17 @@ async fn run_query(
     query_name: &str,
     query: &str,
 ) -> Result<Vec<RecordBatch>, String> {
-    let res = rt
+    let query_result = rt
         .datafusion()
-        .ctx
-        .sql(query)
+        .query_builder(query)
+        .build()
+        .run()
         .await
-        .map_err(|e| format!("query `{connector}` `{query_name}` to plan: {e}"))?
-        .collect()
+        .map_err(|e| format!("query `{connector}` `{query_name}` to plan: {e}"))?;
+
+    let res = query_result
+        .data
+        .try_collect::<Vec<RecordBatch>>()
         .await
         .map_err(|e| format!("query `{connector}` `{query_name}` to results: {e}"))?;
 
