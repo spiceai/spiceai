@@ -20,7 +20,8 @@ use crate::{
     utils::{runtime_ready_check, test_request_context},
 };
 use app::AppBuilder;
-use datafusion::assert_batches_eq;
+use datafusion::{assert_batches_eq, error::DataFusionError};
+use futures::TryStreamExt;
 use rand::Rng;
 use runtime::{datafusion::error::find_datafusion_root, status, Runtime};
 use spicepod::component::{
@@ -305,13 +306,15 @@ WHERE event_name = 'File Download'
 async fn get_query_result(
     rt: &Arc<Runtime>,
     sql: &str,
-) -> Result<Vec<arrow::array::RecordBatch>, datafusion::error::DataFusionError> {
+) -> Result<Vec<arrow::array::RecordBatch>, DataFusionError> {
     rt.datafusion()
-        .ctx
-        .sql(sql)
+        .query_builder(sql)
+        .build()
+        .run()
         .await
-        .map_err(find_datafusion_root)?
-        .collect()
+        .map_err(|e| DataFusionError::External(Box::new(e)))?
+        .data
+        .try_collect()
         .await
 }
 

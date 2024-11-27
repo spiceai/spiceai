@@ -38,12 +38,10 @@ use datafusion::logical_expr::{LogicalPlanBuilder, UNNAMED_TABLE};
 use datafusion::{dataframe::DataFrame, datasource::MemTable, execution::context::SessionContext};
 use futures::TryStreamExt;
 use results::BenchmarkResultsBuilder;
-use runtime::datafusion::query::Protocol;
-use runtime::metrics::TelemetryContext;
+use runtime::request::{Protocol, RequestContext, UserAgent};
 use runtime::{dataupdate::DataUpdate, Runtime};
 use spicepod::component::dataset::acceleration::{self, Acceleration, Mode};
 use spicepod::component::params::Params;
-use util::user_agent::SpiceUserAgent;
 
 mod results;
 mod setup;
@@ -97,6 +95,19 @@ async fn main() -> Result<(), String> {
         rustls::crypto::aws_lc_rs::default_provider(),
     );
 
+    let request_context = Arc::new(
+        RequestContext::builder(Protocol::Internal)
+            .with_user_agent(UserAgent::from_ua_str(&format!(
+                "spicebench/{}",
+                env!("CARGO_PKG_VERSION")
+            )))
+            .build(),
+    );
+
+    Box::pin(request_context.scope(bench_main())).await
+}
+
+async fn bench_main() -> Result<(), String> {
     let mut upload_results_dataset: Option<String> = None;
     if let Ok(env_var) = std::env::var("UPLOAD_RESULTS_DATASET") {
         println!("UPLOAD_RESULTS_DATASET: {env_var}");
@@ -451,20 +462,9 @@ async fn run_query(
     query_name: &str,
     query: &str,
 ) -> Result<Vec<RecordBatch>, String> {
-    let telemetry_context = TelemetryContext {
-        protocol: Protocol::Internal,
-        user_agent: Some(
-            SpiceUserAgent::default()
-                .with_client_name("spicebench")
-                .with_client_version_from_cargo()
-                .with_extension("test_name", query_name),
-        ),
-    };
-
     let query_result = rt
         .datafusion()
         .query_builder(query)
-        .with_telemetry_context(telemetry_context)
         .build()
         .run()
         .await

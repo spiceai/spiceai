@@ -102,6 +102,7 @@ pub(crate) fn routes(
     unauthenticated_router
         .merge(authenticated_router)
         .route_layer(middleware::from_fn(track_metrics))
+        .layer(Extension(Arc::clone(&rt.app)))
         .layer(cors_layer(cors_config))
 }
 

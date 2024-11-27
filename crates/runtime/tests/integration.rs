@@ -156,11 +156,13 @@ where
     if let Some(validate_result) = validate_result {
         let result_batches = rt
             .datafusion()
-            .ctx
-            .sql(query)
+            .query_builder(query)
+            .build()
+            .run()
             .await
-            .map_err(|e| format!("query `{query}` to plan: {e}"))?
-            .collect()
+            .map_err(|e| format!("query `{query}` failed to run: {e}"))?
+            .data
+            .try_collect()
             .await
             .map_err(|e| format!("query `{query}` to results: {e}"))?;
 
@@ -182,13 +184,15 @@ where
     F: FnOnce(Vec<RecordBatch>),
 {
     // Check the plan
-    let plan_results = rt
+    let plan_results: Vec<RecordBatch> = rt
         .datafusion()
-        .ctx
-        .sql(&format!("EXPLAIN {query}"))
+        .query_builder(&format!("EXPLAIN {query}"))
+        .build()
+        .run()
         .await
         .map_err(|e| format!("query `{query}` to plan: {e}"))?
-        .collect()
+        .data
+        .try_collect()
         .await
         .map_err(|e| format!("query `{query}` to results: {e}"))?;
 
@@ -231,11 +235,13 @@ where
     if let Some(validate_result) = validate_result {
         let result_batches = rt
             .datafusion()
-            .ctx
-            .sql(query)
+            .query_builder(query)
+            .build()
+            .run()
             .await
-            .map_err(|e| format!("query `{query}` to plan: {e}"))?
-            .collect()
+            .map_err(|e| format!("query `{query}` failed to run: {e}"))?
+            .data
+            .try_collect()
             .await
             .map_err(|e| format!("query `{query}` to results: {e}"))?;
 

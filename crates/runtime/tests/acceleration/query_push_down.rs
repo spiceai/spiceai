@@ -19,6 +19,7 @@ use std::time::Duration;
 use app::AppBuilder;
 use datafusion::assert_batches_eq;
 use futures::StreamExt;
+use futures::TryStreamExt;
 use runtime::{datafusion::query, Runtime};
 use spicepod::component::{
     dataset::{acceleration::Acceleration, Dataset},
@@ -36,6 +37,7 @@ use crate::{
 async fn acceleration_with_and_without_federation() -> Result<(), anyhow::Error> {
     use crate::get_test_datafusion;
     use crate::postgres::common;
+    use arrow::array::RecordBatch;
     use datafusion::error::DataFusionError;
     use runtime::datafusion::error::SpiceExternalError;
     use runtime::status;
@@ -202,13 +204,15 @@ async fn acceleration_with_and_without_federation() -> Result<(), anyhow::Error>
                 "Expected 1 rows returned"
             );
 
-            let plan_results = rt
+            let plan_results: Vec<RecordBatch> = rt
                 .datafusion()
-                .ctx
-                .sql("EXPLAIN SELECT COUNT(1) FROM abc")
+                .query_builder("EXPLAIN SELECT COUNT(1) FROM abc")
+                .build()
+                .run()
                 .await
                 .expect("sql working")
-                .collect()
+                .data
+                .try_collect()
                 .await
                 .expect("collect working");
 
@@ -229,23 +233,27 @@ async fn acceleration_with_and_without_federation() -> Result<(), anyhow::Error>
             ];
             assert_batches_eq!(expected_plan, &plan_results);
 
-            let _ = rt
+            let _results: Vec<RecordBatch> = rt
                 .datafusion()
-                .ctx
-                .sql("SELECT COUNT(1) FROM non_federated_abc")
+                .query_builder("SELECT COUNT(1) FROM non_federated_abc")
+                .build()
+                .run()
                 .await
                 .expect("sql working")
-                .collect()
+                .data
+                .try_collect()
                 .await
                 .expect("collect working");
 
-            let plan_results = rt
+            let plan_results: Vec<RecordBatch> = rt
                 .datafusion()
-                .ctx
-                .sql("EXPLAIN SELECT COUNT(1) FROM non_federated_abc")
+                .query_builder("EXPLAIN SELECT COUNT(1) FROM non_federated_abc")
+                .build()
+                .run()
                 .await
                 .expect("sql working")
-                .collect()
+                .data
+                .try_collect()
                 .await
                 .expect("collect working");
 
