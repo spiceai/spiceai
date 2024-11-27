@@ -2922,8 +2922,7 @@ dependencies = [
  "graphql-parser",
  "http 1.1.0",
  "object_store",
- "rdkafka 0.36.2",
- "rdkafka 0.37.0",
+ "rdkafka",
  "regex",
  "reqwest 0.12.9",
  "rusqlite",
@@ -8833,24 +8832,6 @@ checksum = "1465873a3dfdaa8ae7cb14b4383657caab0b3e8a0aa9ae8e04b044854c8dfce2"
 dependencies = [
  "crossbeam-deque",
  "crossbeam-utils",
-]
-
-[[package]]
-name = "rdkafka"
-version = "0.36.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1beea247b9a7600a81d4cc33f659ce1a77e1988323d7d2809c7ed1c21f4c316d"
-dependencies = [
- "futures-channel",
- "futures-util",
- "libc",
- "log",
- "rdkafka-sys",
- "serde",
- "serde_derive",
- "serde_json",
- "slab",
- "tokio",
 ]
 
 [[package]]
