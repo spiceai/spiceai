@@ -20,7 +20,10 @@ use std::{
     time::Duration,
 };
 
-use crate::{init_tracing, utils::{test_request_context, wait_until_true}};
+use crate::{
+    init_tracing,
+    utils::{test_request_context, wait_until_true},
+};
 use rand::Rng;
 use runtime::{auth::EndpointAuth, config::Config, Runtime};
 use runtime_auth::{api_key::ApiKeyAuth, HttpAuth};
