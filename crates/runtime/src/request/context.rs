@@ -92,8 +92,8 @@ impl RequestContext {
 
     #[must_use]
     pub fn to_dimensions(&self) -> Vec<KeyValue> {
-        let mut dimensions = vec![KeyValue::new("protocol", self.protocol.as_str())];
-        dimensions.extend(self.dimensions.into_iter().cloned());
+        let mut dimensions = vec![KeyValue::new("protocol", self.protocol().as_str())];
+        dimensions.extend(self.dimensions.iter().cloned());
         dimensions
     }
 

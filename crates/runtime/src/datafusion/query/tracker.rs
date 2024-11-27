@@ -91,7 +91,7 @@ impl QueryTracker {
             ),
         ];
 
-        labels.extend(request_context.to_dimensions().into_iter().cloned());
+        labels.extend(request_context.to_dimensions().into_iter());
 
         crate::metrics::telemetry::track_query_duration(query_duration, &labels);
         crate::metrics::telemetry::track_query_execution_duration(

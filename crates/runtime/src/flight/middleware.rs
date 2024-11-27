@@ -23,7 +23,6 @@ use std::{
 
 use crate::request::{Protocol, RequestContext};
 use app::App;
-use pin_project::pin_project;
 use tower::{Layer, Service};
 
 /// Extracts the request context from the HTTP headers and adds it to the task-local context.
@@ -61,10 +60,11 @@ where
     S: Service<http::Request<ReqBody>, Response = http::Response<ResBody>> + Clone + Send + 'static,
     S::Future: Send + 'static,
     ResBody: Default,
+    ReqBody: Send + 'static,
 {
     type Response = S::Response;
     type Error = S::Error;
-    type Future = RequestContextFuture<S::Future>;
+    type Future = Pin<Box<dyn Future<Output = Result<S::Response, S::Error>> + Send>>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.inner.poll_ready(cx)
@@ -77,33 +77,11 @@ where
         let headers = req.headers();
         let request_context = Arc::new(
             RequestContext::builder(Protocol::Flight)
+                .with_app_opt(self.app.clone())
                 .from_headers(headers)
                 .build(),
         );
 
-        let req: tonic::Request<ReqBody> = tonic::Request::from_http(req);
-
-        let future = request_context.scope(inner.call(req));
-
-        RequestContextFuture { future }
-    }
-}
-
-// Define a future type that will handle the scoped context
-#[pin_project]
-struct RequestContextFuture<F> {
-    #[pin]
-    future: F,
-}
-
-impl<F, T, E> Future for RequestContextFuture<F>
-where
-    F: Future<Output = Result<T, E>>,
-{
-    type Output = F::Output;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.project();
-        this.future.poll(cx)
+        Box::pin(async move { request_context.scope(inner.call(req)).await })
     }
 }
