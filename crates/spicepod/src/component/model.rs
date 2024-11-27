@@ -186,6 +186,7 @@ impl Model {
                     path: id,
                     name: Some("from_id".to_string()),
                     r#type: Some(ModelFileType::Weights),
+                    params: None,
                 });
             }
         }
@@ -203,6 +204,7 @@ impl Model {
                                         path: s.to_string(),
                                         name: None,
                                         r#type: determine_type_from_path(s),
+                                        params: f.params.clone(),
                                     })
                                 } else {
                                     None
@@ -336,6 +338,8 @@ pub struct ModelFile {
 
     /// Should use [`Self::file_type`] to access.
     pub(crate) r#type: Option<ModelFileType>,
+
+    pub params: Option<HashMap<String, String>>,
 }
 
 impl ModelFile {
