@@ -457,7 +457,43 @@ jobs:
         working-directory: test_app
         run: |
           echo "datasets:" >> spicepod.yaml
+
+          # Test dataset with full refresh mode
           echo "  - name: test_postgresql_table" >> spicepod.yaml
+          echo "    from: postgres:test_postgresql_table" >> spicepod.yaml
+          echo "    params:" >> spicepod.yaml
+          echo "      pg_host: localhost" >> spicepod.yaml
+          echo "      pg_port: 5432" >> spicepod.yaml
+          echo "      pg_db: testdb" >> spicepod.yaml
+          echo "      pg_user: postgres" >> spicepod.yaml
+          echo "      pg_sslmode: disable" >> spicepod.yaml
+
+          ENGINE=$(echo '${{ matrix.acceleration.engine }}')
+          MODE=$(echo '${{ matrix.acceleration.mode }}')
+
+          if [[ -n "$ENGINE" ]]; then
+            echo "    time_column: timestamp_column" >> spicepod.yaml
+            echo "    acceleration:" >> spicepod.yaml
+            echo "      enabled: true" >> spicepod.yaml
+            echo "      refresh_sql: SELECT * FROM test_postgresql_table WHERE int2_column != 10" >> spicepod.yaml
+            echo "      engine: $ENGINE" >> spicepod.yaml
+            if [[ -n "$MODE" ]]; then
+              echo "      mode: $MODE" >> spicepod.yaml
+           fi
+          fi
+
+          # add params if present
+          PARAMS=$(echo '${{ toJson(matrix.acceleration.params) }}')
+          if [[ "$PARAMS" != "null" ]]; then
+            echo "      params:" >> spicepod.yaml
+            for key in $(echo "$PARAMS" | jq -r 'keys[]'); do
+              value=$(echo "$PARAMS" | jq -r --arg key "$key" '.[$key]')
+              echo "        $key: $value" >> spicepod.yaml
+            done
+          fi
+
+          # Test dataset with append refresh mode
+          echo "  - name: test_postgresql_table2" >> spicepod.yaml
           echo "    from: postgres:test_postgresql_table" >> spicepod.yaml
           echo "    params:" >> spicepod.yaml
           echo "      pg_host: localhost" >> spicepod.yaml
@@ -475,7 +511,7 @@ jobs:
             echo "      enabled: true" >> spicepod.yaml
             echo "      refresh_mode: append" >> spicepod.yaml
             echo "      refresh_check_interval: 2s" >> spicepod.yaml
-            echo "      refresh_sql: SELECT * FROM test_postgresql_table" >> spicepod.yaml
+            echo "      refresh_sql: SELECT * FROM test_postgresql_table2 WHERE int2_column != 10" >> spicepod.yaml
             echo "      engine: $ENGINE" >> spicepod.yaml
             if [[ -n "$MODE" ]]; then
               echo "      mode: $MODE" >> spicepod.yaml
@@ -509,10 +545,17 @@ jobs:
         run: |
           while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
 
-      - name: Verify dataset
+      - name: Verify dataset (full refresh mode)
         uses: ./.github/actions/verify-dataset
         with:
           name: test_postgresql_table
+          expected-rows-count: 2
+      
+      - name: Verify dataset (append refresh mode)
+        uses: ./.github/actions/verify-dataset
+        with:
+          name: test_postgresql_table2
+          expected-rows-count: 2
 
       - name: Stop spice and check logs
         working-directory: test_app
