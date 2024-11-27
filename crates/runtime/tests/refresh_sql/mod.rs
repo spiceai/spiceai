@@ -139,6 +139,7 @@ async fn spiceai_integration_test_refresh_sql_override_append() -> Result<(), an
             let rt = Runtime::builder()
                 .with_app(app)
                 .with_datafusion(df)
+                .with_runtime_status(status)
                 .build()
                 .await;
 
