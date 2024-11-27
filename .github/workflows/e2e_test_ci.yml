@@ -472,7 +472,6 @@ jobs:
           MODE=$(echo '${{ matrix.acceleration.mode }}')
 
           if [[ -n "$ENGINE" ]]; then
-            echo "    time_column: timestamp_column" >> spicepod.yaml
             echo "    acceleration:" >> spicepod.yaml
             echo "      enabled: true" >> spicepod.yaml
             echo "      refresh_sql: SELECT * FROM test_postgresql_table WHERE int2_column != 10" >> spicepod.yaml
@@ -663,7 +662,42 @@ jobs:
         working-directory: test_app
         run: |
           echo "datasets:" >> spicepod.yaml
+
+          # Test dataset with full refresh mode
           echo "  - name: test_mysql_table" >> spicepod.yaml
+          echo "    from: mysql:test_mysql_table" >> spicepod.yaml
+          echo "    params:" >> spicepod.yaml
+          echo "      mysql_host: localhost" >> spicepod.yaml
+          echo "      mysql_tcp_port: 3306" >> spicepod.yaml
+          echo "      mysql_db: testdb" >> spicepod.yaml
+          echo "      mysql_user: test_user" >> spicepod.yaml
+          echo "      mysql_sslmode: disabled" >> spicepod.yaml
+
+          ENGINE=$(echo '${{ matrix.acceleration.engine }}')
+          MODE=$(echo '${{ matrix.acceleration.mode }}')
+
+          if [[ -n "$ENGINE" ]]; then
+            echo "    acceleration:" >> spicepod.yaml
+            echo "      enabled: true" >> spicepod.yaml
+            echo "      engine: $ENGINE" >> spicepod.yaml
+            echo "      refresh_sql: SELECT * FROM test_mysql_table WHERE col_bit!=0" >> spicepod.yaml
+            if [[ -n "$MODE" ]]; then
+              echo "      mode: $MODE" >> spicepod.yaml
+           fi
+          fi
+
+          # add params if present
+          PARAMS=$(echo '${{ toJson(matrix.acceleration.params) }}')
+          if [[ "$PARAMS" != "null" ]]; then
+            echo "      params:" >> spicepod.yaml
+            for key in $(echo "$PARAMS" | jq -r 'keys[]'); do
+              value=$(echo "$PARAMS" | jq -r --arg key "$key" '.[$key]')
+              echo "        $key: $value" >> spicepod.yaml
+            done
+          fi
+
+          # Test dataset with append refresh mode
+          echo "  - name: test_mysql_table2" >> spicepod.yaml
           echo "    from: mysql:test_mysql_table" >> spicepod.yaml
           echo "    params:" >> spicepod.yaml
           echo "      mysql_host: localhost" >> spicepod.yaml
@@ -682,7 +716,7 @@ jobs:
             echo "      engine: $ENGINE" >> spicepod.yaml
             echo "      refresh_mode: append" >> spicepod.yaml
             echo "      refresh_check_interval: 2s" >> spicepod.yaml
-            echo "      refresh_sql: SELECT * FROM test_mysql_table" >> spicepod.yaml
+            echo "      refresh_sql: SELECT * FROM test_mysql_table2 WHERE col_bit!=0" >> spicepod.yaml
             if [[ -n "$MODE" ]]; then
               echo "      mode: $MODE" >> spicepod.yaml
            fi
@@ -715,10 +749,17 @@ jobs:
         run: |
           while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
 
-      - name: Verify dataset
+      - name: Verify dataset (append refresh mode)
         uses: ./.github/actions/verify-dataset
         with:
           name: test_mysql_table
+          expected-rows-count: 2
+
+      - name: Verify dataset (full refresh mode)
+        uses: ./.github/actions/verify-dataset
+        with:
+          name: test_mysql_table2
+          expected-rows-count: 2
 
       - name: Stop spice and check logs
         working-directory: test_app
@@ -1383,9 +1424,6 @@ jobs:
           echo "    time_column: col_datetime" >> spicepod.yaml
           echo "    acceleration:" >> spicepod.yaml
           echo "      enabled: true" >> spicepod.yaml
-          echo "      refresh_mode: append" >> spicepod.yaml
-          echo "      refresh_check_interval: 2s" >> spicepod.yaml
-          echo "      refresh_sql: SELECT * FROM test_mssql_table" >> spicepod.yaml
 
           cat spicepod.yaml
 
