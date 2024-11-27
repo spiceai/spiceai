@@ -46,7 +46,7 @@ pub enum Error {
     #[snafu(display("Failed to authenticate with Snowflake.\nVerify your credentials and warehouse parameters using the SnowSQL tool: https://docs.snowflake.com/en/user-guide/snowsql"))]
     UnableToAuthenticateGeneric {},
 
-    #[snafu(display("Failed to read reading private key file {file_path}.\nVerify the key file exists with the necessary permissions, and try again.\n{source}"))]
+    #[snafu(display("Failed to read private key file {file_path}.\nVerify the key file exists with the necessary permissions, and try again.\n{source}"))]
     ErrorReadingPrivateKeyFile {
         source: std::io::Error,
         file_path: String,
