@@ -197,12 +197,32 @@ static TEST_CASES: LazyLock<Vec<TestCase>> = LazyLock::new(|| {
 });
 
 #[allow(clippy::expect_fun_call)]
-async fn run_single_test(
-    test: &TestCase,
-    model_name: &str,
-    model: Arc<Box<dyn Chat>>,
-) -> Result<(), anyhow::Error> {
-    let test_name = test.name;
+async fn run_single_test(test_name: &str, model_name: &str) -> Result<(), anyhow::Error> {
+    let _ = dotenvy::from_filename(".env").expect("failed to load .env file");
+    init_tracing(None);
+
+    if TEST_DENY_LIST
+        .iter()
+        .any(|(m, t)| *m == model_name && *t == test_name)
+    {
+        return Ok(());
+    }
+
+    let test = TEST_CASES
+        .iter()
+        .find(|t| t.name == test_name)
+        .expect("test case not found");
+
+    if TEST_ARGS.skip_model(model_name) {
+        tracing::debug!("Skipping test {model_name}/{test_name}");
+        return Ok(());
+    }
+
+    let (_, model) = TEST_MODELS
+        .iter()
+        .find(|(name, _)| *name == model_name)
+        .expect(&format!("model {model_name} not found"));
+
     tracing::info!("Running test {test_name}/{model_name} with {:?}", test.req);
 
     let actual_resp = model.chat_request(test.req.clone()).await.expect(&format!(
@@ -234,36 +254,7 @@ macro_rules! generate_model_tests {
                 paste::paste! {
                     #[tokio::test]
                     async fn [<test_ $model_name_expr _ $test_case_expr>]() {
-                        let model_name = stringify!($model_name_expr);
-                        let test_case = stringify!($test_case_expr);
-
-                        let _ = dotenvy::from_filename(".env").expect("failed to load .env file");
-                        init_tracing(None);
-
-                        if TEST_DENY_LIST
-                            .iter()
-                            .any(|(m, t)| *m == model_name && *t == test_case)
-                        {
-                            return;
-                        }
-
-                        // Get test case
-                        let test = TEST_CASES
-                            .iter()
-                            .find(|t| t.name == test_case)
-                            .expect("test case not found");
-
-                        if TEST_ARGS.skip_model(model_name) {
-                            tracing::debug!("Skipping test {model_name}/{test_case}");
-                            return;
-                        }
-
-                        let (_, model) = TEST_MODELS
-                            .iter()
-                            .find(|(name, _)| *name == model_name)
-                            .expect(&format!("model {model_name} not found"));
-
-                        run_single_test(test, model_name, Arc::clone(model)).await
+                        run_single_test(stringify!($test_case_expr), stringify!($model_name_expr)).await
                             .expect("test failed");
                     }
                 }
