@@ -19,6 +19,7 @@ limitations under the License.
 use crate::{
     docker::RunningContainer,
     mysql::common::{get_mysql_conn, make_mysql_dataset, start_mysql_docker_container},
+    utils::test_request_context,
 };
 use std::{sync::Arc, time::Duration};
 
@@ -136,121 +137,134 @@ async fn get_accelerator(rt: &Runtime, table_name: &str) -> Result<Arc<dyn Table
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn mysql_refresh_retries() -> Result<(), String> {
-    let running_container = prepare_test_environment().await?;
-    let running_container = Arc::new(running_container);
+    test_request_context()
+        .scope(async {
+            let running_container = prepare_test_environment().await?;
+            let running_container = Arc::new(running_container);
 
-    let mut ds_no_retries =
-        make_mysql_dataset("lineitem", "lineitem_no_retries", MYSQL_PORT, false);
-    ds_no_retries.acceleration = Some(Acceleration {
-        enabled: true,
-        refresh_retry_enabled: false,
-        refresh_sql: Some("SELECT * from lineitem_no_retries limit 1".to_string()),
-        ..Default::default()
-    });
+            let mut ds_no_retries =
+                make_mysql_dataset("lineitem", "lineitem_no_retries", MYSQL_PORT, false);
+            ds_no_retries.acceleration = Some(Acceleration {
+                enabled: true,
+                refresh_retry_enabled: false,
+                refresh_sql: Some("SELECT * from lineitem_no_retries limit 1".to_string()),
+                ..Default::default()
+            });
 
-    let mut ds_default_retries =
-        make_mysql_dataset("lineitem", "lineitem_retries", MYSQL_PORT, false);
-    ds_default_retries.acceleration = Some(Acceleration {
-        enabled: true,
-        refresh_sql: Some("SELECT * from lineitem_retries limit 1".to_string()),
-        ..Default::default()
-    });
+            let mut ds_default_retries =
+                make_mysql_dataset("lineitem", "lineitem_retries", MYSQL_PORT, false);
+            ds_default_retries.acceleration = Some(Acceleration {
+                enabled: true,
+                refresh_sql: Some("SELECT * from lineitem_retries limit 1".to_string()),
+                ..Default::default()
+            });
 
-    let app = AppBuilder::new("mysql_refresh_retry")
-        .with_dataset(ds_no_retries)
-        .with_dataset(ds_default_retries)
-        .build();
+            let app = AppBuilder::new("mysql_refresh_retry")
+                .with_dataset(ds_no_retries)
+                .with_dataset(ds_default_retries)
+                .build();
 
-    let rt = Runtime::builder().with_app(app).build().await;
+            let status = runtime::status::RuntimeStatus::new();
+            let df = crate::get_test_datafusion(Arc::clone(&status));
 
-    tokio::select! {
-        () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
-            return Err("Timed out waiting for datasets to load".to_string());
-        }
-        () = rt.load_components() => {}
-    }
+            let rt = Runtime::builder()
+                .with_app(app)
+                .with_datafusion(df)
+                .build()
+                .await;
 
-    let (refresh_task_no_retries, request) =
-        create_refresh_task(&rt, "lineitem_no_retries").await?;
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+                    return Err("Timed out waiting for datasets to load".to_string());
+                }
+                () = rt.load_components() => {}
+            }
 
-    tracing::debug!("Simulating connectivity issue...");
-    running_container.stop().await.map_err(|e| {
-        tracing::error!("running_container.stop: {e}");
-        e.to_string()
-    })?;
+            let (refresh_task_no_retries, request) =
+                create_refresh_task(&rt, "lineitem_no_retries").await?;
 
-    // Refresh should fail fast w/o retries
-    tokio::select! {
-        () = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
-            return Err("Timed out waiting for dataset refresh result".to_string());
-        },
-        res = refresh_task_no_retries.run(request) => {
-            tracing::debug!("Refresh task completed. Is error={}", res.is_err());
-            assert!(res.is_err(), "Expected refresh error but got {res:?}");
-        }
-    };
-
-    let running_container_reference_copy = Arc::clone(&running_container);
-
-    tokio::spawn(async move {
-        // restore connectivity after few seconds
-        time::sleep(Duration::from_secs(2)).await;
-        tracing::debug!("Restoring connectivity...");
-        assert!(running_container_reference_copy
-            .start()
-            .await
-            .map_err(|e| {
-                tracing::error!("running_container.start: {e}");
+            tracing::debug!("Simulating connectivity issue...");
+            running_container.stop().await.map_err(|e| {
+                tracing::error!("running_container.stop: {e}");
                 e.to_string()
-            })
-            .is_ok());
-    });
+            })?;
 
-    // set custom refresh sql to check number of items loaded later
-    rt.datafusion()
-        .update_refresh_sql(
-            TableReference::parse_str("lineitem_retries"),
-            Some("SELECT * from lineitem_retries limit 10".to_string()),
-        )
+            // Refresh should fail fast w/o retries
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                    return Err("Timed out waiting for dataset refresh result".to_string());
+                },
+                res = refresh_task_no_retries.run(request) => {
+                    tracing::debug!("Refresh task completed. Is error={}", res.is_err());
+                    assert!(res.is_err(), "Expected refresh error but got {res:?}");
+                }
+            };
+
+            let running_container_reference_copy = Arc::clone(&running_container);
+
+            tokio::spawn(async move {
+                // restore connectivity after few seconds
+                time::sleep(Duration::from_secs(2)).await;
+                tracing::debug!("Restoring connectivity...");
+                assert!(running_container_reference_copy
+                    .start()
+                    .await
+                    .map_err(|e| {
+                        tracing::error!("running_container.start: {e}");
+                        e.to_string()
+                    })
+                    .is_ok());
+            });
+
+            // set custom refresh sql to check number of items loaded later
+            rt.datafusion()
+                .update_refresh_sql(
+                    TableReference::parse_str("lineitem_retries"),
+                    Some("SELECT * from lineitem_retries limit 10".to_string()),
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+
+            // For this test, must create_refresh request after `rt.datafusion().update_refresh_sql` to avoid getting old `refresh_sql`.
+            let (refresh_task_retries, request) =
+                create_refresh_task(&rt, "lineitem_retries").await?;
+            println!("Running request for 'lineitem_retries' table: {request:?}");
+
+            // Refresh should do retries and succeed
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(20)) => {
+                    return Err("Timed out waiting for dataset refresh result".to_string());
+                },
+                res = refresh_task_retries.run(request) => {
+                    tracing::debug!("Refresh task completed. Is error={}", res.is_err());
+                    assert!(res.is_ok(), "Expected refresh succeed after retrying but got {res:?}");
+                }
+            };
+
+            running_container.remove().await.map_err(|e| {
+                tracing::error!("running_container.remove: {e}");
+                e.to_string()
+            })?;
+
+            // check that the accelerated table contains the expected number of rows
+            let accelerated_table = get_accelerator(&rt, "lineitem_retries").await?;
+            let ctx = SessionContext::new();
+            let state = ctx.state();
+
+            let plan = accelerated_table
+                .scan(&state, None, &[], None)
+                .await
+                .expect("Scan plan can be constructed");
+
+            let result = collect(plan, ctx.task_ctx())
+                .await
+                .expect("Query successful");
+
+            assert_eq!(10, result.first().expect("result").num_rows());
+
+            Ok(())
+        })
         .await
-        .map_err(|e| e.to_string())?;
-
-    // For this test, must create_refresh request after `rt.datafusion().update_refresh_sql` to avoid getting old `refresh_sql`.
-    let (refresh_task_retries, request) = create_refresh_task(&rt, "lineitem_retries").await?;
-    println!("Running request for 'lineitem_retries' table: {request:?}");
-
-    // Refresh should do retries and succeed
-    tokio::select! {
-        () = tokio::time::sleep(std::time::Duration::from_secs(20)) => {
-            return Err("Timed out waiting for dataset refresh result".to_string());
-        },
-        res = refresh_task_retries.run(request) => {
-            tracing::debug!("Refresh task completed. Is error={}", res.is_err());
-            assert!(res.is_ok(), "Expected refresh succeed after retrying but got {res:?}");
-        }
-    };
-
-    running_container.remove().await.map_err(|e| {
-        tracing::error!("running_container.remove: {e}");
-        e.to_string()
-    })?;
-
-    // check that the accelerated table contains the expected number of rows
-    let accelerated_table = get_accelerator(&rt, "lineitem_retries").await?;
-    let ctx = SessionContext::new();
-    let state = ctx.state();
-
-    let plan = accelerated_table
-        .scan(&state, None, &[], None)
-        .await
-        .expect("Scan plan can be constructed");
-
-    let result = collect(plan, ctx.task_ctx())
-        .await
-        .expect("Query successful");
-
-    assert_eq!(10, result.first().expect("result").num_rows());
-
-    Ok(())
 }

@@ -35,7 +35,8 @@ pub struct Runtime {
 
     pub tracing: Option<TracingConfig>,
 
-    pub telemetry: Option<TelemetryConfig>,
+    #[serde(default)]
+    pub telemetry: TelemetryConfig,
 
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     #[serde(default)]
@@ -104,11 +105,33 @@ pub struct TracingConfig {
     pub zipkin_endpoint: Option<String>,
 }
 
+#[derive(Debug, Copy, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(rename_all = "camelCase")]
+pub enum UserAgentCollection {
+    #[default]
+    Full,
+    Disabled,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub struct TelemetryConfig {
+    #[serde(default = "default_true")]
     pub enabled: bool,
+    #[serde(default)]
+    pub user_agent_collection: UserAgentCollection,
+}
+
+impl Default for TelemetryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            user_agent_collection: UserAgentCollection::default(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

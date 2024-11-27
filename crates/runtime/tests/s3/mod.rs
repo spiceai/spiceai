@@ -14,12 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::sync::Arc;
+
 use app::AppBuilder;
 use futures::StreamExt;
-use runtime::{datafusion::query::Protocol, Runtime};
+use runtime::{status, Runtime};
 use spicepod::component::{dataset::Dataset, params::Params};
 
-use crate::init_tracing;
+use crate::{get_test_datafusion, init_tracing, utils::test_request_context};
 
 pub fn get_s3_dataset() -> Dataset {
     let mut dataset = Dataset::new("s3://spiceai-demo-datasets/taxi_trips/2024/", "taxi_trips");
@@ -55,91 +57,110 @@ pub fn get_s3_hive_partitioned_dataset(name: &str, infer_partitions: bool) -> Da
 async fn s3_federation() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
-    let app = AppBuilder::new("s3_federation")
-        .with_dataset(get_s3_dataset())
-        .build();
+    test_request_context()
+        .scope(async {
+            let app = AppBuilder::new("s3_federation")
+                .with_dataset(get_s3_dataset())
+                .build();
 
-    let rt = Runtime::builder().with_app(app).build().await;
+            let status = status::RuntimeStatus::new();
+            let df = get_test_datafusion(Arc::clone(&status));
 
-    // Set a timeout for the test
-    tokio::select! {
-        () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
-            return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
-        }
-        () = rt.load_components() => {}
-    }
+            let rt = Runtime::builder()
+                .with_datafusion(df)
+                .with_app(app)
+                .build()
+                .await;
 
-    let mut query_result = rt
-        .datafusion()
-        .query_builder("SELECT * FROM taxi_trips LIMIT 10", Protocol::Internal)
-        .build()
-        .run()
+            // Set a timeout for the test
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
+                }
+                () = rt.load_components() => {}
+            }
+
+            let mut query_result = rt
+                .datafusion()
+                .query_builder("SELECT * FROM taxi_trips LIMIT 10")
+                .build()
+                .run()
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?;
+            let mut batches = vec![];
+            while let Some(batch) = query_result.data.next().await {
+                batches.push(batch?);
+            }
+
+            assert_eq!(batches.len(), 1);
+            assert_eq!(batches[0].num_rows(), 10);
+
+            Ok(())
+        })
         .await
-        .map_err(|e| anyhow::anyhow!(e))?;
-    let mut batches = vec![];
-    while let Some(batch) = query_result.data.next().await {
-        batches.push(batch?);
-    }
-
-    assert_eq!(batches.len(), 1);
-    assert_eq!(batches[0].num_rows(), 10);
-
-    Ok(())
 }
 
 #[tokio::test]
 async fn s3_hive_partitioning() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
-    let app = AppBuilder::new("s3_hive_partitioning")
-        .with_dataset(get_s3_hive_partitioned_dataset("hive_data", true))
-        .with_dataset(get_s3_hive_partitioned_dataset("hive_data_no_infer", false))
-        .build();
+    test_request_context()
+        .scope(async {
+            let app = AppBuilder::new("s3_hive_partitioning")
+                .with_dataset(get_s3_hive_partitioned_dataset("hive_data", true))
+                .with_dataset(get_s3_hive_partitioned_dataset("hive_data_no_infer", false))
+                .build();
 
-    let rt = Runtime::builder().with_app(app).build().await;
+            let status = status::RuntimeStatus::new();
+            let df = get_test_datafusion(Arc::clone(&status));
 
-    // Set a timeout for the test
-    tokio::select! {
-        () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
-            return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
-        }
-        () = rt.load_components() => {}
-    }
+            let rt = Runtime::builder()
+                .with_app(app)
+                .with_datafusion(df)
+                .build()
+                .await;
 
-    let mut query_result = rt
-        .datafusion()
-        .query_builder("SELECT * FROM hive_data ORDER BY id", Protocol::Internal)
-        .build()
-        .run()
+            // Set a timeout for the test
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
+                }
+                () = rt.load_components() => {}
+            }
+
+            let mut query_result = rt
+                .datafusion()
+                .query_builder("SELECT * FROM hive_data ORDER BY id")
+                .build()
+                .run()
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?;
+            let mut batches = vec![];
+            while let Some(batch) = query_result.data.next().await {
+                batches.push(batch?);
+            }
+
+            let partition_inferred = arrow::util::pretty::pretty_format_batches(&batches)
+                .map_err(|e| anyhow::Error::msg(e.to_string()))?;
+            insta::assert_snapshot!(partition_inferred);
+
+            query_result = rt
+                .datafusion()
+                .query_builder("SELECT * FROM hive_data_no_infer ORDER BY id")
+                .build()
+                .run()
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?;
+            let mut batches = vec![];
+            while let Some(batch) = query_result.data.next().await {
+                batches.push(batch?);
+            }
+
+            let partition_not_inferred = arrow::util::pretty::pretty_format_batches(&batches)
+                .map_err(|e| anyhow::Error::msg(e.to_string()))?;
+            insta::assert_snapshot!(partition_not_inferred);
+
+            Ok(())
+        })
         .await
-        .map_err(|e| anyhow::anyhow!(e))?;
-    let mut batches = vec![];
-    while let Some(batch) = query_result.data.next().await {
-        batches.push(batch?);
-    }
-
-    let partition_inferred = arrow::util::pretty::pretty_format_batches(&batches)
-        .map_err(|e| anyhow::Error::msg(e.to_string()))?;
-    insta::assert_snapshot!(partition_inferred);
-
-    query_result = rt
-        .datafusion()
-        .query_builder(
-            "SELECT * FROM hive_data_no_infer ORDER BY id",
-            Protocol::Internal,
-        )
-        .build()
-        .run()
-        .await
-        .map_err(|e| anyhow::anyhow!(e))?;
-    let mut batches = vec![];
-    while let Some(batch) = query_result.data.next().await {
-        batches.push(batch?);
-    }
-
-    let partition_not_inferred = arrow::util::pretty::pretty_format_batches(&batches)
-        .map_err(|e| anyhow::Error::msg(e.to_string()))?;
-    insta::assert_snapshot!(partition_not_inferred);
-
-    Ok(())
 }

@@ -53,7 +53,7 @@ use datafusion::sql::{sqlparser, TableReference};
 use datafusion_federation::FederatedTableProviderAdaptor;
 use error::find_datafusion_root;
 use itertools::Itertools;
-use query::{Protocol, QueryBuilder};
+use query::QueryBuilder;
 use snafu::prelude::*;
 use tokio::spawn;
 use tokio::sync::oneshot;
@@ -1177,11 +1177,7 @@ impl DataFusion {
             .table_names())
     }
 
-    pub fn query_builder<'a>(
-        self: &Arc<Self>,
-        sql: &'a str,
-        protocol: Protocol,
-    ) -> QueryBuilder<'a> {
-        QueryBuilder::new(sql, Arc::clone(self), protocol)
+    pub fn query_builder<'a>(self: &Arc<Self>, sql: &'a str) -> QueryBuilder<'a> {
+        QueryBuilder::new(sql, Arc::clone(self))
     }
 }

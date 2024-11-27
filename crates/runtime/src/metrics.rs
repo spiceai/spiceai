@@ -243,7 +243,7 @@ pub(crate) mod tools {
 }
 
 pub(crate) mod telemetry {
-    use std::{sync::Arc, time::Duration};
+    use std::time::Duration;
 
     use opentelemetry::{metrics::Histogram, KeyValue};
 
@@ -260,9 +260,9 @@ pub(crate) mod telemetry {
             .init()
     });
 
-    pub fn track_query_count() {
-        telemetry::track_query_count();
-        QUERY_COUNT.add(1, &[]);
+    pub fn track_query_count(dimensions: &[KeyValue]) {
+        telemetry::track_query_count(dimensions);
+        QUERY_COUNT.add(1, dimensions);
     }
 
     static BYTES_PROCESSED: LazyLock<Counter<u64>> = LazyLock::new(|| {
@@ -273,11 +273,9 @@ pub(crate) mod telemetry {
             .init()
     });
 
-    pub fn track_bytes_processed(bytes: u64, protocol: Arc<str>) {
-        telemetry::track_bytes_processed(bytes, Arc::clone(&protocol));
-
-        let dimensions = create_dimensions(protocol);
-        BYTES_PROCESSED.add(bytes, &dimensions);
+    pub fn track_bytes_processed(bytes: u64, dimensions: &[KeyValue]) {
+        telemetry::track_bytes_processed(bytes, dimensions);
+        BYTES_PROCESSED.add(bytes, dimensions);
     }
 
     static BYTES_RETURNED: LazyLock<Counter<u64>> = LazyLock::new(|| {
@@ -288,11 +286,9 @@ pub(crate) mod telemetry {
             .init()
     });
 
-    pub fn track_bytes_returned(bytes: u64, protocol: Arc<str>) {
-        telemetry::track_bytes_returned(bytes, Arc::clone(&protocol));
-
-        let dimensions = create_dimensions(protocol);
-        BYTES_RETURNED.add(bytes, &dimensions);
+    pub fn track_bytes_returned(bytes: u64, dimensions: &[KeyValue]) {
+        telemetry::track_bytes_returned(bytes, dimensions);
+        BYTES_RETURNED.add(bytes, dimensions);
     }
 
     static QUERY_DURATION_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| {
@@ -323,9 +319,5 @@ pub(crate) mod telemetry {
     pub fn track_query_execution_duration(duration: Duration, dimensions: &[KeyValue]) {
         telemetry::track_query_execution_duration(duration, dimensions);
         QUERY_EXECUTION_DURATION_MS.record(duration.as_secs_f64() * 1000.0, dimensions);
-    }
-
-    fn create_dimensions(protocol: Arc<str>) -> [KeyValue; 1] {
-        [KeyValue::new("protocol", protocol)]
     }
 }

@@ -14,13 +14,18 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::time::Duration;
-
 use app::AppBuilder;
+use futures::TryStreamExt;
 use runtime::Runtime;
+use std::sync::Arc;
+use std::time::Duration;
 use tracing::instrument;
 
-use crate::{init_tracing, utils::wait_until_true};
+use crate::{
+    init_tracing,
+    utils::{test_request_context, wait_until_true},
+    RecordBatch,
+};
 
 use std::collections::HashMap;
 
@@ -62,44 +67,54 @@ fn make_databricks_odbc(path: &str, name: &str, acceleration: bool, engine: &str
 #[tokio::test]
 async fn databricks_odbc() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
-    let app = AppBuilder::new("databricks_odbc")
-        .with_dataset(make_databricks_odbc(
-            "samples.tpch.lineitem",
-            "line",
-            false,
-            "arrow",
-        ))
-        .build();
 
-    let rt = Runtime::builder().with_app(app).build().await;
+    test_request_context()
+        .scope(async {
+            let app = AppBuilder::new("databricks_odbc")
+                .with_dataset(make_databricks_odbc(
+                    "samples.tpch.lineitem",
+                    "line",
+                    false,
+                    "arrow",
+                ))
+                .build();
 
-    // Set a timeout for the test
-    tokio::select! {
-        () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
-            return Err("Timed out waiting for datasets to load".to_string());
-        }
-        () = rt.load_components() => {}
-    }
+            let status = runtime::status::RuntimeStatus::new();
+            let df = crate::get_test_datafusion(Arc::clone(&status));
 
-    let result = rt
-        .datafusion()
-        .ctx
-        .sql("SELECT * FROM line LIMIT 10")
+            let rt = Runtime::builder()
+                .with_app(app)
+                .with_datafusion(df)
+                .build()
+                .await;
+
+            // Set a timeout for the test
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+                    return Err("Timed out waiting for datasets to load".to_string());
+                }
+                () = rt.load_components() => {}
+            }
+
+            let query_result = rt
+                .datafusion()
+                .query_builder("SELECT * FROM line LIMIT 10")
+                .build()
+                .run()
+                .await
+                .expect("SQL is used");
+
+            let results = query_result
+                .data
+                .try_collect::<Vec<crate::RecordBatch>>()
+                .await
+                .expect("Query return result");
+
+            assert_eq!(10, results.iter().map(RecordBatch::num_rows).sum::<usize>());
+
+            Ok(())
+        })
         .await
-        .expect("SQL is used")
-        .collect()
-        .await
-        .expect("Query return result");
-
-    let mut num_rows = 0;
-
-    for i in result {
-        num_rows += i.num_rows();
-    }
-
-    assert_eq!(10, num_rows);
-
-    Ok(())
 }
 
 #[tokio::test]
@@ -107,56 +122,62 @@ async fn databricks_odbc() -> Result<(), String> {
 async fn databricks_odbc_with_acceleration() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
-    for engine in [
-        "arrow",
-        #[cfg(feature = "duckdb")]
-        "duckdb",
-        #[cfg(feature = "sqlite")]
-        "sqlite",
-    ] {
-        let app = AppBuilder::new("databricks_odbc")
-            .with_dataset(make_databricks_odbc(
-                "samples.tpch.lineitem",
-                "line",
-                true,
-                engine,
-            ))
-            .build();
+    test_request_context()
+        .scope(async {
+            for engine in [
+                "arrow",
+                #[cfg(feature = "duckdb")]
+                "duckdb",
+                #[cfg(feature = "sqlite")]
+                "sqlite",
+            ] {
+                let app = AppBuilder::new("databricks_odbc")
+                    .with_dataset(make_databricks_odbc(
+                        "samples.tpch.lineitem",
+                        "line",
+                        true,
+                        engine,
+                    ))
+                    .build();
+                let status = runtime::status::RuntimeStatus::new();
+                let df = crate::get_test_datafusion(Arc::clone(&status));
+                let rt = Runtime::builder()
+                    .with_app(app)
+                    .with_datafusion(df)
+                    .build()
+                    .await;
 
-        let rt = Runtime::builder().with_app(app).build().await;
-
-        // Set a timeout for the test
-        tokio::select! {
-            () = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
-                return Err("Timed out waiting for datasets to load".to_string());
-            }
-            () = rt.load_components() => {}
-        }
-
-        assert!(
-            wait_until_true(Duration::from_secs(10), || async {
-                let result = rt
-                    .datafusion()
-                    .ctx
-                    .sql("SELECT * FROM line LIMIT 10")
-                    .await
-                    .expect("SQL is used")
-                    .collect()
-                    .await
-                    .expect("Query return result");
-
-                let mut num_rows = 0;
-
-                for i in result {
-                    num_rows += i.num_rows();
+                // Set a timeout for the test
+                tokio::select! {
+                    () = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+                        return Err("Timed out waiting for datasets to load".to_string());
+                    }
+                    () = rt.load_components() => {}
                 }
 
-                10 == num_rows
-            })
-            .await,
-            "Expected 10 rows returned for engine {engine}"
-        );
-    }
+                assert!(
+                    wait_until_true(Duration::from_secs(10), || async {
+                        let query_result = rt
+                            .datafusion()
+                            .query_builder("SELECT * FROM line LIMIT 10")
+                            .build()
+                            .run()
+                            .await
+                            .expect("Query return result");
+                        let data = query_result
+                            .data
+                            .try_collect::<Vec<RecordBatch>>()
+                            .await
+                            .expect("Query collect result");
 
-    Ok(())
+                        10 == data.iter().map(RecordBatch::num_rows).sum::<usize>()
+                    })
+                    .await,
+                    "Expected 10 rows returned for engine {engine}"
+                );
+            }
+
+            Ok(())
+        })
+        .await
 }

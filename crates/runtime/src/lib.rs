@@ -69,6 +69,7 @@ pub mod objectstore;
 mod opentelemetry;
 mod parameters;
 pub mod podswatcher;
+pub mod request;
 pub mod secrets;
 pub mod spice_metrics;
 pub mod status;
@@ -366,6 +367,7 @@ impl Runtime {
 
         let flight_server_future = tokio::spawn(flight::start(
             config.flight_bind_address,
+            self.app.read().await.as_ref().map(Arc::clone),
             Arc::clone(&self.df),
             tls_config.clone(),
             endpoint_auth.clone(),

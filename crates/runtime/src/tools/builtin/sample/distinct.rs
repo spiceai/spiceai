@@ -21,7 +21,7 @@ use std::{
     sync::Arc,
 };
 
-use crate::datafusion::{query::Protocol, DataFusion};
+use crate::datafusion::DataFusion;
 use arrow::compute::concat;
 use futures::TryStreamExt;
 use schemars::JsonSchema;
@@ -99,12 +99,7 @@ impl DistinctColumnsParams {
         df: Arc<DataFusion>,
         query: &str,
     ) -> Result<ArrayRef, Box<dyn std::error::Error + Send + Sync>> {
-        let result = df
-            .query_builder(query, Protocol::Internal)
-            .build()
-            .run()
-            .await
-            .boxed()?;
+        let result = df.query_builder(query).build().run().await.boxed()?;
 
         let column = result
             .data

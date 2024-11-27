@@ -25,7 +25,6 @@ use std::sync::Arc;
 use tracing_futures::Instrument;
 
 use crate::{
-    datafusion::query::Protocol,
     tools::{utils::parameters, SpiceModelTool},
     Runtime,
 };
@@ -95,7 +94,6 @@ impl SpiceModelTool for LoadMemoryTool {
                         "SELECT value FROM {table_name} WHERE created_at > (NOW() - INTERVAL '{}' SECOND);",
                         last_interval.as_secs()
                     ),
-                    Protocol::Internal,
                 )
                 .build()
                 .run()

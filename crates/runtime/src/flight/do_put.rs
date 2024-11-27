@@ -65,7 +65,7 @@ pub(crate) async fn handle(
     let path = TableReference::parse_str(&fd.path.join("."));
 
     // Initializing tracking here so that both counter and duration have consistent path dimensions
-    let start = metrics::track_flight_request("do_put", Some(&path.to_string()));
+    let start = metrics::track_flight_request("do_put", Some(&path.to_string())).await;
 
     if !flight_svc.datafusion.is_writable(&path) {
         return Err(Status::invalid_argument(format!(

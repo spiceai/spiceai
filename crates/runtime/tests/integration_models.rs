@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+#![allow(clippy::large_futures)]
+
 use opentelemetry_sdk::{runtime::TokioCurrentThread, trace::TracerProvider};
 use runtime::{task_history::otel_exporter::TaskHistoryExporter, Runtime};
 use spicepod::component::runtime::TaskHistoryCapturedOutput;

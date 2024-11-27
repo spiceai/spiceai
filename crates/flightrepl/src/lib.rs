@@ -139,6 +139,7 @@ impl ConditionalEventHandler for KeyEventHandler {
 #[allow(clippy::missing_errors_doc)]
 pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Error>> {
     let mut repl_flight_endpoint = repl_config.repl_flight_endpoint;
+    let user_agent = repl_config.user_agent.unwrap_or_else(get_user_agent);
     let channel = if let Some(tls_root_certificate_file) = repl_config.tls_root_certificate_file {
         let tls_root_certificate = std::fs::read(tls_root_certificate_file)?;
         let tls_root_certificate = tonic::transport::Certificate::from_pem(tls_root_certificate);
@@ -147,11 +148,13 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
             repl_flight_endpoint = "https://localhost:50051".to_string();
         }
         Channel::from_shared(repl_flight_endpoint.clone())?
+            .user_agent(user_agent.clone())?
             .tls_config(client_tls_config)?
             .connect()
             .await
     } else {
         Channel::from_shared(repl_flight_endpoint.clone())?
+            .user_agent(user_agent.clone())?
             .connect()
             .await
     };
@@ -162,8 +165,6 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
             "Unable to connect to spiced at {repl_flight_endpoint}. Is it running?"
         ))
     })?;
-
-    let user_agent = repl_config.user_agent.unwrap_or_else(get_user_agent);
 
     // The encoder/decoder size is limited to 500MB.
     let client = FlightServiceClient::new(channel)

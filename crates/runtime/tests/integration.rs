@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+#![allow(clippy::large_futures)]
+
 use std::sync::Arc;
 
 use arrow::{array::RecordBatch, util::display::FormatOptions};
@@ -21,6 +23,7 @@ use datafusion::{
     execution::context::SessionContext,
     parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder,
 };
+use futures::TryStreamExt;
 
 use runtime::{datafusion::DataFusion, status, Runtime};
 use tracing::subscriber::DefaultGuard;
@@ -119,13 +122,17 @@ where
     F: FnOnce(Vec<RecordBatch>),
 {
     // Check the plan
-    let plan_results = rt
+    let query_results = rt
         .datafusion()
-        .ctx
-        .sql(&format!("EXPLAIN {query}"))
+        .query_builder(&format!("EXPLAIN {query}"))
+        .build()
+        .run()
         .await
-        .map_err(|e| format!("query `{query}` to plan: {e}"))?
-        .collect()
+        .map_err(|e| format!("query `{query}` to plan: {e}"))?;
+
+    let plan_results: Vec<RecordBatch> = query_results
+        .data
+        .try_collect::<Vec<RecordBatch>>()
         .await
         .map_err(|e| format!("query `{query}` to results: {e}"))?;
 
@@ -148,11 +155,13 @@ where
     if let Some(validate_result) = validate_result {
         let result_batches = rt
             .datafusion()
-            .ctx
-            .sql(query)
+            .query_builder(query)
+            .build()
+            .run()
             .await
-            .map_err(|e| format!("query `{query}` to plan: {e}"))?
-            .collect()
+            .map_err(|e| format!("query `{query}` failed to run: {e}"))?
+            .data
+            .try_collect()
             .await
             .map_err(|e| format!("query `{query}` to results: {e}"))?;
 
@@ -174,13 +183,15 @@ where
     F: FnOnce(Vec<RecordBatch>),
 {
     // Check the plan
-    let plan_results = rt
+    let plan_results: Vec<RecordBatch> = rt
         .datafusion()
-        .ctx
-        .sql(&format!("EXPLAIN {query}"))
+        .query_builder(&format!("EXPLAIN {query}"))
+        .build()
+        .run()
         .await
         .map_err(|e| format!("query `{query}` to plan: {e}"))?
-        .collect()
+        .data
+        .try_collect()
         .await
         .map_err(|e| format!("query `{query}` to results: {e}"))?;
 
@@ -223,11 +234,13 @@ where
     if let Some(validate_result) = validate_result {
         let result_batches = rt
             .datafusion()
-            .ctx
-            .sql(query)
+            .query_builder(query)
+            .build()
+            .run()
             .await
-            .map_err(|e| format!("query `{query}` to plan: {e}"))?
-            .collect()
+            .map_err(|e| format!("query `{query}` failed to run: {e}"))?
+            .data
+            .try_collect()
             .await
             .map_err(|e| format!("query `{query}` to results: {e}"))?;
 
