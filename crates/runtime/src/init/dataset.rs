@@ -595,12 +595,13 @@ impl Runtime {
                 if ds.is_file_accelerated() {
                     let datasets = self.initialize_accelerators(&[Arc::clone(&ds)]).await;
                     if datasets.is_empty() {
-                        return;
+                        tracing::error!("Failed to initialize accelerator for dataset {}, verify acceleration configuration and try again", ds.name);
+                    } else {
+                        self.status
+                            .update_dataset(&ds.name, status::ComponentStatus::Initializing);
+                        self.load_dataset(ds).await;
                     }
                 }
-                self.status
-                    .update_dataset(&ds.name, status::ComponentStatus::Initializing);
-                self.load_dataset(ds).await;
             }
         }
 
