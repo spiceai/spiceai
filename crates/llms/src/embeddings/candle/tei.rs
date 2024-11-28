@@ -101,7 +101,7 @@ impl TeiEmbed {
             }
         } else {
             tracing::warn!(
-                "Embedding pooling mode not specified by user. Defaulting to mean pooling."
+                "`params.pooling` not provided for embedding model. Often this can be found in `1_Pooling/config.json`. Defaulting to mean pooling."
             );
             Self::DEFAULT_POOLING_OPERATOR
         };
