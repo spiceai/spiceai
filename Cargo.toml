@@ -98,6 +98,7 @@ opentelemetry_sdk = { version = "0.26", default-features = false, features = [
 ] }
 parquet = "53"
 pem = "3.0.4"
+percent-encoding = "2.3.1"
 prometheus = "0.13"
 pin-project = "1.0"
 r2d2 = "0.8.10"
