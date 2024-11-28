@@ -65,7 +65,8 @@ impl TeiEmbed {
         model_path: &Path,
         config_path: &Path,
         tokenizer_path: &Path,
-        pooling: Option<String>,
+        pooling_overwrite: Option<String>,
+        max_seq_length_overwrite: Option<usize>,
     ) -> Result<Self> {
         let model_filename = model_path
             .file_name()
@@ -90,7 +91,7 @@ impl TeiEmbed {
         );
 
         // Check if user provided pooling is valid, and only default to mean when user doesn't provide one.
-        let pool = if let Some(pooling) = pooling {
+        let pool = if let Some(pooling) = pooling_overwrite {
             match pool_from_str(&pooling) {
                 Some(pool) => pool,
                 None => {
@@ -106,7 +107,7 @@ impl TeiEmbed {
             Self::DEFAULT_POOLING_OPERATOR
         };
 
-        Self::from_dir(&model_root, Some(pool))
+        Self::from_dir(&model_root, Some(pool), max_seq_length_overwrite)
     }
 
     pub async fn from_hf(
@@ -114,6 +115,7 @@ impl TeiEmbed {
         revision: Option<&str>,
         hf_token: Option<String>,
         pooling_overwrite: Option<String>,
+        max_seq_length_overwrite: Option<usize>,
     ) -> Result<Self> {
         // Only error if user-provided value is incorrect.
         let pool = pooling_overwrite
@@ -129,25 +131,33 @@ impl TeiEmbed {
             .transpose()?
             .flatten();
         let model_root = download_hf_artifacts(model_id, revision, hf_token).await?;
-        Self::from_dir(&model_root, pool)
+        Self::from_dir(&model_root, pool, max_seq_length_overwrite)
     }
 
     /// Instantiates a text-embedding-inference service with model, tokenizer, config, etc files in a single directory.
-    pub fn from_dir(root: &Path, pooling_overwrite: Option<Pool>) -> Result<Self> {
+    pub fn from_dir(
+        root: &Path,
+        pooling_overwrite: Option<Pool>,
+        max_seq_length_overwrite: Option<usize>,
+    ) -> Result<Self> {
         let tokenizer = load_tokenizer(root)?;
         let config = load_config(root)?;
 
         // Load [`Tokenization`]
         let position_offset = position_offset(&config);
 
-        // Some models will have `sentence_*_config.json` file defining a specific `max_seq_length`.
-        let max_input_length = match max_seq_length_from_st_config(root.to_path_buf()) {
-            Ok(Some(max_seq_length)) => max_seq_length,
-            Err(e) => {
-                tracing::warn!("Failed to load max_seq_length from ST config: {e}");
-                config.max_position_embeddings - position_offset
+        let max_input_length = if let Some(max_seq_length) = max_seq_length_overwrite {
+            max_seq_length
+        } else {
+            // Some models will have `sentence_*_config.json` file defining a specific `max_seq_length`.
+            match max_seq_length_from_st_config(root.to_path_buf()) {
+                Ok(Some(max_seq_length)) => max_seq_length,
+                Err(e) => {
+                    tracing::warn!("Failed to load max_seq_length from ST config: {e}");
+                    config.max_position_embeddings - position_offset
+                }
+                _ => config.max_position_embeddings - position_offset,
             }
-            _ => config.max_position_embeddings - position_offset,
         };
 
         let token = Tokenization::new(
