@@ -25,7 +25,7 @@ use http::HeaderMap;
 use opentelemetry::KeyValue;
 use spicepod::component::runtime::UserAgentCollection;
 
-use super::{Protocol, UserAgent};
+use super::{baggage, Protocol, UserAgent};
 
 pub struct RequestContext {
     // Use an AtomicU8 to allow updating the protocol without locking
@@ -121,6 +121,7 @@ pub struct RequestContextBuilder {
     protocol: Protocol,
     app: Option<Arc<App>>,
     user_agent: UserAgent,
+    baggage: Vec<KeyValue>,
 }
 
 impl RequestContextBuilder {
@@ -130,6 +131,7 @@ impl RequestContextBuilder {
             protocol,
             app: None,
             user_agent: UserAgent::Absent,
+            baggage: vec![],
         }
     }
 
@@ -151,6 +153,7 @@ impl RequestContextBuilder {
             UserAgentCollection::Full => UserAgent::from_headers(headers),
             UserAgentCollection::Disabled => UserAgent::Absent,
         };
+        self.baggage.extend(baggage::from_headers(headers));
         self
     }
 
@@ -161,8 +164,19 @@ impl RequestContextBuilder {
     }
 
     #[must_use]
+    pub fn with_baggage(mut self, baggage: Vec<KeyValue>) -> Self {
+        self.baggage = baggage;
+        self
+    }
+
+    #[must_use]
+    pub fn baggage_mut(&mut self) -> &mut Vec<KeyValue> {
+        &mut self.baggage
+    }
+
+    #[must_use]
     pub fn build(self) -> RequestContext {
-        let mut dimensions = vec![];
+        let mut dimensions = self.baggage;
 
         let add_runtime_dimensions = |dimensions: &mut Vec<KeyValue>| {
             dimensions.push(KeyValue::new("runtime", super::RUNTIME_NAME));

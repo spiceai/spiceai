@@ -9312,6 +9312,7 @@ dependencies = [
  "opentelemetry-proto",
  "opentelemetry_sdk 0.26.0",
  "otel-arrow",
+ "percent-encoding",
  "pin-project",
  "prometheus",
  "prometheus-parse",
