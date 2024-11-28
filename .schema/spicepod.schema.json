@@ -65,7 +65,14 @@
     "runtime": {
       "description": "Optional runtime configuration",
       "default": {
-        "num_of_parallel_loading_at_start_up": null,
+        "auth": null,
+        "cors": {
+          "allowed_origins": [
+            "*"
+          ],
+          "enabled": false
+        },
+        "dataset_load_parallelism": null,
         "results_cache": {
           "cache_max_size": null,
           "enabled": true,
@@ -73,12 +80,15 @@
           "item_ttl": null
         },
         "task_history": {
-          "captured_output": "truncated",
+          "captured_output": "none",
           "enabled": true,
           "retention_check_interval": "15m",
           "retention_period": "8h"
         },
-        "telemetry": null,
+        "telemetry": {
+          "enabled": true,
+          "user_agent_collection": "full"
+        },
         "tls": null,
         "tracing": null
       },
@@ -176,10 +186,14 @@
           ]
         },
         "ready_state": {
-          "default": "on_load",
-          "allOf": [
+          "default": null,
+          "deprecated": true,
+          "anyOf": [
             {
               "$ref": "#/definitions/ReadyState"
+            },
+            {
+              "type": "null"
             }
           ]
         },
@@ -257,6 +271,41 @@
       },
       "additionalProperties": false
     },
+    "ApiKeyAuth": {
+      "type": "object",
+      "required": [
+        "keys"
+      ],
+      "properties": {
+        "enabled": {
+          "default": true,
+          "type": "boolean"
+        },
+        "keys": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "Auth": {
+      "type": "object",
+      "properties": {
+        "api-key": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ApiKeyAuth"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
     "Catalog": {
       "type": "object",
       "required": [
@@ -314,8 +363,32 @@
         }
       }
     },
+    "Column": {
+      "type": "object",
+      "required": [
+        "name"
+      ],
+      "properties": {
+        "description": {
+          "description": "Optional semantic details about the column",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "embeddings": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/ColumnLevelEmbeddingConfig"
+          }
+        },
+        "name": {
+          "type": "string"
+        }
+      }
+    },
     "ColumnEmbeddingConfig": {
-      "description": "Configuration for if and how a dataset's column should be embedded.",
+      "description": "Configuration for if and how a dataset's column should be embedded.\n\nPrefer to use [`super::dataset::column::ColumnLevelEmbeddingConfig`] going forward. Support for [`ColumnEmbeddingConfig`] will be removed in future.",
       "type": "object",
       "required": [
         "column"
@@ -346,6 +419,35 @@
         "use": {
           "default": "",
           "type": "string"
+        }
+      }
+    },
+    "ColumnLevelEmbeddingConfig": {
+      "description": "Configuration for if and how a dataset's column should be embedded. Different to [`crate::component::embeddings::ColumnEmbeddingConfig`], as [`ColumnLevelEmbeddingConfig`] should be a property of [`Column`], not [`super::Dataset`].\n\n[`crate::component::embeddings::ColumnEmbeddingConfig`] will be deprecated long term in favour of [`ColumnLevelEmbeddingConfig`].",
+      "type": "object",
+      "properties": {
+        "chunking": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/EmbeddingChunkConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "from": {
+          "default": "",
+          "type": "string"
+        },
+        "row_id": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
         }
       }
     },
@@ -426,6 +528,25 @@
         }
       }
     },
+    "CorsConfig": {
+      "type": "object",
+      "properties": {
+        "allowed_origins": {
+          "default": [
+            "*"
+          ],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "enabled": {
+          "default": false,
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
     "Dataset": {
       "type": "object",
       "required": [
@@ -441,6 +562,12 @@
               "type": "null"
             }
           ]
+        },
+        "columns": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/Column"
+          }
         },
         "dependsOn": {
           "type": "array",
@@ -469,6 +596,16 @@
             "null"
           ]
         },
+        "invalid_type_action": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/InvalidTypeAction"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "metadata": {
           "type": "object",
           "additionalProperties": true
@@ -491,6 +628,14 @@
             },
             {
               "type": "null"
+            }
+          ]
+        },
+        "ready_state": {
+          "default": "on_load",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ReadyState"
             }
           ]
         },
@@ -609,6 +754,14 @@
         "unique"
       ]
     },
+    "InvalidTypeAction": {
+      "type": "string",
+      "enum": [
+        "error",
+        "warn",
+        "ignore"
+      ]
+    },
     "Mode": {
       "type": "string",
       "enum": [
@@ -682,6 +835,15 @@
             "null"
           ]
         },
+        "params": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
         "path": {
           "type": "string"
         },
@@ -736,7 +898,7 @@
       "type": "object"
     },
     "ReadyState": {
-      "description": "Controls when the table is marked ready for queries.",
+      "description": "Controls when the dataset is marked ready for queries.",
       "oneOf": [
         {
           "description": "The table is ready once the initial load completes.",
@@ -801,7 +963,31 @@
     "Runtime": {
       "type": "object",
       "properties": {
-        "num_of_parallel_loading_at_start_up": {
+        "auth": {
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Auth"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "cors": {
+          "default": {
+            "allowed_origins": [
+              "*"
+            ],
+            "enabled": false
+          },
+          "allOf": [
+            {
+              "$ref": "#/definitions/CorsConfig"
+            }
+          ]
+        },
+        "dataset_load_parallelism": {
           "type": [
             "integer",
             "null"
@@ -830,7 +1016,7 @@
         },
         "task_history": {
           "default": {
-            "captured_output": "truncated",
+            "captured_output": "none",
             "enabled": true,
             "retention_check_interval": "15m",
             "retention_period": "8h"
@@ -842,12 +1028,13 @@
           ]
         },
         "telemetry": {
-          "anyOf": [
+          "default": {
+            "enabled": true,
+            "user_agent_collection": "full"
+          },
+          "allOf": [
             {
               "$ref": "#/definitions/TelemetryConfig"
-            },
-            {
-              "type": "null"
             }
           ]
         },
@@ -872,7 +1059,8 @@
             }
           ]
         }
-      }
+      },
+      "additionalProperties": false
     },
     "Secret": {
       "description": "The secrets configuration for a Spicepod.\n\nExample: ```yaml secrets: - from: env name: env - from: kubernetes:my_secret_name name: k8s ```",
@@ -922,7 +1110,7 @@
       "type": "object",
       "properties": {
         "captured_output": {
-          "default": "truncated",
+          "default": "none",
           "type": "string"
         },
         "enabled": {
@@ -942,12 +1130,18 @@
     },
     "TelemetryConfig": {
       "type": "object",
-      "required": [
-        "enabled"
-      ],
       "properties": {
         "enabled": {
+          "default": true,
           "type": "boolean"
+        },
+        "user_agent_collection": {
+          "default": "full",
+          "allOf": [
+            {
+              "$ref": "#/definitions/UserAgentCollection"
+            }
+          ]
         }
       },
       "additionalProperties": false
@@ -1053,6 +1247,13 @@
         }
       },
       "additionalProperties": false
+    },
+    "UserAgentCollection": {
+      "type": "string",
+      "enum": [
+        "full",
+        "disabled"
+      ]
     },
     "View": {
       "type": "object",
