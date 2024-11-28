@@ -722,6 +722,28 @@ impl RefreshTask {
             }
         }
 
+        // For all errors that result from calling DataFusion, check if they are due to the task being cancelled and ignore them
+        match error {
+            super::Error::UnableToGetDataFromConnector { source }
+            | super::Error::FailedToRefreshDataset { source }
+            | super::Error::UnableToScanTableProvider { source }
+            | super::Error::UnableToCreateMemTableFromUpdate { source }
+            | super::Error::FailedToQueryLatestTimestamp { source }
+            | super::Error::FailedToWriteData { source } => {
+                // Match against an Internal error with the message "Non Panic Task error":
+                // <https://github.com/apache/datafusion/blob/f6c92fecb23c927bdc6a9feb058f03a2fb61d63f/datafusion/physical-plan/src/stream.rs#L132>
+                if let DataFusionError::Internal(msg) = &source {
+                    if msg.contains("Non Panic Task error") && msg.contains("was cancelled") {
+                        tracing::debug!(
+                            "Ignoring DataFusion error due to task cancellation: {source}"
+                        );
+                        return;
+                    }
+                }
+            }
+            _ => (),
+        }
+
         tracing::warn!(
             "Failed to load data for dataset {}: {error}",
             self.dataset_name
