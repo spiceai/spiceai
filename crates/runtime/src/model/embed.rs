@@ -285,7 +285,7 @@ fn max_seq_length_from_params(
         .map(|s| {
             s.expose_secret().parse().boxed().map_err(|e| {
                 EmbedError::FailedToInstantiateEmbeddingModel {
-                    source: format!("Failed to parse 'max_seq_length' parameter: {}", e).into(),
+                    source: format!("Failed to parse 'max_seq_length' parameter: {e}").into(),
                 }
             })
         })

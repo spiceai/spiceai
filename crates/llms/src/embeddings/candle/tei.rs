@@ -31,7 +31,6 @@ use futures::future::join_all;
 use snafu::ResultExt;
 use tei_backend::{Backend, DType, ModelType, Pool};
 use tei_core::{
-    download::download_artifacts,
     infer::{Infer, PooledEmbeddingsInferResponse},
     queue::Queue,
     tokenization::{EncodingInput, Tokenization},
@@ -150,7 +149,7 @@ impl TeiEmbed {
             max_seq_length
         } else {
             // Some models will have `sentence_*_config.json` file defining a specific `max_seq_length`.
-            match max_seq_length_from_st_config(root.to_path_buf()) {
+            match max_seq_length_from_st_config(root) {
                 Ok(Some(max_seq_length)) => max_seq_length,
                 Err(e) => {
                     tracing::warn!("Failed to load max_seq_length from ST config: {e}");

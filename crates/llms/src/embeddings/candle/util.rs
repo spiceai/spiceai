@@ -33,10 +33,7 @@ use serde::Deserialize;
 use snafu::ResultExt;
 use tei_backend::Pool;
 use tei_core::{
-    download::{
-        download_artifacts, download_new_st_config, download_pool_config, download_st_config,
-        ST_CONFIG_NAMES,
-    },
+    download::{download_artifacts, download_pool_config, download_st_config, ST_CONFIG_NAMES},
     tokenization::EncodingInput,
 };
 
@@ -166,11 +163,6 @@ pub(crate) async fn download_hf_artifacts(
     let _ = download_st_config(&api_repo)
         .await
         .context(FailedWithHFApiSnafu)?;
-
-    let _ = download_new_st_config(&api_repo)
-        .await
-        .context(FailedWithHFApiSnafu)?;
-
     Ok(root_dir)
 }
 
@@ -178,7 +170,7 @@ pub(crate) async fn download_hf_artifacts(
 ///
 /// If no config file is found, or config files don't containt `max_seq_length`, return `None`.
 pub(crate) fn max_seq_length_from_st_config(
-    model_root: PathBuf,
+    model_root: &Path,
 ) -> Result<Option<usize>, serde_json::Error> {
     #[derive(Debug, Deserialize)]
     pub struct STConfig {
