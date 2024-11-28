@@ -3369,7 +3369,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=820e2034638863cd53c78ad7fef73c038c88e581#820e2034638863cd53c78ad7fef73c038c88e581"
+source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=a41d5b2d7b4c4c7abf9bbb777e53b0b9ce8c9f52#a41d5b2d7b4c4c7abf9bbb777e53b0b9ce8c9f52"
 dependencies = [
  "arrow",
  "arrow-json 53.2.0",
@@ -10783,8 +10783,7 @@ dependencies = [
 [[package]]
 name = "text-splitter"
 version = "0.18.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "189450e9eaff1a8037cca4d60ca62c134a7e601187430bdd487c86e25e8d6641"
+source = "git+https://github.com/Jeadie/text-splitter.git?rev=b33e4748576b9a81d436d3f28a6706f860fc45ba#b33e4748576b9a81d436d3f28a6706f860fc45ba"
 dependencies = [
  "ahash 0.8.11",
  "auto_enums",
@@ -10794,7 +10793,7 @@ dependencies = [
  "pulldown-cmark",
  "regex",
  "strum 0.26.3",
- "thiserror 1.0.68",
+ "thiserror 2.0.3",
  "tiktoken-rs",
  "tokenizers",
  "unicode-segmentation",
