@@ -154,7 +154,9 @@ async fn get_file_from_hf(
         repo_type,
         file,
         hf_token,
-    ) {
+    )
+    .await
+    {
         Ok(path) => {
             let bytz = fs::read(path).await.boxed()?;
             Ok(bytz.into())
@@ -261,7 +263,9 @@ pub async fn try_to_embedding(
             let pooling = extract_secret!(params, "pooling");
 
             if let Some(id) = model_id {
-                Ok(Box::new(TeiEmbed::from_hf(&id, None, hf_token, pooling)?))
+                Ok(Box::new(
+                    TeiEmbed::from_hf(&id, None, hf_token, pooling).await?,
+                ))
             } else {
                 Err(EmbedError::FailedToInstantiateEmbeddingModel {
                     source: format!("Failed to load model from: {}", component.from).into(),

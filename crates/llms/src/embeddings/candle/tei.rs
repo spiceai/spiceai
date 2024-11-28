@@ -31,6 +31,7 @@ use futures::future::join_all;
 use snafu::ResultExt;
 use tei_backend::{Backend, DType, ModelType, Pool};
 use tei_core::{
+    download::download_artifacts,
     infer::{Infer, PooledEmbeddingsInferResponse},
     queue::Queue,
     tokenization::{EncodingInput, Tokenization},
@@ -47,8 +48,8 @@ use crate::{
 };
 
 use super::util::{
-    download_hf_artifacts, inputs_from_openai, load_config, load_tokenizer, pool_from_str,
-    position_offset,
+    download_hf_artifacts, inputs_from_openai, load_config, load_tokenizer,
+    max_seq_length_from_st_config, pool_from_str, position_offset,
 };
 
 pub struct TeiEmbed {
@@ -108,7 +109,7 @@ impl TeiEmbed {
         Self::from_dir(&model_root, Some(pool))
     }
 
-    pub fn from_hf(
+    pub async fn from_hf(
         model_id: &str,
         revision: Option<&str>,
         hf_token: Option<String>,
@@ -127,7 +128,7 @@ impl TeiEmbed {
             })
             .transpose()?
             .flatten();
-        let model_root = download_hf_artifacts(model_id, revision, hf_token)?;
+        let model_root = download_hf_artifacts(model_id, revision, hf_token).await?;
         Self::from_dir(&model_root, pool)
     }
 
@@ -138,9 +139,17 @@ impl TeiEmbed {
 
         // Load [`Tokenization`]
         let position_offset = position_offset(&config);
-        // TODO: `max_input_length` should take into account overwrite files like `sentence_bert_config.json`.
-        // See `<https://github.com/huggingface/text-embeddings-inference/blob/cb1e594709fb1caea674ed460b6e426b2b4a531b/router/src/lib.rs#L189>`
-        let max_input_length = config.max_position_embeddings - position_offset;
+
+        // Some models will have `sentence_*_config.json` file defining a specific `max_seq_length`.
+        let max_input_length = match max_seq_length_from_st_config(root.to_path_buf()) {
+            Ok(Some(max_seq_length)) => max_seq_length,
+            Err(e) => {
+                tracing::warn!("Failed to load max_seq_length from ST config: {e}");
+                config.max_position_embeddings - position_offset
+            }
+            _ => config.max_position_embeddings - position_offset,
+        };
+
         let token = Tokenization::new(
             1,
             tokenizer.clone(),
