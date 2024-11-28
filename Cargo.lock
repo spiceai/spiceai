@@ -222,7 +222,7 @@ checksum = "d301b3b94cb4b2f23d7917810addbbaff90738e0ca2be692bd027e70d7e0330c"
 
 [[package]]
 name = "app"
-version = "1.0.0-rc.1"
+version = "1.0.0-rc.2"
 dependencies = [
  "snafu",
  "spicepod",
@@ -540,7 +540,7 @@ dependencies = [
 
 [[package]]
 name = "arrow_sql_gen"
-version = "1.0.0-rc.1"
+version = "1.0.0-rc.2"
 dependencies = [
  "arrow",
  "bigdecimal",
@@ -554,7 +554,7 @@ dependencies = [
 
 [[package]]
 name = "arrow_tools"
-version = "1.0.0-rc.1"
+version = "1.0.0-rc.2"
 dependencies = [
  "arrow",
  "datafusion",
@@ -2011,7 +2011,7 @@ dependencies = [
 
 [[package]]
 name = "cache"
-version = "1.0.0-rc.1"
+version = "1.0.0-rc.2"
 dependencies = [
  "arrow",
  "async-stream",
@@ -2895,7 +2895,7 @@ checksum = "e8566979429cf69b49a5c740c60791108e86440e8be149bbea4fe54d2c32d6e2"
 
 [[package]]
 name = "data_components"
-version = "1.0.0-rc.1"
+version = "1.0.0-rc.2"
 dependencies = [
  "arrow",
  "arrow-buffer",
@@ -3415,7 +3415,7 @@ dependencies = [
 
 [[package]]
 name = "db_connection_pool"
-version = "1.0.0-rc.1"
+version = "1.0.0-rc.2"
 dependencies = [
  "arrow",
  "arrow-odbc",
@@ -3706,7 +3706,7 @@ checksum = "fea41bba32d969b513997752735605054bc0dfa92b4c56bf1189f2e174be7a10"
 
 [[package]]
 name = "document_parse"
-version = "1.0.0-rc.1"
+version = "1.0.0-rc.2"
 dependencies = [
  "bytes",
  "docx-rs",
@@ -4074,7 +4074,7 @@ dependencies = [
 
 [[package]]
 name = "flight_client"
-version = "1.0.0-rc.1"
+version = "1.0.0-rc.2"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -4089,7 +4089,7 @@ dependencies = [
 
 [[package]]
 name = "flightpublisher"
-version = "1.0.0-rc.1"
+version = "1.0.0-rc.2"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -4102,7 +4102,7 @@ dependencies = [
 
 [[package]]
 name = "flightrepl"
-version = "1.0.0-rc.1"
+version = "1.0.0-rc.2"
 dependencies = [
  "ansi_term",
  "arrow-flight",
@@ -4123,7 +4123,7 @@ dependencies = [
 
 [[package]]
 name = "flightsubscriber"
-version = "1.0.0-rc.1"
+version = "1.0.0-rc.2"
 dependencies = [
  "arrow-flight",
  "clap",
@@ -6260,7 +6260,7 @@ checksum = "643cb0b8d4fcc284004d5fd0d67ccf61dfffadb7f75e1e71bc420f4688a3a704"
 
 [[package]]
 name = "llms"
-version = "1.0.0-rc.1"
+version = "1.0.0-rc.2"
 dependencies = [
  "anyhow",
  "async-openai",
@@ -6793,7 +6793,7 @@ dependencies = [
 
 [[package]]
 name = "model_components"
-version = "1.0.0-rc.1"
+version = "1.0.0-rc.2"
 dependencies = [
  "anyhow",
  "arrow",
@@ -7111,7 +7111,7 @@ dependencies = [
 
 [[package]]
 name = "ns_lookup"
-version = "1.0.0-rc.1"
+version = "1.0.0-rc.2"
 dependencies = [
  "snafu",
  "tracing",
@@ -7813,7 +7813,7 @@ dependencies = [
 
 [[package]]
 name = "otel-arrow"
-version = "1.0.0-rc.1"
+version = "1.0.0-rc.2"
 dependencies = [
  "arrow",
  "arrow-buffer",
@@ -7824,7 +7824,7 @@ dependencies = [
 
 [[package]]
 name = "otelpublisher"
-version = "1.0.0-rc.1"
+version = "1.0.0-rc.2"
 dependencies = [
  "clap",
  "futures",
@@ -9235,7 +9235,7 @@ dependencies = [
 
 [[package]]
 name = "runtime"
-version = "1.0.0-rc.1"
+version = "1.0.0-rc.2"
 dependencies = [
  "anyhow",
  "app",
@@ -9359,7 +9359,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-auth"
-version = "1.0.0-rc.1"
+version = "1.0.0-rc.2"
 dependencies = [
  "app",
  "axum",
@@ -10242,7 +10242,7 @@ dependencies = [
 
 [[package]]
 name = "spice-cloud"
-version = "1.0.0-rc.1"
+version = "1.0.0-rc.2"
 dependencies = [
  "async-trait",
  "datafusion",
@@ -10259,7 +10259,7 @@ dependencies = [
 
 [[package]]
 name = "spiced"
-version = "1.0.0-rc.1"
+version = "1.0.0-rc.2"
 dependencies = [
  "app",
  "clap",
@@ -10291,7 +10291,7 @@ dependencies = [
 
 [[package]]
 name = "spicepod"
-version = "1.0.0-rc.1"
+version = "1.0.0-rc.2"
 dependencies = [
  "fundu",
  "schemars",
@@ -10305,7 +10305,7 @@ dependencies = [
 
 [[package]]
 name = "spicepodschema"
-version = "1.0.0-rc.1"
+version = "1.0.0-rc.2"
 dependencies = [
  "schemars",
  "serde_json",
@@ -10673,7 +10673,7 @@ dependencies = [
 
 [[package]]
 name = "telemetry"
-version = "1.0.0-rc.1"
+version = "1.0.0-rc.2"
 dependencies = [
  "arrow",
  "async-trait",
@@ -11914,7 +11914,7 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 
 [[package]]
 name = "util"
-version = "1.0.0-rc.1"
+version = "1.0.0-rc.2"
 dependencies = [
  "backoff",
  "humantime",
