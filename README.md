@@ -133,8 +133,6 @@ Currently supported data stores for local materialization/acceleration. More com
 [postgres]: https://github.com/spiceai/quickstarts/tree/trunk/postgres#postgresql-data-accelerator
 [sqlite]: https://docs.spiceai.org/data-accelerators/sqlite
 
-⚠️ **DEVELOPER PREVIEW** Spice is under active **beta** stage development and is not intended to be used in production until its **1.0-stable** release. If you are interested in running Spice in production, please get in touch so we can support you (See Connect with us below).
-
 ## ⚡️ Quickstart (Local Machine)
 
 <https://github.com/spiceai/spiceai/assets/88671039/85cf9a69-46e7-412e-8b68-22617dcbd4e0>
