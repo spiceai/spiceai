@@ -620,8 +620,7 @@ fn stream_from_response(
                     unreachable!()
                 },
                 MistralResponse::Raw{..} => {
-                    // We set `return_raw_logits: false`
-                    unreachable!()
+                    unreachable!("We set `return_raw_logits: false`")
                 }
              }
         }
