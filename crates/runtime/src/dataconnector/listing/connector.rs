@@ -20,7 +20,7 @@ use crate::dataconnector::ConnectorComponent;
 use crate::dataconnector::DataConnector;
 use crate::dataconnector::DataConnectorError;
 use crate::dataconnector::DataConnectorResult;
-use crate::parameters::ParamLookup;
+use crate::parameters::ExposedParamLookup;
 use crate::parameters::Parameters;
 use async_trait::async_trait;
 use data_components::object::metadata::ObjectStoreMetadataTable;
@@ -41,7 +41,6 @@ use datafusion::execution::config::SessionConfig;
 use datafusion::execution::context::SessionContext;
 use futures::TryStreamExt;
 use object_store::ObjectStore;
-use secrecy::ExposeSecret;
 use snafu::prelude::*;
 use std::any::Any;
 use std::collections::HashSet;
@@ -187,21 +186,23 @@ pub trait ListingTableConnector: DataConnector {
     {
         let mut format = JsonFormat::default();
 
-        if let ParamLookup::Present(comp_as_secret) = params.get("compression") {
-            let compression = comp_as_secret.expose_secret().parse::<FileCompressionType>().boxed().context(crate::dataconnector::InvalidConfigurationSnafu {
+        if let ExposedParamLookup::Present(comp_as_str) = params.get("compression").expose() {
+            let compression = comp_as_str.parse::<FileCompressionType>().boxed().context(crate::dataconnector::InvalidConfigurationSnafu {
                     dataconnector: format!("{self}"),
                     message: format!(
-                        "Invalid JSONL compression_type: {comp_as_secret:?}, supported types are: GZIP, BZIP2, XZ, ZSTD, UNCOMPRESSED"),
+                        "Invalid JSONL compression_type: {comp_as_str}, supported types are: GZIP, BZIP2, XZ, ZSTD, UNCOMPRESSED"),
                     connector_component: ConnectorComponent::from(dataset)
                 })?;
             format = format.with_file_compression_type(compression);
         };
 
-        if let ParamLookup::Present(infer_max_rec_secret) = params.get("schema_infer_max_records") {
-            let schema_infer_max_rec = usize::from_str(infer_max_rec_secret.expose_secret().as_str()).boxed().context(crate::dataconnector::InvalidConfigurationSnafu {
+        if let ExposedParamLookup::Present(infer_max_rec_str) =
+            params.get("schema_infer_max_records").expose()
+        {
+            let schema_infer_max_rec = usize::from_str(infer_max_rec_str).boxed().context(crate::dataconnector::InvalidConfigurationSnafu {
                     dataconnector: format!("{self}"),
                     message: format!(
-                        "JSONL parameter 'schema_infer_max_records' must be an integer, received {infer_max_rec_secret:?}"),
+                        "JSONL parameter 'schema_infer_max_records' must be an integer, not {infer_max_rec_str}"),
                     connector_component: ConnectorComponent::from(dataset)
                 })?;
             format = format.with_schema_infer_max_rec(schema_infer_max_rec);
