@@ -153,7 +153,7 @@ pub trait ListingTableConnector: DataConnector {
                 extension.unwrap_or(".csv".to_string()),
             )),
             (Some("jsonl"), _) | (None, Some("jsonl"))=> Ok((
-                Some(Arc::new(JsonFormat::default())),
+                Some(self.get_jsonl_format(dataset, params)?),
                 extension.unwrap_or(".jsonl".to_string()),
             )),
             (Some("parquet"), _) | (None, Some("parquet"))=> Ok((
