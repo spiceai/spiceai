@@ -59,7 +59,9 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("An issue occurred with Huggingface: {source} "))]
+    #[snafu(display(
+        "When preparing an embedding model, an issue occurred with the Huggingface API: {source} "
+    ))]
     FailedWithHFApi { source: HfApiError },
 
     #[snafu(display("Unsupported source of model: {source}"))]
