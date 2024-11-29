@@ -304,6 +304,8 @@ pub fn transform_stream(
                             prompt_tokens: inner_usage.input_tokens,
                             completion_tokens: inner_usage.output_tokens,
                             total_tokens: inner_usage.input_tokens + inner_usage.output_tokens,
+                            prompt_tokens_details: None,
+                            completion_tokens_details: None,
                         });
                         state.model = Some(model);
                         create_stream_response(

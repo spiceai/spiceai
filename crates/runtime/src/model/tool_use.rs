@@ -29,9 +29,9 @@ use async_openai::types::{
     ChatChoiceStream, ChatCompletionMessageToolCall, ChatCompletionRequestAssistantMessageArgs,
     ChatCompletionRequestMessage, ChatCompletionRequestToolMessageArgs,
     ChatCompletionResponseStream, ChatCompletionTool, ChatCompletionToolChoiceOption,
-    ChatCompletionToolType, CompletionUsage, CreateChatCompletionRequest,
+    ChatCompletionToolType, CompletionTokensDetails, CompletionUsage, CreateChatCompletionRequest,
     CreateChatCompletionResponse, CreateChatCompletionStreamResponse, FinishReason, FunctionCall,
-    FunctionObject,
+    FunctionObject, PromptTokensDetails,
 };
 
 use async_trait::async_trait;
@@ -424,9 +424,62 @@ pub fn combine_usage(
             prompt_tokens: u1.prompt_tokens + u2.prompt_tokens,
             completion_tokens: u1.completion_tokens + u2.completion_tokens,
             total_tokens: u1.total_tokens + u2.total_tokens,
+            prompt_tokens_details: combine_token_details(
+                u1.prompt_tokens_details,
+                u2.prompt_tokens_details,
+            ),
+            completion_tokens_details: combine_completion_details(
+                u1.completion_tokens_details,
+                u2.completion_tokens_details,
+            ),
         }),
         (Some(u1), None) => Some(u1),
         (None, Some(u2)) => Some(u2),
+        (None, None) => None,
+    }
+}
+fn combine_token_details(
+    a: Option<PromptTokensDetails>,
+    b: Option<PromptTokensDetails>,
+) -> Option<PromptTokensDetails> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(PromptTokensDetails {
+            audio_tokens: combine_opt_u32(a.audio_tokens, b.audio_tokens),
+            cached_tokens: combine_opt_u32(a.cached_tokens, b.cached_tokens),
+        }),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
+}
+
+fn combine_completion_details(
+    a: Option<CompletionTokensDetails>,
+    b: Option<CompletionTokensDetails>,
+) -> Option<CompletionTokensDetails> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(CompletionTokensDetails {
+            accepted_prediction_tokens: combine_opt_u32(
+                a.accepted_prediction_tokens,
+                b.accepted_prediction_tokens,
+            ),
+            audio_tokens: combine_opt_u32(a.audio_tokens, b.audio_tokens),
+            reasoning_tokens: combine_opt_u32(a.reasoning_tokens, b.reasoning_tokens),
+            rejected_prediction_tokens: combine_opt_u32(
+                a.rejected_prediction_tokens,
+                b.rejected_prediction_tokens,
+            ),
+        }),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
+}
+fn combine_opt_u32(a: Option<u32>, b: Option<u32>) -> Option<u32> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a + b),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
         (None, None) => None,
     }
 }
