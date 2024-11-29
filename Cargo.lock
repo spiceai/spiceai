@@ -10819,7 +10819,7 @@ dependencies = [
 [[package]]
 name = "text-splitter"
 version = "0.18.1"
-source = "git+https://github.com/Jeadie/text-splitter.git?rev=b33e4748576b9a81d436d3f28a6706f860fc45ba#b33e4748576b9a81d436d3f28a6706f860fc45ba"
+source = "git+https://github.com/spiceai/text-splitter.git?rev=b33e4748576b9a81d436d3f28a6706f860fc45ba#b33e4748576b9a81d436d3f28a6706f860fc45ba"
 dependencies = [
  "ahash 0.8.11",
  "auto_enums",
