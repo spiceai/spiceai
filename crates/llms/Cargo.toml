@@ -33,7 +33,7 @@ tracing.workspace = true
 tracing-futures.workspace = true
 
 ## For Chunking
-text-splitter = { git = "https://github.com/Jeadie/text-splitter.git", rev = "b33e4748576b9a81d436d3f28a6706f860fc45ba", features = [
+text-splitter = { git = "https://github.com/spiceai/text-splitter.git", rev = "b33e4748576b9a81d436d3f28a6706f860fc45ba", features = [
     "markdown",
     "tokenizers",
     "tiktoken-rs",
