@@ -38,7 +38,7 @@ pub trait SqlGeneration: Sync + Send {
 #[must_use]
 pub fn create_prompt(query: &str) -> String {
     format!(
-        r#"Task: Write a SQL query to answer this question: _\"{query}\"_. Instruction: Return only valid SQL code, nothing additional. Columns with capitals must be quoted. For tables with schemas and catalogs '"catalog"."schema"."table"' not '"catalog.schema.table"'."#
+        r#"Task: Write a SQL query to answer this question: _\"{query}\"_. Instruction: Return only valid SQL code, nothing additional, don't wrap it in ```. Columns with capitals must be quoted. For tables with schemas and catalogs '"catalog"."schema"."table"' not '"catalog.schema.table"'."#
     )
 }
 
