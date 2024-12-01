@@ -150,12 +150,11 @@ impl TeiEmbed {
         } else {
             // Some models will have `sentence_*_config.json` file defining a specific `max_seq_length`.
             match max_seq_length_from_st_config(root) {
-                Ok(Some(max_seq_length)) => max_seq_length,
+                Ok(max_seq_length_opt) => max_seq_length_opt.unwrap_or(config.max_position_embeddings - position_offset),
                 Err(e) => {
                     tracing::warn!("Failed to load max_seq_length from ST config: {e}");
                     config.max_position_embeddings - position_offset
                 }
-                _ => config.max_position_embeddings - position_offset,
             }
         };
 
