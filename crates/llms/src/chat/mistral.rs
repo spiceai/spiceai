@@ -157,6 +157,7 @@ impl MistralLlama {
             None,
             None,
             None,
+            None,
         ))
     }
 
@@ -370,6 +371,7 @@ impl MistralLlama {
             tools,
             tool_choice,
             logits_processors: None,
+            return_raw_logits: false,
         })
     }
 
@@ -617,7 +619,10 @@ fn stream_from_response(
                     // Only reacable if `stream=false`.
                     unreachable!()
                 },
-            }
+                MistralResponse::Raw{..} => {
+                    unreachable!("We set `return_raw_logits: false`")
+                }
+             }
         }
     })
 }

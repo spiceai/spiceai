@@ -20,7 +20,7 @@ members = [
     "crates/telemetry",
     "crates/util",
     "tools/flightpublisher/",
-    "tools/flightsubscriber/",  
+    "tools/flightsubscriber/",
     "tools/otelpublisher/",
     "tools/spicepodschema/",
 ]
@@ -47,7 +47,7 @@ arrow-ipc = "53"
 arrow-json = { git = "https://github.com/spiceai/arrow-rs.git", rev = "63d05723107d6dc5f08acc5461417ee42937adcc" }
 arrow-odbc = "11.2.0"
 arrow-schema = "53"
-async-openai = { git = "https://github.com/spiceai/async-openai", rev = "c01795447374ab8608682955a2fe91216bfd9db6" }
+async-openai = { git = "https://github.com/spiceai/async-openai", rev = "eb10e6ae191f5be102ef68cb3bb54bb482511bbd" }
 async-stream = "0.3.5"
 async-trait = "0.1.83"
 axum = { version = "0.7.9", features = ["macros"] }
@@ -99,8 +99,8 @@ opentelemetry_sdk = { version = "0.26", default-features = false, features = [
 parquet = "53"
 pem = "3.0.4"
 percent-encoding = "2.3.1"
-prometheus = "0.13"
 pin-project = "1.0"
+prometheus = "0.13"
 r2d2 = "0.8.10"
 regex = "1.10.3"
 reqwest = { version = "0.12.5", features = ["json", "rustls-tls"] }
@@ -142,8 +142,8 @@ x509-certificate = "0.23.1"
 [patch.crates-io]
 datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "2b93a308f65df1ae0cd8f3f8194b9b60201a500f" }
 datafusion-common = { git = "https://github.com/spiceai/datafusion.git", rev = "2b93a308f65df1ae0cd8f3f8194b9b60201a500f" }
-datafusion-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "2b93a308f65df1ae0cd8f3f8194b9b60201a500f" }
 datafusion-execution = { git = "https://github.com/spiceai/datafusion.git", rev = "2b93a308f65df1ae0cd8f3f8194b9b60201a500f" }
+datafusion-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "2b93a308f65df1ae0cd8f3f8194b9b60201a500f" }
 
 
 object_store = { git = "https://github.com/spiceai/arrow-rs.git", rev = "1f37d9eda6da17b7644115f82d209c00c9566733" }

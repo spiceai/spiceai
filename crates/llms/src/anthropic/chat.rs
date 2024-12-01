@@ -92,6 +92,8 @@ impl TryFrom<MessageCreateResponse> for CreateChatCompletionResponse {
                 prompt_tokens: value.usage.input_tokens,
                 completion_tokens: value.usage.output_tokens,
                 total_tokens: value.usage.input_tokens + value.usage.output_tokens,
+                prompt_tokens_details: None,
+                completion_tokens_details: None,
             }),
             created: SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
