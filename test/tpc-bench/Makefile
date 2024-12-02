@@ -214,3 +214,28 @@ pg-tpcds-load:
 		psql -h $(DB_HOST) -p $(DB_PORT) -U $(DB_USER) $(DB_NAME) -c "\\copy $$table FROM './tmp/$$table.dat' CSV DELIMITER '|';"; \
 	done
 	@echo "Benchmark dataset has been successfully loaded to '$(DB_NAME)' database."
+
+file-tpch-init:
+	@rm -rf ./tmp
+	@mkdir -p ./tmp
+	@for table in region nation customer supplier part partsupp orders lineitem; do \
+		echo "Preparing $$table..."; \
+		cp tpch-kit/dbgen/$$table.tbl ./tmp/$$table.csv; \
+		python ./tpch_file.py ./tmp/$$table; \
+		rm ./tmp/$$table.csv; \
+	done
+
+file-tpch-load:
+	@mkdir -p ./file-tpch-spicepod
+	@for table in region nation customer supplier part partsupp orders lineitem; do \
+		echo "Loading $$table..."; \
+		cp ./tmp/$$table.parquet ./file-tpch-spicepod/$$table.parquet; \
+	done
+	@echo "version: v1beta1" >> ./file-tpch-spicepod/spicepod.yaml
+	@echo "kind: Spicepod" >> ./file-tpch-spicepod/spicepod.yaml
+	@echo "name: file" >> ./file-tpch-spicepod/spicepod.yaml
+	@echo "datasets:" >> ./file-tpch-spicepod/spicepod.yaml
+	@for table in region nation customer supplier part partsupp orders lineitem; do \
+		echo "  - name: $$table" >> ./file-tpch-spicepod/spicepod.yaml; \
+		echo "    path: file:./$$table.parquet" >> ./file-tpch-spicepod/spicepod.yaml; \
+	done
