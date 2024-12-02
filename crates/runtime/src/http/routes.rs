@@ -146,6 +146,7 @@ async fn track_metrics(
     labels.extend(request_dimensions.into_iter());
 
     metrics::REQUESTS_TOTAL.add(1, &labels);
+    metrics::REQUESTS.add(1, &labels);
     metrics::REQUESTS_DURATION_MS.record(latency_ms, &labels);
 
     response
