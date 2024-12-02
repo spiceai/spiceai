@@ -6316,7 +6316,7 @@ dependencies = [
  "text-embeddings-core",
  "text-splitter",
  "tiktoken-rs",
- "tokenizers",
+ "tokenizers 0.21.0",
  "tokio",
  "tracing",
  "tracing-futures",
@@ -6761,7 +6761,7 @@ dependencies = [
  "strum 0.26.3",
  "sysinfo",
  "thiserror 1.0.68",
- "tokenizers",
+ "tokenizers 0.20.4",
  "tokio",
  "tokio-rayon",
  "toml",
@@ -10787,7 +10787,7 @@ dependencies = [
  "serde_json",
  "text-embeddings-backend-core",
  "thiserror 1.0.68",
- "tokenizers",
+ "tokenizers 0.20.4",
  "tracing",
 ]
 
@@ -10811,7 +10811,7 @@ dependencies = [
  "serde_json",
  "text-embeddings-backend",
  "thiserror 1.0.68",
- "tokenizers",
+ "tokenizers 0.20.4",
  "tokio",
  "tracing",
 ]
@@ -10831,7 +10831,7 @@ dependencies = [
  "strum 0.26.3",
  "thiserror 2.0.3",
  "tiktoken-rs",
- "tokenizers",
+ "tokenizers 0.20.4",
  "unicode-segmentation",
 ]
 
@@ -11021,9 +11021,41 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "tokenizers"
-version = "0.20.3"
+version = "0.20.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "67b67c92f6d705e2a1d106fb0b28c696f9074901a9c656ee5d9f5de204c39bf7"
+checksum = "3b08cc37428a476fc9e20ac850132a513a2e1ce32b6a31addf2b74fa7033b905"
+dependencies = [
+ "aho-corasick",
+ "derive_builder",
+ "esaxx-rs",
+ "getrandom 0.2.15",
+ "indicatif",
+ "itertools 0.12.1",
+ "lazy_static",
+ "log",
+ "macro_rules_attribute",
+ "monostate",
+ "onig",
+ "paste",
+ "rand 0.8.5",
+ "rayon",
+ "rayon-cond",
+ "regex",
+ "regex-syntax 0.8.5",
+ "serde",
+ "serde_json",
+ "spm_precompiled",
+ "thiserror 1.0.68",
+ "unicode-normalization-alignments",
+ "unicode-segmentation",
+ "unicode_categories",
+]
+
+[[package]]
+name = "tokenizers"
+version = "0.21.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9ecededfed68a69bc657e486510089e255e53c3d38cc7d4d59c8742668ca2cae"
 dependencies = [
  "aho-corasick",
  "derive_builder",

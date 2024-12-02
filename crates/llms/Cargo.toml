@@ -27,7 +27,7 @@ schemars = "0.8.19"
 secrecy.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
-tokenizers = { version = "0.20.0" }
+tokenizers = { version = "0.21.0" }
 tokio.workspace = true
 tracing.workspace = true
 tracing-futures.workspace = true
