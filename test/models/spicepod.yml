@@ -40,7 +40,7 @@ datasets:
       file_format: parquet
     acceleration:
       enabled: true
-      refresh_sql: SELECT * FROM catalog_page limit 1;
+      refresh_sql: SELECT * FROM catalog_page limit 20;
     embeddings:
       - column: cp_description
         column_pk:

@@ -8,10 +8,10 @@ expression: normalize_search_response(response)
     {
       "dataset": "catalog_page_with_chunking",
       "primary_key": {
-        "cp_catalog_page_sk": 13
+        "cp_catalog_page_sk": 1
       },
       "score": "score_val",
-      "value": "Respects might appear early, long metres. Cases would understan"
+      "value": "In general basic characters welcome. Clearly lively friends con"
     }
   ]
 }
