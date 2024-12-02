@@ -41,7 +41,7 @@ use crate::{
         create_api_bindings_config, get_taxi_trips_dataset, get_tpcds_dataset,
         normalize_chat_completion_response, normalize_embeddings_response,
         normalize_search_response, send_chat_completions_request, send_embeddings_request,
-        send_nsql_request, send_search_request,
+        send_search_request,
     },
     utils::{runtime_ready_check, test_request_context},
 };
@@ -183,33 +183,28 @@ mod nsql {
                             "sample_data_enabled": true,
                         }),
                     },
+                    TestCase {
+                        name: "hf_invalid_model_name",
+                        body: json!({
+                            "query": "how many records (as 'total_records') are in taxi_trips dataset?",
+                            "model": "model_not_in_spice",
+                            "sample_data_enabled": false,
+                        }),
+                    },
+                    TestCase {
+                        name: "hf_invalid_dataset_name",
+                        body: json!({
+                            "query": "how many records (as 'total_records') are in taxi_trips dataset?",
+                            "model": "hf_model",
+                            "datasets": ["dataset_not_in_spice"],
+                            "sample_data_enabled": false,
+                        }),
+                    },
                 ];
 
                 for ts in test_cases {
                     run_nsql_test(http_base_url.as_str(), &ts, &trace_provider).await?;
                 }
-
-                tracing::info!("/v1/nsql: Ensure error when invalid dataset name is provided");
-                assert!(send_nsql_request(
-                    http_base_url.as_str(),
-                    "how many records in taxi_trips dataset?",
-                    Some("hf_model"),
-                    Some(false),
-                    Some(vec!["dataset_not_in_spice".to_string()]),
-                )
-                .await
-                .is_err());
-
-                tracing::info!("/v1/nsql: Ensure error when invalid model name is provided");
-                assert!(send_nsql_request(
-                    http_base_url.as_str(),
-                    "how many records in taxi_trips dataset?",
-                    Some("model_not_in_spice"),
-                    Some(false),
-                    None,
-                )
-                .await
-                .is_err());
 
                 Ok(())
             })

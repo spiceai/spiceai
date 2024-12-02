@@ -63,13 +63,20 @@ mod nsql {
         let mut headers = HeaderMap::new();
         headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        let response = http_post(
+        let response = match http_post(
             format!("{base_url}/v1/nsql").as_str(),
             &ts.body.to_string(),
             headers,
         )
         .await
-        .map_err(|e| anyhow::anyhow!("Failed to execute HTTP POST: {}", e))?;
+        {
+            Ok(response) => response,
+            Err(e) => {
+                tracing::error!("run_nsql_test error: {:?}", e);
+                insta::assert_snapshot!(format!("{}_error", ts.name), e.to_string());
+                return Ok(());
+            }
+        };
         insta::assert_snapshot!(format!("{}_response", ts.name), &response);
 
         // ensure all spans are exported into task_history
@@ -161,39 +168,6 @@ fn get_tpcds_dataset(ds_name: &str) -> Dataset {
         ..Default::default()
     });
     dataset
-}
-
-async fn send_nsql_request(
-    base_url: &str,
-    query: &str,
-    model: Option<&str>,
-    sample_data_enabled: Option<bool>,
-    datasets: Option<Vec<String>>,
-) -> Result<Value, reqwest::Error> {
-    let mut request_body = json!({
-        "query": query,
-    });
-
-    if let Some(m) = model {
-        request_body["model"] = json!(m);
-    }
-    if let Some(sde) = sample_data_enabled {
-        request_body["sample_data_enabled"] = json!(sde);
-    }
-    if let Some(ds) = datasets {
-        request_body["datasets"] = json!(ds);
-    }
-    let response = Client::new()
-        .post(format!("{base_url}/v1/nsql"))
-        .header("Content-Type", "application/json")
-        .json(&request_body)
-        .send()
-        .await?
-        .error_for_status()?
-        .json::<Value>()
-        .await?;
-
-    Ok(response)
 }
 
 async fn send_search_request(
@@ -388,23 +362,28 @@ async fn send_chat_completions_request(
 }
 
 /// Generic function to send a POST request, returning the response as a String.
-async fn http_post(
-    url: &str,
-    body: &str,
-    headers: HeaderMap,
-) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    Client::new()
+pub async fn http_post(url: &str, body: &str, headers: HeaderMap) -> Result<String, anyhow::Error> {
+    let response = Client::new()
         .post(url)
         .headers(headers)
         .body(body.to_string())
         .send()
         .await
-        .boxed()?
-        .error_for_status()
-        .boxed()?
+        .map_err(|e| anyhow::anyhow!("Request error: {e}"))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let message = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "No error message".to_string());
+        return Err(anyhow::anyhow!("HTTP error: {status} - {message}"));
+    }
+
+    response
         .text()
         .await
-        .boxed()
+        .map_err(|e| anyhow::anyhow!("Error reading response body: {e}")) // Map body read error to anyhow
 }
 
 /// Returns a human-readable representation of the SQL query result against a [`Runtime`].
