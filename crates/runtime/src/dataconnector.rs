@@ -79,6 +79,8 @@ pub mod mssql;
 pub mod mysql;
 #[cfg(feature = "odbc")]
 pub mod odbc;
+pub const ODBC_DATACONNECTOR: &str = "odbc"; // const needs to be accessible when ODBC isn't built
+
 #[cfg(feature = "postgres")]
 pub mod postgres;
 pub mod s3;
@@ -222,6 +224,12 @@ pub enum DataConnectorError {
         "Failed to load the {connector_component} ({dataconnector}).\nInvalid type action is not supported for the {dataconnector} Data Connector.\nRemove the parameter from your dataset configuration."
     ))]
     UnsupportedInvalidTypeAction {
+        dataconnector: String,
+        connector_component: ConnectorComponent,
+    },
+
+    #[snafu(display("Cannot setup the {connector_component} ({dataconnector}).\nThe Runtime is running without ODBC support.\nBuild Spice with the `odbc` feature, or use the docker image with ODBC support.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/odbc"))]
+    OdbcNotInstalled {
         dataconnector: String,
         connector_component: ConnectorComponent,
     },
@@ -546,10 +554,21 @@ impl DataConnectorParamsBuilder {
 
         let connector_factory = guard.get(&name);
 
-        let factory = connector_factory.ok_or(DataConnectorError::InvalidConnectorType {
-            dataconnector: name.clone(),
-            connector_component: self.component.clone(),
-        })?;
+        let factory = connector_factory.ok_or_else(|| {
+            if name == ODBC_DATACONNECTOR {
+                DataConnectorError::OdbcNotInstalled {
+                    dataconnector: name.clone(),
+                    connector_component: self.component.clone(),
+                }
+            } else {
+                DataConnectorError::InvalidConnectorType {
+                    dataconnector: name.clone(),
+                    connector_component: self.component.clone(),
+                }
+            }
+        });
+
+        let factory = factory?;
 
         let parameters = Parameters::try_new(
             &format!("connector {name}"),

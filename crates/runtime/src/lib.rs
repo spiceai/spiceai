@@ -134,6 +134,9 @@ pub enum Error {
     #[snafu(display("Unknown data connector: {data_connector}"))]
     UnknownDataConnector { data_connector: String },
 
+    #[snafu(display("The Runtime is running without ODBC support.\nBuild Spice with the `odbc` feature, or use the docker image with ODBC support.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/odbc"))]
+    OdbcNotInstalled,
+
     #[snafu(display("Unable to load secrets for data connector: {data_connector}"))]
     UnableToLoadDataConnectorSecrets { data_connector: String },
 

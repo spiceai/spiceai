@@ -24,6 +24,7 @@ use crate::{
         self,
         localpod::{LocalPodConnector, LOCALPOD_DATACONNECTOR},
         ConnectorComponent, DataConnector, DataConnectorParams, DataConnectorParamsBuilder,
+        ODBC_DATACONNECTOR,
     },
     embeddings::connector::EmbeddingConnector,
     federated_table::FederatedTable,
@@ -31,7 +32,7 @@ use crate::{
     tracing_util::dataset_registered_trace,
     warn_spaced, AcceleratedReadWriteTableWithoutReplicationSnafu,
     AcceleratedTableInvalidChangesSnafu, AcceleratorEngineNotAvailableSnafu,
-    AcceleratorInitializationFailedSnafu, Error, LogErrors, Result, Runtime,
+    AcceleratorInitializationFailedSnafu, Error, LogErrors, OdbcNotInstalledSnafu, Result, Runtime,
     UnableToAttachDataConnectorSnafu, UnableToCreateAcceleratedTableSnafu,
     UnableToInitializeDataConnectorSnafu, UnableToLoadDatasetConnectorSnafu,
     UnableToReceiveAcceleratedTableStatusSnafu, UnknownDataConnectorSnafu,
@@ -500,10 +501,16 @@ impl Runtime {
 
         match dataconnector::create_new_connector(source, params).await {
             Some(dc) => dc.context(UnableToInitializeDataConnectorSnafu {}),
-            None => UnknownDataConnectorSnafu {
-                data_connector: source,
+            None => {
+                if source == ODBC_DATACONNECTOR {
+                    OdbcNotInstalledSnafu.fail()
+                } else {
+                    UnknownDataConnectorSnafu {
+                        data_connector: source,
+                    }
+                    .fail()
+                }
             }
-            .fail(),
         }
     }
 
