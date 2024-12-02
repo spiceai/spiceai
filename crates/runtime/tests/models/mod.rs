@@ -188,10 +188,10 @@ fn get_taxi_trips_dataset() -> Dataset {
     dataset
 }
 
-fn get_tpcds_dataset(ds_name: &str) -> Dataset {
+fn get_tpcds_dataset(ds_name: &str, spice_name: Option<&str>) -> Dataset {
     let mut dataset = Dataset::new(
         format!("s3://spiceai-public-datasets/tpcds/{ds_name}/"),
-        ds_name,
+        spice_name.unwrap_or(ds_name),
     );
     dataset.params = Some(Params::from_string_map(
         vec![
@@ -203,7 +203,10 @@ fn get_tpcds_dataset(ds_name: &str) -> Dataset {
     ));
     dataset.acceleration = Some(Acceleration {
         enabled: true,
-        refresh_sql: Some(format!("SELECT * FROM {ds_name} LIMIT 20")),
+        refresh_sql: Some(format!(
+            "SELECT * FROM {} LIMIT 20",
+            spice_name.unwrap_or(ds_name)
+        )),
         ..Default::default()
     });
     dataset

@@ -154,6 +154,7 @@ mod nsql {
 
 mod search {
     use serde_json::json;
+    use spicepod::component::embeddings::EmbeddingChunkConfig;
 
     use crate::models::search::{run_search_test, TestCase};
 
@@ -165,7 +166,7 @@ mod search {
 
         test_request_context()
             .scope(async {
-                let mut ds_tpcds_item = get_tpcds_dataset("item");
+                let mut ds_tpcds_item = get_tpcds_dataset("item", None);
                 ds_tpcds_item.embeddings = vec![ColumnEmbeddingConfig {
                     column: "i_item_desc".to_string(),
                     model: "hf_minilm".to_string(),
@@ -173,8 +174,23 @@ mod search {
                     chunking: None,
                 }];
 
+                let mut ds_tpcds_cp_with_chunking =
+                    get_tpcds_dataset("catalog_page", Some("catalog_page_with_chunking"));
+                ds_tpcds_cp_with_chunking.embeddings = vec![ColumnEmbeddingConfig {
+                    column: "cp_description".to_string(),
+                    model: "hf_minilm".to_string(),
+                    primary_keys: Some(vec!["cp_catalog_page_sk".to_string()]),
+                    chunking: Some(EmbeddingChunkConfig {
+                        enabled: true,
+                        target_chunk_size: 512,
+                        overlap_size: 128,
+                        trim_whitespace: false,
+                    }),
+                }];
+
                 let app = AppBuilder::new("text-to-sql")
                     .with_dataset(ds_tpcds_item)
+                    .with_dataset(ds_tpcds_cp_with_chunking)
                     .with_embedding(get_huggingface_embeddings(
                         "sentence-transformers/all-MiniLM-L6-v2",
                         "hf_minilm",
@@ -216,6 +232,14 @@ mod search {
                         body: json!({
                             "text": "new patient",
                             "limit": 2,
+                        }),
+                    },
+                    TestCase {
+                        name: "hf_chunking",
+                        body: json!({
+                            "text": "friends",
+                            "datasets": ["catalog_page_with_chunking"],
+                            "limit": 1,
                         }),
                     },
                 ];
