@@ -498,6 +498,7 @@ impl VectorSearch {
                     )
                 )
                 WHERE chunk_rank = 1
+                ORDER by dist ASC
                 LIMIT {n}
             )
             SELECT
