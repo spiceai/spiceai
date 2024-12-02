@@ -39,6 +39,7 @@ mod docker;
 mod duckdb;
 mod endpoint_auth;
 mod federation;
+mod file;
 mod github;
 mod graphql;
 #[cfg(feature = "mysql")]
