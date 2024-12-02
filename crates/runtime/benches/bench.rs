@@ -244,7 +244,7 @@ async fn run_connector_bench(
         }
         #[cfg(feature = "delta_lake")]
         "delta_lake" => {
-            bench_delta::run(&mut rt, &mut benchmark_results).await?;
+            bench_delta::run(&mut rt, &mut benchmark_results, bench_name).await?;
         }
         _ => {}
     }

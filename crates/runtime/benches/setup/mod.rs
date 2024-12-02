@@ -167,7 +167,7 @@ fn build_app(
         #[cfg(feature = "odbc")]
         "odbc-athena" => Ok(crate::bench_odbc_athena::build_app(app_builder)),
         #[cfg(feature = "delta_lake")]
-        "delta_lake" => Ok(crate::bench_delta::build_app(app_builder)),
+        "delta_lake" => crate::bench_delta::build_app(app_builder, bench_name),
         _ => Err(format!("Unknown connector: {connector}")),
     }?;
 
