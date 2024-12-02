@@ -34,6 +34,7 @@ on:
           - ''
           - 'spice.ai connector'
           - 's3 connector'
+          - 'file connector'
           - 'abfs connector'
           - 'spark connector'
           - 'postgres connector'
