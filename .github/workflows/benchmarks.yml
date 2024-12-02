@@ -168,7 +168,7 @@ jobs:
           - cmd: '-c s3'
             name: 's3 connector'
             bench: 'tpch'
-          - cmd: '-c s3'
+          - cmd: '-c file'
             name: 'file connector'
             bench: 'tpch'
           - cmd: '-c s3 -b tpcds'
