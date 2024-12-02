@@ -46,6 +46,7 @@ mod tests {
     const TEST_PARAMETERS: &[ParameterSpec] = &[
         ParameterSpec::runtime("file_extension"),
         ParameterSpec::runtime("file_format"),
+        ParameterSpec::runtime("schema_infer_max_records"),
         ParameterSpec::runtime("csv_has_header"),
         ParameterSpec::runtime("csv_quote"),
         ParameterSpec::runtime("csv_escape"),
