@@ -56,6 +56,11 @@ jobs:
               }
             ];
 
+            if (context.eventName === 'workflow_dispatch') {
+              console.log(context)
+              return matrix.slice(0, 3);
+            }
+
             return context.eventName === 'pull_request' ? matrix.slice(0, 3) : matrix;
 
   build:
