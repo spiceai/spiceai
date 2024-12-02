@@ -228,9 +228,8 @@ pub enum DataConnectorError {
         connector_component: ConnectorComponent,
     },
 
-    #[snafu(display("Cannot setup the {connector_component} ({dataconnector}).\nThe Runtime is running without ODBC support.\nBuild Spice with the `odbc` feature, or use the docker image with ODBC support.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/odbc"))]
+    #[snafu(display("Cannot setup the {connector_component} (odbc).\nThe Runtime is running without ODBC support.\nBuild Spice with the `odbc` feature, or use the docker image with ODBC support.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/odbc"))]
     OdbcNotInstalled {
-        dataconnector: String,
         connector_component: ConnectorComponent,
     },
 }
@@ -557,7 +556,6 @@ impl DataConnectorParamsBuilder {
         let factory = connector_factory.ok_or_else(|| {
             if name == ODBC_DATACONNECTOR {
                 DataConnectorError::OdbcNotInstalled {
-                    dataconnector: name.clone(),
                     connector_component: self.component.clone(),
                 }
             } else {
