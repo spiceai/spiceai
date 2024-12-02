@@ -21,8 +21,8 @@ use crate::{
     init_tracing, init_tracing_with_task_history,
     models::{
         create_api_bindings_config, get_params_with_secrets, get_taxi_trips_dataset,
-        get_tpcds_dataset, http_post, normalize_chat_completion_response,
-        normalize_embeddings_response, normalize_search_response, send_chat_completions_request,
+        get_tpcds_dataset, normalize_chat_completion_response, normalize_embeddings_response,
+        send_chat_completions_request,
     },
     utils::{runtime_ready_check, test_request_context, verify_env_secret_exists},
 };
@@ -125,36 +125,9 @@ mod nsql {
 
 #[allow(clippy::expect_used)]
 mod search {
+    use crate::models::{search::run_search_test, search::TestCase};
+
     use super::*;
-    struct TestCase {
-        name: &'static str,
-        body: serde_json::Value,
-    }
-
-    async fn run_search_test(base_url: &str, ts: &TestCase) -> Result<(), anyhow::Error> {
-        tracing::info!("Running test cases {}", ts.name);
-
-        // Call /v1/search, check response
-        let mut headers = HeaderMap::new();
-        headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        let response_str = http_post(
-            &format!("{base_url}/v1/search").to_string(),
-            &ts.body.to_string(),
-            headers,
-        )
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to execute HTTP POST: {}", e))?;
-
-        let response = serde_json::from_str(&response_str)
-            .map_err(|e| anyhow::anyhow!("Failed to parse HTTP response: {}", e))?;
-
-        insta::assert_snapshot!(
-            format!("{}_response", ts.name),
-            normalize_search_response(response)
-        );
-        Ok(())
-    }
 
     #[tokio::test]
     async fn openai_test_search() -> Result<(), anyhow::Error> {
@@ -207,7 +180,7 @@ mod search {
 
                 let test_cases = [
                     TestCase {
-                        name: "basic",
+                        name: "openai_basic",
                         body: json!({
                             "text": "new patient",
                             "limit": 2,
@@ -216,7 +189,7 @@ mod search {
                         }),
                     },
                     TestCase {
-                        name: "all_datasets",
+                        name: "openai_all_datasets",
                         body: json!({
                             "text": "new patient",
                             "limit": 2,

@@ -110,6 +110,42 @@ mod nsql {
     }
 }
 
+mod search {
+    use http::{header::{ACCEPT, CONTENT_TYPE}, HeaderMap, HeaderValue};
+
+    use crate::models::{http_post, normalize_search_response};
+
+    pub struct TestCase {
+        pub name: &'static str,
+        pub body: serde_json::Value,
+    }
+
+    pub async fn run_search_test(base_url: &str, ts: &TestCase) -> Result<(), anyhow::Error> {
+        tracing::info!("Running test cases {}", ts.name);
+
+        // Call /v1/search, check response
+        let mut headers = HeaderMap::new();
+        headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        let response_str = http_post(
+            &format!("{base_url}/v1/search").to_string(),
+            &ts.body.to_string(),
+            headers,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to execute HTTP POST: {}", e))?;
+
+        let response = serde_json::from_str(&response_str)
+            .map_err(|e| anyhow::anyhow!("Failed to parse HTTP response: {}", e))?;
+
+        insta::assert_snapshot!(
+            format!("{}_response", ts.name),
+            normalize_search_response(response)
+        );
+        Ok(())
+    }
+}
+
 fn create_api_bindings_config() -> Config {
     let mut rng = rand::thread_rng();
     let http_port: u16 = rng.gen_range(50000..60000);
