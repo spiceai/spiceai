@@ -186,7 +186,9 @@ pub trait ListingTableConnector: DataConnector {
     {
         let mut format = JsonFormat::default();
 
-        if let ExposedParamLookup::Present(comp_as_str) = params.get("compression").expose() {
+        if let ExposedParamLookup::Present(comp_as_str) =
+            params.get("file_compression_type").expose()
+        {
             let compression = comp_as_str.parse::<FileCompressionType>().boxed().context(crate::dataconnector::InvalidConfigurationSnafu {
                     dataconnector: format!("{self}"),
                     message: format!(
@@ -235,9 +237,10 @@ pub trait ListingTableConnector: DataConnector {
             .ok()
             .and_then(|f| f.as_bytes().first().copied());
         let schema_infer_max_rec = params
-            .get("csv_schema_infer_max_records")
+            .get("schema_infer_max_records")
             .expose()
             .ok()
+            .or(params.get("csv_schema_infer_max_records").expose().ok()) // For backwards compatibility
             .map_or_else(|| 1000, |f| usize::from_str(f).map_or(1000, |f| f));
         let delimiter = params
             .get("csv_delimiter")
@@ -609,6 +612,7 @@ mod tests {
     const TEST_PARAMETERS: &[ParameterSpec] = &[
         ParameterSpec::runtime("file_extension"),
         ParameterSpec::runtime("file_format"),
+        ParameterSpec::runtime("schema_infer_max_records"),
         ParameterSpec::runtime("csv_has_header"),
         ParameterSpec::runtime("csv_quote"),
         ParameterSpec::runtime("csv_escape"),
