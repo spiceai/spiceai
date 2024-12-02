@@ -25,23 +25,19 @@ use crate::{
     ValidateFn,
 };
 
-pub fn get_dataset() -> Dataset {
+pub fn get_dataset() -> Result<Dataset, anyhow::Error> {
     // if tests are running with `cargo test --package runtime`, this path is relative to the `runtime` crate
     // if tests are running as a built binary, this path is relative to the binary.
     // in binary mode, we expect to be running in the root of the project
-    let file_path = if std::fs::exists("./tests/file/datatypes.parquet")
-        .expect("should check if file exists")
-    {
+    let file_path = if std::fs::exists("./tests/file/datatypes.parquet")? {
         "./tests/file/datatypes.parquet"
-    } else if std::fs::exists("./crates/runtime/tests/file/datatypes.parquet")
-        .expect("should check if file exists")
-    {
+    } else if std::fs::exists("./crates/runtime/tests/file/datatypes.parquet")? {
         "./crates/runtime/tests/file/datatypes.parquet"
     } else {
-        panic!("Could not find datatypes.parquet file");
+        return Err(anyhow::anyhow!("Could not find datatypes.parquet file"));
     };
 
-    Dataset::new(format!("file:{file_path}"), "datatypes")
+    Ok(Dataset::new(format!("file:{file_path}"), "datatypes"))
 }
 
 #[tokio::test]
@@ -52,7 +48,7 @@ async fn file_connector_datatypes() -> Result<(), anyhow::Error> {
     test_request_context()
         .scope(async {
             let app = AppBuilder::new("file_connector")
-                .with_dataset(get_dataset())
+                .with_dataset(get_dataset()?)
                 .build();
 
             let status = status::RuntimeStatus::new();
