@@ -1,0 +1,5 @@
+---
+source: crates/runtime/tests/models/mod.rs
+expression: e.to_string()
+---
+HTTP error: 500 Internal Server Error - invalid args: Unable to get table: Error during planning: No table named 'dataset_not_in_spice'

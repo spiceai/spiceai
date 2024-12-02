@@ -1,0 +1,33 @@
+---
+source: crates/runtime/tests/models/hf.rs
+expression: normalize_search_response(response)
+---
+{
+  "duration_ms": "duration_ms_val",
+  "matches": [
+    {
+      "dataset": "item",
+      "metadata": {
+        "i_color": "smoke",
+        "i_item_id": "AAAAAAAADBAAAAAA"
+      },
+      "primary_key": {
+        "i_item_sk": 19
+      },
+      "score": "score_val",
+      "value": "Patient"
+    },
+    {
+      "dataset": "item",
+      "metadata": {
+        "i_color": "spring",
+        "i_item_id": "AAAAAAAAHAAAAAAA"
+      },
+      "primary_key": {
+        "i_item_sk": 7
+      },
+      "score": "score_val",
+      "value": "New"
+    }
+  ]
+}

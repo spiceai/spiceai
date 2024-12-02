@@ -14,9 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use arrow::{array::StringArray, util::pretty::pretty_format_batches};
+use arrow::util::pretty::pretty_format_batches;
 use async_openai::types::EmbeddingInput;
-use chrono::{DateTime, Utc};
 use futures::TryStreamExt;
 use rand::Rng;
 use reqwest::{header::HeaderMap, Client};
@@ -36,6 +35,80 @@ use std::{
 use serde_json::{json, Value};
 mod hf;
 mod openai;
+
+mod nsql {
+    use chrono::{DateTime, Utc};
+    use http::{
+        header::{ACCEPT, CONTENT_TYPE},
+        HeaderMap, HeaderValue,
+    };
+    use opentelemetry_sdk::trace::TracerProvider;
+
+    use crate::models::http_post;
+
+    pub struct TestCase {
+        pub name: &'static str,
+        pub body: serde_json::Value,
+    }
+
+    pub async fn run_nsql_test(
+        base_url: &str,
+        ts: &TestCase,
+        trace_provider: &TracerProvider,
+    ) -> Result<(), anyhow::Error> {
+        tracing::info!("Running test cases {}", ts.name);
+        let task_start_time = std::time::SystemTime::now();
+
+        // Call /v1/nsql, check response
+        let mut headers = HeaderMap::new();
+        headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        let response = match http_post(
+            format!("{base_url}/v1/nsql").as_str(),
+            &ts.body.to_string(),
+            headers,
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(e) => {
+                tracing::error!("run_nsql_test error: {:?}", e);
+                insta::assert_snapshot!(format!("{}_error", ts.name), e.to_string());
+                return Ok(());
+            }
+        };
+        insta::assert_snapshot!(format!("{}_response", ts.name), &response);
+
+        // ensure all spans are exported into task_history
+        let _ = trace_provider.force_flush();
+
+        // Check task_history table for expected rows.
+        let mut headers = HeaderMap::new();
+        headers.insert(ACCEPT, HeaderValue::from_static("text/plain"));
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+
+        let response = http_post(
+            format!("{base_url}/v1/sql").as_str(),
+            format!(
+                r#"SELECT task, input
+                        FROM runtime.task_history
+                        WHERE task NOT IN ('ai_completion', 'health', 'accelerated_refresh')
+                        AND start_time > '{}'
+                        ORDER BY start_time, task;
+                    "#,
+                Into::<DateTime<Utc>>::into(task_start_time).to_rfc3339()
+            )
+            .as_str(),
+            headers,
+        )
+        .await
+        .map_err(anyhow::Error::msg)?;
+
+        insta::assert_snapshot!(format!("{}_tasks", ts.name), response,);
+
+        Ok(())
+    }
+}
 
 fn create_api_bindings_config() -> Config {
     let mut rng = rand::thread_rng();
@@ -95,51 +168,6 @@ fn get_tpcds_dataset(ds_name: &str) -> Dataset {
         ..Default::default()
     });
     dataset
-}
-
-fn json_is_single_row_with_value(json: &Value, expected_value: i64) -> bool {
-    json.as_array()
-        .filter(|array| array.len() == 1)
-        .and_then(|array| array.first())
-        .map_or(false, |item| {
-            item.as_object().map_or(false, |map| {
-                map.values()
-                    .any(|value| value == &Value::from(expected_value))
-            })
-        })
-}
-
-async fn send_nsql_request(
-    base_url: &str,
-    query: &str,
-    model: Option<&str>,
-    sample_data_enabled: Option<bool>,
-    datasets: Option<Vec<String>>,
-) -> Result<Value, reqwest::Error> {
-    let mut request_body = json!({
-        "query": query,
-    });
-
-    if let Some(m) = model {
-        request_body["model"] = json!(m);
-    }
-    if let Some(sde) = sample_data_enabled {
-        request_body["sample_data_enabled"] = json!(sde);
-    }
-    if let Some(ds) = datasets {
-        request_body["datasets"] = json!(ds);
-    }
-    let response = Client::new()
-        .post(format!("{base_url}/v1/nsql"))
-        .header("Content-Type", "application/json")
-        .json(&request_body)
-        .send()
-        .await?
-        .error_for_status()?
-        .json::<Value>()
-        .await?;
-
-    Ok(response)
 }
 
 async fn send_search_request(
@@ -334,23 +362,28 @@ async fn send_chat_completions_request(
 }
 
 /// Generic function to send a POST request, returning the response as a String.
-async fn http_post(
-    url: &str,
-    body: &str,
-    headers: HeaderMap,
-) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    Client::new()
+pub async fn http_post(url: &str, body: &str, headers: HeaderMap) -> Result<String, anyhow::Error> {
+    let response = Client::new()
         .post(url)
         .headers(headers)
         .body(body.to_string())
         .send()
         .await
-        .boxed()?
-        .error_for_status()
-        .boxed()?
+        .map_err(|e| anyhow::anyhow!("Request error: {e}"))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let message = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "No error message".to_string());
+        return Err(anyhow::anyhow!("HTTP error: {status} - {message}"));
+    }
+
+    response
         .text()
         .await
-        .boxed()
+        .map_err(|e| anyhow::anyhow!("Error reading response body: {e}")) // Map body read error to anyhow
 }
 
 /// Returns a human-readable representation of the SQL query result against a [`Runtime`].
@@ -372,40 +405,6 @@ async fn sql_to_display(
     pretty_format_batches(&data).map(|d| format!("{d}")).boxed()
 }
 
-/// Retrieves executed tasks from the task history since the given timestamp.
-async fn get_executed_tasks(
-    rt: &Runtime,
-    since: DateTime<Utc>,
-) -> Result<Vec<(String, String)>, anyhow::Error> {
-    let query = format!("SELECT task, input FROM runtime.task_history WHERE start_time >= '{}' ORDER BY start_time, task;", since.to_rfc3339());
-    let query_result = rt.datafusion().query_builder(&query).build().run().await?;
-    let data = query_result.data.try_collect::<Vec<_>>().await?;
-
-    let mut tasks = Vec::new();
-
-    for batch in data {
-        let task_column = batch
-            .column(batch.schema().index_of("task")?)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or(anyhow::anyhow!("Failed to downcast column to StringArray"))?;
-
-        let input_column = batch
-            .column(batch.schema().index_of("input")?)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or(anyhow::anyhow!("Failed to downcast column to StringArray"))?;
-
-        for i in 0..batch.num_rows() {
-            let task = task_column.value(i).to_string();
-            let input = input_column.value(i).to_string();
-            tasks.push((task, input));
-        }
-    }
-
-    Ok(tasks)
-}
-
 async fn get_params_with_secrets(
     params: &HashMap<String, Value>,
     rt: &Runtime,
@@ -423,9 +422,4 @@ async fn get_params_with_secrets(
         .collect::<HashMap<_, _>>();
 
     rt.get_params_with_secrets(&params).await
-}
-
-fn pretty_json_str(json_str: &str) -> Result<String, serde_json::Error> {
-    let json: Value = serde_json::from_str(json_str)?;
-    serde_json::to_string_pretty(&json)
 }

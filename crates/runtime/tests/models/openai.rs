@@ -48,72 +48,9 @@ use std::sync::Arc;
 #[allow(clippy::expect_used)]
 mod nsql {
 
+    use crate::models::nsql::{run_nsql_test, TestCase};
+
     use super::*;
-
-    struct TestCase {
-        name: &'static str,
-        body: serde_json::Value,
-    }
-
-    async fn run_nsql_test(
-        base_url: &str,
-        ts: &TestCase,
-        trace_provider: &TracerProvider,
-    ) -> Result<(), anyhow::Error> {
-        tracing::info!("Running test cases {}", ts.name);
-        let task_start_time = std::time::SystemTime::now();
-
-        // Call /v1/nsql, check response
-        let mut headers = HeaderMap::new();
-        headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        let response = http_post(
-            format!("{base_url}/v1/nsql").as_str(),
-            &ts.body.to_string(),
-            headers,
-        )
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to execute HTTP POST: {}", e))?;
-        insta::assert_snapshot!(format!("{}_response", ts.name), &response);
-
-        // ensure all spans are exported into task_history
-        let _ = trace_provider.force_flush();
-
-        // Check task_history table for expected rows.
-        let mut headers = HeaderMap::new();
-        headers.insert(ACCEPT, HeaderValue::from_static("text/plain"));
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        println!(
-            r#"SELECT task, input
-                    FROM runtime.task_history
-                    WHERE task NOT IN ('ai_completion', 'health', 'accelerated_refresh')
-                    AND start_time > '{}'
-                    ORDER BY start_time, task;
-                "#,
-            Into::<DateTime<Utc>>::into(task_start_time).to_rfc3339()
-        );
-        insta::assert_snapshot!(
-            format!("{}_tasks", ts.name),
-            http_post(
-                format!("{base_url}/v1/sql").as_str(),
-                format!(
-                    r#"SELECT task, input
-                            FROM runtime.task_history
-                            WHERE task NOT IN ('ai_completion', 'health', 'accelerated_refresh')
-                            AND start_time > '{}'
-                            ORDER BY start_time, task;
-                        "#,
-                    Into::<DateTime<Utc>>::into(task_start_time).to_rfc3339()
-                )
-                .as_str(),
-                headers
-            )
-            .await
-            .expect("Failed to execute HTTP SQL query")
-        );
-
-        Ok(())
-    }
 
     #[tokio::test]
     async fn openai_test_nsql() -> Result<(), anyhow::Error> {
@@ -153,14 +90,14 @@ mod nsql {
 
             let test_cases = [
                 TestCase {
-                    name: "basic",
+                    name: "openai_basic",
                     body: json!({
                         "query": "how many records (as 'total_records') are in taxi_trips dataset?",
                         "sample_data_enabled": false,
                     }),
                 },
                 TestCase {
-                    name: "with_model",
+                    name: "openai_with_model",
                     body: json!({
                         "query": "how many records (as 'total_records') are in taxi_trips dataset?",
                         "model": "nql-2",
@@ -168,7 +105,7 @@ mod nsql {
                     }),
                 },
                 TestCase {
-                    name: "with_sample_data_enabled",
+                    name: "openai_with_sample_data_enabled",
                     body: json!({
                         "query": "how many records (as 'total_records') are in taxi_trips dataset?",
                         "model": "nql",

@@ -1,0 +1,31 @@
+---
+source: crates/runtime/tests/models/hf.rs
+expression: "normalize_chat_completion_response(response, true)"
+---
+{
+  "choices": [
+    {
+      "finish_reason": "stop",
+      "index": 0,
+      "logprobs": null,
+      "message": {
+        "content": "content_val",
+        "function_call": null,
+        "refusal": null,
+        "role": "assistant",
+        "tool_calls": []
+      }
+    }
+  ],
+  "created": "created_val",
+  "id": "id_val",
+  "model": "hf_model",
+  "object": "chat.completion",
+  "service_tier": null,
+  "system_fingerprint": "system_fingerprint_val",
+  "usage": {
+    "completion_tokens": "completion_tokens_val",
+    "prompt_tokens": "prompt_tokens_val",
+    "total_tokens": "total_tokens_val"
+  }
+}
