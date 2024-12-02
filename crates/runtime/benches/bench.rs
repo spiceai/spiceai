@@ -123,6 +123,7 @@ async fn bench_main() -> Result<(), String> {
                 "spice.ai",
                 "s3",
                 "abfs",
+                "file",
                 #[cfg(feature = "spark")]
                 "spark",
                 #[cfg(feature = "postgres")]
@@ -206,7 +207,7 @@ async fn run_connector_bench(
         "spice.ai" => {
             bench_spicecloud::run(&mut rt, &mut benchmark_results).await?;
         }
-        "s3" => {
+        "s3" | "abfs" | "file" => {
             bench_object_store::run(
                 connector,
                 &mut rt,
@@ -214,17 +215,6 @@ async fn run_connector_bench(
                 None,
                 None,
                 bench_name,
-            )
-            .await?;
-        }
-        "abfs" => {
-            bench_object_store::run(
-                connector,
-                &mut rt,
-                &mut benchmark_results,
-                None,
-                None,
-                "tpch",
             )
             .await?;
         }
