@@ -26,7 +26,22 @@ use crate::{
 };
 
 pub fn get_dataset() -> Dataset {
-    Dataset::new("file:./tests/file/datatypes.parquet", "datatypes")
+    // if tests are running with `cargo test --package runtime`, this path is relative to the `runtime` crate
+    // if tests are running as a built binary, this path is relative to the binary.
+    // in binary mode, we expect to be running in the root of the project
+    let file_path = if std::fs::exists("./tests/file/datatypes.parquet")
+        .expect("should check if file exists")
+    {
+        "./tests/file/datatypes.parquet"
+    } else if std::fs::exists("./crates/runtime/tests/file/datatypes.parquet")
+        .expect("should check if file exists")
+    {
+        "./crates/runtime/tests/file/datatypes.parquet"
+    } else {
+        panic!("Could not find datatypes.parquet file");
+    };
+
+    Dataset::new(format!("file:{file_path}"), "datatypes")
 }
 
 #[tokio::test]
