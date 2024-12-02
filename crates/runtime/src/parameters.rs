@@ -369,10 +369,6 @@ impl ParameterSpec {
         self.deprecation_message = Some(deprecation_message);
         self
     }
-
-    pub fn is_deprecated(&self) -> bool {
-        self.deprecation_message.is_some()
-    }
 }
 
 #[derive(Default, Debug, Clone, Copy, PartialEq)]
