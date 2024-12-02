@@ -56,11 +56,6 @@ jobs:
               }
             ];
 
-            // PR TEST ONLY
-            if (context.eventName === 'workflow_dispatch') {
-              return matrix.filter(target => target.runner !== 'macos-14-large');
-            }
-
             // Filter out macos-14-large runner for trunk pushes
             if (context.eventName === 'push' && context.ref === 'refs/heads/trunk') {
               return matrix.filter(target => target.runner !== 'macos-14-large');
