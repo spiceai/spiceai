@@ -88,12 +88,38 @@ Example:
 
 ## Release Notes
 
-DuckDB Data Connector: Has graduated from Beta to Release Candidate.
+API Key Authentication: Spice now supports optional authentication for API endpoints via configurable API keys, for additional security and control over runtime access.
 
-Included on the next release like:
+Example Spicepod.yml configuration:
+```yaml
+runtime:
+  auth:
+    api-key:
+      enabled: true
+      keys:
+        - ${ secrets:api_key } # Load from a secret store
+        - my-api-key # Or specify directly
+```
+
+Would be included on the next release like:
 
 # Highlights in v1.0-rc.1
 
-DuckDB Data Connector: Has graduated from Beta to Release Candidate.
+{other release note}
+
+API Key Authentication: Spice now supports optional authentication for API endpoints via configurable API keys, for additional security and control over runtime access.
+
+Example Spicepod.yml configuration:
+```yaml
+runtime:
+  auth:
+    api-key:
+      enabled: true
+      keys:
+        - ${ secrets:api_key } # Load from a secret store
+        - my-api-key # Or specify directly
+```
+
+{other release note}
 
 -->
