@@ -111,7 +111,10 @@ mod nsql {
 }
 
 mod search {
-    use http::{header::{ACCEPT, CONTENT_TYPE}, HeaderMap, HeaderValue};
+    use http::{
+        header::{ACCEPT, CONTENT_TYPE},
+        HeaderMap, HeaderValue,
+    };
 
     use crate::models::{http_post, normalize_search_response};
 
@@ -204,47 +207,6 @@ fn get_tpcds_dataset(ds_name: &str) -> Dataset {
         ..Default::default()
     });
     dataset
-}
-
-async fn send_search_request(
-    base_url: &str,
-    text: &str,
-    limit: Option<usize>,
-    datasets: Option<Vec<String>>,
-    where_cond: Option<&str>,
-    additional_columns: Option<Vec<String>>,
-) -> Result<Value, reqwest::Error> {
-    let mut request_body = json!({
-        "text": text,
-    });
-
-    if let Some(limit) = limit {
-        request_body["limit"] = json!(limit);
-    }
-
-    if let Some(ds) = datasets {
-        request_body["datasets"] = json!(ds);
-    }
-
-    if let Some(where_cond) = where_cond {
-        request_body["where_cond"] = json!(where_cond);
-    }
-
-    if let Some(columns) = additional_columns {
-        request_body["additional_columns"] = json!(columns);
-    }
-
-    let response = Client::new()
-        .post(format!("{base_url}/v1/search"))
-        .header("Content-Type", "application/json")
-        .json(&request_body)
-        .send()
-        .await?
-        .error_for_status()?
-        .json::<Value>()
-        .await?;
-
-    Ok(response)
 }
 
 /// Normalizes vector similarity search response for consistent snapshot testing by replacing dynamic
