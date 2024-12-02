@@ -228,7 +228,7 @@ pub enum DataConnectorError {
         connector_component: ConnectorComponent,
     },
 
-    #[snafu(display("Cannot setup the {connector_component} (odbc).\nThe Runtime is running without ODBC support.\nBuild Spice with the `odbc` feature, or use the docker image with ODBC support.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/odbc"))]
+    #[snafu(display("Failed to initialize the {connector_component} (ODBC).\nThe runtime is built without ODBC support.\nBuild Spice.ai OSS with the `odbc` feature enabled or use the Docker image that includes ODBC support.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/odbc"))]
     OdbcNotInstalled {
         connector_component: ConnectorComponent,
     },
