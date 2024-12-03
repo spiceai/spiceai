@@ -110,6 +110,45 @@ mod nsql {
     }
 }
 
+mod search {
+    use http::{
+        header::{ACCEPT, CONTENT_TYPE},
+        HeaderMap, HeaderValue,
+    };
+
+    use crate::models::{http_post, normalize_search_response};
+
+    pub struct TestCase {
+        pub name: &'static str,
+        pub body: serde_json::Value,
+    }
+
+    pub async fn run_search_test(base_url: &str, ts: &TestCase) -> Result<(), anyhow::Error> {
+        tracing::info!("Running test cases {}", ts.name);
+
+        // Call /v1/search, check response
+        let mut headers = HeaderMap::new();
+        headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        let response_str = http_post(
+            &format!("{base_url}/v1/search").to_string(),
+            &ts.body.to_string(),
+            headers,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to execute HTTP POST: {}", e))?;
+
+        let response = serde_json::from_str(&response_str)
+            .map_err(|e| anyhow::anyhow!("Failed to parse HTTP response: {}", e))?;
+
+        insta::assert_snapshot!(
+            format!("{}_response", ts.name),
+            normalize_search_response(response)
+        );
+        Ok(())
+    }
+}
+
 fn create_api_bindings_config() -> Config {
     let mut rng = rand::thread_rng();
     let http_port: u16 = rng.gen_range(50000..60000);
@@ -149,10 +188,10 @@ fn get_taxi_trips_dataset() -> Dataset {
     dataset
 }
 
-fn get_tpcds_dataset(ds_name: &str) -> Dataset {
+fn get_tpcds_dataset(ds_name: &str, spice_name: Option<&str>) -> Dataset {
     let mut dataset = Dataset::new(
         format!("s3://spiceai-public-datasets/tpcds/{ds_name}/"),
-        ds_name,
+        spice_name.unwrap_or(ds_name),
     );
     dataset.params = Some(Params::from_string_map(
         vec![
@@ -164,51 +203,13 @@ fn get_tpcds_dataset(ds_name: &str) -> Dataset {
     ));
     dataset.acceleration = Some(Acceleration {
         enabled: true,
-        refresh_sql: Some(format!("SELECT * FROM {ds_name} LIMIT 20")),
+        refresh_sql: Some(format!(
+            "SELECT * FROM {} LIMIT 20",
+            spice_name.unwrap_or(ds_name)
+        )),
         ..Default::default()
     });
     dataset
-}
-
-async fn send_search_request(
-    base_url: &str,
-    text: &str,
-    limit: Option<usize>,
-    datasets: Option<Vec<String>>,
-    where_cond: Option<&str>,
-    additional_columns: Option<Vec<String>>,
-) -> Result<Value, reqwest::Error> {
-    let mut request_body = json!({
-        "text": text,
-    });
-
-    if let Some(limit) = limit {
-        request_body["limit"] = json!(limit);
-    }
-
-    if let Some(ds) = datasets {
-        request_body["datasets"] = json!(ds);
-    }
-
-    if let Some(where_cond) = where_cond {
-        request_body["where_cond"] = json!(where_cond);
-    }
-
-    if let Some(columns) = additional_columns {
-        request_body["additional_columns"] = json!(columns);
-    }
-
-    let response = Client::new()
-        .post(format!("{base_url}/v1/search"))
-        .header("Content-Type", "application/json")
-        .json(&request_body)
-        .send()
-        .await?
-        .error_for_status()?
-        .json::<Value>()
-        .await?;
-
-    Ok(response)
 }
 
 /// Normalizes vector similarity search response for consistent snapshot testing by replacing dynamic

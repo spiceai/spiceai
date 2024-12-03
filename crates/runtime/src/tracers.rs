@@ -115,3 +115,26 @@ macro_rules! warn_spaced {
         }
     }};
 }
+
+#[macro_export]
+macro_rules! error_spaced {
+    ($tracer:expr, $msg:expr, $key:expr) => {{
+        let mut logged_times = $tracer.logged_times.lock().unwrap_or_else(|poisoned| {
+            tracing::error!("Lock poisoned while logging: {poisoned}");
+            poisoned.into_inner()
+        });
+
+        let now = std::time::Instant::now();
+        let mut should_log = true;
+        if let Some(last_time) = logged_times.get($key) {
+            if now.duration_since(*last_time) < $tracer.interval {
+                should_log = false;
+            }
+        }
+
+        if should_log {
+            logged_times.insert($key.to_string(), now);
+            tracing::error!($msg, $key);
+        }
+    }};
+}

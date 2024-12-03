@@ -21,8 +21,8 @@ use crate::{
     init_tracing, init_tracing_with_task_history,
     models::{
         create_api_bindings_config, get_params_with_secrets, get_taxi_trips_dataset,
-        get_tpcds_dataset, http_post, normalize_chat_completion_response,
-        normalize_embeddings_response, normalize_search_response, send_chat_completions_request,
+        get_tpcds_dataset, normalize_chat_completion_response, normalize_embeddings_response,
+        send_chat_completions_request,
     },
     utils::{runtime_ready_check, test_request_context, verify_env_secret_exists},
 };
@@ -35,7 +35,6 @@ use chrono::{DateTime, Utc};
 use jsonpath_rust::JsonPath;
 use llms::chat::Chat;
 use opentelemetry_sdk::trace::TracerProvider;
-use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, CONTENT_TYPE};
 use runtime::{auth::EndpointAuth, model::try_to_chat_model, Runtime};
 use serde_json::json;
 use spicepod::component::{
@@ -125,36 +124,11 @@ mod nsql {
 
 #[allow(clippy::expect_used)]
 mod search {
+    use spicepod::component::embeddings::EmbeddingChunkConfig;
+
+    use crate::models::{search::run_search_test, search::TestCase};
+
     use super::*;
-    struct TestCase {
-        name: &'static str,
-        body: serde_json::Value,
-    }
-
-    async fn run_search_test(base_url: &str, ts: &TestCase) -> Result<(), anyhow::Error> {
-        tracing::info!("Running test cases {}", ts.name);
-
-        // Call /v1/search, check response
-        let mut headers = HeaderMap::new();
-        headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        let response_str = http_post(
-            &format!("{base_url}/v1/search").to_string(),
-            &ts.body.to_string(),
-            headers,
-        )
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to execute HTTP POST: {}", e))?;
-
-        let response = serde_json::from_str(&response_str)
-            .map_err(|e| anyhow::anyhow!("Failed to parse HTTP response: {}", e))?;
-
-        insta::assert_snapshot!(
-            format!("{}_response", ts.name),
-            normalize_search_response(response)
-        );
-        Ok(())
-    }
 
     #[tokio::test]
     async fn openai_test_search() -> Result<(), anyhow::Error> {
@@ -166,7 +140,7 @@ mod search {
                     .await
                     .map_err(anyhow::Error::msg)?;
 
-                let mut ds_tpcds_item = get_tpcds_dataset("item");
+                let mut ds_tpcds_item = get_tpcds_dataset("item", None);
                 ds_tpcds_item.embeddings = vec![ColumnEmbeddingConfig {
                     column: "i_item_desc".to_string(),
                     model: "openai_embeddings".to_string(),
@@ -174,12 +148,27 @@ mod search {
                     chunking: None,
                 }];
 
+                let mut ds_tpcds_cp_with_chunking =
+                    get_tpcds_dataset("catalog_page", Some("catalog_page_with_chunking"));
+                ds_tpcds_cp_with_chunking.embeddings = vec![ColumnEmbeddingConfig {
+                    column: "cp_description".to_string(),
+                    model: "openai_embeddings".to_string(),
+                    primary_keys: Some(vec!["cp_catalog_page_sk".to_string()]),
+                    chunking: Some(EmbeddingChunkConfig {
+                        enabled: true,
+                        target_chunk_size: 512,
+                        overlap_size: 128,
+                        trim_whitespace: false,
+                    }),
+                }];
+
                 let app = AppBuilder::new("search_app")
                     // taxi_trips dataset is used to test search when there is a dataset w/o embeddings
                     .with_dataset(get_taxi_trips_dataset())
                     .with_dataset(ds_tpcds_item)
+                    .with_dataset(ds_tpcds_cp_with_chunking)
                     .with_embedding(get_openai_embeddings(
-                        Option::<String>::None,
+                        Some("text-embedding-3-small"),
                         "openai_embeddings",
                     ))
                     .build();
@@ -207,7 +196,7 @@ mod search {
 
                 let test_cases = [
                     TestCase {
-                        name: "basic",
+                        name: "openai_basic",
                         body: json!({
                             "text": "new patient",
                             "limit": 2,
@@ -216,10 +205,18 @@ mod search {
                         }),
                     },
                     TestCase {
-                        name: "all_datasets",
+                        name: "openai_all_datasets",
                         body: json!({
                             "text": "new patient",
                             "limit": 2,
+                        }),
+                    },
+                    TestCase {
+                        name: "openai_chunking",
+                        body: json!({
+                            "text": "friends",
+                            "datasets": ["catalog_page_with_chunking"],
+                            "limit": 1,
                         }),
                     },
                 ];
@@ -410,7 +407,7 @@ async fn openai_test_chat_messages() -> Result<(), anyhow::Error> {
                 .await
                 .map_err(anyhow::Error::msg)?;
 
-            let mut ds_tpcds_item = get_tpcds_dataset("item");
+            let mut ds_tpcds_item = get_tpcds_dataset("item", None);
             ds_tpcds_item.embeddings = vec![ColumnEmbeddingConfig {
                 column: "i_item_desc".to_string(),
                 model: "openai_embeddings".to_string(),

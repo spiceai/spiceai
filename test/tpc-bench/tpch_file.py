@@ -1,5 +1,6 @@
 import sys
 import pandas as pd
+from decimal import Decimal, ROUND_HALF_UP
 import os
 
 # Define column names and their respective data types for TPC-H tables
@@ -21,7 +22,7 @@ COLUMN_DEFINITIONS = {
             "c_address": "string",
             "c_nationkey": "int64",
             "c_phone": "string",
-            "c_acctbal": "float64",
+            "c_acctbal": "decimal",
             "c_mktsegment": "string",
             "c_comment": "string",
         },
@@ -50,10 +51,10 @@ COLUMN_DEFINITIONS = {
             "l_partkey": "int64",
             "l_suppkey": "int64",
             "l_linenumber": "int64",
-            "l_quantity": "float64",
-            "l_extendedprice": "float64",
-            "l_discount": "float64",
-            "l_tax": "float64",
+            "l_quantity": "decimal",
+            "l_extendedprice": "decimal",
+            "l_discount": "decimal",
+            "l_tax": "decimal",
             "l_returnflag": "string",
             "l_linestatus": "string",
             "l_shipdate": "datetime64[ns]",
@@ -89,7 +90,7 @@ COLUMN_DEFINITIONS = {
             "o_orderkey": "int64",
             "o_custkey": "int64",
             "o_orderstatus": "string",
-            "o_totalprice": "float64",
+            "o_totalprice": "decimal",
             "o_orderdate": "datetime64[ns]",
             "o_orderpriority": "string",
             "o_clerk": "string",
@@ -117,7 +118,7 @@ COLUMN_DEFINITIONS = {
             "p_type": "string",
             "p_size": "int64",
             "p_container": "string",
-            "p_retailprice": "float64",
+            "p_retailprice": "decimal",
             "p_comment": "string",
         },
     },
@@ -133,7 +134,7 @@ COLUMN_DEFINITIONS = {
             "ps_partkey": "int64",
             "ps_suppkey": "int64",
             "ps_availqty": "int64",
-            "ps_supplycost": "float64",
+            "ps_supplycost": "decimal",
             "ps_comment": "string",
         },
     },
@@ -157,7 +158,7 @@ COLUMN_DEFINITIONS = {
             "s_address": "string",
             "s_nationkey": "int64",
             "s_phone": "string",
-            "s_acctbal": "float64",
+            "s_acctbal": "decimal",
             "s_comment": "string",
         },
     },
@@ -196,6 +197,12 @@ def csv_to_parquet(csv_file, parquet_file):
             col for col, dtype in column_dtypes.items() if dtype.startswith("datetime")
         ],
     )
+
+    for col, dtype in column_dtypes.items():
+        if dtype == "decimal":
+            df[col] = df[col].apply(
+                lambda x: Decimal(x).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
+            )
 
     # Save the DataFrame as a Parquet file with compression
     df.to_parquet(parquet_file, index=False, compression="gzip")

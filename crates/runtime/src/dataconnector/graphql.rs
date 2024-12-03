@@ -17,7 +17,7 @@ limitations under the License.
 use crate::component::dataset::Dataset;
 use async_trait::async_trait;
 use data_components::{
-    graphql::{client::GraphQLClient, provider::GraphQLTableProviderBuilder},
+    graphql::{self, client::GraphQLClient, provider::GraphQLTableProviderBuilder},
     token_provider::{StaticTokenProvider, TokenProvider},
 };
 use datafusion::datasource::TableProvider;
@@ -199,10 +199,22 @@ impl DataConnector for GraphQL {
             GraphQLTableProviderBuilder::new(client)
                 .build(query)
                 .await
-                .map_err(Into::into)
-                .context(super::InternalWithSourceSnafu {
-                    dataconnector: "graphql".to_string(),
-                    connector_component: ConnectorComponent::from(dataset),
+                .map_err(|e| {
+                    if matches!(e, graphql::Error::InvalidGraphQLQuery { .. }) {
+                        let message = format!("{e}");
+                        super::DataConnectorError::InvalidConfiguration {
+                            dataconnector: "graphql".to_string(),
+                            connector_component: ConnectorComponent::from(dataset),
+                            source: e.into(),
+                            message,
+                        }
+                    } else {
+                        super::DataConnectorError::InternalWithSource {
+                            dataconnector: "graphql".to_string(),
+                            connector_component: ConnectorComponent::from(dataset),
+                            source: e.into(),
+                        }
+                    }
                 })?,
         ))
     }

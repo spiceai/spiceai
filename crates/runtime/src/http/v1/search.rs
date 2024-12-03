@@ -45,6 +45,10 @@ pub(crate) async fn post(
         return (StatusCode::BAD_REQUEST, "No data sources provided").into_response();
     }
 
+    if payload.limit.is_some_and(|limit| limit == 0) {
+        return (StatusCode::BAD_REQUEST, "Limit must be greater than 0").into_response();
+    }
+
     let span = tracing::span!(target: "task_history", tracing::Level::INFO, "vector_search", input = %payload.text);
 
     let search_request = match SearchRequest::try_from(payload) {
@@ -56,7 +60,7 @@ pub(crate) async fn post(
     };
 
     match vs.search(&search_request).await {
-        Ok(resp) => match to_matches_sorted(&resp) {
+        Ok(resp) => match to_matches_sorted(&resp, search_request.limit) {
             Ok(m) => (
                 StatusCode::OK,
                 Json(SearchResponse {

@@ -89,11 +89,13 @@ Currently supported data connectors for upstream datasets. More coming soon.
 | --------------- | ------------------------------------- | ----------------- | ------------------------------------------ |
 | `duckdb`        | DuckDB                                | Release Candidate |                                            |
 | `github`        | GitHub                                | Release Candidate |                                            |
+| `graphql`       | GraphQL                               | Release Candidate | JSON                                       |
 | `mysql`         | MySQL                                 | Release Candidate |                                            |
 | `postgres`      | PostgreSQL                            | Release Candidate |                                            |
 | `s3`            | [S3][s3]                              | Release Candidate | Parquet, CSV                               |
 | `databricks`    | [Databricks][databricks]              | Beta              | [Spark Connect][spark] <br/> S3/Delta Lake |
 | `delta_lake`    | Delta Lake                            | Beta              | Delta Lake                                 |
+| `file`          | File                                  | Beta              | Parquet, CSV                               |
 | `flightsql`     | FlightSQL                             | Beta              | Arrow Flight SQL                           |
 | `odbc`          | ODBC                                  | Beta              | ODBC                                       |
 | `spiceai`       | [Spice.ai][spiceai]                   | Beta              | Arrow Flight                               |
@@ -101,9 +103,7 @@ Currently supported data connectors for upstream datasets. More coming soon.
 | `clickhouse`    | Clickhouse                            | Alpha             |                                            |
 | `debezium`      | Debezium CDC                          | Alpha             | Kafka + JSON                               |
 | `dremio`        | [Dremio][dremio]                      | Alpha             | Arrow Flight                               |
-| `file`          | File                                  | Alpha             | Parquet, CSV                               |
 | `ftp`, `sftp`   | FTP/SFTP                              | Alpha             | Parquet, CSV                               |
-| `graphql`       | GraphQL                               | Alpha             | JSON                                       |
 | `http`, `https` | HTTP(s)                               | Alpha             | Parquet, CSV                               |
 | `localpod`      | [Local dataset replication][localpod] | Alpha             |                                            |
 | `mssql`         | Microsoft SQL Server                  | Alpha             | Tabular Data Stream (TDS)                  |

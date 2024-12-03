@@ -21,7 +21,7 @@ use llms::embeddings::{
 };
 use llms::openai::embed::OpenaiEmbed;
 use llms::openai::DEFAULT_EMBEDDING_MODEL;
-use secrecy::{ExposeSecret, Secret};
+use secrecy::{ExposeSecret, Secret, SecretString};
 use snafu::ResultExt;
 use spicepod::component::{embeddings::EmbeddingPrefix, model::ModelFileType};
 use std::path::{Path, PathBuf};
@@ -154,7 +154,9 @@ async fn get_file_from_hf(
         repo_type,
         file,
         hf_token,
-    ) {
+    )
+    .await
+    {
         Ok(path) => {
             let bytz = fs::read(path).await.boxed()?;
             Ok(bytz.into())
@@ -249,19 +251,23 @@ pub async fn try_to_embedding(
                 })?
                 .clone();
             let pooling = params.get("pooling").map(Secret::expose_secret).cloned();
+            let max_seq_len = max_seq_length_from_params(&params)?;
             Ok(Box::new(TeiEmbed::from_local(
                 Path::new(&weights_path),
                 Path::new(&config_path),
                 Path::new(&tokenizer_path),
                 pooling,
+                max_seq_len,
             )?))
         }
         EmbeddingPrefix::HuggingFace => {
             let hf_token = extract_secret!(params, "hf_token");
             let pooling = extract_secret!(params, "pooling");
-
+            let max_seq_len = max_seq_length_from_params(&params)?;
             if let Some(id) = model_id {
-                Ok(Box::new(TeiEmbed::from_hf(&id, None, hf_token, pooling)?))
+                Ok(Box::new(
+                    TeiEmbed::from_hf(&id, None, hf_token, pooling, max_seq_len).await?,
+                ))
             } else {
                 Err(EmbedError::FailedToInstantiateEmbeddingModel {
                     source: format!("Failed to load model from: {}", component.from).into(),
@@ -269,4 +275,19 @@ pub async fn try_to_embedding(
             }
         }
     }
+}
+
+fn max_seq_length_from_params(
+    params: &HashMap<String, SecretString>,
+) -> Result<Option<usize>, EmbedError> {
+    params
+        .get("max_seq_length")
+        .map(|s| {
+            s.expose_secret().parse().boxed().map_err(|e| {
+                EmbedError::FailedToInstantiateEmbeddingModel {
+                    source: format!("Failed to parse 'max_seq_length' parameter: {e}").into(),
+                }
+            })
+        })
+        .transpose()
 }

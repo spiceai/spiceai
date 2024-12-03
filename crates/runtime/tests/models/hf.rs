@@ -40,8 +40,7 @@ use crate::{
     models::{
         create_api_bindings_config, get_taxi_trips_dataset, get_tpcds_dataset,
         normalize_chat_completion_response, normalize_embeddings_response,
-        normalize_search_response, send_chat_completions_request, send_embeddings_request,
-        send_search_request,
+        send_chat_completions_request, send_embeddings_request,
     },
     utils::{runtime_ready_check, test_request_context},
 };
@@ -57,65 +56,6 @@ lazy_static! {
 
 const HF_TEST_MODEL: &str = "microsoft/Phi-3-mini-4k-instruct";
 const HF_TEST_MODEL_TYPE: &str = "phi3";
-
-#[tokio::test]
-async fn huggingface_test_search() -> Result<(), anyhow::Error> {
-    let _tracing = init_tracing(None);
-
-    test_request_context()
-        .scope(async {
-            let mut ds_tpcds_item = get_tpcds_dataset("item");
-            ds_tpcds_item.embeddings = vec![ColumnEmbeddingConfig {
-                column: "i_item_desc".to_string(),
-                model: "hf_minilm".to_string(),
-                primary_keys: Some(vec!["i_item_sk".to_string()]),
-                chunking: None,
-            }];
-
-            let app = AppBuilder::new("text-to-sql")
-                .with_dataset(ds_tpcds_item)
-                .with_embedding(get_huggingface_embeddings(
-                    "sentence-transformers/all-MiniLM-L6-v2",
-                    "hf_minilm",
-                ))
-                .build();
-
-            let api_config = create_api_bindings_config();
-            let http_base_url = format!("http://{}", api_config.http_bind_address);
-
-            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
-
-            let rt_ref_copy = Arc::clone(&rt);
-            tokio::spawn(async move {
-                Box::pin(rt_ref_copy.start_servers(api_config, None, EndpointAuth::no_auth())).await
-            });
-
-            tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
-                    return Err(anyhow::anyhow!("Timed out waiting for components to load"));
-                }
-                () = rt.load_components() => {}
-            }
-
-            runtime_ready_check(&rt).await;
-
-            tracing::info!("/v1/search: Ensure simple search request succeeds");
-            let response = send_search_request(
-                http_base_url.as_str(),
-                "new patient",
-                Some(2),
-                Some(vec!["item".to_string()]),
-                None,
-                Some(vec!["i_color".to_string(), "i_item_id".to_string()]),
-            )
-            .await?;
-
-            insta::assert_snapshot!(format!("search_1"), normalize_search_response(response));
-
-            Ok(())
-        })
-        .await
-}
 
 mod nsql {
 
@@ -206,6 +146,107 @@ mod nsql {
                     run_nsql_test(http_base_url.as_str(), &ts, &trace_provider).await?;
                 }
 
+                Ok(())
+            })
+            .await
+    }
+}
+
+mod search {
+    use serde_json::json;
+    use spicepod::component::embeddings::EmbeddingChunkConfig;
+
+    use crate::models::search::{run_search_test, TestCase};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn huggingface_test_search() -> Result<(), anyhow::Error> {
+        let _tracing = init_tracing(None);
+
+        test_request_context()
+            .scope(async {
+                let mut ds_tpcds_item = get_tpcds_dataset("item", None);
+                ds_tpcds_item.embeddings = vec![ColumnEmbeddingConfig {
+                    column: "i_item_desc".to_string(),
+                    model: "hf_minilm".to_string(),
+                    primary_keys: Some(vec!["i_item_sk".to_string()]),
+                    chunking: None,
+                }];
+
+                let mut ds_tpcds_cp_with_chunking =
+                    get_tpcds_dataset("catalog_page", Some("catalog_page_with_chunking"));
+                ds_tpcds_cp_with_chunking.embeddings = vec![ColumnEmbeddingConfig {
+                    column: "cp_description".to_string(),
+                    model: "hf_minilm".to_string(),
+                    primary_keys: Some(vec!["cp_catalog_page_sk".to_string()]),
+                    chunking: Some(EmbeddingChunkConfig {
+                        enabled: true,
+                        target_chunk_size: 512,
+                        overlap_size: 128,
+                        trim_whitespace: false,
+                    }),
+                }];
+
+                let app = AppBuilder::new("text-to-sql")
+                    .with_dataset(ds_tpcds_item)
+                    .with_dataset(ds_tpcds_cp_with_chunking)
+                    .with_embedding(get_huggingface_embeddings(
+                        "sentence-transformers/all-MiniLM-L6-v2",
+                        "hf_minilm",
+                    ))
+                    .build();
+
+                let api_config = create_api_bindings_config();
+                let http_base_url = format!("http://{}", api_config.http_bind_address);
+
+                let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+
+                let rt_ref_copy = Arc::clone(&rt);
+                tokio::spawn(async move {
+                    Box::pin(rt_ref_copy.start_servers(api_config, None, EndpointAuth::no_auth()))
+                        .await
+                });
+
+                tokio::select! {
+                    () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                        return Err(anyhow::anyhow!("Timed out waiting for components to load"));
+                    }
+                    () = rt.load_components() => {}
+                }
+
+                runtime_ready_check(&rt).await;
+
+                let test_cases = [
+                    TestCase {
+                        name: "hf_basic",
+                        body: json!({
+                            "text": "new patient",
+                            "limit": 2,
+                            "datasets": ["item"],
+                            "additional_columns": ["i_color", "i_item_id"],
+                        }),
+                    },
+                    TestCase {
+                        name: "hf_all_datasets",
+                        body: json!({
+                            "text": "new patient",
+                            "limit": 2,
+                        }),
+                    },
+                    TestCase {
+                        name: "hf_chunking",
+                        body: json!({
+                            "text": "friends",
+                            "datasets": ["catalog_page_with_chunking"],
+                            "limit": 1,
+                        }),
+                    },
+                ];
+
+                for ts in test_cases {
+                    run_search_test(http_base_url.as_str(), &ts).await?;
+                }
                 Ok(())
             })
             .await

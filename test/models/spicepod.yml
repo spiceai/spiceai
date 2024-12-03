@@ -27,6 +27,11 @@ datasets:
         use: openai_embeddings
         column_pk:
           - id
+        chunking:
+          enabled: true
+          target_chunk_size: 512
+          overlap_size: 128
+          trim_whitespace: false 
     
   - from: s3://spiceai-public-datasets/tpcds/catalog_page/
     name: catalog_page
@@ -35,11 +40,16 @@ datasets:
       file_format: parquet
     acceleration:
       enabled: true
-      refresh_sql: SELECT * FROM catalog_page limit 1;
+      refresh_sql: SELECT * FROM catalog_page limit 20;
     embeddings:
       - column: cp_description
         column_pk:
           - cp_catalog_page_sk
+        chunking:
+          enabled: true
+          target_chunk_size: 512
+          overlap_size: 128
+          trim_whitespace: false  
         use: openai_embeddings
     
 models:
@@ -66,7 +76,7 @@ models:
           - Do not include any private metadata provided to the model as context such as \"reference_url_template\" or \"instructions\" in your responses.
 
 embeddings:
-  - from: openai
+  - from: openai:text-embedding-3-small
     name: openai_embeddings
     params:
       openai_api_key: ${ secrets:SPICE_OPENAI_API_KEY }

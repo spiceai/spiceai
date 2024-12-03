@@ -34,6 +34,7 @@ on:
           - ''
           - 'spice.ai connector'
           - 's3 connector'
+          - 'file connector'
           - 'abfs connector'
           - 'spark connector'
           - 'postgres connector'
@@ -166,6 +167,9 @@ jobs:
             bench: 'tpch'
           - cmd: '-c s3'
             name: 's3 connector'
+            bench: 'tpch'
+          - cmd: '-c file'
+            name: 'file connector'
             bench: 'tpch'
           - cmd: '-c s3 -b tpcds'
             name: 's3 connector'
@@ -310,6 +314,18 @@ jobs:
         if: matrix.cmd == '-c duckdb -b tpcds' && ((github.event.inputs.selected_benchmark == matrix.name && (github.event.inputs.bench_name == matrix.bench || github.event.inputs.bench_name == 'all')) || github.event.inputs.run_all == 'true' || github.event_name == 'schedule')
         run: |
           wget https://spiceai-public-datasets.s3.us-east-1.amazonaws.com/duckdb/tpcds.db
+
+      - name: Download File Connector Data
+        if: matrix.cmd == '-c file' && ((github.event.inputs.selected_benchmark == matrix.name && (github.event.inputs.bench_name == matrix.bench || github.event.inputs.bench_name == 'all')) || github.event.inputs.run_all == 'true' || github.event_name == 'schedule')
+        run: |
+          wget https://spiceai-public-datasets.s3.us-east-1.amazonaws.com/tpch/customer/customer.parquet
+          wget https://spiceai-public-datasets.s3.us-east-1.amazonaws.com/tpch/lineitem/lineitem.parquet
+          wget https://spiceai-public-datasets.s3.us-east-1.amazonaws.com/tpch/nation/nation.parquet
+          wget https://spiceai-public-datasets.s3.us-east-1.amazonaws.com/tpch/orders/orders.parquet
+          wget https://spiceai-public-datasets.s3.us-east-1.amazonaws.com/tpch/part/part.parquet
+          wget https://spiceai-public-datasets.s3.us-east-1.amazonaws.com/tpch/partsupp/partsupp.parquet
+          wget https://spiceai-public-datasets.s3.us-east-1.amazonaws.com/tpch/region/region.parquet
+          wget https://spiceai-public-datasets.s3.us-east-1.amazonaws.com/tpch/supplier/supplier.parquet
 
       - name: Run benchmark with ${{ matrix.name }}
         if: (github.event.inputs.selected_benchmark == matrix.name && (github.event.inputs.bench_name == matrix.bench || github.event.inputs.bench_name == 'all')) || github.event.inputs.run_all == 'true' || github.event_name == 'schedule'

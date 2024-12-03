@@ -50,33 +50,25 @@ pub struct DataUpdate {
 }
 
 pub struct StreamingDataUpdate {
-    pub schema: SchemaRef,
     pub data: SendableRecordBatchStream,
     pub update_type: UpdateType,
 }
 
 impl StreamingDataUpdate {
     #[must_use]
-    pub fn new(
-        schema: SchemaRef,
-        data: SendableRecordBatchStream,
-        update_type: UpdateType,
-    ) -> Self {
-        Self {
-            schema,
-            data,
-            update_type,
-        }
+    pub fn new(data: SendableRecordBatchStream, update_type: UpdateType) -> Self {
+        Self { data, update_type }
     }
 
     pub async fn collect_data(self) -> Result<DataUpdate, DataFusionError> {
+        let schema = self.data.schema();
         let data = self
             .data
             .try_collect::<Vec<_>>()
             .await
             .map_err(find_datafusion_root)?;
         Ok(DataUpdate {
-            schema: self.schema,
+            schema,
             data,
             update_type: self.update_type,
         })
@@ -87,13 +79,11 @@ impl TryFrom<DataUpdate> for StreamingDataUpdate {
     type Error = DataFusionError;
 
     fn try_from(data_update: DataUpdate) -> std::result::Result<Self, Self::Error> {
-        let schema = Arc::clone(&data_update.schema);
         let data = Box::pin(
             MemoryStream::try_new(data_update.data, data_update.schema, None)
                 .map_err(find_datafusion_root)?,
         ) as SendableRecordBatchStream;
         Ok(Self {
-            schema,
             data,
             update_type: data_update.update_type,
         })

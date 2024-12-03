@@ -142,7 +142,7 @@ fn build_app(
     app_builder = match connector {
         "spice.ai" => Ok(crate::bench_spicecloud::build_app(app_builder)),
         // Run both S3, ABFS and any other object store benchmarks
-        "s3" | "abfs" => {
+        "s3" | "abfs" | "file" => {
             // SQLite acceleration does not support default TPC-DS source scale so we use a smaller scale
             if bench_name == "tpcds"
                 && acceleration
