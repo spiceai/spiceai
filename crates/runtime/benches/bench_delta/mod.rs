@@ -18,6 +18,7 @@ use app::AppBuilder;
 use runtime::Runtime;
 
 use crate::results::BenchmarkResultsBuilder;
+use crate::{generate_tpcds_queries, generate_tpch_queries};
 use spicepod::component::{dataset::Dataset, params::Params};
 
 pub(crate) async fn run(
@@ -164,63 +165,11 @@ fn get_params() -> Params {
 }
 
 fn get_tpch_test_queries() -> Vec<(&'static str, &'static str)> {
-    vec![
-        ("tpch_q1", include_str!("../queries/tpch/q1.sql")),
-        ("tpch_q2", include_str!("../queries/tpch/q2.sql")),
-        ("tpch_q3", include_str!("../queries/tpch/q3.sql")),
-        ("tpch_q4", include_str!("../queries/tpch/q4.sql")),
-        ("tpch_q5", include_str!("../queries/tpch/q5.sql")),
-        ("tpch_q6", include_str!("../queries/tpch/q6.sql")),
-        ("tpch_q7", include_str!("../queries/tpch/q7.sql")),
-        ("tpch_q8", include_str!("../queries/tpch/q8.sql")),
-        ("tpch_q9", include_str!("../queries/tpch/q9.sql")),
-        ("tpch_q10", include_str!("../queries/tpch/q10.sql")),
-        ("tpch_q11", include_str!("../queries/tpch/q11.sql")),
-        ("tpch_q12", include_str!("../queries/tpch/q12.sql")),
-        ("tpch_q13", include_str!("../queries/tpch/q13.sql")),
-        ("tpch_q14", include_str!("../queries/tpch/q14.sql")),
-        // tpch_q15 has a view creation which we don't support by design
-        ("tpch_q16", include_str!("../queries/tpch/q16.sql")),
-        ("tpch_q17", include_str!("../queries/tpch/q17.sql")),
-        ("tpch_q18", include_str!("../queries/tpch/q18.sql")),
-        ("tpch_q19", include_str!("../queries/tpch/q19.sql")),
-        ("tpch_q20", include_str!("../queries/tpch/q20.sql")),
-        ("tpch_q21", include_str!("../queries/tpch/q21.sql")),
-        ("tpch_q22", include_str!("../queries/tpch/q22.sql")),
-        (
-            "tpch_simple_q1",
-            include_str!("../queries/tpch/simple_q1.sql"),
-        ),
-        (
-            "tpch_simple_q2",
-            include_str!("../queries/tpch/simple_q2.sql"),
-        ),
-        (
-            "tpch_simple_q3",
-            include_str!("../queries/tpch/simple_q3.sql"),
-        ),
-        (
-            "tpch_simple_q4",
-            include_str!("../queries/tpch/simple_q4.sql"),
-        ),
-        (
-            "tpch_simple_q5",
-            include_str!("../queries/tpch/simple_q5.sql"),
-        ),
-    ]
-}
-
-macro_rules! generate_tpcds_queries {
-    ( $( $i:literal ),* ) => {
-        vec![
-            $(
-                (
-                    concat!("tpcds_q", stringify!($i)),
-                    include_str!(concat!("../queries/tpcds/q", stringify!($i), ".sql"))
-                )
-            ),*
-        ]
-    }
+    // tpch_q15 has a view creation which we don't support by design
+    generate_tpch_queries!(
+        q1, q2, q3, q4, q5, q6, q7, q8, q9, q10, q11, q12, q13, q14, q16, q17, q18, q19, q20, q21,
+        q22, simple_q1, simple_q2, simple_q3, simple_q4, simple_q5
+    )
 }
 
 fn get_tpcds_test_queries() -> Vec<(&'static str, &'static str)> {

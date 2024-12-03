@@ -449,3 +449,31 @@ fn get_branch_name() -> String {
             |output| String::from_utf8_lossy(&output.stdout).trim().to_string(),
         )
 }
+
+#[macro_export]
+macro_rules! generate_tpcds_queries {
+    ( $( $i:literal ),* ) => {
+        vec![
+            $(
+                (
+                    concat!("tpcds_q", stringify!($i)),
+                    include_str!(concat!("../queries/tpcds/q", stringify!($i), ".sql"))
+                )
+            ),*
+        ]
+    }
+}
+
+#[macro_export]
+macro_rules! generate_tpch_queries {
+    ( $( $i:tt ),* ) => {
+        vec![
+            $(
+                (
+                    concat!("tpch_", stringify!($i)),
+                    include_str!(concat!("../queries/tpch/", stringify!($i), ".sql"))
+                )
+            ),*
+        ]
+    }
+}

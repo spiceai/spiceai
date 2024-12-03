@@ -136,7 +136,7 @@ async fn bench_main() -> Result<(), String> {
                 "odbc-databricks",
                 #[cfg(feature = "odbc")]
                 "odbc-athena",
-                #[cfg(feature = "delta_lake")]
+                #[cfg(all(feature = "delta_lake", feature = "databricks"))]
                 "delta_lake",
             ];
             for connector in connectors {
