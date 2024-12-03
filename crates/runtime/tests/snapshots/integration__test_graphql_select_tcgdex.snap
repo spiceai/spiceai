@@ -1,0 +1,15 @@
+---
+source: crates/runtime/tests/integration.rs
+assertion_line: 150
+description: "Query: SELECT * FROM tcgdex"
+snapshot_kind: text
+---
++---------------+---------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                  |
++---------------+---------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | BytesProcessedNode                                                                                                                    |
+|               |   TableScan: tcgdex projection=[firstEdCards, holoCards, id, name, normalCards, officialCards, releaseDate, reverseCards, totalCards] |
+| physical_plan | BytesProcessedExec                                                                                                                    |
+|               |   MemoryExec: partitions=1, partition_sizes=[178]                                                                                     |
+|               |                                                                                                                                       |
++---------------+---------------------------------------------------------------------------------------------------------------------------------------+

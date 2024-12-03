@@ -1,0 +1,15 @@
+---
+source: crates/runtime/tests/integration.rs
+assertion_line: 150
+description: "Query: SELECT * FROM swapi"
+snapshot_kind: text
+---
++---------------+--------------------------------------------------------+
+| plan_type     | plan                                                   |
++---------------+--------------------------------------------------------+
+| logical_plan  | BytesProcessedNode                                     |
+|               |   TableScan: swapi projection=[films, name, starships] |
+| physical_plan | BytesProcessedExec                                     |
+|               |   MemoryExec: partitions=1, partition_sizes=[82]       |
+|               |                                                        |
++---------------+--------------------------------------------------------+
