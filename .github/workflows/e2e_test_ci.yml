@@ -1030,7 +1030,7 @@ jobs:
           if [[ -n "$MODE" ]]; then
             echo "      mode: $MODE" >> spicepod.yaml
           fi
-          echo "      refresh_sql: SELECT * FROM eth.recent_blocks LIMIT 1" >> spicepod.yaml
+          echo "      refresh_sql: SELECT * FROM eth.recent_blocks" >> spicepod.yaml
           echo "    params:" >> spicepod.yaml
           echo "      pg_host: localhost" >> spicepod.yaml
           echo "      pg_port: '5432'" >> spicepod.yaml
@@ -1076,7 +1076,7 @@ jobs:
       - name: Manually refresh dataset (with params)
         working-directory: test_app
         run: |
-          output=$(spice refresh eth.recent_blocks --refresh-jitter-max=1s --refresh-sql='SELECT * FROM eth.recent_blocks LIMIT 2' 2>&1)
+          output=$(spice refresh eth.recent_blocks --refresh-jitter-max=1s --refresh-sql='SELECT * FROM eth.recent_blocks' 2>&1)
           echo "$output"
           if [[ $output == *"Dataset refresh triggered"* ]]; then
             # time to refresh dataset
@@ -1145,7 +1145,7 @@ jobs:
           echo "      file_format: parquet" >> spicepod.yaml
           echo "    acceleration:" >> spicepod.yaml
           echo "      enabled: true" >> spicepod.yaml
-          echo "      refresh_sql: select * from customer limit 1;" >> spicepod.yaml
+          echo "      refresh_sql: select * from customer;" >> spicepod.yaml
           cat spicepod.yaml
 
       - name: Start spice runtime
@@ -1263,7 +1263,7 @@ jobs:
           echo "      include: \"**/*.md\"" >> spicepod.yaml
           echo "    acceleration:" >> spicepod.yaml
           echo "      enabled: true" >> spicepod.yaml
-          echo "      refresh_sql: 'SELECT * FROM spiceai.files LIMIT 20'" >> spicepod.yaml
+          echo "      refresh_sql: 'SELECT * FROM spiceai.files'" >> spicepod.yaml
 
           echo "  - from: github:github.com/spiceai/spiceai/issues" >> spicepod.yaml
           echo "    name: spiceai.issues" >> spicepod.yaml
@@ -1271,7 +1271,7 @@ jobs:
           echo "      github_token: \${secrets:GITHUB_TOKEN}" >> spicepod.yaml
           echo "    acceleration:" >> spicepod.yaml
           echo "      enabled: true" >> spicepod.yaml
-          echo "      refresh_sql: 'SELECT * FROM spiceai.issues LIMIT 20'" >> spicepod.yaml
+          echo "      refresh_sql: 'SELECT * FROM spiceai.issues'" >> spicepod.yaml
 
           echo "  - from: github:github.com/spiceai/spiceai/pulls" >> spicepod.yaml
           echo "    name: spiceai.pulls" >> spicepod.yaml
@@ -1279,7 +1279,7 @@ jobs:
           echo "      github_token: \${secrets:GITHUB_TOKEN}" >> spicepod.yaml
           echo "    acceleration:" >> spicepod.yaml
           echo "      enabled: true" >> spicepod.yaml
-          echo "      refresh_sql: 'SELECT * FROM spiceai.pulls LIMIT 20'" >> spicepod.yaml
+          echo "      refresh_sql: 'SELECT * FROM spiceai.pulls'" >> spicepod.yaml
 
           echo "  - from: github:github.com/spiceai/spiceai/commits" >> spicepod.yaml
           echo "    name: spiceai.commits" >> spicepod.yaml
@@ -1287,7 +1287,7 @@ jobs:
           echo "      github_token: \${secrets:GITHUB_TOKEN}" >> spicepod.yaml
           echo "    acceleration:" >> spicepod.yaml
           echo "      enabled: true" >> spicepod.yaml
-          echo "      refresh_sql: 'SELECT * FROM spiceai.commits LIMIT 20'" >> spicepod.yaml
+          echo "      refresh_sql: 'SELECT * FROM spiceai.commits'" >> spicepod.yaml
 
 
           echo "  - from: github:github.com/spiceai/spiceai/stargazers" >> spicepod.yaml
@@ -1296,7 +1296,7 @@ jobs:
           echo "      github_token: \${secrets:GITHUB_TOKEN}" >> spicepod.yaml
           echo "    acceleration:" >> spicepod.yaml
           echo "      enabled: true" >> spicepod.yaml
-          echo "      refresh_sql: 'SELECT * FROM spiceai.stargazers LIMIT 20'" >> spicepod.yaml
+          echo "      refresh_sql: 'SELECT * FROM spiceai.stargazers'" >> spicepod.yaml
 
           cat spicepod.yaml
 
