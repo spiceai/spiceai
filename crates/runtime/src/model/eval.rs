@@ -28,7 +28,6 @@ use async_openai::{
 use async_trait::async_trait;
 use datafusion::sql::TableReference;
 use futures::TryStreamExt;
-use itertools::Itertools;
 use llms::chat::Chat;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -78,6 +77,10 @@ pub trait Scorer: Sync + Send {
     ) -> f32;
 }
 
+pub fn builtin_scorer() -> Vec<(String, dyn Scorer)> {
+    vec![]
+}
+
 /// The possible representations of inputs into a model evaluation, at varying levels of detail for a [`CreateChatCompletionRequest`].
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -107,20 +110,20 @@ impl TryFrom<&DatasetInput> for CreateChatCompletionRequest {
 impl DatasetInput {
     pub fn from_raw(s: &str) -> Self {
         match serde_json::from_str(s) {
-            Ok(m) => DatasetInput::Messages(m),
-            Err(_) => DatasetInput::UserInput(s.to_string()),
+            Ok(m) => Self::Messages(m),
+            Err(_) => Self::UserInput(s.to_string()),
         }
     }
 
     pub fn try_from_value(v: Value) -> Result<Option<Self>, serde_json::Error> {
         match v {
-            Value::String(s) => Ok(Some(DatasetInput::UserInput(s.to_string()))),
+            Value::String(s) => Ok(Some(Self::UserInput(s.to_string()))),
             Value::Array(values) => {
                 let z = values
                     .into_iter()
                     .map(|v| serde_json::from_value(v))
                     .collect::<Result<Vec<ChatCompletionRequestMessage>, serde_json::Error>>();
-                z.map(|m| Some(DatasetInput::Messages(m)))
+                z.map(|m| Some(Self::Messages(m)))
             }
             v if matches!(v, Value::Object(_)) => Ok(Some(serde_json::from_value(v)?)),
             _ => Ok(None),
@@ -136,14 +139,14 @@ impl DatasetInput {
                 Some(
                     arr_str
                         .iter()
-                        .map(|v| v.unwrap_or_default())
+                        .map(Option::unwrap_or_default)
                         .collect::<Vec<&str>>(),
                 )
             } else if let Some(arr_str) = arr.as_any().downcast_ref::<StringViewArray>() {
                 Some(
                     arr_str
                         .iter()
-                        .map(|v| v.unwrap_or_default())
+                        .map(Option::unwrap_or_default)
                         .collect::<Vec<&str>>(),
                 )
             } else {
@@ -151,7 +154,7 @@ impl DatasetInput {
             }
         };
         if let Some(from_str) = from_str_opt {
-            return Ok(from_str.into_iter().map(DatasetInput::from_raw).collect());
+            return Ok(from_str.into_iter().map(Self::from_raw).collect());
         }
 
         // Try [`StructArray`].
@@ -160,8 +163,8 @@ impl DatasetInput {
 
             let raw = rb_to_json_value(&rb)?
                 .into_iter()
-                .map(DatasetInput::try_from_value)
-                .collect::<Result<Vec<Option<DatasetInput>>, serde_json::Error>>()
+                .map(Self::try_from_value)
+                .collect::<Result<Vec<Option<Self>>, serde_json::Error>>()
                 .boxed()?;
 
             let raw_count = raw.len();
@@ -180,15 +183,33 @@ impl DatasetInput {
 }
 
 /// The possible representations of the correct/expected outputs from a [`Chat::chat_request`]  at varying levels of detail for a [`ChatCompletionResponse`].
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(untagged)]
 pub enum DatasetOutput {
     Messages(Vec<ChatChoice>),
     AssistantResponse(String),
 }
+
 impl DatasetOutput {
     pub fn from_raw(s: &str) -> Self {
         match serde_json::from_str(s) {
-            Ok(m) => DatasetOutput::Messages(m),
-            Err(_) => DatasetOutput::AssistantResponse(s.to_string()),
+            Ok(m) => Self::Messages(m),
+            Err(_) => Self::AssistantResponse(s.to_string()),
+        }
+    }
+
+    pub fn try_from_value(v: Value) -> Result<Option<Self>, serde_json::Error> {
+        match v {
+            Value::String(s) => Ok(Some(Self::AssistantResponse(s.to_string()))),
+            Value::Array(values) => {
+                let z = values
+                    .into_iter()
+                    .map(|v| serde_json::from_value(v))
+                    .collect::<Result<Vec<ChatChoice>, serde_json::Error>>();
+                z.map(|m| Some(Self::Messages(m)))
+            }
+            v if matches!(v, Value::Object(_)) => Ok(Some(serde_json::from_value(v)?)),
+            _ => Ok(None),
         }
     }
 
@@ -201,14 +222,14 @@ impl DatasetOutput {
                 Some(
                     arr_str
                         .iter()
-                        .map(|v| v.unwrap_or_default())
+                        .map(Option::unwrap_or_default)
                         .collect::<Vec<&str>>(),
                 )
             } else if let Some(arr_str) = arr.as_any().downcast_ref::<StringViewArray>() {
                 Some(
                     arr_str
                         .iter()
-                        .map(|v| v.unwrap_or_default())
+                        .map(Option::unwrap_or_default)
                         .collect::<Vec<&str>>(),
                 )
             } else {
@@ -216,9 +237,29 @@ impl DatasetOutput {
             }
         };
         if let Some(from_str) = from_str_opt {
-            return Ok(from_str.into_iter().map(DatasetOutput::from_raw).collect());
+            return Ok(from_str.into_iter().map(Self::from_raw).collect());
         }
-        Ok(vec![])
+        if let Some(struct_arr) = arr.as_any().downcast_ref::<StructArray>() {
+            let rb = RecordBatch::try_from(struct_arr.slice(0, struct_arr.len())).boxed()?;
+
+            let raw = rb_to_json_value(&rb)?
+                .into_iter()
+                .map(Self::try_from_value)
+                .collect::<Result<Vec<Option<Self>>, serde_json::Error>>()
+                .boxed()?;
+
+            let raw_count = raw.len();
+            let filtered: Vec<Self> = raw.into_iter().flatten().collect();
+            if filtered.len() == raw_count {
+                Ok(filtered)
+            } else {
+                Err(Box::<dyn std::error::Error + Send + Sync>::from(
+                    "Some values could not be parsed into DatasetInput".to_string(),
+                ))
+            }
+        } else {
+            Ok(vec![])
+        }
     }
 }
 

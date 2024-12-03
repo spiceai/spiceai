@@ -270,6 +270,7 @@ pub struct Runtime {
     embeds: Arc<RwLock<EmbeddingModelStore>>,
     tools: Arc<RwLock<HashMap<String, Tooling>>>,
     evals: Arc<RwLock<Vec<Eval>>>,
+    eval_scorers: Arc<RwLock<HashMap<String, Box<dyn crate::model::Scorer>>>>,
     pods_watcher: Arc<RwLock<Option<podswatcher::PodsWatcher>>>,
     secrets: Arc<RwLock<secrets::Secrets>>,
     datasets_health_monitor: Option<Arc<DatasetsHealthMonitor>>,
@@ -490,8 +491,22 @@ impl Runtime {
             }
         });
 
+        let eval_scorer = tokio::spawn({
+            let self_clone = self.clone();
+            async move {
+                self_clone.load_eval_scorer().await;
+            }
+        });
+
         // Wait for all tasks to complete
-        let load_result = tokio::try_join!(task_history, results_cache, datasets, catalogs, models);
+        let load_result = tokio::try_join!(
+            task_history,
+            results_cache,
+            datasets,
+            catalogs,
+            models,
+            eval_scorer
+        );
 
         if let Err(err) = load_result {
             tracing::error!("Could not start the Spice runtime: {err}");
