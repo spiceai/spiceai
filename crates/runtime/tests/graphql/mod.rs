@@ -217,18 +217,15 @@ fn make_graphql_dataset(
     unnest_depth: Option<u32>,
 ) -> Dataset {
     let mut dataset = Dataset::new(format!("graphql:{path}"), name.to_string());
-    let params = if let Some(unnest_depth) = unnest_depth {
-        HashMap::from([
-            ("json_pointer".to_string(), json_pointer.to_string()),
-            ("graphql_query".to_string(), query.to_string()),
-            ("unnest_depth".to_string(), unnest_depth.to_string()),
-        ])
-    } else {
-        HashMap::from([
-            ("json_pointer".to_string(), json_pointer.to_string()),
-            ("graphql_query".to_string(), query.to_string()),
-        ])
+    let mut params = HashMap::from([
+        ("json_pointer".to_string(), json_pointer.to_string()),
+        ("graphql_query".to_string(), query.to_string()),
+    ]);
+
+    if let Some(unnest_depth) = unnest_depth {
+        params.insert("unnest_depth".to_string(), unnest_depth.to_string());
     };
+
     dataset.params = Some(DatasetParams::from_string_map(params));
     dataset
 }
