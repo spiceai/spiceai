@@ -34,6 +34,7 @@ pub use notify::Error as NotifyError;
 use secrecy::SecretString;
 use secrets::{ParamStr, Secrets};
 use snafu::prelude::*;
+use spicepod::component::eval::Eval;
 use tls::TlsConfig;
 use tokio::sync::oneshot::error::RecvError;
 use tokio::sync::RwLock;
@@ -268,6 +269,7 @@ pub struct Runtime {
     llms: Arc<RwLock<LLMModelStore>>,
     embeds: Arc<RwLock<EmbeddingModelStore>>,
     tools: Arc<RwLock<HashMap<String, Tooling>>>,
+    evals: Arc<RwLock<Vec<Eval>>>,
     pods_watcher: Arc<RwLock<Option<podswatcher::PodsWatcher>>>,
     secrets: Arc<RwLock<secrets::Secrets>>,
     datasets_health_monitor: Option<Arc<DatasetsHealthMonitor>>,
