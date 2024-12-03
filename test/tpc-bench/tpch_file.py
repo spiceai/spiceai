@@ -1,6 +1,6 @@
 import sys
 import pandas as pd
-import decimal
+from decimal import Decimal, getcontext
 import os
 
 # Define column names and their respective data types for TPC-H tables
@@ -198,9 +198,11 @@ def csv_to_parquet(csv_file, parquet_file):
         ],
     )
 
+    getcontext().prec = 15
+
     for col, dtype in column_dtypes.items():
         if dtype == "decimal":
-            df[col] = df[col].map(decimal.Decimal).map(lambda x: round(x, 15))
+            df[col] = df[col].map(Decimal)
 
     # Save the DataFrame as a Parquet file with compression
     df.to_parquet(parquet_file, index=False, compression="gzip")
