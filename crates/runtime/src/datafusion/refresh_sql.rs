@@ -95,13 +95,6 @@ pub fn validate_refresh_sql(
                     }
                 );
                 ensure!(
-                    query.limit.is_none(),
-                    UnexpectedExpressionSnafu {
-                        expr: "LIMIT",
-                        expected_table,
-                    }
-                );
-                ensure!(
                     query.offset.is_none(),
                     UnexpectedExpressionSnafu {
                         expr: "OFFSET",
