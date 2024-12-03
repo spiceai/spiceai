@@ -238,3 +238,104 @@ fn validate_select_columns(
 
     Ok(Arc::new(Schema::new(fields)))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+
+    fn create_test_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+            Field::new("value", DataType::Float64, true),
+        ]))
+    }
+
+    #[test]
+    fn test_valid_select_all() -> Result<()> {
+        let schema = create_test_schema();
+        let table = TableReference::parse_str("test_table");
+        let sql = "SELECT * FROM test_table";
+
+        let result = validate_refresh_sql(table, sql, Arc::clone(&schema))?;
+        assert_eq!(result.fields().len(), 3);
+        Ok(())
+    }
+
+    #[test]
+    fn test_valid_select_columns() -> Result<()> {
+        let schema = create_test_schema();
+        let table = TableReference::parse_str("test_table");
+        let sql = "SELECT id, name FROM test_table";
+
+        let result = validate_refresh_sql(table, sql, Arc::clone(&schema))?;
+        assert_eq!(result.fields().len(), 2);
+        assert_eq!(result.field(0).name(), "id");
+        assert_eq!(result.field(1).name(), "name");
+        Ok(())
+    }
+
+    #[test]
+    fn test_invalid_column() {
+        let schema = create_test_schema();
+        let table = TableReference::parse_str("test_table");
+        let sql = "SELECT id, invalid_column FROM test_table";
+
+        let result = validate_refresh_sql(table, sql, Arc::clone(&schema));
+        assert!(matches!(result, Err(Error::ColumnNotFoundInSource { .. })));
+    }
+
+    #[test]
+    fn test_invalid_table() {
+        let schema = create_test_schema();
+        let table = TableReference::parse_str("test_table");
+        let sql = "SELECT id FROM wrong_table";
+
+        let result = validate_refresh_sql(table, sql, Arc::clone(&schema));
+        assert!(matches!(result, Err(Error::InvalidSqlStatement { .. })));
+    }
+
+    #[test]
+    fn test_invalid_expression() {
+        let schema = create_test_schema();
+        let table = TableReference::parse_str("test_table");
+        let sql = "SELECT id + 1 FROM test_table";
+
+        let result = validate_refresh_sql(table, sql, Arc::clone(&schema));
+        assert!(matches!(result, Err(Error::OnlyColumnReferences { .. })));
+    }
+
+    #[test]
+    fn test_invalid_alias() {
+        let schema = create_test_schema();
+        let table = TableReference::parse_str("test_table");
+        let sql = "SELECT id as user_id FROM test_table";
+
+        let result = validate_refresh_sql(table, sql, Arc::clone(&schema));
+        assert!(matches!(result, Err(Error::OnlyColumnReferences { .. })));
+    }
+
+    #[test]
+    fn test_invalid_group_by() {
+        let schema = create_test_schema();
+        let table = TableReference::parse_str("test_table");
+        let sql = "SELECT id FROM test_table GROUP BY id";
+
+        let result = validate_refresh_sql(table, sql, Arc::clone(&schema));
+        assert!(matches!(result, Err(Error::InvalidSqlStatement { .. })));
+    }
+
+    #[test]
+    fn test_multiple_statements() {
+        let schema = create_test_schema();
+        let table = TableReference::parse_str("test_table");
+        let sql = "SELECT id FROM test_table; SELECT name FROM test_table";
+
+        let result = validate_refresh_sql(table, sql, Arc::clone(&schema));
+        assert!(matches!(
+            result,
+            Err(Error::ExpectedSingleSqlStatement { .. })
+        ));
+    }
+}
