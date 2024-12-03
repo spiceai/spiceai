@@ -1,6 +1,6 @@
 import sys
 import pandas as pd
-from decimal import Decimal, getcontext
+from decimal import Decimal, ROUND_HALF_UP
 import os
 
 # Define column names and their respective data types for TPC-H tables
@@ -198,11 +198,11 @@ def csv_to_parquet(csv_file, parquet_file):
         ],
     )
 
-    getcontext().prec = 15
-
     for col, dtype in column_dtypes.items():
         if dtype == "decimal":
-            df[col] = df[col].map(Decimal)
+            df[col] = df[col].apply(
+                lambda x: Decimal(x).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
+            )
 
     # Save the DataFrame as a Parquet file with compression
     df.to_parquet(parquet_file, index=False, compression="gzip")
