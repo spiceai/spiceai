@@ -15,7 +15,7 @@ All criteria must be met for the connector to be considered [RC](../definitions.
 | DuckDB                  | ✅         | @peasee      |
 | File                    | ❌         |              |
 | FTP/SFTP                | ❌         |              |
-| GraphQL                 | ❌         |              |
+| GraphQL                 | ✅         | @peasee      |
 | GitHub                  | ✅         | @peasee      |
 | HTTP/HTTPS              | ❌         |              |
 | Localpod                | ❌         |              |
