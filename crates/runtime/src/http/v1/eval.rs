@@ -20,7 +20,9 @@ use axum::{
     response::{IntoResponse, Json, Response},
     Extension,
 };
+use axum_extra::TypedHeader;
 use datafusion::sql::TableReference;
+use headers_accept::Accept;
 use http::StatusCode;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
@@ -30,6 +32,8 @@ use crate::{
     model::{run_eval, LLMModelStore},
     Runtime,
 };
+
+use super::{arrow_to_csv, arrow_to_json, arrow_to_plain, ArrowFormat};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct RunEval {
@@ -46,6 +50,7 @@ pub(crate) async fn post(
     Extension(df): Extension<Arc<DataFusion>>,
     Extension(rt): Extension<Arc<Runtime>>,
     Path(eval_name): Path<String>,
+    accept: Option<TypedHeader<Accept>>,
     Json(req): Json<RunEval>,
 ) -> Response {
     let model = req.model;
@@ -76,7 +81,17 @@ pub(crate) async fn post(
     };
 
     match run_eval(eval, df, llm, &HashMap::new()).await {
-        Ok(_) => (StatusCode::OK, "Eval done").into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{}", e)).into_response(),
+        Ok(rb) => {
+            let body_result = match ArrowFormat::from_accept_header(&accept) {
+                ArrowFormat::Json => arrow_to_json(&[rb]),
+                ArrowFormat::Csv => arrow_to_csv(&[rb]),
+                ArrowFormat::Plain => arrow_to_plain(&[rb]),
+            };
+            match body_result {
+                Ok(body) => (StatusCode::OK, body).into_response(),
+                Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
+            }
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
     }
 }

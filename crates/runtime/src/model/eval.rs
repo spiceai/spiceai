@@ -17,7 +17,10 @@ limitations under the License.
 use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
 
 use super::DataFusion;
-use arrow::array::{Array, ArrayRef, RecordBatch, StringArray, StringViewArray, StructArray};
+use arrow::array::{
+    Array, ArrayRef, Float32Array, RecordBatch, StringArray, StringViewArray, StructArray,
+};
+use arrow_schema::{ArrowError, Field, Schema};
 use async_openai::{
     error::OpenAIError,
     types::{
@@ -64,6 +67,9 @@ pub enum Error {
         eval_name: String,
         scorer_name: String,
     },
+
+    #[snafu(display("Failed to create score outputs: {source}"))]
+    FailedToCreateScoreOutputs { source: ArrowError },
 }
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -77,7 +83,8 @@ pub trait Scorer: Sync + Send {
     ) -> f32;
 }
 
-pub fn builtin_scorer() -> Vec<(String, dyn Scorer)> {
+#[must_use]
+pub fn builtin_scorer() -> Vec<(String, Arc<dyn Scorer>)> {
     vec![]
 }
 
@@ -121,7 +128,7 @@ impl DatasetInput {
             Value::Array(values) => {
                 let z = values
                     .into_iter()
-                    .map(|v| serde_json::from_value(v))
+                    .map(serde_json::from_value)
                     .collect::<Result<Vec<ChatCompletionRequestMessage>, serde_json::Error>>();
                 z.map(|m| Some(Self::Messages(m)))
             }
@@ -142,15 +149,15 @@ impl DatasetInput {
                         .map(Option::unwrap_or_default)
                         .collect::<Vec<&str>>(),
                 )
-            } else if let Some(arr_str) = arr.as_any().downcast_ref::<StringViewArray>() {
-                Some(
-                    arr_str
-                        .iter()
-                        .map(Option::unwrap_or_default)
-                        .collect::<Vec<&str>>(),
-                )
             } else {
-                None
+                arr.as_any()
+                    .downcast_ref::<StringViewArray>()
+                    .map(|arr_str| {
+                        arr_str
+                            .iter()
+                            .map(Option::unwrap_or_default)
+                            .collect::<Vec<&str>>()
+                    })
             }
         };
         if let Some(from_str) = from_str_opt {
@@ -159,7 +166,7 @@ impl DatasetInput {
 
         // Try [`StructArray`].
         if let Some(struct_arr) = arr.as_any().downcast_ref::<StructArray>() {
-            let rb = RecordBatch::try_from(struct_arr.slice(0, struct_arr.len())).boxed()?;
+            let rb = RecordBatch::from(struct_arr.slice(0, struct_arr.len()));
 
             let raw = rb_to_json_value(&rb)?
                 .into_iter()
@@ -204,7 +211,7 @@ impl DatasetOutput {
             Value::Array(values) => {
                 let z = values
                     .into_iter()
-                    .map(|v| serde_json::from_value(v))
+                    .map(serde_json::from_value)
                     .collect::<Result<Vec<ChatChoice>, serde_json::Error>>();
                 z.map(|m| Some(Self::Messages(m)))
             }
@@ -225,22 +232,22 @@ impl DatasetOutput {
                         .map(Option::unwrap_or_default)
                         .collect::<Vec<&str>>(),
                 )
-            } else if let Some(arr_str) = arr.as_any().downcast_ref::<StringViewArray>() {
-                Some(
-                    arr_str
-                        .iter()
-                        .map(Option::unwrap_or_default)
-                        .collect::<Vec<&str>>(),
-                )
             } else {
-                None
+                arr.as_any()
+                    .downcast_ref::<StringViewArray>()
+                    .map(|arr_str| {
+                        arr_str
+                            .iter()
+                            .map(Option::unwrap_or_default)
+                            .collect::<Vec<&str>>()
+                    })
             }
         };
         if let Some(from_str) = from_str_opt {
             return Ok(from_str.into_iter().map(Self::from_raw).collect());
         }
         if let Some(struct_arr) = arr.as_any().downcast_ref::<StructArray>() {
-            let rb = RecordBatch::try_from(struct_arr.slice(0, struct_arr.len())).boxed()?;
+            let rb = RecordBatch::from(struct_arr.slice(0, struct_arr.len()));
 
             let raw = rb_to_json_value(&rb)?
                 .into_iter()
@@ -263,12 +270,13 @@ impl DatasetOutput {
     }
 }
 
+#[allow(clippy::borrowed_box, clippy::implicit_hasher)]
 pub async fn run_eval(
     eval: &Eval,
     df: Arc<DataFusion>,
     model: &Box<dyn Chat>,
     scorers: &HashMap<String, Arc<Box<dyn Scorer>>>,
-) -> Result<()> {
+) -> Result<RecordBatch> {
     let Eval {
         name: eval_name,
         scorers: scorer_names,
@@ -291,7 +299,7 @@ pub async fn run_eval(
         TableReference::parse_str(dataset_str).resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA);
 
     let ds = df
-        .query_builder(format!("SELECT input, ideal FROM {}", dataset.to_string()).as_str())
+        .query_builder(format!("SELECT input, ideal FROM {dataset}").as_str())
         .build()
         .run()
         .await
@@ -308,7 +316,7 @@ pub async fn run_eval(
 
     let inputs2 = inputs
         .iter()
-        .map(|a| DatasetInput::try_from_array(*a))
+        .map(|a| DatasetInput::try_from_array(a))
         .collect::<Result<Vec<_>, _>>()
         .context(FailedToParseColumnSnafu {
             column: "input".to_string(),
@@ -318,7 +326,7 @@ pub async fn run_eval(
 
     let ideally = ideals
         .iter()
-        .map(|a| DatasetOutput::try_from_array(*a))
+        .map(|a| DatasetOutput::try_from_array(a))
         .collect::<Result<Vec<_>, _>>()
         .context(FailedToParseColumnSnafu {
             column: "ideal".to_string(),
@@ -328,7 +336,7 @@ pub async fn run_eval(
     let ideal: Vec<&DatasetOutput> = ideally.iter().flatten().collect();
 
     let actual: Vec<DatasetOutput> = if let Some(first_ideal) = ideal.first() {
-        run_model(model, &input, &first_ideal)
+        run_model(model, &input, first_ideal)
             .await
             .context(FailedToRunModelSnafu { eval_name })?
     } else {
@@ -343,11 +351,25 @@ pub async fn run_eval(
             }
         }
     }
+    to_record_batch(result).context(FailedToCreateScoreOutputsSnafu)
+}
 
-    Ok(())
+fn to_record_batch(x: HashMap<String, Vec<f32>>) -> Result<RecordBatch, ArrowError> {
+    let (fields, arrays): (Vec<Field>, Vec<ArrayRef>) = x
+        .into_iter()
+        .map(|(k, v)| {
+            (
+                Field::new(k, arrow_schema::DataType::Float32, false),
+                Arc::new(Float32Array::from(v)) as ArrayRef,
+            )
+        })
+        .unzip();
+
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)
 }
 
 /// Return format of [`DatasetOutput`] determined by `output_format`. `output_format` can be empty, is only used for its enum type.
+#[allow(clippy::borrowed_box)]
 async fn run_model(
     model: &Box<dyn Chat>,
     inputs: &[&DatasetInput],
@@ -366,7 +388,7 @@ async fn run_model(
             ),
             DatasetOutput::Messages(_) => DatasetOutput::Messages(choices),
         };
-        outputs[i] = output
+        outputs[i] = output;
     }
     Ok(outputs)
 }

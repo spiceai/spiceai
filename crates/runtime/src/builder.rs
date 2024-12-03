@@ -166,6 +166,7 @@ impl RuntimeBuilder {
             llms: Arc::new(RwLock::new(HashMap::new())),
             embeds: Arc::new(RwLock::new(HashMap::new())),
             evals: Arc::new(RwLock::new(evals)),
+            eval_scorers: Arc::new(RwLock::new(HashMap::new())),
             tools: Arc::new(RwLock::new(HashMap::new())),
             pods_watcher: Arc::new(RwLock::new(self.pods_watcher)),
             secrets: Arc::new(RwLock::new(secrets)),
