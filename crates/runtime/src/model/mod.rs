@@ -23,11 +23,13 @@ use std::sync::Arc;
 mod chat;
 mod embed;
 mod eval;
+mod eval_scorer;
 mod tool_use;
 
 pub use chat::{try_to_chat_model, LLMModelStore};
 pub use embed::{try_to_embedding, EmbeddingModelStore};
-pub use eval::{builtin_scorer, run_eval, Scorer};
+pub use eval::run_eval;
+pub use eval_scorer::{builtin_scorer, Scorer};
 pub use tool_use::ToolUsingChat;
 
 use crate::DataFusion;

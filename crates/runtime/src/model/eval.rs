@@ -16,9 +16,10 @@ limitations under the License.
 
 use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
 
-use super::DataFusion;
+use super::{eval_scorer::Scorer, DataFusion};
 use arrow::array::{
-    Array, ArrayRef, Float32Array, RecordBatch, StringArray, StringViewArray, StructArray,
+    Array, ArrayRef, Float32Array, ListArray, RecordBatch, StringArray, StringViewArray,
+    StructArray,
 };
 use arrow_schema::{ArrowError, Field, Schema};
 use async_openai::{
@@ -28,7 +29,7 @@ use async_openai::{
         CreateChatCompletionRequest, CreateChatCompletionRequestArgs,
     },
 };
-use async_trait::async_trait;
+
 use datafusion::sql::TableReference;
 use futures::TryStreamExt;
 use llms::chat::Chat;
@@ -37,6 +38,7 @@ use serde_json::Value;
 use snafu::{ResultExt, Snafu};
 use spicepod::component::eval::Eval;
 use std::{collections::HashMap, sync::Arc};
+use tract_core::tract_data::itertools::Itertools;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -72,21 +74,6 @@ pub enum Error {
     FailedToCreateScoreOutputs { source: ArrowError },
 }
 pub type Result<T, E = Error> = std::result::Result<T, E>;
-
-#[async_trait]
-pub trait Scorer: Sync + Send {
-    async fn score(
-        &self,
-        input: &DatasetInput,
-        actual: &DatasetOutput,
-        ideal: &DatasetOutput,
-    ) -> f32;
-}
-
-#[must_use]
-pub fn builtin_scorer() -> Vec<(String, Arc<dyn Scorer>)> {
-    vec![]
-}
 
 /// The possible representations of inputs into a model evaluation, at varying levels of detail for a [`CreateChatCompletionRequest`].
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -132,11 +119,17 @@ impl DatasetInput {
                     .collect::<Result<Vec<ChatCompletionRequestMessage>, serde_json::Error>>();
                 z.map(|m| Some(Self::Messages(m)))
             }
-            v if matches!(v, Value::Object(_)) => Ok(Some(serde_json::from_value(v)?)),
+            v if matches!(v, Value::Object(_)) => {
+                println!(
+                    "DatasetInput::try_from_value, {:#?}",
+                    serde_json::from_value::<DatasetInput>(v.clone()).ok()
+                );
+                Ok(Some(serde_json::from_value(v)?))
+            }
             _ => Ok(None),
         }
     }
-    /// Attempt to parse Arrow column values as a string ([`StringArray`] or [`StringViewArray`]), and failing that, as a [`StructArray`], into one of the valid [`DatasetInput`] formats.
+    /// Attempt to parse Arrow column values as a string ([`StringArray`] or [`StringViewArray`]), and failing that, as a [`ListArray`], into one of the valid [`DatasetInput`] formats.
     pub(crate) fn try_from_array(
         arr: &ArrayRef,
     ) -> Result<Vec<Self>, Box<dyn std::error::Error + Send + Sync>> {
@@ -164,15 +157,27 @@ impl DatasetInput {
             return Ok(from_str.into_iter().map(Self::from_raw).collect());
         }
 
-        // Try [`StructArray`].
-        if let Some(struct_arr) = arr.as_any().downcast_ref::<StructArray>() {
-            let rb = RecordBatch::from(struct_arr.slice(0, struct_arr.len()));
+        if let Some(list_arr) = arr.as_any().downcast_ref::<ListArray>() {
+            let mut raw = Vec::with_capacity(list_arr.len());
+            for i in 0..list_arr.len() {
+                if list_arr.is_null(i) {
+                    raw.push(None);
+                } else {
+                    let struct_arr = list_arr.value(i);
 
-            let raw = rb_to_json_value(&rb)?
-                .into_iter()
-                .map(Self::try_from_value)
-                .collect::<Result<Vec<Option<Self>>, serde_json::Error>>()
-                .boxed()?;
+                    let rb = RecordBatch::from(
+                        struct_arr
+                            .as_any()
+                            .downcast_ref::<StructArray>()
+                            .unwrap()
+                            .slice(0, struct_arr.len()),
+                    );
+
+                    if let Some(v) = Self::try_from_value(rb_to_json_value(&rb)?).boxed()? {
+                        raw.push(Some(v));
+                    };
+                }
+            }
 
             let raw_count = raw.len();
             let filtered: Vec<Self> = raw.into_iter().flatten().collect();
@@ -249,11 +254,7 @@ impl DatasetOutput {
         if let Some(struct_arr) = arr.as_any().downcast_ref::<StructArray>() {
             let rb = RecordBatch::from(struct_arr.slice(0, struct_arr.len()));
 
-            let raw = rb_to_json_value(&rb)?
-                .into_iter()
-                .map(Self::try_from_value)
-                .collect::<Result<Vec<Option<Self>>, serde_json::Error>>()
-                .boxed()?;
+            let raw = vec![Self::try_from_value(rb_to_json_value(&rb)?).boxed()?];
 
             let raw_count = raw.len();
             let filtered: Vec<Self> = raw.into_iter().flatten().collect();
@@ -275,7 +276,7 @@ pub async fn run_eval(
     eval: &Eval,
     df: Arc<DataFusion>,
     model: &Box<dyn Chat>,
-    scorers: &HashMap<String, Arc<Box<dyn Scorer>>>,
+    scorers: &HashMap<String, Arc<dyn Scorer>>,
 ) -> Result<RecordBatch> {
     let Eval {
         name: eval_name,
@@ -294,6 +295,7 @@ pub async fn run_eval(
         };
         scorers_subset.insert(name, scorer);
     }
+    println!("scorers_subset: {:?}", scorers_subset.keys().collect_vec());
 
     let dataset =
         TableReference::parse_str(dataset_str).resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA);
@@ -343,12 +345,15 @@ pub async fn run_eval(
         vec![]
     };
 
-    let mut result: HashMap<String, Vec<f32>> = HashMap::with_capacity(scorers_subset.len());
-    for ((input, ideal), actual) in input.iter().zip(ideal.iter()).zip(actual.iter()) {
+    let mut result: HashMap<String, Vec<f32>> = HashMap::with_capacity(actual.len());
+    for ((actual, input), ideal) in actual.iter().zip(input.iter()).zip(ideal.iter()) {
         for (name, scorer) in &scorers_subset {
+            let s = scorer.score(input, actual, ideal).await;
             if let Some(scorer_results) = result.get_mut(*name) {
-                scorer_results.push(scorer.score(input, actual, ideal).await);
-            }
+                scorer_results.push(s);
+            } else {
+                result.insert((*name).to_string(), vec![s]);
+            };
         }
     }
     to_record_batch(result).context(FailedToCreateScoreOutputsSnafu)
@@ -376,7 +381,7 @@ async fn run_model(
     output_format: &DatasetOutput,
 ) -> Result<Vec<DatasetOutput>, OpenAIError> {
     let mut outputs = Vec::with_capacity(inputs.len());
-    for (i, input) in inputs.iter().enumerate() {
+    for input in inputs {
         let req: CreateChatCompletionRequest = (*input).try_into()?;
         let choices = model.chat_request(req).await?.choices;
         let output = match output_format {
@@ -388,14 +393,12 @@ async fn run_model(
             ),
             DatasetOutput::Messages(_) => DatasetOutput::Messages(choices),
         };
-        outputs[i] = output;
+        outputs.push(output);
     }
     Ok(outputs)
 }
 
-fn rb_to_json_value(
-    data: &RecordBatch,
-) -> Result<Vec<Value>, Box<dyn std::error::Error + Send + Sync>> {
+fn rb_to_json_value(data: &RecordBatch) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
     let mut writer = arrow_json::ArrayWriter::new(Vec::new());
     writer.write_batches(&[data]).boxed()?;
     writer.finish().boxed()?;

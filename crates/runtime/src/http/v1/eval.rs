@@ -13,7 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use std::{collections::HashMap, fmt::Debug, sync::Arc};
+use std::sync::Arc;
 
 use axum::{
     extract::Path,
@@ -80,7 +80,8 @@ pub(crate) async fn post(
             .into_response();
     };
 
-    match run_eval(eval, df, llm, &HashMap::new()).await {
+    let scorers = rt.eval_scorers.read().await;
+    match run_eval(eval, df, llm, &*scorers).await {
         Ok(rb) => {
             let body_result = match ArrowFormat::from_accept_header(&accept) {
                 ArrowFormat::Json => arrow_to_json(&[rb]),

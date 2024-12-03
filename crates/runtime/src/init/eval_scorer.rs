@@ -23,7 +23,7 @@ impl Runtime {
     pub(crate) async fn load_eval_scorer(&self) {
         let mut scorers = self.eval_scorers.write().await;
         for (name, scorer) in builtin_scorer() {
-            scorers.insert(name, Arc::clone(&scorer));
+            scorers.insert(name.to_string(), Arc::clone(&scorer));
         }
     }
 }
