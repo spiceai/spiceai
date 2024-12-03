@@ -68,6 +68,18 @@ pub enum Error {
     MissingStatement,
 }
 
+macro_rules! ensure_no_expr {
+    ($condition:expr, $expr_name:expr, $expected_table:expr) => {
+        ensure!(
+            $condition,
+            UnexpectedExpressionSnafu {
+                expr: $expr_name,
+                expected_table: $expected_table.clone(),
+            }
+        );
+    };
+}
+
 #[allow(clippy::too_many_lines)]
 pub fn validate_refresh_sql(
     expected_table: TableReference,
@@ -87,69 +99,15 @@ pub fn validate_refresh_sql(
     match statement {
         Statement::Statement(statement) => match statement.as_ref() {
             SQLStatement::Query(query) => {
-                ensure!(
-                    query.fetch.is_none(),
-                    UnexpectedExpressionSnafu {
-                        expr: "FETCH",
-                        expected_table,
-                    }
-                );
-                ensure!(
-                    query.offset.is_none(),
-                    UnexpectedExpressionSnafu {
-                        expr: "OFFSET",
-                        expected_table,
-                    }
-                );
-                ensure!(
-                    query.with.is_none(),
-                    UnexpectedExpressionSnafu {
-                        expr: "WITH",
-                        expected_table,
-                    }
-                );
-                ensure!(
-                    query.order_by.is_none(),
-                    UnexpectedExpressionSnafu {
-                        expr: "ORDER BY",
-                        expected_table,
-                    }
-                );
-                ensure!(
-                    query.fetch.is_none(),
-                    UnexpectedExpressionSnafu {
-                        expr: "FETCH",
-                        expected_table,
-                    }
-                );
-                ensure!(
-                    query.for_clause.is_none(),
-                    UnexpectedExpressionSnafu {
-                        expr: "FOR",
-                        expected_table,
-                    }
-                );
-                ensure!(
-                    query.limit_by.is_empty(),
-                    UnexpectedExpressionSnafu {
-                        expr: "LIMIT BY",
-                        expected_table,
-                    }
-                );
-                ensure!(
-                    query.format_clause.is_none(),
-                    UnexpectedExpressionSnafu {
-                        expr: "FORMAT",
-                        expected_table,
-                    }
-                );
-                ensure!(
-                    query.settings.is_none(),
-                    UnexpectedExpressionSnafu {
-                        expr: "SETTINGS",
-                        expected_table,
-                    }
-                );
+                ensure_no_expr!(query.fetch.is_none(), "FETCH", expected_table);
+                ensure_no_expr!(query.offset.is_none(), "OFFSET", expected_table);
+                ensure_no_expr!(query.with.is_none(), "WITH", expected_table);
+                ensure_no_expr!(query.order_by.is_none(), "ORDER BY", expected_table);
+                ensure_no_expr!(query.for_clause.is_none(), "FOR", expected_table);
+                ensure_no_expr!(query.limit_by.is_empty(), "LIMIT BY", expected_table);
+                ensure_no_expr!(query.format_clause.is_none(), "FORMAT", expected_table);
+                ensure_no_expr!(query.settings.is_none(), "SETTINGS", expected_table);
+
                 match query.body.as_ref() {
                     SetExpr::Select(select) => {
                         let refresh_schema = validate_select_columns(
@@ -161,123 +119,42 @@ pub fn validate_refresh_sql(
                             select.from.len() == 1,
                             InvalidSqlStatementSnafu { expected_table }
                         );
-                        ensure!(
-                            select.cluster_by.is_empty(),
-                            UnexpectedExpressionSnafu {
-                                expr: "CLUSTER BY",
-                                expected_table,
-                            }
-                        );
-                        ensure!(
-                            select.connect_by.is_none(),
-                            UnexpectedExpressionSnafu {
-                                expr: "CONNECT BY",
-                                expected_table,
-                            }
-                        );
-                        ensure!(
-                            select.distinct.is_none(),
-                            UnexpectedExpressionSnafu {
-                                expr: "DISTINCT",
-                                expected_table,
-                            }
-                        );
-                        ensure!(
+
+                        ensure_no_expr!(select.cluster_by.is_empty(), "CLUSTER BY", expected_table);
+                        ensure_no_expr!(select.connect_by.is_none(), "CONNECT BY", expected_table);
+                        ensure_no_expr!(select.distinct.is_none(), "DISTINCT", expected_table);
+                        ensure_no_expr!(
                             select.distribute_by.is_empty(),
-                            UnexpectedExpressionSnafu {
-                                expr: "DISTRIBUTE BY",
-                                expected_table,
-                            }
+                            "DISTRIBUTE BY",
+                            expected_table
                         );
+
                         match &select.group_by {
                             GroupByExpr::All(modifiers) => {
-                                ensure!(
-                                    modifiers.is_empty(),
-                                    UnexpectedExpressionSnafu {
-                                        expr: "GROUP BY",
-                                        expected_table,
-                                    }
-                                );
+                                ensure_no_expr!(modifiers.is_empty(), "GROUP BY", expected_table);
                             }
                             GroupByExpr::Expressions(exprs, modifiers) => {
-                                ensure!(
-                                    exprs.is_empty(),
-                                    UnexpectedExpressionSnafu {
-                                        expr: "GROUP BY",
-                                        expected_table,
-                                    }
-                                );
-                                ensure!(
-                                    modifiers.is_empty(),
-                                    UnexpectedExpressionSnafu {
-                                        expr: "GROUP BY",
-                                        expected_table,
-                                    }
-                                );
+                                ensure_no_expr!(exprs.is_empty(), "GROUP BY", expected_table);
+                                ensure_no_expr!(modifiers.is_empty(), "GROUP BY", expected_table);
                             }
                         }
-                        ensure!(
-                            select.having.is_none(),
-                            UnexpectedExpressionSnafu {
-                                expr: "HAVING",
-                                expected_table,
-                            }
-                        );
-                        ensure!(
-                            select.into.is_none(),
-                            UnexpectedExpressionSnafu {
-                                expr: "INTO",
-                                expected_table,
-                            }
-                        );
-                        ensure!(
+
+                        ensure_no_expr!(select.having.is_none(), "HAVING", expected_table);
+                        ensure_no_expr!(select.into.is_none(), "INTO", expected_table);
+                        ensure_no_expr!(
                             select.lateral_views.is_empty(),
-                            UnexpectedExpressionSnafu {
-                                expr: "LATERAL VIEW",
-                                expected_table,
-                            }
+                            "LATERAL VIEW",
+                            expected_table
                         );
-                        ensure!(
-                            select.named_window.is_empty(),
-                            UnexpectedExpressionSnafu {
-                                expr: "WINDOW",
-                                expected_table,
-                            }
-                        );
-                        ensure!(
-                            select.prewhere.is_none(),
-                            UnexpectedExpressionSnafu {
-                                expr: "PREWHERE",
-                                expected_table,
-                            }
-                        );
-                        ensure!(
-                            select.qualify.is_none(),
-                            UnexpectedExpressionSnafu {
-                                expr: "QUALIFY",
-                                expected_table,
-                            }
-                        );
-                        ensure!(
-                            select.sort_by.is_empty(),
-                            UnexpectedExpressionSnafu {
-                                expr: "SORT BY",
-                                expected_table,
-                            }
-                        );
-                        ensure!(
-                            select.top.is_none(),
-                            UnexpectedExpressionSnafu {
-                                expr: "TOP",
-                                expected_table,
-                            }
-                        );
-                        ensure!(
+                        ensure_no_expr!(select.named_window.is_empty(), "WINDOW", expected_table);
+                        ensure_no_expr!(select.prewhere.is_none(), "PREWHERE", expected_table);
+                        ensure_no_expr!(select.qualify.is_none(), "QUALIFY", expected_table);
+                        ensure_no_expr!(select.sort_by.is_empty(), "SORT BY", expected_table);
+                        ensure_no_expr!(select.top.is_none(), "TOP", expected_table);
+                        ensure_no_expr!(
                             select.value_table_mode.is_none(),
-                            UnexpectedExpressionSnafu {
-                                expr: "AS VALUE",
-                                expected_table,
-                            }
+                            "AS VALUE",
+                            expected_table
                         );
 
                         match &select.from[0].relation {
