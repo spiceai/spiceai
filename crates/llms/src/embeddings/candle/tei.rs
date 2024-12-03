@@ -47,8 +47,8 @@ use crate::{
 };
 
 use super::util::{
-    download_hf_artifacts, inputs_from_openai, load_config, load_tokenizer, pool_from_str,
-    position_offset,
+    download_hf_artifacts, inputs_from_openai, load_config, load_tokenizer,
+    max_seq_length_from_st_config, pool_from_str, position_offset,
 };
 
 pub struct TeiEmbed {
@@ -64,7 +64,8 @@ impl TeiEmbed {
         model_path: &Path,
         config_path: &Path,
         tokenizer_path: &Path,
-        pooling: Option<String>,
+        pooling_overwrite: Option<String>,
+        max_seq_length_overwrite: Option<usize>,
     ) -> Result<Self> {
         let model_filename = model_path
             .file_name()
@@ -89,7 +90,7 @@ impl TeiEmbed {
         );
 
         // Check if user provided pooling is valid, and only default to mean when user doesn't provide one.
-        let pool = if let Some(pooling) = pooling {
+        let pool = if let Some(pooling) = pooling_overwrite {
             match pool_from_str(&pooling) {
                 Some(pool) => pool,
                 None => {
@@ -100,19 +101,20 @@ impl TeiEmbed {
             }
         } else {
             tracing::warn!(
-                "Embedding pooling mode not specified by user. Defaulting to mean pooling."
+                "`params.pooling` not provided for embedding model. Often this can be found in `1_Pooling/config.json`. Defaulting to mean pooling."
             );
             Self::DEFAULT_POOLING_OPERATOR
         };
 
-        Self::from_dir(&model_root, Some(pool))
+        Self::from_dir(&model_root, Some(pool), max_seq_length_overwrite)
     }
 
-    pub fn from_hf(
+    pub async fn from_hf(
         model_id: &str,
         revision: Option<&str>,
         hf_token: Option<String>,
         pooling_overwrite: Option<String>,
+        max_seq_length_overwrite: Option<usize>,
     ) -> Result<Self> {
         // Only error if user-provided value is incorrect.
         let pool = pooling_overwrite
@@ -127,20 +129,37 @@ impl TeiEmbed {
             })
             .transpose()?
             .flatten();
-        let model_root = download_hf_artifacts(model_id, revision, hf_token)?;
-        Self::from_dir(&model_root, pool)
+        let model_root = download_hf_artifacts(model_id, revision, hf_token).await?;
+        Self::from_dir(&model_root, pool, max_seq_length_overwrite)
     }
 
     /// Instantiates a text-embedding-inference service with model, tokenizer, config, etc files in a single directory.
-    pub fn from_dir(root: &Path, pooling_overwrite: Option<Pool>) -> Result<Self> {
+    pub fn from_dir(
+        root: &Path,
+        pooling_overwrite: Option<Pool>,
+        max_seq_length_overwrite: Option<usize>,
+    ) -> Result<Self> {
         let tokenizer = load_tokenizer(root)?;
         let config = load_config(root)?;
 
         // Load [`Tokenization`]
         let position_offset = position_offset(&config);
-        // TODO: `max_input_length` should take into account overwrite files like `sentence_bert_config.json`.
-        // See `<https://github.com/huggingface/text-embeddings-inference/blob/cb1e594709fb1caea674ed460b6e426b2b4a531b/router/src/lib.rs#L189>`
-        let max_input_length = config.max_position_embeddings - position_offset;
+
+        let max_input_length = if let Some(max_seq_length) = max_seq_length_overwrite {
+            max_seq_length
+        } else {
+            // Some models will have `sentence_*_config.json` file defining a specific `max_seq_length`.
+            match max_seq_length_from_st_config(root) {
+                Ok(max_seq_length_opt) => {
+                    max_seq_length_opt.unwrap_or(config.max_position_embeddings - position_offset)
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to load max_seq_length from ST config: {e}");
+                    config.max_position_embeddings - position_offset
+                }
+            }
+        };
+
         let token = Tokenization::new(
             1,
             tokenizer.clone(),
