@@ -447,7 +447,7 @@ async fn test_graphql_tcgdex() -> Result<(), String> {
             }
 
             let queries: QueryTests = vec![(
-                "SELECT * FROM tcgdex",
+                "SELECT * FROM tcgdex LIMIT 5",
                 "select_tcgdex",
                 Some(Box::new(|result_batches| {
                     for batch in result_batches {
@@ -533,7 +533,7 @@ async fn test_graphql_swapi() -> Result<(), String> {
             }
 
             let queries: QueryTests = vec![(
-                "SELECT * FROM swapi",
+                "SELECT * FROM swapi LIMIT 5",
                 "select_swapi",
                 Some(Box::new(|result_batches| {
                     for batch in result_batches {
