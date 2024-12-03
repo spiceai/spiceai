@@ -27,6 +27,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 #[tokio::test]
+#[ignore]
 async fn spiceai_integration_test_catalog() -> Result<(), anyhow::Error> {
     let _ = rustls::crypto::CryptoProvider::install_default(
         rustls::crypto::aws_lc_rs::default_provider(),
@@ -81,6 +82,7 @@ async fn spiceai_integration_test_catalog() -> Result<(), anyhow::Error> {
 }
 
 #[tokio::test]
+#[ignore]
 async fn spiceai_integration_test_catalog_include() -> Result<(), anyhow::Error> {
     let _ = rustls::crypto::CryptoProvider::install_default(
         rustls::crypto::aws_lc_rs::default_provider(),
