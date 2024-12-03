@@ -24,7 +24,6 @@ use crate::parameters::ParameterSpec;
 use crate::parameters::Parameters;
 use crate::secrets::Secrets;
 use crate::Runtime;
-use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use data_components::cdc::ChangesStream;
 use datafusion::catalog::CatalogProvider;
@@ -438,7 +437,7 @@ pub async fn get_data(
     table_provider: Arc<dyn TableProvider>,
     sql: Option<String>,
     filters: Vec<Expr>,
-) -> Result<(SchemaRef, SendableRecordBatchStream), DataFusionError> {
+) -> Result<SendableRecordBatchStream, DataFusionError> {
     let mut df = match sql {
         None => {
             let table_source = Arc::new(DefaultTableSource::new(Arc::clone(&table_provider)));
@@ -462,7 +461,7 @@ pub async fn get_data(
     tracing::info!(target: "task_history", sql = %sql, "labels");
 
     let record_batch_stream = df.execute_stream().await.map_err(find_datafusion_root)?;
-    Ok((table_provider.schema(), record_batch_stream))
+    Ok(record_batch_stream)
 }
 
 #[derive(Debug, Clone)]

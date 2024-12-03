@@ -27,6 +27,7 @@ use crate::{
         ODBC_DATACONNECTOR,
     },
     embeddings::connector::EmbeddingConnector,
+    error_spaced,
     federated_table::FederatedTable,
     metrics, status,
     tracing_util::dataset_registered_trace,
@@ -235,6 +236,7 @@ impl Runtime {
         .await;
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn register_loaded_dataset(
         &self,
         ds: Arc<Dataset>,
@@ -336,14 +338,15 @@ impl Runtime {
                     .update_dataset(&ds.name, status::ComponentStatus::Error);
                 metrics::datasets::LOAD_ERROR.add(1, &[]);
                 if let Error::UnableToAttachDataConnector {
-                    source: crate::datafusion::Error::RefreshSql { source },
+                    source: crate::datafusion::Error::RefreshSql { .. },
                     connector_component: _,
                     data_connector: _,
                 } = &err
                 {
-                    tracing::error!("{source}");
+                    error_spaced!(spaced_tracer, "{}{err}", "");
+                } else {
+                    warn_spaced!(spaced_tracer, "{}{err}", "");
                 }
-                warn_spaced!(spaced_tracer, "{}{err}", "");
 
                 Err(err)
             }

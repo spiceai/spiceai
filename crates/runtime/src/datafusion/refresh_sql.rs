@@ -29,18 +29,26 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Unable to parse the refresh SQL: {source}"))]
+    #[snafu(display(
+        "The provided Refresh SQL could not be parsed.\n{source}\nCheck the SQL for syntax errors."
+    ))]
     UnableToParseSql {
         source: sqlparser::parser::ParserError,
     },
 
     #[snafu(display(
-        "Expected a single SQL statement for the refresh SQL, found {num_statements}"
+        "Expected a single SQL statement for the refresh SQL, found {num_statements}.\nRewrite the SQL to only contain a single SELECT statement."
     ))]
     ExpectedSingleSqlStatement { num_statements: usize },
 
     #[snafu(display("Expected a SQL query starting with SELECT <columns> FROM {expected_table}"))]
     InvalidSqlStatement { expected_table: TableReference },
+
+    #[snafu(display("Unexpected '{expr}' in the Refresh SQL statement.\nRewrite the SQL to only perform WHERE filters, i.e. SELECT col1, col2, col3 FROM {expected_table} WHERE col1 = 'foo'"))]
+    UnexpectedExpression {
+        expr: &'static str,
+        expected_table: TableReference,
+    },
 
     #[snafu(display(
         "Only column references are allowed in the SELECT clause of the refresh SQL, custom expressions and aliases are not supported.\nChange the SQL to only use columns references, i.e. SELECT col1, col2, col3 FROM {expected_table}"
@@ -78,111 +86,231 @@ pub fn validate_refresh_sql(
     let statement = statements.pop_front().context(MissingStatementSnafu)?;
     match statement {
         Statement::Statement(statement) => match statement.as_ref() {
-            SQLStatement::Query(query) => match query.body.as_ref() {
-                SetExpr::Select(select) => {
-                    let refresh_schema = validate_select_columns(
-                        &select.projection,
-                        source_schema,
-                        &expected_table,
-                    )?;
-                    ensure!(
-                        select.from.len() == 1,
-                        InvalidSqlStatementSnafu { expected_table }
-                    );
-                    ensure!(
-                        select.cluster_by.is_empty(),
-                        InvalidSqlStatementSnafu { expected_table }
-                    );
-                    ensure!(
-                        select.connect_by.is_none(),
-                        InvalidSqlStatementSnafu { expected_table }
-                    );
-                    ensure!(
-                        select.distinct.is_none(),
-                        InvalidSqlStatementSnafu { expected_table }
-                    );
-                    ensure!(
-                        select.distribute_by.is_empty(),
-                        InvalidSqlStatementSnafu { expected_table }
-                    );
-                    match &select.group_by {
-                        GroupByExpr::All(modifiers) => {
-                            ensure!(
-                                modifiers.is_empty(),
-                                InvalidSqlStatementSnafu { expected_table }
-                            );
-                        }
-                        GroupByExpr::Expressions(exprs, modifiers) => {
-                            ensure!(
-                                exprs.is_empty(),
-                                InvalidSqlStatementSnafu { expected_table }
-                            );
-                            ensure!(
-                                modifiers.is_empty(),
-                                InvalidSqlStatementSnafu { expected_table }
-                            );
-                        }
+            SQLStatement::Query(query) => {
+                ensure!(
+                    query.fetch.is_none(),
+                    UnexpectedExpressionSnafu {
+                        expr: "FETCH",
+                        expected_table,
                     }
-                    ensure!(
-                        select.having.is_none(),
-                        InvalidSqlStatementSnafu { expected_table }
-                    );
-                    ensure!(
-                        select.into.is_none(),
-                        InvalidSqlStatementSnafu { expected_table }
-                    );
-                    ensure!(
-                        select.lateral_views.is_empty(),
-                        InvalidSqlStatementSnafu { expected_table }
-                    );
-                    ensure!(
-                        select.named_window.is_empty(),
-                        InvalidSqlStatementSnafu { expected_table }
-                    );
-                    ensure!(
-                        select.prewhere.is_none(),
-                        InvalidSqlStatementSnafu { expected_table }
-                    );
-                    ensure!(
-                        select.qualify.is_none(),
-                        InvalidSqlStatementSnafu { expected_table }
-                    );
-                    ensure!(
-                        select.sort_by.is_empty(),
-                        InvalidSqlStatementSnafu { expected_table }
-                    );
-                    ensure!(
-                        select.top.is_none(),
-                        InvalidSqlStatementSnafu { expected_table }
-                    );
-                    ensure!(
-                        select.value_table_mode.is_none(),
-                        InvalidSqlStatementSnafu { expected_table }
-                    );
-
-                    match &select.from[0].relation {
-                        sqlparser::ast::TableFactor::Table { name, .. } => {
-                            let table_name_with_schema = name
-                                .0
-                                .iter()
-                                .map(|x| x.value.as_str())
-                                .collect::<Vec<_>>()
-                                .join(".");
-                            ensure!(
-                                TableReference::parse_str(&table_name_with_schema)
-                                    == expected_table,
-                                InvalidSqlStatementSnafu { expected_table }
-                            );
-                        }
-                        _ => {
-                            InvalidSqlStatementSnafu { expected_table }.fail()?;
-                        }
+                );
+                ensure!(
+                    query.limit.is_none(),
+                    UnexpectedExpressionSnafu {
+                        expr: "LIMIT",
+                        expected_table,
                     }
+                );
+                ensure!(
+                    query.offset.is_none(),
+                    UnexpectedExpressionSnafu {
+                        expr: "OFFSET",
+                        expected_table,
+                    }
+                );
+                ensure!(
+                    query.with.is_none(),
+                    UnexpectedExpressionSnafu {
+                        expr: "WITH",
+                        expected_table,
+                    }
+                );
+                ensure!(
+                    query.order_by.is_none(),
+                    UnexpectedExpressionSnafu {
+                        expr: "ORDER BY",
+                        expected_table,
+                    }
+                );
+                ensure!(
+                    query.fetch.is_none(),
+                    UnexpectedExpressionSnafu {
+                        expr: "FETCH",
+                        expected_table,
+                    }
+                );
+                ensure!(
+                    query.for_clause.is_none(),
+                    UnexpectedExpressionSnafu {
+                        expr: "FOR",
+                        expected_table,
+                    }
+                );
+                ensure!(
+                    query.limit_by.is_empty(),
+                    UnexpectedExpressionSnafu {
+                        expr: "LIMIT BY",
+                        expected_table,
+                    }
+                );
+                ensure!(
+                    query.format_clause.is_none(),
+                    UnexpectedExpressionSnafu {
+                        expr: "FORMAT",
+                        expected_table,
+                    }
+                );
+                ensure!(
+                    query.settings.is_none(),
+                    UnexpectedExpressionSnafu {
+                        expr: "SETTINGS",
+                        expected_table,
+                    }
+                );
+                match query.body.as_ref() {
+                    SetExpr::Select(select) => {
+                        let refresh_schema = validate_select_columns(
+                            &select.projection,
+                            source_schema,
+                            &expected_table,
+                        )?;
+                        ensure!(
+                            select.from.len() == 1,
+                            InvalidSqlStatementSnafu { expected_table }
+                        );
+                        ensure!(
+                            select.cluster_by.is_empty(),
+                            UnexpectedExpressionSnafu {
+                                expr: "CLUSTER BY",
+                                expected_table,
+                            }
+                        );
+                        ensure!(
+                            select.connect_by.is_none(),
+                            UnexpectedExpressionSnafu {
+                                expr: "CONNECT BY",
+                                expected_table,
+                            }
+                        );
+                        ensure!(
+                            select.distinct.is_none(),
+                            UnexpectedExpressionSnafu {
+                                expr: "DISTINCT",
+                                expected_table,
+                            }
+                        );
+                        ensure!(
+                            select.distribute_by.is_empty(),
+                            UnexpectedExpressionSnafu {
+                                expr: "DISTRIBUTE BY",
+                                expected_table,
+                            }
+                        );
+                        match &select.group_by {
+                            GroupByExpr::All(modifiers) => {
+                                ensure!(
+                                    modifiers.is_empty(),
+                                    UnexpectedExpressionSnafu {
+                                        expr: "GROUP BY",
+                                        expected_table,
+                                    }
+                                );
+                            }
+                            GroupByExpr::Expressions(exprs, modifiers) => {
+                                ensure!(
+                                    exprs.is_empty(),
+                                    UnexpectedExpressionSnafu {
+                                        expr: "GROUP BY",
+                                        expected_table,
+                                    }
+                                );
+                                ensure!(
+                                    modifiers.is_empty(),
+                                    UnexpectedExpressionSnafu {
+                                        expr: "GROUP BY",
+                                        expected_table,
+                                    }
+                                );
+                            }
+                        }
+                        ensure!(
+                            select.having.is_none(),
+                            UnexpectedExpressionSnafu {
+                                expr: "HAVING",
+                                expected_table,
+                            }
+                        );
+                        ensure!(
+                            select.into.is_none(),
+                            UnexpectedExpressionSnafu {
+                                expr: "INTO",
+                                expected_table,
+                            }
+                        );
+                        ensure!(
+                            select.lateral_views.is_empty(),
+                            UnexpectedExpressionSnafu {
+                                expr: "LATERAL VIEW",
+                                expected_table,
+                            }
+                        );
+                        ensure!(
+                            select.named_window.is_empty(),
+                            UnexpectedExpressionSnafu {
+                                expr: "WINDOW",
+                                expected_table,
+                            }
+                        );
+                        ensure!(
+                            select.prewhere.is_none(),
+                            UnexpectedExpressionSnafu {
+                                expr: "PREWHERE",
+                                expected_table,
+                            }
+                        );
+                        ensure!(
+                            select.qualify.is_none(),
+                            UnexpectedExpressionSnafu {
+                                expr: "QUALIFY",
+                                expected_table,
+                            }
+                        );
+                        ensure!(
+                            select.sort_by.is_empty(),
+                            UnexpectedExpressionSnafu {
+                                expr: "SORT BY",
+                                expected_table,
+                            }
+                        );
+                        ensure!(
+                            select.top.is_none(),
+                            UnexpectedExpressionSnafu {
+                                expr: "TOP",
+                                expected_table,
+                            }
+                        );
+                        ensure!(
+                            select.value_table_mode.is_none(),
+                            UnexpectedExpressionSnafu {
+                                expr: "AS VALUE",
+                                expected_table,
+                            }
+                        );
 
-                    Ok(refresh_schema)
+                        match &select.from[0].relation {
+                            sqlparser::ast::TableFactor::Table { name, .. } => {
+                                let table_name_with_schema = name
+                                    .0
+                                    .iter()
+                                    .map(|x| x.value.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(".");
+                                ensure!(
+                                    TableReference::parse_str(&table_name_with_schema)
+                                        == expected_table,
+                                    InvalidSqlStatementSnafu { expected_table }
+                                );
+                            }
+                            _ => {
+                                InvalidSqlStatementSnafu { expected_table }.fail()?;
+                            }
+                        }
+
+                        Ok(refresh_schema)
+                    }
+                    _ => InvalidSqlStatementSnafu { expected_table }.fail()?,
                 }
-                _ => InvalidSqlStatementSnafu { expected_table }.fail()?,
-            },
+            }
             _ => InvalidSqlStatementSnafu { expected_table }.fail()?,
         },
         _ => InvalidSqlStatementSnafu { expected_table }.fail()?,
@@ -323,7 +451,7 @@ mod tests {
         let sql = "SELECT id FROM test_table GROUP BY id";
 
         let result = validate_refresh_sql(table, sql, Arc::clone(&schema));
-        assert!(matches!(result, Err(Error::InvalidSqlStatement { .. })));
+        assert!(matches!(result, Err(Error::UnexpectedExpression { .. })));
     }
 
     #[test]
