@@ -157,6 +157,15 @@ pub enum Error {
         source: crate::accelerated_table::Error,
     },
 
+    #[snafu(display(
+        "Changing the schema of an accelerated table via the Refresh SQL is not allowed.\nRetry the request, changing the SELECT statement from 'SELECT {selected_columns}' to 'SELECT {refresh_columns}'"
+    ))]
+    RefreshSqlSchemaChangeDisallowed {
+        dataset_name: Arc<str>,
+        selected_columns: Arc<str>,
+        refresh_columns: Arc<str>,
+    },
+
     #[snafu(display("Table {table_name} is not accelerated"))]
     NotAcceleratedTable { table_name: String },
 
@@ -667,6 +676,18 @@ impl DataFusion {
 
         let source_schema = source_table_provider.schema();
 
+        let refresh_sql = dataset.refresh_sql();
+        let refresh_schema = if let Some(refresh_sql) = &refresh_sql {
+            refresh_sql::validate_refresh_sql(
+                dataset.name.clone(),
+                refresh_sql.as_str(),
+                source_schema,
+            )
+            .context(RefreshSqlSnafu)?
+        } else {
+            source_schema
+        };
+
         let acceleration_settings =
             dataset
                 .acceleration
@@ -682,7 +703,7 @@ impl DataFusion {
 
         let accelerated_table_provider = create_accelerator_table(
             dataset.name.clone(),
-            Arc::clone(&source_schema),
+            Arc::clone(&refresh_schema),
             constraints,
             &acceleration_settings,
             secrets,
@@ -701,12 +722,6 @@ impl DataFusion {
                     .update_dataset(&dataset.name, status::ComponentStatus::Ready);
                 initial_load_complete = true;
             }
-        }
-
-        let refresh_sql = dataset.refresh_sql();
-        if let Some(refresh_sql) = &refresh_sql {
-            refresh_sql::validate_refresh_sql(dataset.name.clone(), refresh_sql.as_str())
-                .context(RefreshSqlSnafu)?;
         }
 
         let refresh_mode = source.resolve_refresh_mode(acceleration_settings.refresh_mode);
@@ -737,7 +752,7 @@ impl DataFusion {
             refresh = refresh.period(refresh_data_window);
         }
         refresh
-            .validate_time_format(dataset.name.to_string(), &source_schema)
+            .validate_time_format(dataset.name.to_string(), &refresh_schema)
             .context(InvalidTimeColumnTimeFormatSnafu)?;
 
         let mut accelerated_table_builder = AcceleratedTable::builder(
@@ -919,14 +934,32 @@ impl DataFusion {
         dataset_name: TableReference,
         refresh_sql: Option<String>,
     ) -> Result<()> {
-        if let Some(sql) = &refresh_sql {
-            refresh_sql::validate_refresh_sql(dataset_name.clone(), sql)
-                .context(RefreshSqlSnafu)?;
-        }
-
         let table = self
             .get_accelerated_table_provider(&dataset_name.to_string())
             .await?;
+
+        let refresh_schema = table.schema();
+
+        if let Some(sql) = &refresh_sql {
+            let selected_schema = refresh_sql::validate_refresh_sql(
+                dataset_name.clone(),
+                sql,
+                Arc::clone(&refresh_schema),
+            )
+            .context(RefreshSqlSnafu)?;
+            if selected_schema != refresh_schema {
+                return RefreshSqlSchemaChangeDisallowedSnafu {
+                    dataset_name: Arc::from(dataset_name.to_string()),
+                    selected_columns: Arc::from(
+                        selected_schema.fields().iter().map(|f| f.name()).join(", "),
+                    ),
+                    refresh_columns: Arc::from(
+                        refresh_schema.fields().iter().map(|f| f.name()).join(", "),
+                    ),
+                }
+                .fail();
+            }
+        }
 
         if let Some(accelerated_table) = table.as_any().downcast_ref::<AcceleratedTable>() {
             accelerated_table
