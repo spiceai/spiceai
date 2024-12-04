@@ -9312,6 +9312,7 @@ dependencies = [
  "graph-rs-sdk",
  "graphql-parser",
  "headers-accept",
+ "hf-hub",
  "http 1.1.0",
  "http-body-util",
  "hyper 1.5.1",

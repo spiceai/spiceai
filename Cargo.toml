@@ -75,6 +75,7 @@ futures = "0.3.30"
 globset = "0.4.15"
 graph-rs-sdk = { git = "https://github.com/spiceai/graph-rs-sdk", rev = "f8703df260146b313461029d41c4a021306832b8" }
 graphql-parser = "0.4.0"
+hf-hub = { version = "0.3.0", features = ["tokio"] }
 http = "1.1.0"
 insta = { version = "1.41.1", features = ["filters"] }
 itertools = "0.13"

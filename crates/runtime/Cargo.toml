@@ -134,6 +134,7 @@ azure_storage = "0.21.0"
 azure_storage_blobs = "0.21.0"
 bollard = "0.18.1"
 flightrepl = { path = "../flightrepl" }
+hf-hub = { workspace = true }
 insta.workspace = true
 jsonpath-rust = "0.7.3"
 opentelemetry_sdk = { workspace = true, features = ["rt-tokio-current-thread"] }
@@ -193,6 +194,10 @@ sqlite = [
 [[bench]]
 harness = false
 name = "bench"
+
+[[bench]]
+name = "vector_search"
+harness = false
 
 [target.'cfg(windows)'.dependencies]
 winver = "1.0.0"
