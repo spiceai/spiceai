@@ -64,6 +64,7 @@ impl Scorer for MatchScorer {
         }
     }
 
+    #[allow(clippy::cast_precision_loss)]
     fn metrics(&self, scores: &[f32]) -> Vec<(String, f32)> {
         let n = scores.len();
         if n == 0 {

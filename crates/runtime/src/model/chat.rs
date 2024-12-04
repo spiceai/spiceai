@@ -405,7 +405,7 @@ impl Chat for ChatWrapper {
                 let captured_output: Vec<_> = resp.choices.iter().map(|c| &c.message).collect();
                 match serde_json::to_string(&captured_output) {
                     Ok(output) => {
-                        tracing::info!(target: "task_history", parent: &span, captured_output = %output)
+                        tracing::info!(target: "task_history", parent: &span, captured_output = %output);
                     }
                     Err(e) => tracing::error!("Failed to serialize truncated output: {e}"),
                 }
