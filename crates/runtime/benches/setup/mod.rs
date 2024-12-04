@@ -167,7 +167,7 @@ fn build_app(
         #[cfg(feature = "odbc")]
         "odbc-athena" => Ok(crate::bench_odbc_athena::build_app(app_builder)),
         #[cfg(feature = "delta_lake")]
-        "delta_lake" => Ok(crate::bench_delta::build_app(app_builder)),
+        "delta_lake" => crate::bench_delta::build_app(app_builder, bench_name),
         _ => Err(format!("Unknown connector: {connector}")),
     }?;
 
@@ -448,4 +448,32 @@ fn get_branch_name() -> String {
             |_| "unknown".to_string(),
             |output| String::from_utf8_lossy(&output.stdout).trim().to_string(),
         )
+}
+
+#[macro_export]
+macro_rules! generate_tpcds_queries {
+    ( $( $i:literal ),* ) => {
+        vec![
+            $(
+                (
+                    concat!("tpcds_q", stringify!($i)),
+                    include_str!(concat!("../queries/tpcds/q", stringify!($i), ".sql"))
+                )
+            ),*
+        ]
+    }
+}
+
+#[macro_export]
+macro_rules! generate_tpch_queries {
+    ( $( $i:tt ),* ) => {
+        vec![
+            $(
+                (
+                    concat!("tpch_", stringify!($i)),
+                    include_str!(concat!("../queries/tpch/", stringify!($i), ".sql"))
+                )
+            ),*
+        ]
+    }
 }

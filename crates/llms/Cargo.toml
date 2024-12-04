@@ -53,7 +53,7 @@ tei_candle = { package = "text-embeddings-backend-candle", git = "https://github
 tei_core = { package = "text-embeddings-core", git = "https://github.com/spiceai/text-embeddings-inference.git", rev = "b3925b2f97fcd2bfab9551b432ab659c48e5586b" }
 
 either = "1.13.0"
-indexmap = "2.3.0"
+indexmap = "2.7.0"
 tempfile = "3.13.0"
 
 [dev-dependencies]

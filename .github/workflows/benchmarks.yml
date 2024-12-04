@@ -207,6 +207,9 @@ jobs:
           - cmd: '-c delta_lake'
             name: 'delta_lake connector'
             bench: 'tpch'
+          - cmd: '-c delta_lake -b tpcds'
+            name: 'delta_lake connector'
+            bench: 'tpcds'
           - cmd: '-a arrow'
             name: 'arrow accelerator (memory mode)'
             bench: 'tpch'
@@ -388,7 +391,7 @@ jobs:
       matrix:
         include:
           - cmd: '-a arrow -b clickbench'
-            name: 'arrow accelerator (file mode)'
+            name: 'arrow accelerator (memory mode)'
             bench: 'clickbench'
           - cmd: '-a duckdb -m file -b clickbench'
             name: 'duckdb accelerator (file mode)'

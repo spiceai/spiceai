@@ -132,7 +132,7 @@ tonic = { version = "0.12", features = ["gzip", "tls"] }
 tonic-health = { version = "0.12" }
 tower = "0.5.1"
 tower-http = { version = "0.6.2", features = ["cors"] }
-tracing = "0.1.40"
+tracing = "0.1.41"
 tracing-futures = { version = "0.2.5", features = ["futures-03"] }
 tracing-opentelemetry = "0.27"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
