@@ -149,8 +149,7 @@ datafusion-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "2b
 object_store = { git = "https://github.com/spiceai/arrow-rs.git", rev = "1f37d9eda6da17b7644115f82d209c00c9566733" }
 
 datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "5af0df83c2cd1d3f82f293b066b401a4dfd4064b" }
-# TODO: Change to final commit once https://github.com/datafusion-contrib/datafusion-table-providers/pull/191 is merged
-datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "54f82c8891d90a7da86148d7e96702bd3c9e6c8d" }
+datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "58baab01bdfd282261fbdbc9905a20835fe3cead" }
 
 duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "1034c325aee35eb704e741f56ed942ae22ff4e19" }
 
