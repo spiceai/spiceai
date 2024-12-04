@@ -18,10 +18,9 @@ use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
 
 use super::{eval_scorer::Scorer, DataFusion};
 use arrow::array::{
-    Array, ArrayRef, Float32Array, ListArray, RecordBatch, StringArray, StringViewArray,
-    StructArray,
+    Array, ArrayRef, ListArray, RecordBatch, StringArray, StringViewArray, StructArray,
 };
-use arrow_schema::{ArrowError, Field, Schema};
+use arrow_schema::ArrowError;
 use async_openai::{
     error::OpenAIError,
     types::{
@@ -38,12 +37,12 @@ use serde_json::Value;
 use snafu::{ResultExt, Snafu};
 use spicepod::component::eval::Eval;
 use std::{collections::HashMap, sync::Arc};
-use tract_core::tract_data::itertools::Itertools;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Failed to query eval dataset: {source}"))]
+    #[snafu(display("Failed to query eval dataset '{dataset_name}': {source}"))]
     FailedToQueryDataset {
+        dataset_name: String,
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
@@ -72,6 +71,12 @@ pub enum Error {
 
     #[snafu(display("Failed to create score outputs: {source}"))]
     FailedToCreateScoreOutputs { source: ArrowError },
+
+    #[snafu(display("Failed to parse the input column from the eval dataset because {reason}"))]
+    InvalidInputFormat { reason: String },
+
+    #[snafu(display("Failed to parse the output column from the eval dataset because {reason}"))]
+    InvalidOutputFormat { reason: String },
 }
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -113,27 +118,19 @@ impl DatasetInput {
         match v {
             Value::String(s) => Ok(Some(Self::UserInput(s.to_string()))),
             Value::Array(values) => {
-                let z = values
+                let messages = values
                     .into_iter()
                     .map(serde_json::from_value)
-                    .collect::<Result<Vec<ChatCompletionRequestMessage>, serde_json::Error>>();
-                z.map(|m| Some(Self::Messages(m)))
+                    .collect::<Result<Vec<ChatCompletionRequestMessage>, serde_json::Error>>()?;
+                Ok(Some(Self::Messages(messages)))
             }
-            v if matches!(v, Value::Object(_)) => {
-                println!(
-                    "DatasetInput::try_from_value, {:#?}",
-                    serde_json::from_value::<DatasetInput>(v.clone()).ok()
-                );
-                Ok(Some(serde_json::from_value(v)?))
-            }
+            v if matches!(v, Value::Object(_)) => (Some(serde_json::from_value(v))).transpose(),
             _ => Ok(None),
         }
     }
     /// Attempt to parse Arrow column values as a string ([`StringArray`] or [`StringViewArray`]), and failing that, as a [`ListArray`], into one of the valid [`DatasetInput`] formats.
-    pub(crate) fn try_from_array(
-        arr: &ArrayRef,
-    ) -> Result<Vec<Self>, Box<dyn std::error::Error + Send + Sync>> {
-        // Try String inputs
+    pub(crate) fn try_from_array(arr: &ArrayRef) -> Result<Vec<Self>> {
+        // Try String inputs, as [`DatasetInput::UserInput`].
         let from_str_opt: Option<Vec<&str>> = {
             if let Some(arr_str) = arr.as_any().downcast_ref::<StringArray>() {
                 Some(
@@ -157,40 +154,46 @@ impl DatasetInput {
             return Ok(from_str.into_iter().map(Self::from_raw).collect());
         }
 
-        if let Some(list_arr) = arr.as_any().downcast_ref::<ListArray>() {
-            let mut raw = Vec::with_capacity(list_arr.len());
-            for i in 0..list_arr.len() {
-                if list_arr.is_null(i) {
-                    raw.push(None);
-                } else {
-                    let struct_arr = list_arr.value(i);
+        // Try as [`DatasetInput::Messages`].
+        let list_arr =
+            arr.as_any()
+                .downcast_ref::<ListArray>()
+                .ok_or_else(|| Error::InvalidInputFormat {
+                    reason: "must be a string or list, but was neither".to_string(),
+                })?;
 
-                    let rb = RecordBatch::from(
-                        struct_arr
-                            .as_any()
-                            .downcast_ref::<StructArray>()
-                            .unwrap()
-                            .slice(0, struct_arr.len()),
-                    );
-
-                    if let Some(v) = Self::try_from_value(rb_to_json_value(&rb)?).boxed()? {
-                        raw.push(Some(v));
-                    };
+        let mut result = Vec::with_capacity(list_arr.len());
+        for i in 0..list_arr.len() {
+            if list_arr.is_null(i) {
+                return Err(Error::InvalidInputFormat {
+                    reason: "elements cannot be null".to_string(),
+                });
+            }
+            let arr = list_arr.value(i);
+            let struct_arr = arr.as_any().downcast_ref::<StructArray>().ok_or_else(|| {
+                Error::InvalidInputFormat {
+                    reason: "must be a string or list, but was neither".to_string(),
                 }
-            }
+            })?;
 
-            let raw_count = raw.len();
-            let filtered: Vec<Self> = raw.into_iter().flatten().collect();
-            if filtered.len() == raw_count {
-                Ok(filtered)
-            } else {
-                Err(Box::<dyn std::error::Error + Send + Sync>::from(
-                    "Some values could not be parsed into DatasetInput".to_string(),
-                ))
-            }
-        } else {
-            Ok(vec![])
+            let json_value = rb_to_json_value(&RecordBatch::from(struct_arr)).map_err(|e| {
+                Error::InvalidInputFormat {
+                    reason: format!("could not convert input format into JSON representation: {e}"),
+                }
+            })?;
+
+            match Self::try_from_value(json_value) {
+                Ok(Some(v)) => result.push(v),
+                Ok(None) => {
+                    return Err(Error::InvalidInputFormat { reason: "could not convert valid list-type input element into a known model input format".to_string() });
+                }
+                Err(e) => {
+                    return Err(Error::InvalidInputFormat { reason: format!("could not convert JSON format of input  into a known model input format: {e}") });
+                }
+            };
         }
+
+        Ok(result)
     }
 }
 
@@ -198,14 +201,14 @@ impl DatasetInput {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum DatasetOutput {
-    Messages(Vec<ChatChoice>),
+    Choices(Vec<ChatChoice>),
     AssistantResponse(String),
 }
 
 impl DatasetOutput {
     pub fn from_raw(s: &str) -> Self {
         match serde_json::from_str(s) {
-            Ok(m) => Self::Messages(m),
+            Ok(m) => Self::Choices(m),
             Err(_) => Self::AssistantResponse(s.to_string()),
         }
     }
@@ -214,21 +217,19 @@ impl DatasetOutput {
         match v {
             Value::String(s) => Ok(Some(Self::AssistantResponse(s.to_string()))),
             Value::Array(values) => {
-                let z = values
+                let choices = values
                     .into_iter()
                     .map(serde_json::from_value)
-                    .collect::<Result<Vec<ChatChoice>, serde_json::Error>>();
-                z.map(|m| Some(Self::Messages(m)))
+                    .collect::<Result<Vec<ChatChoice>, serde_json::Error>>()?;
+                Ok(Some(Self::Choices(choices)))
             }
-            v if matches!(v, Value::Object(_)) => Ok(Some(serde_json::from_value(v)?)),
+            v if matches!(v, Value::Object(_)) => (Some(serde_json::from_value(v))).transpose(),
             _ => Ok(None),
         }
     }
 
-    pub(crate) fn try_from_array(
-        arr: &ArrayRef,
-    ) -> Result<Vec<Self>, Box<dyn std::error::Error + Send + Sync>> {
-        // Try String inputs
+    pub(crate) fn try_from_array(arr: &ArrayRef) -> Result<Vec<Self>> {
+        // Try String inputs, as [`DatasetOutput::AssistantResponse`].
         let from_str_opt: Option<Vec<&str>> = {
             if let Some(arr_str) = arr.as_any().downcast_ref::<StringArray>() {
                 Some(
@@ -251,23 +252,47 @@ impl DatasetOutput {
         if let Some(from_str) = from_str_opt {
             return Ok(from_str.into_iter().map(Self::from_raw).collect());
         }
-        if let Some(struct_arr) = arr.as_any().downcast_ref::<StructArray>() {
-            let rb = RecordBatch::from(struct_arr.slice(0, struct_arr.len()));
 
-            let raw = vec![Self::try_from_value(rb_to_json_value(&rb)?).boxed()?];
+        // Try as [`DatasetOutput::Choices`].
+        let list_arr =
+            arr.as_any()
+                .downcast_ref::<ListArray>()
+                .ok_or_else(|| Error::InvalidOutputFormat {
+                    reason: "must be a string or list, but was neither".to_string(),
+                })?;
 
-            let raw_count = raw.len();
-            let filtered: Vec<Self> = raw.into_iter().flatten().collect();
-            if filtered.len() == raw_count {
-                Ok(filtered)
-            } else {
-                Err(Box::<dyn std::error::Error + Send + Sync>::from(
-                    "Some values could not be parsed into DatasetInput".to_string(),
-                ))
+        let mut result = Vec::with_capacity(list_arr.len());
+        for i in 0..list_arr.len() {
+            if list_arr.is_null(i) {
+                return Err(Error::InvalidOutputFormat {
+                    reason: "elements cannot be null".to_string(),
+                });
             }
-        } else {
-            Ok(vec![])
+            let arr = list_arr.value(i);
+            let struct_arr = arr.as_any().downcast_ref::<StructArray>().ok_or_else(|| {
+                Error::InvalidOutputFormat {
+                    reason: "must be a string or list, but was neither".to_string(),
+                }
+            })?;
+
+            let json_value = rb_to_json_value(&RecordBatch::from(struct_arr)).map_err(|e| {
+                Error::InvalidOutputFormat {
+                    reason: format!("could not convert element into JSON representation: {e}"),
+                }
+            })?;
+
+            match Self::try_from_value(json_value) {
+                Ok(Some(v)) => result.push(v),
+                Ok(None) => {
+                    return Err(Error::InvalidOutputFormat { reason: "could not convert valid list-type elements into a known model output format".to_string() });
+                }
+                Err(e) => {
+                    return Err(Error::InvalidOutputFormat { reason: format!("could not convert JSON format of an element into a known model output format: {e}") });
+                }
+            };
         }
+
+        Ok(result)
     }
 }
 
@@ -277,7 +302,7 @@ pub async fn run_eval(
     df: Arc<DataFusion>,
     model: &Box<dyn Chat>,
     scorers: &HashMap<String, Arc<dyn Scorer>>,
-) -> Result<RecordBatch> {
+) -> Result<HashMap<String, Vec<(String, f32)>>> {
     let Eval {
         name: eval_name,
         scorers: scorer_names,
@@ -295,7 +320,6 @@ pub async fn run_eval(
         };
         scorers_subset.insert(name, scorer);
     }
-    println!("scorers_subset: {:?}", scorers_subset.keys().collect_vec());
 
     let dataset =
         TableReference::parse_str(dataset_str).resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA);
@@ -306,71 +330,81 @@ pub async fn run_eval(
         .run()
         .await
         .boxed()
-        .context(FailedToQueryDatasetSnafu)?
+        .context(FailedToQueryDatasetSnafu {
+            dataset_name: dataset.to_string(),
+        })?
         .data
         .try_collect::<Vec<RecordBatch>>()
         .await
         .boxed()
-        .context(FailedToQueryDatasetSnafu)?;
+        .context(FailedToQueryDatasetSnafu {
+            dataset_name: dataset.to_string(),
+        })?;
 
     let (inputs, ideals): (Vec<&ArrayRef>, Vec<&ArrayRef>) =
         ds.iter().map(|rb| (rb.column(0), rb.column(1))).unzip();
 
-    let inputs2 = inputs
+    let inputs = inputs
         .iter()
         .map(|a| DatasetInput::try_from_array(a))
         .collect::<Result<Vec<_>, _>>()
+        .boxed()
         .context(FailedToParseColumnSnafu {
             column: "input".to_string(),
             dataset: dataset.to_string(),
         })?;
-    let input: Vec<&DatasetInput> = inputs2.iter().flatten().collect();
+    let input: Vec<&DatasetInput> = inputs.iter().flatten().collect();
 
-    let ideally = ideals
+    tracing::debug!(
+        "Eval '{eval_name}' dataset '{dataset_str}' input (first): {:?}",
+        input.first()
+    );
+
+    let ideals = ideals
         .iter()
         .map(|a| DatasetOutput::try_from_array(a))
         .collect::<Result<Vec<_>, _>>()
+        .boxed()
         .context(FailedToParseColumnSnafu {
             column: "ideal".to_string(),
             dataset: dataset.to_string(),
         })?;
+    let ideal: Vec<&DatasetOutput> = ideals.iter().flatten().collect();
 
-    let ideal: Vec<&DatasetOutput> = ideally.iter().flatten().collect();
+    tracing::debug!(
+        "Eval '{eval_name}' dataset '{dataset_str}' ideal (first): {:?}",
+        ideal.first()
+    );
 
     let actual: Vec<DatasetOutput> = if let Some(first_ideal) = ideal.first() {
         run_model(model, &input, first_ideal)
             .await
             .context(FailedToRunModelSnafu { eval_name })?
     } else {
+        // Not error, no data in dataset
         vec![]
     };
+    tracing::debug!(
+        "Eval '{eval_name}' dataset '{dataset_str}' actual (first): {:?}",
+        actual.first()
+    );
 
-    let mut result: HashMap<String, Vec<f32>> = HashMap::with_capacity(actual.len());
+    let mut aggregate: HashMap<String, Vec<f32>> = HashMap::with_capacity(actual.len());
     for ((actual, input), ideal) in actual.iter().zip(input.iter()).zip(ideal.iter()) {
         for (name, scorer) in &scorers_subset {
             let s = scorer.score(input, actual, ideal).await;
-            if let Some(scorer_results) = result.get_mut(*name) {
+            if let Some(scorer_results) = aggregate.get_mut(*name) {
                 scorer_results.push(s);
             } else {
-                result.insert((*name).to_string(), vec![s]);
+                aggregate.insert((*name).to_string(), vec![s]);
             };
         }
     }
-    to_record_batch(result).context(FailedToCreateScoreOutputsSnafu)
-}
 
-fn to_record_batch(x: HashMap<String, Vec<f32>>) -> Result<RecordBatch, ArrowError> {
-    let (fields, arrays): (Vec<Field>, Vec<ArrayRef>) = x
-        .into_iter()
-        .map(|(k, v)| {
-            (
-                Field::new(k, arrow_schema::DataType::Float32, false),
-                Arc::new(Float32Array::from(v)) as ArrayRef,
-            )
-        })
-        .unzip();
-
-    RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)
+    Ok(scorers_subset
+        .iter()
+        .map(|(name, scorer)| ((*name).clone(), scorer.metrics(&aggregate[*name])))
+        .collect())
 }
 
 /// Return format of [`DatasetOutput`] determined by `output_format`. `output_format` can be empty, is only used for its enum type.
@@ -391,7 +425,7 @@ async fn run_model(
                     .and_then(|c| c.message.content.clone())
                     .unwrap_or_default(),
             ),
-            DatasetOutput::Messages(_) => DatasetOutput::Messages(choices),
+            DatasetOutput::Choices(_) => DatasetOutput::Choices(choices),
         };
         outputs.push(output);
     }

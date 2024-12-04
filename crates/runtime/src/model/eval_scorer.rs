@@ -27,6 +27,9 @@ pub trait Scorer: Sync + Send {
         actual: &DatasetOutput,
         ideal: &DatasetOutput,
     ) -> f32;
+
+    /// Compute the relevant metrics for this [`Scorer`], given a precomputed scores.
+    fn metrics(&self, scores: &[f32]) -> Vec<(String, f32)>;
 }
 
 /// [`MatchScorer`] checks for equality between the actual and ideal values.
@@ -44,21 +47,38 @@ impl Scorer for MatchScorer {
     ) -> f32 {
         let is_equal = match (actual, ideal) {
             (DatasetOutput::AssistantResponse(a), DatasetOutput::AssistantResponse(b)) => *a == *b,
-            (DatasetOutput::AssistantResponse(a), DatasetOutput::Messages(m))
-            | (DatasetOutput::Messages(m), DatasetOutput::AssistantResponse(a)) => {
+            (DatasetOutput::Choices(a), DatasetOutput::Choices(b)) => a == b,
+            (DatasetOutput::AssistantResponse(a), DatasetOutput::Choices(m))
+            | (DatasetOutput::Choices(m), DatasetOutput::AssistantResponse(a)) => {
                 let b = m
                     .first()
                     .map(|m| m.message.content.clone().unwrap_or_default())
                     .unwrap_or_default();
                 *a == b
             }
-            (DatasetOutput::Messages(a), DatasetOutput::Messages(b)) => a == b,
         };
         if is_equal {
             1.0
         } else {
             0.0
         }
+    }
+
+    fn metrics(&self, scores: &[f32]) -> Vec<(String, f32)> {
+        let n = scores.len();
+        if n == 0 {
+            // Return default metrics for empty input
+            return vec![("mean".to_string(), 0.0), ("std_dev".to_string(), 0.0)];
+        }
+
+        let sum: f32 = scores.iter().copied().sum();
+        let mean = sum / n as f32;
+
+        vec![
+            ("mean".to_string(), mean),
+            // For  Bernoulli r.v., the variance is p(1-p).
+            ("std_dev".to_string(), (mean * (1.0 - mean)).sqrt()),
+        ]
     }
 }
 

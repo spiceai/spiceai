@@ -20,9 +20,7 @@ use axum::{
     response::{IntoResponse, Json, Response},
     Extension,
 };
-use axum_extra::TypedHeader;
 use datafusion::sql::TableReference;
-use headers_accept::Accept;
 use http::StatusCode;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
@@ -33,8 +31,6 @@ use crate::{
     Runtime,
 };
 
-use super::{arrow_to_csv, arrow_to_json, arrow_to_plain, ArrowFormat};
-
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct RunEval {
     pub model: String,
@@ -44,13 +40,11 @@ pub(crate) struct RunEval {
 #[serde(rename_all = "lowercase")]
 pub(crate) struct ModelResponse {}
 
-// #[axum::debug_handler]
 pub(crate) async fn post(
     Extension(llms): Extension<Arc<RwLock<LLMModelStore>>>,
     Extension(df): Extension<Arc<DataFusion>>,
     Extension(rt): Extension<Arc<Runtime>>,
     Path(eval_name): Path<String>,
-    accept: Option<TypedHeader<Accept>>,
     Json(req): Json<RunEval>,
 ) -> Response {
     let model = req.model;
@@ -81,18 +75,8 @@ pub(crate) async fn post(
     };
 
     let scorers = rt.eval_scorers.read().await;
-    match run_eval(eval, df, llm, &*scorers).await {
-        Ok(rb) => {
-            let body_result = match ArrowFormat::from_accept_header(&accept) {
-                ArrowFormat::Json => arrow_to_json(&[rb]),
-                ArrowFormat::Csv => arrow_to_csv(&[rb]),
-                ArrowFormat::Plain => arrow_to_plain(&[rb]),
-            };
-            match body_result {
-                Ok(body) => (StatusCode::OK, body).into_response(),
-                Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
-            }
-        }
+    match run_eval(eval, df, llm, &scorers).await {
+        Ok(result) => (StatusCode::OK, Json(result)).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
     }
 }

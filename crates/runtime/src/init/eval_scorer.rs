@@ -24,6 +24,7 @@ impl Runtime {
         let mut scorers = self.eval_scorers.write().await;
         for (name, scorer) in builtin_scorer() {
             scorers.insert(name.to_string(), Arc::clone(&scorer));
+            tracing::debug!("Successfully loaded eval scorer {name}");
         }
     }
 }
