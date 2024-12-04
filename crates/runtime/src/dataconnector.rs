@@ -227,6 +227,14 @@ pub enum DataConnectorError {
         connector_component: ConnectorComponent,
     },
 
+    #[snafu(display("Failed to load the {connector_component} ({dataconnector}).\nThe field '{field_name}' has an unsupported data type: {data_type}.\nSkip loading this field by setting the `invalid_type_action` parameter to `ignore` or `warn` in the dataset configuration.\nFor details, visit: https://docs.spiceai.org/reference/spicepod/datasets#invalid_type_action"))]
+    UnsupportedDataType {
+        dataconnector: String,
+        connector_component: ConnectorComponent,
+        data_type: String,
+        field_name: String,
+    },
+
     #[snafu(display("Failed to initialize the {connector_component} (ODBC).\nThe runtime is built without ODBC support.\nBuild Spice.ai OSS with the `odbc` feature enabled or use the Docker image that includes ODBC support.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/odbc"))]
     OdbcNotInstalled {
         connector_component: ConnectorComponent,
