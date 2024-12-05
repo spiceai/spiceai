@@ -16,7 +16,7 @@ limitations under the License.
 
 use crate::results::BenchmarkResultsBuilder;
 use app::{App, AppBuilder};
-use datafusion::prelude::SessionContext;
+use datafusion::{prelude::SessionContext, sql::TableReference};
 use futures::Future;
 use runtime::{
     datafusion::DataFusion,
@@ -120,7 +120,10 @@ pub(crate) async fn write_benchmark_results(
     rt: &Runtime,
 ) -> Result<(), String> {
     rt.datafusion()
-        .write_data("oss_benchmarks".into(), benchmark_results)
+        .write_data(
+            &TableReference::parse_str("oss_benchmarks"),
+            benchmark_results,
+        )
         .await
         .map_err(|e| e.to_string())
 }

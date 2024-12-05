@@ -41,7 +41,7 @@ use crate::{
     Runtime,
 };
 
-pub type LLMModelStore = HashMap<String, Box<dyn Chat>>;
+pub type LLMModelStore = HashMap<String, Arc<Box<dyn Chat>>>;
 
 /// Extract a secret from a hashmap of secrets, if it exists.
 macro_rules! extract_secret {

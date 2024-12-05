@@ -47,6 +47,7 @@ use datafusion::error::DataFusionError;
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::physical_plan::collect;
+use datafusion::prelude::SQLOptions;
 use datafusion::sql::parser::DFParser;
 use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 use datafusion::sql::{sqlparser, TableReference};
@@ -72,6 +73,7 @@ pub mod udf;
 
 pub const SPICE_DEFAULT_CATALOG: &str = "spice";
 pub const SPICE_RUNTIME_SCHEMA: &str = "runtime";
+pub const SPICE_EVAL_SCHEMA: &str = "eval";
 pub const SPICE_DEFAULT_SCHEMA: &str = "public";
 pub const SPICE_METADATA_SCHEMA: &str = "metadata";
 
@@ -150,6 +152,9 @@ pub enum Error {
         table_name: String,
         source: DataFusionError,
     },
+
+    #[snafu(display("Unable to execute an internal data modification query: {source}"))]
+    UnableToExecuteInternalDMLQuery { source: DataFusionError },
 
     #[snafu(display("Failed to refresh the dataset {dataset_name}.\n{source}"))]
     UnableToTriggerRefresh {
@@ -273,6 +278,15 @@ impl DataFusion {
     }
 
     #[must_use]
+    fn eval_schema(&self) -> Option<Arc<dyn SchemaProvider>> {
+        if let Some(catalog) = self.ctx.catalog(SPICE_DEFAULT_CATALOG) {
+            return catalog.schema(SPICE_EVAL_SCHEMA);
+        }
+
+        None
+    }
+
+    #[must_use]
     fn schema(&self, schema_name: &str) -> Option<Arc<dyn SchemaProvider>> {
         if let Some(catalog) = self.ctx.catalog(SPICE_DEFAULT_CATALOG) {
             return catalog.schema(schema_name);
@@ -337,6 +351,26 @@ impl DataFusion {
                 .register_table(table_name.table().to_string(), table)
                 .map_err(find_datafusion_root)
                 .context(UnableToRegisterTableToDataFusionSchemaSnafu { schema: "runtime" })?;
+
+            self.data_writers
+                .write()
+                .map_err(|_| Error::UnableToLockDataWriters {})?
+                .insert(table_name);
+        }
+
+        Ok(())
+    }
+
+    pub fn register_eval_table(
+        &self,
+        table_name: TableReference,
+        table: Arc<dyn datafusion::datasource::TableProvider>,
+    ) -> Result<()> {
+        if let Some(eval_schema) = self.eval_schema() {
+            eval_schema
+                .register_table(table_name.table().to_string(), table)
+                .map_err(find_datafusion_root)
+                .context(UnableToRegisterTableToDataFusionSchemaSnafu { schema: "eval" })?;
 
             self.data_writers
                 .write()
@@ -530,12 +564,29 @@ impl DataFusion {
         Ok(())
     }
 
+    /// Do not use for user-provided SQL, for internal use only.
+    pub(crate) async fn run_dml_sql(&self, sql: &str) -> Result<()> {
+        self.ctx
+            .sql_with_options(
+                sql,
+                // Only allow DML
+                SQLOptions::new()
+                    .with_allow_dml(true)
+                    .with_allow_ddl(false)
+                    .with_allow_statements(false),
+            )
+            .await
+            .context(UnableToExecuteInternalDMLQuerySnafu)?;
+
+        Ok(())
+    }
+
     pub async fn write_data(
         &self,
-        table_reference: TableReference,
+        table_reference: &TableReference,
         data_update: DataUpdate,
     ) -> Result<()> {
-        if !self.is_writable(&table_reference) {
+        if !self.is_writable(table_reference) {
             TableNotWritableSnafu {
                 table_name: table_reference.to_string(),
             }
@@ -545,7 +596,7 @@ impl DataFusion {
         self.ensure_sink_dataset(table_reference.clone(), Arc::clone(&data_update.schema))
             .await?;
 
-        let table_provider = self.get_table_provider(&table_reference).await?;
+        let table_provider = self.get_table_provider(table_reference).await?;
 
         verify_schema(
             table_provider.schema().fields(),
@@ -583,7 +634,7 @@ impl DataFusion {
             })?;
 
         self.runtime_status
-            .update_dataset(&table_reference, status::ComponentStatus::Ready);
+            .update_dataset(table_reference, status::ComponentStatus::Ready);
 
         Ok(())
     }

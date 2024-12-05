@@ -104,7 +104,7 @@ impl SpiceModelTool for StoreMemoryTool {
 
             rt.datafusion()
                 .write_data(
-                    table_name,
+                    &table_name,
                     DataUpdate {
                         schema: batch.schema(),
                         data: vec![batch],

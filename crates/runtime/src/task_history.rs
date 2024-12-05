@@ -151,7 +151,7 @@ impl TaskSpan {
         };
 
         df.write_data(
-            TableReference::partial(SPICE_RUNTIME_SCHEMA, DEFAULT_TASK_HISTORY_TABLE),
+            &TableReference::partial(SPICE_RUNTIME_SCHEMA, DEFAULT_TASK_HISTORY_TABLE),
             data_update,
         )
         .await

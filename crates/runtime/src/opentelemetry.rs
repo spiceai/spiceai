@@ -158,7 +158,7 @@ impl MetricsService for Service {
                                 if let Err(e) = self
                                     .datafusion
                                     .write_data(
-                                        TableReference::bare(metric.name.as_str()),
+                                        &TableReference::bare(metric.name.as_str()),
                                         data_update,
                                     )
                                     .await

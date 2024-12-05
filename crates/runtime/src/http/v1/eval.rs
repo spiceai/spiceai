@@ -23,11 +23,12 @@ use axum::{
 use datafusion::sql::TableReference;
 use http::StatusCode;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use tokio::sync::RwLock;
 
 use crate::{
     datafusion::DataFusion,
-    model::{run_eval, LLMModelStore},
+    model::{start_eval_run, LLMModelStore},
     Runtime,
 };
 
@@ -49,8 +50,7 @@ pub(crate) async fn post(
 ) -> Response {
     let model = req.model;
 
-    let llm_lock = llms.read().await;
-    let Some(llm) = llm_lock.get(&model) else {
+    if !llms.read().await.contains_key(&model) {
         return (StatusCode::NOT_FOUND, format!("model '{model}' not found")).into_response();
     };
 
@@ -74,9 +74,9 @@ pub(crate) async fn post(
             .into_response();
     };
 
-    let scorers = rt.eval_scorers.read().await;
-    match run_eval(eval, df, llm, &scorers).await {
-        Ok(result) => (StatusCode::OK, Json(result)).into_response(),
+    // Create row in `eval_run`, then send to work queue, then return to user.
+    match start_eval_run(eval, model, Arc::clone(&df), Arc::clone(&rt.eval_worker)).await {
+        Ok(uuid) => (StatusCode::OK, Json(json!({"id": uuid}))).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
     }
 }

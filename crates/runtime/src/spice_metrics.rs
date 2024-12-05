@@ -72,7 +72,7 @@ impl otel_arrow::ArrowExporter for SpiceMetricsExporter {
         };
 
         self.datafusion
-            .write_data(get_metrics_table_reference(), data_update)
+            .write_data(&get_metrics_table_reference(), data_update)
             .await
             .map_err(|e| MetricsError::Other(e.to_string()))
     }
