@@ -237,7 +237,7 @@ mod tests {
             MatchScorer {}.metrics(&[1.0, 0.0, 1.0, 1.0]),
             vec![
                 ("mean".to_string(), 0.75),
-                ("std_dev".to_string(), 0.43301272)
+                ("std_dev".to_string(), 0.433_012_72)
             ]
         );
     }

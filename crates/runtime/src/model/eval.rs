@@ -23,7 +23,7 @@ use super::{eval_scorer::Scorer, DataFusion};
 use arrow::array::{
     Array, ArrayRef, ListArray, RecordBatch, StringArray, StringViewArray, StructArray,
 };
-use arrow_schema::ArrowError;
+
 use async_openai::{
     error::OpenAIError,
     types::{
@@ -43,7 +43,7 @@ use std::{collections::HashMap, sync::Arc};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Failed to query eval dataset '{dataset_name}': {source}."))]
+    #[snafu(display("Failed to query eval dataset '{dataset_name}': {source}. Ensure the dataset is available and has the correct schema."))]
     FailedToQueryDataset {
         dataset_name: String,
         source: Box<dyn std::error::Error + Send + Sync>,
@@ -66,19 +66,16 @@ pub enum Error {
         source: OpenAIError,
     },
 
-    #[snafu(display("Scorer '{scorer_name}' needed for eval '{eval_name}' is not available"))]
+    #[snafu(display("Scorer '{scorer_name}' needed for eval '{eval_name}' is not available. Ensure '{scorer_name}' is defined in the spicepod and has been sucessfully loaded."))]
     EvalScorerUnavailable {
         eval_name: String,
         scorer_name: String,
     },
 
-    #[snafu(display("Failed to create score outputs: {source}"))]
-    FailedToCreateScoreOutputs { source: ArrowError },
-
-    #[snafu(display("Failed to parse the input column from the eval dataset because {reason}"))]
+    #[snafu(display("Failed to parse the input column from the eval dataset because {reason}. Check that the values in the input column are of valid eval format."))]
     InvalidInputFormat { reason: String },
 
-    #[snafu(display("Failed to parse the output column from the eval dataset because {reason}"))]
+    #[snafu(display("Failed to parse the output column from the eval dataset because {reason}. Check that the values in the output column are of valid eval format."))]
     InvalidOutputFormat { reason: String },
 }
 pub type Result<T, E = Error> = std::result::Result<T, E>;
