@@ -68,6 +68,7 @@ pub static EVAL_RUNS_TABLE_REFERENCE: LazyLock<TableReference> =
         schema: SPICE_EVAL_SCHEMA.into(),
         table: "runs".into(),
     });
+
 pub static EVAL_RUNS_TABLE_TIME_COLUMN: &str = "created_at";
 pub static EVAL_RUNS_TABLE_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     Arc::new(Schema::new(vec![
@@ -82,6 +83,7 @@ pub static EVAL_RUNS_TABLE_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
         Field::new("status", DataType::Utf8, false),
         Field::new("error_message", DataType::Utf8, true),
         Field::new("scorers", DataType::new_list(DataType::Utf8, false), false),
+        // TODO score metrics
     ]))
 });
 
