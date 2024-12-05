@@ -16,37 +16,68 @@ limitations under the License.
 
 use std::{collections::HashMap, sync::Arc};
 
-use crate::datafusion::DataFusion;
+use crate::objectstore::github::GitHubRawObjectStore;
 use axum::{
-    body::Bytes,
-    http::StatusCode,
+    http::{header::CONTENT_TYPE, StatusCode},
     response::{IntoResponse, Response},
-    Extension,
+    Json,
 };
+use object_store::{path::Path, ObjectStore};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-struct GeneratePackageRequest {
-    to: String, // github:{org}/{repo}/{sha}/{path_to_spicepod.yaml}
-    // params:
-    //   token: string
+pub struct GeneratePackageRequest {
+    from: String,
     params: HashMap<String, String>,
 }
-// struct PackageRequest {
-//     org: String,
-//     repo: String,
-//     path: String,
-//     token: Option<String>,
-// }
 
-pub(crate) async fn generate(
-    Extension(df): Extension<Arc<DataFusion>>,
-    Json(payload): Json<PackageRequest>,
-) -> Response {
-    let store = GitHubRawObjectStore::try_new(
-        payload.org,
-        payload.repo,
-        payload.path,
-        payload.token.as_ref(),
-    );
+pub(crate) async fn generate(Json(payload): Json<GeneratePackageRequest>) -> Response {
+    if !payload.from.starts_with("github:") {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(
+                "Invalid `from` field, specify a github source and retry (e.g. github:{org}/{repo}/{sha}/{path_to_spicepod.yaml})",
+            ),
+        )
+            .into_response();
+    }
+
+    let Some(from) = payload.from.split(':').nth(1) else {
+        return (StatusCode::BAD_REQUEST, "Invalid `from` field, specify a github source and retry (e.g. github:{org}/{repo}/{sha}/{path_to_spicepod.yaml})")
+            .into_response();
+    };
+
+    let parts: Vec<&str> = from.splitn(4, '/').collect();
+    let (Some(&org), Some(&repo), Some(&sha), Some(&path)) =
+        (parts.get(0), parts.get(1), parts.get(2), parts.get(3))
+    else {
+        return (StatusCode::BAD_REQUEST, "Invalid `from` field, specify a github source and retry (e.g. github:{org}/{repo}/{sha}/{path_to_spicepod.yaml})")
+        .into_response();
+    };
+
+    let github_token = payload.params.get("github_token").map(String::as_str);
+
+    let store = match GitHubRawObjectStore::try_new(org, repo, sha, github_token) {
+        Ok(store) => Arc::new(store) as Arc<dyn ObjectStore>,
+        Err(e) => {
+            return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
+        }
+    };
+
+    let path = match Path::parse(path) {
+        Ok(path) => path,
+        Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+    };
+
+    let package_zip_bytes = match package::make_zip(&store, &path).await {
+        Ok(bytes) => bytes,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+
+    (
+        StatusCode::OK,
+        [(CONTENT_TYPE, "application/zip")],
+        package_zip_bytes,
+    )
+        .into_response()
 }
