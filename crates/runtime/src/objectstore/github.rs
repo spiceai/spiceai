@@ -18,11 +18,12 @@ use std::fmt::Display;
 
 use async_trait::async_trait;
 use futures::stream::BoxStream;
+use http::{HeaderMap, HeaderValue};
 use object_store::{
     http::{HttpBuilder, HttpStore},
     path::Path,
-    GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOpts,
-    PutOptions, PutPayload, PutResult,
+    ClientOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+    PutMultipartOpts, PutOptions, PutPayload, PutResult,
 };
 use snafu::prelude::*;
 
@@ -32,6 +33,9 @@ pub enum Error {
         "An internal error occured while connecting to GitHub to download files.\n{source}"
     ))]
     HttpBuilderFailed { source: object_store::Error },
+
+    #[snafu(display("An invalid GitHub token was provided."))]
+    InvalidToken,
 }
 
 /// An implementation of the `ObjectStore` trait for raw.githubusercontent.com
@@ -47,11 +51,21 @@ impl GitHubRawObjectStore {
         org: impl Display,
         repo: impl Display,
         rev: impl Display,
+        token: Option<&str>,
     ) -> Result<Self, Error> {
+        let mut headers = HeaderMap::with_capacity(1);
+        if let Some(token) = token {
+            headers.insert(
+                "Authorization",
+                HeaderValue::from_str(&format!("token {token}"))
+                    .map_err(|_| InvalidTokenSnafu.build())?,
+            );
+        }
         let http_store = HttpBuilder::new()
             .with_url(format!(
-                "https://raw.githubusercontent.com/{org}/{repo}/refs/heads/{rev}"
+                "https://raw.githubusercontent.com/{org}/{repo}/{rev}"
             ))
+            .with_client_options(ClientOptions::default().with_default_headers(headers))
             .build()
             .context(HttpBuilderFailedSnafu)?;
         Ok(Self { http_store })
@@ -130,7 +144,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_opts() {
-        let store = GitHubRawObjectStore::try_new("spiceai", "spiceai", "trunk")
+        let store = GitHubRawObjectStore::try_new("spiceai", "spiceai", "refs/heads/trunk", None)
             .expect("failed to create store");
         let result = store
             .get_opts(&Path::from("README.md"), GetOptions::default())
