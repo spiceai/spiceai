@@ -178,7 +178,7 @@ fn driver_is_file(driver: &str) -> bool {
 }
 
 fn parameter_is_integer(parameters: &Parameters, param: &str) -> Result<()> {
-    if let Some(value) = parameters.get("max_binary_size").expose().ok() {
+    if let Some(value) = parameters.get(param).expose().ok() {
         let value = value
             .parse::<usize>()
             .map_err(|_| Error::InvalidParameter {
