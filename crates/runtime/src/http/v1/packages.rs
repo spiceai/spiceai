@@ -49,7 +49,7 @@ pub(crate) async fn generate(Json(payload): Json<GeneratePackageRequest>) -> Res
 
     let parts: Vec<&str> = from.splitn(4, '/').collect();
     let (Some(&org), Some(&repo), Some(&sha), Some(&path)) =
-        (parts.get(0), parts.get(1), parts.get(2), parts.get(3))
+        (parts.first(), parts.get(1), parts.get(2), parts.get(3))
     else {
         return (StatusCode::BAD_REQUEST, "Invalid `from` field, specify a github source and retry (e.g. github:{org}/{repo}/{sha}/{path_to_spicepod.yaml})")
         .into_response();
