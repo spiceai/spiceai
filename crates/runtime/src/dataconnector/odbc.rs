@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use crate::component::dataset::Dataset;
+use crate::parameters::Parameters;
 use async_trait::async_trait;
 use data_components::odbc::ODBCTableFactory;
 use data_components::Read;
@@ -176,23 +177,24 @@ fn driver_is_file(driver: &str) -> bool {
         .is_some()
 }
 
-macro_rules! parameter_is_integer {
-    ($param:expr) => {
-        let value = $param
+fn parameter_is_integer(parameters: &Parameters, param: &str) -> Result<()> {
+    if let Some(value) = parameters.get("max_binary_size").expose().ok() {
+        let value = value
             .parse::<usize>()
             .map_err(|_| Error::InvalidParameter {
-                param: stringify!($param).to_string(),
+                param: param.to_string(),
                 msg: "The parameter must be a positive integer.".to_string(),
             })?;
 
         if value == 0 {
             return Err(Error::InvalidParameter {
-                param: stringify!($param).to_string(),
+                param: param.to_string(),
                 msg: "The parameter must be a positive integer.".to_string(),
-            }
-            .into());
+            });
         }
-    };
+    }
+
+    Ok(())
 }
 
 impl DataConnectorFactory for ODBCFactory {
@@ -201,28 +203,10 @@ impl DataConnectorFactory for ODBCFactory {
         params: DataConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
-            if let Some(binary_size) = params.parameters.get("max_binary_size").expose().ok() {
-                parameter_is_integer!(binary_size);
-            }
-
-            if let Some(text_size) = params.parameters.get("max_text_size").expose().ok() {
-                parameter_is_integer!(text_size);
-            }
-
-            if let Some(bytes_per_batch) =
-                params.parameters.get("max_bytes_per_batch").expose().ok()
-            {
-                parameter_is_integer!(bytes_per_batch);
-            }
-
-            if let Some(rows_per_batch) = params
-                .parameters
-                .get("max_num_rows_per_batch")
-                .expose()
-                .ok()
-            {
-                parameter_is_integer!(rows_per_batch);
-            }
+            parameter_is_integer(&params.parameters, "max_binary_size")?;
+            parameter_is_integer(&params.parameters, "max_text_size")?;
+            parameter_is_integer(&params.parameters, "max_bytes_per_batch")?;
+            parameter_is_integer(&params.parameters, "max_num_rows_per_batch")?;
 
             let dialect =
                 if let Some(sql_dialect) = params.parameters.get("sql_dialect").expose().ok() {
