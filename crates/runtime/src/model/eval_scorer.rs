@@ -58,9 +58,9 @@ impl Scorer for MatchScorer {
             }
         };
         if is_equal {
-            1.0
+            1.0_f32
         } else {
-            0.0
+            0.0_f32
         }
     }
 
@@ -103,7 +103,7 @@ mod tests {
                     &DatasetOutput::from_raw("Hello")
                 )
                 .await,
-            1.0
+            1.0_f32
         );
     }
 
@@ -117,7 +117,7 @@ mod tests {
                     &DatasetOutput::from_raw("Hi")
                 )
                 .await,
-            0.0
+            0.0_f32
         );
     }
 
@@ -129,6 +129,7 @@ mod tests {
                     &DatasetInput::Messages(vec![]),
                     &DatasetOutput::try_from_value(json!([
                         {
+                            "index": 0,
                             "message": {
                                 "role": "assistant",
                                 "content": "Hello"
@@ -139,6 +140,7 @@ mod tests {
                     .unwrap(),
                     &DatasetOutput::try_from_value(json!([
                         {
+                            "index": 0,
                             "message": {
                                 "role": "assistant",
                                 "content": "Hello"
@@ -149,7 +151,7 @@ mod tests {
                     .unwrap(),
                 )
                 .await,
-            1.0
+            1.0_f32
         );
     }
 
@@ -161,6 +163,7 @@ mod tests {
                     &DatasetInput::Messages(vec![]),
                     &DatasetOutput::try_from_value(json!([
                         {
+                            "index": 0,
                             "message": {
                                 "role": "assistant",
                                 "content": "Hello"
@@ -171,6 +174,7 @@ mod tests {
                     .unwrap(),
                     &DatasetOutput::try_from_value(json!([
                         {
+                            "index": 0,
                             "message": {
                                 "role": "assistant",
                                 "content": "Hi"
@@ -181,7 +185,7 @@ mod tests {
                     .unwrap()
                 )
                 .await,
-            0.0
+            0.0_f32
         );
     }
 
@@ -194,6 +198,7 @@ mod tests {
                     &DatasetOutput::from_raw("Hello"),
                     &DatasetOutput::try_from_value(json!([
                         {
+                            "index": 0,
                             "message": {
                                 "role": "assistant",
                                 "content": "Hello"
@@ -204,7 +209,7 @@ mod tests {
                     .unwrap()
                 )
                 .await,
-            1.0
+            1.0_f32
         );
     }
 
@@ -217,6 +222,7 @@ mod tests {
                     &DatasetOutput::from_raw("Hi"),
                     &DatasetOutput::try_from_value(json!([
                         {
+                            "index": 0,
                             "message": {
                                 "role": "assistant",
                                 "content": "Hello"
@@ -227,7 +233,7 @@ mod tests {
                     .unwrap()
                 )
                 .await,
-            0.0
+            0.0_f32
         );
     }
 
@@ -236,8 +242,8 @@ mod tests {
         assert_eq!(
             MatchScorer {}.metrics(&[1.0, 0.0, 1.0, 1.0]),
             vec![
-                ("mean".to_string(), 0.75),
-                ("std_dev".to_string(), 0.433_012_72)
+                ("mean".to_string(), 0.75_f32),
+                ("std_dev".to_string(), 0.433_012_7_f32)
             ]
         );
     }
