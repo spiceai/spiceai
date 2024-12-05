@@ -116,8 +116,7 @@ async fn databricks_delta_lake_integration_test() -> Result<(), anyhow::Error> {
                     &mut rt,
                     &format!("file_integration_test_{snapshot_suffix}"),
                     query,
-                    false, // snapshot plan changes depending on the runner's filesystem
-                    // the file_groups outputs the absolute path to the parquet file
+                    true,
                     validate_result,
                 )
                 .await
