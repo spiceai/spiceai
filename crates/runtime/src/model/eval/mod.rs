@@ -25,6 +25,7 @@ use runs::{EvalRunId, EvalRunStatus};
 use snafu::{ResultExt, Snafu};
 
 pub(crate) mod dataset;
+pub(crate) mod result;
 pub(crate) mod runs;
 pub(crate) mod scorer;
 pub(crate) mod worker;

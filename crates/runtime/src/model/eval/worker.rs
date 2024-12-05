@@ -56,16 +56,15 @@ impl EvalWorker {
         scorers: Arc<RwLock<HashMap<String, Arc<dyn Scorer>>>>,
     ) -> Self {
         let (tx, rx) = mpsc::channel(8);
-        let _backend_thread = Arc::new(EvalThread::new(
-            rx,
-            llms,
-            Arc::clone(&df),
-            Arc::clone(&scorers),
-        ));
 
         Self {
             command_sender: tx,
-            _backend_thread,
+            _backend_thread: Arc::new(EvalThread::new(
+                rx,
+                llms,
+                Arc::clone(&df),
+                Arc::clone(&scorers),
+            )),
             scorers,
             df,
         }
@@ -98,10 +97,8 @@ impl EvalWorker {
             .context(FailedToOffloadEvalRunSnafu {
                 eval_run_id: id.to_string(),
             })?;
-        println!("We shipped the goods");
 
-        update_eval_run_status(Arc::clone(&self.df), id, EvalRunStatus::Queued, None).await?;
-        println!("And reported it");
+        update_eval_run_status(Arc::clone(&self.df), id, &EvalRunStatus::Queued, None).await?;
 
         Ok(())
     }
@@ -125,18 +122,16 @@ impl EvalThread {
             while let Some(cmd) = receiver.recv().await {
                 match cmd {
                     EvalWorkerCommand::RunEval((id, eval, model_name)) => {
-                        println!("We got a command: {id}{eval:?}{model_name}");
                         // Set [`EvalRunStatus::Running`]
                         if let Err(e) = update_eval_run_status(
                             Arc::clone(&df),
                             &id,
-                            EvalRunStatus::Running,
+                            &EvalRunStatus::Running,
                             None,
                         )
                         .await
                         {
-                            // TODO: Improve
-                            tracing::error!("Failed to update eval run status: {e}");
+                            tracing::error!("For eval run '{}', the worker failed to update the status to {}: {e}", id.clone(), EvalRunStatus::Running);
                         }
 
                         let (status, err_opt) = match run_eval(
@@ -149,14 +144,14 @@ impl EvalThread {
                         .await
                         {
                             Err(e) => (EvalRunStatus::Failed, Some(e.to_string())),
+                            // TODO: add score metrics to `spice.eval.runs`.
                             Ok(_) => (EvalRunStatus::Completed, None),
                         };
 
                         if let Err(e) =
-                            update_eval_run_status(Arc::clone(&df), &id, status, err_opt).await
+                            update_eval_run_status(Arc::clone(&df), &id, &status, err_opt).await
                         {
-                            // TODO: Improve
-                            tracing::error!("Failed to update eval run status: {e}");
+                            tracing::error!("For eval run '{}', the worker failed to update the status to {}: {e}", id.clone(), status);
                         }
                     }
                 }
