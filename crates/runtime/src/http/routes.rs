@@ -62,7 +62,8 @@ pub(crate) fn routes(
             "/v1/datasets/:name/acceleration",
             patch(v1::datasets::acceleration),
         )
-        .route("/v1/spicepods", get(v1::spicepods::get));
+        .route("/v1/spicepods", get(v1::spicepods::get))
+        .route("/v1/packages/generate", post(v1::packages::generate));
 
     if cfg!(feature = "models") {
         authenticated_router = authenticated_router

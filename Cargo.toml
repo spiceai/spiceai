@@ -13,6 +13,7 @@ members = [
     "crates/model_components",
     "crates/ns_lookup",
     "crates/otel-arrow",
+    "crates/package",
     "crates/runtime",
     "crates/runtime-auth",
     "crates/spicepod",
@@ -54,6 +55,7 @@ axum = { version = "0.7.9", features = ["macros"] }
 base64 = "0.22.1"
 bb8 = "0.8"
 bb8-postgres = "0.8"
+bytes = "1.9.0"
 chrono = "0.4.38"
 clap = { version = "4.5.21", features = ["derive"] }
 clickhouse-rs = { git = "https://github.com/spiceai/clickhouse-rs.git", tag = "0.2.1", features = [

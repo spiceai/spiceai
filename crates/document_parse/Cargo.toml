@@ -12,5 +12,5 @@ version.workspace = true
 docx-rs = { git = "https://github.com/spiceai/docx-rs", rev="2d86a60b58afb02b157f96b42a92626417e47f71"}
 lopdf = {git = "https://github.com/J-F-Liu/lopdf", rev = "38b8c25f3e92c578baf18928a8ce75d447a6009a" } # "0.34.0"
 snafu.workspace = true
-bytes = "1.6.0"
+bytes.workspace = true
 tokio = { workspace = true, features = ["sync"] }
