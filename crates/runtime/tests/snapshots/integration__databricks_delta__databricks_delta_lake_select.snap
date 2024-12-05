@@ -1,6 +1,6 @@
 ---
 source: crates/runtime/tests/databricks_delta/mod.rs
-description: File Integration Test Results
+description: "Databricks (mode: delta_lake) Integration Test Results"
 ---
 +----------------+-----------------+-----------+-----------+----------+-----------+------------+-------------+------------------------------+------------+----------------------+-------------+-----------+-------------------------------+--------------------+
 | string_col     | long_col        | int_col   | short_col | byte_col | float_col | double_col | boolean_col | binary_col                   | date_col   | timestamp_col        | decimal_col | array_col | struct_col                    | map_col            |

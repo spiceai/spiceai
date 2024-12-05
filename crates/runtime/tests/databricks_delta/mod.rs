@@ -102,11 +102,11 @@ async fn databricks_delta_lake_integration_test() -> Result<(), anyhow::Error> {
                     let results = arrow::util::pretty::pretty_format_batches(&result_batches)
                         .expect("should pretty print result batch");
                     insta::with_settings!({
-                        description => format!("File Integration Test Results"),
+                        description => format!("Databricks (mode: delta_lake) Integration Test Results"),
                         omit_expression => true,
                         snapshot_path => "../snapshots"
                     }, {
-                        insta::assert_snapshot!(format!("file_integration_test_select"), results);
+                        insta::assert_snapshot!(format!("databricks_delta_lake_select"), results);
                     });
                 })),
             )];
@@ -114,7 +114,7 @@ async fn databricks_delta_lake_integration_test() -> Result<(), anyhow::Error> {
             for (query, snapshot_suffix, validate_result) in queries {
                 run_query_and_check_results(
                     &mut rt,
-                    &format!("file_integration_test_{snapshot_suffix}"),
+                    &format!("databricks_delta_lake_test_{snapshot_suffix}"),
                     query,
                     true,
                     validate_result,
