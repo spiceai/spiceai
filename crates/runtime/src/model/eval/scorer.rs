@@ -110,5 +110,160 @@ impl Scorer for MatchScorer {
 
 #[must_use]
 pub fn builtin_scorer() -> Vec<(&'static str, Arc<dyn Scorer>)> {
-    vec![("Match", Arc::new(MatchScorer {}))]
+    vec![("match", Arc::new(MatchScorer {}))]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn test_score_assistant_response_match() {
+        assert_eq!(
+            MatchScorer {}
+                .score(
+                    &DatasetInput::UserInput("What is your name?".to_string()),
+                    &DatasetOutput::from_raw("Hello"),
+                    &DatasetOutput::from_raw("Hello")
+                )
+                .await,
+            1.0
+        );
+    }
+
+    #[tokio::test]
+    async fn test_score_assistant_response_mismatch() {
+        assert_eq!(
+            MatchScorer {}
+                .score(
+                    &DatasetInput::UserInput("What is your name?".to_string()),
+                    &DatasetOutput::from_raw("Hello"),
+                    &DatasetOutput::from_raw("Hi")
+                )
+                .await,
+            0.0
+        );
+    }
+
+    #[tokio::test]
+    async fn test_score_choices_match() {
+        assert_eq!(
+            MatchScorer {}
+                .score(
+                    &DatasetInput::Messages(vec![]),
+                    &DatasetOutput::try_from_value(json!([
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": "Hello"
+                            }
+                        }
+                    ]))
+                    .expect("Failed to parse actual DatasetOutput")
+                    .unwrap(),
+                    &DatasetOutput::try_from_value(json!([
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": "Hello"
+                            }
+                        }
+                    ]))
+                    .expect("Failed to parse ideal DatasetOutput")
+                    .unwrap(),
+                )
+                .await,
+            1.0
+        );
+    }
+
+    #[tokio::test]
+    async fn test_score_choices_mismatch() {
+        assert_eq!(
+            MatchScorer {}
+                .score(
+                    &DatasetInput::Messages(vec![]),
+                    &DatasetOutput::try_from_value(json!([
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": "Hello"
+                            }
+                        }
+                    ]))
+                    .expect("Failed to parse actual DatasetOutput")
+                    .unwrap(),
+                    &DatasetOutput::try_from_value(json!([
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": "Hi"
+                            }
+                        }
+                    ]))
+                    .expect("Failed to parse ideal DatasetOutput")
+                    .unwrap()
+                )
+                .await,
+            0.0
+        );
+    }
+
+    #[tokio::test]
+    async fn test_score_mixed_match() {
+        assert_eq!(
+            MatchScorer {}
+                .score(
+                    &DatasetInput::UserInput("What is your name?".to_string()),
+                    &DatasetOutput::from_raw("Hello"),
+                    &DatasetOutput::try_from_value(json!([
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": "Hello"
+                            }
+                        }
+                    ]))
+                    .expect("Failed to parse ideal DatasetOutput")
+                    .unwrap()
+                )
+                .await,
+            1.0
+        );
+    }
+
+    #[tokio::test]
+    async fn test_score_mixed_mismatch() {
+        assert_eq!(
+            MatchScorer {}
+                .score(
+                    &DatasetInput::UserInput("What is your name?".to_string()),
+                    &DatasetOutput::from_raw("Hi"),
+                    &DatasetOutput::try_from_value(json!([
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": "Hello"
+                            }
+                        }
+                    ]))
+                    .expect("Failed to parse ideal DatasetOutput")
+                    .unwrap()
+                )
+                .await,
+            0.0
+        );
+    }
+
+    #[test]
+    fn test_metrics_non_empty_scores() {
+        assert_eq!(
+            MatchScorer {}.metrics(&[1.0, 0.0, 1.0, 1.0]),
+            vec![
+                ("mean".to_string(), 0.75),
+                ("std_dev".to_string(), 0.433_012_72)
+            ]
+        );
+    }
 }

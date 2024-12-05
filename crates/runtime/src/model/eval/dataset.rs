@@ -14,11 +14,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use crate::{
+    component::validate_identifier,
     datafusion::{DataFusion, SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA},
-    model::eval::{FailedToParseColumnSnafu, FailedToQueryDatasetSnafu},
+    model::{
+        eval::{FailedToParseColumnSnafu, FailedToQueryDatasetSnafu, FailedToRunModelSnafu},
+        Scorer,
+    },
 };
 
 use super::{Error, Result};
@@ -35,6 +39,7 @@ use async_openai::{
 
 use datafusion::sql::TableReference;
 use futures::TryStreamExt;
+use llms::chat::Chat;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use snafu::ResultExt;
@@ -320,6 +325,146 @@ impl DatasetOutput {
 
         Ok(result)
     }
+}
+
+#[allow(clippy::implicit_hasher)]
+pub async fn run_eval(
+    eval: &Eval,
+    df: Arc<DataFusion>,
+    model: &dyn Chat,
+    scorers: &HashMap<String, Arc<dyn Scorer>>,
+) -> Result<HashMap<String, Vec<(String, f32)>>> {
+    let Eval {
+        name: eval_name,
+        scorers: scorer_names,
+        dataset: dataset_str,
+        ..
+    } = eval;
+
+    let mut scorers_subset = HashMap::with_capacity(scorer_names.len());
+    for name in scorer_names {
+        let Some(scorer) = scorers.get(name) else {
+            return Err(Error::EvalScorerUnavailable {
+                scorer_name: name.clone(),
+                eval_name: eval_name.clone(),
+            });
+        };
+        scorers_subset.insert(name, scorer);
+    }
+
+    validate_identifier(dataset_str)
+        .boxed()
+        .context(FailedToQueryDatasetSnafu {
+            dataset_name: dataset_str.to_string(),
+        })?;
+    let dataset =
+        TableReference::parse_str(dataset_str).resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA);
+    let ds = df
+        .query_builder(format!("SELECT input, ideal FROM {dataset}").as_str())
+        .build()
+        .run()
+        .await
+        .boxed()
+        .context(FailedToQueryDatasetSnafu {
+            dataset_name: dataset.to_string(),
+        })?
+        .data
+        .try_collect::<Vec<RecordBatch>>()
+        .await
+        .boxed()
+        .context(FailedToQueryDatasetSnafu {
+            dataset_name: dataset.to_string(),
+        })?;
+
+    let (inputs, ideals): (Vec<&ArrayRef>, Vec<&ArrayRef>) =
+        ds.iter().map(|rb| (rb.column(0), rb.column(1))).unzip();
+
+    let inputs = inputs
+        .iter()
+        .map(|a| DatasetInput::try_from_array(a))
+        .collect::<Result<Vec<_>, _>>()
+        .boxed()
+        .context(FailedToParseColumnSnafu {
+            column: "input".to_string(),
+            dataset: dataset.to_string(),
+        })?;
+    let input: Vec<&DatasetInput> = inputs.iter().flatten().collect();
+
+    tracing::debug!(
+        "Eval '{eval_name}' dataset '{dataset_str}' input (first): {:?}",
+        input.first()
+    );
+
+    let ideals = ideals
+        .iter()
+        .map(|a| DatasetOutput::try_from_array(a))
+        .collect::<Result<Vec<_>, _>>()
+        .boxed()
+        .context(FailedToParseColumnSnafu {
+            column: "ideal".to_string(),
+            dataset: dataset.to_string(),
+        })?;
+    let ideal: Vec<&DatasetOutput> = ideals.iter().flatten().collect();
+
+    tracing::debug!(
+        "Eval '{eval_name}' dataset '{dataset_str}' ideal (first): {:?}",
+        ideal.first()
+    );
+
+    let actual: Vec<DatasetOutput> = if let Some(first_ideal) = ideal.first() {
+        run_model(model, &input, first_ideal)
+            .await
+            .context(FailedToRunModelSnafu { eval_name })?
+    } else {
+        // Not error, no data in dataset
+        vec![]
+    };
+    tracing::debug!(
+        "Eval '{eval_name}' dataset '{dataset_str}' actual (first): {:?}",
+        actual.first()
+    );
+
+    let mut aggregate: HashMap<String, Vec<f32>> = HashMap::with_capacity(actual.len());
+    for ((actual, input), ideal) in actual.iter().zip(input.iter()).zip(ideal.iter()) {
+        for (name, scorer) in &scorers_subset {
+            let s = scorer.score(input, actual, ideal).await;
+            if let Some(scorer_results) = aggregate.get_mut(*name) {
+                scorer_results.push(s);
+            } else {
+                aggregate.insert((*name).to_string(), vec![s]);
+            };
+        }
+    }
+
+    Ok(scorers_subset
+        .iter()
+        .map(|(name, scorer)| ((*name).clone(), scorer.metrics(&aggregate[*name])))
+        .collect())
+}
+
+/// Return format of [`DatasetOutput`] determined by `output_format`. `output_format` can be empty, is only used for its enum type.
+#[allow(clippy::borrowed_box)]
+async fn run_model(
+    model: &dyn Chat,
+    inputs: &[&DatasetInput],
+    output_format: &DatasetOutput,
+) -> Result<Vec<DatasetOutput>, OpenAIError> {
+    let mut outputs = Vec::with_capacity(inputs.len());
+    for input in inputs {
+        let req: CreateChatCompletionRequest = (*input).try_into()?;
+        let choices = model.chat_request(req).await?.choices;
+        let output = match output_format {
+            DatasetOutput::AssistantResponse(_) => DatasetOutput::AssistantResponse(
+                choices
+                    .first()
+                    .and_then(|c| c.message.content.clone())
+                    .unwrap_or_default(),
+            ),
+            DatasetOutput::Choices(_) => DatasetOutput::Choices(choices),
+        };
+        outputs.push(output);
+    }
+    Ok(outputs)
 }
 
 fn rb_to_json_value(data: &RecordBatch) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {

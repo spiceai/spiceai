@@ -253,7 +253,21 @@ fn map_delta_data_type_to_arrow_data_type(
         delta_kernel::schema::DataType::Map(map_type) => {
             let key_type = map_delta_data_type_to_arrow_data_type(map_type.key_type());
             let value_type = map_delta_data_type_to_arrow_data_type(map_type.value_type());
-            DataType::Dictionary(Box::new(key_type), Box::new(value_type))
+            DataType::Map(
+                Arc::new(Field::new_struct(
+                    map_type.type_name.clone(),
+                    vec![
+                        Arc::new(Field::new("key", key_type, false)),
+                        Arc::new(Field::new(
+                            "value",
+                            value_type,
+                            map_type.value_contains_null(),
+                        )),
+                    ],
+                    false,
+                )),
+                false,
+            )
         }
     }
 }

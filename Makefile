@@ -60,6 +60,14 @@ test-integration-models-without-openai:
 test-bench:
 	@cargo bench -p runtime --features postgres,spark,mysql
 
+PHONY: test-bench-vector-search
+test-bench-vector-search:
+	@cargo bench -p runtime --bench vector_search --features models
+
+PHONY: test-bench-vector-search-with-metal
+test-bench-vector-search-with-metal:
+	@cargo bench -p runtime --bench vector_search --features models,metal
+
 .PHONY: lint lint-go lint-rust
 lint: lint-go lint-rust
 
