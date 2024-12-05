@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use crate::component::dataset::Dataset;
+use crate::parameters::Parameters;
 use async_trait::async_trait;
 use data_components::odbc::ODBCTableFactory;
 use data_components::Read;
@@ -176,12 +177,37 @@ fn driver_is_file(driver: &str) -> bool {
         .is_some()
 }
 
+fn parameter_is_integer(parameters: &Parameters, param: &str) -> Result<()> {
+    if let Some(value) = parameters.get(param).expose().ok() {
+        let value = value
+            .parse::<usize>()
+            .map_err(|_| Error::InvalidParameter {
+                param: param.to_string(),
+                msg: "The parameter must be a positive integer.".to_string(),
+            })?;
+
+        if value == 0 {
+            return Err(Error::InvalidParameter {
+                param: param.to_string(),
+                msg: "The parameter must be a positive integer.".to_string(),
+            });
+        }
+    }
+
+    Ok(())
+}
+
 impl DataConnectorFactory for ODBCFactory {
     fn create(
         &self,
         params: DataConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
+            parameter_is_integer(&params.parameters, "max_binary_size")?;
+            parameter_is_integer(&params.parameters, "max_text_size")?;
+            parameter_is_integer(&params.parameters, "max_bytes_per_batch")?;
+            parameter_is_integer(&params.parameters, "max_num_rows_per_batch")?;
+
             let dialect =
                 if let Some(sql_dialect) = params.parameters.get("sql_dialect").expose().ok() {
                     let sql_dialect = SQLDialectParam::new(sql_dialect);
