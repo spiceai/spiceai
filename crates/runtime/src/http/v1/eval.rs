@@ -75,7 +75,7 @@ pub(crate) async fn post(
     };
 
     let scorers = rt.eval_scorers.read().await;
-    match run_eval(eval, df, llm, &scorers).await {
+    match run_eval(eval, df, &**llm, &scorers).await {
         Ok(result) => (StatusCode::OK, Json(result)).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
     }

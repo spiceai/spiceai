@@ -14,7 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
+use crate::{
+    component::validate_identifier,
+    datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA},
+};
 
 use super::{eval_scorer::Scorer, DataFusion};
 use arrow::array::{
@@ -40,14 +43,14 @@ use std::{collections::HashMap, sync::Arc};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Failed to query eval dataset '{dataset_name}': {source}"))]
+    #[snafu(display("Failed to query eval dataset '{dataset_name}': {source}."))]
     FailedToQueryDataset {
         dataset_name: String,
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
     #[snafu(display(
-        "Column '{column}' in eval dataset '{dataset}' could not be parsed: {source}"
+        "Column '{column}' in eval dataset '{dataset}' could not be parsed: {source}."
     ))]
     FailedToParseColumn {
         column: String,
@@ -296,11 +299,11 @@ impl DatasetOutput {
     }
 }
 
-#[allow(clippy::borrowed_box, clippy::implicit_hasher)]
+#[allow(clippy::implicit_hasher)]
 pub async fn run_eval(
     eval: &Eval,
     df: Arc<DataFusion>,
-    model: &Box<dyn Chat>,
+    model: &dyn Chat,
     scorers: &HashMap<String, Arc<dyn Scorer>>,
 ) -> Result<HashMap<String, Vec<(String, f32)>>> {
     let Eval {
@@ -321,9 +324,13 @@ pub async fn run_eval(
         scorers_subset.insert(name, scorer);
     }
 
+    validate_identifier(dataset_str)
+        .boxed()
+        .context(FailedToQueryDatasetSnafu {
+            dataset_name: dataset_str.to_string(),
+        })?;
     let dataset =
         TableReference::parse_str(dataset_str).resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA);
-
     let ds = df
         .query_builder(format!("SELECT input, ideal FROM {dataset}").as_str())
         .build()
@@ -410,7 +417,7 @@ pub async fn run_eval(
 /// Return format of [`DatasetOutput`] determined by `output_format`. `output_format` can be empty, is only used for its enum type.
 #[allow(clippy::borrowed_box)]
 async fn run_model(
-    model: &Box<dyn Chat>,
+    model: &dyn Chat,
     inputs: &[&DatasetInput],
     output_format: &DatasetOutput,
 ) -> Result<Vec<DatasetOutput>, OpenAIError> {
