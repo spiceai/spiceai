@@ -257,9 +257,9 @@ fn map_delta_data_type_to_arrow_data_type(
                 Arc::new(Field::new_struct(
                     map_type.type_name.clone(),
                     vec![
-                        Arc::new(Field::new("keys", key_type, false)),
+                        Arc::new(Field::new("key", key_type, false)),
                         Arc::new(Field::new(
-                            "values",
+                            "value",
                             value_type,
                             map_type.value_contains_null(),
                         )),
