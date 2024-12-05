@@ -18,7 +18,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use crate::model::{
     eval::{dataset::get_eval_data, run_model, scorer::score_results, Result},
-    DatasetOutput,
+    DatasetInput, DatasetOutput, EVAL_RESULTS_TABLE_REFERENCE,
 };
 use crate::{
     datafusion::DataFusion,
@@ -32,7 +32,9 @@ use tokio::{
 };
 
 use super::{
+    result::{write_result_to_table, ResultBuilder},
     runs::{update_eval_run_status, EvalRunId, EvalRunStatus},
+    scorer::result_metrics,
     Error, FailedToOffloadEvalRunSnafu,
 };
 
@@ -134,7 +136,9 @@ impl EvalThread {
                             tracing::error!("For eval run '{}', the worker failed to update the status to {}: {e}", id.clone(), EvalRunStatus::Running);
                         }
 
+                        tracing::trace!("Running eval job='{id}'.");
                         let (status, err_opt) = match run_eval(
+                            &id,
                             Arc::clone(&llms),
                             model_name,
                             &eval,
@@ -151,7 +155,7 @@ impl EvalThread {
                         if let Err(e) =
                             update_eval_run_status(Arc::clone(&df), &id, &status, err_opt).await
                         {
-                            tracing::error!("For eval run '{}', the worker failed to update the status to {}: {e}", id.clone(), status);
+                            tracing::error!("{e}");
                         }
                     }
                 }
@@ -163,6 +167,7 @@ impl EvalThread {
 
 #[allow(clippy::borrowed_box, clippy::implicit_hasher)]
 pub async fn run_eval(
+    id: &EvalRunId,
     llm_store: Arc<RwLock<LLMModelStore>>,
     model_name: String,
     eval: &Eval,
@@ -170,12 +175,13 @@ pub async fn run_eval(
     scorers: Arc<RwLock<HashMap<String, Arc<dyn Scorer>>>>,
 ) -> Result<HashMap<String, Vec<(String, f32)>>> {
     let (input, ideal) = get_eval_data(Arc::clone(&df), eval).await?;
+    tracing::trace!("Retrieved data for eval job='{}'", id.to_string());
 
     let llms = llm_store.read().await;
     let model = llms
         .get(&model_name)
         .ok_or_else(|| Error::FailedToGetModel {
-            model_name,
+            model_name: model_name.clone(),
             eval_name: eval.name.clone(),
         })?;
 
@@ -185,7 +191,11 @@ pub async fn run_eval(
         // Not error, no data in dataset
         vec![]
     };
-
+    tracing::trace!(
+        "Ran model='{}' within eval job='{}'",
+        model_name.clone(),
+        id.to_string()
+    );
     // Only use subset of scorers needed for `eval`.
     let mut scorer_subset = HashMap::with_capacity(eval.scorers.len());
     for name in &eval.scorers {
@@ -198,8 +208,49 @@ pub async fn run_eval(
             })?;
         scorer_subset.insert(name.clone(), Arc::clone(scorer));
     }
+    tracing::trace!(
+        "Retrieved {} scorers for eval job='{}'",
+        scorer_subset.len(),
+        id.to_string()
+    );
+    let scores = score_results(&input, &actual, &ideal, &scorer_subset).await;
+    tracing::trace!("Scored eval job='{}'", id.to_string());
+    write_results(id, Arc::clone(&df), &input, &actual, &ideal, &scores).await?;
+    tracing::trace!(
+        "Wrote results for eval job='{}' to {}",
+        id.to_string(),
+        EVAL_RESULTS_TABLE_REFERENCE.clone()
+    );
+    Ok(result_metrics(scores, &scorer_subset).await)
+}
 
-    Ok(score_results(&input, &actual, &ideal, &scorer_subset).await)
+async fn write_results(
+    run_id: &EvalRunId,
+    df: Arc<DataFusion>,
+    input: &[DatasetInput],
+    output: &[DatasetOutput],
+    expected: &[DatasetOutput],
+    scores: &HashMap<String, Vec<f32>>,
+) -> Result<()> {
+    let mut bldr = ResultBuilder::new();
+    for i in 0..input.len() {
+        let input = &input[i];
+        let output = &output[i];
+        let expected = &expected[i];
+        for (name, score) in scores {
+            bldr.append(
+                run_id,
+                chrono::Utc::now(),
+                input,
+                output,
+                expected,
+                name,
+                score[i],
+            )?;
+        }
+    }
+
+    write_result_to_table(Arc::clone(&df), run_id, &mut bldr).await
 }
 
 impl Drop for EvalThread {

@@ -17,26 +17,19 @@ limitations under the License.
 use crate::{
     datafusion::{DataFusion, SPICE_DEFAULT_CATALOG, SPICE_EVAL_SCHEMA},
     dataupdate::{DataUpdate, UpdateType},
-    model::EvalWorker,
+    model::{DatasetInput, DatasetOutput},
 };
 
-use super::{FailedToUpdateEvalMetadataSnafu, FailedToUpdateEvalRunStatusSnafu};
-use arrow::{
-    array::{ArrayRef, ListArray, RecordBatch, StringArray, TimestampSecondArray},
-    buffer::OffsetBuffer,
-};
+use super::{runs::EvalRunId, FailedToWriteEvalResultsSnafu};
+use arrow::array::{Float32Builder, RecordBatch, StringBuilder, TimestampSecondBuilder};
 use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef, TimeUnit};
+use chrono::{DateTime, Utc};
 use snafu::ResultExt;
-use uuid::Uuid;
 
 use super::Result;
 use datafusion::sql::TableReference;
 
-use spicepod::component::eval::Eval;
-use std::{
-    fmt::Display,
-    sync::{Arc, LazyLock},
-};
+use std::sync::{Arc, LazyLock};
 
 pub static EVAL_RESULTS_TABLE_REFERENCE: LazyLock<TableReference> =
     LazyLock::new(|| TableReference::Full {
@@ -54,22 +47,23 @@ pub static EVAL_RESULTS_TABLE_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
             DataType::Timestamp(TimeUnit::Second, None),
             false,
         ),
-        // input, output, actual, scorer, value
-        Field::new("dataset", DataType::
+        Field::new("input", DataType::Utf8, false),
+        Field::new("output", DataType::Utf8, false),
+        Field::new("actual", DataType::Utf8, false),
+        Field::new("scorer", DataType::Utf8, false),
+        Field::new("value", DataType::Float32, false),
     ]))
 });
 
-/// Writes a new row to `spice.evals.runs` table and returns primary key.
-pub async fn start_eval_run(
-    eval: &Eval,
-    model_name: String,
+pub(crate) async fn write_result_to_table(
     df: Arc<DataFusion>,
-    ew: Arc<EvalWorker>,
-) -> Result<EvalRunId> {
-    let id = uuid::Uuid::new_v4();
-    let rb = EVAL_RESULTS_record(&id, model_name.as_str(), eval)
+    id: &EvalRunId,
+    builder: &mut ResultBuilder,
+) -> Result<()> {
+    let rb = builder
+        .finish()
         .boxed()
-        .context(FailedToUpdateEvalMetadataSnafu {
+        .context(FailedToWriteEvalResultsSnafu {
             eval_run_id: id.to_string(),
         })?;
 
@@ -78,37 +72,73 @@ pub async fn start_eval_run(
         DataUpdate {
             schema: Arc::clone(&EVAL_RESULTS_TABLE_SCHEMA),
             data: vec![rb],
-            update_type: UpdateType::Overwrite,
+            update_type: UpdateType::Append,
         },
     )
     .await
     .boxed()
-    .context(FailedToUpdateEvalMetadataSnafu {
+    .context(FailedToWriteEvalResultsSnafu {
         eval_run_id: id.to_string(),
-    })?;
-
-    ew.queue_eval_job(&id.to_string(), eval, model_name.as_str())
-        .await?;
-
-    Ok(id.to_string())
+    })
 }
 
-fn eval_results_record(uuid: &Uuid, model: &str, eval: &Eval) -> Result<RecordBatch, ArrowError> {
-    let arrays: Vec<ArrayRef> = vec![
-        Arc::new(StringArray::from(vec![uuid.to_string()])),
-        Arc::new(TimestampSecondArray::from(vec![
-            chrono::Utc::now().timestamp()
-        ])),
-        Arc::new(StringArray::from(vec![eval.dataset.clone()])),
-        Arc::new(StringArray::from(vec![model.to_string()])),
-        Arc::new(StringArray::from(vec![EvalRunStatus::Waiting.to_string()])),
-        Arc::new(StringArray::from(vec![None] as Vec<Option<&str>>)),
-        Arc::new(ListArray::try_new(
-            Arc::new(Field::new("item", DataType::Utf8, false)),
-            OffsetBuffer::<i32>::from_lengths([eval.scorers.len()]),
-            Arc::new(StringArray::from_iter_values(eval.scorers.iter().clone())),
-            None,
-        )?),
-    ];
-    RecordBatch::try_new(EVAL_RESULTS_TABLE_SCHEMA.clone(), arrays)
+/// Builder for creating a `RecordBatch` for the [`EVAL_RESULTS_TABLE_REFERENCE`] table
+pub(super) struct ResultBuilder {
+    run_id: StringBuilder,
+    created_at: TimestampSecondBuilder,
+    input: StringBuilder,
+    output: StringBuilder,
+    actual: StringBuilder,
+    scorer: StringBuilder,
+    value: Float32Builder,
+}
+
+impl ResultBuilder {
+    pub fn new() -> Self {
+        Self {
+            run_id: StringBuilder::new(),
+            created_at: TimestampSecondBuilder::new(),
+            input: StringBuilder::new(),
+            output: StringBuilder::new(),
+            actual: StringBuilder::new(),
+            scorer: StringBuilder::new(),
+            value: Float32Builder::new(),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn append(
+        &mut self,
+        id: &EvalRunId,
+        created_at: DateTime<Utc>,
+        input: &DatasetInput,
+        output: &DatasetOutput,
+        actual: &DatasetOutput,
+        scorer: &str,
+        value: f32,
+    ) -> Result<()> {
+        self.run_id.append_value(id);
+        self.created_at.append_value(created_at.timestamp());
+        self.input.append_value(input.try_serialize()?);
+        self.output.append_value(output.try_serialize()?);
+        self.actual.append_value(actual.try_serialize()?);
+        self.scorer.append_value(scorer);
+        self.value.append_value(value);
+        Ok(())
+    }
+
+    pub fn finish(&mut self) -> Result<RecordBatch, ArrowError> {
+        RecordBatch::try_new(
+            EVAL_RESULTS_TABLE_SCHEMA.clone(),
+            vec![
+                Arc::new(self.run_id.finish()),
+                Arc::new(self.created_at.finish()),
+                Arc::new(self.input.finish()),
+                Arc::new(self.output.finish()),
+                Arc::new(self.actual.finish()),
+                Arc::new(self.scorer.finish()),
+                Arc::new(self.value.finish()),
+            ],
+        )
+    }
 }

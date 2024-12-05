@@ -21,6 +21,7 @@ use async_openai::{error::OpenAIError, types::CreateChatCompletionRequest};
 
 use dataset::{DatasetInput, DatasetOutput};
 use llms::chat::Chat;
+use result::EVAL_RESULTS_TABLE_REFERENCE;
 use runs::{EvalRunId, EvalRunStatus};
 use snafu::{ResultExt, Snafu};
 
@@ -71,6 +72,12 @@ pub enum Error {
 
     #[snafu(display("Failed to create score outputs: {source}"))]
     FailedToCreateScoreOutputs { source: ArrowError },
+
+    #[snafu(display("Failed to write eval results to {} for '{eval_run_id}': {source}", EVAL_RESULTS_TABLE_REFERENCE.clone()))]
+    FailedToWriteEvalResults {
+        eval_run_id: EvalRunId,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 
     #[snafu(display("Failed to start an eval run for {eval_name}: {source}"))]
     FailedToStartEvalRun {

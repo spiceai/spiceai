@@ -27,7 +27,8 @@ use crate::{
     datafusion::SPICE_EVAL_SCHEMA,
     internal_table::create_internal_accelerated_table,
     model::{
-        builtin_scorer, EVAL_RUNS_TABLE_REFERENCE, EVAL_RUNS_TABLE_SCHEMA,
+        builtin_scorer, EVAL_RESULTS_TABLE_REFERENCE, EVAL_RESULTS_TABLE_SCHEMA,
+        EVAL_RESULTS_TABLE_TIME_COLUMN, EVAL_RUNS_TABLE_REFERENCE, EVAL_RUNS_TABLE_SCHEMA,
         EVAL_RUNS_TABLE_TIME_COLUMN,
     },
     secrets::Secrets,
@@ -44,7 +45,36 @@ impl Runtime {
     }
 
     pub(crate) async fn load_eval_tables(&self) -> Result<()> {
-        self.load_eval_run_table().await
+        self.load_eval_run_table().await?;
+        self.load_eval_results_table().await
+    }
+
+    pub(crate) async fn load_eval_results_table(&self) -> Result<()> {
+        let retention = Retention::new(
+            Some(EVAL_RESULTS_TABLE_TIME_COLUMN.to_string()),
+            Some(TimeFormat::Timestamptz),
+            Some(Duration::from_secs(24 * 3600)), // Keep data for last 24 hours
+            Some(Duration::from_secs(1800)),      // Check every 30 minutes
+            true,
+        );
+
+        let table = create_internal_accelerated_table(
+            self.status(),
+            TableReference::partial(SPICE_EVAL_SCHEMA, EVAL_RESULTS_TABLE_REFERENCE.table()), // Cannot parse Catalog.
+            EVAL_RESULTS_TABLE_SCHEMA.clone(),
+            Acceleration::default(),
+            Refresh::default(),
+            retention,
+            Arc::new(RwLock::new(Secrets::default())),
+        )
+        .await
+        .context(UnableToCreateEvalRunsTableSnafu)?;
+
+        self.df
+            .register_eval_table(EVAL_RESULTS_TABLE_REFERENCE.clone(), table)
+            .context(UnableToCreateBackendSnafu)?;
+
+        Ok(())
     }
 
     pub(crate) async fn load_eval_run_table(&self) -> Result<()> {

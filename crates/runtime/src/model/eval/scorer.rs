@@ -38,7 +38,7 @@ pub(crate) async fn score_results(
     output: &[DatasetOutput],
     expected: &[DatasetOutput],
     scorers: &HashMap<String, Arc<dyn Scorer>>,
-) -> HashMap<String, Vec<(String, f32)>> {
+) -> HashMap<String, Vec<f32>> {
     let mut aggregate: HashMap<String, Vec<f32>> = HashMap::with_capacity(output.len());
     for ((input, output), expected) in input.iter().zip(output.iter()).zip(expected.iter()) {
         for (name, scorer) in scorers {
@@ -50,10 +50,16 @@ pub(crate) async fn score_results(
             };
         }
     }
+    aggregate
+}
 
+pub(crate) async fn result_metrics(
+    scores: HashMap<String, Vec<f32>>,
+    scorers: &HashMap<String, Arc<dyn Scorer>>,
+) -> HashMap<String, Vec<(String, f32)>> {
     scorers
         .iter()
-        .map(|(name, scorer)| ((*name).clone(), scorer.metrics(&aggregate[name])))
+        .map(|(name, scorer)| ((*name).clone(), scorer.metrics(&scores[name])))
         .collect()
 }
 

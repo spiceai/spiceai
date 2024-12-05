@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
 use crate::model::eval::FailedToParseColumnSnafu;
 use crate::{
@@ -158,6 +158,15 @@ impl DatasetInput {
         }
     }
 
+    pub(crate) fn try_serialize(&self) -> Result<String> {
+        match self {
+            Self::Messages(m) => serde_json::to_string(m).map_err(|_| Error::InvalidInputFormat {
+                reason: "could not serialize input messages".to_string(),
+            }),
+            Self::UserInput(s) => Ok(s.clone()),
+        }
+    }
+
     pub fn try_from_value(v: Value) -> Result<Option<Self>, serde_json::Error> {
         match v {
             Value::String(s) => Ok(Some(Self::UserInput(s.to_string()))),
@@ -247,6 +256,15 @@ impl DatasetOutput {
         match serde_json::from_str(s) {
             Ok(m) => Self::Choices(m),
             Err(_) => Self::AssistantResponse(s.to_string()),
+        }
+    }
+
+    pub(crate) fn try_serialize(&self) -> Result<String> {
+        match self {
+            Self::Choices(c) => serde_json::to_string(c).map_err(|_| Error::InvalidOutputFormat {
+                reason: "could not serialize output choices".to_string(),
+            }),
+            Self::AssistantResponse(s) => Ok(s.clone()),
         }
     }
 
