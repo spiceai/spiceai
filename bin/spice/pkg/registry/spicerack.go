@@ -37,9 +37,9 @@ type SpiceRackRegistry struct{}
 
 func getSpiceRackBaseUrl() string {
 	if strings.HasSuffix(version.Version(), "-dev") {
-		return "https://dev-data.spiceai.io/v0.1"
+		return "https://dev-data.spiceai.io/v1"
 	} else {
-		return "https://api.spicerack.org/v0.1"
+		return "https://api.spicerack.org/v1"
 	}
 }
 
