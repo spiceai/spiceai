@@ -18,7 +18,7 @@ async-stream.workspace = true
 async-trait.workspace = true
 bytes = "1.6.0"
 futures = { workspace = true }
-hf-hub = { version = "0.3.0", features = ["tokio"] }
+hf-hub.workspace = true
 insta = { workspace = true, features = ["filters"] }
 regex = "1.10.4"
 reqwest.workspace = true

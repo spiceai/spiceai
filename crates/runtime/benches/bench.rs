@@ -45,6 +45,7 @@ use spicepod::component::params::Params;
 
 mod results;
 mod setup;
+mod utils;
 
 mod bench_object_store;
 mod bench_spicecloud;

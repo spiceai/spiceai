@@ -14,10 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::results::BenchmarkResultsBuilder;
+use crate::{
+    results::BenchmarkResultsBuilder,
+    utils::{init_tracing, runtime_ready_check},
+};
 use app::{App, AppBuilder};
 use datafusion::prelude::SessionContext;
-use futures::Future;
 use runtime::{
     datafusion::DataFusion,
     dataupdate::DataUpdate,
@@ -32,9 +34,7 @@ use spicepod::component::{
     },
     runtime::ResultsCache,
 };
-use std::{collections::HashMap, process::Command, sync::Arc, time::Duration};
-use tracing_subscriber::EnvFilter;
-
+use std::{collections::HashMap, process::Command, sync::Arc};
 /// The number of times to run each query in the benchmark.
 const ITERATIONS: i32 = 5;
 
@@ -94,25 +94,6 @@ pub(crate) async fn setup_benchmark(
         BenchmarkResultsBuilder::new(get_commit_sha(), get_branch_name(), ITERATIONS);
 
     Ok((benchmark_results, rt))
-}
-
-async fn runtime_ready_check(rt: &Runtime, wait_time: Duration) {
-    assert!(wait_until_true(wait_time, || async { rt.status().is_ready() }).await);
-}
-
-async fn wait_until_true<F, Fut>(max_wait: Duration, mut f: F) -> bool
-where
-    F: FnMut() -> Fut,
-    Fut: Future<Output = bool>,
-{
-    let start = std::time::Instant::now();
-    while start.elapsed() < max_wait {
-        if f().await {
-            return true;
-        }
-        tokio::time::sleep(Duration::from_secs(1)).await;
-    }
-    false
 }
 
 pub(crate) async fn write_benchmark_results(
@@ -384,21 +365,6 @@ fn get_accelerator_indexes(
     } else {
         None
     }
-}
-
-fn init_tracing() {
-    let filter = match std::env::var("SPICED_LOG").ok() {
-        Some(level) => EnvFilter::new(level),
-        _ => EnvFilter::new(
-            "runtime=TRACE,datafusion-federation=TRACE,datafusion-federation-sql=TRACE,bench=TRACE",
-        ),
-    };
-
-    let subscriber = tracing_subscriber::FmtSubscriber::builder()
-        .with_env_filter(filter)
-        .with_ansi(true)
-        .finish();
-    let _ = tracing::subscriber::set_global_default(subscriber);
 }
 
 fn make_spiceai_rw_dataset(path: &str, name: &str) -> Dataset {

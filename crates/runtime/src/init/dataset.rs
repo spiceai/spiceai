@@ -23,8 +23,8 @@ use crate::{
     dataconnector::{
         self,
         localpod::{LocalPodConnector, LOCALPOD_DATACONNECTOR},
-        ConnectorComponent, DataConnector, DataConnectorParams, DataConnectorParamsBuilder,
-        ODBC_DATACONNECTOR,
+        ConnectorComponent, DataConnector, DataConnectorError, DataConnectorParams,
+        DataConnectorParamsBuilder, ODBC_DATACONNECTOR,
     },
     embeddings::connector::EmbeddingConnector,
     error_spaced,
@@ -285,7 +285,11 @@ impl Runtime {
                     self.status
                         .update_dataset(&ds.name, status::ComponentStatus::Error);
                     metrics::datasets::LOAD_ERROR.add(1, &[]);
-                    warn_spaced!(spaced_tracer, "{}{err}", "");
+                    if let DataConnectorError::UnsupportedDataType { .. } = err {
+                        error_spaced!(spaced_tracer, "{}{err}", "");
+                    } else {
+                        warn_spaced!(spaced_tracer, "{}{err}", "");
+                    }
                     return UnableToLoadDatasetConnectorSnafu {
                         dataset: ds.name.clone(),
                     }
