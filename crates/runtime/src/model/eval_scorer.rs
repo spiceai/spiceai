@@ -95,36 +95,38 @@ mod tests {
 
     #[tokio::test]
     async fn test_score_assistant_response_match() {
-        assert_eq!(
-            MatchScorer {}
+        assert!(
+            (MatchScorer {}
                 .score(
                     &DatasetInput::UserInput("What is your name?".to_string()),
                     &DatasetOutput::from_raw("Hello"),
                     &DatasetOutput::from_raw("Hello")
                 )
-                .await,
-            1.0_f32
+                .await
+                - 1.0_f32)
+                .abs()
+                < f32::EPSILON
         );
     }
 
     #[tokio::test]
     async fn test_score_assistant_response_mismatch() {
-        assert_eq!(
+        assert!(
             MatchScorer {}
                 .score(
                     &DatasetInput::UserInput("What is your name?".to_string()),
                     &DatasetOutput::from_raw("Hello"),
                     &DatasetOutput::from_raw("Hi")
                 )
-                .await,
-            0.0_f32
+                .await
+                < f32::EPSILON
         );
     }
 
     #[tokio::test]
     async fn test_score_choices_match() {
-        assert_eq!(
-            MatchScorer {}
+        assert!(
+            (MatchScorer {}
                 .score(
                     &DatasetInput::Messages(vec![]),
                     &DatasetOutput::try_from_value(json!([
@@ -137,7 +139,7 @@ mod tests {
                         }
                     ]))
                     .expect("Failed to parse actual DatasetOutput")
-                    .unwrap(),
+                    .expect("Failed to parse ideal DatasetOutput"),
                     &DatasetOutput::try_from_value(json!([
                         {
                             "index": 0,
@@ -148,16 +150,18 @@ mod tests {
                         }
                     ]))
                     .expect("Failed to parse ideal DatasetOutput")
-                    .unwrap(),
+                    .expect("Failed to parse ideal DatasetOutput")
                 )
-                .await,
-            1.0_f32
+                .await
+                - 1.0_f32)
+                .abs()
+                < f32::EPSILON
         );
     }
 
     #[tokio::test]
     async fn test_score_choices_mismatch() {
-        assert_eq!(
+        assert!(
             MatchScorer {}
                 .score(
                     &DatasetInput::Messages(vec![]),
@@ -171,7 +175,7 @@ mod tests {
                         }
                     ]))
                     .expect("Failed to parse actual DatasetOutput")
-                    .unwrap(),
+                    .expect("Failed to parse ideal DatasetOutput"),
                     &DatasetOutput::try_from_value(json!([
                         {
                             "index": 0,
@@ -182,17 +186,17 @@ mod tests {
                         }
                     ]))
                     .expect("Failed to parse ideal DatasetOutput")
-                    .unwrap()
+                    .expect("Failed to parse ideal DatasetOutput")
                 )
-                .await,
-            0.0_f32
+                .await
+                < f32::EPSILON
         );
     }
 
     #[tokio::test]
     async fn test_score_mixed_match() {
-        assert_eq!(
-            MatchScorer {}
+        assert!(
+            (MatchScorer {}
                 .score(
                     &DatasetInput::UserInput("What is your name?".to_string()),
                     &DatasetOutput::from_raw("Hello"),
@@ -206,16 +210,18 @@ mod tests {
                         }
                     ]))
                     .expect("Failed to parse ideal DatasetOutput")
-                    .unwrap()
+                    .expect("Failed to parse ideal DatasetOutput")
                 )
-                .await,
-            1.0_f32
+                .await
+                - 1.0_f32)
+                .abs()
+                < f32::EPSILON
         );
     }
 
     #[tokio::test]
     async fn test_score_mixed_mismatch() {
-        assert_eq!(
+        assert!(
             MatchScorer {}
                 .score(
                     &DatasetInput::UserInput("What is your name?".to_string()),
@@ -230,21 +236,20 @@ mod tests {
                         }
                     ]))
                     .expect("Failed to parse ideal DatasetOutput")
-                    .unwrap()
+                    .expect("Failed to parse ideal DatasetOutput")
                 )
-                .await,
-            0.0_f32
+                .await
+                < f32::EPSILON
         );
     }
 
     #[test]
     fn test_metrics_non_empty_scores() {
-        assert_eq!(
-            MatchScorer {}.metrics(&[1.0, 0.0, 1.0, 1.0]),
-            vec![
-                ("mean".to_string(), 0.75_f32),
-                ("std_dev".to_string(), 0.433_012_7_f32)
-            ]
-        );
+        let stats = MatchScorer {}.metrics(&[1.0, 0.0, 1.0, 1.0]);
+        assert_eq!(stats.len(), 2);
+        assert_eq!(stats[0].0, "mean".to_string());
+        assert!((stats[0].1 - 0.75_f32).abs() < f32::EPSILON);
+        assert_eq!(stats[1].0, "std_dev".to_string());
+        assert!((stats[1].1 - 0.433_012_7_f32).abs() < f32::EPSILON);
     }
 }
