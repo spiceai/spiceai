@@ -32,6 +32,8 @@ mod abfs;
 mod acceleration;
 mod catalog;
 mod cors;
+#[cfg(all(feature = "delta_lake", feature = "databricks"))]
+mod databricks_delta;
 #[cfg(feature = "delta_lake")]
 mod delta_lake;
 mod docker;
