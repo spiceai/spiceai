@@ -58,7 +58,9 @@ func (r *SpiceRackRegistry) GetPod(podFullPath string) (string, error) {
 	}
 	failureMessage := fmt.Sprintf("An error occurred while fetching Spicepod '%s' from spicerack.org", podFullPath)
 
-	response, err := spice_http.Get(url, "application/zip")
+	response, err := spice_http.Get(url, "application/zip", map[string]string{
+		"Spice-Target-Source": "spice.ai",
+	})
 	if err != nil {
 		slog.Debug(fmt.Sprintf("%s: %s", failureMessage, err.Error()))
 		return "", errors.New(failureMessage)
