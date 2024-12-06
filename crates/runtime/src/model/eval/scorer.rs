@@ -33,6 +33,7 @@ pub trait Scorer: Sync + Send {
     fn metrics(&self, scores: &[f32]) -> Vec<(String, f32)>;
 }
 
+/// Compute the scores for each [`Scorer`] selected given the results of running a model.
 pub(crate) async fn score_results(
     input: &[DatasetInput],
     output: &[DatasetOutput],
@@ -53,6 +54,10 @@ pub(crate) async fn score_results(
     aggregate
 }
 
+/// Use [`Scorer::metrics`] to compute relevant metrics for each type of scorer.
+///
+/// Keys in `scores` should match the keys in `scorers`.
+#[allow(clippy::similar_names)]
 pub(crate) async fn result_metrics(
     scores: HashMap<String, Vec<f32>>,
     scorers: &HashMap<String, Arc<dyn Scorer>>,

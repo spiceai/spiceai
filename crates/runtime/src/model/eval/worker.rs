@@ -18,7 +18,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use crate::model::{
     eval::{dataset::get_eval_data, run_model, scorer::score_results, Result},
-    DatasetInput, DatasetOutput, EVAL_RESULTS_TABLE_REFERENCE,
+    DatasetInput, DatasetOutput,
 };
 use crate::{
     datafusion::DataFusion,
@@ -33,7 +33,7 @@ use tokio::{
 
 use super::{
     result::{write_result_to_table, ResultBuilder},
-    runs::{update_eval_run_status, EvalRunId, EvalRunStatus},
+    runs::{add_metrics_to_eval_run, update_eval_run_status, EvalRunId, EvalRunStatus},
     scorer::result_metrics,
     Error, FailedToOffloadEvalRunSnafu,
 };
@@ -133,7 +133,7 @@ impl EvalThread {
                         )
                         .await
                         {
-                            tracing::error!("For eval run '{}', the worker failed to update the status to {}: {e}", id.clone(), EvalRunStatus::Running);
+                            tracing::error!("{e}");
                         }
 
                         tracing::trace!("Running eval job='{id}'.");
@@ -148,8 +148,7 @@ impl EvalThread {
                         .await
                         {
                             Err(e) => (EvalRunStatus::Failed, Some(e.to_string())),
-                            // TODO: add score metrics to `spice.eval.runs`.
-                            Ok(_) => (EvalRunStatus::Completed, None),
+                            Ok(()) => (EvalRunStatus::Completed, None),
                         };
 
                         if let Err(e) =
@@ -165,17 +164,19 @@ impl EvalThread {
     }
 }
 
-#[allow(clippy::borrowed_box, clippy::implicit_hasher)]
+/// The core logic for [`EvalWorkerCommand::RunEval`].
+///
+/// Does not handle updating the status of the eval run.
+#[allow(clippy::implicit_hasher)]
 pub async fn run_eval(
     id: &EvalRunId,
     llm_store: Arc<RwLock<LLMModelStore>>,
     model_name: String,
     eval: &Eval,
     df: Arc<DataFusion>,
-    scorers: Arc<RwLock<HashMap<String, Arc<dyn Scorer>>>>,
-) -> Result<HashMap<String, Vec<(String, f32)>>> {
+    scorer_registry: Arc<RwLock<HashMap<String, Arc<dyn Scorer>>>>,
+) -> Result<()> {
     let (input, ideal) = get_eval_data(Arc::clone(&df), eval).await?;
-    tracing::trace!("Retrieved data for eval job='{}'", id.to_string());
 
     let llms = llm_store.read().await;
     let model = llms
@@ -191,12 +192,21 @@ pub async fn run_eval(
         // Not error, no data in dataset
         vec![]
     };
-    tracing::trace!(
-        "Ran model='{}' within eval job='{}'",
-        model_name.clone(),
-        id.to_string()
-    );
-    // Only use subset of scorers needed for `eval`.
+
+    let scorers_to_use = get_scorers_for_eval(eval, Arc::clone(&scorer_registry)).await?;
+
+    let scores = score_results(&input, &actual, &ideal, &scorers_to_use).await;
+    write_results(id, Arc::clone(&df), &input, &actual, &ideal, &scores).await?;
+
+    let metrics = result_metrics(scores, &scorers_to_use).await;
+    add_metrics_to_eval_run(Arc::clone(&df), id, &metrics).await?;
+    Ok(())
+}
+
+async fn get_scorers_for_eval(
+    eval: &Eval,
+    scorers: Arc<RwLock<HashMap<String, Arc<dyn Scorer>>>>,
+) -> Result<HashMap<String, Arc<dyn Scorer>>> {
     let mut scorer_subset = HashMap::with_capacity(eval.scorers.len());
     for name in &eval.scorers {
         let scorers_unlock = scorers.read().await;
@@ -208,20 +218,7 @@ pub async fn run_eval(
             })?;
         scorer_subset.insert(name.clone(), Arc::clone(scorer));
     }
-    tracing::trace!(
-        "Retrieved {} scorers for eval job='{}'",
-        scorer_subset.len(),
-        id.to_string()
-    );
-    let scores = score_results(&input, &actual, &ideal, &scorer_subset).await;
-    tracing::trace!("Scored eval job='{}'", id.to_string());
-    write_results(id, Arc::clone(&df), &input, &actual, &ideal, &scores).await?;
-    tracing::trace!(
-        "Wrote results for eval job='{}' to {}",
-        id.to_string(),
-        EVAL_RESULTS_TABLE_REFERENCE.clone()
-    );
-    Ok(result_metrics(scores, &scorer_subset).await)
+    Ok(scorer_subset)
 }
 
 async fn write_results(

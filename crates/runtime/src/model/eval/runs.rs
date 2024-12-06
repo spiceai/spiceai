@@ -34,6 +34,7 @@ use datafusion::sql::TableReference;
 
 use spicepod::component::eval::Eval;
 use std::{
+    collections::HashMap,
     fmt::Display,
     sync::{Arc, LazyLock},
 };
@@ -86,6 +87,14 @@ pub static EVAL_RUNS_TABLE_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
         // TODO score metrics
     ]))
 });
+
+pub(super) async fn add_metrics_to_eval_run(
+    df: Arc<DataFusion>,
+    id: &EvalRunId,
+    metrics: &HashMap<String, Vec<(String, f32)>>,
+) -> Result<()> {
+    Ok(())
+}
 
 pub async fn update_eval_run_status(
     df: Arc<DataFusion>,
