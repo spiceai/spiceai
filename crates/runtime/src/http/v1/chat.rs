@@ -41,6 +41,12 @@ pub(crate) async fn post(
     let span = tracing::span!(target: "task_history", tracing::Level::INFO, "ai_chat", input = %serde_json::to_string(&req).unwrap_or_default());
     span.in_scope(|| tracing::info!(target: "task_history", model = %req.model, "labels"));
 
+    if let Some(ref metadata) = req.metadata {
+        if let Some(serde_json::Value::String(trace_id)) = metadata.get("trace_id") {
+            tracing::info!(target: "task_history", parent: &span.clone(), trace_id = %trace_id);
+        }
+    };
+
     let span_clone = span.clone();
     async move {
         let model_id = req.model.clone();

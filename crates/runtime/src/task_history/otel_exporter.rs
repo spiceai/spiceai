@@ -55,6 +55,10 @@ impl TaskHistoryExporter {
         }
     }
 
+    fn is_valid_traceid(trace_id: &Arc<str>) -> bool {
+        trace_id.len() == 32 && trace_id.chars().all(|c| c.is_ascii_hexdigit())
+    }
+
     fn span_to_task_span(&self, span: SpanData) -> TaskSpan {
         let trace_id: Arc<str> = span.span_context.trace_id().to_string().into();
         let span_id: Arc<str> = span.span_context.span_id().to_string().into();
@@ -72,6 +76,24 @@ impl TaskHistoryExporter {
                 || "".into(),
                 |idx| span.attributes[idx].value.as_str().into(),
             );
+
+        let trace_id_override: Option<Arc<str>> = span
+            .events
+            .iter()
+            .find_map(|event| {
+                let event_attr_idx = event
+                    .attributes
+                    .iter()
+                    .position(|kv| kv.key.as_str() == "trace_id")?;
+                Some(event.attributes[event_attr_idx].value.as_str().into())
+            })
+            .and_then(|trace_id| if Self::is_valid_traceid(&trace_id) {
+                Some(trace_id)
+            } else {
+                tracing::warn!("User provided 'trace_id'='{}' is invalid. Must be a 32 character hex string.", Arc::clone(&trace_id));
+                None
+            });
+
         let captured_output: Option<Arc<str>> = span
             .events
             .iter()
@@ -131,6 +153,7 @@ impl TaskHistoryExporter {
 
         TaskSpan {
             trace_id,
+            trace_id_override,
             span_id,
             parent_span_id,
             task,
@@ -147,10 +170,27 @@ impl TaskHistoryExporter {
 
 impl SpanExporter for TaskHistoryExporter {
     fn export(&mut self, batch: Vec<SpanData>) -> BoxFuture<'static, ExportResult> {
-        let spans = batch
+        let mut spans: Vec<TaskSpan> = batch
             .into_iter()
             .map(|span| self.span_to_task_span(span))
             .collect();
+
+        // If any span has defined a [`TaskSpan::trace_id_override`], we must override others.
+        let overrides: HashMap<Arc<str>, Arc<str>> = spans
+            .iter()
+            .filter_map(|span| {
+                span.trace_id_override
+                    .as_ref()
+                    .map(|new_trace| (Arc::clone(&span.trace_id), Arc::clone(new_trace)))
+            })
+            .collect();
+
+        for span in &mut spans {
+            if let Some(new_trace_id) = overrides.get(&span.trace_id) {
+                span.trace_id = Arc::clone(new_trace_id);
+            }
+        }
+
         let df = Arc::clone(&self.df);
         Box::pin(async move {
             TaskSpan::write(df, spans)

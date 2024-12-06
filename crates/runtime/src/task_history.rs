@@ -44,6 +44,11 @@ pub const DEFAULT_TASK_HISTORY_RETENTION_CHECK_INTERVAL_SECS: u64 = 15 * 60; // 
 pub(crate) struct TaskSpan {
     pub(crate) trace_id: Arc<str>,
 
+    /// A user-defined trace id that can be used to override the default trace id when exported.
+    /// This is useful for when a trace id wants to be known before its eventually written to an exporter.
+    /// If this isn't a valid 16-byte array (in 32 character hexadecimal representation), it will be ignored.
+    pub(crate) trace_id_override: Option<Arc<str>>,
+
     /// An identifier for the top level [`TaskSpan`] that this [`TaskSpan`] occurs in.
     pub(crate) span_id: Arc<str>,
 
