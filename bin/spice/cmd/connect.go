@@ -22,7 +22,7 @@ import (
 
 var connectCmd = &cobra.Command{
 	Use:   "connect",
-	Short: "Connect the local Spicepod to a running Spice instance in Spice.ai",
+	Short: "Adds the Spice.ai Cloud Platform app Spicepod for local use.",
 	Args:  cobra.MinimumNArgs(1),
 	Example: `
 spice connect spiceai/quickstart
