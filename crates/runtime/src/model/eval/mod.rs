@@ -85,8 +85,8 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Failed to update eval '{eval_run_id}' metadata: {source}"))]
-    FailedToUpdateEvalMetadata {
+    #[snafu(display("Failed to update eval run table '{eval_run_id}': {source}"))]
+    FailedToUpdateEvalRunTable {
         eval_run_id: EvalRunId,
         source: Box<dyn std::error::Error + Send + Sync>,
     },

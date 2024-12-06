@@ -20,12 +20,17 @@ use crate::{
     model::EvalWorker,
 };
 
-use super::{FailedToUpdateEvalMetadataSnafu, FailedToUpdateEvalRunStatusSnafu};
+use super::FailedToUpdateEvalRunTableSnafu;
 use arrow::{
-    array::{ArrayRef, ListArray, RecordBatch, StringArray, TimestampSecondArray},
+    array::{
+        ArrayRef, Float32Builder, ListArray, MapBuilder, RecordBatch, StringArray, StringBuilder,
+        TimestampSecondArray,
+    },
     buffer::OffsetBuffer,
+    util::pretty::print_batches,
 };
 use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef, TimeUnit};
+use futures::TryStreamExt;
 use snafu::ResultExt;
 use uuid::Uuid;
 
@@ -71,6 +76,7 @@ pub static EVAL_RUNS_TABLE_REFERENCE: LazyLock<TableReference> =
     });
 
 pub static EVAL_RUNS_TABLE_TIME_COLUMN: &str = "created_at";
+pub static EVAL_RUNS_TABLE_PRIMARY_KEY: &str = "run_id";
 pub static EVAL_RUNS_TABLE_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     Arc::new(Schema::new(vec![
         Field::new("id", DataType::Utf8, false),
@@ -84,43 +90,71 @@ pub static EVAL_RUNS_TABLE_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
         Field::new("status", DataType::Utf8, false),
         Field::new("error_message", DataType::Utf8, true),
         Field::new("scorers", DataType::new_list(DataType::Utf8, false), false),
-        // TODO score metrics
+        Field::new(
+            "metrics",
+            DataType::Map(
+                Arc::new(Field::new_struct(
+                    "entries",
+                    vec![
+                        Arc::new(Field::new("keys", DataType::Utf8, false)),
+                        Arc::new(Field::new("values", DataType::Float32, true)),
+                    ],
+                    false,
+                )),
+                false,
+            ),
+            true,
+        ),
     ]))
 });
 
+/// Add aggregate metrics for an eval run in `spice.evals.runs`.
+/// `metrics` is a map of scorer name to pairs of (metric name, metrics value).
 pub(super) async fn add_metrics_to_eval_run(
     df: Arc<DataFusion>,
     id: &EvalRunId,
     metrics: &HashMap<String, Vec<(String, f32)>>,
 ) -> Result<()> {
-    Ok(())
+    println!("Building metrics: {metrics:#?}");
+    let mut builder = MapBuilder::new(None, StringBuilder::new(), Float32Builder::new());
+    for (scorer, metric_pair) in metrics {
+        for (metric_name, score) in metric_pair {
+            builder
+                .keys()
+                .append_value(format!("{scorer}/{metric_name}"));
+            builder.values().append_value(*score);
+        }
+    }
+
+    builder
+        .append(true)
+        .boxed()
+        .context(FailedToUpdateEvalRunTableSnafu {
+            eval_run_id: id.clone(),
+        })?;
+
+    let mut updates: HashMap<&str, ArrayRef> = HashMap::new();
+    updates.insert("metrics", Arc::new(builder.finish()) as ArrayRef);
+
+    update_eval_run(df, id, updates).await
 }
 
+/// Updates a row in [`EVAL_RUNS_TABLE_REFERENCE`] with the provided status and error message.
 pub async fn update_eval_run_status(
     df: Arc<DataFusion>,
     id: &EvalRunId,
     status: &EvalRunStatus,
     err_msg: Option<String>,
 ) -> Result<()> {
-    let err_msg_clause = err_msg
-        .map(|err| format!(", err_msg = '{err}'"))
-        .unwrap_or_default();
-
-    df.run_dml_sql(
-        format!(
-            "UPDATE {tbl}
-            SET status = '{status}'{err_msg_clause}
-            WHERE id = '{id}';",
-            tbl = EVAL_RUNS_TABLE_REFERENCE.to_quoted_string()
-        )
-        .as_str(),
-    )
-    .await
-    .boxed()
-    .context(FailedToUpdateEvalRunStatusSnafu {
-        eval_id: id.clone(),
-        status: status.clone(),
-    })
+    let mut updates: HashMap<&str, ArrayRef> = HashMap::new();
+    updates.insert(
+        "status",
+        Arc::new(StringArray::from(vec![status.to_string()])),
+    );
+    if let Some(err) = err_msg {
+        updates.insert("error_message", Arc::new(StringArray::from(vec![err])));
+    };
+    update_eval_run(df, id, updates).await
 }
 
 /// Writes a new row to `spice.evals.runs` table and returns primary key.
@@ -133,7 +167,7 @@ pub async fn start_eval_run(
     let id = uuid::Uuid::new_v4();
     let rb = eval_runs_record(&id, model_name.as_str(), eval)
         .boxed()
-        .context(FailedToUpdateEvalMetadataSnafu {
+        .context(FailedToUpdateEvalRunTableSnafu {
             eval_run_id: id.to_string(),
         })?;
 
@@ -147,7 +181,7 @@ pub async fn start_eval_run(
     )
     .await
     .boxed()
-    .context(FailedToUpdateEvalMetadataSnafu {
+    .context(FailedToUpdateEvalRunTableSnafu {
         eval_run_id: id.to_string(),
     })?;
 
@@ -157,7 +191,87 @@ pub async fn start_eval_run(
     Ok(id.to_string())
 }
 
+async fn get_eval_run(
+    df: Arc<DataFusion>,
+    id: &EvalRunId,
+) -> Result<RecordBatch, Box<dyn std::error::Error + Send + Sync>> {
+    let rb = df
+        .query_builder(
+            format!(
+                "SELECT * FROM {tbl} WHERE id = '{id}';",
+                tbl = EVAL_RUNS_TABLE_REFERENCE.to_quoted_string(),
+                id = id
+            )
+            .as_str(),
+        )
+        .build()
+        .run()
+        .await
+        .boxed()?
+        .data
+        .try_collect::<Vec<RecordBatch>>()
+        .await
+        .boxed()?
+        .into_iter()
+        .next()
+        .ok_or(format!("No eval run found with id: {id}"))?;
+
+    Ok(rb)
+}
+
+/// Updates the record batch with the provided updates.
+///
+/// Consumes `updates`.
+fn update_record_batch(
+    record_batch: &RecordBatch,
+    mut updates: HashMap<&str, ArrayRef>,
+) -> Result<RecordBatch, ArrowError> {
+    let schema = record_batch.schema();
+    let mut cols = record_batch.columns().to_vec();
+
+    for (col, arr) in updates.drain() {
+        if let Ok(i) = schema.index_of(col) {
+            cols[i] = arr;
+        }
+    }
+
+    RecordBatch::try_new(schema, cols)
+}
+
+async fn update_eval_run(
+    df: Arc<DataFusion>,
+    id: &EvalRunId,
+    updates: HashMap<&str, ArrayRef>,
+) -> Result<()> {
+    let rb = get_eval_run(Arc::clone(&df), id)
+        .await
+        .context(FailedToUpdateEvalRunTableSnafu {
+            eval_run_id: id.clone(),
+        })?;
+
+    print_batches(&[rb.clone()]).unwrap();
+
+    let new_rb =
+        update_record_batch(&rb, updates)
+            .boxed()
+            .context(FailedToUpdateEvalRunTableSnafu {
+                eval_run_id: id.clone(),
+            })?;
+    print_batches(&[new_rb.clone()]).unwrap();
+
+    df.replace_records(new_rb, &EVAL_RUNS_TABLE_REFERENCE.clone())
+        .await
+        .context(FailedToUpdateEvalRunTableSnafu {
+            eval_run_id: id.clone(),
+        })?;
+    Ok(())
+}
+
 fn eval_runs_record(uuid: &Uuid, model: &str, eval: &Eval) -> Result<RecordBatch, ArrowError> {
+    // `metrics` as single null in MapArray.
+    let mut builder = MapBuilder::new(None, StringBuilder::new(), Float32Builder::new());
+    builder.append(false)?;
+
     let arrays: Vec<ArrayRef> = vec![
         Arc::new(StringArray::from(vec![uuid.to_string()])),
         Arc::new(TimestampSecondArray::from(vec![
@@ -173,6 +287,7 @@ fn eval_runs_record(uuid: &Uuid, model: &str, eval: &Eval) -> Result<RecordBatch
             Arc::new(StringArray::from_iter_values(eval.scorers.iter().clone())),
             None,
         )?),
+        Arc::new(builder.finish()) as ArrayRef,
     ];
     RecordBatch::try_new(EVAL_RUNS_TABLE_SCHEMA.clone(), arrays)
 }

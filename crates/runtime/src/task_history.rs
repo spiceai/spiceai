@@ -91,6 +91,7 @@ impl TaskSpan {
             status,
             tbl_reference,
             Arc::new(TaskSpan::table_schema()),
+            None,
             Acceleration::default(),
             Refresh::default(),
             retention,

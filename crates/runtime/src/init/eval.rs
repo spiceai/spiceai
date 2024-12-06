@@ -28,8 +28,8 @@ use crate::{
     internal_table::create_internal_accelerated_table,
     model::{
         builtin_scorer, EVAL_RESULTS_TABLE_REFERENCE, EVAL_RESULTS_TABLE_SCHEMA,
-        EVAL_RESULTS_TABLE_TIME_COLUMN, EVAL_RUNS_TABLE_REFERENCE, EVAL_RUNS_TABLE_SCHEMA,
-        EVAL_RUNS_TABLE_TIME_COLUMN,
+        EVAL_RESULTS_TABLE_TIME_COLUMN, EVAL_RUNS_TABLE_PRIMARY_KEY, EVAL_RUNS_TABLE_REFERENCE,
+        EVAL_RUNS_TABLE_SCHEMA, EVAL_RUNS_TABLE_TIME_COLUMN,
     },
     secrets::Secrets,
     Result, Runtime, UnableToCreateBackendSnafu, UnableToCreateEvalRunsTableSnafu,
@@ -62,6 +62,7 @@ impl Runtime {
             self.status(),
             TableReference::partial(SPICE_EVAL_SCHEMA, EVAL_RESULTS_TABLE_REFERENCE.table()), // Cannot parse Catalog.
             EVAL_RESULTS_TABLE_SCHEMA.clone(),
+            None,
             Acceleration::default(),
             Refresh::default(),
             retention,
@@ -90,6 +91,7 @@ impl Runtime {
             self.status(),
             TableReference::partial(SPICE_EVAL_SCHEMA, EVAL_RUNS_TABLE_REFERENCE.table()), // Cannot parse Catalog.
             EVAL_RUNS_TABLE_SCHEMA.clone(),
+            Some(vec![EVAL_RUNS_TABLE_PRIMARY_KEY.to_string()]),
             Acceleration::default(),
             Refresh::default(),
             retention,
