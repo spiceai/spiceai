@@ -351,6 +351,7 @@ impl DatasetOutput {
     }
 }
 
+/// Convert a [`RecordBatch`] into its JSON [`Value`].
 fn rb_to_json_value(data: &RecordBatch) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
     let mut writer = arrow_json::ArrayWriter::new(Vec::new());
     writer.write_batches(&[data]).boxed()?;
