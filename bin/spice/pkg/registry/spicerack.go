@@ -52,20 +52,13 @@ func (r *SpiceRackRegistry) GetPod(ctx *context.RuntimeContext, podFullPath stri
 		podVersion = parts[1]
 	}
 
-	if ctx.GetApiKey() == "" {
-		return "", fmt.Errorf("spicerack registry requires an API key")
-	}
-
 	url := fmt.Sprintf("%s/spicepods/%s", getSpiceRackBaseUrl(), podPath)
 	if podVersion != "" {
 		url = fmt.Sprintf("%s/%s", url, podVersion)
 	}
 	failureMessage := fmt.Sprintf("An error occurred while fetching Spicepod '%s' from spicerack.org", podFullPath)
 
-	response, err := spice_http.Get(url, "application/zip", map[string]string{
-		"Spice-Target-Source": "spice.ai",
-		"X-API-Key":           ctx.GetApiKey(),
-	})
+	response, err := spice_http.Get(url, "application/zip", ctx.GetHeaders())
 	if err != nil {
 		slog.Debug(fmt.Sprintf("%s: %s", failureMessage, err.Error()))
 		return "", errors.New(failureMessage)

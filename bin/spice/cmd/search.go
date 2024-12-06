@@ -188,7 +188,11 @@ func sendSearchRequest(rtcontext *context.RuntimeContext, body *SearchRequest) (
 		return nil, fmt.Errorf("error creating search request: %w", err)
 	}
 
-	request.Header = rtcontext.GetHeaders()
+	headers := rtcontext.GetHeaders()
+	for key, value := range headers {
+		request.Header.Set(key, value)
+	}
+	request.Header.Set("Content-Type", "application/json")
 
 	response, err := rtcontext.Client().Do(request)
 	if err != nil {

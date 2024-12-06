@@ -52,7 +52,7 @@ type RuntimeContext struct {
 	httpClient      *http.Client
 	apiKey          string
 	userAgent       string
-	dotEnvValues    map[string]string
+	extraHeaders    map[string]string
 }
 
 func NewContext() *RuntimeContext {
@@ -61,6 +61,7 @@ func NewContext() *RuntimeContext {
 		metricsEndpoint: "http://127.0.0.1:9090",
 		httpClient:      &http.Client{},
 		userAgent:       util.GetSpiceUserAgent("spice"),
+		extraHeaders:    make(map[string]string),
 	}
 	err := rtcontext.Init()
 	if err != nil {
@@ -146,12 +147,12 @@ func (c *RuntimeContext) Init() error {
 	c.appDir = cwd
 	c.podsDir = filepath.Join(c.appDir, constants.SpicePodsDirectoryName)
 
-	c.dotEnvValues, err = loadDotEnvValues()
+	dotEnvValues, err := loadDotEnvValues()
 	if err != nil {
 		return err
 	}
 
-	if apiKey, ok := c.dotEnvValues["SPICE_SPICEAI_API_KEY"]; ok {
+	if apiKey, ok := dotEnvValues["SPICE_SPICEAI_API_KEY"]; ok {
 		c.apiKey = apiKey
 	}
 
@@ -351,19 +352,28 @@ func (c *RuntimeContext) SetUserAgentClient(client string) {
 	c.userAgent = util.GetSpiceUserAgent(client)
 }
 
-func (c *RuntimeContext) GetHeaders() http.Header {
-	headers := make(http.Header)
-	headers.Set("Content-Type", "application/json")
+func (c *RuntimeContext) AddHeaders(headers map[string]string) {
+	for key, value := range headers {
+		c.extraHeaders[key] = value
+	}
+}
+
+func (c *RuntimeContext) GetHeaders() map[string]string {
+	headers := make(map[string]string)
 
 	if c.isCloud {
 		apiKey := os.Getenv("SPICE_API_KEY")
 		if apiKey != "" {
-			headers.Set("X-API-Key", apiKey)
+			headers["X-API-Key"] = apiKey
 		}
 	}
 
 	if c.apiKey != "" {
-		headers.Set("X-API-Key", c.apiKey)
+		headers["X-API-Key"] = c.apiKey
+	}
+
+	for key, value := range c.extraHeaders {
+		headers[key] = value
 	}
 
 	return headers

@@ -41,7 +41,15 @@ var addCmd = &cobra.Command{
 	Example: `
 spice add spiceai/quickstart
 `,
-	Run: func(cmd *cobra.Command, args []string) {
+	Run: getAddOrConnectCmdHandler(false),
+}
+
+func init() {
+	RootCmd.AddCommand(addCmd)
+}
+
+func getAddOrConnectCmdHandler(connect bool) func(cmd *cobra.Command, args []string) {
+	return func(cmd *cobra.Command, args []string) {
 		ctx := context.NewContext()
 		err := ctx.Init()
 		if err != nil {
@@ -53,9 +61,17 @@ spice add spiceai/quickstart
 
 		slog.Info(fmt.Sprintf("Getting Spicepod %s ...\n", podPath))
 
-		if ctx.GetApiKey() == "" {
-			slog.Error("No Spice.ai API key provided, please run `spice login` first.")
-			os.Exit(1)
+		if connect {
+			if ctx.GetApiKey() == "" {
+				slog.Error("No Spice.ai API key provided, please run `spice login` first.")
+				os.Exit(1)
+			}
+
+			headers := map[string]string{
+				"Spice-Target-Source": "spice.ai",
+				"X-API-Key":           ctx.GetApiKey(),
+			}
+			ctx.AddHeaders(headers)
 		}
 
 		r := registry.GetRegistry(podPath)
@@ -128,15 +144,15 @@ spice add spiceai/quickstart
 			}
 		}
 
-		slog.Info(fmt.Sprintf("added %s\n", relativePath))
+		if connect {
+			slog.Info(fmt.Sprintf("connected to %s\n", relativePath))
+		} else {
+			slog.Info(fmt.Sprintf("added %s\n", relativePath))
+		}
 
 		err = checkLatestCliReleaseVersion()
 		if err != nil && util.IsDebug() {
 			slog.Error("failed to check for latest CLI release version", "error", err)
 		}
-	},
-}
-
-func init() {
-	RootCmd.AddCommand(addCmd)
+	}
 }
