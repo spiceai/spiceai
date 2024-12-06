@@ -63,7 +63,7 @@ func getAddOrConnectCmdHandler(connect bool) func(cmd *cobra.Command, args []str
 
 		if connect {
 			if ctx.GetApiKey() == "" {
-				slog.Error("No Spice.ai API key provided, please run `spice login` first.")
+				slog.Error("A valid Spice.ai Cloud Platform API key was not provided. Run `spice login` to authenticate before proceeding.")
 				os.Exit(1)
 			}
 
@@ -144,11 +144,7 @@ func getAddOrConnectCmdHandler(connect bool) func(cmd *cobra.Command, args []str
 			}
 		}
 
-		if connect {
-			slog.Info(fmt.Sprintf("connected to %s\n", relativePath))
-		} else {
-			slog.Info(fmt.Sprintf("added %s\n", relativePath))
-		}
+		slog.Info(fmt.Sprintf("added %s\n", relativePath))
 
 		err = checkLatestCliReleaseVersion()
 		if err != nil && util.IsDebug() {
