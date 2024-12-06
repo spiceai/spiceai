@@ -28,6 +28,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/joho/godotenv"
 	"github.com/spf13/cobra"
 	"github.com/spiceai/spiceai/bin/spice/pkg/constants"
 	"github.com/spiceai/spiceai/bin/spice/pkg/github"
@@ -51,6 +52,7 @@ type RuntimeContext struct {
 	httpClient      *http.Client
 	apiKey          string
 	userAgent       string
+	dotEnvValues    map[string]string
 }
 
 func NewContext() *RuntimeContext {
@@ -143,6 +145,15 @@ func (c *RuntimeContext) Init() error {
 
 	c.appDir = cwd
 	c.podsDir = filepath.Join(c.appDir, constants.SpicePodsDirectoryName)
+
+	c.dotEnvValues, err = loadDotEnvValues()
+	if err != nil {
+		return err
+	}
+
+	if apiKey, ok := c.dotEnvValues["SPICE_SPICEAI_API_KEY"]; ok {
+		c.apiKey = apiKey
+	}
 
 	return nil
 }
@@ -324,6 +335,10 @@ func (c *RuntimeContext) SetApiKey(apiKey string) {
 	c.apiKey = apiKey
 }
 
+func (c *RuntimeContext) GetApiKey() string {
+	return c.apiKey
+}
+
 func (c *RuntimeContext) SetUserAgent(userAgent string) {
 	c.userAgent = userAgent
 }
@@ -360,4 +375,15 @@ func (c *RuntimeContext) IsCloud() bool {
 
 func (c *RuntimeContext) SetHttpEndpoint(endpoint string) {
 	c.httpEndpoint = endpoint
+}
+
+func loadDotEnvValues() (map[string]string, error) {
+	env_file := ".env"
+	if _, err := os.Stat(".env.local"); err == nil {
+		env_file = ".env.local"
+	} else if _, err := os.Stat(env_file); err != nil {
+		return nil, nil
+	}
+
+	return godotenv.Read(env_file)
 }

@@ -81,6 +81,11 @@ spice chat --model <model> --cloud
 	Run: func(cmd *cobra.Command, args []string) {
 		cloud, _ := cmd.Flags().GetBool(cloudKeyFlag)
 		rtcontext := context.NewContext().WithCloud(cloud)
+		err := rtcontext.Init()
+		if err != nil {
+			slog.Error("could not initialize runtime context", "error", err)
+			os.Exit(1)
+		}
 
 		apiKey, _ := cmd.Flags().GetString("api-key")
 		if apiKey != "" {

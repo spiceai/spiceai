@@ -42,12 +42,24 @@ var addCmd = &cobra.Command{
 spice add spiceai/quickstart
 `,
 	Run: func(cmd *cobra.Command, args []string) {
+		ctx := context.NewContext()
+		err := ctx.Init()
+		if err != nil {
+			slog.Error("could not initialize runtime context", "error", err)
+			os.Exit(1)
+		}
+
 		podPath := args[0]
 
 		slog.Info(fmt.Sprintf("Getting Spicepod %s ...\n", podPath))
 
+		if ctx.GetApiKey() == "" {
+			slog.Error("No Spice.ai API key provided, please run `spice login` first.")
+			os.Exit(1)
+		}
+
 		r := registry.GetRegistry(podPath)
-		downloadPath, err := r.GetPod(podPath)
+		downloadPath, err := r.GetPod(ctx, podPath)
 		if err != nil {
 			var itemNotFound *registry.RegistryItemNotFound
 			if errors.As(err, &itemNotFound) {

@@ -43,13 +43,17 @@ func getSpiceRackBaseUrl() string {
 	}
 }
 
-func (r *SpiceRackRegistry) GetPod(podFullPath string) (string, error) {
+func (r *SpiceRackRegistry) GetPod(ctx *context.RuntimeContext, podFullPath string) (string, error) {
 	parts := strings.Split(podFullPath, "@")
 	podPath := podFullPath
 	podVersion := ""
 	if len(parts) == 2 {
 		podPath = parts[0]
 		podVersion = parts[1]
+	}
+
+	if ctx.GetApiKey() == "" {
+		return "", fmt.Errorf("spicerack registry requires an API key")
 	}
 
 	url := fmt.Sprintf("%s/spicepods/%s", getSpiceRackBaseUrl(), podPath)
@@ -60,6 +64,7 @@ func (r *SpiceRackRegistry) GetPod(podFullPath string) (string, error) {
 
 	response, err := spice_http.Get(url, "application/zip", map[string]string{
 		"Spice-Target-Source": "spice.ai",
+		"X-API-Key":           ctx.GetApiKey(),
 	})
 	if err != nil {
 		slog.Debug(fmt.Sprintf("%s: %s", failureMessage, err.Error()))
@@ -86,7 +91,7 @@ func (r *SpiceRackRegistry) GetPod(podFullPath string) (string, error) {
 		return "", err
 	}
 
-	podsPath := context.NewContext().PodsDir()
+	podsPath := ctx.PodsDir()
 	podsPathWithName := filepath.Join(podsPath, podPath)
 
 	podsPerm, err := util.MkDirAllInheritPerm(podsPathWithName)

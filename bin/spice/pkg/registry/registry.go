@@ -19,10 +19,12 @@ package registry
 import (
 	"os"
 	"strings"
+
+	"github.com/spiceai/spiceai/bin/spice/pkg/context"
 )
 
 type SpiceRegistry interface {
-	GetPod(podPath string) (string, error)
+	GetPod(ctx *context.RuntimeContext, podPath string) (string, error)
 }
 
 func GetRegistry(path string) SpiceRegistry {
