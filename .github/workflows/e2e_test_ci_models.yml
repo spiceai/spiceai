@@ -6,10 +6,10 @@ on:
       - trunk
       - release-*
     paths-ignore:
-      - 'docs/**'
-      - 'README.md'
-      - 'version.txt'
-      - 'acknowledgements.md'
+      - "docs/**"
+      - "README.md"
+      - "version.txt"
+      - "acknowledgements.md"
 
   workflow_dispatch:
 
@@ -129,7 +129,7 @@ jobs:
             spiced
 
   test_openai_model:
-    name: 'openai model (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
+    name: "openai model (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})"
     timeout-minutes: 5
     runs-on: ${{ matrix.target.runner }}
     needs:
@@ -143,7 +143,7 @@ jobs:
             target_os: "linux"
             target_arch: "x86_64"
           - name: "macOS aarch64 (Apple Silicon)"
-            runner: [self-hosted, macOS]
+            runner: "macos-14"
             target_os: "darwin"
             target_arch: "aarch64"
     steps:
@@ -176,7 +176,7 @@ jobs:
         timeout-minutes: 1
         run: |
           while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
-      
+
       - name: Install expect (linux)
         if: matrix.target.target_os == 'linux'
         run: |
@@ -202,10 +202,9 @@ jobs:
           killall spice || true
           cat spice.log
 
-
   test_hf_model:
-    name: 'huggingface model (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
-    timeout-minutes: 5
+    name: "huggingface model (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})"
+    timeout-minutes: 10
     runs-on: ${{ matrix.target.runner }}
     needs:
       - build
@@ -244,10 +243,10 @@ jobs:
           spice run &> spice.log &
 
       - name: Wait for Spice runtime is ready
-        timeout-minutes: 1
+        timeout-minutes: 5
         run: |
           while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
-      
+
       - name: Install expect (linux)
         if: matrix.target.target_os == 'linux'
         run: |
@@ -273,5 +272,3 @@ jobs:
         run: |
           killall spice || true
           cat spice.log
-
-  
