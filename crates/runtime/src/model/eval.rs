@@ -412,7 +412,6 @@ pub async fn run_eval(
 }
 
 /// Return format of [`DatasetOutput`] determined by `output_format`. `output_format` can be empty, is only used for its enum type.
-#[allow(clippy::borrowed_box)]
 async fn run_model(
     model: &dyn Chat,
     inputs: &[&DatasetInput],
