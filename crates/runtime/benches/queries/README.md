@@ -427,3 +427,26 @@ select  cast(amc as FLOAT)/cast(pmc as FLOAT) am_pm_ratio
 | **Affected queries**     |     |
 | ------------------------ | --- |
 | [q41.sql](tpcds/q41.sql) |     |
+
+### ODBC - Buffer overflow detected using column definitions in table aliases
+
+**Limitation**: When executing a query using an ODBC source that contains column definitions in a table alias, the Runtime fails with a buffer overflow and core dump. For example, the following query would cause a buffer overflow:
+
+```sql
+SELECT * FROM (SELECT o_orderkey FROM orders LIMIT 10) AS c(key) LIMIT 10;
+```
+
+```bash
+*** buffer overflow detected ***: terminated
+[1]    350993 IOT instruction (core dumped)
+```
+
+**Solution**: Do not use column definitions in a table alias. If aliases are required, create the alias in the subquery like:
+
+```sql
+SELECT * FROM (SELECT o_orderkey AS key FROM orders LIMIT 10) AS c LIMIT 10;
+```
+
+| **Affected queries**     |     |
+| ------------------------ | --- |
+| [simple_q7.sql](tpch/simple_q7.sql) |     |
