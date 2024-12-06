@@ -6,29 +6,30 @@ All criteria must be met for the connector to be considered [RC](../definitions.
 
 ## RC Quality Connectors
 
-| Connector               | RC Quality | DRI Sign-off |
-| ----------------------- | ---------- | ------------ |
-| Clickhouse              | ❌         |              |
-| Databricks              | ❌         |              |
-| Delta Lake              | ❌         |              |
-| Dremio                  | ❌         |              |
-| DuckDB                  | ✅         | @peasee      |
-| File                    | ❌         |              |
-| FTP/SFTP                | ❌         |              |
-| GraphQL                 | ✅         | @peasee      |
-| GitHub                  | ✅         | @peasee      |
-| HTTP/HTTPS              | ❌         |              |
-| Localpod                | ❌         |              |
-| MS SQL                  | ❌         |              |
-| MySQL                   | ✅         | @peasee      |
-| ODBC                    | ❌         |              |
-| PostgreSQL              | ✅         | @Sevenannn   |
-| Sharepoint              | ❌         |              |
-| Snowflake               | ❌         |              |
-| Spice.AI Cloud Platform | ❌         |              |
-| S3                      | ✅         | @Sevenannn   |
-| Azure BlobFS            | ❌         |              |
-| Spark                   | ❌         |              |
+| Connector                        | RC Quality | DRI Sign-off |
+| -------------------------------- | ---------- | ------------ |
+| Clickhouse                       | ❌         |              |
+| Databricks (mode: delta_lake)    | ✅         | @Sevenannn   |
+| Databricks (mode: spark_connect) | ❌         |              |
+| Delta Lake                       | ❌         |              |
+| Dremio                           | ❌         |              |
+| DuckDB                           | ✅         | @peasee      |
+| File                             | ❌         |              |
+| FTP/SFTP                         | ❌         |              |
+| GraphQL                          | ✅         | @peasee      |
+| GitHub                           | ✅         | @peasee      |
+| HTTP/HTTPS                       | ❌         |              |
+| Localpod                         | ❌         |              |
+| MS SQL                           | ❌         |              |
+| MySQL                            | ✅         | @peasee      |
+| ODBC                             | ❌         |              |
+| PostgreSQL                       | ✅         | @Sevenannn   |
+| Sharepoint                       | ❌         |              |
+| Snowflake                        | ❌         |              |
+| Spice.AI Cloud Platform          | ❌         |              |
+| S3                               | ✅         | @Sevenannn   |
+| Azure BlobFS                     | ❌         |              |
+| Spark                            | ❌         |              |
 
 ## RC Release Criteria
 
