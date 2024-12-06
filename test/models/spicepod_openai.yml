@@ -17,7 +17,7 @@ datasets:
       reference_url_template: https://github.com/spiceai/spiceai/issues/<issue_id>
     params:
       github_token: ${secrets:GITHUB_TOKEN}
-      github_query_mode: "search"
+      github_query_mode: 'search'
     acceleration:
       enabled: true
       refresh_retry_max_attempts: 3
@@ -31,8 +31,8 @@ datasets:
           enabled: true
           target_chunk_size: 512
           overlap_size: 128
-          trim_whitespace: false 
-    
+          trim_whitespace: false
+
   - from: s3://spiceai-public-datasets/tpcds/catalog_page/
     name: catalog_page
     description: Represents an e-commerce platform's catalog page metadata
@@ -49,9 +49,9 @@ datasets:
           enabled: true
           target_chunk_size: 512
           overlap_size: 128
-          trim_whitespace: false  
+          trim_whitespace: false
         use: openai_embeddings
-    
+
 models:
   - from: openai:gpt-4o-mini
     name: openai-gpt
