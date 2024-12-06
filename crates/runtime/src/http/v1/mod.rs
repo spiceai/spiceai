@@ -18,6 +18,7 @@ pub mod catalogs;
 pub mod chat;
 pub mod datasets;
 pub mod embeddings;
+pub mod eval;
 pub mod inference;
 pub mod models;
 pub mod nsql;

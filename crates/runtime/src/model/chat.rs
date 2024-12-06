@@ -390,11 +390,11 @@ impl Chat for ChatWrapper {
         &self,
         req: CreateChatCompletionRequest,
     ) -> Result<CreateChatCompletionResponse, OpenAIError> {
-        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "ai_completion", stream=false, model = %req.model, input = %serde_json::to_string(&req).unwrap_or_default(), "labels");
+        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "ai_completion", stream=false, model = %req.model, input = %serde_json::to_string(&req).unwrap_or_default());
         let req = self.prepare_req(req)?;
 
         if let Some(metadata) = &req.metadata {
-            tracing::info!(target: "task_history", metadata = %metadata, "labels");
+            tracing::info!(target: "task_history", parent: &span, metadata = %metadata, "labels");
         }
 
         match self.chat.chat_request(req).instrument(span.clone()).await {
@@ -405,9 +405,9 @@ impl Chat for ChatWrapper {
                 let captured_output: Vec<_> = resp.choices.iter().map(|c| &c.message).collect();
                 match serde_json::to_string(&captured_output) {
                     Ok(output) => {
-                        tracing::info!(target: "task_history", captured_output = %output);
+                        tracing::info!(target: "task_history", parent: &span, captured_output = %output);
                     }
-                    Err(e) => tracing::error!("Failed to serialize truncated output: {}", e),
+                    Err(e) => tracing::error!("Failed to serialize truncated output: {e}"),
                 }
                 resp.model.clone_from(&self.public_name);
                 Ok(resp)

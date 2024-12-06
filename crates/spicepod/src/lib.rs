@@ -23,8 +23,8 @@ use std::collections::HashMap;
 use std::{fmt::Debug, path::PathBuf};
 
 use component::{
-    catalog::Catalog, dataset::Dataset, embeddings::Embeddings, extension::Extension, model::Model,
-    runtime::Runtime, secret::Secret, view::View,
+    catalog::Catalog, dataset::Dataset, embeddings::Embeddings, eval::Eval, extension::Extension,
+    model::Model, runtime::Runtime, secret::Secret, view::View,
 };
 
 use spec::{SpicepodDefinition, SpicepodVersion};
@@ -74,6 +74,8 @@ pub struct Spicepod {
     pub dependencies: Vec<String>,
 
     pub embeddings: Vec<Embeddings>,
+
+    pub evals: Vec<Eval>,
 
     pub tools: Vec<Tool>,
 
@@ -152,6 +154,10 @@ impl Spicepod {
         )
         .context(UnableToResolveSpicepodComponentsSnafu { path: path.clone() })?;
 
+        let resolved_evals =
+            component::resolve_component_references(fs, &path, &spicepod_definition.evals, "evals")
+                .context(UnableToResolveSpicepodComponentsSnafu { path: path.clone() })?;
+
         let resolved_tools =
             component::resolve_component_references(fs, &path, &spicepod_definition.tools, "tools")
                 .context(UnableToResolveSpicepodComponentsSnafu { path: path.clone() })?;
@@ -161,6 +167,7 @@ impl Spicepod {
         detect_duplicate_component_names("view", &resolved_views[..])?;
         detect_duplicate_component_names("model", &resolved_models[..])?;
         detect_duplicate_component_names("embedding", &resolved_embeddings[..])?;
+        detect_duplicate_component_names("eval", &resolved_evals[..])?;
         detect_duplicate_component_names("tool", &resolved_tools[..])?;
 
         Ok(from_definition(
@@ -169,6 +176,7 @@ impl Spicepod {
             resolved_datasets,
             resolved_views,
             resolved_embeddings,
+            resolved_evals,
             resolved_tools,
             resolved_models,
         ))
@@ -196,6 +204,7 @@ impl Spicepod {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 #[must_use]
 fn from_definition(
     spicepod_definition: SpicepodDefinition,
@@ -203,6 +212,7 @@ fn from_definition(
     datasets: Vec<Dataset>,
     views: Vec<View>,
     embeddings: Vec<Embeddings>,
+    evals: Vec<Eval>,
     tools: Vec<Tool>,
     models: Vec<Model>,
 ) -> Spicepod {
@@ -216,6 +226,7 @@ fn from_definition(
         views,
         models,
         embeddings,
+        evals,
         tools,
         dependencies: spicepod_definition.dependencies,
         runtime: spicepod_definition.runtime,

@@ -14,18 +14,17 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Code needed to initialize the runtime
+use std::sync::Arc;
 
-pub(crate) mod catalog;
-pub(crate) mod dataset;
-pub(crate) mod embedding;
-pub(crate) mod eval_scorer;
-pub(crate) mod extension;
-pub(crate) mod llm;
-pub(crate) mod metrics;
-pub(crate) mod model;
-pub(crate) mod pods_watcher;
-pub(crate) mod results_cache;
-pub(crate) mod task_history;
-pub(crate) mod tool;
-pub(crate) mod view;
+use crate::{model::builtin_scorer, Runtime};
+
+impl Runtime {
+    #[allow(clippy::implicit_hasher)]
+    pub(crate) async fn load_eval_scorer(&self) {
+        let mut scorers = self.eval_scorers.write().await;
+        for (name, scorer) in builtin_scorer() {
+            scorers.insert(name.to_string(), Arc::clone(&scorer));
+            tracing::debug!("Successfully loaded eval scorer {name}");
+        }
+    }
+}
