@@ -176,8 +176,10 @@ pub async fn run_eval(
     df: Arc<DataFusion>,
     scorer_registry: Arc<RwLock<HashMap<String, Arc<dyn Scorer>>>>,
 ) -> Result<()> {
+    // Get & prepare the eval dataset
     let (input, ideal) = get_eval_data(Arc::clone(&df), eval).await?;
 
+    // Run the model against the eval dataset.
     let llms = llm_store.read().await;
     let model = llms
         .get(&model_name)
@@ -189,15 +191,16 @@ pub async fn run_eval(
     let actual: Vec<DatasetOutput> = if let Some(first_ideal) = ideal.first() {
         run_model(eval.name.clone(), Arc::clone(model), &input, first_ideal).await?
     } else {
-        // Not error, no data in dataset
+        // Not an error, no data in dataset
         vec![]
     };
 
+    // Score the results
     let scorers_to_use = get_scorers_for_eval(eval, Arc::clone(&scorer_registry)).await?;
-
     let scores = score_results(&input, &actual, &ideal, &scorers_to_use).await;
     write_results(id, Arc::clone(&df), &input, &actual, &ideal, &scores).await?;
 
+    // Compute metrics
     let metrics = result_metrics(scores, &scorers_to_use).await;
     add_metrics_to_eval_run(Arc::clone(&df), id, &metrics).await?;
     Ok(())

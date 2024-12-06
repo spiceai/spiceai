@@ -55,7 +55,7 @@ pub static EVAL_RESULTS_TABLE_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     ]))
 });
 
-pub(crate) async fn write_result_to_table(
+pub(super) async fn write_result_to_table(
     df: Arc<DataFusion>,
     id: &EvalRunId,
     builder: &mut ResultBuilder,

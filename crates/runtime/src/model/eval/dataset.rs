@@ -351,31 +351,6 @@ impl DatasetOutput {
     }
 }
 
-/// Return format of [`DatasetOutput`] determined by `output_format`. `output_format` can be empty, is only used for its enum type.
-#[allow(clippy::borrowed_box)]
-async fn run_model(
-    model: &dyn Chat,
-    inputs: &[&DatasetInput],
-    output_format: &DatasetOutput,
-) -> Result<Vec<DatasetOutput>, OpenAIError> {
-    let mut outputs = Vec::with_capacity(inputs.len());
-    for input in inputs {
-        let req: CreateChatCompletionRequest = (*input).try_into()?;
-        let choices = model.chat_request(req).await?.choices;
-        let output = match output_format {
-            DatasetOutput::AssistantResponse(_) => DatasetOutput::AssistantResponse(
-                choices
-                    .first()
-                    .and_then(|c| c.message.content.clone())
-                    .unwrap_or_default(),
-            ),
-            DatasetOutput::Choices(_) => DatasetOutput::Choices(choices),
-        };
-        outputs.push(output);
-    }
-    Ok(outputs)
-}
-
 fn rb_to_json_value(data: &RecordBatch) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
     let mut writer = arrow_json::ArrayWriter::new(Vec::new());
     writer.write_batches(&[data]).boxed()?;
