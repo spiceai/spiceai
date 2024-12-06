@@ -6,10 +6,10 @@ on:
       - trunk
       - release-*
     paths-ignore:
-      - "docs/**"
-      - "README.md"
-      - "version.txt"
-      - "acknowledgements.md"
+      - 'docs/**'
+      - 'README.md'
+      - 'version.txt'
+      - 'acknowledgements.md'
 
   workflow_dispatch:
 
@@ -30,14 +30,14 @@ jobs:
     strategy:
       matrix:
         target:
-          - name: "Linux x64"
-            builder: "spiceai-runners"
-            target_os: "linux"
-            target_arch: "x86_64"
-          - name: "macOS aarch64 (Apple Silicon)"
-            builder: [self-hosted, macOS]
-            target_os: "darwin"
-            target_arch: "aarch64"
+          - name: 'Linux x64'
+            builder: 'spiceai-runners'
+            target_os: 'linux'
+            target_arch: 'x86_64'
+          - name: 'macOS aarch64 (Apple Silicon)'
+            builder: 'spiceai-macos'
+            target_os: 'darwin'
+            target_arch: 'aarch64'
     steps:
       - uses: actions/checkout@v4
 
@@ -129,7 +129,7 @@ jobs:
             spiced
 
   test_openai_model:
-    name: "openai model (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})"
+    name: 'openai model (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
     timeout-minutes: 5
     runs-on: ${{ matrix.target.runner }}
     needs:
@@ -138,14 +138,14 @@ jobs:
       fail-fast: false
       matrix:
         target:
-          - name: "Linux x64"
-            runner: "spiceai-runners"
-            target_os: "linux"
-            target_arch: "x86_64"
-          - name: "macOS aarch64 (Apple Silicon)"
-            runner: "macos-14"
-            target_os: "darwin"
-            target_arch: "aarch64"
+          - name: 'Linux x64'
+            runner: 'spiceai-runners'
+            target_os: 'linux'
+            target_arch: 'x86_64'
+          - name: 'macOS aarch64 (Apple Silicon)'
+            runner: 'macos-14'
+            target_os: 'darwin'
+            target_arch: 'aarch64'
     steps:
       - uses: actions/checkout@v4
 
@@ -203,7 +203,7 @@ jobs:
           cat spice.log
 
   test_hf_model:
-    name: "huggingface model (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})"
+    name: 'huggingface model (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
     timeout-minutes: 10
     runs-on: ${{ matrix.target.runner }}
     needs:
@@ -212,10 +212,10 @@ jobs:
       fail-fast: false
       matrix:
         target:
-          - name: "macOS aarch64 (Apple Silicon)"
-            runner: [self-hosted, macOS]
-            target_os: "darwin"
-            target_arch: "aarch64"
+          - name: 'macOS aarch64 (Apple Silicon)'
+            runner: 'spiceai-macos'
+            target_os: 'darwin'
+            target_arch: 'aarch64'
     steps:
       - uses: actions/checkout@v4
 
