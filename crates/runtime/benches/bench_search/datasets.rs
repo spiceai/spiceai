@@ -57,7 +57,7 @@ pub(crate) async fn add_mtep_quora_retrieval_dataset(
         .ok_or("Failed to convert PathBuf to str")?;
 
     let tests_path = api_repo
-        .get("queries/test-00000-of-00001.parquet")
+        .get("data/test-00000-of-00001.parquet")
         .await
         .map_err(|e| format!("Failed to download huggingface file: {e}"))?;
     let tests_path_str = tests_path

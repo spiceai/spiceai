@@ -16,7 +16,7 @@ limitations under the License.
 
 use crate::{
     results::BenchmarkResultsBuilder,
-    utils::{init_tracing, runtime_ready_check},
+    utils::{get_branch_name, get_commit_sha, init_tracing, runtime_ready_check},
 };
 use app::{App, AppBuilder};
 use datafusion::prelude::SessionContext;
@@ -34,7 +34,7 @@ use spicepod::component::{
     },
     runtime::ResultsCache,
 };
-use std::{collections::HashMap, process::Command, sync::Arc};
+use std::{collections::HashMap, sync::Arc};
 /// The number of times to run each query in the benchmark.
 const ITERATIONS: i32 = 5;
 
@@ -64,7 +64,7 @@ pub(crate) async fn setup_benchmark(
     acceleration: Option<Acceleration>,
     bench_name: &str,
 ) -> Result<(BenchmarkResultsBuilder, Runtime), String> {
-    init_tracing();
+    init_tracing(None);
 
     let app = build_app(upload_results_dataset, connector, acceleration, bench_name)?;
 
@@ -372,48 +372,6 @@ fn make_spiceai_rw_dataset(path: &str, name: &str) -> Dataset {
     ds.mode = Mode::ReadWrite;
     ds.replication = Some(Replication { enabled: true });
     ds
-}
-
-// This should also append "-dirty" if there are uncommitted changes
-fn get_commit_sha() -> String {
-    let short_sha = Command::new("git")
-        .args(["rev-parse", "--short", "HEAD"])
-        .output()
-        .map_or_else(
-            |_| "unknown".to_string(),
-            |output| String::from_utf8_lossy(&output.stdout).trim().to_string(),
-        );
-    format!(
-        "{}{}",
-        short_sha,
-        if is_repo_dirty() { "-dirty" } else { "" }
-    )
-}
-
-#[allow(clippy::map_unwrap_or)]
-fn is_repo_dirty() -> bool {
-    let output = Command::new("git")
-        .arg("status")
-        .arg("--porcelain")
-        .output()
-        .map(|output| {
-            std::str::from_utf8(&output.stdout)
-                .map(ToString::to_string)
-                .unwrap_or_else(|_| String::new())
-        })
-        .unwrap_or_else(|_| String::new());
-
-    !output.trim().is_empty()
-}
-
-fn get_branch_name() -> String {
-    Command::new("git")
-        .args(["rev-parse", "--abbrev-ref", "HEAD"])
-        .output()
-        .map_or_else(
-            |_| "unknown".to_string(),
-            |output| String::from_utf8_lossy(&output.stdout).trim().to_string(),
-        )
 }
 
 #[macro_export]
