@@ -31,7 +31,7 @@ pub(crate) async fn setup_benchmark(
     configuration_name: &str,
     test_dataset: &str,
     embeddings_model: &str,
-    acceleration: Option<Acceleration>,
+    acceleration: &Option<Acceleration>,
 ) -> Result<(Runtime, SearchBenchmarkResultBuilder), String> {
     init_tracing(Some(
         "runtime=Debug,task_history=WARN,runtime::embeddings=WARN,INFO",
@@ -96,7 +96,7 @@ pub(crate) async fn load_search_queries(rt: &Runtime) -> Result<Vec<String>, Str
 async fn build_bench_app(
     test_dataset: &str,
     embeddings_model: &str,
-    acceleration: Option<Acceleration>,
+    acceleration: &Option<Acceleration>,
 ) -> Result<AppBuilder, String> {
     let app_builder = AppBuilder::new("vector_search_benchmark_test")
         .with_results_cache(ResultsCache {
@@ -105,9 +105,9 @@ async fn build_bench_app(
             item_ttl: None,
             eviction_policy: None,
         })
-        .with_embedding(Embeddings::new(embeddings_model, "test_model"));
+        .with_embedding(create_embeddings_model(embeddings_model));
 
-    add_benchmark_dataset(app_builder, test_dataset, acceleration).await
+    add_benchmark_dataset(app_builder, test_dataset, acceleration.clone()).await
 }
 
 async fn add_benchmark_dataset(
@@ -115,12 +115,22 @@ async fn add_benchmark_dataset(
     dataset: &str,
     acceleration: Option<Acceleration>,
 ) -> Result<AppBuilder, String> {
-    match dataset {
-        "QuoraRetrieval" => {
+    match dataset.to_lowercase().as_str() {
+        "quoraretrieval" => {
             super::datasets::add_mtep_quora_retrieval_dataset(app_builder, acceleration).await
         }
         _ => Err(format!("Unknown benchmark dataset: {dataset}")),
     }
+}
+
+fn create_embeddings_model(embeddings_model: &str) -> Embeddings {
+    let mut model = Embeddings::new(embeddings_model, "test_model");
+    // Add OpenAI API key as a secret; HF models will ignore it
+    model.params.insert(
+        "openai_api_key".to_string(),
+        "${ secrets:SPICE_OPENAI_API_KEY }".into(),
+    );
+    model
 }
 
 fn extract_queries_from_batches(

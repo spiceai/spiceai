@@ -25,7 +25,7 @@ pub(crate) struct SearchBenchmarkResultBuilder {
     commit_sha: String,
     branch_name: String,
 
-    setup_name: String,
+    config_name: String,
 
     started_at: i64,
     finished_at: i64,
@@ -44,7 +44,7 @@ impl Display for SearchBenchmarkResultBuilder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "setup_name: {},\n\
+            "configuration: {},\n\
           status: {},\n\
           run_id: {},\n\
           commit_sha: {},\n\
@@ -55,7 +55,7 @@ impl Display for SearchBenchmarkResultBuilder {
           rps: {:.2},\n\
           mean_response_time: {:.2} ms,\n\
           p95_response_time: {:.2} ms\n",
-            self.setup_name,
+            self.config_name,
             self.status,
             self.run_id,
             self.commit_sha,
@@ -74,16 +74,20 @@ impl SearchBenchmarkResultBuilder {
     pub fn new(
         commit_sha: impl Into<String>,
         branch_name: impl Into<String>,
-        setup_name: impl Into<String>,
+        config_name: impl Into<String>,
     ) -> Self {
         Self {
             run_id: uuid::Uuid::new_v4().to_string(),
             commit_sha: commit_sha.into(),
             branch_name: branch_name.into(),
-            setup_name: setup_name.into(),
+            config_name: config_name.into(),
             started_at: get_current_unix_ms(),
             ..Default::default()
         }
+    }
+
+    pub fn configuration_name(&self) -> String {
+        self.config_name.clone()
     }
 
     pub fn start_index(&mut self) {

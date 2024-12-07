@@ -47,22 +47,60 @@ async fn main() -> Result<(), String> {
             .build(),
     );
 
-    Box::pin(request_context.scope(vector_search_benchmark())).await
+    Box::pin(request_context.scope(vector_search_benchmarks())).await
 }
 
-async fn vector_search_benchmark() -> Result<(), String> {
-    let acceleration = Some(Acceleration {
-        enabled: true,
-        // TODO: temporary limit amout of data to speed up developement/testing. This will be removed in the future.
-        refresh_sql: Some("select * from data limit 1000".into()),
-        ..Default::default()
-    });
+pub struct SearchBenchmarkConfiguration {
+    pub name: &'static str,
+    pub test_dataset: &'static str,
+    pub embeddings_model: &'static str,
+    pub acceleration: Option<Acceleration>,
+}
 
+fn benchmark_configurations() -> Vec<SearchBenchmarkConfiguration> {
+    // TODO: expand configurations with DuckDB acceleration after issue below is resolved
+    // https://github.com/spiceai/spiceai/issues/3796
+
+    vec![
+        SearchBenchmarkConfiguration {
+            name: "quora_minilm-l6-v2_arrow",
+            test_dataset: "QuoraRetrieval",
+            embeddings_model: "huggingface:huggingface.co/sentence-transformers/all-MiniLM-L6-v2",
+            acceleration: Some(Acceleration {
+                enabled: true,
+                // TODO: temporary limit amout of data to speed up developement/testing. This will be removed in the future.
+                refresh_sql: Some("select * from data limit 1000".into()),
+                ..Default::default()
+            }),
+        },
+        SearchBenchmarkConfiguration {
+            name: "quora_openai-text-embedding-3-small_arrow",
+            test_dataset: "QuoraRetrieval",
+            embeddings_model: "openai:text-embedding-3-small",
+            acceleration: Some(Acceleration {
+                enabled: true,
+                // TODO: temporary limit amout of data to speed up developement/testing. This will be removed in the future.
+                refresh_sql: Some("select * from data limit 1000".into()),
+                ..Default::default()
+            }),
+        },
+    ]
+}
+
+async fn vector_search_benchmarks() -> Result<(), String> {
+    for config in benchmark_configurations() {
+        let _ = run_benchmark(&config).await;
+    }
+
+    Ok(())
+}
+
+async fn run_benchmark(config: &SearchBenchmarkConfiguration) -> Result<(), String> {
     let (rt, mut benchmark_result) = setup_benchmark(
-        "Quora_MiniLM-L6-v2_Arrow",
-        "QuoraRetrieval",
-        "huggingface:huggingface.co/sentence-transformers/all-MiniLM-L6-v2",
-        acceleration,
+        config.name,
+        config.test_dataset,
+        config.embeddings_model,
+        &config.acceleration,
     )
     .await?;
 
@@ -88,7 +126,20 @@ async fn vector_search_benchmark() -> Result<(), String> {
 
     benchmark_result.finish(run_search_queries_result.is_ok());
 
-    tracing::info!("Search benchmark results:\n{}", benchmark_result);
+    match &run_search_queries_result {
+        Ok(()) => {
+            tracing::info!(
+                "Benchmark for configuration '{}' completed:\n{benchmark_result}",
+                benchmark_result.configuration_name()
+            );
+        }
+        Err(e) => {
+            tracing::error!(
+                "Benchmark for configuration '{}' failed: {e}\n{benchmark_result}",
+                benchmark_result.configuration_name()
+            );
+        }
+    }
 
     run_search_queries_result
 }
