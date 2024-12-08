@@ -35,7 +35,6 @@ use crate::federated_table::FederatedTable;
 use crate::secrets::Secrets;
 use crate::{status, view};
 
-use arrow::array::RecordBatch;
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow::error::ArrowError;
 use arrow_tools::schema::verify_schema;
@@ -48,14 +47,11 @@ use datafusion::error::DataFusionError;
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::physical_plan::collect;
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::sql::parser::DFParser;
 use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 use datafusion::sql::{sqlparser, TableReference};
 use datafusion_federation::FederatedTableProviderAdaptor;
 use error::find_datafusion_root;
-use futures::stream;
-use futures::FutureExt;
 use itertools::Itertools;
 use query::QueryBuilder;
 use snafu::prelude::*;
@@ -533,34 +529,6 @@ impl DataFusion {
             pending_sink_registrations.remove(pending_registration_idx);
         }
 
-        Ok(())
-    }
-
-    pub(crate) async fn replace_records(
-        &self,
-        rb: RecordBatch,
-        tbl: &TableReference,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let record_batch_stream = Box::pin(RecordBatchStreamAdapter::new(
-            rb.schema(),
-            Box::pin(stream::once(async { Ok(rb) })),
-        ));
-        let ctx = SessionContext::new();
-        let session_state = ctx.state();
-
-        if let Some(tbl) = self.get_table(tbl).await {
-            let insert_plan = tbl
-                .insert_into(
-                    &session_state,
-                    Arc::new(StreamingDataUpdateExecutionPlan::new(record_batch_stream)),
-                    InsertOp::Append,
-                )
-                .await
-                .boxed()?;
-
-            // Do not care about the result of the insert
-            let _ = collect(insert_plan, ctx.task_ctx()).boxed().await.boxed()?;
-        }
         Ok(())
     }
 

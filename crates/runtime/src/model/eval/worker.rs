@@ -52,12 +52,9 @@ pub struct EvalWorker {
 }
 
 impl EvalWorker {
-    pub fn new(
-        llms: Arc<RwLock<LLMModelStore>>,
-        df: Arc<DataFusion>,
-        scorers: Arc<RwLock<HashMap<String, Arc<dyn Scorer>>>>,
-    ) -> Self {
+    pub fn new(llms: Arc<RwLock<LLMModelStore>>, df: Arc<DataFusion>) -> Self {
         let (tx, rx) = mpsc::channel(8);
+        let scorers = Arc::new(RwLock::new(HashMap::new()));
 
         Self {
             command_sender: tx,

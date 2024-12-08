@@ -20,7 +20,6 @@ use crate::{
 };
 use app::{App, AppBuilder};
 use datafusion::{prelude::SessionContext, sql::TableReference};
-use futures::Future;
 use runtime::{
     datafusion::DataFusion,
     dataupdate::DataUpdate,

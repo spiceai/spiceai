@@ -27,7 +27,6 @@ use arrow::{
         TimestampSecondArray,
     },
     buffer::OffsetBuffer,
-    util::pretty::print_batches,
 };
 use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef, TimeUnit};
 use futures::TryStreamExt;
@@ -115,7 +114,6 @@ pub(super) async fn add_metrics_to_eval_run(
     id: &EvalRunId,
     metrics: &HashMap<String, Vec<(String, f32)>>,
 ) -> Result<()> {
-    println!("Building metrics: {metrics:#?}");
     let mut builder = MapBuilder::new(None, StringBuilder::new(), Float32Builder::new());
     for (scorer, metric_pair) in metrics {
         for (metric_name, score) in metric_pair {
@@ -176,7 +174,7 @@ pub async fn start_eval_run(
         DataUpdate {
             schema: Arc::clone(&EVAL_RUNS_TABLE_SCHEMA),
             data: vec![rb],
-            update_type: UpdateType::Overwrite,
+            update_type: UpdateType::Append,
         },
     )
     .await
@@ -249,21 +247,26 @@ async fn update_eval_run(
             eval_run_id: id.clone(),
         })?;
 
-    print_batches(&[rb.clone()]).unwrap();
-
     let new_rb =
         update_record_batch(&rb, updates)
             .boxed()
             .context(FailedToUpdateEvalRunTableSnafu {
                 eval_run_id: id.clone(),
             })?;
-    print_batches(&[new_rb.clone()]).unwrap();
 
-    df.replace_records(new_rb, &EVAL_RUNS_TABLE_REFERENCE.clone())
-        .await
-        .context(FailedToUpdateEvalRunTableSnafu {
-            eval_run_id: id.clone(),
-        })?;
+    df.write_data(
+        &EVAL_RUNS_TABLE_REFERENCE.clone(),
+        DataUpdate {
+            schema: new_rb.schema(),
+            data: vec![new_rb],
+            update_type: UpdateType::Append,
+        },
+    )
+    .await
+    .boxed()
+    .context(FailedToUpdateEvalRunTableSnafu {
+        eval_run_id: id.clone(),
+    })?;
     Ok(())
 }
 

@@ -162,11 +162,7 @@ impl RuntimeBuilder {
             .unwrap_or_default();
 
         let llms = Arc::new(RwLock::new(HashMap::new()));
-        let eval_worker = EvalWorker::new(
-            Arc::clone(&llms),
-            Arc::clone(&df),
-            Arc::new(RwLock::new(HashMap::new())),
-        );
+        let eval_worker = EvalWorker::new(Arc::clone(&llms), Arc::clone(&df));
 
         let mut rt = Runtime {
             app: Arc::new(RwLock::new(self.app)),
