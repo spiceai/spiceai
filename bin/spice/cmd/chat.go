@@ -81,6 +81,11 @@ spice chat --model <model> --cloud
 	Run: func(cmd *cobra.Command, args []string) {
 		cloud, _ := cmd.Flags().GetBool(cloudKeyFlag)
 		rtcontext := context.NewContext().WithCloud(cloud)
+		err := rtcontext.Init()
+		if err != nil {
+			slog.Error("could not initialize runtime context", "error", err)
+			os.Exit(1)
+		}
 
 		apiKey, _ := cmd.Flags().GetString("api-key")
 		if apiKey != "" {
@@ -254,7 +259,11 @@ func sendChatRequest(rtcontext *context.RuntimeContext, body *ChatRequestBody) (
 		return nil, fmt.Errorf("error creating request: %w", err)
 	}
 
-	request.Header = rtcontext.GetHeaders()
+	headers := rtcontext.GetHeaders()
+	for key, value := range headers {
+		request.Header.Set(key, value)
+	}
+	request.Header.Set("Content-Type", "application/json")
 
 	response, err := rtcontext.Client().Do(request)
 	if err != nil {

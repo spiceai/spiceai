@@ -22,6 +22,7 @@ pub mod eval;
 pub mod inference;
 pub mod models;
 pub mod nsql;
+pub mod packages;
 pub mod query;
 pub mod ready;
 pub mod search;

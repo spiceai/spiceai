@@ -38,19 +38,23 @@ func RetryableClient() *retryablehttp.Client {
 	return client
 }
 
-func Get(url string, accept string) (*net_http.Response, error) {
+func Get(url string, accept string, headers map[string]string) (*net_http.Response, error) {
 	req, err := retryablehttp.NewRequest("GET", url, nil)
 	if err != nil {
 		return nil, err
 	}
 
-	return do(req, accept)
+	return do(req, accept, headers)
 }
 
-func do(req *retryablehttp.Request, accept string) (*net_http.Response, error) {
+func do(req *retryablehttp.Request, accept string, headers map[string]string) (*net_http.Response, error) {
 	req.Header.Set("User-Agent", userAgent())
 	if accept != "" {
 		req.Header.Set("Accept", accept)
+	}
+
+	for k, v := range headers {
+		req.Header.Set(k, v)
 	}
 
 	resp, err := RetryableClient().Do(req)

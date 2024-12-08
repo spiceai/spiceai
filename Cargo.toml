@@ -13,6 +13,7 @@ members = [
     "crates/model_components",
     "crates/ns_lookup",
     "crates/otel-arrow",
+    "crates/package",
     "crates/runtime",
     "crates/runtime-auth",
     "crates/spicepod",
@@ -54,6 +55,7 @@ axum = { version = "0.7.9", features = ["macros"] }
 base64 = "0.22.1"
 bb8 = "0.8"
 bb8-postgres = "0.8"
+bytes = "1.9.0"
 chrono = "0.4.38"
 clap = { version = "4.5.21", features = ["derive"] }
 clickhouse-rs = { git = "https://github.com/spiceai/clickhouse-rs.git", tag = "0.2.1", features = [
@@ -147,7 +149,7 @@ datafusion-execution = { git = "https://github.com/spiceai/datafusion.git", rev 
 datafusion-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "2b93a308f65df1ae0cd8f3f8194b9b60201a500f" }
 
 
-object_store = { git = "https://github.com/spiceai/arrow-rs.git", rev = "1f37d9eda6da17b7644115f82d209c00c9566733" }
+object_store = { git = "https://github.com/spiceai/arrow-rs.git", rev = "cee50b7d2ccf749eac89d0fe26fbd8a06c0bb3c4" }
 
 datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "5af0df83c2cd1d3f82f293b066b401a4dfd4064b" }
 datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "58baab01bdfd282261fbdbc9905a20835fe3cead" }

@@ -37,13 +37,13 @@ type SpiceRackRegistry struct{}
 
 func getSpiceRackBaseUrl() string {
 	if strings.HasSuffix(version.Version(), "-dev") {
-		return "https://dev-data.spiceai.io/v0.1"
+		return "https://dev-data.spiceai.io/v1"
 	} else {
-		return "https://api.spicerack.org/v0.1"
+		return "https://api.spicerack.org/v1"
 	}
 }
 
-func (r *SpiceRackRegistry) GetPod(podFullPath string) (string, error) {
+func (r *SpiceRackRegistry) GetPod(ctx *context.RuntimeContext, podFullPath string) (string, error) {
 	parts := strings.Split(podFullPath, "@")
 	podPath := podFullPath
 	podVersion := ""
@@ -58,7 +58,7 @@ func (r *SpiceRackRegistry) GetPod(podFullPath string) (string, error) {
 	}
 	failureMessage := fmt.Sprintf("An error occurred while fetching Spicepod '%s' from spicerack.org", podFullPath)
 
-	response, err := spice_http.Get(url, "application/zip")
+	response, err := spice_http.Get(url, "application/zip", ctx.GetHeaders())
 	if err != nil {
 		slog.Debug(fmt.Sprintf("%s: %s", failureMessage, err.Error()))
 		return "", errors.New(failureMessage)
@@ -84,7 +84,7 @@ func (r *SpiceRackRegistry) GetPod(podFullPath string) (string, error) {
 		return "", err
 	}
 
-	podsPath := context.NewContext().PodsDir()
+	podsPath := ctx.PodsDir()
 	podsPathWithName := filepath.Join(podsPath, podPath)
 
 	podsPerm, err := util.MkDirAllInheritPerm(podsPathWithName)

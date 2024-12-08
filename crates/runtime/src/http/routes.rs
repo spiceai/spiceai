@@ -62,7 +62,8 @@ pub(crate) fn routes(
             "/v1/datasets/:name/acceleration",
             patch(v1::datasets::acceleration),
         )
-        .route("/v1/spicepods", get(v1::spicepods::get));
+        .route("/v1/spicepods", get(v1::spicepods::get))
+        .route("/v1/packages/generate", post(v1::packages::generate));
 
     if cfg!(feature = "models") {
         authenticated_router = authenticated_router
@@ -75,6 +76,7 @@ pub(crate) fn routes(
             .route("/v1/search", post(v1::search::post))
             .route("/v1/tools", get(v1::tools::list))
             .route("/v1/tools/:name", post(v1::tools::post))
+            // Deprecated, use /v1/evals/:name instead
             .route("/v1/tool/:name", post(v1::tools::post))
             .route("/v1/evals/:name", post(v1::eval::post))
             .layer(Extension(Arc::clone(&rt.llms)))

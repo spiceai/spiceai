@@ -14,18 +14,22 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Code needed to initialize the runtime
+package cmd
 
-pub(crate) mod catalog;
-pub(crate) mod dataset;
-pub(crate) mod embedding;
-pub(crate) mod eval;
-pub(crate) mod extension;
-pub(crate) mod llm;
-pub(crate) mod metrics;
-pub(crate) mod model;
-pub(crate) mod pods_watcher;
-pub(crate) mod results_cache;
-pub(crate) mod task_history;
-pub(crate) mod tool;
-pub(crate) mod view;
+import (
+	"github.com/spf13/cobra"
+)
+
+var connectCmd = &cobra.Command{
+	Use:   "connect",
+	Short: "Adds the Spice.ai Cloud Platform app Spicepod for local use.",
+	Args:  cobra.MinimumNArgs(1),
+	Example: `
+spice connect spiceai/quickstart
+`,
+	Run: getAddOrConnectCmdHandler(true),
+}
+
+func init() {
+	RootCmd.AddCommand(connectCmd)
+}

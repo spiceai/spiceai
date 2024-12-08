@@ -41,13 +41,41 @@ var addCmd = &cobra.Command{
 	Example: `
 spice add spiceai/quickstart
 `,
-	Run: func(cmd *cobra.Command, args []string) {
+	Run: getAddOrConnectCmdHandler(false),
+}
+
+func init() {
+	RootCmd.AddCommand(addCmd)
+}
+
+func getAddOrConnectCmdHandler(connect bool) func(cmd *cobra.Command, args []string) {
+	return func(cmd *cobra.Command, args []string) {
+		ctx := context.NewContext()
+		err := ctx.Init()
+		if err != nil {
+			slog.Error("could not initialize runtime context", "error", err)
+			os.Exit(1)
+		}
+
 		podPath := args[0]
 
 		slog.Info(fmt.Sprintf("Getting Spicepod %s ...\n", podPath))
 
+		if connect {
+			if ctx.GetApiKey() == "" {
+				slog.Error("A valid Spice.ai Cloud Platform API key was not provided. Run `spice login` to authenticate before proceeding.")
+				os.Exit(1)
+			}
+
+			headers := map[string]string{
+				"Spice-Target-Source": "spice.ai",
+				"X-API-Key":           ctx.GetApiKey(),
+			}
+			ctx.AddHeaders(headers)
+		}
+
 		r := registry.GetRegistry(podPath)
-		downloadPath, err := r.GetPod(podPath)
+		downloadPath, err := r.GetPod(ctx, podPath)
 		if err != nil {
 			var itemNotFound *registry.RegistryItemNotFound
 			if errors.As(err, &itemNotFound) {
@@ -122,9 +150,5 @@ spice add spiceai/quickstart
 		if err != nil && util.IsDebug() {
 			slog.Error("failed to check for latest CLI release version", "error", err)
 		}
-	},
-}
-
-func init() {
-	RootCmd.AddCommand(addCmd)
+	}
 }

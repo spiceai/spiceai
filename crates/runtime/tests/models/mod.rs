@@ -272,6 +272,12 @@ fn normalize_chat_completion_response(mut json: Value, normalize_message_content
         if let Some(completion_tokens) = usage.get_mut("completion_tokens") {
             *completion_tokens = json!("completion_tokens_val");
         }
+        if let Some(completion_tokens_details) = usage.get_mut("completion_tokens_details") {
+            *completion_tokens_details = json!("completion_tokens_details_val");
+        }
+        if let Some(prompt_tokens_details) = usage.get_mut("prompt_tokens_details") {
+            *prompt_tokens_details = json!("prompt_tokens_details_val");
+        }
         if let Some(prompt_tokens) = usage.get_mut("prompt_tokens") {
             *prompt_tokens = json!("prompt_tokens_val");
         }
