@@ -65,7 +65,7 @@ pub enum Error {
 }
 
 async fn get_local_table_provider(
-    name: TableReference,
+    name: &TableReference,
     schema: &Arc<Schema>,
     primary_key: Option<Vec<String>>,
 ) -> Result<Arc<dyn TableProvider>, Error> {
@@ -104,8 +104,7 @@ pub async fn create_internal_accelerated_table(
     retention: Option<Retention>,
     secrets: Arc<RwLock<Secrets>>,
 ) -> Result<Arc<AcceleratedTable>, Error> {
-    let source_table_provider =
-        get_local_table_provider(name.clone(), &schema, primary_key).await?;
+    let source_table_provider = get_local_table_provider(&name, &schema, primary_key).await?;
     let federated_table = Arc::new(FederatedTable::new(source_table_provider));
 
     let accelerated_table_provider = create_accelerator_table(

@@ -281,15 +281,6 @@ impl DataFusion {
     }
 
     #[must_use]
-    fn eval_schema(&self) -> Option<Arc<dyn SchemaProvider>> {
-        if let Some(catalog) = self.ctx.catalog(SPICE_DEFAULT_CATALOG) {
-            return catalog.schema(SPICE_EVAL_SCHEMA);
-        }
-
-        None
-    }
-
-    #[must_use]
     fn schema(&self, schema_name: &str) -> Option<Arc<dyn SchemaProvider>> {
         if let Some(catalog) = self.ctx.catalog(SPICE_DEFAULT_CATALOG) {
             return catalog.schema(schema_name);
@@ -344,42 +335,29 @@ impl DataFusion {
             .flatten()
     }
 
-    pub fn register_runtime_table(
+    /// Register a table with its [`SchemaProvider`] if it exists and marks it as writable.
+    ///
+    /// This method is generally used for tables that are created by the Spice runtime.
+    pub fn register_table_as_writable_and_with_schema(
         &self,
         table_name: TableReference,
         table: Arc<dyn datafusion::datasource::TableProvider>,
     ) -> Result<()> {
-        if let Some(runtime_schema) = self.runtime_schema() {
-            runtime_schema
-                .register_table(table_name.table().to_string(), table)
-                .map_err(find_datafusion_root)
-                .context(UnableToRegisterTableToDataFusionSchemaSnafu { schema: "runtime" })?;
-
-            self.data_writers
-                .write()
-                .map_err(|_| Error::UnableToLockDataWriters {})?
-                .insert(table_name);
+        if let Some(schema) = table_name.schema() {
+            if let Some(eval_schema) = self.schema(schema) {
+                eval_schema
+                    .register_table(table_name.table().to_string(), table)
+                    .map_err(find_datafusion_root)
+                    .context(UnableToRegisterTableToDataFusionSchemaSnafu {
+                        schema: SPICE_EVAL_SCHEMA,
+                    })?;
+            }
         }
 
-        Ok(())
-    }
-
-    pub fn register_eval_table(
-        &self,
-        table_name: TableReference,
-        table: Arc<dyn datafusion::datasource::TableProvider>,
-    ) -> Result<()> {
-        if let Some(eval_schema) = self.eval_schema() {
-            eval_schema
-                .register_table(table_name.table().to_string(), table)
-                .map_err(find_datafusion_root)
-                .context(UnableToRegisterTableToDataFusionSchemaSnafu { schema: "eval" })?;
-
-            self.data_writers
-                .write()
-                .map_err(|_| Error::UnableToLockDataWriters {})?
-                .insert(table_name);
-        }
+        self.data_writers
+            .write()
+            .map_err(|_| Error::UnableToLockDataWriters {})?
+            .insert(table_name);
 
         Ok(())
     }

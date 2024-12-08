@@ -111,7 +111,7 @@ pub async fn register_metrics_table(datafusion: &Arc<DataFusion>) -> Result<(), 
     .context(UnableToCreateMetricsTableSnafu)?;
 
     datafusion
-        .register_runtime_table(metrics_table_reference, table)
+        .register_table_as_writable_and_with_schema(metrics_table_reference, table)
         .context(UnableToRegisterToMetricsTableSnafu)?;
 
     Ok(())

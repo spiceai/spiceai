@@ -72,7 +72,7 @@ impl Runtime {
         .context(UnableToCreateEvalRunsTableSnafu)?;
 
         self.df
-            .register_eval_table(EVAL_RESULTS_TABLE_REFERENCE.clone(), table)
+            .register_table_as_writable_and_with_schema(EVAL_RESULTS_TABLE_REFERENCE.clone(), table)
             .context(UnableToCreateBackendSnafu)?;
 
         Ok(())
@@ -101,7 +101,7 @@ impl Runtime {
         .context(UnableToCreateEvalRunsTableSnafu)?;
 
         self.df
-            .register_eval_table(EVAL_RUNS_TABLE_REFERENCE.clone(), table)
+            .register_table_as_writable_and_with_schema(EVAL_RUNS_TABLE_REFERENCE.clone(), table)
             .context(UnableToCreateBackendSnafu)?;
 
         Ok(())

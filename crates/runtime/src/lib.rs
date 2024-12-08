@@ -507,7 +507,7 @@ impl Runtime {
                     tracing::error!("Cannot load evals without the 'models' feature enabled. {ENABLE_MODEL_SUPPORT_MESSAGE}");
                 }
 
-                // #[cfg(feature = "models")]
+                // TODO: uncomment #[cfg(feature = "models")]
                 {
                     self_clone.load_eval_scorer().await;
                     if let Err(err) = self_clone.load_eval_tables().await {

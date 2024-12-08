@@ -131,7 +131,7 @@ impl DataFusionBuilder {
             }
         }
 
-        // #[cfg(feature="model")]
+        // TODO: uncomment #[cfg(feature="model")]
         match catalog.register_schema(SPICE_EVAL_SCHEMA, Arc::new(eval_schema)) {
             Ok(_) => {}
             Err(e) => {

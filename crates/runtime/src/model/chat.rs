@@ -41,6 +41,7 @@ use crate::{
     Runtime,
 };
 
+// TODO: check if Arc<Box<dyn Chat>> is still necessary
 pub type LLMModelStore = HashMap<String, Arc<Box<dyn Chat>>>;
 
 /// Extract a secret from a hashmap of secrets, if it exists.
