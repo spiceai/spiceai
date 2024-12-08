@@ -17,6 +17,7 @@ limitations under the License.
 use std::fmt::Display;
 
 mod datasets;
+pub mod evaluator;
 pub mod setup;
 
 #[derive(Default)]
@@ -37,6 +38,8 @@ pub(crate) struct SearchBenchmarkResultBuilder {
     search_finished_at: i64,
     search_response_time: Vec<f64>,
 
+    precision: f64,
+
     status: String,
 }
 
@@ -54,7 +57,8 @@ impl Display for SearchBenchmarkResultBuilder {
           search_time: {:.2} ms,\n\
           rps: {:.2},\n\
           mean_response_time: {:.2} ms,\n\
-          p95_response_time: {:.2} ms\n",
+          p95_response_time: {:.2} ms,\n\
+          precision: {:.2}\n",
             self.config_name,
             self.status,
             self.run_id,
@@ -65,7 +69,8 @@ impl Display for SearchBenchmarkResultBuilder {
             self.search_finished_at - self.search_started_at,
             self.rps(),
             self.mean(),
-            self.quantile(0.95)
+            self.quantile(0.95),
+            self.precision
         )
     }
 }
@@ -108,6 +113,10 @@ impl SearchBenchmarkResultBuilder {
 
     pub fn record_response_time(&mut self, response_time: f64) {
         self.search_response_time.push(response_time);
+    }
+
+    pub fn record_precision(&mut self, precision: f64) {
+        self.precision = precision;
     }
 
     pub fn finish(&mut self, is_successful: bool) {

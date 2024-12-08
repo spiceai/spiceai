@@ -56,11 +56,11 @@ pub(crate) async fn add_mtep_quora_retrieval_dataset(
         .to_str()
         .ok_or("Failed to convert PathBuf to str")?;
 
-    let tests_path = api_repo
+    let scores_path = api_repo
         .get("data/test-00000-of-00001.parquet")
         .await
         .map_err(|e| format!("Failed to download huggingface file: {e}"))?;
-    let tests_path_str = tests_path
+    let scores_path_str = scores_path
         .to_str()
         .ok_or("Failed to convert PathBuf to str")?;
 
@@ -76,7 +76,7 @@ pub(crate) async fn add_mtep_quora_retrieval_dataset(
     Ok(app_builder
         .with_dataset(ds_data)
         .with_dataset(make_local_file_dataset(test_queries_path_str, "test_query"))
-        .with_dataset(make_local_file_dataset(tests_path_str, "tests")))
+        .with_dataset(make_local_file_dataset(scores_path_str, "test_score")))
 }
 
 fn make_local_file_dataset(path: &str, name: &str) -> Dataset {
