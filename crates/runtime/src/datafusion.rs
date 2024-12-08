@@ -272,15 +272,6 @@ impl DataFusion {
     }
 
     #[must_use]
-    fn runtime_schema(&self) -> Option<Arc<dyn SchemaProvider>> {
-        if let Some(catalog) = self.ctx.catalog(SPICE_DEFAULT_CATALOG) {
-            return catalog.schema(SPICE_RUNTIME_SCHEMA);
-        }
-
-        None
-    }
-
-    #[must_use]
     fn schema(&self, schema_name: &str) -> Option<Arc<dyn SchemaProvider>> {
         if let Some(catalog) = self.ctx.catalog(SPICE_DEFAULT_CATALOG) {
             return catalog.schema(schema_name);

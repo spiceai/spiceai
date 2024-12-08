@@ -37,7 +37,6 @@ use async_openai::{
 
 use datafusion::sql::TableReference;
 use futures::TryStreamExt;
-use llms::chat::Chat;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use snafu::ResultExt;
