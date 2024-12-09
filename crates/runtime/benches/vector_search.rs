@@ -145,8 +145,8 @@ async fn run_benchmark(config: &SearchBenchmarkConfiguration) -> Result<(), Stri
 
     let qrels = handle_error!(load_query_relevance_data(&rt).await, benchmark_result)?;
 
-    let search_precision = bench_search::evaluator::evaluate(&qrels, &search_result);
-    benchmark_result.record_precision(search_precision);
+    let search_score = bench_search::evaluator::evaluate(&qrels, &search_result);
+    benchmark_result.record_score(search_score);
 
     benchmark_result.finish(true);
 

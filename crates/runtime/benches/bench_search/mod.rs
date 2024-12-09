@@ -38,7 +38,7 @@ pub(crate) struct SearchBenchmarkResultBuilder {
     search_finished_at: i64,
     search_response_time: Vec<f64>,
 
-    precision: f64,
+    score: f64,
 
     status: String,
 }
@@ -58,7 +58,7 @@ impl Display for SearchBenchmarkResultBuilder {
   rps: {:.2},
   mean_response_time: {:.2} ms,
   p95_response_time: {:.2} ms,
-  precision: {:.2}"#,
+  score: {:.2}"#,
             self.config_name,
             self.status,
             self.run_id,
@@ -70,7 +70,7 @@ impl Display for SearchBenchmarkResultBuilder {
             self.rps().unwrap_or_default(),
             self.mean().unwrap_or_default(),
             self.quantile(0.95).unwrap_or_default(),
-            self.precision
+            self.score
         )
     }
 }
@@ -115,8 +115,8 @@ impl SearchBenchmarkResultBuilder {
         self.search_response_time.push(response_time);
     }
 
-    pub fn record_precision(&mut self, precision: f64) {
-        self.precision = precision;
+    pub fn record_score(&mut self, score: f64) {
+        self.score = score;
     }
 
     pub fn finish(&mut self, is_successful: bool) {
