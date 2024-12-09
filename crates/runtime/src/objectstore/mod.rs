@@ -16,5 +16,6 @@ limitations under the License.
 
 #[cfg(feature = "ftp")]
 pub mod ftp;
+pub mod github;
 #[cfg(feature = "ftp")]
 pub mod sftp;

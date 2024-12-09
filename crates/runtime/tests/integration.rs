@@ -32,6 +32,8 @@ mod abfs;
 mod acceleration;
 mod catalog;
 mod cors;
+#[cfg(all(feature = "delta_lake", feature = "databricks"))]
+mod databricks_delta;
 #[cfg(feature = "delta_lake")]
 mod delta_lake;
 mod docker;
@@ -39,6 +41,7 @@ mod docker;
 mod duckdb;
 mod endpoint_auth;
 mod federation;
+mod file;
 mod github;
 mod graphql;
 #[cfg(feature = "mysql")]

@@ -61,7 +61,7 @@ func NewSpiceApiClient() *SpiceApiClient {
 
 func (s *SpiceApiClient) Init() error {
 	if strings.HasSuffix(version.Version(), "-dev") {
-		s.baseUrl = "https://dev.spice.xyz"
+		s.baseUrl = "https://dev.spice.ai"
 	} else {
 		s.baseUrl = "https://spice.ai"
 	}

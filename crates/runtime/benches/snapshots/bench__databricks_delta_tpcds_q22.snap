@@ -1,0 +1,19 @@
+---
+source: crates/runtime/benches/bench.rs
+expression: records_pretty
+snapshot_kind: text
+---
++------------------+--------------------+-----------------+-------------+--------------------+
+| i_product_name   | i_brand            | i_class         | i_category  | qoh                |
++------------------+--------------------+-----------------+-------------+--------------------+
+| oughtesebarought | edu packimporto #2 | sports-apparel  | Men         | 262.0              |
+| oughtesebarought | edu packimporto #2 | sports-apparel  |             | 262.0              |
+| oughtesebarought | edu packimporto #2 |                 |             | 262.0              |
+| oughtesebarought |                    |                 |             | 262.0              |
+| pricallyantiese  | amalgunivamalg #8  | cameras         | Electronics | 269.0              |
+| pricallyantiese  | amalgunivamalg #8  | cameras         |             | 269.0              |
+| pricallyantiese  | amalgunivamalg #8  |                 |             | 269.0              |
+| pricallyantiese  |                    |                 |             | 269.0              |
+| prin stbarpri    | edu packexporti #2 | school-uniforms | Children    | 297.55555555555554 |
+| prin stbarpri    | edu packexporti #2 | school-uniforms |             | 297.55555555555554 |
++------------------+--------------------+-----------------+-------------+--------------------+

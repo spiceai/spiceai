@@ -45,6 +45,7 @@ use spicepod::component::params::Params;
 
 mod results;
 mod setup;
+mod utils;
 
 mod bench_object_store;
 mod bench_spicecloud;
@@ -123,6 +124,7 @@ async fn bench_main() -> Result<(), String> {
                 "spice.ai",
                 "s3",
                 "abfs",
+                "file",
                 #[cfg(feature = "spark")]
                 "spark",
                 #[cfg(feature = "postgres")]
@@ -135,7 +137,7 @@ async fn bench_main() -> Result<(), String> {
                 "odbc-databricks",
                 #[cfg(feature = "odbc")]
                 "odbc-athena",
-                #[cfg(feature = "delta_lake")]
+                #[cfg(all(feature = "delta_lake", feature = "databricks"))]
                 "delta_lake",
             ];
             for connector in connectors {
@@ -206,7 +208,7 @@ async fn run_connector_bench(
         "spice.ai" => {
             bench_spicecloud::run(&mut rt, &mut benchmark_results).await?;
         }
-        "s3" => {
+        "s3" | "abfs" | "file" => {
             bench_object_store::run(
                 connector,
                 &mut rt,
@@ -214,17 +216,6 @@ async fn run_connector_bench(
                 None,
                 None,
                 bench_name,
-            )
-            .await?;
-        }
-        "abfs" => {
-            bench_object_store::run(
-                connector,
-                &mut rt,
-                &mut benchmark_results,
-                None,
-                None,
-                "tpch",
             )
             .await?;
         }
@@ -254,7 +245,7 @@ async fn run_connector_bench(
         }
         #[cfg(feature = "delta_lake")]
         "delta_lake" => {
-            bench_delta::run(&mut rt, &mut benchmark_results).await?;
+            bench_delta::run(&mut rt, &mut benchmark_results, bench_name).await?;
         }
         _ => {}
     }

@@ -38,11 +38,9 @@ use llms::chat::Chat;
 use crate::{
     init_tracing, init_tracing_with_task_history,
     models::{
-        create_api_bindings_config, get_executed_tasks, get_taxi_trips_dataset, get_tpcds_dataset,
-        json_is_single_row_with_value, normalize_chat_completion_response,
-        normalize_embeddings_response, normalize_search_response, pretty_json_str,
-        send_chat_completions_request, send_embeddings_request, send_nsql_request,
-        send_search_request,
+        create_api_bindings_config, get_taxi_trips_dataset, get_tpcds_dataset,
+        normalize_chat_completion_response, normalize_embeddings_response,
+        send_chat_completions_request, send_embeddings_request,
     },
     utils::{runtime_ready_check, test_request_context},
 };
@@ -59,201 +57,200 @@ lazy_static! {
 const HF_TEST_MODEL: &str = "microsoft/Phi-3-mini-4k-instruct";
 const HF_TEST_MODEL_TYPE: &str = "phi3";
 
-#[tokio::test]
-async fn huggingface_test_search() -> Result<(), anyhow::Error> {
-    let _tracing = init_tracing(None);
+mod nsql {
 
-    test_request_context()
-        .scope(async {
-            let mut ds_tpcds_item = get_tpcds_dataset("item");
-            ds_tpcds_item.embeddings = vec![ColumnEmbeddingConfig {
-                column: "i_item_desc".to_string(),
-                model: "hf_minilm".to_string(),
-                primary_keys: Some(vec!["i_item_sk".to_string()]),
-                chunking: None,
-            }];
+    use serde_json::json;
 
-            let app = AppBuilder::new("text-to-sql")
-                .with_dataset(ds_tpcds_item)
-                .with_embedding(get_huggingface_embeddings(
-                    "sentence-transformers/all-MiniLM-L6-v2",
-                    "hf_minilm",
-                ))
-                .build();
+    use crate::models::nsql::{run_nsql_test, TestCase};
 
-            let api_config = create_api_bindings_config();
-            let http_base_url = format!("http://{}", api_config.http_bind_address);
+    use super::*;
 
-            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+    #[tokio::test]
+    async fn huggingface_test_nsql() -> Result<(), anyhow::Error> {
+        let _tracing = init_tracing(None);
 
-            let rt_ref_copy = Arc::clone(&rt);
-            tokio::spawn(async move {
-                Box::pin(rt_ref_copy.start_servers(api_config, None, EndpointAuth::no_auth())).await
-            });
+        test_request_context()
+            .scope(async {
+                let app = AppBuilder::new("text-to-sql")
+                    .with_dataset(get_taxi_trips_dataset())
+                    .with_model(get_huggingface_model(
+                        HF_TEST_MODEL,
+                        HF_TEST_MODEL_TYPE,
+                        "hf_model",
+                    ))
+                    .build();
 
-            tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
-                    return Err(anyhow::anyhow!("Timed out waiting for components to load"));
+                let api_config = create_api_bindings_config();
+                let http_base_url = format!("http://{}", api_config.http_bind_address);
+
+                let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+
+                let (_tracing, trace_provider) = init_tracing_with_task_history(None, &rt);
+
+                let rt_ref_copy = Arc::clone(&rt);
+                tokio::spawn(async move {
+                    Box::pin(rt_ref_copy.start_servers(api_config, None, EndpointAuth::no_auth())).await
+                });
+
+                let llm_init_lock = LOCAL_LLM_INIT_MUTEX.lock().await;
+
+                tokio::select! {
+                    // increased timeout to download and load huggingface model
+                    () = tokio::time::sleep(std::time::Duration::from_secs(300)) => {
+                        return Err(anyhow::anyhow!("Timed out waiting for components to load"));
+                    }
+                    () = rt.load_components() => {}
                 }
-                () = rt.load_components() => {}
-            }
 
-            runtime_ready_check(&rt).await;
+                drop(llm_init_lock);
 
-            tracing::info!("/v1/search: Ensure simple search request succeeds");
-            let response = send_search_request(
-                http_base_url.as_str(),
-                "new patient",
-                Some(2),
-                Some(vec!["item".to_string()]),
-                None,
-                Some(vec!["i_color".to_string(), "i_item_id".to_string()]),
-            )
-            .await?;
+                runtime_ready_check(&rt).await;
 
-            insta::assert_snapshot!(format!("search_1"), normalize_search_response(response));
+                let test_cases = [
+                    TestCase {
+                        name: "hf_with_model",
+                        body: json!({
+                            "query": "how many records (as 'total_records') are in taxi_trips dataset?",
+                            "model": "hf_model",
+                            "sample_data_enabled": false,
+                        }),
+                    },
+                    TestCase {
+                        name: "hf_with_sample_data_enabled",
+                        body: json!({
+                            "query": "how many records (as 'total_records') are in taxi_trips dataset?",
+                            "model": "hf_model",
+                            "sample_data_enabled": true,
+                        }),
+                    },
+                    TestCase {
+                        name: "hf_invalid_model_name",
+                        body: json!({
+                            "query": "how many records (as 'total_records') are in taxi_trips dataset?",
+                            "model": "model_not_in_spice",
+                            "sample_data_enabled": false,
+                        }),
+                    },
+                    TestCase {
+                        name: "hf_invalid_dataset_name",
+                        body: json!({
+                            "query": "how many records (as 'total_records') are in taxi_trips dataset?",
+                            "model": "hf_model",
+                            "datasets": ["dataset_not_in_spice"],
+                            "sample_data_enabled": false,
+                        }),
+                    },
+                ];
 
-            Ok(())
-        })
-        .await
+                for ts in test_cases {
+                    run_nsql_test(http_base_url.as_str(), &ts, &trace_provider).await?;
+                }
+
+                Ok(())
+            })
+            .await
+    }
 }
 
-#[tokio::test]
-#[allow(clippy::too_many_lines)]
-async fn huggingface_test_nsql() -> Result<(), anyhow::Error> {
-    let _tracing = init_tracing(None);
+mod search {
+    use serde_json::json;
+    use spicepod::component::embeddings::EmbeddingChunkConfig;
 
-    test_request_context()
-        .scope(async {
-            let app = AppBuilder::new("text-to-sql")
-                .with_dataset(get_taxi_trips_dataset())
-                .with_model(get_huggingface_model(
-                    HF_TEST_MODEL,
-                    HF_TEST_MODEL_TYPE,
-                    "hf_model",
-                ))
-                .build();
+    use crate::models::search::{run_search_test, TestCase};
 
-            let api_config = create_api_bindings_config();
-            let http_base_url = format!("http://{}", api_config.http_bind_address);
+    use super::*;
 
-            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+    #[tokio::test]
+    async fn huggingface_test_search() -> Result<(), anyhow::Error> {
+        let _tracing = init_tracing(None);
 
-            let (_tracing, trace_provider) = init_tracing_with_task_history(None, &rt);
+        test_request_context()
+            .scope(async {
+                let mut ds_tpcds_item = get_tpcds_dataset("item", None);
+                ds_tpcds_item.embeddings = vec![ColumnEmbeddingConfig {
+                    column: "i_item_desc".to_string(),
+                    model: "hf_minilm".to_string(),
+                    primary_keys: Some(vec!["i_item_sk".to_string()]),
+                    chunking: None,
+                }];
 
-            let rt_ref_copy = Arc::clone(&rt);
-            tokio::spawn(async move {
-                Box::pin(rt_ref_copy.start_servers(api_config, None, EndpointAuth::no_auth())).await
-            });
+                let mut ds_tpcds_cp_with_chunking =
+                    get_tpcds_dataset("catalog_page", Some("catalog_page_with_chunking"));
+                ds_tpcds_cp_with_chunking.embeddings = vec![ColumnEmbeddingConfig {
+                    column: "cp_description".to_string(),
+                    model: "hf_minilm".to_string(),
+                    primary_keys: Some(vec!["cp_catalog_page_sk".to_string()]),
+                    chunking: Some(EmbeddingChunkConfig {
+                        enabled: true,
+                        target_chunk_size: 512,
+                        overlap_size: 128,
+                        trim_whitespace: false,
+                    }),
+                }];
 
-            let llm_init_lock = LOCAL_LLM_INIT_MUTEX.lock().await;
+                let app = AppBuilder::new("text-to-sql")
+                    .with_dataset(ds_tpcds_item)
+                    .with_dataset(ds_tpcds_cp_with_chunking)
+                    .with_embedding(get_huggingface_embeddings(
+                        "sentence-transformers/all-MiniLM-L6-v2",
+                        "hf_minilm",
+                    ))
+                    .build();
 
-            tokio::select! {
-                // increased timeout to download and load huggingface model
-                () = tokio::time::sleep(std::time::Duration::from_secs(300)) => {
-                    return Err(anyhow::anyhow!("Timed out waiting for components to load"));
+                let api_config = create_api_bindings_config();
+                let http_base_url = format!("http://{}", api_config.http_bind_address);
+
+                let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+
+                let rt_ref_copy = Arc::clone(&rt);
+                tokio::spawn(async move {
+                    Box::pin(rt_ref_copy.start_servers(api_config, None, EndpointAuth::no_auth()))
+                        .await
+                });
+
+                tokio::select! {
+                    () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                        return Err(anyhow::anyhow!("Timed out waiting for components to load"));
+                    }
+                    () = rt.load_components() => {}
                 }
-                () = rt.load_components() => {}
-            }
 
-            drop(llm_init_lock);
+                runtime_ready_check(&rt).await;
 
-            runtime_ready_check(&rt).await;
+                let test_cases = [
+                    TestCase {
+                        name: "hf_basic",
+                        body: json!({
+                            "text": "new patient",
+                            "limit": 2,
+                            "datasets": ["item"],
+                            "additional_columns": ["i_color", "i_item_id"],
+                        }),
+                    },
+                    TestCase {
+                        name: "hf_all_datasets",
+                        body: json!({
+                            "text": "new patient",
+                            "limit": 2,
+                        }),
+                    },
+                    TestCase {
+                        name: "hf_chunking",
+                        body: json!({
+                            "text": "friends",
+                            "datasets": ["catalog_page_with_chunking"],
+                            "limit": 1,
+                        }),
+                    },
+                ];
 
-            tracing::info!("/v1/nsql: Verify nsql request");
-            let task_start_time = std::time::SystemTime::now();
-
-            let response = send_nsql_request(
-                http_base_url.as_str(),
-                "how many records in taxi_trips dataset?",
-                Some("hf_model"),
-                Some(false),
-                None,
-            )
-            .await?;
-
-            assert!(
-                json_is_single_row_with_value(&response, 10),
-                "Expected a single record containing the value 10"
-            );
-
-            // ensure all spans are exported into task_history
-            let _ = trace_provider.force_flush();
-
-            let tasks = get_executed_tasks(&rt, task_start_time.into()).await?;
-
-            let table_schema_task = tasks
-                .iter()
-                .find(|t| t.0 == "tool_use::table_schema")
-                .expect("Expected 'tool_use::table_schema' task to be executed");
-
-            insta::assert_snapshot!(
-                "nsql_table_schema_task",
-                pretty_json_str(&table_schema_task.1)?
-            );
-
-            tracing::info!("/v1/nsql: Verify nsql request with 'sample_data_enabled:true'");
-
-            let task_start_time = std::time::SystemTime::now();
-
-            let response = send_nsql_request(
-                http_base_url.as_str(),
-                "how many records in taxi_trips dataset?",
-                Some("hf_model"),
-                Some(true),
-                None,
-            )
-            .await?;
-
-            assert!(
-                json_is_single_row_with_value(&response, 10),
-                "Expected a single record containing the value 10"
-            );
-
-            // ensure all spans are exported into task_history
-            let _ = trace_provider.force_flush();
-
-            let tasks = get_executed_tasks(&rt, task_start_time.into()).await?;
-
-            let sample_data_task = tasks
-                .iter()
-                .find(|t| t.0 == "tool_use::sample_data")
-                .expect("Expected 'tool_use::sample_data' task to be executed");
-
-            insta::assert_snapshot!("nsql_sample_data_task", sample_data_task.1);
-
-            let sql_query_task = tasks
-                .iter()
-                .find(|t| t.0 == "sql_query")
-                .expect("Expected 'sql_query' task to be executed");
-
-            insta::assert_snapshot!("nsql_sample_data_task_sql_query", sql_query_task.1);
-
-            tracing::info!("/v1/nsql: Ensure error when invalid dataset name is provided");
-            assert!(send_nsql_request(
-                http_base_url.as_str(),
-                "how many records in taxi_trips dataset?",
-                Some("hf_model"),
-                Some(false),
-                Some(vec!["dataset_not_in_spice".to_string()]),
-            )
+                for ts in test_cases {
+                    run_search_test(http_base_url.as_str(), &ts).await?;
+                }
+                Ok(())
+            })
             .await
-            .is_err());
-
-            tracing::info!("/v1/nsql: Ensure error when invalid model name is provided");
-            assert!(send_nsql_request(
-                http_base_url.as_str(),
-                "how many records in taxi_trips dataset?",
-                Some("model_not_in_spice"),
-                Some(false),
-                None,
-            )
-            .await
-            .is_err());
-
-            Ok(())
-        })
-        .await
+    }
 }
 
 #[tokio::test]

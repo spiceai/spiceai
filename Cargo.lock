@@ -222,7 +222,7 @@ checksum = "d301b3b94cb4b2f23d7917810addbbaff90738e0ca2be692bd027e70d7e0330c"
 
 [[package]]
 name = "app"
-version = "1.0.0-rc.1"
+version = "1.0.0-rc.2"
 dependencies = [
  "snafu",
  "spicepod",
@@ -429,7 +429,7 @@ dependencies = [
  "arrow-schema",
  "chrono",
  "half",
- "indexmap 2.6.0",
+ "indexmap 2.7.0",
  "lexical-core",
  "num",
  "serde",
@@ -449,7 +449,7 @@ dependencies = [
  "arrow-schema",
  "chrono",
  "half",
- "indexmap 2.6.0",
+ "indexmap 2.7.0",
  "lexical-core",
  "num",
  "serde",
@@ -540,7 +540,7 @@ dependencies = [
 
 [[package]]
 name = "arrow_sql_gen"
-version = "1.0.0-rc.1"
+version = "1.0.0-rc.2"
 dependencies = [
  "arrow",
  "bigdecimal",
@@ -554,7 +554,7 @@ dependencies = [
 
 [[package]]
 name = "arrow_tools"
-version = "1.0.0-rc.1"
+version = "1.0.0-rc.2"
 dependencies = [
  "arrow",
  "datafusion",
@@ -715,7 +715,7 @@ dependencies = [
  "futures-util",
  "handlebars 5.1.2",
  "http 1.1.0",
- "indexmap 2.6.0",
+ "indexmap 2.7.0",
  "mime",
  "multer",
  "num-traits",
@@ -784,7 +784,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ef5ec94176a12a8cbe985cd73f2e54dc9c702c88c766bdef12f1f3a67cedbee1"
 dependencies = [
  "bytes",
- "indexmap 2.6.0",
+ "indexmap 2.7.0",
  "serde",
  "serde_json",
 ]
@@ -821,8 +821,8 @@ dependencies = [
 
 [[package]]
 name = "async-openai"
-version = "0.24.1"
-source = "git+https://github.com/spiceai/async-openai?rev=c01795447374ab8608682955a2fe91216bfd9db6#c01795447374ab8608682955a2fe91216bfd9db6"
+version = "0.26.0"
+source = "git+https://github.com/spiceai/async-openai?rev=eb10e6ae191f5be102ef68cb3bb54bb482511bbd#eb10e6ae191f5be102ef68cb3bb54bb482511bbd"
 dependencies = [
  "async-convert",
  "backoff",
@@ -1366,25 +1366,26 @@ dependencies = [
 
 [[package]]
 name = "axum-extra"
-version = "0.9.4"
+version = "0.9.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "73c3220b188aea709cf1b6c5f9b01c3bd936bb08bd2b5184a12b35ac8131b1f9"
+checksum = "c794b30c904f0a1c2fb7740f7df7f7972dfaa14ef6f57cb6178dc63e5dca2f04"
 dependencies = [
  "axum",
  "axum-core",
  "bytes",
+ "fastrand 2.2.0",
  "futures-util",
  "headers",
  "http 1.1.0",
  "http-body 1.0.1",
  "http-body-util",
  "mime",
+ "multer",
  "pin-project-lite",
  "serde",
  "tower 0.5.1",
  "tower-layer",
  "tower-service",
- "tracing",
 ]
 
 [[package]]
@@ -1971,9 +1972,9 @@ checksum = "8f1fe948ff07f4bd06c30984e69f5b4899c516a3ef74f34df92a2df2ab535495"
 
 [[package]]
 name = "bytes"
-version = "1.8.0"
+version = "1.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9ac0150caa2ae65ca5bd83f25c7de183dea78d4d366469f148435e2acfbad0da"
+checksum = "325918d6fe32f23b19878fe4b34794ae41fc19ddbe53b10571a4874d44ffd39b"
 dependencies = [
  "serde",
 ]
@@ -2011,7 +2012,7 @@ dependencies = [
 
 [[package]]
 name = "cache"
-version = "1.0.0-rc.1"
+version = "1.0.0-rc.2"
 dependencies = [
  "arrow",
  "async-stream",
@@ -2049,8 +2050,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7e1a39b963e261c58017edf2007e5b63425ad21538aaaf51fe23d1da41703701"
 dependencies = [
  "byteorder",
- "candle-kernels 0.7.2 (registry+https://github.com/rust-lang/crates.io-index)",
- "candle-metal-kernels 0.7.2 (registry+https://github.com/rust-lang/crates.io-index)",
+ "candle-kernels 0.7.2",
+ "candle-metal-kernels 0.7.2",
  "cudarc 0.12.1",
  "gemm",
  "half",
@@ -2069,12 +2070,12 @@ dependencies = [
 
 [[package]]
 name = "candle-core"
-version = "0.7.2"
-source = "git+https://github.com/EricLBuehler/candle.git?rev=2e17ebd#2e17ebd84ccc75ac61c0c24ed9ea9fd1f33baee1"
+version = "0.8.0"
+source = "git+https://github.com/EricLBuehler/candle.git?rev=8742354#87423548e70b471d7c4a760bc16e3aa9e814f56d"
 dependencies = [
  "byteorder",
- "candle-kernels 0.7.2 (git+https://github.com/EricLBuehler/candle.git?rev=2e17ebd)",
- "candle-metal-kernels 0.7.2 (git+https://github.com/EricLBuehler/candle.git?rev=2e17ebd)",
+ "candle-kernels 0.8.0",
+ "candle-metal-kernels 0.8.0",
  "cudarc 0.12.1",
  "float8",
  "gemm",
@@ -2100,9 +2101,30 @@ name = "candle-cublaslt"
 version = "0.2.2"
 source = "git+https://github.com/huggingface/candle-cublaslt?rev=cf789b7dd6d4abb19b03b9556442f94f0588b4a0#cf789b7dd6d4abb19b03b9556442f94f0588b4a0"
 dependencies = [
- "candle-core 0.7.2 (registry+https://github.com/rust-lang/crates.io-index)",
+ "candle-core 0.7.2",
  "cudarc 0.10.0",
  "half",
+]
+
+[[package]]
+name = "candle-hf-hub"
+version = "0.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ca5f45ce8fe55a9e9246a3fc60000d7ed11b88a84d72f753488f7264ce04b102"
+dependencies = [
+ "dirs",
+ "futures",
+ "http 1.1.0",
+ "indicatif",
+ "log",
+ "num_cpus",
+ "rand 0.8.5",
+ "reqwest 0.12.9",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.68",
+ "tokio",
+ "ureq",
 ]
 
 [[package]]
@@ -2116,8 +2138,8 @@ dependencies = [
 
 [[package]]
 name = "candle-kernels"
-version = "0.7.2"
-source = "git+https://github.com/EricLBuehler/candle.git?rev=2e17ebd#2e17ebd84ccc75ac61c0c24ed9ea9fd1f33baee1"
+version = "0.8.0"
+source = "git+https://github.com/EricLBuehler/candle.git?rev=8742354#87423548e70b471d7c4a760bc16e3aa9e814f56d"
 dependencies = [
  "bindgen_cuda 0.1.5",
 ]
@@ -2128,7 +2150,7 @@ version = "0.0.1"
 source = "git+https://github.com/huggingface/candle-layer-norm?rev=94c2add7d94c2d63aebde77f7534614e04dbaea1#94c2add7d94c2d63aebde77f7534614e04dbaea1"
 dependencies = [
  "anyhow",
- "candle-core 0.7.2 (registry+https://github.com/rust-lang/crates.io-index)",
+ "candle-core 0.7.2",
  "half",
  "num_cpus",
  "rayon",
@@ -2148,8 +2170,8 @@ dependencies = [
 
 [[package]]
 name = "candle-metal-kernels"
-version = "0.7.2"
-source = "git+https://github.com/EricLBuehler/candle.git?rev=2e17ebd#2e17ebd84ccc75ac61c0c24ed9ea9fd1f33baee1"
+version = "0.8.0"
+source = "git+https://github.com/EricLBuehler/candle.git?rev=8742354#87423548e70b471d7c4a760bc16e3aa9e814f56d"
 dependencies = [
  "metal 0.27.0",
  "once_cell",
@@ -2163,8 +2185,8 @@ version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "898f8d21b8bdf559a1c8635e2db8386b2134015cd3003c18c1a30a22a67daec6"
 dependencies = [
- "candle-core 0.7.2 (registry+https://github.com/rust-lang/crates.io-index)",
- "candle-metal-kernels 0.7.2 (registry+https://github.com/rust-lang/crates.io-index)",
+ "candle-core 0.7.2",
+ "candle-metal-kernels 0.7.2",
  "half",
  "metal 0.27.0",
  "num-traits",
@@ -2176,11 +2198,11 @@ dependencies = [
 
 [[package]]
 name = "candle-nn"
-version = "0.7.2"
-source = "git+https://github.com/EricLBuehler/candle.git?rev=2e17ebd#2e17ebd84ccc75ac61c0c24ed9ea9fd1f33baee1"
+version = "0.8.0"
+source = "git+https://github.com/EricLBuehler/candle.git?rev=8742354#87423548e70b471d7c4a760bc16e3aa9e814f56d"
 dependencies = [
- "candle-core 0.7.2 (git+https://github.com/EricLBuehler/candle.git?rev=2e17ebd)",
- "candle-metal-kernels 0.7.2 (git+https://github.com/EricLBuehler/candle.git?rev=2e17ebd)",
+ "candle-core 0.8.0",
+ "candle-metal-kernels 0.8.0",
  "half",
  "metal 0.27.0",
  "num-traits",
@@ -2197,7 +2219,7 @@ source = "git+https://github.com/huggingface/candle-rotary?rev=0a718a0856569a92f
 dependencies = [
  "anyhow",
  "bindgen_cuda 0.1.5",
- "candle-core 0.7.2 (registry+https://github.com/rust-lang/crates.io-index)",
+ "candle-core 0.7.2",
  "half",
 ]
 
@@ -2208,8 +2230,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "06b8a130a8ac1d1e20696d89f7a52948902e037ad0eec085fceb77021007cfee"
 dependencies = [
  "byteorder",
- "candle-core 0.7.2 (registry+https://github.com/rust-lang/crates.io-index)",
- "candle-nn 0.7.2 (registry+https://github.com/rust-lang/crates.io-index)",
+ "candle-core 0.7.2",
+ "candle-nn 0.7.2",
  "fancy-regex",
  "num-traits",
  "rand 0.8.5",
@@ -2279,7 +2301,7 @@ version = "0.13.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6d621f687a04efa1f269f1cd13d8cfea9660852bdb3d1cd2c3c9fb6fdd34daf2"
 dependencies = [
- "indexmap 2.6.0",
+ "indexmap 2.7.0",
  "lazy_static",
  "num-traits",
  "regex",
@@ -2895,7 +2917,7 @@ checksum = "e8566979429cf69b49a5c740c60791108e86440e8be149bbea4fe54d2c32d6e2"
 
 [[package]]
 name = "data_components"
-version = "1.0.0-rc.1"
+version = "1.0.0-rc.2"
 dependencies = [
  "arrow",
  "arrow-buffer",
@@ -2979,7 +3001,7 @@ dependencies = [
  "glob",
  "half",
  "hashbrown 0.14.5",
- "indexmap 2.6.0",
+ "indexmap 2.7.0",
  "itertools 0.13.0",
  "log",
  "num_cpus",
@@ -3026,7 +3048,7 @@ dependencies = [
  "chrono",
  "half",
  "hashbrown 0.14.5",
- "indexmap 2.6.0",
+ "indexmap 2.7.0",
  "instant",
  "libc",
  "num_cpus",
@@ -3081,7 +3103,7 @@ dependencies = [
  "datafusion-functions-aggregate-common",
  "datafusion-functions-window-common",
  "datafusion-physical-expr-common",
- "indexmap 2.6.0",
+ "indexmap 2.7.0",
  "paste",
  "serde_json",
  "sqlparser",
@@ -3166,7 +3188,7 @@ dependencies = [
  "datafusion-physical-expr",
  "datafusion-physical-expr-common",
  "half",
- "indexmap 2.6.0",
+ "indexmap 2.7.0",
  "log",
  "paste",
 ]
@@ -3253,7 +3275,7 @@ dependencies = [
  "datafusion-expr",
  "datafusion-physical-expr",
  "hashbrown 0.14.5",
- "indexmap 2.6.0",
+ "indexmap 2.7.0",
  "itertools 0.13.0",
  "log",
  "paste",
@@ -3280,7 +3302,7 @@ dependencies = [
  "datafusion-physical-expr-common",
  "half",
  "hashbrown 0.14.5",
- "indexmap 2.6.0",
+ "indexmap 2.7.0",
  "itertools 0.13.0",
  "log",
  "paste",
@@ -3339,7 +3361,7 @@ dependencies = [
  "futures",
  "half",
  "hashbrown 0.14.5",
- "indexmap 2.6.0",
+ "indexmap 2.7.0",
  "itertools 0.13.0",
  "log",
  "once_cell",
@@ -3359,7 +3381,7 @@ dependencies = [
  "arrow-schema",
  "datafusion-common",
  "datafusion-expr",
- "indexmap 2.6.0",
+ "indexmap 2.7.0",
  "log",
  "regex",
  "sqlparser",
@@ -3369,7 +3391,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=a41d5b2d7b4c4c7abf9bbb777e53b0b9ce8c9f52#a41d5b2d7b4c4c7abf9bbb777e53b0b9ce8c9f52"
+source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=58baab01bdfd282261fbdbc9905a20835fe3cead#58baab01bdfd282261fbdbc9905a20835fe3cead"
 dependencies = [
  "arrow",
  "arrow-json 53.2.0",
@@ -3415,7 +3437,7 @@ dependencies = [
 
 [[package]]
 name = "db_connection_pool"
-version = "1.0.0-rc.1"
+version = "1.0.0-rc.2"
 dependencies = [
  "arrow",
  "arrow-odbc",
@@ -3440,6 +3462,12 @@ dependencies = [
  "tracing-subscriber",
  "util",
 ]
+
+[[package]]
+name = "deflate64"
+version = "0.1.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "da692b8d1080ea3045efaab14434d40468c3d8657e42abddfffca87b428f4c1b"
 
 [[package]]
 name = "defmac"
@@ -3467,7 +3495,7 @@ dependencies = [
  "fix-hidden-lifetime-bug",
  "futures",
  "hdfs-native-object-store",
- "indexmap 2.6.0",
+ "indexmap 2.7.0",
  "itertools 0.13.0",
  "object_store",
  "parquet",
@@ -3706,7 +3734,7 @@ checksum = "fea41bba32d969b513997752735605054bc0dfa92b4c56bf1189f2e174be7a10"
 
 [[package]]
 name = "document_parse"
-version = "1.0.0-rc.1"
+version = "1.0.0-rc.2"
 dependencies = [
  "bytes",
  "docx-rs",
@@ -4074,7 +4102,7 @@ dependencies = [
 
 [[package]]
 name = "flight_client"
-version = "1.0.0-rc.1"
+version = "1.0.0-rc.2"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -4089,7 +4117,7 @@ dependencies = [
 
 [[package]]
 name = "flightpublisher"
-version = "1.0.0-rc.1"
+version = "1.0.0-rc.2"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -4102,7 +4130,7 @@ dependencies = [
 
 [[package]]
 name = "flightrepl"
-version = "1.0.0-rc.1"
+version = "1.0.0-rc.2"
 dependencies = [
  "ansi_term",
  "arrow-flight",
@@ -4123,7 +4151,7 @@ dependencies = [
 
 [[package]]
 name = "flightsubscriber"
-version = "1.0.0-rc.1"
+version = "1.0.0-rc.2"
 dependencies = [
  "arrow-flight",
  "clap",
@@ -4822,7 +4850,7 @@ dependencies = [
  "futures-sink",
  "futures-util",
  "http 0.2.12",
- "indexmap 2.6.0",
+ "indexmap 2.7.0",
  "slab",
  "tokio",
  "tokio-util",
@@ -4841,7 +4869,7 @@ dependencies = [
  "futures-core",
  "futures-sink",
  "http 1.1.0",
- "indexmap 2.6.0",
+ "indexmap 2.7.0",
  "slab",
  "tokio",
  "tokio-util",
@@ -5312,7 +5340,7 @@ dependencies = [
  "http 1.1.0",
  "hyper 1.5.1",
  "hyper-util",
- "rustls 0.23.18",
+ "rustls 0.23.19",
  "rustls-native-certs 0.8.1",
  "rustls-pki-types",
  "tokio",
@@ -5634,9 +5662,9 @@ dependencies = [
 
 [[package]]
 name = "indexmap"
-version = "2.6.0"
+version = "2.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "707907fe3c25f5424cce2cb7e1cbcafee6bdbe735ca90ef77c29e84591e5b9da"
+checksum = "62f822373a4fe84d4bb149bf54e584a7f4abec90e072ed49cda0edea5b95471f"
 dependencies = [
  "equivalent",
  "hashbrown 0.15.1",
@@ -5895,7 +5923,7 @@ version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4ee7893dab2e44ae5f9d0173f26ff4aa327c10b01b06a72b52dd9405b628640d"
 dependencies = [
- "indexmap 2.6.0",
+ "indexmap 2.7.0",
 ]
 
 [[package]]
@@ -6260,7 +6288,7 @@ checksum = "643cb0b8d4fcc284004d5fd0d67ccf61dfffadb7f75e1e71bc420f4688a3a704"
 
 [[package]]
 name = "llms"
-version = "1.0.0-rc.1"
+version = "1.0.0-rc.2"
 dependencies = [
  "anyhow",
  "async-openai",
@@ -6271,7 +6299,7 @@ dependencies = [
  "either",
  "futures",
  "hf-hub",
- "indexmap 2.6.0",
+ "indexmap 2.7.0",
  "insta",
  "jsonpath-rust",
  "lazy_static",
@@ -6312,6 +6340,12 @@ dependencies = [
  "autocfg",
  "scopeguard",
 ]
+
+[[package]]
+name = "lockfree-object-pool"
+version = "0.1.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9374ef4228402d4b7e403e5838cb880d9ee663314b0a900d5a6aabf0c213552e"
 
 [[package]]
 name = "log"
@@ -6364,7 +6398,7 @@ dependencies = [
  "chrono",
  "encoding_rs",
  "flate2",
- "indexmap 2.6.0",
+ "indexmap 2.7.0",
  "itoa",
  "log",
  "md-5",
@@ -6432,6 +6466,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "75761162ae2b0e580d7e7c390558127e5f01b4194debd6221fd8c207fc80e3f5"
 dependencies = [
  "twox-hash",
+]
+
+[[package]]
+name = "lzma-rs"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "297e814c836ae64db86b36cf2a557ba54368d03f6afcd7d947c266692f71115e"
+dependencies = [
+ "byteorder",
+ "crc",
 ]
 
 [[package]]
@@ -6664,15 +6708,17 @@ checksum = "c9be0862c1b3f26a88803c4a49de6889c10e608b3ee9344e6ef5b45fb37ad3d1"
 
 [[package]]
 name = "mistralrs"
-version = "0.3.2"
-source = "git+https://github.com/spiceai/mistral.rs?rev=d70715944e30f335eb59e1a712962b86d7a5d026#d70715944e30f335eb59e1a712962b86d7a5d026"
+version = "0.3.4"
+source = "git+https://github.com/spiceai/mistral.rs?rev=e9e19fdb510d504de961f90ea9398db45a533909#e9e19fdb510d504de961f90ea9398db45a533909"
 dependencies = [
  "anyhow",
- "candle-core 0.7.2 (git+https://github.com/EricLBuehler/candle.git?rev=2e17ebd)",
+ "candle-core 0.8.0",
+ "candle-nn 0.8.0",
+ "clap",
  "either",
  "futures",
  "image 0.25.5",
- "indexmap 2.6.0",
+ "indexmap 2.7.0",
  "mistralrs-core",
  "rand 0.8.5",
  "reqwest 0.12.9",
@@ -6683,8 +6729,8 @@ dependencies = [
 
 [[package]]
 name = "mistralrs-core"
-version = "0.3.2"
-source = "git+https://github.com/spiceai/mistral.rs?rev=d70715944e30f335eb59e1a712962b86d7a5d026#d70715944e30f335eb59e1a712962b86d7a5d026"
+version = "0.3.4"
+source = "git+https://github.com/spiceai/mistral.rs?rev=e9e19fdb510d504de961f90ea9398db45a533909#e9e19fdb510d504de961f90ea9398db45a533909"
 dependencies = [
  "akin",
  "anyhow",
@@ -6695,8 +6741,9 @@ dependencies = [
  "buildstructor",
  "bytemuck",
  "bytemuck_derive",
- "candle-core 0.7.2 (git+https://github.com/EricLBuehler/candle.git?rev=2e17ebd)",
- "candle-nn 0.7.2 (git+https://github.com/EricLBuehler/candle.git?rev=2e17ebd)",
+ "candle-core 0.8.0",
+ "candle-hf-hub",
+ "candle-nn 0.8.0",
  "cfgrammar",
  "chrono",
  "clap",
@@ -6709,9 +6756,8 @@ dependencies = [
  "futures",
  "galil-seiferas",
  "half",
- "hf-hub",
  "image 0.25.5",
- "indexmap 2.6.0",
+ "indexmap 2.7.0",
  "indicatif",
  "itertools 0.13.0",
  "lrtable",
@@ -6753,25 +6799,25 @@ dependencies = [
 
 [[package]]
 name = "mistralrs-paged-attn"
-version = "0.3.2"
-source = "git+https://github.com/spiceai/mistral.rs?rev=d70715944e30f335eb59e1a712962b86d7a5d026#d70715944e30f335eb59e1a712962b86d7a5d026"
+version = "0.3.4"
+source = "git+https://github.com/spiceai/mistral.rs?rev=e9e19fdb510d504de961f90ea9398db45a533909#e9e19fdb510d504de961f90ea9398db45a533909"
 dependencies = [
  "anyhow",
  "bindgen_cuda 0.1.6",
- "candle-core 0.7.2 (git+https://github.com/EricLBuehler/candle.git?rev=2e17ebd)",
+ "candle-core 0.8.0",
  "float8",
  "half",
 ]
 
 [[package]]
 name = "mistralrs-quant"
-version = "0.3.2"
-source = "git+https://github.com/spiceai/mistral.rs?rev=d70715944e30f335eb59e1a712962b86d7a5d026#d70715944e30f335eb59e1a712962b86d7a5d026"
+version = "0.3.4"
+source = "git+https://github.com/spiceai/mistral.rs?rev=e9e19fdb510d504de961f90ea9398db45a533909#e9e19fdb510d504de961f90ea9398db45a533909"
 dependencies = [
  "bindgen_cuda 0.1.5",
  "byteorder",
- "candle-core 0.7.2 (git+https://github.com/EricLBuehler/candle.git?rev=2e17ebd)",
- "candle-nn 0.7.2 (git+https://github.com/EricLBuehler/candle.git?rev=2e17ebd)",
+ "candle-core 0.8.0",
+ "candle-nn 0.8.0",
  "float8",
  "half",
  "lazy_static",
@@ -6779,21 +6825,22 @@ dependencies = [
  "paste",
  "rayon",
  "serde",
+ "thiserror 1.0.68",
  "tracing",
 ]
 
 [[package]]
 name = "mistralrs-vision"
-version = "0.3.2"
-source = "git+https://github.com/spiceai/mistral.rs?rev=d70715944e30f335eb59e1a712962b86d7a5d026#d70715944e30f335eb59e1a712962b86d7a5d026"
+version = "0.3.4"
+source = "git+https://github.com/spiceai/mistral.rs?rev=e9e19fdb510d504de961f90ea9398db45a533909#e9e19fdb510d504de961f90ea9398db45a533909"
 dependencies = [
- "candle-core 0.7.2 (git+https://github.com/EricLBuehler/candle.git?rev=2e17ebd)",
+ "candle-core 0.8.0",
  "image 0.25.5",
 ]
 
 [[package]]
 name = "model_components"
-version = "1.0.0-rc.1"
+version = "1.0.0-rc.2"
 dependencies = [
  "anyhow",
  "arrow",
@@ -7111,7 +7158,7 @@ dependencies = [
 
 [[package]]
 name = "ns_lookup"
-version = "1.0.0-rc.1"
+version = "1.0.0-rc.2"
 dependencies = [
  "snafu",
  "tracing",
@@ -7516,7 +7563,7 @@ dependencies = [
 [[package]]
 name = "object_store"
 version = "0.11.1"
-source = "git+https://github.com/spiceai/arrow-rs.git?rev=1f37d9eda6da17b7644115f82d209c00c9566733#1f37d9eda6da17b7644115f82d209c00c9566733"
+source = "git+https://github.com/spiceai/arrow-rs.git?rev=cee50b7d2ccf749eac89d0fe26fbd8a06c0bb3c4#cee50b7d2ccf749eac89d0fe26fbd8a06c0bb3c4"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -7813,7 +7860,7 @@ dependencies = [
 
 [[package]]
 name = "otel-arrow"
-version = "1.0.0-rc.1"
+version = "1.0.0-rc.2"
 dependencies = [
  "arrow",
  "arrow-buffer",
@@ -7824,7 +7871,7 @@ dependencies = [
 
 [[package]]
 name = "otelpublisher"
-version = "1.0.0-rc.1"
+version = "1.0.0-rc.2"
 dependencies = [
  "clap",
  "futures",
@@ -7844,6 +7891,18 @@ name = "overload"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b15813163c1d831bf4a13c3610c05c0d03b39feb07f7e09fa234dac9b15aaf39"
+
+[[package]]
+name = "package"
+version = "1.0.0-rc.2"
+dependencies = [
+ "bytes",
+ "object_store",
+ "serde_yaml",
+ "snafu",
+ "spicepod",
+ "zip 2.2.1",
+]
 
 [[package]]
 name = "packedvec"
@@ -8047,7 +8106,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b4c5cc86750666a3ed20bdaf5ca2a0344f9c67674cae0515bec2da16fbaa47db"
 dependencies = [
  "fixedbitset",
- "indexmap 2.6.0",
+ "indexmap 2.7.0",
 ]
 
 [[package]]
@@ -8605,7 +8664,7 @@ dependencies = [
  "quinn-proto",
  "quinn-udp",
  "rustc-hash 2.0.0",
- "rustls 0.23.18",
+ "rustls 0.23.19",
  "socket2",
  "thiserror 1.0.68",
  "tokio",
@@ -8622,7 +8681,7 @@ dependencies = [
  "rand 0.8.5",
  "ring",
  "rustc-hash 2.0.0",
- "rustls 0.23.18",
+ "rustls 0.23.19",
  "slab",
  "thiserror 1.0.68",
  "tinyvec",
@@ -9053,7 +9112,7 @@ dependencies = [
  "percent-encoding",
  "pin-project-lite",
  "quinn",
- "rustls 0.23.18",
+ "rustls 0.23.19",
  "rustls-native-certs 0.8.1",
  "rustls-pemfile 2.2.0",
  "rustls-pki-types",
@@ -9235,7 +9294,7 @@ dependencies = [
 
 [[package]]
 name = "runtime"
-version = "1.0.0-rc.1"
+version = "1.0.0-rc.2"
 dependencies = [
  "anyhow",
  "app",
@@ -9287,11 +9346,12 @@ dependencies = [
  "graph-rs-sdk",
  "graphql-parser",
  "headers-accept",
+ "hf-hub",
  "http 1.1.0",
  "http-body-util",
  "hyper 1.5.1",
  "hyper-util",
- "indexmap 2.6.0",
+ "indexmap 2.7.0",
  "insta",
  "itertools 0.13.0",
  "jsonpath-rust",
@@ -9312,6 +9372,8 @@ dependencies = [
  "opentelemetry-proto",
  "opentelemetry_sdk 0.26.0",
  "otel-arrow",
+ "package",
+ "percent-encoding",
  "pin-project",
  "prometheus",
  "prometheus-parse",
@@ -9321,7 +9383,7 @@ dependencies = [
  "reqwest 0.12.9",
  "runtime-auth",
  "rusqlite",
- "rustls 0.23.18",
+ "rustls 0.23.19",
  "rustls-pemfile 2.2.0",
  "schemars",
  "scopeguard",
@@ -9359,7 +9421,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-auth"
-version = "1.0.0-rc.1"
+version = "1.0.0-rc.2"
 dependencies = [
  "app",
  "axum",
@@ -9479,9 +9541,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.18"
+version = "0.23.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9c9cc1d47e243d655ace55ed38201c19ae02c148ae56412ab8750e8f0166ab7f"
+checksum = "934b404430bb06b3fae2cba809eb45a1ab1aecd64491213d7c3301b88393f8d1"
 dependencies = [
  "aws-lc-rs",
  "log",
@@ -9946,7 +10008,7 @@ dependencies = [
  "chrono",
  "hex",
  "indexmap 1.9.3",
- "indexmap 2.6.0",
+ "indexmap 2.7.0",
  "serde",
  "serde_derive",
  "serde_json",
@@ -9959,7 +10021,7 @@ version = "0.9.34+deprecated"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6a8b1a1a2ebf674015cc02edccce75287f1a0130d394307b36743c2f5d504b47"
 dependencies = [
- "indexmap 2.6.0",
+ "indexmap 2.7.0",
  "itoa",
  "ryu",
  "serde",
@@ -10201,6 +10263,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "socks"
+version = "0.3.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f0c3dbbd9ae980613c6dd8e28a9407b50509d3803b57624d5dfe8315218cd58b"
+dependencies = [
+ "byteorder",
+ "libc",
+ "winapi",
+]
+
+[[package]]
 name = "spark-connect-core"
 version = "0.0.1-beta.4"
 source = "git+https://github.com/spiceai/spark-connect-rs.git?rev=81b159ccd10f806fcb2d30f86715f77350ba24a2#81b159ccd10f806fcb2d30f86715f77350ba24a2"
@@ -10242,7 +10315,7 @@ dependencies = [
 
 [[package]]
 name = "spice-cloud"
-version = "1.0.0-rc.1"
+version = "1.0.0-rc.2"
 dependencies = [
  "async-trait",
  "datafusion",
@@ -10259,7 +10332,7 @@ dependencies = [
 
 [[package]]
 name = "spiced"
-version = "1.0.0-rc.1"
+version = "1.0.0-rc.2"
 dependencies = [
  "app",
  "clap",
@@ -10275,7 +10348,7 @@ dependencies = [
  "reqwest 0.12.9",
  "runtime",
  "runtime-auth",
- "rustls 0.23.18",
+ "rustls 0.23.19",
  "rustls-pemfile 2.2.0",
  "serde_json",
  "serde_yaml",
@@ -10291,7 +10364,7 @@ dependencies = [
 
 [[package]]
 name = "spicepod"
-version = "1.0.0-rc.1"
+version = "1.0.0-rc.2"
 dependencies = [
  "fundu",
  "schemars",
@@ -10305,7 +10378,7 @@ dependencies = [
 
 [[package]]
 name = "spicepodschema"
-version = "1.0.0-rc.1"
+version = "1.0.0-rc.2"
 dependencies = [
  "schemars",
  "serde_json",
@@ -10673,7 +10746,7 @@ dependencies = [
 
 [[package]]
 name = "telemetry"
-version = "1.0.0-rc.1"
+version = "1.0.0-rc.2"
 dependencies = [
  "arrow",
  "async-trait",
@@ -10738,10 +10811,10 @@ version = "1.5.0"
 source = "git+https://github.com/spiceai/text-embeddings-inference.git?rev=b3925b2f97fcd2bfab9551b432ab659c48e5586b#b3925b2f97fcd2bfab9551b432ab659c48e5586b"
 dependencies = [
  "anyhow",
- "candle-core 0.7.2 (registry+https://github.com/rust-lang/crates.io-index)",
+ "candle-core 0.7.2",
  "candle-cublaslt",
  "candle-layer-norm",
- "candle-nn 0.7.2 (registry+https://github.com/rust-lang/crates.io-index)",
+ "candle-nn 0.7.2",
  "candle-rotary",
  "candle-transformers",
  "memmap2",
@@ -10783,8 +10856,7 @@ dependencies = [
 [[package]]
 name = "text-splitter"
 version = "0.18.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "189450e9eaff1a8037cca4d60ca62c134a7e601187430bdd487c86e25e8d6641"
+source = "git+https://github.com/spiceai/text-splitter.git?rev=b33e4748576b9a81d436d3f28a6706f860fc45ba#b33e4748576b9a81d436d3f28a6706f860fc45ba"
 dependencies = [
  "ahash 0.8.11",
  "auto_enums",
@@ -10794,7 +10866,7 @@ dependencies = [
  "pulldown-cmark",
  "regex",
  "strum 0.26.3",
- "thiserror 1.0.68",
+ "thiserror 2.0.3",
  "tiktoken-rs",
  "tokenizers",
  "unicode-segmentation",
@@ -11119,7 +11191,7 @@ version = "0.26.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c7bc40d0e5a97695bb96e27995cd3a08538541b0a846f65bba7a359f36700d4"
 dependencies = [
- "rustls 0.23.18",
+ "rustls 0.23.19",
  "rustls-pki-types",
  "tokio",
 ]
@@ -11189,7 +11261,7 @@ version = "0.22.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4ae48d6208a266e853d946088ed816055e556cc6028c5e8e2b84d9fa5dd7c7f5"
 dependencies = [
- "indexmap 2.6.0",
+ "indexmap 2.7.0",
  "serde",
  "serde_spanned",
  "toml_datetime",
@@ -11331,9 +11403,9 @@ dependencies = [
 
 [[package]]
 name = "tracing"
-version = "0.1.40"
+version = "0.1.41"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c3523ab5a71916ccf420eebdf5521fcef02141234bbc0b8a49f2fdc4544364ef"
+checksum = "784e0ac535deb450455cbfa28a6f0df145ea1bb7ae51b821cf5e7927fdcfbdd0"
 dependencies = [
  "log",
  "pin-project-lite",
@@ -11343,9 +11415,9 @@ dependencies = [
 
 [[package]]
 name = "tracing-attributes"
-version = "0.1.27"
+version = "0.1.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "34704c8d6ebcbc939824180af020566b01a7c01f80641264eba0999f6c2b6be7"
+checksum = "395ae124c09f9e6918a2310af6038fba074bcf474ac352496d5910dd59a2226d"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -11354,9 +11426,9 @@ dependencies = [
 
 [[package]]
 name = "tracing-core"
-version = "0.1.32"
+version = "0.1.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c06d3da6113f116aaee68e4d601191614c9053067f9ab7f6edbcb161237daa54"
+checksum = "e672c95779cf947c5311f83787af4fa8fffd12fb27e4993211a84bdfd9610f9c"
 dependencies = [
  "once_cell",
  "valuable",
@@ -11857,10 +11929,11 @@ dependencies = [
  "log",
  "native-tls",
  "once_cell",
- "rustls 0.23.18",
+ "rustls 0.23.19",
  "rustls-pki-types",
  "serde",
  "serde_json",
+ "socks",
  "url",
  "webpki-roots",
 ]
@@ -11915,7 +11988,7 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 
 [[package]]
 name = "util"
-version = "1.0.0-rc.1"
+version = "1.0.0-rc.2"
 dependencies = [
  "backoff",
  "humantime",
@@ -12832,9 +12905,52 @@ dependencies = [
  "crc32fast",
  "crossbeam-utils",
  "displaydoc",
- "indexmap 2.6.0",
+ "indexmap 2.7.0",
  "num_enum",
  "thiserror 1.0.68",
+]
+
+[[package]]
+name = "zip"
+version = "2.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "99d52293fc86ea7cf13971b3bb81eb21683636e7ae24c729cdaf1b7c4157a352"
+dependencies = [
+ "aes",
+ "arbitrary",
+ "bzip2",
+ "constant_time_eq",
+ "crc32fast",
+ "crossbeam-utils",
+ "deflate64",
+ "displaydoc",
+ "flate2",
+ "hmac",
+ "indexmap 2.7.0",
+ "lzma-rs",
+ "memchr",
+ "pbkdf2",
+ "rand 0.8.5",
+ "sha1",
+ "thiserror 2.0.3",
+ "time",
+ "zeroize",
+ "zopfli",
+ "zstd",
+]
+
+[[package]]
+name = "zopfli"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e5019f391bac5cf252e93bbcc53d039ffd62c7bfb7c150414d61369afe57e946"
+dependencies = [
+ "bumpalo",
+ "crc32fast",
+ "lockfree-object-pool",
+ "log",
+ "once_cell",
+ "simd-adler32",
 ]
 
 [[package]]

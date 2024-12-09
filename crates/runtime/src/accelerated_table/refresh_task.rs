@@ -216,7 +216,7 @@ impl RefreshTask {
             InsertOp::Append
         };
 
-        let schema = Arc::clone(&data_update.schema);
+        let schema = Arc::clone(&data_update.data.schema());
 
         let (notify_written_data_stat_available, mut on_written_data_stat_available) =
             oneshot::channel::<RefreshStat>();
@@ -266,7 +266,6 @@ impl RefreshTask {
         let sink = &*sink_lock;
 
         if let Err(e) = sink.insert_into(record_batch_stream, overwrite).await {
-            tracing::warn!("Failed to update the dataset {dataset_name}.\n{e}");
             self.mark_dataset_status(sql, status::ComponentStatus::Error)
                 .await;
             return Err(e);
@@ -446,7 +445,7 @@ impl RefreshTask {
         .map_err(check_and_mark_retriable_error);
 
         match get_data_result {
-            Ok(data) => Ok(StreamingDataUpdate::new(data.0, data.1, update_type)),
+            Ok(data) => Ok(StreamingDataUpdate::new(data, update_type)),
             Err(e) => Err(retry_from_df_error(e)),
         }
     }
@@ -552,19 +551,21 @@ impl RefreshTask {
             .context(super::UnableToScanTableProviderSnafu)?;
 
         let filter_schema = BaseSchema::get_schema(&federated_provider);
-        let schema = Arc::clone(&update.schema);
         let update_type = update.update_type.clone();
 
-        let filtered_data = Box::pin(RecordBatchStreamAdapter::new(Arc::clone(&update.schema), {
-            stream! {
-                while let Some(batch) = update.data.next().await {
-                    let batch = filter_records(&batch?, &existing_records, &filter_schema);
-                    yield batch.map_err(|e| { DataFusionError::External(Box::new(e)) });
+        let filtered_data = Box::pin(RecordBatchStreamAdapter::new(
+            Arc::clone(&update.data.schema()),
+            {
+                stream! {
+                    while let Some(batch) = update.data.next().await {
+                        let batch = filter_records(&batch?, &existing_records, &filter_schema);
+                        yield batch.map_err(|e| { DataFusionError::External(Box::new(e)) });
+                    }
                 }
-            }
-        }));
+            },
+        ));
 
-        Ok(StreamingDataUpdate::new(schema, filtered_data, update_type))
+        Ok(StreamingDataUpdate::new(filtered_data, update_type))
     }
 
     #[allow(clippy::cast_sign_loss)]
@@ -720,6 +721,28 @@ impl RefreshTask {
                     .await;
                 return;
             }
+        }
+
+        // For all errors that result from calling DataFusion, check if they are due to the task being cancelled and ignore them
+        match error {
+            super::Error::UnableToGetDataFromConnector { source }
+            | super::Error::FailedToRefreshDataset { source }
+            | super::Error::UnableToScanTableProvider { source }
+            | super::Error::UnableToCreateMemTableFromUpdate { source }
+            | super::Error::FailedToQueryLatestTimestamp { source }
+            | super::Error::FailedToWriteData { source } => {
+                // Match against an Internal error with the message "Non Panic Task error":
+                // <https://github.com/apache/datafusion/blob/f6c92fecb23c927bdc6a9feb058f03a2fb61d63f/datafusion/physical-plan/src/stream.rs#L132>
+                if let DataFusionError::Internal(msg) = &source {
+                    if msg.contains("Non Panic Task error") && msg.contains("was cancelled") {
+                        tracing::debug!(
+                            "Ignoring DataFusion error due to task cancellation: {source}"
+                        );
+                        return;
+                    }
+                }
+            }
+            _ => (),
         }
 
         tracing::warn!(

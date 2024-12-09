@@ -1,0 +1,5 @@
+---
+source: crates/runtime/tests/models/mod.rs
+expression: e.to_string()
+---
+HTTP error: 400 Bad Request - Model model_not_in_spice not found

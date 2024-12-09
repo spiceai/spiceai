@@ -14,24 +14,27 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::results::BenchmarkResultsBuilder;
+use crate::{
+    results::BenchmarkResultsBuilder,
+    utils::{get_branch_name, get_commit_sha, init_tracing, runtime_ready_check},
+};
 use app::{App, AppBuilder};
 use datafusion::prelude::SessionContext;
-use futures::Future;
 use runtime::{
     datafusion::DataFusion,
     dataupdate::DataUpdate,
     status::{self, RuntimeStatus},
     Runtime,
 };
-use spicepod::component::dataset::{
-    acceleration::{Acceleration, IndexType},
-    replication::Replication,
-    Dataset, Mode,
+use spicepod::component::{
+    dataset::{
+        acceleration::{Acceleration, IndexType},
+        replication::Replication,
+        Dataset, Mode,
+    },
+    runtime::ResultsCache,
 };
-use std::{collections::HashMap, process::Command, sync::Arc, time::Duration};
-use tracing_subscriber::EnvFilter;
-
+use std::{collections::HashMap, sync::Arc};
 /// The number of times to run each query in the benchmark.
 const ITERATIONS: i32 = 5;
 
@@ -61,7 +64,7 @@ pub(crate) async fn setup_benchmark(
     acceleration: Option<Acceleration>,
     bench_name: &str,
 ) -> Result<(BenchmarkResultsBuilder, Runtime), String> {
-    init_tracing();
+    init_tracing(None);
 
     let app = build_app(upload_results_dataset, connector, acceleration, bench_name)?;
 
@@ -93,25 +96,6 @@ pub(crate) async fn setup_benchmark(
     Ok((benchmark_results, rt))
 }
 
-async fn runtime_ready_check(rt: &Runtime, wait_time: Duration) {
-    assert!(wait_until_true(wait_time, || async { rt.status().is_ready() }).await);
-}
-
-async fn wait_until_true<F, Fut>(max_wait: Duration, mut f: F) -> bool
-where
-    F: FnMut() -> Fut,
-    Fut: Future<Output = bool>,
-{
-    let start = std::time::Instant::now();
-    while start.elapsed() < max_wait {
-        if f().await {
-            return true;
-        }
-        tokio::time::sleep(Duration::from_secs(1)).await;
-    }
-    false
-}
-
 pub(crate) async fn write_benchmark_results(
     benchmark_results: DataUpdate,
     rt: &Runtime,
@@ -128,12 +112,18 @@ fn build_app(
     acceleration: Option<Acceleration>,
     bench_name: &str,
 ) -> Result<App, String> {
-    let mut app_builder = AppBuilder::new("runtime_benchmark_test");
+    let mut app_builder =
+        AppBuilder::new("runtime_benchmark_test").with_results_cache(ResultsCache {
+            enabled: false,
+            cache_max_size: None,
+            item_ttl: None,
+            eviction_policy: None,
+        });
 
     app_builder = match connector {
         "spice.ai" => Ok(crate::bench_spicecloud::build_app(app_builder)),
         // Run both S3, ABFS and any other object store benchmarks
-        "s3" | "abfs" => {
+        "s3" | "abfs" | "file" => {
             // SQLite acceleration does not support default TPC-DS source scale so we use a smaller scale
             if bench_name == "tpcds"
                 && acceleration
@@ -158,7 +148,7 @@ fn build_app(
         #[cfg(feature = "odbc")]
         "odbc-athena" => Ok(crate::bench_odbc_athena::build_app(app_builder)),
         #[cfg(feature = "delta_lake")]
-        "delta_lake" => Ok(crate::bench_delta::build_app(app_builder)),
+        "delta_lake" => crate::bench_delta::build_app(app_builder, bench_name),
         _ => Err(format!("Unknown connector: {connector}")),
     }?;
 
@@ -377,21 +367,6 @@ fn get_accelerator_indexes(
     }
 }
 
-fn init_tracing() {
-    let filter = match std::env::var("SPICED_LOG").ok() {
-        Some(level) => EnvFilter::new(level),
-        _ => EnvFilter::new(
-            "runtime=TRACE,datafusion-federation=TRACE,datafusion-federation-sql=TRACE,bench=TRACE",
-        ),
-    };
-
-    let subscriber = tracing_subscriber::FmtSubscriber::builder()
-        .with_env_filter(filter)
-        .with_ansi(true)
-        .finish();
-    let _ = tracing::subscriber::set_global_default(subscriber);
-}
-
 fn make_spiceai_rw_dataset(path: &str, name: &str) -> Dataset {
     let mut ds = Dataset::new(format!("spice.ai:{path}"), name.to_string());
     ds.mode = Mode::ReadWrite;
@@ -399,44 +374,30 @@ fn make_spiceai_rw_dataset(path: &str, name: &str) -> Dataset {
     ds
 }
 
-// This should also append "-dirty" if there are uncommitted changes
-fn get_commit_sha() -> String {
-    let short_sha = Command::new("git")
-        .args(["rev-parse", "--short", "HEAD"])
-        .output()
-        .map_or_else(
-            |_| "unknown".to_string(),
-            |output| String::from_utf8_lossy(&output.stdout).trim().to_string(),
-        );
-    format!(
-        "{}{}",
-        short_sha,
-        if is_repo_dirty() { "-dirty" } else { "" }
-    )
+#[macro_export]
+macro_rules! generate_tpcds_queries {
+    ( $( $i:literal ),* ) => {
+        vec![
+            $(
+                (
+                    concat!("tpcds_q", stringify!($i)),
+                    include_str!(concat!("../queries/tpcds/q", stringify!($i), ".sql"))
+                )
+            ),*
+        ]
+    }
 }
 
-#[allow(clippy::map_unwrap_or)]
-fn is_repo_dirty() -> bool {
-    let output = Command::new("git")
-        .arg("status")
-        .arg("--porcelain")
-        .output()
-        .map(|output| {
-            std::str::from_utf8(&output.stdout)
-                .map(ToString::to_string)
-                .unwrap_or_else(|_| String::new())
-        })
-        .unwrap_or_else(|_| String::new());
-
-    !output.trim().is_empty()
-}
-
-fn get_branch_name() -> String {
-    Command::new("git")
-        .args(["rev-parse", "--abbrev-ref", "HEAD"])
-        .output()
-        .map_or_else(
-            |_| "unknown".to_string(),
-            |output| String::from_utf8_lossy(&output.stdout).trim().to_string(),
-        )
+#[macro_export]
+macro_rules! generate_tpch_queries {
+    ( $( $i:tt ),* ) => {
+        vec![
+            $(
+                (
+                    concat!("tpch_", stringify!($i)),
+                    include_str!(concat!("../queries/tpch/", stringify!($i), ".sql"))
+                )
+            ),*
+        ]
+    }
 }

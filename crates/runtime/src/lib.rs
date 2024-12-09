@@ -34,6 +34,7 @@ pub use notify::Error as NotifyError;
 use secrecy::SecretString;
 use secrets::{ParamStr, Secrets};
 use snafu::prelude::*;
+use spicepod::component::eval::Eval;
 use tls::TlsConfig;
 use tokio::sync::oneshot::error::RecvError;
 use tokio::sync::RwLock;
@@ -133,6 +134,9 @@ pub enum Error {
 
     #[snafu(display("Unknown data connector: {data_connector}"))]
     UnknownDataConnector { data_connector: String },
+
+    #[snafu(display("The runtime is built without ODBC support.\nBuild Spice.ai OSS with the `odbc` feature enabled or use the Docker image that includes ODBC support.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/odbc"))]
+    OdbcNotInstalled,
 
     #[snafu(display("Unable to load secrets for data connector: {data_connector}"))]
     UnableToLoadDataConnectorSecrets { data_connector: String },
@@ -265,6 +269,8 @@ pub struct Runtime {
     llms: Arc<RwLock<LLMModelStore>>,
     embeds: Arc<RwLock<EmbeddingModelStore>>,
     tools: Arc<RwLock<HashMap<String, Tooling>>>,
+    evals: Arc<RwLock<Vec<Eval>>>,
+    eval_scorers: Arc<RwLock<HashMap<String, Arc<dyn crate::model::Scorer>>>>,
     pods_watcher: Arc<RwLock<Option<podswatcher::PodsWatcher>>>,
     secrets: Arc<RwLock<secrets::Secrets>>,
     datasets_health_monitor: Option<Arc<DatasetsHealthMonitor>>,
@@ -297,6 +303,16 @@ impl Runtime {
     #[must_use]
     pub fn status(&self) -> Arc<status::RuntimeStatus> {
         Arc::clone(&self.status)
+    }
+
+    #[must_use]
+    pub fn embeds(&self) -> Arc<RwLock<EmbeddingModelStore>> {
+        Arc::clone(&self.embeds)
+    }
+
+    #[must_use]
+    pub fn app(&self) -> Arc<RwLock<Option<Arc<App>>>> {
+        Arc::clone(&self.app)
     }
 
     /// Requests a loaded extension, or will attempt to load it if part of the autoloaded extensions.
@@ -485,8 +501,22 @@ impl Runtime {
             }
         });
 
+        let eval_scorer = tokio::spawn({
+            let self_clone = self.clone();
+            async move {
+                self_clone.load_eval_scorer().await;
+            }
+        });
+
         // Wait for all tasks to complete
-        let load_result = tokio::try_join!(task_history, results_cache, datasets, catalogs, models);
+        let load_result = tokio::try_join!(
+            task_history,
+            results_cache,
+            datasets,
+            catalogs,
+            models,
+            eval_scorer
+        );
 
         if let Err(err) = load_result {
             tracing::error!("Could not start the Spice runtime: {err}");

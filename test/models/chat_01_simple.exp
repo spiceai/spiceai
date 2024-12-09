@@ -1,0 +1,42 @@
+#!/usr/bin/expect -f
+
+# Runtime response timeout
+set timeout 30:
+
+spawn spice chat
+
+proc chat {message}  {
+    global timeout
+
+     send "$message\r"
+
+    expect {
+        " ERROR " {
+            # allow stream to complete
+            sleep 2
+            send_user "Error detected\n"
+            exit 1
+        }
+        "chat> " {
+            # end of model response
+        }
+        timeout {
+            send_user "Timeout waiting for expected response\n"
+            exit 1
+        }
+    }
+
+    send_user "Model returned expected response\n"
+}
+
+expect "chat>"
+
+chat "What datasets you have access to?"
+sleep 1
+
+chat "How many issues stored in database?"
+
+# Signal to exit (Ctrl+C)
+send \x03
+
+exit 0

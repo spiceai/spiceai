@@ -1,0 +1,17 @@
+[package]
+edition.workspace = true
+exclude.workspace = true
+homepage.workspace = true
+license.workspace = true
+name = "package"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+object_store.workspace = true
+snafu.workspace = true
+serde_yaml.workspace = true
+spicepod = { path = "../spicepod" }
+zip = "2.2.1"
+bytes.workspace = true

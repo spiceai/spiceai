@@ -25,9 +25,9 @@ aws-config = { version = "1.1.10", optional = true }
 aws-sdk-secretsmanager = { version = "1.21.0", optional = true }
 aws-sdk-sts = { version = "1.50.0", optional = true }
 axum.workspace = true
-axum-extra = { version = "0.9.3", features = ["typed-header"] }
+axum-extra = { version = "0.9.6", features = ["typed-header"] }
 base64.workspace = true
-bytes = { version = "1", default-features = false }
+bytes.workspace = true
 cache = { path = "../cache" }
 chrono = { version = "0.4.38" }
 clap.workspace = true
@@ -63,7 +63,11 @@ hyper-util = { version = "0.1.6", features = ["service"] }
 indexmap = "2"
 itertools.workspace = true
 jsonwebtoken = "9.3.0"
-keyring = { version = "3.6.1", features = ["apple-native", "windows-native", "linux-native"], optional = true }
+keyring = { version = "3.6.1", features = [
+    "apple-native",
+    "windows-native",
+    "linux-native",
+], optional = true }
 lazy_static.workspace = true
 llms = { path = "../llms" }
 logos = "0.14.0"
@@ -83,6 +87,8 @@ opentelemetry-proto = { version = "0.27", features = [
 ] }
 opentelemetry_sdk.workspace = true
 otel-arrow = { path = "../otel-arrow" }
+package = { path = "../package" }
+percent-encoding.workspace = true
 pin-project.workspace = true
 prometheus.workspace = true
 prometheus-parse = "0.2.5"
@@ -133,6 +139,7 @@ azure_storage = "0.21.0"
 azure_storage_blobs = "0.21.0"
 bollard = "0.18.1"
 flightrepl = { path = "../flightrepl" }
+hf-hub = { workspace = true }
 insta.workspace = true
 jsonpath-rust = "0.7.3"
 opentelemetry_sdk = { workspace = true, features = ["rt-tokio-current-thread"] }
@@ -192,6 +199,10 @@ sqlite = [
 [[bench]]
 harness = false
 name = "bench"
+
+[[bench]]
+harness = false
+name = "vector_search"
 
 [target.'cfg(windows)'.dependencies]
 winver = "1.0.0"

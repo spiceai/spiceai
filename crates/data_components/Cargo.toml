@@ -18,7 +18,7 @@ async-stream.workspace = true
 async-trait.workspace = true
 base64.workspace = true
 bb8 = {workspace = true, optional = true }
-bytes = "1.6.0"
+bytes.workspace = true
 chrono.workspace = true
 clickhouse-rs = { workspace = true, optional = true }
 datafusion-federation = { workspace = true }

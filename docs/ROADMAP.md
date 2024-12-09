@@ -8,39 +8,29 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 
 - See [Bugs](https://github.com/spiceai/spiceai/labels/bug). Feel free to file a new Issue if you see a bug and let us know on Discord.
 
-## [v1.0-rc.1 (Nov 2024)](https://github.com/spiceai/spiceai/milestone/45)
-
-- Bugfixes and performance improvements
-- Data Accelerators: Arrow & DuckDB (Release Candidate)
-- DuckDB data connector (Release Candidate)
-- S3 data connector (Release Candidate)
-- PostgreSQL data connector (Release Candidate)
-- MySQL data connector (Release Candidate)
-- GitHub data connector (Release Candidate)
-
-## [v1.0-rc.2 (Nov 2024)](https://github.com/spiceai/spiceai/milestone/48)
+## [v1.0-rc.2 (Dec 2024)](https://github.com/spiceai/spiceai/milestone/48)
 
 - Bugfixes and performance improvements
 - GraphQL data connector (Release Candidate)
 - Databricks DeltaLake data connector (Release Candidate)
 - Spice.ai Cloud Platform data connector (Release Candidate)
 - ODBC Data Connector - Athena, Databricks, MySQL (Release Candidate)
-- Dremio data connector (Beta)
-
-## v1.0-rc.3 (Dec 2024)
-
-- Bugfixes and performance improvements
-- DuckDB data connector (Release Candidate)
 - Dremio data connector (Release Candidate)
 - MS SQL data connector (Beta)
 - File data connector (Beta)
+- S3 data connector Iceberg support (Beta)
+- AI Evals (AI-as-a-Judge)
+  - [#3320](https://github.com/spiceai/spiceai/issues/3320) Eval datasets
 
-## v1.0-rc.4 (Dec 2024)
+## v1.0-rc.3 (Dec 2024)
 
 - Bugfixes and performance improvements
 - MS SQL data connector (Release Candidate)
 - File data connector (Release Candidate)
 - Data Accelerators: SQLite & PostgreSQL (Release Candidate)
+- DynamoDB data connector (Alpha)
+- [#3318](https://github.com/spiceai/spiceai/issues/3318) FinanceBench in CI
+- [#3018](https://github.com/spiceai/spiceai/issues/3018) Results caching for embeddings and search
 
 ## v1.0-stable (Jan 2025)
 
@@ -123,9 +113,17 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 | `groq`        | Beta   |
 | `grok`        | Alpha  |
 
-## v1.1
+## v1.1 (Feb 2025)
 
 - Bugfixes
+- Enterprise Search improvements
+  - [#3006](https://github.com/spiceai/spiceai/issues/3006) Search with keyword filtering
+  - [#3016](https://github.com/spiceai/spiceai/issues/3016) Hybrid-Search (DB + Vector)
+  - [#3015](https://github.com/spiceai/spiceai/issues/3015) DataFusion Search
+
+## v1.2 (Mar 2025)
+
+## v1.3 (April 2025)
 
 ## v2 (2025)
 
@@ -140,19 +138,18 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 
 ## Features being considered
 
-- S3 data connector Iceberg support
 - Data Connectors
   - MotherDuck
   - BigQuery
   - Kafka
   - Google Docs
 - Catalog Providers
-  - Iceberg Catalogs
+
   - AWS Glue
+
 - APIs
   - GraphQL API
   - Key/Value API
     - SlateDB data accelerator
     - RocksDB data accelerator
-    - DynamoDB data connector
   - PostgreSQL API

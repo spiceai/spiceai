@@ -23,8 +23,20 @@ use opentelemetry::{
 
 static METER: LazyLock<Meter> = LazyLock::new(|| global::meter("http"));
 
-pub(crate) static REQUESTS_TOTAL: LazyLock<Counter<u64>> =
-    LazyLock::new(|| METER.u64_counter("http_requests_total").init());
+/// Deprecated, to be removed in the future
+pub(crate) static REQUESTS_TOTAL: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("http_requests_total")
+        .with_description("Number of HTTP requests. Deprecated, use http_requests instead.")
+        .init()
+});
+
+pub(crate) static REQUESTS: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("http_requests")
+        .with_description("Number of HTTP requests.")
+        .init()
+});
 
 pub(crate) static REQUESTS_DURATION_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| {
     METER

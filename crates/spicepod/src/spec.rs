@@ -23,6 +23,7 @@ use std::{collections::HashMap, fmt::Debug};
 
 use crate::component::catalog::Catalog;
 use crate::component::embeddings::Embeddings;
+use crate::component::eval::Eval;
 use crate::component::runtime::Runtime;
 use crate::component::secret::Secret;
 use crate::component::tool::Tool;
@@ -100,6 +101,10 @@ pub struct SpicepodDefinition {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     #[serde(default)]
     pub embeddings: Vec<ComponentOrReference<Embeddings>>,
+
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
+    pub evals: Vec<ComponentOrReference<Eval>>,
 
     #[serde(skip_serializing_if = "Vec::is_empty")]
     #[serde(default)]

@@ -24,7 +24,6 @@ use crate::parameters::ParameterSpec;
 use crate::parameters::Parameters;
 use crate::secrets::Secrets;
 use crate::Runtime;
-use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use data_components::cdc::ChangesStream;
 use datafusion::catalog::CatalogProvider;
@@ -79,6 +78,8 @@ pub mod mssql;
 pub mod mysql;
 #[cfg(feature = "odbc")]
 pub mod odbc;
+pub const ODBC_DATACONNECTOR: &str = "odbc"; // const needs to be accessible when ODBC isn't built
+
 #[cfg(feature = "postgres")]
 pub mod postgres;
 pub mod s3;
@@ -223,6 +224,19 @@ pub enum DataConnectorError {
     ))]
     UnsupportedInvalidTypeAction {
         dataconnector: String,
+        connector_component: ConnectorComponent,
+    },
+
+    #[snafu(display("Failed to load the {connector_component} ({dataconnector}).\nThe field '{field_name}' has an unsupported data type: {data_type}.\nSkip loading this field by setting the `invalid_type_action` parameter to `ignore` or `warn` in the dataset configuration.\nFor details, visit: https://docs.spiceai.org/reference/spicepod/datasets#invalid_type_action"))]
+    UnsupportedDataType {
+        dataconnector: String,
+        connector_component: ConnectorComponent,
+        data_type: String,
+        field_name: String,
+    },
+
+    #[snafu(display("Failed to initialize the {connector_component} (ODBC).\nThe runtime is built without ODBC support.\nBuild Spice.ai OSS with the `odbc` feature enabled or use the Docker image that includes ODBC support.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/odbc"))]
+    OdbcNotInstalled {
         connector_component: ConnectorComponent,
     },
 }
@@ -431,7 +445,7 @@ pub async fn get_data(
     table_provider: Arc<dyn TableProvider>,
     sql: Option<String>,
     filters: Vec<Expr>,
-) -> Result<(SchemaRef, SendableRecordBatchStream), DataFusionError> {
+) -> Result<SendableRecordBatchStream, DataFusionError> {
     let mut df = match sql {
         None => {
             let table_source = Arc::new(DefaultTableSource::new(Arc::clone(&table_provider)));
@@ -455,7 +469,7 @@ pub async fn get_data(
     tracing::info!(target: "task_history", sql = %sql, "labels");
 
     let record_batch_stream = df.execute_stream().await.map_err(find_datafusion_root)?;
-    Ok((table_provider.schema(), record_batch_stream))
+    Ok(record_batch_stream)
 }
 
 #[derive(Debug, Clone)]
@@ -546,10 +560,20 @@ impl DataConnectorParamsBuilder {
 
         let connector_factory = guard.get(&name);
 
-        let factory = connector_factory.ok_or(DataConnectorError::InvalidConnectorType {
-            dataconnector: name.clone(),
-            connector_component: self.component.clone(),
-        })?;
+        let factory = connector_factory.ok_or_else(|| {
+            if name == ODBC_DATACONNECTOR {
+                DataConnectorError::OdbcNotInstalled {
+                    connector_component: self.component.clone(),
+                }
+            } else {
+                DataConnectorError::InvalidConnectorType {
+                    dataconnector: name.clone(),
+                    connector_component: self.component.clone(),
+                }
+            }
+        });
+
+        let factory = factory?;
 
         let parameters = Parameters::try_new(
             &format!("connector {name}"),

@@ -17,10 +17,11 @@ limitations under the License.
 use core::time;
 use std::{convert::Infallible, sync::Arc, time::Duration};
 
+use crate::{http::traceparent::override_task_history_with_traceparent, model::LLMModelStore};
 use async_openai::types::{ChatCompletionResponseStream, CreateChatCompletionRequest};
 use async_stream::stream;
 use axum::{
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse, Response,
@@ -32,14 +33,20 @@ use serde::Serialize;
 use tokio::sync::RwLock;
 use tracing::{Instrument, Span};
 
-use crate::model::LLMModelStore;
-
 pub(crate) async fn post(
     Extension(llms): Extension<Arc<RwLock<LLMModelStore>>>,
+    headers: HeaderMap,
     Json(req): Json<CreateChatCompletionRequest>,
 ) -> Response {
-    let span = tracing::span!(target: "task_history", tracing::Level::INFO, "ai_chat", input = %serde_json::to_string(&req).unwrap_or_default());
+    let span = tracing::span!(
+        target: "task_history",
+        tracing::Level::INFO,
+        "ai_chat",
+        input = %serde_json::to_string(&req).unwrap_or_default()
+    );
     span.in_scope(|| tracing::info!(target: "task_history", model = %req.model, "labels"));
+
+    override_task_history_with_traceparent(&span.clone(), &headers);
 
     let span_clone = span.clone();
     async move {

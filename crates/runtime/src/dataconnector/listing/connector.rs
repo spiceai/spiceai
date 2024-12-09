@@ -20,6 +20,7 @@ use crate::dataconnector::ConnectorComponent;
 use crate::dataconnector::DataConnector;
 use crate::dataconnector::DataConnectorError;
 use crate::dataconnector::DataConnectorResult;
+use crate::parameters::ExposedParamLookup;
 use crate::parameters::Parameters;
 use async_trait::async_trait;
 use data_components::object::metadata::ObjectStoreMetadataTable;
@@ -28,6 +29,7 @@ use datafusion::config::ConfigField;
 use datafusion::config::TableParquetOptions;
 use datafusion::datasource::file_format::csv::CsvFormat;
 use datafusion::datasource::file_format::file_compression_type::FileCompressionType;
+use datafusion::datasource::file_format::json::JsonFormat;
 use datafusion::datasource::file_format::parquet::ParquetFormat;
 use datafusion::datasource::file_format::FileFormat;
 use datafusion::datasource::listing::{
@@ -139,48 +141,76 @@ pub trait ListingTableConnector: DataConnector {
             .expose()
             .ok()
             .map(str::to_string);
+        let file_extension = std::path::Path::new(dataset.path().as_str())
+            .extension()
+            .map(|ext| ext.to_ascii_lowercase().to_string_lossy().to_string());
+        let file_format_param = params.get("file_format").expose().ok();
 
-        match params.get("file_format").expose().ok() {
-            Some("csv") => Ok((
+        match (file_format_param, file_extension.as_deref()) {
+            (Some("csv"), _) | (None, Some("csv")) => Ok((
                 Some(self.get_csv_format(dataset, params)?),
                 extension.unwrap_or(".csv".to_string()),
             )),
-            Some("parquet") => Ok((
+            (Some("jsonl"), _) | (None, Some("jsonl"))=> Ok((
+                Some(self.get_jsonl_format(dataset, params)?),
+                extension.unwrap_or(".jsonl".to_string()),
+            )),
+            (Some("parquet"), _) | (None, Some("parquet"))=> Ok((
                 Some(Arc::new(
                     ParquetFormat::default().with_options(self.get_table_parquet_options(dataset)?),
                 )),
                 extension.unwrap_or(".parquet".to_string()),
             )),
-            Some(format) => Ok((None, format!(".{format}"))),
-            None => {
-                if let Some(ext) = std::path::Path::new(dataset.path().as_str()).extension() {
-                    if ext.eq_ignore_ascii_case("csv") {
-                        return Ok((
-                            Some(self.get_csv_format(dataset, params)?),
-                            extension.unwrap_or(".csv".to_string()),
-                        ));
-                    }
-                    if ext.eq_ignore_ascii_case("parquet") {
-                        return Ok((
-                            Some(Arc::new(
-                                ParquetFormat::default()
-                                    .with_options(self.get_table_parquet_options(dataset)?),
-                            )),
-                            extension.unwrap_or(".parquet".to_string()),
-                        ));
-                    }
-                }
-
-                Err(
+            (Some(format), _) => Ok((None, format!(".{format}"))),
+            (_, _) => Err(
                     crate::dataconnector::DataConnectorError::InvalidConfiguration {
                         dataconnector: format!("{self}"),
                         message: "The required 'file_format' parameter is missing.\nEnsure the parameter is provided, and try again.".to_string(),
                         connector_component: ConnectorComponent::from(dataset),
                         source: "Missing file format".into(),
                     },
-                )
-            }
+                ),
         }
+    }
+
+    /// Returns a [`JsonFormat`] based on the provided [`Datasets`] parameters.
+    ///
+    /// If the [`Dataset`] has the relevant parameter, return an error if the value is invalid.
+    fn get_jsonl_format(
+        &self,
+        dataset: &Dataset,
+        params: &Parameters,
+    ) -> DataConnectorResult<Arc<JsonFormat>>
+    where
+        Self: Display,
+    {
+        let mut format = JsonFormat::default();
+
+        if let ExposedParamLookup::Present(comp_as_str) =
+            params.get("file_compression_type").expose()
+        {
+            let compression = comp_as_str.parse::<FileCompressionType>().boxed().context(crate::dataconnector::InvalidConfigurationSnafu {
+                    dataconnector: format!("{self}"),
+                    message: format!(
+                        "Invalid JSONL compression_type: {comp_as_str}, supported types are: GZIP, BZIP2, XZ, ZSTD, UNCOMPRESSED"),
+                    connector_component: ConnectorComponent::from(dataset)
+                })?;
+            format = format.with_file_compression_type(compression);
+        };
+
+        if let ExposedParamLookup::Present(infer_max_rec_str) =
+            params.get("schema_infer_max_records").expose()
+        {
+            let schema_infer_max_rec = usize::from_str(infer_max_rec_str).boxed().context(crate::dataconnector::InvalidConfigurationSnafu {
+                    dataconnector: format!("{self}"),
+                    message: format!(
+                        "JSONL parameter 'schema_infer_max_records' must be an integer, not {infer_max_rec_str}"),
+                    connector_component: ConnectorComponent::from(dataset)
+                })?;
+            format = format.with_schema_infer_max_rec(schema_infer_max_rec);
+        };
+
+        Ok(Arc::new(format))
     }
 
     fn get_csv_format(
@@ -207,9 +237,10 @@ pub trait ListingTableConnector: DataConnector {
             .ok()
             .and_then(|f| f.as_bytes().first().copied());
         let schema_infer_max_rec = params
-            .get("csv_schema_infer_max_records")
+            .get("schema_infer_max_records")
             .expose()
             .ok()
+            .or(params.get("csv_schema_infer_max_records").expose().ok()) // For backwards compatibility
             .map_or_else(|| 1000, |f| usize::from_str(f).map_or(1000, |f| f));
         let delimiter = params
             .get("csv_delimiter")
@@ -330,6 +361,7 @@ impl<T: ListingTableConnector + Display> DataConnector for T {
         let (file_format_opt, extension) = self.get_file_format_and_extension(dataset)?;
         match file_format_opt {
             None => {
+                // Assume its unstructured text data. Use a [`ObjectStoreTextTable`].
                 let content_formatter = document_parse::get_parser_factory(extension.as_str())
                     .await
                     .map(|factory| {
@@ -337,7 +369,6 @@ impl<T: ListingTableConnector + Display> DataConnector for T {
                         factory.default()
                     });
 
-                // Assume its unstructured text data. Use a [`ObjectStoreTextTable`].
                 Ok(ObjectStoreTextTable::try_new(
                     self.get_object_store(dataset)?,
                     &url.clone(),
@@ -581,6 +612,7 @@ mod tests {
     const TEST_PARAMETERS: &[ParameterSpec] = &[
         ParameterSpec::runtime("file_extension"),
         ParameterSpec::runtime("file_format"),
+        ParameterSpec::runtime("schema_infer_max_records"),
         ParameterSpec::runtime("csv_has_header"),
         ParameterSpec::runtime("csv_quote"),
         ParameterSpec::runtime("csv_escape"),

@@ -426,7 +426,34 @@ pub struct Match {
     metadata: HashMap<String, serde_json::Value>,
 }
 
-pub fn to_matches_sorted(result: &VectorSearchResult) -> Result<Vec<Match>> {
+impl Match {
+    #[must_use]
+    pub fn value(&self) -> &str {
+        &self.value
+    }
+
+    #[must_use]
+    pub fn score(&self) -> f64 {
+        self.score
+    }
+
+    #[must_use]
+    pub fn dataset(&self) -> &str {
+        &self.dataset
+    }
+
+    #[must_use]
+    pub fn primary_key(&self) -> &HashMap<String, serde_json::Value> {
+        &self.primary_key
+    }
+
+    #[must_use]
+    pub fn metadata(&self) -> &HashMap<String, serde_json::Value> {
+        &self.metadata
+    }
+}
+
+pub fn to_matches_sorted(result: &VectorSearchResult, limit: usize) -> Result<Vec<Match>> {
     let output = result
         .iter()
         .map(|(a, b)| b.to_matches(a))
@@ -439,6 +466,8 @@ pub fn to_matches_sorted(result: &VectorSearchResult) -> Result<Vec<Match>> {
             .partial_cmp(&a.score)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
+
+    matches.truncate(limit);
 
     Ok(matches)
 }
@@ -496,6 +525,7 @@ impl VectorSearch {
                     )
                 )
                 WHERE chunk_rank = 1
+                ORDER by dist ASC
                 LIMIT {n}
             )
             SELECT

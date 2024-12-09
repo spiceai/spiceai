@@ -22,6 +22,7 @@ use runtime::Runtime;
 use spicepod::component::dataset::acceleration::Mode;
 
 pub(crate) mod abfs;
+pub(crate) mod file;
 pub(crate) mod s3;
 
 pub(crate) fn build_app(
@@ -32,6 +33,7 @@ pub(crate) fn build_app(
     match connector {
         "s3" => s3::build_app(app_builder, bench_name),
         "abfs" => Ok(abfs::build_app(app_builder, bench_name)),
+        "file" => file::build_app(app_builder, bench_name),
         _ => Err(format!("Unsupported connector {connector}")),
     }
 }
@@ -85,6 +87,7 @@ pub(crate) async fn run(
                     | "s3_duckdb_memory"
                     | "abfs"
                     | "s3_duckdb_file"
+                    | "file"
             )
         } else if query_name.starts_with("tpcds_q") {
             matches!(
