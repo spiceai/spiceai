@@ -605,9 +605,7 @@ impl Runtime {
             if let Some(current_ds) = existing_datasets.iter().find(|d| d.name == ds.name) {
                 if ds != *current_ds {
                     self.update_dataset(ds).await;
-                }
-            } else {
-                if ds.is_file_accelerated() {
+                } else if ds.is_file_accelerated() {
                     let datasets = self.initialize_accelerators(&[Arc::clone(&ds)]).await;
                     if datasets.is_empty() {
                         tracing::error!("Failed to initialize accelerator for dataset {}, verify acceleration configuration and try again", ds.name);
