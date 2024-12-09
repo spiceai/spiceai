@@ -186,7 +186,7 @@ pub async fn run_eval(
         })?;
 
     let actual: Vec<DatasetOutput> = if let Some(first_ideal) = ideal.first() {
-        run_model(eval.name.clone(), Arc::clone(model), &input, first_ideal).await?
+        run_model(eval.name.clone(), &**model, &input, first_ideal).await?
     } else {
         // Not an error, no data in dataset
         vec![]

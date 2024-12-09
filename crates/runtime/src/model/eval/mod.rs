@@ -14,8 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::sync::Arc;
-
 use arrow_schema::ArrowError;
 use async_openai::{error::OpenAIError, types::CreateChatCompletionRequest};
 
@@ -118,7 +116,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 #[allow(clippy::borrowed_box)]
 async fn run_model(
     eval_name: String,
-    model: Arc<Box<dyn Chat>>,
+    model: &dyn Chat,
     inputs: &[DatasetInput],
     output_format: &DatasetOutput,
 ) -> Result<Vec<DatasetOutput>> {
