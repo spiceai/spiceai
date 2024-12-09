@@ -126,9 +126,9 @@ impl EvalThread {
                             tracing::Level::INFO,
                             "eval_run",
                             input = %serde_json::to_string(&eval).unwrap_or_default(),
-                            trace_id = %id
+                            trace_id = %id,
                         );
-                        let _guard = span.enter();
+
                         span.in_scope(|| tracing::info!(target: "task_history", model = %model_name, "labels"));
 
                         // Set [`EvalRunStatus::Running`]

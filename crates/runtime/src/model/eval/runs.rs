@@ -31,9 +31,7 @@ use arrow::{
 };
 use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef, TimeUnit};
 use futures::TryStreamExt;
-use opentelemetry::trace::TraceId;
 use snafu::ResultExt;
-use uuid::Uuid;
 
 use super::Result;
 use datafusion::sql::TableReference;
