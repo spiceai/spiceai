@@ -3,17 +3,17 @@ source: crates/runtime/benches/bench.rs
 expression: records_pretty
 snapshot_kind: text
 ---
-+----------------------------------+-----------+
-| l_comment                        | l_partkey |
-+----------------------------------+-----------+
-| avely outside the a              | 82430     |
-| ithely final excu                | 175931    |
-|  quickly regular pl              | 87375     |
-| structions sleep blithely even,  | 70020     |
-| eans nag careful                 | 92488     |
-| uests affix across t             | 51519     |
-|  express deposits. special pe    | 50645     |
-| uriously acros                   | 161751    |
-| bove the unusual reques          | 183057    |
-| y deposits. f                    | 145148    |
-+----------------------------------+-----------+
++---------------------------------------------+-----------+
+| l_comment                                   | l_partkey |
++---------------------------------------------+-----------+
+| y final packages. qui                       | 165646    |
+| encies promise blith                        | 195230    |
+| sly final platelets. foxes sublate carefull | 46339     |
+| s. furiously brave pinto b                  | 198404    |
+| cial packages wake bl                       | 115922    |
+| refully final instructions sleep blithel    | 180550    |
+| r somas nag blithely slyly regular depo     | 126112    |
+| l excuses haggle carefully                  | 125056    |
+| inal, silent accounts! bold, even asymp     | 83574     |
+| tly express                                 | 81216     |
++---------------------------------------------+-----------+
