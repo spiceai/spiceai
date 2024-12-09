@@ -30,14 +30,14 @@ jobs:
     strategy:
       matrix:
         target:
-          - name: "Linux x64"
-            builder: "spiceai-runners"
-            target_os: "linux"
-            target_arch: "x86_64"
-          - name: "macOS aarch64 (Apple Silicon)"
-            builder: "macos-14"
-            target_os: "darwin"
-            target_arch: "aarch64"
+          - name: 'Linux x64'
+            builder: 'spiceai-runners'
+            target_os: 'linux'
+            target_arch: 'x86_64'
+          - name: 'macOS aarch64 (Apple Silicon)'
+            builder: 'spiceai-macos'
+            target_os: 'darwin'
+            target_arch: 'aarch64'
     steps:
       - uses: actions/checkout@v4
 
@@ -45,11 +45,13 @@ jobs:
         run: python3 ./.github/scripts/get_release_version.py
 
       - name: Set up Go
+        if: matrix.target.target_os == 'linux'
         uses: actions/setup-go@v5
         with:
           go-version: ${{ env.GOVER }}
 
       - name: Set up Rust
+        if: matrix.target.target_os == 'linux'
         uses: ./.github/actions/setup-rust
         with:
           os: ${{ matrix.target.target_os }}
@@ -72,8 +74,14 @@ jobs:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build spiced
+        if: matrix.target.target_os != 'darwin'
         run: |
           make -C bin/spiced SPICED_NON_DEFAULT_FEATURES="models"
+
+      - name: Build spiced (macOS)
+        if: matrix.target.target_os == 'darwin'
+        run: |
+          make -C bin/spiced SPICED_NON_DEFAULT_FEATURES="models,metal"
 
       - name: Update build cache (macOS)
         if: matrix.target.target_os == 'darwin'
@@ -130,14 +138,14 @@ jobs:
       fail-fast: false
       matrix:
         target:
-          - name: "Linux x64"
-            runner: "spiceai-runners"
-            target_os: "linux"
-            target_arch: "x86_64"
-          - name: "macOS aarch64 (Apple Silicon)"
-            runner: "macos-14"
-            target_os: "darwin"
-            target_arch: "aarch64"
+          - name: 'Linux x64'
+            runner: 'spiceai-runners'
+            target_os: 'linux'
+            target_arch: 'x86_64'
+          - name: 'macOS aarch64 (Apple Silicon)'
+            runner: 'macos-14'
+            target_os: 'darwin'
+            target_arch: 'aarch64'
     steps:
       - uses: actions/checkout@v4
 
@@ -154,7 +162,7 @@ jobs:
 
       - name: Init spice app
         run: |
-          cp ./test/models/spicepod.yml ./spicepod.yaml
+          cp ./test/models/spicepod_openai.yml ./spicepod.yaml
           cat ./spicepod.yaml
 
       - name: Start spice runtime
@@ -168,7 +176,7 @@ jobs:
         timeout-minutes: 1
         run: |
           while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
-      
+
       - name: Install expect (linux)
         if: matrix.target.target_os == 'linux'
         run: |
@@ -194,4 +202,73 @@ jobs:
           killall spice || true
           cat spice.log
 
-  
+  test_hf_model:
+    name: 'huggingface model (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
+    timeout-minutes: 10
+    runs-on: ${{ matrix.target.runner }}
+    needs:
+      - build
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - name: 'macOS aarch64 (Apple Silicon)'
+            runner: 'spiceai-macos'
+            target_os: 'darwin'
+            target_arch: 'aarch64'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
+        uses: actions/download-artifact@v4
+        with:
+          name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
+          path: ./build
+
+      - name: Install spice
+        uses: ./.github/actions/install-spice
+        with:
+          build-path: ./build
+
+      - name: Init spice app
+        run: |
+          cp ./test/models/spicepod_hf.yml ./spicepod.yaml
+          cat ./spicepod.yaml
+
+      - name: Start spice runtime
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SPICE_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
+        run: |
+          spice run &> spice.log &
+
+      - name: Wait for Spice runtime is ready
+        timeout-minutes: 5
+        run: |
+          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
+
+      - name: Install expect (linux)
+        if: matrix.target.target_os == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y expect
+
+      - name: Install expect (macOS)
+        if: matrix.target.target_os == 'darwin'
+        run: |
+          brew install expect
+
+      - name: Test vector search
+        run: |
+          ./test/models/search_01.exp
+
+      # Local model does not support tools so we check that it can respond only
+      - name: Test chat
+        run: |
+          ./test/models/chat_01_simple.exp
+
+      - name: Stop spice and check logs
+        if: always()
+        run: |
+          killall spice || true
+          cat spice.log

@@ -38,6 +38,8 @@ use crate::{
 
 mod metrics;
 mod routes;
+mod traceparent;
+
 mod v1;
 
 #[derive(Debug, Snafu)]

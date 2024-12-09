@@ -25,6 +25,7 @@ use spicepod::{
         catalog::Catalog,
         dataset::Dataset,
         embeddings::Embeddings,
+        eval::Eval,
         extension::Extension,
         model::Model,
         runtime::{CorsConfig, ResultsCache, Runtime, TlsConfig},
@@ -54,6 +55,8 @@ pub struct App {
     pub models: Vec<Model>,
 
     pub embeddings: Vec<Embeddings>,
+
+    pub evals: Vec<Eval>,
 
     pub tools: Vec<Tool>,
 
@@ -94,6 +97,7 @@ pub struct AppBuilder {
     views: Vec<View>,
     models: Vec<Model>,
     embeddings: Vec<Embeddings>,
+    evals: Vec<Eval>,
     tools: Vec<Tool>,
     spicepods: Vec<Spicepod>,
     runtime: Runtime,
@@ -110,6 +114,7 @@ impl AppBuilder {
             views: vec![],
             models: vec![],
             embeddings: vec![],
+            evals: vec![],
             tools: vec![],
             spicepods: vec![],
             runtime: Runtime::default(),
@@ -125,6 +130,7 @@ impl AppBuilder {
         self.views.extend(spicepod.views.clone());
         self.models.extend(spicepod.models.clone());
         self.embeddings.extend(spicepod.embeddings.clone());
+        self.evals.extend(spicepod.evals.clone());
         self.tools.extend(spicepod.tools.clone());
         self.spicepods.push(spicepod);
         self
@@ -163,6 +169,12 @@ impl AppBuilder {
     #[must_use]
     pub fn with_model(mut self, model: Model) -> AppBuilder {
         self.models.push(model);
+        self
+    }
+
+    #[must_use]
+    pub fn with_eval(mut self, eval: Eval) -> AppBuilder {
+        self.evals.push(eval);
         self
     }
 
@@ -219,6 +231,7 @@ impl AppBuilder {
             views: self.views,
             models: self.models,
             embeddings: self.embeddings,
+            evals: self.evals,
             tools: self.tools,
             spicepods: self.spicepods,
             runtime: self.runtime,
@@ -237,6 +250,7 @@ impl AppBuilder {
         let mut views: Vec<View> = vec![];
         let mut models: Vec<Model> = vec![];
         let mut embeddings: Vec<Embeddings> = vec![];
+        let mut evals: Vec<Eval> = vec![];
         let mut tools: Vec<Tool> = vec![];
 
         for catalog in &spicepod_root.catalogs {
@@ -257,6 +271,10 @@ impl AppBuilder {
 
         for embedding in &spicepod_root.embeddings {
             embeddings.push(embedding.clone());
+        }
+
+        for eval in &spicepod_root.evals {
+            evals.push(eval.clone());
         }
 
         for tool in &spicepod_root.tools {
@@ -287,6 +305,11 @@ impl AppBuilder {
             for embedding in &dependent_spicepod.embeddings {
                 embeddings.push(embedding.clone());
             }
+
+            for eval in &dependent_spicepod.evals {
+                evals.push(eval.clone());
+            }
+
             for tool in &dependent_spicepod.tools {
                 tools.push(tool.clone());
             }
@@ -304,6 +327,7 @@ impl AppBuilder {
             views,
             models,
             embeddings,
+            evals,
             tools,
             spicepods,
             runtime,
