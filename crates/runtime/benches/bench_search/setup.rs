@@ -133,16 +133,18 @@ fn extract_queries_from_batches(records: &[RecordBatch]) -> Result<Vec<Query>, S
         .iter()
         .map(|batch| {
             let id_column = batch
-                .column(0)
+                .column_by_name("id")
+                .ok_or_else(|| "Missing 'id' column".to_string())?
                 .as_any()
                 .downcast_ref::<arrow::array::StringViewArray>()
-                .ok_or_else(|| "Failed to downcast ID column to StringViewArray".to_string())?;
+                .ok_or_else(|| "Failed to downcast 'id' column to StringViewArray".to_string())?;
 
             let text_column = batch
-                .column(1)
+                .column_by_name("text")
+                .ok_or_else(|| "Missing 'text' column".to_string())?
                 .as_any()
                 .downcast_ref::<arrow::array::StringViewArray>()
-                .ok_or_else(|| "Failed to downcast text column to StringViewArray".to_string())?;
+                .ok_or_else(|| "Failed to downcast 'text' column to StringViewArray".to_string())?;
 
             let queries = (0..batch.num_rows())
                 .map(|i| {
@@ -167,22 +169,27 @@ fn extract_query_relevance_from_batches(records: &[RecordBatch]) -> Result<Query
 
     for batch in records {
         let query_id_column = batch
-            .column(0)
+            .column_by_name("query-id")
+            .ok_or_else(|| "Missing 'query-id' column".to_string())?
             .as_any()
             .downcast_ref::<arrow::array::StringViewArray>()
-            .ok_or_else(|| "Failed to downcast query-id column to StringViewArray".to_string())?;
+            .ok_or_else(|| "Failed to downcast 'query-id' column to StringViewArray".to_string())?;
 
         let corpus_id_column = batch
-            .column(1)
+            .column_by_name("corpus-id")
+            .ok_or_else(|| "Missing 'corpus-id' column".to_string())?
             .as_any()
             .downcast_ref::<arrow::array::StringViewArray>()
-            .ok_or_else(|| "Failed to downcast corpus-id column to StringViewArray".to_string())?;
+            .ok_or_else(|| {
+                "Failed to downcast 'corpus-id' column to StringViewArray".to_string()
+            })?;
 
         let score_column = batch
-            .column(2)
+            .column_by_name("score")
+            .ok_or_else(|| "Missing 'score' column".to_string())?
             .as_any()
             .downcast_ref::<arrow::array::Int64Array>()
-            .ok_or_else(|| "Failed to downcast score column to Int64Array".to_string())?;
+            .ok_or_else(|| "Failed to downcast 'score' column to Int64Array".to_string())?;
 
         for i in 0..batch.num_rows() {
             let query_id = query_id_column.value(i).to_string();
