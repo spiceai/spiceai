@@ -16,7 +16,7 @@ limitations under the License.
 
 use crate::component::dataset::Dataset;
 use async_trait::async_trait;
-use data_components::Read;
+use data_components::{Read, ReadWrite};
 use datafusion::datasource::TableProvider;
 use datafusion_table_providers::postgres::PostgresTableFactory;
 use datafusion_table_providers::sql::db_connection_pool::dbconnection;
@@ -138,6 +138,55 @@ impl DataConnectorFactory for PostgresFactory {
 impl DataConnector for Postgres {
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    async fn read_write_provider(
+        &self,
+        dataset: &Dataset,
+    ) -> Option<super::DataConnectorResult<Arc<dyn TableProvider>>> {
+        match ReadWrite::table_provider(
+            &self.postgres_factory,
+            dataset.path().into(),
+            dataset.schema(),
+        )
+        .await
+        {
+            Ok(provider) => Some(Ok(provider)),
+            Err(e) => {
+                if let Some(err_source) = e.source() {
+                    match err_source.downcast_ref::<dbconnection::Error>() {
+                        Some(dbconnection::Error::UndefinedTable {
+                            table_name,
+                            source: _,
+                        }) => {
+                            return Some(Err(DataConnectorError::InvalidTableName {
+                                dataconnector: "postgres".to_string(),
+                                connector_component: ConnectorComponent::from(dataset),
+                                table_name: table_name.clone(),
+                            }));
+                        }
+                        Some(dbconnection::Error::UnsupportedDataType {
+                            data_type,
+                            field_name,
+                        }) => {
+                            return Some(Err(DataConnectorError::UnsupportedDataType {
+                                dataconnector: "postgres".to_string(),
+                                connector_component: ConnectorComponent::from(dataset),
+                                data_type: data_type.clone(),
+                                field_name: field_name.clone(),
+                            }));
+                        }
+                        _ => {}
+                    }
+                }
+
+                return Some(Err(DataConnectorError::UnableToGetReadProvider {
+                    dataconnector: "postgres".to_string(),
+                    connector_component: ConnectorComponent::from(dataset),
+                    source: e,
+                }));
+            }
+        }
     }
 
     async fn read_provider(
