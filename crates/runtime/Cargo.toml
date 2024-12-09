@@ -63,7 +63,11 @@ hyper-util = { version = "0.1.6", features = ["service"] }
 indexmap = "2"
 itertools.workspace = true
 jsonwebtoken = "9.3.0"
-keyring = { version = "3.6.1", features = ["apple-native", "windows-native", "linux-native"], optional = true }
+keyring = { version = "3.6.1", features = [
+    "apple-native",
+    "windows-native",
+    "linux-native",
+], optional = true }
 lazy_static.workspace = true
 llms = { path = "../llms" }
 logos = "0.14.0"
@@ -197,8 +201,8 @@ harness = false
 name = "bench"
 
 [[bench]]
-name = "vector_search"
 harness = false
+name = "vector_search"
 
 [target.'cfg(windows)'.dependencies]
 winver = "1.0.0"
