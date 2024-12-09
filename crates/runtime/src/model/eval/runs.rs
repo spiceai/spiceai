@@ -18,6 +18,7 @@ use crate::{
     datafusion::{DataFusion, SPICE_DEFAULT_CATALOG, SPICE_EVAL_SCHEMA},
     dataupdate::{DataUpdate, UpdateType},
     model::EvalWorker,
+    tracing_util::random_trace_id,
 };
 
 use super::FailedToUpdateEvalRunTableSnafu;
@@ -30,6 +31,7 @@ use arrow::{
 };
 use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef, TimeUnit};
 use futures::TryStreamExt;
+use opentelemetry::trace::TraceId;
 use snafu::ResultExt;
 use uuid::Uuid;
 
@@ -162,8 +164,9 @@ pub async fn start_eval_run(
     df: Arc<DataFusion>,
     ew: Arc<EvalWorker>,
 ) -> Result<EvalRunId> {
-    let id = uuid::Uuid::new_v4();
-    let rb = eval_runs_record(&id, model_name.as_str(), eval)
+    // Use a traceId for the eval run job.
+    let id = random_trace_id().to_string();
+    let rb = eval_runs_record(id.as_str(), model_name.as_str(), eval)
         .boxed()
         .context(FailedToUpdateEvalRunTableSnafu {
             eval_run_id: id.to_string(),
@@ -183,10 +186,9 @@ pub async fn start_eval_run(
         eval_run_id: id.to_string(),
     })?;
 
-    ew.queue_eval_job(&id.to_string(), eval, model_name.as_str())
-        .await?;
+    ew.queue_eval_job(&id, eval, model_name.as_str()).await?;
 
-    Ok(id.to_string())
+    Ok(id)
 }
 
 async fn get_eval_run(
@@ -270,13 +272,13 @@ async fn update_eval_run(
     Ok(())
 }
 
-fn eval_runs_record(uuid: &Uuid, model: &str, eval: &Eval) -> Result<RecordBatch, ArrowError> {
+fn eval_runs_record(id: &str, model: &str, eval: &Eval) -> Result<RecordBatch, ArrowError> {
     // `metrics` as single null in MapArray.
     let mut builder = MapBuilder::new(None, StringBuilder::new(), Float32Builder::new());
     builder.append(false)?;
 
     let arrays: Vec<ArrayRef> = vec![
-        Arc::new(StringArray::from(vec![uuid.to_string()])),
+        Arc::new(StringArray::from(vec![id.to_string()])),
         Arc::new(TimestampSecondArray::from(vec![
             chrono::Utc::now().timestamp()
         ])),

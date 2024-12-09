@@ -30,6 +30,7 @@ use tokio::{
     sync::{mpsc, RwLock},
     task::JoinHandle,
 };
+use tracing_futures::Instrument;
 
 use super::{
     result::{write_result_to_table, ResultBuilder},
@@ -120,6 +121,16 @@ impl EvalThread {
             while let Some(cmd) = receiver.recv().await {
                 match cmd {
                     EvalWorkerCommand::RunEval((id, eval, model_name)) => {
+                        let span = tracing::span!(
+                            target: "task_history",
+                            tracing::Level::INFO,
+                            "eval_run",
+                            input = %serde_json::to_string(&eval).unwrap_or_default(),
+                            trace_id = %id
+                        );
+                        let _guard = span.enter();
+                        span.in_scope(|| tracing::info!(target: "task_history", model = %model_name, "labels"));
+
                         // Set [`EvalRunStatus::Running`]
                         if let Err(e) = update_eval_run_status(
                             Arc::clone(&df),
@@ -141,6 +152,7 @@ impl EvalThread {
                             Arc::clone(&df),
                             Arc::clone(&scorers),
                         )
+                        .instrument(span.clone())
                         .await
                         {
                             Err(e) => (EvalRunStatus::Failed, Some(e.to_string())),
