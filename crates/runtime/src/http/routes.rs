@@ -84,7 +84,6 @@ pub(crate) fn routes(
             .layer(Extension(vector_search))
             .layer(Extension(Arc::clone(&rt.embeds)));
     }
-
     authenticated_router = authenticated_router
         .layer(Extension(Arc::clone(&rt.app)))
         .layer(Extension(Arc::clone(&rt.df)))

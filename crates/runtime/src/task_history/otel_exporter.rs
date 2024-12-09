@@ -28,6 +28,18 @@ use crate::datafusion::DataFusion;
 
 use super::TaskSpan;
 
+macro_rules! extract_attr {
+    ($span:expr, $key:expr) => {
+        $span.events.iter().find_map(|event| {
+            let event_attr_idx = event
+                .attributes
+                .iter()
+                .position(|kv| kv.key.as_str() == $key)?;
+            Some(event.attributes[event_attr_idx].value.as_str().into())
+        })
+    };
+}
+
 #[derive(Clone)]
 pub struct TaskHistoryExporter {
     df: Arc<DataFusion>,
@@ -55,6 +67,10 @@ impl TaskHistoryExporter {
         }
     }
 
+    fn is_valid_span_id(span_id: &Arc<str>) -> bool {
+        span_id.len() == 16 && span_id.chars().all(|c| c.is_ascii_hexdigit())
+    }
+
     fn is_valid_traceid(trace_id: &Arc<str>) -> bool {
         trace_id.len() == 32 && trace_id.chars().all(|c| c.is_ascii_hexdigit())
     }
@@ -77,16 +93,7 @@ impl TaskHistoryExporter {
                 |idx| span.attributes[idx].value.as_str().into(),
             );
 
-        let trace_id_override: Option<Arc<str>> = span
-            .events
-            .iter()
-            .find_map(|event| {
-                let event_attr_idx = event
-                    .attributes
-                    .iter()
-                    .position(|kv| kv.key.as_str() == "trace_id")?;
-                Some(event.attributes[event_attr_idx].value.as_str().into())
-            })
+        let trace_id_override: Option<Arc<str>> = extract_attr!(span, "trace_id")
             .and_then(|trace_id| if Self::is_valid_traceid(&trace_id) {
                 Some(trace_id)
             } else {
@@ -94,17 +101,16 @@ impl TaskHistoryExporter {
                 None
             });
 
-        let captured_output: Option<Arc<str>> = span
-            .events
-            .iter()
-            .find_map(|event| {
-                let event_attr_idx = event
-                    .attributes
-                    .iter()
-                    .position(|kv| kv.key.as_str() == "captured_output")?;
-                Some(event.attributes[event_attr_idx].value.as_str().into())
-            })
-            .map(|output| self.process_output(output));
+        let distributed_parent_id: Option<Arc<str>> = extract_attr!(span, "parent_id")
+            .and_then(|parent_id| if Self::is_valid_span_id(&parent_id) {
+                Some(parent_id)
+            } else {
+                tracing::warn!("User provided 'parent_id'='{}' is a invalid span id. Must be a 32 character hex string.", Arc::clone(&trace_id));
+                None
+            });
+
+        let captured_output: Option<Arc<str>> =
+            extract_attr!(span, "captured_output").map(|output| self.process_output(output));
 
         let start_time = span.start_time;
         let end_time = span.end_time;
@@ -156,6 +162,7 @@ impl TaskHistoryExporter {
             trace_id_override,
             span_id,
             parent_span_id,
+            distributed_parent_id,
             task,
             input,
             captured_output,

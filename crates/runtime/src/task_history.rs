@@ -55,6 +55,11 @@ pub(crate) struct TaskSpan {
     /// An identifier to the [`TaskSpan`] that directly started this [`TaskSpan`].
     pub(crate) parent_span_id: Option<Arc<str>>,
 
+    /// A span id that came from a client-initiated trace. When set, it indicates this span is the child of a trace for a broader, distributed system (i.e. greater than just `spiced` used for distributed tracing).
+    ///
+    /// Only used if `parent_span_id` is `None`.
+    pub(crate) distributed_parent_id: Option<Arc<str>>,
+
     pub(crate) task: Arc<str>,
     pub(crate) input: Arc<str>,
     pub(crate) captured_output: Option<Arc<str>>,
@@ -187,9 +192,10 @@ impl TaskSpan {
                     }
                     "parent_span_id" => {
                         let str_builder = downcast_builder::<StringBuilder>(field_builder)?;
-                        match &span.parent_span_id {
-                            Some(parent_span_id) => str_builder.append_value(parent_span_id),
-                            None => str_builder.append_null(),
+                        match (&span.parent_span_id, &span.distributed_parent_id) {
+                            (Some(parent_span_id), _) => str_builder.append_value(parent_span_id),
+                            (None, Some(parent_id)) => str_builder.append_value(parent_id),
+                            (None, None) => str_builder.append_null(),
                         }
                     }
                     "task" => {
