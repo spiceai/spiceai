@@ -34,7 +34,6 @@ use tokio::{
 use super::{
     result::{write_result_to_table, ResultBuilder},
     runs::{add_metrics_to_eval_run, update_eval_run_status, EvalRunId, EvalRunStatus},
-    scorer::result_metrics,
     Error, FailedToOffloadEvalRunSnafu,
 };
 
@@ -198,7 +197,11 @@ pub async fn run_eval(
     write_results(id, Arc::clone(&df), &input, &actual, &ideal, &scores).await?;
 
     // Compute metrics
-    let metrics = result_metrics(scores, &scorers_to_use).await;
+    let metrics = scorers_to_use
+        .iter()
+        .map(|(name, scorer)| ((*name).clone(), scorer.metrics(&scores[name])))
+        .collect();
+
     add_metrics_to_eval_run(Arc::clone(&df), id, &metrics).await?;
     Ok(())
 }

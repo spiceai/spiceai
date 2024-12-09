@@ -54,20 +54,6 @@ pub(crate) async fn score_results(
     aggregate
 }
 
-/// Use [`Scorer::metrics`] to compute relevant metrics for each type of scorer.
-///
-/// Keys in `scores` should match the keys in `scorers`.
-#[allow(clippy::similar_names)]
-pub(crate) async fn result_metrics(
-    scores: HashMap<String, Vec<f32>>,
-    scorers: &HashMap<String, Arc<dyn Scorer>>,
-) -> HashMap<String, Vec<(String, f32)>> {
-    scorers
-        .iter()
-        .map(|(name, scorer)| ((*name).clone(), scorer.metrics(&scores[name])))
-        .collect()
-}
-
 /// [`MatchScorer`] checks for equality between the actual and ideal values.
 ///
 /// The score is an exact match, but it only compare the less detailed of the two [`DatasetOutput`]. ([`DatasetOutput::AssistantResponse`] < [`DatasetOutput::Messages`]).
