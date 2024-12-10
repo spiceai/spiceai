@@ -229,6 +229,13 @@ impl FlightClient {
         })
     }
 
+    /// Overrides the metadata for the flight client.
+    #[must_use]
+    pub fn with_metadata(mut self, metadata: tonic::metadata::MetadataMap) -> Self {
+        self.metadata = Some(metadata);
+        self
+    }
+
     /// Queries the flight service for the schema of the path.
     ///
     /// # Arguments
