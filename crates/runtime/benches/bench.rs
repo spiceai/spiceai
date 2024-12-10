@@ -237,7 +237,7 @@ async fn run_connector_bench(
         }
         #[cfg(feature = "odbc")]
         "odbc-databricks" => {
-            bench_odbc_databricks::run(&mut rt, &mut benchmark_results).await?;
+            bench_odbc_databricks::run(&mut rt, &mut benchmark_results, bench_name).await?;
         }
         #[cfg(feature = "odbc")]
         "odbc-athena" => {
