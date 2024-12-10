@@ -118,6 +118,16 @@ impl Debezium {
                 .to_string()
                 .parse()
                 .unwrap_or(true),
+            ssl_endpoint_identification_algorithm: params
+                .get("kafka_ssl_endpoint_identification_algorithm")
+                .expose()
+                .ok()
+                .unwrap_or("https")
+                .try_into()
+                .unwrap_or_else(|_| {
+                    tracing::warn!("Invalid value for 'kafka_ssl_endpoint_identification_algorithm'. Supported values: 'none', 'https'. Defaulting to 'https'.");
+                    data_components::kafka::SslIdentification::Https
+                }),
         };
 
         Ok(Self { kafka_config })
@@ -171,6 +181,9 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::runtime("kafka_enable_ssl_certificate_verification")
         .default("true")
         .description("Enable SSL/TLS certificate verification. Default: 'true'."),
+    ParameterSpec::runtime("kafka_ssl_endpoint_identification_algorithm")
+        .default("https")
+        .description("SSL/TLS endpoint identification algorithm. Default: 'https'. Options: 'none', 'https'."),
 ];
 
 impl DataConnectorFactory for DebeziumFactory {
