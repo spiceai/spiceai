@@ -286,8 +286,8 @@ jobs:
           unzip SimbaSparkODBC-2.8.2.1013-Debian-64bit.zip
           sudo dpkg -i simbaspark_2.8.2.1013-2_amd64.deb
           cat <<EOF > /tmp/odbcinst.ini
-          [Simba Spark ODBC Driver]
-          Description=Simba Spark ODBC Driver
+          [Databricks ODBC Driver]
+          Description=Databricks ODBC Driver
           Driver=/opt/simba/spark/lib/64/libsparkodbc_sb64.so
           Setup=/opt/simba/spark/lib/64/libsparkodbc_sb64.so
           EOF
