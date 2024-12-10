@@ -18,6 +18,7 @@ use crate::component::dataset::acceleration::{Engine, RefreshMode};
 use crate::component::dataset::Dataset;
 use crate::dataaccelerator::spice_sys::debezium_kafka::DebeziumKafkaSys;
 use crate::dataconnector::ConnectorComponent;
+use crate::datafusion::refresh_sql;
 use crate::federated_table::FederatedTable;
 use arrow::datatypes::SchemaRef;
 use async_stream::stream;
@@ -48,6 +49,9 @@ pub enum Error {
 
     #[snafu(display("Missing required parameter: 'debezium_kafka_bootstrap_servers'. Specify a value.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/debezium#parameters"))]
     MissingKafkaBootstrapServers,
+
+    #[snafu(display("{source}"))]
+    RefreshSql { source: refresh_sql::Error },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -124,7 +128,7 @@ impl Debezium {
                 .ok()
                 .unwrap_or("https")
                 .try_into()
-                .unwrap_or_else(|_| {
+                .unwrap_or_else(|()| {
                     tracing::warn!("Invalid value for 'kafka_ssl_endpoint_identification_algorithm'. Supported values: 'none', 'https'. Defaulting to 'https'.");
                     data_components::kafka::SslIdentification::Https
                 }),
@@ -302,8 +306,22 @@ impl DataConnector for Debezium {
             None => get_metadata_from_kafka(dataset, &topic, self.kafka_config.clone()).await?,
         };
 
+        let refresh_sql = dataset.refresh_sql();
+        let refresh_schema = if let Some(refresh_sql) = &refresh_sql {
+            refresh_sql::validate_refresh_sql(dataset.name.clone(), refresh_sql.as_str(), schema)
+                .boxed()
+                .map_err(|e| super::DataConnectorError::InvalidConfiguration {
+                    dataconnector: "debezium".to_string(),
+                    message: format!("The refresh SQL is invalid: {e}"),
+                    connector_component: ConnectorComponent::from(dataset),
+                    source: e,
+                })?
+        } else {
+            schema
+        };
+
         let debezium_kafka = Arc::new(DebeziumKafka::new(
-            schema,
+            refresh_schema,
             metadata.primary_keys,
             kafka_consumer,
         ));
