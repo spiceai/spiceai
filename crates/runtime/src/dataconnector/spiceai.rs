@@ -195,24 +195,6 @@ impl DataConnector for SpiceAI {
         dataset: &Dataset,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
         let mut dataset_schema = dataset.schema();
-        if let Some(acceleration) = &dataset.acceleration {
-            if acceleration.refresh_mode == Some(RefreshMode::Append)
-                && dataset.time_column.is_none()
-            {
-                dataset_schema = Some(Arc::new(
-                    append_stream_schema(
-                        self.flight_factory.client(),
-                        SpiceAI::spice_dataset_path(dataset).into(),
-                    )
-                    .await
-                    .boxed()
-                    .context(UnableToGetReadProviderSnafu {
-                        dataconnector: "spice.ai",
-                        connector_component: ConnectorComponent::from(dataset),
-                    })?,
-                ));
-            }
-        }
 
         match Read::table_provider(
             &self.flight_factory,
@@ -341,7 +323,6 @@ impl SpiceAI {
     fn spice_dataset_path<T: Borrow<Dataset>>(dataset: T) -> String {
         let dataset = dataset.borrow();
         let path = dataset.path();
-        let path = path.trim_start_matches("spice.ai/");
         let path_parts: Vec<&str> = path.split('/').collect();
 
         match path_parts.as_slice() {
