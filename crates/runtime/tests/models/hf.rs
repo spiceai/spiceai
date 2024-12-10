@@ -399,7 +399,7 @@ async fn huggingface_test_chat_messages() -> Result<(), anyhow::Error> {
     test_request_context().scope(async {
         let model = Arc::new(create_hf_model(
             HF_TEST_MODEL,
-        &Some(HF_TEST_MODEL_TYPE.to_string()),
+        Some(HF_TEST_MODEL_TYPE),
             None,
         )?);
 

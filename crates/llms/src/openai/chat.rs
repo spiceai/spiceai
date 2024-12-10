@@ -18,6 +18,7 @@ limitations under the License.
 use crate::chat::nsql::structured_output::StructuredOutputSqlGeneration;
 use crate::chat::nsql::{json::JsonSchemaSqlGeneration, SqlGeneration};
 use crate::chat::Chat;
+use async_openai::config::Config;
 use async_openai::error::OpenAIError;
 use async_openai::types::{
     ChatCompletionResponseStream, CreateChatCompletionRequest, CreateChatCompletionResponse,
@@ -34,7 +35,7 @@ pub(crate) const GPT3_5_TURBO_INSTRUCT: &str = "gpt-3.5-turbo";
 pub const DEFAULT_LLM_MODEL: &str = GPT3_5_TURBO_INSTRUCT;
 
 #[async_trait]
-impl Chat for Openai {
+impl<C: Config + Send + Sync> Chat for Openai<C> {
     fn as_sql(&self) -> Option<&dyn SqlGeneration> {
         // Only use structured output schema for OpenAI, not openai compatible.
         if self.supports_structured_output() {

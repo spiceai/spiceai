@@ -95,10 +95,10 @@ pub(crate) fn inputs_from_openai(input: &EmbeddingInput) -> Vec<EncodingInput> {
     }
 }
 
-fn get_api(model_id: &str, revision: Option<&str>, hf_token: Option<String>) -> Result<ApiRepo> {
+fn get_api(model_id: &str, revision: Option<&str>, hf_token: Option<&str>) -> Result<ApiRepo> {
     let api = ApiBuilder::new()
         .with_progress(false)
-        .with_token(hf_token)
+        .with_token(hf_token.map(ToString::to_string))
         .build()
         .boxed()
         .context(FailedToInstantiateEmbeddingModelSnafu)?;
@@ -144,7 +144,7 @@ pub async fn download_hf_file(
 pub(crate) async fn download_hf_artifacts(
     model_id: &str,
     revision: Option<&str>,
-    hf_token: Option<String>,
+    hf_token: Option<&str>,
 ) -> Result<PathBuf> {
     let api_repo = get_api(model_id, revision, hf_token)?;
     let repo_url = api_repo.url("");

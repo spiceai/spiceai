@@ -571,10 +571,10 @@ pub trait Chat: Sync + Send {
 ///    be inferred from the `.model_type` key in a HF's `config.json`.
 pub fn create_hf_model(
     model_id: &str,
-    model_type: &Option<String>,
+    model_type: Option<&str>,
     hf_token_literal: Option<&Secret<String>>,
 ) -> Result<Box<dyn Chat>> {
-    mistral::MistralLlama::from_hf(model_id, model_type.as_deref(), hf_token_literal)
+    mistral::MistralLlama::from_hf(model_id, model_type, hf_token_literal)
         .map(|x| Box::new(x) as Box<dyn Chat>)
 }
 
