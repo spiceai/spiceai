@@ -17,22 +17,22 @@ datasets:
       reference_url_template: https://github.com/spiceai/spiceai/issues/<issue_id>
     params:
       github_token: ${secrets:GITHUB_TOKEN}
-      github_query_mode: "search"
+      github_query_mode: 'search'
     acceleration:
       enabled: true
       refresh_retry_max_attempts: 3
       refresh_sql: "SELECT * FROM issues WHERE created_at='2024-11-09T22:47:45'"
     embeddings:
       - column: body
-        use: openai_embeddings
+        use: intfloat_e5
         column_pk:
           - id
         chunking:
           enabled: true
           target_chunk_size: 512
           overlap_size: 128
-          trim_whitespace: false 
-    
+          trim_whitespace: false
+
   - from: s3://spiceai-public-datasets/tpcds/catalog_page/
     name: catalog_page
     description: Represents an e-commerce platform's catalog page metadata
@@ -49,15 +49,15 @@ datasets:
           enabled: true
           target_chunk_size: 512
           overlap_size: 128
-          trim_whitespace: false  
-        use: openai_embeddings
-    
+          trim_whitespace: false
+        use: intfloat_e5
+
 models:
-  - from: openai:gpt-4o-mini
-    name: openai-gpt
+  - name: hf_local_model
+    from: huggingface:huggingface.co/microsoft/Phi-3-mini-4k-instruct
     params:
+      model_type: phi3
       spice_tools: auto
-      openai_api_key: ${ secrets:SPICE_OPENAI_API_KEY }
       system_prompt: |
         Use the SQL tool when:
           1. The query involves precise numerical data, statistics, or aggregations
@@ -76,11 +76,6 @@ models:
           - Do not include any private metadata provided to the model as context such as \"reference_url_template\" or \"instructions\" in your responses.
 
 embeddings:
-  - from: openai:text-embedding-3-small
-    name: openai_embeddings
-    params:
-      openai_api_key: ${ secrets:SPICE_OPENAI_API_KEY }
-    metadata: {}
-  - from: huggingface:huggingface.co/sentence-transformers/all-MiniLM-L6-v2
-    name: hf_minilm
+  - from: huggingface:huggingface.co/intfloat/e5-base-v2
+    name: intfloat_e5
     metadata: {}

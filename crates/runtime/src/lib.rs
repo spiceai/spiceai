@@ -305,6 +305,16 @@ impl Runtime {
         Arc::clone(&self.status)
     }
 
+    #[must_use]
+    pub fn embeds(&self) -> Arc<RwLock<EmbeddingModelStore>> {
+        Arc::clone(&self.embeds)
+    }
+
+    #[must_use]
+    pub fn app(&self) -> Arc<RwLock<Option<Arc<App>>>> {
+        Arc::clone(&self.app)
+    }
+
     /// Requests a loaded extension, or will attempt to load it if part of the autoloaded extensions.
     pub async fn extension(&self, name: &str) -> Option<Arc<dyn Extension>> {
         let extensions = self.extensions.read().await;

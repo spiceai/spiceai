@@ -14,19 +14,19 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{future::Future, time::Duration};
+use std::{future::Future, process::Command, time::Duration};
 
 use runtime::Runtime;
 use tracing_subscriber::EnvFilter;
 
-pub(crate) fn init_tracing() {
-    let filter = match std::env::var("SPICED_LOG").ok() {
-        Some(level) => EnvFilter::new(level),
+pub(crate) fn init_tracing(trace_config: Option<&str>) {
+    let filter = match (trace_config, std::env::var("SPICED_LOG").ok()) {
+        (_, Some(log)) => EnvFilter::new(log),
+        (Some(level), None) => EnvFilter::new(level),
         _ => EnvFilter::new(
-            "runtime=TRACE,datafusion-federation=TRACE,datafusion-federation-sql=TRACE,bench=TRACE",
+            "runtime=TRACE,datafusion-federation=TRACE,datafusion-federation-sql=TRACE,bench=TRACE,INFO",
         ),
     };
-
     let subscriber = tracing_subscriber::FmtSubscriber::builder()
         .with_env_filter(filter)
         .with_ansi(true)
@@ -51,4 +51,46 @@ where
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
     false
+}
+
+// This should also append "-dirty" if there are uncommitted changes
+pub(crate) fn get_commit_sha() -> String {
+    let short_sha = Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .output()
+        .map_or_else(
+            |_| "unknown".to_string(),
+            |output| String::from_utf8_lossy(&output.stdout).trim().to_string(),
+        );
+    format!(
+        "{}{}",
+        short_sha,
+        if is_repo_dirty() { "-dirty" } else { "" }
+    )
+}
+
+pub(crate) fn get_branch_name() -> String {
+    Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .output()
+        .map_or_else(
+            |_| "unknown".to_string(),
+            |output| String::from_utf8_lossy(&output.stdout).trim().to_string(),
+        )
+}
+
+#[allow(clippy::map_unwrap_or)]
+fn is_repo_dirty() -> bool {
+    let output = Command::new("git")
+        .arg("status")
+        .arg("--porcelain")
+        .output()
+        .map(|output| {
+            std::str::from_utf8(&output.stdout)
+                .map(ToString::to_string)
+                .unwrap_or_else(|_| String::new())
+        })
+        .unwrap_or_else(|_| String::new());
+
+    !output.trim().is_empty()
 }

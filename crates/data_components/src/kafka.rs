@@ -59,6 +59,34 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub enum SslIdentification {
+    None,
+    #[default]
+    Https,
+}
+
+impl TryFrom<&str> for SslIdentification {
+    type Error = ();
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        Ok(match value {
+            "none" => SslIdentification::None,
+            "https" => SslIdentification::Https,
+            _ => return Err(()),
+        })
+    }
+}
+
+impl std::fmt::Display for SslIdentification {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SslIdentification::None => write!(f, "none"),
+            SslIdentification::Https => write!(f, "https"),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct KafkaConfig {
     pub brokers: String,
@@ -68,6 +96,7 @@ pub struct KafkaConfig {
     pub sasl_password: Option<String>,
     pub ssl_ca_location: Option<String>,
     pub enable_ssl_certificate_verification: bool,
+    pub ssl_endpoint_identification_algorithm: SslIdentification,
 }
 
 pub struct KafkaConsumer {
@@ -219,7 +248,15 @@ impl KafkaConsumer {
         }
         if kafka_config.enable_ssl_certificate_verification {
             config.set("enable.ssl.certificate.verification", "true");
+        } else {
+            config.set("enable.ssl.certificate.verification", "false");
         }
+        config.set(
+            "ssl.endpoint.identification.algorithm",
+            kafka_config
+                .ssl_endpoint_identification_algorithm
+                .to_string(),
+        );
 
         let consumer: StreamConsumer = config
             .set_log_level(RDKafkaLogLevel::Debug)
