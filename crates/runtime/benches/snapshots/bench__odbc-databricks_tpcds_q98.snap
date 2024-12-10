@@ -1,0 +1,19 @@
+---
+source: crates/runtime/benches/bench.rs
+expression: records_pretty
+snapshot_kind: text
+---
++------------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------+------------+-------------+-----------------+-------------+--------------+
+| i_item_id        | i_item_desc                                                                                                                                               | i_category | i_class     | i_current_price | itemrevenue | revenueratio |
++------------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------+------------+-------------+-----------------+-------------+--------------+
+| AAAAAAAAAABBAAAA | Sides let essentially quite new materials. Sources must read now with the journals; sometimes financial supporters                                        | Men        | accessories | 5.21            | 5135.95     | 0.429425     |
+| AAAAAAAAAAFDAAAA | Serious, respectable homes help po                                                                                                                        | Men        | accessories | 3.14            | 3468.89     | 0.290039     |
+| AAAAAAAAABAAAAAA | Unquestionably different demands may not turn worldwide false, wide police. Satisfied, littl                                                              | Men        | accessories | 6.49            | 6268.53     | 0.524122     |
+| AAAAAAAAABOCAAAA | Common, scientific quantities need once once southern reasons. Societies leap less. Little, legal readers move english, particular cells. Emp             | Men        | accessories | 3.68            | 3344.58     | 0.279646     |
+| AAAAAAAAACBEAAAA | Powerful occasions used to tackle plans; tough things could perform certainly children. Administrative, useful pr                                         | Men        | accessories | 3.33            | 6238.88     | 0.521643     |
+| AAAAAAAAACCDAAAA | Under little conditions will jump drivers. Raw millions exploit well too little dogs. Theoretical in                                                      | Men        | accessories | 4.09            | 5684.31     | 0.475274     |
+| AAAAAAAAACGAAAAA | Other, likely eyes call thoroughly english others. Grounds think more initially friendly forms. Responsible minutes would use as. Present, individual sit | Men        | accessories | 6.86            | 1390.46     | 0.116259     |
+| AAAAAAAAADAEAAAA | Residential, executive recommendations must not stop also teenage feet. Currently shallow foods shall give just as a whole blue                           | Men        | accessories | 4.20            | 1519.70     | 0.127065     |
+| AAAAAAAAAEDAAAAA | Modern farmers decide wild, usual efforts. Great needs matter without the communities; levels might abandon on a pa                                       | Men        | accessories | 87.37           | 578.82      | 0.048396     |
+| AAAAAAAAAEJDAAAA | Stars provide long. Difficu                                                                                                                               | Men        | accessories | 8.56            | 18531.36    | 1.549437     |
++------------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------+------------+-------------+-----------------+-------------+--------------+

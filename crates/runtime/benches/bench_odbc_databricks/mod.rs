@@ -34,14 +34,13 @@ pub(crate) async fn run(
     let mut errors = Vec::new();
 
     for (query_name, query) in test_queries {
-        let verify_query_results = query_name.starts_with("tpch_q");
         if let Err(e) = super::run_query_and_record_result(
             rt,
             benchmark_results,
             "odbc-databricks",
             query_name,
             query,
-            verify_query_results,
+            true,
         )
         .await
         {
@@ -202,8 +201,8 @@ fn get_tpcds_test_queries() -> Vec<(&'static str, &'static str)> {
         ("tpcds_q10", include_str!("../queries/tpcds/q10.sql")),
         ("tpcds_q11", include_str!("../queries/tpcds/q11.sql")),
         ("tpcds_q12", include_str!("../queries/tpcds/q12.sql")),
-        ("tpcds_q13", include_str!("../queries/tpcds/q13.sql")),
-        ("tpcds_q14", include_str!("../queries/tpcds/q14.sql")),
+        // ("tpcds_q13", include_str!("../queries/tpcds/q13.sql")), this takes excessively long from the ODBC driver re-writing the query to something
+        // ("tpcds_q14", include_str!("../queries/tpcds/q14.sql")), this query contains multiple queries, which aren't supported
         ("tpcds_q15", include_str!("../queries/tpcds/q15.sql")),
         ("tpcds_q16", include_str!("../queries/tpcds/q16.sql")),
         ("tpcds_q17", include_str!("../queries/tpcds/q17.sql")),
@@ -212,8 +211,8 @@ fn get_tpcds_test_queries() -> Vec<(&'static str, &'static str)> {
         ("tpcds_q20", include_str!("../queries/tpcds/q20.sql")),
         ("tpcds_q21", include_str!("../queries/tpcds/q21.sql")),
         ("tpcds_q22", include_str!("../queries/tpcds/q22.sql")),
-        // ("tpcds_q23", include_str!("../queries/tpcds/q23.sql")), // this query contains multiple queries, which aren't supported
-        // ("tpcds_q24", include_str!("../queries/tpcds/q24.sql")), // this query contains multiple queries, which aren't supported
+        // ("tpcds_q23", include_str!("../queries/tpcds/q23.sql")), this query contains multiple queries, which aren't supported
+        // ("tpcds_q24", include_str!("../queries/tpcds/q24.sql")), this query contains multiple queries, which aren't supported
         ("tpcds_q25", include_str!("../queries/tpcds/q25.sql")),
         ("tpcds_q26", include_str!("../queries/tpcds/q26.sql")),
         ("tpcds_q27", include_str!("../queries/tpcds/q27.sql")),
@@ -228,7 +227,7 @@ fn get_tpcds_test_queries() -> Vec<(&'static str, &'static str)> {
         ("tpcds_q36", include_str!("./tpcds_q36.sql")),
         ("tpcds_q37", include_str!("../queries/tpcds/q37.sql")),
         // ("tpcds_q38", include_str!("../queries/tpcds/q38.sql")), unresolved column names
-        // ("tpcds_q39", include_str!("../queries/tpcds/q39.sql")), // this query contains multiple queries, which aren't supported
+        // ("tpcds_q39", include_str!("../queries/tpcds/q39.sql")), this query contains multiple queries, which aren't supported
         ("tpcds_q40", include_str!("../queries/tpcds/q40.sql")),
         ("tpcds_q41", include_str!("../queries/tpcds/q41.sql")),
         ("tpcds_q42", include_str!("../queries/tpcds/q42.sql")),
