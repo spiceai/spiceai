@@ -555,10 +555,10 @@ impl DataFusion {
         )
         .context(SchemaMismatchSnafu)?;
 
-        let overwrite = if data_update.update_type == UpdateType::Overwrite {
-            InsertOp::Overwrite
-        } else {
-            InsertOp::Append
+        let overwrite = match data_update.update_type {
+            UpdateType::Overwrite => InsertOp::Overwrite,
+            UpdateType::Append => InsertOp::Append,
+            UpdateType::Changes => InsertOp::Replace,
         };
 
         let streaming_update = StreamingDataUpdate::try_from(data_update)
@@ -914,10 +914,12 @@ impl DataFusion {
 
     pub async fn refresh_table(
         &self,
-        dataset_name: &str,
+        dataset_name: &TableReference,
         overrides: Option<RefreshOverrides>,
     ) -> Result<()> {
-        let table = self.get_accelerated_table_provider(dataset_name).await?;
+        let table = self
+            .get_accelerated_table_provider(dataset_name.to_string().as_str())
+            .await?;
         if let Some(accelerated_table) = table.as_any().downcast_ref::<AcceleratedTable>() {
             return accelerated_table.trigger_refresh(overrides).await.context(
                 UnableToTriggerRefreshSnafu {

@@ -79,6 +79,11 @@ async fn get_local_table_provider(
 
     let mut sink = SinkConnector::new(Arc::clone(schema));
     if let Some(pk) = primary_key {
+        println!(
+            "We're adding {:?} to {:?}",
+            pk.clone(),
+            name.to_quoted_string()
+        );
         sink = sink.with_primary_key(&pk);
     };
 
@@ -104,13 +109,19 @@ pub async fn create_internal_accelerated_table(
     retention: Option<Retention>,
     secrets: Arc<RwLock<Secrets>>,
 ) -> Result<Arc<AcceleratedTable>, Error> {
-    let source_table_provider = get_local_table_provider(&name, &schema, primary_key).await?;
-    let federated_table = Arc::new(FederatedTable::new(source_table_provider));
-
+    let source_table_provider =
+        get_local_table_provider(&name, &schema, primary_key.clone()).await?;
+    let federated_table = Arc::new(FederatedTable::new(Arc::clone(&source_table_provider)));
+    println!(
+        "create_internal_accelerated_table: name: {:?} == {:?} - {:?}",
+        name.to_quoted_string(),
+        primary_key.clone(),
+        Arc::clone(&source_table_provider).constraints(),
+    );
     let accelerated_table_provider = create_accelerator_table(
         name.clone(),
         Arc::clone(&schema),
-        None,
+        Arc::clone(&source_table_provider).constraints(),
         &acceleration,
         secrets,
         None,

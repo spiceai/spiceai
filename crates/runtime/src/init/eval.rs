@@ -18,12 +18,16 @@ use core::time::Duration;
 use std::sync::Arc;
 
 use datafusion::sql::TableReference;
+use datafusion_table_providers::util::column_reference::ColumnReference;
 use snafu::ResultExt;
 use tokio::sync::RwLock;
 
 use crate::{
     accelerated_table::{refresh::Refresh, Retention},
-    component::dataset::{acceleration::Acceleration, TimeFormat},
+    component::dataset::{
+        acceleration::{Acceleration, IndexType},
+        TimeFormat,
+    },
     datafusion::SPICE_EVAL_SCHEMA,
     internal_table::create_internal_accelerated_table,
     model::{
@@ -63,7 +67,9 @@ impl Runtime {
             TableReference::partial(SPICE_EVAL_SCHEMA, EVAL_RESULTS_TABLE_REFERENCE.table()), // Cannot parse Catalog.
             EVAL_RESULTS_TABLE_SCHEMA.clone(),
             None,
-            Acceleration::default(),
+            Acceleration::default().with_primary_key(ColumnReference::new(vec![
+                EVAL_RESULTS_TABLE_TIME_COLUMN.to_string(),
+            ])),
             Refresh::default(),
             retention,
             Arc::new(RwLock::new(Secrets::default())),

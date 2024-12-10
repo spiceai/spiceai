@@ -17,19 +17,23 @@
 
 //! [`MemTable`] for querying `Vec<RecordBatch>` by `DataFusion`.
 
+use arrow::array::BooleanBuilder;
+use arrow::compute::filter_record_batch;
+use arrow::util::pretty::pretty_format_batches;
 use datafusion::catalog::Session;
 // This is modified from the DataFusion `MemTable` to support overwrites. This file can be removed once that change is upstreamed.
 use datafusion::dataframe::DataFrame;
 use datafusion::logical_expr::dml::InsertOp;
+use datafusion::scalar::ScalarValue;
 use std::any::Any;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Debug};
 
 use std::sync::{Arc, Mutex};
 
 use arrow::{datatypes::SchemaRef, record_batch::RecordBatch};
 use async_trait::async_trait;
-use datafusion::common::{Constraints, SchemaExt};
+use datafusion::common::{Constraint, Constraints, SchemaExt};
 use datafusion::datasource::{provider_as_source, TableProvider, TableType};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::context::SessionContext;
@@ -177,7 +181,19 @@ impl TableProvider for MemTable {
             ));
         }
 
-        let sink = Arc::new(MemSink::new(self.batches.clone(), overwrite));
+        // If the table has a primary key, we need to know it to handle `InsertOp::Replace`.
+        let mut primary_key = None;
+        if let Some(constraints) = self.constraints() {
+            primary_key = constraints.iter().find_map(|c| {
+                if let Constraint::PrimaryKey(pk) = c {
+                    Some(pk.clone())
+                } else {
+                    None
+                }
+            });
+        };
+
+        let sink = Arc::new(MemSink::new(self.batches.clone(), overwrite, primary_key));
         Ok(Arc::new(DataSinkExec::new(
             input,
             sink,
@@ -192,10 +208,14 @@ impl TableProvider for MemTable {
 }
 
 /// Implements for writing to a [`MemTable`]
-struct MemSink {
+pub struct MemSink {
     /// Target locations for writing data
     batches: Vec<PartitionData>,
     overwrite: InsertOp,
+
+    // When `InsertOp::Replace`, the primary key is required to determine how to replace rows.
+    // If `None`, then `InsertOp::Replace` will mimic `InsertOp::Append`.
+    primary_key: Option<Vec<usize>>,
 }
 
 impl Debug for MemSink {
@@ -218,9 +238,125 @@ impl DisplayAs for MemSink {
 }
 
 impl MemSink {
-    fn new(batches: Vec<PartitionData>, overwrite: InsertOp) -> Self {
-        Self { batches, overwrite }
+    fn new(
+        batches: Vec<PartitionData>,
+        overwrite: InsertOp,
+        primary_key: Option<Vec<usize>>,
+    ) -> Self {
+        Self {
+            batches,
+            overwrite,
+            primary_key,
+        }
     }
+
+    /// Help handle `write_all` operations when `InsertOp::Replace` is used and primary keys exist.
+    async fn handle_primary_keys_with_partitions(
+        &self,
+        pk_indices: &[usize],
+        new_batches: Vec<Vec<RecordBatch>>,
+    ) -> Result<u64> {
+        println!("we in!!!");
+        let row_count: usize = new_batches
+            .iter()
+            .flat_map(|b| b.iter())
+            .map(RecordBatch::num_rows)
+            .sum();
+
+        // Create unique string for each primary key across all `new_batches` rows.
+        let new_key_set: HashSet<String> = new_batches
+            .iter()
+            .flat_map(|p| p.iter().map(|b| extract_primary_keys_str(b, pk_indices)))
+            .collect::<Result<Vec<_>, _>>()?
+            .iter()
+            .flatten()
+            .cloned()
+            .collect();
+
+        // Currently, we assume no primary key conflicts within `new_batches`.
+        // We don't have to find primary key conflicts between `new_batches` and `self.batches`, the following will sufice.
+        //   - Filter out any row in `self.batches` that has a primary key in from `new_batches`.
+        //   - Insert all `new_batches` into `self.batches`.
+        let mut futures = Vec::with_capacity(self.batches.len());
+        for (i, partition_data) in self.batches.iter().enumerate() {
+            let part_new_batches = new_batches[i].clone();
+            let part_key_set = &new_key_set;
+            // let pk_indices = pk_indices
+
+            let fut = async move {
+                let mut guard = partition_data.write().await;
+                println!("existing guarg: {}", pretty_format_batches(&guard).unwrap());
+                filter_existing(&mut guard, part_key_set, pk_indices)?;
+                let mut to_append = part_new_batches;
+                println!("to_append: {}", pretty_format_batches(&to_append).unwrap());
+                guard.append(&mut to_append);
+                Ok::<(), DataFusionError>(())
+            };
+            futures.push(fut);
+        }
+
+        // Wait for all partitions to finish
+        futures::future::join_all(futures)
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(row_count as u64)
+    }
+}
+
+/// Create primary key values for a [`RecordBatch`]. For composite keys, values are concatenated with a delimiter '|'.
+fn extract_primary_keys_str(batch: &RecordBatch, pk_indices: &[usize]) -> Result<Vec<String>> {
+    let num_rows = batch.num_rows();
+    let mut keys = Vec::with_capacity(num_rows);
+
+    for row_idx in 0..num_rows {
+        let mut parts = Vec::with_capacity(pk_indices.len());
+        for &col_idx in pk_indices {
+            let col = batch.column(col_idx);
+            let val = ScalarValue::try_from_array(col, row_idx)
+                .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+            parts.push(val.to_string());
+        }
+        // Join all PK parts with a delimiter
+        let key = parts.join("|");
+        keys.push(key);
+    }
+
+    Ok(keys)
+}
+
+/// Filter elements of `existing_batches` that have primary keys from `overwriting_primary_keys`.
+///
+/// This is one part of `InsertOp::Replace` functionality, and still requires the new rows (with conflicting PKs), to be added.
+///
+/// This function modifies `existing_batches` in place.
+fn filter_existing(
+    existing_batches: &mut Vec<RecordBatch>,
+    overwriting_primary_keys: &HashSet<String>,
+    pk_indices: &[usize],
+) -> Result<()> {
+    if existing_batches.is_empty() {
+        return Ok(());
+    }
+
+    // Instead of concatenating, we can filter each batch individually
+    let mut filtered = Vec::with_capacity(existing_batches.len());
+    for batch in existing_batches.drain(..) {
+        let keys = extract_primary_keys_str(&batch, pk_indices)?;
+
+        let mut keep_row_builder = BooleanBuilder::with_capacity(keys.len());
+        for k in keys {
+            keep_row_builder.append_value(!overwriting_primary_keys.contains(&k));
+        }
+        let filtered_batch = filter_record_batch(&batch, &keep_row_builder.finish())?;
+        if filtered_batch.num_rows() > 0 {
+            filtered.push(filtered_batch);
+        }
+    }
+
+    *existing_batches = filtered;
+    Ok(())
 }
 
 #[async_trait]
@@ -238,6 +374,11 @@ impl DataSink for MemSink {
         mut data: SendableRecordBatchStream,
         _context: &Arc<TaskContext>,
     ) -> Result<u64> {
+        println!(
+            "we're writing!@!@ {:?} == {:?}",
+            self.overwrite.clone(),
+            self.primary_key.clone()
+        );
         let num_partitions = self.batches.len();
 
         // buffer up the data round robin style into num_partitions
@@ -254,6 +395,15 @@ impl DataSink for MemSink {
             row_count += batch.num_rows();
             new_batches[i].push(batch);
             i = (i + 1) % num_partitions;
+        }
+
+        if matches!(self.overwrite, InsertOp::Replace) {
+            if let Some(ref pks) = self.primary_key {
+                // This functionality must be handled separately as primary key conflicts can happen across partitions.
+                return self
+                    .handle_primary_keys_with_partitions(pks, new_batches)
+                    .await;
+            }
         }
 
         let mut writable_targets: Vec<_> =

@@ -168,7 +168,7 @@ async fn spiceai_integration_test_refresh_sql_override_append() -> Result<(), an
 
             rt.datafusion()
                 .refresh_table(
-                    "nation",
+                    "nation".into(),
                     Some(RefreshOverrides {
                         sql: Some("SELECT * FROM nation WHERE n_regionkey = 0".to_string()),
                         mode: Some(RefreshMode::Append),

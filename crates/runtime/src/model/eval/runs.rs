@@ -28,6 +28,7 @@ use arrow::{
         TimestampSecondArray,
     },
     buffer::OffsetBuffer,
+    util::pretty::pretty_format_batches,
 };
 use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef, TimeUnit};
 use futures::TryStreamExt;
@@ -75,10 +76,10 @@ pub static EVAL_RUNS_TABLE_REFERENCE: LazyLock<TableReference> =
     });
 
 pub static EVAL_RUNS_TABLE_TIME_COLUMN: &str = "created_at";
-pub static EVAL_RUNS_TABLE_PRIMARY_KEY: &str = "run_id";
+pub static EVAL_RUNS_TABLE_PRIMARY_KEY: &str = "id";
 pub static EVAL_RUNS_TABLE_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Utf8, false),
+        Field::new(EVAL_RUNS_TABLE_PRIMARY_KEY, DataType::Utf8, false),
         Field::new(
             EVAL_RUNS_TABLE_TIME_COLUMN,
             DataType::Timestamp(TimeUnit::Second, None),
@@ -102,7 +103,7 @@ pub static EVAL_RUNS_TABLE_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
                 )),
                 false,
             ),
-            true,
+            false,
         ),
     ]))
 });
@@ -247,6 +248,11 @@ async fn update_eval_run(
             eval_run_id: id.clone(),
         })?;
 
+    println!(
+        "current get {}",
+        pretty_format_batches(&[rb.clone()]).unwrap()
+    );
+
     let new_rb =
         update_record_batch(&rb, updates)
             .boxed()
@@ -259,7 +265,7 @@ async fn update_eval_run(
         DataUpdate {
             schema: new_rb.schema(),
             data: vec![new_rb],
-            update_type: UpdateType::Append,
+            update_type: UpdateType::Changes,
         },
     )
     .await
@@ -267,13 +273,14 @@ async fn update_eval_run(
     .context(FailedToUpdateEvalRunTableSnafu {
         eval_run_id: id.clone(),
     })?;
+
     Ok(())
 }
 
 fn eval_runs_record(id: &str, model: &str, eval: &Eval) -> Result<RecordBatch, ArrowError> {
     // `metrics` as single null in MapArray.
     let mut builder = MapBuilder::new(None, StringBuilder::new(), Float32Builder::new());
-    builder.append(false)?;
+    builder.append(true)?;
 
     let arrays: Vec<ArrayRef> = vec![
         Arc::new(StringArray::from(vec![id.to_string()])),
