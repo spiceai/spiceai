@@ -87,6 +87,7 @@ impl std::fmt::Display for SslIdentification {
     }
 }
 
+#[derive(Clone)]
 pub struct KafkaConfig {
     pub brokers: String,
     pub security_protocol: String,
