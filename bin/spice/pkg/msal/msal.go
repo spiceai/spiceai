@@ -18,9 +18,6 @@ package msal
 import (
 	"context"
 	"fmt"
-	"log/slog"
-	"net/http"
-	"os"
 
 	"github.com/AzureAD/microsoft-authentication-library-for-go/apps/public"
 )
@@ -43,35 +40,10 @@ func InteractivelyAccessToken(ctx context.Context, tenantId string, clientId str
 	if err != nil || len(accounts) == 0 {
 		result, err = publicClient.AcquireTokenInteractive(ctx, scopes, public.WithRedirectURI("http://localhost"))
 		if err != nil {
-			fmt.Errorf("error creating auth code URL: %w", err)
+			return "", fmt.Errorf("error getting token: %w", err)
 		}
 	}
+
 	access_token := result.AccessToken
-
 	return access_token, nil
-}
-
-func run_redirect_server(output_chan chan string) {
-	server := &http.Server{Addr: ":8091"}
-
-	http.HandleFunc("/", construct_get_token(output_chan))
-
-	if err := server.ListenAndServe(); err != nil {
-		slog.Error("fatal error on server", "error", err)
-		os.Exit(1)
-	}
-}
-
-func construct_get_token(output chan string) func(http.ResponseWriter, *http.Request) {
-	return func(w http.ResponseWriter, r *http.Request) {
-		codes, ok := r.URL.Query()["code"]
-		if !ok || len(codes[0]) < 1 {
-			slog.Error("Authorization code missing")
-			os.Exit(1)
-		}
-
-		code := codes[0]
-		output <- code
-		fmt.Fprintf(w, "Authorised!")
-	}
 }
