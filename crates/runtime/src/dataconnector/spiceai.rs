@@ -57,9 +57,6 @@ use tonic::metadata::MetadataValue;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Invalid dataset path: {dataset_path}\nEnsure the path matches the format: <org>/<app>/datasets/<dataset_reference> and retry."))]
-    UnableToParseDatasetPath { dataset_path: String },
-
     #[snafu(display("Missing required parameter: {parameter}. Specify a value.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/spiceai#configuration"))]
     MissingRequiredParameter { parameter: String },
 
@@ -203,12 +200,17 @@ impl DataConnector for SpiceAI {
             }
         };
 
-        let mut map = MetadataMap::new();
-        map.insert("spiceai_org", dataset_path.org);
-        map.insert("spiceai_app", dataset_path.app);
-        let flight_factory = self.flight_factory.clone().with_metadata(map);
+        let (flight_factory, table_reference) = match dataset_path {
+            SpiceAIDatasetPath::OrgAppPath { org, app, path } => {
+                let mut map = MetadataMap::new();
+                map.insert("spiceai_org", org);
+                map.insert("spiceai_app", app);
+                (self.flight_factory.clone().with_metadata(map), path)
+            }
+            SpiceAIDatasetPath::Path(path) => (self.flight_factory.clone(), path),
+        };
 
-        match Read::table_provider(&flight_factory, dataset_path.path, dataset_schema).await {
+        match Read::table_provider(&flight_factory, table_reference, dataset_schema).await {
             Ok(provider) => Ok(provider),
             Err(e) => {
                 if let Some(data_components::flight::Error::UnableToGetSchema {
@@ -247,13 +249,18 @@ impl DataConnector for SpiceAI {
                 }));
             }
         };
-        let mut map = MetadataMap::new();
-        map.insert("spiceai_org", dataset_path.org);
-        map.insert("spiceai_app", dataset_path.app);
-        let flight_factory = self.flight_factory.clone().with_metadata(map);
+        let (flight_factory, table_reference) = match dataset_path {
+            SpiceAIDatasetPath::OrgAppPath { org, app, path } => {
+                let mut map = MetadataMap::new();
+                map.insert("spiceai_org", org);
+                map.insert("spiceai_app", app);
+                (self.flight_factory.clone().with_metadata(map), path)
+            }
+            SpiceAIDatasetPath::Path(path) => (self.flight_factory.clone(), path),
+        };
 
         let read_write_result =
-            ReadWrite::table_provider(&flight_factory, dataset_path.path, dataset.schema())
+            ReadWrite::table_provider(&flight_factory, table_reference, dataset.schema())
                 .await
                 .context(super::UnableToGetReadWriteProviderSnafu {
                     dataconnector: "spice.ai",
@@ -320,10 +327,13 @@ impl DataConnector for SpiceAI {
     }
 }
 
-struct SpiceAIDatasetPath {
-    org: MetadataValue<Ascii>,
-    app: MetadataValue<Ascii>,
-    path: TableReference,
+enum SpiceAIDatasetPath {
+    OrgAppPath {
+        org: MetadataValue<Ascii>,
+        app: MetadataValue<Ascii>,
+        path: TableReference,
+    },
+    Path(TableReference),
 }
 
 impl SpiceAI {
@@ -346,13 +356,13 @@ impl SpiceAI {
                     MetadataValue::try_from(*app).context(InvalidMetadataValueSnafu {
                         value: Arc::from(*app),
                     })?;
-                Ok(SpiceAIDatasetPath {
+                Ok(SpiceAIDatasetPath::OrgAppPath {
                     org,
                     app,
                     path: TableReference::parse_str(dataset_name),
                 })
             }
-            _ => UnableToParseDatasetPathSnafu { dataset_path: path }.fail(),
+            _ => Ok(SpiceAIDatasetPath::Path(TableReference::parse_str(path))),
         }
     }
 }
