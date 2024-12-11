@@ -265,9 +265,9 @@ var sharepointCmd = &cobra.Command{
 		}
 
 		mergeAuthConfig(cmd, api.AUTH_TYPE_SHAREPOINT, map[string]string{
-			api.AUTH_PARAM_TOKEN:     access_token,
-			api.AUTH_PARAM_TENANT_ID: tenant_id,
-			api.AUTH_PARAM_CLIENT_ID: client_id,
+			api.AUTH_PARAM_BEARER_TOKEN: access_token,
+			api.AUTH_PARAM_TENANT_ID:    tenant_id,
+			api.AUTH_PARAM_CLIENT_ID:    client_id,
 		})
 	},
 }

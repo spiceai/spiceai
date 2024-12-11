@@ -27,9 +27,7 @@ import (
 
 // A function that triggers the user's browser to be directed to an interactive OAuth2.0 authorization.
 // The user will be prompted to login and authorize the application to access the requested scopes.
-// The function will block until the user has completed the authorization and the authorization code has been received. It is intended to be used in a CLI environment where the user can be directed to a browser.
-//
-// This function will temporarily start a local server on `:8091`.
+// The function will block until the user has completed the authorization and the access token has been received. It is intended to be used in a CLI environment where the user can be directed to a browser.
 func InteractivelyAccessToken(ctx context.Context, tenantId string, clientId string, scopes []string) (string, error) {
 	authorityURI := fmt.Sprintf("https://login.microsoftonline.com/%s", tenantId)
 	publicClient, err := public.New(clientId, public.WithAuthority(authorityURI))
