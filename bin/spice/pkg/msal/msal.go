@@ -29,10 +29,13 @@ import (
 func InteractivelyGetAccessToken(ctx context.Context, tenantId string, clientId string, scopes []string) (string, error) {
 	authorityURI := fmt.Sprintf("https://login.microsoftonline.com/%s", tenantId)
 	publicClient, err := public.New(clientId, public.WithAuthority(authorityURI))
+	if err != nil {
+		return "", fmt.Errorf("error creating public client: %w", err)
+	}
 
 	accounts, err := publicClient.Accounts(ctx)
 	if err != nil {
-		return "", fmt.Errorf("error creating public client: %w", err)
+		return "", fmt.Errorf("error getting accounts in token cache: %w", err)
 	}
 	var result public.AuthResult
 	if len(accounts) > 0 {
