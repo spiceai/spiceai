@@ -19,7 +19,6 @@
 
 use arrow::array::BooleanBuilder;
 use arrow::compute::filter_record_batch;
-use arrow::util::pretty::pretty_format_batches;
 use datafusion::catalog::Session;
 // This is modified from the DataFusion `MemTable` to support overwrites. This file can be removed once that change is upstreamed.
 use datafusion::dataframe::DataFrame;
@@ -256,7 +255,6 @@ impl MemSink {
         pk_indices: &[usize],
         new_batches: Vec<Vec<RecordBatch>>,
     ) -> Result<u64> {
-        println!("we in!!!");
         let row_count: usize = new_batches
             .iter()
             .flat_map(|b| b.iter())
@@ -264,32 +262,35 @@ impl MemSink {
             .sum();
 
         // Create unique string for each primary key across all `new_batches` rows.
-        let new_key_set: HashSet<String> = new_batches
+        let new_keys: Vec<String> = new_batches
             .iter()
             .flat_map(|p| p.iter().map(|b| extract_primary_keys_str(b, pk_indices)))
             .collect::<Result<Vec<_>, _>>()?
-            .iter()
+            .into_iter()
             .flatten()
-            .cloned()
             .collect();
 
-        // Currently, we assume no primary key conflicts within `new_batches`.
-        // We don't have to find primary key conflicts between `new_batches` and `self.batches`, the following will sufice.
+        let num_new_keys = new_keys.len();
+        let new_key_set: HashSet<String> = new_keys.into_iter().collect();
+        if new_key_set.len() != num_new_keys {
+            return Err(DataFusionError::Execution(
+                "Primary key values must be unique".to_string(),
+            ));
+        }
+
+        // We don't need to find duplicate primary keys, just to determine if there is a collision. Therefore the following will sufice.
         //   - Filter out any row in `self.batches` that has a primary key in from `new_batches`.
         //   - Insert all `new_batches` into `self.batches`.
         let mut futures = Vec::with_capacity(self.batches.len());
         for (i, partition_data) in self.batches.iter().enumerate() {
-            let part_new_batches = new_batches[i].clone();
+            let mut part_new_batches = new_batches[i].clone();
             let part_key_set = &new_key_set;
-            // let pk_indices = pk_indices
 
             let fut = async move {
-                let mut guard = partition_data.write().await;
-                println!("existing guarg: {}", pretty_format_batches(&guard).unwrap());
-                filter_existing(&mut guard, part_key_set, pk_indices)?;
-                let mut to_append = part_new_batches;
-                println!("to_append: {}", pretty_format_batches(&to_append).unwrap());
-                guard.append(&mut to_append);
+                let mut existing_partition = partition_data.write().await;
+                filter_existing(&mut existing_partition, part_key_set, pk_indices)?;
+
+                existing_partition.append(&mut part_new_batches);
                 Ok::<(), DataFusionError>(())
             };
             futures.push(fut);
@@ -374,11 +375,6 @@ impl DataSink for MemSink {
         mut data: SendableRecordBatchStream,
         _context: &Arc<TaskContext>,
     ) -> Result<u64> {
-        println!(
-            "we're writing!@!@ {:?} == {:?}",
-            self.overwrite.clone(),
-            self.primary_key.clone()
-        );
         let num_partitions = self.batches.len();
 
         // buffer up the data round robin style into num_partitions

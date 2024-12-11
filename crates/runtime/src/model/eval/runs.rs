@@ -28,7 +28,6 @@ use arrow::{
         TimestampSecondArray,
     },
     buffer::OffsetBuffer,
-    util::pretty::pretty_format_batches,
 };
 use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef, TimeUnit};
 use futures::TryStreamExt;
@@ -134,6 +133,10 @@ pub(super) async fn add_metrics_to_eval_run(
 
     let mut updates: HashMap<&str, ArrayRef> = HashMap::new();
     updates.insert("metrics", Arc::new(builder.finish()) as ArrayRef);
+    updates.insert(
+        "status",
+        Arc::new(StringArray::from(vec![EvalRunStatus::Waiting.to_string()])),
+    );
 
     update_eval_run(df, id, updates).await
 }
@@ -247,11 +250,6 @@ async fn update_eval_run(
         .context(FailedToUpdateEvalRunTableSnafu {
             eval_run_id: id.clone(),
         })?;
-
-    println!(
-        "current get {}",
-        pretty_format_batches(&[rb.clone()]).unwrap()
-    );
 
     let new_rb =
         update_record_batch(&rb, updates)

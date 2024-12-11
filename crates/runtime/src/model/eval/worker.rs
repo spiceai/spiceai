@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use crate::model::{
     eval::{dataset::get_eval_data, run_model, scorer::score_results, Result},
@@ -158,7 +158,7 @@ impl EvalThread {
                             Err(e) => (EvalRunStatus::Failed, Some(e.to_string())),
                             Ok(()) => (EvalRunStatus::Completed, None),
                         };
-
+                        tokio::time::sleep(Duration::from_secs(10)).await;
                         if let Err(e) =
                             update_eval_run_status(Arc::clone(&df), &id, &status, err_opt).await
                         {

@@ -57,11 +57,6 @@ impl SinkConnector {
 
     #[must_use]
     pub fn with_primary_key(mut self, primary_key: &[String]) -> Self {
-        println!(
-            "with_primary_key: {:?}, {:?}",
-            primary_key.clone(),
-            self.schema.fields()
-        );
         let primary_key_idxs = primary_key
             .iter()
             .filter_map(|p| self.schema.column_with_name(p.as_str()))
