@@ -327,6 +327,7 @@ impl DataConnector for SpiceAI {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
 enum SpiceAIDatasetPath {
     OrgAppPath {
         org: MetadataValue<Ascii>,
@@ -416,44 +417,107 @@ mod tests {
     use super::*;
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn test_spice_dataset_path() {
         let tests = vec![
             (
-                "spice.ai:spice.ai/lukekim/demo/datasets/my_data".to_string(),
-                "lukekim.demo.my_data",
-            ),
-            (
-                "spice.ai:spice.ai/lukekim/demo/my_data".to_string(),
-                "lukekim.demo.my_data",
-            ),
-            (
                 "spice.ai:lukekim/demo/datasets/my_data".to_string(),
-                "lukekim.demo.my_data",
+                SpiceAIDatasetPath::OrgAppPath {
+                    org: MetadataValue::try_from("lukekim").expect("failed to parse org"),
+                    app: MetadataValue::try_from("demo").expect("failed to parse app"),
+                    path: TableReference::parse_str("my_data"),
+                },
             ),
             (
-                "spice.ai:lukekim/demo/my_data".to_string(),
-                "lukekim.demo.my_data",
+                "spice.ai://lukekim/demo/datasets/my_data".to_string(),
+                SpiceAIDatasetPath::OrgAppPath {
+                    org: MetadataValue::try_from("lukekim").expect("failed to parse org"),
+                    app: MetadataValue::try_from("demo").expect("failed to parse app"),
+                    path: TableReference::parse_str("my_data"),
+                },
             ),
             (
                 "spice.ai/lukekim/demo/datasets/my_data".to_string(),
-                "lukekim.demo.my_data",
+                SpiceAIDatasetPath::OrgAppPath {
+                    org: MetadataValue::try_from("lukekim").expect("failed to parse org"),
+                    app: MetadataValue::try_from("demo").expect("failed to parse app"),
+                    path: TableReference::parse_str("my_data"),
+                },
             ),
             (
-                "spice.ai/lukekim/demo/my_data".to_string(),
-                "lukekim.demo.my_data",
+                "spice.ai/eth.recent_blocks".to_string(),
+                SpiceAIDatasetPath::Path(TableReference::parse_str("eth.recent_blocks")),
             ),
-            ("eth.recent_blocks".to_string(), "eth.recent_blocks"),
+            (
+                "spice.ai/eth.transactions".to_string(),
+                SpiceAIDatasetPath::Path(TableReference::parse_str("eth.transactions")),
+            ),
+            (
+                "spice.ai/public.users".to_string(),
+                SpiceAIDatasetPath::Path(TableReference::parse_str("public.users")),
+            ),
+            (
+                "spice.ai/org1/app1/datasets/table_with_underscore".to_string(),
+                SpiceAIDatasetPath::OrgAppPath {
+                    org: MetadataValue::try_from("org1").expect("failed to parse org"),
+                    app: MetadataValue::try_from("app1").expect("failed to parse app"),
+                    path: TableReference::parse_str("table_with_underscore"),
+                },
+            ),
+            (
+                "spice.ai/org-name/app-name/datasets/table-name".to_string(),
+                SpiceAIDatasetPath::OrgAppPath {
+                    org: MetadataValue::try_from("org-name").expect("failed to parse org"),
+                    app: MetadataValue::try_from("app-name").expect("failed to parse app"),
+                    path: TableReference::parse_str("table-name"),
+                },
+            ),
+            (
+                "spice.ai/complex.table.name".to_string(),
+                SpiceAIDatasetPath::Path(TableReference::parse_str("complex.table.name")),
+            ),
+            (
+                "spice.ai/org.name/app.id/datasets/table.name".to_string(),
+                SpiceAIDatasetPath::OrgAppPath {
+                    org: MetadataValue::try_from("org.name").expect("failed to parse org"),
+                    app: MetadataValue::try_from("app.id").expect("failed to parse app"),
+                    path: TableReference::parse_str("table.name"),
+                },
+            ),
+            (
+                "spice.ai/my.org/my.app/datasets/data.table.name".to_string(),
+                SpiceAIDatasetPath::OrgAppPath {
+                    org: MetadataValue::try_from("my.org").expect("failed to parse org"),
+                    app: MetadataValue::try_from("my.app").expect("failed to parse app"),
+                    path: TableReference::parse_str("data.table.name"),
+                },
+            ),
+            (
+                "spice.ai/schema.name.table".to_string(),
+                SpiceAIDatasetPath::Path(TableReference::parse_str("schema.name.table")),
+            ),
+            (
+                "spice.ai/org.with.dots/app.with.dots/datasets/table.with.dots".to_string(),
+                SpiceAIDatasetPath::OrgAppPath {
+                    org: MetadataValue::try_from("org.with.dots").expect("failed to parse org"),
+                    app: MetadataValue::try_from("app.with.dots").expect("failed to parse app"),
+                    path: TableReference::parse_str("table.with.dots"),
+                },
+            ),
+            (
+                "spice.ai/a.b.c/x.y.z/datasets/t1.t2.t3".to_string(),
+                SpiceAIDatasetPath::OrgAppPath {
+                    org: MetadataValue::try_from("a.b.c").expect("failed to parse org"),
+                    app: MetadataValue::try_from("x.y.z").expect("failed to parse app"),
+                    path: TableReference::parse_str("t1.t2.t3"),
+                },
+            ),
         ];
 
         for (input, expected) in tests {
             let dataset = Dataset::try_new(input.clone(), "bar").expect("a valid dataset");
             let dataset_path = SpiceAI::spice_dataset_path(&dataset).expect("a valid dataset path");
-            let path = match dataset_path {
-                SpiceAIDatasetPath::OrgAppPath { path, .. } => path,
-                SpiceAIDatasetPath::Path(path) => path,
-            };
-            let expected_path = TableReference::parse_str(expected);
-            assert_eq!(path, expected_path, "{input}");
+            assert_eq!(dataset_path, expected, "Failed for input: {input}");
         }
     }
 }
