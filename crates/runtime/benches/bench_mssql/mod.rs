@@ -36,7 +36,7 @@ pub(crate) async fn run(
         if let Err(e) = super::run_query_and_record_result(
             rt,
             benchmark_results,
-            "mysql",
+            "mssql",
             query_name,
             query,
             true,
