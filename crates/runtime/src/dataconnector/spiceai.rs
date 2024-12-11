@@ -448,8 +448,12 @@ mod tests {
         for (input, expected) in tests {
             let dataset = Dataset::try_new(input.clone(), "bar").expect("a valid dataset");
             let dataset_path = SpiceAI::spice_dataset_path(&dataset).expect("a valid dataset path");
+            let path = match dataset_path {
+                SpiceAIDatasetPath::OrgAppPath { path, .. } => path,
+                SpiceAIDatasetPath::Path(path) => path,
+            };
             let expected_path = TableReference::parse_str(expected);
-            assert_eq!(dataset_path.path, expected_path, "{input}");
+            assert_eq!(path, expected_path, "{input}");
         }
     }
 }
