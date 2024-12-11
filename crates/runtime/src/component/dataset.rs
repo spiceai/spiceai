@@ -337,61 +337,52 @@ impl Dataset {
         }
     }
 
-    /// Returns the dataset source - the first part of the `from` field before the first `:`.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use runtime::component::dataset::Dataset;
-    ///
-    /// let dataset = Dataset::new("foo:bar".to_string(), "bar".to_string());
-    ///
-    /// assert_eq!(dataset.source(), "foo".to_string());
-    /// ```
-    ///
-    /// ```
-    /// use runtime::component::dataset::Dataset;
-    ///
-    /// let dataset = Dataset::new("foo".to_string(), "bar".to_string());
-    ///
-    /// assert_eq!(dataset.source(), "spice.ai");
-    /// ```
-    #[must_use]
-    pub fn source(&self) -> String {
-        let parts: Vec<&str> = self.from.splitn(2, ':').collect();
-        if parts.len() > 1 {
-            parts[0].to_string()
-        } else {
-            if self.from == "sink" || self.from.is_empty() {
-                return "sink".to_string();
+    /// Helper function that finds the position and length of the first delimiter ('://', ':', or '/')
+    fn find_first_delimiter(&self) -> Option<(usize, usize)> {
+        // Find the earliest occurrence of each delimiter
+        let colon_slash_slash = self.from.find("://");
+        let colon = self.from.find(':');
+        let slash = self.from.find('/');
+
+        // Get the position and length of the first delimiter
+        match (colon_slash_slash, colon, slash) {
+            (Some(css), Some(c), Some(s)) => {
+                let min_pos = css.min(c).min(s);
+                Some(if min_pos == css {
+                    (css, 3)
+                } else {
+                    (min_pos, 1)
+                })
             }
-            "spice.ai".to_string()
+            (Some(css), Some(c), None) => Some(if css < c { (css, 3) } else { (c, 1) }),
+            (Some(css), None, Some(s)) => Some(if css < s { (css, 3) } else { (s, 1) }),
+            (None, Some(c), Some(s)) => Some(if c < s { (c, 1) } else { (s, 1) }),
+            (Some(css), None, None) => Some((css, 3)),
+            (None, Some(c), None) => Some((c, 1)),
+            (None, None, Some(s)) => Some((s, 1)),
+            (None, None, None) => None,
         }
     }
 
-    /// Returns the dataset path - the remainder of the `from` field after the first `:` or the whole string if no `:`.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use crate::component::dataset::Dataset;
-    ///
-    /// let dataset = Dataset::new("foo:bar".to_string(), "bar".to_string());
-    ///
-    /// assert_eq!(dataset.path(), "bar".to_string());
-    /// ```
-    ///
-    /// ```
-    /// use crate::component::dataset::Dataset;
-    ///
-    /// let dataset = Dataset::new("foo".to_string(), "bar".to_string());
-    ///
-    /// assert_eq!(dataset.path(), "foo".to_string());
-    /// ```
+    /// Returns the dataset source - the first part of the `from` field before the first '://', ':', or '/'
+    #[must_use]
+    pub fn source(&self) -> String {
+        if self.from == "sink" || self.from.is_empty() {
+            return "sink".to_string();
+        }
+
+        match self.find_first_delimiter() {
+            Some((0, _)) => String::new(),
+            Some((pos, _)) => self.from[..pos].to_string(),
+            None => "spice.ai".to_string(),
+        }
+    }
+
+    /// Returns the dataset path - the remainder of the `from` field after the first '://', ':', or '/'
     #[must_use]
     pub fn path(&self) -> String {
-        match self.from.find(':') {
-            Some(index) => self.from[index + 1..].to_string(),
+        match self.find_first_delimiter() {
+            Some((pos, len)) => self.from[pos + len..].to_string(),
             None => self.from.clone(),
         }
     }
@@ -751,5 +742,125 @@ mod tests {
         // Test case 5: App is None
         assert!(dataset.get_param("test_param", true));
         assert!(!dataset.get_param("test_param", false));
+    }
+
+    #[test]
+    fn test_source() {
+        let test_cases = vec![
+            // Basic delimiter cases
+            ("foo:bar", "foo"),
+            ("foo/bar", "foo"),
+            ("foo://bar", "foo"),
+            // Empty and sink cases
+            ("", "sink"),
+            ("sink", "sink"),
+            ("sink:", "sink"),
+            ("sink/", "sink"),
+            ("sink://", "sink"),
+            // No delimiter case
+            ("foo", "spice.ai"),
+            // Multiple delimiters - should use first occurrence
+            ("foo:bar:baz", "foo"),
+            ("foo/bar/baz", "foo"),
+            ("foo://bar://baz", "foo"),
+            // Mixed delimiters - should handle "://" first
+            ("foo://bar:baz", "foo"),
+            ("foo://bar/baz", "foo"),
+            ("foo:bar//baz", "foo"),
+            ("foo/bar://baz", "foo"),
+            // Edge cases with delimiters
+            ("://bar", ""),
+            (":bar", ""),
+            ("/bar", ""),
+            ("//bar", ""),
+            // Common real-world patterns
+            ("mysql://localhost", "mysql"),
+            ("http://example.com", "http"),
+            ("https://api.example.com", "https"),
+            ("postgresql://localhost", "postgresql"),
+            ("s3://bucket", "s3"),
+            ("file:/path", "file"),
+            ("snowflake://account", "snowflake"),
+            // Special characters
+            ("foo-bar:baz", "foo-bar"),
+            ("foo_bar:baz", "foo_bar"),
+            ("foo.bar:baz", "foo.bar"),
+            // Unicode characters
+            ("über:data", "über"),
+            ("数据:source", "数据"),
+            // Whitespace handling
+            ("  foo:bar", "  foo"),
+            ("foo  :bar", "foo  "),
+            ("\tfoo:bar", "\tfoo"),
+        ];
+
+        for (input, expected) in test_cases {
+            let dataset =
+                Dataset::try_new(input.to_string(), "test").expect("Failed to create dataset");
+            assert_eq!(dataset.source(), expected, "Failed for input: {input}");
+        }
+    }
+
+    #[test]
+    fn test_path() {
+        let test_cases = vec![
+            // Basic delimiter cases
+            ("foo:bar", "bar"),
+            ("foo/bar", "bar"),
+            ("foo://bar", "bar"),
+            // Empty cases
+            ("", ""),
+            (":", ""),
+            ("/", ""),
+            ("://", ""),
+            // Multiple delimiters - should use first occurrence
+            ("foo:bar:baz", "bar:baz"),
+            ("foo/bar/baz", "bar/baz"),
+            ("foo://bar://baz", "bar://baz"),
+            // Mixed delimiters - should handle "://" first
+            ("foo://bar:baz", "bar:baz"),
+            ("foo://bar/baz", "bar/baz"),
+            ("foo:bar//baz", "bar//baz"),
+            ("foo/bar://baz", "bar://baz"),
+            // Edge cases with delimiters
+            ("://bar", "bar"),
+            (":bar", "bar"),
+            ("/bar", "bar"),
+            ("//bar", "/bar"),
+            // Common real-world patterns
+            ("mysql://localhost:3306", "localhost:3306"),
+            ("http://example.com/path", "example.com/path"),
+            ("https://api.example.com/v1", "api.example.com/v1"),
+            ("postgresql://localhost:5432/db", "localhost:5432/db"),
+            ("s3://bucket/key", "bucket/key"),
+            ("file:/path/to/file", "/path/to/file"),
+            ("file:///path/to/file", "/path/to/file"),
+            ("file://path/to/file", "path/to/file"),
+            ("snowflake://account/db/schema", "account/db/schema"),
+            // Special characters
+            ("foo-bar:baz-qux", "baz-qux"),
+            ("foo_bar:baz_qux", "baz_qux"),
+            ("foo.bar:baz.qux", "baz.qux"),
+            // Unicode characters
+            ("source:数据", "数据"),
+            ("来源:数据", "数据"),
+            // Whitespace handling
+            ("foo:  bar", "  bar"),
+            ("foo:bar  ", "bar  "),
+            ("foo:\tbar", "\tbar"),
+            ("foo:\nbar", "\nbar"),
+            // Query parameters
+            ("mysql://host/db?param=value", "host/db?param=value"),
+            ("http://example.com?q=1&r=2", "example.com?q=1&r=2"),
+            // Authentication information
+            ("mysql://user:pass@host/db", "user:pass@host/db"),
+            ("https://token@api.com", "token@api.com"),
+        ];
+
+        for (input, expected) in test_cases {
+            let dataset =
+                Dataset::try_new(input.to_string(), "test").expect("Failed to create dataset");
+            assert_eq!(dataset.path(), expected, "Failed for input: {input}");
+        }
     }
 }
