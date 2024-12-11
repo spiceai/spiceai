@@ -23,7 +23,6 @@ import (
 	"os"
 
 	"github.com/AzureAD/microsoft-authentication-library-for-go/apps/public"
-	"github.com/pkg/browser"
 )
 
 // A function that triggers the user's browser to be directed to an interactive OAuth2.0 authorization.
@@ -31,32 +30,27 @@ import (
 // The function will block until the user has completed the authorization and the authorization code has been received. It is intended to be used in a CLI environment where the user can be directed to a browser.
 //
 // This function will temporarily start a local server on `:8091`.
-func InteractivelyGetAuthCode(ctx context.Context, tenantId string, clientId string, scopes []string) (string, error) {
-	publicClient, err := public.New(clientId)
+func InteractivelyAccessToken(ctx context.Context, tenantId string, clientId string, scopes []string) (string, error) {
+	authorityURI := fmt.Sprintf("https://login.microsoftonline.com/%s", tenantId)
+	publicClient, err := public.New(clientId, public.WithAuthority(authorityURI))
+
+	accounts, err := publicClient.Accounts(ctx)
 	if err != nil {
 		return "", fmt.Errorf("error creating public client: %w", err)
 	}
-	auth_url, err := publicClient.AuthCodeURL(ctx, clientId, "http://localhost:8091", scopes, public.WithTenantID(tenantId))
-	if err != nil {
-		return "", fmt.Errorf("error creating auth code URL: %w", err)
+	var result public.AuthResult
+	if len(accounts) > 0 {
+		result, err = publicClient.AcquireTokenSilent(ctx, scopes, public.WithSilentAccount(accounts[0]))
 	}
+	if err != nil || len(accounts) == 0 {
+		result, err = publicClient.AcquireTokenInteractive(ctx, scopes, public.WithRedirectURI("http://localhost"))
+		if err != nil {
+			fmt.Errorf("error creating auth code URL: %w", err)
+		}
+	}
+	access_token := result.AccessToken
 
-	auth_code := make(chan string, 1)
-
-	// Start a local server to listen for the redirect
-	go func() {
-		run_redirect_server(auth_code)
-	}()
-
-	fmt.Println("Attempting to open Microsoft authorization page in your default browser")
-	fmt.Println("\nIf the browser does not open, please visit the following URL manually:")
-	fmt.Printf("\n%s\n\n", auth_url)
-	_ = browser.OpenURL(auth_url)
-
-	// Wait for the auth code
-	code := <-auth_code
-
-	return code, nil
+	return access_token, nil
 }
 
 func run_redirect_server(output_chan chan string) {

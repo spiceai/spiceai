@@ -258,16 +258,16 @@ var sharepointCmd = &cobra.Command{
 			os.Exit(1)
 		}
 
-		auth_code, err := msal.InteractivelyGetAuthCode(cmd.Context(), tenant_id, client_id, []string{"User.Read", "Files.Read.All", "Sites.Read.All", "GroupMember.Read.All"})
+		access_token, err := msal.InteractivelyAccessToken(cmd.Context(), tenant_id, client_id, []string{"User.Read", "Files.Read.All", "Sites.Read.All", "GroupMember.Read.All"})
 		if err != nil {
-			slog.Error("Error getting Microsoft auth code", "error", err)
+			slog.Error("Error getting Microsoft access token", "error", err)
 			os.Exit(1)
 		}
 
 		mergeAuthConfig(cmd, api.AUTH_TYPE_SHAREPOINT, map[string]string{
-			api.AUTH_PARAM_AUTHORIZATION_CODE: auth_code,
-			api.AUTH_PARAM_TENANT_ID:          tenant_id,
-			api.AUTH_PARAM_CLIENT_ID:          client_id,
+			api.AUTH_PARAM_TOKEN:     access_token,
+			api.AUTH_PARAM_TENANT_ID: tenant_id,
+			api.AUTH_PARAM_CLIENT_ID: client_id,
 		})
 	},
 }
