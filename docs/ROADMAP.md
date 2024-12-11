@@ -14,7 +14,6 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 - GraphQL data connector (Release Candidate)
 - Databricks DeltaLake data connector (Release Candidate)
 - Spice.ai Cloud Platform data connector (Release Candidate)
-- ODBC Data Connector - Athena, Databricks, MySQL (Release Candidate)
 - Dremio data connector (Release Candidate)
 - MS SQL data connector (Beta)
 - File data connector (Beta)
@@ -43,7 +42,6 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 - Databricks DeltaLake data connector (Stable)
 - Spice.ai Cloud Platform data connector (Stable)
 - S3 data connector (Stable)
-- ODBC Data Connector (Stable)
 - PostgreSQL Data Connector (Stable)
 - MySQL Data Connector (Stable)
 - DuckDB Data Connector (Stable)
@@ -67,7 +65,6 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 | `postgres`      | Stable |
 | `spiceai`       | Stable |
 | `s3`            | Stable |
-| `odbc`          | Stable |
 | `mysql`         | Stable |
 | `file`          | Stable |
 | `duckdb`        | Stable |
@@ -75,6 +72,7 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 | `graphql`       | Stable |
 | `dremio`        | Stable |
 | `mssql`         | Stable |
+| `odbc`          | Beta   |
 | `spark`         | Beta   |
 | `snowflake`     | Beta   |
 | `ftp`, `sftp`   | Beta   |

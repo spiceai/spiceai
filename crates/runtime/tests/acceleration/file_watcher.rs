@@ -39,7 +39,7 @@ fn get_dataset() -> Dataset {
     let path = std::env::current_dir()
         .expect("get current directory")
         .join("test_file_watcher.csv");
-    Dataset::new(format!("file:/{}", path.display()), "names")
+    Dataset::new(format!("file://{}", path.display()), "names")
 }
 
 const NAMES_CSV: &str = include_str!("data/names.csv");

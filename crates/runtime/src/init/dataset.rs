@@ -99,7 +99,7 @@ impl Runtime {
 
             // Get the parent dataset path from the localpod dataset
             let path = ds.path();
-            let path_table_ref = TableReference::parse_str(&path);
+            let path_table_ref = TableReference::parse_str(path);
 
             // Find and remove the parent dataset's future
             if let Some(parent_future) = dataset_futures.remove(&path_table_ref) {
@@ -178,13 +178,13 @@ impl Runtime {
         let spaced_tracer = Arc::clone(&self.spaced_tracer);
 
         let source = ds.source();
-        let params = DataConnectorParamsBuilder::new(source.clone().into(), (&ds).into())
+        let params = DataConnectorParamsBuilder::new(source.into(), (&ds).into())
             .with_runtime(self)
             .await
             .context(UnableToInitializeDataConnectorSnafu)?;
 
         let data_connector: Arc<dyn DataConnector> = match self
-            .get_dataconnector_from_source(&source, params)
+            .get_dataconnector_from_source(source, params)
             .await
         {
             Ok(data_connector) => data_connector,
@@ -304,7 +304,7 @@ impl Runtime {
                 RegisterDatasetContext {
                     data_connector: Arc::clone(&connector),
                     federated_read_table: federated_table,
-                    source,
+                    source: source.to_string(),
                     accelerated_table,
                 },
             )

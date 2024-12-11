@@ -141,7 +141,7 @@ pub trait ListingTableConnector: DataConnector {
             .expose()
             .ok()
             .map(str::to_string);
-        let file_extension = std::path::Path::new(dataset.path().as_str())
+        let file_extension = std::path::Path::new(dataset.path())
             .extension()
             .map(|ext| ext.to_ascii_lowercase().to_string_lossy().to_string());
         let file_format_param = params.get("file_format").expose().ok();

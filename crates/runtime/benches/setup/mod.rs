@@ -144,7 +144,7 @@ fn build_app(
         #[cfg(feature = "duckdb")]
         "duckdb" => crate::bench_duckdb::build_app(app_builder, bench_name),
         #[cfg(feature = "odbc")]
-        "odbc-databricks" => Ok(crate::bench_odbc_databricks::build_app(app_builder)),
+        "odbc-databricks" => crate::bench_odbc_databricks::build_app(app_builder, bench_name),
         #[cfg(feature = "odbc")]
         "odbc-athena" => Ok(crate::bench_odbc_athena::build_app(app_builder)),
         #[cfg(feature = "delta_lake")]

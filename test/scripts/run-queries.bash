@@ -42,7 +42,7 @@ for i in `ls -d $query_folder/**`; do
   sed '/^--/d' < $i > $i.tmp # remove comments because we compact the query into one line
   tr '\n' ' ' <  $i.tmp | $SPICE sql > runqueries.tmp.txt
 
-  rm $i.tmp
+  rm -f $i.tmp
   result=`cat runqueries.tmp.txt`
   echo "$result"
   # if result contains error string, then it failed

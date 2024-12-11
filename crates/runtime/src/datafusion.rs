@@ -829,7 +829,7 @@ impl DataFusion {
         accelerated_table_builder: &mut accelerated_table::Builder,
         dataset: &Dataset,
     ) {
-        let parent_table_reference = TableReference::parse_str(&dataset.path());
+        let parent_table_reference = TableReference::parse_str(dataset.path());
         let Ok(parent_table) = self.get_table_provider(&parent_table_reference).await else {
             tracing::debug!("Could not synchronize refreshes with parent table {parent_table_reference}. Parent table not found.");
             return;
