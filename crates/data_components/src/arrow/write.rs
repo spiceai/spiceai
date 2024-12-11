@@ -17,19 +17,22 @@
 
 //! [`MemTable`] for querying `Vec<RecordBatch>` by `DataFusion`.
 
+use arrow::array::BooleanBuilder;
+use arrow::compute::filter_record_batch;
 use datafusion::catalog::Session;
 // This is modified from the DataFusion `MemTable` to support overwrites. This file can be removed once that change is upstreamed.
 use datafusion::dataframe::DataFrame;
 use datafusion::logical_expr::dml::InsertOp;
+use datafusion::scalar::ScalarValue;
 use std::any::Any;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Debug};
 
 use std::sync::{Arc, Mutex};
 
 use arrow::{datatypes::SchemaRef, record_batch::RecordBatch};
 use async_trait::async_trait;
-use datafusion::common::{Constraints, SchemaExt};
+use datafusion::common::{Constraint, Constraints, SchemaExt};
 use datafusion::datasource::{provider_as_source, TableProvider, TableType};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::context::SessionContext;
@@ -234,9 +237,6 @@ impl DisplayAs for MemSink {
 }
 
 impl MemSink {
-    fn new(batches: Vec<PartitionData>, overwrite: InsertOp) -> Self {
-        Self { batches, overwrite }
-    }
     fn new(
         batches: Vec<PartitionData>,
         overwrite: InsertOp,
