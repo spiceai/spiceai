@@ -123,7 +123,7 @@ impl GraphQL {
             .ok()
             .map(str::to_string);
 
-        let endpoint = Url::parse(&dataset.path()).map_err(Into::into).context(
+        let endpoint = Url::parse(dataset.path()).map_err(Into::into).context(
             super::InvalidConfigurationSnafu {
                 dataconnector: "graphql",
                 message: "The specified URL in the dataset 'from' is not valid. Ensure the URL is valid and try again.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/graphql",

@@ -95,7 +95,7 @@ impl DataConnector for LocalPodConnector {
         dataset: &Dataset,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
         let path = dataset.path();
-        let path_table_ref = TableReference::parse_str(&path);
+        let path_table_ref = TableReference::parse_str(path);
         self.datafusion.get_table(&path_table_ref).await.ok_or(
             super::DataConnectorError::InvalidTableName {
                 dataconnector: LOCALPOD_DATACONNECTOR.to_string(),

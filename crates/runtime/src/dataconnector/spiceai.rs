@@ -20,9 +20,7 @@ use super::DataConnectorError;
 use super::DataConnectorFactory;
 use super::DataConnectorParams;
 use super::ParameterSpec;
-use super::UnableToGetReadProviderSnafu;
 use crate::component::catalog::Catalog;
-use crate::component::dataset::acceleration::RefreshMode;
 use crate::component::dataset::Dataset;
 use crate::federated_table::FederatedTable;
 use crate::Runtime;
@@ -53,11 +51,14 @@ use std::borrow::Borrow;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use tonic::metadata::errors::InvalidMetadataValue;
+use tonic::metadata::Ascii;
 use tonic::metadata::MetadataMap;
+use tonic::metadata::MetadataValue;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Invalid dataset path: {dataset_path}\nEnsure the path is valid"))]
+    #[snafu(display("Invalid dataset path: {dataset_path}\nEnsure the path matches the format: <org>/<app>/datasets/<dataset_reference> and retry."))]
     UnableToParseDatasetPath { dataset_path: String },
 
     #[snafu(display("Missing required parameter: {parameter}. Specify a value.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/spiceai#configuration"))]
@@ -74,6 +75,12 @@ pub enum Error {
 
     #[snafu(display("Failed to get append stream schema.\n{source}"))]
     UnableToGetAppendSchema { source: flight_client::Error },
+
+    #[snafu(display("Could not parse <org> or <app> as ASCII: {value}\nEnsure the org and app are valid ASCII strings and retry."))]
+    InvalidMetadataValue {
+        value: Arc<str>,
+        source: InvalidMetadataValue,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -118,7 +125,6 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::connector("api_key").secret(),
     ParameterSpec::connector("token").secret(),
     ParameterSpec::connector("endpoint"),
-    ParameterSpec::connector("app_id").secret(),
 ];
 
 impl DataConnectorFactory for SpiceAIFactory {
@@ -151,18 +157,9 @@ impl DataConnectorFactory for SpiceAIFactory {
                 .get("api_key")
                 .expose()
                 .ok_or_else(|p| MissingRequiredParameterSnafu { parameter: p.0 }.build())?;
-            let mut credentials = Credentials::new("", api_key);
+            let credentials = Credentials::new("", api_key);
 
-            let metadata_map = params.metadata.get("spiceai_app_id").and_then(|app_id| {
-                app_id.parse().ok().map(|parsed_app_id| {
-                    let mut map = MetadataMap::new();
-                    map.insert("x-spiceai-app-id", parsed_app_id);
-                    credentials = Credentials::new(app_id, api_key);
-                    map
-                })
-            });
-
-            let flight_client = FlightClient::try_new(url, credentials, metadata_map)
+            let flight_client = FlightClient::try_new(url, credentials, None)
                 .await
                 .context(UnableToCreateFlightClientSnafu)?;
             let flight_factory = FlightFactory::new(
@@ -194,15 +191,25 @@ impl DataConnector for SpiceAI {
         &self,
         dataset: &Dataset,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
-        let mut dataset_schema = dataset.schema();
+        let dataset_schema = dataset.schema();
 
-        match Read::table_provider(
-            &self.flight_factory,
-            SpiceAI::spice_dataset_path(dataset).into(),
-            dataset_schema,
-        )
-        .await
-        {
+        let dataset_path = match SpiceAI::spice_dataset_path(dataset) {
+            Ok(dataset_path) => dataset_path,
+            Err(e) => {
+                return Err(DataConnectorError::UnableToGetReadProvider {
+                    dataconnector: "spice.ai".to_string(),
+                    connector_component: ConnectorComponent::from(dataset),
+                    source: Box::new(e),
+                });
+            }
+        };
+
+        let mut map = MetadataMap::new();
+        map.insert("spiceai_org", dataset_path.org);
+        map.insert("spiceai_app", dataset_path.app);
+        let flight_factory = self.flight_factory.clone().with_metadata(map);
+
+        match Read::table_provider(&flight_factory, dataset_path.path, dataset_schema).await {
             Ok(provider) => Ok(provider),
             Err(e) => {
                 if let Some(data_components::flight::Error::UnableToGetSchema {
@@ -231,16 +238,28 @@ impl DataConnector for SpiceAI {
         &self,
         dataset: &Dataset,
     ) -> Option<super::DataConnectorResult<Arc<dyn TableProvider>>> {
-        let read_write_result = ReadWrite::table_provider(
-            &self.flight_factory,
-            SpiceAI::spice_dataset_path(dataset).into(),
-            dataset.schema(),
-        )
-        .await
-        .context(super::UnableToGetReadWriteProviderSnafu {
-            dataconnector: "spice.ai",
-            connector_component: ConnectorComponent::from(dataset),
-        });
+        let dataset_path = match SpiceAI::spice_dataset_path(dataset) {
+            Ok(dataset_path) => dataset_path,
+            Err(e) => {
+                return Some(Err(DataConnectorError::UnableToGetReadProvider {
+                    dataconnector: "spice.ai".to_string(),
+                    connector_component: ConnectorComponent::from(dataset),
+                    source: Box::new(e),
+                }));
+            }
+        };
+        let mut map = MetadataMap::new();
+        map.insert("spiceai_org", dataset_path.org);
+        map.insert("spiceai_app", dataset_path.app);
+        let flight_factory = self.flight_factory.clone().with_metadata(map);
+
+        let read_write_result =
+            ReadWrite::table_provider(&flight_factory, dataset_path.path, dataset.schema())
+                .await
+                .context(super::UnableToGetReadWriteProviderSnafu {
+                    dataconnector: "spice.ai",
+                    connector_component: ConnectorComponent::from(dataset),
+                });
 
         Some(read_write_result)
     }
@@ -302,61 +321,41 @@ impl DataConnector for SpiceAI {
     }
 }
 
+struct SpiceAIDatasetPath {
+    org: MetadataValue<Ascii>,
+    app: MetadataValue<Ascii>,
+    path: TableReference,
+}
+
 impl SpiceAI {
     /// Parses a dataset path from a Spice AI dataset definition.
     ///
-    /// Spice AI datasets have several possible formats for `dataset.path()`:
-    /// 1. `<org>/<app>/datasets/<dataset_name>` or `spice.ai/<org>/<app>/datasets/<dataset_name>`.
-    /// 2. `<org>/<app>` or `spice.ai/<org>/<app>`.
-    /// 3. `some.blessed.dataset` or `spice.ai/some.blessed.dataset`.
-    ///
-    /// The second format is a shorthand for the first format, where the dataset name
-    /// is the same as the local table name specified in `name`.
-    ///
-    /// The third format is a path to a "blessed" Spice AI dataset (i.e. a dataset that is
-    /// defined and provided by Spice). If the dataset path does not match the first two formats,
-    /// then it is assumed to be a path to a blessed dataset.
-    ///
-    /// This function returns the full dataset path for the given dataset as you would query for it in Spice.
-    /// i.e. `<org>.<app>.<dataset_name>`
-    #[allow(clippy::match_same_arms)]
-    fn spice_dataset_path<T: Borrow<Dataset>>(dataset: T) -> String {
+    /// Spice AI datasets have the following format for `dataset.path()`:
+    /// `<org>/<app>/datasets/<dataset_name>`.
+    fn spice_dataset_path<T: Borrow<Dataset>>(dataset: T) -> Result<SpiceAIDatasetPath> {
         let dataset = dataset.borrow();
         let path = dataset.path();
         let path_parts: Vec<&str> = path.split('/').collect();
 
         match path_parts.as_slice() {
-            [org, app] => format!("{org}.{app}.{dataset_name}", dataset_name = dataset.name),
-            [org, app, "datasets", dataset_name] => format!("{org}.{app}.{dataset_name}"),
-            [org, app, dataset_name] => format!("{org}.{app}.{dataset_name}"),
-            _ => path.to_string(),
+            [org, app, "datasets", dataset_name] => {
+                let org: MetadataValue<Ascii> =
+                    MetadataValue::try_from(*org).context(InvalidMetadataValueSnafu {
+                        value: Arc::from(*org),
+                    })?;
+                let app: MetadataValue<Ascii> =
+                    MetadataValue::try_from(*app).context(InvalidMetadataValueSnafu {
+                        value: Arc::from(*app),
+                    })?;
+                Ok(SpiceAIDatasetPath {
+                    org,
+                    app,
+                    path: TableReference::parse_str(dataset_name),
+                })
+            }
+            _ => UnableToParseDatasetPathSnafu { dataset_path: path }.fail(),
         }
     }
-}
-
-async fn append_stream_schema(
-    client: FlightClient,
-    table_reference: TableReference,
-) -> Result<Schema> {
-    let table_paths = match table_reference {
-        TableReference::Bare { table } => vec![table.to_string()],
-        TableReference::Partial { schema, table } => {
-            vec![schema.to_string(), table.to_string()]
-        }
-        TableReference::Full {
-            catalog,
-            schema,
-            table,
-        } => {
-            vec![catalog.to_string(), schema.to_string(), table.to_string()]
-        }
-    };
-    let schema = client
-        .get_schema(table_paths)
-        .await
-        .context(UnableToGetAppendSchemaSnafu)?;
-
-    Ok(schema)
 }
 
 pub fn subscribe_to_append_stream(
@@ -439,7 +438,9 @@ mod tests {
 
         for (input, expected) in tests {
             let dataset = Dataset::try_new(input.clone(), "bar").expect("a valid dataset");
-            assert_eq!(SpiceAI::spice_dataset_path(dataset), expected, "{input}");
+            let dataset_path = SpiceAI::spice_dataset_path(&dataset).expect("a valid dataset path");
+            let expected_path = TableReference::parse_str(expected);
+            assert_eq!(dataset_path.path, expected_path, "{input}");
         }
     }
 }
