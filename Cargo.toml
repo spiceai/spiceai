@@ -129,7 +129,7 @@ tokio-postgres = { version = "0.7.12", features = [
     "with-uuid-1",
 ] }
 tokio-rusqlite = "0.5.1"
-tokio-stream = { version = "0.1.16", features = ["sync"] }
+tokio-stream = { version = "0.1.17", features = ["sync"] }
 tokio-util = { version = "0.7.11", features = ["compat"] }
 tonic = { version = "0.12", features = ["gzip", "tls"] }
 tonic-health = { version = "0.12" }
