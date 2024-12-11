@@ -60,7 +60,7 @@ tokio-postgres = { workspace = true, features = [
 ], optional = true }
 tokio.workspace = true
 tokio-util = { workspace = true, optional = true }
-tonic = { workspace = true, optional = true }
+tonic = { workspace = true }
 tracing.workspace = true
 url = "2.5.4"
 uuid.workspace = true
@@ -79,7 +79,7 @@ duckdb = [
   "datafusion-table-providers/duckdb",
   "datafusion-table-providers/duckdb-federation"
 ]
-flightsql = ["dep:tonic"]
+flightsql = []
 mssql = ["dep:tiberius", "dep:tokio-util", "dep:bb8"]
 mysql = ["datafusion-table-providers/mysql"]
 odbc = []

@@ -212,6 +212,9 @@ jobs:
           - cmd: '-c odbc-databricks'
             name: 'odbc-databricks connector'
             bench: 'tpch'
+          - cmd: '-c odbc-databricks -b tpcds'
+            name: 'odbc-databricks connector'
+            bench: 'tpcds'
           - cmd: '-c odbc-athena'
             name: 'odbc-athena connector'
             bench: 'tpch'
@@ -287,15 +290,15 @@ jobs:
           docker kill --signal=SIGHUP ${{ job.services.postgres_acc.id }}
 
       - name: Install Databricks ODBC driver
-        if: matrix.cmd == '-c odbc-databricks' && ((github.event.inputs.selected_benchmark == matrix.name && (github.event.inputs.bench_name == matrix.bench || github.event.inputs.bench_name == 'all')) || github.event.inputs.run_all == 'true' || github.event_name == 'schedule')
+        if: (matrix.cmd == '-c odbc-databricks' || matrix.cmd == '-c odbc-databricks -b tpcds') && ((github.event.inputs.selected_benchmark == matrix.name && (github.event.inputs.bench_name == matrix.bench || github.event.inputs.bench_name == 'all')) || github.event.inputs.run_all == 'true' || github.event_name == 'schedule')
         run: |
           sudo apt-get install unixodbc unixodbc-dev unzip libsasl2-modules-gssapi-mit -y
           wget https://databricks-bi-artifacts.s3.us-east-2.amazonaws.com/simbaspark-drivers/odbc/2.8.2/SimbaSparkODBC-2.8.2.1013-Debian-64bit.zip
           unzip SimbaSparkODBC-2.8.2.1013-Debian-64bit.zip
           sudo dpkg -i simbaspark_2.8.2.1013-2_amd64.deb
           cat <<EOF > /tmp/odbcinst.ini
-          [Simba Spark ODBC Driver]
-          Description=Simba Spark ODBC Driver
+          [Databricks ODBC Driver]
+          Description=Databricks ODBC Driver
           Driver=/opt/simba/spark/lib/64/libsparkodbc_sb64.so
           Setup=/opt/simba/spark/lib/64/libsparkodbc_sb64.so
           EOF
