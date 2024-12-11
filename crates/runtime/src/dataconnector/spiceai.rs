@@ -203,8 +203,8 @@ impl DataConnector for SpiceAI {
         let (flight_factory, table_reference) = match dataset_path {
             SpiceAIDatasetPath::OrgAppPath { org, app, path } => {
                 let mut map = MetadataMap::new();
-                map.insert("spiceai_org", org);
-                map.insert("spiceai_app", app);
+                map.insert("spiceai-org", org);
+                map.insert("spiceai-app", app);
                 (self.flight_factory.clone().with_metadata(map), path)
             }
             SpiceAIDatasetPath::Path(path) => (self.flight_factory.clone(), path),
