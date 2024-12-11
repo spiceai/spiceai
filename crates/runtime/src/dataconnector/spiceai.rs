@@ -24,7 +24,6 @@ use crate::component::catalog::Catalog;
 use crate::component::dataset::Dataset;
 use crate::federated_table::FederatedTable;
 use crate::Runtime;
-use arrow::datatypes::Schema;
 use arrow_flight::decode::DecodedPayload;
 use async_stream::stream;
 use async_trait::async_trait;
