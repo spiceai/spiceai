@@ -83,11 +83,7 @@ impl Sharepoint {
                     .with_scope([".default"])
                     .build(),
             ),
-            (None, Some(bearer_token)) => {
-                let mut client = GraphClient::new(bearer_token.to_string());
-                client.use_endpoint(&Url::parse("https://graph.microsoft.com/v1.0").unwrap());
-                client
-            }
+            (None, Some(bearer_token)) => GraphClient::new(bearer_token.to_string()),
             (Some(_), Some(_)) => return DuplicateAuthenticationSnafu.fail(),
             (None, None) => return InvalidAuthenticationSnafu.fail(),
         };
