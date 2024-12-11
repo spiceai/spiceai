@@ -201,7 +201,7 @@ fn get_tpcds_test_queries() -> Vec<(&'static str, &'static str)> {
         ("tpcds_q10", include_str!("../queries/tpcds/q10.sql")),
         ("tpcds_q11", include_str!("../queries/tpcds/q11.sql")),
         ("tpcds_q12", include_str!("../queries/tpcds/q12.sql")),
-        // ("tpcds_q13", include_str!("../queries/tpcds/q13.sql")), this takes excessively long from the ODBC driver re-writing the query to something
+        // ("tpcds_q13", include_str!("../queries/tpcds/q13.sql")), this takes excessively long from the ODBC driver re-writing the query to something very inefficient
         // ("tpcds_q14", include_str!("../queries/tpcds/q14.sql")), this query contains multiple queries, which aren't supported
         ("tpcds_q15", include_str!("../queries/tpcds/q15.sql")),
         ("tpcds_q16", include_str!("../queries/tpcds/q16.sql")),
