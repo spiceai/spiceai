@@ -40,6 +40,7 @@ pub fn new_azure_client(
     api_base: Option<&str>,
     api_version: Option<&str>,
     deployment_name: Option<&str>,
+    entra_token: Option<&str>,
     api_key: Option<&str>,
 ) -> Openai<AzureConfig> {
     let mut cfg = AzureConfig::new().with_deployment_id(deployment_name.unwrap_or(model.as_str()));
@@ -54,6 +55,10 @@ pub fn new_azure_client(
 
     if let Some(api_key) = api_key {
         cfg = cfg.with_api_key(api_key);
+    }
+
+    if let Some(entra_token) = entra_token {
+        cfg = cfg.with_entra_token(entra_token);
     }
 
     Openai {

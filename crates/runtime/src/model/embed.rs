@@ -62,7 +62,7 @@ pub async fn try_to_embedding(
         })?;
 
     match prefix {
-        EmbeddingPrefix::Azure => azure(model_id, &params),
+        EmbeddingPrefix::Azure => azure(model_id, component.name.as_str(), &params),
         EmbeddingPrefix::OpenAi => openai(model_id, component, &params, secrets).await,
         EmbeddingPrefix::File => file(model_id.as_deref(), component, &params),
         EmbeddingPrefix::HuggingFace => huggingface(model_id, component, &params).await,
@@ -125,25 +125,34 @@ fn file(
 
 fn azure(
     model_id: Option<String>,
+    model_name: &str,
     params: &HashMap<String, SecretString>,
 ) -> Result<Box<dyn Embed>, EmbedError> {
     let Some(model_name) = model_id else {
         return Err(EmbedError::FailedToInstantiateEmbeddingModel {
-            source: "For Azure models, model id must be specified in `from:azure:<model_id>`."
-                .to_string()
-                .into(),
+            source: format!("For embedding model '{model_name}', model id must be specified in `from:azure:<model_id>`.").into(),
         });
     };
     let api_base = extract_secret!(params, "endpoint");
     let api_version = extract_secret!(params, "azure_api_version");
     let deployment_name = extract_secret!(params, "azure_deployment_name");
     let api_key = extract_secret!(params, "azure_api_key");
+    let entra_token = extract_secret!(params, "azure_entra_token");
+    if api_key.is_some() && entra_token.is_some() {
+        return Err(EmbedError::FailedToInstantiateEmbeddingModel {
+            source: format!(
+                "Azure embedding model '{model_name}' can only use one of 'azure_api_key' or 'azure_entra_token'."
+            )
+            .into(),
+        });
+    }
     Ok(Box::new(OpenaiEmbed::new(llms::openai::new_azure_client(
         model_name,
         api_base,
         api_version,
         deployment_name,
         api_key,
+        entra_token,
     ))))
 }
 
