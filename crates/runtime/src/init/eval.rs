@@ -24,10 +24,7 @@ use tokio::sync::RwLock;
 
 use crate::{
     accelerated_table::{refresh::Refresh, Retention},
-    component::dataset::{
-        acceleration::{Acceleration, IndexType},
-        TimeFormat,
-    },
+    component::dataset::{acceleration::Acceleration, TimeFormat},
     datafusion::SPICE_EVAL_SCHEMA,
     internal_table::create_internal_accelerated_table,
     model::{

@@ -133,10 +133,6 @@ pub(super) async fn add_metrics_to_eval_run(
 
     let mut updates: HashMap<&str, ArrayRef> = HashMap::new();
     updates.insert("metrics", Arc::new(builder.finish()) as ArrayRef);
-    updates.insert(
-        "status",
-        Arc::new(StringArray::from(vec![EvalRunStatus::Waiting.to_string()])),
-    );
 
     update_eval_run(df, id, updates).await
 }
@@ -272,6 +268,16 @@ async fn update_eval_run(
         eval_run_id: id.clone(),
     })?;
 
+    // Invalidate cache so subsequent calls to [`update_eval_run`] get the most up to date table.
+    if let Some(cache) = df.cache_provider() {
+        cache
+            .invalidate_for_table(EVAL_RUNS_TABLE_REFERENCE.clone())
+            .await
+            .boxed()
+            .context(FailedToUpdateEvalRunTableSnafu {
+                eval_run_id: id.clone(),
+            })?;
+    }
     Ok(())
 }
 
