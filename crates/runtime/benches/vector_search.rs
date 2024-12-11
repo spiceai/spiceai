@@ -148,7 +148,7 @@ async fn run_benchmark(config: &SearchBenchmarkConfiguration) -> Result<(), Stri
     tracing::info!("Loading test corpus... Warning: This might take a while!");
 
     // wait untill embeddings are created during initial data load
-    runtime_ready_check(&rt, Duration::from_secs(20 * 60)).await;
+    runtime_ready_check(&rt, Duration::from_secs(60 * 60)).await;
 
     benchmark_result.finish_index();
 
