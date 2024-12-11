@@ -19,6 +19,7 @@
 
 use arrow::array::BooleanBuilder;
 use arrow::compute::filter_record_batch;
+use arrow::util::pretty::pretty_format_batches;
 use datafusion::catalog::Session;
 use datafusion::dataframe::DataFrame;
 use datafusion::logical_expr::dml::InsertOp;
@@ -98,11 +99,28 @@ impl MemTable {
         })
     }
 
-    /// Assign constraints
     #[must_use]
     pub fn with_constraints(mut self, constraints: Constraints) -> Self {
         self.constraints = constraints;
         self
+    }
+
+    /// Attempt to retrieve the primary key from the constraints, and ensure that there are no unsupported [`Constraint::Unique`].
+    fn get_and_ensure_only_primary_keys(&self) -> Result<Option<Vec<usize>>> {
+        if let Some(constraints) = self.constraints() {
+            match constraints.iter().next() {
+                Some(Constraint::PrimaryKey(pk)) => {
+                    return Ok(Some(pk.clone()));
+                }
+                Some(Constraint::Unique(_)) => {
+                    return Err(DataFusionError::Execution(
+                        "Unique constraints are not supported in MemTable".to_string(),
+                    ));
+                }
+                _ => return Ok(None),
+            }
+        }
+        Ok(None)
     }
 
     /// Assign column defaults
@@ -179,17 +197,7 @@ impl TableProvider for MemTable {
             ));
         }
 
-        // If the table has a primary key, we need to know it to handle `InsertOp::Replace`.
-        let mut primary_key = None;
-        if let Some(constraints) = self.constraints() {
-            primary_key = constraints.iter().find_map(|c| {
-                if let Constraint::PrimaryKey(pk) = c {
-                    Some(pk.clone())
-                } else {
-                    None
-                }
-            });
-        };
+        let mut primary_key = self.get_and_ensure_only_primary_keys()?;
 
         let sink = Arc::new(MemSink::new(self.batches.clone(), overwrite, primary_key));
         Ok(Arc::new(DataSinkExec::new(
@@ -211,6 +219,7 @@ struct MemSink {
     batches: Vec<PartitionData>,
     overwrite: InsertOp,
 
+    /// Optional primary key columns. If present, primary key values must be unique, ordered ascendingly.
     primary_key: Option<Vec<usize>>,
 }
 
@@ -242,19 +251,28 @@ impl MemSink {
         Self {
             batches,
             overwrite,
-            primary_key,
+            primary_key: primary_key.map(|pks| {
+                let mut z = pks.clone();
+                z.sort();
+                z
+            }),
         }
     }
 }
 
 /// Create primary key values for a [`RecordBatch`]. For composite keys, values are concatenated with a delimiter '|'.
-fn extract_primary_keys_str(batch: &RecordBatch, pk_indices: &[usize]) -> Result<Vec<String>> {
+///
+/// `pk_indices_ordered` should be in ascending order.
+fn extract_primary_keys_str(
+    batch: &RecordBatch,
+    pk_indices_ordered: &[usize],
+) -> Result<Vec<String>> {
     let num_rows = batch.num_rows();
     let mut keys = Vec::with_capacity(num_rows);
 
     for row_idx in 0..num_rows {
-        let mut parts = Vec::with_capacity(pk_indices.len());
-        for &col_idx in pk_indices {
+        let mut parts = Vec::with_capacity(pk_indices_ordered.len());
+        for &col_idx in pk_indices_ordered {
             let col = batch.column(col_idx);
             let val = ScalarValue::try_from_array(col, row_idx)
                 .map_err(|e| DataFusionError::Execution(e.to_string()))?;
@@ -276,7 +294,7 @@ fn extract_primary_keys_str(batch: &RecordBatch, pk_indices: &[usize]) -> Result
 fn filter_existing(
     existing_batches: &mut Vec<RecordBatch>,
     overwriting_primary_keys: &HashSet<String>,
-    pk_indices: &[usize],
+    pk_indices_ordered: &[usize],
 ) -> Result<()> {
     if existing_batches.is_empty() {
         return Ok(());
@@ -285,7 +303,7 @@ fn filter_existing(
     // Instead of concatenating, we can filter each batch individually
     let mut filtered = Vec::with_capacity(existing_batches.len());
     for batch in existing_batches.drain(..) {
-        let keys = extract_primary_keys_str(&batch, pk_indices)?;
+        let keys = extract_primary_keys_str(&batch, pk_indices_ordered)?;
 
         let mut keep_row_builder = BooleanBuilder::with_capacity(keys.len());
         for k in keys {
@@ -301,11 +319,17 @@ fn filter_existing(
     Ok(())
 }
 
-fn primary_key_identifier(rb: &[Vec<RecordBatch>], primary_keys: &[usize]) -> Result<Vec<String>> {
+fn primary_key_identifier(
+    rb: &[Vec<RecordBatch>],
+    primary_keys_ordered: &[usize],
+) -> Result<Vec<String>> {
     // Create unique string for each primary key across all `new_batches` rows.
     let new_keys: Vec<String> = rb
         .iter()
-        .flat_map(|p| p.iter().map(|b| extract_primary_keys_str(b, primary_keys)))
+        .flat_map(|p| {
+            p.iter()
+                .map(|b| extract_primary_keys_str(b, primary_keys_ordered))
+        })
         .collect::<Result<Vec<_>, _>>()?
         .into_iter()
         .flatten()
@@ -360,10 +384,15 @@ impl DataSink for MemSink {
             }
         }
 
-        let mut writable_targets: Vec<_> =
-            futures::future::join_all(self.batches.iter().map(|target| target.write())).await;
+        // let mut writable_targets: Vec<_> =
+        //     futures::future::join_all(self.batches.iter().map(|target| target.write())).await;
 
-        for (target, mut batches) in writable_targets.iter_mut().zip(new_batches.into_iter()) {
+        for (target, mut batches) in
+            futures::future::join_all(self.batches.iter().map(|target| target.write()))
+                .await
+                .iter_mut()
+                .zip(new_batches.into_iter())
+        {
             // Depending on [`InsertOp`], we may need to mutate the existing `target` before adding new data.
             match self.overwrite {
                 // Ensure no primary key conflicts between new data that is being appended, and existing data (since we are not replacing).
@@ -391,7 +420,19 @@ impl DataSink for MemSink {
                 }
             }
 
-            target.append(&mut batches);
+            // println!("New batch {}", pretty_format_batches(&batches).unwrap());
+
+            target.extend(batches.drain(..));
+            // println!("target after {}", pretty_format_batches(target).unwrap());
+            // println!(
+            //     "New batch after {}",
+            //     pretty_format_batches(&batches).unwrap()
+            // );
+        }
+
+        for b in &self.batches {
+            let part = b.read().await;
+            println!("self.batches \n{}\n", pretty_format_batches(&part).unwrap());
         }
 
         Ok(row_count as u64)
@@ -484,39 +525,374 @@ mod tests {
 
     use arrow::{
         array::{RecordBatch, StringArray, UInt64Array},
-        datatypes::{DataType, Schema},
+        datatypes::{DataType, Schema, SchemaRef},
     };
+    use arrow_buffer::ArrowNativeType;
     use datafusion::{
+        catalog::TableProvider,
+        common::{Constraint, Constraints},
         execution::context::SessionContext,
         logical_expr::{cast, col, lit},
         physical_plan::collect,
         scalar::ScalarValue,
     };
+    use datafusion_table_providers::util::test::MockExec;
 
     use crate::{arrow::write::MemTable, delete::DeletionTableProvider};
+
+    fn create_batch_with_string_columns(data: &[(&str, Vec<&str>)]) -> (RecordBatch, SchemaRef) {
+        let fields: Vec<_> = data
+            .iter()
+            .map(|(name, _)| arrow::datatypes::Field::new(name.to_string(), DataType::Utf8, false))
+            .collect();
+        let schema = Arc::new(Schema::new(fields));
+
+        let arrays = data
+            .iter()
+            .map(|(_, values)| {
+                let arr = StringArray::from(values.clone());
+                Arc::new(arr) as Arc<dyn arrow::array::Array>
+            })
+            .collect::<Vec<_>>();
+
+        (
+            RecordBatch::try_new(schema.clone(), arrays).expect("data should be created"),
+            schema.clone(),
+        )
+    }
+
+    // append, overwrite, replace
+    #[tokio::test]
+    async fn test_write_all_append_not_primary_key() {
+        let (rb, schema) = create_batch_with_string_columns(&[(
+            "primary_key",
+            vec!["1970-01-01", "2012-12-01T11:11:11Z", "2012-12-01T11:11:12Z"],
+        )]);
+        let table = MemTable::try_new(schema, vec![vec![rb]]).expect("mem table should be created");
+        let ctx = SessionContext::new();
+        let state = ctx.state();
+
+        let (insert_rb, new_schema) = create_batch_with_string_columns(&[(
+            "primary_key",
+            vec!["1970-01-01", "2012-12-01T11:11:11Z", "2012-12-01T11:11:12Z"],
+        )]);
+        let exec = Arc::new(MockExec::new(vec![Ok(insert_rb)], new_schema));
+        let insertion = table
+            .insert_into(
+                &state,
+                exec,
+                datafusion::logical_expr::dml::InsertOp::Append,
+            )
+            .await
+            .expect("insertion should be successful");
+
+        let result = collect(insertion, ctx.task_ctx())
+            .await
+            .expect("insert successful")
+            .first()
+            .expect("result should have at least one batch")
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .expect("result should be UInt64Array")
+            .value(0)
+            .to_i64()
+            .expect("insert_into result should return i64");
+
+        assert_eq!(result, 3);
+
+        // Ensure new values have changed correctly.
+        let plan = table
+            .scan(&state, None, &[], None)
+            .await
+            .expect("Scan plan can be constructed");
+
+        let result = collect(plan, ctx.task_ctx())
+            .await
+            .expect("Query successful");
+
+        let values: Vec<_> = result
+            .first()
+            .expect("result should have at least one batch")
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("result should be StringArray")
+            .iter()
+            .collect();
+        assert_eq!(
+            vec![
+                Some("1970-01-01"),
+                Some("2012-12-01T11:11:11Z"),
+                Some("2012-12-01T11:11:12Z"),
+                Some("1970-01-01"),
+                Some("2012-12-01T11:11:11Z"),
+                Some("2012-12-01T11:11:12Z")
+            ],
+            values
+        )
+    }
+
+    #[tokio::test]
+    async fn test_write_all_replace_primary_key() {
+        let (rb, schema) = create_batch_with_string_columns(&[
+            (
+                "primary_key",
+                vec!["1970-01-01", "2012-12-01T11:11:11Z", "2012-12-01T11:11:12Z"],
+            ),
+            ("value", vec!["a", "b", "c"]),
+        ]);
+        let table = MemTable::try_new(schema, vec![vec![rb]])
+            .expect("mem table should be created")
+            .with_constraints(Constraints::new_unverified(vec![Constraint::PrimaryKey(
+                vec![0],
+            )]));
+        let ctx = SessionContext::new();
+        let state = ctx.state();
+
+        let (insert_rb, new_schema) = create_batch_with_string_columns(&[
+            ("primary_key", vec!["2012-12-01T11:11:11Z"]),
+            ("value", vec!["y"]),
+        ]);
+        let exec = Arc::new(MockExec::new(vec![Ok(insert_rb)], new_schema));
+        let insertion = table
+            .insert_into(
+                &state,
+                exec,
+                datafusion::logical_expr::dml::InsertOp::Replace,
+            )
+            .await
+            .expect("insertion should be successful");
+
+        let result = collect(insertion, ctx.task_ctx())
+            .await
+            .expect("insert successful")
+            .first()
+            .expect("result should have at least one batch")
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .expect("result should be UInt64Array")
+            .value(0)
+            .to_i64()
+            .expect("insert_into result should return i64");
+
+        assert_eq!(result, 1);
+
+        // Ensure new values have changed correctly.
+        let plan = table
+            .scan(&state, None, &[], None)
+            .await
+            .expect("Scan plan can be constructed");
+
+        let result = collect(plan, ctx.task_ctx())
+            .await
+            .expect("Query successful");
+
+        let values: Vec<_> = result
+            .first()
+            .expect("result should have at least one batch")
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("result should be StringArray")
+            .iter()
+            .collect();
+        assert_eq!(vec![Some("a"), Some("c"), Some("y")], values)
+    }
+
+    #[tokio::test]
+    async fn test_write_all_overwrite_primary_key() {
+        let (rb, schema) = create_batch_with_string_columns(&[
+            (
+                "primary_key",
+                vec!["1970-01-01", "2012-12-01T11:11:11Z", "2012-12-01T11:11:12Z"],
+            ),
+            ("value", vec!["a", "b", "c"]),
+        ]);
+        let table = MemTable::try_new(schema, vec![vec![rb]])
+            .expect("mem table should be created")
+            .with_constraints(Constraints::new_unverified(vec![Constraint::PrimaryKey(
+                vec![0],
+            )]));
+        let ctx = SessionContext::new();
+        let state = ctx.state();
+        let (insert_rb, new_schema) = create_batch_with_string_columns(&[
+            (
+                "primary_key",
+                vec!["1970-01-01", "2012-12-01T11:11:21Z", "2012-12-01T11:11:22Z"],
+            ),
+            ("value", vec!["x", "y", "z"]),
+        ]);
+        let exec = Arc::new(MockExec::new(vec![Ok(insert_rb)], new_schema));
+        let insertion = table
+            .insert_into(
+                &state,
+                exec,
+                datafusion::logical_expr::dml::InsertOp::Overwrite,
+            )
+            .await
+            .expect("insertion should be successful");
+
+        let result = collect(insertion, ctx.task_ctx())
+            .await
+            .expect("insert successful")
+            .first()
+            .expect("result should have at least one batch")
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .expect("result should be UInt64Array")
+            .value(0)
+            .to_i64()
+            .expect("insert_into result should return i64");
+
+        assert_eq!(result, 3);
+
+        // Ensure new values have changed correctly.
+        let plan = table
+            .scan(&state, None, &[], None)
+            .await
+            .expect("Scan plan can be constructed");
+
+        let result = collect(plan, ctx.task_ctx())
+            .await
+            .expect("Query successful");
+
+        let values: Vec<_> = result
+            .first()
+            .expect("result should have at least one batch")
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("result should be StringArray")
+            .iter()
+            .collect();
+        assert_eq!(vec![Some("x"), Some("y"), Some("z")], values)
+    }
+
+    #[tokio::test]
+    async fn test_write_all_append_primary_key_conflict() {
+        let (rb, schema) = create_batch_with_string_columns(&[(
+            "primary_key",
+            vec!["1970-01-01", "2012-12-01T11:11:11Z", "2012-12-01T11:11:12Z"],
+        )]);
+        let table = MemTable::try_new(schema, vec![vec![rb]])
+            .expect("mem table should be created")
+            .with_constraints(Constraints::new_unverified(vec![Constraint::PrimaryKey(
+                vec![0],
+            )]));
+        let ctx = SessionContext::new();
+        let state = ctx.state();
+
+        let (insert_rb, new_schema) =
+            create_batch_with_string_columns(&[("primary_key", vec!["1970-01-01"])]);
+        let exec = Arc::new(MockExec::new(vec![Ok(insert_rb)], new_schema));
+        let insertion = table
+            .insert_into(
+                &state,
+                exec,
+                datafusion::logical_expr::dml::InsertOp::Append,
+            )
+            .await
+            .expect("insertion should be successful");
+
+        assert!(
+            collect(insertion, ctx.task_ctx()).await.is_err(),
+            "insertion should fail due to primary key conflict"
+        );
+    }
+    #[tokio::test]
+    async fn test_write_all_append_primary_key() {
+        let (rb, schema) = create_batch_with_string_columns(&[
+            (
+                "primary_key",
+                vec!["1970-01-01", "2012-12-01T11:11:11Z", "2012-12-01T11:11:12Z"],
+            ),
+            ("value", vec!["a", "b", "c"]),
+        ]);
+        let table = MemTable::try_new(schema, vec![vec![rb]])
+            .expect("mem table should be created")
+            .with_constraints(Constraints::new_unverified(vec![Constraint::PrimaryKey(
+                vec![0],
+            )]));
+        let ctx = SessionContext::new();
+        let state = ctx.state();
+
+        let (insert_rb, new_schema) = create_batch_with_string_columns(&[
+            (
+                "primary_key",
+                vec!["1970-01-02", "2012-12-01T11:11:21Z", "2012-12-01T11:11:22Z"],
+            ),
+            ("value", vec!["x", "y", "z"]),
+        ]);
+        let exec = Arc::new(MockExec::new(vec![Ok(insert_rb)], new_schema));
+        let insertion = table
+            .insert_into(
+                &state,
+                exec,
+                datafusion::logical_expr::dml::InsertOp::Append,
+            )
+            .await
+            .expect("insertion should be successful");
+
+        let result = collect(insertion, ctx.task_ctx())
+            .await
+            .expect("insert successful")
+            .first()
+            .expect("result should have at least one batch")
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .expect("result should be UInt64Array")
+            .value(0)
+            .to_i64()
+            .expect("insert_into result should return i64");
+
+        assert_eq!(result, 3);
+
+        // Ensure new values have changed correctly.
+        let plan = table
+            .scan(&state, None, &[], None)
+            .await
+            .expect("Scan plan can be constructed");
+
+        let result = collect(plan, ctx.task_ctx())
+            .await
+            .expect("Query successful");
+
+        let values: Vec<_> = result
+            .first()
+            .expect("result should have at least one batch")
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("result should be StringArray")
+            .iter()
+            .collect();
+        assert_eq!(
+            vec![
+                Some("a"),
+                Some("b"),
+                Some("c"),
+                Some("x"),
+                Some("y"),
+                Some("z")
+            ],
+            values
+        )
+    }
 
     #[tokio::test]
     #[allow(clippy::unreadable_literal)]
     async fn test_delete_from() {
-        let schema = Arc::new(Schema::new(vec![arrow::datatypes::Field::new(
+        let (rb, schema) = create_batch_with_string_columns(&[(
             "time_in_string",
-            DataType::Utf8,
-            false,
-        )]));
-        let arr = StringArray::from(vec![
-            "1970-01-01",
-            "2012-12-01T11:11:11Z",
-            "2012-12-01T11:11:12Z",
-        ]);
-
-        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(arr)])
-            .expect("data should be created");
-
-        let table =
-            MemTable::try_new(schema, vec![vec![batch]]).expect("mem table should be created");
-
+            vec!["1970-01-01", "2012-12-01T11:11:11Z", "2012-12-01T11:11:12Z"],
+        )]);
+        let table = MemTable::try_new(schema, vec![vec![rb]]).expect("mem table should be created");
         let ctx = SessionContext::new();
-
+        let state = ctx.state();
         let filter = cast(
             col("time_in_string"),
             DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None),
@@ -527,7 +903,7 @@ mod tests {
         )));
 
         let plan = table
-            .delete_from(&ctx.state(), &vec![filter])
+            .delete_from(&state, &vec![filter])
             .await
             .expect("deletion should be successful");
 
