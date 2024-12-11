@@ -478,8 +478,7 @@ async fn record_explain_plan(
     query_name: &str,
     query: &str,
 ) -> Result<(), String> {
-    // TODO: Turn on snapshot for tpcds queries after tpcds hardening
-    if query_name.starts_with("tpcds") || query_name.starts_with("clickbench") {
+    if query_name.starts_with("clickbench") {
         return Ok(());
     }
 

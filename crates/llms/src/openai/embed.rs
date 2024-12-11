@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
+use async_openai::config::Config;
 use bytes::Bytes;
 use std::sync::Arc;
 
@@ -43,15 +44,14 @@ pub const DEFAULT_EMBEDDING_MODEL: &str = TEXT_EMBED_3_SMALL;
 ///
 /// For non-OpenAI models, a [`Tokenizer`] can be provided to correctly size
 /// chunks (instead of the default `OpenAI` BPE tokenizer).
-#[derive(Default)]
-pub struct OpenaiEmbed {
-    pub inner: Openai,
+pub struct OpenaiEmbed<C: Config> {
+    pub inner: Openai<C>,
     pub chunk_sizer: Option<Arc<dyn ChunkSizer + Send + Sync>>,
 }
 
-impl OpenaiEmbed {
+impl<C: Config> OpenaiEmbed<C> {
     #[must_use]
-    pub fn new(inner: Openai) -> Self {
+    pub fn new(inner: Openai<C>) -> Self {
         Self {
             inner,
             chunk_sizer: None,
@@ -74,7 +74,7 @@ impl OpenaiEmbed {
 }
 
 #[async_trait]
-impl Embed for OpenaiEmbed {
+impl<C: Config + Sync + Send> Embed for OpenaiEmbed<C> {
     async fn embed_request(
         &self,
         req: CreateEmbeddingRequest,

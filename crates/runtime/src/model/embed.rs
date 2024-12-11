@@ -13,6 +13,8 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+#![allow(clippy::implicit_hasher)]
+
 use bytes::Bytes;
 use itertools::Itertools;
 use llms::embeddings::{
@@ -39,8 +41,166 @@ pub type EmbeddingModelStore = HashMap<String, Box<dyn Embed>>;
 /// Extract a secret from a hashmap of secrets, if it exists.
 macro_rules! extract_secret {
     ($params:expr, $key:expr) => {
-        $params.get($key).map(Secret::expose_secret).cloned()
+        $params.get($key).map(|s| s.expose_secret().as_str())
     };
+}
+
+pub async fn try_to_embedding(
+    component: &spicepod::component::embeddings::Embeddings,
+    secrets: Arc<RwLock<Secrets>>,
+) -> Result<Box<dyn Embed>, EmbedError> {
+    let params = get_params_with_secrets(Arc::clone(&secrets), &component.params).await;
+    let model_id = component.get_model_id();
+    let prefix = component
+        .get_prefix()
+        .ok_or(EmbedError::UnknownModelSource {
+            source: format!(
+                "Unknown model source for spicepod component from: {}",
+                component.from.clone()
+            )
+            .into(),
+        })?;
+
+    match prefix {
+        EmbeddingPrefix::Azure => azure(model_id, component.name.as_str(), &params),
+        EmbeddingPrefix::OpenAi => openai(model_id, component, &params, secrets).await,
+        EmbeddingPrefix::File => file(model_id.as_deref(), component, &params),
+        EmbeddingPrefix::HuggingFace => huggingface(model_id, component, &params).await,
+    }
+}
+
+async fn huggingface(
+    model_id: Option<String>,
+    component: &spicepod::component::embeddings::Embeddings,
+    params: &HashMap<String, SecretString>,
+) -> Result<Box<dyn Embed>, EmbedError> {
+    let hf_token = extract_secret!(params, "hf_token");
+    let pooling = extract_secret!(params, "pooling");
+    let max_seq_len = max_seq_length_from_params(params)?;
+    if let Some(id) = model_id {
+        Ok(Box::new(
+            TeiEmbed::from_hf(&id, None, hf_token, pooling, max_seq_len).await?,
+        ))
+    } else {
+        Err(EmbedError::FailedToInstantiateEmbeddingModel {
+            source: format!("Failed to load model from: {}", component.from).into(),
+        })
+    }
+}
+
+fn file(
+    model_id: Option<&str>,
+    component: &spicepod::component::embeddings::Embeddings,
+    params: &HashMap<String, SecretString>,
+) -> Result<Box<dyn Embed>, EmbedError> {
+    let weights_path = model_id
+        .map(ToString::to_string)
+        .or(component.find_any_file_path(ModelFileType::Weights))
+        .ok_or(EmbedError::FailedToInstantiateEmbeddingModel {
+            source: "No 'weights_path' parameter provided".into(),
+        })?
+        .clone();
+    let config_path = component
+        .find_any_file_path(ModelFileType::Config)
+        .ok_or(EmbedError::FailedToInstantiateEmbeddingModel {
+            source: "No 'config_path' parameter provided".into(),
+        })?
+        .clone();
+    let tokenizer_path = component
+        .find_any_file_path(ModelFileType::Tokenizer)
+        .ok_or(EmbedError::FailedToInstantiateEmbeddingModel {
+            source: "No 'tokenizer_path' parameter provided".into(),
+        })?
+        .clone();
+    let pooling = params.get("pooling").map(Secret::expose_secret).cloned();
+    let max_seq_len = max_seq_length_from_params(params)?;
+    Ok(Box::new(TeiEmbed::from_local(
+        Path::new(&weights_path),
+        Path::new(&config_path),
+        Path::new(&tokenizer_path),
+        pooling,
+        max_seq_len,
+    )?))
+}
+
+fn azure(
+    model_id: Option<String>,
+    model_name: &str,
+    params: &HashMap<String, SecretString>,
+) -> Result<Box<dyn Embed>, EmbedError> {
+    let Some(model_name) = model_id else {
+        return Err(EmbedError::FailedToInstantiateEmbeddingModel {
+            source: format!("For embedding model '{model_name}', model id must be specified in `from:azure:<model_id>`.").into(),
+        });
+    };
+    let api_base = extract_secret!(params, "endpoint");
+    let api_version = extract_secret!(params, "azure_api_version");
+    let deployment_name = extract_secret!(params, "azure_deployment_name");
+    let api_key = extract_secret!(params, "azure_api_key");
+    let entra_token = extract_secret!(params, "azure_entra_token");
+    if api_key.is_some() && entra_token.is_some() {
+        return Err(EmbedError::FailedToInstantiateEmbeddingModel {
+            source: format!(
+                "Azure embedding model '{model_name}' can only use one of 'azure_api_key' or 'azure_entra_token'."
+            )
+            .into(),
+        });
+    }
+    Ok(Box::new(OpenaiEmbed::new(llms::openai::new_azure_client(
+        model_name,
+        api_base,
+        api_version,
+        deployment_name,
+        api_key,
+        entra_token,
+    ))))
+}
+
+async fn openai(
+    model_id: Option<String>,
+    component: &spicepod::component::embeddings::Embeddings,
+    params: &HashMap<String, SecretString>,
+    secrets: Arc<RwLock<Secrets>>,
+) -> Result<Box<dyn Embed>, EmbedError> {
+    // If parameter is from secret store, it will have `openai_` prefix
+    let mut embed = OpenaiEmbed::new(llms::openai::new_openai_client(
+        model_id.unwrap_or(DEFAULT_EMBEDDING_MODEL.to_string()),
+        extract_secret!(params, "endpoint"),
+        params
+            .get("api_key")
+            .or(params.get("openai_api_key"))
+            .map(|s| s.expose_secret().as_str()),
+        params
+            .get("org_id")
+            .or(params.get("openai_org_id"))
+            .map(|s| s.expose_secret().as_str()),
+        params
+            .get("project_id")
+            .or(params.get("openai_project_id"))
+            .map(|s| s.expose_secret().as_str()),
+    ));
+
+    // For OpenAI compatible embedding models, we allow users to
+    // specific the tokenizer being used, so that the model can chunk data properly.
+    if let Some(tokenizer_file) = component.find_any_file(ModelFileType::Tokenizer) {
+        tracing::debug!(
+            "Embedding model {} will use tokenizer from local file: {}.",
+            component.name,
+            &tokenizer_file.path
+        );
+        let file_params = if let Some(params) = tokenizer_file.params {
+            get_params_with_secrets(Arc::clone(&secrets), &params).await
+        } else {
+            HashMap::default()
+        };
+
+        let bytz = get_bytes_for_file(tokenizer_file.path.as_str(), &file_params)
+            .await
+            .map_err(|source| EmbedError::FailedToCreateTokenizer { source })?;
+
+        embed = embed.try_with_tokenizer_bytes(&bytz)?;
+    }
+    Ok(Box::new(embed))
 }
 
 /// Retrieves [`Bytes`] for a file/url path.
@@ -164,116 +324,6 @@ async fn get_file_from_hf(
         Err(e) => Err(Box::<dyn std::error::Error + Send + Sync>::from(format!(
             "Downloaded HF url, but failed to get local path. Error: {e:?}"
         ))),
-    }
-}
-
-pub async fn try_to_embedding(
-    component: &spicepod::component::embeddings::Embeddings,
-    secrets: Arc<RwLock<Secrets>>,
-) -> Result<Box<dyn Embed>, EmbedError> {
-    let params = get_params_with_secrets(Arc::clone(&secrets), &component.params).await;
-
-    let prefix = component
-        .get_prefix()
-        .ok_or(EmbedError::UnknownModelSource {
-            source: format!(
-                "Unknown model source for spicepod component from: {}",
-                component.from.clone()
-            )
-            .into(),
-        })?;
-
-    let model_id = component.get_model_id();
-
-    match prefix {
-        EmbeddingPrefix::OpenAi => {
-            // If parameter is from secret store, it will have `openai_` prefix
-            let mut embed = OpenaiEmbed::new(llms::openai::Openai::new(
-                model_id.unwrap_or(DEFAULT_EMBEDDING_MODEL.to_string()),
-                extract_secret!(params, "endpoint"),
-                params
-                    .get("api_key")
-                    .or(params.get("openai_api_key"))
-                    .map(Secret::expose_secret)
-                    .cloned(),
-                params
-                    .get("org_id")
-                    .or(params.get("openai_org_id"))
-                    .map(Secret::expose_secret)
-                    .cloned(),
-                params
-                    .get("project_id")
-                    .or(params.get("openai_project_id"))
-                    .map(Secret::expose_secret)
-                    .cloned(),
-            ));
-
-            // For OpenAI compatible embedding models, we allow users to
-            // specific the tokenizer being used, so that the model can chunk data properly.
-            if let Some(tokenizer_file) = component.find_any_file(ModelFileType::Tokenizer) {
-                tracing::debug!(
-                    "Embedding model {} will use tokenizer from local file: {}.",
-                    component.name,
-                    &tokenizer_file.path
-                );
-                let file_params = if let Some(params) = tokenizer_file.params {
-                    get_params_with_secrets(Arc::clone(&secrets), &params).await
-                } else {
-                    HashMap::default()
-                };
-
-                let bytz = get_bytes_for_file(tokenizer_file.path.as_str(), &file_params)
-                    .await
-                    .map_err(|source| EmbedError::FailedToCreateTokenizer { source })?;
-
-                embed = embed.try_with_tokenizer_bytes(&bytz)?;
-            }
-            Ok(Box::new(embed))
-        }
-        EmbeddingPrefix::File => {
-            let weights_path = model_id
-                .clone()
-                .or(component.find_any_file_path(ModelFileType::Weights))
-                .ok_or(EmbedError::FailedToInstantiateEmbeddingModel {
-                    source: "No 'weights_path' parameter provided".into(),
-                })?
-                .clone();
-            let config_path = component
-                .find_any_file_path(ModelFileType::Config)
-                .ok_or(EmbedError::FailedToInstantiateEmbeddingModel {
-                    source: "No 'config_path' parameter provided".into(),
-                })?
-                .clone();
-            let tokenizer_path = component
-                .find_any_file_path(ModelFileType::Tokenizer)
-                .ok_or(EmbedError::FailedToInstantiateEmbeddingModel {
-                    source: "No 'tokenizer_path' parameter provided".into(),
-                })?
-                .clone();
-            let pooling = params.get("pooling").map(Secret::expose_secret).cloned();
-            let max_seq_len = max_seq_length_from_params(&params)?;
-            Ok(Box::new(TeiEmbed::from_local(
-                Path::new(&weights_path),
-                Path::new(&config_path),
-                Path::new(&tokenizer_path),
-                pooling,
-                max_seq_len,
-            )?))
-        }
-        EmbeddingPrefix::HuggingFace => {
-            let hf_token = extract_secret!(params, "hf_token");
-            let pooling = extract_secret!(params, "pooling");
-            let max_seq_len = max_seq_length_from_params(&params)?;
-            if let Some(id) = model_id {
-                Ok(Box::new(
-                    TeiEmbed::from_hf(&id, None, hf_token, pooling, max_seq_len).await?,
-                ))
-            } else {
-                Err(EmbedError::FailedToInstantiateEmbeddingModel {
-                    source: format!("Failed to load model from: {}", component.from).into(),
-                })
-            }
-        }
     }
 }
 

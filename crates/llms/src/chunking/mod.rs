@@ -154,7 +154,13 @@ mod tests {
     use std::vec;
 
     use super::*;
-    use crate::{embeddings::Embed, openai::embed::OpenaiEmbed};
+    use crate::{
+        embeddings::Embed,
+        openai::{
+            embed::{OpenaiEmbed, DEFAULT_EMBEDDING_MODEL},
+            new_openai_client,
+        },
+    };
 
     #[test]
     fn test_openai_chunker() {
@@ -165,9 +171,15 @@ mod tests {
             file_format: None,
         };
 
-        let chunker = OpenaiEmbed::default()
-            .chunker(&cfg)
-            .expect("Failed to create OpenAI chunker");
+        let chunker = OpenaiEmbed::new(new_openai_client(
+            DEFAULT_EMBEDDING_MODEL.to_string(),
+            None,
+            None,
+            None,
+            None,
+        ))
+        .chunker(&cfg)
+        .expect("Failed to create OpenAI chunker");
         let chunks: Vec<_> = chunker
             .chunks("let cfg = ChunkingConfig {\ntarget_chunk_size: 3\noverlap_size: 1")
             .collect();

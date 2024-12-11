@@ -13,6 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+#![allow(clippy::implicit_hasher)]
 use async_openai::{
     error::OpenAIError,
     types::{
@@ -29,7 +30,7 @@ use llms::{
     anthropic::{Anthropic, AnthropicConfig},
     chat::{nsql::SqlGeneration, Chat, Error as LlmError, Result as ChatResult},
 };
-use secrecy::{ExposeSecret, Secret, SecretString};
+use secrecy::{ExposeSecret, SecretString};
 use spicepod::component::model::{Model, ModelFileType, ModelSource};
 use std::pin::Pin;
 use std::{collections::HashMap, sync::Arc};
@@ -46,14 +47,14 @@ pub type LLMModelStore = HashMap<String, Box<dyn Chat>>;
 /// Extract a secret from a hashmap of secrets, if it exists.
 macro_rules! extract_secret {
     ($params:expr, $key:expr) => {
-        $params.get($key).map(Secret::expose_secret).cloned()
+        $params.get($key).map(|s| s.expose_secret().as_str())
     };
 }
 
 /// Attempt to derive a runnable Chat model from a given component from the Spicepod definition.
-pub async fn try_to_chat_model<S: ::std::hash::BuildHasher>(
+pub async fn try_to_chat_model(
     component: &Model,
-    params: &HashMap<String, SecretString, S>,
+    params: &HashMap<String, SecretString>,
     rt: Arc<Runtime>,
 ) -> Result<Box<dyn Chat>, LlmError> {
     let model = construct_model(component, params)?;
@@ -61,7 +62,7 @@ pub async fn try_to_chat_model<S: ::std::hash::BuildHasher>(
     // Handle tool usage
     let spice_tool_opt: Option<SpiceToolsOptions> = extract_secret!(params, "tools")
         .or(extract_secret!(params, "spice_tools"))
-        .map(|x| x.parse())
+        .map(str::parse)
         .transpose()
         .map_err(|_| LlmError::UnsupportedSpiceToolUseParameterError {})?;
 
@@ -88,9 +89,9 @@ pub async fn try_to_chat_model<S: ::std::hash::BuildHasher>(
     Ok(tool_model)
 }
 
-pub fn construct_model<S: ::std::hash::BuildHasher>(
+pub fn construct_model(
     component: &spicepod::component::model::Model,
-    params: &HashMap<String, SecretString, S>,
+    params: &HashMap<String, SecretString>,
 ) -> Result<Box<dyn Chat>, LlmError> {
     let model_id = component.get_model_id();
     let prefix = component.get_source().ok_or(LlmError::UnknownModelSource {
@@ -101,83 +102,15 @@ pub fn construct_model<S: ::std::hash::BuildHasher>(
         .into(),
     })?;
     let model = match prefix {
-        ModelSource::HuggingFace => {
-            let Some(id) = model_id else {
-                return Err(LlmError::FailedToLoadModel {
-                    source: "No model id for Huggingface model".to_string().into(),
-                });
-            };
-            let model_type = extract_secret!(params, "model_type");
-            let hf_token = params.get("hf_token");
-
-            llms::chat::create_hf_model(&id, &model_type, hf_token)
-        }
-        ModelSource::File => {
-            let model_weights = component.find_all_file_path(ModelFileType::Weights);
-            if model_weights.is_empty() {
-                return Err(LlmError::FailedToLoadModel {
-                    source: "No 'weights_path' parameter provided".into(),
-                });
-            }
-
-            let tokenizer_path = component.find_any_file_path(ModelFileType::Tokenizer);
-            let tokenizer_config_path =
-                component.find_any_file_path(ModelFileType::TokenizerConfig);
-            let config_path = component.find_any_file_path(ModelFileType::Config);
-            let chat_template_literal = params
-                .get("chat_template")
-                .map(|s| s.expose_secret().as_str());
-
-            llms::chat::create_local_model(
-                model_weights.as_slice(),
-                config_path.as_deref(),
-                tokenizer_path.as_deref(),
-                tokenizer_config_path.as_deref(),
-                chat_template_literal,
-            )
-        }
+        ModelSource::HuggingFace => huggingface(model_id, params),
+        ModelSource::File => file(component, params),
+        ModelSource::Anthropic => anthropic(model_id.as_deref(), params),
+        ModelSource::Azure => azure(model_id, component.name.as_str(), params),
+        ModelSource::OpenAi => Ok(openai(model_id, params)),
         ModelSource::SpiceAI => Err(LlmError::UnsupportedTaskForModel {
             from: "spiceai".into(),
             task: "llm".into(),
         }),
-        ModelSource::Anthropic => {
-            let api_base = extract_secret!(params, "endpoint");
-            let api_key = extract_secret!(params, "anthropic_api_key");
-            let auth_token = extract_secret!(params, "anthropic_auth_token");
-
-            if api_key.is_none() && auth_token.is_none() {
-                return Err(LlmError::FailedToLoadModel {
-                    source: "One of following `model.params` is required: `anthropic_api_key` or `anthropic_auth_token`.".into(),
-                });
-            }
-
-            let cfg = AnthropicConfig::default()
-                .with_api_key(api_key)
-                .with_auth_token(auth_token)
-                .with_base_url(api_base);
-
-            let anthropic = Anthropic::new(cfg, model_id.as_deref()).map_err(|_| {
-                LlmError::FailedToLoadModel {
-                    source: format!("Unknown anthropic model: {:?}", model_id.clone()).into(),
-                }
-            })?;
-
-            Ok(Box::new(anthropic) as Box<dyn Chat>)
-        }
-        ModelSource::OpenAi => {
-            let api_base = extract_secret!(params, "endpoint");
-            let api_key = extract_secret!(params, "openai_api_key");
-            let org_id = extract_secret!(params, "openai_org_id");
-            let project_id = extract_secret!(params, "openai_project_id");
-
-            Ok(Box::new(llms::openai::Openai::new(
-                model_id.unwrap_or(DEFAULT_LLM_MODEL.to_string()),
-                api_base,
-                api_key,
-                org_id,
-                project_id,
-            )) as Box<dyn Chat>)
-        }
     }?;
 
     // Handle runtime wrapping
@@ -193,6 +126,123 @@ pub fn construct_model<S: ::std::hash::BuildHasher>(
         component.get_openai_request_overrides(),
     );
     Ok(Box::new(wrapper))
+}
+
+fn anthropic(
+    model_id: Option<&str>,
+    params: &HashMap<String, SecretString>,
+) -> Result<Box<dyn Chat>, LlmError> {
+    let api_base = extract_secret!(params, "endpoint");
+    let api_key = extract_secret!(params, "anthropic_api_key");
+    let auth_token = extract_secret!(params, "anthropic_auth_token");
+
+    if api_key.is_none() && auth_token.is_none() {
+        return Err(LlmError::FailedToLoadModel {
+            source: "One of following `model.params` is required: `anthropic_api_key` or `anthropic_auth_token`.".into(),
+        });
+    }
+
+    let cfg = AnthropicConfig::default()
+        .with_api_key(api_key)
+        .with_auth_token(auth_token)
+        .with_base_url(api_base);
+
+    let anthropic = Anthropic::new(cfg, model_id).map_err(|_| LlmError::FailedToLoadModel {
+        source: format!("Unknown anthropic model: {:?}", model_id.clone()).into(),
+    })?;
+
+    Ok(Box::new(anthropic) as Box<dyn Chat>)
+}
+
+fn huggingface(
+    model_id: Option<String>,
+    params: &HashMap<String, SecretString>,
+) -> Result<Box<dyn Chat>, LlmError> {
+    let Some(id) = model_id else {
+        return Err(LlmError::FailedToLoadModel {
+            source: "No model id for Huggingface model".to_string().into(),
+        });
+    };
+    let model_type = extract_secret!(params, "model_type");
+    let hf_token = params.get("hf_token");
+
+    llms::chat::create_hf_model(&id, model_type, hf_token)
+}
+
+fn openai(model_id: Option<String>, params: &HashMap<String, SecretString>) -> Box<dyn Chat> {
+    let api_base = extract_secret!(params, "endpoint");
+    let api_key = extract_secret!(params, "openai_api_key");
+    let org_id = extract_secret!(params, "openai_org_id");
+    let project_id = extract_secret!(params, "openai_project_id");
+
+    Box::new(llms::openai::new_openai_client(
+        model_id.unwrap_or(DEFAULT_LLM_MODEL.to_string()),
+        api_base,
+        api_key,
+        org_id,
+        project_id,
+    )) as Box<dyn Chat>
+}
+
+fn azure(
+    model_id: Option<String>,
+    model_name: &str,
+    params: &HashMap<String, SecretString>,
+) -> Result<Box<dyn Chat>, LlmError> {
+    let Some(model_name) = model_id else {
+        return Err(LlmError::FailedToLoadModel {
+            source: format!("For Azure model '{model_name}', model id must be specified in `from:azure:<model_id>`.").into(),
+        });
+    };
+    let api_base = extract_secret!(params, "endpoint");
+    let api_version = extract_secret!(params, "azure_api_version");
+    let deployment_name = extract_secret!(params, "azure_deployment_name");
+    let api_key = extract_secret!(params, "azure_api_key");
+    let entra_token = extract_secret!(params, "azure_entra_token");
+
+    if api_key.is_some() && entra_token.is_some() {
+        return Err(LlmError::FailedToLoadModel {
+            source: format!(
+                "For azure model '{model_name}', only one of 'azure_api_key' or 'azure_entra_token' can be provided."
+            )
+            .into(),
+        });
+    }
+    Ok(Box::new(llms::openai::new_azure_client(
+        model_name,
+        api_base,
+        api_version,
+        deployment_name,
+        api_key,
+        entra_token,
+    )) as Box<dyn Chat>)
+}
+
+fn file(
+    component: &spicepod::component::model::Model,
+    params: &HashMap<String, SecretString>,
+) -> Result<Box<dyn Chat>, LlmError> {
+    let model_weights = component.find_all_file_path(ModelFileType::Weights);
+    if model_weights.is_empty() {
+        return Err(LlmError::FailedToLoadModel {
+            source: "No 'weights_path' parameter provided".into(),
+        });
+    }
+
+    let tokenizer_path = component.find_any_file_path(ModelFileType::Tokenizer);
+    let tokenizer_config_path = component.find_any_file_path(ModelFileType::TokenizerConfig);
+    let config_path = component.find_any_file_path(ModelFileType::Config);
+    let chat_template_literal = params
+        .get("chat_template")
+        .map(|s| s.expose_secret().as_str());
+
+    llms::chat::create_local_model(
+        model_weights.as_slice(),
+        config_path.as_deref(),
+        tokenizer_path.as_deref(),
+        tokenizer_config_path.as_deref(),
+        chat_template_literal,
+    )
 }
 
 /// Wraps [`Chat`] models with additional handling specifically for the spice runtime (e.g. telemetry, injecting system prompts).
