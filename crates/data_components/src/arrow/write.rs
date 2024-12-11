@@ -248,46 +248,6 @@ impl MemSink {
             primary_key,
         }
     }
-
-    /// Help handle `write_all` operations when `InsertOp::Replace` is used and primary keys exist.
-    async fn handle_primary_keys_with_partitions(
-        &self,
-        pk_indices: &[usize],
-        new_key_set: HashSet<String>,
-        new_batches: Vec<Vec<RecordBatch>>,
-    ) -> Result<u64> {
-        let row_count: usize = new_batches
-            .iter()
-            .flat_map(|b| b.iter())
-            .map(RecordBatch::num_rows)
-            .sum();
-
-        // We don't need to find duplicate primary keys, just to determine if there is a collision. Therefore the following will sufice.
-        //   - Filter out any row in `self.batches` that has a primary key in from `new_batches`.
-        //   - Insert all `new_batches` into `self.batches`.
-        let mut futures = Vec::with_capacity(self.batches.len());
-        for (i, partition_data) in self.batches.iter().enumerate() {
-            let mut part_new_batches = new_batches[i].clone();
-            let part_key_set = &new_key_set;
-
-            let fut = async move {
-                let mut existing_partition = partition_data.write().await;
-                filter_existing(&mut existing_partition, part_key_set, pk_indices)?;
-
-                existing_partition.append(&mut part_new_batches);
-                Ok::<(), DataFusionError>(())
-            };
-            futures.push(fut);
-        }
-
-        // Wait for all partitions to finish
-        futures::future::join_all(futures)
-            .await
-            .into_iter()
-            .collect::<Result<Vec<_>, _>>()?;
-
-        Ok(row_count as u64)
-    }
 }
 
 /// Create primary key values for a [`RecordBatch`]. For composite keys, values are concatenated with a delimiter '|'.
@@ -377,6 +337,7 @@ impl DataSink for MemSink {
             i = (i + 1) % num_partitions;
         }
 
+        // Ensure new data has no primary key conflicts internally, and generate primary key ids for later comparison to existing partition data.
         let mut new_key_set: HashSet<String> = HashSet::new();
         if let Some(ref pks) = self.primary_key {
             let new_primary_key_ids = primary_key_identifier(&new_batches, pks)?;
@@ -387,33 +348,35 @@ impl DataSink for MemSink {
                     "Primary key values must be unique".to_string(),
                 ));
             }
-
-            if matches!(self.overwrite, InsertOp::Replace) {
-                // This functionality must be handled separately as primary key conflicts can happen across partitions.
-                return self
-                    .handle_primary_keys_with_partitions(pks, new_key_set, new_batches)
-                    .await;
-            }
         }
 
         let mut writable_targets: Vec<_> =
             futures::future::join_all(self.batches.iter().map(|target| target.write())).await;
 
         for (target, mut batches) in writable_targets.iter_mut().zip(new_batches.into_iter()) {
-            if matches!(self.overwrite, InsertOp::Overwrite) {
-                target.clear();
-            }
-
-            // Ensure that when we append, we don't have any primary key conflicts.
-            if matches!(self.overwrite, InsertOp::Append) {
-                if let Some(ref pks) = self.primary_key {
-                    for rb in &batches {
-                        let batch_pks = extract_primary_keys_str(rb, pks)?;
-                        if batch_pks.iter().any(|p| new_key_set.contains(p)) {
-                            return Err(DataFusionError::Execution(
-                                "Primary key values must be unique".to_string(),
-                            ));
+            // Depending on [`InsertOp`], we may need to mutate `batches` before adding new data.
+            match self.overwrite {
+                // Ensure no primary key conflicts between new data that is being appended, and existing data (since we are not replacing).
+                InsertOp::Append => {
+                    if let Some(ref pks) = self.primary_key {
+                        for rb in &batches {
+                            let batch_pks = extract_primary_keys_str(rb, pks)?;
+                            if batch_pks.iter().any(|p| new_key_set.contains(p)) {
+                                return Err(DataFusionError::Execution(
+                                    "Primary key values must be unique".to_string(),
+                                ));
+                            }
                         }
+                    }
+                }
+                // Already handle primary conflicts in new data above.
+                InsertOp::Overwrite => {
+                    target.clear();
+                }
+                // Remove existing data with primary key conflicts. New data will be added in their place.
+                InsertOp::Replace => {
+                    if let Some(ref pks) = self.primary_key {
+                        filter_existing(&mut *target, &new_key_set, pks)?;
                     }
                 }
             }
@@ -425,10 +388,7 @@ impl DataSink for MemSink {
     }
 }
 
-fn primary_key_identifier(
-    rb: &Vec<Vec<RecordBatch>>,
-    primary_keys: &[usize],
-) -> Result<Vec<String>> {
+fn primary_key_identifier(rb: &[Vec<RecordBatch>], primary_keys: &[usize]) -> Result<Vec<String>> {
     // Create unique string for each primary key across all `new_batches` rows.
     let new_keys: Vec<String> = rb
         .iter()
