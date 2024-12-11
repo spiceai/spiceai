@@ -1,0 +1,65 @@
+---
+source: crates/runtime/benches/bench.rs
+description: "Query: select  dt.d_year\n \t,item.i_brand_id brand_id\n \t,item.i_brand brand\n \t,sum(ss_ext_sales_price) ext_price\n from date_dim dt\n     ,store_sales\n     ,item\n where dt.d_date_sk = store_sales.ss_sold_date_sk\n    and store_sales.ss_item_sk = item.i_item_sk\n    and item.i_manager_id = 1\n    and dt.d_moy=11\n    and dt.d_year=2000\n group by dt.d_year\n \t,item.i_brand\n \t,item.i_brand_id\n order by dt.d_year\n \t,ext_price desc\n \t,brand_id\n LIMIT 100 ;\n"
+snapshot_kind: text
+---
++---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                                                      |
++---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Sort: dt.d_year ASC NULLS LAST, ext_price DESC NULLS FIRST, brand_id ASC NULLS LAST, fetch=100                                                                            |
+|               |   Projection: dt.d_year, item.i_brand_id AS brand_id, item.i_brand AS brand, sum(store_sales.ss_ext_sales_price) AS ext_price                                             |
+|               |     Aggregate: groupBy=[[dt.d_year, item.i_brand, item.i_brand_id]], aggr=[[sum(store_sales.ss_ext_sales_price)]]                                                         |
+|               |       Projection: dt.d_year, store_sales.ss_ext_sales_price, item.i_brand_id, item.i_brand                                                                                |
+|               |         Inner Join: store_sales.ss_item_sk = item.i_item_sk                                                                                                               |
+|               |           Projection: dt.d_year, store_sales.ss_item_sk, store_sales.ss_ext_sales_price                                                                                   |
+|               |             Inner Join: dt.d_date_sk = store_sales.ss_sold_date_sk                                                                                                        |
+|               |               SubqueryAlias: dt                                                                                                                                           |
+|               |                 Projection: date_dim.d_date_sk, date_dim.d_year                                                                                                           |
+|               |                   BytesProcessedNode                                                                                                                                      |
+|               |                     Filter: date_dim.d_moy = Int32(11) AND date_dim.d_year = Int32(2000)                                                                                  |
+|               |                       TableScan: date_dim projection=[d_date_sk, d_year, d_moy]                                                                                           |
+|               |               BytesProcessedNode                                                                                                                                          |
+|               |                 TableScan: store_sales projection=[ss_sold_date_sk, ss_item_sk, ss_ext_sales_price]                                                                       |
+|               |           Projection: item.i_item_sk, item.i_brand_id, item.i_brand                                                                                                       |
+|               |             BytesProcessedNode                                                                                                                                            |
+|               |               Filter: item.i_manager_id = Int32(1)                                                                                                                        |
+|               |                 TableScan: item projection=[i_item_sk, i_brand_id, i_brand, i_manager_id]                                                                                 |
+| physical_plan | SortPreservingMergeExec: [d_year@0 ASC NULLS LAST, ext_price@3 DESC, brand_id@1 ASC NULLS LAST], fetch=100                                                                |
+|               |   SortExec: TopK(fetch=100), expr=[d_year@0 ASC NULLS LAST, ext_price@3 DESC, brand_id@1 ASC NULLS LAST], preserve_partitioning=[true]                                    |
+|               |     ProjectionExec: expr=[d_year@0 as d_year, i_brand_id@2 as brand_id, i_brand@1 as brand, sum(store_sales.ss_ext_sales_price)@3 as ext_price]                           |
+|               |       AggregateExec: mode=FinalPartitioned, gby=[d_year@0 as d_year, i_brand@1 as i_brand, i_brand_id@2 as i_brand_id], aggr=[sum(store_sales.ss_ext_sales_price)]        |
+|               |         CoalesceBatchesExec: target_batch_size=8192                                                                                                                       |
+|               |           RepartitionExec: partitioning=Hash([d_year@0, i_brand@1, i_brand_id@2], 4), input_partitions=4                                                                  |
+|               |             AggregateExec: mode=Partial, gby=[d_year@0 as d_year, i_brand@3 as i_brand, i_brand_id@2 as i_brand_id], aggr=[sum(store_sales.ss_ext_sales_price)]           |
+|               |               CoalesceBatchesExec: target_batch_size=8192                                                                                                                 |
+|               |                 HashJoinExec: mode=Partitioned, join_type=Inner, on=[(ss_item_sk@1, i_item_sk@0)], projection=[d_year@0, ss_ext_sales_price@2, i_brand_id@4, i_brand@5]   |
+|               |                   CoalesceBatchesExec: target_batch_size=8192                                                                                                             |
+|               |                     RepartitionExec: partitioning=Hash([ss_item_sk@1], 4), input_partitions=4                                                                             |
+|               |                       CoalesceBatchesExec: target_batch_size=8192                                                                                                         |
+|               |                         HashJoinExec: mode=Partitioned, join_type=Inner, on=[(d_date_sk@0, ss_sold_date_sk@0)], projection=[d_year@1, ss_item_sk@3, ss_ext_sales_price@4] |
+|               |                           CoalesceBatchesExec: target_batch_size=8192                                                                                                     |
+|               |                             RepartitionExec: partitioning=Hash([d_date_sk@0], 4), input_partitions=4                                                                      |
+|               |                               ProjectionExec: expr=[d_date_sk@0 as d_date_sk, d_year@1 as d_year]                                                                         |
+|               |                                 BytesProcessedExec                                                                                                                        |
+|               |                                   CoalesceBatchesExec: target_batch_size=8192                                                                                             |
+|               |                                     FilterExec: d_moy@2 = 11 AND d_year@1 = 2000                                                                                          |
+|               |                                       SchemaCastScanExec                                                                                                                  |
+|               |                                         RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1                                                              |
+|               |                                           MemoryExec: partitions=1, partition_sizes=[9]                                                                                   |
+|               |                           CoalesceBatchesExec: target_batch_size=8192                                                                                                     |
+|               |                             RepartitionExec: partitioning=Hash([ss_sold_date_sk@0], 4), input_partitions=4                                                                |
+|               |                               BytesProcessedExec                                                                                                                          |
+|               |                                 SchemaCastScanExec                                                                                                                        |
+|               |                                   RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1                                                                    |
+|               |                                     MemoryExec: partitions=1, partition_sizes=[352]                                                                                       |
+|               |                   CoalesceBatchesExec: target_batch_size=8192                                                                                                             |
+|               |                     RepartitionExec: partitioning=Hash([i_item_sk@0], 4), input_partitions=4                                                                              |
+|               |                       ProjectionExec: expr=[i_item_sk@0 as i_item_sk, i_brand_id@1 as i_brand_id, i_brand@2 as i_brand]                                                   |
+|               |                         BytesProcessedExec                                                                                                                                |
+|               |                           CoalesceBatchesExec: target_batch_size=8192                                                                                                     |
+|               |                             FilterExec: i_manager_id@3 = 1                                                                                                                |
+|               |                               SchemaCastScanExec                                                                                                                          |
+|               |                                 RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1                                                                      |
+|               |                                   MemoryExec: partitions=1, partition_sizes=[3]                                                                                           |
+|               |                                                                                                                                                                           |
++---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
