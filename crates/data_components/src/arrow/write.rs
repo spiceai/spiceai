@@ -212,8 +212,6 @@ struct MemSink {
     batches: Vec<PartitionData>,
     overwrite: InsertOp,
 
-    // When `InsertOp::Replace`, the primary key is required to determine how to replace rows.
-    // If `None`, then `InsertOp::Replace` will mimic `InsertOp::Append`.
     primary_key: Option<Vec<usize>>,
 }
 
@@ -304,6 +302,19 @@ fn filter_existing(
     Ok(())
 }
 
+fn primary_key_identifier(rb: &[Vec<RecordBatch>], primary_keys: &[usize]) -> Result<Vec<String>> {
+    // Create unique string for each primary key across all `new_batches` rows.
+    let new_keys: Vec<String> = rb
+        .iter()
+        .flat_map(|p| p.iter().map(|b| extract_primary_keys_str(b, primary_keys)))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .flatten()
+        .collect();
+
+    Ok(new_keys)
+}
+
 #[async_trait]
 impl DataSink for MemSink {
     fn as_any(&self) -> &dyn Any {
@@ -354,12 +365,12 @@ impl DataSink for MemSink {
             futures::future::join_all(self.batches.iter().map(|target| target.write())).await;
 
         for (target, mut batches) in writable_targets.iter_mut().zip(new_batches.into_iter()) {
-            // Depending on [`InsertOp`], we may need to mutate `batches` before adding new data.
+            // Depending on [`InsertOp`], we may need to mutate the existing `batches` before adding new data.
             match self.overwrite {
                 // Ensure no primary key conflicts between new data that is being appended, and existing data (since we are not replacing).
                 InsertOp::Append => {
                     if let Some(ref pks) = self.primary_key {
-                        for rb in &batches {
+                        for rb in &**target {
                             let batch_pks = extract_primary_keys_str(rb, pks)?;
                             if batch_pks.iter().any(|p| new_key_set.contains(p)) {
                                 return Err(DataFusionError::Execution(
@@ -369,7 +380,7 @@ impl DataSink for MemSink {
                         }
                     }
                 }
-                // Already handle primary conflicts in new data above.
+                // Already handled primary conflicts in new data above.
                 InsertOp::Overwrite => {
                     target.clear();
                 }
@@ -386,19 +397,6 @@ impl DataSink for MemSink {
 
         Ok(row_count as u64)
     }
-}
-
-fn primary_key_identifier(rb: &[Vec<RecordBatch>], primary_keys: &[usize]) -> Result<Vec<String>> {
-    // Create unique string for each primary key across all `new_batches` rows.
-    let new_keys: Vec<String> = rb
-        .iter()
-        .flat_map(|p| p.iter().map(|b| extract_primary_keys_str(b, primary_keys)))
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
-        .flatten()
-        .collect();
-
-    Ok(new_keys)
 }
 
 #[async_trait]
