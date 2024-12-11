@@ -123,6 +123,9 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::connector("endpoint"),
 ];
 
+const HEADER_ORG: &str = "spiceai-org";
+const HEADER_APP: &str = "spiceai-app";
+
 impl DataConnectorFactory for SpiceAIFactory {
     fn create(
         &self,
@@ -203,8 +206,8 @@ impl DataConnector for SpiceAI {
         let (flight_factory, table_reference) = match dataset_path {
             SpiceAIDatasetPath::OrgAppPath { org, app, path } => {
                 let mut map = MetadataMap::new();
-                map.insert("spiceai-org", org);
-                map.insert("spiceai-app", app);
+                map.insert(HEADER_ORG, org);
+                map.insert(HEADER_APP, app);
                 (self.flight_factory.clone().with_metadata(map), path)
             }
             SpiceAIDatasetPath::Path(path) => (self.flight_factory.clone(), path),
@@ -252,8 +255,8 @@ impl DataConnector for SpiceAI {
         let (flight_factory, table_reference) = match dataset_path {
             SpiceAIDatasetPath::OrgAppPath { org, app, path } => {
                 let mut map = MetadataMap::new();
-                map.insert("spiceai-org", org);
-                map.insert("spiceai-app", app);
+                map.insert(HEADER_ORG, org);
+                map.insert(HEADER_APP, app);
                 (self.flight_factory.clone().with_metadata(map), path)
             }
             SpiceAIDatasetPath::Path(path) => (self.flight_factory.clone(), path),
