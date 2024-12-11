@@ -44,7 +44,6 @@ pub const DEFAULT_EMBEDDING_MODEL: &str = TEXT_EMBED_3_SMALL;
 ///
 /// For non-OpenAI models, a [`Tokenizer`] can be provided to correctly size
 /// chunks (instead of the default `OpenAI` BPE tokenizer).
-// #[derive(Default)]
 pub struct OpenaiEmbed<C: Config> {
     pub inner: Openai<C>,
     pub chunk_sizer: Option<Arc<dyn ChunkSizer + Send + Sync>>,
