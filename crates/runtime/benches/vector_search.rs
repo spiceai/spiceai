@@ -87,7 +87,7 @@ fn benchmark_configurations() -> Vec<SearchBenchmarkConfiguration> {
             acceleration: Some(Acceleration {
                 enabled: true,
                 // TODO: temporary limit amout of data to speed up developement/testing. This will be removed in the future.
-                refresh_sql: Some("select * from data limit 1000".into()),
+                refresh_sql: Some("select * from data limit 20000".into()),
                 ..Default::default()
             }),
         },
@@ -97,8 +97,6 @@ fn benchmark_configurations() -> Vec<SearchBenchmarkConfiguration> {
             embeddings_model: "openai:text-embedding-3-small",
             acceleration: Some(Acceleration {
                 enabled: true,
-                // TODO: temporary limit amout of data to speed up developement/testing. This will be removed in the future.
-                refresh_sql: Some("select * from data limit 1000".into()),
                 ..Default::default()
             }),
         },
