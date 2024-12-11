@@ -146,13 +146,23 @@ fn azure(
             .into(),
         });
     }
+
+    if api_key.is_none() && entra_token.is_none() {
+        return Err(EmbedError::FailedToInstantiateEmbeddingModel {
+            source: format!(
+                "Azure embedding model '{model_name}' requires 'azure_api_key' or 'azure_entra_token'."
+            )
+            .into(),
+        });
+    }
+
     Ok(Box::new(OpenaiEmbed::new(llms::openai::new_azure_client(
         model_name,
         api_base,
         api_version,
         deployment_name,
-        api_key,
         entra_token,
+        api_key,
     ))))
 }
 
