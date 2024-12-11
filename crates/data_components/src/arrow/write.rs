@@ -253,6 +253,7 @@ impl MemSink {
     async fn handle_primary_keys_with_partitions(
         &self,
         pk_indices: &[usize],
+        new_key_set: HashSet<String>,
         new_batches: Vec<Vec<RecordBatch>>,
     ) -> Result<u64> {
         let row_count: usize = new_batches
@@ -260,23 +261,6 @@ impl MemSink {
             .flat_map(|b| b.iter())
             .map(RecordBatch::num_rows)
             .sum();
-
-        // Create unique string for each primary key across all `new_batches` rows.
-        let new_keys: Vec<String> = new_batches
-            .iter()
-            .flat_map(|p| p.iter().map(|b| extract_primary_keys_str(b, pk_indices)))
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .flatten()
-            .collect();
-
-        let num_new_keys = new_keys.len();
-        let new_key_set: HashSet<String> = new_keys.into_iter().collect();
-        if new_key_set.len() != num_new_keys {
-            return Err(DataFusionError::Execution(
-                "Primary key values must be unique".to_string(),
-            ));
-        }
 
         // We don't need to find duplicate primary keys, just to determine if there is a collision. Therefore the following will sufice.
         //   - Filter out any row in `self.batches` that has a primary key in from `new_batches`.
@@ -393,11 +377,21 @@ impl DataSink for MemSink {
             i = (i + 1) % num_partitions;
         }
 
-        if matches!(self.overwrite, InsertOp::Replace) {
-            if let Some(ref pks) = self.primary_key {
+        let mut new_key_set: HashSet<String> = HashSet::new();
+        if let Some(ref pks) = self.primary_key {
+            let new_primary_key_ids = primary_key_identifier(&new_batches, pks)?;
+            let num_new_keys = new_primary_key_ids.len();
+            new_key_set = new_primary_key_ids.into_iter().collect();
+            if new_key_set.len() != num_new_keys {
+                return Err(DataFusionError::Execution(
+                    "Primary key values must be unique".to_string(),
+                ));
+            }
+
+            if matches!(self.overwrite, InsertOp::Replace) {
                 // This functionality must be handled separately as primary key conflicts can happen across partitions.
                 return self
-                    .handle_primary_keys_with_partitions(pks, new_batches)
+                    .handle_primary_keys_with_partitions(pks, new_key_set, new_batches)
                     .await;
             }
         }
@@ -409,11 +403,42 @@ impl DataSink for MemSink {
             if matches!(self.overwrite, InsertOp::Overwrite) {
                 target.clear();
             }
+
+            // Ensure that when we append, we don't have any primary key conflicts.
+            if matches!(self.overwrite, InsertOp::Append) {
+                if let Some(ref pks) = self.primary_key {
+                    for rb in &batches {
+                        let batch_pks = extract_primary_keys_str(rb, pks)?;
+                        if batch_pks.iter().any(|p| new_key_set.contains(p)) {
+                            return Err(DataFusionError::Execution(
+                                "Primary key values must be unique".to_string(),
+                            ));
+                        }
+                    }
+                }
+            }
+
             target.append(&mut batches);
         }
 
         Ok(row_count as u64)
     }
+}
+
+fn primary_key_identifier(
+    rb: &Vec<Vec<RecordBatch>>,
+    primary_keys: &[usize],
+) -> Result<Vec<String>> {
+    // Create unique string for each primary key across all `new_batches` rows.
+    let new_keys: Vec<String> = rb
+        .iter()
+        .flat_map(|p| p.iter().map(|b| extract_primary_keys_str(b, primary_keys)))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .flatten()
+        .collect();
+
+    Ok(new_keys)
 }
 
 #[async_trait]
