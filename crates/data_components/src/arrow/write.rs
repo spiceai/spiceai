@@ -177,7 +177,19 @@ impl TableProvider for MemTable {
             ));
         }
 
-        let sink = Arc::new(MemSink::new(self.batches.clone(), overwrite));
+        // If the table has a primary key, we need to know it to handle `InsertOp::Replace`.
+        let mut primary_key = None;
+        if let Some(constraints) = self.constraints() {
+            primary_key = constraints.iter().find_map(|c| {
+                if let Constraint::PrimaryKey(pk) = c {
+                    Some(pk.clone())
+                } else {
+                    None
+                }
+            });
+        };
+
+        let sink = Arc::new(MemSink::new(self.batches.clone(), overwrite, primary_key));
         Ok(Arc::new(DataSinkExec::new(
             input,
             sink,
@@ -196,6 +208,10 @@ struct MemSink {
     /// Target locations for writing data
     batches: Vec<PartitionData>,
     overwrite: InsertOp,
+
+    // When `InsertOp::Replace`, the primary key is required to determine how to replace rows.
+    // If `None`, then `InsertOp::Replace` will mimic `InsertOp::Append`.
+    primary_key: Option<Vec<usize>>,
 }
 
 impl Debug for MemSink {
@@ -221,6 +237,127 @@ impl MemSink {
     fn new(batches: Vec<PartitionData>, overwrite: InsertOp) -> Self {
         Self { batches, overwrite }
     }
+    fn new(
+        batches: Vec<PartitionData>,
+        overwrite: InsertOp,
+        primary_key: Option<Vec<usize>>,
+    ) -> Self {
+        Self {
+            batches,
+            overwrite,
+            primary_key,
+        }
+    }
+
+    /// Help handle `write_all` operations when `InsertOp::Replace` is used and primary keys exist.
+    async fn handle_primary_keys_with_partitions(
+        &self,
+        pk_indices: &[usize],
+        new_batches: Vec<Vec<RecordBatch>>,
+    ) -> Result<u64> {
+        let row_count: usize = new_batches
+            .iter()
+            .flat_map(|b| b.iter())
+            .map(RecordBatch::num_rows)
+            .sum();
+
+        // Create unique string for each primary key across all `new_batches` rows.
+        let new_keys: Vec<String> = new_batches
+            .iter()
+            .flat_map(|p| p.iter().map(|b| extract_primary_keys_str(b, pk_indices)))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .flatten()
+            .collect();
+
+        let num_new_keys = new_keys.len();
+        let new_key_set: HashSet<String> = new_keys.into_iter().collect();
+        if new_key_set.len() != num_new_keys {
+            return Err(DataFusionError::Execution(
+                "Primary key values must be unique".to_string(),
+            ));
+        }
+
+        // We don't need to find duplicate primary keys, just to determine if there is a collision. Therefore the following will sufice.
+        //   - Filter out any row in `self.batches` that has a primary key in from `new_batches`.
+        //   - Insert all `new_batches` into `self.batches`.
+        let mut futures = Vec::with_capacity(self.batches.len());
+        for (i, partition_data) in self.batches.iter().enumerate() {
+            let mut part_new_batches = new_batches[i].clone();
+            let part_key_set = &new_key_set;
+
+            let fut = async move {
+                let mut existing_partition = partition_data.write().await;
+                filter_existing(&mut existing_partition, part_key_set, pk_indices)?;
+
+                existing_partition.append(&mut part_new_batches);
+                Ok::<(), DataFusionError>(())
+            };
+            futures.push(fut);
+        }
+
+        // Wait for all partitions to finish
+        futures::future::join_all(futures)
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(row_count as u64)
+    }
+}
+
+/// Create primary key values for a [`RecordBatch`]. For composite keys, values are concatenated with a delimiter '|'.
+fn extract_primary_keys_str(batch: &RecordBatch, pk_indices: &[usize]) -> Result<Vec<String>> {
+    let num_rows = batch.num_rows();
+    let mut keys = Vec::with_capacity(num_rows);
+
+    for row_idx in 0..num_rows {
+        let mut parts = Vec::with_capacity(pk_indices.len());
+        for &col_idx in pk_indices {
+            let col = batch.column(col_idx);
+            let val = ScalarValue::try_from_array(col, row_idx)
+                .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+            parts.push(val.to_string());
+        }
+        // Join all PK parts with a delimiter
+        let key = parts.join("|");
+        keys.push(key);
+    }
+
+    Ok(keys)
+}
+
+/// Filter elements of `existing_batches` that have primary keys from `overwriting_primary_keys`.
+///
+/// This is one part of `InsertOp::Replace` functionality, and still requires the new rows (with conflicting PKs), to be added.
+///
+/// This function modifies `existing_batches` in place.
+fn filter_existing(
+    existing_batches: &mut Vec<RecordBatch>,
+    overwriting_primary_keys: &HashSet<String>,
+    pk_indices: &[usize],
+) -> Result<()> {
+    if existing_batches.is_empty() {
+        return Ok(());
+    }
+
+    // Instead of concatenating, we can filter each batch individually
+    let mut filtered = Vec::with_capacity(existing_batches.len());
+    for batch in existing_batches.drain(..) {
+        let keys = extract_primary_keys_str(&batch, pk_indices)?;
+
+        let mut keep_row_builder = BooleanBuilder::with_capacity(keys.len());
+        for k in keys {
+            keep_row_builder.append_value(!overwriting_primary_keys.contains(&k));
+        }
+        let filtered_batch = filter_record_batch(&batch, &keep_row_builder.finish())?;
+        if filtered_batch.num_rows() > 0 {
+            filtered.push(filtered_batch);
+        }
+    }
+
+    *existing_batches = filtered;
+    Ok(())
 }
 
 #[async_trait]
@@ -254,6 +391,15 @@ impl DataSink for MemSink {
             row_count += batch.num_rows();
             new_batches[i].push(batch);
             i = (i + 1) % num_partitions;
+        }
+
+        if matches!(self.overwrite, InsertOp::Replace) {
+            if let Some(ref pks) = self.primary_key {
+                // This functionality must be handled separately as primary key conflicts can happen across partitions.
+                return self
+                    .handle_primary_keys_with_partitions(pks, new_batches)
+                    .await;
+            }
         }
 
         let mut writable_targets: Vec<_> =
