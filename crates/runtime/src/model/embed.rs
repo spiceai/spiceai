@@ -136,11 +136,13 @@ fn azure(
     };
     let api_base = extract_secret!(params, "endpoint");
     let api_version = extract_secret!(params, "azure_api_version");
+    let deployment_name = extract_secret!(params, "azure_deployment_name");
     let api_key = extract_secret!(params, "azure_api_key");
     Ok(Box::new(OpenaiEmbed::new(llms::openai::new_azure_client(
         model_name,
         api_base,
         api_version,
+        deployment_name,
         api_key,
     ))))
 }
