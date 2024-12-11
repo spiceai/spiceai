@@ -20,7 +20,6 @@
 use arrow::array::BooleanBuilder;
 use arrow::compute::filter_record_batch;
 use datafusion::catalog::Session;
-// This is modified from the DataFusion `MemTable` to support overwrites. This file can be removed once that change is upstreamed.
 use datafusion::dataframe::DataFrame;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::scalar::ScalarValue;
