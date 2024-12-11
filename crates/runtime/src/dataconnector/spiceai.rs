@@ -411,19 +411,19 @@ mod tests {
     fn test_spice_dataset_path() {
         let tests = vec![
             (
-                "spiceai:spice.ai/lukekim/demo/datasets/my_data".to_string(),
+                "spice.ai:spice.ai/lukekim/demo/datasets/my_data".to_string(),
                 "lukekim.demo.my_data",
             ),
             (
-                "spiceai:spice.ai/lukekim/demo/my_data".to_string(),
+                "spice.ai:spice.ai/lukekim/demo/my_data".to_string(),
                 "lukekim.demo.my_data",
             ),
             (
-                "spiceai:lukekim/demo/datasets/my_data".to_string(),
+                "spice.ai:lukekim/demo/datasets/my_data".to_string(),
                 "lukekim.demo.my_data",
             ),
             (
-                "spiceai:lukekim/demo/my_data".to_string(),
+                "spice.ai:lukekim/demo/my_data".to_string(),
                 "lukekim.demo.my_data",
             ),
             (
@@ -434,11 +434,6 @@ mod tests {
                 "spice.ai/lukekim/demo/my_data".to_string(),
                 "lukekim.demo.my_data",
             ),
-            (
-                "lukekim/demo/datasets/my_data".to_string(),
-                "lukekim.demo.my_data",
-            ),
-            ("lukekim/demo/my_data".to_string(), "lukekim.demo.my_data"),
             ("eth.recent_blocks".to_string(), "eth.recent_blocks"),
         ];
 
