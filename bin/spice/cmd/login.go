@@ -258,7 +258,7 @@ var sharepointCmd = &cobra.Command{
 			os.Exit(1)
 		}
 
-		access_token, err := msal.InteractivelyAccessToken(cmd.Context(), tenant_id, client_id, []string{"User.Read", "Files.Read.All", "Sites.Read.All", "GroupMember.Read.All"})
+		access_token, err := msal.InteractivelyGetAccessToken(cmd.Context(), tenant_id, client_id, []string{"User.Read", "Files.Read.All", "Sites.Read.All", "GroupMember.Read.All"})
 		if err != nil {
 			slog.Error("Error getting Microsoft access token", "error", err)
 			os.Exit(1)

@@ -25,7 +25,6 @@ use std::any::Any;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use url::Url;
 
 use super::{
     ConnectorComponent, DataConnector, DataConnectorFactory, DataConnectorParams,
@@ -83,7 +82,7 @@ impl Sharepoint {
                     .with_scope([".default"])
                     .build(),
             ),
-            (None, Some(bearer_token)) => GraphClient::new(bearer_token.to_string()),
+            (None, Some(bearer_token)) => GraphClient::new(bearer_token),
             (Some(_), Some(_)) => return DuplicateAuthenticationSnafu.fail(),
             (None, None) => return InvalidAuthenticationSnafu.fail(),
         };
