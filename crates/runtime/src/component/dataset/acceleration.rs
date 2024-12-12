@@ -254,6 +254,7 @@ pub struct Acceleration {
 }
 
 impl Acceleration {
+    #[must_use]
     pub fn with_primary_key(mut self, primary_key: ColumnReference) -> Self {
         self.primary_key = Some(primary_key);
         self

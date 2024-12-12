@@ -11,36 +11,39 @@ version.workspace = true
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+arrow.workspace = true
 arrow-buffer.workspace = true
 arrow-flight.workspace = true
-arrow.workspace = true
 async-stream.workspace = true
 async-trait.workspace = true
 base64.workspace = true
-bb8 = {workspace = true, optional = true }
+bb8 = { workspace = true, optional = true }
 bytes.workspace = true
 chrono.workspace = true
 clickhouse-rs = { workspace = true, optional = true }
+datafusion.workspace = true
 datafusion-federation = { workspace = true }
 datafusion-federation-sql = { workspace = true }
 datafusion-table-providers = { workspace = true }
-datafusion.workspace = true
 db_connection_pool = { path = "../db_connection_pool" }
-delta_kernel = { version = "0.4.0", features = ["default-engine", "cloud"], optional = true }
+delta_kernel = { version = "0.4.0", features = [
+    "default-engine",
+    "cloud",
+], optional = true }
 document_parse = { path = "../document_parse" }
 duckdb = { workspace = true, features = [
-  "bundled",
-  "r2d2",
-  "vtab",
-  "vtab-arrow",
-  "appender-arrow",
+    "bundled",
+    "r2d2",
+    "vtab",
+    "vtab-arrow",
+    "appender-arrow",
 ], optional = true }
 flight_client = { path = "../flight_client" }
 futures.workspace = true
 globset.workspace = true
-graph-rs-sdk = {workspace = true, optional=true}
+graph-rs-sdk = { workspace = true, optional = true }
 graphql-parser.workspace = true
-http = {version= "1.1.0", optional=true}
+http = { version = "1.1.0" }
 object_store = { workspace = true }
 rdkafka = { version = "0.37.0", features = ["ssl-vendored"], optional = true }
 regex = "1.10.4"
@@ -52,13 +55,13 @@ serde_json.workspace = true
 snafu.workspace = true
 snowflake-api = { workspace = true, optional = true }
 spark-connect-rs = { git = "https://github.com/spiceai/spark-connect-rs.git", rev = "81b159ccd10f806fcb2d30f86715f77350ba24a2", features = [
-  "tls",
+    "tls",
 ], optional = true }
 tiberius = { workspace = true, optional = true }
-tokio-postgres = { workspace = true, features = [
-  "with-chrono-0_4",
-], optional = true }
 tokio.workspace = true
+tokio-postgres = { workspace = true, features = [
+    "with-chrono-0_4",
+], optional = true }
 tokio-util = { workspace = true, optional = true }
 tonic = { workspace = true }
 tracing.workspace = true
@@ -74,20 +77,29 @@ databricks = ["delta_lake", "spark_connect"]
 debezium = ["dep:rdkafka"]
 delta_lake = ["dep:delta_kernel"]
 duckdb = [
-  "dep:duckdb",
-  "db_connection_pool/duckdb",
-  "datafusion-table-providers/duckdb",
-  "datafusion-table-providers/duckdb-federation"
+    "dep:duckdb",
+    "db_connection_pool/duckdb",
+    "datafusion-table-providers/duckdb",
+    "datafusion-table-providers/duckdb-federation",
 ]
 flightsql = []
 mssql = ["dep:tiberius", "dep:tokio-util", "dep:bb8"]
 mysql = ["datafusion-table-providers/mysql"]
 odbc = []
-postgres = ["dep:tokio-postgres", "datafusion-table-providers/postgres", "datafusion-table-providers/postgres-federation"]
+postgres = [
+    "dep:tokio-postgres",
+    "datafusion-table-providers/postgres",
+    "datafusion-table-providers/postgres-federation",
+]
+sharepoint = ["dep:graph-rs-sdk"]
+#, "dep:http"]
 snowflake = ["dep:snowflake-api"]
 spark_connect = ["dep:spark-connect-rs"]
-sharepoint = ["dep:graph-rs-sdk", "dep:http"]
-sqlite = ["dep:rusqlite", "datafusion-table-providers/sqlite", "datafusion-table-providers/sqlite-federation"]
+sqlite = [
+    "dep:rusqlite",
+    "datafusion-table-providers/sqlite",
+    "datafusion-table-providers/sqlite-federation",
+]
 
 [dev-dependencies]
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
