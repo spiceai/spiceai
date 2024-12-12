@@ -210,7 +210,7 @@ fn azure(
     }
 
     if api_key.is_none() && entra_token.is_none() {
-        return Err(LlmError::FailedToLoadModel  {
+        return Err(LlmError::FailedToLoadModel {
             source: format!(
                 "Azure model '{model_name}' requires 'azure_api_key' or 'azure_entra_token'."
             )
