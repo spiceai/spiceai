@@ -19,7 +19,6 @@
 
 use arrow::array::BooleanBuilder;
 use arrow::compute::filter_record_batch;
-use arrow::util::pretty::pretty_format_batches;
 use datafusion::catalog::Session;
 use datafusion::dataframe::DataFrame;
 use datafusion::logical_expr::dml::InsertOp;
@@ -384,15 +383,10 @@ impl DataSink for MemSink {
             }
         }
 
-        // let mut writable_targets: Vec<_> =
-        //     futures::future::join_all(self.batches.iter().map(|target| target.write())).await;
+        let mut writable_targets: Vec<_> =
+            futures::future::join_all(self.batches.iter().map(|target| target.write())).await;
 
-        for (target, mut batches) in
-            futures::future::join_all(self.batches.iter().map(|target| target.write()))
-                .await
-                .iter_mut()
-                .zip(new_batches.into_iter())
-        {
+        for (target, mut batches) in writable_targets.iter_mut().zip(new_batches.into_iter()) {
             // Depending on [`InsertOp`], we may need to mutate the existing `target` before adding new data.
             match self.overwrite {
                 // Ensure no primary key conflicts between new data that is being appended, and existing data (since we are not replacing).
@@ -419,20 +413,7 @@ impl DataSink for MemSink {
                     }
                 }
             }
-
-            // println!("New batch {}", pretty_format_batches(&batches).unwrap());
-
-            target.extend(batches.drain(..));
-            // println!("target after {}", pretty_format_batches(target).unwrap());
-            // println!(
-            //     "New batch after {}",
-            //     pretty_format_batches(&batches).unwrap()
-            // );
-        }
-
-        for b in &self.batches {
-            let part = b.read().await;
-            println!("self.batches \n{}\n", pretty_format_batches(&part).unwrap());
+            target.append(&mut batches);
         }
 
         Ok(row_count as u64)
@@ -561,7 +542,6 @@ mod tests {
         )
     }
 
-    // append, overwrite, replace
     #[tokio::test]
     async fn test_write_all_append_not_primary_key() {
         let (rb, schema) = create_batch_with_string_columns(&[(
@@ -611,15 +591,18 @@ mod tests {
             .await
             .expect("Query successful");
 
-        let values: Vec<_> = result
-            .first()
-            .expect("result should have at least one batch")
-            .column(0)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("result should be StringArray")
-            .iter()
-            .collect();
+        let mut results = vec![];
+        for rb in &result {
+            let values: Vec<_> = rb
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("result should be StringArray")
+                .into_iter()
+                .collect();
+            results.extend(values.clone());
+        }
+
         assert_eq!(
             vec![
                 Some("1970-01-01"),
@@ -629,7 +612,7 @@ mod tests {
                 Some("2012-12-01T11:11:11Z"),
                 Some("2012-12-01T11:11:12Z")
             ],
-            values
+            results
         )
     }
 
@@ -689,16 +672,18 @@ mod tests {
             .await
             .expect("Query successful");
 
-        let values: Vec<_> = result
-            .first()
-            .expect("result should have at least one batch")
-            .column(1)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("result should be StringArray")
-            .iter()
-            .collect();
-        assert_eq!(vec![Some("a"), Some("c"), Some("y")], values)
+        let mut results = vec![];
+        for rb in &result {
+            let values: Vec<_> = rb
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("result should be StringArray")
+                .into_iter()
+                .collect();
+            results.extend(values.clone());
+        }
+        assert_eq!(vec![Some("a"), Some("c"), Some("y")], results)
     }
 
     #[tokio::test]
@@ -759,16 +744,19 @@ mod tests {
             .await
             .expect("Query successful");
 
-        let values: Vec<_> = result
-            .first()
-            .expect("result should have at least one batch")
-            .column(1)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("result should be StringArray")
-            .iter()
-            .collect();
-        assert_eq!(vec![Some("x"), Some("y"), Some("z")], values)
+        let mut results = vec![];
+        for rb in &result {
+            let values: Vec<_> = rb
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("result should be StringArray")
+                .into_iter()
+                .collect();
+            results.extend(values.clone());
+        }
+
+        assert_eq!(vec![Some("x"), Some("y"), Some("z")], results)
     }
 
     #[tokio::test]
@@ -861,15 +849,18 @@ mod tests {
             .await
             .expect("Query successful");
 
-        let values: Vec<_> = result
-            .first()
-            .expect("result should have at least one batch")
-            .column(1)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("result should be StringArray")
-            .iter()
-            .collect();
+        let mut results = vec![];
+        for rb in &result {
+            let values: Vec<_> = rb
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("result should be StringArray")
+                .into_iter()
+                .collect();
+            results.extend(values.clone());
+        }
+
         assert_eq!(
             vec![
                 Some("a"),
@@ -879,7 +870,7 @@ mod tests {
                 Some("y"),
                 Some("z")
             ],
-            values
+            results
         )
     }
 
