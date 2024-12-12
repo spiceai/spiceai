@@ -227,6 +227,8 @@ fn normalize_search_response(mut json: Value) -> String {
         *duration = json!("duration_ms_val");
     }
 
+    sort_json_keys(&mut json);
+
     serde_json::to_string_pretty(&json).unwrap_or_default()
 }
 
@@ -295,6 +297,32 @@ fn normalize_chat_completion_response(mut json: Value, normalize_message_content
     }
 
     serde_json::to_string_pretty(&json).unwrap_or_default()
+}
+
+/// Sorts the keys of a JSON object in place for consistent snapshot testing
+fn sort_json_keys(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            let mut sorted_map = serde_json::Map::new();
+            let mut keys: Vec<_> = map.keys().cloned().collect();
+            keys.sort();
+
+            for key in keys {
+                if let Some(mut val) = map.remove(&key) {
+                    sort_json_keys(&mut val); // Recurse into nested objects
+                    sorted_map.insert(key, val);
+                }
+            }
+
+            *map = sorted_map;
+        }
+        Value::Array(array) => {
+            for element in array.iter_mut() {
+                sort_json_keys(element);
+            }
+        }
+        _ => {}
+    }
 }
 
 async fn send_embeddings_request(
