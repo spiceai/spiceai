@@ -217,6 +217,7 @@ pub struct MemSink {
     /// Target locations for writing data
     batches: Vec<PartitionData>,
     overwrite: InsertOp,
+
     /// Optional primary key columns. If present, primary key values must be unique, ordered ascendingly.
     primary_key: Option<Vec<usize>>,
 }
@@ -625,6 +626,7 @@ mod tests {
                 vec!["1970-01-01", "2012-12-01T11:11:11Z", "2012-12-01T11:11:12Z"],
             ),
             ("value", vec!["a", "b", "c"]),
+
         ]);
         let table = MemTable::try_new(schema, vec![vec![rb]])
             .expect("mem table should be created")

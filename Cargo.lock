@@ -65,6 +65,7 @@ dependencies = [
  "const-random",
  "getrandom 0.2.15",
  "once_cell",
+ "serde",
  "version_check",
  "zerocopy",
 ]
@@ -1828,6 +1829,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "borrow-or-share"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3eeab4423108c5d7c744f4d234de88d18d636100093ae04caf4825134b9c3a32"
+
+[[package]]
 name = "borsh"
 version = "1.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2053,7 +2060,7 @@ dependencies = [
 [[package]]
 name = "candle-core"
 version = "0.8.0"
-source = "git+https://github.com/EricLBuehler/candle.git?rev=8742354#87423548e70b471d7c4a760bc16e3aa9e814f56d"
+source = "git+https://github.com/EricLBuehler/candle.git?rev=6800496#6800496261a240aa969fdc47cc9814d7914f0862"
 dependencies = [
  "byteorder",
  "candle-kernels 0.8.0",
@@ -2140,7 +2147,7 @@ dependencies = [
 [[package]]
 name = "candle-kernels"
 version = "0.8.0"
-source = "git+https://github.com/EricLBuehler/candle.git?rev=8742354#87423548e70b471d7c4a760bc16e3aa9e814f56d"
+source = "git+https://github.com/EricLBuehler/candle.git?rev=6800496#6800496261a240aa969fdc47cc9814d7914f0862"
 dependencies = [
  "bindgen_cuda 0.1.5",
 ]
@@ -2169,7 +2176,7 @@ dependencies = [
 [[package]]
 name = "candle-metal-kernels"
 version = "0.8.0"
-source = "git+https://github.com/EricLBuehler/candle.git?rev=8742354#87423548e70b471d7c4a760bc16e3aa9e814f56d"
+source = "git+https://github.com/EricLBuehler/candle.git?rev=6800496#6800496261a240aa969fdc47cc9814d7914f0862"
 dependencies = [
  "metal 0.27.0",
  "once_cell",
@@ -2192,7 +2199,7 @@ dependencies = [
 [[package]]
 name = "candle-nn"
 version = "0.8.0"
-source = "git+https://github.com/EricLBuehler/candle.git?rev=8742354#87423548e70b471d7c4a760bc16e3aa9e814f56d"
+source = "git+https://github.com/EricLBuehler/candle.git?rev=6800496#6800496261a240aa969fdc47cc9814d7914f0862"
 dependencies = [
  "candle-core 0.8.0",
  "candle-metal-kernels 0.8.0",
@@ -2265,6 +2272,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "26b52a9543ae338f279b96b0b9fed9c8093744685043739079ce85cd58f289a6"
 dependencies = [
  "cipher",
+]
+
+[[package]]
+name = "cbindgen"
+version = "0.27.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3fce8dd7fcfcbf3a0a87d8f515194b49d6135acab73e18bd380d1d93bb1a15eb"
+dependencies = [
+ "clap",
+ "heck 0.4.1",
+ "indexmap 2.7.0",
+ "log",
+ "proc-macro2",
+ "quote",
+ "serde",
+ "serde_json",
+ "syn 2.0.90",
+ "tempfile",
+ "toml",
 ]
 
 [[package]]
@@ -3644,6 +3670,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "derivre"
+version = "0.1.0"
+source = "git+https://github.com/microsoft/derivre?rev=02ee497e6e404a0b402b4f68a9abf599d22ed2ed#02ee497e6e404a0b402b4f68a9abf599d22ed2ed"
+dependencies = [
+ "ahash 0.8.11",
+ "anyhow",
+ "bytemuck",
+ "bytemuck_derive",
+ "hashbrown 0.14.5",
+ "regex-syntax 0.8.5",
+]
+
+[[package]]
 name = "des"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4170,6 +4209,17 @@ dependencies = [
  "num-traits",
  "rand 0.8.5",
  "rand_distr",
+]
+
+[[package]]
+name = "fluent-uri"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1918b65d96df47d3591bed19c5cca17e3fa5d0707318e4b5ef2eae01764df7e5"
+dependencies = [
+ "borrow-or-share",
+ "ref-cast",
+ "serde",
 ]
 
 [[package]]
@@ -6285,6 +6335,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4ee93343901ab17bd981295f2cf0026d4ad018c7c31ba84549a4ddbb47a45104"
 
 [[package]]
+name = "llguidance"
+version = "0.4.1"
+source = "git+https://github.com/microsoft/llguidance?rev=cfef3df97372a7b84d74976ff41cc9cb78bca6cc#cfef3df97372a7b84d74976ff41cc9cb78bca6cc"
+dependencies = [
+ "anyhow",
+ "cbindgen",
+ "derivre",
+ "indexmap 2.7.0",
+ "instant",
+ "referencing",
+ "regex-syntax 0.8.5",
+ "rustc-hash 2.1.0",
+ "serde",
+ "serde_json",
+ "toktrie",
+ "url",
+]
+
+[[package]]
 name = "llms"
 version = "1.0.0-rc.2"
 dependencies = [
@@ -6700,7 +6769,7 @@ dependencies = [
 [[package]]
 name = "mistralrs"
 version = "0.3.4"
-source = "git+https://github.com/spiceai/mistral.rs?rev=e9e19fdb510d504de961f90ea9398db45a533909#e9e19fdb510d504de961f90ea9398db45a533909"
+source = "git+https://github.com/spiceai/mistral.rs?rev=b2101b043a4ed28bd508faa57370c0394cce5e05#b2101b043a4ed28bd508faa57370c0394cce5e05"
 dependencies = [
  "anyhow",
  "candle-core 0.8.0",
@@ -6721,7 +6790,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-core"
 version = "0.3.4"
-source = "git+https://github.com/spiceai/mistral.rs?rev=e9e19fdb510d504de961f90ea9398db45a533909#e9e19fdb510d504de961f90ea9398db45a533909"
+source = "git+https://github.com/spiceai/mistral.rs?rev=b2101b043a4ed28bd508faa57370c0394cce5e05#b2101b043a4ed28bd508faa57370c0394cce5e05"
 dependencies = [
  "akin",
  "anyhow",
@@ -6751,6 +6820,7 @@ dependencies = [
  "indexmap 2.7.0",
  "indicatif",
  "itertools 0.13.0",
+ "llguidance",
  "lrtable",
  "minijinja",
  "minijinja-contrib",
@@ -6778,6 +6848,7 @@ dependencies = [
  "tokenizers",
  "tokio",
  "tokio-rayon",
+ "toktrie_hf_tokenizers",
  "toml",
  "tqdm",
  "tracing",
@@ -6791,7 +6862,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-paged-attn"
 version = "0.3.4"
-source = "git+https://github.com/spiceai/mistral.rs?rev=e9e19fdb510d504de961f90ea9398db45a533909#e9e19fdb510d504de961f90ea9398db45a533909"
+source = "git+https://github.com/spiceai/mistral.rs?rev=b2101b043a4ed28bd508faa57370c0394cce5e05#b2101b043a4ed28bd508faa57370c0394cce5e05"
 dependencies = [
  "anyhow",
  "bindgen_cuda 0.1.6",
@@ -6803,7 +6874,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-quant"
 version = "0.3.4"
-source = "git+https://github.com/spiceai/mistral.rs?rev=e9e19fdb510d504de961f90ea9398db45a533909#e9e19fdb510d504de961f90ea9398db45a533909"
+source = "git+https://github.com/spiceai/mistral.rs?rev=b2101b043a4ed28bd508faa57370c0394cce5e05#b2101b043a4ed28bd508faa57370c0394cce5e05"
 dependencies = [
  "bindgen_cuda 0.1.5",
  "byteorder",
@@ -6816,6 +6887,7 @@ dependencies = [
  "paste",
  "rayon",
  "serde",
+ "serde_json",
  "thiserror 1.0.69",
  "tracing",
 ]
@@ -6823,7 +6895,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-vision"
 version = "0.3.4"
-source = "git+https://github.com/spiceai/mistral.rs?rev=e9e19fdb510d504de961f90ea9398db45a533909#e9e19fdb510d504de961f90ea9398db45a533909"
+source = "git+https://github.com/spiceai/mistral.rs?rev=b2101b043a4ed28bd508faa57370c0394cce5e05#b2101b043a4ed28bd508faa57370c0394cce5e05"
 dependencies = [
  "candle-core 0.8.0",
  "image 0.25.5",
@@ -8965,6 +9037,39 @@ dependencies = [
 ]
 
 [[package]]
+name = "ref-cast"
+version = "1.0.23"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ccf0a6f84d5f1d581da8b41b47ec8600871962f2a528115b542b362d4b744931"
+dependencies = [
+ "ref-cast-impl",
+]
+
+[[package]]
+name = "ref-cast-impl"
+version = "1.0.23"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bcc303e793d3734489387d205e9b186fac9c6cfacedd98cbb2e8a5943595f3e6"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.90",
+]
+
+[[package]]
+name = "referencing"
+version = "0.26.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eb853437e467c693ac1dc8c1520105a31b8c2588544ff2f3cfa5a7c706c6c069"
+dependencies = [
+ "ahash 0.8.11",
+ "fluent-uri",
+ "once_cell",
+ "percent-encoding",
+ "serde_json",
+]
+
+[[package]]
 name = "regex"
 version = "1.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9926,6 +10031,7 @@ version = "1.0.133"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c7fceb2473b9166b2294ef05efcb65a3db80803f0b03ef86a5fc88a2b85ee377"
 dependencies = [
+ "indexmap 2.7.0",
  "itoa",
  "memchr",
  "ryu",
@@ -10791,7 +10897,7 @@ dependencies = [
 [[package]]
 name = "text-embeddings-backend"
 version = "1.5.0"
-source = "git+https://github.com/spiceai/text-embeddings-inference.git?rev=b3925b2f97fcd2bfab9551b432ab659c48e5586b#b3925b2f97fcd2bfab9551b432ab659c48e5586b"
+source = "git+https://github.com/spiceai/text-embeddings-inference.git?rev=67b743e3a0babacd72f16ace46b51c49e8c5a672#67b743e3a0babacd72f16ace46b51c49e8c5a672"
 dependencies = [
  "hf-hub",
  "serde_json",
@@ -10804,7 +10910,7 @@ dependencies = [
 [[package]]
 name = "text-embeddings-backend-candle"
 version = "1.5.0"
-source = "git+https://github.com/spiceai/text-embeddings-inference.git?rev=b3925b2f97fcd2bfab9551b432ab659c48e5586b#b3925b2f97fcd2bfab9551b432ab659c48e5586b"
+source = "git+https://github.com/spiceai/text-embeddings-inference.git?rev=67b743e3a0babacd72f16ace46b51c49e8c5a672#67b743e3a0babacd72f16ace46b51c49e8c5a672"
 dependencies = [
  "anyhow",
  "candle-core 0.8.1",
@@ -10827,7 +10933,7 @@ dependencies = [
 [[package]]
 name = "text-embeddings-backend-core"
 version = "1.5.0"
-source = "git+https://github.com/spiceai/text-embeddings-inference.git?rev=b3925b2f97fcd2bfab9551b432ab659c48e5586b#b3925b2f97fcd2bfab9551b432ab659c48e5586b"
+source = "git+https://github.com/spiceai/text-embeddings-inference.git?rev=67b743e3a0babacd72f16ace46b51c49e8c5a672#67b743e3a0babacd72f16ace46b51c49e8c5a672"
 dependencies = [
  "nohash-hasher",
  "thiserror 1.0.69",
@@ -10836,7 +10942,7 @@ dependencies = [
 [[package]]
 name = "text-embeddings-core"
 version = "1.5.0"
-source = "git+https://github.com/spiceai/text-embeddings-inference.git?rev=b3925b2f97fcd2bfab9551b432ab659c48e5586b#b3925b2f97fcd2bfab9551b432ab659c48e5586b"
+source = "git+https://github.com/spiceai/text-embeddings-inference.git?rev=67b743e3a0babacd72f16ace46b51c49e8c5a672#67b743e3a0babacd72f16ace46b51c49e8c5a672"
 dependencies = [
  "async-channel 2.3.1",
  "hf-hub",
@@ -10852,7 +10958,7 @@ dependencies = [
 [[package]]
 name = "text-splitter"
 version = "0.18.1"
-source = "git+https://github.com/spiceai/text-splitter.git?rev=b33e4748576b9a81d436d3f28a6706f860fc45ba#b33e4748576b9a81d436d3f28a6706f860fc45ba"
+source = "git+https://github.com/spiceai/text-splitter.git?rev=0c4d27f482cd7ef09ead3156ef0e7a2031458838#0c4d27f482cd7ef09ead3156ef0e7a2031458838"
 dependencies = [
  "ahash 0.8.11",
  "auto_enums",
@@ -11054,14 +11160,15 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "tokenizers"
-version = "0.20.4"
+version = "0.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3b08cc37428a476fc9e20ac850132a513a2e1ce32b6a31addf2b74fa7033b905"
+checksum = "9ecededfed68a69bc657e486510089e255e53c3d38cc7d4d59c8742668ca2cae"
 dependencies = [
  "aho-corasick",
  "derive_builder",
  "esaxx-rs",
  "getrandom 0.2.15",
+ "hf-hub",
  "indicatif",
  "itertools 0.12.1",
  "lazy_static",
@@ -11227,6 +11334,33 @@ dependencies = [
  "futures-sink",
  "pin-project-lite",
  "tokio",
+]
+
+[[package]]
+name = "toktrie"
+version = "0.1.0"
+source = "git+https://github.com/microsoft/llguidance?rev=cfef3df97372a7b84d74976ff41cc9cb78bca6cc#cfef3df97372a7b84d74976ff41cc9cb78bca6cc"
+dependencies = [
+ "anyhow",
+ "bytemuck",
+ "bytemuck_derive",
+ "rustc-hash 2.1.0",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "toktrie_hf_tokenizers"
+version = "0.1.0"
+source = "git+https://github.com/microsoft/llguidance?rev=cfef3df97372a7b84d74976ff41cc9cb78bca6cc#cfef3df97372a7b84d74976ff41cc9cb78bca6cc"
+dependencies = [
+ "anyhow",
+ "log",
+ "rustc-hash 2.1.0",
+ "serde",
+ "serde_json",
+ "tokenizers",
+ "toktrie",
 ]
 
 [[package]]
