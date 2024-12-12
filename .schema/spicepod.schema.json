@@ -33,6 +33,12 @@
         "$ref": "#/definitions/ComponentOrReference_for_Embeddings"
       }
     },
+    "evals": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/ComponentOrReference_for_Eval"
+      }
+    },
     "extensions": {
       "description": "Optional extensions configuration",
       "type": "object",
@@ -481,6 +487,16 @@
         }
       ]
     },
+    "ComponentOrReference_for_Eval": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/Eval"
+        },
+        {
+          "$ref": "#/definitions/ComponentReference"
+        }
+      ]
+    },
     "ComponentOrReference_for_Model": {
       "anyOf": [
         {
@@ -727,6 +743,40 @@
         "params": {
           "type": "object",
           "additionalProperties": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "Eval": {
+      "type": "object",
+      "required": [
+        "dataset",
+        "name",
+        "scorers"
+      ],
+      "properties": {
+        "dataset": {
+          "type": "string"
+        },
+        "dependsOn": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "type": "string"
+        },
+        "scorers": {
+          "type": "array",
+          "items": {
             "type": "string"
           }
         }
