@@ -39,7 +39,7 @@ impl Runtime {
     #[allow(clippy::implicit_hasher)]
     pub(crate) async fn load_eval_scorer(&self) {
         for (name, scorer) in builtin_scorer() {
-            let mut reg = self.eval_scorer_registry.write().await;
+            let mut reg = self.eval_scorers.write().await;
             reg.insert(name.to_string(), Arc::clone(&scorer));
             tracing::debug!("Successfully loaded eval scorer {name}");
         }
