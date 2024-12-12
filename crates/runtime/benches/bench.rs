@@ -54,6 +54,8 @@ mod bench_spicecloud;
 mod bench_delta;
 #[cfg(feature = "duckdb")]
 mod bench_duckdb;
+#[cfg(feature = "mssql")]
+mod bench_mssql;
 #[cfg(feature = "mysql")]
 mod bench_mysql;
 #[cfg(feature = "odbc")]
@@ -139,6 +141,8 @@ async fn bench_main() -> Result<(), String> {
                 "odbc-athena",
                 #[cfg(all(feature = "delta_lake", feature = "databricks"))]
                 "delta_lake",
+                #[cfg(feature = "mssql")]
+                "mssql",
             ];
             for connector in connectors {
                 run_connector_bench(connector, &upload_results_dataset, args.bench_name.as_ref()).await?;
@@ -246,6 +250,10 @@ async fn run_connector_bench(
         #[cfg(feature = "delta_lake")]
         "delta_lake" => {
             bench_delta::run(&mut rt, &mut benchmark_results, bench_name).await?;
+        }
+        #[cfg(feature = "mssql")]
+        "mssql" => {
+            bench_mssql::run(&mut rt, &mut benchmark_results, bench_name).await?;
         }
         _ => {}
     }
