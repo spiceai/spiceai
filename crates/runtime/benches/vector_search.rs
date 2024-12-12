@@ -20,6 +20,7 @@ use bench_search::{
     setup::{load_query_relevance_data, load_search_queries, setup_benchmark, Query},
     SearchBenchmarkResultBuilder,
 };
+use clap::Parser;
 use futures::{stream, StreamExt, TryStreamExt};
 use runtime::{
     embeddings::vector_search::{
@@ -33,6 +34,19 @@ use utils::runtime_ready_check;
 
 mod bench_search;
 mod utils;
+
+// Define command line arguments for running benchmark test
+#[derive(Parser, Debug)]
+#[command(version, about, long_about = None)]
+struct BenchArgs {
+    /// Run the benchmark
+    #[arg(long)]
+    bench: bool,
+
+    /// Sets the configuration to run benchmark test on
+    #[arg(short, long)]
+    configuration: Option<String>,
+}
 
 #[tokio::main]
 async fn main() -> Result<(), String> {
@@ -63,6 +77,8 @@ fn benchmark_configurations() -> Vec<SearchBenchmarkConfiguration> {
     // TODO: expand configurations with DuckDB acceleration after issue below is resolved
     // https://github.com/spiceai/spiceai/issues/3796
 
+    let args = BenchArgs::parse();
+
     vec![
         SearchBenchmarkConfiguration {
             name: "quora_minilm-l6-v2_arrow",
@@ -71,7 +87,7 @@ fn benchmark_configurations() -> Vec<SearchBenchmarkConfiguration> {
             acceleration: Some(Acceleration {
                 enabled: true,
                 // TODO: temporary limit amout of data to speed up developement/testing. This will be removed in the future.
-                refresh_sql: Some("select * from data limit 1000".into()),
+                refresh_sql: Some("select * from data limit 20000".into()),
                 ..Default::default()
             }),
         },
@@ -81,16 +97,26 @@ fn benchmark_configurations() -> Vec<SearchBenchmarkConfiguration> {
             embeddings_model: "openai:text-embedding-3-small",
             acceleration: Some(Acceleration {
                 enabled: true,
-                // TODO: temporary limit amout of data to speed up developement/testing. This will be removed in the future.
-                refresh_sql: Some("select * from data limit 1000".into()),
                 ..Default::default()
             }),
         },
     ]
+    .into_iter()
+    .filter(|x| match &args.configuration {
+        Some(config) => x.name.to_lowercase() == config.to_lowercase(),
+        None => true,
+    })
+    .collect()
 }
 
 async fn vector_search_benchmarks() -> Result<(), String> {
-    for config in benchmark_configurations() {
+    let benchmark_configurations = benchmark_configurations();
+
+    if benchmark_configurations.is_empty() {
+        return Err("No benchmarks to run: the configuration list is empty.".to_string());
+    }
+
+    for config in benchmark_configurations {
         let _ = run_benchmark(&config).await;
     }
 
@@ -122,7 +148,7 @@ async fn run_benchmark(config: &SearchBenchmarkConfiguration) -> Result<(), Stri
     tracing::info!("Loading test corpus... Warning: This might take a while!");
 
     // wait untill embeddings are created during initial data load
-    runtime_ready_check(&rt, Duration::from_secs(20 * 60)).await;
+    runtime_ready_check(&rt, Duration::from_secs(60 * 60)).await;
 
     benchmark_result.finish_index();
 

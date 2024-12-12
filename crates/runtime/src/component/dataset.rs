@@ -366,24 +366,24 @@ impl Dataset {
 
     /// Returns the dataset source - the first part of the `from` field before the first '://', ':', or '/'
     #[must_use]
-    pub fn source(&self) -> String {
+    pub fn source(&self) -> &str {
         if self.from == "sink" || self.from.is_empty() {
-            return "sink".to_string();
+            return "sink";
         }
 
         match self.find_first_delimiter() {
-            Some((0, _)) => String::new(),
-            Some((pos, _)) => self.from[..pos].to_string(),
-            None => "spice.ai".to_string(),
+            Some((0, _)) => "",
+            Some((pos, _)) => &self.from[..pos],
+            None => "spice.ai",
         }
     }
 
     /// Returns the dataset path - the remainder of the `from` field after the first '://', ':', or '/'
     #[must_use]
-    pub fn path(&self) -> String {
+    pub fn path(&self) -> &str {
         match self.find_first_delimiter() {
-            Some((pos, len)) => self.from[pos + len..].to_string(),
-            None => self.from.clone(),
+            Some((pos, len)) => &self.from[pos + len..],
+            None => &self.from,
         }
     }
 
@@ -400,13 +400,13 @@ impl Dataset {
             let path_str = self.path();
             let dialect = dialect.unwrap_or(&GenericDialect {});
             let mut parts = Parser::new(dialect)
-                .try_with_sql(path_str.as_str())
+                .try_with_sql(path_str)
                 .context(UnableToParseTableReferenceFromPathSnafu {
-                    path: path_str.clone(),
+                    path: path_str.to_string(),
                 })?
                 .parse_multipart_identifier()
                 .context(UnableToParseTableReferenceFromPathSnafu {
-                    path: path_str.clone(),
+                    path: path_str.to_string(),
                 })?
                 .iter()
                 .map(|i| i.value.clone())

@@ -294,7 +294,7 @@ impl DataConnector for Debezium {
                     connector_component: ConnectorComponent::from(dataset),
                 })?;
 
-                kafka_consumer.subscribe(&topic).boxed().context(
+                kafka_consumer.subscribe(topic).boxed().context(
                     super::UnableToGetReadProviderSnafu {
                         dataconnector: "debezium",
                         connector_component: ConnectorComponent::from(dataset),
@@ -303,7 +303,7 @@ impl DataConnector for Debezium {
 
                 (kafka_consumer, metadata, Arc::new(schema))
             }
-            None => get_metadata_from_kafka(dataset, &topic, self.kafka_config.clone()).await?,
+            None => get_metadata_from_kafka(dataset, topic, self.kafka_config.clone()).await?,
         };
 
         let refresh_sql = dataset.refresh_sql();

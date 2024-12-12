@@ -18,12 +18,16 @@ limitations under the License.
 use crate::chat::nsql::structured_output::StructuredOutputSqlGeneration;
 use crate::chat::nsql::{json::JsonSchemaSqlGeneration, SqlGeneration};
 use crate::chat::Chat;
+use async_openai::config::Config;
 use async_openai::error::OpenAIError;
 use async_openai::types::{
-    ChatCompletionResponseStream, CreateChatCompletionRequest, CreateChatCompletionResponse,
+    ChatCompletionRequestMessage, ChatCompletionRequestUserMessage,
+    ChatCompletionRequestUserMessageContent, ChatCompletionResponseStream,
+    CreateChatCompletionRequest, CreateChatCompletionResponse,
 };
 use async_trait::async_trait;
 use futures::TryStreamExt;
+use tracing_futures::Instrument;
 
 use super::Openai;
 
@@ -34,7 +38,7 @@ pub(crate) const GPT3_5_TURBO_INSTRUCT: &str = "gpt-3.5-turbo";
 pub const DEFAULT_LLM_MODEL: &str = GPT3_5_TURBO_INSTRUCT;
 
 #[async_trait]
-impl Chat for Openai {
+impl<C: Config + Send + Sync> Chat for Openai<C> {
     fn as_sql(&self) -> Option<&dyn SqlGeneration> {
         // Only use structured output schema for OpenAI, not openai compatible.
         if self.supports_structured_output() {
@@ -57,6 +61,33 @@ impl Chat for Openai {
             s.model.clone_from(&outer_model);
             s
         })))
+    }
+
+    // Custom healthcheck for OpenAI because Azure dosn't support `max_completion_tokens`.
+    #[allow(deprecated)]
+    async fn health(&self) -> Result<(), crate::chat::Error> {
+        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "health", input = "health");
+
+        if let Err(e) = self
+            .chat_request(CreateChatCompletionRequest {
+                max_tokens: Some(100),
+                messages: vec![ChatCompletionRequestMessage::User(
+                    ChatCompletionRequestUserMessage {
+                        name: None,
+                        content: ChatCompletionRequestUserMessageContent::Text("ping.".to_string()),
+                    },
+                )],
+                ..Default::default()
+            })
+            .instrument(span.clone())
+            .await
+        {
+            tracing::error!(target: "task_history", parent: &span, "{e}");
+            return Err(crate::chat::Error::HealthCheckError {
+                source: Box::new(e),
+            });
+        }
+        Ok(())
     }
 
     async fn chat_request(

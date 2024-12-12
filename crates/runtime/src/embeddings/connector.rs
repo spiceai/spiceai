@@ -59,7 +59,7 @@ impl EmbeddingConnector {
         // Runtime isn't built with model support, but user specified a dataset to use embeddings.
         if !cfg!(feature = "models") {
             return Err(DataConnectorError::InvalidConfigurationNoSource {
-                dataconnector: dataset.source(),
+                dataconnector: dataset.source().to_string(),
                 message: format!("The dataset is configured with an embedding model, but the runtime is not built with model support.\n{ENABLE_MODEL_SUPPORT_MESSAGE}"),
                 connector_component: dataset.into()
             });

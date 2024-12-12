@@ -87,7 +87,7 @@ impl DataConnector for MemoryConnector {
         dataset: &Dataset,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
         let path = dataset.path();
-        let Some(schema) = Self::schema_from_path(path.as_str()) else {
+        let Some(schema) = Self::schema_from_path(path) else {
             return Err(DataConnectorError::UnableToGetReadProvider {
                 dataconnector: "memory".to_string(),
                 connector_component: ConnectorComponent::from(dataset),
@@ -112,7 +112,7 @@ impl DataConnector for MemoryConnector {
         dataset: &Dataset,
     ) -> Option<super::DataConnectorResult<Arc<dyn TableProvider>>> {
         let path = dataset.path();
-        let Some(schema) = Self::schema_from_path(path.as_str()) else {
+        let Some(schema) = Self::schema_from_path(path) else {
             return Some(Err(DataConnectorError::UnableToGetReadProvider {
                 dataconnector: "memory".to_string(),
                 connector_component: ConnectorComponent::from(dataset),
