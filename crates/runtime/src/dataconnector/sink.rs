@@ -136,10 +136,6 @@ impl TableProvider for SinkConnector {
         self
     }
 
-    fn constraints(&self) -> Option<&Constraints> {
-        Some(&self.table_constraints)
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }

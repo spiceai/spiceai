@@ -17,7 +17,6 @@ limitations under the License.
 use crate::{
     datafusion::{DataFusion, SPICE_DEFAULT_CATALOG, SPICE_EVAL_SCHEMA},
     dataupdate::{DataUpdate, UpdateType},
-    model::EvalWorker,
     tracing_util::random_trace_id,
 };
 
@@ -158,13 +157,12 @@ pub async fn update_eval_run_status(
 /// Writes a new row to `spice.evals.runs` table and returns primary key.
 pub async fn start_eval_run(
     eval: &Eval,
-    model_name: String,
+    model_name: &str,
     df: Arc<DataFusion>,
-    ew: Arc<EvalWorker>,
 ) -> Result<EvalRunId> {
     // Use a traceId for the eval run job.
     let id = random_trace_id().to_string();
-    let rb = eval_runs_record(id.as_str(), model_name.as_str(), eval)
+    let rb = eval_runs_record(id.as_str(), model_name, eval)
         .boxed()
         .context(FailedToUpdateEvalRunTableSnafu {
             eval_run_id: id.to_string(),
@@ -184,9 +182,14 @@ pub async fn start_eval_run(
         eval_run_id: id.to_string(),
     })?;
 
-    ew.queue_eval_job(&id, eval, model_name.as_str()).await?;
-
     Ok(id)
+}
+pub fn sql_query_for(id: &EvalRunId) -> String {
+    format!(
+        "SELECT * FROM {tbl} WHERE id = '{id}';",
+        tbl = EVAL_RUNS_TABLE_REFERENCE.to_quoted_string(),
+        id = id
+    )
 }
 
 async fn get_eval_run(
@@ -194,14 +197,7 @@ async fn get_eval_run(
     id: &EvalRunId,
 ) -> Result<RecordBatch, Box<dyn std::error::Error + Send + Sync>> {
     let rb = df
-        .query_builder(
-            format!(
-                "SELECT * FROM {tbl} WHERE id = '{id}';",
-                tbl = EVAL_RUNS_TABLE_REFERENCE.to_quoted_string(),
-                id = id
-            )
-            .as_str(),
-        )
+        .query_builder(sql_query_for(id).as_str())
         .build()
         .run()
         .await

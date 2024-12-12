@@ -17,6 +17,7 @@ limitations under the License.
 use std::{collections::HashMap, sync::Arc};
 
 use async_trait::async_trait;
+use tokio::sync::RwLock;
 
 use super::{DatasetInput, DatasetOutput};
 
@@ -32,6 +33,8 @@ pub trait Scorer: Sync + Send {
     /// Compute the relevant metrics for this [`Scorer`], given a precomputed scores.
     fn metrics(&self, scores: &[f32]) -> Vec<(String, f32)>;
 }
+
+pub type EvalScorerRegistry = Arc<RwLock<HashMap<String, Arc<dyn Scorer>>>>;
 
 /// Compute the scores for each [`Scorer`] selected given the results of running a model.
 pub(crate) async fn score_results(

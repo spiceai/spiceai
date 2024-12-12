@@ -18,7 +18,6 @@ use core::time::Duration;
 use std::sync::Arc;
 
 use datafusion::sql::TableReference;
-use datafusion_table_providers::util::column_reference::ColumnReference;
 use snafu::ResultExt;
 use tokio::sync::RwLock;
 
@@ -40,7 +39,8 @@ impl Runtime {
     #[allow(clippy::implicit_hasher)]
     pub(crate) async fn load_eval_scorer(&self) {
         for (name, scorer) in builtin_scorer() {
-            self.eval_worker.add_scorer(name, Arc::clone(&scorer)).await;
+            let mut reg = self.eval_scorer_registry.write().await;
+            reg.insert(name.to_string(), Arc::clone(&scorer));
             tracing::debug!("Successfully loaded eval scorer {name}");
         }
     }
@@ -64,9 +64,7 @@ impl Runtime {
             TableReference::partial(SPICE_EVAL_SCHEMA, EVAL_RESULTS_TABLE_REFERENCE.table()), // Cannot parse Catalog.
             EVAL_RESULTS_TABLE_SCHEMA.clone(),
             None,
-            Acceleration::default().with_primary_key(ColumnReference::new(vec![
-                EVAL_RESULTS_TABLE_TIME_COLUMN.to_string(),
-            ])),
+            Acceleration::default(),
             Refresh::default(),
             retention,
             Arc::new(RwLock::new(Secrets::default())),

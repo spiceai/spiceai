@@ -20,17 +20,20 @@ use axum::{
     response::{IntoResponse, Json, Response},
     Extension,
 };
+use axum_extra::TypedHeader;
 use datafusion::sql::TableReference;
+use headers_accept::Accept;
 use http::StatusCode;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use tokio::sync::RwLock;
 
 use crate::{
     datafusion::DataFusion,
-    model::{start_eval_run, LLMModelStore},
+    model::{handle_eval_run, sql_query_for, EvalScorerRegistry, LLMModelStore},
     Runtime,
 };
+
+use super::{sql_to_http_response, ArrowFormat};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct RunEval {
@@ -45,6 +48,8 @@ pub(crate) async fn post(
     Extension(llms): Extension<Arc<RwLock<LLMModelStore>>>,
     Extension(df): Extension<Arc<DataFusion>>,
     Extension(rt): Extension<Arc<Runtime>>,
+    Extension(eval_scorer_registry): Extension<EvalScorerRegistry>,
+    accept: Option<TypedHeader<Accept>>,
     Path(eval_name): Path<String>,
     Json(req): Json<RunEval>,
 ) -> Response {
@@ -74,9 +79,23 @@ pub(crate) async fn post(
             .into_response();
     };
 
-    // Create row in `eval_run`, then send to work queue, then return to user.
-    match start_eval_run(eval, model, Arc::clone(&df), Arc::clone(&rt.eval_worker)).await {
-        Ok(uuid) => (StatusCode::OK, Json(json!({"id": uuid}))).into_response(),
+    match handle_eval_run(
+        eval,
+        model,
+        Arc::clone(&df),
+        Arc::clone(&llms),
+        eval_scorer_registry,
+    )
+    .await
+    {
+        Ok(id) => {
+            sql_to_http_response(
+                Arc::clone(&df),
+                sql_query_for(&id).as_str(),
+                ArrowFormat::from_accept_header(&accept),
+            )
+            .await
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
     }
 }

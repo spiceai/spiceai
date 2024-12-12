@@ -24,9 +24,7 @@ use crate::{
     datafusion::DataFusion,
     datasets_health_monitor::DatasetsHealthMonitor,
     extension::{Extension, ExtensionFactory},
-    metrics,
-    model::EvalWorker,
-    podswatcher,
+    metrics, podswatcher,
     secrets::{self, Secrets},
     status,
     timing::TimeMeasurement,
@@ -161,17 +159,14 @@ impl RuntimeBuilder {
             .map(|a| a.evals.clone())
             .unwrap_or_default();
 
-        let llms = Arc::new(RwLock::new(HashMap::new()));
-        let eval_worker = EvalWorker::new(Arc::clone(&llms), Arc::clone(&df));
-
         let mut rt = Runtime {
             app: Arc::new(RwLock::new(self.app)),
             df,
             models: Arc::new(RwLock::new(HashMap::new())),
-            llms,
+            llms: Arc::new(RwLock::new(HashMap::new())),
             embeds: Arc::new(RwLock::new(HashMap::new())),
             evals: Arc::new(RwLock::new(evals)),
-            eval_worker: Arc::new(eval_worker),
+            eval_scorer_registry: Arc::new(RwLock::new(HashMap::new())),
             tools: Arc::new(RwLock::new(HashMap::new())),
             pods_watcher: Arc::new(RwLock::new(self.pods_watcher)),
             secrets: Arc::new(RwLock::new(secrets)),
