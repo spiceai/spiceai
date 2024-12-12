@@ -406,16 +406,6 @@ impl Runtime {
 
                 self.remove_dataset(&ds).await;
 
-                // Initialize file mode accelerator when reloading with file mode acceleration
-                // Fail when there's no successfully initiated dataset
-                if ds.is_file_accelerated() {
-                    let datasets = self.initialize_accelerators(&[Arc::clone(&ds)]).await;
-                    if datasets.is_empty() {
-                        tracing::error!("Failed to initialize accelerator for dataset {}, verify acceleration configuration and try again", ds.name);
-                        return;
-                    }
-                }
-
                 if self
                     .register_loaded_dataset(Arc::clone(&ds), Arc::clone(&connector), None)
                     .await
@@ -599,22 +589,18 @@ impl Runtime {
 
     pub(crate) async fn apply_dataset_diff(&self, current_app: &Arc<App>, new_app: &Arc<App>) {
         let valid_datasets = Self::get_valid_datasets(new_app, LogErrors(true));
+        let initialized_datasets = self.initialize_accelerators(&valid_datasets).await;
         let existing_datasets = Self::get_valid_datasets(current_app, LogErrors(false));
 
-        for ds in valid_datasets {
+        for ds in initialized_datasets {
             if let Some(current_ds) = existing_datasets.iter().find(|d| d.name == ds.name) {
                 if ds != *current_ds {
                     self.update_dataset(ds).await;
-                } else if ds.is_file_accelerated() {
-                    let datasets = self.initialize_accelerators(&[Arc::clone(&ds)]).await;
-                    if datasets.is_empty() {
-                        tracing::error!("Failed to initialize accelerator for dataset {}, verify acceleration configuration and try again", ds.name);
-                    } else {
-                        self.status
-                            .update_dataset(&ds.name, status::ComponentStatus::Initializing);
-                        self.load_dataset(ds).await;
-                    }
                 }
+            } else {
+                self.status
+                    .update_dataset(&ds.name, status::ComponentStatus::Initializing);
+                self.load_dataset(ds).await;
             }
         }
 
