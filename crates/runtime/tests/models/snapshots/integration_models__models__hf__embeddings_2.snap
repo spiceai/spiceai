@@ -3,20 +3,20 @@ source: crates/runtime/tests/models/hf.rs
 expression: normalize_embeddings_response(response)
 ---
 {
-  "object": "list",
-  "model": "hf_minilm",
   "data": [
     {
+      "embedding": "array_384_items",
       "index": 0,
-      "object": "embedding",
-      "embedding": "array_384_items"
+      "object": "embedding"
     },
     {
+      "embedding": "array_384_items",
       "index": 1,
-      "object": "embedding",
-      "embedding": "array_384_items"
+      "object": "embedding"
     }
   ],
+  "model": "hf_minilm",
+  "object": "list",
   "usage": {
     "prompt_tokens": 256,
     "total_tokens": 256
