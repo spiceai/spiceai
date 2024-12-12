@@ -26,6 +26,7 @@ const (
 	AUTH_TYPE_SNOWFLAKE  = "SNOWFLAKE"
 	AUTH_TYPE_SPARK      = "SPARK"
 	AUTH_TYPE_SHAREPOINT = "SHAREPOINT"
+	AUTH_TYPE_ABFS       = "ABFS"
 
 	AUTH_PARAM_API_KEY                = "API_KEY"
 	AUTH_PARAM_KEY                    = "KEY"

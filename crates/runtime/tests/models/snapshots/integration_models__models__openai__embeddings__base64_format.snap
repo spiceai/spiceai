@@ -1,7 +1,6 @@
 ---
 source: crates/runtime/tests/models/openai.rs
 expression: normalize_embeddings_response(response)
-snapshot_kind: text
 ---
 {
   "data": [
