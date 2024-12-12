@@ -196,7 +196,7 @@ impl TableProvider for MemTable {
             ));
         }
 
-        let mut primary_key = self.get_and_ensure_only_primary_keys()?;
+        let primary_key = self.get_and_ensure_only_primary_keys()?;
 
         let sink = Arc::new(MemSink::new(self.batches.clone(), overwrite, primary_key));
         Ok(Arc::new(DataSinkExec::new(
@@ -252,7 +252,7 @@ impl MemSink {
             overwrite,
             primary_key: primary_key.map(|pks| {
                 let mut z = pks.clone();
-                z.sort();
+                z.sort_unstable();
                 z
             }),
         }
@@ -524,7 +524,9 @@ mod tests {
     fn create_batch_with_string_columns(data: &[(&str, Vec<&str>)]) -> (RecordBatch, SchemaRef) {
         let fields: Vec<_> = data
             .iter()
-            .map(|(name, _)| arrow::datatypes::Field::new(name.to_string(), DataType::Utf8, false))
+            .map(|(name, _)| {
+                arrow::datatypes::Field::new((*name).to_string(), DataType::Utf8, false)
+            })
             .collect();
         let schema = Arc::new(Schema::new(fields));
 
@@ -537,8 +539,8 @@ mod tests {
             .collect::<Vec<_>>();
 
         (
-            RecordBatch::try_new(schema.clone(), arrays).expect("data should be created"),
-            schema.clone(),
+            RecordBatch::try_new(Arc::clone(&schema), arrays).expect("data should be created"),
+            Arc::clone(&schema),
         )
     }
 
@@ -613,7 +615,7 @@ mod tests {
                 Some("2012-12-01T11:11:12Z")
             ],
             results
-        )
+        );
     }
 
     #[tokio::test]
@@ -683,7 +685,7 @@ mod tests {
                 .collect();
             results.extend(values.clone());
         }
-        assert_eq!(vec![Some("a"), Some("c"), Some("y")], results)
+        assert_eq!(vec![Some("a"), Some("c"), Some("y")], results);
     }
 
     #[tokio::test]
@@ -756,7 +758,7 @@ mod tests {
             results.extend(values.clone());
         }
 
-        assert_eq!(vec![Some("x"), Some("y"), Some("z")], results)
+        assert_eq!(vec![Some("x"), Some("y"), Some("z")], results);
     }
 
     #[tokio::test]
@@ -871,7 +873,7 @@ mod tests {
                 Some("z")
             ],
             results
-        )
+        );
     }
 
     #[tokio::test]
