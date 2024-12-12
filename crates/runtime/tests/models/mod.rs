@@ -296,6 +296,8 @@ fn normalize_chat_completion_response(mut json: Value, normalize_message_content
         *id = json!("id_val");
     }
 
+    sort_json_keys(&mut json);
+
     serde_json::to_string_pretty(&json).unwrap_or_default()
 }
 
