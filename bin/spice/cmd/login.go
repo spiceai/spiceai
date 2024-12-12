@@ -276,7 +276,7 @@ var sharepointCmd = &cobra.Command{
 
 var abfsCmd = &cobra.Command{
 	Use:   "abfs",
-	Short: "Login to a Microsoft 365 abfs account",
+	Short: "Login to a Azure Storage Account",
 	Example: `
 	spice login abfs --tenant-id <tenant-id> --client-id <client-id>
 
@@ -307,7 +307,7 @@ var abfsCmd = &cobra.Command{
 			os.Exit(1)
 		}
 
-		slog.Info(fmt.Sprintf("%s", aurora.BrightGreen(fmt.Sprintf("Successfully logged into Microsoft 365 abfs with client ID: %s", client_id))))
+		slog.Info(fmt.Sprintf("%s", aurora.BrightGreen(fmt.Sprintf("Successfully logged into Azure Storage Account with client ID: %s", client_id))))
 
 		mergeAuthConfig(cmd, api.AUTH_TYPE_ABFS, map[string]string{
 			api.AUTH_PARAM_BEARER_TOKEN: access_token,
