@@ -1,8 +1,6 @@
 ---
 source: crates/runtime/tests/integration.rs
-assertion_line: 151
 description: "Query: SELECT * FROM tcgdex LIMIT 5"
-snapshot_kind: text
 ---
 +---------------+--------------------------------------------------------------------------------------------------------------------------------------------------+
 | plan_type     | plan                                                                                                                                             |
@@ -12,6 +10,6 @@ snapshot_kind: text
 |               |     TableScan: tcgdex projection=[firstEdCards, holoCards, id, name, normalCards, officialCards, releaseDate, reverseCards, totalCards], fetch=5 |
 | physical_plan | GlobalLimitExec: skip=0, fetch=5                                                                                                                 |
 |               |   BytesProcessedExec                                                                                                                             |
-|               |     MemoryExec: partitions=1, partition_sizes=[178]                                                                                              |
+|               |     MemoryExec: partitions=1, partition_sizes=[179]                                                                                              |
 |               |                                                                                                                                                  |
 +---------------+--------------------------------------------------------------------------------------------------------------------------------------------------+

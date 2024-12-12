@@ -30,6 +30,7 @@ use crate::init_tracing;
 use anyhow::Context;
 use app::AppBuilder;
 use arrow::array::RecordBatch;
+use datafusion::sql::TableReference;
 use datafusion_table_providers::sql::arrow_sql_gen::statement::{
     CreateTableBuilder, InsertBuilder,
 };
@@ -354,7 +355,8 @@ async fn init_mysql_db() -> Result<(), anyhow::Error> {
     let _: Vec<Row> = conn.exec(create_table_stmt, Params::Empty).await?;
 
     tracing::debug!("INSERT INTO lineitem...");
-    let insert_stmt = InsertBuilder::new("lineitem", tpch_lineitem).build_mysql(None)?;
+    let insert_stmt =
+        InsertBuilder::new(&TableReference::from("lineitem"), tpch_lineitem).build_mysql(None)?;
     let _: Vec<Row> = conn.exec(insert_stmt, Params::Empty).await?;
     tracing::debug!("MySQL initialized!");
 

@@ -19,18 +19,12 @@ use async_trait::async_trait;
 use data_components::sharepoint::{client::SharepointClient, table::SharepointTableProvider};
 use datafusion::datasource::TableProvider;
 use document_parse::DocumentParser;
-use graph_rs_sdk::{
-    identity::{
-        AuthorizationCodeCredential, ConfidentialClientApplication, PublicClientApplication,
-    },
-    GraphClient,
-};
+use graph_rs_sdk::{identity::ConfidentialClientApplication, GraphClient};
 use snafu::{ResultExt, Snafu};
 use std::any::Any;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use url::Url;
 
 use super::{
     ConnectorComponent, DataConnector, DataConnectorFactory, DataConnectorParams,
@@ -42,10 +36,10 @@ pub enum Error {
     #[snafu(display("Missing required parameter: {parameter}. Specify a value.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/sharepoint#parameters"))]
     MissingParameter { parameter: String },
 
-    #[snafu(display("No authentication was specified.\nProvide either an 'auth_code' or 'client_secret'.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/sharepoint#parameters"))]
+    #[snafu(display("No authentication was specified.\nProvide either an 'bearer_token' or 'client_secret'.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/sharepoint#parameters"))]
     InvalidAuthentication,
 
-    #[snafu(display("Both `auth_code` and `client_secret` were specified.\nProvide only one of either an 'auth_code' or 'client_secret'.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/sharepoint#parameters"))]
+    #[snafu(display("Both `bearer_token` and `client_secret` were specified.\nProvide only one of either an 'bearer_token' or 'client_secret'.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/sharepoint#parameters"))]
     DuplicateAuthentication,
 
     #[snafu(display(
@@ -78,9 +72,9 @@ impl Sharepoint {
             .ok_or_else(|p| MissingParameterSnafu { parameter: p.0 }.build())?;
 
         let client_secret = params.get("client_secret").expose().ok();
-        let auth_code = params.get("auth_code").expose().ok();
+        let bearer_token = params.get("bearer_token").expose().ok();
 
-        let graph_client = match (client_secret, auth_code) {
+        let graph_client = match (client_secret, bearer_token) {
             (Some(client_secret), None) => GraphClient::from(
                 &ConfidentialClientApplication::builder(client_id)
                     .with_client_secret(client_secret)
@@ -88,23 +82,7 @@ impl Sharepoint {
                     .with_scope([".default"])
                     .build(),
             ),
-            (None, Some(auth_code)) => {
-                // Must match the redirect URL used in `spice login sharepoint...`.
-                let redirect_url =
-                    Url::parse("http://localhost:8091").context(UnableToParseURLSnafu {
-                        url: "http://localhost:8091".to_string(),
-                    })?;
-
-                GraphClient::from(&PublicClientApplication::from(
-                    AuthorizationCodeCredential::new_with_redirect_uri(
-                        tenant_id,
-                        client_id,
-                        "",
-                        auth_code,
-                        redirect_url,
-                    ),
-                ))
-            }
+            (None, Some(bearer_token)) => GraphClient::new(bearer_token),
             (Some(_), Some(_)) => return DuplicateAuthenticationSnafu.fail(),
             (None, None) => return InvalidAuthenticationSnafu.fail(),
         };
@@ -143,7 +121,7 @@ impl SharepointFactory {
 
 const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::connector("client_id").secret().required(),
-    ParameterSpec::connector("auth_code").secret(),
+    ParameterSpec::connector("bearer_token").secret(),
     ParameterSpec::connector("tenant_id").secret().required(),
     ParameterSpec::connector("client_secret").secret(),
     ParameterSpec::runtime("file_format"),

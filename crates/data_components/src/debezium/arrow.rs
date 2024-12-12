@@ -19,10 +19,10 @@ use crate::arrow::struct_builder::StructBuilder;
 use super::change_event::Field as ChangeEventField;
 use arrow::{
     array::{
-        ArrayBuilder, BooleanBuilder, Decimal128Builder, Float32Builder, Float64Builder,
-        Int16Builder, Int32Builder, Int64Builder, ListBuilder, PrimitiveBuilder, RecordBatch,
-        StringBuilder, StructArray, Time64MicrosecondBuilder, TimestampMicrosecondBuilder,
-        TimestampMillisecondBuilder,
+        ArrayBuilder, BinaryBuilder, BooleanBuilder, Decimal128Builder, Float32Builder,
+        Float64Builder, Int16Builder, Int32Builder, Int64Builder, ListBuilder, PrimitiveBuilder,
+        RecordBatch, StringBuilder, StructArray, Time64MicrosecondBuilder,
+        TimestampMicrosecondBuilder, TimestampMillisecondBuilder,
     },
     datatypes::{
         ArrowPrimitiveType, DataType, Date32Type, Field, Int16Type, Int32Type, Int64Type, Schema,
@@ -335,6 +335,15 @@ fn append_field_value_to_builder(
                     .fail()?;
                 }
             }
+        }
+        DataType::Binary => {
+            let binary_builder = downcast_builder::<BinaryBuilder>(builder)?;
+            let base64_decoded = field_value
+                .as_str()
+                .map(|v| BASE64_STANDARD.decode(v))
+                .transpose()
+                .context(UnableToDecodeBase64Snafu)?;
+            binary_builder.append_option(base64_decoded);
         }
         _ => {
             DataTypeNotSupportedSnafu {

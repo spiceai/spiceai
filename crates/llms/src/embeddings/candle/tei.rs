@@ -112,14 +112,14 @@ impl TeiEmbed {
     pub async fn from_hf(
         model_id: &str,
         revision: Option<&str>,
-        hf_token: Option<String>,
-        pooling_overwrite: Option<String>,
+        hf_token: Option<&str>,
+        pooling_overwrite: Option<&str>,
         max_seq_length_overwrite: Option<usize>,
     ) -> Result<Self> {
         // Only error if user-provided value is incorrect.
         let pool = pooling_overwrite
             .map(|pp| {
-                let p = pool_from_str(&pp);
+                let p = pool_from_str(pp);
                 if p.is_none() {
                     return Err(Error::FailedToCreateEmbedding {
                         source: format!("Invalid pooling mode: {pp}").into(),

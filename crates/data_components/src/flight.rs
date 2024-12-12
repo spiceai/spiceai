@@ -38,6 +38,7 @@ use flight_client::FlightClient;
 use futures::{Stream, StreamExt};
 use snafu::prelude::*;
 use std::{any::Any, fmt, sync::Arc};
+use tonic::metadata::MetadataMap;
 
 use self::write::FlightTableWriter;
 
@@ -87,6 +88,12 @@ impl FlightFactory {
     #[must_use]
     pub fn client(&self) -> FlightClient {
         self.client.clone()
+    }
+
+    #[must_use]
+    pub fn with_metadata(mut self, metadata: MetadataMap) -> Self {
+        self.client = self.client.with_metadata(metadata);
+        self
     }
 }
 

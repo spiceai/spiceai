@@ -17,6 +17,7 @@ limitations under the License.
 use std::fmt::Display;
 
 mod datasets;
+pub mod evaluator;
 pub mod setup;
 
 #[derive(Default)]
@@ -37,6 +38,8 @@ pub(crate) struct SearchBenchmarkResultBuilder {
     search_finished_at: i64,
     search_response_time: Vec<f64>,
 
+    score: f64,
+
     status: String,
 }
 
@@ -44,17 +47,18 @@ impl Display for SearchBenchmarkResultBuilder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "configuration: {},\n\
-          status: {},\n\
-          run_id: {},\n\
-          commit_sha: {},\n\
-          branch_name: {},\n\
-          started_at: {},\n\
-          index_time: {:.2} ms,\n\
-          search_time: {:.2} ms,\n\
-          rps: {:.2},\n\
-          mean_response_time: {:.2} ms,\n\
-          p95_response_time: {:.2} ms\n",
+            r#"configuration: {},
+  status: {},
+  run_id: {},
+  commit_sha: {},
+  branch_name: {},
+  started_at: {},
+  index_time: {:.2} ms,
+  search_time: {:.2} ms,
+  rps: {:.2},
+  mean_response_time: {:.2} ms,
+  p95_response_time: {:.2} ms,
+  score: {:.2}"#,
             self.config_name,
             self.status,
             self.run_id,
@@ -63,9 +67,10 @@ impl Display for SearchBenchmarkResultBuilder {
             self.started_at,
             self.index_finished_at - self.index_started_at,
             self.search_finished_at - self.search_started_at,
-            self.rps(),
-            self.mean(),
-            self.quantile(0.95)
+            self.rps().unwrap_or_default(),
+            self.mean().unwrap_or_default(),
+            self.quantile(0.95).unwrap_or_default(),
+            self.score
         )
     }
 }
@@ -110,6 +115,10 @@ impl SearchBenchmarkResultBuilder {
         self.search_response_time.push(response_time);
     }
 
+    pub fn record_score(&mut self, score: f64) {
+        self.score = score;
+    }
+
     pub fn finish(&mut self, is_successful: bool) {
         self.finished_at = get_current_unix_ms();
         self.status = if is_successful { "completed" } else { "failed" }.to_string();
@@ -117,36 +126,38 @@ impl SearchBenchmarkResultBuilder {
 
     // Calculate Requests Per Second (RPS)
     #[allow(clippy::cast_precision_loss)]
-    pub(crate) fn rps(&self) -> f64 {
+    pub(crate) fn rps(&self) -> Option<f64> {
+        if self.search_response_time.is_empty() {
+            return None;
+        }
         let total_time_sec =
             (self.search_finished_at as f64 - self.search_started_at as f64) / 1000.0;
-        self.search_response_time.len() as f64 / total_time_sec
+        Some(self.search_response_time.len() as f64 / total_time_sec)
     }
 
     // Calculate Mean Value
     #[allow(clippy::cast_precision_loss)]
-    pub(crate) fn mean(&self) -> f64 {
+    pub(crate) fn mean(&self) -> Option<f64> {
         if self.search_response_time.is_empty() {
-            0.0
-        } else {
-            self.search_response_time.iter().sum::<f64>() / self.search_response_time.len() as f64
+            return None;
         }
+        Some(self.search_response_time.iter().sum::<f64>() / self.search_response_time.len() as f64)
     }
 
     // Calculate Quantile (for example P95)
     #[allow(clippy::cast_possible_truncation)]
     #[allow(clippy::cast_sign_loss)]
     #[allow(clippy::cast_precision_loss)]
-    pub fn quantile(&self, quantile: f64) -> f64 {
+    pub fn quantile(&self, quantile: f64) -> Option<f64> {
         if self.search_response_time.is_empty() || !(0.0..=1.0).contains(&quantile) {
-            return 0.0;
+            return None;
         }
 
         let mut sorted_times = self.search_response_time.clone();
         sorted_times.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
         let idx = ((sorted_times.len() as f64) * quantile).ceil() as usize - 1;
-        sorted_times[idx.clamp(0, sorted_times.len() - 1)]
+        Some(sorted_times[idx.clamp(0, sorted_times.len() - 1)])
     }
 }
 

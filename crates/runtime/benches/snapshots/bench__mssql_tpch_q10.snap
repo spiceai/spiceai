@@ -1,0 +1,19 @@
+---
+source: crates/runtime/benches/bench.rs
+expression: records_pretty
+snapshot_kind: text
+---
++-----------+--------------------+-------------+-----------+----------------+------------------------------------------+-----------------+-------------------------------------------------------------------------------------------------------------+
+| c_custkey | c_name             | revenue     | c_acctbal | n_name         | c_address                                | c_phone         | c_comment                                                                                                   |
++-----------+--------------------+-------------+-----------+----------------+------------------------------------------+-----------------+-------------------------------------------------------------------------------------------------------------+
+| 57040     | Customer#000057040 | 734235.2455 | 632.87    | JAPAN          | Eioyzjf4pp                               | 22-895-641-3466 | sits. slyly regular requests sleep alongside of the regular inst                                            |
+| 143347    | Customer#000143347 | 721002.6948 | 2557.47   | EGYPT          | 1aReFYv,Kw4                              | 14-742-935-3718 | ggle carefully enticing requests. final deposits use bold, bold pinto beans. ironic, idle re                |
+| 60838     | Customer#000060838 | 679127.3077 | 2454.77   | BRAZIL         | 64EaJ5vMAHWJlBOxJklpNc2RJiWE             | 12-913-494-9813 |  need to boost against the slyly regular account                                                            |
+| 101998    | Customer#000101998 | 637029.5667 | 3790.89   | UNITED KINGDOM | 01c9CILnNtfOQYmZj                        | 33-593-865-6378 | ress foxes wake slyly after the bold excuses. ironic platelets are furiously carefully bold theodolites     |
+| 125341    | Customer#000125341 | 633508.0860 | 4983.51   | GERMANY        | S29ODD6bceU8QSuuEJznkNaK                 | 17-582-695-5962 | arefully even depths. blithely even excuses sleep furiously. foxes use except the dependencies. ca          |
+| 25501     | Customer#000025501 | 620269.7849 | 7725.04   | ETHIOPIA       |   W556MXuoiaYCCZamJI,Rn0B4ACUGdkQ8DZ     | 15-874-808-6793 | he pending instructions wake carefully at the pinto beans. regular, final instructions along the slyly fina |
+| 115831    | Customer#000115831 | 596423.8672 | 5098.10   | FRANCE         | rFeBbEEyk dl ne7zV5fDrmiq1oK09wV7pxqCgIc | 16-715-386-3788 | l somas sleep. furiously final deposits wake blithely regular pinto b                                       |
+| 84223     | Customer#000084223 | 594998.0239 | 528.65    | UNITED KINGDOM | nAVZCs6BaWap rrM27N 2qBnzc5WBauxbA       | 33-442-824-8191 |  slyly final deposits haggle regular, pending dependencies. pending escapades wake                          |
+| 54289     | Customer#000054289 | 585603.3918 | 5583.02   | IRAN           | vXCxoCsU0Bad5JQI ,oobkZ                  | 20-834-292-4707 | ely special foxes are quickly finally ironic p                                                              |
+| 39922     | Customer#000039922 | 584878.1134 | 7321.11   | GERMANY        | Zgy4s50l2GKN4pLDPBU8m342gIw6R            | 17-147-757-8036 | y final requests. furiously final foxes cajole blithely special platelets. f                                |
++-----------+--------------------+-------------+-----------+----------------+------------------------------------------+-----------------+-------------------------------------------------------------------------------------------------------------+

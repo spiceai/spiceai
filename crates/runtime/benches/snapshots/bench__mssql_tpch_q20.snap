@@ -1,0 +1,19 @@
+---
+source: crates/runtime/benches/bench.rs
+expression: records_pretty
+snapshot_kind: text
+---
++--------------------+--------------------------------------+
+| s_name             | s_address                            |
++--------------------+--------------------------------------+
+| Supplier#000000020 | iybAE,RmTymrZVYaFZva2SH,j            |
+| Supplier#000000091 | YV45D7TkfdQanOOZ7q9QxkyGUapU1oOWU6q3 |
+| Supplier#000000205 | rF uV8d0JNEk                         |
+| Supplier#000000285 | Br7e1nnt1yxrw6ImgpJ7YdhFDjuBf        |
+| Supplier#000000287 | 7a9SP7qW5Yku5PvSg                    |
+| Supplier#000000354 | w8fOo5W,aS                           |
+| Supplier#000000378 | FfbhyCxWvcPrO8ltp9                   |
+| Supplier#000000402 | i9Sw4DoyMhzhKXCH9By,AYSgmD           |
+| Supplier#000000530 | 0qwCMwobKY OcmLyfRXlagA8ukENJv,      |
+| Supplier#000000555 | TfB,a5bfl3Ah 3Z 74GqnNs6zKVGM        |
++--------------------+--------------------------------------+

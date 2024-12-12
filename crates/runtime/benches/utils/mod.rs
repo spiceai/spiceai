@@ -24,7 +24,7 @@ pub(crate) fn init_tracing(trace_config: Option<&str>) {
         (_, Some(log)) => EnvFilter::new(log),
         (Some(level), None) => EnvFilter::new(level),
         _ => EnvFilter::new(
-            "runtime=TRACE,datafusion-federation=TRACE,datafusion-federation-sql=TRACE,bench=TRACE,INFO",
+            "datafusion-federation=TRACE,datafusion-federation-sql=TRACE,bench=TRACE,runtime=TRACE,secrets=INFO,data_components=INFO,cache=INFO,extensions=INFO,spice_cloud=INFO,llms=INFO,reqwest_retry::middleware=off,task_history=off,WARN",
         ),
     };
     let subscriber = tracing_subscriber::FmtSubscriber::builder()

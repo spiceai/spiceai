@@ -426,6 +426,33 @@ pub struct Match {
     metadata: HashMap<String, serde_json::Value>,
 }
 
+impl Match {
+    #[must_use]
+    pub fn value(&self) -> &str {
+        &self.value
+    }
+
+    #[must_use]
+    pub fn score(&self) -> f64 {
+        self.score
+    }
+
+    #[must_use]
+    pub fn dataset(&self) -> &str {
+        &self.dataset
+    }
+
+    #[must_use]
+    pub fn primary_key(&self) -> &HashMap<String, serde_json::Value> {
+        &self.primary_key
+    }
+
+    #[must_use]
+    pub fn metadata(&self) -> &HashMap<String, serde_json::Value> {
+        &self.metadata
+    }
+}
+
 pub fn to_matches_sorted(result: &VectorSearchResult, limit: usize) -> Result<Vec<Match>> {
     let output = result
         .iter()

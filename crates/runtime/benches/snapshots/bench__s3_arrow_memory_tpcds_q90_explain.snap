@@ -1,0 +1,158 @@
+---
+source: crates/runtime/benches/bench.rs
+description: "Query: select  cast(amc as decimal(15,4))/cast(pmc as decimal(15,4)) am_pm_ratio\n from ( select count(*) amc\n       from web_sales, household_demographics , time_dim, web_page\n       where ws_sold_time_sk = time_dim.t_time_sk\n         and ws_ship_hdemo_sk = household_demographics.hd_demo_sk\n         and ws_web_page_sk = web_page.wp_web_page_sk\n         and time_dim.t_hour between 9 and 9+1\n         and household_demographics.hd_dep_count = 2\n         and web_page.wp_char_count between 2500 and 5200) at,\n      ( select count(*) pmc\n       from web_sales, household_demographics , time_dim, web_page\n       where ws_sold_time_sk = time_dim.t_time_sk\n         and ws_ship_hdemo_sk = household_demographics.hd_demo_sk\n         and ws_web_page_sk = web_page.wp_web_page_sk\n         and time_dim.t_hour between 15 and 15+1\n         and household_demographics.hd_dep_count = 2\n         and web_page.wp_char_count between 2500 and 5200) pt\n order by am_pm_ratio\n  LIMIT 100;\n"
+snapshot_kind: text
+---
++---------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                                                         |
++---------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Sort: am_pm_ratio ASC NULLS LAST, fetch=100                                                                                                                                  |
+|               |   Projection: CAST(at.amc AS Decimal128(15, 4)) / CAST(pt.pmc AS Decimal128(15, 4)) AS am_pm_ratio                                                                           |
+|               |     Cross Join:                                                                                                                                                              |
+|               |       SubqueryAlias: at                                                                                                                                                      |
+|               |         Projection: count(*) AS amc                                                                                                                                          |
+|               |           Aggregate: groupBy=[[]], aggr=[[count(Int64(1)) AS count(*)]]                                                                                                      |
+|               |             Projection:                                                                                                                                                      |
+|               |               Inner Join: web_sales.ws_web_page_sk = web_page.wp_web_page_sk                                                                                                 |
+|               |                 Projection: web_sales.ws_web_page_sk                                                                                                                         |
+|               |                   Inner Join: web_sales.ws_sold_time_sk = time_dim.t_time_sk                                                                                                 |
+|               |                     Projection: web_sales.ws_sold_time_sk, web_sales.ws_web_page_sk                                                                                          |
+|               |                       Inner Join: web_sales.ws_ship_hdemo_sk = household_demographics.hd_demo_sk                                                                             |
+|               |                         BytesProcessedNode                                                                                                                                   |
+|               |                           TableScan: web_sales projection=[ws_sold_time_sk, ws_ship_hdemo_sk, ws_web_page_sk]                                                                |
+|               |                         Projection: household_demographics.hd_demo_sk                                                                                                        |
+|               |                           BytesProcessedNode                                                                                                                                 |
+|               |                             Filter: household_demographics.hd_dep_count = Int32(2)                                                                                           |
+|               |                               TableScan: household_demographics projection=[hd_demo_sk, hd_dep_count]                                                                        |
+|               |                     Projection: time_dim.t_time_sk                                                                                                                           |
+|               |                       BytesProcessedNode                                                                                                                                     |
+|               |                         Filter: time_dim.t_hour >= Int32(9) AND time_dim.t_hour <= Int32(10)                                                                                 |
+|               |                           TableScan: time_dim projection=[t_time_sk, t_hour]                                                                                                 |
+|               |                 Projection: web_page.wp_web_page_sk                                                                                                                          |
+|               |                   BytesProcessedNode                                                                                                                                         |
+|               |                     Filter: web_page.wp_char_count >= Int32(2500) AND web_page.wp_char_count <= Int32(5200)                                                                  |
+|               |                       TableScan: web_page projection=[wp_web_page_sk, wp_char_count]                                                                                         |
+|               |       SubqueryAlias: pt                                                                                                                                                      |
+|               |         Projection: count(*) AS pmc                                                                                                                                          |
+|               |           Aggregate: groupBy=[[]], aggr=[[count(Int64(1)) AS count(*)]]                                                                                                      |
+|               |             Projection:                                                                                                                                                      |
+|               |               Inner Join: web_sales.ws_web_page_sk = web_page.wp_web_page_sk                                                                                                 |
+|               |                 Projection: web_sales.ws_web_page_sk                                                                                                                         |
+|               |                   Inner Join: web_sales.ws_sold_time_sk = time_dim.t_time_sk                                                                                                 |
+|               |                     Projection: web_sales.ws_sold_time_sk, web_sales.ws_web_page_sk                                                                                          |
+|               |                       Inner Join: web_sales.ws_ship_hdemo_sk = household_demographics.hd_demo_sk                                                                             |
+|               |                         BytesProcessedNode                                                                                                                                   |
+|               |                           TableScan: web_sales projection=[ws_sold_time_sk, ws_ship_hdemo_sk, ws_web_page_sk]                                                                |
+|               |                         Projection: household_demographics.hd_demo_sk                                                                                                        |
+|               |                           BytesProcessedNode                                                                                                                                 |
+|               |                             Filter: household_demographics.hd_dep_count = Int32(2)                                                                                           |
+|               |                               TableScan: household_demographics projection=[hd_demo_sk, hd_dep_count]                                                                        |
+|               |                     Projection: time_dim.t_time_sk                                                                                                                           |
+|               |                       BytesProcessedNode                                                                                                                                     |
+|               |                         Filter: time_dim.t_hour >= Int32(15) AND time_dim.t_hour <= Int32(16)                                                                                |
+|               |                           TableScan: time_dim projection=[t_time_sk, t_hour]                                                                                                 |
+|               |                 Projection: web_page.wp_web_page_sk                                                                                                                          |
+|               |                   BytesProcessedNode                                                                                                                                         |
+|               |                     Filter: web_page.wp_char_count >= Int32(2500) AND web_page.wp_char_count <= Int32(5200)                                                                  |
+|               |                       TableScan: web_page projection=[wp_web_page_sk, wp_char_count]                                                                                         |
+| physical_plan | SortExec: TopK(fetch=100), expr=[am_pm_ratio@0 ASC NULLS LAST], preserve_partitioning=[false]                                                                                |
+|               |   ProjectionExec: expr=[CAST(amc@0 AS Decimal128(15, 4)) / CAST(pmc@1 AS Decimal128(15, 4)) as am_pm_ratio]                                                                  |
+|               |     CrossJoinExec                                                                                                                                                            |
+|               |       ProjectionExec: expr=[count(*)@0 as amc]                                                                                                                               |
+|               |         AggregateExec: mode=Final, gby=[], aggr=[count(*)]                                                                                                                   |
+|               |           CoalescePartitionsExec                                                                                                                                             |
+|               |             AggregateExec: mode=Partial, gby=[], aggr=[count(*)]                                                                                                             |
+|               |               ProjectionExec: expr=[]                                                                                                                                        |
+|               |                 CoalesceBatchesExec: target_batch_size=8192                                                                                                                  |
+|               |                   HashJoinExec: mode=Partitioned, join_type=Inner, on=[(ws_web_page_sk@0, wp_web_page_sk@0)]                                                                 |
+|               |                     CoalesceBatchesExec: target_batch_size=8192                                                                                                              |
+|               |                       RepartitionExec: partitioning=Hash([ws_web_page_sk@0], 4), input_partitions=4                                                                          |
+|               |                         CoalesceBatchesExec: target_batch_size=8192                                                                                                          |
+|               |                           HashJoinExec: mode=Partitioned, join_type=Inner, on=[(ws_sold_time_sk@0, t_time_sk@0)], projection=[ws_web_page_sk@1]                              |
+|               |                             CoalesceBatchesExec: target_batch_size=8192                                                                                                      |
+|               |                               RepartitionExec: partitioning=Hash([ws_sold_time_sk@0], 4), input_partitions=4                                                                 |
+|               |                                 CoalesceBatchesExec: target_batch_size=8192                                                                                                  |
+|               |                                   HashJoinExec: mode=Partitioned, join_type=Inner, on=[(ws_ship_hdemo_sk@1, hd_demo_sk@0)], projection=[ws_sold_time_sk@0, ws_web_page_sk@2] |
+|               |                                     CoalesceBatchesExec: target_batch_size=8192                                                                                              |
+|               |                                       RepartitionExec: partitioning=Hash([ws_ship_hdemo_sk@1], 4), input_partitions=4                                                        |
+|               |                                         BytesProcessedExec                                                                                                                   |
+|               |                                           SchemaCastScanExec                                                                                                                 |
+|               |                                             RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1                                                             |
+|               |                                               MemoryExec: partitions=1, partition_sizes=[88]                                                                                 |
+|               |                                     CoalesceBatchesExec: target_batch_size=8192                                                                                              |
+|               |                                       RepartitionExec: partitioning=Hash([hd_demo_sk@0], 4), input_partitions=4                                                              |
+|               |                                         ProjectionExec: expr=[hd_demo_sk@0 as hd_demo_sk]                                                                                    |
+|               |                                           BytesProcessedExec                                                                                                                 |
+|               |                                             CoalesceBatchesExec: target_batch_size=8192                                                                                      |
+|               |                                               FilterExec: hd_dep_count@1 = 2                                                                                                 |
+|               |                                                 RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1                                                         |
+|               |                                                   SchemaCastScanExec                                                                                                         |
+|               |                                                     MemoryExec: partitions=1, partition_sizes=[1]                                                                            |
+|               |                             CoalesceBatchesExec: target_batch_size=8192                                                                                                      |
+|               |                               RepartitionExec: partitioning=Hash([t_time_sk@0], 4), input_partitions=4                                                                       |
+|               |                                 ProjectionExec: expr=[t_time_sk@0 as t_time_sk]                                                                                              |
+|               |                                   BytesProcessedExec                                                                                                                         |
+|               |                                     CoalesceBatchesExec: target_batch_size=8192                                                                                              |
+|               |                                       FilterExec: t_hour@1 >= 9 AND t_hour@1 <= 10                                                                                           |
+|               |                                         SchemaCastScanExec                                                                                                                   |
+|               |                                           RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1                                                               |
+|               |                                             MemoryExec: partitions=1, partition_sizes=[11]                                                                                   |
+|               |                     CoalesceBatchesExec: target_batch_size=8192                                                                                                              |
+|               |                       RepartitionExec: partitioning=Hash([wp_web_page_sk@0], 4), input_partitions=4                                                                          |
+|               |                         ProjectionExec: expr=[wp_web_page_sk@0 as wp_web_page_sk]                                                                                            |
+|               |                           BytesProcessedExec                                                                                                                                 |
+|               |                             CoalesceBatchesExec: target_batch_size=8192                                                                                                      |
+|               |                               FilterExec: wp_char_count@1 >= 2500 AND wp_char_count@1 <= 5200                                                                                |
+|               |                                 RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1                                                                         |
+|               |                                   SchemaCastScanExec                                                                                                                         |
+|               |                                     MemoryExec: partitions=1, partition_sizes=[1]                                                                                            |
+|               |       ProjectionExec: expr=[count(*)@0 as pmc]                                                                                                                               |
+|               |         AggregateExec: mode=Final, gby=[], aggr=[count(*)]                                                                                                                   |
+|               |           CoalescePartitionsExec                                                                                                                                             |
+|               |             AggregateExec: mode=Partial, gby=[], aggr=[count(*)]                                                                                                             |
+|               |               ProjectionExec: expr=[]                                                                                                                                        |
+|               |                 CoalesceBatchesExec: target_batch_size=8192                                                                                                                  |
+|               |                   HashJoinExec: mode=Partitioned, join_type=Inner, on=[(ws_web_page_sk@0, wp_web_page_sk@0)]                                                                 |
+|               |                     CoalesceBatchesExec: target_batch_size=8192                                                                                                              |
+|               |                       RepartitionExec: partitioning=Hash([ws_web_page_sk@0], 4), input_partitions=4                                                                          |
+|               |                         CoalesceBatchesExec: target_batch_size=8192                                                                                                          |
+|               |                           HashJoinExec: mode=Partitioned, join_type=Inner, on=[(ws_sold_time_sk@0, t_time_sk@0)], projection=[ws_web_page_sk@1]                              |
+|               |                             CoalesceBatchesExec: target_batch_size=8192                                                                                                      |
+|               |                               RepartitionExec: partitioning=Hash([ws_sold_time_sk@0], 4), input_partitions=4                                                                 |
+|               |                                 CoalesceBatchesExec: target_batch_size=8192                                                                                                  |
+|               |                                   HashJoinExec: mode=Partitioned, join_type=Inner, on=[(ws_ship_hdemo_sk@1, hd_demo_sk@0)], projection=[ws_sold_time_sk@0, ws_web_page_sk@2] |
+|               |                                     CoalesceBatchesExec: target_batch_size=8192                                                                                              |
+|               |                                       RepartitionExec: partitioning=Hash([ws_ship_hdemo_sk@1], 4), input_partitions=4                                                        |
+|               |                                         BytesProcessedExec                                                                                                                   |
+|               |                                           SchemaCastScanExec                                                                                                                 |
+|               |                                             RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1                                                             |
+|               |                                               MemoryExec: partitions=1, partition_sizes=[88]                                                                                 |
+|               |                                     CoalesceBatchesExec: target_batch_size=8192                                                                                              |
+|               |                                       RepartitionExec: partitioning=Hash([hd_demo_sk@0], 4), input_partitions=4                                                              |
+|               |                                         ProjectionExec: expr=[hd_demo_sk@0 as hd_demo_sk]                                                                                    |
+|               |                                           BytesProcessedExec                                                                                                                 |
+|               |                                             CoalesceBatchesExec: target_batch_size=8192                                                                                      |
+|               |                                               FilterExec: hd_dep_count@1 = 2                                                                                                 |
+|               |                                                 RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1                                                         |
+|               |                                                   SchemaCastScanExec                                                                                                         |
+|               |                                                     MemoryExec: partitions=1, partition_sizes=[1]                                                                            |
+|               |                             CoalesceBatchesExec: target_batch_size=8192                                                                                                      |
+|               |                               RepartitionExec: partitioning=Hash([t_time_sk@0], 4), input_partitions=4                                                                       |
+|               |                                 ProjectionExec: expr=[t_time_sk@0 as t_time_sk]                                                                                              |
+|               |                                   BytesProcessedExec                                                                                                                         |
+|               |                                     CoalesceBatchesExec: target_batch_size=8192                                                                                              |
+|               |                                       FilterExec: t_hour@1 >= 15 AND t_hour@1 <= 16                                                                                          |
+|               |                                         SchemaCastScanExec                                                                                                                   |
+|               |                                           RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1                                                               |
+|               |                                             MemoryExec: partitions=1, partition_sizes=[11]                                                                                   |
+|               |                     CoalesceBatchesExec: target_batch_size=8192                                                                                                              |
+|               |                       RepartitionExec: partitioning=Hash([wp_web_page_sk@0], 4), input_partitions=4                                                                          |
+|               |                         ProjectionExec: expr=[wp_web_page_sk@0 as wp_web_page_sk]                                                                                            |
+|               |                           BytesProcessedExec                                                                                                                                 |
+|               |                             CoalesceBatchesExec: target_batch_size=8192                                                                                                      |
+|               |                               FilterExec: wp_char_count@1 >= 2500 AND wp_char_count@1 <= 5200                                                                                |
+|               |                                 RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1                                                                         |
+|               |                                   SchemaCastScanExec                                                                                                                         |
+|               |                                     MemoryExec: partitions=1, partition_sizes=[1]                                                                                            |
+|               |                                                                                                                                                                              |
++---------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+

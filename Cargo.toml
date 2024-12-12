@@ -48,7 +48,7 @@ arrow-ipc = "53"
 arrow-json = { git = "https://github.com/spiceai/arrow-rs.git", rev = "63d05723107d6dc5f08acc5461417ee42937adcc" }
 arrow-odbc = "11.2.0"
 arrow-schema = "53"
-async-openai = { git = "https://github.com/spiceai/async-openai", rev = "eb10e6ae191f5be102ef68cb3bb54bb482511bbd" }
+async-openai = { git = "https://github.com/spiceai/async-openai", rev = "528f9fedf9d8eeb3b92a64607246a5ad5c4523dc" }
 async-stream = "0.3.5"
 async-trait = "0.1.83"
 axum = { version = "0.7.9", features = ["macros"] }
@@ -129,7 +129,7 @@ tokio-postgres = { version = "0.7.12", features = [
     "with-uuid-1",
 ] }
 tokio-rusqlite = "0.5.1"
-tokio-stream = { version = "0.1.16", features = ["sync"] }
+tokio-stream = { version = "0.1.17", features = ["sync"] }
 tokio-util = { version = "0.7.11", features = ["compat"] }
 tonic = { version = "0.12", features = ["gzip", "tls"] }
 tonic-health = { version = "0.12" }
@@ -152,7 +152,7 @@ datafusion-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "2b
 object_store = { git = "https://github.com/spiceai/arrow-rs.git", rev = "cee50b7d2ccf749eac89d0fe26fbd8a06c0bb3c4" }
 
 datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "5af0df83c2cd1d3f82f293b066b401a4dfd4064b" }
-datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "58baab01bdfd282261fbdbc9905a20835fe3cead" }
+datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "b64bbf0393f8a49ab7cba97e2f3cbb1b06a3e695" }
 
 duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "1034c325aee35eb704e741f56ed942ae22ff4e19" }
 
