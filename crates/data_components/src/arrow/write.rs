@@ -213,7 +213,7 @@ impl TableProvider for MemTable {
 }
 
 /// Implements for writing to a [`MemTable`]
-pub struct MemSink {
+struct MemSink {
     /// Target locations for writing data
     batches: Vec<PartitionData>,
     overwrite: InsertOp,
@@ -626,7 +626,6 @@ mod tests {
                 vec!["1970-01-01", "2012-12-01T11:11:11Z", "2012-12-01T11:11:12Z"],
             ),
             ("value", vec!["a", "b", "c"]),
-
         ]);
         let table = MemTable::try_new(schema, vec![vec![rb]])
             .expect("mem table should be created")

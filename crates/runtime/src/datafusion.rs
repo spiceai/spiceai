@@ -152,9 +152,6 @@ pub enum Error {
         source: DataFusionError,
     },
 
-    #[snafu(display("Unable to execute an internal data modification query: {source}"))]
-    UnableToExecuteInternalDMLQuery { source: DataFusionError },
-
     #[snafu(display("Failed to refresh the dataset {dataset_name}.\n{source}"))]
     UnableToTriggerRefresh {
         dataset_name: String,

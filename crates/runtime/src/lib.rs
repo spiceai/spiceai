@@ -275,7 +275,7 @@ pub struct Runtime {
     embeds: Arc<RwLock<EmbeddingModelStore>>,
     tools: Arc<RwLock<HashMap<String, Tooling>>>,
     evals: Arc<RwLock<Vec<Eval>>>,
-    eval_scorer_registry: EvalScorerRegistry,
+    eval_scorers: EvalScorerRegistry,
     pods_watcher: Arc<RwLock<Option<podswatcher::PodsWatcher>>>,
     secrets: Arc<RwLock<secrets::Secrets>>,
     datasets_health_monitor: Option<Arc<DatasetsHealthMonitor>>,
