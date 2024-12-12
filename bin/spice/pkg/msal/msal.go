@@ -49,7 +49,6 @@ func InteractivelyGetAccessToken(ctx context.Context, tenantId string, clientId 
 	}
 
 	access_token := result.AccessToken
-	fmt.Println("Authorised!")
 
 	return access_token, nil
 }
