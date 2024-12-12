@@ -6769,7 +6769,7 @@ dependencies = [
 [[package]]
 name = "mistralrs"
 version = "0.3.4"
-source = "git+https://github.com/spiceai/mistral.rs?rev=b2101b043a4ed28bd508faa57370c0394cce5e05#b2101b043a4ed28bd508faa57370c0394cce5e05"
+source = "git+https://github.com/spiceai/mistral.rs?rev=2978e4039af71007588478be60aa076e2a21437d#2978e4039af71007588478be60aa076e2a21437d"
 dependencies = [
  "anyhow",
  "candle-core 0.8.0",
@@ -6790,7 +6790,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-core"
 version = "0.3.4"
-source = "git+https://github.com/spiceai/mistral.rs?rev=b2101b043a4ed28bd508faa57370c0394cce5e05#b2101b043a4ed28bd508faa57370c0394cce5e05"
+source = "git+https://github.com/spiceai/mistral.rs?rev=2978e4039af71007588478be60aa076e2a21437d#2978e4039af71007588478be60aa076e2a21437d"
 dependencies = [
  "akin",
  "anyhow",
@@ -6862,7 +6862,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-paged-attn"
 version = "0.3.4"
-source = "git+https://github.com/spiceai/mistral.rs?rev=b2101b043a4ed28bd508faa57370c0394cce5e05#b2101b043a4ed28bd508faa57370c0394cce5e05"
+source = "git+https://github.com/spiceai/mistral.rs?rev=2978e4039af71007588478be60aa076e2a21437d#2978e4039af71007588478be60aa076e2a21437d"
 dependencies = [
  "anyhow",
  "bindgen_cuda 0.1.6",
@@ -6874,7 +6874,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-quant"
 version = "0.3.4"
-source = "git+https://github.com/spiceai/mistral.rs?rev=b2101b043a4ed28bd508faa57370c0394cce5e05#b2101b043a4ed28bd508faa57370c0394cce5e05"
+source = "git+https://github.com/spiceai/mistral.rs?rev=2978e4039af71007588478be60aa076e2a21437d#2978e4039af71007588478be60aa076e2a21437d"
 dependencies = [
  "bindgen_cuda 0.1.5",
  "byteorder",
@@ -6895,7 +6895,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-vision"
 version = "0.3.4"
-source = "git+https://github.com/spiceai/mistral.rs?rev=b2101b043a4ed28bd508faa57370c0394cce5e05#b2101b043a4ed28bd508faa57370c0394cce5e05"
+source = "git+https://github.com/spiceai/mistral.rs?rev=2978e4039af71007588478be60aa076e2a21437d#2978e4039af71007588478be60aa076e2a21437d"
 dependencies = [
  "candle-core 0.8.0",
  "image 0.25.5",
@@ -10897,7 +10897,7 @@ dependencies = [
 [[package]]
 name = "text-embeddings-backend"
 version = "1.5.0"
-source = "git+https://github.com/spiceai/text-embeddings-inference.git?rev=67b743e3a0babacd72f16ace46b51c49e8c5a672#67b743e3a0babacd72f16ace46b51c49e8c5a672"
+source = "git+https://github.com/spiceai/text-embeddings-inference.git?rev=b59b7b62860e75abea9b222de6100b4d1b1fac92#b59b7b62860e75abea9b222de6100b4d1b1fac92"
 dependencies = [
  "hf-hub",
  "serde_json",
@@ -10910,7 +10910,7 @@ dependencies = [
 [[package]]
 name = "text-embeddings-backend-candle"
 version = "1.5.0"
-source = "git+https://github.com/spiceai/text-embeddings-inference.git?rev=67b743e3a0babacd72f16ace46b51c49e8c5a672#67b743e3a0babacd72f16ace46b51c49e8c5a672"
+source = "git+https://github.com/spiceai/text-embeddings-inference.git?rev=b59b7b62860e75abea9b222de6100b4d1b1fac92#b59b7b62860e75abea9b222de6100b4d1b1fac92"
 dependencies = [
  "anyhow",
  "candle-core 0.8.1",
@@ -10933,7 +10933,7 @@ dependencies = [
 [[package]]
 name = "text-embeddings-backend-core"
 version = "1.5.0"
-source = "git+https://github.com/spiceai/text-embeddings-inference.git?rev=67b743e3a0babacd72f16ace46b51c49e8c5a672#67b743e3a0babacd72f16ace46b51c49e8c5a672"
+source = "git+https://github.com/spiceai/text-embeddings-inference.git?rev=b59b7b62860e75abea9b222de6100b4d1b1fac92#b59b7b62860e75abea9b222de6100b4d1b1fac92"
 dependencies = [
  "nohash-hasher",
  "thiserror 1.0.69",
@@ -10942,7 +10942,7 @@ dependencies = [
 [[package]]
 name = "text-embeddings-core"
 version = "1.5.0"
-source = "git+https://github.com/spiceai/text-embeddings-inference.git?rev=67b743e3a0babacd72f16ace46b51c49e8c5a672#67b743e3a0babacd72f16ace46b51c49e8c5a672"
+source = "git+https://github.com/spiceai/text-embeddings-inference.git?rev=b59b7b62860e75abea9b222de6100b4d1b1fac92#b59b7b62860e75abea9b222de6100b4d1b1fac92"
 dependencies = [
  "async-channel 2.3.1",
  "hf-hub",
@@ -10958,15 +10958,17 @@ dependencies = [
 [[package]]
 name = "text-splitter"
 version = "0.18.1"
-source = "git+https://github.com/spiceai/text-splitter.git?rev=0c4d27f482cd7ef09ead3156ef0e7a2031458838#0c4d27f482cd7ef09ead3156ef0e7a2031458838"
+source = "git+https://github.com/spiceai/text-splitter.git?rev=58f9c21006e01e5e968c5de80a0398b3f5ec439a#58f9c21006e01e5e968c5de80a0398b3f5ec439a"
 dependencies = [
  "ahash 0.8.11",
  "auto_enums",
  "either",
+ "hashbrown 0.15.2",
  "itertools 0.13.0",
  "once_cell",
  "pulldown-cmark",
  "regex",
+ "rustls 0.23.19",
  "strum 0.26.3",
  "thiserror 2.0.6",
  "tiktoken-rs",
