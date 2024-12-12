@@ -16,17 +16,17 @@ expression: req_str
       "name": "sql_mode",
       "schema": {
         "$schema": "http://json-schema.org/draft-07/schema#",
-        "additionalProperties": false,
+        "title": "StructuredNsqlOutput",
+        "type": "object",
+        "required": [
+          "sql"
+        ],
         "properties": {
           "sql": {
             "type": "string"
           }
         },
-        "required": [
-          "sql"
-        ],
-        "title": "StructuredNsqlOutput",
-        "type": "object"
+        "additionalProperties": false
       },
       "strict": true
     }

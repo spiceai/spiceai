@@ -36,7 +36,7 @@ use tei_core::{
     tokenization::{EncodingInput, Tokenization},
     TextEmbeddingsError,
 };
-use tokenizers::Tokenizer;
+use tokenizers::{Tokenizer, TruncationDirection};
 
 use crate::{
     chunking::{Chunker, ChunkingConfig, RecursiveSplittingChunker},
@@ -222,7 +222,7 @@ impl TeiEmbed {
                     .embed_pooled(
                         input,
                         false, // Don't automatically truncate, error.
-                        tokenizers::TruncationDirection::Right,
+                        TruncationDirection::Right,
                         None,
                         true,
                         permit,
