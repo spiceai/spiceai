@@ -92,7 +92,7 @@ pub(crate) async fn post(
             sql_to_http_response(
                 Arc::clone(&df),
                 sql_query_for(&id).as_str(),
-                ArrowFormat::from_accept_header(&accept),
+                ArrowFormat::from_accept_header(accept.as_ref()),
             )
             .await
         }
