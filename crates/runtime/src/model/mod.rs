@@ -34,8 +34,8 @@ pub use eval::{
         EVAL_RESULTS_TABLE_REFERENCE, EVAL_RESULTS_TABLE_SCHEMA, EVAL_RESULTS_TABLE_TIME_COLUMN,
     },
     runs::{
-        sql_query_for, start_eval_run, EVAL_RUNS_TABLE_PRIMARY_KEY, EVAL_RUNS_TABLE_REFERENCE,
-        EVAL_RUNS_TABLE_SCHEMA, EVAL_RUNS_TABLE_TIME_COLUMN,
+        sql_query_for, start_tracing_eval_run, EVAL_RUNS_TABLE_PRIMARY_KEY,
+        EVAL_RUNS_TABLE_REFERENCE, EVAL_RUNS_TABLE_SCHEMA, EVAL_RUNS_TABLE_TIME_COLUMN,
     },
     scorer::{builtin_scorer, EvalScorerRegistry, Scorer},
 };

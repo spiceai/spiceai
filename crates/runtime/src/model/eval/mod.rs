@@ -24,7 +24,8 @@ use dataset::{get_eval_data, DatasetInput, DatasetOutput};
 use llms::chat::Chat;
 use result::{write_result_to_table, ResultBuilder, EVAL_RESULTS_TABLE_REFERENCE};
 use runs::{
-    add_metrics_to_eval_run, start_eval_run, update_eval_run_status, EvalRunId, EvalRunStatus,
+    add_metrics_to_eval_run, start_tracing_eval_run, update_eval_run_status, EvalRunId,
+    EvalRunStatus,
 };
 use scorer::score_results;
 use snafu::{ResultExt, Snafu};
@@ -137,7 +138,7 @@ pub async fn handle_eval_run(
         "eval_run",
         input = %serde_json::to_string(&eval).unwrap_or_default(),
     );
-    let id = start_eval_run(eval, model_name.as_str(), Arc::clone(&df)).await?;
+    let id = start_tracing_eval_run(eval, model_name.as_str(), Arc::clone(&df)).await?;
 
     span.in_scope(
         || tracing::info!(target: "task_history",trace_id = %id, model = %model_name.clone(), "labels"),
