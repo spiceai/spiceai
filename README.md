@@ -98,6 +98,7 @@ Currently supported data connectors for upstream datasets. More coming soon.
 | `delta_lake`                       | Delta Lake                            | Beta              | Delta Lake                   |
 | `file`                             | File                                  | Beta              | Parquet, CSV                 |
 | `flightsql`                        | FlightSQL                             | Beta              | Arrow Flight SQL             |
+| `mssql`                            | Microsoft SQL Server                  | Beta              | Tabular Data Stream (TDS)    |
 | `odbc`                             | ODBC                                  | Beta              | ODBC                         |
 | `spiceai`                          | [Spice.ai][spiceai]                   | Beta              | Arrow Flight                 |
 | `abfs`                             | Azure BlobFS                          | Alpha             | Parquet, CSV                 |
@@ -107,7 +108,6 @@ Currently supported data connectors for upstream datasets. More coming soon.
 | `ftp`, `sftp`                      | FTP/SFTP                              | Alpha             | Parquet, CSV                 |
 | `http`, `https`                    | HTTP(s)                               | Alpha             | Parquet, CSV                 |
 | `localpod`                         | [Local dataset replication][localpod] | Alpha             |                              |
-| `mssql`                            | Microsoft SQL Server                  | Alpha             | Tabular Data Stream (TDS)    |
 | `sharepoint`                       | Microsoft SharePoint                  | Alpha             | Unstructured UTF-8 documents |
 | `snowflake`                        | Snowflake                             | Alpha             | Arrow                        |
 | `spark`                            | Spark                                 | Alpha             | [Spark Connect][spark]       |
