@@ -2,7 +2,11 @@ mod eval;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use std::path::{Path, PathBuf};
+use std::{
+    os,
+    path::{Path, PathBuf},
+    process::exit,
+};
 
 use eval::EvalSpecification;
 
@@ -51,13 +55,22 @@ fn main() -> Result<()> {
 
     let output: Vec<_> = files
         .iter()
-        .map(|f| EvalSpecification::validate_from_file(f, data_dir.as_path()))
-        .collect::<anyhow::Result<Vec<_>>>()?;
+        .map(|f| {
+            let e = match EvalSpecification::validate_from_file(f, data_dir.as_path()) {
+                Ok(e) => {
+                    println!("Eval '{}' is valid.", f.display());
+                    e
+                }
+                Err(e) => {
+                    eprintln!("Error validating {:?}: {}", f, e);
+                    exit(1);
+                }
+            };
+            e
+        })
+        .collect::<Vec<_>>();
 
-    for o in output {
-        println!("Eval {:?} is valid.", o.id);
-    }
-
+    println!("{} evals found", output.len());
     Ok(())
 }
 

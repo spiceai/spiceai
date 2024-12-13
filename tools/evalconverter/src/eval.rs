@@ -33,6 +33,8 @@ pub enum EvalEntry {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct EvalDefinition {
     pub class: String,
+
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub args: HashMap<String, Value>,
 }
 
@@ -41,6 +43,8 @@ pub struct EvalMetadata {
     id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    disclaimer: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     metrics: Option<Vec<String>>,
 }
@@ -58,14 +62,13 @@ impl EvalSpecification {
 
     /// Validate the specification from a YAML file, and converts it into an internal representation.
     pub fn validate(&self, data_dir: &Path) -> Result<Eval> {
-        self.resolve_file_paths(data_dir)?;
-
         let Some((
             name,
             EvalMetadata {
                 id,
                 description,
                 metrics,
+                ..
             },
         )) = self.get_metadata()
         else {
@@ -77,6 +80,8 @@ impl EvalSpecification {
             return Err(anyhow!("For {name}, expected '{id}' entry"));
         };
 
+        self.resolve_file_paths(def, data_dir)?;
+
         Ok(Eval {
             id: id.clone(),
             description: description.clone(),
@@ -86,18 +91,16 @@ impl EvalSpecification {
         })
     }
 
-    pub fn resolve_file_paths(&self, reference_dir: &Path) -> Result<()> {
-        for (_, entry) in self.get_definition_entries() {
-            for (key, value) in &entry.args {
-                let Value::String(s) = value else {
-                    continue;
-                };
-                if is_potential_file_key(key.as_str()) && !reference_dir.join(s).exists() {
-                    return Err(anyhow!(
-                        "Value in `{key}: {}` should be a file, but does not exist.",
-                        reference_dir.join(s).display()
-                    ));
-                }
+    pub fn resolve_file_paths(&self, def: &EvalDefinition, data_dir: &Path) -> Result<()> {
+        for (key, value) in &def.args {
+            let Value::String(s) = value else {
+                continue;
+            };
+            if is_potential_file_key(key.as_str()) && !data_dir.join(s).exists() {
+                return Err(anyhow!(
+                    "Value in `{key}: {}` should be a file, but does not exist.",
+                    data_dir.join(s).display()
+                ));
             }
         }
         Ok(())
