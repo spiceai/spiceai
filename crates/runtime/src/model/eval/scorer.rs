@@ -14,10 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
-use super::eval::{DatasetInput, DatasetOutput};
 use async_trait::async_trait;
+use tokio::sync::RwLock;
+
+use super::{DatasetInput, DatasetOutput};
 
 #[async_trait]
 pub trait Scorer: Sync + Send {
@@ -30,6 +32,29 @@ pub trait Scorer: Sync + Send {
 
     /// Compute the relevant metrics for this [`Scorer`], given a precomputed scores.
     fn metrics(&self, scores: &[f32]) -> Vec<(String, f32)>;
+}
+
+pub type EvalScorerRegistry = Arc<RwLock<HashMap<String, Arc<dyn Scorer>>>>;
+
+/// Compute the scores for each [`Scorer`] selected given the results of running a model.
+pub(crate) async fn score_results(
+    input: &[DatasetInput],
+    output: &[DatasetOutput],
+    expected: &[DatasetOutput],
+    scorers: &HashMap<String, Arc<dyn Scorer>>,
+) -> HashMap<String, Vec<f32>> {
+    let mut aggregate: HashMap<String, Vec<f32>> = HashMap::with_capacity(output.len());
+    for ((input, output), expected) in input.iter().zip(output.iter()).zip(expected.iter()) {
+        for (name, scorer) in scorers {
+            let s = scorer.score(input, output, expected).await;
+            if let Some(scorer_results) = aggregate.get_mut(name) {
+                scorer_results.push(s);
+            } else {
+                aggregate.insert((*name).to_string(), vec![s]);
+            };
+        }
+    }
+    aggregate
 }
 
 /// [`MatchScorer`] checks for equality between the actual and ideal values.

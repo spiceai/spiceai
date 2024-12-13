@@ -20,16 +20,20 @@ use axum::{
     response::{IntoResponse, Json, Response},
     Extension,
 };
+use axum_extra::TypedHeader;
 use datafusion::sql::TableReference;
+use headers_accept::Accept;
 use http::StatusCode;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
 use crate::{
     datafusion::DataFusion,
-    model::{run_eval, LLMModelStore},
+    model::{handle_eval_run, sql_query_for, EvalScorerRegistry, LLMModelStore},
     Runtime,
 };
+
+use super::{sql_to_http_response, ArrowFormat};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct RunEval {
@@ -44,13 +48,14 @@ pub(crate) async fn post(
     Extension(llms): Extension<Arc<RwLock<LLMModelStore>>>,
     Extension(df): Extension<Arc<DataFusion>>,
     Extension(rt): Extension<Arc<Runtime>>,
+    Extension(eval_scorer_registry): Extension<EvalScorerRegistry>,
+    accept: Option<TypedHeader<Accept>>,
     Path(eval_name): Path<String>,
     Json(req): Json<RunEval>,
 ) -> Response {
     let model = req.model;
 
-    let llm_lock = llms.read().await;
-    let Some(llm) = llm_lock.get(&model) else {
+    if !llms.read().await.contains_key(&model) {
         return (StatusCode::NOT_FOUND, format!("model '{model}' not found")).into_response();
     };
 
@@ -74,9 +79,23 @@ pub(crate) async fn post(
             .into_response();
     };
 
-    let scorers = rt.eval_scorers.read().await;
-    match run_eval(eval, df, &**llm, &scorers).await {
-        Ok(result) => (StatusCode::OK, Json(result)).into_response(),
+    match handle_eval_run(
+        eval,
+        model,
+        Arc::clone(&df),
+        Arc::clone(&llms),
+        eval_scorer_registry,
+    )
+    .await
+    {
+        Ok(id) => {
+            sql_to_http_response(
+                Arc::clone(&df),
+                sql_query_for(&id).as_str(),
+                ArrowFormat::from_accept_header(&accept),
+            )
+            .await
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
     }
 }
