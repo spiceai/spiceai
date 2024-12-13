@@ -361,7 +361,7 @@ pub(crate) fn map_type_name_to_column_type(data_type: &str) -> Option<ColumnType
         "char" | "varchar" | "text" => ColumnType::BigVarChar,
         "nchar" | "nvarchar" | "ntext" => ColumnType::NVarchar,
         "uniqueidentifier" => ColumnType::Guid,
-        "binary" => ColumnType::BigBinary,
+        "binary" | "timestamp" | "rowversion" => ColumnType::BigBinary, // Timestamp is not a typical ISO timestamp in MS SQL - it's a binary synonym for rowversion
         "varbinary" | "image" => ColumnType::BigVarBin,
         "xml" => ColumnType::Xml,
         "money" => ColumnType::Money,

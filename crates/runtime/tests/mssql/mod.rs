@@ -65,6 +65,7 @@ async fn init_mssql_db(port: u16) -> Result<(), anyhow::Error> {
       col_float FLOAT,
       col_double REAL,
       col_timestamp TIMESTAMP,
+      col_datetime DATETIME,
       col_date DATE,
       col_time TIME,
       col_blob BINARY(50),
@@ -91,6 +92,7 @@ async fn init_mssql_db(port: u16) -> Result<(), anyhow::Error> {
       col_float,
       col_double,
       col_timestamp,
+      col_datetime,
       col_date,
       col_time,
       col_blob,
@@ -109,6 +111,7 @@ async fn init_mssql_db(port: u16) -> Result<(), anyhow::Error> {
       1.1,
       1.1,
       DEFAULT,
+      CAST('2019-01-01 00:00:00' AS DATETIME),
       '2019-01-01',
       '12:34:56',
       CAST('blob' AS BINARY),
@@ -135,6 +138,7 @@ async fn init_mssql_db(port: u16) -> Result<(), anyhow::Error> {
       col_float,
       col_double,
       col_timestamp,
+      col_datetime,
       col_date,
       col_time,
       col_blob,
@@ -145,6 +149,7 @@ async fn init_mssql_db(port: u16) -> Result<(), anyhow::Error> {
       col_char
     ) VALUES (
       'b9daf5da-adc2-4eca-b283-b565b442e646',
+      NULL,
       NULL,
       NULL,
       NULL,
@@ -223,7 +228,7 @@ async fn mssql_integration_test() -> Result<(), String> {
                 "select",
                 Some(Box::new(|result_batches| {
                     for batch in &result_batches {
-                        assert_eq!(batch.num_columns(), 16, "num_cols: {}", batch.num_columns());
+                        assert_eq!(batch.num_columns(), 18, "num_cols: {}", batch.num_columns());
                         assert_eq!(batch.num_rows(), 2, "num_rows: {}", batch.num_rows());
                     }
 
