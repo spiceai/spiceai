@@ -42,15 +42,10 @@ async fn init_mssql_db(port: u16) -> Result<(), anyhow::Error> {
     config.encryption(tiberius::EncryptionLevel::Off);
     config.authentication(tiberius::AuthMethod::sql_server("sa", MSSQL_ROOT_PASSWORD));
 
-    let manager = SqlServerConnectionManager::create(config)
-        .await
-        .expect("should create connection manager");
-    let mut connection = manager.get().await.expect("should get connection");
+    let manager = SqlServerConnectionManager::create(config).await?;
+    let mut connection = manager.get().await?;
 
-    let _ = connection
-        .execute("DROP TABLE IF EXISTS test", &[])
-        .await
-        .expect("should drop table");
+    let _ = connection.execute("DROP TABLE IF EXISTS test", &[]).await?;
 
     let _ = connection
         .execute(
@@ -77,8 +72,7 @@ async fn init_mssql_db(port: u16) -> Result<(), anyhow::Error> {
     );",
             &[],
         )
-        .await
-        .expect("should create table");
+        .await?;
 
     let _ = connection
         .execute(
@@ -123,8 +117,7 @@ async fn init_mssql_db(port: u16) -> Result<(), anyhow::Error> {
     );",
             &[],
         )
-        .await
-        .expect("should insert row");
+        .await?;
 
     let _ = connection
         .execute(
@@ -169,8 +162,7 @@ async fn init_mssql_db(port: u16) -> Result<(), anyhow::Error> {
     );",
             &[],
         )
-        .await
-        .expect("should insert row");
+        .await?;
 
     Ok(())
 }
