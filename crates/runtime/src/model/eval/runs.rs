@@ -155,7 +155,7 @@ pub async fn update_eval_run_status(
 }
 
 /// Writes a new row to `spice.evals.runs` table and returns primary key.
-pub async fn start_eval_run(
+pub async fn start_tracing_eval_run(
     eval: &Eval,
     model_name: &str,
     df: Arc<DataFusion>,
