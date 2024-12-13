@@ -14,6 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use opentelemetry::trace::TraceId;
+use rand::RngCore;
+
 use crate::{
     component::dataset::{
         acceleration::{Acceleration, Mode, RefreshMode, ZeroResultsAction},
@@ -80,6 +83,19 @@ fn dataset_acceleration_info(
         info.push_str(", fallback on source on empty result");
     }
     info
+}
+
+pub fn random_trace_id() -> TraceId {
+    let mut bytes = [0u8; 16];
+    let mut rng = rand::thread_rng();
+    rng.fill_bytes(&mut bytes);
+
+    // Ensure the TraceId is not all zeros
+    if bytes.iter().all(|&b| b == 0) {
+        return random_trace_id();
+    }
+
+    TraceId::from_bytes(bytes)
 }
 
 #[cfg(test)]

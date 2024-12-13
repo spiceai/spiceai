@@ -114,6 +114,7 @@ impl DataFusionBuilder {
         let catalog = MemoryCatalogProvider::new();
         let default_schema = SpiceSchemaProvider::new();
         let runtime_schema = SpiceSchemaProvider::new();
+
         let metadata_schema = SpiceSchemaProvider::new();
 
         match catalog.register_schema(SPICE_DEFAULT_SCHEMA, Arc::new(default_schema)) {
@@ -127,6 +128,17 @@ impl DataFusionBuilder {
             Ok(_) => {}
             Err(e) => {
                 panic!("Unable to register spice runtime schema: {e}");
+            }
+        }
+
+        if cfg!(feature = "models") {
+            use super::SPICE_EVAL_SCHEMA;
+            let eval_schema = SpiceSchemaProvider::new();
+            match catalog.register_schema(SPICE_EVAL_SCHEMA, Arc::new(eval_schema)) {
+                Ok(_) => {}
+                Err(e) => {
+                    panic!("Unable to register spice eval schema: {e}");
+                }
             }
         }
 

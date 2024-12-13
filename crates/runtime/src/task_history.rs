@@ -101,6 +101,7 @@ impl TaskSpan {
             status,
             tbl_reference,
             Arc::new(TaskSpan::table_schema()),
+            None,
             Acceleration::default(),
             Refresh::default(),
             retention,
@@ -161,7 +162,7 @@ impl TaskSpan {
         };
 
         df.write_data(
-            TableReference::partial(SPICE_RUNTIME_SCHEMA, DEFAULT_TASK_HISTORY_TABLE),
+            &TableReference::partial(SPICE_RUNTIME_SCHEMA, DEFAULT_TASK_HISTORY_TABLE),
             data_update,
         )
         .await

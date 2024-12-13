@@ -81,6 +81,7 @@ pub(crate) fn routes(
             .route("/v1/evals/:name", post(v1::eval::post))
             .layer(Extension(Arc::clone(&rt.llms)))
             .layer(Extension(Arc::clone(&rt.models)))
+            .layer(Extension(Arc::clone(&rt.eval_scorers)))
             .layer(Extension(vector_search))
             .layer(Extension(Arc::clone(&rt.embeds)));
     }

@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use arrow::array::RecordBatch;
+use datafusion::sql::TableReference;
 use futures::TryStreamExt;
 use std::{sync::Arc, time::Duration};
 
@@ -168,7 +169,7 @@ async fn spiceai_integration_test_refresh_sql_override_append() -> Result<(), an
 
             rt.datafusion()
                 .refresh_table(
-                    "nation",
+                    &TableReference::parse_str("nation"),
                     Some(RefreshOverrides {
                         sql: Some("SELECT * FROM nation WHERE n_regionkey = 0".to_string()),
                         mode: Some(RefreshMode::Append),

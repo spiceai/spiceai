@@ -62,7 +62,7 @@ impl Runtime {
         {
             Ok(table) => self
                 .df
-                .register_runtime_table(
+                .register_table_as_writable_and_with_schema(
                     TableReference::partial(
                         SPICE_RUNTIME_SCHEMA,
                         task_history::DEFAULT_TASK_HISTORY_TABLE,

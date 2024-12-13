@@ -205,7 +205,7 @@ pub(crate) async fn refresh(
 
     match df
         .refresh_table(
-            &dataset.name,
+            &TableReference::parse_str(dataset.name.as_str()),
             overrides_opt.map(|Json(overrides)| overrides),
         )
         .await

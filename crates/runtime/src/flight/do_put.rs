@@ -126,7 +126,7 @@ pub(crate) async fn handle(
                         let _ = channel.send(data_update.clone());
                     };
 
-                    if let Err(e) = df.write_data(path.clone(), data_update).await {
+                    if let Err(e) = df.write_data(&path, data_update).await {
                         return Some((
                             Err(Status::internal(format!("Error writing data: {e}"))),
                             flight,
