@@ -280,7 +280,8 @@ pub(crate) fn rows_to_arrow(rows: &[Row], schema: &SchemaRef) -> super::Result<R
                     match v {
                         Some(v) => {
                             if matches!(mssql_type, ColumnType::BigChar | ColumnType::NChar) {
-                                builder.append_value(v.trim_end());
+                                builder.append_value(v.trim_end()); // MS SQL returns space-padded chars to the length of the char
+                                                                    // memory execution does not trim space-padded chars in WHERE clauses, but MS SQL does - trim incoming CHARs to replicate this behavior
                             } else {
                                 builder.append_value(v);
                             }
