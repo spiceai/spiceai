@@ -278,7 +278,13 @@ pub(crate) fn rows_to_arrow(rows: &[Row], schema: &SchemaRef) -> super::Result<R
                     };
                     let v = row.get::<&str, usize>(i);
                     match v {
-                        Some(v) => builder.append_value(v),
+                        Some(v) => {
+                            if matches!(mssql_type, ColumnType::BigChar | ColumnType::NChar) {
+                                builder.append_value(v.trim_end());
+                            } else {
+                                builder.append_value(v);
+                            }
+                        }
                         None => builder.append_null(),
                     }
                 }
