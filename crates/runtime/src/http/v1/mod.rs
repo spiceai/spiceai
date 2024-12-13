@@ -74,8 +74,8 @@ pub(crate) fn accept_header_types(accept: &TypedHeader<Accept>) -> Vec<String> {
 }
 
 impl ArrowFormat {
-    pub fn from_accept_header(accept: &Option<TypedHeader<Accept>>) -> ArrowFormat {
-        accept.as_ref().map_or(ArrowFormat::default(), |header| {
+    pub fn from_accept_header(accept: Option<&TypedHeader<Accept>>) -> ArrowFormat {
+        accept.map_or(ArrowFormat::default(), |header| {
             accept_header_types(header)
                 .iter()
                 .find_map(|h| match h.as_str() {

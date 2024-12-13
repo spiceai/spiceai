@@ -321,7 +321,7 @@ pub(crate) async fn sample(
         }
     };
 
-    let res = match ArrowFormat::from_accept_header(&accept) {
+    let res = match ArrowFormat::from_accept_header(accept.as_ref()) {
         ArrowFormat::Json => arrow_to_json(&[sample]),
         ArrowFormat::Csv => arrow_to_csv(&[sample]),
         ArrowFormat::Plain => arrow_to_plain(&[sample]),

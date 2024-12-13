@@ -145,7 +145,7 @@ async fn bench_main() -> Result<(), String> {
                 "mssql",
             ];
             for connector in connectors {
-                run_connector_bench(connector, &upload_results_dataset, args.bench_name.as_ref()).await?;
+                run_connector_bench(connector, upload_results_dataset.as_ref(), args.bench_name.as_ref()).await?;
             }
             let accelerators: Vec<Acceleration> = vec![
                 create_acceleration("arrow", acceleration::Mode::Memory, args.bench_name.as_ref()),
@@ -161,13 +161,13 @@ async fn bench_main() -> Result<(), String> {
                 create_acceleration("postgres", acceleration::Mode::Memory, args.bench_name.as_ref()),
             ];
             for accelerator in accelerators {
-                run_accelerator_bench(accelerator.clone(), &upload_results_dataset, "tpch").await?;
-                run_accelerator_bench(accelerator, &upload_results_dataset, "tpcds").await?;
+                run_accelerator_bench(accelerator.clone(), upload_results_dataset.as_ref(), "tpch").await?;
+                run_accelerator_bench(accelerator, upload_results_dataset.as_ref(), "tpcds").await?;
             }
         },
         (Some(connector), None, None) => {
             // Run connector benchmark test
-            run_connector_bench(connector, &upload_results_dataset, args.bench_name.as_ref()).await?;
+            run_connector_bench(connector, upload_results_dataset.as_ref(), args.bench_name.as_ref()).await?;
         },
         (None, Some(accelerator), mode) => {
             // Run accelerator benchmark test
@@ -181,13 +181,13 @@ async fn bench_main() -> Result<(), String> {
 
             match args.bench_name.as_ref() {
                 "tpch" => {
-                    run_accelerator_bench(acceleration, &upload_results_dataset, "tpch").await?;
+                    run_accelerator_bench(acceleration, upload_results_dataset.as_ref(), "tpch").await?;
                 }
                 "tpcds" => {
-                    run_accelerator_bench(acceleration, &upload_results_dataset, "tpcds").await?;
+                    run_accelerator_bench(acceleration, upload_results_dataset.as_ref(), "tpcds").await?;
                 }
                 "clickbench" => {
-                    run_accelerator_bench(acceleration, &upload_results_dataset, "clickbench").await?;
+                    run_accelerator_bench(acceleration, upload_results_dataset.as_ref(), "clickbench").await?;
                 }
                 _ => return Err(format!("Invalid mode bench_name parameter {}", args.bench_name)),
             }
@@ -200,7 +200,7 @@ async fn bench_main() -> Result<(), String> {
 
 async fn run_connector_bench(
     connector: &str,
-    upload_results_dataset: &Option<String>,
+    upload_results_dataset: Option<&String>,
     bench_name: &str,
 ) -> Result<(), String> {
     let mut display_records = vec![];
@@ -262,7 +262,7 @@ async fn run_connector_bench(
     let mut records = data_update.data.clone();
     display_records.append(&mut records);
 
-    if let Some(upload_results_dataset) = upload_results_dataset.clone() {
+    if let Some(upload_results_dataset) = upload_results_dataset {
         tracing::info!("Writing benchmark results to dataset {upload_results_dataset}...");
         setup::write_benchmark_results(data_update, &rt).await?;
     }
@@ -273,7 +273,7 @@ async fn run_connector_bench(
 
 async fn run_accelerator_bench(
     accelerator: Acceleration,
-    upload_results_dataset: &Option<String>,
+    upload_results_dataset: Option<&String>,
     bench_name: &str,
 ) -> Result<(), String> {
     let mut display_records = vec![];
@@ -299,7 +299,7 @@ async fn run_accelerator_bench(
     let mut records = data_update.data.clone();
     display_records.append(&mut records);
 
-    if let Some(upload_results_dataset) = upload_results_dataset.clone() {
+    if let Some(upload_results_dataset) = upload_results_dataset {
         tracing::info!("Writing benchmark results to dataset {upload_results_dataset}...");
         setup::write_benchmark_results(data_update, &rt).await?;
     }

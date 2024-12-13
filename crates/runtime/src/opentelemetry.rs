@@ -128,7 +128,7 @@ impl MetricsService for Service {
                         let (record_batch_result, data_points_count) = metric_data_to_record_batch(
                             metric.name.as_str(),
                             &data,
-                            &existing_schema,
+                            existing_schema.as_ref(),
                         );
                         total_data_points += data_points_count;
 
@@ -212,7 +212,7 @@ async fn create_health_service() -> HealthServer<impl Health> {
 pub fn metric_data_to_record_batch(
     metric: &str,
     data: &Data,
-    existing_schema: &Option<Schema>,
+    existing_schema: Option<&Schema>,
 ) -> (Result<RecordBatch>, u64) {
     match data {
         Data::Gauge(gauge) => (
@@ -253,7 +253,7 @@ macro_rules! append_value {
 fn number_data_points_to_record_batch(
     metric: &str,
     data_points: &Vec<NumberDataPoint>,
-    existing_schema: &Option<Schema>,
+    existing_schema: Option<&Schema>,
 ) -> Result<RecordBatch> {
     let mut values_builder: Option<Box<dyn ArrayBuilder>> = None;
     let mut values_type = DataType::Null;
@@ -411,7 +411,7 @@ macro_rules! append_attribute {
 fn attributes_to_fields_and_columns(
     metric: &str,
     attributes: &[&[KeyValue]],
-    existing_schema: &Option<Schema>,
+    existing_schema: Option<&Schema>,
 ) -> (
     IndexMap<String, Arc<Field>>,
     IndexMap<String, Box<dyn ArrayBuilder>>,
@@ -522,7 +522,7 @@ fn attributes_to_fields_and_columns(
 fn initialize_attribute_schema(
     fields: &mut IndexMap<String, Arc<Field>>,
     columns: &mut IndexMap<String, Box<dyn ArrayBuilder>>,
-    existing_schema: &Option<Schema>,
+    existing_schema: Option<&Schema>,
 ) {
     if let Some(s) = existing_schema {
         for field in s.fields() {

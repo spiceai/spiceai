@@ -83,7 +83,7 @@ impl ObjectStoreTextTable {
     fn to_record_batch(
         meta_list: &[ObjectMeta],
         raw: &[Bytes],
-        formatter: &Option<Arc<dyn DocumentParser>>,
+        formatter: Option<&Arc<dyn DocumentParser>>,
     ) -> Result<RecordBatch, ArrowError> {
         if meta_list.len() != raw.len() {
             return Err(ArrowError::ParseError("Length mismatch".to_string()));
@@ -103,7 +103,7 @@ impl ObjectStoreTextTable {
             .enumerate()
             .map(|(idx, bytes)| {
                 let utf8 = match formatter {
-                    Some(ref f) => f
+                    Some(f) => f
                         .parse(bytes)
                         .and_then(|doc| doc.as_flat_utf8())
                         .boxed()
@@ -284,7 +284,7 @@ pub(crate) fn to_sendable_stream(
                     let result: GetResult = ctx.store.get(&object_meta.location).await?;
                     let bytz = result.bytes().await?;
 
-                    match ObjectStoreTextTable::to_record_batch(&[object_meta], &[bytz], &formatter) {
+                    match ObjectStoreTextTable::to_record_batch(&[object_meta], &[bytz], formatter.as_ref()) {
                         Ok(batch) => {
                             let n = batch.num_rows();
                             yield Ok(batch);

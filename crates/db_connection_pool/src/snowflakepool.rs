@@ -111,11 +111,19 @@ impl SnowflakeConnectionPool {
 
         let api = match auth_type.as_str() {
             "snowflake" => init_snowflake_api_with_password_auth(
-                &account, username, &warehouse, &role, params,
+                &account,
+                username,
+                warehouse.as_ref(),
+                role.as_ref(),
+                params,
             )?,
-            "keypair" => {
-                init_snowflake_api_with_keypair_auth(&account, username, &warehouse, &role, params)?
-            }
+            "keypair" => init_snowflake_api_with_keypair_auth(
+                &account,
+                username,
+                warehouse.as_ref(),
+                role.as_ref(),
+                params,
+            )?,
             _ => InvalidParameterValueSnafu {
                 param_key: "snowflake_auth_type",
                 param_value: auth_type,
@@ -163,8 +171,8 @@ impl SnowflakeConnectionPool {
 fn init_snowflake_api_with_password_auth(
     account: &str,
     username: &str,
-    warehouse: &Option<String>,
-    role: &Option<String>,
+    warehouse: Option<&String>,
+    role: Option<&String>,
     params: &HashMap<String, SecretString>,
 ) -> Result<SnowflakeApi, Error> {
     let password = params
@@ -173,11 +181,11 @@ fn init_snowflake_api_with_password_auth(
         .context(MissingRequiredSecretSnafu { name: "password" })?;
     let api = SnowflakeApi::with_password_auth(
         account,
-        warehouse.as_deref(),
+        warehouse.map(String::as_str),
         None,
         None,
         username,
-        role.as_deref(),
+        role.map(String::as_str),
         password,
     )
     .context(UnableToConnectSnafu)?;
@@ -188,8 +196,8 @@ fn init_snowflake_api_with_password_auth(
 fn init_snowflake_api_with_keypair_auth(
     account: &str,
     username: &str,
-    warehouse: &Option<String>,
-    role: &Option<String>,
+    warehouse: Option<&String>,
+    role: Option<&String>,
     params: &HashMap<String, SecretString>,
 ) -> Result<SnowflakeApi, Error> {
     let private_key_path = params
@@ -220,11 +228,11 @@ fn init_snowflake_api_with_keypair_auth(
 
     let api = SnowflakeApi::with_certificate_auth(
         account,
-        warehouse.as_deref(),
+        warehouse.map(String::as_str),
         None,
         None,
         username,
-        role.as_deref(),
+        role.map(String::as_str),
         &private_key_pem,
     )
     .context(UnableToConnectSnafu)?;

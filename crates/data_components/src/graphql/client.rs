@@ -727,7 +727,7 @@ impl GraphQLClient {
         let body = format!(r#"{{"query": {}}}"#, json!(query_string));
 
         let mut request = self.client.post(self.endpoint.clone()).body(body);
-        request = request_with_auth(request, &self.auth).await;
+        request = request_with_auth(request, self.auth.as_ref()).await;
 
         let response = request.send().await.context(ReqwestInternalSnafu)?;
         let response_headers = response.headers().clone();
@@ -776,7 +776,7 @@ impl GraphQLClient {
             unwrapped = unnest_json_objects(&self.unnest_parameters, &unwrapped)?;
         }
 
-        let schema = get_json_schema(&self.schema, &schema, &unwrapped)?;
+        let schema = get_json_schema(self.schema.as_ref(), schema.as_ref(), &unwrapped)?;
 
         let mut res = vec![];
         for v in unwrapped {
@@ -855,8 +855,8 @@ impl GraphQLClient {
 }
 
 fn get_json_schema(
-    client_schema: &Option<SchemaRef>,
-    schema_override: &Option<SchemaRef>,
+    client_schema: Option<&SchemaRef>,
+    schema_override: Option<&SchemaRef>,
     json_iter: &[Value],
 ) -> Result<SchemaRef> {
     if let Some(schema) = schema_override {
@@ -873,8 +873,8 @@ fn get_json_schema(
     Ok(Arc::new(schema))
 }
 
-async fn request_with_auth(request_builder: RequestBuilder, auth: &Option<Auth>) -> RequestBuilder {
-    match &auth {
+async fn request_with_auth(request_builder: RequestBuilder, auth: Option<&Auth>) -> RequestBuilder {
+    match auth {
         Some(Auth::Basic(user, pass)) => request_builder.basic_auth(user, pass.clone()),
         Some(Auth::Bearer(token_provider)) => {
             if let Ok(token) = token_provider.get_token().await {

@@ -59,7 +59,7 @@ fn get_test_datafusion(status: Arc<RuntimeStatus>) -> Arc<DataFusion> {
 }
 
 pub(crate) async fn setup_benchmark(
-    upload_results_dataset: &Option<String>,
+    upload_results_dataset: Option<&String>,
     connector: &str,
     acceleration: Option<Acceleration>,
     bench_name: &str,
@@ -107,7 +107,7 @@ pub(crate) async fn write_benchmark_results(
 }
 
 fn build_app(
-    upload_results_dataset: &Option<String>,
+    upload_results_dataset: Option<&String>,
     connector: &str,
     acceleration: Option<Acceleration>,
     bench_name: &str,

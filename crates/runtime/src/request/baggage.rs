@@ -79,7 +79,7 @@ pub enum BaggageIterator<'a> {
     Some(Box<dyn Iterator<Item = KeyValue> + 'a>),
 }
 
-impl<'a> Iterator for BaggageIterator<'a> {
+impl Iterator for BaggageIterator<'_> {
     type Item = KeyValue;
 
     fn next(&mut self) -> Option<KeyValue> {

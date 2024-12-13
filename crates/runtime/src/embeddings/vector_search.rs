@@ -379,7 +379,7 @@ impl VectorSearchTableResult {
 
     pub fn to_matches(&self, table: &TableReference) -> Result<Vec<Match>> {
         // Early exit on no data.
-        if !self.data.first().is_some_and(|d| d.num_rows() > 0) {
+        if self.data.first().is_none_or(|d| d.num_rows() == 0) {
             return Ok(vec![]);
         }
 
