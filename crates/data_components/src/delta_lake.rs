@@ -52,10 +52,10 @@ use crate::Read;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Delta Lake Table connection failed.\n{source}\nVerify Delta Lake Connector configuration and try again."))]
+    #[snafu(display("Delta Lake Table connection failed.\n{source}\n"))]
     DeltaTableError { source: delta_kernel::Error },
 
-    #[snafu(display("Delta Lake Table checkpoint file is missing or incorrect.\n{source}\nEnsure the checkpoint file is valid and try again."))]
+    #[snafu(display("Delta Lake Table checkpoint files are missing or incorrect.\n{source}\nEnsure the checkpoint files in _delta_log are valid and try again."))]
     DeltaCheckpointError { source: delta_kernel::Error },
 }
 
