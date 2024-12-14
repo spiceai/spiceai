@@ -52,8 +52,11 @@ use crate::Read;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Delta Lake Table connection failed.\n{source}\nVerify Delta Lake Connector configuration and try again.\nFor details, visit https://docs.spiceai.org/components/data-connectors/delta-lake#configuration"))]
+    #[snafu(display("Delta Lake Table connection failed.\n{source}\nVerify Delta Lake Connector configuration and try again."))]
     DeltaTableError { source: delta_kernel::Error },
+
+    #[snafu(display("Delta Lake Table checkpoint file is missing or incorrect.\n{source}\nEnsure the checkpoint file is valid and try again."))]
+    DeltaCheckpointError { source: delta_kernel::Error },
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -92,8 +95,8 @@ pub struct DeltaTable {
 
 impl DeltaTable {
     pub fn from(table_location: String, options: HashMap<String, SecretString>) -> Result<Self> {
-        let table =
-            Table::try_from_uri(ensure_folder_location(table_location)).context(DeltaTableSnafu)?;
+        let table = Table::try_from_uri(ensure_folder_location(table_location))
+            .map_err(handle_delta_error)?;
 
         let mut storage_options: HashMap<String, String> = HashMap::new();
         for (key, value) in options {
@@ -116,12 +119,12 @@ impl DeltaTable {
                 storage_options,
                 Arc::new(TokioBackgroundExecutor::new()),
             )
-            .context(DeltaTableSnafu)?,
+            .map_err(handle_delta_error)?,
         );
 
         let snapshot = table
             .snapshot(engine.as_ref(), None)
-            .context(DeltaTableSnafu)?;
+            .map_err(handle_delta_error)?;
 
         let arrow_schema = Self::get_schema(&snapshot);
         let delta_schema = snapshot.schema().clone();
@@ -595,6 +598,21 @@ async fn get_parquet_access_plan(
 
     tracing::debug!("Created ParquetAccessPlan with {row_groups:?}");
     Ok(ParquetAccessPlan::new(row_groups))
+}
+
+fn handle_delta_error(delta_error: delta_kernel::Error) -> Error {
+    match delta_error {
+        delta_kernel::Error::InvalidCheckpoint(_) => {
+            return Error::DeltaCheckpointError {
+                source: delta_error,
+            }
+        }
+        _ => {
+            return Error::DeltaTableError {
+                source: delta_error,
+            }
+        }
+    }
 }
 
 #[cfg(test)]
