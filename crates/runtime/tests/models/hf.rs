@@ -71,8 +71,21 @@ mod nsql {
 
         test_request_context()
             .scope(async {
+
+                let mut taxi_trips_with_embeddings = get_taxi_trips_dataset();
+                taxi_trips_with_embeddings.embeddings = vec![ColumnEmbeddingConfig {
+                    column: "store_and_fwd_flag".to_string(),
+                    model: "hf_minilm".to_string(),
+                    primary_keys: None,
+                    chunking: None,
+                }];
+
                 let app = AppBuilder::new("text-to-sql")
-                    .with_dataset(get_taxi_trips_dataset())
+                    .with_dataset(taxi_trips_with_embeddings)
+                    .with_embedding(get_huggingface_embeddings(
+                        "sentence-transformers/all-MiniLM-L6-v2",
+                        "hf_minilm",
+                    ))
                     .with_model(get_huggingface_model(
                         HF_TEST_MODEL,
                         HF_TEST_MODEL_TYPE,
