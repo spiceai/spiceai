@@ -85,7 +85,7 @@ assignees: ''
   - **AI/ML Models:**
   - [ ] [Searching GitHub files with Spice](https://github.com/spiceai/quickstarts/tree/trunk/search_github_files)
   - [ ] [Text-to-SQL with Spicel](https://github.com/spiceai/quickstarts/tree/trunk/text-to-sql)
-  - [ ] [Using Azure OpenAI models](https://github.com/spiceai/quickstarts/tree/trunk/azure_openai)
+  - [ ] [Spice with Azure OpenAI](https://github.com/spiceai/quickstarts/tree/trunk/azure_openai)
   - **Other Quickstarts:**
   - [ ] [Advanced Data Refresh](https://github.com/spiceai/quickstarts/blob/trunk/acceleration/data-refresh/README.md)
   - [ ] [Data Retention Policy](https://github.com/spiceai/quickstarts/blob/trunk/retention/README.md)
