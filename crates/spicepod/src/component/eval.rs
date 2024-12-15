@@ -24,6 +24,8 @@ use super::{Nameable, WithDependsOn};
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub struct Eval {
     pub name: String,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     pub dataset: String,
     pub scorers: Vec<String>,

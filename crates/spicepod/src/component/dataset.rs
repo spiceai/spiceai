@@ -94,7 +94,7 @@ pub struct Dataset {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub columns: Vec<Column>,
 
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_default")]
     pub mode: Mode,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]

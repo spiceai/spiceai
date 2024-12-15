@@ -95,11 +95,16 @@ fn dataset_needed(eval: &Eval, data_dir: &Path) -> Option<DatasetComponent> {
         if is_potential_file_key(key) {
             return Some(DatasetComponent::new(
                 format!("file:{}", data_dir.join(s).display()),
-                eval.id.clone(),
+                normalise_table_name(eval.id.as_str()),
             ));
         }
         None
     })
+}
+
+/// Normalise a table name to a valid identifier.
+fn normalise_table_name(x: &str) -> String {
+    x.to_lowercase().replace("-", "_").replace(".", "__")
 }
 
 impl EvalSpecification {
