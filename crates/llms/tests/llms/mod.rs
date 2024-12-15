@@ -196,7 +196,7 @@ static TEST_CASES: LazyLock<Vec<TestCase>> = LazyLock::new(|| {
     ]
 });
 
-#[allow(clippy::expect_fun_call)]
+#[allow(clippy::expect_used)]
 async fn run_single_test(test_name: &str, model_name: &str) -> Result<(), anyhow::Error> {
     let _ = dotenvy::from_filename(".env").expect("failed to load .env file");
     init_tracing(None);
@@ -221,13 +221,14 @@ async fn run_single_test(test_name: &str, model_name: &str) -> Result<(), anyhow
     let (_, model) = TEST_MODELS
         .iter()
         .find(|(name, _)| *name == model_name)
-        .expect(&format!("model {model_name} not found"));
+        .unwrap_or_else(|| panic!("model {model_name} not found"));
 
     tracing::info!("Running test {test_name}/{model_name} with {:?}", test.req);
 
-    let actual_resp = model.chat_request(test.req.clone()).await.expect(&format!(
-        "For test {test_name}/{model_name}, chat_request failed"
-    ));
+    let actual_resp = model
+        .chat_request(test.req.clone())
+        .await
+        .unwrap_or_else(|_| panic!("For test {test_name}/{model_name}, chat_request failed"));
     tracing::trace!("Response for {test_name}/{model_name}: {actual_resp:?}");
 
     let resp_value =
