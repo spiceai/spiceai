@@ -490,10 +490,10 @@
     "ComponentOrReference_for_Eval": {
       "anyOf": [
         {
-          "$ref": "#/definitions/Eval"
+          "$ref": "#/definitions/ComponentReference"
         },
         {
-          "$ref": "#/definitions/ComponentReference"
+          "$ref": "#/definitions/Eval"
         }
       ]
     },
