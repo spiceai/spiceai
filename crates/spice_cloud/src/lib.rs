@@ -205,7 +205,7 @@ impl SpiceExtension {
 
         runtime
             .datafusion()
-            .register_runtime_table(metrics_table_reference, table)
+            .register_table_as_writable_and_with_schema(metrics_table_reference, table)
             .boxed()
             .map_err(|e| runtime::extension::Error::UnableToStartExtension { source: e })?;
 

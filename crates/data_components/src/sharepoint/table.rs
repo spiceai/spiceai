@@ -99,7 +99,7 @@ impl TableProvider for SharepointTableProvider {
             projection,
             &self.schema(),
             limit,
-            &self.formatter,
+            self.formatter.as_ref(),
         )?))
     }
 }
@@ -119,7 +119,7 @@ impl SharepointListExec {
         projections: Option<&Vec<usize>>,
         schema: &SchemaRef,
         limit: Option<usize>,
-        formatter: &Option<Arc<dyn DocumentParser>>,
+        formatter: Option<&Arc<dyn DocumentParser>>,
     ) -> DataFusionResult<Self> {
         let projected_schema = project_schema(schema, projections)?;
         let properties = PlanProperties::new(
@@ -134,7 +134,7 @@ impl SharepointListExec {
             properties,
             limit,
             projections: projections.cloned(),
-            formatter: formatter.clone(),
+            formatter: formatter.cloned(),
         })
     }
 

@@ -19,7 +19,7 @@ use crate::{
     utils::{get_branch_name, get_commit_sha, init_tracing, runtime_ready_check},
 };
 use app::{App, AppBuilder};
-use datafusion::prelude::SessionContext;
+use datafusion::{prelude::SessionContext, sql::TableReference};
 use runtime::{
     datafusion::DataFusion,
     dataupdate::DataUpdate,
@@ -59,7 +59,7 @@ fn get_test_datafusion(status: Arc<RuntimeStatus>) -> Arc<DataFusion> {
 }
 
 pub(crate) async fn setup_benchmark(
-    upload_results_dataset: &Option<String>,
+    upload_results_dataset: Option<&String>,
     connector: &str,
     acceleration: Option<Acceleration>,
     bench_name: &str,
@@ -101,13 +101,16 @@ pub(crate) async fn write_benchmark_results(
     rt: &Runtime,
 ) -> Result<(), String> {
     rt.datafusion()
-        .write_data("oss_benchmarks".into(), benchmark_results)
+        .write_data(
+            &TableReference::parse_str("oss_benchmarks"),
+            benchmark_results,
+        )
         .await
         .map_err(|e| e.to_string())
 }
 
 fn build_app(
-    upload_results_dataset: &Option<String>,
+    upload_results_dataset: Option<&String>,
     connector: &str,
     acceleration: Option<Acceleration>,
     bench_name: &str,

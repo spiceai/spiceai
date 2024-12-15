@@ -41,7 +41,7 @@ pub(crate) async fn setup_benchmark(
     configuration_name: &str,
     test_dataset: &str,
     embeddings_model: &str,
-    acceleration: &Option<Acceleration>,
+    acceleration: Option<&Acceleration>,
 ) -> Result<(Runtime, SearchBenchmarkResultBuilder), String> {
     init_tracing(Some(
         "runtime=Debug,task_history=WARN,runtime::embeddings=WARN,INFO",
@@ -210,7 +210,7 @@ fn extract_query_relevance_from_batches(records: &[RecordBatch]) -> Result<Query
 async fn build_bench_app(
     test_dataset: &str,
     embeddings_model: &str,
-    acceleration: &Option<Acceleration>,
+    acceleration: Option<&Acceleration>,
 ) -> Result<AppBuilder, String> {
     let app_builder = AppBuilder::new("vector_search_benchmark_test")
         .with_results_cache(ResultsCache {
@@ -221,7 +221,7 @@ async fn build_bench_app(
         })
         .with_embedding(create_embeddings_model(embeddings_model));
 
-    add_benchmark_dataset(app_builder, test_dataset, acceleration.clone()).await
+    add_benchmark_dataset(app_builder, test_dataset, acceleration.cloned()).await
 }
 
 async fn add_benchmark_dataset(

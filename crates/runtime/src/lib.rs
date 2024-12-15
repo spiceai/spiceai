@@ -18,8 +18,10 @@ limitations under the License.
 use std::net::SocketAddr;
 use std::{collections::HashMap, sync::Arc};
 
-use crate::auth::EndpointAuth;
-use crate::{dataconnector::DataConnector, datafusion::DataFusion};
+use crate::{
+    auth::EndpointAuth, dataconnector::DataConnector, datafusion::DataFusion,
+    internal_table::Error as InternalTableError, model::ENABLE_MODEL_SUPPORT_MESSAGE,
+};
 use ::datafusion::error::DataFusionError;
 use ::datafusion::sql::{sqlparser, TableReference};
 use app::App;
@@ -28,7 +30,7 @@ use config::Config;
 use dataconnector::ConnectorComponent;
 use datasets_health_monitor::DatasetsHealthMonitor;
 use extension::ExtensionFactory;
-use model::{EmbeddingModelStore, LLMModelStore};
+use model::{EmbeddingModelStore, EvalScorerRegistry, LLMModelStore};
 use model_components::model::Model;
 pub use notify::Error as NotifyError;
 use secrecy::SecretString;
@@ -232,6 +234,9 @@ pub enum Error {
     #[snafu(display("Unable to create metrics table: {source}"))]
     UnableToCreateMetricsTable { source: DataFusionError },
 
+    #[snafu(display("Unable to create eval runs table: {source}"))]
+    UnableToCreateEvalRunsTable { source: InternalTableError },
+
     #[snafu(display("Unable to register metrics table: {source}"))]
     UnableToRegisterMetricsTable { source: datafusion::Error },
 
@@ -270,7 +275,7 @@ pub struct Runtime {
     embeds: Arc<RwLock<EmbeddingModelStore>>,
     tools: Arc<RwLock<HashMap<String, Tooling>>>,
     evals: Arc<RwLock<Vec<Eval>>>,
-    eval_scorers: Arc<RwLock<HashMap<String, Arc<dyn crate::model::Scorer>>>>,
+    eval_scorers: EvalScorerRegistry,
     pods_watcher: Arc<RwLock<Option<podswatcher::PodsWatcher>>>,
     secrets: Arc<RwLock<secrets::Secrets>>,
     datasets_health_monitor: Option<Arc<DatasetsHealthMonitor>>,
@@ -504,7 +509,21 @@ impl Runtime {
         let eval_scorer = tokio::spawn({
             let self_clone = self.clone();
             async move {
-                self_clone.load_eval_scorer().await;
+                let app_lock = self_clone.app.read().await;
+
+                if !cfg!(feature = "models")
+                    && app_lock.as_ref().is_some_and(|s| !s.evals.is_empty())
+                {
+                    tracing::error!("Cannot load evals without the 'models' feature enabled. {ENABLE_MODEL_SUPPORT_MESSAGE}");
+                }
+
+                #[cfg(feature = "models")]
+                {
+                    self_clone.load_eval_scorer().await;
+                    if let Err(err) = self_clone.load_eval_tables().await {
+                        tracing::warn!("Creating internal eval run table: {err}");
+                    }
+                }
             }
         });
 

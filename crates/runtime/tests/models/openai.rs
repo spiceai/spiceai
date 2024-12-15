@@ -60,10 +60,22 @@ mod nsql {
                 .await
                 .map_err(anyhow::Error::msg)?;
 
+            let mut taxi_trips_with_embeddings = get_taxi_trips_dataset();
+                taxi_trips_with_embeddings.embeddings = vec![ColumnEmbeddingConfig {
+                    column: "store_and_fwd_flag".to_string(),
+                    model: "openai_embeddings".to_string(),
+                    primary_keys: None,
+                    chunking: None,
+                }];
+
             let app = AppBuilder::new("text-to-sql")
-                .with_dataset(get_taxi_trips_dataset())
+                .with_dataset(taxi_trips_with_embeddings)
                 .with_model(get_openai_model("gpt-4o-mini", "nql"))
                 .with_model(get_openai_model("gpt-4o-mini", "nql-2"))
+                .with_embedding(get_openai_embeddings(
+                    Some("text-embedding-3-small"),
+                    "openai_embeddings",
+                ))
                 .build();
 
             let api_config = create_api_bindings_config();

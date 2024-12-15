@@ -35,9 +35,9 @@ use data_components::flight::FlightTable;
 use data_components::{Read, ReadWrite};
 use datafusion::catalog::CatalogProvider;
 use datafusion::datasource::TableProvider;
-use datafusion::sql::unparser::dialect::DefaultDialect;
 use datafusion::sql::unparser::dialect::Dialect;
 use datafusion::sql::unparser::dialect::IntervalStyle;
+use datafusion::sql::unparser::dialect::PostgreSqlDialect;
 use datafusion::sql::TableReference;
 use datafusion_federation::FederatedTableProviderAdaptor;
 use flight_client::Credentials;
@@ -98,7 +98,7 @@ impl Dialect for SpiceCloudPlatformDialect {
     }
 
     fn identifier_quote_style(&self, identifier: &str) -> Option<char> {
-        DefaultDialect {}.identifier_quote_style(identifier)
+        PostgreSqlDialect {}.identifier_quote_style(identifier)
     }
 }
 

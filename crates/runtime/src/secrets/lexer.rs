@@ -50,7 +50,7 @@ impl<'a> SecretReplacementMatcher<'a> {
     }
 }
 
-impl<'a> Iterator for SecretReplacementMatcher<'a> {
+impl Iterator for SecretReplacementMatcher<'_> {
     type Item = ReplacementMatch;
 
     fn next(&mut self) -> Option<Self::Item> {

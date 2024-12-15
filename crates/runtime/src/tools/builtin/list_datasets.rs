@@ -104,7 +104,7 @@ pub async fn get_dataset_elements(
 
     app.datasets
         .iter()
-        .filter(|d| !opt_include.is_some_and(|ts| !ts.contains(&d.name)))
+        .filter(|d| opt_include.is_none_or(|ts| ts.contains(&d.name)))
         .map(|d| ListDatasetElement {
             table: TableReference::parse_str(&d.name)
                 .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)

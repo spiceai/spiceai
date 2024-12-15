@@ -68,7 +68,7 @@ impl From<LogVerbosity> for EnvFilter {
 }
 
 pub(crate) async fn init_tracing(
-    app: &Option<Arc<App>>,
+    app: Option<&Arc<App>>,
     config: Option<&TracingConfig>,
     df: Arc<DataFusion>,
     verbosity: LogVerbosity,
@@ -113,7 +113,7 @@ pub(crate) async fn init_tracing(
 
 async fn datafusion_task_history_tracing<S>(
     df: Arc<DataFusion>,
-    app: &Option<Arc<App>>,
+    app: Option<&Arc<App>>,
     config: Option<&TracingConfig>,
 ) -> Result<impl Layer<S>, Box<dyn std::error::Error + Send + Sync>>
 where

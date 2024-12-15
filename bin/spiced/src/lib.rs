@@ -219,7 +219,7 @@ pub async fn run(args: Args) -> Result<()> {
     let rt = builder.build().await;
 
     spiced_tracing::init_tracing(
-        &app,
+        app.as_ref(),
         tracing_config.as_ref(),
         rt.datafusion(),
         LogVerbosity::from_flags_and_env(

@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 use arrow::array::{ArrayRef, RecordBatch};
+use arrow_schema::DataType;
 use datafusion::{common::utils::quote_identifier, sql::TableReference};
 use itertools::Itertools;
 use std::{
@@ -129,26 +130,40 @@ impl SampleFrom for DistinctColumnsParams {
 
         let schema = provider.schema();
 
-        let columns = schema
-            .fields()
-            .iter()
-            .map(|f| f.name().clone())
-            .collect::<Vec<String>>();
+        let columns = schema.fields();
 
         let mut result: Vec<ArrayRef> = Vec::with_capacity(columns.len());
 
         for (i, column) in columns.iter().enumerate() {
-            // Only sample distinctly from columns that are specified in the `cols` field, or if `cols` is None.
-            let column_data = if self.cols.is_none()
-                || self.cols.as_ref().is_some_and(|cols| cols.contains(column))
+            // Only sample distinctly from columns that are specified in the `cols` field, if `cols` is None and distinct sampling is supported
+            let column_data = if column_supports_distinct_sampling(column)
+                && (self.cols.is_none()
+                    || self
+                        .cols
+                        .as_ref()
+                        .is_some_and(|cols| cols.contains(column.name())))
             {
-                Self::sample_distinct_from_column(Arc::clone(&df), &tbl, column, self.limit).await?
+                Self::sample_distinct_from_column(Arc::clone(&df), &tbl, column.name(), self.limit)
+                    .await?
             } else {
-                Self::sample_from_column(Arc::clone(&df), &tbl, column, self.limit).await?
+                Self::sample_from_column(Arc::clone(&df), &tbl, column.name(), self.limit).await?
             };
             result.insert(i, column_data);
         }
 
         RecordBatch::try_new(Arc::clone(&schema), result).boxed()
     }
+}
+
+fn column_supports_distinct_sampling(column: &arrow_schema::Field) -> bool {
+    // We can only sample distinct values from types that implements SortField
+    !matches!(
+        column.data_type(),
+        DataType::FixedSizeList(_, _)
+            | DataType::List(_)
+            | DataType::Struct(_)
+            | DataType::Map(_, _)
+            | DataType::Dictionary(_, _)
+            | DataType::Union(_, _)
+    )
 }
