@@ -64,19 +64,18 @@ fn main() -> Result<()> {
 
     let output: Vec<_> = files
         .iter()
-        .map(|f| {
-            let e = match EvalSpecification::validate_from_file(f, data_dir.as_path()) {
-                Ok(e) => {
+        .flat_map(
+            |f| match EvalSpecification::validate_from_file(f, data_dir.as_path()) {
+                Ok(evals) => {
                     println!("Eval '{}' is valid.", f.display());
-                    e
+                    evals
                 }
-                Err(e) => {
-                    eprintln!("Error validating {:?}: {}", f, e);
+                Err(err) => {
+                    eprintln!("Error validating {f:?}: {err}");
                     exit(1);
                 }
-            };
-            e
-        })
+            },
+        )
         .collect::<Vec<_>>();
     println!("{} evals found", output.len());
 
