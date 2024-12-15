@@ -44,6 +44,8 @@ mod federation;
 mod file;
 mod github;
 mod graphql;
+#[cfg(feature = "mssql")]
+mod mssql;
 #[cfg(feature = "mysql")]
 mod mysql;
 #[cfg(feature = "odbc")]

@@ -151,7 +151,7 @@ impl RuntimeBuilder {
             None
         };
 
-        let secrets = Self::load_secrets(&self.app).await;
+        let secrets = Self::load_secrets(self.app.as_ref()).await;
 
         let evals = self
             .app
@@ -194,7 +194,7 @@ impl RuntimeBuilder {
         rt
     }
 
-    async fn load_secrets(app: &Option<Arc<App>>) -> Secrets {
+    async fn load_secrets(app: Option<&Arc<App>>) -> Secrets {
         let _guard = TimeMeasurement::new(&metrics::secrets::STORES_LOAD_DURATION_MS, &[]);
         let mut secrets = secrets::Secrets::new();
 

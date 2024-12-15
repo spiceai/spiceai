@@ -226,7 +226,7 @@ impl ToolUsingChat {
         Ok(Some(messages))
     }
 
-    async fn _chat_request(
+    async fn chat_request_inner(
         &self,
         req: CreateChatCompletionRequest,
         recursion_limit: Option<usize>,
@@ -280,8 +280,8 @@ impl ToolUsingChat {
                 // New messages means we have run spice tools locally, ready to recall model.
                 Some(messages) => {
                     let mut resp = self
-                        ._chat_request(
-                            create_new_recursive_req(&inner_req, messages, &resp.usage),
+                        .chat_request_inner(
+                            create_new_recursive_req(&inner_req, messages, resp.usage.as_ref()),
                             recursion_limit.map(|r| r - 1),
                         )
                         .await?;
@@ -310,7 +310,7 @@ impl ToolUsingChat {
         }
     }
 
-    async fn _chat_stream(
+    async fn chat_stream_inner(
         &self,
         req: CreateChatCompletionRequest,
     ) -> Result<ChatCompletionResponseStream, OpenAIError> {
@@ -367,7 +367,7 @@ impl Chat for ToolUsingChat {
         req: CreateChatCompletionRequest,
     ) -> Result<ChatCompletionResponseStream, OpenAIError> {
         let inner_req = self.prepare_req(req).await?;
-        self._chat_stream(inner_req).await
+        self.chat_stream_inner(inner_req).await
     }
 
     async fn chat_request(
@@ -375,7 +375,8 @@ impl Chat for ToolUsingChat {
         req: CreateChatCompletionRequest,
     ) -> Result<CreateChatCompletionResponse, OpenAIError> {
         let inner_req = self.prepare_req(req).await?;
-        self._chat_request(inner_req, self.recursion_limit).await
+        self.chat_request_inner(inner_req, self.recursion_limit)
+            .await
     }
 
     fn as_sql(&self) -> Option<&dyn SqlGeneration> {
@@ -394,7 +395,7 @@ impl Chat for ToolUsingChat {
 fn create_new_recursive_req(
     req: &CreateChatCompletionRequest,
     new_msg: Vec<ChatCompletionRequestMessage>,
-    marginal_usage: &Option<CompletionUsage>,
+    marginal_usage: Option<&CompletionUsage>,
 ) -> CreateChatCompletionRequest {
     let mut new_req = req.clone();
     new_req.messages = new_msg;
@@ -630,10 +631,10 @@ fn make_a_stream(
                                 };
 
                                 match model
-                                    ._chat_stream(create_new_recursive_req(
+                                    .chat_stream_inner(create_new_recursive_req(
                                         &req,
                                         new_messages,
-                                        &response.usage,
+                                        response.usage.as_ref(),
                                     ))
                                     .await
                                 {

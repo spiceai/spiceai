@@ -278,7 +278,14 @@ pub(crate) fn rows_to_arrow(rows: &[Row], schema: &SchemaRef) -> super::Result<R
                     };
                     let v = row.get::<&str, usize>(i);
                     match v {
-                        Some(v) => builder.append_value(v),
+                        Some(v) => {
+                            if matches!(mssql_type, ColumnType::BigChar | ColumnType::NChar) {
+                                builder.append_value(v.trim_end()); // MS SQL returns space-padded chars to the length of the char
+                                                                    // memory execution does not trim space-padded chars in WHERE clauses, but MS SQL does - trim incoming CHARs to replicate this behavior
+                            } else {
+                                builder.append_value(v);
+                            }
+                        }
                         None => builder.append_null(),
                     }
                 }
@@ -361,7 +368,7 @@ pub(crate) fn map_type_name_to_column_type(data_type: &str) -> Option<ColumnType
         "char" | "varchar" | "text" => ColumnType::BigVarChar,
         "nchar" | "nvarchar" | "ntext" => ColumnType::NVarchar,
         "uniqueidentifier" => ColumnType::Guid,
-        "binary" => ColumnType::BigBinary,
+        "binary" | "timestamp" | "rowversion" => ColumnType::BigBinary, // Timestamp is not a typical ISO timestamp in MS SQL - it's a binary synonym for rowversion
         "varbinary" | "image" => ColumnType::BigVarBin,
         "xml" => ColumnType::Xml,
         "money" => ColumnType::Money,

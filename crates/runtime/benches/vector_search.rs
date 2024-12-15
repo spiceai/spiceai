@@ -141,7 +141,7 @@ async fn run_benchmark(config: &SearchBenchmarkConfiguration) -> Result<(), Stri
         config.name,
         config.test_dataset,
         config.embeddings_model,
-        &config.acceleration,
+        config.acceleration.as_ref(),
     )
     .await?;
 

@@ -55,13 +55,13 @@ pub(crate) async fn run(
                 if engine.clone().unwrap_or_default().as_str() == "postgres" {
                     super::bench_postgres::get_tpcds_test_queries()
                 } else {
-                    get_tpcds_test_queries(&engine)
+                    get_tpcds_test_queries(engine.as_deref())
                 }
             }
 
             #[cfg(not(feature = "postgres"))]
             {
-                get_tpcds_test_queries(&engine)
+                get_tpcds_test_queries(engine.as_deref())
             }
         }
         "clickbench" => get_clickbench_test_queries(),
@@ -178,7 +178,7 @@ fn get_tpch_test_queries() -> Vec<(&'static str, &'static str)> {
 }
 
 #[allow(clippy::too_many_lines)]
-fn get_tpcds_test_queries(engine: &Option<String>) -> Vec<(&'static str, &'static str)> {
+fn get_tpcds_test_queries(engine: Option<&str>) -> Vec<(&'static str, &'static str)> {
     let test_queries = vec![
         // see workarounds for more information on skipped queries: https://github.com/spiceai/spiceai/blob/trunk/crates/runtime/benches/queries/README.md
         ("tpcds_q1", include_str!("../queries/tpcds/q1.sql")),
@@ -282,7 +282,7 @@ fn get_tpcds_test_queries(engine: &Option<String>) -> Vec<(&'static str, &'stati
         ("tpcds_q99", include_str!("../queries/tpcds/q99.sql")),
     ];
 
-    let overrides: HashMap<_, Option<&str>> = (match engine.as_deref() {
+    let overrides: HashMap<_, Option<&str>> = (match engine {
         Some("sqlite") => vec![
             (
                 "tpcds_q49",

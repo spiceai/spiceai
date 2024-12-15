@@ -62,6 +62,8 @@ async fn query_delta_lake_with_partitions() -> Result<(), String> {
             .arg("-d")
             .arg(&path)
             .spawn()
+            .expect("unzip failed")
+            .wait()
             .expect("unzip failed");
 
         let app = AppBuilder::new("delta_lake_partition_test")

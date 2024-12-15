@@ -157,6 +157,10 @@ impl TaskHistoryExporter {
             labels.insert("runtime_query".into(), "true".into());
         }
 
+        // Remove trace_id and parent_id from `labels`, if they exist (no issue if they don't).
+        labels.remove(&Into::<Arc<str>>::into("trace_id"));
+        labels.remove(&Into::<Arc<str>>::into("parent_id"));
+
         TaskSpan {
             trace_id,
             trace_id_override,

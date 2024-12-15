@@ -139,7 +139,14 @@ impl ConditionalEventHandler for KeyEventHandler {
 #[allow(clippy::missing_errors_doc)]
 pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Error>> {
     let mut repl_flight_endpoint = repl_config.repl_flight_endpoint;
-    let user_agent = repl_config.user_agent.unwrap_or_else(get_user_agent);
+    let mut user_agent = get_user_agent();
+    if let Some(user_agent_override) = repl_config.user_agent {
+        // Prepend the user agent with the Spice.ai user agent
+        let mut new_agent = user_agent_override;
+        new_agent.push(' ');
+        new_agent.push_str(&user_agent);
+        user_agent = new_agent;
+    }
     let channel = if let Some(tls_root_certificate_file) = repl_config.tls_root_certificate_file {
         let tls_root_certificate = std::fs::read(tls_root_certificate_file)?;
         let tls_root_certificate = tonic::transport::Certificate::from_pem(tls_root_certificate);

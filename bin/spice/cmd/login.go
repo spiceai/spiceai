@@ -274,6 +274,49 @@ var sharepointCmd = &cobra.Command{
 	},
 }
 
+var abfsCmd = &cobra.Command{
+	Use:   "abfs",
+	Short: "Login to a Azure Storage Account",
+	Example: `
+	spice login abfs --tenant-id <tenant-id> --client-id <client-id>
+
+# See more at: https://docs.spiceai.org/
+`,
+	Run: func(cmd *cobra.Command, args []string) {
+		tenant_id, err := cmd.Flags().GetString(m365TenantId)
+		if err != nil {
+			slog.Error("getting tenant_id", "error", err)
+			os.Exit(1)
+		} else if tenant_id == "" {
+			slog.Error("No tenant_id provided, use --tenant-id")
+			os.Exit(1)
+		}
+
+		client_id, err := cmd.Flags().GetString(m365ClientId)
+		if err != nil {
+			slog.Error("getting client_id", "error", err)
+			os.Exit(1)
+		} else if client_id == "" {
+			slog.Error("No client_id provided, use --client-id")
+			os.Exit(1)
+		}
+
+		access_token, err := msal.InteractivelyGetAccessToken(cmd.Context(), tenant_id, client_id, []string{"https://storage.azure.com/.default"})
+		if err != nil {
+			slog.Error("Error getting Microsoft access token", "error", err)
+			os.Exit(1)
+		}
+
+		slog.Info(fmt.Sprintf("%s", aurora.BrightGreen(fmt.Sprintf("Successfully logged into Azure Storage Account with client ID: %s", client_id))))
+
+		mergeAuthConfig(cmd, api.AUTH_TYPE_ABFS, map[string]string{
+			api.AUTH_PARAM_BEARER_TOKEN: access_token,
+			api.AUTH_PARAM_TENANT_ID:    tenant_id,
+			api.AUTH_PARAM_CLIENT_ID:    client_id,
+		})
+	},
+}
+
 var sparkCmd = &cobra.Command{
 	Use:   "spark",
 	Short: "Login to a Spark Connect remote",
@@ -562,6 +605,10 @@ func init() {
 	sharepointCmd.Flags().StringP(m365TenantId, "t", "", "Microsoft organization tenant ID")
 	sharepointCmd.Flags().StringP(m365ClientId, "c", "", "Microsoft Azure AD application client ID")
 	loginCmd.AddCommand(sharepointCmd)
+
+	abfsCmd.Flags().StringP(m365TenantId, "t", "", "Microsoft organization tenant ID")
+	abfsCmd.Flags().StringP(m365ClientId, "c", "", "Microsoft Azure AD application client ID")
+	loginCmd.AddCommand(abfsCmd)
 
 	s3Cmd.Flags().StringP(accessKeyFlag, "k", "", "Access key")
 	s3Cmd.Flags().StringP(accessSecretFlag, "s", "", "Access Secret")

@@ -65,8 +65,9 @@ pub enum Error {
 }
 
 async fn get_local_table_provider(
-    name: TableReference,
+    name: &TableReference,
     schema: &Arc<Schema>,
+    primary_key: Option<Vec<String>>,
 ) -> Result<Arc<dyn TableProvider>, Error> {
     // This shouldn't error because we control the name passed in, and it shouldn't contain a catalog.
     let mut dataset = Dataset::try_new("sink".to_string(), &name.to_string())
@@ -76,7 +77,12 @@ async fn get_local_table_provider(
         })?;
     dataset.mode = Mode::ReadWrite;
 
-    let data_connector = Arc::new(SinkConnector::new(Arc::clone(schema))) as Arc<dyn DataConnector>;
+    let mut sink = SinkConnector::new(Arc::clone(schema));
+    if let Some(pk) = primary_key {
+        sink = sink.with_primary_key(&pk);
+    };
+
+    let data_connector = Arc::new(sink) as Arc<dyn DataConnector>;
 
     let source_table_provider = data_connector
         .read_write_provider(&dataset)
@@ -87,22 +93,24 @@ async fn get_local_table_provider(
     Ok(source_table_provider)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn create_internal_accelerated_table(
     runtime_status: Arc<status::RuntimeStatus>,
     name: TableReference,
     schema: Arc<Schema>,
+    primary_key: Option<Vec<String>>,
     acceleration: Acceleration,
     refresh: Refresh,
     retention: Option<Retention>,
     secrets: Arc<RwLock<Secrets>>,
 ) -> Result<Arc<AcceleratedTable>, Error> {
-    let source_table_provider = get_local_table_provider(name.clone(), &schema).await?;
-    let federated_table = Arc::new(FederatedTable::new(source_table_provider));
-
+    let source_table_provider =
+        get_local_table_provider(&name, &schema, primary_key.clone()).await?;
+    let federated_table = Arc::new(FederatedTable::new(Arc::clone(&source_table_provider)));
     let accelerated_table_provider = create_accelerator_table(
         name.clone(),
         Arc::clone(&schema),
-        None,
+        Arc::clone(&source_table_provider).constraints(),
         &acceleration,
         secrets,
         None,

@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use arrow::datatypes::Schema;
+use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::{
     catalog::{Session, TableProviderFactory},
@@ -54,8 +54,9 @@ impl TableProviderFactory for ArrowFactory {
         _state: &dyn Session,
         cmd: &CreateExternalTable,
     ) -> DataFusionResult<Arc<dyn TableProvider>> {
-        let schema: Schema = cmd.schema.as_ref().into();
-        let mem_table = MemTable::try_new(Arc::new(schema), vec![])?;
+        let schema: SchemaRef = Arc::new(cmd.schema.as_arrow().clone());
+        let mem_table =
+            MemTable::try_new(schema, vec![])?.with_constraints(cmd.constraints.clone());
         let delete_adapter = DeletionTableProviderAdapter::new(Arc::new(mem_table));
         Ok(Arc::new(delete_adapter))
     }
