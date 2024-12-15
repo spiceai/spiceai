@@ -8,7 +8,7 @@ use spicepod::{
     Spicepod,
 };
 use std::{
-    os,
+    default, os,
     path::{Path, PathBuf},
     process::exit,
 };
@@ -25,6 +25,10 @@ struct Cli {
     /// Override base path for resolving relative paths
     #[arg(short, long)]
     base_path: Option<PathBuf>,
+
+    /// Path to write Spicepod YAML file
+    #[arg(short, long, default_value = "spicepod.yml")]
+    spicepod_output: PathBuf,
 
     /// Enable verbose logging
     #[arg(short, long, action)]
@@ -91,10 +95,9 @@ fn main() -> Result<()> {
         .unzip();
 
     let pod = spicepod_definition(datasets, evals);
-    let pod_file = Path::new("spicepod.yaml");
 
-    serde_yaml::to_writer(std::fs::File::create(pod_file)?, &pod)?;
-    println!("Spicepod written to {}", pod_file.display());
+    serde_yaml::to_writer(std::fs::File::create(cli.spicepod_output.as_path())?, &pod)?;
+    println!("Spicepod written to {}", cli.spicepod_output.display());
     Ok(())
 }
 
