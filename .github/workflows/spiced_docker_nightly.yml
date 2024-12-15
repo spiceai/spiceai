@@ -72,7 +72,7 @@ jobs:
     needs: [check_commits, setup]
     if: needs.check_commits.outputs.has_new_commits == 'true'
 
-    runs-on: hosted-linux-arm-runner-16-cores
+    runs-on: hosted-linux-arm-runner
 
     steps:
       - uses: actions/checkout@v4
