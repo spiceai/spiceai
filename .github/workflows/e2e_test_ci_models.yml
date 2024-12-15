@@ -51,7 +51,6 @@ jobs:
           go-version: ${{ env.GOVER }}
 
       - name: Set up Rust
-        if: matrix.target.target_os == 'linux'
         uses: ./.github/actions/setup-rust
         with:
           os: ${{ matrix.target.target_os }}
