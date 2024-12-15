@@ -2,13 +2,18 @@ mod eval;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use spicepod::{
+    component::{dataset::Dataset, eval::Eval, ComponentOrReference},
+    spec::{SpicepodDefinition, SpicepodKind, SpicepodVersion},
+    Spicepod,
+};
 use std::{
     os,
     path::{Path, PathBuf},
     process::exit,
 };
 
-use eval::EvalSpecification;
+use eval::{spice_components, EvalSpecification};
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -69,8 +74,27 @@ fn main() -> Result<()> {
             e
         })
         .collect::<Vec<_>>();
-
     println!("{} evals found", output.len());
+
+    let (evals, datasets): (Vec<Eval>, Vec<Dataset>) = output
+        .iter()
+        .filter_map(|e| match spice_components(e, data_dir.as_path()) {
+            Ok((e, d)) => Some((e, d)),
+            Err(err) => {
+                println!(
+                    "  Eval '{}' cannot be converted to spicepod component: {err}",
+                    e.name
+                );
+                None
+            }
+        })
+        .unzip();
+
+    let pod = spicepod_definition(datasets, evals);
+    let pod_file = Path::new("spicepod.yaml");
+
+    serde_yaml::to_writer(std::fs::File::create(pod_file)?, &pod)?;
+    println!("Spicepod written to {}", pod_file.display());
     Ok(())
 }
 
@@ -90,4 +114,30 @@ fn yaml_files_from(dir: &Path) -> Result<Vec<PathBuf>> {
             }
         })
         .collect::<Vec<PathBuf>>())
+}
+
+fn spicepod_definition(datasets: Vec<Dataset>, evals: Vec<Eval>) -> SpicepodDefinition {
+    SpicepodDefinition {
+        version: SpicepodVersion::V1Beta1,
+        kind: SpicepodKind::Spicepod,
+        name: "spicepod".to_string(),
+        datasets: datasets
+            .into_iter()
+            .map(ComponentOrReference::Component)
+            .collect(),
+        evals: evals
+            .into_iter()
+            .map(ComponentOrReference::Component)
+            .collect(),
+        runtime: spicepod::component::runtime::Runtime::default(),
+        extensions: Default::default(),
+        secrets: Default::default(),
+        metadata: Default::default(),
+        catalogs: Default::default(),
+        views: Default::default(),
+        models: Default::default(),
+        tools: Default::default(),
+        embeddings: Default::default(),
+        dependencies: Default::default(),
+    }
 }

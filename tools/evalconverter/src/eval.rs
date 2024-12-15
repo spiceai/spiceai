@@ -2,6 +2,7 @@ use anyhow::{anyhow, Context, Result};
 use path_clean::PathClean;
 use serde::{Deserialize, Serialize};
 use serde_yaml::Value;
+use spicepod::component::{dataset::Dataset as DatasetComponent, eval::Eval as EvalComponent};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -14,14 +15,67 @@ pub struct EvalSpecification {
 
 /// Valid Eval from a specification YAML file.
 pub struct Eval {
+    // Name of eval
+    pub name: String,
+
+    // Id of [`EvalDefinition`] used.
     pub id: String,
     pub description: Option<String>,
     pub metrics: Option<Vec<String>>,
 
-    pub class: String,
+    pub class: Class,
     pub args: HashMap<String, Value>,
 }
 pub type Class = String;
+
+fn class_to_scorer(c: &Class) -> Option<String> {
+    match c.as_str() {
+        "evals.elsuite.basic.match:Match" => Some("match".to_string()),
+        _ => None,
+    }
+}
+
+/// Converts an [`Eval`] into the spice components needed to run the eval in spice.
+///
+/// [`DatasetComponent`] is non-optional because, currently, every eval needs a dataset.
+pub(super) fn spice_components(
+    eval: &Eval,
+    data_dir: &Path,
+) -> Result<(EvalComponent, DatasetComponent)> {
+    let Some(scorer) = class_to_scorer(&eval.class) else {
+        return Err(anyhow!("Unsupported class: {}", eval.class));
+    };
+
+    let Some(dataset) = dataset_needed(eval, data_dir) else {
+        return Err(anyhow!("Need dataset for eval '{}'", eval.name));
+    };
+
+    Ok((
+        EvalComponent {
+            name: eval.name.clone(),
+            scorers: vec![scorer],
+            dataset: dataset.name.clone(),
+            description: None,
+            depends_on: vec![],
+        },
+        dataset,
+    ))
+}
+
+/// Construct the associated [`DatasetComponent`] for the given eval, as a local file dataset.
+fn dataset_needed(eval: &Eval, data_dir: &Path) -> Option<DatasetComponent> {
+    eval.args.iter().find_map(|(key, value)| {
+        let Value::String(s) = value else { return None };
+
+        if is_potential_file_key(key) {
+            return Some(DatasetComponent::new(
+                format!("file:{}", data_dir.join(s).display()),
+                eval.id.clone(),
+            ));
+        }
+        None
+    })
+}
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(untagged)]
@@ -84,6 +138,7 @@ impl EvalSpecification {
 
         Ok(Eval {
             id: id.clone(),
+            name: name.to_string(),
             description: description.clone(),
             metrics: metrics.clone(),
             class: def.class.clone(),

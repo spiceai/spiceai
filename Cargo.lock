@@ -3975,6 +3975,7 @@ dependencies = [
  "path-clean",
  "serde",
  "serde_yaml",
+ "spicepod",
 ]
 
 [[package]]
