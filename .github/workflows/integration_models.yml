@@ -22,9 +22,14 @@ concurrency:
 jobs:
   build:
     name: Build Test Binary
-    runs-on: [self-hosted, macOS]
+    runs-on: 'spiceai-macos'
     steps:
       - uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+        with:
+          os: 'darwin'
 
       # Build the test binary without running tests
       - name: Build AI integration test binary
@@ -44,7 +49,7 @@ jobs:
     name: Test OpenAI Models
     needs: build
     permissions: read-all
-    runs-on: [self-hosted, macOS]
+    runs-on: 'spiceai-macos'
     steps:
       - uses: actions/checkout@v4
 
