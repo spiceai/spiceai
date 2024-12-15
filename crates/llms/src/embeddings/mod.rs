@@ -12,6 +12,7 @@ limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
 
+use crate::chunking::{Chunker, ChunkingConfig, RecursiveSplittingChunker};
 use async_openai::{
     error::{ApiError, OpenAIError},
     types::{
@@ -20,10 +21,9 @@ use async_openai::{
     },
 };
 use async_trait::async_trait;
+use hf_hub::api::tokio::ApiError as HfApiError;
 use snafu::{ResultExt, Snafu};
 use std::sync::Arc;
-
-use crate::chunking::{Chunker, ChunkingConfig, RecursiveSplittingChunker};
 
 pub mod candle;
 
@@ -49,10 +49,20 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
+    #[snafu(display("Failed to create tokenizer: {source}"))]
+    FailedToCreateTokenizer {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
     #[snafu(display("Failed to instantiate embedding model: {source}"))]
     FailedToInstantiateEmbeddingModel {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+
+    #[snafu(display(
+        "When preparing an embedding model, an issue occurred with the Huggingface API: {source} "
+    ))]
+    FailedWithHFApi { source: HfApiError },
 
     #[snafu(display("Unsupported source of model: {source}"))]
     UnknownModelSource {

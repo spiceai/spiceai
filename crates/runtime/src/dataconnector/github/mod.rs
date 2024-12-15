@@ -393,7 +393,7 @@ impl DataConnector for Github {
         &self,
         dataset: &Dataset,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
-        let path = dataset.path().clone();
+        let path = dataset.path().to_string();
         let mut parts = path.split('/');
 
         let query_mode = dataset

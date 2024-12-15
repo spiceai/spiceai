@@ -75,6 +75,7 @@ impl WithDependsOn<Model> for Model {
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub enum ModelSource {
     OpenAi,
+    Azure,
     Anthropic,
     HuggingFace,
     SpiceAI,
@@ -94,6 +95,8 @@ impl TryFrom<&str> for ModelSource {
             Ok(ModelSource::Anthropic)
         } else if value.starts_with("openai") {
             Ok(ModelSource::OpenAi)
+        } else if value.starts_with("azure") {
+            Ok(ModelSource::Azure)
         } else if value.starts_with("spiceai") {
             Ok(ModelSource::SpiceAI)
         } else {
@@ -107,6 +110,7 @@ impl Display for ModelSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ModelSource::OpenAi => write!(f, "openai"),
+            ModelSource::Azure => write!(f, "azure"),
             ModelSource::Anthropic => write!(f, "anthropic"),
             ModelSource::HuggingFace => write!(f, "huggingface:huggingface.co"),
             ModelSource::File => write!(f, "file"),
@@ -186,6 +190,7 @@ impl Model {
                     path: id,
                     name: Some("from_id".to_string()),
                     r#type: Some(ModelFileType::Weights),
+                    params: None,
                 });
             }
         }
@@ -203,6 +208,7 @@ impl Model {
                                         path: s.to_string(),
                                         name: None,
                                         r#type: determine_type_from_path(s),
+                                        params: f.params.clone(),
                                     })
                                 } else {
                                     None
@@ -272,10 +278,13 @@ impl Model {
             return None;
         };
 
-        // OpenAI and SpiceAi only support Llm and Ml respectively.
-        if source == ModelSource::OpenAi || source == ModelSource::Anthropic {
+        // Some providers only support either ML or LLMs.
+        if matches!(
+            source,
+            ModelSource::Azure | ModelSource::OpenAi | ModelSource::Anthropic
+        ) {
             return Some(ModelType::Llm);
-        };
+        }
         if source == ModelSource::SpiceAI {
             return Some(ModelType::Ml);
         };
@@ -336,6 +345,8 @@ pub struct ModelFile {
 
     /// Should use [`Self::file_type`] to access.
     pub(crate) r#type: Option<ModelFileType>,
+
+    pub params: Option<HashMap<String, String>>,
 }
 
 impl ModelFile {

@@ -360,8 +360,12 @@ pub async fn create_accelerator_table(
     .await
     .context(AccelerationCreationFailedSnafu)?;
 
+    // Not all acceleration engines support creating tables with schemas so we include the schema as part of the table name.
+    // For example, Table {schema: "schema", table: "table_name"} is converted to Table {table: "schema.table_name"}.
+    let accelerated_table_name = TableReference::bare(table_name.to_string());
+
     let mut external_table_builder =
-        AcceleratorExternalTableBuilder::new(table_name, Arc::clone(&schema), engine)
+        AcceleratorExternalTableBuilder::new(accelerated_table_name, Arc::clone(&schema), engine)
             .mode(acceleration_settings.mode)
             .options(params)
             .indexes(acceleration_settings.indexes.clone());

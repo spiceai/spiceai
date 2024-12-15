@@ -19,6 +19,8 @@ limitations under the License.
 pub(crate) mod catalog;
 pub(crate) mod dataset;
 pub(crate) mod embedding;
+#[cfg(feature = "models")]
+pub(crate) mod eval;
 pub(crate) mod extension;
 pub(crate) mod llm;
 pub(crate) mod metrics;

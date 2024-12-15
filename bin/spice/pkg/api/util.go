@@ -44,7 +44,11 @@ func doRuntimeApiRequest[T interface{}](rtcontext *context.RuntimeContext, metho
 		if err != nil {
 			return *new(T), fmt.Errorf("error creating request: %w", err)
 		}
-		request.Header = rtcontext.GetHeaders()
+		headers := rtcontext.GetHeaders()
+		for key, value := range headers {
+			request.Header.Set(key, value)
+		}
+		request.Header.Set("Content-Type", "application/json")
 		resp, err = rtcontext.Client().Do(request)
 	case POST:
 		var reader io.Reader
@@ -56,7 +60,11 @@ func doRuntimeApiRequest[T interface{}](rtcontext *context.RuntimeContext, metho
 		if err != nil {
 			return *new(T), fmt.Errorf("error creating request: %w", err)
 		}
-		request.Header = rtcontext.GetHeaders()
+		headers := rtcontext.GetHeaders()
+		for key, value := range headers {
+			request.Header.Set(key, value)
+		}
+		request.Header.Set("Content-Type", "application/json")
 		resp, err = rtcontext.Client().Do(request)
 	default:
 		return *new(T), fmt.Errorf("unsupported method: %s", method)

@@ -21,7 +21,7 @@ use llms::{
     anthropic::{Anthropic, AnthropicConfig},
     chat::{create_hf_model, create_local_model, Chat, Error as ChatError},
     embeddings::candle::link_files_into_tmp_dir,
-    openai::Openai,
+    openai::new_openai_client,
 };
 use secrecy::Secret;
 use std::{
@@ -33,10 +33,10 @@ use std::{
 
 pub(crate) fn create_openai(model_id: &str) -> Arc<Box<dyn Chat>> {
     let api_key = std::env::var("SPICE_OPENAI_API_KEY").ok();
-    Arc::new(Box::new(Openai::new(
+    Arc::new(Box::new(new_openai_client(
         model_id.to_string(),
         None,
-        api_key,
+        api_key.as_deref(),
         None,
         None,
     )))
@@ -52,13 +52,10 @@ pub(crate) fn create_anthropic(model_id: Option<&str>) -> Result<Arc<Box<dyn Cha
 }
 
 pub(crate) fn create_hf(model_id: &str) -> Result<Arc<Box<dyn Chat>>, ChatError> {
-    let hf_token = std::env::var("HF_TOKEN").ok().map(Secret::new);
-    let model_type = None;
-
     Ok(Arc::new(create_hf_model(
         model_id,
-        &model_type,
-        hf_token.as_ref(),
+        None,
+        std::env::var("HF_TOKEN").ok().map(Secret::new).as_ref(),
     )?))
 }
 

@@ -151,7 +151,13 @@ impl RuntimeBuilder {
             None
         };
 
-        let secrets = Self::load_secrets(&self.app).await;
+        let secrets = Self::load_secrets(self.app.as_ref()).await;
+
+        let evals = self
+            .app
+            .as_ref()
+            .map(|a| a.evals.clone())
+            .unwrap_or_default();
 
         let mut rt = Runtime {
             app: Arc::new(RwLock::new(self.app)),
@@ -159,6 +165,8 @@ impl RuntimeBuilder {
             models: Arc::new(RwLock::new(HashMap::new())),
             llms: Arc::new(RwLock::new(HashMap::new())),
             embeds: Arc::new(RwLock::new(HashMap::new())),
+            evals: Arc::new(RwLock::new(evals)),
+            eval_scorers: Arc::new(RwLock::new(HashMap::new())),
             tools: Arc::new(RwLock::new(HashMap::new())),
             pods_watcher: Arc::new(RwLock::new(self.pods_watcher)),
             secrets: Arc::new(RwLock::new(secrets)),
@@ -186,7 +194,7 @@ impl RuntimeBuilder {
         rt
     }
 
-    async fn load_secrets(app: &Option<Arc<App>>) -> Secrets {
+    async fn load_secrets(app: Option<&Arc<App>>) -> Secrets {
         let _guard = TimeMeasurement::new(&metrics::secrets::STORES_LOAD_DURATION_MS, &[]);
         let mut secrets = secrets::Secrets::new();
 

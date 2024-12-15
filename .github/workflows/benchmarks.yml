@@ -34,10 +34,12 @@ on:
           - ''
           - 'spice.ai connector'
           - 's3 connector'
+          - 'file connector'
           - 'abfs connector'
           - 'spark connector'
           - 'postgres connector'
           - 'mysql connector'
+          - 'mssql connector'
           - 'duckdb connector'
           - 'odbc-databricks connector'
           - 'odbc-athena connector'
@@ -58,7 +60,7 @@ on:
           - 'no'
 
 env:
-  FEATURES: 'postgres,spark,mysql,odbc,delta_lake,databricks,duckdb,sqlite'
+  FEATURES: 'postgres,spark,mysql,mssql,odbc,delta_lake,databricks,duckdb,sqlite'
 
 jobs:
   build-database-bench-binary:
@@ -96,6 +98,13 @@ jobs:
     needs: build-database-bench-binary
 
     services:
+      mssql_tpch:
+        image: ${{ matrix.cmd == '-c mssql' && 'ghcr.io/spiceai/spice-mssql-bench:latest' || '' }}
+        ports:
+          - 1433:1433
+        env:
+          MSSQL_SA_PASSWORD: S3cretP@ssw0rd
+          DB_NAME: tpch_sf1
       mysql_tpch:
         image: ${{ matrix.cmd == '-c mysql' && 'ghcr.io/spiceai/spice-mysql-bench:latest' || '' }}
         options: >-
@@ -167,6 +176,9 @@ jobs:
           - cmd: '-c s3'
             name: 's3 connector'
             bench: 'tpch'
+          - cmd: '-c file'
+            name: 'file connector'
+            bench: 'tpch'
           - cmd: '-c s3 -b tpcds'
             name: 's3 connector'
             bench: 'tpcds'
@@ -185,6 +197,9 @@ jobs:
           - cmd: '-c mysql'
             name: 'mysql connector'
             bench: 'tpch'
+          - cmd: '-c mssql'
+            name: 'mssql connector'
+            bench: 'tpch'
           - cmd: '-c duckdb'
             name: 'duckdb connector'
             bench: 'tpch'
@@ -197,12 +212,18 @@ jobs:
           - cmd: '-c odbc-databricks'
             name: 'odbc-databricks connector'
             bench: 'tpch'
+          - cmd: '-c odbc-databricks -b tpcds'
+            name: 'odbc-databricks connector'
+            bench: 'tpcds'
           - cmd: '-c odbc-athena'
             name: 'odbc-athena connector'
             bench: 'tpch'
           - cmd: '-c delta_lake'
             name: 'delta_lake connector'
             bench: 'tpch'
+          - cmd: '-c delta_lake -b tpcds'
+            name: 'delta_lake connector'
+            bench: 'tpcds'
           - cmd: '-a arrow'
             name: 'arrow accelerator (memory mode)'
             bench: 'tpch'
@@ -269,15 +290,15 @@ jobs:
           docker kill --signal=SIGHUP ${{ job.services.postgres_acc.id }}
 
       - name: Install Databricks ODBC driver
-        if: matrix.cmd == '-c odbc-databricks' && ((github.event.inputs.selected_benchmark == matrix.name && (github.event.inputs.bench_name == matrix.bench || github.event.inputs.bench_name == 'all')) || github.event.inputs.run_all == 'true' || github.event_name == 'schedule')
+        if: (matrix.cmd == '-c odbc-databricks' || matrix.cmd == '-c odbc-databricks -b tpcds') && ((github.event.inputs.selected_benchmark == matrix.name && (github.event.inputs.bench_name == matrix.bench || github.event.inputs.bench_name == 'all')) || github.event.inputs.run_all == 'true' || github.event_name == 'schedule')
         run: |
           sudo apt-get install unixodbc unixodbc-dev unzip libsasl2-modules-gssapi-mit -y
           wget https://databricks-bi-artifacts.s3.us-east-2.amazonaws.com/simbaspark-drivers/odbc/2.8.2/SimbaSparkODBC-2.8.2.1013-Debian-64bit.zip
           unzip SimbaSparkODBC-2.8.2.1013-Debian-64bit.zip
           sudo dpkg -i simbaspark_2.8.2.1013-2_amd64.deb
           cat <<EOF > /tmp/odbcinst.ini
-          [Simba Spark ODBC Driver]
-          Description=Simba Spark ODBC Driver
+          [Databricks ODBC Driver]
+          Description=Databricks ODBC Driver
           Driver=/opt/simba/spark/lib/64/libsparkodbc_sb64.so
           Setup=/opt/simba/spark/lib/64/libsparkodbc_sb64.so
           EOF
@@ -304,12 +325,33 @@ jobs:
       - name: Download DuckDB Connector Data
         if: matrix.cmd == '-c duckdb' && ((github.event.inputs.selected_benchmark == matrix.name && (github.event.inputs.bench_name == matrix.bench || github.event.inputs.bench_name == 'all')) || github.event.inputs.run_all == 'true' || github.event_name == 'schedule')
         run: |
-          wget https://spiceai-public-datasets.s3.us-east-1.amazonaws.com/duckdb/tpch.db
+          sudo wget https://dl.min.io/client/mc/release/linux-amd64/mc -O /usr/local/bin/mc
+          sudo chmod +x /usr/local/bin/mc
+          mc alias set spice-bench-minio ${{ secrets.CLICKBENCH_S3_ENDPOINT }} ${{ secrets.CLICKBENCH_S3_KEY }} ${{ secrets.CLICKBENCH_S3_SECRET }} 
+          mc cp spice-bench-minio/benchmarks/duckdb/tpch.db ./
 
       - name: Download DuckDB Connector Data
         if: matrix.cmd == '-c duckdb -b tpcds' && ((github.event.inputs.selected_benchmark == matrix.name && (github.event.inputs.bench_name == matrix.bench || github.event.inputs.bench_name == 'all')) || github.event.inputs.run_all == 'true' || github.event_name == 'schedule')
         run: |
-          wget https://spiceai-public-datasets.s3.us-east-1.amazonaws.com/duckdb/tpcds.db
+          sudo wget https://dl.min.io/client/mc/release/linux-amd64/mc -O /usr/local/bin/mc
+          sudo chmod +x /usr/local/bin/mc
+          mc alias set spice-bench-minio ${{ secrets.CLICKBENCH_S3_ENDPOINT }} ${{ secrets.CLICKBENCH_S3_KEY }} ${{ secrets.CLICKBENCH_S3_SECRET }} 
+          mc cp spice-bench-minio/benchmarks/duckdb/tpcds.db ./
+
+      - name: Download File Connector Data
+        if: matrix.cmd == '-c file' && ((github.event.inputs.selected_benchmark == matrix.name && (github.event.inputs.bench_name == matrix.bench || github.event.inputs.bench_name == 'all')) || github.event.inputs.run_all == 'true' || github.event_name == 'schedule')
+        run: |
+          sudo wget https://dl.min.io/client/mc/release/linux-amd64/mc -O /usr/local/bin/mc
+          sudo chmod +x /usr/local/bin/mc
+          mc alias set spice-bench-minio ${{ secrets.CLICKBENCH_S3_ENDPOINT }} ${{ secrets.CLICKBENCH_S3_KEY }} ${{ secrets.CLICKBENCH_S3_SECRET }} 
+          mc cp spice-bench-minio/benchmarks/tpch_sf1/customer/ ./ --recursive
+          mc cp spice-bench-minio/benchmarks/tpch_sf1/lineitem/ ./ --recursive
+          mc cp spice-bench-minio/benchmarks/tpch_sf1/nation/ ./ --recursive
+          mc cp spice-bench-minio/benchmarks/tpch_sf1/orders/ ./ --recursive
+          mc cp spice-bench-minio/benchmarks/tpch_sf1/part/ ./ --recursive
+          mc cp spice-bench-minio/benchmarks/tpch_sf1/partsupp/ ./ --recursive
+          mc cp spice-bench-minio/benchmarks/tpch_sf1/region/ ./ --recursive
+          mc cp spice-bench-minio/benchmarks/tpch_sf1/supplier/ ./ --recursive
 
       - name: Run benchmark with ${{ matrix.name }}
         if: (github.event.inputs.selected_benchmark == matrix.name && (github.event.inputs.bench_name == matrix.bench || github.event.inputs.bench_name == 'all')) || github.event.inputs.run_all == 'true' || github.event_name == 'schedule'
@@ -330,6 +372,13 @@ jobs:
           MYSQL_BENCHMARK_MYSQL_PASS: root
           MYSQL_TPCH_BENCHMARK_MYSQL_DB: tpch_sf1
           MYSQL_TPCDS_BENCHMARK_MYSQL_DB: tpcds_sf1
+          MSSQL_BENCHMARK_MSSQL_HOST: localhost
+          MSSQL_BENCHMARK_MSSQL_USER: sa
+          MSSQL_BENCHMARK_MSSQL_PASS: S3cretP@ssw0rd
+          MSSQL_TPCH_BENCHMARK_MSSQL_DB: tpch_sf1
+          S3_ENDPOINT: ${{ secrets.CLICKBENCH_S3_ENDPOINT}}
+          S3_KEY: ${{ secrets.CLICKBENCH_S3_KEY}}
+          S3_SECRET: ${{ secrets.CLICKBENCH_S3_SECRET}}
           DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
           DATABRICKS_ODBC_PATH: ${{ secrets.DATABRICKS_ODBC_PATH }}
           DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
@@ -372,7 +421,7 @@ jobs:
       matrix:
         include:
           - cmd: '-a arrow -b clickbench'
-            name: 'arrow accelerator (file mode)'
+            name: 'arrow accelerator (memory mode)'
             bench: 'clickbench'
           - cmd: '-a duckdb -m file -b clickbench'
             name: 'duckdb accelerator (file mode)'
@@ -410,9 +459,9 @@ jobs:
         continue-on-error: true
         env:
           UPLOAD_RESULTS_DATASET: 'spiceai.tests.oss_benchmarks'
-          CLICKBENCH_S3_ENDPOINT: ${{ secrets.CLICKBENCH_S3_ENDPOINT}}
-          CLICKBENCH_S3_KEY: ${{ secrets.CLICKBENCH_S3_KEY}}
-          CLICKBENCH_S3_SECRET: ${{ secrets.CLICKBENCH_S3_SECRET}}
+          S3_ENDPOINT: ${{ secrets.CLICKBENCH_S3_ENDPOINT}}
+          S3_KEY: ${{ secrets.CLICKBENCH_S3_KEY}}
+          S3_SECRET: ${{ secrets.CLICKBENCH_S3_SECRET}}
 
   create-pr:
     runs-on: ubuntu-latest

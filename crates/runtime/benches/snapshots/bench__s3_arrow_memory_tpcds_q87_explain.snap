@@ -1,0 +1,160 @@
+---
+source: crates/runtime/benches/bench.rs
+description: "Query: select count(*)\nfrom ((select distinct c_last_name, c_first_name, d_date\n       from store_sales, date_dim, customer\n       where store_sales.ss_sold_date_sk = date_dim.d_date_sk\n         and store_sales.ss_customer_sk = customer.c_customer_sk\n         and d_month_seq between 1189 and 1189+11)\n       except\n      (select distinct c_last_name, c_first_name, d_date\n       from catalog_sales, date_dim, customer\n       where catalog_sales.cs_sold_date_sk = date_dim.d_date_sk\n         and catalog_sales.cs_bill_customer_sk = customer.c_customer_sk\n         and d_month_seq between 1189 and 1189+11)\n       except\n      (select distinct c_last_name, c_first_name, d_date\n       from web_sales, date_dim, customer\n       where web_sales.ws_sold_date_sk = date_dim.d_date_sk\n         and web_sales.ws_bill_customer_sk = customer.c_customer_sk\n         and d_month_seq between 1189 and 1189+11)\n) cool_cust\n;\n"
+snapshot_kind: text
+---
++---------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                                                               |
++---------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Aggregate: groupBy=[[]], aggr=[[count(Int64(1)) AS count(*)]]                                                                                                                      |
+|               |   SubqueryAlias: cool_cust                                                                                                                                                         |
+|               |     Projection:                                                                                                                                                                    |
+|               |       LeftAnti Join: customer.c_last_name = customer.c_last_name, customer.c_first_name = customer.c_first_name, date_dim.d_date = date_dim.d_date                                 |
+|               |         Aggregate: groupBy=[[customer.c_last_name, customer.c_first_name, date_dim.d_date]], aggr=[[]]                                                                             |
+|               |           LeftAnti Join: customer.c_last_name = customer.c_last_name, customer.c_first_name = customer.c_first_name, date_dim.d_date = date_dim.d_date                             |
+|               |             Aggregate: groupBy=[[customer.c_last_name, customer.c_first_name, date_dim.d_date]], aggr=[[]]                                                                         |
+|               |               Projection: customer.c_last_name, customer.c_first_name, date_dim.d_date                                                                                             |
+|               |                 Inner Join: store_sales.ss_customer_sk = customer.c_customer_sk                                                                                                    |
+|               |                   Projection: store_sales.ss_customer_sk, date_dim.d_date                                                                                                          |
+|               |                     Inner Join: store_sales.ss_sold_date_sk = date_dim.d_date_sk                                                                                                   |
+|               |                       BytesProcessedNode                                                                                                                                           |
+|               |                         TableScan: store_sales projection=[ss_sold_date_sk, ss_customer_sk]                                                                                        |
+|               |                       Projection: date_dim.d_date_sk, date_dim.d_date                                                                                                              |
+|               |                         BytesProcessedNode                                                                                                                                         |
+|               |                           Filter: date_dim.d_month_seq >= Int32(1189) AND date_dim.d_month_seq <= Int32(1200)                                                                      |
+|               |                             TableScan: date_dim projection=[d_date_sk, d_date, d_month_seq]                                                                                        |
+|               |                   BytesProcessedNode                                                                                                                                               |
+|               |                     TableScan: customer projection=[c_customer_sk, c_first_name, c_last_name]                                                                                      |
+|               |             Aggregate: groupBy=[[customer.c_last_name, customer.c_first_name, date_dim.d_date]], aggr=[[]]                                                                         |
+|               |               Projection: customer.c_last_name, customer.c_first_name, date_dim.d_date                                                                                             |
+|               |                 Inner Join: catalog_sales.cs_bill_customer_sk = customer.c_customer_sk                                                                                             |
+|               |                   Projection: catalog_sales.cs_bill_customer_sk, date_dim.d_date                                                                                                   |
+|               |                     Inner Join: catalog_sales.cs_sold_date_sk = date_dim.d_date_sk                                                                                                 |
+|               |                       BytesProcessedNode                                                                                                                                           |
+|               |                         TableScan: catalog_sales projection=[cs_sold_date_sk, cs_bill_customer_sk]                                                                                 |
+|               |                       Projection: date_dim.d_date_sk, date_dim.d_date                                                                                                              |
+|               |                         BytesProcessedNode                                                                                                                                         |
+|               |                           Filter: date_dim.d_month_seq >= Int32(1189) AND date_dim.d_month_seq <= Int32(1200)                                                                      |
+|               |                             TableScan: date_dim projection=[d_date_sk, d_date, d_month_seq]                                                                                        |
+|               |                   BytesProcessedNode                                                                                                                                               |
+|               |                     TableScan: customer projection=[c_customer_sk, c_first_name, c_last_name]                                                                                      |
+|               |         Aggregate: groupBy=[[customer.c_last_name, customer.c_first_name, date_dim.d_date]], aggr=[[]]                                                                             |
+|               |           Projection: customer.c_last_name, customer.c_first_name, date_dim.d_date                                                                                                 |
+|               |             Inner Join: web_sales.ws_bill_customer_sk = customer.c_customer_sk                                                                                                     |
+|               |               Projection: web_sales.ws_bill_customer_sk, date_dim.d_date                                                                                                           |
+|               |                 Inner Join: web_sales.ws_sold_date_sk = date_dim.d_date_sk                                                                                                         |
+|               |                   BytesProcessedNode                                                                                                                                               |
+|               |                     TableScan: web_sales projection=[ws_sold_date_sk, ws_bill_customer_sk]                                                                                         |
+|               |                   Projection: date_dim.d_date_sk, date_dim.d_date                                                                                                                  |
+|               |                     BytesProcessedNode                                                                                                                                             |
+|               |                       Filter: date_dim.d_month_seq >= Int32(1189) AND date_dim.d_month_seq <= Int32(1200)                                                                          |
+|               |                         TableScan: date_dim projection=[d_date_sk, d_date, d_month_seq]                                                                                            |
+|               |               BytesProcessedNode                                                                                                                                                   |
+|               |                 TableScan: customer projection=[c_customer_sk, c_first_name, c_last_name]                                                                                          |
+| physical_plan | AggregateExec: mode=Final, gby=[], aggr=[count(*)]                                                                                                                                 |
+|               |   CoalescePartitionsExec                                                                                                                                                           |
+|               |     AggregateExec: mode=Partial, gby=[], aggr=[count(*)]                                                                                                                           |
+|               |       ProjectionExec: expr=[]                                                                                                                                                      |
+|               |         CoalesceBatchesExec: target_batch_size=8192                                                                                                                                |
+|               |           HashJoinExec: mode=Partitioned, join_type=LeftAnti, on=[(c_last_name@0, c_last_name@0), (c_first_name@1, c_first_name@1), (d_date@2, d_date@2)]                          |
+|               |             AggregateExec: mode=SinglePartitioned, gby=[c_last_name@0 as c_last_name, c_first_name@1 as c_first_name, d_date@2 as d_date], aggr=[]                                 |
+|               |               CoalesceBatchesExec: target_batch_size=8192                                                                                                                          |
+|               |                 HashJoinExec: mode=Partitioned, join_type=LeftAnti, on=[(c_last_name@0, c_last_name@0), (c_first_name@1, c_first_name@1), (d_date@2, d_date@2)]                    |
+|               |                   AggregateExec: mode=FinalPartitioned, gby=[c_last_name@0 as c_last_name, c_first_name@1 as c_first_name, d_date@2 as d_date], aggr=[]                            |
+|               |                     CoalesceBatchesExec: target_batch_size=8192                                                                                                                    |
+|               |                       RepartitionExec: partitioning=Hash([c_last_name@0, c_first_name@1, d_date@2], 4), input_partitions=4                                                         |
+|               |                         AggregateExec: mode=Partial, gby=[c_last_name@0 as c_last_name, c_first_name@1 as c_first_name, d_date@2 as d_date], aggr=[]                               |
+|               |                           ProjectionExec: expr=[c_last_name@2 as c_last_name, c_first_name@1 as c_first_name, d_date@0 as d_date]                                                  |
+|               |                             CoalesceBatchesExec: target_batch_size=8192                                                                                                            |
+|               |                               HashJoinExec: mode=Partitioned, join_type=Inner, on=[(ss_customer_sk@0, c_customer_sk@0)], projection=[d_date@1, c_first_name@3, c_last_name@4]      |
+|               |                                 CoalesceBatchesExec: target_batch_size=8192                                                                                                        |
+|               |                                   RepartitionExec: partitioning=Hash([ss_customer_sk@0], 4), input_partitions=4                                                                    |
+|               |                                     CoalesceBatchesExec: target_batch_size=8192                                                                                                    |
+|               |                                       HashJoinExec: mode=Partitioned, join_type=Inner, on=[(ss_sold_date_sk@0, d_date_sk@0)], projection=[ss_customer_sk@1, d_date@3]              |
+|               |                                         CoalesceBatchesExec: target_batch_size=8192                                                                                                |
+|               |                                           RepartitionExec: partitioning=Hash([ss_sold_date_sk@0], 4), input_partitions=4                                                           |
+|               |                                             BytesProcessedExec                                                                                                                     |
+|               |                                               SchemaCastScanExec                                                                                                                   |
+|               |                                                 RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1                                                               |
+|               |                                                   MemoryExec: partitions=1, partition_sizes=[352]                                                                                  |
+|               |                                         CoalesceBatchesExec: target_batch_size=8192                                                                                                |
+|               |                                           RepartitionExec: partitioning=Hash([d_date_sk@0], 4), input_partitions=4                                                                 |
+|               |                                             ProjectionExec: expr=[d_date_sk@0 as d_date_sk, d_date@1 as d_date]                                                                    |
+|               |                                               BytesProcessedExec                                                                                                                   |
+|               |                                                 CoalesceBatchesExec: target_batch_size=8192                                                                                        |
+|               |                                                   FilterExec: d_month_seq@2 >= 1189 AND d_month_seq@2 <= 1200                                                                      |
+|               |                                                     SchemaCastScanExec                                                                                                             |
+|               |                                                       RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1                                                         |
+|               |                                                         MemoryExec: partitions=1, partition_sizes=[9]                                                                              |
+|               |                                 CoalesceBatchesExec: target_batch_size=8192                                                                                                        |
+|               |                                   RepartitionExec: partitioning=Hash([c_customer_sk@0], 4), input_partitions=4                                                                     |
+|               |                                     BytesProcessedExec                                                                                                                             |
+|               |                                       SchemaCastScanExec                                                                                                                           |
+|               |                                         RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1                                                                       |
+|               |                                           MemoryExec: partitions=1, partition_sizes=[13]                                                                                           |
+|               |                   AggregateExec: mode=FinalPartitioned, gby=[c_last_name@0 as c_last_name, c_first_name@1 as c_first_name, d_date@2 as d_date], aggr=[]                            |
+|               |                     CoalesceBatchesExec: target_batch_size=8192                                                                                                                    |
+|               |                       RepartitionExec: partitioning=Hash([c_last_name@0, c_first_name@1, d_date@2], 4), input_partitions=4                                                         |
+|               |                         AggregateExec: mode=Partial, gby=[c_last_name@0 as c_last_name, c_first_name@1 as c_first_name, d_date@2 as d_date], aggr=[]                               |
+|               |                           ProjectionExec: expr=[c_last_name@2 as c_last_name, c_first_name@1 as c_first_name, d_date@0 as d_date]                                                  |
+|               |                             CoalesceBatchesExec: target_batch_size=8192                                                                                                            |
+|               |                               HashJoinExec: mode=Partitioned, join_type=Inner, on=[(cs_bill_customer_sk@0, c_customer_sk@0)], projection=[d_date@1, c_first_name@3, c_last_name@4] |
+|               |                                 CoalesceBatchesExec: target_batch_size=8192                                                                                                        |
+|               |                                   RepartitionExec: partitioning=Hash([cs_bill_customer_sk@0], 4), input_partitions=4                                                               |
+|               |                                     CoalesceBatchesExec: target_batch_size=8192                                                                                                    |
+|               |                                       HashJoinExec: mode=Partitioned, join_type=Inner, on=[(cs_sold_date_sk@0, d_date_sk@0)], projection=[cs_bill_customer_sk@1, d_date@3]         |
+|               |                                         CoalesceBatchesExec: target_batch_size=8192                                                                                                |
+|               |                                           RepartitionExec: partitioning=Hash([cs_sold_date_sk@0], 4), input_partitions=4                                                           |
+|               |                                             BytesProcessedExec                                                                                                                     |
+|               |                                               SchemaCastScanExec                                                                                                                   |
+|               |                                                 RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1                                                               |
+|               |                                                   MemoryExec: partitions=1, partition_sizes=[176]                                                                                  |
+|               |                                         CoalesceBatchesExec: target_batch_size=8192                                                                                                |
+|               |                                           RepartitionExec: partitioning=Hash([d_date_sk@0], 4), input_partitions=4                                                                 |
+|               |                                             ProjectionExec: expr=[d_date_sk@0 as d_date_sk, d_date@1 as d_date]                                                                    |
+|               |                                               BytesProcessedExec                                                                                                                   |
+|               |                                                 CoalesceBatchesExec: target_batch_size=8192                                                                                        |
+|               |                                                   FilterExec: d_month_seq@2 >= 1189 AND d_month_seq@2 <= 1200                                                                      |
+|               |                                                     SchemaCastScanExec                                                                                                             |
+|               |                                                       RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1                                                         |
+|               |                                                         MemoryExec: partitions=1, partition_sizes=[9]                                                                              |
+|               |                                 CoalesceBatchesExec: target_batch_size=8192                                                                                                        |
+|               |                                   RepartitionExec: partitioning=Hash([c_customer_sk@0], 4), input_partitions=4                                                                     |
+|               |                                     BytesProcessedExec                                                                                                                             |
+|               |                                       SchemaCastScanExec                                                                                                                           |
+|               |                                         RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1                                                                       |
+|               |                                           MemoryExec: partitions=1, partition_sizes=[13]                                                                                           |
+|               |             AggregateExec: mode=FinalPartitioned, gby=[c_last_name@0 as c_last_name, c_first_name@1 as c_first_name, d_date@2 as d_date], aggr=[]                                  |
+|               |               CoalesceBatchesExec: target_batch_size=8192                                                                                                                          |
+|               |                 RepartitionExec: partitioning=Hash([c_last_name@0, c_first_name@1, d_date@2], 4), input_partitions=4                                                               |
+|               |                   AggregateExec: mode=Partial, gby=[c_last_name@0 as c_last_name, c_first_name@1 as c_first_name, d_date@2 as d_date], aggr=[]                                     |
+|               |                     ProjectionExec: expr=[c_last_name@2 as c_last_name, c_first_name@1 as c_first_name, d_date@0 as d_date]                                                        |
+|               |                       CoalesceBatchesExec: target_batch_size=8192                                                                                                                  |
+|               |                         HashJoinExec: mode=Partitioned, join_type=Inner, on=[(ws_bill_customer_sk@0, c_customer_sk@0)], projection=[d_date@1, c_first_name@3, c_last_name@4]       |
+|               |                           CoalesceBatchesExec: target_batch_size=8192                                                                                                              |
+|               |                             RepartitionExec: partitioning=Hash([ws_bill_customer_sk@0], 4), input_partitions=4                                                                     |
+|               |                               CoalesceBatchesExec: target_batch_size=8192                                                                                                          |
+|               |                                 HashJoinExec: mode=Partitioned, join_type=Inner, on=[(ws_sold_date_sk@0, d_date_sk@0)], projection=[ws_bill_customer_sk@1, d_date@3]               |
+|               |                                   CoalesceBatchesExec: target_batch_size=8192                                                                                                      |
+|               |                                     RepartitionExec: partitioning=Hash([ws_sold_date_sk@0], 4), input_partitions=4                                                                 |
+|               |                                       BytesProcessedExec                                                                                                                           |
+|               |                                         SchemaCastScanExec                                                                                                                         |
+|               |                                           RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1                                                                     |
+|               |                                             MemoryExec: partitions=1, partition_sizes=[88]                                                                                         |
+|               |                                   CoalesceBatchesExec: target_batch_size=8192                                                                                                      |
+|               |                                     RepartitionExec: partitioning=Hash([d_date_sk@0], 4), input_partitions=4                                                                       |
+|               |                                       ProjectionExec: expr=[d_date_sk@0 as d_date_sk, d_date@1 as d_date]                                                                          |
+|               |                                         BytesProcessedExec                                                                                                                         |
+|               |                                           CoalesceBatchesExec: target_batch_size=8192                                                                                              |
+|               |                                             FilterExec: d_month_seq@2 >= 1189 AND d_month_seq@2 <= 1200                                                                            |
+|               |                                               SchemaCastScanExec                                                                                                                   |
+|               |                                                 RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1                                                               |
+|               |                                                   MemoryExec: partitions=1, partition_sizes=[9]                                                                                    |
+|               |                           CoalesceBatchesExec: target_batch_size=8192                                                                                                              |
+|               |                             RepartitionExec: partitioning=Hash([c_customer_sk@0], 4), input_partitions=4                                                                           |
+|               |                               BytesProcessedExec                                                                                                                                   |
+|               |                                 SchemaCastScanExec                                                                                                                                 |
+|               |                                   RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1                                                                             |
+|               |                                     MemoryExec: partitions=1, partition_sizes=[13]                                                                                                 |
+|               |                                                                                                                                                                                    |
++---------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+

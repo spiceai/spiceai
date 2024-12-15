@@ -72,7 +72,7 @@ impl otel_arrow::ArrowExporter for SpiceMetricsExporter {
         };
 
         self.datafusion
-            .write_data(get_metrics_table_reference(), data_update)
+            .write_data(&get_metrics_table_reference(), data_update)
             .await
             .map_err(|e| MetricsError::Other(e.to_string()))
     }
@@ -101,6 +101,7 @@ pub async fn register_metrics_table(datafusion: &Arc<DataFusion>) -> Result<(), 
         datafusion.runtime_status(),
         metrics_table_reference.clone(),
         otel_arrow::schema(),
+        None,
         Acceleration::default(),
         Refresh::default(),
         retention,
@@ -110,7 +111,7 @@ pub async fn register_metrics_table(datafusion: &Arc<DataFusion>) -> Result<(), 
     .context(UnableToCreateMetricsTableSnafu)?;
 
     datafusion
-        .register_runtime_table(metrics_table_reference, table)
+        .register_table_as_writable_and_with_schema(metrics_table_reference, table)
         .context(UnableToRegisterToMetricsTableSnafu)?;
 
     Ok(())

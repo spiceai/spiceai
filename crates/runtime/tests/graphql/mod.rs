@@ -28,6 +28,7 @@ use runtime::{status, Runtime};
 use spicepod::component::{dataset::Dataset, params::Params as DatasetParams};
 use tokio::net::TcpListener;
 
+use crate::utils::test_request_context;
 use crate::{get_test_datafusion, init_tracing, run_query_and_check_results, ValidateFn};
 
 type ServiceSchema = Schema<QueryRoot, EmptyMutation, EmptySubscription>;
@@ -208,12 +209,23 @@ async fn start_server() -> Result<(tokio::sync::oneshot::Sender<()>, SocketAddr)
     Ok((tx, addr))
 }
 
-fn make_graphql_dataset(path: &str, name: &str, query: &str, json_pointer: &str) -> Dataset {
+fn make_graphql_dataset(
+    path: &str,
+    name: &str,
+    query: &str,
+    json_pointer: &str,
+    unnest_depth: Option<u32>,
+) -> Dataset {
     let mut dataset = Dataset::new(format!("graphql:{path}"), name.to_string());
-    let params = HashMap::from([
+    let mut params = HashMap::from([
         ("json_pointer".to_string(), json_pointer.to_string()),
         ("graphql_query".to_string(), query.to_string()),
     ]);
+
+    if let Some(unnest_depth) = unnest_depth {
+        params.insert("unnest_depth".to_string(), unnest_depth.to_string());
+    };
+
     dataset.params = Some(DatasetParams::from_string_map(params));
     dataset
 }
@@ -222,148 +234,329 @@ fn make_graphql_dataset(path: &str, name: &str, query: &str, json_pointer: &str)
 async fn test_graphql() -> Result<(), String> {
     type QueryTests<'a> = Vec<(&'a str, &'a str, Option<Box<ValidateFn>>)>;
     let _tracing = init_tracing(Some("integration=debug,info"));
-    let (tx, addr) = start_server().await?;
-    tracing::debug!("Server started at {}", addr);
-    let app = AppBuilder::new("graphql_integration_test")
-        .with_dataset(make_graphql_dataset(
-            &format!("http://{addr}/graphql"),
-            "test_graphql",
-            "query { users { id name posts { id title content } } }",
-            "/data/users",
-        ))
-        .build();
-    let status = status::RuntimeStatus::new();
-    let df = get_test_datafusion(Arc::clone(&status));
-    let mut rt = Runtime::builder()
-        .with_app(app)
-        .with_datafusion(df)
-        .with_runtime_status(status)
-        .build()
-        .await;
 
-    tokio::select! {
-        () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
-            return Err("Timed out waiting for datasets to load".to_string());
-        }
-        () = rt.load_components() => {}
-    }
+    test_request_context()
+        .scope(async {
+            let (tx, addr) = start_server().await?;
+            tracing::debug!("Server started at {}", addr);
+            let app = AppBuilder::new("graphql_integration_test")
+                .with_dataset(make_graphql_dataset(
+                    &format!("http://{addr}/graphql"),
+                    "test_graphql",
+                    "query { users { id name posts { id title content } } }",
+                    "/data/users",
+                    None,
+                ))
+                .build();
+            let status = status::RuntimeStatus::new();
+            let df = get_test_datafusion(Arc::clone(&status));
+            let mut rt = Runtime::builder()
+                .with_app(app)
+                .with_datafusion(df)
+                .with_runtime_status(status)
+                .build()
+                .await;
 
-    let queries: QueryTests = vec![
-        (
-            "SELECT * FROM test_graphql",
-            "select_all",
-            Some(Box::new(|result_batches| {
-                for batch in result_batches {
-                    assert_eq!(batch.num_columns(), 3, "num_cols: {}", batch.num_columns());
-                    assert_eq!(batch.num_rows(), 1, "num_rows: {}", batch.num_rows());
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+                    return Err("Timed out waiting for datasets to load".to_string());
                 }
-            })),
-        ),
-        (
-            "SELECT posts[1]['title'] from test_graphql",
-            "select_posts_title",
-            Some(Box::new(|result_batches| {
-                for batch in result_batches {
-                    assert_eq!(batch.num_columns(), 1, "num_cols: {}", batch.num_columns());
-                    assert_eq!(batch.num_rows(), 1, "num_rows: {}", batch.num_rows());
-                }
-            })),
-        ),
-    ];
+                () = rt.load_components() => {}
+            }
 
-    for (query, snapshot_suffix, validate_result) in queries {
-        run_query_and_check_results(
-            &mut rt,
-            &format!("test_graphql_{snapshot_suffix}"),
-            query,
-            true,
-            validate_result,
-        )
-        .await?;
-    }
+            let queries: QueryTests = vec![
+                (
+                    "SELECT * FROM test_graphql",
+                    "select_all",
+                    Some(Box::new(|result_batches| {
+                        for batch in result_batches {
+                            assert_eq!(batch.num_columns(), 3, "num_cols: {}", batch.num_columns());
+                            assert_eq!(batch.num_rows(), 1, "num_rows: {}", batch.num_rows());
+                        }
+                    })),
+                ),
+                (
+                    "SELECT posts[1]['title'] from test_graphql",
+                    "select_posts_title",
+                    Some(Box::new(|result_batches| {
+                        for batch in result_batches {
+                            assert_eq!(batch.num_columns(), 1, "num_cols: {}", batch.num_columns());
+                            assert_eq!(batch.num_rows(), 1, "num_rows: {}", batch.num_rows());
+                        }
+                    })),
+                ),
+            ];
 
-    tx.send(()).map_err(|()| {
-        tracing::error!("Failed to send shutdown signal");
-        "Failed to send shutdown signal".to_string()
-    })?;
+            for (query, snapshot_suffix, validate_result) in queries {
+                run_query_and_check_results(
+                    &mut rt,
+                    &format!("test_graphql_{snapshot_suffix}"),
+                    query,
+                    true,
+                    validate_result,
+                )
+                .await?;
+            }
 
-    Ok(())
+            tx.send(()).map_err(|()| {
+                tracing::error!("Failed to send shutdown signal");
+                "Failed to send shutdown signal".to_string()
+            })?;
+
+            Ok(())
+        })
+        .await
 }
 
 #[tokio::test]
 async fn test_graphql_pagination() -> Result<(), String> {
     type QueryTests<'a> = Vec<(&'a str, &'a str, Option<Box<ValidateFn>>)>;
     let _tracing = init_tracing(Some("integration=debug,info"));
-    let (tx, addr) = start_server().await?;
-    tracing::debug!("Server started at {}", addr);
-    let app = AppBuilder::new("graphql_integration_test")
-        .with_dataset(make_graphql_dataset(
-            &format!("http://{addr}/graphql"),
-            "test_graphql",
-            "query { paginatedUsers(first: 2) { users { id name posts { id title content } } pageInfo { hasNextPage endCursor } } }",
-            "/data/paginatedUsers/users",
-        ))
-        .build();
-    let status = status::RuntimeStatus::new();
-    let df = get_test_datafusion(Arc::clone(&status));
-    let mut rt = Runtime::builder()
-        .with_app(app)
-        .with_datafusion(df)
-        .with_runtime_status(status)
-        .build()
-        .await;
 
-    tokio::select! {
-        () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
-            return Err("Timed out waiting for datasets to load".to_string());
+    test_request_context().scope(async {
+        let (tx, addr) = start_server().await?;
+        tracing::debug!("Server started at {}", addr);
+        let app = AppBuilder::new("graphql_integration_test")
+            .with_dataset(make_graphql_dataset(
+                &format!("http://{addr}/graphql"),
+                "test_graphql",
+                "query { paginatedUsers(first: 2) { users { id name posts { id title content } } pageInfo { hasNextPage endCursor } } }",
+                "/data/paginatedUsers/users",
+                None
+            ))
+            .build();
+        let status = status::RuntimeStatus::new();
+        let df = get_test_datafusion(Arc::clone(&status));
+        let mut rt = Runtime::builder()
+            .with_app(app)
+            .with_datafusion(df)
+            .with_runtime_status(status)
+            .build()
+            .await;
+
+        tokio::select! {
+            () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+                return Err("Timed out waiting for datasets to load".to_string());
+            }
+            () = rt.load_components() => {}
         }
-        () = rt.load_components() => {}
-    }
 
-    let queries: QueryTests = vec![
-        (
-            "SELECT * FROM test_graphql",
-            "select_all",
-            Some(Box::new(|result_batches| {
-                let mut total = 0;
-                for batch in result_batches {
-                    assert_eq!(batch.num_columns(), 3, "num_cols: {}", batch.num_columns());
-                    assert_eq!(batch.num_rows(), 1, "num_rows: {}", batch.num_rows());
-                    total += batch.num_rows();
+        let queries: QueryTests = vec![
+            (
+                "SELECT * FROM test_graphql",
+                "select_all",
+                Some(Box::new(|result_batches| {
+                    let mut total = 0;
+                    for batch in result_batches {
+                        assert_eq!(batch.num_columns(), 3, "num_cols: {}", batch.num_columns());
+                        assert_eq!(batch.num_rows(), 1, "num_rows: {}", batch.num_rows());
+                        total += batch.num_rows();
+                    }
+                    assert_eq!(total, 4);
+                })),
+            ),
+            (
+                "SELECT * FROM test_graphql where id = '4' limit 1",
+                "select_limit_1_id_4",
+                Some(Box::new(|result_batches| {
+                    let mut total = 0;
+                    for batch in result_batches {
+                        assert_eq!(batch.num_columns(), 3, "num_cols: {}", batch.num_columns());
+                        assert_eq!(batch.num_rows(), 1, "num_rows: {}", batch.num_rows());
+                        total += batch.num_rows();
+                    }
+                    assert_eq!(total, 1);
+                })),
+            ),
+        ];
+
+        for (query, snapshot_suffix, validate_result) in queries {
+            run_query_and_check_results(
+                &mut rt,
+                &format!("test_graphql_pagination_{snapshot_suffix}"),
+                query,
+                true,
+                validate_result,
+            )
+            .await?;
+        }
+
+        tx.send(()).map_err(|()| {
+            tracing::error!("Failed to send shutdown signal");
+            "Failed to send shutdown signal".to_string()
+        })?;
+
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+async fn test_graphql_tcgdex() -> Result<(), String> {
+    type QueryTests<'a> = Vec<(&'a str, &'a str, Option<Box<ValidateFn>>)>;
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    test_request_context()
+        .scope(async {
+            let (tx, addr) = start_server().await?;
+            tracing::debug!("Server started at {}", addr);
+
+            let query = "
+            query sets {
+                sets {
+                    id
+                    name
+                    releaseDate
+                    cardCount {
+                        totalCards: total
+                        normalCards: normal
+                        holoCards: holo
+                        reverseCards: reverse
+                        officialCards: official
+                        firstEdCards: firstEd
+                    }
                 }
-                assert_eq!(total, 4);
-            })),
-        ),
-        (
-            "SELECT * FROM test_graphql where id = '4' limit 1",
-            "select_limit_1_id_4",
-            Some(Box::new(|result_batches| {
-                let mut total = 0;
-                for batch in result_batches {
-                    assert_eq!(batch.num_columns(), 3, "num_cols: {}", batch.num_columns());
-                    assert_eq!(batch.num_rows(), 1, "num_rows: {}", batch.num_rows());
-                    total += batch.num_rows();
+            }";
+
+            let app = AppBuilder::new("graphql_integration_test")
+                .with_dataset(make_graphql_dataset(
+                    "https://api.tcgdex.net/v2/graphql",
+                    "tcgdex",
+                    query,
+                    "/data/sets",
+                    Some(1),
+                ))
+                .build();
+            let status = status::RuntimeStatus::new();
+            let df = get_test_datafusion(Arc::clone(&status));
+            let mut rt = Runtime::builder()
+                .with_app(app)
+                .with_datafusion(df)
+                .with_runtime_status(status)
+                .build()
+                .await;
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+                    return Err("Timed out waiting for datasets to load".to_string());
                 }
-                assert_eq!(total, 1);
-            })),
-        ),
-    ];
+                () = rt.load_components() => {}
+            }
 
-    for (query, snapshot_suffix, validate_result) in queries {
-        run_query_and_check_results(
-            &mut rt,
-            &format!("test_graphql_pagination_{snapshot_suffix}"),
-            query,
-            true,
-            validate_result,
-        )
-        .await?;
-    }
+            let queries: QueryTests = vec![(
+                "SELECT * FROM tcgdex LIMIT 5",
+                "select_tcgdex",
+                Some(Box::new(|result_batches| {
+                    for batch in result_batches {
+                        assert_eq!(batch.num_columns(), 9, "num_cols: {}", batch.num_columns());
+                        assert!(batch.num_rows() > 0, "num_rows: {}", batch.num_rows());
+                    }
+                })),
+            )];
 
-    tx.send(()).map_err(|()| {
-        tracing::error!("Failed to send shutdown signal");
-        "Failed to send shutdown signal".to_string()
-    })?;
+            for (query, snapshot_suffix, validate_result) in queries {
+                run_query_and_check_results(
+                    &mut rt,
+                    &format!("test_graphql_{snapshot_suffix}"),
+                    query,
+                    true,
+                    validate_result,
+                )
+                .await?;
+            }
 
-    Ok(())
+            tx.send(()).map_err(|()| {
+                tracing::error!("Failed to send shutdown signal");
+                "Failed to send shutdown signal".to_string()
+            })?;
+
+            Ok(())
+        })
+        .await
+}
+
+#[tokio::test]
+async fn test_graphql_swapi() -> Result<(), String> {
+    type QueryTests<'a> = Vec<(&'a str, &'a str, Option<Box<ValidateFn>>)>;
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    test_request_context()
+        .scope(async {
+            let (tx, addr) = start_server().await?;
+            tracing::debug!("Server started at {}", addr);
+
+            let query = "
+            query {
+                allPeople {
+                    people {
+                        name
+                        filmConnection {
+                            films {
+                                title
+                            }
+                        }
+                        starshipConnection {
+                            starships {
+                                name
+                            }
+                        }
+                    }
+                }
+            }";
+
+            let app = AppBuilder::new("graphql_integration_test")
+                .with_dataset(make_graphql_dataset(
+                    "https://swapi-graphql.netlify.app/.netlify/functions/index",
+                    "swapi",
+                    query,
+                    "/data/allPeople/people",
+                    Some(1),
+                ))
+                .build();
+            let status = status::RuntimeStatus::new();
+            let df = get_test_datafusion(Arc::clone(&status));
+            let mut rt = Runtime::builder()
+                .with_app(app)
+                .with_datafusion(df)
+                .with_runtime_status(status)
+                .build()
+                .await;
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+                    return Err("Timed out waiting for datasets to load".to_string());
+                }
+                () = rt.load_components() => {}
+            }
+
+            let queries: QueryTests = vec![(
+                "SELECT * FROM swapi LIMIT 5",
+                "select_swapi",
+                Some(Box::new(|result_batches| {
+                    for batch in result_batches {
+                        assert_eq!(batch.num_columns(), 3, "num_cols: {}", batch.num_columns());
+                        assert!(batch.num_rows() > 0, "num_rows: {}", batch.num_rows());
+                    }
+                })),
+            )];
+
+            for (query, snapshot_suffix, validate_result) in queries {
+                run_query_and_check_results(
+                    &mut rt,
+                    &format!("test_graphql_{snapshot_suffix}"),
+                    query,
+                    true,
+                    validate_result,
+                )
+                .await?;
+            }
+
+            tx.send(()).map_err(|()| {
+                tracing::error!("Failed to send shutdown signal");
+                "Failed to send shutdown signal".to_string()
+            })?;
+
+            Ok(())
+        })
+        .await
 }

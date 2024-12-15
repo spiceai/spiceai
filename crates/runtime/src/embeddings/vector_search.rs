@@ -38,7 +38,7 @@ use tokio::sync::RwLock;
 use tracing::{Instrument, Span};
 
 use crate::accelerated_table::AcceleratedTable;
-use crate::datafusion::query::{write_to_json_string, Protocol};
+use crate::datafusion::query::write_to_json_string;
 use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
 use crate::{datafusion::DataFusion, model::EmbeddingModelStore};
 use crate::{embedding_col, offset_col};
@@ -379,7 +379,7 @@ impl VectorSearchTableResult {
 
     pub fn to_matches(&self, table: &TableReference) -> Result<Vec<Match>> {
         // Early exit on no data.
-        if !self.data.first().is_some_and(|d| d.num_rows() > 0) {
+        if self.data.first().is_none_or(|d| d.num_rows() == 0) {
             return Ok(vec![]);
         }
 
@@ -426,7 +426,34 @@ pub struct Match {
     metadata: HashMap<String, serde_json::Value>,
 }
 
-pub fn to_matches_sorted(result: &VectorSearchResult) -> Result<Vec<Match>> {
+impl Match {
+    #[must_use]
+    pub fn value(&self) -> &str {
+        &self.value
+    }
+
+    #[must_use]
+    pub fn score(&self) -> f64 {
+        self.score
+    }
+
+    #[must_use]
+    pub fn dataset(&self) -> &str {
+        &self.dataset
+    }
+
+    #[must_use]
+    pub fn primary_key(&self) -> &HashMap<String, serde_json::Value> {
+        &self.primary_key
+    }
+
+    #[must_use]
+    pub fn metadata(&self) -> &HashMap<String, serde_json::Value> {
+        &self.metadata
+    }
+}
+
+pub fn to_matches_sorted(result: &VectorSearchResult, limit: usize) -> Result<Vec<Match>> {
     let output = result
         .iter()
         .map(|(a, b)| b.to_matches(a))
@@ -439,6 +466,8 @@ pub fn to_matches_sorted(result: &VectorSearchResult) -> Result<Vec<Match>> {
             .partial_cmp(&a.score)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
+
+    matches.truncate(limit);
 
     Ok(matches)
 }
@@ -496,6 +525,7 @@ impl VectorSearch {
                     )
                 )
                 WHERE chunk_rank = 1
+                ORDER by dist ASC
                 LIMIT {n}
             )
             SELECT
@@ -570,7 +600,7 @@ impl VectorSearch {
 
         let batches: Vec<RecordBatch> = self
             .df
-            .query_builder(&query, Protocol::Internal)
+            .query_builder(&query)
             .build()
             .run()
             .await

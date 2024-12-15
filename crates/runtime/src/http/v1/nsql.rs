@@ -123,10 +123,8 @@ fn default_model() -> String {
 }
 
 /// Checks if the request is asking to only generate SQL.
-fn return_sql_only(accept: &Option<TypedHeader<Accept>>) -> bool {
-    accept
-        .as_ref()
-        .is_some_and(|a| accept_header_types(a).contains(&"application/sql".to_string()))
+fn return_sql_only(accept: Option<&TypedHeader<Accept>>) -> bool {
+    accept.is_some_and(|a| accept_header_types(a).contains(&"application/sql".to_string()))
 }
 
 pub(crate) async fn post(
@@ -211,7 +209,7 @@ pub(crate) async fn post(
         Ok(Some(model_sql_query)) => {
             let cleaned_query = clean_model_based_sql(&model_sql_query);
 
-            if return_sql_only(&accept) {
+            if return_sql_only(accept.as_ref()) {
                 tracing::trace!("Not running query, requested SQL only:\n{cleaned_query}");
                 return (StatusCode::OK, cleaned_query).into_response();
             }
@@ -220,7 +218,7 @@ pub(crate) async fn post(
             sql_to_http_response(
                 Arc::clone(&df),
                 &cleaned_query,
-                ArrowFormat::from_accept_header(&accept),
+                ArrowFormat::from_accept_header(accept.as_ref()),
             )
             .instrument(span.clone())
             .await

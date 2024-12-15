@@ -66,12 +66,15 @@ const PARAMETERS: &[ParameterSpec] = &[
     // Common listing table parameters
     ParameterSpec::runtime("file_format"),
     ParameterSpec::runtime("file_extension"),
+    ParameterSpec::runtime("schema_infer_max_records")
+        .description("Set a limit in terms of records to scan to infer the schema."),
     ParameterSpec::runtime("csv_has_header")
         .description("Set true to indicate that the first line is a header."),
     ParameterSpec::runtime("csv_quote").description("The quote character in a row."),
     ParameterSpec::runtime("csv_escape").description("The escape character in a row."),
     ParameterSpec::runtime("csv_schema_infer_max_records")
-        .description("Set a limit in terms of records to scan to infer the schema."),
+        .description("Set a limit in terms of records to scan to infer the schema.")
+        .deprecated("use 'schema_infer_max_records' instead"),
     ParameterSpec::runtime("csv_delimiter")
         .description("The character separating values within a row."),
     ParameterSpec::runtime("file_compression_type")
@@ -173,6 +176,8 @@ impl ListingTableConnector for File {
             return Ok(());
         };
 
+        tracing::info!("Watching changes to {}", path.display());
+
         let watcher_task = tokio::spawn(async move {
             let mut watcher: RecommendedWatcher = match notify::recommended_watcher(
                 move |res: Result<notify::Event, notify::Error>| match res {
@@ -225,20 +230,12 @@ impl ListingTableConnector for File {
 
         accelerated_table.handlers.push(watcher_task);
 
-        tracing::info!("Watching changes to {}", get_path(dataset).display());
-
         Ok(())
     }
 }
 
 fn get_path(dataset: &Dataset) -> PathBuf {
-    let clean_from = dataset.from.replace("file://", "file:/");
-
-    let Some(path) = clean_from.strip_prefix("file:") else {
-        unreachable!("The 'from' parameter must start with 'file:'.");
-    };
-
-    PathBuf::from(path)
+    PathBuf::from(dataset.path())
 }
 
 #[cfg(test)]
@@ -250,8 +247,9 @@ mod tests {
     fn test_get_path() {
         let test_cases = vec![
             ("file:/path/to/file.csv", PathBuf::from("/path/to/file.csv")),
+            ("file://path/to/file.csv", PathBuf::from("path/to/file.csv")),
             (
-                "file://path/to/file.csv",
+                "file:///path/to/file.csv",
                 PathBuf::from("/path/to/file.csv"),
             ),
             (
@@ -266,13 +264,5 @@ mod tests {
             let result = get_path(&dataset);
             assert_eq!(result, expected, "Failed for input: {input}");
         }
-    }
-
-    #[test]
-    #[should_panic(expected = "The 'from' parameter must start with 'file:'.")]
-    fn test_get_path_empty_input() {
-        let dataset = Dataset::try_new(String::new(), "foo").expect("valid dataset");
-
-        get_path(&dataset);
     }
 }

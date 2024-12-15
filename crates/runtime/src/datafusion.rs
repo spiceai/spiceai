@@ -53,7 +53,7 @@ use datafusion::sql::{sqlparser, TableReference};
 use datafusion_federation::FederatedTableProviderAdaptor;
 use error::find_datafusion_root;
 use itertools::Itertools;
-use query::{Protocol, QueryBuilder};
+use query::QueryBuilder;
 use snafu::prelude::*;
 use tokio::spawn;
 use tokio::sync::oneshot;
@@ -72,6 +72,7 @@ pub mod udf;
 
 pub const SPICE_DEFAULT_CATALOG: &str = "spice";
 pub const SPICE_RUNTIME_SCHEMA: &str = "runtime";
+pub const SPICE_EVAL_SCHEMA: &str = "eval";
 pub const SPICE_DEFAULT_SCHEMA: &str = "public";
 pub const SPICE_METADATA_SCHEMA: &str = "metadata";
 
@@ -157,6 +158,15 @@ pub enum Error {
         source: crate::accelerated_table::Error,
     },
 
+    #[snafu(display(
+        "Changing the schema of an accelerated table via the Refresh SQL is not allowed.\nRetry the request, changing the SELECT statement from 'SELECT {selected_columns}' to 'SELECT {refresh_columns}'"
+    ))]
+    RefreshSqlSchemaChangeDisallowed {
+        dataset_name: Arc<str>,
+        selected_columns: Arc<str>,
+        refresh_columns: Arc<str>,
+    },
+
     #[snafu(display("Table {table_name} is not accelerated"))]
     NotAcceleratedTable { table_name: String },
 
@@ -197,8 +207,10 @@ pub enum Error {
     #[snafu(display("{source}"))]
     InvalidTimeColumnTimeFormat { source: refresh::Error },
 
-    #[snafu(display("Acceleration mode {mode} not supported for dataset from source {from}"))]
-    UnsupportedAccelerationMode { mode: String, from: String },
+    #[snafu(display(
+         "Acceleration mode `append` requires `time_column` parameter for source {from}.\nConfigure `time_column` parameter and try again.\nFor details, visit: https://docs.spiceai.org/reference/spicepod/datasets#time_column"
+    ))]
+    AppendRequiresTimeColumn { from: String },
 
     #[snafu(display("Unable to retrieve underlying table provider from federation"))]
     UnableToRetrieveTableFromFederation { table_name: String },
@@ -250,15 +262,6 @@ impl DataFusion {
     #[must_use]
     pub fn runtime_status(&self) -> Arc<status::RuntimeStatus> {
         Arc::clone(&self.runtime_status)
-    }
-
-    #[must_use]
-    fn runtime_schema(&self) -> Option<Arc<dyn SchemaProvider>> {
-        if let Some(catalog) = self.ctx.catalog(SPICE_DEFAULT_CATALOG) {
-            return catalog.schema(SPICE_RUNTIME_SCHEMA);
-        }
-
-        None
     }
 
     #[must_use]
@@ -316,22 +319,29 @@ impl DataFusion {
             .flatten()
     }
 
-    pub fn register_runtime_table(
+    /// Register a table with its [`SchemaProvider`] if it exists and marks it as writable.
+    ///
+    /// This method is generally used for tables that are created by the Spice runtime.
+    pub fn register_table_as_writable_and_with_schema(
         &self,
         table_name: TableReference,
         table: Arc<dyn datafusion::datasource::TableProvider>,
     ) -> Result<()> {
-        if let Some(runtime_schema) = self.runtime_schema() {
-            runtime_schema
-                .register_table(table_name.table().to_string(), table)
-                .map_err(find_datafusion_root)
-                .context(UnableToRegisterTableToDataFusionSchemaSnafu { schema: "runtime" })?;
-
-            self.data_writers
-                .write()
-                .map_err(|_| Error::UnableToLockDataWriters {})?
-                .insert(table_name);
+        if let Some(schema) = table_name.schema() {
+            if let Some(eval_schema) = self.schema(schema) {
+                eval_schema
+                    .register_table(table_name.table().to_string(), table)
+                    .map_err(find_datafusion_root)
+                    .context(UnableToRegisterTableToDataFusionSchemaSnafu {
+                        schema: SPICE_EVAL_SCHEMA,
+                    })?;
+            }
         }
+
+        self.data_writers
+            .write()
+            .map_err(|_| Error::UnableToLockDataWriters {})?
+            .insert(table_name);
 
         Ok(())
     }
@@ -521,10 +531,10 @@ impl DataFusion {
 
     pub async fn write_data(
         &self,
-        table_reference: TableReference,
+        table_reference: &TableReference,
         data_update: DataUpdate,
     ) -> Result<()> {
-        if !self.is_writable(&table_reference) {
+        if !self.is_writable(table_reference) {
             TableNotWritableSnafu {
                 table_name: table_reference.to_string(),
             }
@@ -534,7 +544,7 @@ impl DataFusion {
         self.ensure_sink_dataset(table_reference.clone(), Arc::clone(&data_update.schema))
             .await?;
 
-        let table_provider = self.get_table_provider(&table_reference).await?;
+        let table_provider = self.get_table_provider(table_reference).await?;
 
         verify_schema(
             table_provider.schema().fields(),
@@ -542,10 +552,10 @@ impl DataFusion {
         )
         .context(SchemaMismatchSnafu)?;
 
-        let overwrite = if data_update.update_type == UpdateType::Overwrite {
-            InsertOp::Overwrite
-        } else {
-            InsertOp::Append
+        let overwrite = match data_update.update_type {
+            UpdateType::Overwrite => InsertOp::Overwrite,
+            UpdateType::Append => InsertOp::Append,
+            UpdateType::Changes => InsertOp::Replace,
         };
 
         let streaming_update = StreamingDataUpdate::try_from(data_update)
@@ -572,7 +582,7 @@ impl DataFusion {
             })?;
 
         self.runtime_status
-            .update_dataset(&table_reference, status::ComponentStatus::Ready);
+            .update_dataset(table_reference, status::ComponentStatus::Ready);
 
         Ok(())
     }
@@ -665,6 +675,18 @@ impl DataFusion {
 
         let source_schema = source_table_provider.schema();
 
+        let refresh_sql = dataset.refresh_sql();
+        let refresh_schema = if let Some(refresh_sql) = &refresh_sql {
+            refresh_sql::validate_refresh_sql(
+                dataset.name.clone(),
+                refresh_sql.as_str(),
+                source_schema,
+            )
+            .context(RefreshSqlSnafu)?
+        } else {
+            source_schema
+        };
+
         let acceleration_settings =
             dataset
                 .acceleration
@@ -680,7 +702,7 @@ impl DataFusion {
 
         let accelerated_table_provider = create_accelerator_table(
             dataset.name.clone(),
-            Arc::clone(&source_schema),
+            Arc::clone(&refresh_schema),
             constraints,
             &acceleration_settings,
             secrets,
@@ -699,12 +721,6 @@ impl DataFusion {
                     .update_dataset(&dataset.name, status::ComponentStatus::Ready);
                 initial_load_complete = true;
             }
-        }
-
-        let refresh_sql = dataset.refresh_sql();
-        if let Some(refresh_sql) = &refresh_sql {
-            refresh_sql::validate_refresh_sql(dataset.name.clone(), refresh_sql.as_str())
-                .context(RefreshSqlSnafu)?;
         }
 
         let refresh_mode = source.resolve_refresh_mode(acceleration_settings.refresh_mode);
@@ -735,7 +751,7 @@ impl DataFusion {
             refresh = refresh.period(refresh_data_window);
         }
         refresh
-            .validate_time_format(dataset.name.to_string(), &source_schema)
+            .validate_time_format(dataset.name.to_string(), &refresh_schema)
             .context(InvalidTimeColumnTimeFormatSnafu)?;
 
         let mut accelerated_table_builder = AcceleratedTable::builder(
@@ -768,7 +784,6 @@ impl DataFusion {
         }
 
         if refresh_mode == RefreshMode::Changes {
-            let source = Box::leak(Box::new(Arc::clone(&source)));
             let changes_stream = source.changes_stream(Arc::clone(&source_table_provider));
 
             if let Some(changes_stream) = changes_stream {
@@ -777,13 +792,11 @@ impl DataFusion {
         }
 
         if refresh_mode == RefreshMode::Append && dataset.time_column.is_none() {
-            let source = Box::leak(Box::new(source));
             let append_stream = source.append_stream(source_table_provider);
             if let Some(append_stream) = append_stream {
                 accelerated_table_builder.append_stream(append_stream);
             } else {
-                return Err(Error::UnsupportedAccelerationMode {
-                    mode: "append".to_string(),
+                return Err(Error::AppendRequiresTimeColumn {
                     from: dataset.from.clone(),
                 });
             };
@@ -815,7 +828,7 @@ impl DataFusion {
         accelerated_table_builder: &mut accelerated_table::Builder,
         dataset: &Dataset,
     ) {
-        let parent_table_reference = TableReference::parse_str(&dataset.path());
+        let parent_table_reference = TableReference::parse_str(dataset.path());
         let Ok(parent_table) = self.get_table_provider(&parent_table_reference).await else {
             tracing::debug!("Could not synchronize refreshes with parent table {parent_table_reference}. Parent table not found.");
             return;
@@ -898,10 +911,12 @@ impl DataFusion {
 
     pub async fn refresh_table(
         &self,
-        dataset_name: &str,
+        dataset_name: &TableReference,
         overrides: Option<RefreshOverrides>,
     ) -> Result<()> {
-        let table = self.get_accelerated_table_provider(dataset_name).await?;
+        let table = self
+            .get_accelerated_table_provider(dataset_name.to_string().as_str())
+            .await?;
         if let Some(accelerated_table) = table.as_any().downcast_ref::<AcceleratedTable>() {
             return accelerated_table.trigger_refresh(overrides).await.context(
                 UnableToTriggerRefreshSnafu {
@@ -920,14 +935,32 @@ impl DataFusion {
         dataset_name: TableReference,
         refresh_sql: Option<String>,
     ) -> Result<()> {
-        if let Some(sql) = &refresh_sql {
-            refresh_sql::validate_refresh_sql(dataset_name.clone(), sql)
-                .context(RefreshSqlSnafu)?;
-        }
-
         let table = self
             .get_accelerated_table_provider(&dataset_name.to_string())
             .await?;
+
+        let refresh_schema = table.schema();
+
+        if let Some(sql) = &refresh_sql {
+            let selected_schema = refresh_sql::validate_refresh_sql(
+                dataset_name.clone(),
+                sql,
+                Arc::clone(&refresh_schema),
+            )
+            .context(RefreshSqlSnafu)?;
+            if selected_schema != refresh_schema {
+                return RefreshSqlSchemaChangeDisallowedSnafu {
+                    dataset_name: Arc::from(dataset_name.to_string()),
+                    selected_columns: Arc::from(
+                        selected_schema.fields().iter().map(|f| f.name()).join(", "),
+                    ),
+                    refresh_columns: Arc::from(
+                        refresh_schema.fields().iter().map(|f| f.name()).join(", "),
+                    ),
+                }
+                .fail();
+            }
+        }
 
         if let Some(accelerated_table) = table.as_any().downcast_ref::<AcceleratedTable>() {
             accelerated_table
@@ -1177,11 +1210,7 @@ impl DataFusion {
             .table_names())
     }
 
-    pub fn query_builder<'a>(
-        self: &Arc<Self>,
-        sql: &'a str,
-        protocol: Protocol,
-    ) -> QueryBuilder<'a> {
-        QueryBuilder::new(sql, Arc::clone(self), protocol)
+    pub fn query_builder<'a>(self: &Arc<Self>, sql: &'a str) -> QueryBuilder<'a> {
+        QueryBuilder::new(sql, Arc::clone(self))
     }
 }

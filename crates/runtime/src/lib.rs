@@ -18,21 +18,25 @@ limitations under the License.
 use std::net::SocketAddr;
 use std::{collections::HashMap, sync::Arc};
 
-use crate::auth::EndpointAuth;
-use crate::{dataconnector::DataConnector, datafusion::DataFusion};
+use crate::{
+    auth::EndpointAuth, dataconnector::DataConnector, datafusion::DataFusion,
+    internal_table::Error as InternalTableError, model::ENABLE_MODEL_SUPPORT_MESSAGE,
+};
 use ::datafusion::error::DataFusionError;
 use ::datafusion::sql::{sqlparser, TableReference};
 use app::App;
 use builder::RuntimeBuilder;
 use config::Config;
+use dataconnector::ConnectorComponent;
 use datasets_health_monitor::DatasetsHealthMonitor;
 use extension::ExtensionFactory;
-use model::{EmbeddingModelStore, LLMModelStore};
+use model::{EmbeddingModelStore, EvalScorerRegistry, LLMModelStore};
 use model_components::model::Model;
 pub use notify::Error as NotifyError;
 use secrecy::SecretString;
-use secrets::ParamStr;
+use secrets::{ParamStr, Secrets};
 use snafu::prelude::*;
+use spicepod::component::eval::Eval;
 use tls::TlsConfig;
 use tokio::sync::oneshot::error::RecvError;
 use tokio::sync::RwLock;
@@ -68,6 +72,7 @@ pub mod objectstore;
 mod opentelemetry;
 mod parameters;
 pub mod podswatcher;
+pub mod request;
 pub mod secrets;
 pub mod spice_metrics;
 pub mod status;
@@ -132,6 +137,9 @@ pub enum Error {
     #[snafu(display("Unknown data connector: {data_connector}"))]
     UnknownDataConnector { data_connector: String },
 
+    #[snafu(display("The runtime is built without ODBC support.\nBuild Spice.ai OSS with the `odbc` feature enabled or use the Docker image that includes ODBC support.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/odbc"))]
+    OdbcNotInstalled,
+
     #[snafu(display("Unable to load secrets for data connector: {data_connector}"))]
     UnableToLoadDataConnectorSecrets { data_connector: String },
 
@@ -146,9 +154,10 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Unable to attach data connector {data_connector}: {source}"))]
+    #[snafu(display("Failed to setup the {connector_component} ({data_connector}).\n{source}"))]
     UnableToAttachDataConnector {
         source: datafusion::Error,
+        connector_component: ConnectorComponent,
         data_connector: String,
     },
 
@@ -225,6 +234,9 @@ pub enum Error {
     #[snafu(display("Unable to create metrics table: {source}"))]
     UnableToCreateMetricsTable { source: DataFusionError },
 
+    #[snafu(display("Unable to create eval runs table: {source}"))]
+    UnableToCreateEvalRunsTable { source: InternalTableError },
+
     #[snafu(display("Unable to register metrics table: {source}"))]
     UnableToRegisterMetricsTable { source: datafusion::Error },
 
@@ -262,6 +274,8 @@ pub struct Runtime {
     llms: Arc<RwLock<LLMModelStore>>,
     embeds: Arc<RwLock<EmbeddingModelStore>>,
     tools: Arc<RwLock<HashMap<String, Tooling>>>,
+    evals: Arc<RwLock<Vec<Eval>>>,
+    eval_scorers: EvalScorerRegistry,
     pods_watcher: Arc<RwLock<Option<podswatcher::PodsWatcher>>>,
     secrets: Arc<RwLock<secrets::Secrets>>,
     datasets_health_monitor: Option<Arc<DatasetsHealthMonitor>>,
@@ -294,6 +308,16 @@ impl Runtime {
     #[must_use]
     pub fn status(&self) -> Arc<status::RuntimeStatus> {
         Arc::clone(&self.status)
+    }
+
+    #[must_use]
+    pub fn embeds(&self) -> Arc<RwLock<EmbeddingModelStore>> {
+        Arc::clone(&self.embeds)
+    }
+
+    #[must_use]
+    pub fn app(&self) -> Arc<RwLock<Option<Arc<App>>>> {
+        Arc::clone(&self.app)
     }
 
     /// Requests a loaded extension, or will attempt to load it if part of the autoloaded extensions.
@@ -364,6 +388,7 @@ impl Runtime {
 
         let flight_server_future = tokio::spawn(flight::start(
             config.flight_bind_address,
+            self.app.read().await.as_ref().map(Arc::clone),
             Arc::clone(&self.df),
             tls_config.clone(),
             endpoint_auth.clone(),
@@ -481,8 +506,36 @@ impl Runtime {
             }
         });
 
+        let eval_scorer = tokio::spawn({
+            let self_clone = self.clone();
+            async move {
+                let app_lock = self_clone.app.read().await;
+
+                if !cfg!(feature = "models")
+                    && app_lock.as_ref().is_some_and(|s| !s.evals.is_empty())
+                {
+                    tracing::error!("Cannot load evals without the 'models' feature enabled. {ENABLE_MODEL_SUPPORT_MESSAGE}");
+                }
+
+                #[cfg(feature = "models")]
+                {
+                    self_clone.load_eval_scorer().await;
+                    if let Err(err) = self_clone.load_eval_tables().await {
+                        tracing::warn!("Creating internal eval run table: {err}");
+                    }
+                }
+            }
+        });
+
         // Wait for all tasks to complete
-        let load_result = tokio::try_join!(task_history, results_cache, datasets, catalogs, models);
+        let load_result = tokio::try_join!(
+            task_history,
+            results_cache,
+            datasets,
+            catalogs,
+            models,
+            eval_scorer
+        );
 
         if let Err(err) = load_result {
             tracing::error!("Could not start the Spice runtime: {err}");
@@ -494,19 +547,27 @@ impl Runtime {
         params: &HashMap<String, String>,
     ) -> HashMap<String, SecretString> {
         let shared_secrets = Arc::clone(&self.secrets);
-        let secrets = shared_secrets.read().await;
-
-        let mut params_with_secrets: HashMap<String, SecretString> = HashMap::new();
-
-        // Inject secrets from the user-supplied params.
-        // This will replace any instances of `${ store:key }` with the actual secret value.
-        for (k, v) in params {
-            let secret = secrets.inject_secrets(k, ParamStr(v)).await;
-            params_with_secrets.insert(k.clone(), secret);
-        }
-
-        params_with_secrets
+        get_params_with_secrets(shared_secrets, params).await
     }
+}
+
+#[allow(clippy::implicit_hasher)]
+pub async fn get_params_with_secrets(
+    secrets: Arc<RwLock<Secrets>>,
+    params: &HashMap<String, String>,
+) -> HashMap<String, SecretString> {
+    let secrets = secrets.read().await;
+
+    let mut params_with_secrets: HashMap<String, SecretString> = HashMap::new();
+
+    // Inject secrets from the user-supplied params.
+    // This will replace any instances of `${ store:key }` with the actual secret value.
+    for (k, v) in params {
+        let secret = secrets.inject_secrets(k, ParamStr(v)).await;
+        params_with_secrets.insert(k.clone(), secret);
+    }
+
+    params_with_secrets
 }
 
 #[must_use]

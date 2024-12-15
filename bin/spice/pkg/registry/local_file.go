@@ -30,7 +30,7 @@ import (
 
 type LocalFileRegistry struct{}
 
-func (r *LocalFileRegistry) GetPod(podPath string) (string, error) {
+func (r *LocalFileRegistry) GetPod(ctx *context.RuntimeContext, podPath string) (string, error) {
 	stat, err := os.Stat(podPath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -50,11 +50,9 @@ func (r *LocalFileRegistry) GetPod(podPath string) (string, error) {
 		}
 	}
 
-	rtcontext := context.NewContext()
-
 	// Validate source
 	podManifestFileName := fmt.Sprintf("%s.yaml", strings.ToLower(filepath.Base(podPath)))
-	podManifestPath := filepath.Join(rtcontext.PodsDir(), podManifestFileName)
+	podManifestPath := filepath.Join(ctx.PodsDir(), podManifestFileName)
 
 	if _, err := os.Stat(filepath.Join(podPath, podManifestFileName)); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -64,7 +62,7 @@ func (r *LocalFileRegistry) GetPod(podPath string) (string, error) {
 	}
 
 	// Prepare destination
-	podsDir := rtcontext.PodsDir()
+	podsDir := ctx.PodsDir()
 	if _, err = os.Stat(podsDir); err != nil {
 		if !errors.Is(err, os.ErrNotExist) {
 			return "", fmt.Errorf("error fetching Spicepod %s: %w", podPath, err)

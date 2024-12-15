@@ -99,6 +99,17 @@ impl Parameters {
             }
         }
 
+        // Check for deprecated parameters
+        for parameter in all_params {
+            if let Some(deprecation_message) = parameter.deprecation_message {
+                if let Some((param, _)) = params.iter().find(|p| p.0 == parameter.name) {
+                    tracing::warn!(
+                        "Parameter '{param}' is deprecated for {component_name}: {deprecation_message}",
+                    );
+                }
+            }
+        }
+
         // Check if all required parameters are present
         for parameter in all_params {
             // If the parameter is missing and has a default value, add it to the params
@@ -268,6 +279,7 @@ pub struct ParameterSpec {
     pub help_link: &'static str,
     pub examples: &'static [&'static str],
     pub r#type: ParameterType,
+    pub deprecation_message: Option<&'static str>,
 }
 
 impl ParameterSpec {
@@ -282,6 +294,7 @@ impl ParameterSpec {
             help_link: "",
             examples: &[],
             r#type: ParameterType::Connector,
+            deprecation_message: None,
         }
     }
 
@@ -296,6 +309,7 @@ impl ParameterSpec {
             help_link: "",
             examples: &[],
             r#type: ParameterType::Runtime,
+            deprecation_message: None,
         }
     }
 
@@ -310,6 +324,7 @@ impl ParameterSpec {
             help_link: "",
             examples: &[],
             r#type: ParameterType::Accelerator,
+            deprecation_message: None,
         }
     }
 
@@ -346,6 +361,12 @@ impl ParameterSpec {
     #[must_use]
     pub const fn examples(mut self, examples: &'static [&'static str]) -> Self {
         self.examples = examples;
+        self
+    }
+
+    #[must_use]
+    pub const fn deprecated(mut self, deprecation_message: &'static str) -> Self {
+        self.deprecation_message = Some(deprecation_message);
         self
     }
 }

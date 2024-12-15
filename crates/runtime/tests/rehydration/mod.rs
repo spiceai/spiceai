@@ -21,7 +21,7 @@ use crate::{
     docker::RunningContainer,
     get_test_datafusion,
     mysql::common::{get_mysql_conn, make_mysql_dataset, start_mysql_docker_container},
-    utils::runtime_ready_check,
+    utils::{runtime_ready_check, test_request_context},
 };
 use std::sync::Arc;
 
@@ -30,12 +30,13 @@ use crate::init_tracing;
 use anyhow::Context;
 use app::AppBuilder;
 use arrow::array::RecordBatch;
+use datafusion::sql::TableReference;
 use datafusion_table_providers::sql::arrow_sql_gen::statement::{
     CreateTableBuilder, InsertBuilder,
 };
 use futures::TryStreamExt;
 use mysql_async::{prelude::Queryable, Params, Row};
-use runtime::{datafusion::query::Protocol, spice_data_base_path, status, Runtime};
+use runtime::{spice_data_base_path, status, Runtime};
 use spicepod::component::dataset::{
     acceleration::{Acceleration, IndexType, Mode},
     Dataset,
@@ -56,45 +57,48 @@ mod sqlite;
 async fn spill_to_disk_and_rehydration() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
     let _guard = ACCELERATION_MUTEX.lock().await;
-    let running_container = prepare_test_environment()
-        .await
-        .map_err(|e| anyhow::anyhow!(e))?;
-    let running_container = Arc::new(running_container);
 
-    let config = vec![
-        #[cfg(feature = "duckdb")]
-        ("duckdb", None),
-        #[cfg(feature = "duckdb")]
-        ("duckdb", Some("./.spice/my_duckdb.db")),
-        #[cfg(feature = "sqlite")]
-        ("sqlite", None),
-        #[cfg(feature = "sqlite")]
-        ("sqlite", Some("./.spice/my_sqlite.db")),
-    ];
+    test_request_context().scope(async {
+        let running_container = prepare_test_environment()
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+        let running_container = Arc::new(running_container);
 
-    for (idx, (engine, db_file_path)) in config.into_iter().enumerate() {
-        tracing::info!("Testing spill-to-disk and rehydration with engine: {engine}, db_file_path: {db_file_path:?}");
+        let config = vec![
+            #[cfg(feature = "duckdb")]
+            ("duckdb", None),
+            #[cfg(feature = "duckdb")]
+            ("duckdb", Some("./.spice/my_duckdb.db")),
+            #[cfg(feature = "sqlite")]
+            ("sqlite", None),
+            #[cfg(feature = "sqlite")]
+            ("sqlite", Some("./.spice/my_sqlite.db")),
+        ];
 
-        if idx > 0 {
-            // Ensure the container is running as the tests manipulate it
-            running_container
-                .start()
-                .await
-                .map_err(|e| anyhow::anyhow!(e))?;
-            tokio::time::sleep(std::time::Duration::from_millis(5000)).await;
+        for (idx, (engine, db_file_path)) in config.into_iter().enumerate() {
+            tracing::info!("Testing spill-to-disk and rehydration with engine: {engine}, db_file_path: {db_file_path:?}");
+
+            if idx > 0 {
+                // Ensure the container is running as the tests manipulate it
+                running_container
+                    .start()
+                    .await
+                    .map_err(|e| anyhow::anyhow!(e))?;
+                tokio::time::sleep(std::time::Duration::from_millis(5000)).await;
+            }
+            execute_spill_to_disk_and_rehydration(Arc::clone(&running_container), engine, db_file_path)
+                .await?;
         }
-        execute_spill_to_disk_and_rehydration(Arc::clone(&running_container), engine, db_file_path)
-            .await?;
-    }
 
-    running_container
-        .remove()
-        .await
-        .map_err(|e| anyhow::anyhow!(e))?;
+        running_container
+            .remove()
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
 
-    tracing::info!("Spill-to-disk and rehydration tests passed!");
+        tracing::info!("Spill-to-disk and rehydration tests passed!");
 
-    Ok(())
+        Ok(())
+    }).await
 }
 
 /// Validates spill-to-disk and rehydration functionality by simulating runtime restarts
@@ -246,7 +250,7 @@ fn resolve_local_db_file_path(
 async fn run_query(query: &str, rt: &Runtime) -> Result<Vec<RecordBatch>, anyhow::Error> {
     let query_result = rt
         .datafusion()
-        .query_builder(query, Protocol::Internal)
+        .query_builder(query)
         .build()
         .run()
         .await
@@ -351,7 +355,8 @@ async fn init_mysql_db() -> Result<(), anyhow::Error> {
     let _: Vec<Row> = conn.exec(create_table_stmt, Params::Empty).await?;
 
     tracing::debug!("INSERT INTO lineitem...");
-    let insert_stmt = InsertBuilder::new("lineitem", tpch_lineitem).build_mysql(None)?;
+    let insert_stmt =
+        InsertBuilder::new(&TableReference::from("lineitem"), tpch_lineitem).build_mysql(None)?;
     let _: Vec<Row> = conn.exec(insert_stmt, Params::Empty).await?;
     tracing::debug!("MySQL initialized!");
 

@@ -47,6 +47,7 @@ assignees: ''
   - [ ] [Spice with rust sdk sample](https://github.com/spiceai/samples/blob/trunk/client-sdk/spice-rs-sdk-sample/README.md)
   - [ ] [Spice with spice.js sdk sample](https://github.com/spiceai/samples/blob/trunk/client-sdk/spice.js-sdk-sample/README.md)
   - [ ] [Spice with spicepy sdk sample](https://github.com/spiceai/samples/blob/trunk/client-sdk/spicepy-sdk-sample/README.md)
+  - [ ] [Spice with the OpenAI SDK](https://github.com/spiceai/samples/tree/trunk/spice_openai_sdk)
 - [ ] Full test pass and update if necessary over existing and new Quickstarts
   - **Data Connectors:**
   - [ ] [Apache Superset](https://github.com/spiceai/quickstarts/blob/trunk/superset/README.md)
@@ -82,8 +83,9 @@ assignees: ''
   - [ ] [Spice.ai Cloud Platform Catalog Connector](https://github.com/spiceai/quickstarts/blob/trunk/catalogs/spiceai/README.md)
   - [ ] [Unity Catalog Connector](https://github.com/spiceai/quickstarts/blob/trunk/catalogs/unity_catalog/README.md)
   - **AI/ML Models:**
-  - [ ] [search_github_files](https://github.com/spiceai/quickstarts/tree/trunk/search_github_files)
-  - [ ] [text-to-sql](https://github.com/spiceai/quickstarts/tree/trunk/text-to-sql)
+  - [ ] [Searching GitHub files with Spice](https://github.com/spiceai/quickstarts/tree/trunk/search_github_files)
+  - [ ] [Text-to-SQL with Spicel](https://github.com/spiceai/quickstarts/tree/trunk/text-to-sql)
+  - [ ] [Spice with Azure OpenAI](https://github.com/spiceai/quickstarts/tree/trunk/azure_openai)
   - **Other Quickstarts:**
   - [ ] [Advanced Data Refresh](https://github.com/spiceai/quickstarts/blob/trunk/acceleration/data-refresh/README.md)
   - [ ] [Data Retention Policy](https://github.com/spiceai/quickstarts/blob/trunk/retention/README.md)

@@ -23,16 +23,20 @@ use prost::Message;
 use tonic::{Request, Response, Status};
 
 use crate::{
-    flight::{metrics, record_batches_to_flight_stream, to_tonic_err, Service},
+    flight::{
+        metrics, record_batches_to_flight_stream, to_tonic_err, util::set_flightsql_protocol,
+        Service,
+    },
     timing::TimedStream,
 };
 
 /// Get a `FlightInfo` for listing schemas.
-pub(crate) fn get_flight_info(
+pub(crate) async fn get_flight_info(
     query: &sql::CommandGetDbSchemas,
     request: Request<FlightDescriptor>,
 ) -> Response<FlightInfo> {
-    let _start = metrics::track_flight_request("get_flight_info", Some("get_db_schemas"));
+    let _start = metrics::track_flight_request("get_flight_info", Some("get_db_schemas")).await;
+    set_flightsql_protocol().await;
 
     tracing::trace!("get_flight_info");
     let fd = request.into_inner();
@@ -48,11 +52,13 @@ pub(crate) fn get_flight_info(
     Response::new(info)
 }
 
-pub(crate) fn do_get(
+pub(crate) async fn do_get(
     flight_svc: &Service,
     query: sql::CommandGetDbSchemas,
 ) -> Result<Response<<Service as FlightService>::DoGetStream>, Status> {
-    let start = metrics::track_flight_request("do_get", Some("get_db_schemas"));
+    let start = metrics::track_flight_request("do_get", Some("get_db_schemas")).await;
+    set_flightsql_protocol().await;
+
     let catalog = &query.catalog;
     tracing::trace!("do_get: {query:?}");
     let filtered_catalogs = match catalog {

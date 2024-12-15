@@ -125,7 +125,7 @@ pub(crate) enum Delta {
 impl Delta {
     pub fn into_completion(
         self,
-        role: &Option<MessageRole>,
+        role: Option<&MessageRole>,
         tool_content: Option<&ContentBlockToolUse>,
     ) -> ChatCompletionStreamResponseDelta {
         match (self, tool_content) {
@@ -304,6 +304,8 @@ pub fn transform_stream(
                             prompt_tokens: inner_usage.input_tokens,
                             completion_tokens: inner_usage.output_tokens,
                             total_tokens: inner_usage.input_tokens + inner_usage.output_tokens,
+                            prompt_tokens_details: None,
+                            completion_tokens_details: None,
                         });
                         state.model = Some(model);
                         create_stream_response(
@@ -346,7 +348,7 @@ pub fn transform_stream(
                                 logprobs: None,
                                 finish_reason: None,
                                 delta: delta.into_completion(
-                                    &state.role,
+                                    state.role.as_ref(),
                                     state.tool_id_to_content_block.get(&index),
                                 ),
                             }),

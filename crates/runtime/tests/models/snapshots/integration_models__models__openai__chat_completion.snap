@@ -1,7 +1,6 @@
 ---
 source: crates/runtime/tests/models/openai.rs
 expression: "normalize_chat_completion_response(response, false)"
-snapshot_kind: text
 ---
 {
   "choices": [
@@ -26,7 +25,9 @@ snapshot_kind: text
   "system_fingerprint": "system_fingerprint_val",
   "usage": {
     "completion_tokens": "completion_tokens_val",
+    "completion_tokens_details": "completion_tokens_details_val",
     "prompt_tokens": "prompt_tokens_val",
+    "prompt_tokens_details": "prompt_tokens_details_val",
     "total_tokens": "total_tokens_val"
   }
 }

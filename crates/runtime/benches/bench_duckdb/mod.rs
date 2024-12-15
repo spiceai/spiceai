@@ -34,13 +34,15 @@ pub(crate) async fn run(
     let mut errors = Vec::new();
 
     for (query_name, query) in test_queries {
+        let verify_query_results =
+            query_name.starts_with("tpch_q") || query_name.starts_with("tpcds_q");
         if let Err(e) = super::run_query_and_record_result(
             rt,
             benchmark_results,
             "duckdb",
             query_name,
             query,
-            true,
+            verify_query_results,
         )
         .await
         {

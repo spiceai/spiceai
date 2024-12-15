@@ -28,6 +28,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/joho/godotenv"
 	"github.com/spf13/cobra"
 	"github.com/spiceai/spiceai/bin/spice/pkg/constants"
 	"github.com/spiceai/spiceai/bin/spice/pkg/github"
@@ -51,6 +52,7 @@ type RuntimeContext struct {
 	httpClient      *http.Client
 	apiKey          string
 	userAgent       string
+	extraHeaders    map[string]string
 }
 
 func NewContext() *RuntimeContext {
@@ -59,6 +61,7 @@ func NewContext() *RuntimeContext {
 		metricsEndpoint: "http://127.0.0.1:9090",
 		httpClient:      &http.Client{},
 		userAgent:       util.GetSpiceUserAgent("spice"),
+		extraHeaders:    make(map[string]string),
 	}
 	err := rtcontext.Init()
 	if err != nil {
@@ -143,6 +146,15 @@ func (c *RuntimeContext) Init() error {
 
 	c.appDir = cwd
 	c.podsDir = filepath.Join(c.appDir, constants.SpicePodsDirectoryName)
+
+	dotEnvValues, err := loadDotEnvValues()
+	if err != nil {
+		return err
+	}
+
+	if apiKey, ok := dotEnvValues["SPICE_SPICEAI_API_KEY"]; ok {
+		c.apiKey = apiKey
+	}
 
 	return nil
 }
@@ -324,6 +336,10 @@ func (c *RuntimeContext) SetApiKey(apiKey string) {
 	c.apiKey = apiKey
 }
 
+func (c *RuntimeContext) GetApiKey() string {
+	return c.apiKey
+}
+
 func (c *RuntimeContext) SetUserAgent(userAgent string) {
 	c.userAgent = userAgent
 }
@@ -336,19 +352,28 @@ func (c *RuntimeContext) SetUserAgentClient(client string) {
 	c.userAgent = util.GetSpiceUserAgent(client)
 }
 
-func (c *RuntimeContext) GetHeaders() http.Header {
-	headers := make(http.Header)
-	headers.Set("Content-Type", "application/json")
+func (c *RuntimeContext) AddHeaders(headers map[string]string) {
+	for key, value := range headers {
+		c.extraHeaders[key] = value
+	}
+}
+
+func (c *RuntimeContext) GetHeaders() map[string]string {
+	headers := make(map[string]string)
 
 	if c.isCloud {
 		apiKey := os.Getenv("SPICE_API_KEY")
 		if apiKey != "" {
-			headers.Set("X-API-Key", apiKey)
+			headers["X-API-Key"] = apiKey
 		}
 	}
 
 	if c.apiKey != "" {
-		headers.Set("X-API-Key", c.apiKey)
+		headers["X-API-Key"] = c.apiKey
+	}
+
+	for key, value := range c.extraHeaders {
+		headers[key] = value
 	}
 
 	return headers
@@ -360,4 +385,15 @@ func (c *RuntimeContext) IsCloud() bool {
 
 func (c *RuntimeContext) SetHttpEndpoint(endpoint string) {
 	c.httpEndpoint = endpoint
+}
+
+func loadDotEnvValues() (map[string]string, error) {
+	env_file := ".env"
+	if _, err := os.Stat(".env.local"); err == nil {
+		env_file = ".env.local"
+	} else if _, err := os.Stat(env_file); err != nil {
+		return nil, nil
+	}
+
+	return godotenv.Read(env_file)
 }

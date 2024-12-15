@@ -21,14 +21,22 @@ use std::{
 };
 
 use crate::embeddings::{
-    candle::ModelConfig, Error, FailedToInstantiateEmbeddingModelSnafu, Result,
+    candle::ModelConfig, Error, FailedToInstantiateEmbeddingModelSnafu, FailedWithHFApiSnafu,
+    Result,
 };
 use async_openai::types::EmbeddingInput;
-use hf_hub::{api::sync::ApiBuilder, Repo, RepoType};
+use hf_hub::{
+    api::tokio::{ApiBuilder, ApiRepo},
+    Repo, RepoType,
+};
 use serde::Deserialize;
 use snafu::ResultExt;
 use tei_backend::Pool;
-use tei_core::tokenization::EncodingInput;
+use tei_core::{
+    download::{download_artifacts, download_pool_config, download_st_config, ST_CONFIG_NAMES},
+    tokenization::EncodingInput,
+};
+
 use tempfile::tempdir;
 use tokenizers::Tokenizer;
 
@@ -87,15 +95,10 @@ pub(crate) fn inputs_from_openai(input: &EmbeddingInput) -> Vec<EncodingInput> {
     }
 }
 
-/// For a given `HuggingFace` repo, download the needed files to create a `CandleEmbedding`.
-pub(crate) fn download_hf_artifacts(
-    model_id: &str,
-    revision: Option<&str>,
-    hf_token: Option<String>,
-) -> Result<PathBuf> {
+fn get_api(model_id: &str, revision: Option<&str>, hf_token: Option<&str>) -> Result<ApiRepo> {
     let api = ApiBuilder::new()
         .with_progress(false)
-        .with_token(hf_token)
+        .with_token(hf_token.map(ToString::to_string))
         .build()
         .boxed()
         .context(FailedToInstantiateEmbeddingModelSnafu)?;
@@ -107,44 +110,80 @@ pub(crate) fn download_hf_artifacts(
     };
     let api_repo = api.repo(repo.clone());
 
-    tracing::trace!("Downloading 'config.json' for {}", repo.url());
-    api_repo
-        .get("config.json")
-        .boxed()
-        .context(FailedToInstantiateEmbeddingModelSnafu)?;
+    Ok(api_repo)
+}
 
-    tracing::trace!("Downloading 'tokenizer.json' for {}", repo.url());
-    api_repo
-        .get("tokenizer.json")
-        .boxed()
-        .context(FailedToInstantiateEmbeddingModelSnafu)?;
+pub async fn download_hf_file(
+    repo_id: &str,
+    revision: Option<&str>,
+    repo_type_opt: Option<&str>,
+    file: &str,
+    hf_token: Option<&str>,
+) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
+    let api = ApiBuilder::new()
+        .with_progress(false)
+        .with_token(hf_token.map(ToString::to_string))
+        .build()
+        .boxed()?;
 
-    tracing::trace!("Downloading 'model.safetensors' for {}", repo.url());
-    let model = if let Ok(p) = api_repo.get("model.safetensors") {
-        p
-    } else {
-        let p = api_repo
-            .get("pytorch_model.bin")
-            .boxed()
-            .context(FailedToInstantiateEmbeddingModelSnafu)?;
-        tracing::warn!("`model.safetensors` not found. Using `pytorch_model.bin` instead. Model loading will be significantly slower.");
-        p
+    let repo_type = match repo_type_opt {
+        Some("datasets") => RepoType::Dataset,
+        Some("spaces") => RepoType::Space,
+        _ => RepoType::Model,
     };
 
-    tracing::trace!("Downloading '1_Pooling/config.json' for {}", repo.url());
-    if let Err(e) = api_repo.get("1_Pooling/config.json") {
-        // May not be an issue, will be checked later.
-        tracing::trace!(
-            "`1_Pooling/config.json` not found for {model_id}@{revision}. Error: {e}",
-            revision = revision.unwrap_or_default()
-        );
-    }
+    let repo = if let Some(revision) = revision {
+        Repo::with_revision(repo_id.to_string(), repo_type, revision.to_string())
+    } else {
+        Repo::new(repo_id.to_string(), repo_type)
+    };
+    api.repo(repo).get(file).await.boxed()
+}
 
-    Ok(model
-        .parent()
-        .ok_or("".into())
-        .context(FailedToInstantiateEmbeddingModelSnafu)?
-        .to_path_buf())
+/// For a given `HuggingFace` repo, download the needed files to create a `CandleEmbedding`.
+pub(crate) async fn download_hf_artifacts(
+    model_id: &str,
+    revision: Option<&str>,
+    hf_token: Option<&str>,
+) -> Result<PathBuf> {
+    let api_repo = get_api(model_id, revision, hf_token)?;
+    let repo_url = api_repo.url("");
+
+    tracing::trace!("Downloading artifacts for {repo_url}");
+    let root_dir = download_artifacts(&api_repo)
+        .await
+        .context(FailedWithHFApiSnafu)?;
+
+    tracing::trace!("Downloading pool config for {repo_url}");
+    let _ = download_pool_config(&api_repo)
+        .await
+        .context(FailedWithHFApiSnafu)?;
+
+    tracing::trace!("Downloading sentence transformer config for {repo_url}");
+    let _ = download_st_config(&api_repo)
+        .await
+        .context(FailedWithHFApiSnafu)?;
+    Ok(root_dir)
+}
+
+/// For a local repo of model artifacts, attempt to find a relevant `sentence_transformers` config file, and extract the `max_seq_length` from it.
+///
+/// If no config file is found, or config files don't containt `max_seq_length`, return `None`.
+pub(crate) fn max_seq_length_from_st_config(
+    model_root: &Path,
+) -> Result<Option<usize>, serde_json::Error> {
+    #[derive(Debug, Deserialize)]
+    pub struct STConfig {
+        max_seq_length: usize,
+    }
+    for name in ST_CONFIG_NAMES {
+        let config_path = model_root.join(name);
+        if let Ok(config) = fs::read_to_string(config_path) {
+            let st_config: STConfig = serde_json::from_str(config.as_str())?;
+            return Ok(Some(st_config.max_seq_length));
+        }
+    }
+    Ok(None)
 }
 
 /// Create a temporary directory with the provided files softlinked into the base folder (i.e not nested). The files are linked with to names defined in the hashmap, as keys.

@@ -36,13 +36,16 @@ use clap::Parser;
 use datafusion::datasource::provider_as_source;
 use datafusion::logical_expr::{LogicalPlanBuilder, UNNAMED_TABLE};
 use datafusion::{dataframe::DataFrame, datasource::MemTable, execution::context::SessionContext};
+use futures::TryStreamExt;
 use results::BenchmarkResultsBuilder;
+use runtime::request::{Protocol, RequestContext, UserAgent};
 use runtime::{dataupdate::DataUpdate, Runtime};
 use spicepod::component::dataset::acceleration::{self, Acceleration, Mode};
 use spicepod::component::params::Params;
 
 mod results;
 mod setup;
+mod utils;
 
 mod bench_object_store;
 mod bench_spicecloud;
@@ -51,6 +54,8 @@ mod bench_spicecloud;
 mod bench_delta;
 #[cfg(feature = "duckdb")]
 mod bench_duckdb;
+#[cfg(feature = "mssql")]
+mod bench_mssql;
 #[cfg(feature = "mysql")]
 mod bench_mysql;
 #[cfg(feature = "odbc")]
@@ -93,6 +98,19 @@ async fn main() -> Result<(), String> {
         rustls::crypto::aws_lc_rs::default_provider(),
     );
 
+    let request_context = Arc::new(
+        RequestContext::builder(Protocol::Internal)
+            .with_user_agent(UserAgent::from_ua_str(&format!(
+                "spicebench/{}",
+                env!("CARGO_PKG_VERSION")
+            )))
+            .build(),
+    );
+
+    Box::pin(request_context.scope(bench_main())).await
+}
+
+async fn bench_main() -> Result<(), String> {
     let mut upload_results_dataset: Option<String> = None;
     if let Ok(env_var) = std::env::var("UPLOAD_RESULTS_DATASET") {
         println!("UPLOAD_RESULTS_DATASET: {env_var}");
@@ -108,6 +126,7 @@ async fn main() -> Result<(), String> {
                 "spice.ai",
                 "s3",
                 "abfs",
+                "file",
                 #[cfg(feature = "spark")]
                 "spark",
                 #[cfg(feature = "postgres")]
@@ -120,11 +139,13 @@ async fn main() -> Result<(), String> {
                 "odbc-databricks",
                 #[cfg(feature = "odbc")]
                 "odbc-athena",
-                #[cfg(feature = "delta_lake")]
+                #[cfg(all(feature = "delta_lake", feature = "databricks"))]
                 "delta_lake",
+                #[cfg(feature = "mssql")]
+                "mssql",
             ];
             for connector in connectors {
-                run_connector_bench(connector, &upload_results_dataset, args.bench_name.as_ref()).await?;
+                run_connector_bench(connector, upload_results_dataset.as_ref(), args.bench_name.as_ref()).await?;
             }
             let accelerators: Vec<Acceleration> = vec![
                 create_acceleration("arrow", acceleration::Mode::Memory, args.bench_name.as_ref()),
@@ -140,13 +161,13 @@ async fn main() -> Result<(), String> {
                 create_acceleration("postgres", acceleration::Mode::Memory, args.bench_name.as_ref()),
             ];
             for accelerator in accelerators {
-                run_accelerator_bench(accelerator.clone(), &upload_results_dataset, "tpch").await?;
-                run_accelerator_bench(accelerator, &upload_results_dataset, "tpcds").await?;
+                run_accelerator_bench(accelerator.clone(), upload_results_dataset.as_ref(), "tpch").await?;
+                run_accelerator_bench(accelerator, upload_results_dataset.as_ref(), "tpcds").await?;
             }
         },
         (Some(connector), None, None) => {
             // Run connector benchmark test
-            run_connector_bench(connector, &upload_results_dataset, args.bench_name.as_ref()).await?;
+            run_connector_bench(connector, upload_results_dataset.as_ref(), args.bench_name.as_ref()).await?;
         },
         (None, Some(accelerator), mode) => {
             // Run accelerator benchmark test
@@ -160,13 +181,13 @@ async fn main() -> Result<(), String> {
 
             match args.bench_name.as_ref() {
                 "tpch" => {
-                    run_accelerator_bench(acceleration, &upload_results_dataset, "tpch").await?;
+                    run_accelerator_bench(acceleration, upload_results_dataset.as_ref(), "tpch").await?;
                 }
                 "tpcds" => {
-                    run_accelerator_bench(acceleration, &upload_results_dataset, "tpcds").await?;
+                    run_accelerator_bench(acceleration, upload_results_dataset.as_ref(), "tpcds").await?;
                 }
                 "clickbench" => {
-                    run_accelerator_bench(acceleration, &upload_results_dataset, "clickbench").await?;
+                    run_accelerator_bench(acceleration, upload_results_dataset.as_ref(), "clickbench").await?;
                 }
                 _ => return Err(format!("Invalid mode bench_name parameter {}", args.bench_name)),
             }
@@ -179,7 +200,7 @@ async fn main() -> Result<(), String> {
 
 async fn run_connector_bench(
     connector: &str,
-    upload_results_dataset: &Option<String>,
+    upload_results_dataset: Option<&String>,
     bench_name: &str,
 ) -> Result<(), String> {
     let mut display_records = vec![];
@@ -191,7 +212,7 @@ async fn run_connector_bench(
         "spice.ai" => {
             bench_spicecloud::run(&mut rt, &mut benchmark_results).await?;
         }
-        "s3" => {
+        "s3" | "abfs" | "file" => {
             bench_object_store::run(
                 connector,
                 &mut rt,
@@ -199,17 +220,6 @@ async fn run_connector_bench(
                 None,
                 None,
                 bench_name,
-            )
-            .await?;
-        }
-        "abfs" => {
-            bench_object_store::run(
-                connector,
-                &mut rt,
-                &mut benchmark_results,
-                None,
-                None,
-                "tpch",
             )
             .await?;
         }
@@ -231,7 +241,7 @@ async fn run_connector_bench(
         }
         #[cfg(feature = "odbc")]
         "odbc-databricks" => {
-            bench_odbc_databricks::run(&mut rt, &mut benchmark_results).await?;
+            bench_odbc_databricks::run(&mut rt, &mut benchmark_results, bench_name).await?;
         }
         #[cfg(feature = "odbc")]
         "odbc-athena" => {
@@ -239,7 +249,11 @@ async fn run_connector_bench(
         }
         #[cfg(feature = "delta_lake")]
         "delta_lake" => {
-            bench_delta::run(&mut rt, &mut benchmark_results).await?;
+            bench_delta::run(&mut rt, &mut benchmark_results, bench_name).await?;
+        }
+        #[cfg(feature = "mssql")]
+        "mssql" => {
+            bench_mssql::run(&mut rt, &mut benchmark_results, bench_name).await?;
         }
         _ => {}
     }
@@ -248,7 +262,7 @@ async fn run_connector_bench(
     let mut records = data_update.data.clone();
     display_records.append(&mut records);
 
-    if let Some(upload_results_dataset) = upload_results_dataset.clone() {
+    if let Some(upload_results_dataset) = upload_results_dataset {
         tracing::info!("Writing benchmark results to dataset {upload_results_dataset}...");
         setup::write_benchmark_results(data_update, &rt).await?;
     }
@@ -259,7 +273,7 @@ async fn run_connector_bench(
 
 async fn run_accelerator_bench(
     accelerator: Acceleration,
-    upload_results_dataset: &Option<String>,
+    upload_results_dataset: Option<&String>,
     bench_name: &str,
 ) -> Result<(), String> {
     let mut display_records = vec![];
@@ -285,7 +299,7 @@ async fn run_accelerator_bench(
     let mut records = data_update.data.clone();
     display_records.append(&mut records);
 
-    if let Some(upload_results_dataset) = upload_results_dataset.clone() {
+    if let Some(upload_results_dataset) = upload_results_dataset {
         tracing::info!("Writing benchmark results to dataset {upload_results_dataset}...");
         setup::write_benchmark_results(data_update, &rt).await?;
     }
@@ -447,13 +461,17 @@ async fn run_query(
     query_name: &str,
     query: &str,
 ) -> Result<Vec<RecordBatch>, String> {
-    let res = rt
+    let query_result = rt
         .datafusion()
-        .ctx
-        .sql(query)
+        .query_builder(query)
+        .build()
+        .run()
         .await
-        .map_err(|e| format!("query `{connector}` `{query_name}` to plan: {e}"))?
-        .collect()
+        .map_err(|e| format!("query `{connector}` `{query_name}` to plan: {e}"))?;
+
+    let res = query_result
+        .data
+        .try_collect::<Vec<RecordBatch>>()
         .await
         .map_err(|e| format!("query `{connector}` `{query_name}` to results: {e}"))?;
 
@@ -468,8 +486,7 @@ async fn record_explain_plan(
     query_name: &str,
     query: &str,
 ) -> Result<(), String> {
-    // TODO: Turn on snapshot for tpcds queries after tpcds hardening
-    if query_name.starts_with("tpcds") || query_name.starts_with("clickbench") {
+    if query_name.starts_with("clickbench") {
         return Ok(());
     }
 

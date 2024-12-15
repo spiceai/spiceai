@@ -18,6 +18,7 @@ use crate::component::dataset::acceleration::{Engine, RefreshMode};
 use crate::component::dataset::Dataset;
 use crate::dataaccelerator::spice_sys::debezium_kafka::DebeziumKafkaSys;
 use crate::dataconnector::ConnectorComponent;
+use crate::datafusion::refresh_sql;
 use crate::federated_table::FederatedTable;
 use arrow::datatypes::SchemaRef;
 use async_stream::stream;
@@ -40,14 +41,17 @@ use super::{DataConnector, DataConnectorFactory, DataConnectorParams, ParameterS
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Invalid value for debezium_transport. Valid values: 'kafka'"))]
-    InvalidTransport,
+    #[snafu(display("Invalid value for 'debezium_transport': {transport}.\nSupported values: 'kafka'\nFor details, visit: https://docs.spiceai.org/components/data-connectors/debezium#parameters"))]
+    InvalidTransport { transport: String },
 
-    #[snafu(display("Invalid value for debezium_message_format: Valid values: 'json'"))]
-    InvalidMessageFormat,
+    #[snafu(display("Invalid value for 'debezium_message_format': {format}.\nSupported values: 'json'\nFor details, visit: https://docs.spiceai.org/components/data-connectors/debezium#parameters"))]
+    InvalidMessageFormat { format: String },
 
-    #[snafu(display("Missing required parameter: debezium_kafka_bootstrap_servers"))]
+    #[snafu(display("Missing required parameter: 'debezium_kafka_bootstrap_servers'. Specify a value.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/debezium#parameters"))]
     MissingKafkaBootstrapServers,
+
+    #[snafu(display("{source}"))]
+    RefreshSql { source: refresh_sql::Error },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -64,10 +68,16 @@ impl Debezium {
         let message_format = params.get("message_format").expose().ok().unwrap_or("json");
 
         if transport != "kafka" {
-            return InvalidTransportSnafu.fail();
+            return InvalidTransportSnafu {
+                transport: transport.to_string(),
+            }
+            .fail();
         }
         if message_format != "json" {
-            return InvalidMessageFormatSnafu.fail();
+            return InvalidMessageFormatSnafu {
+                format: message_format.to_string(),
+            }
+            .fail();
         }
 
         let kafka_config = KafkaConfig {
@@ -112,6 +122,16 @@ impl Debezium {
                 .to_string()
                 .parse()
                 .unwrap_or(true),
+            ssl_endpoint_identification_algorithm: params
+                .get("kafka_ssl_endpoint_identification_algorithm")
+                .expose()
+                .ok()
+                .unwrap_or("https")
+                .try_into()
+                .unwrap_or_else(|()| {
+                    tracing::warn!("Invalid value for 'kafka_ssl_endpoint_identification_algorithm'. Supported values: 'none', 'https'. Defaulting to 'https'.");
+                    data_components::kafka::SslIdentification::Https
+                }),
         };
 
         Ok(Self { kafka_config })
@@ -165,6 +185,9 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::runtime("kafka_enable_ssl_certificate_verification")
         .default("true")
         .description("Enable SSL/TLS certificate verification. Default: 'true'."),
+    ParameterSpec::runtime("kafka_ssl_endpoint_identification_algorithm")
+        .default("https")
+        .description("SSL/TLS endpoint identification algorithm. Default: 'https'. Options: 'none', 'https'."),
 ];
 
 impl DataConnectorFactory for DebeziumFactory {
@@ -271,7 +294,7 @@ impl DataConnector for Debezium {
                     connector_component: ConnectorComponent::from(dataset),
                 })?;
 
-                kafka_consumer.subscribe(&topic).boxed().context(
+                kafka_consumer.subscribe(topic).boxed().context(
                     super::UnableToGetReadProviderSnafu {
                         dataconnector: "debezium",
                         connector_component: ConnectorComponent::from(dataset),
@@ -280,11 +303,25 @@ impl DataConnector for Debezium {
 
                 (kafka_consumer, metadata, Arc::new(schema))
             }
-            None => get_metadata_from_kafka(dataset, &topic, self.kafka_config.clone()).await?,
+            None => get_metadata_from_kafka(dataset, topic, self.kafka_config.clone()).await?,
+        };
+
+        let refresh_sql = dataset.refresh_sql();
+        let refresh_schema = if let Some(refresh_sql) = &refresh_sql {
+            refresh_sql::validate_refresh_sql(dataset.name.clone(), refresh_sql.as_str(), schema)
+                .boxed()
+                .map_err(|e| super::DataConnectorError::InvalidConfiguration {
+                    dataconnector: "debezium".to_string(),
+                    message: format!("The refresh SQL is invalid: {e}"),
+                    connector_component: ConnectorComponent::from(dataset),
+                    source: e,
+                })?
+        } else {
+            schema
         };
 
         let debezium_kafka = Arc::new(DebeziumKafka::new(
-            schema,
+            refresh_schema,
             metadata.primary_keys,
             kafka_consumer,
         ));

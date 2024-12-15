@@ -18,7 +18,6 @@ use async_trait::async_trait;
 use std::sync::Arc;
 
 use crate::{
-    datafusion::query::Protocol,
     tools::{utils::parameters, SpiceModelTool},
     Runtime,
 };
@@ -84,7 +83,7 @@ impl SpiceModelTool for SqlTool {
 
             let query_result = rt
                 .datafusion()
-                .query_builder(&req.query, Protocol::Internal)
+                .query_builder(&req.query)
                 .build()
                 .run()
                 .await

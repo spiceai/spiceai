@@ -23,15 +23,17 @@ use crate::{
     dataconnector::{
         self,
         localpod::{LocalPodConnector, LOCALPOD_DATACONNECTOR},
-        DataConnector, DataConnectorParams, DataConnectorParamsBuilder,
+        ConnectorComponent, DataConnector, DataConnectorError, DataConnectorParams,
+        DataConnectorParamsBuilder, ODBC_DATACONNECTOR,
     },
     embeddings::connector::EmbeddingConnector,
+    error_spaced,
     federated_table::FederatedTable,
     metrics, status,
     tracing_util::dataset_registered_trace,
     warn_spaced, AcceleratedReadWriteTableWithoutReplicationSnafu,
     AcceleratedTableInvalidChangesSnafu, AcceleratorEngineNotAvailableSnafu,
-    AcceleratorInitializationFailedSnafu, Error, LogErrors, Result, Runtime,
+    AcceleratorInitializationFailedSnafu, Error, LogErrors, OdbcNotInstalledSnafu, Result, Runtime,
     UnableToAttachDataConnectorSnafu, UnableToCreateAcceleratedTableSnafu,
     UnableToInitializeDataConnectorSnafu, UnableToLoadDatasetConnectorSnafu,
     UnableToReceiveAcceleratedTableStatusSnafu, UnknownDataConnectorSnafu,
@@ -97,7 +99,7 @@ impl Runtime {
 
             // Get the parent dataset path from the localpod dataset
             let path = ds.path();
-            let path_table_ref = TableReference::parse_str(&path);
+            let path_table_ref = TableReference::parse_str(path);
 
             // Find and remove the parent dataset's future
             if let Some(parent_future) = dataset_futures.remove(&path_table_ref) {
@@ -176,13 +178,13 @@ impl Runtime {
         let spaced_tracer = Arc::clone(&self.spaced_tracer);
 
         let source = ds.source();
-        let params = DataConnectorParamsBuilder::new(source.clone().into(), (&ds).into())
+        let params = DataConnectorParamsBuilder::new(source.into(), (&ds).into())
             .with_runtime(self)
             .await
             .context(UnableToInitializeDataConnectorSnafu)?;
 
         let data_connector: Arc<dyn DataConnector> = match self
-            .get_dataconnector_from_source(&source, params)
+            .get_dataconnector_from_source(source, params)
             .await
         {
             Ok(data_connector) => data_connector,
@@ -234,6 +236,7 @@ impl Runtime {
         .await;
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn register_loaded_dataset(
         &self,
         ds: Arc<Dataset>,
@@ -282,7 +285,11 @@ impl Runtime {
                     self.status
                         .update_dataset(&ds.name, status::ComponentStatus::Error);
                     metrics::datasets::LOAD_ERROR.add(1, &[]);
-                    warn_spaced!(spaced_tracer, "{}{err}", "");
+                    if let DataConnectorError::UnsupportedDataType { .. } = err {
+                        error_spaced!(spaced_tracer, "{}{err}", "");
+                    } else {
+                        warn_spaced!(spaced_tracer, "{}{err}", "");
+                    }
                     return UnableToLoadDatasetConnectorSnafu {
                         dataset: ds.name.clone(),
                     }
@@ -297,7 +304,7 @@ impl Runtime {
                 RegisterDatasetContext {
                     data_connector: Arc::clone(&connector),
                     federated_read_table: federated_table,
-                    source,
+                    source: source.to_string(),
                     accelerated_table,
                 },
             )
@@ -335,13 +342,15 @@ impl Runtime {
                     .update_dataset(&ds.name, status::ComponentStatus::Error);
                 metrics::datasets::LOAD_ERROR.add(1, &[]);
                 if let Error::UnableToAttachDataConnector {
-                    source: crate::datafusion::Error::RefreshSql { source },
+                    source: crate::datafusion::Error::RefreshSql { .. },
+                    connector_component: _,
                     data_connector: _,
                 } = &err
                 {
-                    tracing::error!("{source}");
+                    error_spaced!(spaced_tracer, "{}{err}", "");
+                } else {
+                    warn_spaced!(spaced_tracer, "{}{err}", "");
                 }
-                warn_spaced!(spaced_tracer, "{}{err}", "");
 
                 Err(err)
             }
@@ -396,15 +405,6 @@ impl Runtime {
                 }
 
                 self.remove_dataset(&ds).await;
-
-                // Initialize file mode accelerator when reloading with file mode acceleration
-                // Fail when there's no successfully initiated dataset
-                if ds.is_file_accelerated() {
-                    let datasets = self.initialize_accelerators(&[Arc::clone(&ds)]).await;
-                    if datasets.is_empty() {
-                        return;
-                    }
-                }
 
                 if self
                     .register_loaded_dataset(Arc::clone(&ds), Arc::clone(&connector), None)
@@ -499,10 +499,16 @@ impl Runtime {
 
         match dataconnector::create_new_connector(source, params).await {
             Some(dc) => dc.context(UnableToInitializeDataConnectorSnafu {}),
-            None => UnknownDataConnectorSnafu {
-                data_connector: source,
+            None => {
+                if source == ODBC_DATACONNECTOR {
+                    OdbcNotInstalledSnafu.fail()
+                } else {
+                    UnknownDataConnectorSnafu {
+                        data_connector: source,
+                    }
+                    .fail()
+                }
             }
-            .fail(),
         }
     }
 
@@ -525,7 +531,7 @@ impl Runtime {
             let ds_name: TableReference = ds.name.clone();
             self.df
                 .register_table(
-                    ds,
+                    Arc::clone(&ds),
                     crate::datafusion::Table::Federated {
                         data_connector,
                         federated_read_table,
@@ -534,6 +540,7 @@ impl Runtime {
                 .await
                 .context(UnableToAttachDataConnectorSnafu {
                     data_connector: source,
+                    connector_component: ConnectorComponent::from(&ds),
                 })?;
 
             self.status
@@ -565,7 +572,7 @@ impl Runtime {
             .update_dataset(&ds.name, status::ComponentStatus::Refreshing);
         self.df
             .register_table(
-                ds,
+                Arc::clone(&ds),
                 crate::datafusion::Table::Accelerated {
                     source: data_connector,
                     federated_read_table,
@@ -576,14 +583,16 @@ impl Runtime {
             .await
             .context(UnableToAttachDataConnectorSnafu {
                 data_connector: source,
+                connector_component: ConnectorComponent::from(&ds),
             })
     }
 
     pub(crate) async fn apply_dataset_diff(&self, current_app: &Arc<App>, new_app: &Arc<App>) {
         let valid_datasets = Self::get_valid_datasets(new_app, LogErrors(true));
+        let initialized_datasets = self.initialize_accelerators(&valid_datasets).await;
         let existing_datasets = Self::get_valid_datasets(current_app, LogErrors(false));
 
-        for ds in valid_datasets {
+        for ds in initialized_datasets {
             if let Some(current_ds) = existing_datasets.iter().find(|d| d.name == ds.name) {
                 if ds != *current_ds {
                     self.update_dataset(ds).await;

@@ -1,0 +1,97 @@
+---
+name: search benchmark tests
+
+on:
+  schedule:
+    - cron: '0 10 * * 6' # Runs at 10 AM UTC (2AM PT) on Saturdays.
+  workflow_dispatch:
+    inputs:
+      run_all:
+        description: 'Run all benchmarks'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+      selected_configuration:
+        description: 'Individual configuration to run'
+        required: false
+        default: 'quora_minilm-l6-v2_arrow'
+        type: choice
+        options:
+          - 'quora_minilm-l6-v2_arrow'
+          - 'quora_openai-text-embedding-3-small_arrow'
+
+env:
+  FEATURES: 'models,duckdb'
+
+jobs:
+  build-bench-binary:
+    name: Build benchmark binary
+    timeout-minutes: 30
+    runs-on: spiceai-runners
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+        with:
+          os: 'linux'
+
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v3
+
+      - name: Install the cc tool chain for building benchmark binary
+        uses: ./.github/actions/setup-cc
+
+      - name: Build benchmark binary
+        run: cargo bench -p runtime --bench vector_search --features ${{ env.FEATURES }} --profile release --no-run
+
+      - name: Find, move, and rename benchmark binary
+        run: find target/release/deps -type f -name "vector_search-*" ! -name "*.d" -exec mv {} ./spice_bench \;
+
+      - name: Upload benchmark binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: spice_bench
+          path: ./spice_bench
+
+  run-bench:
+    name: Run ${{ matrix.name }}
+    timeout-minutes: 60
+    runs-on: spiceai-runners
+    needs: build-bench-binary
+
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        include:
+          - cmd: '--configuration quora_minilm-l6-v2_arrow'
+            name: 'quora_minilm-l6-v2_arrow'
+          - cmd: '--configuration quora_openai-text-embedding-3-small_arrow'
+            name: 'quora_openai-text-embedding-3-small_arrow'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up API Keys
+        run: |
+          echo 'SPICE_OPENAI_API_KEY="${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}"' > .env
+
+      - name: Download benchmark binary
+        uses: actions/download-artifact@v4
+        with:
+          name: spice_bench
+
+      - name: Make benchmark binary executable
+        run: chmod +x ./spice_bench
+
+      - name: Benchmark ${{ matrix.name }}
+        if: github.event.inputs.selected_configuration == matrix.name || github.event.inputs.run_all == 'true' || github.event_name == 'schedule'
+        run: ./spice_bench ${{ matrix.cmd }}
+
+      - name: Remove spice_bench file
+        run: |
+          rm -f spice_bench

@@ -16,7 +16,7 @@ limitations under the License.
 
 use crate::component::dataset::Dataset;
 use async_trait::async_trait;
-use data_components::Read;
+use data_components::{Read, ReadWrite};
 use datafusion::datasource::TableProvider;
 use datafusion_table_providers::postgres::PostgresTableFactory;
 use datafusion_table_providers::sql::db_connection_pool::dbconnection;
@@ -81,7 +81,11 @@ impl DataConnectorFactory for PostgresFactory {
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             match PostgresConnectionPool::new(params.parameters.to_secret_map()).await {
-                Ok(pool) => {
+                Ok(mut pool) => {
+                    if let Some(invalid_type_action) = params.invalid_type_action {
+                        pool = pool.with_invalid_type_action(invalid_type_action);
+                    }
+
                     let postgres_factory = PostgresTableFactory::new(Arc::new(pool));
                     Ok(Arc::new(Postgres { postgres_factory }) as Arc<dyn DataConnector>)
                 }
@@ -117,6 +121,10 @@ impl DataConnectorFactory for PostgresFactory {
         })
     }
 
+    fn supports_invalid_type_action(&self) -> bool {
+        true
+    }
+
     fn prefix(&self) -> &'static str {
         "pg"
     }
@@ -130,6 +138,55 @@ impl DataConnectorFactory for PostgresFactory {
 impl DataConnector for Postgres {
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    async fn read_write_provider(
+        &self,
+        dataset: &Dataset,
+    ) -> Option<super::DataConnectorResult<Arc<dyn TableProvider>>> {
+        match ReadWrite::table_provider(
+            &self.postgres_factory,
+            dataset.path().into(),
+            dataset.schema(),
+        )
+        .await
+        {
+            Ok(provider) => Some(Ok(provider)),
+            Err(e) => {
+                if let Some(err_source) = e.source() {
+                    match err_source.downcast_ref::<dbconnection::Error>() {
+                        Some(dbconnection::Error::UndefinedTable {
+                            table_name,
+                            source: _,
+                        }) => {
+                            return Some(Err(DataConnectorError::InvalidTableName {
+                                dataconnector: "postgres".to_string(),
+                                connector_component: ConnectorComponent::from(dataset),
+                                table_name: table_name.clone(),
+                            }));
+                        }
+                        Some(dbconnection::Error::UnsupportedDataType {
+                            data_type,
+                            field_name,
+                        }) => {
+                            return Some(Err(DataConnectorError::UnsupportedDataType {
+                                dataconnector: "postgres".to_string(),
+                                connector_component: ConnectorComponent::from(dataset),
+                                data_type: data_type.clone(),
+                                field_name: field_name.clone(),
+                            }));
+                        }
+                        _ => {}
+                    }
+                }
+
+                return Some(Err(DataConnectorError::UnableToGetReadProvider {
+                    dataconnector: "postgres".to_string(),
+                    connector_component: ConnectorComponent::from(dataset),
+                    source: e,
+                }));
+            }
+        }
     }
 
     async fn read_provider(
@@ -146,16 +203,29 @@ impl DataConnector for Postgres {
             Ok(provider) => Ok(provider),
             Err(e) => {
                 if let Some(err_source) = e.source() {
-                    if let Some(dbconnection::Error::UndefinedTable {
-                        table_name,
-                        source: _,
-                    }) = err_source.downcast_ref::<dbconnection::Error>()
-                    {
-                        return Err(DataConnectorError::InvalidTableName {
-                            dataconnector: "postgres".to_string(),
-                            connector_component: ConnectorComponent::from(dataset),
-                            table_name: table_name.clone(),
-                        });
+                    match err_source.downcast_ref::<dbconnection::Error>() {
+                        Some(dbconnection::Error::UndefinedTable {
+                            table_name,
+                            source: _,
+                        }) => {
+                            return Err(DataConnectorError::InvalidTableName {
+                                dataconnector: "postgres".to_string(),
+                                connector_component: ConnectorComponent::from(dataset),
+                                table_name: table_name.clone(),
+                            });
+                        }
+                        Some(dbconnection::Error::UnsupportedDataType {
+                            data_type,
+                            field_name,
+                        }) => {
+                            return Err(DataConnectorError::UnsupportedDataType {
+                                dataconnector: "postgres".to_string(),
+                                connector_component: ConnectorComponent::from(dataset),
+                                data_type: data_type.clone(),
+                                field_name: field_name.clone(),
+                            });
+                        }
+                        _ => {}
                     }
                 }
 

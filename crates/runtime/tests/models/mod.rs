@@ -14,13 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use arrow::{array::StringArray, util::pretty::pretty_format_batches};
+use arrow::util::pretty::pretty_format_batches;
 use async_openai::types::EmbeddingInput;
-use chrono::{DateTime, Utc};
 use futures::TryStreamExt;
 use rand::Rng;
 use reqwest::{header::HeaderMap, Client};
-use runtime::{config::Config, datafusion::query::Protocol, Runtime};
+use runtime::{config::Config, Runtime};
 use secrecy::SecretString;
 use snafu::ResultExt;
 use spicepod::component::{
@@ -36,6 +35,119 @@ use std::{
 use serde_json::{json, Value};
 mod hf;
 mod openai;
+
+mod nsql {
+    use chrono::{DateTime, Utc};
+    use http::{
+        header::{ACCEPT, CONTENT_TYPE},
+        HeaderMap, HeaderValue,
+    };
+    use opentelemetry_sdk::trace::TracerProvider;
+
+    use crate::models::http_post;
+
+    pub struct TestCase {
+        pub name: &'static str,
+        pub body: serde_json::Value,
+    }
+
+    pub async fn run_nsql_test(
+        base_url: &str,
+        ts: &TestCase,
+        trace_provider: &TracerProvider,
+    ) -> Result<(), anyhow::Error> {
+        tracing::info!("Running test cases {}", ts.name);
+        let task_start_time = std::time::SystemTime::now();
+
+        // Call /v1/nsql, check response
+        let mut headers = HeaderMap::new();
+        headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        let response = match http_post(
+            format!("{base_url}/v1/nsql").as_str(),
+            &ts.body.to_string(),
+            headers,
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(e) => {
+                tracing::error!("run_nsql_test error: {:?}", e);
+                insta::assert_snapshot!(format!("{}_error", ts.name), e.to_string());
+                return Ok(());
+            }
+        };
+        insta::assert_snapshot!(format!("{}_response", ts.name), &response);
+
+        // ensure all spans are exported into task_history
+        let _ = trace_provider.force_flush();
+
+        // Check task_history table for expected rows.
+        let mut headers = HeaderMap::new();
+        headers.insert(ACCEPT, HeaderValue::from_static("text/plain"));
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+
+        let response = http_post(
+            format!("{base_url}/v1/sql").as_str(),
+            format!(
+                r#"SELECT task, input
+                        FROM runtime.task_history
+                        WHERE task NOT IN ('ai_completion', 'health', 'accelerated_refresh')
+                        AND start_time > '{}'
+                        ORDER BY start_time, task;
+                    "#,
+                Into::<DateTime<Utc>>::into(task_start_time).to_rfc3339()
+            )
+            .as_str(),
+            headers,
+        )
+        .await
+        .map_err(anyhow::Error::msg)?;
+
+        insta::assert_snapshot!(format!("{}_tasks", ts.name), response,);
+
+        Ok(())
+    }
+}
+
+mod search {
+    use http::{
+        header::{ACCEPT, CONTENT_TYPE},
+        HeaderMap, HeaderValue,
+    };
+
+    use crate::models::{http_post, normalize_search_response};
+
+    pub struct TestCase {
+        pub name: &'static str,
+        pub body: serde_json::Value,
+    }
+
+    pub async fn run_search_test(base_url: &str, ts: &TestCase) -> Result<(), anyhow::Error> {
+        tracing::info!("Running test cases {}", ts.name);
+
+        // Call /v1/search, check response
+        let mut headers = HeaderMap::new();
+        headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        let response_str = http_post(
+            &format!("{base_url}/v1/search").to_string(),
+            &ts.body.to_string(),
+            headers,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to execute HTTP POST: {}", e))?;
+
+        let response = serde_json::from_str(&response_str)
+            .map_err(|e| anyhow::anyhow!("Failed to parse HTTP response: {}", e))?;
+
+        insta::assert_snapshot!(
+            format!("{}_response", ts.name),
+            normalize_search_response(response)
+        );
+        Ok(())
+    }
+}
 
 fn create_api_bindings_config() -> Config {
     let mut rng = rand::thread_rng();
@@ -76,10 +188,10 @@ fn get_taxi_trips_dataset() -> Dataset {
     dataset
 }
 
-fn get_tpcds_dataset(ds_name: &str) -> Dataset {
+fn get_tpcds_dataset(ds_name: &str, spice_name: Option<&str>) -> Dataset {
     let mut dataset = Dataset::new(
         format!("s3://spiceai-public-datasets/tpcds/{ds_name}/"),
-        ds_name,
+        spice_name.unwrap_or(ds_name),
     );
     dataset.params = Some(Params::from_string_map(
         vec![
@@ -91,96 +203,13 @@ fn get_tpcds_dataset(ds_name: &str) -> Dataset {
     ));
     dataset.acceleration = Some(Acceleration {
         enabled: true,
-        refresh_sql: Some(format!("SELECT * FROM {ds_name} LIMIT 20")),
+        refresh_sql: Some(format!(
+            "SELECT * FROM {} LIMIT 20",
+            spice_name.unwrap_or(ds_name)
+        )),
         ..Default::default()
     });
     dataset
-}
-
-fn json_is_single_row_with_value(json: &Value, expected_value: i64) -> bool {
-    json.as_array()
-        .filter(|array| array.len() == 1)
-        .and_then(|array| array.first())
-        .map_or(false, |item| {
-            item.as_object().map_or(false, |map| {
-                map.values()
-                    .any(|value| value == &Value::from(expected_value))
-            })
-        })
-}
-
-async fn send_nsql_request(
-    base_url: &str,
-    query: &str,
-    model: Option<&str>,
-    sample_data_enabled: Option<bool>,
-    datasets: Option<Vec<String>>,
-) -> Result<Value, reqwest::Error> {
-    let mut request_body = json!({
-        "query": query,
-    });
-
-    if let Some(m) = model {
-        request_body["model"] = json!(m);
-    }
-    if let Some(sde) = sample_data_enabled {
-        request_body["sample_data_enabled"] = json!(sde);
-    }
-    if let Some(ds) = datasets {
-        request_body["datasets"] = json!(ds);
-    }
-    let response = Client::new()
-        .post(format!("{base_url}/v1/nsql"))
-        .header("Content-Type", "application/json")
-        .json(&request_body)
-        .send()
-        .await?
-        .error_for_status()?
-        .json::<Value>()
-        .await?;
-
-    Ok(response)
-}
-
-async fn send_search_request(
-    base_url: &str,
-    text: &str,
-    limit: Option<usize>,
-    datasets: Option<Vec<String>>,
-    where_cond: Option<&str>,
-    additional_columns: Option<Vec<String>>,
-) -> Result<Value, reqwest::Error> {
-    let mut request_body = json!({
-        "text": text,
-    });
-
-    if let Some(limit) = limit {
-        request_body["limit"] = json!(limit);
-    }
-
-    if let Some(ds) = datasets {
-        request_body["datasets"] = json!(ds);
-    }
-
-    if let Some(where_cond) = where_cond {
-        request_body["where_cond"] = json!(where_cond);
-    }
-
-    if let Some(columns) = additional_columns {
-        request_body["additional_columns"] = json!(columns);
-    }
-
-    let response = Client::new()
-        .post(format!("{base_url}/v1/search"))
-        .header("Content-Type", "application/json")
-        .json(&request_body)
-        .send()
-        .await?
-        .error_for_status()?
-        .json::<Value>()
-        .await?;
-
-    Ok(response)
 }
 
 /// Normalizes vector similarity search response for consistent snapshot testing by replacing dynamic
@@ -197,6 +226,8 @@ fn normalize_search_response(mut json: Value) -> String {
     if let Some(duration) = json.get_mut("duration_ms") {
         *duration = json!("duration_ms_val");
     }
+
+    sort_json_keys(&mut json);
 
     serde_json::to_string_pretty(&json).unwrap_or_default()
 }
@@ -215,6 +246,8 @@ fn normalize_embeddings_response(mut json: Value) -> String {
             }
         }
     }
+
+    sort_json_keys(&mut json);
 
     serde_json::to_string_pretty(&json).unwrap_or_default()
 }
@@ -243,6 +276,12 @@ fn normalize_chat_completion_response(mut json: Value, normalize_message_content
         if let Some(completion_tokens) = usage.get_mut("completion_tokens") {
             *completion_tokens = json!("completion_tokens_val");
         }
+        if let Some(completion_tokens_details) = usage.get_mut("completion_tokens_details") {
+            *completion_tokens_details = json!("completion_tokens_details_val");
+        }
+        if let Some(prompt_tokens_details) = usage.get_mut("prompt_tokens_details") {
+            *prompt_tokens_details = json!("prompt_tokens_details_val");
+        }
         if let Some(prompt_tokens) = usage.get_mut("prompt_tokens") {
             *prompt_tokens = json!("prompt_tokens_val");
         }
@@ -259,7 +298,35 @@ fn normalize_chat_completion_response(mut json: Value, normalize_message_content
         *id = json!("id_val");
     }
 
+    sort_json_keys(&mut json);
+
     serde_json::to_string_pretty(&json).unwrap_or_default()
+}
+
+/// Sorts the keys of a JSON object in place for consistent snapshot testing
+fn sort_json_keys(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            let mut sorted_map = serde_json::Map::new();
+            let mut keys: Vec<_> = map.keys().cloned().collect();
+            keys.sort();
+
+            for key in keys {
+                if let Some(mut val) = map.remove(&key) {
+                    sort_json_keys(&mut val); // Recurse into nested objects
+                    sorted_map.insert(key, val);
+                }
+            }
+
+            *map = sorted_map;
+        }
+        Value::Array(array) => {
+            for element in array.iter_mut() {
+                sort_json_keys(element);
+            }
+        }
+        _ => {}
+    }
 }
 
 async fn send_embeddings_request(
@@ -334,23 +401,28 @@ async fn send_chat_completions_request(
 }
 
 /// Generic function to send a POST request, returning the response as a String.
-async fn http_post(
-    url: &str,
-    body: &str,
-    headers: HeaderMap,
-) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    Client::new()
+pub async fn http_post(url: &str, body: &str, headers: HeaderMap) -> Result<String, anyhow::Error> {
+    let response = Client::new()
         .post(url)
         .headers(headers)
         .body(body.to_string())
         .send()
         .await
-        .boxed()?
-        .error_for_status()
-        .boxed()?
+        .map_err(|e| anyhow::anyhow!("Request error: {e}"))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let message = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "No error message".to_string());
+        return Err(anyhow::anyhow!("HTTP error: {status} - {message}"));
+    }
+
+    response
         .text()
         .await
-        .boxed()
+        .map_err(|e| anyhow::anyhow!("Error reading response body: {e}")) // Map body read error to anyhow
 }
 
 /// Returns a human-readable representation of the SQL query result against a [`Runtime`].
@@ -360,7 +432,7 @@ async fn sql_to_display(
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let data = rt
         .datafusion()
-        .query_builder(query, Protocol::Internal)
+        .query_builder(query)
         .build()
         .run()
         .await
@@ -370,45 +442,6 @@ async fn sql_to_display(
         .await
         .boxed()?;
     pretty_format_batches(&data).map(|d| format!("{d}")).boxed()
-}
-
-/// Retrieves executed tasks from the task history since the given timestamp.
-async fn get_executed_tasks(
-    rt: &Runtime,
-    since: DateTime<Utc>,
-) -> Result<Vec<(String, String)>, anyhow::Error> {
-    let query = format!("SELECT task, input FROM runtime.task_history WHERE start_time >= '{}' ORDER BY start_time, task;", since.to_rfc3339());
-    let query_result = rt
-        .datafusion()
-        .query_builder(&query, Protocol::Internal)
-        .build()
-        .run()
-        .await?;
-    let data = query_result.data.try_collect::<Vec<_>>().await?;
-
-    let mut tasks = Vec::new();
-
-    for batch in data {
-        let task_column = batch
-            .column(batch.schema().index_of("task")?)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or(anyhow::anyhow!("Failed to downcast column to StringArray"))?;
-
-        let input_column = batch
-            .column(batch.schema().index_of("input")?)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or(anyhow::anyhow!("Failed to downcast column to StringArray"))?;
-
-        for i in 0..batch.num_rows() {
-            let task = task_column.value(i).to_string();
-            let input = input_column.value(i).to_string();
-            tasks.push((task, input));
-        }
-    }
-
-    Ok(tasks)
 }
 
 async fn get_params_with_secrets(
@@ -428,9 +461,4 @@ async fn get_params_with_secrets(
         .collect::<HashMap<_, _>>();
 
     rt.get_params_with_secrets(&params).await
-}
-
-fn pretty_json_str(json_str: &str) -> Result<String, serde_json::Error> {
-    let json: Value = serde_json::from_str(json_str)?;
-    serde_json::to_string_pretty(&json)
 }

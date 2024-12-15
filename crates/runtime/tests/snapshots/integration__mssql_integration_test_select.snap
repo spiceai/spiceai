@@ -1,0 +1,14 @@
+---
+source: crates/runtime/tests/integration.rs
+description: "Query: SELECT * FROM test"
+snapshot_kind: text
+---
++---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                                                                                                                             |
++---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | BytesProcessedNode                                                                                                                                                                                                                               |
+|               |   TableScan: test projection=[id, col_bit, col_tiny, col_short, col_long, col_longlong, col_float, col_double, col_timestamp, col_datetime, col_date, col_time, col_blob, col_varchar, col_string, col_var_string, col_decimal, col_char]        |
+| physical_plan | BytesProcessedExec                                                                                                                                                                                                                               |
+|               |   SqlServerExec sql=SELECT id, col_bit, col_tiny, col_short, col_long, col_longlong, col_float, col_double, col_timestamp, col_datetime, col_date, col_time, col_blob, col_varchar, col_string, col_var_string, col_decimal, col_char FROM test  |
+|               |                                                                                                                                                                                                                                                  |
++---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+

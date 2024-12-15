@@ -16,7 +16,7 @@ limitations under the License.
 
 #![allow(clippy::missing_errors_doc)]
 
-use std::{collections::HashMap, fmt::Display, path::PathBuf, str::FromStr, sync::Arc};
+use std::{collections::HashMap, path::PathBuf};
 
 use snafu::prelude::*;
 pub use spicepod;
@@ -25,6 +25,7 @@ use spicepod::{
         catalog::Catalog,
         dataset::Dataset,
         embeddings::Embeddings,
+        eval::Eval,
         extension::Extension,
         model::Model,
         runtime::{CorsConfig, ResultsCache, Runtime, TlsConfig},
@@ -35,7 +36,9 @@ use spicepod::{
     Spicepod,
 };
 
-#[derive(Debug, PartialEq)]
+pub mod runtime;
+
+#[derive(Debug, PartialEq, Clone)]
 pub struct App {
     pub name: String,
 
@@ -53,6 +56,8 @@ pub struct App {
 
     pub embeddings: Vec<Embeddings>,
 
+    pub evals: Vec<Eval>,
+
     pub tools: Vec<Tool>,
 
     pub spicepods: Vec<Spicepod>,
@@ -61,28 +66,6 @@ pub struct App {
 }
 
 impl App {
-    /// Get a parameter from the app's runtime params, with a default value if the parameter is not set or is not valid.
-    ///
-    /// Returns `default_value` if the parameter is not set or is not valid.
-    ///
-    /// If the parameter is set but is not valid, logs a warning and returns `default_value`.
-    #[must_use]
-    pub fn get_runtime_param<T>(app: &Option<Arc<Self>>, param: &str, default_value: T) -> T
-    where
-        T: Display + FromStr,
-    {
-        let Some(value) = app.as_ref().and_then(|app| app.runtime.params.get(param)) else {
-            return default_value;
-        };
-
-        if let Ok(parsed_value) = value.parse::<T>() {
-            parsed_value
-        } else {
-            eprintln!("runtime.params.{param} is not valid, defaulting to {default_value}");
-            default_value
-        }
-    }
-
     /// Retrieve all dataset names that are of a specific connector type.
     #[must_use]
     pub fn datasets_of_connector_type(&self, prefix: &str) -> Vec<String> {
@@ -114,6 +97,7 @@ pub struct AppBuilder {
     views: Vec<View>,
     models: Vec<Model>,
     embeddings: Vec<Embeddings>,
+    evals: Vec<Eval>,
     tools: Vec<Tool>,
     spicepods: Vec<Spicepod>,
     runtime: Runtime,
@@ -130,6 +114,7 @@ impl AppBuilder {
             views: vec![],
             models: vec![],
             embeddings: vec![],
+            evals: vec![],
             tools: vec![],
             spicepods: vec![],
             runtime: Runtime::default(),
@@ -145,6 +130,7 @@ impl AppBuilder {
         self.views.extend(spicepod.views.clone());
         self.models.extend(spicepod.models.clone());
         self.embeddings.extend(spicepod.embeddings.clone());
+        self.evals.extend(spicepod.evals.clone());
         self.tools.extend(spicepod.tools.clone());
         self.spicepods.push(spicepod);
         self
@@ -187,6 +173,12 @@ impl AppBuilder {
     }
 
     #[must_use]
+    pub fn with_eval(mut self, eval: Eval) -> AppBuilder {
+        self.evals.push(eval);
+        self
+    }
+
+    #[must_use]
     pub fn with_embedding(mut self, embedding: Embeddings) -> AppBuilder {
         self.embeddings.push(embedding);
         self
@@ -223,6 +215,12 @@ impl AppBuilder {
     }
 
     #[must_use]
+    pub fn with_runtime(mut self, runtime: Runtime) -> AppBuilder {
+        self.runtime = runtime;
+        self
+    }
+
+    #[must_use]
     pub fn build(self) -> App {
         App {
             name: self.name,
@@ -233,6 +231,7 @@ impl AppBuilder {
             views: self.views,
             models: self.models,
             embeddings: self.embeddings,
+            evals: self.evals,
             tools: self.tools,
             spicepods: self.spicepods,
             runtime: self.runtime,
@@ -251,6 +250,7 @@ impl AppBuilder {
         let mut views: Vec<View> = vec![];
         let mut models: Vec<Model> = vec![];
         let mut embeddings: Vec<Embeddings> = vec![];
+        let mut evals: Vec<Eval> = vec![];
         let mut tools: Vec<Tool> = vec![];
 
         for catalog in &spicepod_root.catalogs {
@@ -271,6 +271,10 @@ impl AppBuilder {
 
         for embedding in &spicepod_root.embeddings {
             embeddings.push(embedding.clone());
+        }
+
+        for eval in &spicepod_root.evals {
+            evals.push(eval.clone());
         }
 
         for tool in &spicepod_root.tools {
@@ -301,6 +305,11 @@ impl AppBuilder {
             for embedding in &dependent_spicepod.embeddings {
                 embeddings.push(embedding.clone());
             }
+
+            for eval in &dependent_spicepod.evals {
+                evals.push(eval.clone());
+            }
+
             for tool in &dependent_spicepod.tools {
                 tools.push(tool.clone());
             }
@@ -318,50 +327,10 @@ impl AppBuilder {
             views,
             models,
             embeddings,
+            evals,
             tools,
             spicepods,
             runtime,
         })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::collections::HashMap;
-
-    fn create_app_with_params(params: HashMap<String, String>) -> Arc<App> {
-        Arc::new(AppBuilder::new("test").with_runtime_params(params).build())
-    }
-
-    #[test]
-    fn test_get_runtime_param() {
-        // Test case 1: Parameter is not set
-        let app = Some(create_app_with_params(HashMap::new()));
-        assert!(App::get_runtime_param(&app, "test_param", true));
-        assert!(!App::get_runtime_param(&app, "test_param", false));
-
-        // Test case 2: Parameter is set to "true"
-        let mut params = HashMap::new();
-        params.insert("test_param".to_string(), "true".to_string());
-        let app = Some(create_app_with_params(params));
-        assert!(App::get_runtime_param(&app, "test_param", false));
-
-        // Test case 3: Parameter is set to "false"
-        let mut params = HashMap::new();
-        params.insert("test_param".to_string(), "false".to_string());
-        let app = Some(create_app_with_params(params));
-        assert!(!App::get_runtime_param(&app, "test_param", true));
-
-        // Test case 4: Parameter is set to an invalid boolean value
-        let mut params = HashMap::new();
-        params.insert("test_param".to_string(), "not_a_bool".to_string());
-        let app = Some(create_app_with_params(params));
-        assert!(App::get_runtime_param(&app, "test_param", true));
-        assert!(!App::get_runtime_param(&app, "test_param", false));
-
-        // Test case 5: App is None
-        assert!(App::get_runtime_param(&None, "test_param", true));
-        assert!(!App::get_runtime_param(&None, "test_param", false));
     }
 }

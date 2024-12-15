@@ -253,6 +253,14 @@ pub struct Acceleration {
     pub disable_query_push_down: bool,
 }
 
+impl Acceleration {
+    #[must_use]
+    pub fn with_primary_key(mut self, primary_key: ColumnReference) -> Self {
+        self.primary_key = Some(primary_key);
+        self
+    }
+}
+
 impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
     type Error = crate::Error;
 

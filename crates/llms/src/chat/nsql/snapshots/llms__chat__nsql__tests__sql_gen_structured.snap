@@ -6,7 +6,7 @@ expression: req_str
   "messages": [
     {
       "role": "system",
-      "content": "Task: Write a SQL query to answer this question: _\\\"SELECT * FROM table\\\"_. Instruction: Return only valid SQL code, nothing additional. Columns with capitals must be quoted. For tables with schemas and catalogs '\"catalog\".\"schema\".\"table\"' not '\"catalog.schema.table\"'."
+      "content": "Task: Write a SQL query to answer this question: _\\\"SELECT * FROM table\\\"_. Instruction: Return only valid SQL code, nothing additional, don't wrap it in ```. Columns with capitals must be quoted. For tables with schemas and catalogs '\"catalog\".\"schema\".\"table\"' not '\"catalog.schema.table\"'."
     }
   ],
   "model": "model_id",
@@ -16,17 +16,17 @@ expression: req_str
       "name": "sql_mode",
       "schema": {
         "$schema": "http://json-schema.org/draft-07/schema#",
-        "additionalProperties": false,
+        "title": "StructuredNsqlOutput",
+        "type": "object",
+        "required": [
+          "sql"
+        ],
         "properties": {
           "sql": {
             "type": "string"
           }
         },
-        "required": [
-          "sql"
-        ],
-        "title": "StructuredNsqlOutput",
-        "type": "object"
+        "additionalProperties": false
       },
       "strict": true
     }

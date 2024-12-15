@@ -41,5 +41,5 @@ pub(crate) async fn post(
         }
     };
 
-    sql_to_http_response(df, &query, ArrowFormat::from_accept_header(&accept)).await
+    sql_to_http_response(df, &query, ArrowFormat::from_accept_header(accept.as_ref())).await
 }

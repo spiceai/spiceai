@@ -1,0 +1,102 @@
+name: spice-mssql-bench docker
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check disk space
+        run: df . -h
+
+      - name: Free disk space
+        run: |
+          sudo docker rmi $(docker image ls -aq) >/dev/null 2>&1 || true
+          sudo rm -rf \
+            /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/share/powershell /usr/share/swift /usr/local/.ghcup \
+            /usr/lib/jvm || true
+          echo "some directories deleted"
+          sudo apt install aptitude -y >/dev/null 2>&1
+          sudo aptitude purge aria2 ansible azure-cli shellcheck rpm xorriso zsync \
+            esl-erlang firefox gfortran-8 gfortran-9 google-chrome-stable \
+            google-cloud-sdk imagemagick \
+            libmagickcore-dev libmagickwand-dev libmagic-dev ant ant-optional kubectl \
+            mercurial apt-transport-https mono-complete libmysqlclient \
+            unixodbc-dev yarn chrpath libssl-dev libxft-dev \
+            libfreetype6 libfreetype6-dev libfontconfig1 libfontconfig1-dev \
+            snmp pollinate libpq-dev postgresql-client powershell ruby-full \
+            sphinxsearch subversion mongodb-org azure-cli microsoft-edge-stable \
+            -y -f >/dev/null 2>&1
+          sudo aptitude purge google-cloud-sdk -f -y >/dev/null 2>&1
+          sudo aptitude purge microsoft-edge-stable -f -y >/dev/null 2>&1 || true
+          sudo apt purge microsoft-edge-stable -f -y >/dev/null 2>&1 || true
+          sudo aptitude purge '~n ^php' -f -y >/dev/null 2>&1
+          sudo aptitude purge '~n ^dotnet' -f -y >/dev/null 2>&1
+          sudo apt-get autoremove -y >/dev/null 2>&1
+          sudo apt-get autoclean -y >/dev/null 2>&1
+          echo "some packages purged"
+
+      - name: Check disk space
+        run: |
+          sudo dpkg-query -Wf '${Installed-Size}\t${Package}\n' | sort -nr | head
+          df . -h
+          sudo du /usr/ -hx -d 4 --threshold=1G | sort -hr | head
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Pull MSSQL Docker image
+        run: docker pull mcr.microsoft.com/mssql/server:2022-latest
+
+      - name: Start temporary MSSQL server
+        working-directory: ./test/tpc-bench/mssql-tpch
+        run: |
+          mkdir -p ./data
+          docker run --name spice-mssql-bench-temp -v ./data:/data -e MSSQL_SA_PASSWORD=S3cretP@ssw0rd -e ACCEPT_EULA=Y -p 1433:1433 -d mcr.microsoft.com/mssql/server:2022-latest
+
+      - name: Install necessary tools
+        run: |
+          sudo add-apt-repository ppa:ubuntu-toolchain-r/ppa -y && sudo apt-get update && sudo apt-get install -y make flex bison byacc git g++-9 gcc-9
+          curl https://packages.microsoft.com/keys/microsoft.asc | sudo tee /etc/apt/trusted.gpg.d/microsoft.asc
+          sudo add-apt-repository "$(wget -qO- https://packages.microsoft.com/config/ubuntu/20.04/prod.list)" -y
+          sudo apt-get update
+          sudo apt-get install sqlcmd -y
+
+      - name: Initialize TPCH data
+        working-directory: ./test/tpc-bench
+        run: |
+          make tpch-init
+          for sf in 0.01 1; do
+            DB_NAME=tpch_sf${sf//./_}
+            DBGEN_SCALE=$sf make tpch-gen
+            DB_HOST=127.0.0.1 DB_PORT=3306 DB_USER=sa DB_PASS="S3cretP@ssw0rd" DB_NAME=$DB_NAME make mssql-init
+            DB_HOST=127.0.0.1 DB_PORT=3306 DB_USER=sa DB_PASS="S3cretP@ssw0rd" DB_NAME=$DB_NAME make mssql-load
+            DB_HOST=127.0.0.1 DB_PORT=3306 DB_USER=sa DB_PASS="S3cretP@ssw0rd" DB_NAME=$DB_NAME make mssql-backup
+            rm ./mssql-tpch/data/*.tbl
+            sudo chmod a+r ./mssql-tpch/data/*.bak
+            ls -lh ./mssql-tpch/data
+          done
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./test/tpc-bench/mssql-tpch
+          file: ./test/tpc-bench/mssql-tpch/Dockerfile
+          platforms: linux/amd64 # there is no arm64 MS SQL image. https://github.com/microsoft/mssql-docker/issues/802
+          push: true
+          tags: |
+            ghcr.io/spiceai/spice-mssql-bench:latest
+            ghcr.io/spiceai/spice-mssql-bench:${{ github.sha }}

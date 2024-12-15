@@ -90,6 +90,19 @@ impl RecursiveSplittingChunker<Characters> {
     }
 }
 
+pub(crate) struct ArcSizer(Arc<dyn ChunkSizer + Send + Sync>);
+impl ChunkSizer for ArcSizer {
+    fn size(&self, chunk: &str) -> usize {
+        self.0.size(chunk)
+    }
+}
+
+impl From<Arc<dyn ChunkSizer + Send + Sync>> for ArcSizer {
+    fn from(sizer: Arc<dyn ChunkSizer + Send + Sync>) -> Self {
+        ArcSizer(sizer)
+    }
+}
+
 /// Basic wrapper around a [`Arc<Tokenizer>`], so as to be able to `impl ChunkSizer for TokenizerWrapper`.
 pub(crate) struct TokenizerWrapper(Arc<Tokenizer>);
 
@@ -141,7 +154,13 @@ mod tests {
     use std::vec;
 
     use super::*;
-    use crate::{embeddings::Embed, openai::Openai};
+    use crate::{
+        embeddings::Embed,
+        openai::{
+            embed::{OpenaiEmbed, DEFAULT_EMBEDDING_MODEL},
+            new_openai_client,
+        },
+    };
 
     #[test]
     fn test_openai_chunker() {
@@ -152,9 +171,15 @@ mod tests {
             file_format: None,
         };
 
-        let chunker = Openai::default()
-            .chunker(&cfg)
-            .expect("Failed to create OpenAI chunker");
+        let chunker = OpenaiEmbed::new(new_openai_client(
+            DEFAULT_EMBEDDING_MODEL.to_string(),
+            None,
+            None,
+            None,
+            None,
+        ))
+        .chunker(&cfg)
+        .expect("Failed to create OpenAI chunker");
         let chunks: Vec<_> = chunker
             .chunks("let cfg = ChunkingConfig {\ntarget_chunk_size: 3\noverlap_size: 1")
             .collect();

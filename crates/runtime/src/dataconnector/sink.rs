@@ -22,6 +22,7 @@ use std::{any::Any, fmt, pin::Pin, sync::Arc};
 use crate::component::dataset::{acceleration::RefreshMode, Dataset};
 use datafusion::{
     catalog::Session,
+    common::{Constraint, Constraints},
     datasource::{TableProvider, TableType},
     execution::{SendableRecordBatchStream, TaskContext},
     logical_expr::{dml::InsertOp, Expr},
@@ -42,12 +43,29 @@ use super::{DataConnector, DataConnectorFactory, DataConnectorParams, ParameterS
 #[derive(Debug, Clone)]
 pub struct SinkConnector {
     schema: SchemaRef,
+    table_constraints: Constraints,
 }
 
 impl SinkConnector {
     #[must_use]
     pub fn new(schema: SchemaRef) -> Self {
-        Self { schema }
+        Self {
+            schema,
+            table_constraints: Constraints::empty(),
+        }
+    }
+
+    #[must_use]
+    pub fn with_primary_key(mut self, primary_key: &[String]) -> Self {
+        let primary_key_idxs = primary_key
+            .iter()
+            .filter_map(|p| self.schema.column_with_name(p.as_str()))
+            .map(|(idx, _)| idx)
+            .collect::<Vec<_>>();
+
+        self.table_constraints =
+            Constraints::new_unverified(vec![Constraint::PrimaryKey(primary_key_idxs)]);
+        self
     }
 }
 
@@ -124,6 +142,10 @@ impl TableProvider for SinkConnector {
 
     fn table_type(&self) -> TableType {
         TableType::Base
+    }
+
+    fn constraints(&self) -> Option<&Constraints> {
+        Some(&self.table_constraints)
     }
 
     async fn scan(

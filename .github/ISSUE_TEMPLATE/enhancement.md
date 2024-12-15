@@ -6,8 +6,7 @@ type: enhancement
 assignees: ''
 ---
 
-**_Remove italics helper text upon creation._**
-
+<!--
 _REMEMBER, BE **SMART**!_
 
 _S: Specific_
@@ -15,21 +14,22 @@ _M: Measurable_
 _A: Achievable_
 _R: Relevant_
 _T: Time-Bound_
+-->
 
 ## Goal-State/What/Result
 
-_A clear and concise description of what the enhancement is and the target goal-state._
+<!-- _A clear and concise description of what the enhancement is and the target goal-state._ -->
 
 ## Why/Purpose
 
-_Clear and concise answer to why this should be done now._
+<!-- _Clear and concise answer to why this should be done now._ -->
 
 ## By When
 
-_A target date for done-done completion of the entire enhancement._
+<!-- _A target date for done-done completion of the entire enhancement._ -->
 
-**Issue/Spec written and reviewed:** <Target Date>
-**Done-Done:** <Target Date>
+**Issue/Spec written and reviewed:** _Target Date_
+**Done-Done:** _Target Date_
 
 ## Done-Done
 
@@ -42,7 +42,7 @@ _A target date for done-done completion of the entire enhancement._
 - [ ] Performance / Benchmarks
 - [ ] Documentation
 - [ ] Samples/Quickstarts/Tutorials
-- [ ] Release Notes
+- [ ] Release Notes prepared
 
 ## The Algorithm
 
@@ -54,22 +54,72 @@ _A target date for done-done completion of the entire enhancement._
 
 ## Specification
 
-_Provide a basic specification of the enhancement._
+<!-- _Provide a basic specification of the enhancement._ -->
 
 ### Security Review
 
-_Provide threat model and security review._
+<!-- _Provide threat model and security review._ -->
 
 ## How/Plan
 
-_A clear and concise plan of how this should be implemented._
+<!-- _A clear and concise plan of how this should be implemented._ -->
 
 ### Implementation (Sub-Issues)
 
+<!--
 - [ ] _Sub-Issue 1_
 - [ ] _Sub-Issue 2_
+-->
 
 ### QA
 
+<!--
 - [ ] _Sub-Issue 1_
 - [ ] _Sub-Issue 2_
+-->
+
+## Release Notes
+
+<!--
+
+Release notes for this enhancement, to be filled once completed. These release notes will be included as highlights on the next release.
+
+Example:
+
+## Release Notes
+
+API Key Authentication: Spice now supports optional authentication for API endpoints via configurable API keys, for additional security and control over runtime access.
+
+Example Spicepod.yml configuration:
+```yaml
+runtime:
+  auth:
+    api-key:
+      enabled: true
+      keys:
+        - ${ secrets:api_key } # Load from a secret store
+        - my-api-key # Or specify directly
+```
+
+Would be included on the next release like:
+
+# Highlights in v1.0-rc.1
+
+{other release note}
+
+API Key Authentication: Spice now supports optional authentication for API endpoints via configurable API keys, for additional security and control over runtime access.
+
+Example Spicepod.yml configuration:
+```yaml
+runtime:
+  auth:
+    api-key:
+      enabled: true
+      keys:
+        - ${ secrets:api_key } # Load from a secret store
+        - my-api-key # Or specify directly
+```
+
+{other release note}
+
+-->
