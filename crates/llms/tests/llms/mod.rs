@@ -196,7 +196,7 @@ static TEST_CASES: LazyLock<Vec<TestCase>> = LazyLock::new(|| {
     ]
 });
 
-#[allow(clippy::expect_used)]
+#[allow(clippy::expect_used, clippy::expect_fun_call)]
 async fn run_single_test(test_name: &str, model_name: &str) -> Result<(), anyhow::Error> {
     let _ = dotenvy::from_filename(".env").expect("failed to load .env file");
     init_tracing(None);
