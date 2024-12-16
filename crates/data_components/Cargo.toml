@@ -26,7 +26,7 @@ datafusion-federation = { workspace = true }
 datafusion-federation-sql = { workspace = true }
 datafusion-table-providers = { workspace = true }
 db_connection_pool = { path = "../db_connection_pool" }
-delta_kernel = { git="https://github.com/spiceai/delta-kernel-rs.git", rev = "08b650fea4ff4946c8599b544699d0c6897a66ff", features = [
+delta_kernel = { git="https://github.com/spiceai/delta-kernel-rs.git", rev = "69e11a29a6dc67ec1d969e3a652f00924b995b3a", features = [
     "default-engine",
     "cloud",
 ], optional = true }
