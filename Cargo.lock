@@ -3500,9 +3500,9 @@ checksum = "aafbece59594ed57696a1a69e8bb3ca1683fbc9cdb41d5c02726070b2cd8f19d"
 
 [[package]]
 name = "delta_kernel"
-version = "0.4.1"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2efadff110c892910f5b1b09a764845dd136f5dabdd802e64f2968586fbe19e6"
+checksum = "1b7daacebfee9fc8a63b092b4a1e595c1c99d98560565e7b66ec7fddaa5cdf99"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -3539,9 +3539,9 @@ dependencies = [
 
 [[package]]
 name = "delta_kernel_derive"
-version = "0.4.1"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "49fe89c064f509a4a00c00c895af4b966e4b592e7ddf6a476eae856a9b883623"
+checksum = "f5fb1008c70d6b0cf6d3a6655bc6e2b1a31bb11281745a17f06e3f5cbf5f6891"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -12180,6 +12180,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8c5f0a0af699448548ad1a2fbf920fb4bee257eae39953ba95cb84891a0446a"
 dependencies = [
  "getrandom 0.2.15",
+ "rand 0.8.5",
  "serde",
 ]
 
