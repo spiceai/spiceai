@@ -33,13 +33,14 @@ use util::fibonacci_backoff::FibonacciBackoffBuilder;
 use util::{retry, RetryError};
 
 use crate::datafusion::error::{find_datafusion_root, get_spice_df_error, SpiceExternalError};
+use crate::datafusion::is_spice_internal_dataset;
 use crate::datafusion::schema::BaseSchema;
 use crate::federated_table::FederatedTable;
 use crate::timing::MultiTimeMeasurement;
 use crate::{
     component::dataset::acceleration::RefreshMode,
     dataconnector::get_data,
-    datafusion::{filter_converter::TimestampFilterConvert, schema, SPICE_RUNTIME_SCHEMA},
+    datafusion::{filter_converter::TimestampFilterConvert, schema},
     dataupdate::{DataUpdate, StreamingDataUpdate, UpdateType},
     execution_plan::schema_cast::EnsureSchema,
     object_store_registry::default_runtime_env,
@@ -292,7 +293,7 @@ impl RefreshTask {
         let dataset_name = self.dataset_name.clone();
         let filter_converter = self.get_filter_converter(refresh);
 
-        if dataset_name.schema() == Some(SPICE_RUNTIME_SCHEMA) {
+        if is_spice_internal_dataset(&dataset_name) {
             tracing::debug!("Loading data for dataset {dataset_name}");
         } else {
             tracing::info!("Loading data for dataset {dataset_name}");
@@ -397,7 +398,7 @@ impl RefreshTask {
                 String::new()
             };
 
-            if self.dataset_name.schema() == Some(SPICE_RUNTIME_SCHEMA) {
+            if is_spice_internal_dataset(&self.dataset_name) {
                 tracing::debug!(
                     "Loaded {num_rows} rows{memory_size} for dataset {dataset_name} in {elapsed}.",
                 );

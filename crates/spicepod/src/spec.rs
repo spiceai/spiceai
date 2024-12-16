@@ -24,6 +24,7 @@ use std::{collections::HashMap, fmt::Debug};
 use crate::component::catalog::Catalog;
 use crate::component::embeddings::Embeddings;
 use crate::component::eval::Eval;
+use crate::component::is_default;
 use crate::component::runtime::Runtime;
 use crate::component::secret::Secret;
 use crate::component::tool::Tool;
@@ -60,7 +61,7 @@ pub struct SpicepodDefinition {
     pub kind: SpicepodKind,
 
     /// Optional runtime configuration
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_default")]
     pub runtime: Runtime,
 
     /// Optional extensions configuration
@@ -75,7 +76,7 @@ pub struct SpicepodDefinition {
     ///   - from: env
     ///     name: env
     /// ```
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub secrets: Vec<Secret>,
 
     #[serde(skip_serializing_if = "HashMap::is_empty")]

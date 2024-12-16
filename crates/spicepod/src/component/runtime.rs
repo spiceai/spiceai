@@ -16,6 +16,7 @@ limitations under the License.
 
 use std::{collections::HashMap, error::Error, sync::Arc};
 
+use super::is_default;
 #[cfg(feature = "schemars")]
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -26,29 +27,33 @@ const TASK_HISTORY_RETENTION_MINIMUM: u64 = 60; // 1 minute
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct Runtime {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_default")]
     pub results_cache: ResultsCache,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub dataset_load_parallelism: Option<usize>,
 
     /// If set, the runtime will configure all endpoints to use TLS
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tls: Option<TlsConfig>,
 
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tracing: Option<TracingConfig>,
 
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_default")]
     pub telemetry: TelemetryConfig,
 
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     #[serde(default)]
     pub params: HashMap<String, String>,
 
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_default")]
     pub task_history: TaskHistory,
 
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth: Option<Auth>,
 
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_default")]
     pub cors: CorsConfig,
 }
 

@@ -1216,3 +1216,12 @@ impl DataFusion {
         QueryBuilder::new(sql, Arc::clone(self))
     }
 }
+
+#[must_use]
+pub fn is_spice_internal_dataset(dataset: &TableReference) -> bool {
+    dataset.schema().is_some_and(|schema| {
+        schema == SPICE_RUNTIME_SCHEMA
+            || schema == SPICE_METADATA_SCHEMA
+            || schema == SPICE_EVAL_SCHEMA
+    })
+}

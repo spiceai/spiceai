@@ -17,14 +17,17 @@ limitations under the License.
 use std::collections::HashMap;
 
 use arrow::array::RecordBatch;
+use datafusion::sql::TableReference;
 use futures::TryStreamExt;
-use runtime::Runtime;
+use runtime::{dataupdate::DataUpdate, Runtime};
 
 use crate::utils::{get_branch_name, get_commit_sha, init_tracing};
 
 use app::AppBuilder;
 use spicepod::component::{
-    dataset::acceleration::Acceleration, embeddings::Embeddings, runtime::ResultsCache,
+    dataset::{acceleration::Acceleration, replication::Replication, Dataset, Mode},
+    embeddings::Embeddings,
+    runtime::ResultsCache,
 };
 
 use super::SearchBenchmarkResultBuilder;
@@ -42,6 +45,7 @@ pub(crate) async fn setup_benchmark(
     test_dataset: &str,
     embeddings_model: &str,
     acceleration: Option<&Acceleration>,
+    upload_results_dataset: Option<&String>,
 ) -> Result<(Runtime, SearchBenchmarkResultBuilder), String> {
     init_tracing(Some(
         "runtime=Debug,task_history=WARN,runtime::embeddings=WARN,INFO",
@@ -50,9 +54,17 @@ pub(crate) async fn setup_benchmark(
     let mut benchmark_result =
         SearchBenchmarkResultBuilder::new(get_commit_sha(), get_branch_name(), configuration_name);
 
-    let app = build_bench_app(test_dataset, embeddings_model, acceleration)
-        .await?
-        .build();
+    let app_builder = build_bench_app(test_dataset, embeddings_model, acceleration).await?;
+
+    let app = match upload_results_dataset {
+        Some(dataset_path) => app_builder
+            .with_dataset(make_spiceai_rw_dataset(
+                dataset_path,
+                "oss_search_benchmarks",
+            ))
+            .build(),
+        None => app_builder.build(),
+    };
 
     let rt = Runtime::builder().with_app(app).build().await;
 
@@ -245,4 +257,24 @@ fn create_embeddings_model(embeddings_model: &str) -> Embeddings {
         "${ secrets:SPICE_OPENAI_API_KEY }".into(),
     );
     model
+}
+
+fn make_spiceai_rw_dataset(path: &str, name: &str) -> Dataset {
+    let mut ds = Dataset::new(format!("spice.ai:{path}"), name.to_string());
+    ds.mode = Mode::ReadWrite;
+    ds.replication = Some(Replication { enabled: true });
+    ds
+}
+
+pub(crate) async fn write_benchmark_results(
+    benchmark_results: DataUpdate,
+    rt: &Runtime,
+) -> Result<(), String> {
+    rt.datafusion()
+        .write_data(
+            &TableReference::parse_str("oss_search_benchmarks"),
+            benchmark_results,
+        )
+        .await
+        .map_err(|e| e.to_string())
 }
