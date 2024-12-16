@@ -220,7 +220,7 @@ fn azure(
     if api_key.is_none() && entra_token.is_none() {
         return Err(LlmError::FailedToLoadModel {
             source: format!(
-                "Azure model '{model_name}' requires 'azure_api_key' or 'azure_entra_token'.\nFor details on model configuration, visit https://docs.spiceai.org/components/models/azure"
+                "Azure model '{model_name}' requires either 'azure_api_key' or 'azure_entra_token'. See https://docs.spiceai.org/components/models/azure for details."
             )
             .into(),
         });
