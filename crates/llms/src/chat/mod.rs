@@ -21,7 +21,7 @@ use futures::{Stream, StreamExt, TryStreamExt};
 use nsql::SqlGeneration;
 use rand::distributions::Alphanumeric;
 use rand::{thread_rng, Rng};
-use secrecy::Secret;
+use secrecy::{ExposeSecret, Secret};
 use serde::{Deserialize, Serialize};
 use snafu::{ResultExt, Snafu};
 use std::path::PathBuf;
@@ -47,6 +47,8 @@ pub mod mistral;
 pub mod nsql;
 use indexmap::IndexMap;
 use mistralrs::MessageContent;
+
+use crate::embeddings::candle::download_hf_file;
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone, Copy)]
 #[serde(rename_all = "lowercase")]
@@ -576,6 +578,34 @@ pub fn create_hf_model(
 ) -> Result<Box<dyn Chat>> {
     mistral::MistralLlama::from_hf(model_id, model_type, hf_token_literal)
         .map(|x| Box::new(x) as Box<dyn Chat>)
+}
+
+pub async fn create_hf_w_gguf(
+    model_id: &str,
+    path: &Path,
+    hf_token_literal: Option<&Secret<String>>,
+) -> Result<Box<dyn Chat>> {
+    let Some(path_str) = path.to_str() else {
+        return Err(Error::FailedToLoadModel {
+            source: Box::<dyn std::error::Error + Send + Sync>::from(format!(
+                "Path '{}' into model '{}' is not valid",
+                path.display(),
+                model_id
+            )),
+        });
+    };
+
+    let gguf_file = download_hf_file(
+        model_id,
+        None,
+        None,
+        path_str,
+        hf_token_literal.map(|l| l.expose_secret().as_str()),
+    )
+    .await
+    .context(FailedToLoadModelSnafu)?;
+
+    create_local_model(&[gguf_file.display().to_string()], None, None, None, None)
 }
 
 #[allow(unused_variables)]

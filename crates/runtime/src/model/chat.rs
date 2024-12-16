@@ -32,8 +32,8 @@ use llms::{
 };
 use secrecy::{ExposeSecret, SecretString};
 use spicepod::component::model::{Model, ModelFileType, ModelSource};
-use std::pin::Pin;
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, path::PathBuf, str::FromStr, sync::Arc};
+use std::{path::Path, pin::Pin};
 use tracing_futures::Instrument;
 
 use super::tool_use::ToolUsingChat;
@@ -57,7 +57,7 @@ pub async fn try_to_chat_model(
     params: &HashMap<String, SecretString>,
     rt: Arc<Runtime>,
 ) -> Result<Box<dyn Chat>, LlmError> {
-    let model = construct_model(component, params)?;
+    let model = construct_model(component, params).await?;
 
     // Handle tool usage
     let spice_tool_opt: Option<SpiceToolsOptions> = extract_secret!(params, "tools")
@@ -89,7 +89,7 @@ pub async fn try_to_chat_model(
     Ok(tool_model)
 }
 
-pub fn construct_model(
+pub async fn construct_model(
     component: &spicepod::component::model::Model,
     params: &HashMap<String, SecretString>,
 ) -> Result<Box<dyn Chat>, LlmError> {
@@ -102,7 +102,7 @@ pub fn construct_model(
         .into(),
     })?;
     let model = match prefix {
-        ModelSource::HuggingFace => huggingface(model_id, params),
+        ModelSource::HuggingFace => huggingface(model_id, component, params).await,
         ModelSource::File => file(component, params),
         ModelSource::Anthropic => anthropic(model_id.as_deref(), params),
         ModelSource::Azure => azure(model_id, component.name.as_str(), params),
@@ -154,8 +154,9 @@ fn anthropic(
     Ok(Box::new(anthropic) as Box<dyn Chat>)
 }
 
-fn huggingface(
+async fn huggingface(
     model_id: Option<String>,
+    component: &spicepod::component::model::Model,
     params: &HashMap<String, SecretString>,
 ) -> Result<Box<dyn Chat>, LlmError> {
     let Some(id) = model_id else {
@@ -165,6 +166,29 @@ fn huggingface(
     };
     let model_type = extract_secret!(params, "model_type");
     let hf_token = params.get("hf_token");
+
+    // For GGUF models, we require user specify via `.files[].path`
+    let gguf_path = component
+        .find_all_file_path(ModelFileType::Weights)
+        .iter()
+        .find_map(|p| {
+            let path = PathBuf::from_str(p.as_str());
+            if let Ok(Some(ref ext)) = path.as_ref().map(|pp| pp.extension()) {
+                if ext.eq_ignore_ascii_case("gguf") {
+                    return PathBuf::from_str(p.as_str()).ok();
+                };
+            }
+            None
+        });
+
+    if let Some(path) = gguf_path {
+        tracing::debug!(
+            "For Huggingface model {}, the GGUF model {} will be downloaded and used.",
+            component.name,
+            path.display()
+        );
+        return llms::chat::create_hf_w_gguf(id.as_str(), path.as_path(), hf_token).await;
+    }
 
     llms::chat::create_hf_model(&id, model_type, hf_token)
 }
