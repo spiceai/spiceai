@@ -105,4 +105,11 @@ impl<C: Config> Openai<C> {
     fn supports_structured_output(&self) -> bool {
         self.client.config().api_base() == OPENAI_API_BASE && self.model.starts_with("gpt-4o")
     }
+
+    /// Returns true if the `OpenAI` compatible model supports `max_completion_tokens` in [`CreateChatCompletionRequest`].
+    ///
+    /// This is useful for limiting the number of tokens used in health checks.
+    fn supports_max_completion_tokens(&self) -> bool {
+        self.client.config().api_base() == OPENAI_API_BASE
+    }
 }

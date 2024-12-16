@@ -1155,6 +1155,7 @@ impl DataFusion {
     /// Specifically filters out:
     ///  - `spice.runtime`
     ///  - `spice.metadata`
+    ///  - `spice.eval`
     pub fn get_user_table_names(&self) -> Vec<TableReference> {
         self.ctx
             .catalog_names()
@@ -1173,7 +1174,8 @@ impl DataFusion {
                             .iter()
                             .filter(|schema| {
                                 !(ctlg == SPICE_DEFAULT_CATALOG && *schema == SPICE_RUNTIME_SCHEMA
-                                    || *schema == SPICE_METADATA_SCHEMA)
+                                    || *schema == SPICE_METADATA_SCHEMA
+                                    || *schema == SPICE_EVAL_SCHEMA)
                             })
                             .flat_map(|schema| {
                                 c.schema(schema)
@@ -1213,4 +1215,13 @@ impl DataFusion {
     pub fn query_builder<'a>(self: &Arc<Self>, sql: &'a str) -> QueryBuilder<'a> {
         QueryBuilder::new(sql, Arc::clone(self))
     }
+}
+
+#[must_use]
+pub fn is_spice_internal_dataset(dataset: &TableReference) -> bool {
+    dataset.schema().is_some_and(|schema| {
+        schema == SPICE_RUNTIME_SCHEMA
+            || schema == SPICE_METADATA_SCHEMA
+            || schema == SPICE_EVAL_SCHEMA
+    })
 }

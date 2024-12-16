@@ -13,6 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+
 use async_openai::types::CreateChatCompletionRequest;
 use jsonpath_rust::JsonPath;
 use llms::chat::Chat;
@@ -35,6 +36,7 @@ pub struct TestCase {
     /// This is used in snapshot testing to assert certain properties of the response.
     pub json_path: Vec<(&'static str, &'static str)>,
 }
+
 /// Creates [`TestCase`] instances from request/response that JSON serialize to
 /// [`CreateChatCompletionRequest`] and [`CreateChatCompletionResponse`].
 #[macro_export]
@@ -49,7 +51,51 @@ macro_rules! test_case {
     };
 }
 
-/// Test case parameters (for [`run_test_case`]) to run for each model.
+/// For a given mode name, a function that instantiates the model..
+type ModelFn<'a> = (&'a str, Box<dyn Fn() -> Arc<Box<dyn Chat>>>);
+
+/// A given model to test.
+type ModelDef<'a> = (&'a str, Arc<Box<dyn Chat>>);
+#[allow(clippy::expect_used)]
+static TEST_MODELS: LazyLock<Vec<ModelDef>> = LazyLock::new(|| {
+    let model_creators: [ModelFn; 4] = [
+        (
+            "anthropic",
+            Box::new(|| create::create_anthropic(None).expect("failed to create anthropic model")),
+        ),
+        ("openai", Box::new(|| create::create_openai("gpt-4o-mini"))),
+        (
+            "hf_phi3",
+            Box::new(|| {
+                create::create_hf("microsoft/Phi-3-mini-4k-instruct")
+                    .expect("failed to create 'microsoft/Phi-3-mini-4k-instruct' from HF")
+            }),
+        ),
+        (
+            "local_phi3",
+            Box::new(|| {
+                create::create_local("microsoft/Phi-3-mini-4k-instruct")
+                    .expect("failed to create 'microsoft/Phi-3-mini-4k-instruct' from local system")
+            }),
+        ),
+    ];
+
+    model_creators
+        .iter()
+        .filter_map(|(name, creator)| {
+            if TEST_ARGS.skip_model(name) {
+                None
+            } else {
+                Some((*name, creator()))
+            }
+        })
+        .collect()
+});
+
+/// A mapping of model names (in [`TEST_MODELS`]) and test names (in [`TEST_CASES`]) to skip.
+static TEST_DENY_LIST: LazyLock<Vec<(&'static str, &'static str)>> =
+    LazyLock::new(|| vec![("hf_phi3", "tool_use"), ("local_phi3", "tool_use")]);
+
 static TEST_CASES: LazyLock<Vec<TestCase>> = LazyLock::new(|| {
     vec![
         test_case!(
@@ -81,22 +127,22 @@ static TEST_CASES: LazyLock<Vec<TestCase>> = LazyLock::new(|| {
                 "messages": [
                     {
                         "role": "system",
-                        "content": "Repeat back any user message."
+                        "content": "Quote back the exact message from the user"
                     },
                     {
                         "role": "user",
-                        "content": "Hi"
+                        "content": "pong"
                     }
                 ]
             }),
             vec![
                 (
                     "assistant_response",
-                    "$.choices[*].message[?(@.role == 'assistant' && @.content ~= 'Hi')].length()"
+                    "$.choices[*].message[?(@.role == 'assistant' && @.content ~= 'pong')].length()"
                 ),
                 (
                     "replied_appropriately",
-                    "$.choices[*].message[?(@.content ~= 'Hi')].length()"
+                    "$.choices[*].message[?(@.content ~= 'pong')].length()"
                 )
             ]
         ),
@@ -150,74 +196,47 @@ static TEST_CASES: LazyLock<Vec<TestCase>> = LazyLock::new(|| {
     ]
 });
 
-/// For a given mode name, a function that instantiates the model..
-type ModelFn<'a> = (&'a str, Box<dyn Fn() -> Arc<Box<dyn Chat>>>);
-
-/// A given model to test.
-type ModelDef<'a> = (&'a str, Arc<Box<dyn Chat>>);
-#[allow(clippy::expect_used)]
-static TEST_MODELS: LazyLock<Vec<ModelDef>> = LazyLock::new(|| {
-    let model_creators: [ModelFn; 4] = [
-        (
-            "anthropic",
-            Box::new(|| create::create_anthropic(None).expect("failed to create anthropic model")),
-        ),
-        ("openai", Box::new(|| create::create_openai("gpt-4o-mini"))),
-        (
-            "hf/phi3",
-            Box::new(|| {
-                create::create_hf("microsoft/Phi-3-mini-4k-instruct")
-                    .expect("failed to create 'microsoft/Phi-3-mini-4k-instruct' from HF")
-            }),
-        ),
-        (
-            "local/phi3",
-            Box::new(|| {
-                create::create_local("microsoft/Phi-3-mini-4k-instruct")
-                    .expect("failed to create 'microsoft/Phi-3-mini-4k-instruct' from local system")
-            }),
-        ),
-    ];
-
-    model_creators
-        .iter()
-        .filter_map(|(name, creator)| {
-            if TEST_ARGS.skip_model(name) {
-                None
-            } else {
-                Some((*name, creator()))
-            }
-        })
-        .collect()
-});
-
-/// A mapping of model names (in [`TEST_MODELS`]) and test names (in [`TEST_CASES`]) to skip.
-static TEST_DENY_LIST: LazyLock<Vec<(&'static str, &'static str)>> =
-    LazyLock::new(|| vec![("hf/phi3", "tool_use"), ("local/phi3", "tool_use")]);
-
-/// Run a single [`TestCase`] for a model.
 #[allow(clippy::expect_used, clippy::expect_fun_call)]
-async fn run_test_case(
-    test: &TestCase,
-    model_name: &'static str,
-    model: Arc<Box<dyn Chat>>,
-) -> Result<(), anyhow::Error> {
-    let test_name = test.name;
+async fn run_single_test(test_name: &str, model_name: &str) -> Result<(), anyhow::Error> {
+    let _ = dotenvy::from_filename(".env").expect("failed to load .env file");
+    init_tracing(None);
+
+    if TEST_DENY_LIST
+        .iter()
+        .any(|(m, t)| *m == model_name && *t == test_name)
+    {
+        return Ok(());
+    }
+
+    let test = TEST_CASES
+        .iter()
+        .find(|t| t.name == test_name)
+        .expect("test case not found");
+
+    if TEST_ARGS.skip_model(model_name) {
+        tracing::debug!("Skipping test {model_name}/{test_name}");
+        return Ok(());
+    }
+
+    let (_, model) = TEST_MODELS
+        .iter()
+        .find(|(name, _)| *name == model_name)
+        .unwrap_or_else(|| panic!("model {model_name} not found"));
+
     tracing::info!("Running test {test_name}/{model_name} with {:?}", test.req);
 
     let actual_resp = model
         .chat_request(test.req.clone())
         .await
-        .expect(format!("For test {test_name}/{model_name}, chat_request failed").as_str());
-
+        .unwrap_or_else(|_| panic!("For test {test_name}/{model_name}, chat_request failed"));
     tracing::trace!("Response for {test_name}/{model_name}: {actual_resp:?}");
-    // Convert to [`serde_json::Value`] for JSONPath testing.
-    let resp_value = serde_json::to_value(&actual_resp).expect(
-        format!("For test {test_name}/{model_name}, failed to serialize response to JSON").as_str(),
-    );
+
+    let resp_value =
+        serde_json::to_value(&actual_resp).expect("failed to serialize response to JSON");
+
     for (id, json_ptr) in &test.json_path {
         let resp_ptr = JsonPath::from_str(json_ptr)
-            .expect(format!("For test {test_name}, invalid JSONPath selector for id={id}").as_str())
+            .expect("invalid JSONPath selector")
             .find(&resp_value);
         insta::assert_snapshot!(
             format!("{test_name}_{model_name}_{id}"),
@@ -227,26 +246,40 @@ async fn run_test_case(
     Ok(())
 }
 
-#[tokio::test]
-#[allow(clippy::expect_used, clippy::expect_fun_call)]
-async fn run_all_tests() {
-    // Set ENV variables before we lazy load `TEST_MODELS`.
-    let _ = dotenvy::from_filename(".env").expect("failed to load .env file");
-    init_tracing(None);
-
-    for ts in TEST_CASES.iter() {
-        for (model_name, model) in TEST_MODELS.iter() {
-            if crate::llms::TEST_DENY_LIST
-                .iter()
-                .any(|(m, t)| m == model_name && *t == ts.name)
-            {
-                tracing::info!("Skipping test {model_name}/{}", ts.name);
-                continue;
-            }
-
-            run_test_case(ts, model_name, Arc::clone(model))
-                .await
-                .expect(format!("Failed to run test {model_name}/{}", ts.name).as_str());
+// Macro to create test module and functions
+#[macro_export]
+macro_rules! generate_model_tests {
+    () => {
+        macro_rules! test_model_case {
+            ($model_name_expr:expr, $test_case_expr:expr) => {
+                paste::paste! {
+                    #[tokio::test]
+                    async fn [<test_ $model_name_expr _ $test_case_expr>]() {
+                        run_single_test(stringify!($test_case_expr), stringify!($model_name_expr)).await
+                            .expect("test failed");
+                    }
+                }
+            };
         }
-    }
+
+        test_model_case!(anthropic, basic);
+        test_model_case!(openai, basic);
+        test_model_case!(hf_phi3, basic);
+        test_model_case!(local_phi3, basic);
+
+        test_model_case!(anthropic, system_prompt);
+        test_model_case!(openai, system_prompt);
+        test_model_case!(hf_phi3, system_prompt);
+        test_model_case!(local_phi3, system_prompt);
+
+        test_model_case!(anthropic, tool_use);
+        test_model_case!(openai, tool_use);
+        test_model_case!(hf_phi3, tool_use);
+        test_model_case!(local_phi3, tool_use);
+    };
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    generate_model_tests!();
 }

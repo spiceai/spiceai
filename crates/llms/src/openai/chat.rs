@@ -68,20 +68,22 @@ impl<C: Config + Send + Sync> Chat for Openai<C> {
     async fn health(&self) -> Result<(), crate::chat::Error> {
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "health", input = "health");
 
-        if let Err(e) = self
-            .chat_request(CreateChatCompletionRequest {
-                max_tokens: Some(100),
-                messages: vec![ChatCompletionRequestMessage::User(
-                    ChatCompletionRequestUserMessage {
-                        name: None,
-                        content: ChatCompletionRequestUserMessageContent::Text("ping.".to_string()),
-                    },
-                )],
-                ..Default::default()
-            })
-            .instrument(span.clone())
-            .await
-        {
+        let mut req = CreateChatCompletionRequest {
+            messages: vec![ChatCompletionRequestMessage::User(
+                ChatCompletionRequestUserMessage {
+                    name: None,
+                    content: ChatCompletionRequestUserMessageContent::Text("ping.".to_string()),
+                },
+            )],
+            ..Default::default()
+        };
+        if self.supports_max_completion_tokens() {
+            req.max_completion_tokens = Some(100);
+        } else {
+            req.max_tokens = Some(100);
+        }
+
+        if let Err(e) = self.chat_request(req).instrument(span.clone()).await {
             tracing::error!(target: "task_history", parent: &span, "{e}");
             return Err(crate::chat::Error::HealthCheckError {
                 source: Box::new(e),

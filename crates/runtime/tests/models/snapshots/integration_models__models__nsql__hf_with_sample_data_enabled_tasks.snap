@@ -179,6 +179,7 @@ expression: response
 |                        |             ) combined                                                                    |
 |                        |             ORDER BY priority, "Airport_fee"                                              |
 |                        |             LIMIT 3                                                                       |
+| sql_query              | SELECT store_and_fwd_flag_embedding FROM spice.public.taxi_trips LIMIT 3                  |
 | tool_use::sample_data  | RandomSample({"dataset":"spice.public.taxi_trips","limit":3})                             |
 | sql_query              | SELECT * FROM spice.public.taxi_trips LIMIT 3                                             |
 | sql_query              | SELECT COUNT(*) AS total_records FROM "taxi_trips"                                        |

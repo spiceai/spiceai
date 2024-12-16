@@ -1,0 +1,15 @@
+[package]
+description = "Converts https://github.com/openai/evals into SpiceAI compatible formats"
+edition = "2021"
+name = "evalconverter"
+version = "0.1.0"
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.5.0", features = ["derive"] }
+env_logger = "0.10"
+log = "0.4"
+path-clean = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.9"
+spicepod = { path = "../../crates/spicepod", features = ["schemars"] }
