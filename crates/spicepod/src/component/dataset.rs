@@ -22,7 +22,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::{embeddings::ColumnEmbeddingConfig, params::Params, Nameable, WithDependsOn};
+use super::{
+    embeddings::ColumnEmbeddingConfig, is_default, params::Params, Nameable, WithDependsOn,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
@@ -83,6 +85,7 @@ pub struct Dataset {
 
     pub name: String,
 
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
 
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
@@ -91,7 +94,7 @@ pub struct Dataset {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub columns: Vec<Column>,
 
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_default")]
     pub mode: Mode,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -121,7 +124,7 @@ pub struct Dataset {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub invalid_type_action: Option<InvalidTypeAction>,
 
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_default")]
     pub ready_state: ReadyState,
 }
 

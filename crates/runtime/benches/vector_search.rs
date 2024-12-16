@@ -17,12 +17,13 @@ limitations under the License.
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use bench_search::{
-    setup::{load_query_relevance_data, load_search_queries, setup_benchmark, Query},
+    setup::{self, load_query_relevance_data, load_search_queries, setup_benchmark, Query},
     SearchBenchmarkResultBuilder,
 };
 use clap::Parser;
 use futures::{stream, StreamExt, TryStreamExt};
 use runtime::{
+    dataupdate::DataUpdate,
     embeddings::vector_search::{
         self, parse_explicit_primary_keys, SearchRequest, VectorSearch, VectorSearchResult,
     },
@@ -63,7 +64,13 @@ async fn main() -> Result<(), String> {
             .build(),
     );
 
-    Box::pin(request_context.scope(vector_search_benchmarks())).await
+    let mut upload_results_dataset: Option<String> = None;
+    if let Ok(env_var) = std::env::var("SEARCH_BENCHMARK_UPLOAD_RESULTS_DATASET") {
+        println!("SEARCH_BENCHMARK_UPLOAD_RESULTS_DATASET: {env_var}");
+        upload_results_dataset = Some(env_var);
+    }
+
+    Box::pin(request_context.scope(vector_search_benchmarks(upload_results_dataset.as_ref()))).await
 }
 
 pub struct SearchBenchmarkConfiguration {
@@ -109,7 +116,7 @@ fn benchmark_configurations() -> Vec<SearchBenchmarkConfiguration> {
     .collect()
 }
 
-async fn vector_search_benchmarks() -> Result<(), String> {
+async fn vector_search_benchmarks(upload_results_dataset: Option<&String>) -> Result<(), String> {
     let benchmark_configurations = benchmark_configurations();
 
     if benchmark_configurations.is_empty() {
@@ -117,7 +124,7 @@ async fn vector_search_benchmarks() -> Result<(), String> {
     }
 
     for config in benchmark_configurations {
-        let _ = run_benchmark(&config).await;
+        let _ = run_benchmark(&config, upload_results_dataset).await;
     }
 
     Ok(())
@@ -136,12 +143,16 @@ macro_rules! handle_error {
     };
 }
 
-async fn run_benchmark(config: &SearchBenchmarkConfiguration) -> Result<(), String> {
+async fn run_benchmark(
+    config: &SearchBenchmarkConfiguration,
+    upload_results_dataset: Option<&String>,
+) -> Result<(), String> {
     let (rt, mut benchmark_result) = setup_benchmark(
         config.name,
         config.test_dataset,
         config.embeddings_model,
         config.acceleration.as_ref(),
+        upload_results_dataset,
     )
     .await?;
 
@@ -180,6 +191,16 @@ async fn run_benchmark(config: &SearchBenchmarkConfiguration) -> Result<(), Stri
         "Benchmark for configuration '{}' completed:\n{benchmark_result}",
         benchmark_result.configuration_name()
     );
+
+    if let Some(upload_results_dataset) = upload_results_dataset {
+        tracing::info!("Writing benchmark results to dataset {upload_results_dataset}...");
+        let data_update: DataUpdate = benchmark_result.into();
+        setup::write_benchmark_results(data_update, &rt)
+            .await
+            .inspect_err(|err| {
+                tracing::error!("Failed to write benchmark results to dataset: {err}");
+            })?;
+    }
 
     Ok(())
 }
