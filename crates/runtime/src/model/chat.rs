@@ -203,9 +203,8 @@ fn azure(
     if api_base.is_none() {
         return Err(LlmError::FailedToLoadModel {
             source: format!(
-                "Azure model '{model_name}' requires 'endpoint' parameter.\nFor details on model configuration, visit https://docs.spiceai.org/components/models/azure"
-            )
-            .into(),
+    "Azure model '{model_name}' requires the 'endpoint' parameter. See https://docs.spiceai.org/components/models/azure for details."
+).into(),
         });
     }
 
