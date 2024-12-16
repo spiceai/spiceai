@@ -45,8 +45,6 @@ pub struct Eval {
 
     // Id of [`EvalDefinition`] used.
     pub id: String,
-    pub description: Option<String>,
-    pub metrics: Option<Vec<String>>,
 
     pub class: Class,
     pub args: HashMap<String, Value>,
@@ -104,7 +102,7 @@ fn dataset_needed(eval: &Eval, data_dir: &Path) -> Option<DatasetComponent> {
 
 /// Normalise a table name to a valid identifier.
 fn normalise_table_name(x: &str) -> String {
-    x.to_lowercase().replace("-", "_").replace(".", "__")
+    x.to_lowercase().replace('-', "_").replace('.', "__")
 }
 
 impl EvalSpecification {
@@ -127,7 +125,7 @@ impl EvalSpecification {
             .iter()
             .filter_map(|(n, e)| match e {
                 EvalEntry::Metadata(m) => Some((n.clone(), m)),
-                _ => None,
+                EvalEntry::Definition(_) => None,
             })
             .collect();
 
@@ -147,33 +145,20 @@ impl EvalSpecification {
 
         pairs
             .iter()
-            .map(
-                |(
-                    name,
-                    EvalMetadata {
-                        id,
-                        description,
-                        metrics,
-                        ..
-                    },
-                    def,
-                )| {
-                    self.resolve_file_paths(def, data_dir)?;
+            .map(|(name, EvalMetadata { id, .. }, def)| {
+                Self::resolve_file_paths(def, data_dir)?;
 
-                    Ok(Eval {
-                        id: id.clone(),
-                        name: name.to_string(),
-                        description: description.clone(),
-                        metrics: metrics.clone(),
-                        class: def.class.clone(),
-                        args: def.args.clone(),
-                    })
-                },
-            )
+                Ok(Eval {
+                    id: id.clone(),
+                    name: name.to_string(),
+                    class: def.class.clone(),
+                    args: def.args.clone(),
+                })
+            })
             .collect::<Result<Vec<Eval>>>()
     }
 
-    pub fn resolve_file_paths(&self, def: &EvalDefinition, data_dir: &Path) -> Result<()> {
+    pub fn resolve_file_paths(def: &EvalDefinition, data_dir: &Path) -> Result<()> {
         for (key, value) in &def.args {
             let Value::String(s) = value else {
                 continue;
@@ -187,29 +172,8 @@ impl EvalSpecification {
         }
         Ok(())
     }
-
-    pub fn get_metadata(&self) -> Option<(&str, &EvalMetadata)> {
-        self.entries.iter().find_map(|(name, entry)| match entry {
-            EvalEntry::Metadata(metadata) => Some((name.as_str(), metadata)),
-            _ => None,
-        })
-    }
-
-    /// Get all definition entries
-    pub fn get_definition_entries(&self) -> Vec<(&str, &EvalDefinition)> {
-        self.entries
-            .iter()
-            .filter_map(|(name, entry)| match entry {
-                EvalEntry::Definition(definition) => Some((name.as_str(), definition)),
-                _ => None,
-            })
-            .collect()
-    }
 }
 
 fn is_potential_file_key(value: &str) -> bool {
-    match value {
-        "samples_jsonl" => true,
-        _ => false,
-    }
+    matches!(value, "samples_jsonl")
 }

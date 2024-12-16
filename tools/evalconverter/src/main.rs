@@ -1,14 +1,13 @@
 mod eval;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::Parser;
 use spicepod::{
     component::{dataset::Dataset, eval::Eval, ComponentOrReference},
     spec::{SpicepodDefinition, SpicepodKind, SpicepodVersion},
-    Spicepod,
 };
 use std::{
-    default, os,
+    collections::HashMap,
     path::{Path, PathBuf},
     process::exit,
 };
@@ -50,7 +49,10 @@ fn main() -> Result<()> {
     let data_dir = cli.base_path.unwrap_or(if cli.input.is_dir() {
         cli.input.clone()
     } else {
-        cli.input.parent().unwrap().to_path_buf()
+        let Some(parent) = cli.input.parent() else {
+            anyhow::bail!("Input path must be a directory or a YAML file");
+        };
+        parent.to_path_buf()
     });
 
     // Determine input handling strategy
@@ -132,14 +134,14 @@ fn spicepod_definition(datasets: Vec<Dataset>, evals: Vec<Eval>) -> SpicepodDefi
             .map(ComponentOrReference::Component)
             .collect(),
         runtime: spicepod::component::runtime::Runtime::default(),
-        extensions: Default::default(),
-        secrets: Default::default(),
-        metadata: Default::default(),
-        catalogs: Default::default(),
-        views: Default::default(),
-        models: Default::default(),
-        tools: Default::default(),
-        embeddings: Default::default(),
-        dependencies: Default::default(),
+        extensions: HashMap::default(),
+        secrets: Vec::default(),
+        metadata: HashMap::default(),
+        catalogs: Vec::default(),
+        views: Vec::default(),
+        models: Vec::default(),
+        tools: Vec::default(),
+        embeddings: Vec::default(),
+        dependencies: Vec::default(),
     }
 }
