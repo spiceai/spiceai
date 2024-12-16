@@ -191,7 +191,7 @@ fn azure(
 ) -> Result<Box<dyn Chat>, LlmError> {
     let Some(model_name) = model_id else {
         return Err(LlmError::FailedToLoadModel {
-            source: format!("For Azure model '{model_name}', model id must be specified in `from:azure:<model_id>`.").into(),
+            source: format!("For Azure model '{model_name}', model id must be specified in `from:azure:<model_id>`.\nFor details on model configuration, visit https://docs.spiceai.org/components/models/azure").into(),
         });
     };
     let api_base = extract_secret!(params, "endpoint");
@@ -200,10 +200,19 @@ fn azure(
     let api_key = extract_secret!(params, "azure_api_key");
     let entra_token = extract_secret!(params, "azure_entra_token");
 
+    if api_base.is_none() {
+        return Err(LlmError::FailedToLoadModel {
+            source: format!(
+                "Azure model '{model_name}' requires 'endpoint' parameter.\nFor details on model configuration, visit https://docs.spiceai.org/components/models/azure"
+            )
+            .into(),
+        });
+    }
+
     if api_key.is_some() && entra_token.is_some() {
         return Err(LlmError::FailedToLoadModel {
             source: format!(
-                "For azure model '{model_name}', only one of 'azure_api_key' or 'azure_entra_token' can be provided."
+                "For azure model '{model_name}', only one of 'azure_api_key' or 'azure_entra_token' can be provided.\nFor details on model configuration, visit https://docs.spiceai.org/components/models/azure"
             )
             .into(),
         });
@@ -212,7 +221,7 @@ fn azure(
     if api_key.is_none() && entra_token.is_none() {
         return Err(LlmError::FailedToLoadModel {
             source: format!(
-                "Azure model '{model_name}' requires 'azure_api_key' or 'azure_entra_token'."
+                "Azure model '{model_name}' requires 'azure_api_key' or 'azure_entra_token'.\nFor details on model configuration, visit https://docs.spiceai.org/components/models/azure"
             )
             .into(),
         });
