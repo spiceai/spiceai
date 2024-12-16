@@ -14,7 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::fmt::Display;
+use std::{fmt::Display, sync::Arc};
+
+use arrow::array::{Float64Array, Int64Array, RecordBatch, StringArray};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use runtime::dataupdate::{DataUpdate, UpdateType};
 
 mod datasets;
 pub mod evaluator;
@@ -158,6 +162,68 @@ impl SearchBenchmarkResultBuilder {
 
         let idx = ((sorted_times.len() as f64) * quantile).ceil() as usize - 1;
         Some(sorted_times[idx.clamp(0, sorted_times.len() - 1)])
+    }
+
+    pub(crate) fn build(self) -> RecordBatch {
+        let schema = results_schema();
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec![self.run_id.as_str()])),
+                Arc::new(StringArray::from(vec![self.commit_sha.as_str()])),
+                Arc::new(StringArray::from(vec![self.branch_name.as_str()])),
+                Arc::new(StringArray::from(vec![self.config_name.as_str()])),
+                Arc::new(StringArray::from(vec![self.status.as_str()])),
+                Arc::new(Int64Array::from(vec![self.started_at])),
+                Arc::new(Int64Array::from(vec![self.finished_at])),
+                Arc::new(Int64Array::from(vec![
+                    self.index_finished_at - self.index_started_at,
+                ])),
+                Arc::new(Int64Array::from(vec![
+                    self.search_finished_at - self.search_started_at,
+                ])),
+                Arc::new(Float64Array::from(vec![self.rps().unwrap_or_default()])),
+                Arc::new(Float64Array::from(vec![self.mean().unwrap_or_default()])),
+                Arc::new(Float64Array::from(vec![self
+                    .quantile(0.95)
+                    .unwrap_or_default()])),
+                Arc::new(Float64Array::from(vec![self.score])),
+            ],
+        );
+        match batch {
+            Ok(batch) => batch,
+            Err(e) => panic!("Error building record batch: {e}"),
+        }
+    }
+}
+
+fn results_schema() -> SchemaRef {
+    let fields = vec![
+        Field::new("run_id", DataType::Utf8, false),
+        Field::new("commit_sha", DataType::Utf8, false),
+        Field::new("branch_name", DataType::Utf8, false),
+        Field::new("config_name", DataType::Utf8, false),
+        Field::new("status", DataType::Utf8, false),
+        Field::new("started_at", DataType::Int64, false),
+        Field::new("finished_at", DataType::Int64, false),
+        Field::new("index_duration_ms", DataType::Int64, false),
+        Field::new("search_duration_ms", DataType::Int64, false),
+        Field::new("rps", DataType::Float64, false),
+        Field::new("mean_response_time_ms", DataType::Float64, false),
+        Field::new("p95_response_time_ms", DataType::Float64, false),
+        Field::new("score", DataType::Float64, false),
+    ];
+    Arc::new(Schema::new(fields))
+}
+
+impl From<SearchBenchmarkResultBuilder> for DataUpdate {
+    fn from(builder: SearchBenchmarkResultBuilder) -> Self {
+        let batch = builder.build();
+        DataUpdate {
+            schema: batch.schema(),
+            data: vec![batch],
+            update_type: UpdateType::Append,
+        }
     }
 }
 
