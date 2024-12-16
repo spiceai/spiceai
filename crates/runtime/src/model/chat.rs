@@ -191,7 +191,9 @@ fn azure(
 ) -> Result<Box<dyn Chat>, LlmError> {
     let Some(model_name) = model_id else {
         return Err(LlmError::FailedToLoadModel {
-            source: format!("For Azure model '{model_name}', model id must be specified in `from:azure:<model_id>`.\nFor details on model configuration, visit https://docs.spiceai.org/components/models/azure").into(),
+            source: format!(
+    "Azure model '{model_name}' requires a model ID in the format `from:azure:<model_id>`. See https://docs.spiceai.org/components/models/azure for details."
+).into(),
         });
     };
     let api_base = extract_secret!(params, "endpoint");
