@@ -211,7 +211,7 @@ fn azure(
     if api_key.is_some() && entra_token.is_some() {
         return Err(LlmError::FailedToLoadModel {
             source: format!(
-                "For azure model '{model_name}', only one of 'azure_api_key' or 'azure_entra_token' can be provided.\nFor details on model configuration, visit https://docs.spiceai.org/components/models/azure"
+                "Azure model '{model_name}' allows only one of 'azure_api_key' or 'azure_entra_token'. See https://docs.spiceai.org/components/models/azure for details."
             )
             .into(),
         });
