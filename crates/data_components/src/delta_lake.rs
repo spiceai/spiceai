@@ -55,7 +55,7 @@ pub enum Error {
     #[snafu(display("Delta Lake Table connection failed.\n{source}\n"))]
     DeltaTableError { source: delta_kernel::Error },
 
-    #[snafu(display("Delta Lake Table checkpoint files are missing or incorrect.\n{source}\nEnsure the checkpoint files in _delta_log are valid and try again."))]
+    #[snafu(display("Delta Lake Table checkpoint files are missing or incorrect.\n{source}\nRecreate checkpoint for the Delta Lake Table and try again."))]
     DeltaCheckpointError { source: delta_kernel::Error },
 }
 
