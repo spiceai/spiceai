@@ -20,7 +20,7 @@ All criteria must be met for the connector to be considered Beta, with exception
 | GitHub                           | ✅           | @peasee      |
 | HTTP/HTTPS                       | ❌           |              |
 | Localpod                         | ❌           |              |
-| MS SQL                           | ❌           |              |
+| MS SQL                           | ✅           | @peasee      |
 | MySQL                            | ✅           | @peasee      |
 | ODBC                             | ❌           |              |
 | PostgreSQL                       | ✅           | @Sevenannn   |
