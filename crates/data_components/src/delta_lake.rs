@@ -602,16 +602,12 @@ async fn get_parquet_access_plan(
 
 fn handle_delta_error(delta_error: delta_kernel::Error) -> Error {
     match delta_error {
-        delta_kernel::Error::InvalidCheckpoint(_) => {
-            return Error::DeltaCheckpointError {
-                source: delta_error,
-            }
-        }
-        _ => {
-            return Error::DeltaTableError {
-                source: delta_error,
-            }
-        }
+        delta_kernel::Error::InvalidCheckpoint(_) => Error::DeltaCheckpointError {
+            source: delta_error,
+        },
+        _ => Error::DeltaTableError {
+            source: delta_error,
+        },
     }
 }
 
