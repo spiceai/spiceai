@@ -33,7 +33,7 @@ use llms::{
 use secrecy::{ExposeSecret, SecretString};
 use spicepod::component::model::{Model, ModelFileType, ModelSource};
 use std::{collections::HashMap, path::PathBuf, str::FromStr, sync::Arc};
-use std::{path::Path, pin::Pin};
+use std::pin::Pin;
 use tracing_futures::Instrument;
 
 use super::tool_use::ToolUsingChat;
@@ -173,7 +173,7 @@ async fn huggingface(
         .iter()
         .find_map(|p| {
             let path = PathBuf::from_str(p.as_str());
-            if let Ok(Some(ref ext)) = path.as_ref().map(|pp| pp.extension()) {
+            if let Ok(Some(ext)) = path.as_ref().map(|pp| pp.extension()) {
                 if ext.eq_ignore_ascii_case("gguf") {
                     return PathBuf::from_str(p.as_str()).ok();
                 };
