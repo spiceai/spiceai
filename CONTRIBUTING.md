@@ -128,7 +128,7 @@ sudo apt update
 sudo apt install build-essential curl openssl libssl-dev pkg-config protobuf-compiler cmake
 
 # Install Go
-export GO_VERSION="1.22.4"
+export GO_VERSION="1.23.4"
 rm -rf /tmp/spice
 mkdir -p /tmp/spice
 cd /tmp/spice

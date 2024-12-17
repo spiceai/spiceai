@@ -67,7 +67,7 @@ jobs:
     runs-on: ${{ matrix.target.builder }}
     needs: setup-matrix
     env:
-      GOVER: 1.22.0
+      GOVER: 1.23.4
       GOOS: ${{ matrix.target.target_os }}
       GOARCH: ${{ matrix.target.target_arch_go }}
 

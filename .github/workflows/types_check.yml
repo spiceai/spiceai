@@ -9,7 +9,7 @@ jobs:
     name: Build ${{ matrix.name }} binaries
     runs-on: ${{ matrix.runner }}
     env:
-      GOVER: 1.22.0
+      GOVER: 1.23.4
       GOOS: ${{ matrix.target_os }}
       GOARCH: ${{ matrix.target_arch_go }}
 
