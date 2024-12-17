@@ -172,4 +172,23 @@ impl RuntimeStatus {
         };
         statuses.clone()
     }
+
+    /// Returns the status of all registered models.
+    ///
+    /// Keys are the `model_name`, not the format from [`RuntimeStatus::get_all_statuses`] (i.e. `model:<model_name>`).
+    #[must_use]
+    pub fn get_model_statuses(&self) -> HashMap<String, ComponentStatus> {
+        let statuses = match self.statuses.read() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
+        statuses
+            .iter()
+            .filter_map(|(k, v)| {
+                k.strip_prefix("model:")
+                    .map(|model_name| (model_name.to_string(), *v))
+            })
+            .collect()
+    }
 }

@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/manifoldco/promptui"
 	"github.com/peterh/liner"
@@ -31,9 +32,14 @@ type Message struct {
 }
 
 type ChatRequestBody struct {
-	Messages []Message `json:"messages"`
-	Model    string    `json:"model"`
-	Stream   bool      `json:"stream"`
+	Messages      []Message      `json:"messages"`
+	Model         string         `json:"model"`
+	Stream        bool           `json:"stream"`
+	StreamOptions *StreamOptions `json:"stream_options"`
+}
+
+type StreamOptions struct {
+	IncludeUsage bool `json:"include_usage"`
 }
 
 type Delta struct {
@@ -51,13 +57,19 @@ type Choice struct {
 }
 
 type ChatCompletion struct {
-	ID                string      `json:"id"`
-	Choices           []Choice    `json:"choices"`
-	Created           int64       `json:"created"`
-	Model             string      `json:"model"`
-	SystemFingerprint string      `json:"system_fingerprint"`
-	Object            string      `json:"object"`
-	Usage             interface{} `json:"usage"`
+	ID                string   `json:"id"`
+	Choices           []Choice `json:"choices"`
+	Created           int64    `json:"created"`
+	Model             string   `json:"model"`
+	SystemFingerprint string   `json:"system_fingerprint"`
+	Object            string   `json:"object"`
+	Usage             *Usage   `json:"usage"`
+}
+
+type Usage struct {
+	CompletionTokens int `json:"completion_tokens"`
+	PromptTokens     int `json:"prompt_tokens"`
+	TotalTokens      int `json:"total_tokens"`
 }
 
 type OpenAIError struct {
@@ -112,21 +124,30 @@ spice chat --model <model> --cloud
 				slog.Error("could not list models", "error", err)
 				os.Exit(1)
 			}
+
 			if len(models) == 0 {
 				slog.Error("No models found")
 				os.Exit(1)
 			}
 
-			modelsSelection := []string{}
-			selectedModel := models[0].Name
-			if len(models) > 1 {
-				for _, model := range models {
-					modelsSelection = append(modelsSelection, model.Name)
+			available_models := []string{}
+			for _, model := range models {
+				if model.Status == "Ready" {
+					available_models = append(available_models, model.Name)
 				}
+			}
+
+			if len(available_models) == 0 {
+				slog.Error("No models are ready")
+				os.Exit(1)
+			}
+
+			selectedModel := available_models[0]
+			if len(available_models) > 1 {
 
 				prompt := promptui.Select{
 					Label:        "Select model",
-					Items:        modelsSelection,
+					Items:        available_models,
 					HideSelected: true,
 				}
 
@@ -173,9 +194,10 @@ spice chat --model <model> --cloud
 			}()
 
 			body := &ChatRequestBody{
-				Messages: messages,
-				Model:    model,
-				Stream:   true,
+				Messages:      messages,
+				Model:         model,
+				Stream:        true,
+				StreamOptions: &StreamOptions{IncludeUsage: true},
 			}
 
 			response, err := sendChatRequest(rtcontext, body)
@@ -186,6 +208,11 @@ spice chat --model <model> --cloud
 
 			scanner := bufio.NewScanner(response.Body)
 			var responseMessage = ""
+
+			/// Usage for the entire stream, and related timing.
+			var usage Usage
+			startTime := time.Now()
+			var endTime time.Time
 
 			doneLoading := false
 
@@ -221,6 +248,11 @@ spice chat --model <model> --cloud
 					doneLoading = true
 				}
 
+				if chatResponse.Usage != nil {
+					usage = *chatResponse.Usage
+					endTime = time.Now()
+				}
+
 				if len(chatResponse.Choices) == 0 {
 					continue
 				}
@@ -242,7 +274,17 @@ spice chat --model <model> --cloud
 			if responseMessage != "" {
 				messages = append(messages, Message{Role: "assistant", Content: responseMessage})
 			}
-			cmd.Print("\n\n")
+			if usage != (Usage{}) {
+				duration := float32(endTime.Sub(startTime).Abs().Milliseconds()) / 1000.0
+				tps := float32(usage.TotalTokens) / duration
+				cmd.Printf(`
+
+Total tokens: %d (%.2f/s). Completion: %d. Prompt: %d.
+------------
+`, usage.CompletionTokens, tps, usage.PromptTokens, usage.TotalTokens)
+			} else {
+				cmd.Print("\n\n")
+			}
 		}
 	},
 }

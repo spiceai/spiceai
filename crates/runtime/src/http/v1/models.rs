@@ -13,7 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use app::App;
 use axum::{
@@ -26,12 +26,17 @@ use csv::Writer;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
+use crate::{status::ComponentStatus, Runtime};
+
 use super::Format;
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct ModelsQueryParams {
     #[serde(default)]
     format: Format,
+
+    #[serde(default)]
+    status: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -40,12 +45,19 @@ pub(crate) struct ModelResponse {
     pub name: String,
     pub from: String,
     pub datasets: Option<Vec<String>>,
+    pub status: Option<ComponentStatus>,
 }
 
 pub(crate) async fn get(
     Extension(app): Extension<Arc<RwLock<Option<Arc<App>>>>>,
+    Extension(rt): Extension<Arc<Runtime>>,
     Query(params): Query<ModelsQueryParams>,
 ) -> Response {
+    let statuses = if params.status {
+        rt.status.get_model_statuses()
+    } else {
+        HashMap::default()
+    };
     let resp = match app.read().await.as_ref() {
         Some(a) => a
             .models
@@ -61,6 +73,11 @@ pub(crate) async fn get(
                     name: m.name.clone(),
                     from: m.from.clone(),
                     datasets: d,
+                    status: if params.status {
+                        statuses.get(&m.name).copied()
+                    } else {
+                        None
+                    },
                 }
             })
             .collect::<Vec<ModelResponse>>(),
