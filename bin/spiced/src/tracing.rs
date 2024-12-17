@@ -18,12 +18,12 @@ use std::{borrow::Cow, sync::Arc};
 
 use app::{spicepod::component::runtime::TracingConfig, App};
 use futures::future::BoxFuture;
-use opentelemetry::global::Error as OtelError;
-use opentelemetry::trace::TraceError;
+use opentelemetry::{trace::TraceError, InstrumentationScope};
 use opentelemetry_sdk::{
+    error::Error as OtelError,
     export::trace::{ExportResult, SpanData, SpanExporter},
     runtime::TrySendError,
-    trace::{Config, TracerProvider},
+    trace::TracerProvider,
     Resource,
 };
 use reqwest::Client;
@@ -104,10 +104,6 @@ pub(crate) async fn init_tracing(
 
     tracing::subscriber::set_global_default(subscriber)?;
 
-    if let Err(e) = opentelemetry::global::set_error_handler(handle_opentelemetry_error) {
-        tracing::debug!("Failed to set OpenTelemetry error handler: {e}");
-    }
-
     Ok(())
 }
 
@@ -119,7 +115,6 @@ async fn datafusion_task_history_tracing<S>(
 where
     S: Subscriber + for<'span> LookupSpan<'span>,
 {
-    let trace_config = Config::default().with_resource(Resource::empty());
     let app_name = app.as_ref().map(|app| app.name.clone());
 
     let captured_output = app
@@ -140,11 +135,12 @@ where
 
     let mut provider_builder =
         TracerProvider::builder().with_batch_exporter(exporter, opentelemetry_sdk::runtime::Tokio);
-    provider_builder = provider_builder.with_config(trace_config);
+    provider_builder = provider_builder.with_resource(Resource::default());
     let provider = provider_builder.build();
-    let tracer = opentelemetry::trace::TracerProvider::tracer_builder(&provider, "task_history")
+    let scope = InstrumentationScope::builder("task_history")
         .with_version(env!("CARGO_PKG_VERSION"))
         .build();
+    let tracer = opentelemetry::trace::TracerProvider::tracer_with_scope(&provider, scope);
 
     let layer = tracing_opentelemetry::layer()
         .with_tracer(tracer)

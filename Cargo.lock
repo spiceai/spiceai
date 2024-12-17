@@ -2036,7 +2036,7 @@ dependencies = [
  "fundu",
  "futures",
  "moka",
- "opentelemetry 0.27.1",
+ "opentelemetry",
  "snafu",
  "spicepod",
  "tokio",
@@ -7801,20 +7801,6 @@ dependencies = [
 
 [[package]]
 name = "opentelemetry"
-version = "0.26.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "570074cc999d1a58184080966e5bd3bf3a9a4af650c3b05047c2621e7405cd17"
-dependencies = [
- "futures-core",
- "futures-sink",
- "js-sys",
- "once_cell",
- "pin-project-lite",
- "thiserror 1.0.69",
-]
-
-[[package]]
-name = "opentelemetry"
 version = "0.27.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ab70038c28ed37b97d8ed414b6429d343a8bbf44c9f79ec854f3a643029ba6d7"
@@ -7836,7 +7822,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "http 1.2.0",
- "opentelemetry 0.27.1",
+ "opentelemetry",
  "reqwest 0.12.9",
 ]
 
@@ -7847,8 +7833,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1b834e966ea5e2d03dfe5f2253f03d22cce21403ee940265070eeee96cee0bcc"
 dependencies = [
  "once_cell",
- "opentelemetry 0.27.1",
- "opentelemetry_sdk 0.27.1",
+ "opentelemetry",
+ "opentelemetry_sdk",
  "prometheus",
  "protobuf",
  "tracing",
@@ -7861,8 +7847,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a6e05acbfada5ec79023c85368af14abd0b307c015e9064d249b2a950ef459a6"
 dependencies = [
  "hex",
- "opentelemetry 0.27.1",
- "opentelemetry_sdk 0.27.1",
+ "opentelemetry",
+ "opentelemetry_sdk",
  "prost 0.13.4",
  "serde",
  "tonic",
@@ -7884,33 +7870,15 @@ dependencies = [
  "futures-core",
  "http 1.2.0",
  "once_cell",
- "opentelemetry 0.27.1",
+ "opentelemetry",
  "opentelemetry-http",
  "opentelemetry-semantic-conventions",
- "opentelemetry_sdk 0.27.1",
+ "opentelemetry_sdk",
  "reqwest 0.12.9",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
  "typed-builder",
-]
-
-[[package]]
-name = "opentelemetry_sdk"
-version = "0.26.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d2c627d9f4c9cdc1f21a29ee4bfbd6028fcb8bcf2a857b43f3abdf72c9c862f3"
-dependencies = [
- "async-trait",
- "futures-channel",
- "futures-executor",
- "futures-util",
- "glob",
- "once_cell",
- "opentelemetry 0.26.0",
- "percent-encoding",
- "rand 0.8.5",
- "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -7924,7 +7892,7 @@ dependencies = [
  "futures-executor",
  "futures-util",
  "glob",
- "opentelemetry 0.27.1",
+ "opentelemetry",
  "percent-encoding",
  "rand 0.8.5",
  "serde_json",
@@ -7965,8 +7933,8 @@ dependencies = [
  "arrow",
  "arrow-buffer",
  "async-trait",
- "opentelemetry 0.27.1",
- "opentelemetry_sdk 0.27.1",
+ "opentelemetry",
+ "opentelemetry_sdk",
 ]
 
 [[package]]
@@ -9509,10 +9477,10 @@ dependencies = [
  "ns_lookup",
  "object_store",
  "once_cell",
- "opentelemetry 0.27.1",
+ "opentelemetry",
  "opentelemetry-prometheus",
  "opentelemetry-proto",
- "opentelemetry_sdk 0.27.1",
+ "opentelemetry_sdk",
  "otel-arrow",
  "package",
  "percent-encoding",
@@ -10484,11 +10452,11 @@ dependencies = [
  "clap",
  "flightrepl",
  "futures",
- "opentelemetry 0.27.1",
+ "opentelemetry",
  "opentelemetry-http",
  "opentelemetry-prometheus",
  "opentelemetry-zipkin",
- "opentelemetry_sdk 0.27.1",
+ "opentelemetry_sdk",
  "otel-arrow",
  "prometheus",
  "reqwest 0.12.9",
@@ -10898,8 +10866,8 @@ dependencies = [
  "async-trait",
  "flight_client",
  "hostname 0.4.0",
- "opentelemetry 0.27.1",
- "opentelemetry_sdk 0.27.1",
+ "opentelemetry",
+ "opentelemetry_sdk",
  "otel-arrow",
  "sha2",
  "tokio",
@@ -11634,14 +11602,14 @@ dependencies = [
 
 [[package]]
 name = "tracing-opentelemetry"
-version = "0.27.0"
+version = "0.28.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dc58af5d3f6c5811462cabb3289aec0093f7338e367e5a33d28c0433b3c7360b"
+checksum = "97a971f6058498b5c0f1affa23e7ea202057a7301dbff68e968b2d578bcbd053"
 dependencies = [
  "js-sys",
  "once_cell",
- "opentelemetry 0.26.0",
- "opentelemetry_sdk 0.26.0",
+ "opentelemetry",
+ "opentelemetry_sdk",
  "smallvec",
  "tracing",
  "tracing-core",
@@ -13166,8 +13134,3 @@ checksum = "16099418600b4d8f028622f73ff6e3deaabdff330fb9a2a131dea781ee8b0768"
 dependencies = [
  "zune-core",
 ]
-
-[[patch.unused]]
-name = "opentelemetry-prometheus"
-version = "0.17.0"
-source = "git+https://github.com/open-telemetry/opentelemetry-rust.git?rev=e91138351a689cd21923c15eb48f5fbc95ded807#e91138351a689cd21923c15eb48f5fbc95ded807"

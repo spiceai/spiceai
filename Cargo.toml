@@ -138,7 +138,7 @@ tower = "0.5.1"
 tower-http = { version = "0.6.2", features = ["cors"] }
 tracing = "0.1.41"
 tracing-futures = { version = "0.2.5", features = ["futures-03"] }
-tracing-opentelemetry = "0.27"
+tracing-opentelemetry = "0.28"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 uuid = "1.9.1"
 x509-certificate = "0.23.1"
@@ -164,6 +164,3 @@ rusqlite = { git = "https://github.com/spiceai/rusqlite.git", rev = "97054b6af72
 
 # Tracking Issue: https://github.com/allan2/dotenvy/issues/113
 dotenvy = { git = "https://github.com/spiceai/dotenvy.git", rev = "e5cef1871b08003198949dfe2da988633eaad78f" }
-
-# Required until next release with opentelemetry 0.26 support: https://github.com/open-telemetry/opentelemetry-rust/pull/2183
-opentelemetry-prometheus = { git = "https://github.com/open-telemetry/opentelemetry-rust.git", rev = "e91138351a689cd21923c15eb48f5fbc95ded807" }
