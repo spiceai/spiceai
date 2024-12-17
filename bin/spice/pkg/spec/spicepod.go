@@ -17,6 +17,9 @@ limitations under the License.
 package spec
 
 import (
+	"reflect"
+	"strings"
+
 	"gopkg.in/yaml.v3"
 )
 
@@ -38,22 +41,17 @@ type SpicepodSpec struct {
 	Node *yaml.Node `yaml:",inline"`
 }
 
+var knownFields map[string]bool
+
+func init() {
+	knownFields = getKnownFields()
+}
+
 // Custom UnmarshalYAML to handle both known and unknown fields
 func (s *SpicepodSpec) UnmarshalYAML(value *yaml.Node) error {
 	// Decode known fields
 	if err := value.Decode(&s.SpicepodSpecFields); err != nil {
 		return err
-	}
-
-	// Create a map of known fields for quick lookup
-	knownFields := map[string]bool{
-		"version":      true,
-		"kind":         true,
-		"name":         true,
-		"params":       true,
-		"metadata":     true,
-		"dependencies": true,
-		"datasets":     true,
 	}
 
 	// Create a new node for unknown fields
@@ -108,4 +106,23 @@ func (s SpicepodSpec) MarshalYAML() (interface{}, error) {
 	}
 
 	return result, nil
+}
+
+// getKnownFields returns a map of field names from the yaml tags of SpicepodSpecFields
+func getKnownFields() map[string]bool {
+	knownFields := make(map[string]bool)
+	t := reflect.TypeOf(SpicepodSpecFields{})
+
+	for i := 0; i < t.NumField(); i++ {
+		field := t.Field(i)
+		// Get the yaml tag
+		if tag, ok := field.Tag.Lookup("yaml"); ok {
+			// Split the tag on ',' and take the first part (the field name)
+			name := strings.Split(tag, ",")[0]
+			if name != "" {
+				knownFields[name] = true
+			}
+		}
+	}
+	return knownFields
 }
