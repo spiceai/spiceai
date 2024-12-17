@@ -55,10 +55,6 @@ pub(crate) async fn post(
 ) -> Response {
     let model = req.model;
 
-    if !llms.read().await.contains_key(&model) {
-        return (StatusCode::NOT_FOUND, format!("model '{model}' not found")).into_response();
-    };
-
     let evals = rt.evals.read().await;
     let Some(eval) = evals.iter().find(|e| e.name == eval_name) else {
         return (
@@ -66,6 +62,10 @@ pub(crate) async fn post(
             format!("eval '{eval_name}' not found"),
         )
             .into_response();
+    };
+
+    if !llms.read().await.contains_key(&model) {
+        return (StatusCode::NOT_FOUND, format!("model '{model}' not found")).into_response();
     };
 
     if !df
