@@ -16,15 +16,18 @@ limitations under the License.
 
 package spec
 
-import "gopkg.in/yaml.v3"
+import (
+	"gopkg.in/yaml.v3"
+)
 
 type SpicepodSpec struct {
-	Version      string            `json:"version,omitempty" csv:"version" yaml:"version,omitempty"`
-	Kind         string            `json:"kind,omitempty" csv:"kind" yaml:"kind,omitempty"`
-	Name         string            `json:"name,omitempty" csv:"name" yaml:"name,omitempty"`
-	Params       map[string]string `json:"params,omitempty" yaml:"params,omitempty" mapstructure:"params,omitempty"`
-	Metadata     map[string]string `json:"metadata,omitempty" csv:"metadata" yaml:"metadata,omitempty"`
-	Dependencies []string          `json:"dependencies,omitempty" csv:"dependencies" yaml:"dependencies,omitempty"`
+	Version      string                   `json:"version,omitempty" csv:"version" yaml:"version,omitempty"`
+	Kind         string                   `json:"kind,omitempty" csv:"kind" yaml:"kind,omitempty"`
+	Name         string                   `json:"name,omitempty" csv:"name" yaml:"name,omitempty"`
+	Params       map[string]string        `json:"params,omitempty" yaml:"params,omitempty" mapstructure:"params,omitempty"`
+	Metadata     map[string]string        `json:"metadata,omitempty" csv:"metadata" yaml:"metadata,omitempty"`
+	Dependencies []string                 `json:"dependencies,omitempty" csv:"dependencies" yaml:"dependencies,omitempty"`
+	Datasets     []map[string]interface{} `json:"datasets,omitempty" csv:"datasets" yaml:"datasets,omitempty"`
 
 	// Embed yaml.Node to preserve unknown fields
 	Node *yaml.Node `yaml:",inline"`
@@ -34,12 +37,13 @@ type SpicepodSpec struct {
 func (s *SpicepodSpec) UnmarshalYAML(value *yaml.Node) error {
 	// Create a temporary type without the yaml.Node to avoid recursive unmarshaling
 	type TempSpec struct {
-		Version      string            `yaml:"version,omitempty"`
-		Kind         string            `yaml:"kind,omitempty"`
-		Name         string            `yaml:"name,omitempty"`
-		Params       map[string]string `yaml:"params,omitempty"`
-		Metadata     map[string]string `yaml:"metadata,omitempty"`
-		Dependencies []string          `yaml:"dependencies,omitempty"`
+		Version      string                   `yaml:"version,omitempty"`
+		Kind         string                   `yaml:"kind,omitempty"`
+		Name         string                   `yaml:"name,omitempty"`
+		Params       map[string]string        `yaml:"params,omitempty"`
+		Metadata     map[string]string        `yaml:"metadata,omitempty"`
+		Dependencies []string                 `yaml:"dependencies,omitempty"`
+		Datasets     []map[string]interface{} `yaml:"datasets,omitempty"`
 	}
 
 	// Decode known fields into temporary struct
@@ -55,7 +59,7 @@ func (s *SpicepodSpec) UnmarshalYAML(value *yaml.Node) error {
 	s.Params = tmp.Params
 	s.Metadata = tmp.Metadata
 	s.Dependencies = tmp.Dependencies
-
+	s.Datasets = tmp.Datasets
 	// Get the content node
 	contentNode := value
 	if value.Kind == yaml.DocumentNode && len(value.Content) > 0 {
@@ -76,6 +80,7 @@ func (s *SpicepodSpec) UnmarshalYAML(value *yaml.Node) error {
 		"params":       true,
 		"metadata":     true,
 		"dependencies": true,
+		"datasets":     true,
 	}
 
 	// Preserve unknown fields
@@ -108,59 +113,42 @@ func (s *SpicepodSpec) UnmarshalYAML(value *yaml.Node) error {
 
 // Custom MarshalYAML to output both known and unknown fields
 func (s SpicepodSpec) MarshalYAML() (interface{}, error) {
+	// Create a temporary type without the Node field to avoid recursive marshaling
+	type TempSpec struct {
+		Version      string                   `yaml:"version,omitempty"`
+		Kind         string                   `yaml:"kind,omitempty"`
+		Name         string                   `yaml:"name,omitempty"`
+		Params       map[string]string        `yaml:"params,omitempty"`
+		Metadata     map[string]string        `yaml:"metadata,omitempty"`
+		Dependencies []string                 `yaml:"dependencies,omitempty"`
+		Datasets     []map[string]interface{} `yaml:"datasets,omitempty"`
+	}
+
 	// Create a new node for the result
 	result := &yaml.Node{
 		Kind: yaml.MappingNode,
 		Tag:  "!!map",
 	}
 
-	// Add known fields first
-	if s.Version != "" {
-		result.Content = append(result.Content,
-			&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: "version"},
-			&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: s.Version})
+	// Let yaml handle encoding of all known fields
+	var knownNode yaml.Node
+	if err := knownNode.Encode(TempSpec{
+		Version:      s.Version,
+		Kind:         s.Kind,
+		Name:         s.Name,
+		Params:       s.Params,
+		Metadata:     s.Metadata,
+		Dependencies: s.Dependencies,
+		Datasets:     s.Datasets,
+	}); err != nil {
+		return nil, err
 	}
-	if s.Kind != "" {
-		result.Content = append(result.Content,
-			&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: "kind"},
-			&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: s.Kind})
-	}
-	if s.Name != "" {
-		result.Content = append(result.Content,
-			&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: "name"},
-			&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: s.Name})
-	}
-	if len(s.Params) > 0 {
-		paramsNode := &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
-		for k, v := range s.Params {
-			paramsNode.Content = append(paramsNode.Content,
-				&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: k},
-				&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: v})
-		}
-		result.Content = append(result.Content,
-			&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: "params"},
-			paramsNode)
-	}
-	if len(s.Metadata) > 0 {
-		metadataNode := &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
-		for k, v := range s.Metadata {
-			metadataNode.Content = append(metadataNode.Content,
-				&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: k},
-				&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: v})
-		}
-		result.Content = append(result.Content,
-			&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: "metadata"},
-			metadataNode)
-	}
-	if len(s.Dependencies) > 0 {
-		depsNode := &yaml.Node{Kind: yaml.SequenceNode, Tag: "!!seq"}
-		for _, dep := range s.Dependencies {
-			depsNode.Content = append(depsNode.Content,
-				&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: dep})
-		}
-		result.Content = append(result.Content,
-			&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: "dependencies"},
-			depsNode)
+
+	// Add known fields to result
+	if knownNode.Kind == yaml.DocumentNode && len(knownNode.Content) > 0 {
+		result.Content = append(result.Content, knownNode.Content[0].Content...)
+	} else {
+		result.Content = append(result.Content, knownNode.Content...)
 	}
 
 	// Add unknown fields from Node if they exist
@@ -169,14 +157,4 @@ func (s SpicepodSpec) MarshalYAML() (interface{}, error) {
 	}
 
 	return result, nil
-}
-
-// Helper function to find a key in the YAML node content
-func findKey(content []*yaml.Node, key string) (int, bool) {
-	for i := 0; i < len(content); i += 2 {
-		if content[i].Value == key {
-			return i, true
-		}
-	}
-	return -1, false
 }
