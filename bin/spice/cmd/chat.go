@@ -130,24 +130,24 @@ spice chat --model <model> --cloud
 				os.Exit(1)
 			}
 
-			available_models := []string{}
+			availableModels := []string{}
 			for _, model := range models {
 				if model.Status == "Ready" {
-					available_models = append(available_models, model.Name)
+					availableModels = append(availableModels, model.Name)
 				}
 			}
 
-			if len(available_models) == 0 {
+			if len(availableModels) == 0 {
 				slog.Error("No models are ready")
 				os.Exit(1)
 			}
 
-			selectedModel := available_models[0]
-			if len(available_models) > 1 {
+			selectedModel := availableModels[0]
+			if len(availableModels) > 1 {
 
 				prompt := promptui.Select{
 					Label:        "Select model",
-					Items:        available_models,
+					Items:        availableModels,
 					HideSelected: true,
 				}
 
@@ -275,19 +275,35 @@ spice chat --model <model> --cloud
 				messages = append(messages, Message{Role: "assistant", Content: responseMessage})
 			}
 			if usage != (Usage{}) {
-				duration := float32(endTime.Sub(startTime).Abs().Milliseconds()) / 1000.0
-				tps := float32(usage.TotalTokens) / duration
-				usage_line := fmt.Sprintf(
-					"Total tokens: %d (%.2f/s). Completion: %d. Prompt: %d.",
-					usage.TotalTokens, tps, usage.CompletionTokens, usage.PromptTokens,
-				)
-				line := strings.Repeat("-", len(usage_line)+2)
-				cmd.Printf("\n\n+%s+\n| %s |\n+%s+\n\n", line, usage_line, line)
+				cmd.Printf("\n\n%s\n\n", generateUsageMessage(&usage, endTime.Sub(startTime).Abs()))
 			} else {
 				cmd.Print("\n\n")
 			}
 		}
 	},
+}
+
+// `generateUsageMessage` generates a boxed summary of the usage statistics.
+//
+// ```shell
+// +-----------------------------------------------------------+
+// | Total tokens: 229 (53.60/s). Completion: 219. Prompt: 10. |
+// +-----------------------------------------------------------+
+// ```
+func generateUsageMessage(u *Usage, dur time.Duration) string {
+	if u == nil {
+		return ""
+	}
+
+	tps := float32(dur.Milliseconds()) / 1000.0
+	usage_line := fmt.Sprintf(
+		"Total tokens: %d (%.2f/s). Completion: %d. Prompt: %d.",
+		u.TotalTokens, tps, u.CompletionTokens, u.PromptTokens,
+	)
+
+	// Dynamically generate a line of the same length as the usage line
+	line := strings.Repeat("-", len(usage_line)+2)
+	return fmt.Sprintf("+%s+\n| %s |\n+%s+", line, usage_line, line)
 }
 
 func sendChatRequest(rtcontext *context.RuntimeContext, body *ChatRequestBody) (*http.Response, error) {
