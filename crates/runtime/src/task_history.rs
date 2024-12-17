@@ -16,15 +16,17 @@ limitations under the License.
 
 use crate::accelerated_table::refresh::Refresh;
 use crate::datafusion::DataFusion;
-use crate::dataupdate::DataUpdate;
+use crate::dataupdate::{DataUpdate, UpdateType};
 use crate::internal_table::create_internal_accelerated_table;
 use crate::status;
 use crate::{component::dataset::acceleration::Acceleration, datafusion::SPICE_RUNTIME_SCHEMA};
 use crate::{component::dataset::TimeFormat, secrets::Secrets};
-use arrow::array::{ArrayBuilder, MapBuilder, RecordBatch, StringBuilder};
+use arrow::array::{ArrayBuilder, MapBuilder, RecordBatch, StringArray, StringBuilder};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+use arrow_schema::ArrowError;
 use data_components::arrow::struct_builder::StructBuilder;
 use datafusion::sql::TableReference;
+use futures::TryStreamExt;
 use snafu::prelude::*;
 use snafu::{ResultExt, Snafu};
 use std::collections::HashMap;
@@ -101,7 +103,7 @@ impl TaskSpan {
             status,
             tbl_reference,
             Arc::new(TaskSpan::table_schema()),
-            None,
+            Some(vec!["span_id".to_string()]),
             Acceleration::default(),
             Refresh::default(),
             retention,
@@ -151,6 +153,15 @@ impl TaskSpan {
     }
 
     pub async fn write(df: Arc<DataFusion>, spans: Vec<TaskSpan>) -> Result<(), Error> {
+        let overrides: Vec<_> = spans
+            .iter()
+            .filter_map(|s| {
+                s.trace_id_override
+                    .as_ref()
+                    .map(|new_trace| (Arc::clone(&s.trace_id), Arc::clone(new_trace)))
+            })
+            .collect();
+
         let data = Self::to_record_batch(spans)
             .boxed()
             .context(UnableToWriteToTableSnafu)?;
@@ -168,6 +179,65 @@ impl TaskSpan {
         .await
         .boxed()
         .context(UnableToWriteToTableSnafu)?;
+
+        // Override trace_ids if necessary. Must be after above write so that it also handles override this batch of spans.
+        for (from, to) in overrides {
+            Self::override_trace_id(Arc::clone(&df), from, to)
+                .await
+                .boxed()
+                .context(UnableToUpdateTracesSnafu)?;
+        }
+
+        Ok(())
+    }
+
+    async fn override_trace_id(
+        df: Arc<DataFusion>,
+        from: Arc<str>,
+        to: Arc<str>,
+    ) -> Result<(), Error> {
+        let overriden: Vec<_> = df
+            .query_builder(
+                format!(
+                    "SELECT * FROM {} where trace_id = '{from}'",
+                    TableReference::partial(SPICE_RUNTIME_SCHEMA, DEFAULT_TASK_HISTORY_TABLE)
+                        .to_quoted_string()
+                )
+                .as_str(),
+            )
+            .build()
+            .run()
+            .await
+            .boxed()
+            .context(UnableToUpdateTracesSnafu)?
+            .data
+            .try_collect::<Vec<RecordBatch>>()
+            .await
+            .boxed()
+            .context(UnableToUpdateTracesSnafu)?
+            .into_iter()
+            .filter_map(|rb| {
+                let (idx, _) = rb.schema().column_with_name("trace_id")?;
+                let mut cols = rb.columns().to_vec();
+
+                cols[idx] = Arc::new(StringArray::from(vec![to.to_string(); rb.num_rows()]));
+                Some(RecordBatch::try_new(rb.schema(), cols))
+            })
+            .collect::<Result<_, ArrowError>>()
+            .boxed()
+            .context(UnableToUpdateTracesSnafu)?;
+
+        df.write_data(
+            &TableReference::partial(SPICE_RUNTIME_SCHEMA, DEFAULT_TASK_HISTORY_TABLE),
+            DataUpdate {
+                schema: Arc::new(Self::table_schema()),
+                data: overriden,
+                update_type: UpdateType::Changes,
+            },
+        )
+        .await
+        .boxed()
+        .context(UnableToUpdateTracesSnafu)?;
 
         Ok(())
     }
@@ -292,6 +362,11 @@ pub enum Error {
 
     #[snafu(display("Error writing to `task_history` table: {source}"))]
     UnableToWriteToTable {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display("Unable to update `trace_id` column in the `task_history` table: {source}"))]
+    UnableToUpdateTraces {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 

@@ -181,26 +181,10 @@ impl TaskHistoryExporter {
 
 impl SpanExporter for TaskHistoryExporter {
     fn export(&mut self, batch: Vec<SpanData>) -> BoxFuture<'static, ExportResult> {
-        let mut spans: Vec<TaskSpan> = batch
+        let spans: Vec<TaskSpan> = batch
             .into_iter()
             .map(|span| self.span_to_task_span(span))
             .collect();
-
-        // If any span has defined a [`TaskSpan::trace_id_override`], we must override others.
-        let overrides: HashMap<Arc<str>, Arc<str>> = spans
-            .iter()
-            .filter_map(|span| {
-                span.trace_id_override
-                    .as_ref()
-                    .map(|new_trace| (Arc::clone(&span.trace_id), Arc::clone(new_trace)))
-            })
-            .collect();
-
-        for span in &mut spans {
-            if let Some(new_trace_id) = overrides.get(&span.trace_id) {
-                span.trace_id = Arc::clone(new_trace_id);
-            }
-        }
 
         let df = Arc::clone(&self.df);
         Box::pin(async move {
