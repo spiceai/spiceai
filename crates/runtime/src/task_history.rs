@@ -217,6 +217,7 @@ impl TaskSpan {
             .context(UnableToUpdateTracesSnafu)?
             .into_iter()
             .filter_map(|rb| {
+                // Replace the trace id column with the new `to` trace id.
                 let (idx, _) = rb.schema().column_with_name("trace_id")?;
                 let mut cols = rb.columns().to_vec();
 
