@@ -32,8 +32,8 @@ use llms::{
 };
 use secrecy::{ExposeSecret, SecretString};
 use spicepod::component::model::{Model, ModelFileType, ModelSource};
-use std::{collections::HashMap, path::PathBuf, str::FromStr, sync::Arc};
 use std::pin::Pin;
+use std::{collections::HashMap, path::PathBuf, str::FromStr, sync::Arc};
 use tracing_futures::Instrument;
 
 use super::tool_use::ToolUsingChat;
