@@ -16,6 +16,7 @@ limitations under the License.
 
 #![allow(clippy::large_futures)]
 
+use opentelemetry::InstrumentationScope;
 use opentelemetry_sdk::{runtime::TokioCurrentThread, trace::TracerProvider};
 use runtime::{task_history::otel_exporter::TaskHistoryExporter, Runtime};
 use spicepod::component::runtime::TaskHistoryCapturedOutput;
@@ -60,9 +61,10 @@ fn init_tracing_with_task_history(
         .with_batch_exporter(task_history_exporter, TokioCurrentThread)
         .build();
 
-    let tracer = opentelemetry::trace::TracerProvider::tracer_builder(&provider, "task_history")
+    let scope = InstrumentationScope::builder("task_history")
         .with_version(env!("CARGO_PKG_VERSION"))
         .build();
+    let tracer = opentelemetry::trace::TracerProvider::tracer_with_scope(&provider, scope);
 
     let task_history_layer = tracing_opentelemetry::layer()
         .with_tracer(tracer)
