@@ -7829,27 +7829,29 @@ dependencies = [
 
 [[package]]
 name = "opentelemetry-http"
-version = "0.26.0"
+version = "0.27.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6351496aeaa49d7c267fb480678d85d1cd30c5edb20b497c48c56f62a8c14b99"
+checksum = "10a8a7f5f6ba7c1b286c2fbca0454eaba116f63bbe69ed250b642d36fbb04d80"
 dependencies = [
  "async-trait",
  "bytes",
  "http 1.2.0",
- "opentelemetry 0.26.0",
+ "opentelemetry 0.27.1",
  "reqwest 0.12.9",
 ]
 
 [[package]]
 name = "opentelemetry-prometheus"
-version = "0.17.0"
-source = "git+https://github.com/open-telemetry/opentelemetry-rust.git?rev=e91138351a689cd21923c15eb48f5fbc95ded807#e91138351a689cd21923c15eb48f5fbc95ded807"
+version = "0.27.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1b834e966ea5e2d03dfe5f2253f03d22cce21403ee940265070eeee96cee0bcc"
 dependencies = [
  "once_cell",
- "opentelemetry 0.26.0",
- "opentelemetry_sdk 0.26.0",
+ "opentelemetry 0.27.1",
+ "opentelemetry_sdk 0.27.1",
  "prometheus",
  "protobuf",
+ "tracing",
 ]
 
 [[package]]
@@ -7868,24 +7870,24 @@ dependencies = [
 
 [[package]]
 name = "opentelemetry-semantic-conventions"
-version = "0.26.0"
+version = "0.27.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "db945c1eaea8ac6a9677185357480d215bb6999faa9f691d0c4d4d641eab7a09"
+checksum = "bc1b6902ff63b32ef6c489e8048c5e253e2e4a803ea3ea7e783914536eb15c52"
 
 [[package]]
 name = "opentelemetry-zipkin"
-version = "0.26.0"
+version = "0.27.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dd5f25a628014191d3e98bb4794e37771b580e9c3de341cf1c813019aa721278"
+checksum = "4c630342febc883d74af134b87f75f0bded45bd56d1a7673685df23d400a9d26"
 dependencies = [
  "async-trait",
  "futures-core",
  "http 1.2.0",
  "once_cell",
- "opentelemetry 0.26.0",
+ "opentelemetry 0.27.1",
  "opentelemetry-http",
  "opentelemetry-semantic-conventions",
- "opentelemetry_sdk 0.26.0",
+ "opentelemetry_sdk 0.27.1",
  "reqwest 0.12.9",
  "serde",
  "serde_json",
@@ -7908,10 +7910,7 @@ dependencies = [
  "opentelemetry 0.26.0",
  "percent-encoding",
  "rand 0.8.5",
- "serde_json",
  "thiserror 1.0.69",
- "tokio",
- "tokio-stream",
 ]
 
 [[package]]
@@ -7930,6 +7929,9 @@ dependencies = [
  "rand 0.8.5",
  "serde_json",
  "thiserror 1.0.69",
+ "tokio",
+ "tokio-stream",
+ "tracing",
 ]
 
 [[package]]
@@ -7964,7 +7966,7 @@ dependencies = [
  "arrow-buffer",
  "async-trait",
  "opentelemetry 0.27.1",
- "opentelemetry_sdk 0.26.0",
+ "opentelemetry_sdk 0.27.1",
 ]
 
 [[package]]
@@ -9510,7 +9512,7 @@ dependencies = [
  "opentelemetry 0.27.1",
  "opentelemetry-prometheus",
  "opentelemetry-proto",
- "opentelemetry_sdk 0.26.0",
+ "opentelemetry_sdk 0.27.1",
  "otel-arrow",
  "package",
  "percent-encoding",
@@ -10486,7 +10488,7 @@ dependencies = [
  "opentelemetry-http",
  "opentelemetry-prometheus",
  "opentelemetry-zipkin",
- "opentelemetry_sdk 0.26.0",
+ "opentelemetry_sdk 0.27.1",
  "otel-arrow",
  "prometheus",
  "reqwest 0.12.9",
@@ -10897,7 +10899,7 @@ dependencies = [
  "flight_client",
  "hostname 0.4.0",
  "opentelemetry 0.27.1",
- "opentelemetry_sdk 0.26.0",
+ "opentelemetry_sdk 0.27.1",
  "otel-arrow",
  "sha2",
  "tokio",
@@ -13164,3 +13166,8 @@ checksum = "16099418600b4d8f028622f73ff6e3deaabdff330fb9a2a131dea781ee8b0768"
 dependencies = [
  "zune-core",
 ]
+
+[[patch.unused]]
+name = "opentelemetry-prometheus"
+version = "0.17.0"
+source = "git+https://github.com/open-telemetry/opentelemetry-rust.git?rev=e91138351a689cd21923c15eb48f5fbc95ded807#e91138351a689cd21923c15eb48f5fbc95ded807"

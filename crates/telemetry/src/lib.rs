@@ -25,13 +25,14 @@ use std::{sync::LazyLock, time::Duration};
 pub mod anonymous;
 mod exporter;
 mod meter;
+mod noop;
 
 static QUERY_COUNT: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
         .u64_counter("query_executions")
         .with_description("Number of query executions.")
         .with_unit("queries")
-        .init()
+        .build()
 });
 
 pub fn track_query_count(dimensions: &[KeyValue]) {
@@ -43,7 +44,7 @@ static BYTES_PROCESSED: LazyLock<Counter<u64>> = LazyLock::new(|| {
         .u64_counter("query_processed_bytes")
         .with_description("Number of bytes processed by the runtime.")
         .with_unit("By")
-        .init()
+        .build()
 });
 
 pub fn track_bytes_processed(bytes: u64, dimensions: &[KeyValue]) {
@@ -55,7 +56,7 @@ static BYTES_RETURNED: LazyLock<Counter<u64>> = LazyLock::new(|| {
         .u64_counter("query_returned_bytes")
         .with_description("Number of bytes returned to query clients.")
         .with_unit("By")
-        .init()
+        .build()
 });
 
 pub fn track_bytes_returned(bytes: u64, dimensions: &[KeyValue]) {
@@ -69,7 +70,7 @@ static QUERY_DURATION_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| {
             "The total amount of time spent planning and executing queries in milliseconds.",
         )
         .with_unit("ms")
-        .init()
+        .build()
 });
 
 pub fn track_query_duration(duration: Duration, dimensions: &[KeyValue]) {
@@ -83,7 +84,7 @@ static QUERY_EXECUTION_DURATION_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| 
             "The total amount of time spent only executing queries. This is 0 for cached queries.",
         )
         .with_unit("ms")
-        .init()
+        .build()
 });
 
 pub fn track_query_execution_duration(duration: Duration, dimensions: &[KeyValue]) {

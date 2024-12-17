@@ -89,13 +89,13 @@ odbc-api = { version = "8.1.2" }
 opentelemetry = { version = "0.27", default-features = false, features = [
     "metrics",
 ] }
-opentelemetry-http = { version = "0.26", features = ["reqwest-rustls"] }
-opentelemetry-prometheus = "0.17"
-opentelemetry-zipkin = { version = "0.26", default-features = false, features = [
+opentelemetry-http = { version = "0.27", features = ["reqwest-rustls"] }
+opentelemetry-prometheus = "0.27"
+opentelemetry-zipkin = { version = "0.27", default-features = false, features = [
     "reqwest",
     "reqwest-rustls",
 ] }
-opentelemetry_sdk = { version = "0.26", default-features = false, features = [
+opentelemetry_sdk = { version = "0.27", default-features = false, features = [
     "metrics",
     "rt-tokio",
     "trace",

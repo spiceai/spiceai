@@ -241,6 +241,7 @@ pub enum AttributeValueType {
     Map = 5,
     Slice = 6,
     Bytes = 7,
+    Unknown = 255, // u8::MAX
 }
 
 impl AttributeValueType {
@@ -259,6 +260,7 @@ impl AttributeValueType {
             5 => Some(AttributeValueType::Map),
             6 => Some(AttributeValueType::Slice),
             7 => Some(AttributeValueType::Bytes),
+            255 => Some(AttributeValueType::Unknown),
             _ => None,
         }
     }
@@ -274,18 +276,17 @@ impl std::fmt::Display for AttributeValueType {
             AttributeValueType::Map => "Map",
             AttributeValueType::Slice => "Slice",
             AttributeValueType::Bytes => "Bytes",
+            AttributeValueType::Unknown => "Unknown",
         };
         write!(f, "{s}")
     }
 }
 
-pub(crate) fn temporality_to_i32(
-    temporality: opentelemetry_sdk::metrics::data::Temporality,
-) -> i32 {
+pub(crate) fn temporality_to_i32(temporality: opentelemetry_sdk::metrics::Temporality) -> i32 {
     // Based on https://github.com/open-telemetry/opentelemetry-proto/blob/main/opentelemetry/proto/metrics/v1/metrics.proto#L278
     match temporality {
-        opentelemetry_sdk::metrics::data::Temporality::Delta => 1,
-        opentelemetry_sdk::metrics::data::Temporality::Cumulative => 2,
+        opentelemetry_sdk::metrics::Temporality::Delta => 1,
+        opentelemetry_sdk::metrics::Temporality::Cumulative => 2,
         _ => panic!("Invalid temporality"),
     }
 }

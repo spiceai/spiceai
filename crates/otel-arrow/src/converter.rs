@@ -24,9 +24,9 @@ use arrow::array::{
 use arrow::datatypes::{DataType, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use arrow_buffer::{BufferBuilder, NullBufferBuilder, OffsetBuffer};
-use opentelemetry::metrics::MetricsError;
-use opentelemetry::InstrumentationLibrary;
+use opentelemetry::InstrumentationScope;
 use opentelemetry_sdk::metrics::data::{Gauge, Histogram, Metric, ResourceMetrics, Sum};
+use opentelemetry_sdk::metrics::MetricError;
 use opentelemetry_sdk::Resource;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -338,7 +338,7 @@ impl OtelToArrowConverter {
     pub fn convert(
         &mut self,
         resource_metrics: &ResourceMetrics,
-    ) -> Result<RecordBatch, MetricsError> {
+    ) -> Result<RecordBatch, MetricError> {
         for scope_metrics in &resource_metrics.scope_metrics {
             for metric in &scope_metrics.metrics {
                 self.process_metric(metric, &resource_metrics.resource, &scope_metrics.scope)?;
@@ -364,15 +364,15 @@ impl OtelToArrowConverter {
         ];
 
         RecordBatch::try_new(crate::schema::schema(), arrays)
-            .map_err(|e| MetricsError::Other(e.to_string()))
+            .map_err(|e| MetricError::Other(e.to_string()))
     }
 
     fn process_metric(
         &mut self,
         metric: &Metric,
         resource: &Resource,
-        instrument_scope: &InstrumentationLibrary,
-    ) -> Result<(), MetricsError> {
+        instrument_scope: &InstrumentationScope,
+    ) -> Result<(), MetricError> {
         let data = metric.data.as_any();
 
         // This is unfortunately the only way to downcast a generic trait object
@@ -395,7 +395,7 @@ impl OtelToArrowConverter {
         } else if let Some(gauge) = data.downcast_ref::<Gauge<f64>>() {
             self.process_gauge(gauge, metric, resource, instrument_scope);
         } else {
-            return Err(MetricsError::Other("Unsupported metric type".into()));
+            return Err(MetricError::Other("Unsupported metric type".into()));
         }
 
         Ok(())
@@ -406,7 +406,7 @@ impl OtelToArrowConverter {
         sum: &Sum<T>,
         metric: &Metric,
         resource: &Resource,
-        instrument_scope: &InstrumentationLibrary,
+        instrument_scope: &InstrumentationScope,
     ) {
         for data_point in &sum.data_points {
             self.time_unix_nano_builder
@@ -442,7 +442,7 @@ impl OtelToArrowConverter {
         gauge: &Gauge<T>,
         metric: &Metric,
         resource: &Resource,
-        instrument_scope: &InstrumentationLibrary,
+        instrument_scope: &InstrumentationScope,
     ) {
         for data_point in &gauge.data_points {
             self.time_unix_nano_builder
@@ -477,7 +477,7 @@ impl OtelToArrowConverter {
         histogram: &Histogram<T>,
         metric: &Metric,
         resource: &Resource,
-        instrument_scope: &InstrumentationLibrary,
+        instrument_scope: &InstrumentationScope,
     ) {
         for data_point in &histogram.data_points {
             self.time_unix_nano_builder
@@ -551,10 +551,7 @@ impl OtelToArrowConverter {
 
         let attributes: Vec<opentelemetry::KeyValue> = resource
             .iter()
-            .map(|(key, value)| opentelemetry::KeyValue {
-                key: key.clone(),
-                value: value.clone(),
-            })
+            .map(|(key, value)| opentelemetry::KeyValue::new(key.clone(), value.clone()))
             .collect();
         Self::add_attributes_to_builder(&mut self.resource_builder.attributes_builder, &attributes);
 
@@ -565,16 +562,16 @@ impl OtelToArrowConverter {
         self.resource_builder.append(true);
     }
 
-    fn add_scope(&mut self, scope: &InstrumentationLibrary) {
-        self.scope_builder.name_builder.append_value(&scope.name);
+    fn add_scope(&mut self, scope: &InstrumentationScope) {
+        self.scope_builder.name_builder.append_value(scope.name());
 
         self.scope_builder
             .version_builder
-            .append_option(scope.version.as_ref());
+            .append_option(scope.version());
 
         Self::add_attributes_to_builder(
             &mut self.scope_builder.attributes_builder,
-            &scope.attributes,
+            scope.attributes().cloned().collect::<Vec<_>>().as_slice(),
         );
 
         self.scope_builder
@@ -583,8 +580,7 @@ impl OtelToArrowConverter {
 
         self.scope_builder.append(true);
 
-        self.schema_url_builder
-            .append_option(scope.schema_url.as_ref());
+        self.schema_url_builder.append_option(scope.schema_url());
     }
 
     fn add_attributes_to_builder(
@@ -648,6 +644,18 @@ impl OtelToArrowConverter {
                     builder.bool_builder.append_null();
                     // TODO: serialize the value to bytes
                     builder.bytes_builder.append_value([]);
+                    builder.ser_builder.append_null();
+                }
+                _ => {
+                    // We don't recognize this value type, so append nulls
+                    builder
+                        .type_builder
+                        .append_value(crate::schema::AttributeValueType::Unknown.to_u8());
+                    builder.str_builder.append_null();
+                    builder.int_builder.append_null();
+                    builder.double_builder.append_null();
+                    builder.bool_builder.append_null();
+                    builder.bytes_builder.append_null();
                     builder.ser_builder.append_null();
                 }
             }

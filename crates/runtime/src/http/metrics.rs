@@ -28,19 +28,19 @@ pub(crate) static REQUESTS_TOTAL: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
         .u64_counter("http_requests_total")
         .with_description("Number of HTTP requests. Deprecated, use http_requests instead.")
-        .init()
+        .build()
 });
 
 pub(crate) static REQUESTS: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
         .u64_counter("http_requests")
         .with_description("Number of HTTP requests.")
-        .init()
+        .build()
 });
 
 pub(crate) static REQUESTS_DURATION_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| {
     METER
         .f64_histogram("http_requests_duration_ms")
         .with_unit("ms")
-        .init()
+        .build()
 });

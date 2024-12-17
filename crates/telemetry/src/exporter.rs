@@ -19,8 +19,7 @@ use std::sync::Arc;
 use arrow::array::RecordBatch;
 use async_trait::async_trait;
 use flight_client::{Credentials, FlightClient};
-use opentelemetry::metrics::MetricsError;
-use opentelemetry_sdk::metrics::{data::Temporality, reader::TemporalitySelector, InstrumentKind};
+use opentelemetry_sdk::metrics::MetricError;
 
 #[derive(Debug, Clone)]
 pub struct AnonymousTelemetryExporter {
@@ -40,15 +39,9 @@ impl AnonymousTelemetryExporter {
     }
 }
 
-impl TemporalitySelector for AnonymousTelemetryExporter {
-    fn temporality(&self, _kind: InstrumentKind) -> Temporality {
-        Temporality::Cumulative
-    }
-}
-
 #[async_trait]
 impl otel_arrow::ArrowExporter for AnonymousTelemetryExporter {
-    async fn export(&self, metrics: RecordBatch) -> Result<(), MetricsError> {
+    async fn export(&self, metrics: RecordBatch) -> Result<(), MetricError> {
         let Some(mut flight_client) = self.flight_client.clone() else {
             return Ok(());
         };
@@ -60,11 +53,11 @@ impl otel_arrow::ArrowExporter for AnonymousTelemetryExporter {
         Ok(())
     }
 
-    async fn force_flush(&self) -> Result<(), MetricsError> {
+    async fn force_flush(&self) -> Result<(), MetricError> {
         Ok(())
     }
 
-    fn shutdown(&self) -> Result<(), MetricsError> {
+    fn shutdown(&self) -> Result<(), MetricError> {
         Ok(())
     }
 }
