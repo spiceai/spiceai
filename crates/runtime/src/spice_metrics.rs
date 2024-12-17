@@ -20,10 +20,7 @@ use std::time::Duration;
 use arrow::array::RecordBatch;
 use async_trait::async_trait;
 use datafusion::sql::TableReference;
-use opentelemetry::metrics::MetricsError;
-use opentelemetry_sdk::metrics::data::Temporality;
-use opentelemetry_sdk::metrics::reader::TemporalitySelector;
-use opentelemetry_sdk::metrics::InstrumentKind;
+use opentelemetry_sdk::metrics::MetricError;
 use snafu::prelude::*;
 use tokio::sync::RwLock;
 
@@ -56,15 +53,9 @@ impl SpiceMetricsExporter {
     }
 }
 
-impl TemporalitySelector for SpiceMetricsExporter {
-    fn temporality(&self, _kind: InstrumentKind) -> Temporality {
-        Temporality::Cumulative
-    }
-}
-
 #[async_trait]
 impl otel_arrow::ArrowExporter for SpiceMetricsExporter {
-    async fn export(&self, metrics: RecordBatch) -> Result<(), MetricsError> {
+    async fn export(&self, metrics: RecordBatch) -> Result<(), MetricError> {
         let data_update = DataUpdate {
             schema: metrics.schema(),
             data: vec![metrics],
@@ -74,14 +65,14 @@ impl otel_arrow::ArrowExporter for SpiceMetricsExporter {
         self.datafusion
             .write_data(&get_metrics_table_reference(), data_update)
             .await
-            .map_err(|e| MetricsError::Other(e.to_string()))
+            .map_err(|e| MetricError::Other(e.to_string()))
     }
 
-    async fn force_flush(&self) -> Result<(), MetricsError> {
+    async fn force_flush(&self) -> Result<(), MetricError> {
         Ok(())
     }
 
-    fn shutdown(&self) -> Result<(), MetricsError> {
+    fn shutdown(&self) -> Result<(), MetricError> {
         Ok(())
     }
 }
