@@ -32,7 +32,11 @@ fn status_to_arrow_error(status: tonic::Status) -> ArrowError {
 
 impl SqlFlightClient {
     pub fn new(chan: Channel, api_key: Option<String>, user_agent: Option<String>) -> Self {
-        let user_agent = user_agent.unwrap_or_else(get_user_agent);
+        // Prepend the user agent with the provided user agent if it exists
+        let user_agent = match user_agent {
+            Some(ua) => format!("{ua} {}", get_user_agent()),
+            None => get_user_agent(),
+        };
 
         let mut headers = HashMap::new();
         headers.insert("User-Agent".to_string(), user_agent);

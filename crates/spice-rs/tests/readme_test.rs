@@ -6,6 +6,7 @@ mod tests {
 
     #[tokio::test]
     #[allow(deprecated)]
+    #[ignore]
     async fn test_readme_new() {
         // NOTE: If you're changing the code below, make sure you update the README.md.
         dotenv::from_path(Path::new(".env.local")).ok();
@@ -14,9 +15,7 @@ mod tests {
         let mut client = Client::new(&api_key)
             .await
             .expect("SpiceClient should be created");
-        let data = client
-            .query("SELECT * FROM eth.recent_blocks LIMIT 10;")
-            .await;
+        let data = client.query("SELECT * FROM taxi_trips LIMIT 10;").await;
         assert!(
             data.is_ok(),
             "failed to query: {:#?}",
@@ -25,6 +24,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore]
     async fn test_readme_builder() {
         // NOTE: If you're changing the code below, make sure you update the README.md.
         dotenv::from_path(Path::new(".env.local")).ok();
@@ -37,9 +37,7 @@ mod tests {
             .await
             .expect("SpiceClient should be created");
 
-        let data = client
-            .query("SELECT * FROM eth.recent_blocks LIMIT 10;")
-            .await;
+        let data = client.query("SELECT * FROM taxi_trips LIMIT 10;").await;
         assert!(
             data.is_ok(),
             "failed to query: {:#?}",

@@ -65,30 +65,8 @@ async fn main() {
     .await
     .unwrap();
 
-  let data = client.query("SELECT * FROM eth.recent_blocks LIMIT 10;").await;
+  let data = client.query("SELECT * FROM taxi_trips LIMIT 10;").await;
 }
-
-```
-
-### Firecache Query
-
-Firecache SQL Query
-
-```rust
-use spiceai::ClientBuilder;
-
-#[tokio::main]
-async fn main() {
-  let mut client = ClientBuilder::new()
-    .api_key("API_KEY")
-    .use_spiceai_cloud()
-    .build()
-    .await
-    .unwrap();
-
-  let data = client.fire_query("SELECT * FROM eth.recent_blocks LIMIT 10;").await;
-}
-
 ```
 
 ## Documentation
