@@ -18,10 +18,7 @@ use std::{collections::HashMap, sync::Arc};
 use tokio::sync::RwLock;
 
 use arrow_schema::ArrowError;
-use async_openai::{
-    error::{ApiError, OpenAIError},
-    types::CreateChatCompletionRequest,
-};
+use async_openai::{error::OpenAIError, types::CreateChatCompletionRequest};
 
 use dataset::{get_eval_data, DatasetInput, DatasetOutput};
 use llms::chat::Chat;
@@ -31,7 +28,7 @@ use runs::{
     EvalRunStatus,
 };
 use scorer::score_results;
-use snafu::{ResultExt, Snafu};
+use snafu::{ensure, ResultExt, Snafu};
 use spicepod::component::eval::Eval;
 use tracing_futures::Instrument;
 
@@ -73,6 +70,14 @@ pub enum Error {
     FailedToRunModel {
         eval_name: String,
         source: OpenAIError,
+    },
+
+    #[snafu(display(
+        "The model {model_name}, during eval '{eval_name}' did not produce the expected number of rows."
+    ))]
+    ModelProducedFewerRows {
+        model_name: String,
+        eval_name: String,
     },
 
     #[snafu(display(
@@ -213,21 +218,13 @@ async fn run_eval(
         vec![]
     };
 
-    if actual.len() != ideal.len() {
-        return Err(Error::FailedToRunModel {
+    ensure!(
+        actual.len() == ideal.len(),
+        ModelProducedFewerRowsSnafu {
             eval_name: eval.name.clone(),
-            source: OpenAIError::ApiError(ApiError {
-                message: format!(
-                    "model returned {} outputs, but expected {}",
-                    actual.len(),
-                    ideal.len()
-                ),
-                r#type: None,
-                param: None,
-                code: None,
-            }),
-        });
-    }
+            model_name: model_name.clone()
+        }
+    );
 
     // Score the results
     let scorers_to_use = get_scorers_for_eval(eval, Arc::clone(&scorer_registry)).await?;
