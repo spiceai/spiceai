@@ -12,6 +12,10 @@ func TestSpicepodSpec_UnmarshalYAML_KnownFields(t *testing.T) {
 version: v1beta1
 kind: Spicepod
 name: test-pod
+datasets:
+  - from: spice.ai/spiceai/tpch/datasets/tpch.customer
+    name: tpch.customer
+  - ref: datasets/lineitem
 params:
   key1: value1
   key2: value2
@@ -46,6 +50,12 @@ dependencies:
 	if !reflect.DeepEqual(spicePod.Dependencies, []string{"dep1", "dep2"}) {
 		t.Errorf("Dependencies not as expected, got %v", spicePod.Dependencies)
 	}
+	if !reflect.DeepEqual(spicePod.Datasets, []map[string]interface{}{
+		{"from": "spice.ai/spiceai/tpch/datasets/tpch.customer", "name": "tpch.customer"},
+		{"ref": "datasets/lineitem"},
+	}) {
+		t.Errorf("Datasets not as expected, got %v", spicePod.Datasets)
+	}
 }
 
 func TestSpicepodSpec_UnmarshalYAML_UnknownFields(t *testing.T) {
@@ -53,6 +63,10 @@ func TestSpicepodSpec_UnmarshalYAML_UnknownFields(t *testing.T) {
 version: v1beta1
 kind: Spicepod
 name: test-pod
+datasets:
+  - from: spice.ai/spiceai/tpch/datasets/tpch.customer
+    name: tpch.customer
+  - ref: datasets/lineitem
 unknown_field: value
 nested_unknown:
   field1: value1
@@ -106,6 +120,10 @@ func TestSpicepodSpec_MarshalYAML(t *testing.T) {
 version: v1beta1
 kind: Spicepod
 name: test-pod
+datasets:
+  - from: spice.ai/spiceai/tpch/datasets/tpch.customer
+    name: tpch.customer
+  - ref: datasets/lineitem
 params:
   key1: value1
 unknown_field: test
@@ -143,6 +161,32 @@ nested_unknown:
 	}
 	if params, ok := result["params"].(map[string]interface{}); !ok || params["key1"] != "value1" {
 		t.Errorf("Params not preserved correctly")
+	}
+	if datasets, ok := result["datasets"].([]interface{}); !ok {
+		t.Errorf("Datasets not preserved correctly, expected []interface{}, got %T", result["datasets"])
+	} else if len(datasets) != 2 {
+		t.Errorf("Expected 2 datasets, got %d", len(datasets))
+	} else {
+		// Check first dataset
+		if dataset0, ok := datasets[0].(map[string]interface{}); !ok {
+			t.Errorf("First dataset not a map, got %T", datasets[0])
+		} else {
+			if dataset0["from"] != "spice.ai/spiceai/tpch/datasets/tpch.customer" {
+				t.Errorf("First dataset 'from' not preserved, got %v", dataset0["from"])
+			}
+			if dataset0["name"] != "tpch.customer" {
+				t.Errorf("First dataset 'name' not preserved, got %v", dataset0["name"])
+			}
+		}
+
+		// Check second dataset
+		if dataset1, ok := datasets[1].(map[string]interface{}); !ok {
+			t.Errorf("Second dataset not a map, got %T", datasets[1])
+		} else {
+			if dataset1["ref"] != "datasets/lineitem" {
+				t.Errorf("Second dataset 'ref' not preserved, got %v", dataset1["ref"])
+			}
+		}
 	}
 
 	// Check unknown fields
