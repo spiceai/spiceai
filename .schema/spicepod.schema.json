@@ -70,34 +70,6 @@
     },
     "runtime": {
       "description": "Optional runtime configuration",
-      "default": {
-        "auth": null,
-        "cors": {
-          "allowed_origins": [
-            "*"
-          ],
-          "enabled": false
-        },
-        "dataset_load_parallelism": null,
-        "results_cache": {
-          "cache_max_size": null,
-          "enabled": true,
-          "eviction_policy": null,
-          "item_ttl": null
-        },
-        "task_history": {
-          "captured_output": "none",
-          "enabled": true,
-          "retention_check_interval": "15m",
-          "retention_period": "8h"
-        },
-        "telemetry": {
-          "enabled": true,
-          "user_agent_collection": "full"
-        },
-        "tls": null,
-        "tracing": null
-      },
       "allOf": [
         {
           "$ref": "#/definitions/Runtime"
@@ -106,7 +78,6 @@
     },
     "secrets": {
       "description": "Optional spicepod secrets configuration Default value is: ```yaml secrets: - from: env name: env ```",
-      "default": [],
       "type": "array",
       "items": {
         "$ref": "#/definitions/Secret"
@@ -490,10 +461,10 @@
     "ComponentOrReference_for_Eval": {
       "anyOf": [
         {
-          "$ref": "#/definitions/ComponentReference"
+          "$ref": "#/definitions/Eval"
         },
         {
-          "$ref": "#/definitions/Eval"
+          "$ref": "#/definitions/ComponentReference"
         }
       ]
     },
@@ -627,12 +598,7 @@
           "additionalProperties": true
         },
         "mode": {
-          "default": "read",
-          "allOf": [
-            {
-              "$ref": "#/definitions/Mode"
-            }
-          ]
+          "$ref": "#/definitions/Mode"
         },
         "name": {
           "type": "string"
@@ -648,12 +614,7 @@
           ]
         },
         "ready_state": {
-          "default": "on_load",
-          "allOf": [
-            {
-              "$ref": "#/definitions/ReadyState"
-            }
-          ]
+          "$ref": "#/definitions/ReadyState"
         },
         "replication": {
           "anyOf": [
@@ -1014,7 +975,6 @@
       "type": "object",
       "properties": {
         "auth": {
-          "default": null,
           "anyOf": [
             {
               "$ref": "#/definitions/Auth"
@@ -1025,17 +985,7 @@
           ]
         },
         "cors": {
-          "default": {
-            "allowed_origins": [
-              "*"
-            ],
-            "enabled": false
-          },
-          "allOf": [
-            {
-              "$ref": "#/definitions/CorsConfig"
-            }
-          ]
+          "$ref": "#/definitions/CorsConfig"
         },
         "dataset_load_parallelism": {
           "type": [
@@ -1052,41 +1002,13 @@
           }
         },
         "results_cache": {
-          "default": {
-            "cache_max_size": null,
-            "enabled": true,
-            "eviction_policy": null,
-            "item_ttl": null
-          },
-          "allOf": [
-            {
-              "$ref": "#/definitions/ResultsCache"
-            }
-          ]
+          "$ref": "#/definitions/ResultsCache"
         },
         "task_history": {
-          "default": {
-            "captured_output": "none",
-            "enabled": true,
-            "retention_check_interval": "15m",
-            "retention_period": "8h"
-          },
-          "allOf": [
-            {
-              "$ref": "#/definitions/TaskHistory"
-            }
-          ]
+          "$ref": "#/definitions/TaskHistory"
         },
         "telemetry": {
-          "default": {
-            "enabled": true,
-            "user_agent_collection": "full"
-          },
-          "allOf": [
-            {
-              "$ref": "#/definitions/TelemetryConfig"
-            }
-          ]
+          "$ref": "#/definitions/TelemetryConfig"
         },
         "tls": {
           "description": "If set, the runtime will configure all endpoints to use TLS",
