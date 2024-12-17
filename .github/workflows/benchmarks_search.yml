@@ -89,6 +89,9 @@ jobs:
         run: chmod +x ./spice_bench
 
       - name: Benchmark ${{ matrix.name }}
+        env:
+          SPICE_SPICEAI_API_KEY: ${{ secrets.SPICE_SPICEAI_BENCHMARK_API_KEY }}
+          SEARCH_BENCHMARK_UPLOAD_RESULTS_DATASET: 'spice.benchmarks.oss_search_benchmarks'
         if: github.event.inputs.selected_configuration == matrix.name || github.event.inputs.run_all == 'true' || github.event_name == 'schedule'
         run: ./spice_bench ${{ matrix.cmd }}
 
