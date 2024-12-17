@@ -103,6 +103,7 @@ assignees: ''
 - [ ] Merge [Quickstarts PRs](https://github.com/spiceai/quickstarts/pulls)
 - [ ] Update release notes
   - [ ] Ensure any external contributors have been acknowledged.
+  - [ ] Ensure notable dependency updates have been included in the release notes (`datafusion`, `datafusion-table-providers`, etc) under the `## Dependencies` header
 - [ ] Add any SDK releases to the release notes
   - [ ] [spice.js](https://github.com/spiceai/spice.js/releases)
   - [ ] [spicepy](https://github.com/spiceai/spicepy/releases)
