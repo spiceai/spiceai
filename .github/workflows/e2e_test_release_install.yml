@@ -24,7 +24,7 @@ jobs:
             target_os: darwin
             target_arch: aarch64
           - name: macOS x64 (Intel)
-            runner: macos-12
+            runner: macos-13
             target_os: darwin
             target_arch: x86_64
           - name: Windows x64
