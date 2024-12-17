@@ -277,11 +277,12 @@ spice chat --model <model> --cloud
 			if usage != (Usage{}) {
 				duration := float32(endTime.Sub(startTime).Abs().Milliseconds()) / 1000.0
 				tps := float32(usage.TotalTokens) / duration
-				cmd.Printf(`
-
-Total tokens: %d (%.2f/s). Completion: %d. Prompt: %d.
-------------
-`, usage.CompletionTokens, tps, usage.PromptTokens, usage.TotalTokens)
+				usage_line := fmt.Sprintf(
+					"Total tokens: %d (%.2f/s). Completion: %d. Prompt: %d.",
+					usage.TotalTokens, tps, usage.CompletionTokens, usage.PromptTokens,
+				)
+				line := strings.Repeat("-", len(usage_line)+2)
+				cmd.Printf("\n\n+%s+\n| %s |\n+%s+\n\n", line, usage_line, line)
 			} else {
 				cmd.Print("\n\n")
 			}
