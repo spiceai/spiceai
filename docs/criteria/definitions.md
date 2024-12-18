@@ -52,3 +52,39 @@ Defines the supported access modes for a particular accelerator:
 - DuckDB: in-memory or file based.
 - SQLite: in-memory or file based.
 - PostgreSQL: database only.
+
+## Throughput Test
+
+A Throughput test is derived from the throughput test requirements of the TPC-H benchmark definitions. In Spice, a throughput test refers to executing multiple parallel executions of the same query during a throughput test.
+
+Refer to the specific benchmark test for the required number of parallel queries.
+
+A timing measurement is calculated for each parallel query completion, measured as `Ts`. The measurement is calculated in seconds, begins when the query is sent to Spice, and ends when the last data row is retrieved from Spice. `Ts` is rounded up to the next 0.01 second.
+
+## Throughput Metric
+
+A throughput metric is calculated from the cumulative sum of `Ts` from every parallel query execution. This cumulative timing measurement is measured as `Cs`.
+
+A metric of throughput, measured as Queries Per Hour * Scale Factor, is calculated as: `(Parallel Queries * 22 * 3600) * Cs / Scale`.
+
+## TPC-H Throughput Test Parallel Queries
+
+The following table defines how many parallel queries are required at a given scale factor for Spice throughput tests:
+
+| Scale Factor | Parallel Queries |
+| ------------ | ---------------- |
+| 1            | 8                |
+| 10           | 16               |
+| 100          | 32               |
+| 1000         | 64               |
+
+## TPC-DS Throughput Test Parallel Queries
+
+The following table defines how many parallel queries are required at a given scale factor for Spice throughput tests:
+
+| Scale Factor | Parallel Queries |
+| ------------ | ---------------- |
+| 1            | 4                |
+| 10           | 8                |
+| 100          | 16               |
+| 1000         | 32               |
