@@ -1,8 +1,8 @@
 # Spice.ai OSS Data Connectors - Stable Release Criteria
 
-This document defines the set of criteria that is required before a data connector is considered to be of [Stable](../definitions.md) quality.
+This document defines the set of criteria that is required before a data connector is considered to be of Stable quality.
 
-All criteria must be met for the connector to be considered [Stable](../definitions.md), with exceptions only permitted in some circumstances (e.g. it would be technically infeasible to add a feature/fix a bug for a particular connector).
+All criteria must be met for the connector to be considered Stable, with exceptions only permitted in some circumstances (e.g. it would be technically infeasible to add a feature/fix a bug for a particular connector).
 
 ## Stable Quality Connectors
 
