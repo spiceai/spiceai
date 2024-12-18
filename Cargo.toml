@@ -101,6 +101,7 @@ opentelemetry_sdk = { version = "0.27", default-features = false, features = [
     "trace",
 ] }
 parquet = "53"
+paste = "1.0.15"
 pem = "3.0.4"
 percent-encoding = "2.3.1"
 pin-project = "1.0"
@@ -142,6 +143,7 @@ tracing-opentelemetry = "0.28"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 uuid = "1.9.1"
 x509-certificate = "0.23.1"
+
 
 [patch.crates-io]
 datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "2b93a308f65df1ae0cd8f3f8194b9b60201a500f" }
