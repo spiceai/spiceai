@@ -68,3 +68,140 @@ impl Scorer for Includes {
         vec![("mean".to_string(), mean(scores))]
     }
 }
+
+#[allow(deprecated)]
+#[cfg(test)]
+mod tests {
+    use super::Includes;
+    use super::Scorer;
+    use super::{DatasetInput, DatasetOutput};
+    use async_openai::types::{ChatChoice, ChatCompletionResponseMessage, FinishReason, Role};
+    use paste::paste;
+
+    /// Macro to define test cases for Includes scorer with `AssistantResponse` variant.
+    macro_rules! test_includes_case {
+        ($test_case_name:ident, $actual:expr, $ideal:expr, $score:expr) => {
+            paste! {
+                #[tokio::test]
+                async fn [<test_ $test_case_name>]() {
+                    let actual_score = Includes{}.score(&DatasetInput::UserInput(String::new()), &DatasetOutput::AssistantResponse($actual.to_string()), &DatasetOutput::AssistantResponse($ideal.to_string())).await;
+                    assert!(
+                        ($score - actual_score).abs() < f32::EPSILON,
+                        "Test case `{}` failed: expected {}, got {}",
+                        stringify!($test_case_name),
+                        $score,
+                        actual_score
+                    );
+                }
+            }
+        };
+    }
+
+    /// Macro to define test cases for Includes scorer with Choices variant.
+    macro_rules! test_includes_choices_case {
+        ($test_case_name:ident, $actual_vec:expr, $ideal_vec:expr, $score:expr, $ignore_case:expr) => {
+            paste! {
+                #[tokio::test]
+                async fn [<test_ $test_case_name>]() {
+
+                    // Construct actual Choices
+                    let actual_choices: Vec<ChatChoice> = $actual_vec.iter().map(|content| {
+                        ChatChoice {
+                            index: 0, // Index can be arbitrary for tests
+                            message: ChatCompletionResponseMessage {
+                                content: Some(content.to_string()),
+                                role: Role::Assistant,
+                                function_call: None,
+                                tool_calls: None,
+                                refusal: None,
+                            },
+                            finish_reason: Some(FinishReason::Stop),
+                            logprobs: None,
+                        }
+                    }).collect();
+
+                    // Construct ideal Choices
+                    let ideal_choices: Vec<ChatChoice> = $ideal_vec.iter().map(|content| {
+                        ChatChoice {
+                            index: 0, // Index can be arbitrary for tests
+                            message: ChatCompletionResponseMessage {
+                                content: Some(content.to_string()),
+                                role: Role::Assistant,
+                                function_call: None,
+                                tool_calls: None,
+                                refusal: None,
+                            },
+                            finish_reason: Some(FinishReason::Stop),
+                            logprobs: None,
+                        }
+                    }).collect();
+
+                    let actual_score = Includes{}.score(&DatasetInput::UserInput(String::new()), &DatasetOutput::Choices(actual_choices), &DatasetOutput::Choices(ideal_choices)).await;
+                    assert!(
+                        ($score - actual_score).abs() < f32::EPSILON,
+                        "Test case `{}` failed: expected {}, got {}",
+                        stringify!($test_case_name),
+                        $score,
+                        actual_score
+                    );
+                }
+            }
+        };
+    }
+
+    test_includes_case!(
+        exact_match,
+        "The quick brown fox jumps over the lazy dog.",
+        "The quick brown fox jumps over the lazy dog.",
+        1.0
+    );
+
+    test_includes_case!(
+        articles_ignored_match,
+        "An apple a day keeps the doctor away.",
+        "apple a day keeps the doctor away",
+        1.0
+    );
+
+    test_includes_case!(
+        partial_inclusion_actual_contains_ideal,
+        "The quick brown fox jumps over the lazy dog near the river.",
+        "quick brown fox jumps over the lazy dog",
+        1.0
+    );
+
+    test_includes_case!(
+        no_match,
+        "A completely different sentence.",
+        "The quick brown fox jumps over the lazy dog.",
+        0.0
+    );
+
+    test_includes_case!(empty_strings_match, "", "", 1.0);
+
+    test_includes_case!(
+        one_empty_one_non_empty_actual_empty,
+        "",
+        "non-empty string",
+        0.0
+    );
+
+    test_includes_choices_case!(
+        mismatched_number_of_outputs_more_actual,
+        [
+            "The quick brown fox jumps over the lazy dog.",
+            "Additional response."
+        ],
+        ["quick brown fox jumps over lazy dog"],
+        0.0,
+        false
+    );
+
+    test_includes_choices_case!(
+        multiple_choices_match,
+        ["The quick brown fox.", "Jumps over the lazy dog."],
+        ["quick brown fox", "lazy dog"],
+        1.0,
+        false
+    );
+}
