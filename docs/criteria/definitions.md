@@ -55,9 +55,9 @@ Defines the supported access modes for a particular accelerator:
 
 ## Throughput Test
 
-A Throughput test is derived from the throughput test requirements of the TPC-H benchmark definitions. In Spice, a throughput test refers to executing multiple parallel executions of the same query during a throughput test.
+A throughput test is derived from the throughput test requirements of the TPC-H benchmark definitions. In Spice, a throughput test refers to executing multiple parallel executions of the same query.
 
-Refer to the specific benchmark test for the required number of parallel queries.
+Refer to the specific benchmark test definition for the required number of parallel queries.
 
 A timing measurement is calculated for each parallel query completion, measured as `Ts`. The measurement is calculated in seconds, begins when the query is sent to Spice, and ends when the last data row is retrieved from Spice. `Ts` is rounded up to the next 0.01 second.
 
@@ -65,7 +65,7 @@ A timing measurement is calculated for each parallel query completion, measured 
 
 A throughput metric is calculated from the cumulative sum of `Ts` from every parallel query execution. This cumulative timing measurement is measured as `Cs`.
 
-A metric of throughput, measured as Queries Per Hour * Scale Factor, is calculated as: `(Parallel Queries * 22 * 3600) * Cs / Scale`.
+A metric of throughput, measured as Queries Per Hour * Scale Factor, is calculated as: `(Parallel Query Count * 22 * 3600) * Cs / Scale`.
 
 ## TPC-H Throughput Test Parallel Queries
 
@@ -88,3 +88,9 @@ The following table defines how many parallel queries are required at a given sc
 | 10           | 8                |
 | 100          | 16               |
 | 1000         | 32               |
+
+## Load Test
+
+A load test refers to an extended duration throughput test. For a given throughput test, a load test is where the throughput test is repeated for a set number of hours.
+
+The system is provided with no delays or pauses between throughput test repetitions, resulting in a sustained high-load test.

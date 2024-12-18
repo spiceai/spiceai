@@ -140,9 +140,10 @@ Indexes are not required for test coverage, but can be introduced if required fo
 - [ ] End-to-end test to cover connecting to TPC-H SF1 for the connector type and benchmarking TPC-H queries (official and simple).
   - [ ] Connectors should run all queries with no [Major or Minor Bugs](../definitions.md).
   - [ ] End-to-end tests should perform [Throughput Tests](../definitions.md) at the required [parallel query count](../definitions.md)
-  - [ ] [Throughput Metric](../definitions.md) is calculated and reported with a parallel query count of 1 to serve as a baseline metric.
-  - [ ] [Throughput Metric](../definitions.md) is reported as a metric in the test on the overall connector.
-  - [ ] Memory usage is collected at the end-to-end test and reported as a metric on the overall connector.
+  - [ ] [Throughput Metric](../definitions.md) is calculated and reported as a metric with a parallel query count of 1 to serve as a baseline metric.
+  - [ ] [Throughput Metric](../definitions.md) is calculated and reported as a metric at the required [parallel query count](../definitions.md).
+  - [ ] A [Load Test](../definitions.md) runs for a minimum of 8 hours as part of the end-to-end test. At least 99% of the time, query [timing measurements](../definitions.md) during the load test must remain below the 1% highest [timing measurements](../definitions.md) of the first throughput test, and the service must not become unavailable for the entire duration of the test.
+  - [ ] Memory usage is collected at the end of the end-to-end test and reported as a metric on the overall connector.
 - [ ] A test script exists that can load TPC-H data at the [designated scale factor](#stable-release-criteria) into this connector.
 - [ ] The connector can load TPC-H at the [designated scale factor](#stable-release-criteria), and can run all queries with no [Major or Minor Bugs](../definitions.md).
 - [ ] TPC-H queries that execute successfully on Datafusion, should execute successfully on the connector.
@@ -152,9 +153,10 @@ Indexes are not required for test coverage, but can be introduced if required fo
 - [ ] End-to-end test to cover connecting to TPC-H SF1 for the connector type and benchmarking TPC-DS queries (official and simple).
   - [ ] Connectors should run all queries with no [Major or Minor Bugs](../definitions.md).
   - [ ] End-to-end tests should perform [Throughput Tests](../definitions.md) at the required [parallel query count](../definitions.md)
-  - [ ] [Throughput Metric](../definitions.md) is calculated and reported with a parallel query count of 1 to serve as a baseline metric.
-  - [ ] [Throughput Metric](../definitions.md) is reported as a metric in the test on the overall connector.
-  - [ ] Memory usage is collected at the end-to-end test and reported as a metric on the overall connector.
+  - [ ] [Throughput Metric](../definitions.md) is calculated and reported as a metric with a parallel query count of 1 to serve as a baseline metric.
+  - [ ] [Throughput Metric](../definitions.md) is calculated and reported as a metric at the required [parallel query count](../definitions.md).
+  - [ ] A [Load Test](../definitions.md) runs for a minimum of 8 hours as part of the end-to-end test. At least 99% of the time, query [timing measurements](../definitions.md) during the load test must remain below the 1% highest [timing measurements](../definitions.md) of the first throughput test, and the service must not become unavailable for the entire duration of the test.
+  - [ ] Memory usage is collected at the end of the end-to-end test and reported as a metric on the overall connector.
 - [ ] A test script exists that can load TPC-DS data at the [designated scale factor](#stable-release-criteria) into this connector.
 - [ ] The connector can load TPC-DS at the [designated scale factor](#stable-release-criteria), and can run all queries with no [Major or Minor Bugs](../definitions.md).
 - [ ] TPC-DS queries that execute successfully on Datafusion, should execute successfully on the connector.
