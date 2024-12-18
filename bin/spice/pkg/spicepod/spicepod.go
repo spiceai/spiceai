@@ -52,9 +52,11 @@ func CreateManifest(name string, spicepodDir string) (string, error) {
 	}
 
 	skeletonPod := &spec.SpicepodSpec{
-		Name:    name,
-		Version: "v1beta1",
-		Kind:    "Spicepod",
+		SpicepodSpecFields: spec.SpicepodSpecFields{
+			Name:    name,
+			Version: "v1beta1",
+			Kind:    "Spicepod",
+		},
 	}
 
 	skeletonPodContentBytes, err := yaml.Marshal(skeletonPod)

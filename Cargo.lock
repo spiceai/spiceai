@@ -229,7 +229,7 @@ checksum = "d301b3b94cb4b2f23d7917810addbbaff90738e0ca2be692bd027e70d7e0330c"
 
 [[package]]
 name = "app"
-version = "1.0.0-rc.2"
+version = "1.0.0-rc.3"
 dependencies = [
  "snafu",
  "spicepod",
@@ -547,7 +547,7 @@ dependencies = [
 
 [[package]]
 name = "arrow_sql_gen"
-version = "1.0.0-rc.2"
+version = "1.0.0-rc.3"
 dependencies = [
  "arrow",
  "bigdecimal",
@@ -561,7 +561,7 @@ dependencies = [
 
 [[package]]
 name = "arrow_tools"
-version = "1.0.0-rc.2"
+version = "1.0.0-rc.3"
 dependencies = [
  "arrow",
  "datafusion",
@@ -2026,7 +2026,7 @@ dependencies = [
 
 [[package]]
 name = "cache"
-version = "1.0.0-rc.2"
+version = "1.0.0-rc.3"
 dependencies = [
  "arrow",
  "async-stream",
@@ -2036,7 +2036,7 @@ dependencies = [
  "fundu",
  "futures",
  "moka",
- "opentelemetry 0.26.0",
+ "opentelemetry",
  "snafu",
  "spicepod",
  "tokio",
@@ -2940,7 +2940,7 @@ checksum = "e8566979429cf69b49a5c740c60791108e86440e8be149bbea4fe54d2c32d6e2"
 
 [[package]]
 name = "data_components"
-version = "1.0.0-rc.2"
+version = "1.0.0-rc.3"
 dependencies = [
  "arrow",
  "arrow-buffer",
@@ -3460,7 +3460,7 @@ dependencies = [
 
 [[package]]
 name = "db_connection_pool"
-version = "1.0.0-rc.2"
+version = "1.0.0-rc.3"
 dependencies = [
  "arrow",
  "arrow-odbc",
@@ -3768,7 +3768,7 @@ checksum = "fea41bba32d969b513997752735605054bc0dfa92b4c56bf1189f2e174be7a10"
 
 [[package]]
 name = "document_parse"
-version = "1.0.0-rc.2"
+version = "1.0.0-rc.3"
 dependencies = [
  "bytes",
  "docx-rs",
@@ -4173,7 +4173,7 @@ dependencies = [
 
 [[package]]
 name = "flight_client"
-version = "1.0.0-rc.2"
+version = "1.0.0-rc.3"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -4188,7 +4188,7 @@ dependencies = [
 
 [[package]]
 name = "flightpublisher"
-version = "1.0.0-rc.2"
+version = "1.0.0-rc.3"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -4201,7 +4201,7 @@ dependencies = [
 
 [[package]]
 name = "flightrepl"
-version = "1.0.0-rc.2"
+version = "1.0.0-rc.3"
 dependencies = [
  "ansi_term",
  "arrow-flight",
@@ -4222,7 +4222,7 @@ dependencies = [
 
 [[package]]
 name = "flightsubscriber"
-version = "1.0.0-rc.2"
+version = "1.0.0-rc.3"
 dependencies = [
  "arrow-flight",
  "clap",
@@ -6390,7 +6390,7 @@ dependencies = [
 
 [[package]]
 name = "llms"
-version = "1.0.0-rc.2"
+version = "1.0.0-rc.3"
 dependencies = [
  "anyhow",
  "async-openai",
@@ -6938,7 +6938,7 @@ dependencies = [
 
 [[package]]
 name = "model_components"
-version = "1.0.0-rc.2"
+version = "1.0.0-rc.3"
 dependencies = [
  "anyhow",
  "arrow",
@@ -7256,7 +7256,7 @@ dependencies = [
 
 [[package]]
 name = "ns_lookup"
-version = "1.0.0-rc.2"
+version = "1.0.0-rc.3"
 dependencies = [
  "snafu",
  "tracing",
@@ -7800,20 +7800,6 @@ dependencies = [
 
 [[package]]
 name = "opentelemetry"
-version = "0.26.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "570074cc999d1a58184080966e5bd3bf3a9a4af650c3b05047c2621e7405cd17"
-dependencies = [
- "futures-core",
- "futures-sink",
- "js-sys",
- "once_cell",
- "pin-project-lite",
- "thiserror 1.0.69",
-]
-
-[[package]]
-name = "opentelemetry"
 version = "0.27.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ab70038c28ed37b97d8ed414b6429d343a8bbf44c9f79ec854f3a643029ba6d7"
@@ -7828,27 +7814,29 @@ dependencies = [
 
 [[package]]
 name = "opentelemetry-http"
-version = "0.26.0"
+version = "0.27.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6351496aeaa49d7c267fb480678d85d1cd30c5edb20b497c48c56f62a8c14b99"
+checksum = "10a8a7f5f6ba7c1b286c2fbca0454eaba116f63bbe69ed250b642d36fbb04d80"
 dependencies = [
  "async-trait",
  "bytes",
  "http 1.2.0",
- "opentelemetry 0.26.0",
+ "opentelemetry",
  "reqwest 0.12.9",
 ]
 
 [[package]]
 name = "opentelemetry-prometheus"
-version = "0.17.0"
-source = "git+https://github.com/open-telemetry/opentelemetry-rust.git?rev=e91138351a689cd21923c15eb48f5fbc95ded807#e91138351a689cd21923c15eb48f5fbc95ded807"
+version = "0.27.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1b834e966ea5e2d03dfe5f2253f03d22cce21403ee940265070eeee96cee0bcc"
 dependencies = [
  "once_cell",
- "opentelemetry 0.26.0",
- "opentelemetry_sdk 0.26.0",
+ "opentelemetry",
+ "opentelemetry_sdk",
  "prometheus",
  "protobuf",
+ "tracing",
 ]
 
 [[package]]
@@ -7858,8 +7846,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a6e05acbfada5ec79023c85368af14abd0b307c015e9064d249b2a950ef459a6"
 dependencies = [
  "hex",
- "opentelemetry 0.27.1",
- "opentelemetry_sdk 0.27.1",
+ "opentelemetry",
+ "opentelemetry_sdk",
  "prost 0.13.4",
  "serde",
  "tonic",
@@ -7867,50 +7855,29 @@ dependencies = [
 
 [[package]]
 name = "opentelemetry-semantic-conventions"
-version = "0.26.0"
+version = "0.27.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "db945c1eaea8ac6a9677185357480d215bb6999faa9f691d0c4d4d641eab7a09"
+checksum = "bc1b6902ff63b32ef6c489e8048c5e253e2e4a803ea3ea7e783914536eb15c52"
 
 [[package]]
 name = "opentelemetry-zipkin"
-version = "0.26.0"
+version = "0.27.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dd5f25a628014191d3e98bb4794e37771b580e9c3de341cf1c813019aa721278"
+checksum = "4c630342febc883d74af134b87f75f0bded45bd56d1a7673685df23d400a9d26"
 dependencies = [
  "async-trait",
  "futures-core",
  "http 1.2.0",
  "once_cell",
- "opentelemetry 0.26.0",
+ "opentelemetry",
  "opentelemetry-http",
  "opentelemetry-semantic-conventions",
- "opentelemetry_sdk 0.26.0",
+ "opentelemetry_sdk",
  "reqwest 0.12.9",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
  "typed-builder",
-]
-
-[[package]]
-name = "opentelemetry_sdk"
-version = "0.26.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d2c627d9f4c9cdc1f21a29ee4bfbd6028fcb8bcf2a857b43f3abdf72c9c862f3"
-dependencies = [
- "async-trait",
- "futures-channel",
- "futures-executor",
- "futures-util",
- "glob",
- "once_cell",
- "opentelemetry 0.26.0",
- "percent-encoding",
- "rand 0.8.5",
- "serde_json",
- "thiserror 1.0.69",
- "tokio",
- "tokio-stream",
 ]
 
 [[package]]
@@ -7924,11 +7891,14 @@ dependencies = [
  "futures-executor",
  "futures-util",
  "glob",
- "opentelemetry 0.27.1",
+ "opentelemetry",
  "percent-encoding",
  "rand 0.8.5",
  "serde_json",
  "thiserror 1.0.69",
+ "tokio",
+ "tokio-stream",
+ "tracing",
 ]
 
 [[package]]
@@ -7957,18 +7927,18 @@ dependencies = [
 
 [[package]]
 name = "otel-arrow"
-version = "1.0.0-rc.2"
+version = "1.0.0-rc.3"
 dependencies = [
  "arrow",
  "arrow-buffer",
  "async-trait",
- "opentelemetry 0.26.0",
- "opentelemetry_sdk 0.26.0",
+ "opentelemetry",
+ "opentelemetry_sdk",
 ]
 
 [[package]]
 name = "otelpublisher"
-version = "1.0.0-rc.2"
+version = "1.0.0-rc.3"
 dependencies = [
  "clap",
  "futures",
@@ -7991,7 +7961,7 @@ checksum = "b15813163c1d831bf4a13c3610c05c0d03b39feb07f7e09fa234dac9b15aaf39"
 
 [[package]]
 name = "package"
-version = "1.0.0-rc.2"
+version = "1.0.0-rc.3"
 dependencies = [
  "bytes",
  "object_store",
@@ -9433,7 +9403,7 @@ dependencies = [
 
 [[package]]
 name = "runtime"
-version = "1.0.0-rc.2"
+version = "1.0.0-rc.3"
 dependencies = [
  "anyhow",
  "app",
@@ -9506,10 +9476,10 @@ dependencies = [
  "ns_lookup",
  "object_store",
  "once_cell",
- "opentelemetry 0.26.0",
+ "opentelemetry",
  "opentelemetry-prometheus",
  "opentelemetry-proto",
- "opentelemetry_sdk 0.26.0",
+ "opentelemetry_sdk",
  "otel-arrow",
  "package",
  "percent-encoding",
@@ -9560,7 +9530,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-auth"
-version = "1.0.0-rc.2"
+version = "1.0.0-rc.3"
 dependencies = [
  "app",
  "axum",
@@ -10458,7 +10428,7 @@ dependencies = [
 
 [[package]]
 name = "spice-cloud"
-version = "1.0.0-rc.2"
+version = "1.0.0-rc.3"
 dependencies = [
  "async-trait",
  "datafusion",
@@ -10475,17 +10445,17 @@ dependencies = [
 
 [[package]]
 name = "spiced"
-version = "1.0.0-rc.2"
+version = "1.0.0-rc.3"
 dependencies = [
  "app",
  "clap",
  "flightrepl",
  "futures",
- "opentelemetry 0.26.0",
+ "opentelemetry",
  "opentelemetry-http",
  "opentelemetry-prometheus",
  "opentelemetry-zipkin",
- "opentelemetry_sdk 0.26.0",
+ "opentelemetry_sdk",
  "otel-arrow",
  "prometheus",
  "reqwest 0.12.9",
@@ -10507,7 +10477,7 @@ dependencies = [
 
 [[package]]
 name = "spicepod"
-version = "1.0.0-rc.2"
+version = "1.0.0-rc.3"
 dependencies = [
  "fundu",
  "schemars",
@@ -10521,7 +10491,7 @@ dependencies = [
 
 [[package]]
 name = "spicepodschema"
-version = "1.0.0-rc.2"
+version = "1.0.0-rc.3"
 dependencies = [
  "schemars",
  "serde_json",
@@ -10889,14 +10859,14 @@ dependencies = [
 
 [[package]]
 name = "telemetry"
-version = "1.0.0-rc.2"
+version = "1.0.0-rc.3"
 dependencies = [
  "arrow",
  "async-trait",
  "flight_client",
  "hostname 0.4.0",
- "opentelemetry 0.26.0",
- "opentelemetry_sdk 0.26.0",
+ "opentelemetry",
+ "opentelemetry_sdk",
  "otel-arrow",
  "sha2",
  "tokio",
@@ -11631,14 +11601,14 @@ dependencies = [
 
 [[package]]
 name = "tracing-opentelemetry"
-version = "0.27.0"
+version = "0.28.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dc58af5d3f6c5811462cabb3289aec0093f7338e367e5a33d28c0433b3c7360b"
+checksum = "97a971f6058498b5c0f1affa23e7ea202057a7301dbff68e968b2d578bcbd053"
 dependencies = [
  "js-sys",
  "once_cell",
- "opentelemetry 0.26.0",
- "opentelemetry_sdk 0.26.0",
+ "opentelemetry",
+ "opentelemetry_sdk",
  "smallvec",
  "tracing",
  "tracing-core",
@@ -12152,7 +12122,7 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 
 [[package]]
 name = "util"
-version = "1.0.0-rc.2"
+version = "1.0.0-rc.3"
 dependencies = [
  "backoff",
  "humantime",

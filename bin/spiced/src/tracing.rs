@@ -18,12 +18,10 @@ use std::{borrow::Cow, sync::Arc};
 
 use app::{spicepod::component::runtime::TracingConfig, App};
 use futures::future::BoxFuture;
-use opentelemetry::global::Error as OtelError;
-use opentelemetry::trace::TraceError;
+use opentelemetry::InstrumentationScope;
 use opentelemetry_sdk::{
     export::trace::{ExportResult, SpanData, SpanExporter},
-    runtime::TrySendError,
-    trace::{Config, TracerProvider},
+    trace::TracerProvider,
     Resource,
 };
 use reqwest::Client;
@@ -104,10 +102,6 @@ pub(crate) async fn init_tracing(
 
     tracing::subscriber::set_global_default(subscriber)?;
 
-    if let Err(e) = opentelemetry::global::set_error_handler(handle_opentelemetry_error) {
-        tracing::debug!("Failed to set OpenTelemetry error handler: {e}");
-    }
-
     Ok(())
 }
 
@@ -119,7 +113,6 @@ async fn datafusion_task_history_tracing<S>(
 where
     S: Subscriber + for<'span> LookupSpan<'span>,
 {
-    let trace_config = Config::default().with_resource(Resource::empty());
     let app_name = app.as_ref().map(|app| app.name.clone());
 
     let captured_output = app
@@ -140,11 +133,12 @@ where
 
     let mut provider_builder =
         TracerProvider::builder().with_batch_exporter(exporter, opentelemetry_sdk::runtime::Tokio);
-    provider_builder = provider_builder.with_config(trace_config);
+    provider_builder = provider_builder.with_resource(Resource::default());
     let provider = provider_builder.build();
-    let tracer = opentelemetry::trace::TracerProvider::tracer_builder(&provider, "task_history")
+    let scope = InstrumentationScope::builder("task_history")
         .with_version(env!("CARGO_PKG_VERSION"))
         .build();
+    let tracer = opentelemetry::trace::TracerProvider::tracer_with_scope(&provider, scope);
 
     let layer = tracing_opentelemetry::layer()
         .with_tracer(tracer)
@@ -251,35 +245,5 @@ impl SpanExporter for OtelExportMultiplexer {
         for exporter in &mut self.exporters {
             exporter.set_resource(resource);
         }
-    }
-}
-
-fn handle_opentelemetry_error(e: OtelError) {
-    if let OtelError::Trace(trace_error) = e {
-        handle_trace_error(trace_error);
-    } else {
-        tracing::error!("OpenTelemetry error occurred: {e}");
-    }
-}
-
-fn handle_trace_error(e: TraceError) {
-    if let TraceError::Other(other) = e {
-        handle_trace_other_error(other);
-    } else {
-        tracing::error!("OpenTelemetry trace error occurred: {e}");
-    }
-}
-
-#[allow(clippy::needless_pass_by_value)]
-fn handle_trace_other_error(other: Box<dyn std::error::Error + Send + Sync>) {
-    if let Some(send_error) = other.downcast_ref::<TrySendError>() {
-        if let TrySendError::ChannelClosed = send_error {
-            // This is expected to happen when the runtime is shutting down
-            tracing::trace!("OpenTelemetry trace channel closed");
-        } else {
-            tracing::error!("OpenTelemetry trace error occurred: {other}");
-        }
-    } else {
-        tracing::error!("OpenTelemetry trace error occurred: {other}");
     }
 }

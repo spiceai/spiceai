@@ -1,6 +1,6 @@
 module github.com/spiceai/spiceai
 
-go 1.22.0
+go 1.23.0
 
 require (
 	github.com/AzureAD/microsoft-authentication-library-for-go v1.3.2

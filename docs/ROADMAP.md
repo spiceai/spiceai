@@ -8,22 +8,11 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 
 - See [Bugs](https://github.com/spiceai/spiceai/labels/bug). Feel free to file a new Issue if you see a bug and let us know on Discord.
 
-## [v1.0-rc.2 (Dec 2024)](https://github.com/spiceai/spiceai/milestone/48)
-
-- Bugfixes and performance improvements
-- GraphQL data connector (Release Candidate)
-- Databricks DeltaLake data connector (Release Candidate)
-- Spice.ai Cloud Platform data connector (Release Candidate)
-- Dremio data connector (Release Candidate)
-- MS SQL data connector (Beta)
-- File data connector (Beta)
-- S3 data connector Iceberg support (Beta)
-- AI Evals (AI-as-a-Judge)
-  - [#3320](https://github.com/spiceai/spiceai/issues/3320) Eval datasets
-
 ## v1.0-rc.3 (Dec 2024)
 
 - Bugfixes and performance improvements
+- Spice.ai Cloud Platform data connector (Release Candidate)
+- Dremio data connector (Release Candidate)
 - MS SQL data connector (Release Candidate)
 - File data connector (Release Candidate)
 - Data Accelerators: SQLite & PostgreSQL (Release Candidate)

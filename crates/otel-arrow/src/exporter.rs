@@ -16,28 +16,24 @@ limitations under the License.
 
 use arrow::array::RecordBatch;
 use async_trait::async_trait;
-use opentelemetry::metrics::MetricsError;
 use opentelemetry_sdk::metrics::{
-    data::{ResourceMetrics, Temporality},
-    exporter::PushMetricsExporter,
-    reader::TemporalitySelector,
-    InstrumentKind,
+    data::ResourceMetrics, exporter::PushMetricExporter, MetricError, Temporality,
 };
 
 use crate::converter::OtelToArrowConverter;
 
 #[async_trait]
-pub trait ArrowExporter: TemporalitySelector + Send + Sync + 'static {
-    async fn export(&self, metrics: RecordBatch) -> Result<(), MetricsError>;
+pub trait ArrowExporter: Send + Sync + 'static {
+    async fn export(&self, metrics: RecordBatch) -> Result<(), MetricError>;
 
-    async fn force_flush(&self) -> Result<(), MetricsError>;
+    async fn force_flush(&self) -> Result<(), MetricError>;
 
     /// Shutdown the exporter.
     ///
     /// # Errors
     ///
     /// This function will return an error if the shutdown couldn't complete successfully.
-    fn shutdown(&self) -> Result<(), MetricsError>;
+    fn shutdown(&self) -> Result<(), MetricError>;
 }
 
 pub struct OtelArrowExporter<E: ArrowExporter> {
@@ -58,26 +54,24 @@ impl<E: ArrowExporter> OtelArrowExporter<E> {
     }
 }
 
-impl<E: ArrowExporter> TemporalitySelector for OtelArrowExporter<E> {
-    fn temporality(&self, kind: InstrumentKind) -> Temporality {
-        self.exporter.temporality(kind)
-    }
-}
-
 #[async_trait]
-impl<E: ArrowExporter> PushMetricsExporter for OtelArrowExporter<E> {
-    async fn export(&self, metrics: &mut ResourceMetrics) -> Result<(), MetricsError> {
+impl<E: ArrowExporter> PushMetricExporter for OtelArrowExporter<E> {
+    async fn export(&self, metrics: &mut ResourceMetrics) -> Result<(), MetricError> {
         let mut converter = OtelToArrowConverter::new(metrics.scope_metrics.len());
         let batch = converter.convert(metrics)?;
 
         self.exporter.export(batch).await
     }
 
-    async fn force_flush(&self) -> Result<(), MetricsError> {
+    async fn force_flush(&self) -> Result<(), MetricError> {
         self.exporter.force_flush().await
     }
 
-    fn shutdown(&self) -> Result<(), MetricsError> {
+    fn shutdown(&self) -> Result<(), MetricError> {
         self.exporter.shutdown()
+    }
+
+    fn temporality(&self) -> Temporality {
+        Temporality::Cumulative
     }
 }

@@ -30,14 +30,14 @@ pub(crate) mod spiced_runtime {
         RUNTIME_METER
             .u64_counter("runtime_flight_server_started")
             .with_description("Indicates the runtime Flight server has started.")
-            .init()
+            .build()
     });
 
     pub(crate) static HTTP_SERVER_START: LazyLock<Counter<u64>> = LazyLock::new(|| {
         RUNTIME_METER
             .u64_counter("runtime_http_server_started")
             .with_description("Indicates the runtime HTTP server has started.")
-            .init()
+            .build()
     });
 }
 
@@ -52,7 +52,7 @@ pub(crate) mod secrets {
             .f64_histogram("secrets_store_load_duration_ms")
             .with_description("Duration in milliseconds to load the secret stores.")
             .with_unit("ms")
-            .init()
+            .build()
     });
 }
 
@@ -66,28 +66,28 @@ pub(crate) mod datasets {
             .f64_gauge("dataset_unavailable_time_ms")
             .with_description("Time dataset went offline in milliseconds.")
             .with_unit("ms")
-            .init()
+            .build()
     });
 
     pub(crate) static LOAD_ERROR: LazyLock<Counter<u64>> = LazyLock::new(|| {
         DATASETS_METER
             .u64_counter("dataset_load_errors")
             .with_description("Number of errors loading the dataset.")
-            .init()
+            .build()
     });
 
     pub(crate) static COUNT: LazyLock<UpDownCounter<i64>> = LazyLock::new(|| {
         DATASETS_METER
             .i64_up_down_counter("dataset_active_count")
             .with_description("Number of currently loaded datasets.")
-            .init()
+            .build()
     });
 
     pub(crate) static STATUS: LazyLock<Gauge<u64>> = LazyLock::new(|| {
         DATASETS_METER
             .u64_gauge("dataset_load_state")
             .with_description("Status of the dataset. 1=Initializing, 2=Ready, 3=Disabled, 4=Error, 5=Refreshing.")
-            .init()
+            .build()
     });
 }
 
@@ -100,14 +100,14 @@ pub(crate) mod catalogs {
         CATALOGS_METER
             .u64_counter("catalog_load_errors")
             .with_description("Number of errors loading the catalog provider.")
-            .init()
+            .build()
     });
 
     pub(crate) static STATUS: LazyLock<Gauge<u64>> = LazyLock::new(|| {
         CATALOGS_METER
             .u64_gauge("catalog_load_state")
             .with_description("Status of the catalog provider. 1=Initializing, 2=Ready, 3=Disabled, 4=Error, 5=Refreshing.")
-            .init()
+            .build()
     });
 }
 
@@ -120,7 +120,7 @@ pub(crate) mod views {
         VIEWS_METER
             .u64_counter("view_load_errors")
             .with_description("Number of errors loading the view.")
-            .init()
+            .build()
     });
     pub(crate) static STATUS: LazyLock<Gauge<u64>> = LazyLock::new(|| {
         VIEWS_METER
@@ -128,7 +128,7 @@ pub(crate) mod views {
             .with_description(
                 "Status of the views. 1=Initializing, 2=Ready, 3=Disabled, 4=Error, 5=Refreshing.",
             )
-            .init()
+            .build()
     });
 }
 
@@ -143,21 +143,21 @@ pub(crate) mod embeddings {
         EMBEDDINGS_METER
             .u64_counter("embeddings_load_errors")
             .with_description("Number of errors loading the embedding.")
-            .init()
+            .build()
     });
 
     pub(crate) static COUNT: LazyLock<UpDownCounter<i64>> = LazyLock::new(|| {
         EMBEDDINGS_METER
             .i64_up_down_counter("embeddings_active_count")
             .with_description("Number of currently loaded embeddings.")
-            .init()
+            .build()
     });
 
     pub(crate) static STATUS: LazyLock<Gauge<u64>> = LazyLock::new(|| {
         EMBEDDINGS_METER
             .u64_gauge("embeddings_load_state")
             .with_description("Status of the embedding. 1=Initializing, 2=Ready, 3=Disabled, 4=Error, 5=Refreshing.")
-            .init()
+            .build()
     });
 }
 
@@ -170,7 +170,7 @@ pub(crate) mod models {
         MODELS_METER
             .u64_counter("model_load_errors")
             .with_description("Number of errors loading the model.")
-            .init()
+            .build()
     });
 
     pub(crate) static LOAD_DURATION_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| {
@@ -178,14 +178,14 @@ pub(crate) mod models {
             .f64_histogram("model_load_duration_ms")
             .with_description("Duration in milliseconds to load the model.")
             .with_unit("ms")
-            .init()
+            .build()
     });
 
     pub(crate) static COUNT: LazyLock<UpDownCounter<i64>> = LazyLock::new(|| {
         MODELS_METER
             .i64_up_down_counter("model_active_count")
             .with_description("Number of currently loaded models.")
-            .init()
+            .build()
     });
 
     pub(crate) static STATUS: LazyLock<Gauge<u64>> = LazyLock::new(|| {
@@ -194,7 +194,7 @@ pub(crate) mod models {
             .with_description(
                 "Status of the model. 1=Initializing, 2=Ready, 3=Disabled, 4=Error, 5=Refreshing.",
             )
-            .init()
+            .build()
     });
 }
 
@@ -209,7 +209,7 @@ pub(crate) mod llms {
             .with_description(
                 "Status of the LLM model. 1=Initializing, 2=Ready, 3=Disabled, 4=Error, 5=Refreshing.",
             )
-            .init()
+            .build()
     });
 }
 
@@ -222,7 +222,7 @@ pub(crate) mod tools {
         TOOLS_METER
             .i64_up_down_counter("tool_active_count")
             .with_description("Number of currently loaded LLM tools.")
-            .init()
+            .build()
     });
 
     pub(crate) static STATUS: LazyLock<Gauge<u64>> = LazyLock::new(|| {
@@ -231,14 +231,14 @@ pub(crate) mod tools {
             .with_description(
                 "Status of the LLM tools. 1=Initializing, 2=Ready, 3=Disabled, 4=Error, 5=Refreshing.",
             )
-            .init()
+            .build()
     });
 
     pub(crate) static LOAD_ERROR: LazyLock<Counter<u64>> = LazyLock::new(|| {
         TOOLS_METER
             .u64_counter("tool_load_errors")
             .with_description("Number of errors loading the LLM tool.")
-            .init()
+            .build()
     });
 }
 
@@ -257,7 +257,7 @@ pub(crate) mod telemetry {
             .u64_counter("query_executions")
             .with_description("Number of query executions.")
             .with_unit("queries")
-            .init()
+            .build()
     });
 
     pub fn track_query_count(dimensions: &[KeyValue]) {
@@ -270,7 +270,7 @@ pub(crate) mod telemetry {
             .u64_counter("query_processed_bytes")
             .with_description("Number of bytes processed by the runtime.")
             .with_unit("By")
-            .init()
+            .build()
     });
 
     pub fn track_bytes_processed(bytes: u64, dimensions: &[KeyValue]) {
@@ -283,7 +283,7 @@ pub(crate) mod telemetry {
             .u64_counter("query_returned_bytes")
             .with_description("Number of bytes returned to query clients.")
             .with_unit("By")
-            .init()
+            .build()
     });
 
     pub fn track_bytes_returned(bytes: u64, dimensions: &[KeyValue]) {
@@ -298,7 +298,7 @@ pub(crate) mod telemetry {
                 "The total amount of time spent planning and executing queries in milliseconds.",
             )
             .with_unit("ms")
-            .init()
+            .build()
     });
 
     pub fn track_query_duration(duration: Duration, dimensions: &[KeyValue]) {
@@ -313,7 +313,7 @@ pub(crate) mod telemetry {
             "The total amount of time spent only executing queries. This is 0 for cached queries.",
         )
         .with_unit("ms")
-        .init()
+        .build()
     });
 
     pub fn track_query_execution_duration(duration: Duration, dimensions: &[KeyValue]) {

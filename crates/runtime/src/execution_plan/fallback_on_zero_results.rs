@@ -250,7 +250,7 @@ mod metrics {
         METER
             .u64_counter("accelerated_zero_results_federated_fallback")
             .with_description("Number of times the federated table was queried due to the accelerated table returning zero results.")
-            .init()
+            .build()
     });
 }
 

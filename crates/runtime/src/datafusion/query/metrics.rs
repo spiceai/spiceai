@@ -27,5 +27,5 @@ pub(crate) static FAILURES: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
         .u64_counter("query_failures")
         .with_description("Number of query failures.")
-        .init()
+        .build()
 });

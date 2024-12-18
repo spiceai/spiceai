@@ -16,7 +16,9 @@ limitations under the License.
 
 use std::sync::{Arc, LazyLock, OnceLock};
 
-use opentelemetry::metrics::{noop::NoopMeterProvider, Meter, MeterProvider};
+use opentelemetry::metrics::{Meter, MeterProvider};
+
+use crate::noop::NoopMeterProvider;
 
 pub(crate) static METER_PROVIDER_ONCE: OnceLock<Arc<dyn MeterProvider + Send + Sync>> =
     OnceLock::new();

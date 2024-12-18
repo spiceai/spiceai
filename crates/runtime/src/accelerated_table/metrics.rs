@@ -27,7 +27,7 @@ pub(crate) static REFRESH_ERRORS: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
         .u64_counter("dataset_acceleration_refresh_errors")
         .with_description("Number of errors refreshing the dataset.")
-        .init()
+        .build()
 });
 
 pub(crate) static LAST_REFRESH_TIME_MS: LazyLock<Gauge<f64>> = LazyLock::new(|| {
@@ -35,7 +35,7 @@ pub(crate) static LAST_REFRESH_TIME_MS: LazyLock<Gauge<f64>> = LazyLock::new(|| 
         .f64_gauge("dataset_acceleration_last_refresh_time_ms")
         .with_description("Unix timestamp in seconds when the last refresh completed.")
         .with_unit("ms")
-        .init()
+        .build()
 });
 
 pub(crate) static REFRESH_DURATION_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| {
@@ -43,12 +43,12 @@ pub(crate) static REFRESH_DURATION_MS: LazyLock<Histogram<f64>> = LazyLock::new(
         .f64_histogram("dataset_acceleration_refresh_duration_ms")
         .with_description("Duration in milliseconds to load a full or appended refresh data.")
         .with_unit("ms")
-        .init()
+        .build()
 });
 
 pub(crate) static READY_STATE_FALLBACK: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
         .u64_counter("accelerated_ready_state_federated_fallback")
         .with_description("Number of times the federated table was queried due to the accelerated table loading the initial data.")
-        .init()
+        .build()
 });

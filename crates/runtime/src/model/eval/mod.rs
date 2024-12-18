@@ -28,7 +28,7 @@ use runs::{
     EvalRunStatus,
 };
 use scorer::score_results;
-use snafu::{ResultExt, Snafu};
+use snafu::{ensure, ResultExt, Snafu};
 use spicepod::component::eval::Eval;
 use tracing_futures::Instrument;
 
@@ -58,12 +58,26 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
+    #[snafu(display("Failed to prepare data for eval '{eval_name}': {source}"))]
+    FailedToPrepareData {
+        eval_name: String,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
     #[snafu(display(
         "During evaluation '{eval_name}', an error occured when running the model: {source}"
     ))]
     FailedToRunModel {
         eval_name: String,
         source: OpenAIError,
+    },
+
+    #[snafu(display(
+        "The model {model_name}, during eval '{eval_name}' did not produce the expected number of rows."
+    ))]
+    ModelProducedFewerRows {
+        model_name: String,
+        eval_name: String,
     },
 
     #[snafu(display(
@@ -176,6 +190,17 @@ async fn run_eval(
 ) -> Result<()> {
     // Get & prepare the eval dataset
     let (input, ideal) = get_eval_data(Arc::clone(&df), eval).await?;
+    if input.len() != ideal.len() {
+        return Err(Error::FailedToPrepareData {
+            eval_name: eval.name.clone(),
+            source: Box::<dyn std::error::Error + Send + Sync>::from(format!(
+                "input ({}) and ideal ({}) in eval dataset '{}' do not have the same length",
+                input.len(),
+                ideal.len(),
+                eval.dataset.clone()
+            )),
+        });
+    }
 
     // Run the model against the eval dataset.
     let llms = llm_store.read().await;
@@ -192,6 +217,14 @@ async fn run_eval(
         // Not an error, no data in dataset
         vec![]
     };
+
+    ensure!(
+        actual.len() == ideal.len(),
+        ModelProducedFewerRowsSnafu {
+            eval_name: eval.name.clone(),
+            model_name: model_name.clone()
+        }
+    );
 
     // Score the results
     let scorers_to_use = get_scorers_for_eval(eval, Arc::clone(&scorer_registry)).await?;

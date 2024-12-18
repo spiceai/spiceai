@@ -2,12 +2,13 @@
 
 ## Supported Versions
 
-As Spice.ai is in active development (beta), only the latest version is supported for security updates.
+As Spice.ai is in active development (release candidate), only the latest version is supported for security updates.
 
-| Version | Supported          |
-| ------- | ------------------ |
-| 0.20.x  | :white_check_mark: |
-| < 0.20  | :x:                |
+| Version    | Supported          |
+| ---------- | ------------------ |
+| 1.0.0-rc.2 | :white_check_mark: |
+| 1.0.0-rc.1 | :x:                |
+| < 1.0.0    | :x:                |
 
 ## Reporting a Vulnerability
 

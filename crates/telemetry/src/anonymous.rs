@@ -23,10 +23,8 @@ use crate::exporter::AnonymousTelemetryExporter;
 use opentelemetry::KeyValue;
 use opentelemetry_sdk::{
     metrics::{
-        data::{ResourceMetrics, Temporality},
-        exporter::PushMetricsExporter,
-        reader::{MetricReader, TemporalitySelector},
-        InstrumentKind, ManualReader, PeriodicReader, Pipeline, SdkMeterProvider,
+        data::ResourceMetrics, exporter::PushMetricExporter, reader::MetricReader, InstrumentKind,
+        ManualReader, PeriodicReader, Pipeline, SdkMeterProvider, Temporality,
     },
     runtime::Tokio,
     Resource,
@@ -137,20 +135,18 @@ impl MetricReader for InitialReader {
         self.reader.register_pipeline(pipeline);
     }
 
-    fn collect(&self, rm: &mut ResourceMetrics) -> opentelemetry::metrics::Result<()> {
+    fn collect(&self, rm: &mut ResourceMetrics) -> opentelemetry_sdk::metrics::MetricResult<()> {
         self.reader.collect(rm)
     }
 
-    fn force_flush(&self) -> opentelemetry::metrics::Result<()> {
+    fn force_flush(&self) -> opentelemetry_sdk::metrics::MetricResult<()> {
         self.reader.force_flush()
     }
 
-    fn shutdown(&self) -> opentelemetry::metrics::Result<()> {
+    fn shutdown(&self) -> opentelemetry_sdk::metrics::MetricResult<()> {
         self.reader.shutdown()
     }
-}
 
-impl TemporalitySelector for InitialReader {
     fn temporality(&self, kind: InstrumentKind) -> Temporality {
         self.reader.temporality(kind)
     }
