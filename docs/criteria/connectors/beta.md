@@ -107,8 +107,8 @@ The following features/tests are dependent on the required features/tests for th
 
 Support for schema inference in a connector is classified as:
 
-- ☑️: Inferred schema. The source does not support native schema inference, and schema is inferred from the first row of results.
-- ➖: Inferred schema. The connector does not support native schema inference, and schema is inferred from the first row of results.
+- ☑️: Inferred schema. The source does not support natively detecting schema, and schema is inferred from the first row of results.
+- ➖: Inferred schema. The connector does not support natively detecting schema, and schema is inferred from the first row of results.
 
 #### Federation
 

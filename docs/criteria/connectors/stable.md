@@ -40,7 +40,7 @@ These connectors are exempt from running the TPC derived test packages, and rely
 
 This table defines the required features and/or tests for each connector:
 
-| Connector                        | [TPC-H (Scale)][tpch] | [TPC-DS (Scale)][tpcds] | [Federation][fed] | [Data Correctness][data] | [Streaming][stream] | [Schema Inference][schema] |
+| Connector                        | [TPC-H (Scale)][tpch] | [TPC-DS (Scale)][tpcds] | [Federation][fed] | [Data Correctness][data] | [Streaming][stream] | [Schema Detection][schema] |
 | -------------------------------- | --------------------- | ----------------------- | ----------------- | ------------------------ | ------------------- | ------------------ |
 | Clickhouse                       | ✅ (1000)             | ✅ (1000)              | ✅                | ✅                      | ✅                  | ✅                |
 | Databricks (mode: delta_lake)    | ✅ (5)                | ✅ (5)                 | ☑️                | ✅                      | ✅                  | ✅                |
@@ -102,9 +102,9 @@ The following features/tests are dependent on the required features/tests for th
 
 Support for schema inference in a connector is classified as:
 
-- ✅: Native schema. The connector supports native schema inference.
-- ☑️: Inferred schema. The source does not support native schema inference, and schema is inferred from the first row of results.
-- ➖: Inferred schema. The connector does not support native schema inference, and schema is inferred from the first row of results.
+- ✅: Native schema. The connector supports natively detecting schema.
+- ☑️: Inferred schema. The source does not support natively detecting schema, and schema is inferred from the first row of results.
+- ➖: Inferred schema. The connector does not support natively detecting schema, and schema is inferred from the first row of results.
 
 ##### Native schema
 
