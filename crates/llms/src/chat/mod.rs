@@ -310,8 +310,10 @@ pub fn message_to_mistral(
             tool_calls,
             ..
         }) => {
-            let mut map: IndexMap<String, MessageContent> = IndexMap::new();
-
+            let mut map: IndexMap<String, MessageContent> = IndexMap::from([(
+                String::from("role"),
+                Either::Left(String::from("assistant")),
+            )]);
             match content {
                 Some(ChatCompletionRequestAssistantMessageContent::Text(s)) => {
                     map.insert("content".to_string(), Either::Left(s.clone()));
