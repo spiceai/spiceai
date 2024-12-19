@@ -38,10 +38,6 @@ impl Namespace {
     pub fn from_parts(parts: Vec<String>) -> Self {
         Self { parts }
     }
-
-    pub fn is_empty(&self) -> bool {
-        self.parts.is_empty()
-    }
 }
 
 impl<'de> Deserialize<'de> for Namespace {
