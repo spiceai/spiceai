@@ -26,6 +26,8 @@ use spicepod::component::runtime::CorsConfig;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use utoipa::OpenApi;
+
+#[cfg(feature = "dev")]
 use utoipa_swagger_ui::SwaggerUi;
 
 use axum::{
@@ -72,9 +74,10 @@ pub(crate) fn routes(
         .route("/v1/packages/generate", post(v1::packages::generate));
 
     // Enable Swagger UI & OpenAPI JSON for dev.
-    if cfg!(feature = "dev") {
+    #[cfg(feature = "dev")]
+    {
         authenticated_router = authenticated_router
-            .merge(SwaggerUi::new("/docs").url("/docs/openapi.json", ApiDoc::openapi()))
+            .merge(SwaggerUi::new("/docs").url("/docs/openapi.json", ApiDoc::openapi()));
     }
 
     if cfg!(feature = "models") {
