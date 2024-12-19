@@ -25,6 +25,8 @@ use opentelemetry::KeyValue;
 use spicepod::component::runtime::CorsConfig;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use utoipa::OpenApi;
+use utoipa_swagger_ui::SwaggerUi;
 
 use axum::{
     body::Body,
@@ -40,6 +42,10 @@ use tokio::time::Instant;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 
 use super::{metrics, v1};
+
+#[derive(OpenApi)]
+#[openapi(paths(v1::eval::post, v1::eval::list, v1::tools::list, v1::tools::post))]
+struct ApiDoc;
 
 pub(crate) fn routes(
     rt: &Arc<Runtime>,
@@ -65,6 +71,12 @@ pub(crate) fn routes(
         .route("/v1/spicepods", get(v1::spicepods::get))
         .route("/v1/packages/generate", post(v1::packages::generate));
 
+    // Enable Swagger UI & OpenAPI JSON for dev.
+    if cfg!(feature = "dev") {
+        authenticated_router = authenticated_router
+            .merge(SwaggerUi::new("/docs").url("/docs/openapi.json", ApiDoc::openapi()))
+    }
+
     if cfg!(feature = "models") {
         authenticated_router = authenticated_router
             .route("/v1/models", get(v1::models::get))
@@ -79,6 +91,7 @@ pub(crate) fn routes(
             // Deprecated, use /v1/evals/:name instead
             .route("/v1/tool/:name", post(v1::tools::post))
             .route("/v1/evals/:name", post(v1::eval::post))
+            .route("/v1/evals/", get(v1::eval::list))
             .layer(Extension(Arc::clone(&rt.llms)))
             .layer(Extension(Arc::clone(&rt.models)))
             .layer(Extension(Arc::clone(&rt.eval_scorers)))

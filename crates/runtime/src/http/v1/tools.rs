@@ -28,13 +28,26 @@ use serde_json::json;
 use crate::{tools::Tooling, Runtime};
 
 /// The structure of the JSON elements returned by the `/v1/tools` endpoint.
-#[derive(Serialize, Debug, Clone, PartialEq, Eq, Hash, Default, Deserialize)]
+#[derive(Serialize, Debug, Clone, PartialEq, Eq, Hash, Default, Deserialize, utoipa::ToSchema)]
 struct ListToolElement {
     name: String,
     description: Option<String>,
     parameters: Option<serde_json::Value>,
 }
 
+/// List all available tools in the Spice runtime.
+#[utoipa::path(
+    get,
+    path = "/v1/tools",
+    tag = "Tools",
+    responses(
+        (status = 200, description = "All tools available in the Spice runtime", body = [ListToolElement],
+            examples((
+                "Basic" = (value = json!([{"name": "get_readiness", "description": "Retrieves the readiness status of all runtime components including registered datasets, models, and embeddings.", "parameters": null}, {"name": "list_datasets", "description": "List all SQL tables available.", "parameters": null}]))
+            ))
+        )
+    )
+)]
 pub(crate) async fn list(Extension(rt): Extension<Arc<Runtime>>) -> Response {
     let tools = &*rt.tools.read().await;
     let tools = tools
@@ -52,6 +65,49 @@ pub(crate) async fn list(Extension(rt): Extension<Arc<Runtime>>) -> Response {
     (StatusCode::OK, Json(tools)).into_response()
 }
 
+/// Run a loaded tool.
+///
+/// The format of the request body and JSON response match the tool's
+#[utoipa::path(
+    post,
+    path = "/v1/tools/{name}",
+    tag = "Tools",
+    params(
+        ("name" = String, Path, description = "Name of the tool")
+    ),
+    request_body(
+        description = "Tool specific input parameters. See /v1/tools for parameter schema.",
+        content_type = "application/json",
+        examples((
+            "sql" = (value = json!({"query": "SELECT avg(total_amount), avg(tip_amount), count(1), passenger_count FROM my_table GROUP BY passenger_count ORDER BY passenger_count ASC LIMIT 3"}))
+        ))
+    ),
+    responses(
+        (status = 200, description = "Tool Specific response, in JSON format", body=serde_json::Value,  examples((
+            "sql" = (value = json!([{
+              "AVG(my_table.tip_amount)": 3.072259971396793,
+              "AVG(my_table.total_amount)": 25.327816939456525,
+              "COUNT(Int64(1))": 31465,
+              "passenger_count": 0
+            },
+            {
+              "AVG(my_table.tip_amount)": 3.3712622884680057,
+              "AVG(my_table.total_amount)": 26.205230445474996,
+              "COUNT(Int64(1))": 2188739,
+              "passenger_count": 1
+            },
+            {
+              "AVG(my_table.tip_amount)": 3.7171302113290854,
+              "AVG(my_table.total_amount)": 29.520659930930304,
+              "COUNT(Int64(1))": 405103,
+              "passenger_count": 2
+            }]))
+        ))),
+        (status = 404, description = "Tool not found", body = String, example="Tool no_sql not found"),
+        (status = 500, description = "Error occured whilst calling the tool", body = serde_json::Value,
+            example=json!({"message": "Error calling tool no_sql: No such tool"}))
+    )
+)]
 pub(crate) async fn post(
     Extension(rt): Extension<Arc<Runtime>>,
     Path(tool_name): Path<String>,
