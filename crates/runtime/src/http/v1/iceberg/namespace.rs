@@ -65,3 +65,15 @@ impl Serialize for Namespace {
         seq.end()
     }
 }
+
+#[derive(Deserialize)]
+pub struct NamespacePath(String);
+
+impl From<NamespacePath> for Namespace {
+    fn from(path: NamespacePath) -> Self {
+        // Since path is already URL-decoded by Axum, split directly
+        Self {
+            parts: path.0.split('\u{1F}').map(ToString::to_string).collect(),
+        }
+    }
+}

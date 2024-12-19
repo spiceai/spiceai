@@ -18,13 +18,13 @@ use std::sync::Arc;
 
 use crate::{datafusion::is_spice_internal_schema, DataFusion};
 use axum::{
-    extract::Query,
+    extract::{Path, Query},
     http::status,
     response::{IntoResponse, Response},
     Extension, Json,
 };
 use error::IcebergResponseError;
-use namespace::Namespace;
+use namespace::{Namespace, NamespacePath};
 use serde::{self, Deserialize, Serialize};
 
 mod error;
@@ -59,28 +59,65 @@ pub(crate) async fn get_namespaces(
     Extension(datafusion): Extension<Arc<DataFusion>>,
     Query(params): Query<ParentNamespaceQueryParams>,
 ) -> Response {
+    match get_child_namespaces_impl(&datafusion, &params.parent) {
+        Ok(namespaces) => (
+            status::StatusCode::OK,
+            Json(NamespacesResponse { namespaces }),
+        )
+            .into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+pub(crate) async fn head_namespace(
+    Extension(datafusion): Extension<Arc<DataFusion>>,
+    Path(namespace): Path<NamespacePath>,
+) -> Response {
+    let namespace = Namespace::from(namespace);
+    match get_child_namespaces_impl(&datafusion, &namespace) {
+        Ok(_) => status::StatusCode::OK.into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+pub(crate) async fn get_namespace(
+    Extension(datafusion): Extension<Arc<DataFusion>>,
+    Path(namespace): Path<NamespacePath>,
+) -> Response {
+    let namespace = Namespace::from(namespace);
+    match get_child_namespaces_impl(&datafusion, &namespace) {
+        Ok(_) => (
+            status::StatusCode::OK,
+            Json(NamespacesResponse {
+                namespaces: vec![namespace],
+            }),
+        )
+            .into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+fn get_child_namespaces_impl(
+    datafusion: &DataFusion,
+    namespace: &Namespace,
+) -> Result<Vec<Namespace>, IcebergResponseError> {
     let catalog_names = datafusion.ctx.catalog_names();
 
-    match params.parent.parts.len() {
+    match namespace.parts.len() {
         0 => {
             let namespaces = catalog_names
                 .into_iter()
                 .map(Namespace::from_single_part)
                 .collect();
-            (
-                status::StatusCode::OK,
-                Json(NamespacesResponse { namespaces }),
-            )
-                .into_response()
+            Ok(namespaces)
         }
         1 => {
             // The user has specified a single namespace, so we want to return all of the schemas in that namespace
-            let catalog_name = params.parent.parts[0].clone();
+            let catalog_name = namespace.parts[0].clone();
             let Some(catalog) = datafusion.ctx.catalog(catalog_name.as_str()) else {
-                return IcebergResponseError::no_such_namespace(
+                return Err(IcebergResponseError::no_such_namespace(
                     "Namespace provided in the parent does not exist".to_string(),
-                )
-                .into_response();
+                ));
             };
 
             let schema_names = catalog.schema_names().into_iter().filter(|schema_name| {
@@ -89,41 +126,30 @@ pub(crate) async fn get_namespaces(
             let namespaces = schema_names
                 .map(|schema_name| Namespace::from_parts(vec![catalog_name.clone(), schema_name]))
                 .collect();
-            (
-                status::StatusCode::OK,
-                Json(NamespacesResponse { namespaces }),
-            )
-                .into_response()
+            Ok(namespaces)
         }
         2 => {
-            let catalog_name = params.parent.parts[0].clone();
-            let schema_name = params.parent.parts[1].clone();
+            let catalog_name = namespace.parts[0].clone();
+            let schema_name = namespace.parts[1].clone();
             let Some(catalog) = datafusion.ctx.catalog(catalog_name.as_str()) else {
-                return IcebergResponseError::no_such_namespace(
+                return Err(IcebergResponseError::no_such_namespace(
                     "Namespace provided in the parent does not exist".to_string(),
-                )
-                .into_response();
+                ));
             };
             let mut schema_names = catalog.schema_names().into_iter().filter(|schema_name| {
                 !is_spice_internal_schema(catalog_name.as_str(), schema_name)
             });
             if !schema_names.any(|s| s == schema_name) {
-                return IcebergResponseError::no_such_namespace(
+                return Err(IcebergResponseError::no_such_namespace(
                     "Namespace provided in the parent does not exist".to_string(),
-                )
-                .into_response();
+                ));
             }
 
             // There are no namespaces under this schema, so we return an empty list
-            (
-                status::StatusCode::OK,
-                Json(NamespacesResponse { namespaces: vec![] }),
-            )
-                .into_response()
+            Ok(vec![])
         }
-        3.. => IcebergResponseError::no_such_namespace(
+        3.. => Err(IcebergResponseError::no_such_namespace(
             "Namespace provided in the parent does not exist".to_string(),
-        )
-        .into_response(),
+        )),
     }
 }

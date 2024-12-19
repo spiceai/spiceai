@@ -20,7 +20,7 @@ use crate::Runtime;
 use crate::{config, request::RequestContext};
 
 use app::App;
-use axum::routing::patch;
+use axum::routing::{head, patch};
 use opentelemetry::KeyValue;
 use spicepod::component::runtime::CorsConfig;
 use std::sync::Arc;
@@ -63,9 +63,17 @@ pub(crate) fn routes(
             patch(v1::datasets::acceleration),
         )
         .route("/v1/spicepods", get(v1::spicepods::get))
-        .route("/v1/packages/generate", post(v1::packages::generate))
-        .route("/v1/iceberg/config", get(v1::iceberg::get_config))
-        .route("/v1/iceberg/namespaces", get(v1::iceberg::get_namespaces));
+        .route("/v1/packages/generate", post(v1::packages::generate));
+
+    let iceberg_router = Router::new()
+        .route("/v1/config", get(v1::iceberg::get_config))
+        .route("/v1/iceberg/namespaces", get(v1::iceberg::get_namespaces))
+        .route(
+            "/v1/iceberg/namespaces/:namespace",
+            get(v1::iceberg::get_namespace).head(v1::iceberg::head_namespace),
+        );
+
+    authenticated_router = authenticated_router.merge(iceberg_router);
 
     if cfg!(feature = "models") {
         authenticated_router = authenticated_router
