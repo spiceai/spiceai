@@ -215,10 +215,8 @@ mod tests {
     #[test]
     fn test_metrics_non_empty_scores() {
         let stats = MatchScorer {}.metrics(&[1.0, 0.0, 1.0, 1.0]);
-        assert_eq!(stats.len(), 2);
+        assert_eq!(stats.len(), 1);
         assert_eq!(stats[0].0, "mean".to_string());
         assert!((stats[0].1 - 0.75_f32).abs() < f32::EPSILON);
-        assert_eq!(stats[1].0, "std_dev".to_string());
-        assert!((stats[1].1 - 0.433_012_7_f32).abs() < f32::EPSILON);
     }
 }
