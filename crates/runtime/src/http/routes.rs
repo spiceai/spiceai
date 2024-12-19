@@ -20,7 +20,7 @@ use crate::Runtime;
 use crate::{config, request::RequestContext};
 
 use app::App;
-use axum::routing::{head, patch};
+use axum::routing::patch;
 use opentelemetry::KeyValue;
 use spicepod::component::runtime::CorsConfig;
 use std::sync::Arc;
@@ -71,6 +71,10 @@ pub(crate) fn routes(
         .route(
             "/v1/iceberg/namespaces/:namespace",
             get(v1::iceberg::get_namespace).head(v1::iceberg::head_namespace),
+        )
+        .route(
+            "/v1/iceberg/namespaces/:namespace/tables",
+            get(v1::iceberg::list_tables),
         );
 
     authenticated_router = authenticated_router.merge(iceberg_router);

@@ -16,7 +16,7 @@ limitations under the License.
 
 use serde::{ser::SerializeSeq, Deserialize, Serialize};
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct Namespace {
     pub parts: Vec<String>,
 }

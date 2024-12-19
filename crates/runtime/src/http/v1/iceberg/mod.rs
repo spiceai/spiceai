@@ -116,7 +116,7 @@ fn get_child_namespaces_impl(
             let catalog_name = namespace.parts[0].clone();
             let Some(catalog) = datafusion.ctx.catalog(catalog_name.as_str()) else {
                 return Err(IcebergResponseError::no_such_namespace(
-                    "Namespace provided in the parent does not exist".to_string(),
+                    "Namespace does not exist".to_string(),
                 ));
             };
 
@@ -133,7 +133,7 @@ fn get_child_namespaces_impl(
             let schema_name = namespace.parts[1].clone();
             let Some(catalog) = datafusion.ctx.catalog(catalog_name.as_str()) else {
                 return Err(IcebergResponseError::no_such_namespace(
-                    "Namespace provided in the parent does not exist".to_string(),
+                    "Namespace does not exist".to_string(),
                 ));
             };
             let mut schema_names = catalog.schema_names().into_iter().filter(|schema_name| {
@@ -141,7 +141,7 @@ fn get_child_namespaces_impl(
             });
             if !schema_names.any(|s| s == schema_name) {
                 return Err(IcebergResponseError::no_such_namespace(
-                    "Namespace provided in the parent does not exist".to_string(),
+                    "Namespace does not exist".to_string(),
                 ));
             }
 
@@ -149,7 +149,96 @@ fn get_child_namespaces_impl(
             Ok(vec![])
         }
         3.. => Err(IcebergResponseError::no_such_namespace(
-            "Namespace provided in the parent does not exist".to_string(),
+            "Namespace does not exist".to_string(),
         )),
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct TableIdentifier {
+    namespace: Namespace,
+    name: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ListTablesResponse {
+    identifiers: Vec<TableIdentifier>,
+}
+
+pub(crate) async fn list_tables(
+    Extension(datafusion): Extension<Arc<DataFusion>>,
+    Path(namespace): Path<NamespacePath>,
+) -> Response {
+    let namespace = Namespace::from(namespace);
+
+    match namespace.parts.len() {
+        // If only catalog is specified, return empty list
+        1 => {
+            let catalog_name = &namespace.parts[0];
+            if datafusion.ctx.catalog(catalog_name).is_none() {
+                return IcebergResponseError::no_such_namespace(format!(
+                    "Catalog '{catalog_name}' does not exist"
+                ))
+                .into_response();
+            };
+            (
+                status::StatusCode::OK,
+                Json(ListTablesResponse {
+                    identifiers: Vec::new(),
+                }),
+            )
+                .into_response()
+        }
+
+        // For catalog + schema, list the tables
+        2 => {
+            let catalog_name = &namespace.parts[0];
+            let schema_name = &namespace.parts[1];
+
+            if is_spice_internal_schema(catalog_name, schema_name) {
+                return IcebergResponseError::no_such_namespace(
+                    "Namespace does not exist".to_string(),
+                )
+                .into_response();
+            }
+
+            // Get the catalog
+            let Some(catalog) = datafusion.ctx.catalog(catalog_name) else {
+                return IcebergResponseError::no_such_namespace(format!(
+                    "Catalog '{catalog_name}' does not exist"
+                ))
+                .into_response();
+            };
+
+            // Get the schema and its tables
+            let Some(schema) = catalog.schema(schema_name) else {
+                return IcebergResponseError::no_such_namespace(format!(
+                    "Schema '{schema_name}' does not exist in catalog '{catalog_name}'"
+                ))
+                .into_response();
+            };
+            let table_names = schema.table_names();
+
+            // Convert to TableIdentifier format
+            let identifiers: Vec<TableIdentifier> = table_names
+                .into_iter()
+                .map(|table_name| TableIdentifier {
+                    namespace: namespace.clone(),
+                    name: table_name,
+                })
+                .collect();
+
+            (
+                status::StatusCode::OK,
+                Json(ListTablesResponse { identifiers }),
+            )
+                .into_response()
+        }
+
+        // For invalid namespace lengths (0 or > 2), return error
+        _ => IcebergResponseError::no_such_namespace(
+            "Invalid namespace: must specify catalog and optionally schema".to_string(),
+        )
+        .into_response(),
     }
 }
