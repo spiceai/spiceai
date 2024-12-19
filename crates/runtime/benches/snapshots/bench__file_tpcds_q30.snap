@@ -1,0 +1,19 @@
+---
+source: crates/runtime/benches/bench.rs
+expression: records_pretty
+snapshot_kind: text
+---
++------------------+--------------+--------------+-------------+-----------------------+-------------+---------------+--------------+---------------------+---------+--------------------------------+-----------------------+------------------+
+| c_customer_id    | c_salutation | c_first_name | c_last_name | c_preferred_cust_flag | c_birth_day | c_birth_month | c_birth_year | c_birth_country     | c_login | c_email_address                | c_last_review_date_sk | ctr_total_return |
++------------------+--------------+--------------+-------------+-----------------------+-------------+---------------+--------------+---------------------+---------+--------------------------------+-----------------------+------------------+
+| AAAAAAAAACJMAAAA | Dr.          | Amanda       | Grimes      | Y                     | 18          | 6             | 1955         | LIBERIA             |         | Amanda.Grimes@6bDT.com         | 2452605               | 2365.00          |
+| AAAAAAAAACOPAAAA | Mrs.         | Casandra     | Ford        | Y                     | 8           | 3             | 1956         | MOROCCO             |         | Casandra.Ford@RV8CTX2T86VY.edu | 2452625               | 7331.93          |
+| AAAAAAAAAKACBAAA | Dr.          | Julie        | Howe        | Y                     | 20          | 10            | 1932         | ANGUILLA            |         | Julie.Howe@Iv.edu              | 2452330               | 3703.64          |
+| AAAAAAAAALFFBAAA | Ms.          | Katrina      | Oliver      | Y                     | 29          | 7             | 1936         | NEW ZEALAND         |         | Katrina.Oliver@r18C6nUAq.com   | 2452395               | 3098.55          |
+| AAAAAAAAAMGBAAAA | Ms.          | Joyce        | Harris      | N                     | 13          | 1             | 1946         | GUINEA              |         | Joyce.Harris@gs.com            | 2452547               | 4526.55          |
+| AAAAAAAAAMNGBAAA | Dr.          | Anthony      | Matson      | N                     | 23          | 12            | 1979         | SOLOMON ISLANDS     |         | Anthony.Matson@IYE9jGP3.com    | 2452470               | 2193.84          |
+| AAAAAAAABAIBBAAA | Mrs.         | Anna         | Yanez       | N                     | 10          | 9             | 1951         | ANTIGUA AND BARBUDA |         | Anna.Yanez@lxMkGQ78.edu        | 2452424               | 1763.52          |
+| AAAAAAAABAMLAAAA | Mrs.         | Susan        | Roberts     | Y                     | 22          | 5             | 1985         | LIECHTENSTEIN       |         | Susan.Roberts@UNvxXkFc.edu     | 2452529               | 2909.76          |
+| AAAAAAAABBGJAAAA | Dr.          | David        | Burgess     | N                     | 24          | 7             | 1932         | BRUNEI DARUSSALAM   |         | David.Burgess@jN.edu           | 2452497               | 5884.92          |
+| AAAAAAAABBIEBAAA | Miss         | Tabatha      | Smith       | Y                     | 11          | 1             | 1930         | PITCAIRN            |         | Tabatha.Smith@C89rMdanZ.edu    | 2452296               | 6715.08          |
++------------------+--------------+--------------+-------------+-----------------------+-------------+---------------+--------------+---------------------+---------+--------------------------------+-----------------------+------------------+

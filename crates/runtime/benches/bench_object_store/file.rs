@@ -30,7 +30,78 @@ pub fn build_app(app_builder: AppBuilder, bench_name: &str) -> Result<AppBuilder
             .with_dataset(make_dataset("region.parquet", "region", bench_name))
             .with_dataset(make_dataset("nation.parquet", "nation", bench_name))
             .with_dataset(make_dataset("supplier.parquet", "supplier", bench_name))),
-        _ => Err("Only tpch benchmark suites are supported for the file connector".to_string()),
+        "tpcds" => Ok(app_builder
+            .with_dataset(make_dataset(
+                "call_center.parquet",
+                "call_center",
+                bench_name,
+            ))
+            .with_dataset(make_dataset(
+                "catalog_page.parquet",
+                "catalog_page",
+                bench_name,
+            ))
+            .with_dataset(make_dataset(
+                "catalog_returns.parquet",
+                "catalog_returns",
+                bench_name,
+            ))
+            .with_dataset(make_dataset(
+                "catalog_sales.parquet",
+                "catalog_sales",
+                bench_name,
+            ))
+            .with_dataset(make_dataset("customer.parquet", "customer", bench_name))
+            .with_dataset(make_dataset(
+                "customer_address.parquet",
+                "customer_address",
+                bench_name,
+            ))
+            .with_dataset(make_dataset(
+                "customer_demographics.parquet",
+                "customer_demographics",
+                bench_name,
+            ))
+            .with_dataset(make_dataset("date_dim.parquet", "date_dim", bench_name))
+            .with_dataset(make_dataset(
+                "household_demographics.parquet",
+                "household_demographics",
+                bench_name,
+            ))
+            .with_dataset(make_dataset(
+                "income_band.parquet",
+                "income_band",
+                bench_name,
+            ))
+            .with_dataset(make_dataset("inventory.parquet", "inventory", bench_name))
+            .with_dataset(make_dataset("item.parquet", "item", bench_name))
+            .with_dataset(make_dataset("promotion.parquet", "promotion", bench_name))
+            .with_dataset(make_dataset("reason.parquet", "reason", bench_name))
+            .with_dataset(make_dataset("ship_mode.parquet", "ship_mode", bench_name))
+            .with_dataset(make_dataset("store.parquet", "store", bench_name))
+            .with_dataset(make_dataset(
+                "store_returns.parquet",
+                "store_returns",
+                bench_name,
+            ))
+            .with_dataset(make_dataset(
+                "store_sales.parquet",
+                "store_sales",
+                bench_name,
+            ))
+            .with_dataset(make_dataset("time_dim.parquet", "time_dim", bench_name))
+            .with_dataset(make_dataset("warehouse.parquet", "warehouse", bench_name))
+            .with_dataset(make_dataset("web_page.parquet", "web_page", bench_name))
+            .with_dataset(make_dataset(
+                "web_returns.parquet",
+                "web_returns",
+                bench_name,
+            ))
+            .with_dataset(make_dataset("web_sales.parquet", "web_sales", bench_name))
+            .with_dataset(make_dataset("web_site.parquet", "web_site", bench_name))),
+        _ => Err(
+            "Only tpch and tpcds benchmark suites are supported for the file connector".to_string(),
+        ),
     }
 }
 
