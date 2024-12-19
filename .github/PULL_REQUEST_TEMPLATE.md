@@ -14,7 +14,7 @@
 
 ## 📄 Documentation Updates
 
-<!-- list any documentation related issues, quickstarts/samples or video content related to this PR -->
+<!-- list any documentation related issues, cookbook recipes or video content related to this PR -->
 
 ## 🤔 Concerns
 

@@ -61,9 +61,9 @@ Spice makes it fast and easy to query data from one or more sources using SQL. Y
 
 ### Example Use-Cases
 
-**1. Faster applications and frontends.** Accelerate and co-locate datasets with applications and frontends, to serve more concurrent queries and users with faster page loads and data updates. [Try the CQRS sample app](https://github.com/spiceai/samples/tree/trunk/acceleration#local-materialization-and-acceleration-cqrs-sample)
+**1. Faster applications and frontends.** Accelerate and co-locate datasets with applications and frontends, to serve more concurrent queries and users with faster page loads and data updates. [Try the CQRS sample app](https://github.com/spiceai/cookbook/tree/trunk/cqrs#readme)
 
-**2. Faster dashboards, analytics, and BI.** Faster, more responsive dashboards without massive compute costs. [Watch the Apache Superset demo](https://github.com/spiceai/samples/blob/trunk/sales-bi/README.md)
+**2. Faster dashboards, analytics, and BI.** Faster, more responsive dashboards without massive compute costs. [Watch the Apache Superset demo](https://github.com/spiceai/cookbook/blob/trunk/sales-bi/README.md)
 
 **3. Faster data pipelines, machine learning training and inferencing.** Co-locate datasets in pipelines where the data is needed to minimize data-movement and improve query performance.
 
@@ -112,12 +112,12 @@ Currently supported data connectors for upstream datasets. More coming soon.
 | `snowflake`                        | Snowflake                             | Alpha             | Arrow                        |
 | `spark`                            | Spark                                 | Alpha             | [Spark Connect][spark]       |
 
-[databricks]: https://github.com/spiceai/quickstarts/tree/trunk/databricks#spice-on-databricks
+[databricks]: https://github.com/spiceai/cookbook/tree/trunk/databricks/delta_lake
 [spark]: https://spark.apache.org/docs/latest/spark-connect-overview.html
-[s3]: https://github.com/spiceai/quickstarts/tree/trunk/s3#readme
-[spiceai]: https://github.com/spiceai/quickstarts/tree/trunk/spiceai#readme
-[dremio]: https://github.com/spiceai/quickstarts/tree/trunk/dremio#readme
-[localpod]: https://github.com/spiceai/quickstarts/blob/trunk/localpod/README.md
+[s3]: https://github.com/spiceai/cookbook/tree/trunk/s3#readme
+[spiceai]: https://github.com/spiceai/cookbook/tree/trunk/spiceai#readme
+[dremio]: https://github.com/spiceai/cookbook/tree/trunk/dremio#readme
+[localpod]: https://github.com/spiceai/cookbook/blob/trunk/localpod/README.md
 
 ### Supported Data Stores/Accelerators
 
@@ -131,7 +131,7 @@ Currently supported data stores for local materialization/acceleration. More com
 | `sqlite`   | Embedded [SQLite][sqlite]       | Beta              | `memory`, `file` |
 
 [duckdb]: https://docs.spiceai.org/data-accelerators/duckdb
-[postgres]: https://github.com/spiceai/quickstarts/tree/trunk/postgres#postgresql-data-accelerator
+[postgres]: https://github.com/spiceai/cookbook/tree/trunk/postgres/accelerator#postgresql-data-accelerator
 [sqlite]: https://docs.spiceai.org/data-accelerators/sqlite
 
 ## ⚡️ Quickstart (Local Machine)
@@ -293,9 +293,15 @@ helm install spiceai spiceai/spiceai
 
 ## 🏎️ Next Steps
 
+### Explore the Spice.ai Cookbook
+
+The Spice.ai Cookbook is a collection of recipes and examples for using Spice. Find it at [https://github.com/spiceai/cookbook](https://github.com/spiceai/cookbook#readme).
+
+### Using Spice.ai Cloud Platform
+
 You can use any number of predefined datasets available from the Spice.ai Cloud Platform in the Spice runtime.
 
-A list of publicly available datasets from Spice.ai can be found here: [https://docs.spice.ai/building-blocks/datasets](https://docs.spice.ai/building-blocks/datasets).
+A list of publicly available datasets from the Spice.ai Cloud Platform can be found on Spicerack: [https://spicerack.org/](https://spicerack.org/).
 
 In order to access public datasets from Spice.ai, you will first need to create an account with Spice.ai by selecting the free tier membership.
 

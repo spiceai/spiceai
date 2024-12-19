@@ -80,7 +80,7 @@ Indexes are not required for test coverage, but can be introduced if required fo
 - [ ] Documentation includes all information and steps for a user to set up the accelerator.
 - [ ] Documentation includes all known issues/limitations for the accelerator.
 - [ ] Documentation includes any exceptions made to allow this accelerator to reach Beta quality (e.g. if a particular data type cannot be supported by the accelerator).
-- [ ] The accelerator has an easy to follow quickstart.
+- [ ] The accelerator has an easy to follow cookbook recipe.
 - [ ] All [Minor Bugs](../definitions.md) for TPC-DS and TPC-H are raised as issues.
 - [ ] All ClickBench bugs are raised as issues.
 - [ ] The accelerator status is updated in the table of accelerators in [spiceai/docs](https://github.com/spiceai/docs).
