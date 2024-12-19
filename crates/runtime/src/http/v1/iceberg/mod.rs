@@ -23,7 +23,7 @@ use axum::{
     response::{IntoResponse, Response},
     Extension, Json,
 };
-use error::{IcebergResponseError, InternalServerErrorCode};
+use error::IcebergResponseError;
 use namespace::Namespace;
 use serde::{self, Deserialize, Serialize};
 

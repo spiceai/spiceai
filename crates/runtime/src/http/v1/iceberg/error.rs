@@ -21,6 +21,7 @@ use axum::{
 };
 use serde::{Serialize, Serializer};
 
+#[allow(dead_code)]
 #[derive(Debug)]
 enum IcebergErrorType {
     NoSuchNamespaceException,
@@ -57,6 +58,7 @@ impl Serialize for IcebergErrorType {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Copy, Clone)]
 pub enum InternalServerErrorCode {
     CatalogNotFound,
@@ -95,6 +97,7 @@ impl IcebergResponseError {
         }
     }
 
+    #[allow(dead_code)]
     pub fn bad_request(message: String) -> Self {
         Self {
             error: IcebergError {
@@ -105,6 +108,7 @@ impl IcebergResponseError {
         }
     }
 
+    #[allow(dead_code)]
     pub fn internal(code: InternalServerErrorCode) -> Self {
         Self {
             error: IcebergError {
