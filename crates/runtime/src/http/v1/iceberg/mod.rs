@@ -35,11 +35,11 @@ pub(crate) async fn get_config() -> &'static str {
   "overrides": {},
   "defaults": {},
   "endpoints": [
-    "GET /v1/namespaces",
-    "HEAD /v1/namespaces/{namespace}",
-    "GET /v1/namespaces/{namespace}/tables",
-    "HEAD /v1/namespaces/{namespace}/tables/{table}",
-    "GET /v1/namespaces/{namespace}/tables/{table}"
+    "GET /v1/iceberg/namespaces",
+    "HEAD /v1/iceberg/namespaces/{namespace}",
+    "GET /v1/iceberg/namespaces/{namespace}/tables",
+    "HEAD /v1/iceberg/namespaces/{namespace}/tables/{table}",
+    "GET /v1/iceberg/namespaces/{namespace}/tables/{table}"
   ]
 }"#
 }
