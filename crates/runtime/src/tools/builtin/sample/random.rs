@@ -27,7 +27,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use snafu::ResultExt;
 
-#[derive(Debug, Clone, JsonSchema, Serialize, Deserialize)]
+#[derive(Debug, Clone, JsonSchema, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct RandomSampleParams {
     #[serde(rename = "dataset")]
     /// The SQL dataset to sample data from.

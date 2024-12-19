@@ -49,7 +49,7 @@ arrow-ipc = "53"
 arrow-json = { git = "https://github.com/spiceai/arrow-rs.git", rev = "63d05723107d6dc5f08acc5461417ee42937adcc" }
 arrow-odbc = "11.2.0"
 arrow-schema = "53"
-async-openai = { git = "https://github.com/spiceai/async-openai", rev = "528f9fedf9d8eeb3b92a64607246a5ad5c4523dc" }
+async-openai = { git = "https://github.com/spiceai/async-openai", rev = "a0a9ae00570f47580a8059b378921728ef7fe6f2" }
 async-stream = "0.3.5"
 async-trait = "0.1.83"
 axum = { version = "0.7.9", features = ["macros"] }
@@ -142,6 +142,7 @@ tracing-opentelemetry = "0.28"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 uuid = "1.9.1"
 x509-certificate = "0.23.1"
+
 
 [patch.crates-io]
 datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "2b93a308f65df1ae0cd8f3f8194b9b60201a500f" }

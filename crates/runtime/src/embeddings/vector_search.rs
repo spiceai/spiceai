@@ -122,7 +122,7 @@ impl Display for RetrievalLimit {
 
 static VECTOR_DISTANCE_COLUMN_NAME: &str = "dist";
 
-#[derive(Debug, Clone, JsonSchema, Serialize, Deserialize)]
+#[derive(Debug, Clone, JsonSchema, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub struct SearchRequestJson {
     /// The text to search documents for similarity
@@ -412,18 +412,25 @@ impl VectorSearchTableResult {
 
 pub type VectorSearchResult = HashMap<TableReference, VectorSearchTableResult>;
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+///
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct Match {
+    /// The value of the match (e.g., document snippet, identifier, etc.)
     value: String,
 
+    /// The similarity of the match to the query
     score: f64,
+
+    /// The name of the dataset where the match was found
     dataset: String,
 
+    /// Primary key(s) identifying the matched item in the dataset
     #[serde(skip_serializing_if = "HashMap::is_empty")]
-    primary_key: HashMap<String, serde_json::Value>,
+    pub primary_key: HashMap<String, serde_json::Value>,
 
+    /// Additional metadata for the match, requested explicitly by the user.
     #[serde(skip_serializing_if = "HashMap::is_empty")]
-    metadata: HashMap<String, serde_json::Value>,
+    pub metadata: HashMap<String, serde_json::Value>,
 }
 
 impl Match {

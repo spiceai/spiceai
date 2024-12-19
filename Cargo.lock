@@ -822,7 +822,7 @@ dependencies = [
 [[package]]
 name = "async-openai"
 version = "0.26.0"
-source = "git+https://github.com/spiceai/async-openai?rev=528f9fedf9d8eeb3b92a64607246a5ad5c4523dc#528f9fedf9d8eeb3b92a64607246a5ad5c4523dc"
+source = "git+https://github.com/spiceai/async-openai?rev=a0a9ae00570f47580a8059b378921728ef7fe6f2#a0a9ae00570f47580a8059b378921728ef7fe6f2"
 dependencies = [
  "async-convert",
  "backoff",
@@ -842,6 +842,7 @@ dependencies = [
  "tokio-stream",
  "tokio-util",
  "tracing",
+ "utoipa",
 ]
 
 [[package]]

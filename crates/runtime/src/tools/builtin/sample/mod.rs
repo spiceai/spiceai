@@ -42,7 +42,7 @@ pub trait SampleFrom: Send + Sync {
     > + Send;
 }
 
-#[derive(Debug, Clone, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, JsonSchema, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 pub enum SampleTableMethod {
     #[serde(rename = "distinct")]
     DistinctColumns,

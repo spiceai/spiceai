@@ -25,12 +25,54 @@ use axum::{
 use object_store::{path::Path, ObjectStore};
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct GeneratePackageRequest {
-    from: String,
-    params: HashMap<String, String>,
+    /// The GitHub source path in the format `github:{org}/{repo}/{sha}/{path_to_spicepod.yaml}`
+    pub from: String,
+
+    /// A key-value map of optional parameters (e.g., `github_token`)
+    pub params: HashMap<String, String>,
 }
 
+/// Generate a package from a GitHub source path.
+///
+/// This endpoint generates a zip package from a specified GitHub source.
+#[utoipa::path(
+    post,
+    path = "/v1/packages/generate",
+    operation_id = "generate_package",
+    tag = "General",
+    request_body(
+        description = "Parameters required to generate a package",
+        content((
+            GeneratePackageRequest = "application/json",
+            example = json!({
+                "from": "github:myorg/myrepo/abc12345/spicepod.yaml",
+                "params": {
+                    "github_token": "ghp_exampleToken12345"
+                }
+            })
+        ))
+    ),
+    responses(
+        (status = 200, description = "Package generated successfully", content((
+            Vec<u8> = "application/zip",
+            example = "<binary zip file response>"
+        ))),
+        (status = 400, description = "Invalid request parameters", content((
+            serde_json::Value = "application/json",
+            example = json!({
+                "error": "Invalid `from` field, specify a github source and retry (e.g. github:{org}/{repo}/{sha}/{path_to_spicepod.yaml})"
+            })
+        ))),
+        (status = 500, description = "Internal server error", content((
+            serde_json::Value = "application/json",
+            example = json!({
+                "error": "An unexpected error occurred"
+            })
+        )))
+    )
+)]
 pub(crate) async fn generate(Json(payload): Json<GeneratePackageRequest>) -> Response {
     if !payload.from.starts_with("github:") {
         return (
