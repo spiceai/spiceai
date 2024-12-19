@@ -63,7 +63,9 @@ pub(crate) fn routes(
             patch(v1::datasets::acceleration),
         )
         .route("/v1/spicepods", get(v1::spicepods::get))
-        .route("/v1/packages/generate", post(v1::packages::generate));
+        .route("/v1/packages/generate", post(v1::packages::generate))
+        .route("/v1/iceberg/config", get(v1::iceberg::get_config))
+        .route("/v1/iceberg/namespaces", get(v1::iceberg::get_namespaces));
 
     let iceberg_router = Router::new()
         .route("/v1/config", get(v1::iceberg::get_config))
