@@ -65,7 +65,7 @@ impl Scorer for FuzzyMatch {
             }
         });
 
-        // TODO: Should consider using F1 score instead of boolean accuracy.
+        // TODO: Also use F1 Score, see https://github.com/spiceai/spiceai/issues/3932
         if is_match {
             1.0
         } else {
