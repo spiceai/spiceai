@@ -51,5 +51,5 @@ The Alpha Release Criteria is not intended to cover any edge cases or complex fu
 
 - [ ] Documentation includes all information and steps for a user to set up the connector.
 - [ ] Documentation includes all known issues/limitations for the connector.
-- [ ] The connector has an easy to follow quickstart.
+- [ ] The connector has an easy to follow cookbook recipe.
 - [ ] The connector is added to the table of connectors in [spiceai/docs](https://github.com/spiceai/docs).
