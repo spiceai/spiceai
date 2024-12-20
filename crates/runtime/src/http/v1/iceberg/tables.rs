@@ -26,6 +26,8 @@ use axum::{
     Extension,
 };
 use datafusion::sql::TableReference;
+use serde::{Serialize, Serializer};
+use uuid::Uuid;
 
 /// Check if a table exists.
 ///
@@ -55,6 +57,41 @@ pub(crate) async fn head(
     }
 }
 
+struct LoadTableResponse {
+    metadata: TableMetadata,
+}
+
+#[derive(Debug)]
+enum TableFormatVersion {
+    V1,
+    V2,
+}
+
+impl Serialize for TableFormatVersion {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            TableFormatVersion::V1 => serializer.serialize_u8(1),
+            TableFormatVersion::V2 => serializer.serialize_u8(2),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct Schema {
+    schema_id: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct TableMetadata {
+    format_version: TableFormatVersion,
+    table_uuid: Uuid,
+    location: String,
+    schemas: Vec<Schema>,
+}
+
 /// Get a table.
 ///
 /// This endpoint returns the table if it exists, otherwise it returns a 404 Not Found response.
@@ -72,11 +109,16 @@ pub(crate) async fn get(
     Extension(datafusion): Extension<Arc<DataFusion>>,
     Path((namespace, table)): Path<(NamespacePath, String)>,
 ) -> Response {
-    (
-        status::StatusCode::OK,
-        format!("Namespace: {namespace:?}, Table: {table}"),
-    )
-        .into_response()
+    let namespace = Namespace::from(namespace);
+    let Some(table_reference) = table_reference(&namespace, &table) else {
+        return status::StatusCode::NOT_FOUND.into_response();
+    };
+
+    let Some(table) = datafusion.get_table(&table_reference).await else {
+        return status::StatusCode::NOT_FOUND.into_response();
+    };
+
+    status::StatusCode::OK.into_response()
 }
 
 fn table_reference(namespace: &Namespace, table: &str) -> Option<TableReference> {
