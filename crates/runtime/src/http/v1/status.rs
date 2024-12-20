@@ -29,7 +29,8 @@ use axum::{
 
 use crate::{config, status::ComponentStatus};
 
-#[derive(Debug, Serialize, Deserialize, utoipa::IntoParams)]
+#[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::IntoParams))]
 #[serde(rename_all = "lowercase")]
 pub struct QueryParams {
     /// The format of the response, either "json" or "csv". Defaults to "json".
@@ -37,14 +38,16 @@ pub struct QueryParams {
     pub format: Format,
 }
 
-#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
+#[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum Format {
     Json,
     Csv,
 }
 
-#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
+#[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct ConnectionDetails {
     /// The name of the connection (e.g., "http", "flight", "metrics", "opentelemetry")
     pub name: &'static str,
@@ -61,7 +64,7 @@ fn default_format() -> Format {
 }
 
 /// Return the status of connections in the runtime.
-#[utoipa::path(
+#[cfg_attr(feature = "openapi", utoipa::path(
     get,
     path = "/v1/status",
     operation_id = "get_status",
@@ -101,7 +104,7 @@ fn default_format() -> Format {
             String, example = "Error converting to CSV"
         )))
     )
-)]
+))]
 pub(crate) async fn get(
     Extension(cfg): Extension<Arc<config::Config>>,
     Extension(with_metrics): Extension<Option<SocketAddr>>,

@@ -30,7 +30,8 @@ use crate::{status::ComponentStatus, Runtime};
 
 use super::Format;
 
-#[derive(Debug, Deserialize, utoipa::IntoParams)]
+#[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::IntoParams))]
 pub struct ModelsQueryParams {
     /// The format of the response (e.g., `json` or `csv`).
     #[serde(default)]
@@ -41,7 +42,8 @@ pub struct ModelsQueryParams {
     pub status: bool,
 }
 
-#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
+#[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "lowercase")]
 pub(crate) struct ModelResponse {
     /// The name of the model
@@ -58,7 +60,7 @@ pub(crate) struct ModelResponse {
 }
 
 /// Get a list of models
-#[utoipa::path(
+#[cfg_attr(feature = "openapi", utoipa::path(
     get,
     path = "/v1/models",
     operation_id = "get_models",
@@ -96,7 +98,7 @@ example_model_2,spiceai,,initializing
             })
         )))
     )
-)]
+))]
 pub(crate) async fn get(
     Extension(app): Extension<Arc<RwLock<Option<Arc<App>>>>>,
     Extension(rt): Extension<Arc<Runtime>>,

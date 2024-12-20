@@ -122,7 +122,8 @@ impl Display for RetrievalLimit {
 
 static VECTOR_DISTANCE_COLUMN_NAME: &str = "dist";
 
-#[derive(Debug, Clone, JsonSchema, Serialize, Deserialize, utoipa::ToSchema)]
+#[derive(Debug, Clone, JsonSchema, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "lowercase")]
 pub struct SearchRequestJson {
     /// The text to search documents for similarity
@@ -412,7 +413,8 @@ impl VectorSearchTableResult {
 
 pub type VectorSearchResult = HashMap<TableReference, VectorSearchTableResult>;
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct Match {
     /// The value of the match (e.g., document snippet, identifier, etc.)
     value: String,

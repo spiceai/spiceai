@@ -33,7 +33,7 @@ mod namespace;
 /// Get API configuration.
 ///
 /// This endpoint returns the API configuration, including details about overrides, defaults, and available endpoints.
-#[utoipa::path(
+#[cfg_attr(feature = "openapi", utoipa::path(
     get,
     path = "/v1/iceberg/config",
     operation_id = "get_config",
@@ -54,7 +54,7 @@ mod namespace;
             })
         )))
     )
-)]
+))]
 pub(crate) async fn get_config() -> &'static str {
     r#"{
   "overrides": {},
@@ -69,14 +69,16 @@ pub(crate) async fn get_config() -> &'static str {
 }"#
 }
 
-#[derive(Debug, Deserialize, utoipa::IntoParams)]
+#[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::IntoParams))]
 pub(crate) struct ParentNamespaceQueryParams {
     /// The parent namespace from which to retrieve child namespaces.
     #[serde(default)]
     parent: Namespace,
 }
 
-#[derive(Debug, Serialize, utoipa::ToSchema)]
+#[derive(Debug, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 struct NamespacesResponse {
     namespaces: Vec<Namespace>,
 }
@@ -85,7 +87,7 @@ struct NamespacesResponse {
 ///
 /// This endpoint retrieves namespaces available in the Iceberg catalog.
 /// If a `parent` namespace is provided, it will list the child namespaces under the specified parent.
-#[utoipa::path(
+#[cfg_attr(feature = "openapi", utoipa::path(
     get,
     path = "/v1/iceberg/namespaces",
     operation_id = "get_iceberg_namespaces",
@@ -132,7 +134,7 @@ struct NamespacesResponse {
             })
         )))
     )
-)]
+))]
 pub(crate) async fn get_namespaces(
     Extension(datafusion): Extension<Arc<DataFusion>>,
     Query(params): Query<ParentNamespaceQueryParams>,

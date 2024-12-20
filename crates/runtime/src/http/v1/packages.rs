@@ -24,7 +24,8 @@ use object_store::{path::Path, ObjectStore};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, sync::Arc};
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct GeneratePackageRequest {
     /// The GitHub source path in the format `github:{org}/{repo}/{sha}/{path_to_spicepod.yaml}`
     pub from: String,
@@ -36,7 +37,7 @@ pub struct GeneratePackageRequest {
 /// Generate a package from a GitHub source path.
 ///
 /// This endpoint generates a zip package from a specified GitHub source.
-#[utoipa::path(
+#[cfg_attr(feature = "openapi", utoipa::path(
     post,
     path = "/v1/packages/generate",
     operation_id = "generate_package",
@@ -71,7 +72,7 @@ pub struct GeneratePackageRequest {
             })
         )))
     )
-)]
+))]
 pub(crate) async fn generate(Json(payload): Json<GeneratePackageRequest>) -> Response {
     if !payload.from.starts_with("github:") {
         return (

@@ -26,6 +26,7 @@ use spicepod::component::runtime::CorsConfig;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+#[cfg(feature = "openapi")]
 use utoipa::OpenApi;
 
 #[cfg(feature = "dev")]
@@ -46,7 +47,7 @@ use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 
 use super::{metrics, v1};
 
-#[allow(dead_code)]
+#[cfg(feature = "openapi")]
 #[derive(OpenApi)]
 #[openapi(paths(
     v1::catalogs::get,
@@ -228,6 +229,7 @@ fn cors_layer(cors_config: &CorsConfig) -> CorsLayer {
         .allow_origin(allowed_origins)
 }
 
+#[cfg(feature = "openapi")]
 #[cfg(test)]
 mod tests {
     use super::*;

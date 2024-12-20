@@ -77,7 +77,8 @@ pub static EVAL_RUNS_TABLE_TIME_COLUMN: &str = "created_at";
 pub static EVAL_RUNS_TABLE_PRIMARY_KEY: &str = "id";
 
 /// Represents the response for an evaluation run
-#[derive(Debug, utoipa::ToSchema)]
+#[derive(Debug)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct EvalRunResponse {
     /// Unique identifier for the evaluation run
     pub primary_key: String,

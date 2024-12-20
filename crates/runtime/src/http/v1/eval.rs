@@ -29,20 +29,24 @@ use tokio::sync::RwLock;
 
 use crate::{
     datafusion::DataFusion,
-    model::{handle_eval_run, sql_query_for, EvalRunResponse, EvalScorerRegistry, LLMModelStore},
+    model::{handle_eval_run, sql_query_for, EvalScorerRegistry, LLMModelStore},
     Runtime,
 };
+
+#[cfg(feature = "openapi")]
+use crate::model::EvalRunResponse;
 
 use super::{sql_to_http_response, ArrowFormat};
 
 /// Input parameters to start an evaluation run for a given model.
-#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
+#[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub(crate) struct RunEval {
     pub model: String,
 }
 
 /// Evaluate a model against a eval spice specification
-#[utoipa::path(
+#[cfg_attr(feature = "openapi", utoipa::path(
     post,
     path = "/v1/evals/{name}",
     operation_id = "post_eval",
@@ -83,7 +87,7 @@ pub(crate) struct RunEval {
             +-------------+---------------------+-----------+---------------+-----------+----------------+------------------+---------------------------------------+"#)
         )),
     )
-)]
+))]
 pub(crate) async fn post(
     Extension(llms): Extension<Arc<RwLock<LLMModelStore>>>,
     Extension(df): Extension<Arc<DataFusion>>,
@@ -140,7 +144,8 @@ pub(crate) async fn post(
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
+#[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 struct ListEvalElement {
     pub name: String,
 
@@ -151,7 +156,7 @@ struct ListEvalElement {
 }
 
 /// List all evals available to run in the Spice runtime.
-#[utoipa::path(
+#[cfg_attr(feature = "openapi", utoipa::path(
     get,
     path = "/v1/evals",
     tag = "Evaluations",
@@ -165,7 +170,7 @@ struct ListEvalElement {
             }])
         )
     )
-)]
+))]
 pub(crate) async fn list(Extension(rt): Extension<Arc<Runtime>>) -> Response {
     let evals_lock = rt.evals.read().await;
     let evals: Vec<_> = evals_lock

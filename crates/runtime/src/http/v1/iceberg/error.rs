@@ -22,7 +22,8 @@ use axum::{
 use serde::{Serialize, Serializer};
 
 #[allow(dead_code)]
-#[derive(Debug, utoipa::ToSchema)]
+#[derive(Debug)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 enum IcebergErrorType {
     NoSuchNamespaceException,
     BadRequestException,
@@ -74,14 +75,16 @@ impl std::fmt::Display for InternalServerErrorCode {
     }
 }
 
-#[derive(Debug, Serialize, utoipa::ToSchema)]
+#[derive(Debug, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 struct IcebergError {
     message: String,
     r#type: IcebergErrorType,
     code: u16,
 }
 
-#[derive(Debug, Serialize, utoipa::ToSchema)]
+#[derive(Debug, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct IcebergResponseError {
     error: IcebergError,
 }

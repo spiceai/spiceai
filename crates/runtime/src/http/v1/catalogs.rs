@@ -35,13 +35,15 @@ use tract_core::tract_data::itertools::Itertools;
 
 use super::{convert_entry_to_csv, Format};
 
-#[derive(Debug, Deserialize, utoipa::IntoParams)]
+#[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::IntoParams))]
 pub(crate) struct CatalogFilter {
     /// Filters catalogs by source (e.g., 'spiceai').
     from: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
+#[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "lowercase")]
 pub(crate) struct CatalogResponseItem {
     pub from: String,
@@ -53,7 +55,7 @@ const TEXT_CSV: MediaType = MediaType::from_parts(TEXT, CSV, None, &[]);
 const ACCEPT_LIST: &[MediaType; 2] = &[APPLICATION_JSON, TEXT_CSV];
 
 /// Get a list of catalogs.
-#[utoipa::path(
+#[cfg_attr(feature = "openapi", utoipa::path(
     get,
     path = "/v1/catalogs",
     operation_id = "get_catalogs",
@@ -83,7 +85,7 @@ spiceai,spiceai
             })
         )))
     )
-)]
+))]
 pub(crate) async fn get(
     Extension(app): Extension<Arc<RwLock<Option<Arc<App>>>>>,
     Query(filter): Query<CatalogFilter>,

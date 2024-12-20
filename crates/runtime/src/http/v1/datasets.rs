@@ -48,13 +48,15 @@ use super::{
     Format,
 };
 
-#[derive(Debug, Deserialize, utoipa::ToSchema, utoipa::IntoParams)]
+#[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::IntoParams))]
 pub struct DatasetFilter {
     /// Filters datasets by source (e.g., `postgres:aidemo_messages`).
     source: Option<String>,
 }
 
-#[derive(Debug, Deserialize, utoipa::IntoParams)]
+#[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::IntoParams))]
 pub struct DatasetQueryParams {
     /// If true, includes the status of each dataset in the response. Default is false.
     #[serde(default)]
@@ -65,7 +67,8 @@ pub struct DatasetQueryParams {
     format: Format,
 }
 
-#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
+#[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "lowercase")]
 pub struct DatasetResponseItem {
     /// The source where the dataset is located
@@ -89,7 +92,8 @@ pub struct DatasetResponseItem {
     pub properties: HashMap<String, serde_json::Value>,
 }
 
-#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
+#[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub(crate) struct Property {
     pub key: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -101,7 +105,7 @@ pub(crate) struct Property {
 /// This endpoint returns a list of configured datasets. The response can be formatted as **JSON** or **CSV**,
 /// and additional filters can be applied using query parameters.
 
-#[utoipa::path(
+#[cfg_attr(feature = "openapi", utoipa::path(
     get,
     path = "/v1/datasets",
     operation_id = "get_datasets",
@@ -143,7 +147,7 @@ postgres:aidemo_messages,general,false,false
             String, example = "An unexpected error occurred while processing datasets"
         )))
     )
-)]
+))]
 pub(crate) async fn get(
     Extension(app): Extension<Arc<RwLock<Option<Arc<App>>>>>,
     Extension(df): Extension<Arc<DataFusion>>,
@@ -204,14 +208,16 @@ pub(crate) async fn get(
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
+#[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "lowercase")]
 pub(crate) struct MessageResponse {
     /// The message describing the result of the request
     pub message: String,
 }
 
-#[derive(Deserialize, utoipa::ToSchema)]
+#[derive(Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct AccelerationRequest {
     /// SQL statement used for the refresh. Defaults to the `refresh_sql` specified in the spicepod.
     pub refresh_sql: Option<String>,
@@ -221,7 +227,7 @@ pub struct AccelerationRequest {
 ///
 /// This endpoint triggers an on-demand refresh for an accelerated dataset.
 /// The refresh only applies to `full` and `append` refresh modes (not `changes` mode).
-#[utoipa::path(
+#[cfg_attr(feature = "openapi", utoipa::path(
     post,
     path = "/v1/datasets/{name}/acceleration/refresh",
     operation_id = "post_dataset_refresh",
@@ -264,7 +270,7 @@ pub struct AccelerationRequest {
             })
         )))
     )
-)]
+))]
 pub(crate) async fn refresh(
     Extension(app): Extension<Arc<RwLock<Option<Arc<App>>>>>,
     Extension(df): Extension<Arc<DataFusion>>,
@@ -343,7 +349,7 @@ pub(crate) async fn refresh(
 /// The change is **temporary** and will revert to the `spicepod.yml` definition at the next runtime restart.
 ///
 
-#[utoipa::path(
+#[cfg_attr(feature = "openapi", utoipa::path(
     patch,
     path = "/v1/datasets/{name}/acceleration",
     operation_id = "patch_dataset_acceleration",
@@ -375,7 +381,7 @@ pub(crate) async fn refresh(
             })
         )))
     )
-)]
+))]
 pub(crate) async fn acceleration(
     Extension(app): Extension<Arc<RwLock<Option<Arc<App>>>>>,
     Extension(df): Extension<Arc<DataFusion>>,
@@ -431,7 +437,8 @@ pub(crate) async fn acceleration(
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct SampleQueryParams {
     /// The type of sampling to apply (e.g., `distinct_columns`, `random_sample`, `top_n_sample`)
     #[serde(rename = "type")]
@@ -444,7 +451,7 @@ pub struct SampleQueryParams {
 /// The type of sampling method can be specified using the `type` query parameter,
 /// and the body will be interpreted accordingly.
 
-#[utoipa::path(
+#[cfg_attr(feature = "openapi", utoipa::path(
     post,
     path = "/v1/datasets/sample",
     operation_id = "post_sample_dataset",
@@ -513,7 +520,7 @@ value2,456
             })
         )))
     )
-)]
+))]
 pub(crate) async fn sample(
     Extension(df): Extension<Arc<DataFusion>>,
     accept: Option<TypedHeader<Accept>>,

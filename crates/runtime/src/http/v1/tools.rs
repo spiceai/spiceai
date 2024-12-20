@@ -28,7 +28,8 @@ use serde_json::json;
 use crate::{tools::Tooling, Runtime};
 
 /// Summary of a tool available to run, and the schema of its input parameters.
-#[derive(Serialize, Debug, Clone, PartialEq, Eq, Hash, Default, Deserialize, utoipa::ToSchema)]
+#[derive(Serialize, Debug, Clone, PartialEq, Eq, Hash, Default, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 struct ListToolElement {
     name: String,
     description: Option<String>,
@@ -36,7 +37,7 @@ struct ListToolElement {
 }
 
 /// List all available tools in the Spice runtime.
-#[utoipa::path(
+#[cfg_attr(feature = "openapi", utoipa::path(
     get,
     path = "/v1/tools",
     tag = "Tools",
@@ -50,7 +51,7 @@ struct ListToolElement {
             ])
         )
     )
-)]
+))]
 pub(crate) async fn list(Extension(rt): Extension<Arc<Runtime>>) -> Response {
     let tools = &*rt.tools.read().await;
     let tools = tools
@@ -71,7 +72,7 @@ pub(crate) async fn list(Extension(rt): Extension<Arc<Runtime>>) -> Response {
 /// Run a loaded tool.
 ///
 /// The format of the request body and JSON response match the tool's
-#[utoipa::path(
+#[cfg_attr(feature = "openapi", utoipa::path(
     post,
     path = "/v1/tools/{name}",
     tag = "Tools",
@@ -110,7 +111,7 @@ pub(crate) async fn list(Extension(rt): Extension<Arc<Runtime>>) -> Response {
         (status = 500, description = "Error occured whilst calling the tool", body = serde_json::Value,
             example=json!({"message": "Error calling tool no_sql: No such tool"}))
     )
-)]
+))]
 pub(crate) async fn post(
     Extension(rt): Extension<Arc<Runtime>>,
     Path(tool_name): Path<String>,

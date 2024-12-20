@@ -18,9 +18,9 @@ use core::time;
 use std::{convert::Infallible, sync::Arc, time::Duration};
 
 use crate::{http::traceparent::override_task_history_with_traceparent, model::LLMModelStore};
-use async_openai::types::{
-    ChatCompletionResponseStream, CreateChatCompletionRequest, CreateChatCompletionResponse,
-};
+#[cfg(feature = "openapi")]
+use async_openai::types::CreateChatCompletionResponse;
+use async_openai::types::{ChatCompletionResponseStream, CreateChatCompletionRequest};
 use async_stream::stream;
 use axum::{
     http::{HeaderMap, StatusCode},
@@ -36,7 +36,7 @@ use tokio::sync::RwLock;
 use tracing::{Instrument, Span};
 
 /// Creates a model response for the given chat conversation.
-#[utoipa::path(
+#[cfg_attr(feature = "openapi", utoipa::path(
     post,
     path = "/v1/chat/completions",
     operation_id = "post_chat_completions",
@@ -93,7 +93,7 @@ use tracing::{Instrument, Span};
             })
         )))
     )
-)]
+))]
 pub(crate) async fn post(
     Extension(llms): Extension<Arc<RwLock<LLMModelStore>>>,
     headers: HeaderMap,

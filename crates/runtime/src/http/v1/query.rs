@@ -31,7 +31,7 @@ use super::{sql_to_http_response, ArrowFormat};
 /// Execute a SQL query and return the results in either JSON or Arrow format.
 ///
 /// This endpoint allows users to execute SQL queries directly from an HTTP request. The SQL query is sent as plain text in the request body.
-#[utoipa::path(
+#[cfg_attr(feature = "openapi", utoipa::path(
     post,
     path = "/v1/sql",
     operation_id = "post_sql",
@@ -99,7 +99,7 @@ use super::{sql_to_http_response, ArrowFormat};
             example = "Unexpected internal server error occurred"
         )))
     )
-)]
+))]
 pub(crate) async fn post(
     Extension(df): Extension<Arc<DataFusion>>,
     accept: Option<TypedHeader<Accept>>,

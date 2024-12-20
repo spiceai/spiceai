@@ -24,7 +24,8 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::{sync::Arc, time::Instant};
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 struct SearchResponse {
     /// List of matches that were found in the datasets
     pub matches: Vec<Match>,
@@ -37,7 +38,7 @@ struct SearchResponse {
 ///
 /// The search operation will return the most relevant matches based on cosine similarity with the input `text`.
 /// The datasets queries should have an embedding column, and the appropriate embedding model loaded.
-#[utoipa::path(
+#[cfg_attr(feature = "openapi", utoipa::path(
     post,
     path = "/v1/search",
     operation_id = "post_search",
@@ -97,7 +98,7 @@ struct SearchResponse {
             ))
         )
     )
-)]
+))]
 pub(crate) async fn post(
     Extension(vs): Extension<Arc<VectorSearch>>,
     Json(payload): Json<SearchRequestJson>,

@@ -30,25 +30,29 @@ use std::{collections::HashMap, sync::Arc};
 use tokio::sync::RwLock;
 use tract_core::tract_data::itertools::Itertools;
 
-#[derive(Default, Serialize, Deserialize, utoipa::ToSchema)]
+#[derive(Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct BatchPredictRequest {
     /// The list of prediction requests, each specifying the model to use for the prediction
     #[serde(default)]
     pub predictions: Vec<PredictRequest>,
 }
 
-#[derive(Serialize, Deserialize, utoipa::ToSchema)]
+#[derive(Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct PredictRequest {
     pub model_name: String,
 }
 
-#[derive(Serialize, utoipa::ToSchema)]
+#[derive(Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct BatchPredictResponse {
     pub predictions: Vec<PredictResponse>,
     pub duration_ms: u128,
 }
 
-#[derive(Serialize, utoipa::ToSchema)]
+#[derive(Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct PredictResponse {
     /// The status of the prediction
     pub status: PredictStatus,
@@ -72,7 +76,8 @@ pub struct PredictResponse {
     pub duration_ms: u128,
 }
 
-#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
+#[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub enum PredictStatus {
     /// Prediction was successful
     Success,
@@ -87,7 +92,7 @@ pub enum PredictStatus {
 /// Make a ML prediction using a specific model.
 ///
 /// This endpoint allows you to make a prediction using a specific machine learning model.
-#[utoipa::path(
+#[cfg_attr(feature = "openapi", utoipa::path(
     get,
     path = "/v1/models/{name}/predict",
     operation_id = "get_model_predict",
@@ -125,7 +130,7 @@ pub enum PredictStatus {
             })
         )))
     )
-)]
+))]
 pub(crate) async fn get(
     Extension(app): Extension<Arc<RwLock<Option<Arc<App>>>>>,
     Extension(df): Extension<Arc<DataFusion>>,
@@ -149,7 +154,7 @@ pub(crate) async fn get(
 /// Make batch ML predictions using multiple models.
 ///
 /// This endpoint allows for processing muliple machine learning models in parallel. This is useful for ensembling or A/B testing different models.
-#[utoipa::path(
+#[cfg_attr(feature = "openapi", utoipa::path(
     post,
     path = "/v1/predict",
     operation_id = "post_batch_predict",
@@ -193,7 +198,7 @@ pub(crate) async fn get(
             String, example = "An unexpected error occurred while processing batch predictions"
         )))
     )
-)]
+))]
 pub(crate) async fn post(
     Extension(app): Extension<Arc<RwLock<Option<Arc<App>>>>>,
     Extension(df): Extension<Arc<DataFusion>>,

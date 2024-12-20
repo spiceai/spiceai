@@ -29,14 +29,16 @@ use tokio::sync::RwLock;
 
 use super::{convert_entry_to_csv, Format};
 
-#[derive(Default, Debug, Deserialize, utoipa::IntoParams)]
+#[derive(Default, Debug, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::IntoParams))]
 pub struct SpicepodQueryParams {
     /// The format of the response. Possible values are 'json' (default) or 'csv'.
     #[serde(default)]
     pub format: Format,
 }
 
-#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
+#[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct SpicepodCsvRow {
     /// The name of the spicepod
     pub name: String,
@@ -60,7 +62,7 @@ pub struct SpicepodCsvRow {
 /// Get a list of spicepods and their details.
 ///
 /// This endpoint returns a list of all spicepods in the system. In CSV format, it will return a summarised form.
-#[utoipa::path(
+#[cfg_attr(feature = "openapi", utoipa::path(
     get,
     path = "/v1/spicepods",
     operation_id = "get_spicepods",
@@ -94,7 +96,7 @@ pub struct SpicepodCsvRow {
             String, example = "Internal server error"
         )))
     )
-)]
+))]
 pub(crate) async fn get(
     Extension(app): Extension<Arc<RwLock<Option<Arc<App>>>>>,
     Query(params): Query<SpicepodQueryParams>,

@@ -27,7 +27,8 @@ use serde::{Deserialize, Serialize};
 use crate::metrics;
 
 /// Represents the status of a component (e.g. dataset, model, etc).
-#[derive(Debug, PartialEq, Eq, Copy, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+#[derive(Debug, PartialEq, Eq, Copy, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub enum ComponentStatus {
     /// The component is initializing and not yet ready
     Initializing,

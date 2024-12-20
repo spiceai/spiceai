@@ -42,7 +42,8 @@ pub trait SampleFrom: Send + Sync {
     > + Send;
 }
 
-#[derive(Debug, Clone, JsonSchema, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[derive(Debug, Clone, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub enum SampleTableMethod {
     #[serde(rename = "distinct")]
     DistinctColumns,
