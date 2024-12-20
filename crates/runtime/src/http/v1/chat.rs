@@ -61,7 +61,7 @@ use tracing::{Instrument, Span};
             example = json!({
                 "id": "chatcmpl-123",
                 "object": "chat.completion",
-                "created": 1677652288,
+                "created": 1_677_652_288,
                 "model": "gpt-4o-mini",
                 "system_fingerprint": "fp_44709d6fcb",
                 "choices": [{

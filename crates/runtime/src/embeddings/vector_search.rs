@@ -412,7 +412,6 @@ impl VectorSearchTableResult {
 
 pub type VectorSearchResult = HashMap<TableReference, VectorSearchTableResult>;
 
-///
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct Match {
     /// The value of the match (e.g., document snippet, identifier, etc.)

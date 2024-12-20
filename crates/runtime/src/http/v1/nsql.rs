@@ -158,24 +158,24 @@ fn return_sql_only(accept: Option<&TypedHeader<Accept>>) -> bool {
     responses(
         (status = 200, description = "Generated SQL query (SQL only)", content((
             String = "application/sql",
-            example = r#"
+            example = "
 SELECT customer_id, SUM(total_sales)
 FROM sales_data
 GROUP BY customer_id
 ORDER BY SUM(total_sales) DESC
 LIMIT 5
-"#
+"
         ))),
         (status = 200, description = "SQL query executed successfully", content((
             Vec<serde_json::Value> = "application/json",
             example = json!([
                 {
                     "customer_id": "12345",
-                    "total_sales": 150000
+                    "total_sales": 150_000
                 },
                 {
                     "customer_id": "67890",
-                    "total_sales": 125000
+                    "total_sales": 125_000
                 }
             ])
         ))),

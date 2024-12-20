@@ -31,7 +31,7 @@ pub mod spicepods;
 pub mod status;
 pub mod tools;
 
-use std::{default, sync::Arc};
+use std::sync::Arc;
 
 use crate::{
     component::dataset::Dataset,

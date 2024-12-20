@@ -51,21 +51,21 @@ use super::{sql_to_http_response, ArrowFormat};
             Vec<serde_json::Value> = "application/json",
             example = json!([
                 {
-                    "AVG(my_table.tip_amount)": 3.072259971396793,
-                    "AVG(my_table.total_amount)": 25.327816939456525,
-                    "COUNT(Int64(1))": 31465,
+                    "AVG(my_table.tip_amount)": 3.072_259_971_396_793,
+                    "AVG(my_table.total_amount)": 25.327_816_939_456_525,
+                    "COUNT(Int64(1))": 31_465,
                     "passenger_count": 0
                 },
                 {
-                    "AVG(my_table.tip_amount)": 3.3712622884680057,
-                    "AVG(my_table.total_amount)": 26.205230445474996,
-                    "COUNT(Int64(1))": 2188739,
+                    "AVG(my_table.tip_amount)": 3.371_262_288_468_005_7,
+                    "AVG(my_table.total_amount)": 26.205_230_445_474_996,
+                    "COUNT(Int64(1))": 2_188_739,
                     "passenger_count": 1
                 },
                 {
-                    "AVG(my_table.tip_amount)": 3.7171302113290854,
-                    "AVG(my_table.total_amount)": 29.520659930930304,
-                    "COUNT(Int64(1))": 405103,
+                    "AVG(my_table.tip_amount)": 3.717_130_211_329_085_4,
+                    "AVG(my_table.total_amount)": 29.520_659_930_930_304,
+                    "COUNT(Int64(1))": 405_103,
                     "passenger_count": 2
                 }
             ])

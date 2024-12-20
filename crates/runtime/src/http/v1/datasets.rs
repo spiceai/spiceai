@@ -132,12 +132,12 @@ pub(crate) struct Property {
             ])
         ), (
             String = "text/csv",
-            example = r#"
+            example = "
 from,name,replication_enabled,acceleration_enabled
 postgres:syncs,daily_journal_accelerated,false,true
 databricks:hive_metastore.default.messages,messages_accelerated,false,true
 postgres:aidemo_messages,general,false,false
-"#
+"
         ))),
         (status = 500, description = "Internal server error occurred while processing datasets", content((
             String, example = "An unexpected error occurred while processing datasets"
@@ -485,20 +485,20 @@ pub struct SampleQueryParams {
         ))),
         (status = 200, description = "The sampled data in CSV format.", content((
             String = "text/csv",
-            example = r#"
+            example = "
 column_a,column_b
 value1,123
 value2,456
-"#
+"
         ))),
         (status = 200, description = "The sampled data in plain text format.", content((
             String = "text/plain",
-            example = r#"
+            example = "
 | column_a | column_b |
 |----------|----------|
 | value1   | 123      |
 | value2   | 456      |
-"#
+"
         ))),
         (status = 400, description = "Invalid request body", content((
             serde_json::Value = "application/json",

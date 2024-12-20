@@ -71,10 +71,10 @@ const ACCEPT_LIST: &[MediaType; 2] = &[APPLICATION_JSON, TEXT_CSV];
         ))),
         (status = 200, description = "List of catalogs in CSV format", content((
             String = "text/csv",
-            example = r#"
+            example = "
 from,name
 spiceai,spiceai
-"#
+"
         ))),
         (status = 500, description = "Internal server error occurred while processing catalogs", content((
             serde_json::Value = "application/json",

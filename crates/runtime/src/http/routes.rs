@@ -26,7 +26,7 @@ use spicepod::component::runtime::CorsConfig;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-use utoipa::{openapi, OpenApi};
+use utoipa::OpenApi;
 
 #[cfg(feature = "dev")]
 use utoipa_swagger_ui::SwaggerUi;
@@ -46,6 +46,7 @@ use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 
 use super::{metrics, v1};
 
+#[allow(dead_code)]
 #[derive(OpenApi)]
 #[openapi(paths(
     v1::catalogs::get,
@@ -232,9 +233,9 @@ mod tests {
     use super::*;
     use utoipa::OpenApi;
 
-    /// Make sure that all routes are defined in the OpenAPI spec. If you add a new route, you must
-    ///   1. Add the route to the OpenAPI spec in the `#[openapi(paths(...))]` attribute abover
-    ///   2. Add the route to the `expected_routes` HashSet below
+    /// Make sure that all routes are defined in the `OpenAPI` spec. If you add a new route, you must
+    ///   1. Add the route to the `OpenAPI` spec in the `#[openapi(paths(...))]` attribute abover
+    ///   2. Add the route to the `expected_routes` `HashSet` below
     #[test]
     fn all_routes_in_openapi_spec() {
         let openapi = ApiDoc::openapi();
@@ -242,7 +243,7 @@ mod tests {
             .paths
             .paths
             .keys()
-            .map(|path| path.to_string())
+            .map(ToString::to_string)
             .collect();
 
         let expected_routes: std::collections::HashSet<String> = [
@@ -270,7 +271,7 @@ mod tests {
             "/v1/evals",
         ]
         .iter()
-        .map(|s| s.to_string())
+        .map(|&s| s.to_string())
         .collect();
 
         let missing_in_openapi: Vec<_> = expected_routes.difference(&openapi_paths).collect();

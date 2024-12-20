@@ -50,7 +50,7 @@ pub struct BatchPredictResponse {
 
 #[derive(Serialize, utoipa::ToSchema)]
 pub struct PredictResponse {
-    /// The status of the prediction (Success, BadRequest, InternalError)
+    /// The status of the prediction
     pub status: PredictStatus,
 
     /// The error message if the request failed
