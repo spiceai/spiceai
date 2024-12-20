@@ -20,7 +20,7 @@ use crate::Runtime;
 use crate::{config, request::RequestContext};
 
 use app::App;
-use axum::routing::{head, patch};
+use axum::routing::patch;
 use opentelemetry::KeyValue;
 use spicepod::component::runtime::CorsConfig;
 use std::sync::Arc;
