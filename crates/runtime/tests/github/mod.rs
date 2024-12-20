@@ -44,6 +44,7 @@ fn make_github_dataset(owner: &str, repo: &str, query_type: &str, query_mode: &s
 }
 
 #[tokio::test]
+#[test_retry::retry]
 async fn test_github_pulls() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
