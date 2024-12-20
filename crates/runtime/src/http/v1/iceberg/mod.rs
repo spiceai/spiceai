@@ -32,7 +32,7 @@ mod namespace;
 
 /// Get Iceberg Catalog API configuration.
 ///
-/// This endpoint returns the Iceberg CatalogAPI configuration, including details about overrides, defaults, and available endpoints.
+/// This endpoint returns the Iceberg Catalog API configuration, including details about overrides, defaults, and available endpoints.
 #[cfg_attr(feature = "openapi", utoipa::path(
     get,
     path = "/v1/iceberg/config",
