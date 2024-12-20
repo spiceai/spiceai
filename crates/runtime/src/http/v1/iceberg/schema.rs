@@ -329,7 +329,7 @@ mod tests {
         }
 
         if let Type::Primitive(p) = &fields[8].field_type {
-            assert_eq!(p.0, "decimal(10,2)");
+            assert_eq!(p.0, "decimal(10, 2)");
         } else {
             panic!("Expected decimal type");
         }
