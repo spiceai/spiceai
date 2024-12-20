@@ -43,6 +43,7 @@ use tracing::{Instrument, Span};
     tag = "AI",
     request_body(
         description = "Create a chat completion request using a language model.",
+        required = true,
         content((
             CreateChatCompletionRequest = "application/json",
             example = json!({

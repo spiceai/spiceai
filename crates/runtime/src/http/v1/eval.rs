@@ -59,6 +59,7 @@ pub(crate) struct RunEval {
     ),
     request_body(
         description = "Parameters to run the evaluation",
+        required = true,
         content((RunEval = "application/json", example = json!({ "model": "example_model" })))
     ),
     responses(

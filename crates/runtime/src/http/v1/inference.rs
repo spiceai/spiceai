@@ -161,6 +161,7 @@ pub(crate) async fn get(
     tag = "AI",
     request_body(
         description = "Batch prediction request containing a list of prediction requests for specific models",
+        required = true,
         content((
             BatchPredictRequest = "application/json",
             example = json!({

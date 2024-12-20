@@ -41,6 +41,7 @@ use super::{sql_to_http_response, ArrowFormat};
     ),
     request_body(
         description = "SQL query to execute",
+        required = true,
         content((
             String = "text/plain",
             example = "SELECT avg(total_amount), avg(tip_amount), count(1), passenger_count FROM my_table GROUP BY passenger_count ORDER BY passenger_count ASC LIMIT 3"

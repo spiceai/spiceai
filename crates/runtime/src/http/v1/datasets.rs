@@ -359,6 +359,7 @@ pub(crate) async fn refresh(
     ),
     request_body(
         description = "The updated SQL statement for the dataset's refresh.",
+        required = true,
         content((
             AccelerationRequest = "application/json",
             example = json!({
@@ -461,6 +462,7 @@ pub struct SampleQueryParams {
     ),
     request_body(
         description = "The request body depends on the type of sampling selected.",
+        required = true,
         content((
             DistinctColumnsParams = "application/json", example = json!({
                 "dataset": "postgres:aidemo_messages",
