@@ -45,12 +45,14 @@ pub(crate) async fn head(
     Path((namespace, table)): Path<(NamespacePath, String)>,
 ) -> Response {
     let namespace = Namespace::from(namespace);
-    let Some(table_reference) = table_reference(namespace, table) else {
+    let Some(table_reference) = table_reference(&namespace, &table) else {
         return status::StatusCode::NOT_FOUND.into_response();
     };
 
-    let table = datafusion.get_table(&table_reference).await;
-    status::StatusCode::OK.into_response()
+    match datafusion.get_table(&table_reference).await {
+        Some(_) => status::StatusCode::OK.into_response(),
+        None => status::StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 /// Get a table.
@@ -77,17 +79,17 @@ pub(crate) async fn get(
         .into_response()
 }
 
-fn table_reference(namespace: Namespace, table: String) -> Option<TableReference> {
+fn table_reference(namespace: &Namespace, table: &str) -> Option<TableReference> {
     if namespace.parts.len() != 2 {
         return None;
     }
 
-    let catalog = namespace.parts[0];
-    let schema = namespace.parts[1];
+    let catalog = namespace.parts[0].as_str();
+    let schema = namespace.parts[1].as_str();
 
-    if is_spice_internal_schema(&catalog, &schema) {
+    if is_spice_internal_schema(catalog, schema) {
         return None;
     }
 
-    Some(TableReference::new(catalog, schema, table))
+    Some(TableReference::full(catalog, schema, table))
 }
