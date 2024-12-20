@@ -61,7 +61,7 @@ dotenvy.workspace = true
 insta.workspace = true
 jsonpath-rust = "0.7.3"
 lazy_static.workspace = true
-paste = "1.0.15"
+paste.workspace = true
 tracing-opentelemetry.workspace = true
 tracing-subscriber.workspace = true
 

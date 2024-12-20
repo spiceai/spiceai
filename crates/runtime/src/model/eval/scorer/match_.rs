@@ -14,48 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::HashMap, sync::Arc};
-
 use async_trait::async_trait;
-use tokio::sync::RwLock;
 
-use super::{DatasetInput, DatasetOutput};
+use crate::model::eval::scorer::mean;
 
-#[async_trait]
-pub trait Scorer: Sync + Send {
-    async fn score(
-        &self,
-        input: &DatasetInput,
-        actual: &DatasetOutput,
-        ideal: &DatasetOutput,
-    ) -> f32;
-
-    /// Compute the relevant metrics for this [`Scorer`], given a precomputed scores.
-    fn metrics(&self, scores: &[f32]) -> Vec<(String, f32)>;
-}
-
-pub type EvalScorerRegistry = Arc<RwLock<HashMap<String, Arc<dyn Scorer>>>>;
-
-/// Compute the scores for each [`Scorer`] selected given the results of running a model.
-pub(crate) async fn score_results(
-    input: &[DatasetInput],
-    output: &[DatasetOutput],
-    expected: &[DatasetOutput],
-    scorers: &HashMap<String, Arc<dyn Scorer>>,
-) -> HashMap<String, Vec<f32>> {
-    let mut aggregate: HashMap<String, Vec<f32>> = HashMap::with_capacity(output.len());
-    for ((input, output), expected) in input.iter().zip(output.iter()).zip(expected.iter()) {
-        for (name, scorer) in scorers {
-            let s = scorer.score(input, output, expected).await;
-            if let Some(scorer_results) = aggregate.get_mut(name) {
-                scorer_results.push(s);
-            } else {
-                aggregate.insert((*name).to_string(), vec![s]);
-            };
-        }
-    }
-    aggregate
-}
+use super::{DatasetInput, DatasetOutput, Scorer};
 
 /// [`MatchScorer`] checks for equality between the actual and ideal values.
 ///
@@ -89,28 +52,9 @@ impl Scorer for MatchScorer {
         }
     }
 
-    #[allow(clippy::cast_precision_loss)]
     fn metrics(&self, scores: &[f32]) -> Vec<(String, f32)> {
-        let n = scores.len();
-        if n == 0 {
-            // Return default metrics for empty input
-            return vec![("mean".to_string(), 0.0), ("std_dev".to_string(), 0.0)];
-        }
-
-        let sum: f32 = scores.iter().copied().sum();
-        let mean = sum / n as f32;
-
-        vec![
-            ("mean".to_string(), mean),
-            // For  Bernoulli r.v., the variance is p(1-p).
-            ("std_dev".to_string(), (mean * (1.0 - mean)).sqrt()),
-        ]
+        vec![("mean".to_string(), mean(scores))]
     }
-}
-
-#[must_use]
-pub fn builtin_scorer() -> Vec<(&'static str, Arc<dyn Scorer>)> {
-    vec![("match", Arc::new(MatchScorer {}))]
 }
 
 #[cfg(test)]
@@ -271,10 +215,8 @@ mod tests {
     #[test]
     fn test_metrics_non_empty_scores() {
         let stats = MatchScorer {}.metrics(&[1.0, 0.0, 1.0, 1.0]);
-        assert_eq!(stats.len(), 2);
+        assert_eq!(stats.len(), 1);
         assert_eq!(stats[0].0, "mean".to_string());
         assert!((stats[0].1 - 0.75_f32).abs() < f32::EPSILON);
-        assert_eq!(stats[1].0, "std_dev".to_string());
-        assert!((stats[1].1 - 0.433_012_7_f32).abs() < f32::EPSILON);
     }
 }

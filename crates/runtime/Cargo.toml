@@ -146,6 +146,7 @@ hf-hub = { workspace = true }
 insta.workspace = true
 jsonpath-rust = "0.7.3"
 opentelemetry_sdk = { workspace = true, features = ["rt-tokio-current-thread"] }
+paste.workspace = true
 scopeguard = "1.2.0"
 serde_json = { workspace = true, features = ["preserve_order"] }
 spice-cloud = { path = "../spice_cloud" }
