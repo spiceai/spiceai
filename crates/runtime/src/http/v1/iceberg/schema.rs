@@ -14,11 +14,16 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use arrow::datatypes::{DataType, Field as ArrowField, Schema as ArrowSchema};
+use std::{str::FromStr, sync::Arc};
+
+use arrow::{
+    array::timezone::Tz,
+    datatypes::{DataType, Schema as ArrowSchema, TimeUnit},
+    error::ArrowError,
+};
+use chrono::{Offset, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use snafu::{ResultExt, Snafu};
-use std::collections::HashMap;
-use std::sync::Arc;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -30,6 +35,9 @@ pub enum Error {
 
     #[snafu(display("Invalid map type: expected struct type for map entries"))]
     InvalidMapType,
+
+    #[snafu(display("Invalid time zone {zone}: {source}"))]
+    InvalidTimeZone { source: ArrowError, zone: Arc<str> },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -51,10 +59,10 @@ pub enum Type {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MapType {
     #[serde(rename = "key-id")]
-    key_id: i32,
+    key_id: usize,
     key: Box<Type>,
     #[serde(rename = "value-id")]
-    value_id: i32,
+    value_id: usize,
     value: Box<Type>,
     #[serde(rename = "value-required")]
     value_required: bool,
@@ -63,7 +71,7 @@ pub struct MapType {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ListType {
     #[serde(rename = "element-id")]
-    element_id: i32,
+    element_id: usize,
     element: Box<Type>,
     #[serde(rename = "element-required")]
     element_required: bool,
@@ -71,7 +79,7 @@ pub struct ListType {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StructField {
-    id: i32,
+    id: usize,
     name: String,
     #[serde(rename = "type")]
     field_type: Type,
@@ -86,6 +94,7 @@ pub struct StructType {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(clippy::struct_field_names)]
 pub struct Schema {
     #[serde(flatten)]
     struct_type: StructType,
@@ -101,6 +110,7 @@ pub struct Schema {
 impl TryFrom<ArrowSchema> for Schema {
     type Error = Error;
 
+    #[allow(clippy::cast_possible_truncation)]
     fn try_from(arrow_schema: ArrowSchema) -> Result<Self, Self::Error> {
         let fields = arrow_schema
             .fields()
@@ -108,11 +118,11 @@ impl TryFrom<ArrowSchema> for Schema {
             .enumerate()
             .map(|(idx, field)| {
                 Ok(StructField {
-                    id: idx as i32,
+                    id: idx,
                     name: field.name().clone(),
                     field_type: arrow_datatype_to_type(field.data_type())?,
                     required: !field.is_nullable(),
-                    doc: field.metadata().get("doc").map(|s| s.to_string()),
+                    doc: field.metadata().get("doc").map(ToString::to_string),
                 })
             })
             .collect::<Result<Vec<_>, Error>>()?;
@@ -125,6 +135,7 @@ impl TryFrom<ArrowSchema> for Schema {
     }
 }
 
+#[allow(clippy::cast_possible_truncation)]
 fn arrow_datatype_to_type(dt: &DataType) -> Result<Type, Error> {
     match dt {
         // Primitive types
@@ -139,8 +150,41 @@ fn arrow_datatype_to_type(dt: &DataType) -> Result<Type, Error> {
             Ok(Type::Primitive(PrimitiveType(format!("fixed[{size}]"))))
         }
         DataType::Decimal128(precision, scale) => Ok(Type::Primitive(PrimitiveType(format!(
-            "decimal({precision},{scale})",
+            "decimal({precision}, {scale})",
         )))),
+        DataType::Date32 => Ok(Type::Primitive(PrimitiveType("date".to_string()))),
+        DataType::Time64(unit) if *unit == TimeUnit::Microsecond => {
+            Ok(Type::Primitive(PrimitiveType("time".to_string())))
+        }
+        DataType::Timestamp(unit, Some(zone)) => {
+            let tz = Tz::from_str(zone).context(InvalidTimeZoneSnafu {
+                zone: Arc::clone(zone),
+            })?;
+
+            let tz_offset = tz.offset_from_utc_datetime(&Utc::now().naive_utc()).fix();
+            let is_utc = tz_offset.local_minus_utc() == 0;
+
+            let timestamp_type = if is_utc { "timestamptz" } else { "timestamp" };
+
+            match *unit {
+                TimeUnit::Second | TimeUnit::Millisecond | TimeUnit::Microsecond => {
+                    Ok(Type::Primitive(PrimitiveType(timestamp_type.to_string())))
+                }
+                _ => UnsupportedTypeSnafu {
+                    datatype: DataType::Timestamp(*unit, Some(Arc::clone(zone))),
+                }
+                .fail(),
+            }
+        }
+        DataType::Timestamp(unit, None) => match *unit {
+            TimeUnit::Second | TimeUnit::Millisecond | TimeUnit::Microsecond => {
+                Ok(Type::Primitive(PrimitiveType("timestamp".to_string())))
+            }
+            _ => UnsupportedTypeSnafu {
+                datatype: DataType::Timestamp(*unit, None),
+            }
+            .fail(),
+        },
 
         // List type
         DataType::List(field) => Ok(Type::List(Box::new(ListType {
@@ -153,9 +197,9 @@ fn arrow_datatype_to_type(dt: &DataType) -> Result<Type, Error> {
         DataType::Map(field, _sorted) => match field.data_type() {
             DataType::Struct(fields) if fields.len() == 2 => Ok(Type::Map(Box::new(MapType {
                 key_id: 0,
-                key: Box::new(arrow_datatype_to_type(&fields[0].data_type())?),
+                key: Box::new(arrow_datatype_to_type(fields[0].data_type())?),
                 value_id: 1,
-                value: Box::new(arrow_datatype_to_type(&fields[1].data_type())?),
+                value: Box::new(arrow_datatype_to_type(fields[1].data_type())?),
                 value_required: !fields[1].is_nullable(),
             }))),
             DataType::Struct(_) => InvalidMapStructureSnafu.fail(),
@@ -169,11 +213,11 @@ fn arrow_datatype_to_type(dt: &DataType) -> Result<Type, Error> {
                 .enumerate()
                 .map(|(idx, field)| {
                     Ok(StructField {
-                        id: idx as i32,
+                        id: idx,
                         name: field.name().clone(),
                         field_type: arrow_datatype_to_type(field.data_type())?,
                         required: !field.is_nullable(),
-                        doc: field.metadata().get("doc").map(|s| s.to_string()),
+                        doc: field.metadata().get("doc").map(ToString::to_string),
                     })
                 })
                 .collect::<Result<Vec<_>, Error>>()?;
@@ -356,11 +400,14 @@ mod tests {
     #[test]
     fn test_invalid_map_structure() {
         // Test with a map that has an invalid structure (not exactly 2 fields)
-        let invalid_struct = DataType::Struct(vec![
-            Field::new("key", DataType::Utf8, false),
-            Field::new("value", DataType::Int64, true),
-            Field::new("extra", DataType::Boolean, true),
-        ]);
+        let invalid_struct = DataType::Struct(
+            vec![
+                Field::new("key", DataType::Utf8, false),
+                Field::new("value", DataType::Int64, true),
+                Field::new("extra", DataType::Boolean, true),
+            ]
+            .into(),
+        );
         let arrow_schema = ArrowSchema::new(vec![Field::new(
             "map_field",
             DataType::Map(
