@@ -14,4 +14,18 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-pub mod spice_duckdb;
+use std::sync::Arc;
+
+use datafusion::sql::unparser::dialect::{Dialect, DuckDBDialect, ScalarFnToSqlHandler};
+
+mod duckdb;
+
+/// Creates a new instance of the `DuckDB` dialect with support for Spice internal UDFs
+pub fn new_duckdb_dialect() -> Arc<dyn Dialect> {
+    let dialect = DuckDBDialect::new().with_custom_scalar_overrides(vec![(
+        "cosine_distance",
+        Box::new(duckdb::cosine_distance_to_sql) as ScalarFnToSqlHandler,
+    )]);
+
+    Arc::new(dialect) as Arc<dyn Dialect>
+}

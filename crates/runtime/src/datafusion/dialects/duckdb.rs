@@ -14,39 +14,17 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::sync::Arc;
-
 use datafusion::error::DataFusionError;
 use datafusion::prelude::Expr;
 use datafusion::sql::sqlparser::ast::{self, Function, FunctionArgExpr, Ident, ObjectName};
-use datafusion::sql::unparser::dialect::{Dialect, DuckDBDialect, ScalarFnToSqlHandler};
 use itertools::Itertools;
-pub struct SpiceDuckDBDialect {}
 
-impl SpiceDuckDBDialect {
-    #[must_use]
-    pub fn new_arc() -> Arc<dyn Dialect> {
-        let dialect = DuckDBDialect::new().with_custom_scalar_overrides(vec![(
-            "cosine_distance",
-            Box::new(cosine_distance_to_sql) as ScalarFnToSqlHandler,
-        )]);
-
-        Arc::new(dialect) as Arc<dyn Dialect>
-    }
-}
-
-/// Converts the `cosine_distance` UDF into DuckDB `array_cosine_distance` function:
+/// Converts the `cosine_distance` UDF into `DuckDB` `array_cosine_distance` function:
 /// `https://duckdb.org/docs/sql/functions/array.html#array_cosine_distancearray1-array2`
 ///
-///  - replaces `make_array` function with the array constructor (`make_array` is not supported in DuckDB)
-///  - adds required ::FLOAT[array_len] casting, otherwise DuckDB will throw an error:
-///
-/// SQL Error: java.sql.SQLException: Binder Error: No function matches the given name and argument types 'array_cosine_distance(FLOAT[384], DOUBLE[])'. You might need to add explicit type casts.
-///  Candidate functions:
-///  array_cosine_distance(FLOAT[ANY], FLOAT[ANY]) -> FLOAT
-///  array_cosine_distance(DOUBLE[ANY], DOUBLE[ANY]) -> DOUBLE
-///
-fn cosine_distance_to_sql(
+///  - replaces `make_array` function with the array constructor (`make_array` is not supported in `DuckDB`)
+///  - casts to `DuckDB` Array (`FixedSizeList`)
+pub(crate) fn cosine_distance_to_sql(
     unparser: &datafusion::sql::unparser::Unparser,
     args: &[Expr],
 ) -> Result<Option<datafusion::sql::sqlparser::ast::Expr>, DataFusionError> {
@@ -117,11 +95,13 @@ mod tests {
         sql::{unparser::Unparser, TableReference},
     };
 
+    use crate::datafusion::dialects::new_duckdb_dialect;
+
     use super::*;
 
     #[test]
     fn test_cosine_distance_to_sql_scalars() {
-        let dialect = SpiceDuckDBDialect::new_arc();
+        let dialect = new_duckdb_dialect();
         let unparser = Unparser::new(dialect.as_ref());
         let args = vec![
             // raw values
@@ -139,17 +119,19 @@ mod tests {
                 ],
             )),
         ];
+        let result = cosine_distance_to_sql(&unparser, &args)
+            .expect("should execute successfully")
+            .expect("should return expression");
 
-        let result = cosine_distance_to_sql(&unparser, &args).unwrap();
         let expected =
             "array_cosine_distance([1.0, 2.0, 3.0]::FLOAT[3], [4.0, 5.0, 6.0]::FLOAT[3])";
 
-        assert_eq!(result.unwrap().to_string(), expected);
+        assert_eq!(result.to_string(), expected);
     }
 
     #[test]
     fn test_cosine_distance_to_sql_column_and_scalar() {
-        let dialect = SpiceDuckDBDialect::new_arc();
+        let dialect = new_duckdb_dialect();
         let unparser = Unparser::new(dialect.as_ref());
         let args = vec![
             Expr::Column(Column {
@@ -166,10 +148,12 @@ mod tests {
             )),
         ];
 
-        let result = cosine_distance_to_sql(&unparser, &args).unwrap();
+        let result = cosine_distance_to_sql(&unparser, &args)
+            .expect("should execute successfully")
+            .expect("should return expression");
         let expected =
             r#"array_cosine_distance("table_name"."column_name", [4.0, 5.0, 6.0]::FLOAT[3])"#;
 
-        assert_eq!(result.unwrap().to_string(), expected);
+        assert_eq!(result.to_string(), expected);
     }
 }

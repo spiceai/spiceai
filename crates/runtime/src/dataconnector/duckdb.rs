@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::{component::dataset::Dataset, spice_dialects::spice_duckdb::SpiceDuckDBDialect};
+use crate::{component::dataset::Dataset, datafusion::dialects::new_duckdb_dialect};
 use async_trait::async_trait;
 use data_components::Read;
 use datafusion::datasource::TableProvider;
@@ -67,7 +67,7 @@ impl DuckDB {
                 ),
         );
 
-        Ok(DuckDBTableFactory::new(pool).with_dialect(SpiceDuckDBDialect::new_arc()))
+        Ok(DuckDBTableFactory::new(pool).with_dialect(new_duckdb_dialect()))
     }
 
     pub(crate) fn create_file(
@@ -88,7 +88,7 @@ impl DuckDB {
                 ),
         );
 
-        Ok(DuckDBTableFactory::new(pool).with_dialect(SpiceDuckDBDialect::new_arc()))
+        Ok(DuckDBTableFactory::new(pool).with_dialect(new_duckdb_dialect()))
     }
 }
 

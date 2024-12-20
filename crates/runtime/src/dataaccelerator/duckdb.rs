@@ -33,11 +33,10 @@ use crate::{
         acceleration::{Engine, Mode},
         Dataset,
     },
+    datafusion::dialects::new_duckdb_dialect,
     make_spice_data_directory,
     parameters::ParameterSpec,
-    spice_data_base_path,
-    spice_dialects::spice_duckdb::SpiceDuckDBDialect,
-    Runtime,
+    spice_data_base_path, Runtime,
 };
 
 use super::{DataAccelerator, Error as DataAcceleratorError};
@@ -87,7 +86,7 @@ impl DuckDBAccelerator {
         Self {
             // DuckDB accelerator uses params.duckdb_file for file connection
             duckdb_factory: DuckDBTableProviderFactory::new(AccessMode::ReadWrite)
-                .with_dialect(SpiceDuckDBDialect::new_arc()),
+                .with_dialect(new_duckdb_dialect()),
         }
     }
 
