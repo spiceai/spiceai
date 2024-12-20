@@ -127,6 +127,9 @@ tracing-futures.workspace = true
 tract-core = "0.21.0"
 url = "2.5.4"
 util = { path = "../util" }
+utoipa = { version = "5.2.0", features = ["axum_extras"], optional = true }
+utoipa-swagger-ui = { version = "8.0.3", features = ["axum"], optional = true }
+
 uuid = { workspace = true, features = ["v7"] }
 x509-certificate.workspace = true
 
@@ -144,11 +147,11 @@ insta.workspace = true
 jsonpath-rust = "0.7.3"
 opentelemetry_sdk = { workspace = true, features = ["rt-tokio-current-thread"] }
 scopeguard = "1.2.0"
+serde_json = { workspace = true, features = ["preserve_order"] }
 spice-cloud = { path = "../spice_cloud" }
 tokio = { workspace = true, features = ["time", "test-util"] }
 tracing-opentelemetry.workspace = true
 tracing-subscriber.workspace = true
-serde_json = { workspace = true, features = ["preserve_order"] }
 
 [features]
 aws-secrets-manager = [
@@ -167,7 +170,7 @@ databricks = ["data_components/databricks"]
 debezium = ["data_components/debezium"]
 default = ["keyring-secret-store", "aws-secrets-manager", "sharepoint"]
 delta_lake = ["data_components/delta_lake"]
-dev = []
+dev = ["openapi"]
 dremio = []
 duckdb = ["dep:duckdb", "db_connection_pool/duckdb", "data_components/duckdb"]
 flightsql = ["data_components/flightsql"]
@@ -178,6 +181,7 @@ models = ["model_components/full", "llms/mistralrs"]
 mssql = ["dep:tiberius", "dep:tokio-util", "data_components/mssql"]
 mysql = ["dep:mysql_async", "db_connection_pool/mysql", "data_components/mysql"]
 odbc = ["db_connection_pool/odbc", "data_components/odbc"]
+openapi = ["utoipa-swagger-ui", "utoipa"]
 postgres = [
     "db_connection_pool/postgres",
     "data_components/postgres",

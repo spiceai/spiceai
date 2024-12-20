@@ -30,6 +30,31 @@ use serde::{self, Deserialize, Serialize};
 mod error;
 mod namespace;
 
+/// Get Iceberg Catalog API configuration.
+///
+/// This endpoint returns the Iceberg CatalogAPI configuration, including details about overrides, defaults, and available endpoints.
+#[cfg_attr(feature = "openapi", utoipa::path(
+    get,
+    path = "/v1/iceberg/config",
+    operation_id = "get_config",
+    tag = "Iceberg",
+    responses(
+        (status = 200, description = "API configuration retrieved successfully", content((
+            serde_json::Value = "application/json",
+            example = json!({
+                "overrides": {},
+                "defaults": {},
+                "endpoints": [
+                    "GET /v1/iceberg/namespaces",
+                    "HEAD /v1/iceberg/namespaces/{namespace}",
+                    "GET /v1/iceberg/namespaces/{namespace}/tables",
+                    "HEAD /v1/iceberg/namespaces/{namespace}/tables/{table}",
+                    "GET /v1/iceberg/namespaces/{namespace}/tables/{table}"
+                ]
+            })
+        )))
+    )
+))]
 pub(crate) async fn get_config() -> &'static str {
     r#"{
   "overrides": {},
@@ -45,16 +70,71 @@ pub(crate) async fn get_config() -> &'static str {
 }
 
 #[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::IntoParams))]
 pub(crate) struct ParentNamespaceQueryParams {
+    /// The parent namespace from which to retrieve child namespaces.
     #[serde(default)]
     parent: Namespace,
 }
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 struct NamespacesResponse {
     namespaces: Vec<Namespace>,
 }
 
+/// Get a list of namespaces.
+///
+/// This endpoint retrieves namespaces available in the Iceberg catalog.
+/// If a `parent` namespace is provided, it will list the child namespaces under the specified parent.
+#[cfg_attr(feature = "openapi", utoipa::path(
+    get,
+    path = "/v1/iceberg/namespaces",
+    operation_id = "get_iceberg_namespaces",
+    tag = "Iceberg",
+    params(ParentNamespaceQueryParams),
+    responses(
+        (status = 200, description = "Namespaces retrieved successfully", content((
+            NamespacesResponse = "application/json",
+            example = json!({
+                "namespaces": [
+                    { "parts": ["catalog_a"] },
+                    { "parts": ["catalog_b", "schema_1"] }
+                ]
+            })
+        ))),
+        (status = 404, description = "Namespace not found", content((
+            IcebergResponseError = "application/json",
+            example = json!({
+                "error": {
+                    "message": "Namespace provided does not exist",
+                    "type": "NoSuchNamespaceException",
+                    "code": 404
+                }
+            })
+        ))),
+        (status = 400, description = "Bad request", content((
+            IcebergResponseError = "application/json",
+            example = json!({
+                "error": {
+                    "message": "Invalid namespace request",
+                    "type": "BadRequestException",
+                    "code": 400
+                }
+            })
+        ))),
+        (status = 500, description = "Internal server error", content((
+            IcebergResponseError = "application/json",
+            example = json!({
+                "error": {
+                    "message": "Internal Server Error: DF_SCHEMA_NOT_FOUND",
+                    "type": "InternalServerError",
+                    "code": 500
+                }
+            })
+        )))
+    )
+))]
 pub(crate) async fn get_namespaces(
     Extension(datafusion): Extension<Arc<DataFusion>>,
     Query(params): Query<ParentNamespaceQueryParams>,
@@ -69,6 +149,19 @@ pub(crate) async fn get_namespaces(
     }
 }
 
+/// Check if a namespace exists.
+///
+/// This endpoint returns a 200 OK response if the namespace exists, otherwise it returns a 404 Not Found response.
+#[cfg_attr(feature = "openapi", utoipa::path(
+    head,
+    path = "/v1/iceberg/namespaces/{namespace}",
+    operation_id = "head_namespace",
+    tag = "Iceberg",
+    responses(
+        (status = 200, description = "Namespace exists"),
+        (status = 404, description = "Namespace does not exist")
+    )
+))]
 pub(crate) async fn head_namespace(
     Extension(datafusion): Extension<Arc<DataFusion>>,
     Path(namespace): Path<NamespacePath>,
@@ -80,6 +173,19 @@ pub(crate) async fn head_namespace(
     }
 }
 
+/// Check if a namespace exists.
+///
+/// This endpoint returns a 200 OK response if the namespace exists, otherwise it returns a 404 Not Found response.
+#[cfg_attr(feature = "openapi", utoipa::path(
+    get,
+    path = "/v1/iceberg/namespaces/{namespace}",
+    operation_id = "get_namespace",
+    tag = "Iceberg",
+    responses(
+        (status = 200, description = "Namespace exists"),
+        (status = 404, description = "Namespace does not exist")
+    )
+))]
 pub(crate) async fn get_namespace(
     Extension(datafusion): Extension<Arc<DataFusion>>,
     Path(namespace): Path<NamespacePath>,

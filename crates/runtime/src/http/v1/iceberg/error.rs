@@ -23,6 +23,7 @@ use serde::{Serialize, Serializer};
 
 #[allow(dead_code)]
 #[derive(Debug)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 enum IcebergErrorType {
     NoSuchNamespaceException,
     BadRequestException,
@@ -75,6 +76,7 @@ impl std::fmt::Display for InternalServerErrorCode {
 }
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 struct IcebergError {
     message: String,
     r#type: IcebergErrorType,
@@ -82,6 +84,7 @@ struct IcebergError {
 }
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct IcebergResponseError {
     error: IcebergError,
 }

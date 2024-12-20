@@ -32,6 +32,7 @@ use snafu::ResultExt;
 use super::SampleFrom;
 
 #[derive(Debug, Clone, JsonSchema, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct DistinctColumnsParams {
     #[serde(rename = "dataset")]
     /// The SQL dataset to sample data from.

@@ -75,6 +75,36 @@ pub static EVAL_RUNS_TABLE_REFERENCE: LazyLock<TableReference> =
 
 pub static EVAL_RUNS_TABLE_TIME_COLUMN: &str = "created_at";
 pub static EVAL_RUNS_TABLE_PRIMARY_KEY: &str = "id";
+
+/// Represents the response for an evaluation run
+#[derive(Debug)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct EvalRunResponse {
+    /// Unique identifier for the evaluation run
+    pub primary_key: String,
+
+    /// Timestamp indicating when the evaluation was created or run
+    pub time_column: String,
+
+    /// The name of the dataset used for the evaluation
+    pub dataset: String,
+
+    /// The model used for the evaluation
+    pub model: String,
+
+    /// The status of the evaluation (e.g., "completed", "failed", etc.)
+    pub status: String,
+
+    /// The error message if the evaluation failed, otherwise `None`
+    pub error_message: Option<String>,
+
+    /// List of scorers used in the evaluation
+    pub scorers: Vec<String>,
+
+    /// A map of metric names to their corresponding values
+    pub metrics: HashMap<String, f64>,
+}
+
 pub static EVAL_RUNS_TABLE_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     Arc::new(Schema::new(vec![
         Field::new(EVAL_RUNS_TABLE_PRIMARY_KEY, DataType::Utf8, false),
