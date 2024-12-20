@@ -81,11 +81,8 @@ pub(crate) async fn list(Extension(rt): Extension<Arc<Runtime>>) -> Response {
     ),
     request_body(
         description = "Tool specific input parameters. See /v1/tools for parameter schema.",
-        required = true,
-        content = (
-            "application/json" = (
-                schema = serde_json::Value,
-                example = json!({
+        content(
+            (serde_json::Value = "application/json", example = json!({
                     "query": "SELECT avg(total_amount), avg(tip_amount), count(1), passenger_count FROM my_table GROUP BY passenger_count ORDER BY passenger_count ASC LIMIT 3"
                 })
             )

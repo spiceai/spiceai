@@ -146,7 +146,6 @@ fn return_sql_only(accept: Option<&TypedHeader<Accept>>) -> bool {
     ),
     request_body(
         description = "Request body to generate an NSQL query",
-        required = true,
         content((
             Request = "application/json",
             example = json!({

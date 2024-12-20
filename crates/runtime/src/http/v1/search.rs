@@ -45,7 +45,6 @@ struct SearchResponse {
     tag = "SQL",
     request_body(
         description = "Search request parameters",
-        required = true,
         content((
             SearchRequestJson = "application/json",
                 example = json!({

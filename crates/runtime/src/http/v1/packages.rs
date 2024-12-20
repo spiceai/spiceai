@@ -44,7 +44,6 @@ pub struct GeneratePackageRequest {
     tag = "General",
     request_body(
         description = "Parameters required to generate a package",
-        required = true,
         content((
             GeneratePackageRequest = "application/json",
             example = json!({

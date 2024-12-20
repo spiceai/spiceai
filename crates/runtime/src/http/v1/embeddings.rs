@@ -37,7 +37,6 @@ use tokio::sync::RwLock;
     tag = "AI",
     request_body(
         description = "Embedding creation request parameters",
-        required = true,
         content((
             CreateEmbeddingRequest = "application/json",
             example = json!({
