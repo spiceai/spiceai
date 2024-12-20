@@ -16,16 +16,16 @@ limitations under the License.
 
 use std::sync::Arc;
 
-use crate::{datafusion::is_spice_internal_schema, DataFusion};
+use super::namespace::{Namespace, NamespacePath};
+use crate::datafusion::is_spice_internal_schema;
+use crate::DataFusion;
 use axum::{
-    extract::{Path, Query},
+    extract::Path,
     http::status,
     response::{IntoResponse, Response},
-    Extension, Json,
+    Extension,
 };
-use error::IcebergResponseError;
-use namespace::{Namespace, NamespacePath};
-use serde::{self, Deserialize, Serialize};
+use datafusion::sql::TableReference;
 
 /// Check if a table exists.
 ///
@@ -42,14 +42,15 @@ use serde::{self, Deserialize, Serialize};
 ))]
 pub(crate) async fn head(
     Extension(datafusion): Extension<Arc<DataFusion>>,
-    Path(namespace): Path<NamespacePath>,
-    Path(table): Path<String>,
+    Path((namespace, table)): Path<(NamespacePath, String)>,
 ) -> Response {
     let namespace = Namespace::from(namespace);
-    match get_child_namespaces_impl(&datafusion, &namespace) {
-        Ok(_) => status::StatusCode::OK.into_response(),
-        Err(e) => e.into_response(),
-    }
+    let Some(table_reference) = table_reference(namespace, table) else {
+        return status::StatusCode::NOT_FOUND.into_response();
+    };
+
+    let table = datafusion.get_table(&table_reference).await;
+    status::StatusCode::OK.into_response()
 }
 
 /// Get a table.
@@ -67,18 +68,26 @@ pub(crate) async fn head(
 ))]
 pub(crate) async fn get(
     Extension(datafusion): Extension<Arc<DataFusion>>,
-    Path(namespace): Path<NamespacePath>,
-    Path(table): Path<String>,
+    Path((namespace, table)): Path<(NamespacePath, String)>,
 ) -> Response {
-    let namespace = Namespace::from(namespace);
-    match get_child_namespaces_impl(&datafusion, &namespace) {
-        Ok(_) => (
-            status::StatusCode::OK,
-            Json(NamespacesResponse {
-                namespaces: vec![namespace],
-            }),
-        )
-            .into_response(),
-        Err(e) => e.into_response(),
+    (
+        status::StatusCode::OK,
+        format!("Namespace: {namespace:?}, Table: {table}"),
+    )
+        .into_response()
+}
+
+fn table_reference(namespace: Namespace, table: String) -> Option<TableReference> {
+    if namespace.parts.len() != 2 {
+        return None;
     }
+
+    let catalog = namespace.parts[0];
+    let schema = namespace.parts[1];
+
+    if is_spice_internal_schema(&catalog, &schema) {
+        return None;
+    }
+
+    Some(TableReference::new(catalog, schema, table))
 }

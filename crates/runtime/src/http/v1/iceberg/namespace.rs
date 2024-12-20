@@ -67,7 +67,7 @@ impl Serialize for Namespace {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 pub struct NamespacePath(String);
 
 impl From<NamespacePath> for Namespace {
