@@ -146,16 +146,16 @@ x509-certificate = "0.23.1"
 
 
 [patch.crates-io]
-datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "2b93a308f65df1ae0cd8f3f8194b9b60201a500f" }
-datafusion-common = { git = "https://github.com/spiceai/datafusion.git", rev = "2b93a308f65df1ae0cd8f3f8194b9b60201a500f" }
-datafusion-execution = { git = "https://github.com/spiceai/datafusion.git", rev = "2b93a308f65df1ae0cd8f3f8194b9b60201a500f" }
-datafusion-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "2b93a308f65df1ae0cd8f3f8194b9b60201a500f" }
+datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "37f0f144650db9e07a09c02fdbb69179438316be" }
+datafusion-common = { git = "https://github.com/spiceai/datafusion.git", rev = "37f0f144650db9e07a09c02fdbb69179438316be" }
+datafusion-execution = { git = "https://github.com/spiceai/datafusion.git", rev = "37f0f144650db9e07a09c02fdbb69179438316be" }
+datafusion-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "37f0f144650db9e07a09c02fdbb69179438316be" }
 
 
 object_store = { git = "https://github.com/spiceai/arrow-rs.git", rev = "cee50b7d2ccf749eac89d0fe26fbd8a06c0bb3c4" }
 
 datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "5af0df83c2cd1d3f82f293b066b401a4dfd4064b" }
-datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "b64bbf0393f8a49ab7cba97e2f3cbb1b06a3e695" }
+datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "1f2631473b2b4ed779d797a94d4ac2bca0bd1efd" }
 
 duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "1034c325aee35eb704e741f56ed942ae22ff4e19" }
 
