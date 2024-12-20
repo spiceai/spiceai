@@ -95,7 +95,7 @@ mod tests {
         sql::{unparser::Unparser, TableReference},
     };
 
-    use crate::datafusion::dialects::new_duckdb_dialect;
+    use crate::datafusion::dialect::new_duckdb_dialect;
 
     use super::*;
 

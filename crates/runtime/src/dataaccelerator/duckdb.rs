@@ -33,7 +33,7 @@ use crate::{
         acceleration::{Engine, Mode},
         Dataset,
     },
-    datafusion::dialects::new_duckdb_dialect,
+    datafusion::dialect::new_duckdb_dialect,
     make_spice_data_directory,
     parameters::ParameterSpec,
     spice_data_base_path, Runtime,
