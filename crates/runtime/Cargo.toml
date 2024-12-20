@@ -128,7 +128,7 @@ tract-core = "0.21.0"
 url = "2.5.4"
 util = { path = "../util" }
 utoipa = { version = "5.2.0", features = ["axum_extras"] }
-utoipa-swagger-ui = { version = "8.0.3", features = ["axum"] }
+utoipa-swagger-ui = { version = "8.0.3", features = ["axum"], optional = true }
 
 uuid = { workspace = true, features = ["v7"] }
 x509-certificate.workspace = true
@@ -170,7 +170,7 @@ databricks = ["data_components/databricks"]
 debezium = ["data_components/debezium"]
 default = ["keyring-secret-store", "aws-secrets-manager", "sharepoint"]
 delta_lake = ["data_components/delta_lake"]
-dev = []
+dev = ["utoipa-swagger-ui"]
 dremio = []
 duckdb = ["dep:duckdb", "db_connection_pool/duckdb", "data_components/duckdb"]
 flightsql = ["data_components/flightsql"]
