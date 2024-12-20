@@ -261,16 +261,36 @@ fn get_child_namespaces_impl(
 }
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 struct TableIdentifier {
     namespace: Namespace,
     name: String,
 }
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 struct ListTablesResponse {
     identifiers: Vec<TableIdentifier>,
 }
 
+#[cfg_attr(feature = "openapi", utoipa::path(
+    get,
+    path = "/v1/iceberg/namespaces/{namespace}/tables",
+    operation_id = "list_tables",
+    tag = "Iceberg",
+    responses(
+        (status = 200, description = "Tables retrieved successfully", content((
+            ListTablesResponse = "application/json",
+            example = json!({
+                "identifiers": [
+                    { "namespace": { "parts": ["catalog_a"] }, "name": "table_1" },
+                    { "namespace": { "parts": ["catalog_b", "schema_1"] }, "name": "table_2" }
+                ]
+            })
+        ))),
+        (status = 404, description = "Namespace does not exist")
+    )
+))]
 pub(crate) async fn list_tables(
     Extension(datafusion): Extension<Arc<DataFusion>>,
     Path(namespace): Path<NamespacePath>,
