@@ -30,9 +30,9 @@ use serde::{self, Deserialize, Serialize};
 mod error;
 mod namespace;
 
-/// Get API configuration.
+/// Get Iceberg Catalog API configuration.
 ///
-/// This endpoint returns the API configuration, including details about overrides, defaults, and available endpoints.
+/// This endpoint returns the Iceberg CatalogAPI configuration, including details about overrides, defaults, and available endpoints.
 #[cfg_attr(feature = "openapi", utoipa::path(
     get,
     path = "/v1/iceberg/config",
@@ -149,6 +149,19 @@ pub(crate) async fn get_namespaces(
     }
 }
 
+/// Check if a namespace exists.
+///
+/// This endpoint returns a 200 OK response if the namespace exists, otherwise it returns a 404 Not Found response.
+#[cfg_attr(feature = "openapi", utoipa::path(
+    head,
+    path = "/v1/iceberg/namespaces/{namespace}",
+    operation_id = "head_namespace",
+    tag = "Iceberg",
+    responses(
+        (status = 200, description = "Namespace exists"),
+        (status = 404, description = "Namespace does not exist")
+    )
+))]
 pub(crate) async fn head_namespace(
     Extension(datafusion): Extension<Arc<DataFusion>>,
     Path(namespace): Path<NamespacePath>,
@@ -160,6 +173,19 @@ pub(crate) async fn head_namespace(
     }
 }
 
+/// Check if a namespace exists.
+///
+/// This endpoint returns a 200 OK response if the namespace exists, otherwise it returns a 404 Not Found response.
+#[cfg_attr(feature = "openapi", utoipa::path(
+    get,
+    path = "/v1/iceberg/namespaces/{namespace}",
+    operation_id = "get_namespace",
+    tag = "Iceberg",
+    responses(
+        (status = 200, description = "Namespace exists"),
+        (status = 404, description = "Namespace does not exist")
+    )
+))]
 pub(crate) async fn get_namespace(
     Extension(datafusion): Extension<Arc<DataFusion>>,
     Path(namespace): Path<NamespacePath>,
