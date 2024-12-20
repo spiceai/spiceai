@@ -68,6 +68,7 @@ impl Serialize for Namespace {
 }
 
 #[derive(Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct NamespacePath(String);
 
 impl From<NamespacePath> for Namespace {
