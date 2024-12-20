@@ -35,7 +35,9 @@ use crate::{
     },
     make_spice_data_directory,
     parameters::ParameterSpec,
-    spice_data_base_path, Runtime,
+    spice_data_base_path,
+    spice_dialects::spice_duckdb::SpiceDuckDBDialect,
+    Runtime,
 };
 
 use super::{DataAccelerator, Error as DataAcceleratorError};
@@ -84,7 +86,8 @@ impl DuckDBAccelerator {
     pub fn new() -> Self {
         Self {
             // DuckDB accelerator uses params.duckdb_file for file connection
-            duckdb_factory: DuckDBTableProviderFactory::new(AccessMode::ReadWrite),
+            duckdb_factory: DuckDBTableProviderFactory::new(AccessMode::ReadWrite)
+                .with_dialect(SpiceDuckDBDialect::new_arc()),
         }
     }
 

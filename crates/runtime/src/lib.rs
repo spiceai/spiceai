@@ -74,6 +74,7 @@ mod parameters;
 pub mod podswatcher;
 pub mod request;
 pub mod secrets;
+pub mod spice_dialects;
 pub mod spice_metrics;
 pub mod status;
 pub mod task_history;
