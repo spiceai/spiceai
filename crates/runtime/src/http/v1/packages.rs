@@ -14,8 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::HashMap, sync::Arc};
-
 use crate::objectstore::github::GitHubRawObjectStore;
 use axum::{
     http::{header::CONTENT_TYPE, StatusCode},
@@ -24,6 +22,7 @@ use axum::{
 };
 use object_store::{path::Path, ObjectStore};
 use serde::{Deserialize, Serialize};
+use std::{collections::HashMap, sync::Arc};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct GeneratePackageRequest {

@@ -48,13 +48,13 @@ use super::{
     Format,
 };
 
-#[derive(Debug, Deserialize, utoipa::ToSchema)]
+#[derive(Debug, Deserialize, utoipa::ToSchema, utoipa::IntoParams)]
 pub struct DatasetFilter {
     /// Filters datasets by source (e.g., `postgres:aidemo_messages`).
     source: Option<String>,
 }
 
-#[derive(Debug, Deserialize, utoipa::ToSchema)]
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
 pub struct DatasetQueryParams {
     /// If true, includes the status of each dataset in the response. Default is false.
     #[serde(default)]
@@ -106,13 +106,9 @@ pub(crate) struct Property {
     path = "/v1/datasets",
     operation_id = "get_datasets",
     tag = "Datasets",
-    params(
-        ("source" = String, Query, description = "Filters datasets by source (e.g., `postgres:aidemo_messages`)."),
-        ("status" = bool, Query, description = "If true, includes the status of each dataset in the response. Default is false."),
-        ("format" = String, Query, description = "The format of the response. Possible values are 'json' (default) or 'csv'.")
-    ),
+    params(DatasetQueryParams, DatasetFilter),
     responses(
-        (status = 200, description = "List of datasets in JSON format", content((
+        (status = 200, description = "List of datasets", content((
             DatasetResponseItem = "application/json",
             example = json!([
                 {
@@ -134,8 +130,7 @@ pub(crate) struct Property {
                     "acceleration_enabled": false
                 }
             ])
-        ))),
-        (status = 200, description = "List of datasets in CSV format", content((
+        ), (
             String = "text/csv",
             example = r#"
 from,name,replication_enabled,acceleration_enabled

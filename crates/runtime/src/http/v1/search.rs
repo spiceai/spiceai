@@ -85,13 +85,13 @@ struct SearchResponse {
             )
         )),
         (status = 400, description = "Invalid request parameters", content((
-            String = "application/json", example = json!({
+            serde_json::Value = "application/json", example = json!({
                     "error": "No data sources provided"
                 })
             ))
         ),
         (status = 500, description = "Internal server error", content((
-            String="application/json", example = json!({
+            serde_json::Value = "application/json", example = json!({
                     "error": "Unexpected internal server error occurred"
                 })
             ))

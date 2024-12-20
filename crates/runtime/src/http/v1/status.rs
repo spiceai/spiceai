@@ -29,7 +29,7 @@ use axum::{
 
 use crate::{config, status::ComponentStatus};
 
-#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
+#[derive(Debug, Serialize, Deserialize, utoipa::IntoParams)]
 #[serde(rename_all = "lowercase")]
 pub struct QueryParams {
     /// The format of the response, either "json" or "csv". Defaults to "json".
@@ -66,9 +66,7 @@ fn default_format() -> Format {
     path = "/v1/status",
     operation_id = "get_status",
     tag = "General",
-    params(
-        ("format" = String, Query, description = "The format of the response.")
-    ),
+    params(QueryParams),
     responses(
         (status = 200, description = "List of connection statuses", content((
             Vec<ConnectionDetails> = "application/json",
@@ -94,8 +92,8 @@ fn default_format() -> Format {
                     "status": "Error"
                 }
             ])
-        ))),
-        (status = 200, description = "The status of connections in CSV format", content((
+        ),
+        (
             String = "text/csv",
             example = "name,endpoint,status\nhttp,http://127.0.0.1:8080,Ready\nflight,http://127.0.0.1:9000,Initializing\nmetrics,N/A,Disabled\nopentelemetry,http://127.0.0.1:4317,Error"
         ))),

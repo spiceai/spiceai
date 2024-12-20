@@ -27,6 +27,7 @@ use headers_accept::Accept;
 use crate::datafusion::DataFusion;
 
 use super::{sql_to_http_response, ArrowFormat};
+
 /// Execute a SQL query and return the results in either JSON or Arrow format.
 ///
 /// This endpoint allows users to execute SQL queries directly from an HTTP request. The SQL query is sent as plain text in the request body.
@@ -35,6 +36,9 @@ use super::{sql_to_http_response, ArrowFormat};
     path = "/v1/sql",
     operation_id = "post_sql",
     tag = "SQL",
+    params(
+        ("Accept" = String, Header, description = "The format of the response, one of 'application/json' (default), 'text/csv' or 'text/plain'."),
+    ),
     request_body(
         description = "SQL query to execute",
         content((

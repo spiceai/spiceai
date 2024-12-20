@@ -30,7 +30,7 @@ use crate::{status::ComponentStatus, Runtime};
 
 use super::Format;
 
-#[derive(Debug, Deserialize, utoipa::ToSchema)]
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
 pub struct ModelsQueryParams {
     /// The format of the response (e.g., `json` or `csv`).
     #[serde(default)]
@@ -63,10 +63,7 @@ pub(crate) struct ModelResponse {
     path = "/v1/models",
     operation_id = "get_models",
     tag = "AI",
-    params(
-        ("format" = String, Query, description = "The format of the response. Possible values are 'json' (default) or 'csv'."),
-        ("status" = bool, Query, description = "If true, includes the status of each model in the response. Default is false.")
-    ),
+    params(ModelsQueryParams),
     responses(
         (status = 200, description = "List of models in JSON format", content((
             ModelResponse = "application/json",
@@ -84,8 +81,7 @@ pub(crate) struct ModelResponse {
                     "status": "initializing"
                 }
             ])
-        ))),
-        (status = 200, description = "List of models in CSV format", content((
+        ), (
             String = "text/csv",
             example = r#"
 name,from,datasets,status

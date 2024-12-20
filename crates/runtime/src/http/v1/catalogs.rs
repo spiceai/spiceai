@@ -35,8 +35,9 @@ use tract_core::tract_data::itertools::Itertools;
 
 use super::{convert_entry_to_csv, Format};
 
-#[derive(Debug, Deserialize, utoipa::ToSchema)]
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
 pub(crate) struct CatalogFilter {
+    /// Filters catalogs by source (e.g., 'spiceai').
     from: Option<String>,
 }
 
@@ -57,9 +58,7 @@ const ACCEPT_LIST: &[MediaType; 2] = &[APPLICATION_JSON, TEXT_CSV];
     path = "/v1/catalogs",
     operation_id = "get_catalogs",
     tag = "Datasets",
-    params(
-        ("from" = String, Query, description = "Filters catalogs by source (e.g., 'spiceai').")
-    ),
+    params(CatalogFilter),
     responses(
         (status = 200, description = "List of catalogs in JSON format", content((
             CatalogResponseItem = "application/json",

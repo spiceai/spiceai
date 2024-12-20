@@ -27,7 +27,7 @@ use serde_json::json;
 
 use crate::{tools::Tooling, Runtime};
 
-/// The structure of the JSON elements returned by the `/v1/tools` endpoint.
+/// Summary of a tool available to run, and the schema of its input parameters.
 #[derive(Serialize, Debug, Clone, PartialEq, Eq, Hash, Default, Deserialize, utoipa::ToSchema)]
 struct ListToolElement {
     name: String,
@@ -41,10 +41,13 @@ struct ListToolElement {
     path = "/v1/tools",
     tag = "Tools",
     responses(
-        (status = 200, description = "All tools available in the Spice runtime", body = [ListToolElement],
-            examples((
-                "Basic" = (value = json!([{"name": "get_readiness", "description": "Retrieves the readiness status of all runtime components including registered datasets, models, and embeddings.", "parameters": null}, {"name": "list_datasets", "description": "List all SQL tables available.", "parameters": null}]))
-            ))
+        (
+            status = 200,  body = [ListToolElement],
+            description = "All tools available in the Spice runtime",
+            example = json!([
+                {"name": "get_readiness", "description": "Retrieves the readiness status of all runtime components including registered datasets, models, and embeddings.", "parameters": null},
+                {"name": "list_datasets", "description": "List all SQL tables available.", "parameters": null}
+            ])
         )
     )
 )]

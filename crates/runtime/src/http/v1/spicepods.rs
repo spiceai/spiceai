@@ -29,12 +29,8 @@ use tokio::sync::RwLock;
 
 use super::{convert_entry_to_csv, Format};
 
-#[derive(Default, Debug, Deserialize, utoipa::ToSchema)]
+#[derive(Default, Debug, Deserialize, utoipa::IntoParams)]
 pub struct SpicepodQueryParams {
-    /// If true, only spicepods with active status are returned. Default is false.
-    #[serde(default)]
-    pub status: bool,
-
     /// The format of the response. Possible values are 'json' (default) or 'csv'.
     #[serde(default)]
     pub format: Format,
@@ -69,10 +65,7 @@ pub struct SpicepodCsvRow {
     path = "/v1/spicepods",
     operation_id = "get_spicepods",
     tag = "General",
-    params(
-        ("status" = bool, Query, description = "If true, only spicepods with active status are returned."),
-        ("format" = String, Query, description = "The format of the response. Possible values are 'json' (default) or 'csv'.")
-    ),
+    params(SpicepodQueryParams),
     responses(
         (status = 200, description = "List of spicepods", content((
             // Don't use Vec<Spicepod> here, to avoid propagating the utoipa::ToSchema trait

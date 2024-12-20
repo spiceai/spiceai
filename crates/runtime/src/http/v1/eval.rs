@@ -48,6 +48,9 @@ pub(crate) struct RunEval {
     operation_id = "post_eval",
     tag = "Evaluations",
     params(
+        ("Accept" = String, Header, description = "The format of the response, one of 'application/json' (default), 'text/csv' or 'text/plain'."),
+    ),
+    params(
         ("name" = String, Path, description = "Name of the evaluation to run")
     ),
     request_body(
@@ -154,7 +157,12 @@ struct ListEvalElement {
     tag = "Evaluations",
     responses(
         (status = 200, description = "All evals available in the Spice runtime", body = [ListEvalElement],
-            example = json!([])
+            example = json!([{
+                "name": "knows_math",
+                "description": "Questions from first year, undergraduate math exams",
+                "dataset": "math_exams",
+                "scorers": ["match", "professor_logical_consistency"]
+            }])
         )
     )
 )]
