@@ -30,48 +30,107 @@ use std::{collections::HashMap, sync::Arc};
 use tokio::sync::RwLock;
 use tract_core::tract_data::itertools::Itertools;
 
-#[derive(Deserialize)]
+#[derive(Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct BatchPredictRequest {
+    /// The list of prediction requests, each specifying the model to use for the prediction
     #[serde(default)]
     pub predictions: Vec<PredictRequest>,
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct PredictRequest {
     pub model_name: String,
 }
 
 #[derive(Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct BatchPredictResponse {
     pub predictions: Vec<PredictResponse>,
     pub duration_ms: u128,
 }
 
 #[derive(Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct PredictResponse {
+    /// The status of the prediction
     pub status: PredictStatus,
 
+    /// The error message if the request failed
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
 
+    /// The name of the model used for the prediction
     pub model_name: String,
 
+    /// The version of the model used
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_version: Option<String>,
 
+    /// The prediction result, typically an array of floats
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prediction: Option<Vec<f32>>,
 
+    /// The time taken to complete the prediction (in milliseconds)
     pub duration_ms: u128,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub enum PredictStatus {
+    /// Prediction was successful
     Success,
+
+    /// The request was invalid
     BadRequest,
+
+    /// An internal error occurred while making the prediction
     InternalError,
 }
 
+/// Make a ML prediction using a specific model.
+///
+/// This endpoint allows you to make a prediction using a specific machine learning model.
+#[cfg_attr(feature = "openapi", utoipa::path(
+    get,
+    path = "/v1/models/{name}/predict",
+    operation_id = "get_model_predict",
+    tag = "AI",
+    params(
+        ("name" = String, Path, description = "The name of the model to make a prediction with.")
+    ),
+    responses(
+        (status = 200, description = "Prediction made successfully", content((
+            PredictResponse = "application/json",
+            example = json!({
+                "status": "Success",
+                "model_name": "my_model_name",
+                "model_version": "1.0",
+                "prediction": [0.45, 0.50, 0.55],
+                "duration_ms": 123
+            })
+        ))),
+        (status = 400, description = "Invalid request to the model", content((
+            PredictResponse = "application/json",
+            example = json!({
+                "status": "BadRequest",
+                "error_message": "You gave me a bad request :(",
+                "model_name": "my_model_name",
+                "duration_ms": 12
+            })
+        ))),
+        (status = 500, description = "Internal server error occurred during prediction", content((
+            PredictResponse = "application/json",
+            example = json!({
+                "status": "InternalError",
+                "error_message": "Oops, the server couldn't predict",
+                "model_name": "my_model_name",
+                "duration_ms": 12
+            })
+        )))
+    )
+))]
 pub(crate) async fn get(
     Extension(app): Extension<Arc<RwLock<Option<Arc<App>>>>>,
     Extension(df): Extension<Arc<DataFusion>>,
@@ -92,7 +151,55 @@ pub(crate) async fn get(
             .into_response(),
     }
 }
-
+/// Make batch ML predictions using multiple models.
+///
+/// This endpoint allows for processing muliple machine learning models in parallel. This is useful for ensembling or A/B testing different models.
+#[cfg_attr(feature = "openapi", utoipa::path(
+    post,
+    path = "/v1/predict",
+    operation_id = "post_batch_predict",
+    tag = "AI",
+    request_body(
+        description = "Batch prediction request containing a list of prediction requests for specific models",
+        required = true,
+        content((
+            BatchPredictRequest = "application/json",
+            example = json!({
+                "predictions": [
+                    { "model_name": "drive_stats_a" },
+                    { "model_name": "drive_stats_b" }
+                ]
+            })
+        ))
+    ),
+    responses(
+        (status = 200, description = "Batch predictions completed successfully", content((
+            BatchPredictResponse = "application/json",
+            example = json!({
+                "duration_ms": 81,
+                "predictions": [
+                    {
+                        "status": "Success",
+                        "model_name": "drive_stats_a",
+                        "model_version": "1.0",
+                        "prediction": [0.45, 0.5, 0.55],
+                        "duration_ms": 42
+                    },
+                    {
+                        "status": "Success",
+                        "model_name": "drive_stats_b",
+                        "model_version": "1.0",
+                        "prediction": [0.43, 0.51, 0.53],
+                        "duration_ms": 42
+                    }
+                ]
+            })
+        ))),
+        (status = 500, description = "Internal server error occurred during batch prediction", content((
+            String, example = "An unexpected error occurred while processing batch predictions"
+        )))
+    )
+))]
 pub(crate) async fn post(
     Extension(app): Extension<Arc<RwLock<Option<Arc<App>>>>>,
     Extension(df): Extension<Arc<DataFusion>>,

@@ -46,7 +46,7 @@ tpcds-init:
 
 	@echo "Initialized successfully."
 
-tpcds-gen: tpch-init
+tpcds-gen:
 	@(cd tpcds-kit/tools && mkdir -p ./tmp/data)
 
 	@# Check if DBGEN_SCALE is set, else default to 1
@@ -237,7 +237,37 @@ file-tpch-load:
 	@echo "datasets:" >> ./file-tpch-spicepod/spicepod.yaml
 	@for table in region nation customer supplier part partsupp orders lineitem; do \
 		echo "  - name: $$table" >> ./file-tpch-spicepod/spicepod.yaml; \
-		echo "    path: file:./$$table.parquet" >> ./file-tpch-spicepod/spicepod.yaml; \
+		echo "    from: file:./$$table.parquet" >> ./file-tpch-spicepod/spicepod.yaml; \
+	done
+
+file-tpcds-init:
+	@echo "Generating TPC-DS data at scale factor $(SCALE_FACTOR) and exporting to Parquet..."
+	@echo "Running DuckDB to generate TPC-DS data..."
+	duckdb tpcds.db -c "LOAD tpcds; CALL dsdgen(sf = 1);"
+	@mkdir -p ./tmp
+    # Export each table as a Parquet file
+	@for table in call_center catalog_page catalog_returns catalog_sales customer \
+                  customer_address customer_demographics date_dim household_demographics \
+                  income_band inventory item promotion reason ship_mode store store_returns \
+                  store_sales time_dim warehouse web_page web_returns web_sales web_site; do \
+		echo "Exporting $$table to $$table.parquet"; \
+		duckdb tpcds.db "COPY $$table TO './tmp/$$table.parquet' (FORMAT 'parquet');"; \
+	done
+	@rm -rf tpcds.db
+
+file-tpcds-load:
+	@mkdir -p ./file-tpcds-spicepod
+	@for table in call_center catalog_page catalog_returns catalog_sales customer customer_address customer_demographics date_dim household_demographics income_band inventory item promotion reason ship_mode store store_returns store_sales time_dim warehouse web_page web_returns web_sales web_site; do \
+		echo "Loading $$table..."; \
+		cp ./tmp/$$table.parquet ./file-tpcds-spicepod/$$table.parquet; \
+	done
+	@echo "version: v1beta1" >> ./file-tpcds-spicepod/spicepod.yaml
+	@echo "kind: Spicepod" >> ./file-tpcds-spicepod/spicepod.yaml
+	@echo "name: file" >> ./file-tpcds-spicepod/spicepod.yaml
+	@echo "datasets:" >> ./file-tpcds-spicepod/spicepod.yaml
+	@for table in call_center catalog_page catalog_returns catalog_sales customer customer_address customer_demographics date_dim household_demographics income_band inventory item promotion reason ship_mode store store_returns store_sales time_dim warehouse web_page web_returns web_sales web_site; do \
+		echo "  - name: $$table" >> ./file-tpcds-spicepod/spicepod.yaml; \
+		echo "    from: file:./$$table.parquet" >> ./file-tpcds-spicepod/spicepod.yaml; \
 	done
 
 mssql-init:

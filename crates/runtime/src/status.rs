@@ -26,13 +26,24 @@ use serde::{Deserialize, Serialize};
 
 use crate::metrics;
 
+/// Represents the status of a component (e.g. dataset, model, etc).
 #[derive(Debug, PartialEq, Eq, Copy, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub enum ComponentStatus {
-    Initializing = 1,
-    Ready = 2,
-    Disabled = 3,
-    Error = 4,
-    Refreshing = 5,
+    /// The component is initializing and not yet ready
+    Initializing,
+
+    /// The component is ready to accept connections
+    Ready,
+
+    /// The component is disabled and not running
+    Disabled,
+
+    /// An error occurred in the component
+    Error,
+
+    /// The component is in the process of refreshing its state
+    Refreshing,
 }
 
 impl Display for ComponentStatus {

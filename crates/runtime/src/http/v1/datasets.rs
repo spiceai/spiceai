@@ -49,41 +49,105 @@ use super::{
 };
 
 #[derive(Debug, Deserialize)]
-pub(crate) struct DatasetFilter {
+#[cfg_attr(feature = "openapi", derive(utoipa::IntoParams))]
+pub struct DatasetFilter {
+    /// Filters datasets by source (e.g., `postgres:aidemo_messages`).
     source: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
-pub(crate) struct DatasetQueryParams {
+#[cfg_attr(feature = "openapi", derive(utoipa::IntoParams))]
+pub struct DatasetQueryParams {
+    /// If true, includes the status of each dataset in the response. Default is false.
     #[serde(default)]
     status: bool,
 
+    /// The format of the response. Possible values are 'json' (default) or 'csv'.
     #[serde(default)]
     format: Format,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "lowercase")]
-pub(crate) struct DatasetResponseItem {
+pub struct DatasetResponseItem {
+    /// The source where the dataset is located
     pub from: String,
+
+    /// The name of the dataset
     pub name: String,
+
+    /// Whether replication is enabled for the dataset
     pub replication_enabled: bool,
+
+    /// Whether acceleration is enabled for the dataset
     pub acceleration_enabled: bool,
 
+    /// Optional status of the dataset
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<ComponentStatus>,
 
+    /// Custom properties for the dataset
     #[serde(skip_serializing_if = "HashMap::is_empty", default)]
     pub properties: HashMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub(crate) struct Property {
     pub key: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub value: Option<serde_json::Value>, // support any valid JSON type (String, Int, Object, etc)
 }
 
+/// Get a list of datasets.
+///
+/// This endpoint returns a list of configured datasets. The response can be formatted as **JSON** or **CSV**,
+/// and additional filters can be applied using query parameters.
+
+#[cfg_attr(feature = "openapi", utoipa::path(
+    get,
+    path = "/v1/datasets",
+    operation_id = "get_datasets",
+    tag = "Datasets",
+    params(DatasetQueryParams, DatasetFilter),
+    responses(
+        (status = 200, description = "List of datasets", content((
+            DatasetResponseItem = "application/json",
+            example = json!([
+                {
+                    "from": "postgres:syncs",
+                    "name": "daily_journal_accelerated",
+                    "replication_enabled": false,
+                    "acceleration_enabled": true
+                },
+                {
+                    "from": "databricks:hive_metastore.default.messages",
+                    "name": "messages_accelerated",
+                    "replication_enabled": false,
+                    "acceleration_enabled": true
+                },
+                {
+                    "from": "postgres:aidemo_messages",
+                    "name": "general",
+                    "replication_enabled": false,
+                    "acceleration_enabled": false
+                }
+            ])
+        ), (
+            String = "text/csv",
+            example = "
+from,name,replication_enabled,acceleration_enabled
+postgres:syncs,daily_journal_accelerated,false,true
+databricks:hive_metastore.default.messages,messages_accelerated,false,true
+postgres:aidemo_messages,general,false,false
+"
+        ))),
+        (status = 500, description = "Internal server error occurred while processing datasets", content((
+            String, example = "An unexpected error occurred while processing datasets"
+        )))
+    )
+))]
 pub(crate) async fn get(
     Extension(app): Extension<Arc<RwLock<Option<Arc<App>>>>>,
     Extension(df): Extension<Arc<DataFusion>>,
@@ -145,16 +209,68 @@ pub(crate) async fn get(
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "lowercase")]
 pub(crate) struct MessageResponse {
+    /// The message describing the result of the request
     pub message: String,
 }
 
 #[derive(Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct AccelerationRequest {
+    /// SQL statement used for the refresh. Defaults to the `refresh_sql` specified in the spicepod.
     pub refresh_sql: Option<String>,
 }
 
+/// Trigger an on-demand refresh for an accelerated dataset.
+///
+/// This endpoint triggers an on-demand refresh for an accelerated dataset.
+/// The refresh only applies to `full` and `append` refresh modes (not `changes` mode).
+#[cfg_attr(feature = "openapi", utoipa::path(
+    post,
+    path = "/v1/datasets/{name}/acceleration/refresh",
+    operation_id = "post_dataset_refresh",
+    tag = "Datasets",
+    params(
+        ("name" = String, Path, description = "The name of the dataset to refresh.")
+    ),
+    request_body(
+        description = "On-demand refresh request for a specific dataset.",
+        content((
+            AccelerationRequest = "application/json",
+            example = json!({
+                "refresh_sql": "SELECT * FROM taxi_trips WHERE tip_amount > 10.0"
+            })
+        ))
+    ),
+    responses(
+        (status = 201, description = "Dataset refresh triggered successfully", content((
+            MessageResponse = "application/json",
+            example = json!({
+                "message": "Dataset refresh triggered for taxi_trips."
+            })
+        ))),
+        (status = 404, description = "Dataset not found", content((
+            MessageResponse = "application/json",
+            example = json!({
+                "message": "Dataset taxi_trips not found"
+            })
+        ))),
+        (status = 400, description = "Acceleration not enabled for the dataset", content((
+            MessageResponse = "application/json",
+            example = json!({
+                "message": "Dataset taxi_trips does not have acceleration enabled"
+            })
+        ))),
+        (status = 500, description = "Internal server error occurred while processing refresh", content((
+            MessageResponse = "application/json",
+            example = json!({
+                "message": "Unexpected internal error occurred while processing refresh"
+            })
+        )))
+    )
+))]
 pub(crate) async fn refresh(
     Extension(app): Extension<Arc<RwLock<Option<Arc<App>>>>>,
     Extension(df): Extension<Arc<DataFusion>>,
@@ -227,6 +343,46 @@ pub(crate) async fn refresh(
     }
 }
 
+/// Update the refresh SQL for a dataset's acceleration.
+///
+/// This endpoint allows for updating the `refresh_sql` parameter for a dataset's acceleration at runtime.
+/// The change is **temporary** and will revert to the `spicepod.yml` definition at the next runtime restart.
+///
+
+#[cfg_attr(feature = "openapi", utoipa::path(
+    patch,
+    path = "/v1/datasets/{name}/acceleration",
+    operation_id = "patch_dataset_acceleration",
+    tag = "Datasets",
+    params(
+        ("name" = String, Path, description = "The name of the dataset to update.")
+    ),
+    request_body(
+        description = "The updated SQL statement for the dataset's refresh.",
+        required = true,
+        content((
+            AccelerationRequest = "application/json",
+            example = json!({
+                "refresh_sql": "SELECT * FROM eth_recent_blocks WHERE block_number > 100"
+            })
+        ))
+    ),
+    responses(
+        (status = 200, description = "The refresh SQL was updated successfully."),
+        (status = 404, description = "The specified dataset was not found", content((
+            MessageResponse = "application/json",
+            example = json!({
+                "message": "Dataset eth_recent_blocks not found"
+            })
+        ))),
+        (status = 500, description = "An internal server error occurred while updating the refresh SQL", content((
+            MessageResponse = "application/json",
+            example = json!({
+                "message": "Request failed. An internal server error occurred while updating refresh SQL."
+            })
+        )))
+    )
+))]
 pub(crate) async fn acceleration(
     Extension(app): Extension<Arc<RwLock<Option<Arc<App>>>>>,
     Extension(df): Extension<Arc<DataFusion>>,
@@ -283,11 +439,90 @@ pub(crate) async fn acceleration(
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct SampleQueryParams {
+    /// The type of sampling to apply (e.g., `distinct_columns`, `random_sample`, `top_n_sample`)
     #[serde(rename = "type")]
     pub r#type: Option<SampleTableMethod>,
 }
 
+/// Sample data from a dataset.
+///
+/// This endpoint allows for sampling data from a dataset using different methods.
+/// The type of sampling method can be specified using the `type` query parameter,
+/// and the body will be interpreted accordingly.
+
+#[cfg_attr(feature = "openapi", utoipa::path(
+    post,
+    path = "/v1/datasets/sample",
+    operation_id = "post_sample_dataset",
+    tag = "Datasets",
+    params(
+        ("type" = String, Query, description = "The type of sampling to apply. Possible values: 'distinct_columns', 'random_sample', 'top_n_sample'.")
+    ),
+    request_body(
+        description = "The request body depends on the type of sampling selected.",
+        required = true,
+        content((
+            DistinctColumnsParams = "application/json", example = json!({
+                "dataset": "postgres:aidemo_messages",
+                "cols": ["column_a", "column_b"],
+                "limit": 100,
+            })
+        ),(
+            RandomSampleParams = "application/json",
+            example = json!({
+                "dataset": "postgres:aidemo_messages",
+                "limit": 100,
+            })
+        ),(
+            TopSamplesParams = "application/json",
+            example = json!({
+                "dataset": "postgres:aidemo_messages",
+                "order_by": "column_a",
+                "limit": 100,
+            })
+        ))
+    ),
+    responses(
+        (status = 200, description = "The sampled data from the dataset.", content((
+            Array<Object> = "application/json",
+            example = json!([
+                { "column_a": "value1", "column_b": 123 },
+                { "column_a": "value2", "column_b": 456 }
+            ])
+        ))),
+        (status = 200, description = "The sampled data in CSV format.", content((
+            String = "text/csv",
+            example = "
+column_a,column_b
+value1,123
+value2,456
+"
+        ))),
+        (status = 200, description = "The sampled data in plain text format.", content((
+            String = "text/plain",
+            example = "
+| column_a | column_b |
+|----------|----------|
+| value1   | 123      |
+| value2   | 456      |
+"
+        ))),
+        (status = 400, description = "Invalid request body", content((
+            serde_json::Value = "application/json",
+            example = json!({
+                "error": "Invalid request body"
+            })
+        ))),
+        (status = 500, description = "Internal server error occurred while sampling the dataset", content((
+            serde_json::Value = "application/json",
+            example = json!({
+                "error": "An unexpected error occurred while sampling the dataset"
+            })
+        )))
+    )
+))]
 pub(crate) async fn sample(
     Extension(df): Extension<Arc<DataFusion>>,
     accept: Option<TypedHeader<Accept>>,

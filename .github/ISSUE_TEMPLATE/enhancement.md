@@ -41,7 +41,7 @@ _T: Time-Bound_
 - [ ] Tests
 - [ ] Performance / Benchmarks
 - [ ] Documentation
-- [ ] Samples/Quickstarts/Tutorials
+- [ ] Cookbook Recipes/Tutorials
 - [ ] Release Notes prepared
 
 ## The Algorithm

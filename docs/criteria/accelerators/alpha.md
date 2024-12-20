@@ -40,5 +40,5 @@ The Alpha Release Criteria is not intended to cover edge cases or advanced funct
 
 - [ ] Documentation includes all information and steps for a user to set up the Accelerator.
 - [ ] Documentation includes all known issues/limitations for the Accelerator.
-- [ ] The Accelerator has an easy to follow quickstart.
+- [ ] The Accelerator has an easy to follow cookbook recipe.
 - [ ] The Accelerator is added to the table of Accelerators in [spiceai/docs](https://github.com/spiceai/docs).

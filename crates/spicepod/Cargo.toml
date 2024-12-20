@@ -11,9 +11,9 @@ version.workspace = true
 fundu.workspace = true
 schemars = { version = "0.8.19", optional = true }
 serde = { workspace = true, features = ["derive", "rc"] }
+serde-value = "0.7.0"
 serde_json.workspace = true
 serde_yaml.workspace = true
-serde-value = "0.7.0"
 snafu.workspace = true
 tracing.workspace = true
 

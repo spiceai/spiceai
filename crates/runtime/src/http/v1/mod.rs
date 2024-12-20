@@ -19,6 +19,7 @@ pub mod chat;
 pub mod datasets;
 pub mod embeddings;
 pub mod eval;
+pub mod iceberg;
 pub mod inference;
 pub mod models;
 pub mod nsql;
@@ -50,11 +51,15 @@ use snafu::ResultExt;
 
 use futures::TryStreamExt;
 
-#[derive(Default, Debug, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum Format {
+    /// JSON format
     #[default]
     Json,
+
+    /// CSV format
     Csv,
 }
 

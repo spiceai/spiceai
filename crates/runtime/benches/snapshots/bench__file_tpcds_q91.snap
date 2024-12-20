@@ -1,0 +1,12 @@
+---
+source: crates/runtime/benches/bench.rs
+expression: records_pretty
+snapshot_kind: text
+---
++------------------+------------------+--------------+--------------+
+| call_center      | call_center_name | manager      | returns_loss |
++------------------+------------------+--------------+--------------+
+| AAAAAAAABAAAAAAA | NY Metro         | Bob Belcher  | 3803.30      |
+| AAAAAAAAEAAAAAAA | North Midwest    | Larry Mccray | 3486.41      |
+| AAAAAAAAEAAAAAAA | North Midwest    | Larry Mccray | 490.38       |
++------------------+------------------+--------------+--------------+
