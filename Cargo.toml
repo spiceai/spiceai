@@ -101,6 +101,7 @@ opentelemetry_sdk = { version = "0.27", default-features = false, features = [
     "trace",
 ] }
 parquet = "53"
+paste = "1.0.15"
 pem = "3.0.4"
 percent-encoding = "2.3.1"
 pin-project = "1.0"

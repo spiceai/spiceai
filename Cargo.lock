@@ -9483,6 +9483,7 @@ dependencies = [
  "opentelemetry_sdk",
  "otel-arrow",
  "package",
+ "paste",
  "percent-encoding",
  "pin-project",
  "prometheus",
