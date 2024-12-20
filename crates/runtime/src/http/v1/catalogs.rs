@@ -36,11 +36,14 @@ use tract_core::tract_data::itertools::Itertools;
 use super::{convert_entry_to_csv, Format};
 
 #[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::IntoParams))]
 pub(crate) struct CatalogFilter {
+    /// Filters catalogs by source (e.g., 'spiceai').
     from: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "lowercase")]
 pub(crate) struct CatalogResponseItem {
     pub from: String,
@@ -51,6 +54,38 @@ const APPLICATION_JSON: MediaType = MediaType::from_parts(APPLICATION, JSON, Non
 const TEXT_CSV: MediaType = MediaType::from_parts(TEXT, CSV, None, &[]);
 const ACCEPT_LIST: &[MediaType; 2] = &[APPLICATION_JSON, TEXT_CSV];
 
+/// Get a list of catalogs.
+#[cfg_attr(feature = "openapi", utoipa::path(
+    get,
+    path = "/v1/catalogs",
+    operation_id = "get_catalogs",
+    tag = "Datasets",
+    params(CatalogFilter),
+    responses(
+        (status = 200, description = "List of catalogs in JSON format", content((
+            CatalogResponseItem = "application/json",
+            example = json!([
+                {
+                    "from": "spiceai",
+                    "name": "spiceai"
+                }
+            ])
+        ))),
+        (status = 200, description = "List of catalogs in CSV format", content((
+            String = "text/csv",
+            example = "
+from,name
+spiceai,spiceai
+"
+        ))),
+        (status = 500, description = "Internal server error occurred while processing catalogs", content((
+            serde_json::Value = "application/json",
+            example = json!({
+                "error": "An unexpected error occurred while processing the catalogs"
+            })
+        )))
+    )
+))]
 pub(crate) async fn get(
     Extension(app): Extension<Arc<RwLock<Option<Arc<App>>>>>,
     Query(filter): Query<CatalogFilter>,

@@ -29,33 +29,74 @@ use tokio::sync::RwLock;
 
 use super::{convert_entry_to_csv, Format};
 
-#[derive(Debug, Deserialize)]
-pub(crate) struct SpicepodQueryParams {
-    #[allow(dead_code)]
+#[derive(Default, Debug, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::IntoParams))]
+pub struct SpicepodQueryParams {
+    /// The format of the response. Possible values are 'json' (default) or 'csv'.
     #[serde(default)]
-    status: bool,
-
-    #[serde(default)]
-    format: Format,
+    pub format: Format,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub(crate) struct SpicepodCsvRow {
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct SpicepodCsvRow {
+    /// The name of the spicepod
     pub name: String,
 
+    /// The version of the spicepod
     pub version: String,
 
+    /// The number of datasets in this spicepod
     #[serde(default)]
     pub datasets_count: usize,
 
+    /// The number of models in this spicepod
     #[serde(default)]
     pub models_count: usize,
 
+    /// The number of dependencies in this spicepod
     #[serde(default)]
     pub dependencies_count: usize,
 }
 
+/// Get a list of spicepods and their details.
+///
+/// This endpoint returns a list of all spicepods in the system. In CSV format, it will return a summarised form.
+#[cfg_attr(feature = "openapi", utoipa::path(
+    get,
+    path = "/v1/spicepods",
+    operation_id = "get_spicepods",
+    tag = "General",
+    params(SpicepodQueryParams),
+    responses(
+        (status = 200, description = "List of spicepods", content((
+            // Don't use Vec<Spicepod> here, to avoid propagating the utoipa::ToSchema trait
+            Vec<serde_json::Value> = "application/json",
+            example = json!([
+                {
+                    "name": "spicepod1",
+                    "version": "v1.0.0",
+                    "datasets_count": 3,
+                    "models_count": 2,
+                    "dependencies_count": 5
+                },
+                {
+                    "name": "spicepod2",
+                    "version": "v2.0.0",
+                    "datasets_count": 4,
+                    "models_count": 3,
+                    "dependencies_count": 2
+                }
+            ])
+        ), (
+            String = "text/csv",
+            example = "name,version,datasets_count,models_count,dependencies_count\nspicepod1,v1.0.0,3,2,5\nspicepod2,v2.0.0,4,3,2"
+        ))),
+        (status = 500, description = "Internal server error", content((
+            String, example = "Internal server error"
+        )))
+    )
+))]
 pub(crate) async fn get(
     Extension(app): Extension<Arc<RwLock<Option<Arc<App>>>>>,
     Query(params): Query<SpicepodQueryParams>,

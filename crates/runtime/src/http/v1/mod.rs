@@ -51,11 +51,15 @@ use snafu::ResultExt;
 
 use futures::TryStreamExt;
 
-#[derive(Default, Debug, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum Format {
+    /// JSON format
     #[default]
     Json,
+
+    /// CSV format
     Csv,
 }
 

@@ -17,6 +17,7 @@ limitations under the License.
 use serde::{ser::SerializeSeq, Deserialize, Serialize};
 
 #[derive(Debug, Default)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct Namespace {
     pub parts: Vec<String>,
 }

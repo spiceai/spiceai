@@ -18,6 +18,8 @@ use std::sync::Arc;
 
 use crate::model::EmbeddingModelStore;
 use async_openai::types::CreateEmbeddingRequest;
+#[cfg(feature = "openapi")]
+use async_openai::types::CreateEmbeddingResponse;
 use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
@@ -25,6 +27,63 @@ use axum::{
 };
 use tokio::sync::RwLock;
 
+/// Creates an embedding vector representing the input text.
+///
+/// Get a vector representation of a given input that can be easily consumed by machine learning models and algorithms.
+#[cfg_attr(feature = "openapi", utoipa::path(
+    post,
+    path = "/v1/embeddings",
+    operation_id = "post_embeddings",
+    tag = "AI",
+    request_body(
+        description = "Embedding creation request parameters",
+        required = true,
+        content((
+            CreateEmbeddingRequest = "application/json",
+            example = json!({
+                "input": "The food was delicious and the waiter...",
+                "model": "text-embedding-ada-002",
+                "encoding_format": "float"
+            })
+        ))
+    ),
+    responses(
+        (status = 200, description = "Embedding created successfully", content((
+            CreateEmbeddingResponse = "application/json",
+            example = json!({
+                "object": "list",
+                "data": [
+                    {
+                        "object": "embedding",
+                        "embedding": [
+                            0.002_306_425_5,
+                            -0.009_327_292,
+                            -0.002_884_222_2
+                        ],
+                        "index": 0
+                    }
+                ],
+                "model": "text-embedding-ada-002",
+                "usage": {
+                    "prompt_tokens": 8,
+                    "total_tokens": 8
+                }
+            })
+        ))),
+        (status = 404, description = "Model not found", content((
+            String = "application/json",
+            example = json!({
+                "error": "model not found"
+            })
+        ))),
+        (status = 500, description = "Internal server error", content((
+            String = "application/json",
+            example = json!({
+                "error": "Unexpected internal server error occurred"
+            })
+        )))
+    )
+))]
 pub(crate) async fn post(
     Extension(embeddings): Extension<Arc<RwLock<EmbeddingModelStore>>>,
     Json(req): Json<CreateEmbeddingRequest>,

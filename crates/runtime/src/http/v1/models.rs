@@ -31,23 +31,74 @@ use crate::{status::ComponentStatus, Runtime};
 use super::Format;
 
 #[derive(Debug, Deserialize)]
-pub(crate) struct ModelsQueryParams {
+#[cfg_attr(feature = "openapi", derive(utoipa::IntoParams))]
+pub struct ModelsQueryParams {
+    /// The format of the response (e.g., `json` or `csv`).
     #[serde(default)]
-    format: Format,
+    pub format: Format,
 
+    /// If true, includes the status of each model in the response.
     #[serde(default)]
-    status: bool,
+    pub status: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "lowercase")]
 pub(crate) struct ModelResponse {
+    /// The name of the model
     pub name: String,
+
+    /// The source from which the model was loaded (e.g., `openai`, `spiceai`)
     pub from: String,
+
+    /// The datasets associated with this model, if any
     pub datasets: Option<Vec<String>>,
+
+    /// The status of the model (e.g., `ready`, `initializing`, `error`)
     pub status: Option<ComponentStatus>,
 }
 
+/// Get a list of models
+#[cfg_attr(feature = "openapi", utoipa::path(
+    get,
+    path = "/v1/models",
+    operation_id = "get_models",
+    tag = "AI",
+    params(ModelsQueryParams),
+    responses(
+        (status = 200, description = "List of models in JSON format", content((
+            ModelResponse = "application/json",
+            example = json!([
+                {
+                    "name": "example_model_1",
+                    "from": "openai",
+                    "datasets": ["dataset_a", "dataset_b"],
+                    "status": "ready"
+                },
+                {
+                    "name": "example_model_2",
+                    "from": "spiceai",
+                    "datasets": null,
+                    "status": "initializing"
+                }
+            ])
+        ), (
+            String = "text/csv",
+            example = r#"
+name,from,datasets,status
+example_model_1,openai,"[\"dataset_a\", \"dataset_b\"]",ready
+example_model_2,spiceai,,initializing
+"#
+        ))),
+        (status = 500, description = "Internal server error occurred while processing models", content((
+            serde_json::Value = "application/json",
+            example = json!({
+                "error": "App not initialized"
+            })
+        )))
+    )
+))]
 pub(crate) async fn get(
     Extension(app): Extension<Arc<RwLock<Option<Arc<App>>>>>,
     Extension(rt): Extension<Arc<Runtime>>,

@@ -30,30 +30,81 @@ use axum::{
 use crate::{config, status::ComponentStatus};
 
 #[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::IntoParams))]
 #[serde(rename_all = "lowercase")]
 pub struct QueryParams {
+    /// The format of the response, either "json" or "csv". Defaults to "json".
     #[serde(default = "default_format")]
-    format: Format,
+    pub format: Format,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum Format {
     Json,
     Csv,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct ConnectionDetails {
-    name: &'static str,
-    endpoint: String,
-    status: ComponentStatus,
+    /// The name of the connection (e.g., "http", "flight", "metrics", "opentelemetry")
+    pub name: &'static str,
+
+    /// The endpoint of the connection (e.g., URL or IP address)
+    pub endpoint: String,
+
+    /// The status of the component (e.g., Ready, Initializing, Disabled, Error, etc.)
+    pub status: ComponentStatus,
 }
 
 fn default_format() -> Format {
     Format::Json
 }
 
+/// Return the status of connections in the runtime.
+#[cfg_attr(feature = "openapi", utoipa::path(
+    get,
+    path = "/v1/status",
+    operation_id = "get_status",
+    tag = "General",
+    params(QueryParams),
+    responses(
+        (status = 200, description = "List of connection statuses", content((
+            Vec<ConnectionDetails> = "application/json",
+            example = json!([
+                {
+                    "name": "http",
+                    "endpoint": "http://127.0.0.1:8080",
+                    "status": "Ready"
+                },
+                {
+                    "name": "flight",
+                    "endpoint": "http://127.0.0.1:9000",
+                    "status": "Initializing"
+                },
+                {
+                    "name": "metrics",
+                    "endpoint": "N/A",
+                    "status": "Disabled"
+                },
+                {
+                    "name": "opentelemetry",
+                    "endpoint": "http://127.0.0.1:4317",
+                    "status": "Error"
+                }
+            ])
+        ),
+        (
+            String = "text/csv",
+            example = "name,endpoint,status\nhttp,http://127.0.0.1:8080,Ready\nflight,http://127.0.0.1:9000,Initializing\nmetrics,N/A,Disabled\nopentelemetry,http://127.0.0.1:4317,Error"
+        ))),
+        (status = 500, description = "Error converting to CSV", content((
+            String, example = "Error converting to CSV"
+        )))
+    )
+))]
 pub(crate) async fn get(
     Extension(cfg): Extension<Arc<config::Config>>,
     Extension(with_metrics): Extension<Option<SocketAddr>>,
