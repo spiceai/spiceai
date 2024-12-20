@@ -109,6 +109,10 @@ pub(crate) fn routes(
         .route(
             "/v1/iceberg/namespaces/:namespace/tables",
             get(v1::iceberg::list_tables),
+        )
+        .route(
+            "/v1/iceberg/namespaces/:namespace/tables/:table",
+            get(v1::iceberg::tables::get).head(v1::iceberg::tables::head),
         );
 
     authenticated_router = authenticated_router.merge(iceberg_router);
