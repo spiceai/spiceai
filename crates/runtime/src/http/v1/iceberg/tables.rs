@@ -16,14 +16,18 @@ limitations under the License.
 
 use std::sync::Arc;
 
-use super::namespace::{Namespace, NamespacePath};
+use super::{
+    error::{IcebergResponseError, InternalServerErrorCode},
+    namespace::{Namespace, NamespacePath},
+    schema::Schema,
+};
 use crate::datafusion::is_spice_internal_schema;
 use crate::DataFusion;
 use axum::{
     extract::Path,
     http::status,
     response::{IntoResponse, Response},
-    Extension,
+    Extension, Json,
 };
 use datafusion::sql::TableReference;
 use serde::{Serialize, Serializer};
@@ -57,13 +61,15 @@ pub(crate) async fn head(
     }
 }
 
+#[derive(Debug, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 struct LoadTableResponse {
     metadata: TableMetadata,
 }
 
 #[derive(Debug)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 enum TableFormatVersion {
-    V1,
     V2,
 }
 
@@ -73,18 +79,13 @@ impl Serialize for TableFormatVersion {
         S: Serializer,
     {
         match self {
-            TableFormatVersion::V1 => serializer.serialize_u8(1),
             TableFormatVersion::V2 => serializer.serialize_u8(2),
         }
     }
 }
 
 #[derive(Debug, Serialize)]
-struct Schema {
-    schema_id: usize,
-}
-
-#[derive(Debug, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 struct TableMetadata {
     format_version: TableFormatVersion,
     table_uuid: Uuid,
@@ -100,9 +101,23 @@ struct TableMetadata {
     path = "/v1/iceberg/namespaces/{namespace}/tables/{table}",
     operation_id = "get_table",
     tag = "Iceberg",
+    params(
+        ("namespace" = String, Path, description = "The namespace of the table."),
+        ("table" = String, Path, description = "The name of the table.")
+    ),
     responses(
-        (status = 200, description = "Table exists"),
-        (status = 404, description = "Table does not exist")
+        (status = 200, description = "Table exists", body = LoadTableResponse),
+        (status = 404, description = "Table does not exist"),
+        (status = 500, description = "An internal server error occurred while getting the table", content((
+            IcebergResponseError = "application/json",
+            example = json!({
+                "error": {
+                    "message": "Request failed. An internal server error occurred while getting the table.",
+                    "r#type": "InternalServerError",
+                    "code": 500
+                }
+            })
+        )))
     )
 ))]
 pub(crate) async fn get(
@@ -118,7 +133,26 @@ pub(crate) async fn get(
         return status::StatusCode::NOT_FOUND.into_response();
     };
 
-    status::StatusCode::OK.into_response()
+    let arrow_schema = table.schema();
+    let iceberg_schema = match Schema::try_from(arrow_schema.as_ref()) {
+        Ok(schema) => schema,
+        Err(e) => {
+            tracing::debug!("Error converting arrow schema to iceberg schema: {e}");
+            return IcebergResponseError::internal(InternalServerErrorCode::InvalidSchema)
+                .into_response();
+        }
+    };
+
+    let metadata = TableMetadata {
+        format_version: TableFormatVersion::V2,
+        table_uuid: Uuid::new_v4(),
+        location: format!("spice.ai/{table_reference}"),
+        schemas: vec![iceberg_schema],
+    };
+
+    let response = LoadTableResponse { metadata };
+
+    (status::StatusCode::OK, Json(response)).into_response()
 }
 
 fn table_reference(namespace: &Namespace, table: &str) -> Option<TableReference> {
