@@ -9,7 +9,6 @@ members = [
     "crates/document_parse",
     "crates/flightrepl",
     "crates/flight_client",
-    "crates/iceberg",
     "crates/llms",
     "crates/model_components",
     "crates/ns_lookup",
@@ -81,6 +80,7 @@ graph-rs-sdk = { git = "https://github.com/spiceai/graph-rs-sdk", rev = "f8703df
 graphql-parser = "0.4.0"
 hf-hub = { version = "0.3.0", features = ["tokio"] }
 http = "1.1.0"
+iceberg = "0.4.0"
 insta = { version = "1.41.1", features = ["filters"] }
 itertools = "0.13"
 lazy_static = "1.5.0"
@@ -167,3 +167,5 @@ rusqlite = { git = "https://github.com/spiceai/rusqlite.git", rev = "97054b6af72
 
 # Tracking Issue: https://github.com/allan2/dotenvy/issues/113
 dotenvy = { git = "https://github.com/spiceai/dotenvy.git", rev = "e5cef1871b08003198949dfe2da988633eaad78f" }
+
+iceberg = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "557c79ff2c443c089e09d3ad60d382eb7fdba7bf" }

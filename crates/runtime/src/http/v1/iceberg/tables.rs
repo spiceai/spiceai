@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use super::{
@@ -22,6 +23,7 @@ use super::{
 };
 use crate::datafusion::is_spice_internal_schema;
 use crate::DataFusion;
+use arrow::datatypes::Schema as ArrowSchema;
 use axum::{
     extract::Path,
     http::status,
@@ -29,9 +31,11 @@ use axum::{
     Extension, Json,
 };
 use datafusion::sql::TableReference;
-use iceberg::schema::Schema;
+use iceberg::{arrow::arrow_schema_to_schema, spec::Schema};
 use serde::{Serialize, Serializer};
 use uuid::Uuid;
+
+const PARQUET_FIELD_ID_META_KEY: &str = "PARQUET:field_id";
 
 /// Check if a table exists.
 ///
@@ -134,10 +138,13 @@ pub(crate) async fn get(
     };
 
     let arrow_schema = table.schema();
-    let iceberg_schema = match Schema::try_from(arrow_schema.as_ref()) {
+    let arrow_schema = assign_field_ids(&arrow_schema);
+    let iceberg_schema = match arrow_schema_to_schema(&arrow_schema) {
         Ok(schema) => schema,
         Err(e) => {
-            tracing::debug!("Error converting arrow schema to iceberg schema: {e}");
+            tracing::debug!(
+                "Error converting arrow schema to iceberg schema for {table_reference}: {e}"
+            );
             return IcebergResponseError::internal(InternalServerErrorCode::InvalidSchema)
                 .into_response();
         }
@@ -168,4 +175,18 @@ fn table_reference(namespace: &Namespace, table: &str) -> Option<TableReference>
     }
 
     Some(TableReference::full(catalog, schema, table))
+}
+
+/// Iceberg requires field IDs to be set, and the iceberg-rust crate expects them to be set in the
+/// `PARQUET:field_id` metadata key.
+fn assign_field_ids(schema: &ArrowSchema) -> ArrowSchema {
+    let mut fields = vec![];
+    for (i, field) in schema.fields.iter().enumerate() {
+        let field = Arc::unwrap_or_clone(Arc::clone(field));
+        fields.push(field.with_metadata(HashMap::from([(
+            PARQUET_FIELD_ID_META_KEY.to_string(),
+            format!("{i}"),
+        )])));
+    }
+    ArrowSchema::new(fields)
 }
