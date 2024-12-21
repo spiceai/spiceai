@@ -29,7 +29,6 @@ use serde::{self, Deserialize, Serialize};
 
 mod error;
 mod namespace;
-mod schema;
 pub mod tables;
 
 /// Get Iceberg Catalog API configuration.

@@ -5532,6 +5532,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "iceberg"
+version = "1.0.0-rc.3"
+dependencies = [
+ "arrow",
+ "chrono",
+ "serde",
+ "snafu",
+]
+
+[[package]]
 name = "icu_collections"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9461,6 +9471,7 @@ dependencies = [
  "http-body-util",
  "hyper 1.5.1",
  "hyper-util",
+ "iceberg",
  "indexmap 2.7.0",
  "insta",
  "itertools 0.13.0",

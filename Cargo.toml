@@ -9,6 +9,7 @@ members = [
     "crates/document_parse",
     "crates/flightrepl",
     "crates/flight_client",
+    "crates/iceberg",
     "crates/llms",
     "crates/model_components",
     "crates/ns_lookup",

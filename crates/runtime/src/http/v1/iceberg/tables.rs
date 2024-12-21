@@ -19,7 +19,6 @@ use std::sync::Arc;
 use super::{
     error::{IcebergResponseError, InternalServerErrorCode},
     namespace::{Namespace, NamespacePath},
-    schema::Schema,
 };
 use crate::datafusion::is_spice_internal_schema;
 use crate::DataFusion;
@@ -30,6 +29,7 @@ use axum::{
     Extension, Json,
 };
 use datafusion::sql::TableReference;
+use iceberg::schema::Schema;
 use serde::{Serialize, Serializer};
 use uuid::Uuid;
 

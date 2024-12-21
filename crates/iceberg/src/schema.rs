@@ -18,7 +18,7 @@ use std::{str::FromStr, sync::Arc};
 
 use arrow::{
     array::timezone::Tz,
-    datatypes::{DataType, Schema as ArrowSchema, TimeUnit},
+    datatypes::{DataType, Field, Schema as ArrowSchema, TimeUnit},
     error::ArrowError,
 };
 use chrono::{Offset, TimeZone, Utc};
@@ -38,6 +38,18 @@ pub enum Error {
 
     #[snafu(display("Invalid time zone {zone}: {source}"))]
     InvalidTimeZone { source: ArrowError, zone: Arc<str> },
+
+    #[snafu(display("Failed to parse fixed size binary length: {source}"))]
+    InvalidFixedSize { source: std::num::ParseIntError },
+
+    #[snafu(display("Failed to parse decimal precision/scale: {source}"))]
+    InvalidDecimalFormat { source: std::num::ParseIntError },
+
+    #[snafu(display("Invalid decimal format, expected 'decimal(precision, scale)'"))]
+    MalformedDecimal,
+
+    #[snafu(display("Unknown primitive type: {type_str}"))]
+    UnknownPrimitiveType { type_str: String },
 }
 
 #[derive(Debug, Clone)]
@@ -69,10 +81,12 @@ pub enum Type {
 }
 
 impl Type {
+    #[must_use]
     pub fn primitive(value: impl Into<String>) -> Self {
         Type::Primitive(PrimitiveType(value.into()))
     }
 
+    #[must_use]
     pub fn complex(complex_type: ComplexType) -> Self {
         Type::Complex(complex_type)
     }
@@ -164,6 +178,112 @@ impl TryFrom<&ArrowSchema> for Schema {
             schema_id: None,
             identifier_field_ids: None,
         })
+    }
+}
+
+impl TryFrom<&Schema> for ArrowSchema {
+    type Error = Error;
+
+    fn try_from(schema: &Schema) -> Result<Self, Self::Error> {
+        let fields = schema
+            .struct_type
+            .fields
+            .iter()
+            .map(|field| {
+                Ok(Field::new(
+                    &field.name,
+                    type_to_arrow_datatype(&field.field_type)?,
+                    !field.required,
+                ))
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
+
+        Ok(ArrowSchema::new(fields))
+    }
+}
+
+fn type_to_arrow_datatype(type_: &Type) -> Result<DataType, Error> {
+    match type_ {
+        Type::Primitive(p) => match p.0.as_str() {
+            "boolean" => Ok(DataType::Boolean),
+            "int" => Ok(DataType::Int32),
+            "long" => Ok(DataType::Int64),
+            "float" => Ok(DataType::Float32),
+            "double" => Ok(DataType::Float64),
+            "date" => Ok(DataType::Date32),
+            "time" => Ok(DataType::Time64(TimeUnit::Microsecond)),
+            "timestamp" => Ok(DataType::Timestamp(TimeUnit::Microsecond, None)),
+            "timestamptz" => Ok(DataType::Timestamp(
+                TimeUnit::Microsecond,
+                Some("UTC".into()),
+            )),
+            "string" => Ok(DataType::Utf8),
+            "binary" => Ok(DataType::Binary),
+            s if s.starts_with("fixed[") => {
+                let size = s
+                    .trim_start_matches("fixed[")
+                    .trim_end_matches(']')
+                    .parse()
+                    .context(InvalidFixedSizeSnafu)?;
+                Ok(DataType::FixedSizeBinary(size))
+            }
+            s if s.starts_with("decimal(") => {
+                let parts: Vec<&str> = s
+                    .trim_start_matches("decimal(")
+                    .trim_end_matches(')')
+                    .split(',')
+                    .collect();
+                if parts.len() != 2 {
+                    return MalformedDecimalSnafu.fail();
+                }
+                let precision = parts[0].trim().parse().context(InvalidDecimalFormatSnafu)?;
+                let scale = parts[1].trim().parse().context(InvalidDecimalFormatSnafu)?;
+                Ok(DataType::Decimal128(precision, scale))
+            }
+            unknown => UnknownPrimitiveTypeSnafu {
+                type_str: unknown.to_string(),
+            }
+            .fail(),
+        },
+        Type::Complex(complex) => match complex {
+            ComplexType::List(list) => Ok(DataType::List(Arc::new(Field::new(
+                "item",
+                type_to_arrow_datatype(&list.element)?,
+                !list.element_required,
+            )))),
+            ComplexType::Map(map) => {
+                let struct_fields = vec![
+                    Field::new("key", type_to_arrow_datatype(&map.key)?, false),
+                    Field::new(
+                        "value",
+                        type_to_arrow_datatype(&map.value)?,
+                        !map.value_required,
+                    ),
+                ];
+                Ok(DataType::Map(
+                    Arc::new(Field::new(
+                        "entries",
+                        DataType::Struct(struct_fields.into()),
+                        false,
+                    )),
+                    false,
+                ))
+            }
+            ComplexType::Struct(struct_type) => {
+                let fields = struct_type
+                    .fields
+                    .iter()
+                    .map(|f| {
+                        Ok(Field::new(
+                            &f.name,
+                            type_to_arrow_datatype(&f.field_type)?,
+                            !f.required,
+                        ))
+                    })
+                    .collect::<Result<Vec<_>, Error>>()?;
+                Ok(DataType::Struct(fields.into()))
+            }
+        },
     }
 }
 
@@ -457,5 +577,130 @@ mod tests {
 
         let result = Schema::try_from(&arrow_schema);
         assert!(matches!(result, Err(Error::InvalidMapStructure)));
+    }
+
+    #[test]
+    fn test_roundtrip_conversion() -> Result<(), Error> {
+        let original_schema = ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("active", DataType::Boolean, false),
+            Field::new(
+                "scores",
+                DataType::List(Arc::new(Field::new("item", DataType::Float64, true))),
+                true,
+            ),
+        ]);
+
+        let iceberg_schema = Schema::try_from(&original_schema)?;
+        let converted_schema = ArrowSchema::try_from(&iceberg_schema)?;
+
+        assert_eq!(
+            original_schema.fields().len(),
+            converted_schema.fields().len()
+        );
+
+        for (orig, conv) in original_schema
+            .fields()
+            .iter()
+            .zip(converted_schema.fields())
+        {
+            assert_eq!(orig.name(), conv.name());
+            assert_eq!(orig.data_type(), conv.data_type());
+            assert_eq!(orig.is_nullable(), conv.is_nullable());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_complex_type_conversion() -> Result<(), Error> {
+        let map_type = DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(
+                    vec![
+                        Field::new("key", DataType::Utf8, false),
+                        Field::new("value", DataType::Int32, true),
+                    ]
+                    .into(),
+                ),
+                false,
+            )),
+            false,
+        );
+
+        let original_schema = ArrowSchema::new(vec![
+            Field::new("map_field", map_type, false),
+            Field::new(
+                "struct_field",
+                DataType::Struct(
+                    vec![
+                        Field::new("inner_int", DataType::Int32, false),
+                        Field::new("inner_str", DataType::Utf8, true),
+                    ]
+                    .into(),
+                ),
+                true,
+            ),
+        ]);
+
+        let iceberg_schema = Schema::try_from(&original_schema)?;
+        let converted_schema = ArrowSchema::try_from(&iceberg_schema)?;
+
+        assert_eq!(
+            original_schema.fields().len(),
+            converted_schema.fields().len()
+        );
+
+        for (orig, conv) in original_schema
+            .fields()
+            .iter()
+            .zip(converted_schema.fields())
+        {
+            assert_eq!(orig.name(), conv.name());
+            assert_eq!(orig.data_type(), conv.data_type());
+            assert_eq!(orig.is_nullable(), conv.is_nullable());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_invalid_primitive_type() {
+        let schema = Schema {
+            struct_type: StructType {
+                fields: vec![StructField {
+                    id: 0,
+                    name: "test".to_string(),
+                    field_type: Type::Primitive(PrimitiveType("invalid".to_string())),
+                    required: true,
+                    doc: None,
+                }],
+            },
+            schema_id: None,
+            identifier_field_ids: None,
+        };
+
+        let result = ArrowSchema::try_from(&schema);
+        assert!(matches!(result, Err(Error::UnknownPrimitiveType { .. })));
+    }
+
+    #[test]
+    fn test_invalid_decimal_format() {
+        let schema = Schema {
+            struct_type: StructType {
+                fields: vec![StructField {
+                    id: 0,
+                    name: "test".to_string(),
+                    field_type: Type::Primitive(PrimitiveType("decimal(10)".to_string())),
+                    required: true,
+                    doc: None,
+                }],
+            },
+            schema_id: None,
+            identifier_field_ids: None,
+        };
+
+        let result = ArrowSchema::try_from(&schema);
+        assert!(matches!(result, Err(Error::MalformedDecimal)));
     }
 }
