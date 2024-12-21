@@ -36,6 +36,7 @@ use crate::{
     Runtime,
 };
 
+pub use routes::ApiDoc;
 mod metrics;
 mod routes;
 mod traceparent;

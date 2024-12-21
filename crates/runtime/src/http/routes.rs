@@ -73,7 +73,7 @@ use super::{metrics, v1};
     v1::tools::list,
     v1::tools::post,
 ))]
-struct ApiDoc;
+pub struct ApiDoc;
 
 pub(crate) fn routes(
     rt: &Arc<Runtime>,

@@ -10537,6 +10537,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "spiceschema"
+version = "1.0.0-rc.3"
+dependencies = [
+ "clap",
+ "runtime",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "utoipa",
+]
+
+[[package]]
 name = "spin"
 version = "0.9.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
