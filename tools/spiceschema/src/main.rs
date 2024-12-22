@@ -29,7 +29,7 @@ enum Command {
             .args(["format", "json", "yaml", "toml"])
     ))]
     Http {
-        /// `--format` takes a ValueEnum: json, yaml, toml
+        /// `--format` takes a `ValueEnum`: json, yaml, toml
         #[arg(
             long,
             value_enum,
@@ -74,9 +74,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 (Some(f), _, _, _) => f,
                 // If user typed `--yaml` directly
                 (None, _, true, _) => &OutputFormat::Yaml,
-                // If user typed `--json` directly
-                (None, true, _, _) => &OutputFormat::Json,
-                // If nothing is set, default to JSON
+                // Default to JSON
                 _ => &OutputFormat::Json,
             };
 
