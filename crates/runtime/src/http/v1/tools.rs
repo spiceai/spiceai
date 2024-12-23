@@ -36,7 +36,9 @@ struct ListToolElement {
     parameters: Option<serde_json::Value>,
 }
 
-/// List all available tools in the Spice runtime.
+/// List Tools
+///
+/// List available tools in the Spice runtime.
 #[cfg_attr(feature = "openapi", utoipa::path(
     get,
     path = "/v1/tools",
@@ -69,7 +71,7 @@ pub(crate) async fn list(Extension(rt): Extension<Arc<Runtime>>) -> Response {
     (StatusCode::OK, Json(tools)).into_response()
 }
 
-/// Run a loaded tool.
+/// Run tool.
 ///
 /// The format of the request body and JSON response match the tool's
 #[cfg_attr(feature = "openapi", utoipa::path(

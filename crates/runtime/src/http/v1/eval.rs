@@ -45,6 +45,8 @@ pub(crate) struct RunEval {
     pub model: String,
 }
 
+/// Run Eval
+///
 /// Evaluate a model against a eval spice specification
 #[cfg_attr(feature = "openapi", utoipa::path(
     post,
@@ -155,7 +157,9 @@ struct ListEvalElement {
     pub scorers: Vec<String>,
 }
 
-/// List all evals available to run in the Spice runtime.
+/// List Evals
+///
+/// Return all evals available to run in the runtime.
 #[cfg_attr(feature = "openapi", utoipa::path(
     get,
     path = "/v1/evals",

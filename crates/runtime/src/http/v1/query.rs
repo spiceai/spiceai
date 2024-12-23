@@ -28,7 +28,9 @@ use crate::datafusion::DataFusion;
 
 use super::{sql_to_http_response, ArrowFormat};
 
-/// Execute a SQL query and return the results in either JSON or Arrow format.
+/// SQL Query
+///
+/// Execute a SQL query and return the results.
 ///
 /// This endpoint allows users to execute SQL queries directly from an HTTP request. The SQL query is sent as plain text in the request body.
 #[cfg_attr(feature = "openapi", utoipa::path(

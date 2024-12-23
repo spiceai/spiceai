@@ -34,6 +34,7 @@ use utoipa::OpenApi;
 #[cfg(feature = "dev")]
 use utoipa_swagger_ui::SwaggerUi;
 
+use super::{metrics, v1};
 use axum::{
     body::Body,
     extract::MatchedPath,
@@ -47,37 +48,44 @@ use runtime_auth::layer::http::AuthLayer;
 use tokio::time::Instant;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 
-use super::{metrics, v1};
-
 #[cfg(feature = "openapi")]
 #[derive(OpenApi)]
 #[openapi(
+    servers(
+        (url = "http://localhost:8090", description = "Local development server. Configure with `--http`."),
+    ),
+    security(
+        ("api_key" = [])
+    ),
     paths(
-        v1::catalogs::get,
-        v1::chat::post,
-        v1::datasets::acceleration,
+        // Order here will be preserved in sidebar at https://docs.spiceai.org/api/http/runtime.
+        v1::query::post,
         v1::datasets::get,
+        v1::datasets::acceleration,
         v1::datasets::refresh,
         v1::datasets::sample,
-        v1::embeddings::post,
-        v1::eval::list,
-        v1::eval::post,
+        v1::catalogs::get,
         v1::iceberg::get_config,
         v1::iceberg::get_namespaces,
-        v1::inference::get,
-        v1::inference::post,
-        v1::models::get,
-        v1::nsql::post,
-        v1::packages::generate,
-        v1::query::post,
+        v1::iceberg::head_namespace,
         v1::ready::get,
-        v1::search::post,
         v1::status::get,
         v1::spicepods::get,
+        v1::embeddings::post,
+        v1::search::post,
+        v1::chat::post,
+        v1::models::get,
+        v1::nsql::post,
+        v1::eval::list,
+        v1::eval::post,
+        v1::inference::get,
+        v1::inference::post,
         v1::tools::list,
         v1::tools::post,
+        v1::packages::generate,
     ),
-    components(schemas(DatasetQueryParams, DatasetFilter, Format))
+
+    components(schemas(DatasetQueryParams, DatasetFilter, Format)) // These schemas, for some reason, weren't getting picked up.
 )]
 pub struct ApiDoc;
 

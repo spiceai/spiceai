@@ -59,7 +59,9 @@ pub(crate) struct ModelResponse {
     pub status: Option<ComponentStatus>,
 }
 
-/// Get a list of models
+/// List Models
+///
+/// List all models, both machine learning and language models, available in the runtime.
 #[cfg_attr(feature = "openapi", utoipa::path(
     get,
     path = "/v1/models",

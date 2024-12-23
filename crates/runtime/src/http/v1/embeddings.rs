@@ -27,6 +27,8 @@ use axum::{
 };
 use tokio::sync::RwLock;
 
+/// Create Embeddings
+///
 /// Creates an embedding vector representing the input text.
 ///
 /// Get a vector representation of a given input that can be easily consumed by machine learning models and algorithms.

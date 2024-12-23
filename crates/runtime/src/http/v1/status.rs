@@ -52,7 +52,9 @@ pub struct ConnectionDetails {
     pub status: ComponentStatus,
 }
 
-/// Return the status of connections in the runtime.
+/// Check Runtime Status
+///
+/// Return the status of all connections (http, flight, metrics, opentelemetry) in the runtime.
 #[cfg_attr(feature = "openapi", utoipa::path(
     get,
     path = "/v1/status",

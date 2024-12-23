@@ -35,6 +35,8 @@ use serde::Serialize;
 use tokio::sync::RwLock;
 use tracing::{Instrument, Span};
 
+/// Create Chat Completion
+///
 /// Creates a model response for the given chat conversation.
 #[cfg_attr(feature = "openapi", utoipa::path(
     post,

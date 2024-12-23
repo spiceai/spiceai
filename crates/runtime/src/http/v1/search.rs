@@ -34,6 +34,8 @@ struct SearchResponse {
     pub duration_ms: u128,
 }
 
+/// Vector Search
+///
 /// Perform a vector search operation on a dataset.
 ///
 /// The search operation will return the most relevant matches based on cosine similarity with the input `text`.

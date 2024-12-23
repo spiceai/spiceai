@@ -99,7 +99,7 @@ pub(crate) struct Property {
     pub value: Option<serde_json::Value>, // support any valid JSON type (String, Int, Object, etc)
 }
 
-/// Get a list of datasets.
+/// List Datasets
 ///
 /// This endpoint returns a list of configured datasets. The response can be formatted as **JSON** or **CSV**,
 /// and additional filters can be applied using query parameters.
@@ -222,6 +222,8 @@ pub struct AccelerationRequest {
     pub refresh_sql: Option<String>,
 }
 
+/// Refresh Dataset
+///
 /// Trigger an on-demand refresh for an accelerated dataset.
 ///
 /// This endpoint triggers an on-demand refresh for an accelerated dataset.
@@ -342,6 +344,8 @@ pub(crate) async fn refresh(
     }
 }
 
+/// Update Refresh SQL
+///
 /// Update the refresh SQL for a dataset's acceleration.
 ///
 /// This endpoint allows for updating the `refresh_sql` parameter for a dataset's acceleration at runtime.
@@ -444,7 +448,7 @@ pub struct SampleQueryParams {
     pub r#type: Option<SampleTableMethod>,
 }
 
-/// Sample data from a dataset.
+/// Sample Dataset
 ///
 /// This endpoint allows for sampling data from a dataset using different methods.
 /// The type of sampling method can be specified using the `type` query parameter,
