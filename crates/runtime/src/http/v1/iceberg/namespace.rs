@@ -16,7 +16,7 @@ limitations under the License.
 
 use serde::{ser::SerializeSeq, Deserialize, Serialize};
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct Namespace {
     pub parts: Vec<String>,
@@ -67,7 +67,8 @@ impl Serialize for Namespace {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct NamespacePath(String);
 
 impl From<NamespacePath> for Namespace {

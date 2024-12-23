@@ -23,7 +23,7 @@ async-stream.workspace = true
 async-trait.workspace = true
 aws-config = { version = "1.1.10", optional = true }
 aws-sdk-secretsmanager = { version = "1.21.0", optional = true }
-aws-sdk-sts = { version = "1.51.0", optional = true }
+aws-sdk-sts = { version = "1.52.0", optional = true }
 axum.workspace = true
 axum-extra = { version = "0.9.6", features = ["typed-header"] }
 base64.workspace = true
@@ -60,6 +60,7 @@ http.workspace = true
 http-body-util = "0.1.2"
 hyper = "1.5.1"
 hyper-util = { version = "0.1.6", features = ["service"] }
+iceberg.workspace = true
 indexmap = "2"
 itertools.workspace = true
 jsonwebtoken = "9.3.0"
@@ -70,7 +71,7 @@ keyring = { version = "3.6.1", features = [
 ], optional = true }
 lazy_static.workspace = true
 llms = { path = "../llms" }
-logos = "0.14.0"
+logos = "0.15.0"
 mediatype = "0.19.18"
 model_components = { path = "../model_components" }
 mysql_async = { workspace = true, optional = true }
@@ -128,7 +129,7 @@ tract-core = "0.21.0"
 url = "2.5.4"
 util = { path = "../util" }
 utoipa = { version = "5.2.0", features = ["axum_extras"], optional = true }
-utoipa-swagger-ui = { version = "8.0.3", features = ["axum"], optional = true }
+utoipa-swagger-ui = { version = "8.1.0", features = ["axum"], optional = true }
 
 uuid = { workspace = true, features = ["v7"] }
 x509-certificate.workspace = true

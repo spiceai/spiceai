@@ -63,6 +63,7 @@ use tokio::time::{sleep, Instant};
 pub mod query;
 
 pub mod builder;
+pub mod dialect;
 pub mod error;
 mod extension;
 pub mod filter_converter;

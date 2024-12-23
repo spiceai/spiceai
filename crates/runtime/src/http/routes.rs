@@ -119,10 +119,18 @@ pub(crate) fn routes(
 
     let iceberg_router = Router::new()
         .route("/v1/config", get(v1::iceberg::get_config))
-        .route("/v1/iceberg/namespaces", get(v1::iceberg::get_namespaces))
+        .route("/v1/namespaces", get(v1::iceberg::get_namespaces))
         .route(
-            "/v1/iceberg/namespaces/:namespace",
+            "/v1/namespaces/:namespace",
             get(v1::iceberg::get_namespace).head(v1::iceberg::head_namespace),
+        )
+        .route(
+            "/v1/namespaces/:namespace/tables",
+            get(v1::iceberg::list_tables),
+        )
+        .route(
+            "/v1/namespaces/:namespace/tables/:table",
+            get(v1::iceberg::tables::get).head(v1::iceberg::tables::head),
         );
 
     authenticated_router = authenticated_router.merge(iceberg_router);

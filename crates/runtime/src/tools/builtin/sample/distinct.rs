@@ -135,6 +135,9 @@ impl SampleFrom for DistinctColumnsParams {
 
         let mut result: Vec<ArrayRef> = Vec::with_capacity(columns.len());
 
+        // Sampling data will return at most `limit` rows, but may return fewer if the table has fewer rows or empty
+        let mut min_sample_rows_count = self.limit;
+
         for (i, column) in columns.iter().enumerate() {
             // Only sample distinctly from columns that are specified in the `cols` field, if `cols` is None and distinct sampling is supported
             let column_data = if column_supports_distinct_sampling(column)
@@ -149,10 +152,23 @@ impl SampleFrom for DistinctColumnsParams {
             } else {
                 Self::sample_from_column(Arc::clone(&df), &tbl, column.name(), self.limit).await?
             };
+
+            min_sample_rows_count = min_sample_rows_count.min(column_data.len());
+
             result.insert(i, column_data);
         }
 
-        RecordBatch::try_new(Arc::clone(&schema), result).boxed()
+        // If the number of rows sampled is less than the limit, ensure that all columns have the same length
+        // as different samling methods may return different number of rows in this case.
+        // It is safe to truncate as such rows contain duplicate values
+        if min_sample_rows_count < self.limit {
+            result = result
+                .into_iter()
+                .map(|col| col.slice(0, min_sample_rows_count))
+                .collect();
+        }
+
+        RecordBatch::try_new(schema, result).boxed()
     }
 }
 
