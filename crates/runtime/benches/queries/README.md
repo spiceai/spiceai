@@ -437,6 +437,6 @@ The [ClickBench benchmark queries](./clickbench) are used under the [Creative Co
 - **Original Author(s):** [ClickBench Authors](https://github.com/ClickHouse/ClickBench)
 - **Source Repository:** [https://github.com/ClickBench/ClickBench](https://github.com/ClickHouse/ClickBench)
 - **License:** [CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/)
-- **Modifications:** This version use a subset of database sources, and makes the following modifications:
+- **Modifications:** This version uses a subset of database sources, and makes the following modifications:
   - Renames the `datafusion` source to `arrow`.
   - Separates source `queries.sql` into individual query files split by line.
