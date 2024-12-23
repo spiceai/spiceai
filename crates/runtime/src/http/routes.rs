@@ -15,8 +15,12 @@ limitations under the License.
 */
 
 use crate::embeddings::vector_search;
-use crate::http::v1::datasets::{DatasetFilter, DatasetQueryParams};
-use crate::http::v1::Format;
+
+#[cfg(feature = "openapi")]
+use crate::http::v1::{
+    datasets::{DatasetFilter, DatasetQueryParams},
+    Format,
+};
 use crate::request::Protocol;
 use crate::Runtime;
 use crate::{config, request::RequestContext};
