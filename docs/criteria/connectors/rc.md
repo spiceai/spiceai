@@ -15,6 +15,7 @@ All criteria must be met for the connector to be considered [RC](../definitions.
 | Dremio                           | ➖         |              |
 | DuckDB                           | ✅         | @peasee      |
 | File                             | ➖         |              |
+| FlightSQL                        | ➖         |              |
 | FTP/SFTP                         | ➖         |              |
 | GraphQL                          | ✅         | @peasee      |
 | GitHub                           | ✅         | @peasee      |
@@ -117,7 +118,7 @@ Support for schema inference in a connector is classified as:
 Support for federation in a connector is classified as:
 
 - ✅: Full federation. The connector supports full federation and query push down.
-- ☑️: Partial federation. The connector supports partial federation and query push down.
+- ☑️: Partial filter push-down. The connector supports partial filter push-down in queries.
 - ➖: No federation. The connector does not support federation or query push down.
 
 ##### Full Federation
@@ -125,11 +126,11 @@ Support for federation in a connector is classified as:
 - [ ] The connector supports full federation within a single dataset (e.g. `select * from my_dataset`)
 - [ ] The connector supports federation push down across multiple datasets within the same connection source (e.g. `select * from first_dataset, second_dataset`)
 
-##### Partial Federation
+##### Partial Filter Push-down
 
-- [ ] The connector supports filter federation within a single dataset for common use case columns (e.g. `select * from my_dataset where id = 1`)
+- [ ] The connector supports filter push-down within a single dataset for common use case columns (e.g. `select * from my_dataset where id = 1`)
   - Common use case should be determined at the discretion of the DRI for the connector.
-  - For example, the GitHub connector should support filter federation for the author, state and title of issues.
+  - For example, the GitHub connector should support filter push-down for the author, state and title of issues.
 
 #### Test Coverage
 

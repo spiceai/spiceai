@@ -14,13 +14,14 @@ All criteria must be met for the connector to be considered Alpha. As Alpha sign
 | Delta Lake                       | ➖            |              |
 | Dremio                           | ➖            |              |
 | DuckDB                           | ✅            | @peasee      |
-| File                             | ➖            |              |
+| File                             | ✅            | @peasee      |
+| FlightSQL                        | ➖            |              |
 | FTP/SFTP                         | ➖            |              |
 | GraphQL                          | ➖            |              |
 | GitHub                           | ✅            | @peasee      |
 | HTTP/HTTPS                       | ➖            |              |
 | Localpod                         | ➖            |              |
-| MS SQL                           | ➖            |              |
+| MS SQL                           | ✅            | @peasee      |
 | MySQL                            | ✅            | @peasee      |
 | ODBC                             | ➖            |              |
 | PostgreSQL                       | ✅            | @Sevenannn   |
