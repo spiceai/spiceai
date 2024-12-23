@@ -53,7 +53,10 @@ use futures::TryStreamExt;
 
 #[cfg(feature = "openapi")]
 use utoipa::{
-    openapi::{path::ParameterBuilder, schema::SchemaType, Required, Type},
+    openapi::{
+        path::{Parameter, ParameterBuilder, ParameterIn},
+        Required,
+    },
     schema,
 };
 
@@ -71,13 +74,11 @@ pub enum Format {
 
 #[cfg(feature = "openapi")]
 impl utoipa::IntoParams for Format {
-    fn into_params(
-        parameter_in_provider: impl Fn() -> Option<utoipa::openapi::path::ParameterIn>,
-    ) -> Vec<utoipa::openapi::path::Parameter> {
+    fn into_params(parameter_in_provider: impl Fn() -> Option<ParameterIn>) -> Vec<Parameter> {
         vec![ParameterBuilder::new()
             .description(Some(""))
             .name("format")
-            .required(utoipa::openapi::Required::True)
+            .required(Required::True)
             .parameter_in(parameter_in_provider().unwrap_or_default())
             .schema(Some(schema!(Format)))
             .build()]
