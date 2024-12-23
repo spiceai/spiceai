@@ -295,6 +295,29 @@ fn get_accelerator_indexes(
                     }
                     _ => None,
                 },
+                "clickbench" => match dataset {
+                    "hits" => {
+                        let mut indexes: HashMap<String, IndexType> = HashMap::new();
+                        indexes
+                            .insert("(ClientIP, SearchEngineID)".to_string(), IndexType::Enabled);
+                        indexes.insert("(ClientIP, WatchID)".to_string(), IndexType::Enabled);
+                        indexes.insert(
+                            "(MobilePhone, MobilePhoneModel)".to_string(),
+                            IndexType::Enabled,
+                        );
+                        indexes.insert(
+                            "(SearchEngineID, SearchPhrase)".to_string(),
+                            IndexType::Enabled,
+                        );
+                        indexes.insert("(SearchPhrase, UserID)".to_string(), IndexType::Enabled);
+                        indexes.insert("AdvEngineID".to_string(), IndexType::Enabled);
+                        indexes.insert("MobilePhoneModel".to_string(), IndexType::Enabled);
+                        indexes.insert("SearchPhrase".to_string(), IndexType::Enabled);
+                        indexes.insert("UserID".to_string(), IndexType::Enabled);
+                        Some(indexes)
+                    }
+                    _ => None,
+                },
                 _ => None,
             },
             "postgres" => match bench_name {

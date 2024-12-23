@@ -463,6 +463,12 @@ jobs:
           - cmd: '-a duckdb -m memory -b clickbench'
             name: 'duckdb accelerator (memory mode)'
             bench: 'clickbench'
+          - cmd: '-a sqlite -m memory -b clickbench'
+            name: 'sqlite accelerator (memory mode)'
+            bench: 'clickbench'
+          - cmd: '-a sqlite -m file -b clickbench'
+            name: 'sqlite accelerator (file mode)'
+            bench: 'clickbench'
 
     steps:
       - name: Checkout repository
