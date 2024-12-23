@@ -48,7 +48,7 @@ pub(crate) async fn setup_benchmark(
     upload_results_dataset: Option<&String>,
 ) -> Result<(Runtime, SearchBenchmarkResultBuilder), String> {
     init_tracing(Some(
-        "runtime=Debug,task_history=WARN,runtime::embeddings=WARN,INFO",
+        "runtime=DEBUG,task_history=WARN,runtime::embeddings=WARN,INFO",
     ));
 
     let mut benchmark_result =
