@@ -65,9 +65,15 @@ A timing measurement is calculated for each parallel query completion, measured 
 
 A throughput metric is calculated from the cumulative sum of `Ts` from every parallel query execution. This cumulative timing measurement is measured as `Cs`.
 
-A metric of throughput, measured as Queries Per Hour * Scale Factor, is calculated as: `(Parallel Query Count * 22 * 3600) * Cs / Scale`.
+A metric of throughput, measured as Queries Per Hour * Scale Factor, is calculated as: `(Parallel Query Count * Test Suite Query Count * 3600) / Cs * Scale`.
 
-## TPC-H Throughput Test Parallel Queries
+## TPC-H Throughput Test
+
+### Test Suite Query Count
+
+There is a baseline number of 22 queries in the TPC-H test. Some connectors may run less queries. For these queries, the Test Suite Query Count is reduced by the number of skipped queries.
+
+### Parallel Queries
 
 The following table defines how many parallel queries are required at a given scale factor for Spice throughput tests:
 
@@ -78,7 +84,13 @@ The following table defines how many parallel queries are required at a given sc
 | 100          | 32               |
 | 1000         | 64               |
 
-## TPC-DS Throughput Test Parallel Queries
+## TPC-DS Throughput Test
+
+### Test Suite Query Count
+
+There is a baseline number of 99 queries in the TPC-DS test. Some connectors may run less queries. For these queries, the Test Suite Query Count is reduced by the number of skipped queries.
+
+### Parallel Queries
 
 The following table defines how many parallel queries are required at a given scale factor for Spice throughput tests:
 
