@@ -28,9 +28,9 @@ use axum::{
 /// This endpoint returns the readiness status of the service. If the service is ready, it returns an HTTP 200 status with the message "ready". If not, it returns a 503 status with the message "not ready".
 #[cfg_attr(feature = "openapi", utoipa::path(
     get,
-    path = "/v1/status",
-    operation_id = "get_status",
-    tag = "Status",
+    path = "/v1/ready",
+    operation_id = "ready",
+    tag = "Ready",
     responses(
         (status = 200, description = "Service is ready", content((String = "text/plain", example = "ready"))),
         (status = 503, description = "Service is not ready", content((String = "text/plain", example = "not ready")))

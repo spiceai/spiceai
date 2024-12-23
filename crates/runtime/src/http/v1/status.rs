@@ -29,21 +29,14 @@ use axum::{
 
 use crate::{config, status::ComponentStatus};
 
+use super::Format;
+
 #[derive(Debug, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::IntoParams))]
 #[serde(rename_all = "lowercase")]
 pub struct QueryParams {
     /// The format of the response, either "json" or "csv". Defaults to "json".
-    #[serde(default = "default_format")]
     pub format: Format,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[serde(rename_all = "lowercase")]
-pub enum Format {
-    Json,
-    Csv,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -57,10 +50,6 @@ pub struct ConnectionDetails {
 
     /// The status of the component (e.g., Ready, Initializing, Disabled, Error, etc.)
     pub status: ComponentStatus,
-}
-
-fn default_format() -> Format {
-    Format::Json
 }
 
 /// Return the status of connections in the runtime.

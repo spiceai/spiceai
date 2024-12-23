@@ -15,6 +15,8 @@ limitations under the License.
 */
 
 use crate::embeddings::vector_search;
+use crate::http::v1::datasets::{DatasetFilter, DatasetQueryParams};
+use crate::http::v1::Format;
 use crate::request::Protocol;
 use crate::Runtime;
 use crate::{config, request::RequestContext};
@@ -49,30 +51,34 @@ use super::{metrics, v1};
 
 #[cfg(feature = "openapi")]
 #[derive(OpenApi)]
-#[openapi(paths(
-    v1::catalogs::get,
-    v1::chat::post,
-    v1::datasets::acceleration,
-    v1::datasets::get,
-    v1::datasets::refresh,
-    v1::datasets::sample,
-    v1::embeddings::post,
-    v1::eval::list,
-    v1::eval::post,
-    v1::iceberg::get_config,
-    v1::iceberg::get_namespaces,
-    v1::inference::get,
-    v1::inference::post,
-    v1::models::get,
-    v1::nsql::post,
-    v1::packages::generate,
-    v1::query::post,
-    v1::search::post,
-    v1::status::get,
-    v1::spicepods::get,
-    v1::tools::list,
-    v1::tools::post,
-))]
+#[openapi(
+    paths(
+        v1::catalogs::get,
+        v1::chat::post,
+        v1::datasets::acceleration,
+        v1::datasets::get,
+        v1::datasets::refresh,
+        v1::datasets::sample,
+        v1::embeddings::post,
+        v1::eval::list,
+        v1::eval::post,
+        v1::iceberg::get_config,
+        v1::iceberg::get_namespaces,
+        v1::inference::get,
+        v1::inference::post,
+        v1::models::get,
+        v1::nsql::post,
+        v1::packages::generate,
+        v1::query::post,
+        v1::ready::get,
+        v1::search::post,
+        v1::status::get,
+        v1::spicepods::get,
+        v1::tools::list,
+        v1::tools::post,
+    ),
+    components(schemas(DatasetQueryParams, DatasetFilter, Format))
+)]
 pub struct ApiDoc;
 
 pub(crate) fn routes(

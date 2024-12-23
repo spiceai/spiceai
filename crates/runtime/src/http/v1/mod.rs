@@ -50,6 +50,10 @@ use serde::{Deserialize, Serialize};
 use snafu::ResultExt;
 
 use futures::TryStreamExt;
+use utoipa::{
+    openapi::{path::ParameterBuilder, schema::SchemaType, Required, Type},
+    schema,
+};
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -61,6 +65,35 @@ pub enum Format {
 
     /// CSV format
     Csv,
+}
+
+impl utoipa::IntoParams for Format {
+    fn into_params(
+        parameter_in_provider: impl Fn() -> Option<utoipa::openapi::path::ParameterIn>,
+    ) -> Vec<utoipa::openapi::path::Parameter> {
+        vec![ParameterBuilder::new()
+            .name("format") // Query parameter name
+            .description(Some(
+                "The format of the response. Possible values: 'json' or 'csv'.",
+            ))
+            .required(Required::True) // This parameter is required
+            .parameter_in(parameter_in_provider().unwrap_or_default())
+            .schema(Some(
+                utoipa::openapi::ObjectBuilder::new()
+                    .schema_type(SchemaType::Type(Type::String))
+                    .enum_values(Some(vec!["json", "csv"]))
+                    .build(),
+            ))
+            .build()]
+
+        // vec![ParameterBuilder::new()
+        //     .description(Some(""))
+        //     .name("format")
+        //     .required(utoipa::openapi::Required::True)
+        //     .parameter_in(parameter_in_provider().unwrap_or_default())
+        //     .schema(Some(schema!(Format)))
+        //     .build()]
+    }
 }
 
 #[derive(Default, Debug, Serialize, Deserialize)]

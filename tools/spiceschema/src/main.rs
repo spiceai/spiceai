@@ -12,7 +12,7 @@ use utoipa::OpenApi;
 #[command(
     name = "spiceschema",
     version = "0.1.0",
-    about = "A CLI tool to generate API schemas in JSON, YAML, or TOML.",
+    about = "A CLI tool to generate API schemas in JSON or YAML.",
     long_about = None
 )]
 struct Cli {
@@ -26,29 +26,25 @@ enum Command {
     #[command(group(
         ArgGroup::new("format_group")
             .required(false)
-            .args(["format", "json", "yaml", "toml"])
+            .args(["format", "json", "yaml"])
     ))]
     Http {
-        /// `--format` takes a `ValueEnum`: json, yaml, toml
+        /// `--format` takes a `ValueEnum`: json, yaml
         #[arg(
             long,
             value_enum,
-            help = "Output format (json|yaml|toml)",
-            conflicts_with_all = ["json", "yaml", "toml"]
+            help = "Output format (json|yaml)",
+            conflicts_with_all = ["json", "yaml"]
         )]
         format: Option<OutputFormat>,
 
         /// `--json` is an alias to format=json
-        #[arg(long, help = "Output in JSON format", conflicts_with_all = ["format", "yaml", "toml"])]
+        #[arg(long, help = "Output in JSON format", conflicts_with_all = ["format", "yaml"])]
         json: bool,
 
         /// `--yaml` is an alias to format=yaml
-        #[arg(long, help = "Output in YAML format", conflicts_with_all = ["format", "json", "toml"])]
+        #[arg(long, help = "Output in YAML format", conflicts_with_all = ["format", "json"])]
         yaml: bool,
-
-        /// `--toml` is an alias to format=toml
-        #[arg(long, help = "Output in TOML format", conflicts_with_all = ["format", "json", "yaml"])]
-        toml: bool,
     },
 }
 
@@ -56,12 +52,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     match &cli.cmd {
-        Some(Command::Http {
-            format,
-            json,
-            yaml,
-            toml,
-        }) => {
+        Some(Command::Http { format, json, yaml }) => {
             let Ok(json_str) = ApiDoc::openapi().to_json() else {
                 return Err(Box::from("Failed to generate OpenAPI schema"));
             };
@@ -69,11 +60,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let parsed: Value = serde_json::from_str(json_str.as_str())?;
 
             // 2) Determine final output format (defaults to JSON if none specified)
-            let final_format = match (format, json, yaml, toml) {
+            let final_format = match (format, json, yaml) {
                 // If user typed `--format=xyz`, use that
-                (Some(f), _, _, _) => f,
+                (Some(f), _, _) => f,
                 // If user typed `--yaml` directly
-                (None, _, true, _) => &OutputFormat::Yaml,
+                (None, _, true) => &OutputFormat::Yaml,
                 // Default to JSON
                 _ => &OutputFormat::Json,
             };

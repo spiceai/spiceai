@@ -49,16 +49,15 @@ use super::{
 };
 
 #[derive(Debug, Deserialize)]
-#[cfg_attr(feature = "openapi", derive(utoipa::IntoParams))]
+#[cfg_attr(feature = "openapi", derive(utoipa::IntoParams, utoipa::ToSchema))]
 pub struct DatasetFilter {
     /// Filters datasets by source (e.g., `postgres:aidemo_messages`).
     source: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
-#[cfg_attr(feature = "openapi", derive(utoipa::IntoParams))]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema, utoipa::IntoParams))]
 pub struct DatasetQueryParams {
-    /// If true, includes the status of each dataset in the response. Default is false.
     #[serde(default)]
     status: bool,
 
