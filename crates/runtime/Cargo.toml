@@ -71,7 +71,7 @@ keyring = { version = "3.6.1", features = [
 ], optional = true }
 lazy_static.workspace = true
 llms = { path = "../llms" }
-logos = "0.14.0"
+logos = "0.15.0"
 mediatype = "0.19.18"
 model_components = { path = "../model_components" }
 mysql_async = { workspace = true, optional = true }
