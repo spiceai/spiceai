@@ -434,8 +434,8 @@ select  cast(amc as FLOAT)/cast(pmc as FLOAT) am_pm_ratio
 
 The [ClickBench benchmark queries](./clickbench) are used under the [Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International License (CC BY-NC-SA 4.0)](https://creativecommons.org/licenses/by-nc-sa/4.0/).
 
-- **Original Author(s):** [ClickBench Authors](https://github.com/ClickBench/ClickBench)
-- **Source Repository:** [https://github.com/ClickBench/ClickBench](https://github.com/ClickBench/ClickBench)
+- **Original Author(s):** [ClickBench Authors](https://github.com/ClickHouse/ClickBench)
+- **Source Repository:** [https://github.com/ClickBench/ClickBench](https://github.com/ClickHouse/ClickBench)
 - **License:** [CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/)
 - **Modifications:** This version use a subset of database sources, and makes the following modifications:
   - Renames the `datafusion` source to `arrow`.
