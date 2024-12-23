@@ -77,4 +77,4 @@ jobs:
         run: cargo check --no-default-features --features debezium
 
       - name: Build with only openapi
-        run: cargo check --no-default-features --features openapi
+        run: cargo check --no-default-features --features runtime/openapi
