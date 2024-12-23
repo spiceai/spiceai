@@ -4,9 +4,6 @@ set -e
 
 current_dir=$(pwd)
 benches=(
-    "postgresql-tuned:postgres"
-    "duckdb:duckdb"
-    "sqlite:sqlite"
     "datafusion:arrow"
 )
 
