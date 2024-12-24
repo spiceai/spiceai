@@ -84,7 +84,7 @@ struct NamespacesResponse {
     namespaces: Vec<Namespace>,
 }
 
-/// List Iceberge namespaces.
+/// List Iceberg namespaces
 ///
 /// This endpoint retrieves namespaces available in the Iceberg catalog.
 /// If a `parent` namespace is provided, it will list the child namespaces under the specified parent.
