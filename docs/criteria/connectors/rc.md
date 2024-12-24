@@ -8,28 +8,29 @@ All criteria must be met for the connector to be considered [RC](../definitions.
 
 | Connector                        | RC Quality | DRI Sign-off |
 | -------------------------------- | ---------- | ------------ |
-| Clickhouse                       | ❌         |              |
+| Clickhouse                       | ➖         |              |
 | Databricks (mode: delta_lake)    | ✅         | @Sevenannn   |
-| Databricks (mode: spark_connect) | ❌         |              |
-| Delta Lake                       | ❌         |              |
-| Dremio                           | ❌         |              |
+| Databricks (mode: spark_connect) | ➖         |              |
+| Delta Lake                       | ➖         |              |
+| Dremio                           | ➖         |              |
 | DuckDB                           | ✅         | @peasee      |
-| File                             | ❌         |              |
-| FTP/SFTP                         | ❌         |              |
+| File                             | ➖         |              |
+| FlightSQL                        | ➖         |              |
+| FTP/SFTP                         | ➖         |              |
 | GraphQL                          | ✅         | @peasee      |
 | GitHub                           | ✅         | @peasee      |
-| HTTP/HTTPS                       | ❌         |              |
-| Localpod                         | ❌         |              |
-| MS SQL                           | ❌         |              |
+| HTTP/HTTPS                       | ➖         |              |
+| Localpod                         | ➖         |              |
+| MS SQL                           | ➖         |              |
 | MySQL                            | ✅         | @peasee      |
-| ODBC                             | ❌         |              |
+| ODBC                             | ➖         |              |
 | PostgreSQL                       | ✅         | @Sevenannn   |
-| Sharepoint                       | ❌         |              |
-| Snowflake                        | ❌         |              |
-| Spice.AI Cloud Platform          | ❌         |              |
+| Sharepoint                       | ➖         |              |
+| Snowflake                        | ➖         |              |
+| Spice.AI Cloud Platform          | ➖         |              |
 | S3                               | ✅         | @Sevenannn   |
-| Azure BlobFS                     | ❌         |              |
-| Spark                            | ❌         |              |
+| Azure BlobFS                     | ➖         |              |
+| Spark                            | ➖         |              |
 
 ## RC Release Criteria
 
@@ -40,29 +41,36 @@ These connectors are exempt from running the TPC derived test packages, and rely
 
 This table defines the required features and/or tests for each connector:
 
-| Connector                        | [TPC-H Derived Tests (Scale Factor)](#tpc-h) | [TPC-DS Derived Tests (Scale Factor)](#tpc-ds) | [Federation](#federation) | [Data Correctness](#data-correctness) | [Streaming](#streaming) | [Native Schema Inference](#schema-inference) |
-| -------------------------------- | -------------------------------------------- | ---------------------------------------------- | ------------------------- | ------------------------------------- | ----------------------- | -------------------------------------------- |
-| Clickhouse                       | ✅ (100)                                     | ✅ (100)                                       | ✅                        | ✅                                    | ✅                      | ✅                                           |
-| Databricks (mode: delta_lake)    | ✅ (1)                                       | ✅ (1)                                         | ⚠️                        | ✅                                    | ✅                      | ✅                                           |
-| Databricks (mode: spark_connect) | ✅ (100)                                     | ✅ (100)                                       | ✅                        | ✅                                    | ✅                      | ✅                                           |
-| Delta Lake                       | ✅ (1)                                       | ✅ (1)                                         | ⚠️                        | ✅                                    | ✅                      | ✅                                           |
-| Dremio                           | ✅ (100)                                     | ✅ (100)                                       | ✅                        | ✅                                    | ✅                      | ✅                                           |
-| DuckDB                           | ✅ (100)                                     | ✅ (100)                                       | ✅                        | ✅                                    | ✅                      | ✅                                           |
-| File                             | ✅ (1)                                       | ✅ (1)                                         | ❌                        | ❌                                    | ✅                      | ❌                                           |
-| FTP/SFTP                         | ❌                                           | ❌                                             | ❌                        | ❌                                    | ❌                      | ❌                                           |
-| GraphQL                          | ❌                                           | ❌                                             | ❌                        | ❌                                    | ❌                      | ❌                                           |
-| GitHub                           | ❌                                           | ❌                                             | ⚠️                        | ❌                                    | ❌                      | ⚠️                                           |
-| HTTP/HTTPS                       | ❌                                           | ❌                                             | ❌                        | ❌                                    | ❌                      | ❌                                           |
-| MS SQL                           | ✅ (100)                                     | ✅ (100)                                       | ✅                        | ✅                                    | ✅                      | ✅                                           |
-| MySQL                            | ✅ (100)                                     | ✅ (100)                                       | ✅                        | ✅                                    | ✅                      | ✅                                           |
-| ODBC                             | ✅ (100)                                     | ✅ (100)                                       | ✅                        | ✅                                    | ✅                      | ✅                                           |
-| PostgreSQL                       | ✅ (100)                                     | ✅ (100)                                       | ✅                        | ✅                                    | ✅                      | ✅                                           |
-| Sharepoint                       | ❌                                           | ❌                                             | ⚠️                        | ❌                                    | ❌                      | ⚠️                                           |
-| Snowflake                        | ✅ (100)                                     | ✅ (100)                                       | ✅                        | ✅                                    | ✅                      | ✅                                           |
-| Spice.AI Cloud Platform          | ✅ (100)                                     | ✅ (100)                                       | ✅                        | ✅                                    | ✅                      | ✅                                           |
-| S3                               | ✅ (1)                                       | ✅ (1)                                         | ⚠️                        | ❌                                    | ✅                      | ❌                                           |
-| Azure BlobFS                     | ✅ (1)                                       | ✅ (1)                                         | ⚠️                        | ❌                                    | ✅                      | ❌                                           |
-| Spark                            | ✅ (1)                                       | ✅ (1)                                         | ✅                        | ✅                                    | ✅                      | ✅                                           |
+| Connector                        | [TPC-H (Scale)][tpch] | [TPC-DS (Scale)][tpcds] | [Federation][fed] | [Data Correctness][data] | [Streaming][stream] | [Schema Inference][schema] |
+| -------------------------------- | --------------------- | ----------------------- | ----------------- | ------------------------ | ------------------- | ------------------ |
+| Clickhouse                       | ✅ (100)              | ✅ (100)               | ✅                | ✅                      | ✅                  | ✅                |
+| Databricks (mode: delta_lake)    | ✅ (1)                | ✅ (1)                 | ☑️                | ✅                      | ✅                  | ✅                |
+| Databricks (mode: spark_connect) | ✅ (100)              | ✅ (100)               | ✅                | ✅                      | ✅                  | ✅                |
+| Delta Lake                       | ✅ (1)                | ✅ (1)                 | ☑️                | ✅                      | ✅                  | ✅                |
+| Dremio                           | ✅ (100)              | ✅ (100)               | ✅                | ✅                      | ✅                  | ✅                |
+| DuckDB                           | ✅ (100)              | ✅ (100)               | ✅                | ✅                      | ✅                  | ✅                |
+| File                             | ✅ (1)                | ✅ (1)                 | ➖                | ➖                      | ✅                  | ☑️                |
+| FTP/SFTP                         | ➖                    | ➖                     | ➖                | ➖                      | ➖                  | ☑️                |
+| GraphQL                          | ➖                    | ➖                     | ➖                | ➖                      | ➖                  | ☑️                |
+| GitHub                           | ➖                    | ➖                     | ☑️                | ➖                      | ➖                  | ☑️                |
+| HTTP/HTTPS                       | ✅ (1)                | ✅ (1)                 | ➖                | ➖                      | ➖                  | ☑️                |
+| MS SQL                           | ✅ (100)              | ✅ (100)               | ✅                | ✅                      | ✅                  | ✅                |
+| MySQL                            | ✅ (100)              | ✅ (100)               | ✅                | ✅                      | ✅                  | ✅                |
+| ODBC                             | ✅ (100)              | ✅ (100)               | ✅                | ✅                      | ✅                  | ✅                |
+| PostgreSQL                       | ✅ (100)              | ✅ (100)               | ✅                | ✅                      | ✅                  | ✅                |
+| Sharepoint                       | ➖                    | ➖                     | ☑️                | ➖                      | ➖                  | ☑️                |
+| Snowflake                        | ✅ (100)              | ✅ (100)               | ✅                | ✅                      | ✅                  | ✅                |
+| Spice.AI Cloud Platform          | ✅ (100)              | ✅ (100)               | ✅                | ✅                      | ✅                  | ✅                |
+| S3                               | ✅ (1)                | ✅ (1)                 | ☑️                | ➖                      | ✅                  | ☑️                |
+| Azure BlobFS                     | ✅ (1)                | ✅ (1)                 | ☑️                | ➖                      | ✅                  | ☑️                |
+| Spark                            | ✅ (1)                | ✅ (1)                 | ✅                | ✅                      | ✅                  | ✅                |
+
+[tpch]: #tpc-h
+[tpcds]: #tpc-ds
+[fed]: #federation
+[stream]: #streaming
+[data]: #data-correctness
+[schema]: #schema-inference
 
 ### All Connectors
 
@@ -97,42 +105,36 @@ The following features/tests are dependent on the required features/tests for th
 
 Support for schema inference in a connector is classified as:
 
-- ✅: Full coverage. The connector supports native schema inference.
-- ⚠️: Partial coverage. The connector does not support native schema inference, but it requires no inference (e.g. static schema, etc).
-- ❌: No coverage. The connector does not support native schema inference, and typically infers schema from the first row of results.
+- ✅: Native schema. The connector supports natively detecting schema.
+- ☑️: Inferred schema. The source does not support natively detecting schema, and schema is inferred from the first row of results.
+- ➖: Inferred schema. The connector does not support natively detecting schema, and schema is inferred from the first row of results.
 
-##### Full Coverage
+##### Native schema
 
 - [ ] The schema for data returned from queries is determined using a native CLI/library method provided by the connector.
-
-##### Partial Coverage
-
-- [ ] The connector does not support native schema inference, but it requires no inference.
-
-##### No Coverage
-
-- [ ] The connector does not support native schema inference.
 
 #### Federation
 
 Support for federation in a connector is classified as:
 
-- ✅: Full coverage. The connector supports full federation and query push down.
-- ⚠️: Partial coverage. The connector supports partial federation and query push down.
-- ❌: No coverage. The connector does not support federation or query push down.
+- ✅: Full federation. The connector supports full federation and query push down.
+- ☑️: Partial filter push-down. The connector supports partial filter push-down in queries.
+- ➖: No federation. The connector does not support federation or query push down.
 
-##### Full Coverage
+##### Full Federation
 
 - [ ] The connector supports full federation within a single dataset (e.g. `select * from my_dataset`)
 - [ ] The connector supports federation push down across multiple datasets within the same connection source (e.g. `select * from first_dataset, second_dataset`)
 
-##### Partial Coverage
+##### Partial Filter Push-down
 
-- [ ] The connector supports filter federation within a single dataset for common use case columns (e.g. `select * from my_dataset where id = 1`)
+- [ ] The connector supports filter push-down within a single dataset for common use case columns (e.g. `select * from my_dataset where id = 1`)
   - Common use case should be determined at the discretion of the DRI for the connector.
-  - For example, the GitHub connector should support filter federation for the author, state and title of issues.
+  - For example, the GitHub connector should support filter push-down for the author, state and title of issues.
 
 #### Test Coverage
+
+- ➖: Not required. The test suite is not required for this connector, because it is not applicable (e.g. GraphQL, etc).
 
 Indexes are not required for test coverage, but can be introduced if required for tests to pass (e.g. due to performance characteristics, etc).
 
@@ -162,9 +164,7 @@ Indexes are not required for test coverage, but can be introduced if required fo
 
 #### Data Correctness
 
-Data correctness can only be validated where the connector has a native CLI to replicate identical results. For connectors that do not have a native CLI to generate identical results, skip these tests.
-
-Connectors that are excluded from these tests does not indicate that data is incorrect - it indicates only that we do not perform _automated_ testing of data correctness.
+- ➖: Not required. The test suite is not required for this connector.
 
 - [ ] TPC-H queries at the [designated scale factor](#rc-release-criteria) return identical results in Spice and the native connector CLI.
 - [ ] TPC-DS queries at the [designated scale factor](#rc-release-criteria) return identical results in Spice and the native connector CLI.
