@@ -1,0 +1,63 @@
+name: Generate Spiceschema OpenAPI
+
+on:
+  push:
+    branches: [trunk]
+    paths:
+      - "tools/spiceschema/**"
+      - "crates/**"
+  workflow_dispatch:
+
+jobs:
+  generate_openapi:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Build Cargo project
+        run: cargo build --manifest-path tools/spiceschema/Cargo.toml
+
+      - name: Run Cargo project to generate OpenAPI
+        run: cargo run --manifest-path tools/spiceschema/Cargo.toml -- http --json > .schema/openapi.json
+
+      - name: Verify OpenAPI file
+        run: |
+          if [ -f ".schema/openapi.json" ]; then
+            echo ".schema/openapi.json file was successfully created."
+            cat .schema/openapi.json
+          else
+            echo ".schema/openapi.json file was not created."
+            exit 1
+          fi
+
+      - name: Upload OpenAPI artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: openapi.json
+          path: .schema/openapi.json
+
+      - name: Create PR
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          git config --global user.name 'Spice Schema Bot'
+          git config --global user.email 'schema-bot@spice.ai'
+          git checkout -b openapi/${GITHUB_RUN_ID}
+          # Check for changes
+          if [[ $(git diff --exit-code .schema/openapi.json) ]]; then
+            git add .schema/openapi.json
+            git commit -m "Update openapi.json"
+            git push origin openapi/${GITHUB_RUN_ID}
+            gh pr create \
+              --title "Update openapi.json" \
+              --body "Updated OpenAPI specification using new spiceschema tool" \
+              --base trunk \
+              --head openapi/${GITHUB_RUN_ID}
+          else
+            echo "No changes detected"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -179,11 +179,11 @@ flightsql = ["data_components/flightsql"]
 ftp = ["dep:suppaftp", "dep:ssh2"]
 keyring-secret-store = ["dep:keyring"]
 metal = ["llms/metal"]
-models = ["model_components/full", "llms/mistralrs"]
+models = ["model_components/full"]
 mssql = ["dep:tiberius", "dep:tokio-util", "data_components/mssql"]
 mysql = ["dep:mysql_async", "db_connection_pool/mysql", "data_components/mysql"]
 odbc = ["db_connection_pool/odbc", "data_components/odbc"]
-openapi = ["utoipa-swagger-ui", "utoipa"]
+openapi = ["dep:utoipa-swagger-ui", "dep:utoipa"]
 postgres = [
     "db_connection_pool/postgres",
     "data_components/postgres",

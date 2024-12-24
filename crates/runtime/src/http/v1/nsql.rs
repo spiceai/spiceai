@@ -132,6 +132,8 @@ fn return_sql_only(accept: Option<&TypedHeader<Accept>>) -> bool {
     accept.is_some_and(|a| accept_header_types(a).contains(&"application/sql".to_string()))
 }
 
+/// Text to SQL
+///
 /// Generate and optionally execute an NSQL query.
 ///
 /// This endpoint generates a SQL query using a natural language query (NSQL) and optionally executes it.
@@ -146,7 +148,6 @@ fn return_sql_only(accept: Option<&TypedHeader<Accept>>) -> bool {
     ),
     request_body(
         description = "Request body to generate an NSQL query",
-        required = true,
         content((
             Request = "application/json",
             example = json!({

@@ -36,7 +36,9 @@ struct ListToolElement {
     parameters: Option<serde_json::Value>,
 }
 
-/// List all available tools in the Spice runtime.
+/// List Tools
+///
+/// List available tools in the Spice runtime.
 #[cfg_attr(feature = "openapi", utoipa::path(
     get,
     path = "/v1/tools",
@@ -69,7 +71,7 @@ pub(crate) async fn list(Extension(rt): Extension<Arc<Runtime>>) -> Response {
     (StatusCode::OK, Json(tools)).into_response()
 }
 
-/// Run a loaded tool.
+/// Run Tool
 ///
 /// The format of the request body and JSON response match the tool's
 #[cfg_attr(feature = "openapi", utoipa::path(
@@ -81,11 +83,8 @@ pub(crate) async fn list(Extension(rt): Extension<Arc<Runtime>>) -> Response {
     ),
     request_body(
         description = "Tool specific input parameters. See /v1/tools for parameter schema.",
-        required = true,
-        content = (
-            "application/json" = (
-                schema = serde_json::Value,
-                example = json!({
+        content(
+            (serde_json::Value = "application/json", example = json!({
                     "query": "SELECT avg(total_amount), avg(tip_amount), count(1), passenger_count FROM my_table GROUP BY passenger_count ORDER BY passenger_count ASC LIMIT 3"
                 })
             )

@@ -27,7 +27,7 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
         with:
-          os: 'linux'
+          os: "linux"
 
       - name: Set up make
         uses: ./.github/actions/setup-make
@@ -35,7 +35,7 @@ jobs:
       - name: Set up cc
         uses: ./.github/actions/setup-cc
 
-      # Putting this into a GitHub Actions matrix will run a separate job per matrix item, whereas in theory 
+      # Putting this into a GitHub Actions matrix will run a separate job per matrix item, whereas in theory
       # this can re-use the existing build cache to go faster.
       - name: Build without default features
         run: cargo check --no-default-features
@@ -75,3 +75,6 @@ jobs:
 
       - name: Build with only debezium
         run: cargo check --no-default-features --features debezium
+
+      - name: Build with only openapi
+        run: cargo check --no-default-features --features runtime/openapi

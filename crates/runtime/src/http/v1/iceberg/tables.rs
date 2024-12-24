@@ -92,8 +92,12 @@ impl Serialize for TableFormatVersion {
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 struct TableMetadata {
     format_version: TableFormatVersion,
+    #[cfg_attr(feature = "openapi", schema(value_type=String, example="2b9da507-2c07-4bb3-9f0b-8df66a5e9e53"))]
     table_uuid: Uuid,
     location: String,
+
+    /// Iceberg schemas, see `<https://apache.github.io/iceberg/spec/#schemas>`.
+    #[cfg_attr(feature = "openapi", schema(value_type=Type::Object, example="2b9da507-2c07-4bb3-9f0b-8df66a5e9e53"))]
     schemas: Vec<Schema>,
 }
 

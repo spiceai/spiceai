@@ -59,9 +59,9 @@ pub struct SpicepodCsvRow {
     pub dependencies_count: usize,
 }
 
-/// Get a list of spicepods and their details.
+/// List Spicepods
 ///
-/// This endpoint returns a list of all spicepods in the system. In CSV format, it will return a summarised form.
+/// Get a list of spicepods and their details. In CSV format, it will return a summarised form.
 #[cfg_attr(feature = "openapi", utoipa::path(
     get,
     path = "/v1/spicepods",
