@@ -34,7 +34,7 @@ pub struct GeneratePackageRequest {
     pub params: HashMap<String, String>,
 }
 
-/// Zip Github source
+/// Generate Package
 ///
 /// This endpoint generates a zip package from a specified GitHub source.
 #[cfg_attr(feature = "openapi", utoipa::path(
