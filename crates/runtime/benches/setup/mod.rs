@@ -191,6 +191,8 @@ fn get_accelerator_refresh_sql(
 ) -> Option<String> {
     if let Some("sqlite") = engine {
         if bench_name == "clickbench" {
+            // SQLite has troubles loading the whole ClickBench set with indexes enabled
+            // remove this refresh SQL when we support index creation after table load
             return Some(format!("SELECT * FROM {dataset} LIMIT 10000000"));
         }
     }
