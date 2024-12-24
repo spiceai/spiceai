@@ -16,13 +16,8 @@ limitations under the License.
 use std::{collections::HashMap, sync::Arc};
 
 use crate::{
-    accelerated_table::refresh::RefreshOverrides,
-    component::dataset::Dataset,
-    tools::builtin::sample::{
-        distinct::DistinctColumnsParams, random::RandomSampleParams, top_samples::TopSamplesParams,
-        SampleFrom, SampleTableMethod, SampleTableParams,
-    },
-    LogErrors, Runtime,
+    accelerated_table::refresh::RefreshOverrides, component::dataset::Dataset,
+    datafusion::DataFusion, status::ComponentStatus, LogErrors, Runtime,
 };
 use app::App;
 use axum::{
@@ -32,21 +27,12 @@ use axum::{
     response::{IntoResponse, Response},
     Extension, Json,
 };
-use axum_extra::TypedHeader;
 use datafusion::sql::TableReference;
-use headers_accept::Accept;
-use http::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::RwLock;
-use tract_core::tract_data::itertools::Itertools;
 
-use crate::{datafusion::DataFusion, status::ComponentStatus};
-
-use super::{
-    arrow_to_csv, arrow_to_json, arrow_to_plain, convert_entry_to_csv, dataset_status, ArrowFormat,
-    Format,
-};
+use super::{convert_entry_to_csv, dataset_status, Format};
 
 #[derive(Debug, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::IntoParams, utoipa::ToSchema))]
@@ -179,7 +165,7 @@ pub(crate) async fn get(
         None => valid_datasets,
     };
 
-    let resp = datasets
+    let resp: Vec<_> = datasets
         .iter()
         .map(|d| DatasetResponseItem {
             from: d.from.clone(),
@@ -193,7 +179,7 @@ pub(crate) async fn get(
                 None
             },
         })
-        .collect_vec();
+        .collect();
 
     match params.format {
         Format::Json => (status::StatusCode::OK, Json(resp)).into_response(),
@@ -437,135 +423,6 @@ pub(crate) async fn acceleration(
             }),
         )
             .into_response(),
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-pub struct SampleQueryParams {
-    /// The type of sampling to apply (e.g., `distinct_columns`, `random_sample`, `top_n_sample`)
-    #[serde(rename = "type")]
-    pub r#type: Option<SampleTableMethod>,
-}
-
-/// Sample Dataset
-///
-/// This endpoint allows for sampling data from a dataset using different methods.
-/// The type of sampling method can be specified using the `type` query parameter,
-/// and the body will be interpreted accordingly.
-
-#[cfg_attr(feature = "openapi", utoipa::path(
-    post,
-    path = "/v1/datasets/sample",
-    operation_id = "post_sample_dataset",
-    tag = "Datasets",
-    params(
-        ("type" = String, Query, description = "The type of sampling to apply. Possible values: 'distinct_columns', 'random_sample', 'top_n_sample'.")
-    ),
-    request_body(
-        description = "The request body depends on the type of sampling selected.",
-        content((
-            DistinctColumnsParams = "application/json", example = json!({
-                "dataset": "postgres:aidemo_messages",
-                "cols": ["column_a", "column_b"],
-                "limit": 100,
-            })
-        ),(
-            RandomSampleParams = "application/json",
-            example = json!({
-                "dataset": "postgres:aidemo_messages",
-                "limit": 100,
-            })
-        ),(
-            TopSamplesParams = "application/json",
-            example = json!({
-                "dataset": "postgres:aidemo_messages",
-                "order_by": "column_a",
-                "limit": 100,
-            })
-        ))
-    ),
-    responses(
-        (status = 200, description = "The sampled data from the dataset.", content((
-            Array<Object> = "application/json",
-            example = json!([
-                { "column_a": "value1", "column_b": 123 },
-                { "column_a": "value2", "column_b": 456 }
-            ])
-        ))),
-        (status = 200, description = "The sampled data in CSV format.", content((
-            String = "text/csv",
-            example = "
-column_a,column_b
-value1,123
-value2,456
-"
-        ))),
-        (status = 200, description = "The sampled data in plain text format.", content((
-            String = "text/plain",
-            example = "
-| column_a | column_b |
-|----------|----------|
-| value1   | 123      |
-| value2   | 456      |
-"
-        ))),
-        (status = 400, description = "Invalid request body", content((
-            serde_json::Value = "application/json",
-            example = json!({
-                "error": "Invalid request body"
-            })
-        ))),
-        (status = 500, description = "Internal server error occurred while sampling the dataset", content((
-            serde_json::Value = "application/json",
-            example = json!({
-                "error": "An unexpected error occurred while sampling the dataset"
-            })
-        )))
-    )
-))]
-pub(crate) async fn sample(
-    Extension(df): Extension<Arc<DataFusion>>,
-    accept: Option<TypedHeader<Accept>>,
-    Query(query): Query<SampleQueryParams>,
-    body: String,
-) -> Response {
-    // Convulted way to handle parsing [`SampleTableParams`] since params might overlap. Allow
-    // users to specify the type of sampling they want.
-    let params_result = match query.r#type {
-        Some(SampleTableMethod::DistinctColumns) => {
-            serde_json::from_str::<DistinctColumnsParams>(&body)
-                .map(SampleTableParams::DistinctColumns)
-        }
-        Some(SampleTableMethod::RandomSample) => {
-            serde_json::from_str::<RandomSampleParams>(&body).map(SampleTableParams::RandomSample)
-        }
-        Some(SampleTableMethod::TopNSample) => {
-            serde_json::from_str::<TopSamplesParams>(&body).map(SampleTableParams::TopNSample)
-        }
-        None => serde_json::from_str::<SampleTableParams>(&body),
-    };
-
-    let Ok(params) = params_result else {
-        return (status::StatusCode::BAD_REQUEST, "Invalid request body").into_response();
-    };
-
-    let sample = match params.sample(df).await {
-        Ok(sample) => sample,
-        Err(e) => {
-            return (status::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
-        }
-    };
-
-    let res = match ArrowFormat::from_accept_header(accept.as_ref()) {
-        ArrowFormat::Json => arrow_to_json(&[sample]),
-        ArrowFormat::Csv => arrow_to_csv(&[sample]),
-        ArrowFormat::Plain => arrow_to_plain(&[sample]),
-    };
-
-    match res {
-        Ok(body) => (StatusCode::OK, body).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
 

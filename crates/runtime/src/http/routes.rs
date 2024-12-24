@@ -67,7 +67,6 @@ use tower_http::cors::{AllowOrigin, Any, CorsLayer};
         v1::datasets::get,
         v1::datasets::acceleration,
         v1::datasets::refresh,
-        v1::datasets::sample,
         v1::catalogs::get,
         v1::iceberg::get_config,
         v1::iceberg::get_namespaces,
@@ -105,7 +104,6 @@ pub(crate) fn routes(
         .route("/v1/status", get(v1::status::get))
         .route("/v1/catalogs", get(v1::catalogs::get))
         .route("/v1/datasets", get(v1::datasets::get))
-        .route("/v1/datasets/sample", post(v1::datasets::sample))
         .route(
             "/v1/datasets/:name/acceleration/refresh",
             post(v1::datasets::refresh),
