@@ -276,7 +276,7 @@ jobs:
       - name: Set up Spice.ai API Key
         if: (github.event.inputs.selected_benchmark == matrix.name && (github.event.inputs.bench_name == matrix.bench || github.event.inputs.bench_name == 'all')) || github.event.inputs.run_all == 'true' || github.event_name == 'schedule'
         run: |
-          echo 'SPICEAI_API_KEY="${{ secrets.SPICE_SECRET_SPICEAI_TPCH_BENCHMARK_KEY }}"' > .env
+          echo 'SPICEAI_API_KEY="${{ secrets.SPICE_SECRET_SPICEAI_BENCHMARK_KEY }}"' > .env
 
       - name: Download benchmark binary
         if: (github.event.inputs.selected_benchmark == matrix.name && (github.event.inputs.bench_name == matrix.bench || github.event.inputs.bench_name == 'all')) || github.event.inputs.run_all == 'true' || github.event_name == 'schedule'
@@ -420,6 +420,7 @@ jobs:
           AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ secrets.AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY }}
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_S3_ATHENA_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_S3_ATHENA_SECRET_ACCESS_KEY }}
+          SPICEAI_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TPCH_BENCHMARK_KEY }}
 
       - name: Remove spice_bench file
         run: |
