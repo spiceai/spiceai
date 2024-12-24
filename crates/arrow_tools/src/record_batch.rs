@@ -143,7 +143,7 @@ pub fn to_primitive_type_list(
 /// # Errors
 ///
 /// This function will return an error if arrow conversion fails.
-pub fn truncate_record_batch_data(
+pub fn truncate_string_columns(
     record_batch: &RecordBatch,
     max_characters: usize,
 ) -> Result<RecordBatch, ArrowError> {
@@ -397,7 +397,7 @@ mod test {
 
         let input_batch = parse_json_to_batch(input_batch_json_data, Arc::clone(&schema));
 
-        let processed_batch = truncate_record_batch_data(&input_batch, 5)
+        let processed_batch = truncate_string_columns(&input_batch, 5)
             .expect("truncate_record_batch_data should succeed");
 
         let expected_batch_json_data = r#"
