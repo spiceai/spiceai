@@ -242,7 +242,6 @@ fn trancate_str(str: Option<&str>, max_characters: usize) -> Option<&str> {
     match str {
         Some(value) => {
             if value.len() > max_characters {
-                // Some(String::from(&value[..max_characters]))
                 Some(&value[..max_characters])
             } else {
                 Some(value)
