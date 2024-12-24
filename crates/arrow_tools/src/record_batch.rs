@@ -140,6 +140,7 @@ pub fn to_primitive_type_list(
 
 /// Recursively truncates the data in a record batch to the specified maximum number of characters.
 /// The truncation is applied to `Utf8` and `Utf8View` data.
+///
 /// # Errors
 ///
 /// This function will return an error if arrow conversion fails.
