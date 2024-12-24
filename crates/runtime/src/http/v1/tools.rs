@@ -71,7 +71,7 @@ pub(crate) async fn list(Extension(rt): Extension<Arc<Runtime>>) -> Response {
     (StatusCode::OK, Json(tools)).into_response()
 }
 
-/// Run tool.
+/// Run Tool
 ///
 /// The format of the request body and JSON response match the tool's
 #[cfg_attr(feature = "openapi", utoipa::path(

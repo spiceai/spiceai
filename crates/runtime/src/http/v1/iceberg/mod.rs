@@ -31,7 +31,7 @@ mod error;
 mod namespace;
 pub mod tables;
 
-/// Get Iceberg API config.
+/// Get Iceberg API config
 ///
 /// This endpoint returns the Iceberg Catalog API configuration, including details about overrides, defaults, and available endpoints.
 #[cfg_attr(feature = "openapi", utoipa::path(
@@ -150,7 +150,7 @@ pub(crate) async fn get_namespaces(
     }
 }
 
-/// Check Namespace exists.
+/// Check Namespace exists
 ///
 /// This endpoint returns a 200 OK response if the namespace exists, otherwise it returns a 404 Not Found response.
 #[cfg_attr(feature = "openapi", utoipa::path(

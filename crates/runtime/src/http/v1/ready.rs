@@ -23,7 +23,7 @@ use axum::{
     Extension,
 };
 
-/// Ready Check
+/// Check Readiness
 ///
 /// Check the runtime status of all the components of the runtime. If the service is ready, it returns an HTTP 200 status with the message "ready". If not, it returns a 503 status with the message "not ready".
 ///
