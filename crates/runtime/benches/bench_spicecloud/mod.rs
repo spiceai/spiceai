@@ -52,14 +52,38 @@ pub(crate) async fn run(
 
 pub fn build_app(app_builder: AppBuilder) -> AppBuilder {
     app_builder
-        .with_dataset(make_spiceai_dataset("tpch.customer", "customer"))
-        .with_dataset(make_spiceai_dataset("tpch.lineitem", "lineitem"))
-        .with_dataset(make_spiceai_dataset("tpch.part", "part"))
-        .with_dataset(make_spiceai_dataset("tpch.partsupp", "partsupp"))
-        .with_dataset(make_spiceai_dataset("tpch.orders", "orders"))
-        .with_dataset(make_spiceai_dataset("tpch.nation", "nation"))
-        .with_dataset(make_spiceai_dataset("tpch.region", "region"))
-        .with_dataset(make_spiceai_dataset("tpch.supplier", "supplier"))
+        .with_dataset(make_spiceai_dataset(
+            "spiceai/tpch/datasets/tpch.customer",
+            "customer",
+        ))
+        .with_dataset(make_spiceai_dataset(
+            "spiceai/tpch/datasets/tpch.lineitem",
+            "lineitem",
+        ))
+        .with_dataset(make_spiceai_dataset(
+            "spiceai/tpch/datasets/tpch.part",
+            "part",
+        ))
+        .with_dataset(make_spiceai_dataset(
+            "spiceai/tpch/datasets/tpch.partsupp",
+            "partsupp",
+        ))
+        .with_dataset(make_spiceai_dataset(
+            "spiceai/tpch/datasets/tpch.orders",
+            "orders",
+        ))
+        .with_dataset(make_spiceai_dataset(
+            "spiceai/tpch/datasets/tpch.nation",
+            "nation",
+        ))
+        .with_dataset(make_spiceai_dataset(
+            "spiceai/tpch/datasets/tpch.region",
+            "region",
+        ))
+        .with_dataset(make_spiceai_dataset(
+            "spiceai/tpch/datasets/tpch.supplier",
+            "supplier",
+        ))
 }
 
 fn make_spiceai_dataset(path: &str, name: &str) -> Dataset {
@@ -69,12 +93,10 @@ fn make_spiceai_dataset(path: &str, name: &str) -> Dataset {
 fn get_tpch_test_queries() -> Vec<(&'static str, &'static str)> {
     vec![
         ("tpch_q1", include_str!("../queries/tpch/q1.sql")),
-        // Execution error: Unable to query Flight: Unable to query: status: InvalidArgument, message: \"Table 'tpch.nation' not found
+        // DoGet recv error: rpc error: code = InvalidArgument desc = Correlated scalar subquery can only be used in Projection, Filter, Aggregate plan nodes
         // ("tpch_q2", include_str!("../queries/tpch/q2.sql")),
         ("tpch_q3", include_str!("../queries/tpch/q3.sql")),
-        // Error: "query `tpch_q4` to results: External error: Execution error: Unable to query Flight: Unable to query: status: InvalidArgument, message: \"Table 'tpch.lineitem' not found\\nstartLine 1\\nstartColumn 846\\nendLine 1\\nendColumn 862\\nSQL Query SELECT \\\"tpch\\\".\\\"orders\\\".\\\"o_orderpriority\\\", COUNT(1) AS \\\"order_count\\\" FROM \\\"tpch\\\".\\\"orders\\\" WHERE (((\\\"tpch\\\".\\\"orders\\\".\\\"o_orderdate\\\" >= CAST('1993-07-01' AS TIMESTAMP)) AND (\\\"tpch\\\".\\\"orders\\\".\\\"o_orderdate\\\" < CAST((CAST('1993-07-01' AS DATE) + INTERVAL '3' MONTH) AS TIMESTAMP))) AND EXISTS (SELECT \\\"tpch\\\".\\\"lineitem\\\".\\\"l_orderkey\\\", \\\"tpch\\\".\\\"lineitem\\\".\\\"l_partkey\\\", \\\"tpch\\\".\\\"lineitem\\\".\\\"l_suppkey\\\", \\\"tpch\\\".\\\"lineitem\\\".\\\"l_linenumber\\\", \\\"tpch\\\".\\\"lineitem\\\".\\\"l_quantity\\\", \\\"tpch\\\".\\\"lineitem\\\".\\\"l_extendedprice\\\", \\\"tpch\\\".\\\"lineitem\\\".\\\"l_discount\\\", \\\"tpch\\\".\\\"lineitem\\\".\\\"l_tax\\\", \\\"tpch\\\".\\\"lineitem\\\".\\\"l_returnflag\\\", \\\"tpch\\\".\\\"lineitem\\\".\\\"l_linestatus\\\", \\\"tpch\\\".\\\"lineitem\\\".\\\"l_shipdate\\\", \\\"tpch\\\".\\\"lineitem\\\".\\\"l_commitdate\\\", \\\"tpch\\\".\\\"lineitem\\\".\\\"l_receiptdate\\\", \\\"tpch\\\".\\\"lineitem\\\".\\\"l_shipinstruct\\\", \\\"tpch\\\".\\\"lineitem\\\".\\\"l_shipmode\\\", \\\"tpch\\\".\\\"lineitem\\\".\\\"l_comment\\\" FROM \\\"tpch\\\".\\\"lineitem\\\" WHERE ((\\\"tpch\\\".\\\"lineitem\\\".\\\"l_orderkey\\\" = \\\"tpch\\\".\\\"orders\\\".\\\"o_orderkey\\\") AND (\\\"tpch\\\".\\\"lineitem\\\".\\\"l_commitdate\\\" < \\\"tpch\\\".\\\"lineitem\\\".\\\"l_receiptdate\\\")))) GROUP BY \\\"tpch\\\".\\\"orders\\\".\\\"o_orderpriority\\\" ORDER BY \\\"tpch\\\".\\\"orders\\\".\\\"o_orderpriority\\\" ASC NULLS LAST\", details: [], metadata: MetadataMap { headers: {\"date\": \"Thu, 11 Jul 2024 10:46:10 GMT\", \"content-type\": \"application/grpc\", \"strict-transport-security\": \"max-age=15724800; includeSubDomains\", \"alt-svc\": \"h3=\\\":443\\\"; ma=86400\", \"cf-ray\": \"8a18354d2b5f5ac0-MEL\", \"cf-cache-status\": \"DYNAMIC\", \"server\": \"cloudflare\"} }"
-        // potential data source bug
-        // ("tpch_q4", include_str!("tpch_q4.sql")),
+        ("tpch_q4", include_str!("../queries/tpch/q4.sql")),
         ("tpch_q5", include_str!("../queries/tpch/q5.sql")),
         ("tpch_q6", include_str!("../queries/tpch/q6.sql")),
         ("tpch_q7", include_str!("../queries/tpch/q7.sql")),
@@ -86,18 +108,13 @@ fn get_tpch_test_queries() -> Vec<(&'static str, &'static str)> {
         ("tpch_q13", include_str!("../queries/tpch/q13.sql")),
         ("tpch_q14", include_str!("../queries/tpch/q14.sql")),
         // tpch_q15 has a view creation which we don't support by design
-
-        // Execution error: Unable to query Flight: Unable to query: status: InvalidArgument, message: \"Table 'tpch.supplier' not found
-        // ("tpch_q16", include_str!("tpch_q16.sql")),
+        ("tpch_q16", include_str!("../queries/tpch/q16.sql")),
         ("tpch_q17", include_str!("../queries/tpch/q17.sql")),
-        // Execution error: Unable to query Flight: Unable to query: status: InvalidArgument, message: \"Table 'tpch.lineitem' not found
-        // ("tpch_q18", include_str!("../queries/tpch/q18.sql")),
+        ("tpch_q18", include_str!("../queries/tpch/q18.sql")),
         ("tpch_q19", include_str!("../queries/tpch/q19.sql")),
-        // Error: "query `tpch_q20` to results: External error: Execution error: Unable to query Flight: Unable to query: status: InvalidArgument, message: \"Table 'tpch.partsupp' not found\\nstartLine 1\\nstartColumn 228\\nendLine 1\\nendColumn 244\\nSQL Query SELECT \\\"tpch\\\".\\\"supplier\\\".\\\"s_name\\\", \\\"tpch\\\".\\\"supplier\\\".\\\"s_address\\\" FROM \\\"tpch\\\".\\\"supplier\\\" JOIN \\\"tpch\\\".\\\"nation\\\" ON true WHERE ((\\\"tpch\\\".\\\"supplier\\\".\\\"s_suppkey\\\" IN (SELECT \\\"tpch\\\".\\\"partsupp\\\".\\\"ps_suppkey\\\" FROM \\\"tpch\\\".\\\"partsupp\\\" WHERE (\\\"tpch\\\".\\\"partsupp\\\".\\\"ps_partkey\\\" IN (SELECT \\\"tpch\\\".\\\"part\\\".\\\"p_partkey\\\" FROM \\\"tpch\\\".\\\"part\\\" WHERE \\\"tpch\\\".\\\"part\\\".\\\"p_name\\\" LIKE 'forest%') AND (CAST(\\\"tpch\\\".\\\"partsupp\\\".\\\"ps_availqty\\\" AS DOUBLE) > (SELECT (0.5 * CAST(SUM(\\\"tpch\\\".\\\"lineitem\\\".\\\"l_quantity\\\") AS DOUBLE)) FROM \\\"tpch\\\".\\\"lineitem\\\" WHERE ((((\\\"tpch\\\".\\\"lineitem\\\".\\\"l_partkey\\\" = \\\"tpch\\\".\\\"partsupp\\\".\\\"ps_partkey\\\") AND (\\\"tpch\\\".\\\"lineitem\\\".\\\"l_suppkey\\\" = \\\"tpch\\\".\\\"partsupp\\\".\\\"ps_suppkey\\\")) AND (\\\"tpch\\\".\\\"lineitem\\\".\\\"l_shipdate\\\" >= CAST(CAST('1994-01-01' AS DATE) AS TIMESTAMP))) AND (\\\"tpch\\\".\\\"lineitem\\\".\\\"l_shipdate\\\" < CAST((CAST('1994-01-01' AS DATE) + INTERVAL '12' MONTH) AS TIMESTAMP))))))) AND (\\\"tpch\\\".\\\"supplier\\\".\\\"s_nationkey\\\" = \\\"tpch\\\".\\\"nation\\\".\\\"n_nationkey\\\")) AND (\\\"tpch\\\".\\\"nation\\\".\\\"n_name\\\" = 'CANADA')) ORDER BY \\\"tpch\\\".\\\"supplier\\\".\\\"s_name\\\" ASC NULLS LAST\", details: [], metadata: MetadataMap { headers: {\"date\": \"Thu, 11 Jul 2024 10:51:30 GMT\", \"content-type\": \"application/grpc\", \"strict-transport-security\": \"max-age=15724800; includeSubDomains\", \"alt-svc\": \"h3=\\\":443\\\"; ma=86400\", \"cf-ray\": \"8a183d1d0a305ab0-MEL\", \"cf-cache-status\": \"DYNAMIC\", \"server\": \"cloudflare\"} }"
-        // ("tpch_q20", include_str!("tpch_q20.sql")),
+        ("tpch_q20", include_str!("../queries/tpch/q20.sql")),
         ("tpch_q21", include_str!("../queries/tpch/q21.sql")),
-        // Error: "query `tpch_q22` to results: External error: Execution error: Unable to query Flight: Unable to query: status: InvalidArgument, message: \"Table 'tpch.orders' not found
-        // ("tpch_q22", include_str!("tpch_q22.sql")),
+        ("tpch_q22", include_str!("../queries/tpch/q22.sql")),
         (
             "tpch_simple_q1",
             include_str!("../queries/tpch/simple_q1.sql"),
