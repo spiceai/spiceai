@@ -35,6 +35,8 @@ use serde::Serialize;
 use tokio::sync::RwLock;
 use tracing::{Instrument, Span};
 
+/// Create Chat Completion
+///
 /// Creates a model response for the given chat conversation.
 #[cfg_attr(feature = "openapi", utoipa::path(
     post,
@@ -43,7 +45,6 @@ use tracing::{Instrument, Span};
     tag = "AI",
     request_body(
         description = "Create a chat completion request using a language model.",
-        required = true,
         content((
             CreateChatCompletionRequest = "application/json",
             example = json!({

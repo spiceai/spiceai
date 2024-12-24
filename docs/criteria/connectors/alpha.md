@@ -8,28 +8,29 @@ All criteria must be met for the connector to be considered Alpha. As Alpha sign
 
 | Connector                        | Alpha Quality | DRI Sign-off |
 | -------------------------------- | ------------- | ------------ |
-| Clickhouse                       | ❌            |              |
+| Clickhouse                       | ➖            |              |
 | Databricks (mode: delta_lake)    | ✅            | @Sevenannn   |
-| Databricks (mode: spark_connect) | ❌            |              |
-| Delta Lake                       | ❌            |              |
-| Dremio                           | ❌            |              |
+| Databricks (mode: spark_connect) | ➖            |              |
+| Delta Lake                       | ➖            |              |
+| Dremio                           | ➖            |              |
 | DuckDB                           | ✅            | @peasee      |
-| File                             | ❌            |              |
-| FTP/SFTP                         | ❌            |              |
-| GraphQL                          | ❌            |              |
+| File                             | ✅            | @peasee      |
+| FlightSQL                        | ➖            |              |
+| FTP/SFTP                         | ➖            |              |
+| GraphQL                          | ➖            |              |
 | GitHub                           | ✅            | @peasee      |
-| HTTP/HTTPS                       | ❌            |              |
-| Localpod                         | ❌            |              |
-| MS SQL                           | ❌            |              |
+| HTTP/HTTPS                       | ➖            |              |
+| Localpod                         | ➖            |              |
+| MS SQL                           | ✅            | @peasee      |
 | MySQL                            | ✅            | @peasee      |
-| ODBC                             | ❌            |              |
+| ODBC                             | ➖            |              |
 | PostgreSQL                       | ✅            | @Sevenannn   |
-| Sharepoint                       | ❌            |              |
-| Snowflake                        | ❌            |              |
-| Spice.AI Cloud Platform          | ❌            |              |
+| Sharepoint                       | ➖            |              |
+| Snowflake                        | ➖            |              |
+| Spice.AI Cloud Platform          | ➖            |              |
 | S3                               | ✅            | @Sevenannn   |
-| Azure BlobFS                     | ❌            |              |
-| Spark                            | ❌            |              |
+| Azure BlobFS                     | ➖            |              |
+| Spark                            | ➖            |              |
 
 ## Alpha Release Criteria
 

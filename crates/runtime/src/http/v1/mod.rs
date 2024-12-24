@@ -51,6 +51,15 @@ use snafu::ResultExt;
 
 use futures::TryStreamExt;
 
+#[cfg(feature = "openapi")]
+use utoipa::{
+    openapi::{
+        path::{Parameter, ParameterBuilder, ParameterIn},
+        Required,
+    },
+    schema,
+};
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "lowercase")]
@@ -61,6 +70,19 @@ pub enum Format {
 
     /// CSV format
     Csv,
+}
+
+#[cfg(feature = "openapi")]
+impl utoipa::IntoParams for Format {
+    fn into_params(parameter_in_provider: impl Fn() -> Option<ParameterIn>) -> Vec<Parameter> {
+        vec![ParameterBuilder::new()
+            .description(Some(""))
+            .name("format")
+            .required(Required::True)
+            .parameter_in(parameter_in_provider().unwrap_or_default())
+            .schema(Some(schema!(Format)))
+            .build()]
+    }
 }
 
 #[derive(Default, Debug, Serialize, Deserialize)]

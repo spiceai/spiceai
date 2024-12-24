@@ -170,6 +170,8 @@ fn build_app(
         app.datasets.iter_mut().for_each(|ds| {
             let mut accel = accel.clone();
             let indexes = get_accelerator_indexes(accel.engine.clone(), &ds.name, bench_name);
+            accel.refresh_sql =
+                get_accelerator_refresh_sql(accel.engine.as_deref(), &ds.name, bench_name);
             if let Some(indexes) = indexes {
                 accel.indexes = indexes;
             }
@@ -180,6 +182,22 @@ fn build_app(
     }
 
     Ok(app)
+}
+
+fn get_accelerator_refresh_sql(
+    engine: Option<&str>,
+    dataset: &str,
+    bench_name: &str,
+) -> Option<String> {
+    if let Some("sqlite") = engine {
+        if bench_name == "clickbench" {
+            // SQLite has troubles loading the whole ClickBench set with indexes enabled
+            // remove this refresh SQL when we support index creation after table load
+            return Some(format!("SELECT * FROM {dataset} LIMIT 10000000"));
+        }
+    }
+
+    None
 }
 
 #[allow(clippy::too_many_lines)]
@@ -291,6 +309,29 @@ fn get_accelerator_indexes(
                         let mut indexes: HashMap<String, IndexType> = HashMap::new();
                         indexes.insert("ws_bill_customer_sk".to_string(), IndexType::Enabled);
                         indexes.insert("ws_sold_date_sk".to_string(), IndexType::Enabled);
+                        Some(indexes)
+                    }
+                    _ => None,
+                },
+                "clickbench" => match dataset {
+                    "hits" => {
+                        let mut indexes: HashMap<String, IndexType> = HashMap::new();
+                        indexes
+                            .insert("(ClientIP, SearchEngineID)".to_string(), IndexType::Enabled);
+                        indexes.insert("(ClientIP, WatchID)".to_string(), IndexType::Enabled);
+                        indexes.insert(
+                            "(MobilePhone, MobilePhoneModel)".to_string(),
+                            IndexType::Enabled,
+                        );
+                        indexes.insert(
+                            "(SearchEngineID, SearchPhrase)".to_string(),
+                            IndexType::Enabled,
+                        );
+                        indexes.insert("(SearchPhrase, UserID)".to_string(), IndexType::Enabled);
+                        indexes.insert("AdvEngineID".to_string(), IndexType::Enabled);
+                        indexes.insert("MobilePhoneModel".to_string(), IndexType::Enabled);
+                        indexes.insert("SearchPhrase".to_string(), IndexType::Enabled);
+                        indexes.insert("UserID".to_string(), IndexType::Enabled);
                         Some(indexes)
                     }
                     _ => None,

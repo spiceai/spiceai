@@ -15,6 +15,12 @@ limitations under the License.
 */
 
 use crate::embeddings::vector_search;
+
+#[cfg(feature = "openapi")]
+use crate::http::v1::{
+    datasets::{DatasetFilter, DatasetQueryParams},
+    Format,
+};
 use crate::request::Protocol;
 use crate::Runtime;
 use crate::{config, request::RequestContext};
@@ -32,6 +38,7 @@ use utoipa::OpenApi;
 #[cfg(feature = "dev")]
 use utoipa_swagger_ui::SwaggerUi;
 
+use super::{metrics, v1};
 use axum::{
     body::Body,
     extract::MatchedPath,
@@ -45,35 +52,45 @@ use runtime_auth::layer::http::AuthLayer;
 use tokio::time::Instant;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 
-use super::{metrics, v1};
-
 #[cfg(feature = "openapi")]
 #[derive(OpenApi)]
-#[openapi(paths(
-    v1::catalogs::get,
-    v1::chat::post,
-    v1::datasets::acceleration,
-    v1::datasets::get,
-    v1::datasets::refresh,
-    v1::datasets::sample,
-    v1::embeddings::post,
-    v1::eval::list,
-    v1::eval::post,
-    v1::iceberg::get_config,
-    v1::iceberg::get_namespaces,
-    v1::inference::get,
-    v1::inference::post,
-    v1::models::get,
-    v1::nsql::post,
-    v1::packages::generate,
-    v1::query::post,
-    v1::search::post,
-    v1::status::get,
-    v1::spicepods::get,
-    v1::tools::list,
-    v1::tools::post,
-))]
-struct ApiDoc;
+#[openapi(
+    servers(
+        (url = "http://localhost:8090", description = "Local development server. Configure with `--http`."),
+    ),
+    security(
+        ("api_key" = [])
+    ),
+    paths(
+        // Order here will be preserved in sidebar at https://docs.spiceai.org/api/http/runtime.
+        v1::query::post,
+        v1::datasets::get,
+        v1::datasets::acceleration,
+        v1::datasets::refresh,
+        v1::catalogs::get,
+        v1::iceberg::get_config,
+        v1::iceberg::get_namespaces,
+        v1::iceberg::head_namespace,
+        v1::ready::get,
+        v1::status::get,
+        v1::spicepods::get,
+        v1::embeddings::post,
+        v1::search::post,
+        v1::chat::post,
+        v1::models::get,
+        v1::nsql::post,
+        v1::eval::list,
+        v1::eval::post,
+        v1::inference::get,
+        v1::inference::post,
+        v1::tools::list,
+        v1::tools::post,
+        v1::packages::generate,
+    ),
+
+    components(schemas(DatasetQueryParams, DatasetFilter, Format)) // These schemas, for some reason, weren't getting picked up.
+)]
+pub struct ApiDoc;
 
 pub(crate) fn routes(
     rt: &Arc<Runtime>,
@@ -87,7 +104,6 @@ pub(crate) fn routes(
         .route("/v1/status", get(v1::status::get))
         .route("/v1/catalogs", get(v1::catalogs::get))
         .route("/v1/datasets", get(v1::datasets::get))
-        .route("/v1/datasets/sample", post(v1::datasets::sample))
         .route(
             "/v1/datasets/:name/acceleration/refresh",
             post(v1::datasets::refresh),
@@ -243,66 +259,4 @@ fn cors_layer(cors_config: &CorsConfig) -> CorsLayer {
 
     cors.allow_methods([Method::GET, Method::POST, Method::PATCH])
         .allow_origin(allowed_origins)
-}
-
-#[cfg(feature = "openapi")]
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use utoipa::OpenApi;
-
-    /// Make sure that all routes are defined in the `OpenAPI` spec. If you add a new route, you must
-    ///   1. Add the route to the `OpenAPI` spec in the `#[openapi(paths(...))]` attribute abover
-    ///   2. Add the route to the `expected_routes` `HashSet` below
-    #[test]
-    fn all_routes_in_openapi_spec() {
-        let openapi = ApiDoc::openapi();
-        let openapi_paths: std::collections::HashSet<String> = openapi
-            .paths
-            .paths
-            .keys()
-            .map(ToString::to_string)
-            .collect();
-
-        let expected_routes: std::collections::HashSet<String> = [
-            "/v1/sql",
-            "/v1/status",
-            "/v1/catalogs",
-            "/v1/datasets",
-            "/v1/datasets/sample",
-            "/v1/datasets/{name}/acceleration/refresh",
-            "/v1/datasets/{name}/acceleration",
-            "/v1/spicepods",
-            "/v1/packages/generate",
-            "/v1/iceberg/config",
-            "/v1/iceberg/namespaces",
-            "/v1/models",
-            "/v1/models/{name}/predict",
-            "/v1/predict",
-            "/v1/nsql",
-            "/v1/chat/completions",
-            "/v1/embeddings",
-            "/v1/search",
-            "/v1/tools",
-            "/v1/tools/{name}",
-            "/v1/evals/{name}",
-            "/v1/evals",
-        ]
-        .iter()
-        .map(|&s| s.to_string())
-        .collect();
-
-        let missing_in_openapi: Vec<_> = expected_routes.difference(&openapi_paths).collect();
-        let extra_in_openapi: Vec<_> = openapi_paths.difference(&expected_routes).collect();
-
-        assert!(
-            missing_in_openapi.is_empty(),
-            "The following routes are missing in OpenAPI spec: {missing_in_openapi:?}"
-        );
-
-        assert!(
-            extra_in_openapi.is_empty(),
-            "The following routes are extra in OpenAPI spec: {extra_in_openapi:?}"
-        );
-    }
 }

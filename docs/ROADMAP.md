@@ -13,37 +13,32 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 - Bugfixes and performance improvements
 - Spice.ai Cloud Platform data connector (Release Candidate)
 - Dremio data connector (Release Candidate)
-- MS SQL data connector (Release Candidate)
 - File data connector (Release Candidate)
 - Data Accelerators: SQLite & PostgreSQL (Release Candidate)
-- DynamoDB data connector (Alpha)
+- Iceberg Catalog Connector (Alpha)
 - [#3318](https://github.com/spiceai/spiceai/issues/3318) FinanceBench in CI
-- [#3018](https://github.com/spiceai/spiceai/issues/3018) Results caching for embeddings and search
 
 ## v1.0-stable (Jan 2025)
 
 - Bugfixes and performance improvements
-- CLI
-  - Spicepod publish to [spicerack.org](https://spicerack.org)
 - Data Accelerators: Arrow, DuckDB, SQLite, PostgreSQL (Stable)
-- Model Providers: OpenAI, Hugging Face (Stable)
-- Catalog Providers: Unity Catalog, Spice.AI Cloud Platform (Stable)
+- Model Providers: OpenAI, Hugging Face, File (Stable)
+- Catalog Providers: Unity Catalog, Spice.ai Cloud Platform (Stable)
 - Databricks DeltaLake data connector (Stable)
 - Spice.ai Cloud Platform data connector (Stable)
 - S3 data connector (Stable)
 - PostgreSQL Data Connector (Stable)
 - MySQL Data Connector (Stable)
-- DuckDB Data Connector (Stable)
 - GitHub Data Connector (Stable)
-- GraphQL Data Connector (Stable)
 - MS SQL data connector (Stable)
 - File data connector (Stable)
 - Dremio data connector (Stable)
-- Model Providers: Anthropic, Groq, Grok, File (Beta)
-- Catalog Providers: Databricks (Beta)
+- Model Providers: Anthropic, Groq, Grok (Beta)
+- Catalog Providers: Databricks, Iceberg Tables (Beta)
 - FTP/SFTP Data Connector (Beta)
 - Snowflake Data Connector (Beta)
 - Spark Data Connector (Beta)
+- DynamoDB data connector (Alpha)
 
 ### v1.0-stable Data Connector Support
 
@@ -58,7 +53,6 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 | `file`          | Stable |
 | `duckdb`        | Stable |
 | `github`        | Stable |
-| `graphql`       | Stable |
 | `dremio`        | Stable |
 | `mssql`         | Stable |
 | `odbc`          | Beta   |
@@ -70,6 +64,7 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 | `flightsql`     | Alpha  |
 | `debezium`      | Alpha  |
 | `sharepoint`    | Alpha  |
+| `dynamodb`      | Alpha  |
 
 ### v1.0-stable Data Accelerator Support
 
@@ -87,6 +82,7 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 | `unity_catalog` | Stable |
 | `spice.ai`      | Stable |
 | `databricks`    | Beta   |
+| `iceberg`       | Alpha  |
 
 ### v1.0-stable Model Provider Support
 
@@ -94,7 +90,7 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 | ------------- | ------ |
 | `openai`      | Stable |
 | `huggingface` | Stable |
-| `file`        | Beta   |
+| `file`        | Stable |
 | `anthropic`   | Beta   |
 | `azure`       | Beta   |
 | `groq`        | Beta   |
@@ -103,6 +99,8 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 ## v1.1 (Feb 2025)
 
 - Bugfixes
+- DuckDB Data Connector (Stable)
+- [#3018](https://github.com/spiceai/spiceai/issues/3018) Results caching for embeddings and search
 - Enterprise Search improvements
   - [#3006](https://github.com/spiceai/spiceai/issues/3006) Search with keyword filtering
   - [#3016](https://github.com/spiceai/spiceai/issues/3016) Hybrid-Search (DB + Vector)

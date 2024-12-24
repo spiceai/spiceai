@@ -41,8 +41,8 @@ text-splitter = { git = "https://github.com/spiceai/text-splitter.git", rev = "5
 pulldown-cmark = "0.12.1"
 tiktoken-rs = "0.6.0"
 
-mistralrs = { git = "https://github.com/spiceai/mistral.rs", rev = "2978e4039af71007588478be60aa076e2a21437d", optional = true }
-mistralrs-core = { git = "https://github.com/spiceai/mistral.rs", rev = "2978e4039af71007588478be60aa076e2a21437d", optional = true, package = "mistralrs-core" }
+mistralrs = { git = "https://github.com/spiceai/mistral.rs", rev = "2978e4039af71007588478be60aa076e2a21437d"}
+mistralrs-core = { git = "https://github.com/spiceai/mistral.rs", rev = "2978e4039af71007588478be60aa076e2a21437d", package = "mistralrs-core" }
 rand = "0.8.5"
 tei_backend = { package = "text-embeddings-backend", git = "https://github.com/spiceai/text-embeddings-inference.git", rev = "b59b7b62860e75abea9b222de6100b4d1b1fac92", features = [
     "candle",
@@ -72,11 +72,9 @@ cuda = [
     "mistralrs-core/cuda",
     "mistralrs/cuda",
 ]
-default = ["mistralrs"]
 metal = [
     "tei_backend/metal",
     "tei_candle/metal",
     "mistralrs-core/metal",
     "mistralrs/metal",
 ]
-mistralrs = ["dep:mistralrs", "dep:mistralrs-core"]

@@ -120,7 +120,7 @@ async fn test_http_auth() -> Result<(), anyhow::Error> {
         tracing::info!("Metrics health check passed");
 
         // v1/status is authenticated
-        let status_url = format!("http://127.0.0.1:{http_port}/v1/status");
+        let status_url = format!("http://127.0.0.1:{http_port}/v1/status?format=json");
         let response = http_client
             .get(&status_url)
             .send()

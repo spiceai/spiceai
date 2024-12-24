@@ -28,7 +28,7 @@ use std::sync::Arc;
 
 use crate::Runtime;
 
-use super::{builtin::get_builtin_tools, options::SpiceToolsOptions, SpiceModelTool};
+use super::{options::SpiceToolsOptions, SpiceModelTool};
 
 /// Creates the messages that would be sent and received if a language model were to request the `tool`
 /// to be called (via an assistant message), with defined `arg`, and the response from running the
@@ -83,22 +83,15 @@ pub fn parameters<T: JsonSchema + Serialize>() -> Option<Value> {
 
 #[must_use]
 pub async fn get_tools(rt: Arc<Runtime>, opts: &SpiceToolsOptions) -> Vec<Arc<dyn SpiceModelTool>> {
-    match opts {
-        SpiceToolsOptions::Disabled => vec![],
-        SpiceToolsOptions::Auto => get_builtin_tools(),
-        SpiceToolsOptions::Specific(t) => {
-            // TODO check for "categories/groups" of tools: builtin, memory
-            let mut tools = vec![];
-            let all_tools = rt.tools.read().await;
+    let all_tools = rt.tools.read().await;
 
-            for tt in t {
-                if let Some(tool) = all_tools.get(tt) {
-                    tools.extend(tool.tools().await);
-                } else {
-                    tracing::warn!("Tool {tt} not found in registry");
-                }
-            }
-            tools
+    let mut tools = vec![];
+    for tt in opts.tools_by_name() {
+        if let Some(tool) = all_tools.get(tt) {
+            tools.extend(tool.tools().await);
+        } else {
+            tracing::warn!("Tool {tt} not found in registry");
         }
     }
+    tools
 }

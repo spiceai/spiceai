@@ -1,0 +1,17 @@
+[package]
+edition.workspace = true
+exclude.workspace = true
+homepage.workspace = true
+license.workspace = true
+name = "spiceschema"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+clap = { version = "4.3", features = ["derive"] }
+runtime = { path = "../../crates/runtime", features = ["openapi", "models"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+utoipa = { version = "5.2.0", features = ["axum_extras"] }

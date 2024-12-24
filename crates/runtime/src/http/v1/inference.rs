@@ -89,9 +89,9 @@ pub enum PredictStatus {
     InternalError,
 }
 
-/// Make a ML prediction using a specific model.
+/// ML Prediction
 ///
-/// This endpoint allows you to make a prediction using a specific machine learning model.
+/// Make a ML prediction using a specific model.
 #[cfg_attr(feature = "openapi", utoipa::path(
     get,
     path = "/v1/models/{name}/predict",
@@ -151,9 +151,9 @@ pub(crate) async fn get(
             .into_response(),
     }
 }
-/// Make batch ML predictions using multiple models.
+/// Batch ML Predictions
 ///
-/// This endpoint allows for processing muliple machine learning models in parallel. This is useful for ensembling or A/B testing different models.
+/// Perform a batch of ML predictions, using multiple models, in one request. This is useful for ensembling or A/B testing different models.
 #[cfg_attr(feature = "openapi", utoipa::path(
     post,
     path = "/v1/predict",
@@ -161,7 +161,6 @@ pub(crate) async fn get(
     tag = "AI",
     request_body(
         description = "Batch prediction request containing a list of prediction requests for specific models",
-        required = true,
         content((
             BatchPredictRequest = "application/json",
             example = json!({
