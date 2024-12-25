@@ -500,6 +500,10 @@ fn get_huggingface_model(
         .insert("model_type".to_string(), model_type.into().into());
 
     model
+        .params
+        .insert("hf_token".to_string(), "${ secrets:SPICE_HF_TOKEN }".into());
+
+    model
 }
 
 fn get_huggingface_embeddings(model: impl Into<String>, name: impl Into<String>) -> Embeddings {
