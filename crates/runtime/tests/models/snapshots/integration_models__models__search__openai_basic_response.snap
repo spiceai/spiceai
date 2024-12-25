@@ -14,7 +14,7 @@ expression: normalize_search_response(response)
       "primary_key": {
         "i_item_sk": 19
       },
-      "score": "score_val",
+      "score": "0.7685",
       "value": "Patient"
     },
     {
@@ -26,7 +26,7 @@ expression: normalize_search_response(response)
       "primary_key": {
         "i_item_sk": 7
       },
-      "score": "score_val",
+      "score": "0.7484",
       "value": "New"
     }
   ]

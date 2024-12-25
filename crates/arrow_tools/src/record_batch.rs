@@ -138,6 +138,119 @@ pub fn to_primitive_type_list(
     Err(ArrowError::CastError("Invalid column type".into()))
 }
 
+/// Recursively truncates the data in a record batch to the specified maximum number of characters.
+/// The truncation is applied to `Utf8` and `Utf8View` data.
+///
+/// # Errors
+///
+/// This function will return an error if arrow conversion fails.
+pub fn truncate_string_columns(
+    record_batch: &RecordBatch,
+    max_characters: usize,
+) -> Result<RecordBatch, ArrowError> {
+    let schema = record_batch.schema();
+    let columns = record_batch
+        .columns()
+        .iter()
+        .zip(schema.fields())
+        .map(|(column, field)| truncate_column_data(Arc::clone(column), field, max_characters))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    RecordBatch::try_new(schema, columns)
+}
+
+fn truncate_column_data(
+    column: ArrayRef,
+    field: &Arc<Field>,
+    max_characters: usize,
+) -> Result<ArrayRef, ArrowError> {
+    match field.data_type() {
+        DataType::Utf8View => {
+            let string_array = column
+                .as_any()
+                .downcast_ref::<arrow::array::StringViewArray>()
+                .ok_or(ArrowError::CastError(
+                    "Failed to downcast to StringViewArray".into(),
+                ))?;
+
+            let truncated = string_array
+                .iter()
+                .map(|x| trancate_str(x, max_characters))
+                .collect::<arrow::array::StringViewArray>();
+
+            Ok(Arc::new(truncated) as ArrayRef)
+        }
+        DataType::Utf8 => {
+            let string_array = column
+                .as_any()
+                .downcast_ref::<arrow::array::StringArray>()
+                .ok_or(ArrowError::CastError(
+                    "Failed to downcast to ListArray".into(),
+                ))?;
+
+            let truncated = string_array
+                .iter()
+                .map(|x| trancate_str(x, max_characters))
+                .collect::<arrow::array::StringArray>();
+
+            Ok(Arc::new(truncated) as ArrayRef)
+        }
+        DataType::List(field) => {
+            let list_array = column
+                .as_any()
+                .downcast_ref::<arrow::array::ListArray>()
+                .ok_or_else(|| ArrowError::CastError("Failed to downcast to ListArray".into()))?;
+
+            let truncated_values =
+                truncate_column_data(Arc::clone(list_array.values()), field, max_characters)?;
+
+            let list = ListArray::new(
+                Arc::clone(field),
+                arrow::buffer::OffsetBuffer::new(
+                    arrow::buffer::Buffer::from_slice_ref(list_array.value_offsets()).into(),
+                ),
+                truncated_values,
+                list_array.logical_nulls(),
+            );
+
+            Ok(Arc::new(list) as ArrayRef)
+        }
+        DataType::Struct(fields) => {
+            let struct_array = column
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .ok_or_else(|| ArrowError::CastError("Failed to downcast to StructArray".into()))?;
+
+            let columns = fields
+                .iter()
+                .enumerate()
+                .map(|(i, field)| {
+                    let field_data = struct_array.column(i);
+                    truncate_column_data(Arc::clone(field_data), field, max_characters)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+
+            let truncated_struct =
+                StructArray::from(fields.iter().cloned().zip(columns).collect::<Vec<_>>());
+            Ok(Arc::new(truncated_struct) as ArrayRef)
+        }
+        _ => Ok(column),
+    }
+}
+
+fn trancate_str(str: Option<&str>, max_characters: usize) -> Option<&str> {
+    match str {
+        Some(value) => {
+            if value.len() > max_characters {
+                Some(&value[..max_characters])
+            } else {
+                Some(value)
+            }
+        }
+        None => None,
+    }
+}
+
 #[cfg(test)]
 mod test {
 
@@ -256,5 +369,45 @@ mod test {
         .expect("should create new record batch");
 
         assert_eq!(expected_list_batch, processed_batch);
+    }
+
+    #[test]
+    fn test_truncate_record_batch_data_complex_data() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "labels",
+            DataType::List(Arc::new(Field::new(
+                "struct",
+                DataType::Struct(
+                    vec![
+                        Field::new("id", DataType::Int32, true),
+                        Field::new("name", DataType::Utf8, true),
+                    ]
+                    .into(),
+                ),
+                true,
+            ))),
+            true,
+        )]));
+
+        let input_batch_json_data = r#"
+            {"labels": [{"id": 1, "name": "123"}, {"id": 2, "name": "12345"}, {"id": 1, "name": "123456789"}]}
+            {"labels": null}
+            {"labels": [{"id": 4,"name":"test12345"}, {"id": null,"name":null}]}
+            "#;
+
+        let input_batch = parse_json_to_batch(input_batch_json_data, Arc::clone(&schema));
+
+        let processed_batch = truncate_string_columns(&input_batch, 5)
+            .expect("truncate_record_batch_data should succeed");
+
+        let expected_batch_json_data = r#"
+            {"labels": [{"id": 1, "name": "123"}, {"id": 2, "name": "12345"}, {"id": 1, "name": "12345"}]}
+            {"labels": null}
+            {"labels": [{"id": 4,"name":"test1"}, {"id": null,"name":null}]}
+            "#;
+
+        let expected_batch = parse_json_to_batch(expected_batch_json_data, schema);
+
+        assert_eq!(processed_batch, expected_batch);
     }
 }
