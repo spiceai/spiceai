@@ -3237,31 +3237,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "datafusion-federation"
-version = "0.1.6"
-source = "git+https://github.com/spiceai/datafusion-federation.git?rev=72374f605ec9617ff1852ca43297233202ec2d43#72374f605ec9617ff1852ca43297233202ec2d43"
-dependencies = [
- "arrow-json 53.3.0",
- "async-stream",
- "async-trait",
- "datafusion",
- "futures",
-]
-
-[[package]]
-name = "datafusion-federation-sql"
-version = "0.1.6"
-source = "git+https://github.com/spiceai/datafusion-federation.git?rev=72374f605ec9617ff1852ca43297233202ec2d43#72374f605ec9617ff1852ca43297233202ec2d43"
-dependencies = [
- "async-trait",
- "datafusion",
- "datafusion-federation 0.1.6 (git+https://github.com/spiceai/datafusion-federation.git?rev=5af0df83c2cd1d3f82f293b066b401a4dfd4064b)",
- "futures",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "datafusion-federation-sql"
 version = "0.1.6"
 source = "git+https://github.com/spiceai/datafusion-federation.git?rev=72374f605ec9617ff1852ca43297233202ec2d43#72374f605ec9617ff1852ca43297233202ec2d43"
