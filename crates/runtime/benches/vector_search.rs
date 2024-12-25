@@ -29,7 +29,10 @@ use runtime::{
     },
     request::{Protocol, RequestContext, UserAgent},
 };
-use spicepod::component::dataset::acceleration::Acceleration;
+use spicepod::component::{
+    dataset::acceleration::{self, Acceleration},
+    embeddings::EmbeddingChunkConfig,
+};
 use tokio::time::Instant;
 use utils::runtime_ready_check;
 
@@ -73,40 +76,94 @@ async fn main() -> Result<(), String> {
     Box::pin(request_context.scope(vector_search_benchmarks(upload_results_dataset.as_ref()))).await
 }
 
+// add default configuration for benchmark test
 pub struct SearchBenchmarkConfiguration {
     pub name: &'static str,
     pub test_dataset: &'static str,
     pub embeddings_model: &'static str,
     pub acceleration: Option<Acceleration>,
+    pub chunking: Option<EmbeddingChunkConfig>,
+}
+
+impl SearchBenchmarkConfiguration {
+    #[must_use]
+    pub fn new(
+        name: &'static str,
+        test_dataset: &'static str,
+        embeddings_model: &'static str,
+    ) -> Self {
+        Self {
+            name,
+            test_dataset,
+            embeddings_model,
+            acceleration: None,
+            chunking: None,
+        }
+    }
+    #[must_use]
+    fn with_acceleration(mut self, acceleration: Acceleration) -> Self {
+        self.acceleration = Some(acceleration);
+        self
+    }
+    #[must_use]
+    fn with_chunking(mut self, chunking: EmbeddingChunkConfig) -> Self {
+        self.chunking = Some(chunking);
+        self
+    }
 }
 
 fn benchmark_configurations() -> Vec<SearchBenchmarkConfiguration> {
-    // TODO: expand configurations with DuckDB acceleration after issue below is resolved
-    // https://github.com/spiceai/spiceai/issues/3796
-
     let args = BenchArgs::parse();
 
     vec![
-        SearchBenchmarkConfiguration {
-            name: "quora_minilm-l6-v2_arrow",
-            test_dataset: "QuoraRetrieval",
-            embeddings_model: "huggingface:huggingface.co/sentence-transformers/all-MiniLM-L6-v2",
-            acceleration: Some(Acceleration {
-                enabled: true,
-                // TODO: temporary limit amout of data to speed up developement/testing. This will be removed in the future.
-                refresh_sql: Some("select * from data limit 20000".into()),
-                ..Default::default()
-            }),
-        },
-        SearchBenchmarkConfiguration {
-            name: "quora_openai-text-embedding-3-small_arrow",
-            test_dataset: "QuoraRetrieval",
-            embeddings_model: "openai:text-embedding-3-small",
-            acceleration: Some(Acceleration {
-                enabled: true,
-                ..Default::default()
-            }),
-        },
+        SearchBenchmarkConfiguration::new(
+            "quora_minilm-l6-v2_arrow",
+            "QuoraRetrieval",
+            "huggingface:huggingface.co/sentence-transformers/all-MiniLM-L6-v2",
+        )
+        .with_acceleration(Acceleration {
+            enabled: true,
+            // TODO: temporary limit amout of data to speed up developement/testing. This will be removed in the future.
+            refresh_sql: Some("select * from data limit 20000".into()),
+            ..Default::default()
+        }),
+        SearchBenchmarkConfiguration::new(
+            "quora_openai-text-embedding-3-small_arrow",
+            "QuoraRetrieval",
+            "openai:text-embedding-3-small",
+        )
+        .with_acceleration(Acceleration {
+            enabled: true,
+            ..Default::default()
+        }),
+        SearchBenchmarkConfiguration::new(
+            "quora_openai-text-embedding-3-small_duckdb",
+            "QuoraRetrieval",
+            "openai:text-embedding-3-small",
+        )
+        .with_acceleration(Acceleration {
+            enabled: true,
+            engine: Some("duckdb".into()),
+            mode: acceleration::Mode::File,
+            ..Default::default()
+        }),
+        SearchBenchmarkConfiguration::new(
+            "quora_openai-text-embedding-3-small_duckdb_chunking",
+            "QuoraRetrieval",
+            "openai:text-embedding-3-small",
+        )
+        .with_acceleration(Acceleration {
+            enabled: true,
+            engine: Some("duckdb".into()),
+            mode: acceleration::Mode::File,
+            ..Default::default()
+        })
+        .with_chunking(EmbeddingChunkConfig {
+            enabled: true,
+            target_chunk_size: 512,
+            overlap_size: 128,
+            trim_whitespace: false,
+        }),
     ]
     .into_iter()
     .filter(|x| match &args.configuration {
@@ -147,14 +204,7 @@ async fn run_benchmark(
     config: &SearchBenchmarkConfiguration,
     upload_results_dataset: Option<&String>,
 ) -> Result<(), String> {
-    let (rt, mut benchmark_result) = setup_benchmark(
-        config.name,
-        config.test_dataset,
-        config.embeddings_model,
-        config.acceleration.as_ref(),
-        upload_results_dataset,
-    )
-    .await?;
+    let (rt, mut benchmark_result) = setup_benchmark(config, upload_results_dataset).await?;
 
     tracing::info!("Loading test corpus... Warning: This might take a while!");
 

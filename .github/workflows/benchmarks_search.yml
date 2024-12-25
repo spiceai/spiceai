@@ -22,6 +22,8 @@ on:
         options:
           - 'quora_minilm-l6-v2_arrow'
           - 'quora_openai-text-embedding-3-small_arrow'
+          - 'quora_openai-text-embedding-3-small_duckdb'
+          - 'quora_openai-text-embedding-3-small_duckdb_chunking'
 
 env:
   FEATURES: 'models,duckdb'
@@ -72,6 +74,10 @@ jobs:
             name: 'quora_minilm-l6-v2_arrow'
           - cmd: '--configuration quora_openai-text-embedding-3-small_arrow'
             name: 'quora_openai-text-embedding-3-small_arrow'
+          - cmd: '--configuration quora_openai-text-embedding-3-small_duckdb'
+            name: 'quora_openai-text-embedding-3-small_duckdb'
+          - cmd: '--configuration quora_openai-text-embedding-3-small_duckdb_chunking'
+            name: 'quora_openai-text-embedding-3-small_duckdb_chunking'
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -91,7 +97,8 @@ jobs:
       - name: Benchmark ${{ matrix.name }}
         env:
           SPICE_SPICEAI_API_KEY: ${{ secrets.SPICE_SPICEAI_BENCHMARK_API_KEY }}
-          SEARCH_BENCHMARK_UPLOAD_RESULTS_DATASET: 'spice.benchmarks.oss_search_benchmarks'
+          # Disabled until oss_search_benchmarks is enabled for write
+          # SEARCH_BENCHMARK_UPLOAD_RESULTS_DATASET: 'spice.benchmarks.oss_search_benchmarks'
         if: github.event.inputs.selected_configuration == matrix.name || github.event.inputs.run_all == 'true' || github.event_name == 'schedule'
         run: ./spice_bench ${{ matrix.cmd }}
 
