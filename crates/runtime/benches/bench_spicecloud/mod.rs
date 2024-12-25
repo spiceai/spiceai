@@ -16,13 +16,19 @@ limitations under the License.
 use crate::results::BenchmarkResultsBuilder;
 use app::AppBuilder;
 use runtime::Runtime;
-use spicepod::component::dataset::Dataset;
+use spicepod::component::{dataset::Dataset, params::Params};
 
 pub(crate) async fn run(
     rt: &mut Runtime,
     benchmark_results: &mut BenchmarkResultsBuilder,
+    bench_name: &str,
 ) -> Result<(), String> {
-    let test_queries = get_tpch_test_queries();
+    let test_queries = match bench_name {
+        "tpch" => get_tpch_test_queries(),
+        "tpcds" => get_tpcds_test_queries(),
+        _ => return Err(format!("Invalid benchmark to run {bench_name}")),
+    };
+
     let mut errors = Vec::new();
 
     for (query_name, query) in test_queries {
@@ -50,31 +56,81 @@ pub(crate) async fn run(
     Ok(())
 }
 
-pub fn build_app(app_builder: AppBuilder) -> AppBuilder {
-    app_builder
-        .with_dataset(make_spiceai_dataset("tpch.customer", "customer"))
-        .with_dataset(make_spiceai_dataset("tpch.lineitem", "lineitem"))
-        .with_dataset(make_spiceai_dataset("tpch.part", "part"))
-        .with_dataset(make_spiceai_dataset("tpch.partsupp", "partsupp"))
-        .with_dataset(make_spiceai_dataset("tpch.orders", "orders"))
-        .with_dataset(make_spiceai_dataset("tpch.nation", "nation"))
-        .with_dataset(make_spiceai_dataset("tpch.region", "region"))
-        .with_dataset(make_spiceai_dataset("tpch.supplier", "supplier"))
+pub fn build_app(app_builder: AppBuilder, bench_name: &str) -> Result<AppBuilder, String> {
+    match bench_name {
+        "tpch" => Ok(app_builder
+            .with_dataset(make_spiceai_dataset("customer", bench_name))
+            .with_dataset(make_spiceai_dataset("lineitem", bench_name))
+            .with_dataset(make_spiceai_dataset("part", bench_name))
+            .with_dataset(make_spiceai_dataset("partsupp", bench_name))
+            .with_dataset(make_spiceai_dataset("orders", bench_name))
+            .with_dataset(make_spiceai_dataset("nation", bench_name))
+            .with_dataset(make_spiceai_dataset("region", bench_name))
+            .with_dataset(make_spiceai_dataset("supplier", bench_name))),
+
+        "tpcds" => Ok(app_builder
+            .with_dataset(make_spiceai_dataset("call_center", bench_name))
+            .with_dataset(make_spiceai_dataset("catalog_page", bench_name))
+            .with_dataset(make_spiceai_dataset("catalog_sales", bench_name))
+            .with_dataset(make_spiceai_dataset("catalog_returns", bench_name))
+            .with_dataset(make_spiceai_dataset("income_band", bench_name))
+            .with_dataset(make_spiceai_dataset("inventory", bench_name))
+            .with_dataset(make_spiceai_dataset("store_sales", bench_name))
+            .with_dataset(make_spiceai_dataset("store_returns", bench_name))
+            .with_dataset(make_spiceai_dataset("web_sales", bench_name))
+            .with_dataset(make_spiceai_dataset("web_returns", bench_name))
+            .with_dataset(make_spiceai_dataset("customer", bench_name))
+            .with_dataset(make_spiceai_dataset("customer_address", bench_name))
+            .with_dataset(make_spiceai_dataset("customer_demographics", bench_name))
+            .with_dataset(make_spiceai_dataset("date_dim", bench_name))
+            .with_dataset(make_spiceai_dataset("household_demographics", bench_name))
+            .with_dataset(make_spiceai_dataset("item", bench_name))
+            .with_dataset(make_spiceai_dataset("promotion", bench_name))
+            .with_dataset(make_spiceai_dataset("reason", bench_name))
+            .with_dataset(make_spiceai_dataset("ship_mode", bench_name))
+            .with_dataset(make_spiceai_dataset("store", bench_name))
+            .with_dataset(make_spiceai_dataset("time_dim", bench_name))
+            .with_dataset(make_spiceai_dataset("warehouse", bench_name))
+            .with_dataset(make_spiceai_dataset("web_page", bench_name))
+            .with_dataset(make_spiceai_dataset("web_site", bench_name))),
+
+        _ => Err("Only tpcds or tpch benchmark suites are supported".to_string()),
+    }
 }
 
-fn make_spiceai_dataset(path: &str, name: &str) -> Dataset {
-    Dataset::new(format!("spice.ai:{path}"), name.to_string())
+fn make_spiceai_dataset(name: &str, bench_name: &str) -> Dataset {
+    let from = match bench_name {
+        "tpch" => format!("spice.ai:spiceai/tpch/datasets/{bench_name}.{name}"),
+        "tpcds" => format!("spice.ai:spiceai/benchmarks-tpcds/datasets/{bench_name}.{name}"),
+        _ => panic!("Only tpcds or tpch benchmark suites are supported"),
+    };
+
+    let mut dataset = Dataset::new(from, name.to_string());
+    dataset.params = Some(get_params(bench_name));
+    dataset
+}
+
+fn get_params(bench_name: &str) -> Params {
+    let api_key = match bench_name {
+        "tpch" => std::env::var("SPICEAI_TPCH_API_KEY").unwrap_or_default(),
+        "tpcds" => std::env::var("SPICEAI_TPCDS_API_KEY").unwrap_or_default(),
+        _ => panic!("Only tpcds or tpch benchmark suites are supported"),
+    };
+
+    Params::from_string_map(
+        vec![("spiceai_api_key".to_string(), api_key)]
+            .into_iter()
+            .collect(),
+    )
 }
 
 fn get_tpch_test_queries() -> Vec<(&'static str, &'static str)> {
     vec![
         ("tpch_q1", include_str!("../queries/tpch/q1.sql")),
-        // Execution error: Unable to query Flight: Unable to query: status: InvalidArgument, message: \"Table 'tpch.nation' not found
+        // DoGet recv error: rpc error: code = InvalidArgument desc = Correlated scalar subquery can only be used in Projection, Filter, Aggregate plan nodes
         // ("tpch_q2", include_str!("../queries/tpch/q2.sql")),
         ("tpch_q3", include_str!("../queries/tpch/q3.sql")),
-        // Error: "query `tpch_q4` to results: External error: Execution error: Unable to query Flight: Unable to query: status: InvalidArgument, message: \"Table 'tpch.lineitem' not found\\nstartLine 1\\nstartColumn 846\\nendLine 1\\nendColumn 862\\nSQL Query SELECT \\\"tpch\\\".\\\"orders\\\".\\\"o_orderpriority\\\", COUNT(1) AS \\\"order_count\\\" FROM \\\"tpch\\\".\\\"orders\\\" WHERE (((\\\"tpch\\\".\\\"orders\\\".\\\"o_orderdate\\\" >= CAST('1993-07-01' AS TIMESTAMP)) AND (\\\"tpch\\\".\\\"orders\\\".\\\"o_orderdate\\\" < CAST((CAST('1993-07-01' AS DATE) + INTERVAL '3' MONTH) AS TIMESTAMP))) AND EXISTS (SELECT \\\"tpch\\\".\\\"lineitem\\\".\\\"l_orderkey\\\", \\\"tpch\\\".\\\"lineitem\\\".\\\"l_partkey\\\", \\\"tpch\\\".\\\"lineitem\\\".\\\"l_suppkey\\\", \\\"tpch\\\".\\\"lineitem\\\".\\\"l_linenumber\\\", \\\"tpch\\\".\\\"lineitem\\\".\\\"l_quantity\\\", \\\"tpch\\\".\\\"lineitem\\\".\\\"l_extendedprice\\\", \\\"tpch\\\".\\\"lineitem\\\".\\\"l_discount\\\", \\\"tpch\\\".\\\"lineitem\\\".\\\"l_tax\\\", \\\"tpch\\\".\\\"lineitem\\\".\\\"l_returnflag\\\", \\\"tpch\\\".\\\"lineitem\\\".\\\"l_linestatus\\\", \\\"tpch\\\".\\\"lineitem\\\".\\\"l_shipdate\\\", \\\"tpch\\\".\\\"lineitem\\\".\\\"l_commitdate\\\", \\\"tpch\\\".\\\"lineitem\\\".\\\"l_receiptdate\\\", \\\"tpch\\\".\\\"lineitem\\\".\\\"l_shipinstruct\\\", \\\"tpch\\\".\\\"lineitem\\\".\\\"l_shipmode\\\", \\\"tpch\\\".\\\"lineitem\\\".\\\"l_comment\\\" FROM \\\"tpch\\\".\\\"lineitem\\\" WHERE ((\\\"tpch\\\".\\\"lineitem\\\".\\\"l_orderkey\\\" = \\\"tpch\\\".\\\"orders\\\".\\\"o_orderkey\\\") AND (\\\"tpch\\\".\\\"lineitem\\\".\\\"l_commitdate\\\" < \\\"tpch\\\".\\\"lineitem\\\".\\\"l_receiptdate\\\")))) GROUP BY \\\"tpch\\\".\\\"orders\\\".\\\"o_orderpriority\\\" ORDER BY \\\"tpch\\\".\\\"orders\\\".\\\"o_orderpriority\\\" ASC NULLS LAST\", details: [], metadata: MetadataMap { headers: {\"date\": \"Thu, 11 Jul 2024 10:46:10 GMT\", \"content-type\": \"application/grpc\", \"strict-transport-security\": \"max-age=15724800; includeSubDomains\", \"alt-svc\": \"h3=\\\":443\\\"; ma=86400\", \"cf-ray\": \"8a18354d2b5f5ac0-MEL\", \"cf-cache-status\": \"DYNAMIC\", \"server\": \"cloudflare\"} }"
-        // potential data source bug
-        // ("tpch_q4", include_str!("tpch_q4.sql")),
+        ("tpch_q4", include_str!("../queries/tpch/q4.sql")),
         ("tpch_q5", include_str!("../queries/tpch/q5.sql")),
         ("tpch_q6", include_str!("../queries/tpch/q6.sql")),
         ("tpch_q7", include_str!("../queries/tpch/q7.sql")),
@@ -86,18 +142,13 @@ fn get_tpch_test_queries() -> Vec<(&'static str, &'static str)> {
         ("tpch_q13", include_str!("../queries/tpch/q13.sql")),
         ("tpch_q14", include_str!("../queries/tpch/q14.sql")),
         // tpch_q15 has a view creation which we don't support by design
-
-        // Execution error: Unable to query Flight: Unable to query: status: InvalidArgument, message: \"Table 'tpch.supplier' not found
-        // ("tpch_q16", include_str!("tpch_q16.sql")),
+        ("tpch_q16", include_str!("../queries/tpch/q16.sql")),
         ("tpch_q17", include_str!("../queries/tpch/q17.sql")),
-        // Execution error: Unable to query Flight: Unable to query: status: InvalidArgument, message: \"Table 'tpch.lineitem' not found
-        // ("tpch_q18", include_str!("../queries/tpch/q18.sql")),
+        ("tpch_q18", include_str!("../queries/tpch/q18.sql")),
         ("tpch_q19", include_str!("../queries/tpch/q19.sql")),
-        // Error: "query `tpch_q20` to results: External error: Execution error: Unable to query Flight: Unable to query: status: InvalidArgument, message: \"Table 'tpch.partsupp' not found\\nstartLine 1\\nstartColumn 228\\nendLine 1\\nendColumn 244\\nSQL Query SELECT \\\"tpch\\\".\\\"supplier\\\".\\\"s_name\\\", \\\"tpch\\\".\\\"supplier\\\".\\\"s_address\\\" FROM \\\"tpch\\\".\\\"supplier\\\" JOIN \\\"tpch\\\".\\\"nation\\\" ON true WHERE ((\\\"tpch\\\".\\\"supplier\\\".\\\"s_suppkey\\\" IN (SELECT \\\"tpch\\\".\\\"partsupp\\\".\\\"ps_suppkey\\\" FROM \\\"tpch\\\".\\\"partsupp\\\" WHERE (\\\"tpch\\\".\\\"partsupp\\\".\\\"ps_partkey\\\" IN (SELECT \\\"tpch\\\".\\\"part\\\".\\\"p_partkey\\\" FROM \\\"tpch\\\".\\\"part\\\" WHERE \\\"tpch\\\".\\\"part\\\".\\\"p_name\\\" LIKE 'forest%') AND (CAST(\\\"tpch\\\".\\\"partsupp\\\".\\\"ps_availqty\\\" AS DOUBLE) > (SELECT (0.5 * CAST(SUM(\\\"tpch\\\".\\\"lineitem\\\".\\\"l_quantity\\\") AS DOUBLE)) FROM \\\"tpch\\\".\\\"lineitem\\\" WHERE ((((\\\"tpch\\\".\\\"lineitem\\\".\\\"l_partkey\\\" = \\\"tpch\\\".\\\"partsupp\\\".\\\"ps_partkey\\\") AND (\\\"tpch\\\".\\\"lineitem\\\".\\\"l_suppkey\\\" = \\\"tpch\\\".\\\"partsupp\\\".\\\"ps_suppkey\\\")) AND (\\\"tpch\\\".\\\"lineitem\\\".\\\"l_shipdate\\\" >= CAST(CAST('1994-01-01' AS DATE) AS TIMESTAMP))) AND (\\\"tpch\\\".\\\"lineitem\\\".\\\"l_shipdate\\\" < CAST((CAST('1994-01-01' AS DATE) + INTERVAL '12' MONTH) AS TIMESTAMP))))))) AND (\\\"tpch\\\".\\\"supplier\\\".\\\"s_nationkey\\\" = \\\"tpch\\\".\\\"nation\\\".\\\"n_nationkey\\\")) AND (\\\"tpch\\\".\\\"nation\\\".\\\"n_name\\\" = 'CANADA')) ORDER BY \\\"tpch\\\".\\\"supplier\\\".\\\"s_name\\\" ASC NULLS LAST\", details: [], metadata: MetadataMap { headers: {\"date\": \"Thu, 11 Jul 2024 10:51:30 GMT\", \"content-type\": \"application/grpc\", \"strict-transport-security\": \"max-age=15724800; includeSubDomains\", \"alt-svc\": \"h3=\\\":443\\\"; ma=86400\", \"cf-ray\": \"8a183d1d0a305ab0-MEL\", \"cf-cache-status\": \"DYNAMIC\", \"server\": \"cloudflare\"} }"
-        // ("tpch_q20", include_str!("tpch_q20.sql")),
+        ("tpch_q20", include_str!("../queries/tpch/q20.sql")),
         ("tpch_q21", include_str!("../queries/tpch/q21.sql")),
-        // Error: "query `tpch_q22` to results: External error: Execution error: Unable to query Flight: Unable to query: status: InvalidArgument, message: \"Table 'tpch.orders' not found
-        // ("tpch_q22", include_str!("tpch_q22.sql")),
+        ("tpch_q22", include_str!("../queries/tpch/q22.sql")),
         (
             "tpch_simple_q1",
             include_str!("../queries/tpch/simple_q1.sql"),
@@ -126,5 +177,135 @@ fn get_tpch_test_queries() -> Vec<(&'static str, &'static str)> {
             "tpch_simple_q7",
             include_str!("../queries/tpch/simple_q7.sql"),
         ),
+    ]
+}
+
+#[allow(clippy::too_many_lines)]
+fn get_tpcds_test_queries() -> Vec<(&'static str, &'static str)> {
+    vec![
+        // see workarounds for more information on skipped queries: https://github.com/spiceai/spiceai/blob/trunk/crates/runtime/benches/queries/README.md
+        ("tpcds_q1", include_str!("../queries/tpcds/q1.sql")),
+        ("tpcds_q2", include_str!("../queries/tpcds/q2.sql")),
+        ("tpcds_q3", include_str!("../queries/tpcds/q3.sql")),
+        ("tpcds_q4", include_str!("../queries/tpcds/q4.sql")),
+        // Query tpcds_q5 failed with error: Query Error: query `spice.ai` `tpcds_q5` to results: Execution error: This feature is not implemented: Unsupported Interval Expression with last_field Some(Second); Snapshot Test Error: Snapshort assertion failed for spice.ai, tpcds_q5
+        // ("tpcds_q5", include_str!("../queries/tpcds/q5.sql")),
+        // Query tpcds_q6 failed with error: Query Error: query `spice.ai` `tpcds_q6` to results: Execution error: DoGet recv error: rpc error: code = InvalidArgument desc = Correlated scalar subquery can only be used in Projection, Filter, Aggregate plan nodes; Snapshot Test Error: Snapshort assertion failed for spice.ai, tpcds_q6
+        // ("tpcds_q6", include_str!("../queries/tpcds/q6.sql")),
+        ("tpcds_q7", include_str!("../queries/tpcds/q7.sql")),
+        // ("tpcds_q8", include_str!("../queries/tpcds/q8.sql")), // EXCEPT and INTERSECT aren't supported
+        ("tpcds_q9", include_str!("../queries/tpcds/q9.sql")),
+        // Query tpcds_q10 failed with error: Query Error: query `spice.ai` `tpcds_q10` to results: Execution error: DoGet recv error: rpc error: code = InvalidArgument desc = No field named c.c_customer_sk. Valid fields are __correlated_sq_1.ss_customer_sk.; Snapshot Test Error: Snapshort assertion failed for spice.ai, tpcds_q10
+        // ("tpcds_q10", include_str!("../queries/tpcds/q10.sql")),
+        ("tpcds_q11", include_str!("../queries/tpcds/q11.sql")),
+        // Query tpcds_q12 failed with error: Query Error: query `spice.ai` `tpcds_q12` to results: Execution error: This feature is not implemented: Unsupported Interval Expression with last_field Some(Second); Snapshot Test Error: Snapshort assertion failed for spice.ai, tpcds_q12
+        // ("tpcds_q12", include_str!("../queries/tpcds/q12.sql")),
+        ("tpcds_q13", include_str!("../queries/tpcds/q13.sql")),
+        // ("tpcds_q14", include_str!("../queries/tpcds/q14.sql")), // EXCEPT and INTERSECT aren't supported
+        ("tpcds_q15", include_str!("../queries/tpcds/q15.sql")),
+        // Query tpcds_q16 failed with error: Query Error: query `spice.ai` `tpcds_q16` to results: Execution error: This feature is not implemented: Unsupported Interval Expression with last_field Some(Second); Snapshot Test Error: Snapshort assertion failed for spice.ai, tpcds_q16
+        // ("tpcds_q16", include_str!("../queries/tpcds/q16.sql")),
+        ("tpcds_q17", include_str!("../queries/tpcds/q17.sql")),
+        ("tpcds_q18", include_str!("../queries/tpcds/q18.sql")),
+        ("tpcds_q19", include_str!("../queries/tpcds/q19.sql")),
+        // Query tpcds_q20 failed with error: Query Error: query `spice.ai` `tpcds_q20` to results: Execution error: This feature is not implemented: Unsupported Interval Expression with last_field Some(Second); Snapshot Test Error: Snapshort assertion failed for spice.ai, tpcds_q20
+        // ("tpcds_q20", include_str!("../queries/tpcds/q20.sql")),
+        // Query tpcds_q21 failed with error: Query Error: query `spice.ai` `tpcds_q21` to results: Execution error: This feature is not implemented: Unsupported Interval Expression with last_field Some(Second); Snapshot Test Error: Snapshort assertion failed for spice.ai, tpcds_q21
+        // ("tpcds_q21", include_str!("../queries/tpcds/q21.sql")),
+        // Query tpcds_q22 failed with error: Query Error: query `spice.ai` `tpcds_q22` to results: Execution error: Query execution failed.
+        //   Tonic error: status: ResourceExhausted, message: "DoGet recv error: rpc error: code = ResourceExhausted desc = grpc: received message larger than max (144718330 vs. 104857600)", details: [], metadata: MetadataMap { headers: {} }
+        //   Verify the configuration and try again.; Snapshot Test Error: Snapshort assertion failed for spice.ai, tpcds_q22
+        // ("tpcds_q22", include_str!("../queries/tpcds/q22.sql")),
+        // ("tpcds_q23", include_str!("../queries/tpcds/q23.sql")), // this query contains multiple queries, which aren't supported
+        // ("tpcds_q24", include_str!("../queries/tpcds/q24.sql")), // this query contains multiple queries, which aren't supported
+        ("tpcds_q25", include_str!("../queries/tpcds/q25.sql")),
+        ("tpcds_q26", include_str!("../queries/tpcds/q26.sql")),
+        ("tpcds_q27", include_str!("../queries/tpcds/q27.sql")),
+        ("tpcds_q28", include_str!("../queries/tpcds/q28.sql")),
+        ("tpcds_q29", include_str!("../queries/tpcds/q29.sql")),
+        ("tpcds_q30", include_str!("../queries/tpcds/q30.sql")),
+        ("tpcds_q31", include_str!("../queries/tpcds/q31.sql")),
+        // Query tpcds_q32 failed with error: Query Error: query `spice.ai` `tpcds_q32` to results: Execution error: This feature is not implemented: Unsupported Interval Expression with last_field Some(Second); Snapshot Test Error: Snapshort assertion failed for spice.ai, tpcds_q32
+        // ("tpcds_q32", include_str!("../queries/tpcds/q32.sql")),
+        ("tpcds_q33", include_str!("../queries/tpcds/q33.sql")),
+        ("tpcds_q34", include_str!("../queries/tpcds/q34.sql")),
+        // Query tpcds_q35 failed with error: Query Error: query `spice.ai` `tpcds_q35` to results: Execution error: DoGet recv error: rpc error: code = InvalidArgument desc = No field named c.c_customer_sk. Valid fields are __correlated_sq_1.ss_customer_sk.; Snapshot Test Error: Snapshort assertion failed for spice.ai, tpcds_q35
+        // ("tpcds_q35", include_str!("../queries/tpcds/q35.sql")),
+        ("tpcds_q36", include_str!("../queries/tpcds/q36.sql")),
+        // Query tpcds_q37 failed with error: Query Error: query `spice.ai` `tpcds_q37` to results: Execution error: This feature is not implemented: Unsupported Interval Expression with last_field Some(Second); Snapshot Test Error: Snapshort assertion failed for spice.ai, tpcds_q37
+        // ("tpcds_q37", include_str!("../queries/tpcds/q37.sql")),
+        // ("tpcds_q38", include_str!("../queries/tpcds/q38.sql")), // EXCEPT and INTERSECT aren't supported
+        // ("tpcds_q39", include_str!("../queries/tpcds/q39.sql")), // this query contains multiple queries, which aren't supported
+        // Query tpcds_q40 failed with error: Query Error: query `spice.ai` `tpcds_q40` to results: Execution error: This feature is not implemented: Unsupported Interval Expression with last_field Some(Second); Snapshot Test Error: Snapshort assertion failed for spice.ai, tpcds_q40
+        // ("tpcds_q40", include_str!("../queries/tpcds/q40.sql")),
+        ("tpcds_q41", include_str!("../queries/tpcds/q41.sql")),
+        ("tpcds_q42", include_str!("../queries/tpcds/q42.sql")),
+        ("tpcds_q43", include_str!("../queries/tpcds/q43.sql")),
+        ("tpcds_q44", include_str!("../queries/tpcds/q44.sql")),
+        ("tpcds_q45", include_str!("../queries/tpcds/q45.sql")),
+        ("tpcds_q46", include_str!("../queries/tpcds/q46.sql")),
+        ("tpcds_q47", include_str!("../queries/tpcds/q47.sql")),
+        ("tpcds_q48", include_str!("../queries/tpcds/q48.sql")),
+        ("tpcds_q49", include_str!("../queries/tpcds/q49.sql")),
+        ("tpcds_q50", include_str!("../queries/tpcds/q50.sql")),
+        ("tpcds_q51", include_str!("../queries/tpcds/q51.sql")),
+        ("tpcds_q52", include_str!("../queries/tpcds/q52.sql")),
+        ("tpcds_q53", include_str!("../queries/tpcds/q53.sql")),
+        ("tpcds_q54", include_str!("../queries/tpcds/q54.sql")),
+        ("tpcds_q55", include_str!("../queries/tpcds/q55.sql")),
+        ("tpcds_q56", include_str!("../queries/tpcds/q56.sql")),
+        ("tpcds_q57", include_str!("../queries/tpcds/q57.sql")),
+        ("tpcds_q58", include_str!("../queries/tpcds/q58.sql")),
+        ("tpcds_q59", include_str!("../queries/tpcds/q59.sql")),
+        ("tpcds_q60", include_str!("../queries/tpcds/q60.sql")),
+        ("tpcds_q61", include_str!("../queries/tpcds/q61.sql")),
+        ("tpcds_q62", include_str!("../queries/tpcds/q62.sql")),
+        ("tpcds_q63", include_str!("../queries/tpcds/q63.sql")),
+        ("tpcds_q64", include_str!("../queries/tpcds/q64.sql")),
+        ("tpcds_q65", include_str!("../queries/tpcds/q65.sql")),
+        ("tpcds_q66", include_str!("../queries/tpcds/q66.sql")),
+        ("tpcds_q67", include_str!("../queries/tpcds/q67.sql")),
+        ("tpcds_q68", include_str!("../queries/tpcds/q68.sql")),
+        // Query tpcds_q69 failed with error: Query Error: query `spice.ai` `tpcds_q69` to results: Execution error: DoGet recv error: rpc error: code = InvalidArgument desc = No field named c.c_customer_sk. Valid fields are __correlated_sq_1.ss_customer_sk.; Snapshot Test Error: Snapshort assertion failed for spice.ai, tpcds_q69
+        // ("tpcds_q69", include_str!("../queries/tpcds/q69.sql")),
+        ("tpcds_q70", include_str!("../queries/tpcds/q70.sql")),
+        ("tpcds_q71", include_str!("../queries/tpcds/q71.sql")),
+        // Query tpcds_q72 failed with error: Query Error: query `spice.ai` `tpcds_q72` to results: Execution error: This feature is not implemented: Unsupported Interval Expression with last_field Some(Second); Snapshot Test Error: Snapshort assertion failed for spice.ai, tpcds_q72
+        // ("tpcds_q72", include_str!("../queries/tpcds/q72.sql")),
+        ("tpcds_q73", include_str!("../queries/tpcds/q73.sql")),
+        ("tpcds_q74", include_str!("../queries/tpcds/q74.sql")),
+        ("tpcds_q75", include_str!("../queries/tpcds/q75.sql")),
+        ("tpcds_q76", include_str!("../queries/tpcds/q76.sql")),
+        // Query tpcds_q77 failed with error: Query Error: query `spice.ai` `tpcds_q77` to results: Execution error: This feature is not implemented: Unsupported Interval Expression with last_field Some(Second); Snapshot Test Error: Snapshort assertion failed for spice.ai, tpcds_q77
+        // ("tpcds_q77", include_str!("../queries/tpcds/q77.sql")),
+        ("tpcds_q78", include_str!("../queries/tpcds/q78.sql")),
+        ("tpcds_q79", include_str!("../queries/tpcds/q79.sql")),
+        // Query tpcds_q80 failed with error: Query Error: query `spice.ai` `tpcds_q80` to results: Execution error: This feature is not implemented: Unsupported Interval Expression with last_field Some(Second); Snapshot Test Error: Snapshort assertion failed for spice.ai, tpcds_q80
+        // ("tpcds_q80", include_str!("../queries/tpcds/q80.sql")),
+        ("tpcds_q81", include_str!("../queries/tpcds/q81.sql")),
+        // Query tpcds_q82 failed with error: Query Error: query `spice.ai` `tpcds_q82` to results: Execution error: This feature is not implemented: Unsupported Interval Expression with last_field Some(Second); Snapshot Test Error: Snapshort assertion failed for spice.ai, tpcds_q82
+        // ("tpcds_q82", include_str!("../queries/tpcds/q82.sql")),
+        ("tpcds_q83", include_str!("../queries/tpcds/q83.sql")),
+        ("tpcds_q84", include_str!("../queries/tpcds/q84.sql")),
+        ("tpcds_q85", include_str!("../queries/tpcds/q85.sql")),
+        ("tpcds_q86", include_str!("../queries/tpcds/q86.sql")),
+        // ("tpcds_q87", include_str!("../queries/tpcds/q87.sql")), // EXCEPT and INTERSECT aren't supported
+        ("tpcds_q88", include_str!("../queries/tpcds/q88.sql")),
+        ("tpcds_q89", include_str!("../queries/tpcds/q89.sql")),
+        ("tpcds_q90", include_str!("../queries/tpcds/q90.sql")),
+        // Query tpcds_q91 failed with error: Query Error: query `spice.ai` `tpcds_q91` to plan: Failed to execute query: Schema error: No field named "tpcds.call_center". Valid fields are call_center, call_center_name, manager, returns_loss, "sum(tpcds.catalog_returns.cr_net_loss)".; Snapshot Test Error: Snapshort assertion failed for spice.ai, tpcds_q91
+        // ("tpcds_q91", include_str!("../queries/tpcds/q91.sql")),
+        // Query tpcds_q92 failed with error: Query Error: query `spice.ai` `tpcds_q92` to results: Execution error: This feature is not implemented: Unsupported Interval Expression with last_field Some(Second); Snapshot Test Error: Snapshort assertion failed for spice.ai, tpcds_q92
+        // ("tpcds_q92", include_str!("../queries/tpcds/q92.sql")),
+        ("tpcds_q93", include_str!("../queries/tpcds/q93.sql")),
+        // Query tpcds_q94 failed with error: Query Error: query `spice.ai` `tpcds_q94` to results: Execution error: This feature is not implemented: Unsupported Interval Expression with last_field Some(Second); Snapshot Test Error: Snapshort assertion failed for spice.ai, tpcds_q94
+        // ("tpcds_q94", include_str!("../queries/tpcds/q94.sql")),
+        // Query tpcds_q95 failed with error: Query Error: query `spice.ai` `tpcds_q95` to results: Execution error: This feature is not implemented: Unsupported Interval Expression with last_field Some(Second); Snapshot Test Error: Snapshort assertion failed for spice.ai, tpcds_q95
+        // ("tpcds_q95", include_str!("../queries/tpcds/q95.sql")),
+        ("tpcds_q96", include_str!("../queries/tpcds/q96.sql")),
+        ("tpcds_q97", include_str!("../queries/tpcds/q97.sql")),
+        // Query tpcds_q98 failed with error: Query Error: query `spice.ai` `tpcds_q98` to results: Execution error: This feature is not implemented: Unsupported Interval Expression with last_field Some(Second); Snapshot Test Error: Snapshort assertion failed for spice.ai, tpcds_q98
+        // ("tpcds_q98", include_str!("../queries/tpcds/q98.sql")),
+        ("tpcds_q99", include_str!("../queries/tpcds/q99.sql")),
     ]
 }

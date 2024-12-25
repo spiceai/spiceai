@@ -513,27 +513,27 @@ impl VectorSearch {
         };
 
         format!(
-            "WITH ranked_docs as (
-                SELECT {pks}, {VECTOR_DISTANCE_COLUMN_NAME}, offset FROM (
-                    SELECT
-                        {pks},
-                        offset,
-                        {VECTOR_DISTANCE_COLUMN_NAME},
-                        ROW_NUMBER() OVER (
-                            PARTITION BY ({pks})
-                            ORDER BY dist ASC
-                        ) AS chunk_rank
-                    FROM (
-                        SELECT
-                            {pks},
-                            unnest({embed_col_offset}) AS offset,
-                            cosine_distance(unnest({embed_col_embedding}), {embedding:?}) AS {VECTOR_DISTANCE_COLUMN_NAME}
-                        FROM {table_name}
-                        {where_cond}
-                    )
-                )
+            "WITH distances as (
+                SELECT
+                    {pks},
+                    unnest({embed_col_offset}) AS offset,
+                    cosine_distance(unnest({embed_col_embedding}), {embedding:?}) AS {VECTOR_DISTANCE_COLUMN_NAME}
+                FROM {table_name}
+                {where_cond}
+            ),
+            ranks as (
+                SELECT
+                    {pks},
+                    distances.offset,
+                    distances.{VECTOR_DISTANCE_COLUMN_NAME},
+                    ROW_NUMBER() OVER (PARTITION BY ({pks}) ORDER BY distances.{VECTOR_DISTANCE_COLUMN_NAME} ASC) AS chunk_rank
+                FROM distances
+            ),
+            ranked_docs as (
+                select {pks}, ranks.{VECTOR_DISTANCE_COLUMN_NAME}, ranks.offset
+                from ranks
                 WHERE chunk_rank = 1
-                ORDER by dist ASC
+                ORDER by {VECTOR_DISTANCE_COLUMN_NAME} ASC
                 LIMIT {n}
             )
             SELECT

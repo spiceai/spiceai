@@ -42,7 +42,6 @@ use async_openai::{
     },
 };
 
-#[cfg(feature = "mistralrs")]
 pub mod mistral;
 pub mod nsql;
 use indexmap::IndexMap;
@@ -197,8 +196,7 @@ pub fn message_to_content(message: &ChatCompletionRequestMessage) -> String {
     }
 }
 
-/// Convert a structured [`ChatCompletionRequestMessage`] to the mistral.rs compatible [`RequesstMessage`] type.
-#[cfg(feature = "mistralrs")]
+/// Convert a structured [`ChatCompletionRequestMessage`] to the mistral.rs compatible [`RequestMessage`] type.
 #[must_use]
 #[allow(clippy::too_many_lines)]
 pub fn message_to_mistral(

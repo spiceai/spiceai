@@ -17,6 +17,7 @@ limitations under the License.
 
 use std::str::FromStr;
 
+use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 
 /// Options to specify which and how tools can be used by a specific LLM.
@@ -25,6 +26,9 @@ use serde::{Deserialize, Serialize};
 pub enum SpiceToolsOptions {
     /// Automatically use all available builtin tools.
     Auto,
+
+    /// Use builtin tools relevant for text-to-SQL.
+    Nsql,
 
     /// Disable all tools.
     Disabled,
@@ -38,9 +42,43 @@ impl SpiceToolsOptions {
     #[must_use]
     pub fn can_use_tools(&self) -> bool {
         match self {
-            SpiceToolsOptions::Auto => true,
+            SpiceToolsOptions::Auto | SpiceToolsOptions::Nsql => true,
             SpiceToolsOptions::Disabled => false,
             SpiceToolsOptions::Specific(t) => !t.is_empty(),
+        }
+    }
+
+    pub(crate) fn tools_by_name(&self) -> Vec<&str> {
+        match self {
+            SpiceToolsOptions::Auto => vec![
+                "document_similarity",
+                "table_schema",
+                "sql",
+                "list_datasets",
+                "get_readiness",
+                "random_sample",
+                "distinct_columns",
+                "top_n_sample",
+            ],
+            SpiceToolsOptions::Nsql => vec![
+                "table_schema",
+                "sql",
+                "list_datasets",
+                "random_sample",
+                "distinct_columns",
+                "top_n_sample",
+            ],
+            SpiceToolsOptions::Disabled => vec![],
+            SpiceToolsOptions::Specific(t) => t
+                .iter()
+                // Handle nested groupings. e.g: `spiced_tools: nsql, my_other_tool`.
+                .flat_map(|s| match s.parse() {
+                    Ok(SpiceToolsOptions::Nsql) => SpiceToolsOptions::Nsql.tools_by_name(),
+                    Ok(SpiceToolsOptions::Auto) => SpiceToolsOptions::Auto.tools_by_name(),
+                    _ => vec![s.as_str()],
+                })
+                .unique()
+                .collect(),
         }
     }
 }
@@ -51,6 +89,7 @@ impl FromStr for SpiceToolsOptions {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.trim().to_lowercase().as_str() {
             "auto" => Ok(SpiceToolsOptions::Auto),
+            "nsql" => Ok(SpiceToolsOptions::Nsql),
             "disabled" => Ok(SpiceToolsOptions::Disabled),
             _ => Ok(SpiceToolsOptions::Specific(
                 s.split(',')
@@ -59,5 +98,42 @@ impl FromStr for SpiceToolsOptions {
                     .collect(),
             )),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use itertools::Itertools;
+
+    use super::*;
+
+    #[test]
+    fn test_nested_tool_opts() {
+        assert_eq!(
+            SpiceToolsOptions::Specific(vec!["nsql".to_string(), "my_other_tool".to_string()])
+                .tools_by_name(),
+            vec![
+                "table_schema",
+                "sql",
+                "list_datasets",
+                "random_sample",
+                "distinct_columns",
+                "top_n_sample",
+                "my_other_tool"
+            ]
+        );
+
+        let opt = SpiceToolsOptions::Specific(vec![
+            "nsql".to_string(),
+            "my_other_tool".to_string(),
+            "sql".to_string(),
+        ]);
+        let tools = opt.tools_by_name();
+
+        assert_eq!(
+            tools.len(),
+            tools.iter().unique().count(),
+            "'SpiceToolsOptions::tools_by_name' should not produce duplicates"
+        );
     }
 }

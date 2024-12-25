@@ -213,12 +213,13 @@ fn get_tpcds_dataset(ds_name: &str, spice_name: Option<&str>) -> Dataset {
 }
 
 /// Normalizes vector similarity search response for consistent snapshot testing by replacing dynamic
-/// values(such as scores and durations) with placeholders.
+/// values such as duration with placeholder and rounding scores to 4 decimal places.
 fn normalize_search_response(mut json: Value) -> String {
     if let Some(matches) = json.get_mut("matches").and_then(|m| m.as_array_mut()) {
         for m in matches {
             if let Some(score) = m.get_mut("score") {
-                *score = json!("score_val");
+                // round score to 4 decimals for consistent snapshot testing
+                *score = json!(format!("{:.4}", score.as_f64().unwrap_or(0.0)));
             }
         }
     }

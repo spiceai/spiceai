@@ -98,5 +98,11 @@ jobs:
           chmod +x ./integration_test/ai_integration_test
 
       - name: Run integration test
+        env:
+          SPICE_HF_TOKEN: ${{ secrets.SPICE_SECRET_HF_TOKEN }}
         run: |
+          if [ -z "$SPICE_HF_TOKEN" ] ; then
+            echo "Error: Hugging Face API Token is not defined."
+            exit 1
+          fi
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" ./integration_test/ai_integration_test --nocapture huggingface_test

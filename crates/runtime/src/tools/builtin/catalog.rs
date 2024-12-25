@@ -19,11 +19,10 @@ use secrecy::{ExposeSecret, SecretString};
 use spicepod::component::tool::Tool;
 use std::{collections::HashMap, sync::Arc};
 
-use crate::tools::{catalog::SpiceToolCatalog, factory::ToolFactory};
+use crate::tools::{catalog::SpiceToolCatalog, factory::ToolFactory, options::SpiceToolsOptions};
 
 use super::{
     document_similarity::DocumentSimilarityTool,
-    get_builtin_tools,
     get_readiness::GetReadinessTool,
     list_datasets::ListDatasetsTool,
     sample::{tool::SampleDataTool, SampleTableMethod},
@@ -35,7 +34,6 @@ use super::{
 pub struct BuiltinToolCatalog {}
 
 impl BuiltinToolCatalog {
-    // Must be in sync with [`super::get_builtin_tools`].
     pub(crate) fn construct_builtin(
         id: &str,
         name: Option<&str>,
@@ -102,7 +100,13 @@ impl ToolFactory for BuiltinToolCatalog {
 #[async_trait]
 impl SpiceToolCatalog for BuiltinToolCatalog {
     async fn all(&self) -> Vec<Arc<dyn SpiceModelTool>> {
-        get_builtin_tools()
+        let mut tools = vec![];
+        for t in SpiceToolsOptions::Auto.tools_by_name() {
+            if let Some(tool) = Self::construct_builtin(t, None, None, &HashMap::new()) {
+                tools.push(tool);
+            }
+        }
+        tools
     }
 
     async fn get(&self, name: &str) -> Option<Arc<dyn SpiceModelTool>> {
