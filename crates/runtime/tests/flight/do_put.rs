@@ -16,7 +16,9 @@ limitations under the License.
 
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
+    pin::Pin,
     sync::Arc,
+    task::{Context, Poll},
     time::Duration,
 };
 
@@ -25,17 +27,23 @@ use crate::{
     utils::{test_request_context, wait_until_true},
 };
 use arrow::array::{Int32Array, RecordBatch, StringArray};
-use arrow_flight::{encode::FlightDataEncoderBuilder, FlightClient, FlightDescriptor, PutResult};
+use arrow_flight::{
+    encode::FlightDataEncoderBuilder, error::FlightError, FlightClient, FlightDescriptor, PutResult,
+};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::sql::TableReference;
-use futures::stream::TryStreamExt;
+use futures::{stream::TryStreamExt, Stream};
 use rand::Rng;
 use runtime::{
     accelerated_table::refresh::Refresh, auth::EndpointAuth,
     component::dataset::acceleration::Acceleration, config::Config, datafusion::DataFusion,
     internal_table::create_internal_accelerated_table, secrets::Secrets, Runtime,
 };
-use tokio::sync::RwLock;
+use tokio::{
+    sync::RwLock,
+    time::{sleep, timeout},
+};
+use tokio_stream::StreamExt;
 use tonic::transport::Channel;
 
 const LOCALHOST: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
@@ -44,93 +52,160 @@ const LOCALHOST: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
 async fn test_flight_do_put_basic() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
-    test_request_context().scope(async {
-        let mut rng = rand::thread_rng();
-        let http_port: u16 = rng.gen_range(50000..60000);
-        let flight_port: u16 = http_port + 1;
-        let otel_port: u16 = http_port + 2;
-        let metrics_port: u16 = http_port + 3;
+    test_request_context()
+        .scope(async {
+            let (channel, df) = start_spice_test_app().await?;
 
-        tracing::debug!(
-            "Ports: http: {http_port}, flight: {flight_port}, otel: {otel_port}, metrics: {metrics_port}"
-        );
+            let mut client = FlightClient::new(channel);
 
-        let api_config = Config::new()
-            .with_http_bind_address(SocketAddr::new(LOCALHOST, http_port))
-            .with_flight_bind_address(SocketAddr::new(LOCALHOST, flight_port))
-            .with_open_telemetry_bind_address(SocketAddr::new(LOCALHOST, otel_port));
+            let test_record_batch = test_record_batch()?;
 
-        let registry = prometheus::Registry::new();
+            let flight_descriptor = FlightDescriptor::new_path(vec!["my_table".to_string()]);
+            let flight_data_stream = FlightDataEncoderBuilder::new()
+                .with_flight_descriptor(Some(flight_descriptor))
+                .build(futures::stream::iter(
+                    // simulate two record batches / two FlightData messages
+                    [test_record_batch.clone(), test_record_batch]
+                        .into_iter()
+                        .map(Ok)
+                        .collect::<Vec<_>>(),
+                ));
 
-        let rt = Runtime::builder()
-            .with_metrics_server(SocketAddr::new(LOCALHOST, metrics_port), registry)
-            .build()
-            .await;
-
-        let df = rt.datafusion();
-
-        let test_record_batch = test_record_batch()?;
-
-        register_test_table(&df, test_record_batch.schema(), TableReference::parse_str("public.my_table")).await?;
-
-        // Start the servers
-        tokio::spawn(async move {
-            Box::pin(Arc::new(rt).start_servers(
-                api_config,
-                None,
-                EndpointAuth::default(),
-            ))
-            .await
-        });
-
-        // Wait for the servers to start
-        tracing::info!("Waiting for servers to start...");
-        wait_until_true(Duration::from_secs(10), || async {
-            reqwest::get(format!("http://localhost:{http_port}/health"))
+            let response: Vec<PutResult> = client
+                .do_put(flight_data_stream)
                 .await
-                .is_ok()
+                .map_err(anyhow::Error::from)?
+                .try_collect()
+                .await
+                .map_err(anyhow::Error::from)?;
+
+            let response_str = format!("{response:?}");
+            insta::assert_snapshot!("do_put_basic_reponse", response_str);
+
+            let query = df
+                .query_builder("SELECT * from my_table")
+                .build()
+                .run()
+                .await?;
+
+            let results: Vec<RecordBatch> = query.data.try_collect::<Vec<RecordBatch>>().await?;
+            let results_str =
+                arrow::util::pretty::pretty_format_batches(&results).expect("pretty batches");
+            insta::assert_snapshot!("do_put_basic_table_content", results_str);
+
+            Ok(())
         })
-        .await;
+        .await
+}
 
-        let channel = Channel::from_shared(format!("http://localhost:{flight_port}"))?
-            .connect()
-            .await
-            .expect("to connect to flight endpoint");
+#[tokio::test]
+async fn test_do_put_stream_error() -> Result<(), Box<dyn std::error::Error>> {
+    let (channel, df) = start_spice_test_app().await?;
 
-        let mut client = FlightClient::new(channel);
+    let mut client = FlightClient::new(channel);
 
-        let flight_descriptor = FlightDescriptor::new_path(vec!["my_table".to_string()]);
-        let flight_data_stream = FlightDataEncoderBuilder::new()
-            .with_flight_descriptor(Some(flight_descriptor))
-            .build(futures::stream::iter(
-                // simulate two record batches / FlightData messages
-                [test_record_batch.clone(), test_record_batch].into_iter().map(Ok).collect::<Vec<_>>(),
-            ));
+    let test_record_batch = test_record_batch()?;
 
-        let _response: Vec<PutResult> = client
+    let repeating_stream = RepeatingStream {
+        batch: test_record_batch.clone(),
+    };
+
+    // simulate a sending the same record batch every 250ms
+    let delayed_stream = repeating_stream.then(|batch| async move {
+        sleep(Duration::from_millis(250)).await;
+        batch
+    });
+
+    let flight_descriptor = FlightDescriptor::new_path(vec!["my_table".to_string()]);
+    let flight_data_stream = FlightDataEncoderBuilder::new()
+        .with_flight_descriptor(Some(flight_descriptor))
+        .build(delayed_stream);
+
+    // simulate unexpected stream termination after 3 seconds
+    let result = timeout(Duration::from_secs(3), async {
+        let result: Result<Vec<PutResult>, FlightError> = client
             .do_put(flight_data_stream)
             .await
-            .map_err(anyhow::Error::from)?
+            .expect("to get result stream")
             .try_collect()
+            .await;
+        result
+    })
+    .await;
+
+    assert!(
+        result.is_err(),
+        "Expected an error but got a successful result"
+    );
+
+    // Verify that no data was written to the table
+    let query = df
+        .query_builder("SELECT * from my_table")
+        .build()
+        .run()
+        .await?;
+
+    let results: Vec<RecordBatch> = query.data.try_collect::<Vec<RecordBatch>>().await?;
+    let results_str = arrow::util::pretty::pretty_format_batches(&results).expect("pretty batches");
+    insta::assert_snapshot!("stream_error_table_content", results_str);
+
+    Ok(())
+}
+
+async fn start_spice_test_app() -> Result<(Channel, Arc<DataFusion>), anyhow::Error> {
+    let mut rng = rand::thread_rng();
+    let http_port: u16 = rng.gen_range(50000..60000);
+    let flight_port: u16 = http_port + 1;
+    let otel_port: u16 = http_port + 2;
+    let metrics_port: u16 = http_port + 3;
+
+    tracing::debug!(
+        "Ports: http: {http_port}, flight: {flight_port}, otel: {otel_port}, metrics: {metrics_port}"
+    );
+
+    let api_config = Config::new()
+        .with_http_bind_address(SocketAddr::new(LOCALHOST, http_port))
+        .with_flight_bind_address(SocketAddr::new(LOCALHOST, flight_port))
+        .with_open_telemetry_bind_address(SocketAddr::new(LOCALHOST, otel_port));
+
+    let registry = prometheus::Registry::new();
+
+    let rt = Runtime::builder()
+        .with_metrics_server(SocketAddr::new(LOCALHOST, metrics_port), registry)
+        .build()
+        .await;
+
+    let df = rt.datafusion();
+
+    let test_record_batch = test_record_batch()?;
+
+    register_test_table(
+        &df,
+        test_record_batch.schema(),
+        TableReference::parse_str("public.my_table"),
+    )
+    .await?;
+
+    // Start the servers
+    tokio::spawn(async move {
+        Box::pin(Arc::new(rt).start_servers(api_config, None, EndpointAuth::default())).await
+    });
+
+    // Wait for the servers to start
+    tracing::info!("Waiting for servers to start...");
+    wait_until_true(Duration::from_secs(10), || async {
+        reqwest::get(format!("http://localhost:{http_port}/health"))
             .await
-            .map_err(anyhow::Error::from)?;
+            .is_ok()
+    })
+    .await;
 
+    let channel = Channel::from_shared(format!("http://localhost:{flight_port}"))?
+        .connect()
+        .await
+        .map_err(anyhow::Error::from)?;
 
-        let query = df
-            .query_builder(
-                "SELECT * from my_table",
-            )
-            .build()
-            .run()
-            .await?;
-
-        let results: Vec<RecordBatch> = query.data.try_collect::<Vec<RecordBatch>>().await?;
-        let results_str =
-            arrow::util::pretty::pretty_format_batches(&results).expect("pretty batches");
-        insta::assert_snapshot!(results_str);
-
-        Ok(())
-    }).await
+    Ok((channel, df))
 }
 
 fn test_record_batch() -> Result<RecordBatch, anyhow::Error> {
@@ -172,4 +247,16 @@ async fn register_test_table(
         .map_err(anyhow::Error::from)?;
 
     Ok(())
+}
+
+struct RepeatingStream {
+    batch: RecordBatch,
+}
+
+impl Stream for RepeatingStream {
+    type Item = Result<RecordBatch, FlightError>;
+
+    fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Poll::Ready(Some(Ok(self.batch.clone())))
+    }
 }

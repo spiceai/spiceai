@@ -154,6 +154,8 @@ pub(crate) async fn handle(
                 }
             }
         };
+
+        tracing::trace!("Finished writing data to path: {path}");
     };
 
     let timed_stream = TimedStream::new(response_stream, move || start);
