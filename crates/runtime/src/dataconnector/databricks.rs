@@ -20,7 +20,6 @@ use data_components::databricks_delta::DatabricksDelta;
 use data_components::databricks_spark::DatabricksSparkConnect;
 use data_components::unity_catalog::Endpoint;
 use data_components::Read;
-use datafusion::catalog::CatalogProvider;
 use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
 use secrecy::ExposeSecret;
@@ -53,7 +52,6 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct Databricks {
     read_provider: Arc<dyn Read>,
-    params: Parameters,
 }
 
 impl Databricks {
@@ -75,7 +73,6 @@ impl Databricks {
             );
             Ok(Self {
                 read_provider: Arc::new(databricks_delta.clone()),
-                params,
             })
         } else {
             let mut databricks_use_ssl = true;
@@ -104,7 +101,6 @@ impl Databricks {
             .context(UnableToConstructDatabricksSparkSnafu)?;
             Ok(Self {
                 read_provider: Arc::new(databricks_spark.clone()),
-                params,
             })
         }
     }
