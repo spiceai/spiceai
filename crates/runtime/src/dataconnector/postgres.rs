@@ -140,7 +140,6 @@ impl DataConnector for Postgres {
         self
     }
 
-    #[cfg(feature = "postgres_write")]
     async fn read_write_provider(
         &self,
         dataset: &Dataset,
