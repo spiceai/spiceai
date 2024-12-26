@@ -38,19 +38,6 @@ use crate::{
 
 use super::{metrics, Service};
 
-// async fn get_sender_channel(
-//     channel_map: Arc<RwLock<HashMap<TableReference, Arc<Sender<DataUpdate>>>>>,
-//     path: &TableReference,
-// ) -> Option<Arc<Sender<DataUpdate>>> {
-//     let channel_map_read = channel_map.read().await;
-//     if channel_map_read.contains_key(path) {
-//         let channel = channel_map_read.get(path)?;
-//         Some(Arc::clone(channel))
-//     } else {
-//         None
-//     }
-// }
-
 pub(crate) async fn handle(
     flight_svc: &Service,
     request: Request<Streaming<FlightData>>,
@@ -145,7 +132,6 @@ pub(crate) async fn handle(
                                 tracing::error!("Error sending record batch to write channel: {e}");
                                 yield Err(Status::internal(format!("Error sending record batch to write channel: {e}")));
                             }
-
                             yield Ok(PutResult::default());
                         }
                         Ok(None) => {
@@ -157,7 +143,6 @@ pub(crate) async fn handle(
                                 tracing::error!("Write operation failed: {e}");
                                 yield Err(Status::internal(format!("Write operation failed: {e}")));
                             }
-
                             break;
                         }
                         Err(e) => {
