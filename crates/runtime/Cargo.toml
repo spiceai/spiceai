@@ -202,6 +202,7 @@ sqlite = [
     "data_components/sqlite",
     "dep:rusqlite",
 ]
+postgres_write = []
 
 [[bench]]
 harness = false
