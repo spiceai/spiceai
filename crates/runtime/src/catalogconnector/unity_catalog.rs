@@ -31,33 +31,9 @@ use data_components::Read;
 use data_components::RefreshableCatalogProvider;
 use datafusion::sql::TableReference;
 use secrecy::SecretString;
-use snafu::prelude::*;
 use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
-
-#[derive(Debug, Snafu)]
-pub enum Error {
-    #[snafu(display("Unable to parse SpiceAI dataset path: {dataset_path}"))]
-    UnableToParseDatasetPath { dataset_path: String },
-
-    #[snafu(display("Unable to publish data to SpiceAI: {source}"))]
-    UnableToPublishData { source: flight_client::Error },
-
-    #[snafu(display("Missing required secrets"))]
-    MissingRequiredSecrets,
-
-    #[snafu(display(r#"Unable to connect to endpoint "{endpoint}": {source}"#))]
-    UnableToVerifyEndpointConnection {
-        source: ns_lookup::Error,
-        endpoint: String,
-    },
-
-    #[snafu(display("Unable to create flight client: {source}"))]
-    UnableToCreateFlightClient { source: flight_client::Error },
-}
-
-pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Clone)]
 pub struct UnityCatalog {

@@ -56,10 +56,19 @@ pub enum Error {
         connector_component: ConnectorComponent,
         message: String,
     },
+
+    #[snafu(display("Failed to load the {connector_component} ({connector}).\nAn unknown Catalog Connector Error occurred: {source}\nPlease report a bug on GitHub: https://github.com/spiceai/spiceai/issues"))]
+    InternalWithSource {
+        connector: String,
+        connector_component: ConnectorComponent,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+#[cfg(feature = "databricks")]
+pub mod databricks;
 #[cfg(feature = "delta_lake")]
 pub mod unity_catalog;
 
@@ -95,6 +104,16 @@ pub async fn register_all() {
             unity_catalog::UnityCatalog::new_connector,
             "unity_catalog",
             unity_catalog::PARAMETERS,
+        ),
+    );
+
+    #[cfg(feature = "databricks")]
+    registry.insert(
+        "databricks".to_string(),
+        CatalogConnectorFactory::new(
+            databricks::Databricks::new_connector,
+            "databricks",
+            databricks::PARAMETERS,
         ),
     );
 }
