@@ -159,7 +159,7 @@ fn get_tpch_test_queries() -> Vec<(&'static str, &'static str)> {
             "tpch_simple_q2",
             include_str!("../queries/tpch/simple_q2.sql"),
         ),
-        // DoGet recv error: rpc error: code = InvalidArgument desc = No field named l1.l_orderkey. Valid fields are __correlated_sq_1.l_orderkey, __correlated_sq_1.l_suppkey.
+        // Tonic error: status: ResourceExhausted, message: "DoGet recv error: rpc error: code = ResourceExhausted desc = grpc: received message larger than max (1646208435 vs. 104857600)", details: [], metadata: MetadataMap { headers: {} }
         // (
         //     "tpch_simple_q3",
         //     include_str!("../queries/tpch/simple_q3.sql"),
