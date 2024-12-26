@@ -16,7 +16,9 @@ limitations under the License.
 
 use crate::component::dataset::Dataset;
 use async_trait::async_trait;
-use data_components::{Read, ReadWrite};
+use data_components::Read;
+#[cfg(feature = "postgres-write")]
+use data_components::ReadWrite;
 use datafusion::datasource::TableProvider;
 use datafusion_table_providers::postgres::PostgresTableFactory;
 use datafusion_table_providers::sql::db_connection_pool::dbconnection;
@@ -140,6 +142,7 @@ impl DataConnector for Postgres {
         self
     }
 
+    #[cfg(feature = "postgres-write")]
     async fn read_write_provider(
         &self,
         dataset: &Dataset,
