@@ -179,7 +179,7 @@ impl Runtime {
 
         let source = ds.source();
         let params = DataConnectorParamsBuilder::new(source.into(), (&ds).into())
-            .with_runtime(self)
+            .build(self.secrets())
             .await
             .context(UnableToInitializeDataConnectorSnafu)?;
 

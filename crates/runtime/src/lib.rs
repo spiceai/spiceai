@@ -543,14 +543,6 @@ impl Runtime {
             tracing::error!("Could not start the Spice runtime: {err}");
         }
     }
-
-    pub async fn get_params_with_secrets(
-        &self,
-        params: &HashMap<String, String>,
-    ) -> HashMap<String, SecretString> {
-        let shared_secrets = Arc::clone(&self.secrets);
-        get_params_with_secrets(shared_secrets, params).await
-    }
 }
 
 #[allow(clippy::implicit_hasher)]

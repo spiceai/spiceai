@@ -20,7 +20,7 @@ use crate::models::sql_to_display;
 use crate::{
     init_tracing, init_tracing_with_task_history,
     models::{
-        create_api_bindings_config, get_params_with_secrets, get_taxi_trips_dataset,
+        create_api_bindings_config, get_params_with_secrets_value, get_taxi_trips_dataset,
         get_tpcds_dataset, normalize_chat_completion_response, normalize_embeddings_response,
         send_chat_completions_request,
     },
@@ -607,7 +607,7 @@ async fn get_openai_chat_model(
         .params
         .insert("tools".to_string(), tools.into().into());
 
-    let model_secrets = get_params_with_secrets(&model_with_tools.params, &rt).await;
+    let model_secrets = get_params_with_secrets_value(&model_with_tools.params, &rt).await;
     try_to_chat_model(&model_with_tools, &model_secrets, rt)
         .await
         .map_err(anyhow::Error::from)

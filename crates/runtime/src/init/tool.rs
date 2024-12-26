@@ -17,7 +17,7 @@ limitations under the License.
 use std::{collections::HashMap, sync::Arc};
 
 use crate::{
-    metrics, status,
+    get_params_with_secrets, metrics, status,
     tools::{self, factory::default_available_catalogs},
     Runtime, SpiceModelTool, SpiceToolCatalog, UnableToInitializeLlmToolSnafu,
 };
@@ -74,7 +74,7 @@ impl Runtime {
         self.status
             .update_tool(&tool.name, status::ComponentStatus::Initializing);
         let params_with_secrets: HashMap<String, SecretString> =
-            self.get_params_with_secrets(&tool.params).await;
+            get_params_with_secrets(self.secrets(), &tool.params).await;
 
         match tools::factory::forge(tool, params_with_secrets)
             .await

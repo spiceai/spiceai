@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use catalog::SpiceAICatalogProvider;
@@ -319,7 +319,7 @@ async fn get_spiceai_table_provider(
     dataset.replication = Some(Replication { enabled: true });
 
     let params = DataConnectorParamsBuilder::new(name.into(), (&dataset).into())
-        .without_runtime(HashMap::new(), secrets)
+        .build(secrets)
         .await
         .context(UnableToCreateDataConnectorSnafu)?;
 

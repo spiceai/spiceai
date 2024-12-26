@@ -82,7 +82,7 @@ impl Runtime {
 
         let source = catalog.provider.clone();
         let params = DataConnectorParamsBuilder::new(source.clone().into(), (&catalog).into())
-            .with_runtime(self)
+            .build(self.secrets())
             .await
             .context(UnableToInitializeDataConnectorSnafu)?;
 

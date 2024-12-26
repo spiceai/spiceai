@@ -17,7 +17,8 @@ limitations under the License.
 use std::{collections::HashMap, sync::Arc};
 
 use crate::{
-    metrics, model::ENABLE_MODEL_SUPPORT_MESSAGE, status, timing::TimeMeasurement, Runtime,
+    get_params_with_secrets, metrics, model::ENABLE_MODEL_SUPPORT_MESSAGE, status,
+    timing::TimeMeasurement, Runtime,
 };
 use app::App;
 use model_components::model::Model;
@@ -74,7 +75,7 @@ impl Runtime {
                 }
             })
             .collect::<HashMap<_, _>>();
-        let params = self.get_params_with_secrets(&p).await;
+        let params = get_params_with_secrets(self.secrets(), &p).await;
 
         let model_type = m.model_type();
         tracing::trace!("Model type for {} is {:#?}", m.name, model_type.clone());

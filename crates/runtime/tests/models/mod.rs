@@ -19,7 +19,7 @@ use async_openai::types::EmbeddingInput;
 use futures::TryStreamExt;
 use rand::Rng;
 use reqwest::{header::HeaderMap, Client};
-use runtime::{config::Config, Runtime};
+use runtime::{config::Config, get_params_with_secrets, Runtime};
 use secrecy::SecretString;
 use snafu::ResultExt;
 use spicepod::component::{
@@ -445,7 +445,7 @@ async fn sql_to_display(
     pretty_format_batches(&data).map(|d| format!("{d}")).boxed()
 }
 
-async fn get_params_with_secrets(
+async fn get_params_with_secrets_value(
     params: &HashMap<String, Value>,
     rt: &Runtime,
 ) -> HashMap<String, SecretString> {
@@ -461,5 +461,5 @@ async fn get_params_with_secrets(
         })
         .collect::<HashMap<_, _>>();
 
-    rt.get_params_with_secrets(&params).await
+    get_params_with_secrets(rt.secrets(), &params).await
 }

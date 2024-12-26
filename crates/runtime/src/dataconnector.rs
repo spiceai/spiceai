@@ -20,6 +20,7 @@ use crate::component::dataset::acceleration::RefreshMode;
 use crate::component::dataset::Dataset;
 use crate::datafusion::error::find_datafusion_root;
 use crate::federated_table::FederatedTable;
+use crate::get_params_with_secrets;
 use crate::parameters::ParameterSpec;
 use crate::parameters::Parameters;
 use crate::secrets::Secrets;
@@ -36,7 +37,6 @@ use datafusion::logical_expr::{Expr, LogicalPlanBuilder};
 use datafusion::sql::unparser::Unparser;
 use datafusion::sql::TableReference;
 use datafusion_table_providers::InvalidTypeAction;
-use secrecy::SecretString;
 use snafu::prelude::*;
 use std::any::Any;
 use std::collections::HashMap;
@@ -507,7 +507,6 @@ impl std::fmt::Display for ConnectorComponent {
 
 pub struct DataConnectorParams {
     pub(crate) parameters: Parameters,
-    pub(crate) metadata: HashMap<String, String>,
     pub(crate) invalid_type_action: Option<InvalidTypeAction>,
     pub(crate) component: ConnectorComponent,
 }
@@ -526,35 +525,19 @@ impl DataConnectorParamsBuilder {
         }
     }
 
-    pub async fn with_runtime(
+    pub async fn build(
         &self,
-        runtime: &Runtime,
-    ) -> Result<DataConnectorParams, Box<dyn std::error::Error + Send + Sync>> {
-        match &self.component {
-            ConnectorComponent::Catalog(catalog) => {
-                let secrets = runtime.secrets();
-                let params = runtime.get_params_with_secrets(&catalog.params).await;
-                let params = self.without_runtime(params, secrets).await?;
-
-                Ok(params)
-            }
-            ConnectorComponent::Dataset(dataset) => {
-                let secrets = runtime.secrets();
-                let params = runtime.get_params_with_secrets(&dataset.params).await;
-                let mut params = self.without_runtime(params, secrets).await?;
-                params.metadata.clone_from(&dataset.metadata);
-                params.invalid_type_action = dataset.invalid_type_action.map(Into::into);
-
-                Ok(params)
-            }
-        }
-    }
-
-    pub async fn without_runtime(
-        &self,
-        params: HashMap<String, SecretString>,
         secrets: Arc<RwLock<Secrets>>,
     ) -> Result<DataConnectorParams, Box<dyn std::error::Error + Send + Sync>> {
+        let params = match &self.component {
+            ConnectorComponent::Catalog(catalog) => {
+                get_params_with_secrets(Arc::clone(&secrets), &catalog.params).await
+            }
+            ConnectorComponent::Dataset(dataset) => {
+                get_params_with_secrets(Arc::clone(&secrets), &dataset.params).await
+            }
+        };
+
         let name = self.connector.to_string();
         let guard = DATA_CONNECTOR_FACTORY_REGISTRY.lock().await;
 
@@ -586,7 +569,6 @@ impl DataConnectorParamsBuilder {
 
         Ok(DataConnectorParams {
             parameters,
-            metadata: HashMap::new(),
             invalid_type_action: None,
             component: self.component.clone(),
         })

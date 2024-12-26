@@ -22,6 +22,7 @@ use super::ParameterSpec;
 use super::Parameters;
 use crate::component::catalog::Catalog;
 use crate::component::dataset::Dataset;
+use crate::get_params_with_secrets;
 use crate::Runtime;
 use async_trait::async_trait;
 use data_components::delta_lake::DeltaTableFactory;
@@ -197,11 +198,10 @@ impl DataConnector for UnityCatalog {
 
         // Copy the catalog params into the dataset params, and allow user to override
         let mut dataset_params: HashMap<String, SecretString> =
-            runtime.get_params_with_secrets(&catalog.params).await;
+            get_params_with_secrets(runtime.secrets(), &catalog.params).await;
 
-        let secret_dataset_params = runtime
-            .get_params_with_secrets(&catalog.dataset_params)
-            .await;
+        let secret_dataset_params =
+            get_params_with_secrets(runtime.secrets(), &catalog.dataset_params).await;
 
         for (key, value) in secret_dataset_params {
             dataset_params.insert(key, value);
