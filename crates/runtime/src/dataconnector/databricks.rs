@@ -35,7 +35,7 @@ use std::sync::Arc;
 use std::{collections::HashMap, future::Future};
 
 use super::{
-    ConnectorComponent, DataConnector, DataConnectorFactory, DataConnectorParams, ParameterSpec,
+    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorFactory, ParameterSpec,
     Parameters,
 };
 
@@ -174,7 +174,7 @@ impl Databricks {
         let (table_creator, table_reference_creator) = if let Some("delta_lake") = mode {
             (
                 Arc::new(DeltaTableFactory::new(params.to_secret_map())) as Arc<dyn Read>,
-                table_reference_creator_delta_lake as fn(UCTable) -> Option<TableReference>,
+                table_reference_creator_delta_lake as fn(&UCTable) -> Option<TableReference>,
             )
         } else {
             let dataset_databricks = match Databricks::new(params).await.map_err(|source| {
@@ -190,7 +190,7 @@ impl Databricks {
 
             (
                 dataset_databricks.read_provider,
-                table_reference_creator_spark as fn(UCTable) -> Option<TableReference>,
+                table_reference_creator_spark as fn(&UCTable) -> Option<TableReference>,
             )
         };
 
@@ -292,7 +292,7 @@ const PARAMETERS: &[ParameterSpec] = &[
 impl DataConnectorFactory for DatabricksFactory {
     fn create(
         &self,
-        params: DataConnectorParams,
+        params: ConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             let databricks = Databricks::new(params.parameters).await?;
@@ -340,16 +340,16 @@ impl DataConnector for Databricks {
 }
 
 #[allow(clippy::unnecessary_wraps)]
-fn table_reference_creator_spark(uc_table: UCTable) -> Option<TableReference> {
+fn table_reference_creator_spark(uc_table: &UCTable) -> Option<TableReference> {
     let table_reference = TableReference::Full {
-        catalog: uc_table.catalog_name.into(),
-        schema: uc_table.schema_name.into(),
-        table: uc_table.name.into(),
+        catalog: uc_table.catalog_name.clone().into(),
+        schema: uc_table.schema_name.clone().into(),
+        table: uc_table.name.clone().into(),
     };
     Some(table_reference)
 }
 
-fn table_reference_creator_delta_lake(uc_table: UCTable) -> Option<TableReference> {
-    let storage_location = uc_table.storage_location?;
+fn table_reference_creator_delta_lake(uc_table: &UCTable) -> Option<TableReference> {
+    let storage_location = uc_table.storage_location.as_deref()?;
     Some(TableReference::bare(format!("{storage_location}/")))
 }

@@ -35,7 +35,7 @@ use runtime::{
     },
     dataaccelerator::{self, create_accelerator_table},
     dataconnector::{
-        create_new_connector, DataConnector, DataConnectorError, DataConnectorParamsBuilder,
+        create_new_connector, ConnectorParamsBuilder, DataConnector, DataConnectorError,
     },
     extension::{Error as ExtensionError, Extension, ExtensionFactory, ExtensionManifest, Result},
     federated_table::FederatedTable,
@@ -318,7 +318,7 @@ async fn get_spiceai_table_provider(
     dataset.mode = Mode::ReadWrite;
     dataset.replication = Some(Replication { enabled: true });
 
-    let params = DataConnectorParamsBuilder::new(name.into(), (&dataset).into())
+    let params = ConnectorParamsBuilder::new(name.into(), (&dataset).into())
         .build(secrets)
         .await
         .context(UnableToCreateDataConnectorSnafu)?;

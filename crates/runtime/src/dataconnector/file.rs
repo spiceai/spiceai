@@ -31,7 +31,7 @@ use std::{any::Any, env};
 use tokio::sync::mpsc;
 use url::Url;
 
-use super::DataConnectorParams;
+use super::ConnectorParams;
 use super::{
     listing::ListingTableConnector, DataConnector, DataConnectorFactory, DataConnectorResult,
     InvalidConfigurationSnafu, ParameterSpec, Parameters,
@@ -86,7 +86,7 @@ const PARAMETERS: &[ParameterSpec] = &[
 impl DataConnectorFactory for FileFactory {
     fn create(
         &self,
-        params: DataConnectorParams,
+        params: ConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             Ok(Arc::new(File {

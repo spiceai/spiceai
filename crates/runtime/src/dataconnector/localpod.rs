@@ -29,7 +29,7 @@ use crate::datafusion::DataFusion;
 use crate::DataConnector;
 use crate::{component::dataset::Dataset, parameters::ParameterSpec};
 
-use super::{ConnectorComponent, DataConnectorFactory, DataConnectorParams};
+use super::{ConnectorComponent, ConnectorParams, DataConnectorFactory};
 
 pub const LOCALPOD_DATACONNECTOR: &str = "localpod";
 
@@ -51,7 +51,7 @@ impl LocalPodFactory {
 impl DataConnectorFactory for LocalPodFactory {
     fn create(
         &self,
-        params: DataConnectorParams,
+        params: ConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             Err(Box::new(super::DataConnectorError::Internal {

@@ -14,14 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use super::CatalogConnector;
 use super::ConnectorComponent;
-use super::DataConnector;
-use super::DataConnectorFactory;
-use super::DataConnectorParams;
 use super::ParameterSpec;
 use super::Parameters;
 use crate::component::catalog::Catalog;
-use crate::component::dataset::Dataset;
+use crate::dataconnector::ConnectorParams;
 use crate::get_params_with_secrets;
 use crate::Runtime;
 use async_trait::async_trait;
@@ -30,15 +28,13 @@ use data_components::unity_catalog::provider::UnityCatalogProvider;
 use data_components::unity_catalog::UCTable;
 use data_components::unity_catalog::UnityCatalog as UnityCatalogClient;
 use data_components::Read;
-use datafusion::catalog::CatalogProvider;
-use datafusion::datasource::TableProvider;
+use data_components::RefreshableCatalogProvider;
 use datafusion::sql::TableReference;
 use secrecy::SecretString;
 use snafu::prelude::*;
 use std::any::Any;
-use std::pin::Pin;
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::{collections::HashMap, future::Future};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -68,22 +64,16 @@ pub struct UnityCatalog {
     params: Parameters,
 }
 
-#[derive(Default, Copy, Clone)]
-pub struct UnityCatalogFactory {}
-
-impl UnityCatalogFactory {
+impl UnityCatalog {
     #[must_use]
-    pub fn new() -> Self {
-        Self {}
-    }
-
-    #[must_use]
-    pub fn new_arc() -> Arc<dyn DataConnectorFactory> {
-        Arc::new(Self {}) as Arc<dyn DataConnectorFactory>
+    pub fn new_connector(params: ConnectorParams) -> Arc<dyn CatalogConnector> {
+        Arc::new(Self {
+            params: params.parameters,
+        })
     }
 }
 
-const PARAMETERS: &[ParameterSpec] = &[
+pub(crate) const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::connector("token").secret().description(
         "The personal access token used to authenticate against the Unity Catalog API.",
     ),
@@ -125,70 +115,38 @@ const PARAMETERS: &[ParameterSpec] = &[
         .secret(),
 ];
 
-impl DataConnectorFactory for UnityCatalogFactory {
-    fn create(
-        &self,
-        params: DataConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
-        Box::pin(async move {
-            Ok(Arc::new(UnityCatalog {
-                params: params.parameters,
-            }) as Arc<dyn DataConnector>)
-        })
-    }
-
-    fn prefix(&self) -> &'static str {
-        "unity_catalog"
-    }
-
-    fn parameters(&self) -> &'static [ParameterSpec] {
-        PARAMETERS
-    }
-}
-
 #[async_trait]
-impl DataConnector for UnityCatalog {
+impl CatalogConnector for UnityCatalog {
     fn as_any(&self) -> &dyn Any {
         self
     }
 
-    async fn read_provider(
-        &self,
-        dataset: &Dataset,
-    ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
-        Err(super::DataConnectorError::UnableToGetReadProvider {
-            dataconnector: "unity_catalog".to_string(),
-            source: "The Unity Catalog only supports catalogs, not individual datasets.\nSetup a Unity Catalog instead: https://docs.spiceai.org/components/catalogs/unity-catalog".into(),
-            connector_component: ConnectorComponent::from(dataset)
-        })
-    }
-
-    async fn catalog_provider(
+    async fn refreshable_catalog_provider(
         self: Arc<Self>,
         runtime: &Runtime,
         catalog: &Catalog,
-    ) -> Option<super::DataConnectorResult<Arc<dyn CatalogProvider>>> {
+    ) -> super::Result<Arc<dyn RefreshableCatalogProvider>> {
         let Some(catalog_id) = catalog.catalog_id.clone() else {
-            return Some(Err(
-                super::DataConnectorError::InvalidConfigurationNoSource {
-                    dataconnector: "unity_catalog".into(),
+            return Err(
+                super::Error::InvalidConfigurationNoSource {
+                    connector: "unity_catalog".into(),
                     message: "A Catalog Path is required for Unity Catalog.\nFor details, visit: https://docs.spiceai.org/components/catalogs/unity-catalog#from".into(),
                     connector_component: ConnectorComponent::from(catalog),
                 },
-            ));
+            );
         };
 
         // The catalog_id for the unity_catalog provider is the full URL to the catalog like:
         // https://<host>/api/2.1/unity-catalog/catalogs/<catalog_id>
         let (endpoint, catalog_id) = match UnityCatalogClient::parse_catalog_url(&catalog_id)
-            .map_err(|e| super::DataConnectorError::InvalidConfiguration {
-                dataconnector: "unity_catalog".to_string(),
+            .map_err(|e| super::Error::InvalidConfiguration {
+                connector: "unity_catalog".to_string(),
                 connector_component: ConnectorComponent::from(catalog),
                 message: e.to_string(),
                 source: Box::new(e),
             }) {
             Ok((endpoint, catalog_id)) => (endpoint, catalog_id),
-            Err(e) => return Some(Err(e)),
+            Err(e) => return Err(e),
         };
 
         let client = Arc::new(UnityCatalogClient::new(
@@ -220,19 +178,19 @@ impl DataConnector for UnityCatalog {
         {
             Ok(provider) => provider,
             Err(e) => {
-                return Some(Err(super::DataConnectorError::UnableToGetCatalogProvider {
-                    dataconnector: "unity_catalog".to_string(),
+                return Err(super::Error::UnableToGetCatalogProvider {
+                    connector: "unity_catalog".to_string(),
                     connector_component: ConnectorComponent::from(catalog),
                     source: Box::new(e),
-                }))
+                })
             }
         };
 
-        Some(Ok(Arc::new(catalog_provider) as Arc<dyn CatalogProvider>))
+        Ok(Arc::new(catalog_provider) as Arc<dyn RefreshableCatalogProvider>)
     }
 }
 
-fn table_reference_creator(uc_table: UCTable) -> Option<TableReference> {
-    let storage_location = uc_table.storage_location?;
+fn table_reference_creator(uc_table: &UCTable) -> Option<TableReference> {
+    let storage_location = uc_table.storage_location.as_deref()?;
     Some(TableReference::bare(format!("{storage_location}/")))
 }

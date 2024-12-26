@@ -56,8 +56,8 @@ use std::{any::Any, future::Future, pin::Pin, str::FromStr, sync::Arc};
 use url::Url;
 
 use super::{
-    graphql::default_spice_client, ConnectorComponent, DataConnector, DataConnectorError,
-    DataConnectorFactory, DataConnectorParams, ParameterSpec, Parameters,
+    graphql::default_spice_client, ConnectorComponent, ConnectorParams, DataConnector,
+    DataConnectorError, DataConnectorFactory, ParameterSpec, Parameters,
 };
 
 mod commits;
@@ -325,7 +325,7 @@ const PARAMETERS: &[ParameterSpec] = &[
 impl DataConnectorFactory for GithubFactory {
     fn create(
         &self,
-        params: DataConnectorParams,
+        params: ConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         let token = params.parameters.get("token").expose().ok();
         let client_id = params.parameters.get("client_id").expose().ok();

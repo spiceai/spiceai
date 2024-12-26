@@ -31,8 +31,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use super::{
-    AnyErrorResult, ConnectorComponent, DataConnector, DataConnectorError, DataConnectorFactory,
-    DataConnectorParams, ParameterSpec,
+    AnyErrorResult, ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError,
+    DataConnectorFactory, ParameterSpec,
 };
 
 #[derive(Debug, Snafu)]
@@ -50,9 +50,7 @@ pub struct DuckDB {
 }
 
 impl DuckDB {
-    pub(crate) fn create_in_memory(
-        params: &DataConnectorParams,
-    ) -> AnyErrorResult<DuckDBTableFactory> {
+    pub(crate) fn create_in_memory(params: &ConnectorParams) -> AnyErrorResult<DuckDBTableFactory> {
         let pool = Arc::new(
             DuckDbConnectionPool::new_memory()
                 .map_err(|source| DataConnectorError::UnableToConnectInternal {
@@ -72,7 +70,7 @@ impl DuckDB {
 
     pub(crate) fn create_file(
         path: &str,
-        params: &DataConnectorParams,
+        params: &ConnectorParams,
     ) -> AnyErrorResult<DuckDBTableFactory> {
         let pool = Arc::new(
             DuckDbConnectionPool::new_file(path, &AccessMode::ReadOnly)
@@ -112,7 +110,7 @@ const PARAMETERS: &[ParameterSpec] = &[ParameterSpec::connector("open")];
 impl DataConnectorFactory for DuckDBFactory {
     fn create(
         &self,
-        params: DataConnectorParams,
+        params: ConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             let duckdb_factory =
