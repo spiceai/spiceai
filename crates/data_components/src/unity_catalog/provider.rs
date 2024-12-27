@@ -21,6 +21,7 @@ use datafusion::{
     error::DataFusionError,
     sql::TableReference,
 };
+use futures::{StreamExt, TryStreamExt};
 use globset::GlobSet;
 use snafu::prelude::*;
 use std::{
@@ -101,11 +102,17 @@ impl CatalogProvider for UnityCatalogProvider {
 #[async_trait]
 impl RefreshableCatalogProvider for UnityCatalogProvider {
     async fn refresh(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let refresh_futures = self.schemas.values().map(|schema| schema.refresh());
-        futures::future::join_all(refresh_futures)
-            .await
-            .into_iter()
-            .collect::<Result<Vec<_>, _>>()?;
+        let max_concurrent = 5;
+        let futures = self
+            .schemas
+            .values()
+            .cloned()
+            .map(|schema| async move { schema.refresh().await });
+
+        futures::stream::iter(futures)
+            .buffer_unordered(max_concurrent)
+            .try_collect::<Vec<_>>()
+            .await?;
         Ok(())
     }
 }
