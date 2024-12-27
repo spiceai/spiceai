@@ -82,6 +82,13 @@ impl Dialect for DremioDialect {
     ) -> datafusion::sql::sqlparser::ast::DataType {
         datafusion::sql::sqlparser::ast::DataType::Timestamp(None, TimezoneInfo::None)
     }
+
+    fn window_func_support_window_frame(&self, func_name: &str) -> bool {
+        if matches!(func_name, "rank" | "row_number" | "dense_rank") {
+            return false;
+        }
+        true
+    }
 }
 
 #[derive(Default, Copy, Clone)]
