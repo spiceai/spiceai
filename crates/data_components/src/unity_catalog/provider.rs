@@ -243,6 +243,30 @@ impl UnityCatalogSchemaProvider {
             Ok(guard) => guard,
             Err(e) => e.into_inner(),
         };
+        if !removed_tables.is_empty() || !new_table_providers.is_empty() {
+            let mut message = format!(
+                "Refreshed schema {}.{}. ",
+                self.schema.catalog_name, self.schema.name
+            );
+            if !removed_tables.is_empty() {
+                message.push_str(&format!("Tables removed: {}.", removed_tables.join(", ")));
+            }
+            if !new_table_providers.is_empty() {
+                if !removed_tables.is_empty() {
+                    message.push(' ');
+                }
+                message.push_str(&format!(
+                    "Tables added: {}.",
+                    new_table_providers
+                        .keys()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .as_slice()
+                        .join(", ")
+                ));
+            }
+            tracing::info!("{}", message);
+        }
         for table_name in removed_tables {
             guard.remove(&table_name);
         }
