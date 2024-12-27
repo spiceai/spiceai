@@ -67,7 +67,8 @@ use arrow_flight::{
 pub struct Service {
     datafusion: Arc<DataFusion>,
     channel_map: Arc<RwLock<HashMap<TableReference, Arc<Sender<DataUpdate>>>>>,
-    basic_auth: Option<Arc<dyn FlightBasicAuth + Send + Sync>>,
+    // TODO - rework, access via getter or function to check access
+    pub basic_auth: Option<Arc<dyn FlightBasicAuth + Send + Sync>>,
 }
 
 #[tonic::async_trait]

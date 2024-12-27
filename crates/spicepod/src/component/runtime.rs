@@ -228,7 +228,7 @@ impl TaskHistory {
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct Auth {
-    #[serde(rename = "api-key")]
+    #[serde(alias="api-key")]
     pub api_key: Option<ApiKeyAuth>,
 }
 
@@ -238,7 +238,14 @@ pub struct Auth {
 pub struct ApiKeyAuth {
     #[serde(default = "default_true")]
     pub enabled: bool,
-    pub keys: Vec<String>,
+    pub keys: Vec<ApiKey>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+pub enum ApiKey {
+    ReadOnly { key: String },
+    ReadWrite { key: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -260,6 +267,61 @@ impl Default for CorsConfig {
         Self {
             enabled: false,
             allowed_origins: default_allowed_origins(),
+        }
+    }
+}
+
+impl ApiKey {
+    pub fn from_str(input: &str) ->Self {
+        if let Some((key, kind)) = input.rsplit_once(':') {
+            match kind {
+                "ro" =>ApiKey::ReadOnly { key: key.to_string() },
+                "rw" =>ApiKey::ReadWrite { key: key.to_string() },
+                // _ => Err(format!("Invalid key type suffix: {}", kind)),
+                _  => ApiKey::ReadOnly { key: input.to_string() },
+            }
+        } else {
+            // Default to ReadOnly if no suffix is provided
+            ApiKey::ReadOnly { key: input.to_string() }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ApiKey {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let input = String::deserialize(deserializer)?;
+
+        Ok(ApiKey::from_str(&input))
+    }
+}
+
+impl Serialize for ApiKey {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            ApiKey::ReadOnly { key } => serializer.serialize_str(key),
+            ApiKey::ReadWrite { key } => serializer.serialize_str(&format!("{key}:rw")),
+        }
+    }
+}
+
+impl PartialEq<str> for ApiKey {
+    fn eq(&self, other: &str) -> bool {
+        match self {
+            ApiKey::ReadOnly { key } | ApiKey::ReadWrite { key } => key == other,
+        }
+    }
+}
+
+impl AsRef<str> for ApiKey {
+    fn as_ref(&self) -> &str {
+        match self {
+            ApiKey::ReadOnly { key } | ApiKey::ReadWrite { key } => key.as_str(),
         }
     }
 }

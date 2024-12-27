@@ -14,17 +14,18 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use app::spicepod::component::runtime::ApiKey;
 use axum::http;
 
 use crate::{error::Error, AuthVerdict, FlightBasicAuth, GrpcAuth, HttpAuth};
 
 pub struct ApiKeyAuth {
-    api_keys: Vec<String>,
+    api_keys: Vec<ApiKey>,
 }
 
 impl ApiKeyAuth {
     #[must_use]
-    pub fn new(api_keys: Vec<String>) -> Self {
+    pub fn new(api_keys: Vec<ApiKey>) -> Self {
         Self { api_keys }
     }
 }
@@ -61,6 +62,14 @@ impl FlightBasicAuth for ApiKeyAuth {
         } else {
             Ok(AuthVerdict::Deny)
         }
+    }
+
+    fn is_write_allowed(&self, bearer_token: &str) -> Result<AuthVerdict, Error> {
+        if let Some(ApiKey::ReadWrite { key }) = self.api_keys.iter().find(|key| *key == bearer_token) {
+            return Ok(AuthVerdict::Allow);
+        }
+
+        Ok(AuthVerdict::Deny)
     }
 }
 
@@ -100,7 +109,7 @@ mod tests {
 
     #[test]
     fn test_valid_api_key() {
-        let auth = ApiKeyAuth::new(vec!["valid-key".to_string()]);
+        let auth = ApiKeyAuth::new(vec![ApiKey::from_str("valid-key")]);
         let parts = create_request_parts(Some("valid-key"));
 
         let result = auth.http_verify(&parts);
@@ -109,7 +118,7 @@ mod tests {
 
     #[test]
     fn test_invalid_api_key() {
-        let auth = ApiKeyAuth::new(vec!["valid-key".to_string()]);
+        let auth = ApiKeyAuth::new(vec![ApiKey::from_str("valid-key")]);
         let parts = create_request_parts(Some("invalid-key"));
 
         let result = auth.http_verify(&parts);
@@ -118,7 +127,7 @@ mod tests {
 
     #[test]
     fn test_missing_api_key() {
-        let auth = ApiKeyAuth::new(vec!["valid-key".to_string()]);
+        let auth = ApiKeyAuth::new(vec![ApiKey::from_str("valid-key")]);
         let parts = create_request_parts(None);
 
         let result = auth.http_verify(&parts);
@@ -128,9 +137,9 @@ mod tests {
     #[test]
     fn test_multiple_valid_keys() {
         let auth = ApiKeyAuth::new(vec![
-            "key1".to_string(),
-            "key2".to_string(),
-            "key3".to_string(),
+            ApiKey::from_str("key1"),
+            ApiKey::from_str("key2"),
+            ApiKey::from_str("key3"),
         ]);
 
         let parts = create_request_parts(Some("key2"));

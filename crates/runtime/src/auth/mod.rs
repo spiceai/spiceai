@@ -20,7 +20,7 @@ use crate::{
 };
 use runtime_auth::{api_key::ApiKeyAuth, FlightBasicAuth, GrpcAuth, HttpAuth};
 use secrecy::ExposeSecret;
-use spicepod::component::runtime::ApiKeyAuth as SpicepodApiKeyAuth;
+use spicepod::component::runtime::{ApiKey, ApiKeyAuth as SpicepodApiKeyAuth};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -97,13 +97,23 @@ impl Default for EndpointAuth {
 async fn api_key_auth(secrets: &Secrets, api_key_auth: &SpicepodApiKeyAuth) -> Arc<ApiKeyAuth> {
     let mut keys = Vec::with_capacity(api_key_auth.keys.len());
     for key in &api_key_auth.keys {
-        keys.push(
-            secrets
-                .inject_secrets("keys", ParamStr(key))
-                .await
-                .expose_secret()
-                .clone(),
-        );
+
+        let secret_key =secrets
+            .inject_secrets("keys", ParamStr(key.as_ref()))
+            .await
+            .expose_secret()
+            .clone();
+
+        let key = match key {
+            ApiKey::ReadOnly { key: _ } => {
+                ApiKey::ReadOnly { key: secret_key } 
+            },
+            ApiKey::ReadWrite { key: _ } => {
+                ApiKey::ReadWrite { key: secret_key } 
+            },
+        };
+
+        keys.push(key);
     }
 
     Arc::new(ApiKeyAuth::new(keys))

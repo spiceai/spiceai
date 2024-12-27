@@ -28,6 +28,7 @@ use arrow_flight::{error::FlightError, flight_service_client::FlightServiceClien
 use rand::Rng;
 use runtime::{auth::EndpointAuth, config::Config, Runtime};
 use runtime_auth::{api_key::ApiKeyAuth, FlightBasicAuth};
+use spicepod::component::runtime::ApiKey;
 use tonic::transport::Channel;
 
 const LOCALHOST: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
@@ -62,7 +63,7 @@ async fn test_flight_auth() -> Result<(), anyhow::Error> {
             .build()
             .await;
 
-        let api_key_auth = Arc::new(ApiKeyAuth::new(vec!["valid".to_string()]))
+        let api_key_auth = Arc::new(ApiKeyAuth::new(vec![ApiKey::from_str("valid")]))
             as Arc<dyn FlightBasicAuth + Send + Sync>;
 
         // Start the servers
