@@ -67,7 +67,7 @@ pub fn validate_basic_auth_handshake(
     }
 }
 
-fn get_authorization_value<'a>(
+pub fn get_authorization_value<'a>(
     metadata: &'a MetadataMap,
     prefix: &'static str,
 ) -> Result<&'a str, Status> {

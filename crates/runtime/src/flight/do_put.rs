@@ -21,6 +21,7 @@ use arrow_flight::{
     flight_service_server::FlightService, utils::flight_data_to_arrow_batch, FlightData, PutResult,
 };
 use arrow_ipc::convert::try_schema_from_flatbuffer_bytes;
+use data_components::flight;
 use datafusion::{
     error::DataFusionError, execution::SendableRecordBatchStream,
     physical_plan::stream::RecordBatchStreamAdapter, sql::TableReference,
@@ -42,6 +43,22 @@ pub(crate) async fn handle(
     flight_svc: &Service,
     request: Request<Streaming<FlightData>>,
 ) -> Result<Response<<Service as FlightService>::DoPutStream>, Status> {
+
+    let Some(auth) = &flight_svc.basic_auth else {
+        return Err(Status::unauthenticated("DoPut requires auth enabled"));
+     };
+ 
+     let bearer_token = match runtime_auth::layer::flight::get_authorization_value(request.metadata(), "Bearer") {
+         Ok(bearer_token) => bearer_token,
+         Err(e) => return Err(e),
+     };
+ 
+     match auth.is_write_allowed(bearer_token) {
+         Ok(runtime_auth::AuthVerdict::Allow) => (),
+         Ok(runtime_auth::AuthVerdict::Deny) => return Err(Status::permission_denied("Write access denied")),
+         Err(e) => return Err(Status::internal(format!("Error validating write access: {e}"))),
+     };
+
     let mut streaming_flight = request.into_inner();
 
     let Ok(Some(message)) = streaming_flight.message().await else {

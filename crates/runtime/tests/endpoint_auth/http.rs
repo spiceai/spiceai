@@ -27,6 +27,7 @@ use crate::{
 use rand::Rng;
 use runtime::{auth::EndpointAuth, config::Config, Runtime};
 use runtime_auth::{api_key::ApiKeyAuth, HttpAuth};
+use spicepod::component::runtime::ApiKey;
 
 const LOCALHOST: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
 
@@ -64,7 +65,7 @@ async fn test_http_auth() -> Result<(), anyhow::Error> {
             .await;
 
         let api_key_auth =
-            Arc::new(ApiKeyAuth::new(vec!["valid".to_string()])) as Arc<dyn HttpAuth + Send + Sync>;
+            Arc::new(ApiKeyAuth::new(vec![ApiKey::from_str("valid")])) as Arc<dyn HttpAuth + Send + Sync>;
 
         // Start the servers
         tokio::spawn(async move {

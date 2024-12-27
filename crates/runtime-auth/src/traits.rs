@@ -49,6 +49,8 @@ pub trait FlightBasicAuth {
     ///
     /// This function will return an error if the validator can't validate the bearer token.
     fn is_valid(&self, bearer_token: &str) -> Result<AuthVerdict, Error>;
+
+    fn is_write_allowed(&self, bearer_token: &str) -> Result<AuthVerdict, Error>;
 }
 
 pub trait GrpcAuth {
