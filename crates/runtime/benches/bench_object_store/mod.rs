@@ -372,6 +372,7 @@ fn get_clickbench_test_queries(engine: Option<&str>) -> Vec<(&'static str, &'sta
         // SQLite does not support "to_timestamp"
         // the underlying object store data source stores them as epoch integers
         // which SQLite can convert with 'datetime()' and 'date()' but the functions are not supported by datafusion and aren't federated
+        // on data sources where the columns are already date/timestamp, the queries run successfully
         queries.remove(6);
         queries.remove(18);
         queries.remove(23);
