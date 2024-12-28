@@ -360,6 +360,19 @@ macro_rules! generate_clickbench_queries {
     }
 }
 
+macro_rules! generate_clickbench_query_overrides {
+    ( $engine:expr, $( $i:literal ),* ) => {
+        vec![
+            $(
+                (
+                    concat!("clickbench_q", stringify!($i)),
+                    include_str!(concat!("../queries/clickbench/", $engine, "/q", stringify!($i), ".sql"))
+                )
+            ),*
+        ]
+    }
+}
+
 fn get_clickbench_test_queries(engine: Option<&str>) -> Vec<(&'static str, &'static str)> {
     let mut queries = generate_clickbench_queries!(
         1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
@@ -367,6 +380,14 @@ fn get_clickbench_test_queries(engine: Option<&str>) -> Vec<(&'static str, &'sta
     );
 
     if let Some("sqlite") = engine {
+        let overrides = generate_clickbench_query_overrides!(
+            "sqlite", 7, 19, 24, 25, 27, 37, 38, 39, 40, 41, 42, 43
+        );
+
+        for (i, v) in overrides.iter().enumerate() {
+            queries[i] = *v;
+        }
+
         queries.remove(28); // q29 includes regexp_replace which is not supported by sqlite
     }
 
