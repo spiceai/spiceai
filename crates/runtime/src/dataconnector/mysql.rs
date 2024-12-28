@@ -33,8 +33,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use super::{
-    ConnectorComponent, DataConnector, DataConnectorError, DataConnectorFactory,
-    DataConnectorParams, ParameterSpec,
+    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
+    ParameterSpec,
 };
 
 #[derive(Debug, Snafu)]
@@ -78,7 +78,7 @@ const PARAMETERS: &[ParameterSpec] = &[
 impl DataConnectorFactory for MySQLFactory {
     fn create(
         &self,
-        params: DataConnectorParams,
+        params: ConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             let pool: Arc<

@@ -1,0 +1,4038 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "runtime",
+    "description": "The spiced runtime",
+    "license": {
+      "name": "Apache-2.0"
+    },
+    "version": "1.0.0-rc.3"
+  },
+  "servers": [
+    {
+      "url": "http://localhost:8090",
+      "description": "Local development server. Configure with `--http`."
+    }
+  ],
+  "paths": {
+    "/v1/catalogs": {
+      "get": {
+        "tags": [
+          "Datasets"
+        ],
+        "summary": "List Catalogs",
+        "operationId": "get_catalogs",
+        "parameters": [
+          {
+            "name": "from",
+            "in": "query",
+            "description": "Filters catalogs by source (e.g., 'spiceai').",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "List of catalogs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CatalogResponseItem"
+                },
+                "example": [
+                  {
+                    "from": "spiceai",
+                    "name": "spiceai"
+                  }
+                ]
+              },
+              "text/csv": {
+                "schema": {
+                  "type": "string"
+                },
+                "example": "\nfrom,name\nspiceai,spiceai\n"
+              }
+            }
+          },
+          "500": {
+            "description": "Internal server error occurred while processing catalogs",
+            "content": {
+              "application/json": {
+                "schema": {},
+                "example": {
+                  "error": "An unexpected error occurred while processing the catalogs"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/chat/completions": {
+      "post": {
+        "tags": [
+          "AI"
+        ],
+        "summary": "Create Chat Completion",
+        "description": "Creates a model response for the given chat conversation.",
+        "operationId": "post_chat_completions",
+        "requestBody": {
+          "description": "Create a chat completion request using a language model.",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateChatCompletionRequest"
+              },
+              "example": {
+                "model": "gpt-4o",
+                "messages": [
+                  {
+                    "role": "developer",
+                    "content": "You are a helpful assistant."
+                  },
+                  {
+                    "role": "user",
+                    "content": "Hello!"
+                  }
+                ],
+                "stream": false
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Chat completion generated successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreateChatCompletionResponse"
+                },
+                "example": {
+                  "id": "chatcmpl-123",
+                  "object": "chat.completion",
+                  "created": 1677652288,
+                  "model": "gpt-4o-mini",
+                  "system_fingerprint": "fp_44709d6fcb",
+                  "choices": [
+                    {
+                      "index": 0,
+                      "message": {
+                        "role": "assistant",
+                        "content": "\n\nHello there, how may I assist you today?"
+                      },
+                      "logprobs": null,
+                      "finish_reason": "stop"
+                    }
+                  ],
+                  "usage": {
+                    "prompt_tokens": 9,
+                    "completion_tokens": 12,
+                    "total_tokens": 21,
+                    "completion_tokens_details": {
+                      "reasoning_tokens": 0,
+                      "accepted_prediction_tokens": 0,
+                      "rejected_prediction_tokens": 0
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The specified model was not found"
+          },
+          "500": {
+            "description": "An internal server error occurred while processing the chat completion",
+            "content": {
+              "application/json": {
+                "schema": {},
+                "example": {
+                  "error": "An internal server error occurred while processing the chat completion."
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/datasets": {
+      "get": {
+        "tags": [
+          "Datasets"
+        ],
+        "summary": "List Datasets",
+        "description": "This endpoint returns a list of configured datasets. The response can be formatted as **JSON** or **CSV**,\nand additional filters can be applied using query parameters.",
+        "operationId": "get_datasets",
+        "parameters": [
+          {
+            "name": "status",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "format",
+            "in": "query",
+            "description": "The format of the response. Possible values are 'json' (default) or 'csv'.",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/Format"
+            }
+          },
+          {
+            "name": "source",
+            "in": "query",
+            "description": "Filters datasets by source (e.g., `postgres:aidemo_messages`).",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "List of datasets",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DatasetResponseItem"
+                },
+                "example": [
+                  {
+                    "from": "postgres:syncs",
+                    "name": "daily_journal_accelerated",
+                    "replication_enabled": false,
+                    "acceleration_enabled": true
+                  },
+                  {
+                    "from": "databricks:hive_metastore.default.messages",
+                    "name": "messages_accelerated",
+                    "replication_enabled": false,
+                    "acceleration_enabled": true
+                  },
+                  {
+                    "from": "postgres:aidemo_messages",
+                    "name": "general",
+                    "replication_enabled": false,
+                    "acceleration_enabled": false
+                  }
+                ]
+              },
+              "text/csv": {
+                "schema": {
+                  "type": "string"
+                },
+                "example": "\nfrom,name,replication_enabled,acceleration_enabled\npostgres:syncs,daily_journal_accelerated,false,true\ndatabricks:hive_metastore.default.messages,messages_accelerated,false,true\npostgres:aidemo_messages,general,false,false\n"
+              }
+            }
+          },
+          "500": {
+            "description": "Internal server error occurred while processing datasets",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                },
+                "example": "An unexpected error occurred while processing datasets"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/datasets/sample": {
+      "post": {
+        "tags": [
+          "Datasets"
+        ],
+        "summary": "Sample Dataset",
+        "description": "This endpoint allows for sampling data from a dataset using different methods.\nThe type of sampling method can be specified using the `type` query parameter,\nand the body will be interpreted accordingly.",
+        "operationId": "post_sample_dataset",
+        "parameters": [
+          {
+            "name": "type",
+            "in": "query",
+            "description": "The type of sampling to apply. Possible values: 'distinct_columns', 'random_sample', 'top_n_sample'.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "description": "The request body depends on the type of sampling selected.",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TopSamplesParams"
+              },
+              "example": {
+                "dataset": "postgres:aidemo_messages",
+                "order_by": "column_a",
+                "limit": 100
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The sampled data in plain text format.",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                },
+                "example": "\n| column_a | column_b |\n|----------|----------|\n| value1   | 123      |\n| value2   | 456      |\n"
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request body",
+            "content": {
+              "application/json": {
+                "schema": {},
+                "example": {
+                  "error": "Invalid request body"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal server error occurred while sampling the dataset",
+            "content": {
+              "application/json": {
+                "schema": {},
+                "example": {
+                  "error": "An unexpected error occurred while sampling the dataset"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/datasets/{name}/acceleration": {
+      "patch": {
+        "tags": [
+          "Datasets"
+        ],
+        "summary": "Update Refresh SQL",
+        "description": "Update the refresh SQL for a dataset's acceleration.\n\nThis endpoint allows for updating the `refresh_sql` parameter for a dataset's acceleration at runtime.\nThe change is **temporary** and will revert to the `spicepod.yml` definition at the next runtime restart.\n\n",
+        "operationId": "patch_dataset_acceleration",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "The name of the dataset to update.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "description": "The updated SQL statement for the dataset's refresh.",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AccelerationRequest"
+              },
+              "example": {
+                "refresh_sql": "SELECT * FROM eth_recent_blocks WHERE block_number > 100"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The refresh SQL was updated successfully."
+          },
+          "404": {
+            "description": "The specified dataset was not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MessageResponse"
+                },
+                "example": {
+                  "message": "Dataset eth_recent_blocks not found"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "An internal server error occurred while updating the refresh SQL",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MessageResponse"
+                },
+                "example": {
+                  "message": "Request failed. An internal server error occurred while updating refresh SQL."
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/datasets/{name}/acceleration/refresh": {
+      "post": {
+        "tags": [
+          "Datasets"
+        ],
+        "summary": "Refresh Dataset",
+        "description": "Trigger an on-demand refresh for an accelerated dataset.\n\nThis endpoint triggers an on-demand refresh for an accelerated dataset.\nThe refresh only applies to `full` and `append` refresh modes (not `changes` mode).",
+        "operationId": "post_dataset_refresh",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "The name of the dataset to refresh.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "description": "On-demand refresh request for a specific dataset.",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AccelerationRequest"
+              },
+              "example": {
+                "refresh_sql": "SELECT * FROM taxi_trips WHERE tip_amount > 10.0"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Dataset refresh triggered successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MessageResponse"
+                },
+                "example": {
+                  "message": "Dataset refresh triggered for taxi_trips."
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Acceleration not enabled for the dataset",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MessageResponse"
+                },
+                "example": {
+                  "message": "Dataset taxi_trips does not have acceleration enabled"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Dataset not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MessageResponse"
+                },
+                "example": {
+                  "message": "Dataset taxi_trips not found"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal server error occurred while processing refresh",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MessageResponse"
+                },
+                "example": {
+                  "message": "Unexpected internal error occurred while processing refresh"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/embeddings": {
+      "post": {
+        "tags": [
+          "AI"
+        ],
+        "summary": "Create Embeddings",
+        "description": "Creates an embedding vector representing the input text.\n\nGet a vector representation of a given input that can be easily consumed by machine learning models and algorithms.",
+        "operationId": "post_embeddings",
+        "requestBody": {
+          "description": "Embedding creation request parameters",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateEmbeddingRequest"
+              },
+              "example": {
+                "input": "The food was delicious and the waiter...",
+                "model": "text-embedding-ada-002",
+                "encoding_format": "float"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Embedding created successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreateEmbeddingResponse"
+                },
+                "example": {
+                  "object": "list",
+                  "data": [
+                    {
+                      "object": "embedding",
+                      "embedding": [
+                        0.0023064255,
+                        -0.009327292,
+                        -0.0028842222
+                      ],
+                      "index": 0
+                    }
+                  ],
+                  "model": "text-embedding-ada-002",
+                  "usage": {
+                    "prompt_tokens": 8,
+                    "total_tokens": 8
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Model not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "string"
+                },
+                "example": {
+                  "error": "model not found"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal server error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "string"
+                },
+                "example": {
+                  "error": "Unexpected internal server error occurred"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/evals": {
+      "get": {
+        "tags": [
+          "Evaluations"
+        ],
+        "summary": "List Evals",
+        "description": "Return all evals available to run in the runtime.",
+        "operationId": "list",
+        "responses": {
+          "200": {
+            "description": "All evals available in the Spice runtime",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ListEvalElement"
+                  }
+                },
+                "example": [
+                  {
+                    "name": "knows_math",
+                    "description": "Questions from first year, undergraduate math exams",
+                    "dataset": "math_exams",
+                    "scorers": [
+                      "match",
+                      "professor_logical_consistency"
+                    ]
+                  }
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/evals/{name}": {
+      "post": {
+        "tags": [
+          "Evaluations"
+        ],
+        "summary": "Run Eval",
+        "description": "Evaluate a model against a eval spice specification",
+        "operationId": "post_eval",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Name of the evaluation to run",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "description": "Parameters to run the evaluation",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RunEval"
+              },
+              "example": {
+                "model": "example_model"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Evaluation run successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EvalRunResponse"
+                },
+                "example": {
+                  "primary_key": "eval_12345",
+                  "time_column": "2024-12-19T12:34:56Z",
+                  "dataset": "my_dataset",
+                  "model": "example_model",
+                  "status": "completed",
+                  "error_message": null,
+                  "scorers": [
+                    "scorer1",
+                    "scorer2"
+                  ],
+                  "metrics": {
+                    "scorer1/accuracy": 0.95,
+                    "scorer2/accuracy": 0.93
+                  }
+                }
+              },
+              "text/csv": {
+                "example": "primary_key,time_column,dataset,model,status,error_message,scorers,metrics\neval_12345,2024-12-19T12:34:56Z,my_dataset,example_model,completed,,\"[\"\"scorer1\"\", \"\"scorer2\"\"]\",\"{\"\"scorer1/accuracy\"\":0.95, \"\"scorer2/accuracy\"\":0.93}\""
+              },
+              "text/plain": {
+                "example": "+-------------+---------------------+-----------+---------------+-----------+----------------+------------------+---------------------------------------+\n            | primary_key | time_column         | dataset   | model         | status    | error_message  |      scorers     | metrics                               |\n            +-------------+---------------------+-----------+---------------+-----------+----------------+------------------+---------------------------------------+\n            | eval_12345  | 2024-12-19T12:34:56Z| my_dataset| example_model | completed |                | scorer1, scorer2 | {\"accuracy\": 0.95, \"precision\": 0.93} |\n            +-------------+---------------------+-----------+---------------+-----------+----------------+------------------+---------------------------------------+"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/iceberg/config": {
+      "get": {
+        "tags": [
+          "Iceberg"
+        ],
+        "summary": "Get Iceberg API config",
+        "description": "This endpoint returns the Iceberg Catalog API configuration, including details about overrides, defaults, and available endpoints.",
+        "operationId": "get_config",
+        "responses": {
+          "200": {
+            "description": "API configuration retrieved successfully",
+            "content": {
+              "application/json": {
+                "schema": {},
+                "example": {
+                  "overrides": {},
+                  "defaults": {},
+                  "endpoints": [
+                    "GET /v1/iceberg/namespaces",
+                    "HEAD /v1/iceberg/namespaces/{namespace}",
+                    "GET /v1/iceberg/namespaces/{namespace}/tables",
+                    "HEAD /v1/iceberg/namespaces/{namespace}/tables/{table}",
+                    "GET /v1/iceberg/namespaces/{namespace}/tables/{table}"
+                  ]
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/iceberg/namespaces": {
+      "get": {
+        "tags": [
+          "Iceberg"
+        ],
+        "summary": "List Iceberg namespaces",
+        "description": "This endpoint retrieves namespaces available in the Iceberg catalog.\nIf a `parent` namespace is provided, it will list the child namespaces under the specified parent.",
+        "operationId": "get_iceberg_namespaces",
+        "parameters": [
+          {
+            "name": "parent",
+            "in": "query",
+            "description": "The parent namespace from which to retrieve child namespaces.",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/Namespace"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Namespaces retrieved successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NamespacesResponse"
+                },
+                "example": {
+                  "namespaces": [
+                    {
+                      "parts": [
+                        "catalog_a"
+                      ]
+                    },
+                    {
+                      "parts": [
+                        "catalog_b",
+                        "schema_1"
+                      ]
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IcebergResponseError"
+                },
+                "example": {
+                  "error": {
+                    "message": "Invalid namespace request",
+                    "type": "BadRequestException",
+                    "code": 400
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Namespace not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IcebergResponseError"
+                },
+                "example": {
+                  "error": {
+                    "message": "Namespace provided does not exist",
+                    "type": "NoSuchNamespaceException",
+                    "code": 404
+                  }
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal server error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IcebergResponseError"
+                },
+                "example": {
+                  "error": {
+                    "message": "Internal Server Error: DF_SCHEMA_NOT_FOUND",
+                    "type": "InternalServerError",
+                    "code": 500
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/iceberg/namespaces/{namespace}": {
+      "head": {
+        "tags": [
+          "Iceberg"
+        ],
+        "summary": "Check Namespace exists",
+        "description": "This endpoint returns a 200 OK response if the namespace exists, otherwise it returns a 404 Not Found response.",
+        "operationId": "head_namespace",
+        "responses": {
+          "200": {
+            "description": "Namespace exists"
+          },
+          "404": {
+            "description": "Namespace does not exist"
+          }
+        }
+      }
+    },
+    "/v1/models": {
+      "get": {
+        "tags": [
+          "AI"
+        ],
+        "summary": "List Models",
+        "description": "List all models, both machine learning and language models, available in the runtime.",
+        "operationId": "get_models",
+        "parameters": [
+          {
+            "name": "format",
+            "in": "query",
+            "description": "The format of the response (e.g., `json` or `csv`).",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/Format"
+            }
+          },
+          {
+            "name": "status",
+            "in": "query",
+            "description": "If true, includes the status of each model in the response.",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "List of models in JSON format",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ModelResponse"
+                },
+                "example": [
+                  {
+                    "name": "example_model_1",
+                    "from": "openai",
+                    "datasets": [
+                      "dataset_a",
+                      "dataset_b"
+                    ],
+                    "status": "ready"
+                  },
+                  {
+                    "name": "example_model_2",
+                    "from": "spiceai",
+                    "datasets": null,
+                    "status": "initializing"
+                  }
+                ]
+              },
+              "text/csv": {
+                "schema": {
+                  "type": "string"
+                },
+                "example": "\nname,from,datasets,status\nexample_model_1,openai,\"[\\\"dataset_a\\\", \\\"dataset_b\\\"]\",ready\nexample_model_2,spiceai,,initializing\n"
+              }
+            }
+          },
+          "500": {
+            "description": "Internal server error occurred while processing models",
+            "content": {
+              "application/json": {
+                "schema": {},
+                "example": {
+                  "error": "App not initialized"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/models/{name}/predict": {
+      "get": {
+        "tags": [
+          "AI"
+        ],
+        "summary": "ML Prediction",
+        "description": "Make a ML prediction using a specific model.",
+        "operationId": "get_model_predict",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "The name of the model to make a prediction with.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Prediction made successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PredictResponse"
+                },
+                "example": {
+                  "status": "Success",
+                  "model_name": "my_model_name",
+                  "model_version": "1.0",
+                  "prediction": [
+                    0.45,
+                    0.5,
+                    0.55
+                  ],
+                  "duration_ms": 123
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request to the model",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PredictResponse"
+                },
+                "example": {
+                  "status": "BadRequest",
+                  "error_message": "You gave me a bad request :(",
+                  "model_name": "my_model_name",
+                  "duration_ms": 12
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal server error occurred during prediction",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PredictResponse"
+                },
+                "example": {
+                  "status": "InternalError",
+                  "error_message": "Oops, the server couldn't predict",
+                  "model_name": "my_model_name",
+                  "duration_ms": 12
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/nsql": {
+      "post": {
+        "tags": [
+          "SQL"
+        ],
+        "summary": "Text to SQL",
+        "description": "Generate and optionally execute an NSQL query.\n\nThis endpoint generates a SQL query using a natural language query (NSQL) and optionally executes it.\nThe SQL query is generated by the specified model and executed if the `Accept` header is not set to `application/sql`.",
+        "operationId": "post_nsql",
+        "parameters": [
+          {
+            "name": "Accept",
+            "in": "header",
+            "description": "The format of the response, one of 'application/json' (default), 'application/sql', 'text/csv' or 'text/plain'. 'application/sql' will only return the SQL query generated by the model.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "description": "Request body to generate an NSQL query",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Request"
+              },
+              "example": {
+                "query": "Get the top 5 customers by total sales",
+                "model": "nql",
+                "sample_data_enabled": true,
+                "datasets": [
+                  "sales_data"
+                ]
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "SQL query executed successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {}
+                },
+                "example": [
+                  {
+                    "customer_id": "12345",
+                    "total_sales": 150000
+                  },
+                  {
+                    "customer_id": "67890",
+                    "total_sales": 125000
+                  }
+                ]
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request parameters",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "string"
+                },
+                "example": "Model nsql not found"
+              }
+            }
+          },
+          "500": {
+            "description": "Internal server error",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                },
+                "example": "No query produced from NSQL model"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/packages/generate": {
+      "post": {
+        "tags": [
+          "General"
+        ],
+        "summary": "Generate Package",
+        "description": "This endpoint generates a zip package from a specified GitHub source.",
+        "operationId": "generate_package",
+        "requestBody": {
+          "description": "Parameters required to generate a package",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/GeneratePackageRequest"
+              },
+              "example": {
+                "from": "github:myorg/myrepo/abc12345/spicepod.yaml",
+                "params": {
+                  "github_token": "ghp_exampleToken12345"
+                }
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Package generated successfully",
+            "content": {
+              "application/zip": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "type": "integer",
+                    "format": "int32",
+                    "minimum": 0
+                  }
+                },
+                "example": "<binary zip file response>"
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request parameters",
+            "content": {
+              "application/json": {
+                "schema": {},
+                "example": {
+                  "error": "Invalid `from` field, specify a github source and retry (e.g. github:{org}/{repo}/{sha}/{path_to_spicepod.yaml})"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal server error",
+            "content": {
+              "application/json": {
+                "schema": {},
+                "example": {
+                  "error": "An unexpected error occurred"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/predict": {
+      "post": {
+        "tags": [
+          "AI"
+        ],
+        "summary": "Batch ML Predictions",
+        "description": "Perform a batch of ML predictions, using multiple models, in one request. This is useful for ensembling or A/B testing different models.",
+        "operationId": "post_batch_predict",
+        "requestBody": {
+          "description": "Batch prediction request containing a list of prediction requests for specific models",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BatchPredictRequest"
+              },
+              "example": {
+                "predictions": [
+                  {
+                    "model_name": "drive_stats_a"
+                  },
+                  {
+                    "model_name": "drive_stats_b"
+                  }
+                ]
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Batch predictions completed successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BatchPredictResponse"
+                },
+                "example": {
+                  "duration_ms": 81,
+                  "predictions": [
+                    {
+                      "status": "Success",
+                      "model_name": "drive_stats_a",
+                      "model_version": "1.0",
+                      "prediction": [
+                        0.45,
+                        0.5,
+                        0.55
+                      ],
+                      "duration_ms": 42
+                    },
+                    {
+                      "status": "Success",
+                      "model_name": "drive_stats_b",
+                      "model_version": "1.0",
+                      "prediction": [
+                        0.43,
+                        0.51,
+                        0.53
+                      ],
+                      "duration_ms": 42
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal server error occurred during batch prediction",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                },
+                "example": "An unexpected error occurred while processing batch predictions"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/ready": {
+      "get": {
+        "tags": [
+          "Ready"
+        ],
+        "summary": "Check Readiness",
+        "description": "Check the runtime status of all the components of the runtime. If the service is ready, it returns an HTTP 200 status with the message \"ready\". If not, it returns a 503 status with the message \"not ready\".\n\nThe behavior for when an accelerated dataset is considered ready is configurable via the `ready_state` parameter. See [Data refresh](https://docs.spiceai.org/components/data-accelerators/data-refresh#ready-state) for more details.\n\n### Readiness Probe\nIn production deployments, the /v1/ready endpoint can be used as a readiness probe for a Spice deployment to ensure traffic is routed to the Spice runtime only after all datasets have finished loading.\n\nExample Kubernetes readiness probe:\n```yaml\nreadinessProbe:\n httpGet:\n   path: /v1/ready\n   port: 8090\n```",
+        "operationId": "ready",
+        "responses": {
+          "200": {
+            "description": "Service is ready",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                },
+                "example": "ready"
+              }
+            }
+          },
+          "503": {
+            "description": "Service is not ready",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                },
+                "example": "not ready"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/search": {
+      "post": {
+        "tags": [
+          "SQL"
+        ],
+        "summary": "Vector Search",
+        "description": "Perform a vector search operation on a dataset.\n\nThe search operation will return the most relevant matches based on cosine similarity with the input `text`.\nThe datasets queries should have an embedding column, and the appropriate embedding model loaded.",
+        "operationId": "post_search",
+        "requestBody": {
+          "description": "Search request parameters",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SearchRequestJson"
+              },
+              "example": {
+                "datasets": [
+                  "app_messages"
+                ],
+                "text": "Tokyo plane tickets",
+                "where": "user=1234321",
+                "additional_columns": [
+                  "timestamp"
+                ],
+                "limit": 3
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Search completed successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SearchResponse"
+                },
+                "example": {
+                  "matches": [
+                    {
+                      "value": "I booked use some tickets",
+                      "dataset": "app_messages",
+                      "primary_key": {
+                        "id": "6fd5a215-0881-421d-ace0-b293b83452b5"
+                      },
+                      "metadata": {
+                        "timestamp": 1724716542
+                      }
+                    },
+                    {
+                      "value": "direct to Narata",
+                      "dataset": "app_messages",
+                      "primary_key": {
+                        "id": "8a25595f-99fb-4404-8c82-e1046d8f4c4b"
+                      },
+                      "metadata": {
+                        "timestamp": 1724715881
+                      }
+                    },
+                    {
+                      "value": "Yes, we're sitting together",
+                      "dataset": "app_messages",
+                      "primary_key": {
+                        "id": "8421ed84-b86d-4b10-b4da-7a432e8912c0"
+                      },
+                      "metadata": {
+                        "timestamp": 1724716123
+                      }
+                    }
+                  ],
+                  "duration_ms": 42
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request parameters",
+            "content": {
+              "application/json": {
+                "schema": {},
+                "example": {
+                  "error": "No data sources provided"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal server error",
+            "content": {
+              "application/json": {
+                "schema": {},
+                "example": {
+                  "error": "Unexpected internal server error occurred"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/spicepods": {
+      "get": {
+        "tags": [
+          "General"
+        ],
+        "summary": "List Spicepods",
+        "description": "Get a list of spicepods and their details. In CSV format, it will return a summarised form.",
+        "operationId": "get_spicepods",
+        "parameters": [
+          {
+            "name": "format",
+            "in": "query",
+            "description": "The format of the response. Possible values are 'json' (default) or 'csv'.",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/Format"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "List of spicepods",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {}
+                },
+                "example": [
+                  {
+                    "name": "spicepod1",
+                    "version": "v1.0.0",
+                    "datasets_count": 3,
+                    "models_count": 2,
+                    "dependencies_count": 5
+                  },
+                  {
+                    "name": "spicepod2",
+                    "version": "v2.0.0",
+                    "datasets_count": 4,
+                    "models_count": 3,
+                    "dependencies_count": 2
+                  }
+                ]
+              },
+              "text/csv": {
+                "schema": {
+                  "type": "string"
+                },
+                "example": "name,version,datasets_count,models_count,dependencies_count\nspicepod1,v1.0.0,3,2,5\nspicepod2,v2.0.0,4,3,2"
+              }
+            }
+          },
+          "500": {
+            "description": "Internal server error",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                },
+                "example": "Internal server error"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/sql": {
+      "post": {
+        "tags": [
+          "SQL"
+        ],
+        "summary": "SQL Query",
+        "description": "Execute a SQL query and return the results.\n\nThis endpoint allows users to execute SQL queries directly from an HTTP request. The SQL query is sent as plain text in the request body.",
+        "operationId": "post_sql",
+        "parameters": [
+          {
+            "name": "Accept",
+            "in": "header",
+            "description": "The format of the response, one of 'application/json' (default), 'text/csv' or 'text/plain'.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "description": "SQL query to execute",
+          "content": {
+            "text/plain": {
+              "schema": {
+                "type": "string"
+              },
+              "example": "SELECT avg(total_amount), avg(tip_amount), count(1), passenger_count FROM my_table GROUP BY passenger_count ORDER BY passenger_count ASC LIMIT 3"
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "SQL query executed successfully (JSON format)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {}
+                },
+                "example": [
+                  {
+                    "AVG(my_table.tip_amount)": 3.072259971396793,
+                    "AVG(my_table.total_amount)": 25.327816939456525,
+                    "COUNT(Int64(1))": 31465,
+                    "passenger_count": 0
+                  },
+                  {
+                    "AVG(my_table.tip_amount)": 3.3712622884680057,
+                    "AVG(my_table.total_amount)": 26.205230445474996,
+                    "COUNT(Int64(1))": 2188739,
+                    "passenger_count": 1
+                  },
+                  {
+                    "AVG(my_table.tip_amount)": 3.7171302113290854,
+                    "AVG(my_table.total_amount)": 29.520659930930304,
+                    "COUNT(Int64(1))": 405103,
+                    "passenger_count": 2
+                  }
+                ]
+              },
+              "text/csv": {
+                "schema": {
+                  "type": "string"
+                },
+                "example": "\"AVG(my_table.tip_amount)\",\"AVG(my_table.total_amount)\",\"COUNT(Int64(1))\",\"passenger_count\"\n3.072259971396793,25.327816939456525,31465,0\n3.3712622884680057,26.205230445474996,2188739,1\n3.7171302113290854,29.520659930930304,405103,2"
+              },
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                },
+                "example": "\n            +----------------------------+----------------------------+----------------+---------------------+\n            | \"AVG(my_table.tip_amount)\"  | \"AVG(my_table.total_amount)\" | \"COUNT(Int64(1))\" | \"passenger_count\"   |\n            +----------------------------+----------------------------+----------------+---------------------+\n            | 3.072259971396793           | 25.327816939456525         | 31465          | 0                   |\n            +----------------------------+----------------------------+----------------+---------------------+\n            | 3.3712622884680057          | 26.205230445474996         | 2188739        | 1                   |\n            +----------------------------+----------------------------+----------------+---------------------+\n            | 3.7171302113290854          | 29.520659930930304         | 405103         | 2                   |\n            +----------------------------+----------------------------+----------------+---------------------+"
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid SQL query or malformed input",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                },
+                "example": "Error reading query: invalid UTF-8 sequence"
+              }
+            }
+          },
+          "500": {
+            "description": "Internal server error",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                },
+                "example": "Unexpected internal server error occurred"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/status": {
+      "get": {
+        "tags": [
+          "General"
+        ],
+        "summary": "Check Runtime Status",
+        "description": "Return the status of all connections (http, flight, metrics, opentelemetry) in the runtime.",
+        "operationId": "get_status",
+        "parameters": [
+          {
+            "name": "format",
+            "in": "query",
+            "description": "The format of the response, either \"json\" or \"csv\". Defaults to \"json\".",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/Format"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "List of connection statuses",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ConnectionDetails"
+                  }
+                },
+                "example": [
+                  {
+                    "name": "http",
+                    "endpoint": "http://127.0.0.1:8080",
+                    "status": "Ready"
+                  },
+                  {
+                    "name": "flight",
+                    "endpoint": "http://127.0.0.1:9000",
+                    "status": "Initializing"
+                  },
+                  {
+                    "name": "metrics",
+                    "endpoint": "N/A",
+                    "status": "Disabled"
+                  },
+                  {
+                    "name": "opentelemetry",
+                    "endpoint": "http://127.0.0.1:4317",
+                    "status": "Error"
+                  }
+                ]
+              },
+              "text/csv": {
+                "schema": {
+                  "type": "string"
+                },
+                "example": "name,endpoint,status\nhttp,http://127.0.0.1:8080,Ready\nflight,http://127.0.0.1:9000,Initializing\nmetrics,N/A,Disabled\nopentelemetry,http://127.0.0.1:4317,Error"
+              }
+            }
+          },
+          "500": {
+            "description": "Error converting to CSV",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                },
+                "example": "Error converting to CSV"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/tools": {
+      "get": {
+        "tags": [
+          "Tools"
+        ],
+        "summary": "List Tools",
+        "description": "List available tools in the Spice runtime.",
+        "operationId": "list",
+        "responses": {
+          "200": {
+            "description": "All tools available in the Spice runtime",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ListToolElement"
+                  }
+                },
+                "example": [
+                  {
+                    "name": "get_readiness",
+                    "description": "Retrieves the readiness status of all runtime components including registered datasets, models, and embeddings.",
+                    "parameters": null
+                  },
+                  {
+                    "name": "list_datasets",
+                    "description": "List all SQL tables available.",
+                    "parameters": null
+                  }
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/tools/{name}": {
+      "post": {
+        "tags": [
+          "Tools"
+        ],
+        "summary": "Run Tool",
+        "description": "The format of the request body and JSON response match the tool's",
+        "operationId": "post",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Name of the tool",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "description": "Tool specific input parameters. See /v1/tools for parameter schema.",
+          "content": {
+            "application/json": {
+              "schema": {},
+              "example": {
+                "query": "SELECT avg(total_amount), avg(tip_amount), count(1), passenger_count FROM my_table GROUP BY passenger_count ORDER BY passenger_count ASC LIMIT 3"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Tool Specific response, in JSON format",
+            "content": {
+              "application/json": {
+                "schema": {},
+                "examples": {
+                  "sql": {
+                    "value": [
+                      {
+                        "AVG(my_table.tip_amount)": 3.072259971396793,
+                        "AVG(my_table.total_amount)": 25.327816939456525,
+                        "COUNT(Int64(1))": 31465,
+                        "passenger_count": 0
+                      },
+                      {
+                        "AVG(my_table.tip_amount)": 3.3712622884680057,
+                        "AVG(my_table.total_amount)": 26.205230445474996,
+                        "COUNT(Int64(1))": 2188739,
+                        "passenger_count": 1
+                      },
+                      {
+                        "AVG(my_table.tip_amount)": 3.7171302113290854,
+                        "AVG(my_table.total_amount)": 29.520659930930304,
+                        "COUNT(Int64(1))": 405103,
+                        "passenger_count": 2
+                      }
+                    ]
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Tool not found",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                },
+                "example": "Tool no_sql not found"
+              }
+            }
+          },
+          "500": {
+            "description": "Error occured whilst calling the tool",
+            "content": {
+              "application/json": {
+                "schema": {},
+                "example": {
+                  "message": "Error calling tool no_sql: No such tool"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "AccelerationRequest": {
+        "type": "object",
+        "properties": {
+          "refresh_sql": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "SQL statement used for the refresh. Defaults to the `refresh_sql` specified in the spicepod."
+          }
+        }
+      },
+      "BatchPredictRequest": {
+        "type": "object",
+        "properties": {
+          "predictions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PredictRequest"
+            },
+            "description": "The list of prediction requests, each specifying the model to use for the prediction"
+          }
+        }
+      },
+      "BatchPredictResponse": {
+        "type": "object",
+        "required": [
+          "predictions",
+          "duration_ms"
+        ],
+        "properties": {
+          "duration_ms": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "predictions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PredictResponse"
+            }
+          }
+        }
+      },
+      "CatalogResponseItem": {
+        "type": "object",
+        "required": [
+          "from",
+          "name"
+        ],
+        "properties": {
+          "from": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          }
+        }
+      },
+      "ChatChoice": {
+        "type": "object",
+        "required": [
+          "index",
+          "message"
+        ],
+        "properties": {
+          "finish_reason": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/FinishReason",
+                "description": "The reason the model stopped generating tokens. This will be `stop` if the model hit a natural stop point or a provided stop sequence,\n`length` if the maximum number of tokens specified in the request was reached,\n`content_filter` if content was omitted due to a flag from our content filters,\n`tool_calls` if the model called a tool, or `function_call` (deprecated) if the model called a function."
+              }
+            ]
+          },
+          "index": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The index of the choice in the list of choices.",
+            "minimum": 0
+          },
+          "logprobs": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ChatChoiceLogprobs",
+                "description": "Log probability information for the choice."
+              }
+            ]
+          },
+          "message": {
+            "$ref": "#/components/schemas/ChatCompletionResponseMessage"
+          }
+        }
+      },
+      "ChatChoiceLogprobs": {
+        "type": "object",
+        "properties": {
+          "content": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/ChatCompletionTokenLogprob"
+            },
+            "description": "A list of message content tokens with log probability information."
+          },
+          "refusal": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/ChatCompletionTokenLogprob"
+            }
+          }
+        }
+      },
+      "ChatCompletionFunctionCall": {
+        "oneOf": [
+          {
+            "type": "string",
+            "description": "The model does not call a function, and responds to the end-user.",
+            "enum": [
+              "none"
+            ]
+          },
+          {
+            "type": "string",
+            "description": "The model can pick between an end-user or calling a function.",
+            "enum": [
+              "auto"
+            ]
+          },
+          {
+            "type": "object",
+            "description": "Forces the model to call the specified function.",
+            "required": [
+              "Function"
+            ],
+            "properties": {
+              "Function": {
+                "type": "object",
+                "description": "Forces the model to call the specified function.",
+                "required": [
+                  "name"
+                ],
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        ]
+      },
+      "ChatCompletionFunctions": {
+        "type": "object",
+        "required": [
+          "name",
+          "parameters"
+        ],
+        "properties": {
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "A description of what the function does, used by the model to choose when and how to call the function."
+          },
+          "name": {
+            "type": "string",
+            "description": "The name of the function to be called. Must be a-z, A-Z, 0-9, or contain underscores and dashes, with a maximum length of 64."
+          },
+          "parameters": {
+            "description": "The parameters the functions accepts, described as a JSON Schema object. See the [guide](https://platform.openai.com/docs/guides/text-generation/function-calling) for examples, and the [JSON Schema reference](https://json-schema.org/understanding-json-schema/) for documentation about the format.\n\nOmitting `parameters` defines a function with an empty parameter list."
+          }
+        },
+        "deprecated": true
+      },
+      "ChatCompletionMessageToolCall": {
+        "type": "object",
+        "required": [
+          "id",
+          "type",
+          "function"
+        ],
+        "properties": {
+          "function": {
+            "$ref": "#/components/schemas/FunctionCall",
+            "description": "The function that the model called."
+          },
+          "id": {
+            "type": "string",
+            "description": "The ID of the tool call."
+          },
+          "type": {
+            "$ref": "#/components/schemas/ChatCompletionToolType",
+            "description": "The type of the tool. Currently, only `function` is supported."
+          }
+        }
+      },
+      "ChatCompletionNamedToolChoice": {
+        "type": "object",
+        "description": "Specifies a tool the model should use. Use to force the model to call a specific function.",
+        "required": [
+          "type",
+          "function"
+        ],
+        "properties": {
+          "function": {
+            "$ref": "#/components/schemas/FunctionName"
+          },
+          "type": {
+            "$ref": "#/components/schemas/ChatCompletionToolType",
+            "description": "The type of the tool. Currently, only `function` is supported."
+          }
+        }
+      },
+      "ChatCompletionRequestAssistantMessage": {
+        "type": "object",
+        "properties": {
+          "content": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ChatCompletionRequestAssistantMessageContent",
+                "description": "The contents of the assistant message. Required unless `tool_calls` or `function_call` is specified."
+              }
+            ]
+          },
+          "function_call": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/FunctionCall",
+                "description": "Deprecated and replaced by `tool_calls`. The name and arguments of a function that should be called, as generated by the model."
+              }
+            ]
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "An optional name for the participant. Provides the model information to differentiate between participants of the same role."
+          },
+          "refusal": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The refusal message by the assistant."
+          },
+          "tool_calls": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/ChatCompletionMessageToolCall"
+            }
+          }
+        }
+      },
+      "ChatCompletionRequestAssistantMessageContent": {
+        "oneOf": [
+          {
+            "type": "string",
+            "description": "The text contents of the message."
+          },
+          {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ChatCompletionRequestAssistantMessageContentPart"
+            },
+            "description": "An array of content parts with a defined type. Can be one or more of type `text`, or exactly one of type `refusal`."
+          }
+        ]
+      },
+      "ChatCompletionRequestAssistantMessageContentPart": {
+        "oneOf": [
+          {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ChatCompletionRequestMessageContentPartText"
+              },
+              {
+                "type": "object",
+                "required": [
+                  "type"
+                ],
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "text"
+                    ]
+                  }
+                }
+              }
+            ]
+          },
+          {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ChatCompletionRequestMessageContentPartRefusal"
+              },
+              {
+                "type": "object",
+                "required": [
+                  "type"
+                ],
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "refusal"
+                    ]
+                  }
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "ChatCompletionRequestFunctionMessage": {
+        "type": "object",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "content": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The return value from the function call, to return to the model."
+          },
+          "name": {
+            "type": "string",
+            "description": "The name of the function to call."
+          }
+        }
+      },
+      "ChatCompletionRequestMessage": {
+        "oneOf": [
+          {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ChatCompletionRequestSystemMessage"
+              },
+              {
+                "type": "object",
+                "required": [
+                  "role"
+                ],
+                "properties": {
+                  "role": {
+                    "type": "string",
+                    "enum": [
+                      "system"
+                    ]
+                  }
+                }
+              }
+            ]
+          },
+          {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ChatCompletionRequestUserMessage"
+              },
+              {
+                "type": "object",
+                "required": [
+                  "role"
+                ],
+                "properties": {
+                  "role": {
+                    "type": "string",
+                    "enum": [
+                      "user"
+                    ]
+                  }
+                }
+              }
+            ]
+          },
+          {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ChatCompletionRequestAssistantMessage"
+              },
+              {
+                "type": "object",
+                "required": [
+                  "role"
+                ],
+                "properties": {
+                  "role": {
+                    "type": "string",
+                    "enum": [
+                      "assistant"
+                    ]
+                  }
+                }
+              }
+            ]
+          },
+          {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ChatCompletionRequestToolMessage"
+              },
+              {
+                "type": "object",
+                "required": [
+                  "role"
+                ],
+                "properties": {
+                  "role": {
+                    "type": "string",
+                    "enum": [
+                      "tool"
+                    ]
+                  }
+                }
+              }
+            ]
+          },
+          {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ChatCompletionRequestFunctionMessage"
+              },
+              {
+                "type": "object",
+                "required": [
+                  "role"
+                ],
+                "properties": {
+                  "role": {
+                    "type": "string",
+                    "enum": [
+                      "function"
+                    ]
+                  }
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "ChatCompletionRequestMessageContentPartImage": {
+        "type": "object",
+        "required": [
+          "image_url"
+        ],
+        "properties": {
+          "image_url": {
+            "$ref": "#/components/schemas/ImageUrl"
+          }
+        }
+      },
+      "ChatCompletionRequestMessageContentPartRefusal": {
+        "type": "object",
+        "required": [
+          "refusal"
+        ],
+        "properties": {
+          "refusal": {
+            "type": "string",
+            "description": "The refusal message generated by the model."
+          }
+        }
+      },
+      "ChatCompletionRequestMessageContentPartText": {
+        "type": "object",
+        "required": [
+          "text"
+        ],
+        "properties": {
+          "text": {
+            "type": "string"
+          }
+        }
+      },
+      "ChatCompletionRequestSystemMessage": {
+        "type": "object",
+        "required": [
+          "content"
+        ],
+        "properties": {
+          "content": {
+            "$ref": "#/components/schemas/ChatCompletionRequestSystemMessageContent",
+            "description": "The contents of the system message."
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "An optional name for the participant. Provides the model information to differentiate between participants of the same role."
+          }
+        }
+      },
+      "ChatCompletionRequestSystemMessageContent": {
+        "oneOf": [
+          {
+            "type": "string",
+            "description": "The text contents of the system message."
+          },
+          {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ChatCompletionRequestSystemMessageContentPart"
+            },
+            "description": "An array of content parts with a defined type. For system messages, only type `text` is supported."
+          }
+        ]
+      },
+      "ChatCompletionRequestSystemMessageContentPart": {
+        "oneOf": [
+          {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ChatCompletionRequestMessageContentPartText"
+              },
+              {
+                "type": "object",
+                "required": [
+                  "type"
+                ],
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "text"
+                    ]
+                  }
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "ChatCompletionRequestToolMessage": {
+        "type": "object",
+        "description": "Tool message",
+        "required": [
+          "content",
+          "tool_call_id"
+        ],
+        "properties": {
+          "content": {
+            "$ref": "#/components/schemas/ChatCompletionRequestToolMessageContent",
+            "description": "The contents of the tool message."
+          },
+          "tool_call_id": {
+            "type": "string"
+          }
+        }
+      },
+      "ChatCompletionRequestToolMessageContent": {
+        "oneOf": [
+          {
+            "type": "string",
+            "description": "The text contents of the tool message."
+          },
+          {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ChatCompletionRequestToolMessageContentPart"
+            },
+            "description": "An array of content parts with a defined type. For tool messages, only type `text` is supported."
+          }
+        ]
+      },
+      "ChatCompletionRequestToolMessageContentPart": {
+        "oneOf": [
+          {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ChatCompletionRequestMessageContentPartText"
+              },
+              {
+                "type": "object",
+                "required": [
+                  "type"
+                ],
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "text"
+                    ]
+                  }
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "ChatCompletionRequestUserMessage": {
+        "type": "object",
+        "required": [
+          "content"
+        ],
+        "properties": {
+          "content": {
+            "$ref": "#/components/schemas/ChatCompletionRequestUserMessageContent",
+            "description": "The contents of the user message."
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "An optional name for the participant. Provides the model information to differentiate between participants of the same role."
+          }
+        }
+      },
+      "ChatCompletionRequestUserMessageContent": {
+        "oneOf": [
+          {
+            "type": "string",
+            "description": "The text contents of the message."
+          },
+          {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ChatCompletionRequestUserMessageContentPart"
+            },
+            "description": "An array of content parts with a defined type, each can be of type `text` or `image_url` when passing in images. You can pass multiple images by adding multiple `image_url` content parts. Image input is only supported when using the `gpt-4o` model."
+          }
+        ]
+      },
+      "ChatCompletionRequestUserMessageContentPart": {
+        "oneOf": [
+          {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ChatCompletionRequestMessageContentPartText"
+              },
+              {
+                "type": "object",
+                "required": [
+                  "type"
+                ],
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "text"
+                    ]
+                  }
+                }
+              }
+            ]
+          },
+          {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ChatCompletionRequestMessageContentPartImage"
+              },
+              {
+                "type": "object",
+                "required": [
+                  "type"
+                ],
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "image_url"
+                    ]
+                  }
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "ChatCompletionResponseMessage": {
+        "type": "object",
+        "description": "A chat completion message generated by the model.",
+        "required": [
+          "role"
+        ],
+        "properties": {
+          "content": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The contents of the message."
+          },
+          "function_call": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/FunctionCall",
+                "description": "Deprecated and replaced by `tool_calls`.\nThe name and arguments of a function that should be called, as generated by the model."
+              }
+            ]
+          },
+          "refusal": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The refusal message generated by the model."
+          },
+          "role": {
+            "$ref": "#/components/schemas/Role",
+            "description": "The role of the author of this message."
+          },
+          "tool_calls": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/ChatCompletionMessageToolCall"
+            },
+            "description": "The tool calls generated by the model, such as function calls."
+          }
+        }
+      },
+      "ChatCompletionStreamOptions": {
+        "type": "object",
+        "description": "Options for streaming response. Only set this when you set `stream: true`.",
+        "required": [
+          "include_usage"
+        ],
+        "properties": {
+          "include_usage": {
+            "type": "boolean",
+            "description": "If set, an additional chunk will be streamed before the `data: [DONE]` message. The `usage` field on this chunk shows the token usage statistics for the entire request, and the `choices` field will always be an empty array. All other chunks will also include a `usage` field, but with a null value."
+          }
+        }
+      },
+      "ChatCompletionTokenLogprob": {
+        "type": "object",
+        "required": [
+          "token",
+          "logprob",
+          "top_logprobs"
+        ],
+        "properties": {
+          "bytes": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            },
+            "description": "A list of integers representing the UTF-8 bytes representation of the token. Useful in instances where characters are represented by multiple tokens and their byte representations must be combined to generate the correct text representation. Can be `null` if there is no bytes representation for the token."
+          },
+          "logprob": {
+            "type": "number",
+            "format": "float",
+            "description": "The log probability of this token, if it is within the top 20 most likely tokens. Otherwise, the value `-9999.0` is used to signify that the token is very unlikely."
+          },
+          "token": {
+            "type": "string",
+            "description": "The token."
+          },
+          "top_logprobs": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TopLogprobs"
+            },
+            "description": "List of the most likely tokens and their log probability, at this token position. In rare cases, there may be fewer than the number of requested `top_logprobs` returned."
+          }
+        }
+      },
+      "ChatCompletionTool": {
+        "type": "object",
+        "required": [
+          "type",
+          "function"
+        ],
+        "properties": {
+          "function": {
+            "$ref": "#/components/schemas/FunctionObject"
+          },
+          "type": {
+            "$ref": "#/components/schemas/ChatCompletionToolType"
+          }
+        }
+      },
+      "ChatCompletionToolChoiceOption": {
+        "oneOf": [
+          {
+            "type": "string",
+            "enum": [
+              "none"
+            ]
+          },
+          {
+            "type": "string",
+            "enum": [
+              "auto"
+            ]
+          },
+          {
+            "type": "string",
+            "enum": [
+              "required"
+            ]
+          },
+          {
+            "type": "object",
+            "required": [
+              "named"
+            ],
+            "properties": {
+              "named": {
+                "$ref": "#/components/schemas/ChatCompletionNamedToolChoice"
+              }
+            }
+          }
+        ],
+        "description": "Controls which (if any) tool is called by the model.\n`none` means the model will not call any tool and instead generates a message.\n`auto` means the model can pick between generating a message or calling one or more tools.\n`required` means the model must call one or more tools.\nSpecifying a particular tool via `{\"type\": \"function\", \"function\": {\"name\": \"my_function\"}}` forces the model to call that tool.\n\n`none` is the default when no tools are present. `auto` is the default if tools are present.present."
+      },
+      "ChatCompletionToolType": {
+        "type": "string",
+        "enum": [
+          "function"
+        ]
+      },
+      "CompletionTokensDetails": {
+        "type": "object",
+        "description": "Breakdown of tokens used in a completion.",
+        "properties": {
+          "accepted_prediction_tokens": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Tokens that were accepted in the prediction",
+            "minimum": 0
+          },
+          "audio_tokens": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Audio input tokens generated by the model.",
+            "minimum": 0
+          },
+          "reasoning_tokens": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Tokens generated by the model for reasoning.",
+            "minimum": 0
+          },
+          "rejected_prediction_tokens": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "When using Predicted Outputs, the number of tokens in the\nprediction that did not appear in the completion. However, like\nreasoning tokens, these tokens are still counted in the total\ncompletion tokens for purposes of billing, output, and context\nwindow limits.",
+            "minimum": 0
+          }
+        }
+      },
+      "CompletionUsage": {
+        "type": "object",
+        "description": "Usage statistics for the completion request.",
+        "required": [
+          "prompt_tokens",
+          "completion_tokens",
+          "total_tokens"
+        ],
+        "properties": {
+          "completion_tokens": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Number of tokens in the generated completion.",
+            "minimum": 0
+          },
+          "completion_tokens_details": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/CompletionTokensDetails",
+                "description": "Breakdown of tokens used in a completion."
+              }
+            ]
+          },
+          "prompt_tokens": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Number of tokens in the prompt.",
+            "minimum": 0
+          },
+          "prompt_tokens_details": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PromptTokensDetails",
+                "description": "Breakdown of tokens used in the prompt."
+              }
+            ]
+          },
+          "total_tokens": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Total number of tokens used in the request (prompt + completion).",
+            "minimum": 0
+          }
+        }
+      },
+      "ComponentStatus": {
+        "type": "string",
+        "description": "Represents the status of a component (e.g. dataset, model, etc).",
+        "enum": [
+          "Initializing",
+          "Ready",
+          "Disabled",
+          "Error",
+          "Refreshing"
+        ]
+      },
+      "ConnectionDetails": {
+        "type": "object",
+        "required": [
+          "name",
+          "endpoint",
+          "status"
+        ],
+        "properties": {
+          "endpoint": {
+            "type": "string",
+            "description": "The endpoint of the connection (e.g., URL or IP address)"
+          },
+          "name": {
+            "type": "string",
+            "description": "The name of the connection (e.g., \"http\", \"flight\", \"metrics\", \"opentelemetry\")"
+          },
+          "status": {
+            "$ref": "#/components/schemas/ComponentStatus",
+            "description": "The status of the component (e.g., Ready, Initializing, Disabled, Error, etc.)"
+          }
+        }
+      },
+      "CreateChatCompletionRequest": {
+        "type": "object",
+        "required": [
+          "messages",
+          "model"
+        ],
+        "properties": {
+          "frequency_penalty": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "float",
+            "description": "Number between -2.0 and 2.0. Positive values penalize new tokens based on their existing frequency in the text so far, decreasing the model's likelihood to repeat the same line verbatim.\n\n[See more information about frequency and presence penalties.](https://platform.openai.com/docs/api-reference/parameter-details)"
+          },
+          "function_call": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ChatCompletionFunctionCall",
+                "description": "Deprecated in favor of `tool_choice`.\n\nControls which (if any) function is called by the model.\n`none` means the model will not call a function and instead generates a message.\n`auto` means the model can pick between generating a message or calling a function.\nSpecifying a particular function via `{\"name\": \"my_function\"}` forces the model to call that function.\n\n`none` is the default when no functions are present. `auto` is the default if functions are present."
+              }
+            ]
+          },
+          "functions": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/ChatCompletionFunctions"
+            },
+            "description": "Deprecated in favor of `tools`.\n\nA list of functions the model may generate JSON inputs for.",
+            "deprecated": true
+          },
+          "logit_bias": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "Modify the likelihood of specified tokens appearing in the completion.\n\nAccepts a json object that maps tokens (specified by their token ID in the tokenizer) to an associated bias value from -100 to 100.\nMathematically, the bias is added to the logits generated by the model prior to sampling.\nThe exact effect will vary per model, but values between -1 and 1 should decrease or increase likelihood of selection;\nvalues like -100 or 100 should result in a ban or exclusive selection of the relevant token.",
+            "additionalProperties": {},
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "logprobs": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Whether to return log probabilities of the output tokens or not. If true, returns the log probabilities of each output token returned in the `content` of `message`."
+          },
+          "max_completion_tokens": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "An upper bound for the number of tokens that can be generated for a completion, including visible output tokens and reasoning tokens.",
+            "minimum": 0
+          },
+          "max_tokens": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "The maximum number of tokens that can be generated in the chat completion. This value can be used to control costs for text generated via API.\nThis value is now **deprecated** in favor of max_completion_tokens, and is not compatible with o1 series models.",
+            "deprecated": true,
+            "minimum": 0
+          },
+          "messages": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ChatCompletionRequestMessage"
+            },
+            "description": "A list of messages comprising the conversation so far. [Example Python code](https://cookbook.openai.com/examples/how_to_format_inputs_to_chatgpt_models)."
+          },
+          "metadata": {
+            "description": "Developer-defined tags and values used for filtering completions."
+          },
+          "model": {
+            "type": "string",
+            "description": "ID of the model to use.\nSee the [model endpoint compatibility](https://platform.openai.com/docs/models/model-endpoint-compatibility) table for details on which models work with the Chat API."
+          },
+          "n": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "How many chat completion choices to generate for each input message. Note that you will be charged based on the number of generated tokens across all of the choices. Keep `n` as `1` to minimize costs.",
+            "minimum": 0
+          },
+          "parallel_tool_calls": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Whether to enable [parallel function calling](https://platform.openai.com/docs/guides/function-calling/parallel-function-calling) during tool use."
+          },
+          "presence_penalty": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "float",
+            "description": "Number between -2.0 and 2.0. Positive values penalize new tokens based on whether they appear in the text so far, increasing the model's likelihood to talk about new topics.\n\n[See more information about frequency and presence penalties.](https://platform.openai.com/docs/api-reference/parameter-details)"
+          },
+          "response_format": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ResponseFormat",
+                "description": "An object specifying the format that the model must output. Compatible with [GPT-4o](https://platform.openai.com/docs/models/gpt-4o), [GPT-4o mini](https://platform.openai.com/docs/models/gpt-4o-mini), [GPT-4 Turbo](https://platform.openai.com/docs/models/gpt-4-and-gpt-4-turbo) and all GPT-3.5 Turbo models newer than `gpt-3.5-turbo-1106`.\n\nSetting to `{ \"type\": \"json_schema\", \"json_schema\": {...} }` enables Structured Outputs which guarantees the model will match your supplied JSON schema. Learn more in the [Structured Outputs guide](https://platform.openai.com/docs/guides/structured-outputs).\n\nSetting to `{ \"type\": \"json_object\" }` enables JSON mode, which guarantees the message the model generates is valid JSON.\n\n**Important:** when using JSON mode, you **must** also instruct the model to produce JSON yourself via a system or user message. Without this, the model may generate an unending stream of whitespace until the generation reaches the token limit, resulting in a long-running and seemingly \"stuck\" request. Also note that the message content may be partially cut off if `finish_reason=\"length\"`, which indicates the generation exceeded `max_tokens` or the conversation exceeded the max context length."
+              }
+            ]
+          },
+          "seed": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": " This feature is in Beta.\nIf specified, our system will make a best effort to sample deterministically, such that repeated requests\nwith the same `seed` and parameters should return the same result.\nDeterminism is not guaranteed, and you should refer to the `system_fingerprint` response parameter to monitor changes in the backend."
+          },
+          "service_tier": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ServiceTier",
+                "description": "Specifies the latency tier to use for processing the request. This parameter is relevant for customers subscribed to the scale tier service:\n- If set to 'auto', the system will utilize scale tier credits until they are exhausted.\n- If set to 'default', the request will be processed using the default service tier with a lower uptime SLA and no latency guarentee.\n- When not set, the default behavior is 'auto'.\n\nWhen this parameter is set, the response body will include the `service_tier` utilized."
+              }
+            ]
+          },
+          "stop": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Stop",
+                "description": "Up to 4 sequences where the API will stop generating further tokens."
+              }
+            ]
+          },
+          "store": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Whether or not to store the output of this chat completion request for use in [model distillation](https://platform.openai.com/docs/guides/distillation) or [evals](https://platform.openai.com/docs/guides/evals) products."
+          },
+          "stream": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "If set, partial message deltas will be sent, like in ChatGPT.\nTokens will be sent as data-only [server-sent events](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events/Using_server-sent_events#Event_stream_format)\nas they become available, with the stream terminated by a `data: [DONE]` message. [Example Python code](https://cookbook.openai.com/examples/how_to_stream_completions)."
+          },
+          "stream_options": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ChatCompletionStreamOptions"
+              }
+            ]
+          },
+          "temperature": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "float",
+            "description": "What sampling temperature to use, between 0 and 2. Higher values like 0.8 will make the output more random,\nwhile lower values like 0.2 will make it more focused and deterministic.\n\nWe generally recommend altering this or `top_p` but not both."
+          },
+          "tool_choice": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ChatCompletionToolChoiceOption"
+              }
+            ]
+          },
+          "tools": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/ChatCompletionTool"
+            },
+            "description": "A list of tools the model may call. Currently, only functions are supported as a tool.\nUse this to provide a list of functions the model may generate JSON inputs for. A max of 128 functions are supported."
+          },
+          "top_logprobs": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "An integer between 0 and 20 specifying the number of most likely tokens to return at each token position, each with an associated log probability. `logprobs` must be set to `true` if this parameter is used.",
+            "minimum": 0
+          },
+          "top_p": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "float",
+            "description": "An alternative to sampling with temperature, called nucleus sampling,\nwhere the model considers the results of the tokens with top_p probability mass.\nSo 0.1 means only the tokens comprising the top 10% probability mass are considered.\n\n We generally recommend altering this or `temperature` but not both."
+          },
+          "user": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "A unique identifier representing your end-user, which can help OpenAI to monitor and detect abuse. [Learn more](https://platform.openai.com/docs/guides/safety-best-practices/end-user-ids)."
+          }
+        }
+      },
+      "CreateChatCompletionResponse": {
+        "type": "object",
+        "description": "Represents a chat completion response returned by model, based on the provided input.",
+        "required": [
+          "id",
+          "choices",
+          "created",
+          "model",
+          "object"
+        ],
+        "properties": {
+          "choices": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ChatChoice"
+            },
+            "description": "A list of chat completion choices. Can be more than one if `n` is greater than 1."
+          },
+          "created": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The Unix timestamp (in seconds) of when the chat completion was created.",
+            "minimum": 0
+          },
+          "id": {
+            "type": "string",
+            "description": "A unique identifier for the chat completion."
+          },
+          "model": {
+            "type": "string",
+            "description": "The model used for the chat completion."
+          },
+          "object": {
+            "type": "string",
+            "description": "The object type, which is always `chat.completion`."
+          },
+          "service_tier": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ServiceTierResponse",
+                "description": "The service tier used for processing the request. This field is only included if the `service_tier` parameter is specified in the request."
+              }
+            ]
+          },
+          "system_fingerprint": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "This fingerprint represents the backend configuration that the model runs with.\n\nCan be used in conjunction with the `seed` request parameter to understand when backend changes have been made that might impact determinism."
+          },
+          "usage": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/CompletionUsage"
+              }
+            ]
+          }
+        }
+      },
+      "CreateEmbeddingRequest": {
+        "type": "object",
+        "required": [
+          "model",
+          "input"
+        ],
+        "properties": {
+          "dimensions": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "The number of dimensions the resulting output embeddings should have. Only supported in `text-embedding-3` and later models.",
+            "minimum": 0
+          },
+          "encoding_format": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/EncodingFormat",
+                "description": "The format to return the embeddings in. Can be either `float` or [`base64`](https://pypi.org/project/pybase64/). Defaults to float"
+              }
+            ]
+          },
+          "input": {
+            "$ref": "#/components/schemas/EmbeddingInput",
+            "description": "Input text to embed, encoded as a string or array of tokens. To embed multiple inputs in a single request, pass an array of strings or array of token arrays. The input must not exceed the max input tokens for the model (8192 tokens for `text-embedding-ada-002`), cannot be an empty string, and any array must be 2048 dimensions or less. [Example Python code](https://cookbook.openai.com/examples/how_to_count_tokens_with_tiktoken) for counting tokens."
+          },
+          "model": {
+            "type": "string",
+            "description": "ID of the model to use. You can use the\n[List models](https://platform.openai.com/docs/api-reference/models/list)\nAPI to see all of your available models, or see our\n[Model overview](https://platform.openai.com/docs/models/overview)\nfor descriptions of them."
+          },
+          "user": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "A unique identifier representing your end-user, which will help OpenAI\n to monitor and detect abuse. [Learn more](https://platform.openai.com/docs/usage-policies/end-user-ids)."
+          }
+        }
+      },
+      "CreateEmbeddingResponse": {
+        "type": "object",
+        "required": [
+          "object",
+          "model",
+          "data",
+          "usage"
+        ],
+        "properties": {
+          "data": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Embedding"
+            },
+            "description": "The list of embeddings generated by the model."
+          },
+          "model": {
+            "type": "string",
+            "description": "The name of the model used to generate the embedding."
+          },
+          "object": {
+            "type": "string"
+          },
+          "usage": {
+            "$ref": "#/components/schemas/EmbeddingUsage",
+            "description": "The usage information for the request."
+          }
+        }
+      },
+      "DatasetFilter": {
+        "type": "object",
+        "properties": {
+          "source": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Filters datasets by source (e.g., `postgres:aidemo_messages`)."
+          }
+        }
+      },
+      "DatasetQueryParams": {
+        "type": "object",
+        "properties": {
+          "format": {
+            "$ref": "#/components/schemas/Format",
+            "description": "The format of the response. Possible values are 'json' (default) or 'csv'."
+          },
+          "status": {
+            "type": "boolean"
+          }
+        }
+      },
+      "DatasetResponseItem": {
+        "type": "object",
+        "required": [
+          "from",
+          "name",
+          "replication_enabled",
+          "acceleration_enabled"
+        ],
+        "properties": {
+          "acceleration_enabled": {
+            "type": "boolean",
+            "description": "Whether acceleration is enabled for the dataset"
+          },
+          "from": {
+            "type": "string",
+            "description": "The source where the dataset is located"
+          },
+          "name": {
+            "type": "string",
+            "description": "The name of the dataset"
+          },
+          "properties": {
+            "type": "object",
+            "description": "Custom properties for the dataset",
+            "additionalProperties": {},
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "replication_enabled": {
+            "type": "boolean",
+            "description": "Whether replication is enabled for the dataset"
+          },
+          "status": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ComponentStatus",
+                "description": "Optional status of the dataset"
+              }
+            ]
+          }
+        }
+      },
+      "DistinctColumnsParams": {
+        "type": "object",
+        "required": [
+          "dataset",
+          "limit"
+        ],
+        "properties": {
+          "cols": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "The columns to sample distinct values from. If None, all columns are sampled."
+          },
+          "dataset": {
+            "type": "string",
+            "description": "The SQL dataset to sample data from."
+          },
+          "limit": {
+            "type": "integer",
+            "description": "The number of rows, each with distinct values per column, to sample.",
+            "minimum": 0
+          }
+        }
+      },
+      "Embedding": {
+        "type": "object",
+        "description": "Represents an embedding vector returned by embedding endpoint.",
+        "required": [
+          "index",
+          "object",
+          "embedding"
+        ],
+        "properties": {
+          "embedding": {
+            "$ref": "#/components/schemas/EmbeddingVector",
+            "description": "The embedding vector, which is a list of floats. The length of vector\ndepends on the model as listed in the [embedding guide](https://platform.openai.com/docs/guides/embeddings)."
+          },
+          "index": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The index of the embedding in the list of embeddings.",
+            "minimum": 0
+          },
+          "object": {
+            "type": "string",
+            "description": "The object type, which is always \"embedding\"."
+          }
+        }
+      },
+      "EmbeddingInput": {
+        "oneOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "type": "array",
+            "items": {
+              "type": "array",
+              "items": {
+                "type": "integer",
+                "format": "int32",
+                "minimum": 0
+              }
+            }
+          }
+        ]
+      },
+      "EmbeddingUsage": {
+        "type": "object",
+        "required": [
+          "prompt_tokens",
+          "total_tokens"
+        ],
+        "properties": {
+          "prompt_tokens": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The number of tokens used by the prompt.",
+            "minimum": 0
+          },
+          "total_tokens": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The total number of tokens used by the request.",
+            "minimum": 0
+          }
+        }
+      },
+      "EmbeddingVector": {
+        "oneOf": [
+          {
+            "type": "array",
+            "items": {
+              "type": "number",
+              "format": "float"
+            }
+          },
+          {
+            "type": "string"
+          }
+        ]
+      },
+      "EncodingFormat": {
+        "type": "string",
+        "enum": [
+          "float",
+          "base64"
+        ]
+      },
+      "EvalRunResponse": {
+        "type": "object",
+        "description": "Represents the response for an evaluation run",
+        "required": [
+          "primary_key",
+          "time_column",
+          "dataset",
+          "model",
+          "status",
+          "scorers",
+          "metrics"
+        ],
+        "properties": {
+          "dataset": {
+            "type": "string",
+            "description": "The name of the dataset used for the evaluation"
+          },
+          "error_message": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The error message if the evaluation failed, otherwise `None`"
+          },
+          "metrics": {
+            "type": "object",
+            "description": "A map of metric names to their corresponding values",
+            "additionalProperties": {
+              "type": "number",
+              "format": "double"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "model": {
+            "type": "string",
+            "description": "The model used for the evaluation"
+          },
+          "primary_key": {
+            "type": "string",
+            "description": "Unique identifier for the evaluation run"
+          },
+          "scorers": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "List of scorers used in the evaluation"
+          },
+          "status": {
+            "type": "string",
+            "description": "The status of the evaluation (e.g., \"completed\", \"failed\", etc.)"
+          },
+          "time_column": {
+            "type": "string",
+            "description": "Timestamp indicating when the evaluation was created or run"
+          }
+        }
+      },
+      "FinishReason": {
+        "type": "string",
+        "enum": [
+          "stop",
+          "length",
+          "tool_calls",
+          "content_filter",
+          "function_call"
+        ]
+      },
+      "Format": {
+        "type": "string",
+        "enum": [
+          "json",
+          "csv"
+        ]
+      },
+      "FunctionCall": {
+        "type": "object",
+        "description": "The name and arguments of a function that should be called, as generated by the model.",
+        "required": [
+          "name",
+          "arguments"
+        ],
+        "properties": {
+          "arguments": {
+            "type": "string",
+            "description": "The arguments to call the function with, as generated by the model in JSON format. Note that the model does not always generate valid JSON, and may hallucinate parameters not defined by your function schema. Validate the arguments in your code before calling your function."
+          },
+          "name": {
+            "type": "string",
+            "description": "The name of the function to call."
+          }
+        }
+      },
+      "FunctionName": {
+        "type": "object",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "The name of the function to call."
+          }
+        }
+      },
+      "FunctionObject": {
+        "type": "object",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "A description of what the function does, used by the model to choose when and how to call the function."
+          },
+          "name": {
+            "type": "string",
+            "description": "The name of the function to be called. Must be a-z, A-Z, 0-9, or contain underscores and dashes, with a maximum length of 64."
+          },
+          "parameters": {
+            "description": "The parameters the functions accepts, described as a JSON Schema object. See the [guide](https://platform.openai.com/docs/guides/text-generation/function-calling) for examples, and the [JSON Schema reference](https://json-schema.org/understanding-json-schema/) for documentation about the format.\n\nOmitting `parameters` defines a function with an empty parameter list."
+          },
+          "strict": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Whether to enable strict schema adherence when generating the function call. If set to true, the model will follow the exact schema defined in the `parameters` field. Only a subset of JSON Schema is supported when `strict` is `true`. Learn more about Structured Outputs in the [function calling guide](https://platform.openai.com/docs/guides/function-calling)."
+          }
+        }
+      },
+      "GeneratePackageRequest": {
+        "type": "object",
+        "required": [
+          "from",
+          "params"
+        ],
+        "properties": {
+          "from": {
+            "type": "string",
+            "description": "The GitHub source path in the format `github:{org}/{repo}/{sha}/{path_to_spicepod.yaml}`"
+          },
+          "params": {
+            "type": "object",
+            "description": "A key-value map of optional parameters (e.g., `github_token`)",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "IcebergError": {
+        "type": "object",
+        "required": [
+          "message",
+          "type",
+          "code"
+        ],
+        "properties": {
+          "code": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "message": {
+            "type": "string"
+          },
+          "type": {
+            "$ref": "#/components/schemas/IcebergErrorType"
+          }
+        }
+      },
+      "IcebergErrorType": {
+        "type": "string",
+        "enum": [
+          "NoSuchNamespaceException",
+          "BadRequestException",
+          "InternalServerError"
+        ]
+      },
+      "IcebergResponseError": {
+        "type": "object",
+        "required": [
+          "error"
+        ],
+        "properties": {
+          "error": {
+            "$ref": "#/components/schemas/IcebergError"
+          }
+        }
+      },
+      "ImageDetail": {
+        "type": "string",
+        "enum": [
+          "auto",
+          "low",
+          "high"
+        ]
+      },
+      "ImageUrl": {
+        "type": "object",
+        "required": [
+          "url"
+        ],
+        "properties": {
+          "detail": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ImageDetail",
+                "description": "Specifies the detail level of the image. Learn more in the [Vision guide](https://platform.openai.com/docs/guides/vision/low-or-high-fidelity-image-understanding)."
+              }
+            ]
+          },
+          "url": {
+            "type": "string",
+            "description": "Either a URL of the image or the base64 encoded image data."
+          }
+        }
+      },
+      "ListEvalElement": {
+        "type": "object",
+        "required": [
+          "name",
+          "dataset",
+          "scorers"
+        ],
+        "properties": {
+          "dataset": {
+            "type": "string"
+          },
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "scorers": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "ListToolElement": {
+        "type": "object",
+        "description": "Summary of a tool available to run, and the schema of its input parameters.",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "parameters": {}
+        }
+      },
+      "Match": {
+        "type": "object",
+        "required": [
+          "value",
+          "score",
+          "dataset"
+        ],
+        "properties": {
+          "dataset": {
+            "type": "string",
+            "description": "The name of the dataset where the match was found"
+          },
+          "metadata": {
+            "type": "object",
+            "description": "Additional metadata for the match, requested explicitly by the user.",
+            "additionalProperties": {},
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "primary_key": {
+            "type": "object",
+            "description": "Primary key(s) identifying the matched item in the dataset",
+            "additionalProperties": {},
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "score": {
+            "type": "number",
+            "format": "double",
+            "description": "The similarity of the match to the query"
+          },
+          "value": {
+            "type": "string",
+            "description": "The value of the match (e.g., document snippet, identifier, etc.)"
+          }
+        }
+      },
+      "MessageResponse": {
+        "type": "object",
+        "required": [
+          "message"
+        ],
+        "properties": {
+          "message": {
+            "type": "string",
+            "description": "The message describing the result of the request"
+          }
+        }
+      },
+      "ModelResponse": {
+        "type": "object",
+        "required": [
+          "name",
+          "from"
+        ],
+        "properties": {
+          "datasets": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "The datasets associated with this model, if any"
+          },
+          "from": {
+            "type": "string",
+            "description": "The source from which the model was loaded (e.g., `openai`, `spiceai`)"
+          },
+          "name": {
+            "type": "string",
+            "description": "The name of the model"
+          },
+          "status": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ComponentStatus",
+                "description": "The status of the model (e.g., `ready`, `initializing`, `error`)"
+              }
+            ]
+          }
+        }
+      },
+      "Namespace": {
+        "type": "object",
+        "required": [
+          "parts"
+        ],
+        "properties": {
+          "parts": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "NamespacesResponse": {
+        "type": "object",
+        "required": [
+          "namespaces"
+        ],
+        "properties": {
+          "namespaces": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Namespace"
+            }
+          }
+        }
+      },
+      "PredictRequest": {
+        "type": "object",
+        "required": [
+          "model_name"
+        ],
+        "properties": {
+          "model_name": {
+            "type": "string"
+          }
+        }
+      },
+      "PredictResponse": {
+        "type": "object",
+        "required": [
+          "status",
+          "model_name",
+          "duration_ms"
+        ],
+        "properties": {
+          "duration_ms": {
+            "type": "integer",
+            "description": "The time taken to complete the prediction (in milliseconds)",
+            "minimum": 0
+          },
+          "error_message": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The error message if the request failed"
+          },
+          "model_name": {
+            "type": "string",
+            "description": "The name of the model used for the prediction"
+          },
+          "model_version": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The version of the model used"
+          },
+          "prediction": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "number",
+              "format": "float"
+            },
+            "description": "The prediction result, typically an array of floats"
+          },
+          "status": {
+            "$ref": "#/components/schemas/PredictStatus",
+            "description": "The status of the prediction"
+          }
+        }
+      },
+      "PredictStatus": {
+        "type": "string",
+        "enum": [
+          "Success",
+          "BadRequest",
+          "InternalError"
+        ]
+      },
+      "PromptTokensDetails": {
+        "type": "object",
+        "description": "Breakdown of tokens used in a prompt.",
+        "properties": {
+          "audio_tokens": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Audio input tokens present in the prompt.",
+            "minimum": 0
+          },
+          "cached_tokens": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Cached tokens present in the prompt.",
+            "minimum": 0
+          }
+        }
+      },
+      "RandomSampleParams": {
+        "type": "object",
+        "required": [
+          "dataset",
+          "limit"
+        ],
+        "properties": {
+          "dataset": {
+            "type": "string",
+            "description": "The SQL dataset to sample data from."
+          },
+          "limit": {
+            "type": "integer",
+            "description": "The number of rows, each with distinct values per column, to sample.",
+            "minimum": 0
+          }
+        }
+      },
+      "Request": {
+        "type": "object",
+        "required": [
+          "query"
+        ],
+        "properties": {
+          "datasets": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "Names of datasets to sample from. If omitted, all datasets are used."
+          },
+          "model": {
+            "type": "string",
+            "description": "The name of the model to use for SQL generation. Default: \"nql\""
+          },
+          "query": {
+            "type": "string",
+            "description": "The natural language query to be converted into SQL"
+          },
+          "sample_data_enabled": {
+            "type": "boolean",
+            "description": "Whether sample data is included in the context for SQL generation. Default: true"
+          }
+        }
+      },
+      "ResponseFormat": {
+        "oneOf": [
+          {
+            "type": "object",
+            "description": "The type of response format being defined: `text`",
+            "required": [
+              "type"
+            ],
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": [
+                  "text"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "The type of response format being defined: `json_object`",
+            "required": [
+              "type"
+            ],
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": [
+                  "json_object"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "The type of response format being defined: `json_schema`",
+            "required": [
+              "json_schema",
+              "type"
+            ],
+            "properties": {
+              "json_schema": {
+                "$ref": "#/components/schemas/ResponseFormatJsonSchema"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "json_schema"
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "ResponseFormatJsonSchema": {
+        "type": "object",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "A description of what the response format is for, used by the model to determine how to respond in the format."
+          },
+          "name": {
+            "type": "string",
+            "description": "The name of the response format. Must be a-z, A-Z, 0-9, or contain underscores and dashes, with a maximum length"
+          },
+          "schema": {
+            "description": "The schema for the response format, described as a JSON Schema object."
+          },
+          "strict": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Whether to enable strict schema adherence when generating the output. If set to true, the model will always follow the exact schema defined in the `schema` field. Only a subset of JSON Schema is supported when `strict` is `true`. To learn more, read the [Structured Outputs guide](https://platform.openai.com/docs/guides/structured-outputs)."
+          }
+        }
+      },
+      "Role": {
+        "type": "string",
+        "enum": [
+          "system",
+          "user",
+          "assistant",
+          "tool",
+          "function"
+        ]
+      },
+      "RunEval": {
+        "type": "object",
+        "description": "Input parameters to start an evaluation run for a given model.",
+        "required": [
+          "model"
+        ],
+        "properties": {
+          "model": {
+            "type": "string"
+          }
+        }
+      },
+      "SearchRequestJson": {
+        "type": "object",
+        "required": [
+          "text"
+        ],
+        "properties": {
+          "additional_columns": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Additional columns to return from the dataset."
+          },
+          "datasets": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "The datasets to search for similarity. If None, search across all datasets. For available datasets, use the `list_datasets` tool and ensure `can_search_documents==true`."
+          },
+          "limit": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Number of documents to return for each dataset",
+            "minimum": 0
+          },
+          "text": {
+            "type": "string",
+            "description": "The text to search documents for similarity"
+          },
+          "where": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "An SQL filter predicate to apply. Format: 'WHERE `where_cond`'."
+          }
+        }
+      },
+      "SearchResponse": {
+        "type": "object",
+        "required": [
+          "matches",
+          "duration_ms"
+        ],
+        "properties": {
+          "duration_ms": {
+            "type": "integer",
+            "description": "Total time taken to execute the search, in milliseconds",
+            "minimum": 0
+          },
+          "matches": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Match"
+            },
+            "description": "List of matches that were found in the datasets"
+          }
+        }
+      },
+      "ServiceTier": {
+        "type": "string",
+        "enum": [
+          "auto",
+          "default"
+        ]
+      },
+      "ServiceTierResponse": {
+        "type": "string",
+        "enum": [
+          "scale",
+          "default"
+        ]
+      },
+      "Stop": {
+        "oneOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        ]
+      },
+      "TopLogprobs": {
+        "type": "object",
+        "required": [
+          "token",
+          "logprob"
+        ],
+        "properties": {
+          "bytes": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            },
+            "description": "A list of integers representing the UTF-8 bytes representation of the token. Useful in instances where characters are represented by multiple tokens and their byte representations must be combined to generate the correct text representation. Can be `null` if there is no bytes representation for the token."
+          },
+          "logprob": {
+            "type": "number",
+            "format": "float",
+            "description": "The log probability of this token."
+          },
+          "token": {
+            "type": "string",
+            "description": "The token."
+          }
+        }
+      },
+      "TopSamplesParams": {
+        "type": "object",
+        "required": [
+          "dataset",
+          "limit",
+          "order_by"
+        ],
+        "properties": {
+          "dataset": {
+            "type": "string",
+            "description": "The SQL dataset to sample data from."
+          },
+          "limit": {
+            "type": "integer",
+            "description": "The number of rows, each with distinct values per column, to sample.",
+            "minimum": 0
+          },
+          "order_by": {
+            "type": "string",
+            "description": "How to order the samples before retrieving the top N."
+          }
+        }
+      }
+    }
+  },
+  "security": [
+    {
+      "api_key": []
+    }
+  ]
+}

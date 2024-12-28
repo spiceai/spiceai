@@ -22,7 +22,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use url::Url;
 
-use super::{listing, ConnectorComponent, DataConnectorParams};
+use super::{listing, ConnectorComponent, ConnectorParams};
 use super::{
     listing::ListingTableConnector, DataConnector, DataConnectorFactory, DataConnectorResult,
     ParameterSpec, Parameters,
@@ -83,7 +83,7 @@ const PARAMETERS: &[ParameterSpec] = &[
 impl DataConnectorFactory for FTPFactory {
     fn create(
         &self,
-        params: DataConnectorParams,
+        params: ConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             let ftp = FTP {

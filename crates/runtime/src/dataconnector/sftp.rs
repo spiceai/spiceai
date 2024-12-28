@@ -26,7 +26,7 @@ use super::{
     listing::{self, ListingTableConnector},
     DataConnector, DataConnectorFactory, DataConnectorResult, ParameterSpec, Parameters,
 };
-use super::{ConnectorComponent, DataConnectorParams};
+use super::{ConnectorComponent, ConnectorParams};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -92,7 +92,7 @@ const PARAMETERS: &[ParameterSpec] = &[
 impl DataConnectorFactory for SFTPFactory {
     fn create(
         &self,
-        params: DataConnectorParams,
+        params: ConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             let sftp = SFTP {

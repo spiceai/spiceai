@@ -19,7 +19,7 @@ use std::{error::Error, sync::Arc};
 
 use ::arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
-use datafusion::{datasource::TableProvider, sql::TableReference};
+use datafusion::{catalog::CatalogProvider, datasource::TableProvider, sql::TableReference};
 
 pub mod arrow;
 #[cfg(feature = "clickhouse")]
@@ -85,4 +85,9 @@ pub trait ReadWrite: Send + Sync {
         table_reference: TableReference,
         schema: Option<SchemaRef>,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn Error + Send + Sync>>;
+}
+
+#[async_trait]
+pub trait RefreshableCatalogProvider: CatalogProvider {
+    async fn refresh(&self) -> Result<(), Box<dyn Error + Send + Sync>>;
 }

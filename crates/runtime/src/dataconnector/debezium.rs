@@ -37,7 +37,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use super::{DataConnector, DataConnectorFactory, DataConnectorParams, ParameterSpec, Parameters};
+use super::{ConnectorParams, DataConnector, DataConnectorFactory, ParameterSpec, Parameters};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -193,7 +193,7 @@ const PARAMETERS: &[ParameterSpec] = &[
 impl DataConnectorFactory for DebeziumFactory {
     fn create(
         &self,
-        params: DataConnectorParams,
+        params: ConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             let debezium = Debezium::new(params.parameters)?;

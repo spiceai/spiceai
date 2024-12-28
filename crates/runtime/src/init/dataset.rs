@@ -23,8 +23,8 @@ use crate::{
     dataconnector::{
         self,
         localpod::{LocalPodConnector, LOCALPOD_DATACONNECTOR},
-        ConnectorComponent, DataConnector, DataConnectorError, DataConnectorParams,
-        DataConnectorParamsBuilder, ODBC_DATACONNECTOR,
+        ConnectorComponent, ConnectorParams, ConnectorParamsBuilder, DataConnector,
+        DataConnectorError, ODBC_DATACONNECTOR,
     },
     embeddings::connector::EmbeddingConnector,
     error_spaced,
@@ -178,8 +178,8 @@ impl Runtime {
         let spaced_tracer = Arc::clone(&self.spaced_tracer);
 
         let source = ds.source();
-        let params = DataConnectorParamsBuilder::new(source.into(), (&ds).into())
-            .with_runtime(self)
+        let params = ConnectorParamsBuilder::new(source.into(), (&ds).into())
+            .build(self.secrets())
             .await
             .context(UnableToInitializeDataConnectorSnafu)?;
 
@@ -491,7 +491,7 @@ impl Runtime {
     pub(crate) async fn get_dataconnector_from_source(
         &self,
         source: &str,
-        params: DataConnectorParams,
+        params: ConnectorParams,
     ) -> Result<Arc<dyn DataConnector>> {
         // Unlike most other data connectors, the localpod connector needs a reference to the current DataFusion instance.
         if source == LOCALPOD_DATACONNECTOR {

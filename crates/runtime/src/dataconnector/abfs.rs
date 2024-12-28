@@ -16,8 +16,8 @@ limitations under the License.
 
 use super::listing::{build_fragments, ListingTableConnector};
 use super::{
-    ConnectorComponent, DataConnector, DataConnectorFactory, DataConnectorParams,
-    DataConnectorResult, ParameterSpec, Parameters,
+    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorFactory, DataConnectorResult,
+    ParameterSpec, Parameters,
 };
 
 use crate::component::dataset::Dataset;
@@ -163,7 +163,7 @@ const PARAMETERS: &[ParameterSpec] = &[
 impl DataConnectorFactory for AzureBlobFSFactory {
     fn create(
         &self,
-        mut params: DataConnectorParams,
+        mut params: ConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         if let Some(sas_token) = params.parameters.get("sas_string").expose().ok() {
             if let Some(sas_token) = sas_token.strip_prefix('?') {

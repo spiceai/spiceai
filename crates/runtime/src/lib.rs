@@ -51,6 +51,7 @@ use crate::extension::Extension;
 pub mod accelerated_table;
 pub mod auth;
 mod builder;
+pub mod catalogconnector;
 pub mod component;
 pub mod config;
 pub mod dataaccelerator;
@@ -122,6 +123,11 @@ pub enum Error {
     },
 
     #[snafu(display("{source}"))]
+    UnableToInitializeCatalogConnector {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display("{source}"))]
     UnableToInitializeLlm {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
@@ -136,8 +142,11 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Unknown data connector: {data_connector}"))]
+    #[snafu(display("Unknown data connector: {data_connector}.\nSpecify a valid data connector and retry. For details, visit: https://docs.spiceai.org/components/data-connectors"))]
     UnknownDataConnector { data_connector: String },
+
+    #[snafu(display("Unknown catalog connector: {catalog_connector}.\nSpecify a valid catalog connector and retry. For details, visit: https://docs.spiceai.org/components/catalogs"))]
+    UnknownCatalogConnector { catalog_connector: String },
 
     #[snafu(display("The runtime is built without ODBC support.\nBuild Spice.ai OSS with the `odbc` feature enabled or use the Docker image that includes ODBC support.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/odbc"))]
     OdbcNotInstalled,
@@ -542,14 +551,6 @@ impl Runtime {
         if let Err(err) = load_result {
             tracing::error!("Could not start the Spice runtime: {err}");
         }
-    }
-
-    pub async fn get_params_with_secrets(
-        &self,
-        params: &HashMap<String, String>,
-    ) -> HashMap<String, SecretString> {
-        let shared_secrets = Arc::clone(&self.secrets);
-        get_params_with_secrets(shared_secrets, params).await
     }
 }
 

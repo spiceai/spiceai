@@ -28,8 +28,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use super::{
-    ConnectorComponent, DataConnector, DataConnectorError, DataConnectorFactory,
-    DataConnectorParams, ParameterSpec, Parameters,
+    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
+    ParameterSpec, Parameters,
 };
 
 #[derive(Debug, Snafu)]
@@ -94,7 +94,7 @@ const PARAMETERS: &[ParameterSpec] = &[ParameterSpec::connector("remote").secret
 impl DataConnectorFactory for SparkFactory {
     fn create(
         &self,
-        params: DataConnectorParams,
+        params: ConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             match Spark::new(params.parameters).await {
