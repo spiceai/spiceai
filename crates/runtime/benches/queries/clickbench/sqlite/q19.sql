@@ -1,1 +1,1 @@
-SELECT "UserID", EXTRACT(MINUTE FROM "EventTime") AS m, "SearchPhrase", COUNT(*) FROM hits GROUP BY "UserID", m, "SearchPhrase" ORDER BY COUNT(*) DESC LIMIT 10;
+SELECT "UserID", date_part('minute', "EventTime") AS m, "SearchPhrase", COUNT(*) FROM hits GROUP BY "UserID", m, "SearchPhrase" ORDER BY COUNT(*) DESC LIMIT 10;
