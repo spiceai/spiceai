@@ -39,6 +39,7 @@ pub mod duckdb;
 pub mod flight;
 #[cfg(feature = "flightsql")]
 pub mod flightsql;
+pub mod iceberg;
 #[cfg(feature = "debezium")]
 pub mod kafka;
 #[cfg(feature = "mssql")]
