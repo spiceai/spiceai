@@ -159,6 +159,7 @@ fn get_tpch_test_queries() -> Vec<(&'static str, &'static str)> {
             "tpch_simple_q2",
             include_str!("../queries/tpch/simple_q2.sql"),
         ),
+        // See: https://github.com/spiceai/spiceai/issues/3980
         // Tonic error: status: ResourceExhausted, message: "DoGet recv error: rpc error: code = ResourceExhausted desc = grpc: received message larger than max (1646208435 vs. 104857600)", details: [], metadata: MetadataMap { headers: {} }
         // (
         //     "tpch_simple_q3",
