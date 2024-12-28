@@ -1,1 +1,1 @@
-SELECT MIN("EventDate"), MAX("EventDate") FROM hits;
+SELECT MIN(date("EventTime", 'unixepoch')), MAX(date("EventTime", 'unixepoch')) FROM hits;
