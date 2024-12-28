@@ -384,8 +384,11 @@ fn get_clickbench_test_queries(engine: Option<&str>) -> Vec<(&'static str, &'sta
             "sqlite", 7, 19, 24, 25, 27, 37, 38, 39, 40, 41, 42, 43
         );
 
+        let override_indexes: [u8; 12] = [6, 18, 23, 24, 26, 36, 37, 38, 39, 40, 41, 42];
+
         for (i, v) in overrides.iter().enumerate() {
-            queries[i] = *v;
+            let target_index = override_indexes[i] as usize;
+            queries[target_index] = *v;
         }
 
         queries.remove(28); // q29 includes regexp_replace which is not supported by sqlite
