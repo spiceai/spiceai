@@ -143,6 +143,7 @@ fn get_tpch_test_queries() -> Vec<(&'static str, &'static str)> {
         ("tpch_q14", include_str!("../queries/tpch/q14.sql")),
         // tpch_q15 has a view creation which we don't support by design
         ("tpch_q16", include_str!("../queries/tpch/q16.sql")),
+        // See: https://github.com/spiceai/spiceai/issues/3980
         // DoGet recv error: rpc error: code = InvalidArgument desc = Correlated scalar subquery can only be used in Projection, Filter, Aggregate plan nodes
         // ("tpch_q17", include_str!("../queries/tpch/q17.sql")),
         ("tpch_q18", include_str!("../queries/tpch/q18.sql")),
