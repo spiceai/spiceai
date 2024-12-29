@@ -34,9 +34,9 @@ struct SearchResponse {
     pub duration_ms: u128,
 }
 
-/// Vector Search
+/// Search
 ///
-/// Perform a vector search operation on a dataset.
+/// Perform a vector similarity search (VSS) operation on a dataset.
 ///
 /// The search operation will return the most relevant matches based on cosine similarity with the input `text`.
 /// The datasets queries should have an embedding column, and the appropriate embedding model loaded.
