@@ -35,7 +35,7 @@ Indexes are not required for test coverage, but can be introduced if required fo
   - An accelerator that takes longer than 1 hour to load the dataset is considered a test fail.
 - [ ] An end-to-end test is created using a refresh SQL that excludes results from the accelerator for the TPC-H dataset at scale factor 1 in all [Access Modes](../definitions.md). TPC-H queries should induce a zero results action, with `on_zero_results: use_source` behavior.
   - The test validates that for queries that would return results from the source that are excluded in the accelerator, that they correctly return results through the use of `on_zero_results`.
-  - A connector that is currently Release Candidate quality or higher must be used as the acceleration source, to reduce the impact of connector-related ClickBench issues.
+  - A connector that is currently Release Candidate quality or higher must be used as the acceleration source, to reduce the impact of connector-related issues.
 - [ ] An end-to-end [Throughput Test](../definitions.md) is performed on the accelerator using the TPC-H dataset at scale factor 1 in all [Access Modes](../definitions.md).
   - [ ] End-to-end tests should perform [Throughput Tests](../definitions.md) at the required [parallel query count](../definitions.md)
   - [ ] [Throughput Metric](../definitions.md) is calculated and reported as a metric with a parallel query count of 1 to serve as a baseline metric.
@@ -49,7 +49,7 @@ Indexes are not required for test coverage, but can be introduced if required fo
   - An accelerator that takes longer than 1 hour to load the dataset is considered a test fail.
 - [ ] An end-to-end test is created using a refresh SQL that excludes results from the accelerator for the TPC-DS dataset at scale factor 1 in all [Access Modes](../definitions.md). TPC-DS queries should induce a zero results action, with `on_zero_results: use_source` behavior.
   - The test validates that for queries that would return results from the source that are excluded in the accelerator, that they correctly return results through the use of `on_zero_results`.
-  - A connector that is currently Release Candidate quality or higher must be used as the acceleration source, to reduce the impact of connector-related ClickBench issues.
+  - A connector that is currently Release Candidate quality or higher must be used as the acceleration source, to reduce the impact of connector-related issues.
 - [ ] An end-to-end [Throughput Test](../definitions.md) is performed on the accelerator using the TPC-DS dataset at scale factor 1 in all [Access Modes](../definitions.md).
   - [ ] End-to-end tests should perform [Throughput Tests](../definitions.md) at the required [parallel query count](../definitions.md)
   - [ ] [Throughput Metric](../definitions.md) is calculated and reported as a metric with a parallel query count of 1 to serve as a baseline metric.
@@ -64,7 +64,7 @@ Indexes are not required for test coverage, but can be introduced if required fo
   - An accelerator that takes longer than 1 hour to load the dataset is considered a test fail.
 - [ ] An end-to-end test is created using a refresh SQL that excludes results from the accelerator for the ClickBench dataset in all [Access Modes](../definitions.md). ClickBench queries should induce a zero results action, with `on_zero_results: use_source` behavior.
   - The test validates that for queries that would return results from the source that are excluded in the accelerator, that they correctly return results through the use of `on_zero_results`.
-  - A connector that is currently Release Candidate quality or higher must be used as the acceleration source, to reduce the impact of connector-related ClickBench issues.
+  - A connector that is currently Release Candidate quality or higher must be used as the acceleration source, to reduce the impact of connector-related issues.
 
 ### Documentation
 
