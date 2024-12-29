@@ -228,7 +228,7 @@ impl TaskHistory {
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct Auth {
-    #[serde(alias="api-key")]
+    #[serde(alias = "api-key")]
     pub api_key: Option<ApiKeyAuth>,
 }
 
@@ -272,17 +272,26 @@ impl Default for CorsConfig {
 }
 
 impl ApiKey {
-    pub fn from_str(input: &str) ->Self {
+    #[must_use]
+    pub fn parse_str(input: &str) -> Self {
         if let Some((key, kind)) = input.rsplit_once(':') {
             match kind {
-                "ro" =>ApiKey::ReadOnly { key: key.to_string() },
-                "rw" =>ApiKey::ReadWrite { key: key.to_string() },
+                "ro" => ApiKey::ReadOnly {
+                    key: key.to_string(),
+                },
+                "rw" => ApiKey::ReadWrite {
+                    key: key.to_string(),
+                },
                 // _ => Err(format!("Invalid key type suffix: {}", kind)),
-                _  => ApiKey::ReadOnly { key: input.to_string() },
+                _ => ApiKey::ReadOnly {
+                    key: input.to_string(),
+                },
             }
         } else {
             // Default to ReadOnly if no suffix is provided
-            ApiKey::ReadOnly { key: input.to_string() }
+            ApiKey::ReadOnly {
+                key: input.to_string(),
+            }
         }
     }
 }
@@ -294,7 +303,7 @@ impl<'de> Deserialize<'de> for ApiKey {
     {
         let input = String::deserialize(deserializer)?;
 
-        Ok(ApiKey::from_str(&input))
+        Ok(ApiKey::parse_str(&input))
     }
 }
 

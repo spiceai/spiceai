@@ -65,7 +65,7 @@ async fn test_http_auth() -> Result<(), anyhow::Error> {
             .await;
 
         let api_key_auth =
-            Arc::new(ApiKeyAuth::new(vec![ApiKey::from_str("valid")])) as Arc<dyn HttpAuth + Send + Sync>;
+            Arc::new(ApiKeyAuth::new(vec![ApiKey::parse_str("valid")])) as Arc<dyn HttpAuth + Send + Sync>;
 
         // Start the servers
         tokio::spawn(async move {

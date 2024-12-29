@@ -63,7 +63,7 @@ async fn test_flight_auth() -> Result<(), anyhow::Error> {
             .build()
             .await;
 
-        let api_key_auth = Arc::new(ApiKeyAuth::new(vec![ApiKey::from_str("valid")]))
+        let api_key_auth = Arc::new(ApiKeyAuth::new(vec![ApiKey::parse_str("valid")]))
             as Arc<dyn FlightBasicAuth + Send + Sync>;
 
         // Start the servers

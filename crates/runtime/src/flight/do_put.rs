@@ -21,7 +21,6 @@ use arrow_flight::{
     flight_service_server::FlightService, utils::flight_data_to_arrow_batch, FlightData, PutResult,
 };
 use arrow_ipc::convert::try_schema_from_flatbuffer_bytes;
-use data_components::flight;
 use datafusion::{
     error::DataFusionError, execution::SendableRecordBatchStream,
     physical_plan::stream::RecordBatchStreamAdapter, sql::TableReference,
@@ -34,30 +33,25 @@ use async_stream::stream;
 
 use crate::{
     dataupdate::{StreamingDataUpdate, UpdateType},
+    request::RequestContext,
     timing::TimedStream,
 };
 
 use super::{metrics, Service};
 
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn handle(
     flight_svc: &Service,
     request: Request<Streaming<FlightData>>,
 ) -> Result<Response<<Service as FlightService>::DoPutStream>, Status> {
-
-    let Some(auth) = &flight_svc.basic_auth else {
-        return Err(Status::unauthenticated("DoPut requires auth enabled"));
-     };
- 
-     let bearer_token = match runtime_auth::layer::flight::get_authorization_value(request.metadata(), "Bearer") {
-         Ok(bearer_token) => bearer_token,
-         Err(e) => return Err(e),
-     };
- 
-     match auth.is_write_allowed(bearer_token) {
-         Ok(runtime_auth::AuthVerdict::Allow) => (),
-         Ok(runtime_auth::AuthVerdict::Deny) => return Err(Status::permission_denied("Write access denied")),
-         Err(e) => return Err(Status::internal(format!("Error validating write access: {e}"))),
-     };
+    match RequestContext::current(crate::request::AsyncMarker::new().await).auth_principal() {
+            Some(principal) => {
+                if !principal.groups().iter().any(|group| *group == "write" || *group == "read_write") {
+                    return Err(Status::permission_denied("Write access denied. Verify that authentication key used has write access and try again."));
+                }
+            },
+            None => return Err(Status::unauthenticated("Flight DoPut requires authentication enabled.\nFor auth details, visit https://docs.spiceai.org/api/auth")),
+     }
 
     let mut streaming_flight = request.into_inner();
 

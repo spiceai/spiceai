@@ -67,7 +67,7 @@ pub fn validate_basic_auth_handshake(
     }
 }
 
-pub fn get_authorization_value<'a>(
+fn get_authorization_value<'a>(
     metadata: &'a MetadataMap,
     prefix: &'static str,
 ) -> Result<&'a str, Status> {
@@ -153,7 +153,8 @@ where
         };
 
         match auth_verifier.is_valid(bearer_token) {
-            Ok(AuthVerdict::Allow) => {
+            Ok(AuthVerdict::Allow(_principal)) => {
+                // TODO: RequestContext::current(AsyncMarker::new().await).set_auth_principal(principal);
                 let (metadata, extensions, msg) = req.into_parts();
 
                 // Tonic has an `into_http` method that does this, but its private.

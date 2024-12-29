@@ -26,7 +26,7 @@ pub fn make_interceptor(
     move |req: tonic::Request<()>| {
         if let Some(auth_verifier) = &auth_verifier {
             match auth_verifier.grpc_verify(&req) {
-                Ok(AuthVerdict::Allow) => Ok(req),
+                Ok(AuthVerdict::Allow(_)) => Ok(req),
                 Ok(AuthVerdict::Deny) => Err(Status::unauthenticated("Invalid credentials")),
                 Err(e) => {
                     tracing::error!("Error verifying credentials: {e}");

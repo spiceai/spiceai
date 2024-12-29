@@ -17,12 +17,13 @@ limitations under the License.
 use std::{
     future::Future,
     marker::PhantomData,
-    sync::{atomic::AtomicU8, Arc, LazyLock},
+    sync::{atomic::AtomicU8, Arc, LazyLock, OnceLock},
 };
 
 use app::App;
 use http::HeaderMap;
 use opentelemetry::KeyValue;
+use runtime_auth::AuthPrincipalRef;
 use spicepod::component::runtime::UserAgentCollection;
 
 use super::{baggage, Protocol, UserAgent};
@@ -31,6 +32,7 @@ pub struct RequestContext {
     // Use an AtomicU8 to allow updating the protocol without locking
     protocol: AtomicU8,
     dimensions: Vec<KeyValue>,
+    auth_principal: OnceLock<AuthPrincipalRef>,
 }
 
 tokio::task_local! {
@@ -114,6 +116,20 @@ impl RequestContext {
     pub fn update_protocol(&self, protocol: Protocol) {
         self.protocol
             .store(protocol as u8, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn set_auth_principal(
+        &self,
+        auth_principal: AuthPrincipalRef,
+    ) -> Result<(), super::GenericError> {
+        self.auth_principal
+            .set(auth_principal)
+            .map_err(|_| "Auth principal already set".into())
+    }
+
+    #[must_use]
+    pub fn auth_principal(&self) -> Option<&AuthPrincipalRef> {
+        self.auth_principal.get()
     }
 }
 
@@ -214,6 +230,7 @@ impl RequestContextBuilder {
         RequestContext {
             protocol: AtomicU8::new(self.protocol as u8),
             dimensions,
+            auth_principal: OnceLock::new(),
         }
     }
 }

@@ -14,12 +14,34 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::sync::Arc;
+
 use crate::error::Error;
+use app::spicepod::component::runtime::ApiKey;
 use axum::http;
 
+pub type AuthPrincipalRef = Arc<dyn AuthPrincipal + Sync + Send>;
+
+pub trait AuthPrincipal {
+    fn username(&self) -> &str; // The username as presented during auth
+    fn groups(&self) -> &[&str]; // Group memberships
+}
+
 pub enum AuthVerdict {
-    Allow,
+    Allow(AuthPrincipalRef),
     Deny,
+}
+
+impl AuthPrincipal for ApiKey {
+    fn username(&self) -> &str {
+        "api_key_auth"
+    }
+    fn groups(&self) -> &[&str] {
+        match self {
+            ApiKey::ReadOnly { .. } => &["read"],
+            ApiKey::ReadWrite { .. } => &["read_write"],
+        }
+    }
 }
 
 pub trait HttpAuth {
@@ -49,8 +71,6 @@ pub trait FlightBasicAuth {
     ///
     /// This function will return an error if the validator can't validate the bearer token.
     fn is_valid(&self, bearer_token: &str) -> Result<AuthVerdict, Error>;
-
-    fn is_write_allowed(&self, bearer_token: &str) -> Result<AuthVerdict, Error>;
 }
 
 pub trait GrpcAuth {

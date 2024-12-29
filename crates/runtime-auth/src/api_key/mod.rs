@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::sync::Arc;
+
 use app::spicepod::component::runtime::ApiKey;
 use axum::http;
 
@@ -39,8 +41,8 @@ impl HttpAuth for ApiKeyAuth {
             .and_then(|value| value.to_str().ok())
             .unwrap_or_default();
 
-        if self.api_keys.iter().any(|key| key == api_key) {
-            Ok(AuthVerdict::Allow)
+        if let Some(api_key) = self.api_keys.iter().find(|key| *key == api_key) {
+            Ok(AuthVerdict::Allow(Arc::new(api_key.clone())))
         } else {
             Ok(AuthVerdict::Deny)
         }
@@ -57,19 +59,11 @@ impl FlightBasicAuth for ApiKeyAuth {
     }
 
     fn is_valid(&self, bearer_token: &str) -> Result<AuthVerdict, Error> {
-        if self.api_keys.iter().any(|key| key == bearer_token) {
-            Ok(AuthVerdict::Allow)
+        if let Some(api_key) = self.api_keys.iter().find(|key| *key == bearer_token) {
+            Ok(AuthVerdict::Allow(Arc::new(api_key.clone())))
         } else {
             Ok(AuthVerdict::Deny)
         }
-    }
-
-    fn is_write_allowed(&self, bearer_token: &str) -> Result<AuthVerdict, Error> {
-        if let Some(ApiKey::ReadWrite { key }) = self.api_keys.iter().find(|key| *key == bearer_token) {
-            return Ok(AuthVerdict::Allow);
-        }
-
-        Ok(AuthVerdict::Deny)
     }
 }
 
@@ -83,8 +77,8 @@ impl GrpcAuth for ApiKeyAuth {
             return Ok(AuthVerdict::Deny);
         };
 
-        if self.api_keys.iter().any(|key| key == api_key) {
-            Ok(AuthVerdict::Allow)
+        if let Some(api_key) = self.api_keys.iter().find(|key| *key == api_key) {
+            Ok(AuthVerdict::Allow(Arc::new(api_key.clone())))
         } else {
             Ok(AuthVerdict::Deny)
         }
@@ -109,16 +103,16 @@ mod tests {
 
     #[test]
     fn test_valid_api_key() {
-        let auth = ApiKeyAuth::new(vec![ApiKey::from_str("valid-key")]);
+        let auth = ApiKeyAuth::new(vec![ApiKey::parse_str("valid-key")]);
         let parts = create_request_parts(Some("valid-key"));
 
         let result = auth.http_verify(&parts);
-        assert!(matches!(result, Ok(AuthVerdict::Allow)));
+        assert!(matches!(result, Ok(AuthVerdict::Allow(_))));
     }
 
     #[test]
     fn test_invalid_api_key() {
-        let auth = ApiKeyAuth::new(vec![ApiKey::from_str("valid-key")]);
+        let auth = ApiKeyAuth::new(vec![ApiKey::parse_str("valid-key")]);
         let parts = create_request_parts(Some("invalid-key"));
 
         let result = auth.http_verify(&parts);
@@ -127,7 +121,7 @@ mod tests {
 
     #[test]
     fn test_missing_api_key() {
-        let auth = ApiKeyAuth::new(vec![ApiKey::from_str("valid-key")]);
+        let auth = ApiKeyAuth::new(vec![ApiKey::parse_str("valid-key")]);
         let parts = create_request_parts(None);
 
         let result = auth.http_verify(&parts);
@@ -137,13 +131,13 @@ mod tests {
     #[test]
     fn test_multiple_valid_keys() {
         let auth = ApiKeyAuth::new(vec![
-            ApiKey::from_str("key1"),
-            ApiKey::from_str("key2"),
-            ApiKey::from_str("key3"),
+            ApiKey::parse_str("key1"),
+            ApiKey::parse_str("key2"),
+            ApiKey::parse_str("key3"),
         ]);
 
         let parts = create_request_parts(Some("key2"));
         let result = auth.http_verify(&parts);
-        assert!(matches!(result, Ok(AuthVerdict::Allow)));
+        assert!(matches!(result, Ok(AuthVerdict::Allow(_))));
     }
 }
