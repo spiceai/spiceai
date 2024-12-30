@@ -61,7 +61,7 @@ on:
           - 'no'
 
 env:
-  FEATURES: 'postgres,spark,mysql,mssql,odbc,delta_lake,databricks,duckdb,sqlite'
+  FEATURES: 'postgres,spark,mysql,mssql,odbc,delta_lake,databricks,duckdb,sqlite,dremio'
 
 jobs:
   build-database-bench-binary:
