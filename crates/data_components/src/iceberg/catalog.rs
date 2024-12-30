@@ -30,12 +30,37 @@ pub struct RestCatalog {
     inner: IcebergRestCatalog,
 }
 
+/// The kinds of tables that can be returned from the `RestCatalog`.
+#[derive(Debug, Clone, Copy)]
+pub enum IcebergTableKind {
+    Iceberg,
+    Spice,
+}
+
+/// The table type that can be returned from the `RestCatalog`.
+#[derive(Debug)]
+pub enum IcebergTable {
+    Iceberg(Table),
+    Spice(String),
+}
+
 impl RestCatalog {
     #[must_use]
-    pub fn new(catalog_config: RestCatalogConfig) -> Self {
+    #[allow(clippy::missing_panics_doc)]
+    pub fn new(catalog_config: RestCatalogConfig, table_kind: IcebergTableKind) -> Self {
+        // This will be removed in the next PR.
+        assert!(
+            matches!(table_kind, IcebergTableKind::Iceberg),
+            "RestCatalog currently only supports Iceberg tables"
+        );
         Self {
             inner: IcebergRestCatalog::new(catalog_config),
         }
+    }
+
+    pub async fn load_table(&self, table: &TableIdent) -> IcebergResult<IcebergTable> {
+        let table = self.inner.load_table(table).await?;
+        Ok(IcebergTable::Iceberg(table))
     }
 }
 
@@ -113,8 +138,12 @@ impl Catalog for RestCatalog {
     }
 
     /// Load table from the catalog.
-    async fn load_table(&self, table: &TableIdent) -> IcebergResult<Table> {
-        self.inner.load_table(table).await
+    async fn load_table(&self, _table: &TableIdent) -> IcebergResult<Table> {
+        // We use the load table implementation from our RestCatalog, not this trait's version.
+        return Err(IcebergError::new(
+            ErrorKind::FeatureUnsupported,
+            "Not implemented",
+        ));
     }
 
     /// Drop a table from the catalog.
@@ -177,6 +206,7 @@ mod tests {
                     ("s3.region".to_string(), "us-east-1".to_string()),
                 ]))
                 .build(),
+            IcebergTableKind::Iceberg,
         );
 
         let namespaces = catalog.list_namespaces(None).await;
@@ -200,6 +230,10 @@ mod tests {
             .await
             .expect("Failed to load table");
         println!("{table:?}");
+
+        let IcebergTable::Iceberg(table) = table else {
+            panic!("Expected Iceberg table");
+        };
 
         let df_table_provider = IcebergTableProvider::try_new_from_table(table)
             .await

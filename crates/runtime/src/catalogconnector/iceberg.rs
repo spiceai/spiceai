@@ -20,9 +20,16 @@ use crate::{
     http::v1::iceberg::namespace::Namespace as HttpNamespace, Runtime,
 };
 use async_trait::async_trait;
-use data_components::RefreshableCatalogProvider;
+use data_components::{
+    iceberg::{
+        catalog::{IcebergTableKind, RestCatalog},
+        provider::IcebergCatalogProvider,
+    },
+    RefreshableCatalogProvider,
+};
 use iceberg::{Namespace, NamespaceIdent};
 use iceberg_catalog_rest::RestCatalogConfig;
+use secrecy::ExposeSecret;
 use snafu::prelude::*;
 use std::{any::Any, collections::HashMap, sync::Arc};
 use url::Url;
@@ -68,46 +75,64 @@ impl IcebergCatalog {
 }
 
 pub(crate) const PARAMETERS: &[ParameterSpec] = &[
-    ParameterSpec::connector("token").secret().description(
-        "The personal access token used to authenticate against the Iceberg REST Catalog API.",
-    ),
+    ParameterSpec::connector("token")
+        .secret()
+        .description("Bearer token value to use for Authorization header."),
+    ParameterSpec::connector("oauth2_credential")
+        .secret()
+        .description(
+            "Credential to use for OAuth2 client credential flow when initializing the catalog. Separated by a colon as <client_id>:<client_secret>.",
+        ),
+    ParameterSpec::connector("oauth2_token_url")
+        .description("The URL to use for OAuth2 token endpoint."),
+    ParameterSpec::connector("oauth2_scope")
+        .description(
+            "The scope to use for OAuth2 token endpoint (default: catalog).",
+        )
+        .default("catalog"),
+    ParameterSpec::connector("oauth2_server_uri")
+        .description("The URL to use for OAuth2 server tokens endpoint (default: catalog base URI + 'v1/oauth/tokens')."),
     // S3 storage options
-    ParameterSpec::connector("aws_region")
-        .description("The AWS region to use for S3 storage.")
+    ParameterSpec::connector("s3_endpoint")
+        .description(
+            "Configure an alternative endpoint for the S3 service. This can be any s3-compatible object storage service. i.e. Minio, Cloudflare R2, etc.",
+        )
         .secret(),
-    ParameterSpec::connector("aws_access_key_id")
+    ParameterSpec::connector("s3_access_key_id")
         .description("The AWS access key ID to use for S3 storage.")
         .secret(),
-    ParameterSpec::connector("aws_secret_access_key")
+    ParameterSpec::connector("s3_secret_access_key")
         .description("The AWS secret access key to use for S3 storage.")
         .secret(),
-    ParameterSpec::connector("aws_endpoint")
-        .description("The AWS endpoint to use for S3 storage.")
+    ParameterSpec::connector("s3_session_token")
+        .description("Configure the static session token used for S3 storage.")
         .secret(),
-    // Azure storage options
-    ParameterSpec::connector("azure_storage_account_name")
-        .description("The storage account to use for Azure storage.")
+    ParameterSpec::connector("s3_region")
+        .description("The AWS S3 region to use.")
         .secret(),
-    ParameterSpec::connector("azure_storage_account_key")
-        .description("The storage account key to use for Azure storage.")
+    ParameterSpec::connector("s3_role_session_name")
+        .description("An optional identifier for the assumed role session for auditing purposes.")
         .secret(),
-    ParameterSpec::connector("azure_storage_client_id")
-        .description("The service principal client id for accessing the storage account.")
+    ParameterSpec::connector("s3_role_arn")
+        .description("The Amazon Resource Name (ARN) of the role to assume. If provided instead of s3_access_key_id and s3_secret_access_key, temporary credentials will be fetched by assuming this role")
         .secret(),
-    ParameterSpec::connector("azure_storage_client_secret")
-        .description("The service principal client secret for accessing the storage account.")
-        .secret(),
-    ParameterSpec::connector("azure_storage_sas_key")
-        .description("The shared access signature key for accessing the storage account.")
-        .secret(),
-    ParameterSpec::connector("azure_storage_endpoint")
-        .description("The endpoint for the Azure Blob storage account.")
-        .secret(),
-    // GCS storage options
-    ParameterSpec::connector("google_service_account")
-        .description("Filesystem path to the Google service account JSON key file.")
-        .secret(),
+    ParameterSpec::connector("s3_connect_timeout")
+        .description("Configure socket connection timeout, in seconds (default: 60).")
 ];
+
+/// Maps a Spice parameter name to an Iceberg property name.
+fn map_param_name_to_iceberg_prop(param_name: &str) -> Option<String> {
+    match param_name {
+        "s3_endpoint" => Some("s3.endpoint".to_string()),
+        "s3_access_key_id" => Some("s3.access-key-id".to_string()),
+        "s3_secret_access_key" => Some("s3.secret-access-key".to_string()),
+        "s3_session_token" => Some("s3.session-token".to_string()),
+        "s3_region" => Some("s3.region".to_string()),
+        "s3_role_session_name" => Some("client.assume-role.session-name".to_string()),
+        "s3_role_arn" => Some("client.assume-role.arn".to_string()),
+        _ => None,
+    }
+}
 
 #[async_trait]
 impl CatalogConnector for IcebergCatalog {
@@ -117,7 +142,7 @@ impl CatalogConnector for IcebergCatalog {
 
     async fn refreshable_catalog_provider(
         self: Arc<Self>,
-        runtime: &Runtime,
+        _runtime: &Runtime,
         catalog: &Catalog,
     ) -> super::Result<Arc<dyn RefreshableCatalogProvider>> {
         let Some(catalog_id) = catalog.catalog_id.clone() else {
@@ -130,7 +155,7 @@ impl CatalogConnector for IcebergCatalog {
             );
         };
 
-        let (catalog_config, namespace) = match parse_catalog_url(catalog_id.as_str()) {
+        let (base_uri, mut props, namespace) = match parse_catalog_url(catalog_id.as_str()) {
             Ok(result) => result,
             Err(e) => {
                 return Err(super::Error::InvalidConfiguration {
@@ -142,9 +167,31 @@ impl CatalogConnector for IcebergCatalog {
             }
         };
 
-        todo!();
+        for (key, value) in &self.params {
+            if let Some(prop) = map_param_name_to_iceberg_prop(key.as_str()) {
+                props.insert(prop, value.expose_secret().to_string());
+            }
+        }
 
-        //Ok(Arc::new(catalog_provider) as Arc<dyn RefreshableCatalogProvider>)
+        let catalog_config = RestCatalogConfig::builder()
+            .uri(base_uri)
+            .props(props)
+            .build();
+
+        let catalog_client = RestCatalog::new(catalog_config, IcebergTableKind::Iceberg);
+
+        let catalog_provider = IcebergCatalogProvider::try_new(
+            Arc::new(catalog_client),
+            namespace.map(|n| n.name().clone()),
+        )
+        .await
+        .map_err(|e| super::Error::UnableToGetCatalogProvider {
+            connector: "iceberg".into(),
+            connector_component: ConnectorComponent::from(catalog),
+            source: Box::new(e),
+        })?;
+
+        Ok(Arc::new(catalog_provider) as Arc<dyn RefreshableCatalogProvider>)
     }
 }
 
@@ -158,7 +205,8 @@ impl CatalogConnector for IcebergCatalog {
 /// Returns:
 /// ```rust
 /// (
-///   RestCatalogConfig { uri: "https://my.iceberg.com", props: {} },
+///   "https://my.iceberg.com",
+///   {},
 ///   Namespace { name: "spiceai_sandbox", properties: {} }
 /// )
 /// ```
@@ -170,11 +218,14 @@ impl CatalogConnector for IcebergCatalog {
 /// Returns:
 /// ```rust
 /// (
-///   RestCatalogConfig { uri: "https://my.iceberg.com", props: {"prefix": "my_prefix"} },
+///   "https://my.iceberg.com",
+///   {"prefix": "my_prefix"},
 ///   Namespace { name: "spiceai_sandbox", properties: {} }
 /// )
 /// ```
-pub fn parse_catalog_url(url: &str) -> Result<(RestCatalogConfig, Option<Namespace>)> {
+pub fn parse_catalog_url(
+    url: &str,
+) -> Result<(String, HashMap<String, String>, Option<Namespace>)> {
     // Parse the URL
     let parsed = Url::parse(url).context(UrlParseSnafu)?;
 
@@ -242,14 +293,8 @@ pub fn parse_catalog_url(url: &str) -> Result<(RestCatalogConfig, Option<Namespa
         props.insert("prefix".to_string(), prefix);
     }
 
-    // Return the RestCatalogConfig + Namespace
-    Ok((
-        RestCatalogConfig::builder()
-            .uri(base_uri)
-            .props(props)
-            .build(),
-        namespace,
-    ))
+    // Return the Base URI + Properties + Namespace
+    Ok((base_uri, props, namespace))
 }
 
 #[cfg(test)]
@@ -259,7 +304,10 @@ mod tests {
     #[test]
     fn test_parse_catalog_url_no_prefix() {
         let url = "https://my.iceberg.com/v1/namespaces/spiceai_sandbox";
-        let (_, namespace) = parse_catalog_url(url).expect("Failed to parse catalog URL");
+        let (base_uri, props, namespace) =
+            parse_catalog_url(url).expect("Failed to parse catalog URL");
+        assert_eq!(base_uri, "https://my.iceberg.com");
+        assert!(props.is_empty());
         assert_eq!(
             namespace
                 .clone()
@@ -278,7 +326,10 @@ mod tests {
     #[test]
     fn test_parse_catalog_url_with_prefix() {
         let url = "https://my.iceberg.com/v1/my_prefix/namespaces/spiceai_sandbox";
-        let (_, namespace) = parse_catalog_url(url).expect("Failed to parse catalog URL");
+        let (base_uri, props, namespace) =
+            parse_catalog_url(url).expect("Failed to parse catalog URL");
+        assert_eq!(base_uri, "https://my.iceberg.com");
+        assert_eq!(props.get("prefix"), Some(&"my_prefix".to_string()));
         assert_eq!(
             namespace
                 .clone()
@@ -320,6 +371,6 @@ mod tests {
         let url = "https://my.iceberg.com/v1/namespaces";
         let result = parse_catalog_url(url);
         assert!(result.is_ok());
-        assert!(result.expect("Failed to parse catalog URL").1.is_none());
+        assert!(result.expect("Failed to parse catalog URL").2.is_none());
     }
 }
