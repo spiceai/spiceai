@@ -368,23 +368,6 @@ fn get_clickbench_test_queries(engine: Option<&str>) -> Vec<(&'static str, &'sta
 
     if let Some("sqlite") = engine {
         queries.remove(28); // q29 includes regexp_replace which is not supported by sqlite
-
-        // SQLite does not support "to_timestamp"
-        // the underlying object store data source stores them as epoch integers
-        // which SQLite can convert with 'datetime()' and 'date()' but the functions are not supported by datafusion and aren't federated
-        // on data sources where the columns are already date/timestamp, the queries run successfully
-        queries.remove(6);
-        queries.remove(18);
-        queries.remove(23);
-        queries.remove(24);
-        queries.remove(26);
-        queries.remove(36);
-        queries.remove(37);
-        queries.remove(38);
-        queries.remove(39);
-        queries.remove(40);
-        queries.remove(41);
-        queries.remove(42);
     }
 
     queries

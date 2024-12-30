@@ -1,1 +1,1 @@
-SELECT "UserID", date_part('minute', datetime("EventTime", 'unixepoch')) AS m, "SearchPhrase", COUNT(*) FROM hits GROUP BY "UserID", m, "SearchPhrase" ORDER BY COUNT(*) DESC LIMIT 10;
+SELECT "UserID", date_part('minute', from_unixtime("EventTime")) AS m, "SearchPhrase", COUNT(*) FROM hits GROUP BY "UserID", m, "SearchPhrase" ORDER BY COUNT(*) DESC LIMIT 10;

@@ -12,7 +12,7 @@ All criteria must be met for the accelerator to be considered [RC](../definition
 | ----------- | ------------ | ------------ |
 | Arrow       | ✅           | @sgrebnov    |
 | DuckDB      | ✅           | @peasee      |
-| SQLite      | ❌           |              |
+| SQLite      | ✅           | @peasee      |
 | PostgreSQL  | ❌           |              |
 
 ## RC Release Criteria
