@@ -146,7 +146,7 @@ bollard = "0.18.1"
 flightrepl = { path = "../flightrepl" }
 hf-hub = { workspace = true }
 insta.workspace = true
-jsonpath-rust = "0.7.3"
+jsonpath-rust = "0.7.5"
 opentelemetry_sdk = { workspace = true, features = ["rt-tokio-current-thread"] }
 paste.workspace = true
 scopeguard = "1.2.0"
