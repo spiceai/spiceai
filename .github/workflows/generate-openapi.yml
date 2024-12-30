@@ -66,8 +66,8 @@ jobs:
       - name: Commit schema to `spiceai/docs` repository
         if: env.pr_created == 'true'
         run: |
-          git clone https://github.com/spiceai/docs.git spiceaidocs
-          cd spiceaidocs
+          git clone https://github.com/spiceai/docs.git spiceai-docs
+          cd spiceai-docs
           git config --global user.name 'Spice Schema Bot'
           git config --global user.email 'schema-bot@spice.ai'
           cp ../.schema/spicepod.schema.json spiceaidocs/public/openapi.json
