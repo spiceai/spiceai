@@ -15,9 +15,9 @@ limitations under the License.
 */
 
 use super::ConnectorComponent;
+use super::ConnectorParams;
 use super::DataConnector;
 use super::DataConnectorFactory;
-use super::DataConnectorParams;
 use super::ParameterSpec;
 use async_trait::async_trait;
 use data_components::snowflake::SnowflakeTableFactory;
@@ -78,7 +78,7 @@ const PARAMETERS: &[ParameterSpec] = &[
 impl DataConnectorFactory for SnowflakeFactory {
     fn create(
         &self,
-        params: DataConnectorParams,
+        params: ConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             let pool: Arc<

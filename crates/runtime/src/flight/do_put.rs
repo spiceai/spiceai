@@ -16,32 +16,27 @@ limitations under the License.
 
 use std::{collections::HashMap, sync::Arc};
 
-use arrow_flight::{flight_service_server::FlightService, FlightData, PutResult};
+use arrow::array::RecordBatch;
+use arrow_flight::{
+    flight_service_server::FlightService, utils::flight_data_to_arrow_batch, FlightData, PutResult,
+};
 use arrow_ipc::convert::try_schema_from_flatbuffer_bytes;
-use datafusion::sql::TableReference;
-use futures::stream;
-use tokio::sync::{broadcast::Sender, RwLock};
+use datafusion::{
+    error::DataFusionError, execution::SendableRecordBatchStream,
+    physical_plan::stream::RecordBatchStreamAdapter, sql::TableReference,
+};
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 
+use async_stream::stream;
+
 use crate::{
-    dataupdate::{DataUpdate, UpdateType},
+    dataupdate::{StreamingDataUpdate, UpdateType},
     timing::TimedStream,
 };
 
 use super::{metrics, Service};
-
-async fn get_sender_channel(
-    channel_map: Arc<RwLock<HashMap<TableReference, Arc<Sender<DataUpdate>>>>>,
-    path: &TableReference,
-) -> Option<Arc<Sender<DataUpdate>>> {
-    let channel_map_read = channel_map.read().await;
-    if channel_map_read.contains_key(path) {
-        let channel = channel_map_read.get(path)?;
-        Some(Arc::clone(channel))
-    } else {
-        None
-    }
-}
 
 pub(crate) async fn handle(
     flight_svc: &Service,
@@ -91,61 +86,77 @@ pub(crate) async fn handle(
         batches.push(first_batch);
     }
 
-    let channel_map = Arc::clone(&flight_svc.channel_map);
     let df = Arc::clone(&flight_svc.datafusion);
 
-    let response_stream = stream::unfold(streaming_flight, move |mut flight| {
-        let schema = Arc::clone(&schema);
-        let df = Arc::clone(&df);
-        let dictionaries_by_id = Arc::clone(&dictionaries_by_id);
+    let response_stream = stream! {
+        // channel to propogate new record batches to the data writing stream
+        let (batch_tx, batch_rx)= mpsc::channel::<Result<RecordBatch, DataFusionError>>(100);
+
+        let write_stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(Arc::clone(&schema), Box::new(ReceiverStream::new(batch_rx))));
+        let streaming_update = StreamingDataUpdate::new(write_stream, UpdateType::Append);
         let path = path.clone();
-        let channel_map = Arc::clone(&channel_map);
-        async move {
-            match flight.message().await {
-                Ok(Some(message)) => {
-                    let new_batch = match arrow_flight::utils::flight_data_to_arrow_batch(
-                        &message,
-                        Arc::clone(&schema),
-                        &dictionaries_by_id,
-                    ) {
-                        Ok(batches) => batches,
+        let mut write_future = Box::pin(df.write_streaming_data(&path, streaming_update));
+
+        loop {
+            tokio::select! {
+                // Poll the writing task to check if it has completed with an error while processing the data
+                write_result = &mut write_future => {
+                    match write_result {
+                        Ok(()) => unreachable!("Write operation should not complete successfully before the end of the stream"),
                         Err(e) => {
-                            tracing::error!("Failed to convert flight data to batches: {e}");
-                            return None;
+                            tracing::error!("Write operation failed: {e}");
+                            yield Err(Status::internal(format!("Write operation failed: {e}")));
+                            break;
                         }
-                    };
-                    tracing::trace!("Received batch with {} rows", new_batch.num_rows());
+                    }
+                },
+                message = streaming_flight.message() => {
+                    match message {
+                        Ok(Some(message)) => {
+                            let new_batch = match flight_data_to_arrow_batch(
+                                &message,
+                                Arc::clone(&schema),
+                                &dictionaries_by_id,
+                            ) {
+                                Ok(batches) => batches,
+                                Err(e) => {
+                                    tracing::error!("Failed to convert flight data to batches: {e}");
+                                    yield Err(Status::internal(format!("Failed to convert flight data to batches: {e}")));
+                                    break;
+                                }
+                            };
 
-                    let data_update = DataUpdate {
-                        data: vec![new_batch],
-                        schema: Arc::clone(&schema),
-                        update_type: UpdateType::Append,
-                    };
+                            tracing::trace!("Received batch with {} rows", new_batch.num_rows());
 
-                    if let Some(channel) = get_sender_channel(channel_map, &path).await {
-                        let _ = channel.send(data_update.clone());
-                    };
+                            if let Err(e) = batch_tx.send(Ok(new_batch)).await {
+                                tracing::error!("Error sending record batch to write channel: {e}");
+                                yield Err(Status::internal(format!("Error sending record batch to write channel: {e}")));
+                            }
+                            yield Ok(PutResult::default());
+                        }
+                        Ok(None) => {
+                            // End of the stream; signal that stream is completed and data write should be finalized
+                            drop(batch_tx);
 
-                    if let Err(e) = df.write_data(&path, data_update).await {
-                        return Some((
-                            Err(Status::internal(format!("Error writing data: {e}"))),
-                            flight,
-                        ));
-                    };
-
-                    Some((Ok(PutResult::default()), flight))
+                            // Wait for the write operation to complete
+                            if let Err(e) = write_future.await {
+                                tracing::error!("Write operation failed: {e}");
+                                yield Err(Status::internal(format!("Write operation failed: {e}")));
+                            }
+                            break;
+                        }
+                        Err(e) => {
+                            tracing::error!("Error reading message: {e}");
+                            yield Err(Status::internal(format!("Error reading message: {e}")));
+                            break;
+                        }
+                    }
                 }
-                Ok(None) => {
-                    // End of the stream
-                    None
-                }
-                Err(e) => Some((
-                    Err(Status::internal(format!("Error reading message: {e}"))),
-                    flight,
-                )),
             }
-        }
-    });
+        };
+
+        tracing::trace!("Finished writing data to path: {path}");
+    };
 
     let timed_stream = TimedStream::new(response_stream, move || start);
 

@@ -27,7 +27,7 @@ use super::{
     DataConnector, DataConnectorError, DataConnectorFactory, DataConnectorResult, ParameterSpec,
     Parameters,
 };
-use super::{ConnectorComponent, DataConnectorParams};
+use super::{ConnectorComponent, ConnectorParams};
 
 pub struct Https {
     params: Parameters,
@@ -82,7 +82,7 @@ const PARAMETERS: &[ParameterSpec] = &[
 impl DataConnectorFactory for HttpsFactory {
     fn create(
         &self,
-        params: DataConnectorParams,
+        params: ConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             Ok(Arc::new(Https {

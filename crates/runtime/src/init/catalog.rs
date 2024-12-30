@@ -17,10 +17,11 @@ limitations under the License.
 use std::sync::Arc;
 
 use crate::{
+    catalogconnector::{self, get_catalog_provider, CatalogConnector},
     component::catalog::Catalog,
-    dataconnector::{DataConnector, DataConnectorParamsBuilder},
-    metrics, status, warn_spaced, DataConnectorDoesntSupportCatalogsSnafu, LogErrors, Result,
-    Runtime, UnableToInitializeDataConnectorSnafu, UnableToLoadCatalogConnectorSnafu,
+    dataconnector::ConnectorParamsBuilder,
+    metrics, status, warn_spaced, LogErrors, Result, Runtime,
+    UnableToInitializeCatalogConnectorSnafu, UnableToLoadCatalogConnectorSnafu,
 };
 use app::App;
 use futures::future::join_all;
@@ -76,32 +77,30 @@ impl Runtime {
         .await;
     }
 
-    async fn load_catalog_connector(&self, catalog: &Catalog) -> Result<Arc<dyn DataConnector>> {
+    async fn load_catalog_connector(&self, catalog: &Catalog) -> Result<Arc<dyn CatalogConnector>> {
         let spaced_tracer = Arc::clone(&self.spaced_tracer);
         let catalog = catalog.clone();
 
         let source = catalog.provider.clone();
-        let params = DataConnectorParamsBuilder::new(source.clone().into(), (&catalog).into())
-            .with_runtime(self)
+        let params = ConnectorParamsBuilder::new(source.clone().into(), (&catalog).into())
+            .build(self.secrets())
             .await
-            .context(UnableToInitializeDataConnectorSnafu)?;
+            .context(UnableToInitializeCatalogConnectorSnafu)?;
 
-        let data_connector: Arc<dyn DataConnector> = match self
-            .get_dataconnector_from_source(&source, params)
-            .await
-        {
-            Ok(data_connector) => data_connector,
-            Err(err) => {
-                let catalog_name = &catalog.name;
-                self.status
-                    .update_catalog(catalog_name, status::ComponentStatus::Error);
-                metrics::catalogs::LOAD_ERROR.add(1, &[]);
-                warn_spaced!(spaced_tracer, "{} {err}", catalog_name);
-                return Err(crate::Error::UnableToInitializeDataConnector { source: err.into() });
-            }
+        let Some(catalog_connector) = catalogconnector::create_new_connector(&source, params).await
+        else {
+            let catalog_name = &catalog.name;
+            self.status
+                .update_catalog(catalog_name, status::ComponentStatus::Error);
+            metrics::catalogs::LOAD_ERROR.add(1, &[]);
+            let err = crate::Error::UnknownCatalogConnector {
+                catalog_connector: source,
+            };
+            warn_spaced!(spaced_tracer, "{} {err}", catalog_name);
+            return Err(err);
         };
 
-        Ok(data_connector)
+        Ok(catalog_connector)
     }
 
     fn catalogs_iter<'a>(app: &Arc<App>) -> impl Iterator<Item = Result<Catalog>> + 'a {
@@ -128,21 +127,17 @@ impl Runtime {
     async fn register_catalog(
         &self,
         catalog: &Catalog,
-        data_connector: Arc<dyn DataConnector>,
+        catalog_connector: Arc<dyn CatalogConnector>,
     ) -> Result<()> {
         tracing::info!(
             "Registering catalog '{}' for {}",
             &catalog.name,
             &catalog.provider
         );
-        let catalog_provider = data_connector
-            .catalog_provider(self, catalog)
+        let catalog_provider = get_catalog_provider(catalog_connector, self, catalog, None)
             .await
-            .context(DataConnectorDoesntSupportCatalogsSnafu {
-                dataconnector: catalog.provider.clone(),
-            })?
             .boxed()
-            .context(UnableToInitializeDataConnectorSnafu)?;
+            .context(UnableToInitializeCatalogConnectorSnafu)?;
         let num_schemas = catalog_provider
             .schema_names()
             .iter()

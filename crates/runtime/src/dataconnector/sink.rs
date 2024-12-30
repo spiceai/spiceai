@@ -35,7 +35,7 @@ use datafusion::{
 };
 use futures::Future;
 
-use super::{DataConnector, DataConnectorFactory, DataConnectorParams, ParameterSpec};
+use super::{ConnectorParams, DataConnector, DataConnectorFactory, ParameterSpec};
 
 /// A no-op connector that allows for Spice to act as a "sink" for data.
 ///
@@ -87,7 +87,7 @@ impl SinkConnectorFactory {
 impl DataConnectorFactory for SinkConnectorFactory {
     fn create(
         &self,
-        _params: DataConnectorParams,
+        _params: ConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             let schema = Schema::new(vec![Field::new("placeholder", DataType::Utf8, false)]);

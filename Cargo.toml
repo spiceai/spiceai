@@ -82,6 +82,8 @@ graphql-parser = "0.4.0"
 hf-hub = { version = "0.3.0", features = ["tokio"] }
 http = "1.1.0"
 iceberg = "0.4.0"
+iceberg-datafusion = "0.4.0"
+iceberg-catalog-rest = "0.4.0"
 insta = { version = "1.41.1", features = ["filters"] }
 itertools = "0.13"
 lazy_static = "1.5.0"
@@ -148,10 +150,10 @@ x509-certificate = "0.23.1"
 
 
 [patch.crates-io]
-datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "6c8a1e46b1c0b3cbafac79167917dc17df97eae3" }
-datafusion-common = { git = "https://github.com/spiceai/datafusion.git", rev = "6c8a1e46b1c0b3cbafac79167917dc17df97eae3" }
-datafusion-execution = { git = "https://github.com/spiceai/datafusion.git", rev = "6c8a1e46b1c0b3cbafac79167917dc17df97eae3" }
-datafusion-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "6c8a1e46b1c0b3cbafac79167917dc17df97eae3" }
+datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "ffc3ca6bef06a97dbe5c4da1e507ce224511998d" }
+datafusion-common = { git = "https://github.com/spiceai/datafusion.git", rev = "ffc3ca6bef06a97dbe5c4da1e507ce224511998d" }
+datafusion-execution = { git = "https://github.com/spiceai/datafusion.git", rev = "ffc3ca6bef06a97dbe5c4da1e507ce224511998d" }
+datafusion-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "ffc3ca6bef06a97dbe5c4da1e507ce224511998d" }
 
 
 object_store = { git = "https://github.com/spiceai/arrow-rs.git", rev = "cee50b7d2ccf749eac89d0fe26fbd8a06c0bb3c4" }

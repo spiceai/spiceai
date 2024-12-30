@@ -15,9 +15,9 @@ limitations under the License.
 */
 
 use super::ConnectorComponent;
+use super::ConnectorParams;
 use super::DataConnector;
 use super::DataConnectorFactory;
-use super::DataConnectorParams;
 use super::ParameterSpec;
 use crate::component::dataset::Dataset;
 use crate::dataconnector::DataConnectorError;
@@ -108,7 +108,7 @@ const PARAMETERS: &[ParameterSpec] = &[
 impl DataConnectorFactory for DremioFactory {
     fn create(
         &self,
-        params: DataConnectorParams,
+        params: ConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             let endpoint: Arc<str> = params

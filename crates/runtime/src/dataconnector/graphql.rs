@@ -27,8 +27,8 @@ use std::{any::Any, future::Future, pin::Pin, sync::Arc};
 use url::Url;
 
 use super::{
-    ConnectorComponent, DataConnector, DataConnectorError, DataConnectorFactory,
-    DataConnectorParams, InvalidConfigurationSnafu, ParameterSpec, Parameters,
+    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
+    InvalidConfigurationSnafu, ParameterSpec, Parameters,
 };
 
 pub struct GraphQL {
@@ -75,7 +75,7 @@ const PARAMETERS: &[ParameterSpec] = &[
 impl DataConnectorFactory for GraphQLFactory {
     fn create(
         &self,
-        params: DataConnectorParams,
+        params: ConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             let graphql = GraphQL {

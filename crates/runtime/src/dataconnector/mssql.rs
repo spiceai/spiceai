@@ -28,8 +28,8 @@ use std::{any::Any, future::Future};
 use tiberius::{Config, EncryptionLevel};
 
 use super::{
-    ConnectorComponent, DataConnector, DataConnectorFactory, DataConnectorParams,
-    DataConnectorResult, ParameterSpec, Parameters, UnableToGetReadProviderSnafu,
+    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorFactory, DataConnectorResult,
+    ParameterSpec, Parameters, UnableToGetReadProviderSnafu,
 };
 
 #[derive(Debug, Snafu)]
@@ -167,7 +167,7 @@ impl SqlServerFactory {
 impl DataConnectorFactory for SqlServerFactory {
     fn create(
         &self,
-        params: DataConnectorParams,
+        params: ConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             Ok(Arc::new(SqlServer::new(&params.parameters).await?) as Arc<dyn DataConnector>)

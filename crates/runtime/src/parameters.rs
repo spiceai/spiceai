@@ -199,6 +199,11 @@ impl Parameters {
             self.params.push((key, value));
         }
     }
+
+    /// Returns an iterator over the parameter key-value pairs
+    pub fn iter(&self) -> std::slice::Iter<'_, (String, SecretString)> {
+        self.params.iter()
+    }
 }
 
 #[derive(Clone)]
@@ -206,6 +211,15 @@ pub struct Parameters {
     params: Vec<(String, SecretString)>,
     prefix: &'static str,
     all_params: &'static [ParameterSpec],
+}
+
+impl<'a> IntoIterator for &'a Parameters {
+    type Item = &'a (String, SecretString);
+    type IntoIter = std::slice::Iter<'a, (String, SecretString)>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.params.iter()
+    }
 }
 
 #[derive(Debug, Clone)]

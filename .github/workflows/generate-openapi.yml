@@ -42,13 +42,13 @@ jobs:
           path: .schema/openapi.json
 
       - name: Create PR
-        if: github.event_name == 'workflow_dispatch'
         run: |
           git config --global user.name 'Spice Schema Bot'
           git config --global user.email 'schema-bot@spice.ai'
           git checkout -b openapi/${GITHUB_RUN_ID}
-          # Check for changes
-          if [[ $(git diff --exit-code .schema/openapi.json) ]]; then
+          if git diff --exit-code -- .schema/openapi.json; then
+            echo "No changes detected"
+          else
             git add .schema/openapi.json
             git commit -m "Update openapi.json"
             git push origin openapi/${GITHUB_RUN_ID}
@@ -57,7 +57,6 @@ jobs:
               --body "Updated OpenAPI specification using new spiceschema tool" \
               --base trunk \
               --head openapi/${GITHUB_RUN_ID}
-          else
-            echo "No changes detected"
+          fi
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

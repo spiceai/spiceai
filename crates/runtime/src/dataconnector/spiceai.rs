@@ -15,10 +15,10 @@ limitations under the License.
 */
 
 use super::ConnectorComponent;
+use super::ConnectorParams;
 use super::DataConnector;
 use super::DataConnectorError;
 use super::DataConnectorFactory;
-use super::DataConnectorParams;
 use super::ParameterSpec;
 use crate::component::catalog::Catalog;
 use crate::component::dataset::Dataset;
@@ -129,7 +129,7 @@ const HEADER_APP: &str = "spiceai-app";
 impl DataConnectorFactory for SpiceAIFactory {
     fn create(
         &self,
-        params: DataConnectorParams,
+        params: ConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         let default_flight_url: Arc<str> = if cfg!(feature = "dev") {
             "https://dev-flight.spiceai.io".into()

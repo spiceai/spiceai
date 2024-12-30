@@ -588,6 +588,56 @@ impl DataFusion {
         Ok(())
     }
 
+    pub async fn write_streaming_data(
+        &self,
+        table_reference: &TableReference,
+        streaming_update: StreamingDataUpdate,
+    ) -> Result<()> {
+        if !self.is_writable(table_reference) {
+            TableNotWritableSnafu {
+                table_name: table_reference.to_string(),
+            }
+            .fail()?;
+        }
+
+        let update_schema = streaming_update.data.schema();
+
+        self.ensure_sink_dataset(table_reference.clone(), Arc::clone(&update_schema))
+            .await?;
+
+        let table_provider = self.get_table_provider(table_reference).await?;
+
+        verify_schema(table_provider.schema().fields(), update_schema.fields())
+            .context(SchemaMismatchSnafu)?;
+
+        let overwrite = match streaming_update.update_type {
+            UpdateType::Overwrite => InsertOp::Overwrite,
+            UpdateType::Append => InsertOp::Append,
+            UpdateType::Changes => InsertOp::Replace,
+        };
+
+        let insert_plan = table_provider
+            .insert_into(
+                &self.ctx.state(),
+                Arc::new(StreamingDataUpdateExecutionPlan::new(streaming_update.data)),
+                overwrite,
+            )
+            .await
+            .map_err(find_datafusion_root)
+            .context(UnableToPlanTableInsertSnafu {
+                table_name: table_reference.to_string(),
+            })?;
+
+        let _ = collect(insert_plan, self.ctx.task_ctx())
+            .await
+            .map_err(find_datafusion_root)
+            .context(UnableToExecuteTableInsertSnafu {
+                table_name: table_reference.to_string(),
+            })?;
+
+        Ok(())
+    }
+
     pub async fn get_arrow_schema(&self, dataset: &str) -> Result<Schema> {
         let data_frame = self
             .ctx

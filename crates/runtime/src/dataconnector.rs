@@ -15,11 +15,13 @@ limitations under the License.
 */
 
 use crate::accelerated_table::AcceleratedTable;
+use crate::catalogconnector::CATALOG_CONNECTOR_FACTORY_REGISTRY;
 use crate::component::catalog::Catalog;
 use crate::component::dataset::acceleration::RefreshMode;
 use crate::component::dataset::Dataset;
 use crate::datafusion::error::find_datafusion_root;
 use crate::federated_table::FederatedTable;
+use crate::get_params_with_secrets;
 use crate::parameters::ParameterSpec;
 use crate::parameters::Parameters;
 use crate::secrets::Secrets;
@@ -36,7 +38,6 @@ use datafusion::logical_expr::{Expr, LogicalPlanBuilder};
 use datafusion::sql::unparser::Unparser;
 use datafusion::sql::TableReference;
 use datafusion_table_providers::InvalidTypeAction;
-use secrecy::SecretString;
 use snafu::prelude::*;
 use std::any::Any;
 use std::collections::HashMap;
@@ -93,8 +94,6 @@ pub mod snowflake;
 #[cfg(feature = "spark")]
 pub mod spark;
 pub mod spiceai;
-#[cfg(feature = "delta_lake")]
-pub mod unity_catalog;
 
 #[derive(Debug, Snafu)]
 pub enum DataConnectorError {
@@ -267,7 +266,7 @@ pub async fn register_connector_factory(
 /// `None` if the connector for `name` is not registered, otherwise a `Result` containing the result of calling the constructor to create a `DataConnector`.
 pub async fn create_new_connector(
     name: &str,
-    params: DataConnectorParams,
+    params: ConnectorParams,
 ) -> Option<AnyErrorResult<Arc<dyn DataConnector>>> {
     let guard = DATA_CONNECTOR_FACTORY_REGISTRY.lock().await;
 
@@ -330,19 +329,13 @@ pub async fn register_all() {
     register_connector_factory("snowflake", snowflake::SnowflakeFactory::new_arc()).await;
     #[cfg(feature = "debezium")]
     register_connector_factory("debezium", debezium::DebeziumFactory::new_arc()).await;
-    #[cfg(feature = "delta_lake")]
-    register_connector_factory(
-        "unity_catalog",
-        unity_catalog::UnityCatalogFactory::new_arc(),
-    )
-    .await;
     register_connector_factory("localpod", localpod::LocalPodFactory::new_arc()).await;
 }
 
 pub trait DataConnectorFactory: Send + Sync {
     fn create(
         &self,
-        params: DataConnectorParams,
+        params: ConnectorParams,
     ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>>;
 
     fn supports_invalid_type_action(&self) -> bool {
@@ -505,19 +498,18 @@ impl std::fmt::Display for ConnectorComponent {
     }
 }
 
-pub struct DataConnectorParams {
+pub struct ConnectorParams {
     pub(crate) parameters: Parameters,
-    pub(crate) metadata: HashMap<String, String>,
     pub(crate) invalid_type_action: Option<InvalidTypeAction>,
     pub(crate) component: ConnectorComponent,
 }
 
-pub struct DataConnectorParamsBuilder {
+pub struct ConnectorParamsBuilder {
     connector: Arc<str>,
     component: ConnectorComponent,
 }
 
-impl DataConnectorParamsBuilder {
+impl ConnectorParamsBuilder {
     #[must_use]
     pub fn new(connector: Arc<str>, component: ConnectorComponent) -> Self {
         Self {
@@ -526,67 +518,62 @@ impl DataConnectorParamsBuilder {
         }
     }
 
-    pub async fn with_runtime(
+    pub async fn build(
         &self,
-        runtime: &Runtime,
-    ) -> Result<DataConnectorParams, Box<dyn std::error::Error + Send + Sync>> {
-        match &self.component {
+        secrets: Arc<RwLock<Secrets>>,
+    ) -> Result<ConnectorParams, Box<dyn std::error::Error + Send + Sync>> {
+        let name = self.connector.to_string();
+        let (params, prefix, parameters) = match &self.component {
             ConnectorComponent::Catalog(catalog) => {
-                let secrets = runtime.secrets();
-                let params = runtime.get_params_with_secrets(&catalog.params).await;
-                let params = self.without_runtime(params, secrets).await?;
+                let guard = CATALOG_CONNECTOR_FACTORY_REGISTRY.lock().await;
+                let connector_factory = guard.get(&name);
 
-                Ok(params)
+                let factory =
+                    connector_factory.ok_or_else(|| DataConnectorError::InvalidConnectorType {
+                        dataconnector: name.clone(),
+                        connector_component: self.component.clone(),
+                    })?;
+
+                (
+                    get_params_with_secrets(Arc::clone(&secrets), &catalog.params).await,
+                    factory.prefix(),
+                    factory.parameters(),
+                )
             }
             ConnectorComponent::Dataset(dataset) => {
-                let secrets = runtime.secrets();
-                let params = runtime.get_params_with_secrets(&dataset.params).await;
-                let mut params = self.without_runtime(params, secrets).await?;
-                params.metadata.clone_from(&dataset.metadata);
-                params.invalid_type_action = dataset.invalid_type_action.map(Into::into);
+                let guard = DATA_CONNECTOR_FACTORY_REGISTRY.lock().await;
+                let connector_factory = guard.get(&name);
 
-                Ok(params)
+                let factory = connector_factory.ok_or_else(|| {
+                    if name == ODBC_DATACONNECTOR {
+                        DataConnectorError::OdbcNotInstalled {
+                            connector_component: self.component.clone(),
+                        }
+                    } else {
+                        DataConnectorError::InvalidConnectorType {
+                            dataconnector: name.clone(),
+                            connector_component: self.component.clone(),
+                        }
+                    }
+                })?;
+
+                let params = get_params_with_secrets(Arc::clone(&secrets), &dataset.params).await;
+
+                (params, factory.prefix(), factory.parameters())
             }
-        }
-    }
-
-    pub async fn without_runtime(
-        &self,
-        params: HashMap<String, SecretString>,
-        secrets: Arc<RwLock<Secrets>>,
-    ) -> Result<DataConnectorParams, Box<dyn std::error::Error + Send + Sync>> {
-        let name = self.connector.to_string();
-        let guard = DATA_CONNECTOR_FACTORY_REGISTRY.lock().await;
-
-        let connector_factory = guard.get(&name);
-
-        let factory = connector_factory.ok_or_else(|| {
-            if name == ODBC_DATACONNECTOR {
-                DataConnectorError::OdbcNotInstalled {
-                    connector_component: self.component.clone(),
-                }
-            } else {
-                DataConnectorError::InvalidConnectorType {
-                    dataconnector: name.clone(),
-                    connector_component: self.component.clone(),
-                }
-            }
-        });
-
-        let factory = factory?;
+        };
 
         let parameters = Parameters::try_new(
             &format!("connector {name}"),
             params.into_iter().collect(),
-            factory.prefix(),
+            prefix,
             secrets,
-            factory.parameters(),
+            parameters,
         )
         .await?;
 
-        Ok(DataConnectorParams {
+        Ok(ConnectorParams {
             parameters,
-            metadata: HashMap::new(),
             invalid_type_action: None,
             component: self.component.clone(),
         })

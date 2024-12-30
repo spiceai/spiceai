@@ -173,6 +173,9 @@ jobs:
           - cmd: '-c spice.ai'
             name: 'spice.ai connector'
             bench: 'tpch'
+          - cmd: '-c spice.ai -b tpcds'
+            name: 'spice.ai connector'
+            bench: 'tpcds'
           - cmd: '-c s3'
             name: 's3 connector'
             bench: 'tpch'
@@ -330,7 +333,7 @@ jobs:
         run: |
           sudo wget https://dl.min.io/client/mc/release/linux-amd64/mc -O /usr/local/bin/mc
           sudo chmod +x /usr/local/bin/mc
-          mc alias set spice-bench-minio ${{ secrets.CLICKBENCH_S3_ENDPOINT }} ${{ secrets.CLICKBENCH_S3_KEY }} ${{ secrets.CLICKBENCH_S3_SECRET }} 
+          mc alias set spice-bench-minio ${{ secrets.CLICKBENCH_S3_ENDPOINT }} ${{ secrets.CLICKBENCH_S3_KEY }} ${{ secrets.CLICKBENCH_S3_SECRET }}
           mc cp spice-bench-minio/benchmarks/duckdb/tpch.db ./
 
       - name: Download DuckDB Connector Data
@@ -338,7 +341,7 @@ jobs:
         run: |
           sudo wget https://dl.min.io/client/mc/release/linux-amd64/mc -O /usr/local/bin/mc
           sudo chmod +x /usr/local/bin/mc
-          mc alias set spice-bench-minio ${{ secrets.CLICKBENCH_S3_ENDPOINT }} ${{ secrets.CLICKBENCH_S3_KEY }} ${{ secrets.CLICKBENCH_S3_SECRET }} 
+          mc alias set spice-bench-minio ${{ secrets.CLICKBENCH_S3_ENDPOINT }} ${{ secrets.CLICKBENCH_S3_KEY }} ${{ secrets.CLICKBENCH_S3_SECRET }}
           mc cp spice-bench-minio/benchmarks/duckdb/tpcds.db ./
 
       - name: Download File Connector TPCH Data
@@ -346,7 +349,7 @@ jobs:
         run: |
           sudo wget https://dl.min.io/client/mc/release/linux-amd64/mc -O /usr/local/bin/mc
           sudo chmod +x /usr/local/bin/mc
-          mc alias set spice-bench-minio ${{ secrets.CLICKBENCH_S3_ENDPOINT }} ${{ secrets.CLICKBENCH_S3_KEY }} ${{ secrets.CLICKBENCH_S3_SECRET }} 
+          mc alias set spice-bench-minio ${{ secrets.CLICKBENCH_S3_ENDPOINT }} ${{ secrets.CLICKBENCH_S3_KEY }} ${{ secrets.CLICKBENCH_S3_SECRET }}
           mc cp spice-bench-minio/benchmarks/tpch_sf1/customer/ ./ --recursive
           mc cp spice-bench-minio/benchmarks/tpch_sf1/lineitem/ ./ --recursive
           mc cp spice-bench-minio/benchmarks/tpch_sf1/nation/ ./ --recursive
@@ -361,7 +364,7 @@ jobs:
         run: |
           sudo wget https://dl.min.io/client/mc/release/linux-amd64/mc -O /usr/local/bin/mc
           sudo chmod +x /usr/local/bin/mc
-          mc alias set spice-bench-minio ${{ secrets.CLICKBENCH_S3_ENDPOINT }} ${{ secrets.CLICKBENCH_S3_KEY }} ${{ secrets.CLICKBENCH_S3_SECRET }} 
+          mc alias set spice-bench-minio ${{ secrets.CLICKBENCH_S3_ENDPOINT }} ${{ secrets.CLICKBENCH_S3_KEY }} ${{ secrets.CLICKBENCH_S3_SECRET }}
           mc cp spice-bench-minio/benchmarks/tpcds_sf1/call_center/ ./ --recursive
           mc cp spice-bench-minio/benchmarks/tpcds_sf1/catalog_page/ ./ --recursive
           mc cp spice-bench-minio/benchmarks/tpcds_sf1/catalog_returns/ ./ --recursive

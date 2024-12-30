@@ -28,7 +28,7 @@ use namespace::{Namespace, NamespacePath};
 use serde::{self, Deserialize, Serialize};
 
 mod error;
-mod namespace;
+pub mod namespace;
 pub mod tables;
 
 /// Get Iceberg API config

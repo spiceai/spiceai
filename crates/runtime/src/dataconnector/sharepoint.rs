@@ -27,8 +27,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use super::{
-    ConnectorComponent, DataConnector, DataConnectorFactory, DataConnectorParams,
-    DataConnectorResult, ParameterSpec, Parameters, UnableToGetReadProviderSnafu,
+    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorFactory, DataConnectorResult,
+    ParameterSpec, Parameters, UnableToGetReadProviderSnafu,
 };
 
 #[derive(Debug, Snafu)]
@@ -130,7 +130,7 @@ const PARAMETERS: &[ParameterSpec] = &[
 impl DataConnectorFactory for SharepointFactory {
     fn create(
         &self,
-        params: DataConnectorParams,
+        params: ConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             Ok(Arc::new(Sharepoint::new(&params.parameters)?) as Arc<dyn DataConnector>)

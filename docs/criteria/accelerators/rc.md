@@ -6,13 +6,11 @@ All criteria must be met for the accelerator to be considered [RC](../definition
 
 ## RC Quality Accelerators
 
-| Accelerator | RC Quality | DRI Sign-off |
-| - | - | - |
-| Accelerator | Beta Quality | DRI Sign-off |
+| Accelerator | RC   Quality | DRI Sign-off |
 | ----------- | ------------ | ------------ |
 | Arrow       | ✅           | @sgrebnov    |
 | DuckDB      | ✅           | @peasee      |
-| SQLite      | ❌           |              |
+| SQLite      | ✅           | @peasee      |
 | PostgreSQL  | ❌           |              |
 
 ## RC Release Criteria
