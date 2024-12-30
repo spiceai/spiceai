@@ -90,8 +90,8 @@ pub(crate) const PARAMETERS: &[ParameterSpec] = &[
             "The scope to use for OAuth2 token endpoint (default: catalog).",
         )
         .default("catalog"),
-    ParameterSpec::connector("oauth2_server_uri")
-        .description("The URL to use for OAuth2 server tokens endpoint (default: catalog base URI + 'v1/oauth/tokens')."),
+    ParameterSpec::connector("oauth2_server_url")
+        .description("URL of the OAuth2 server tokens endpoint."),
     // S3 storage options
     ParameterSpec::connector("s3_endpoint")
         .description(
@@ -123,6 +123,10 @@ pub(crate) const PARAMETERS: &[ParameterSpec] = &[
 /// Maps a Spice parameter name to an Iceberg property name.
 fn map_param_name_to_iceberg_prop(param_name: &str) -> Option<String> {
     match param_name {
+        "token" => Some("token".to_string()),
+        "oauth2_credential" => Some("credential".to_string()),
+        "oauth2_server_url" => Some("oauth2-server-uri".to_string()),
+        "oauth2_scope" => Some("scope".to_string()),
         "s3_endpoint" => Some("s3.endpoint".to_string()),
         "s3_access_key_id" => Some("s3.access-key-id".to_string()),
         "s3_secret_access_key" => Some("s3.secret-access-key".to_string()),
