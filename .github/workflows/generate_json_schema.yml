@@ -60,9 +60,10 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Commit schema to `spiceai/docs` repository
-        run: |
-          git clone https://github.com/spiceai/docs.git
-          cd docs
+        run: |  
+          mkdir -p spiceaidocs
+          git clone https://github.com/spiceai/docs.git spiceaidocs
+          cd spiceaidocs
           git config --global user.name 'Spice Schema Bot'
           git config --global user.email 'schema-bot@spice.ai'
           cp ../.schema/spicepod.schema.json spiceaidocs/public/openapi.json
