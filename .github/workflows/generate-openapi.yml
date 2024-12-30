@@ -48,7 +48,9 @@ jobs:
           git checkout -b openapi/${GITHUB_RUN_ID}
           if git diff --exit-code -- .schema/openapi.json; then
             echo "No changes detected"
+            echo "pr_created=false" >> $GITHUB_ENV
           else
+            echo "pr_created=true" >> $GITHUB_ENV
             git add .schema/openapi.json
             git commit -m "Update openapi.json"
             git push origin openapi/${GITHUB_RUN_ID}
@@ -58,5 +60,24 @@ jobs:
               --base trunk \
               --head openapi/${GITHUB_RUN_ID}
           fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Commit schema to `spiceai/docs` repository
+        if: env.pr_created == 'true'
+        run: |
+          git clone https://github.com/spiceai/docs.git spiceaidocs
+          cd spiceaidocs
+          git config --global user.name 'Spice Schema Bot'
+          git config --global user.email 'schema-bot@spice.ai'
+          cp ../.schema/spicepod.schema.json spiceaidocs/public/openapi.json
+          git checkout -b openapi/${GITHUB_RUN_ID}
+          git add spiceaidocs/public/openapi.json
+          git commit -m "Update openapi.json with the latest spicepod.schema.json"
+          git push origin update-schema-${GITHUB_RUN_ID}
+          gh pr create --repo spiceai/docs \
+            --title "Update openapi.json" \
+            --body "This PR updates openapi.json with the latest spicepod.schema.json." \
+            --base trunk --head update-schema-${GITHUB_RUN_ID}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

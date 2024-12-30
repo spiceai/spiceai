@@ -58,22 +58,3 @@ jobs:
           fi
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Commit schema to `spiceai/docs` repository
-        run: |  
-          mkdir -p spiceaidocs
-          git clone https://github.com/spiceai/docs.git spiceaidocs
-          cd spiceaidocs
-          git config --global user.name 'Spice Schema Bot'
-          git config --global user.email 'schema-bot@spice.ai'
-          cp ../.schema/spicepod.schema.json spiceaidocs/public/openapi.json
-          git checkout -b update-schema-${GITHUB_RUN_ID}
-          git add spiceaidocs/public/openapi.json
-          git commit -m "Update openapi.json with the latest spicepod.schema.json"
-          git push origin update-schema-${GITHUB_RUN_ID}
-          gh pr create --repo spiceai/docs \
-            --title "Update openapi.json" \
-            --body "This PR updates openapi.json with the latest spicepod.schema.json." \
-            --base trunk --head update-schema-${GITHUB_RUN_ID}
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
