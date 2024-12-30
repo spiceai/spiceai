@@ -69,6 +69,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[cfg(feature = "databricks")]
 pub mod databricks;
+pub mod iceberg;
 #[cfg(feature = "delta_lake")]
 pub mod unity_catalog;
 
@@ -114,6 +115,15 @@ pub async fn register_all() {
             databricks::Databricks::new_connector,
             "databricks",
             databricks::PARAMETERS,
+        ),
+    );
+
+    registry.insert(
+        "iceberg".to_string(),
+        CatalogConnectorFactory::new(
+            iceberg::IcebergCatalog::new_connector,
+            "iceberg",
+            iceberg::PARAMETERS,
         ),
     );
 }
