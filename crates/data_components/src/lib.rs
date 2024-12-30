@@ -68,6 +68,7 @@ pub mod delete;
 pub mod graphql;
 pub mod object;
 pub mod poly;
+pub mod table_reference;
 pub mod token_provider;
 
 #[async_trait]

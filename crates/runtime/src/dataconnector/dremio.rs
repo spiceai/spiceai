@@ -23,6 +23,7 @@ use crate::component::dataset::Dataset;
 use crate::dataconnector::DataConnectorError;
 use async_trait::async_trait;
 use data_components::flight::FlightFactory;
+use data_components::table_reference::parse_multi_part_table_reference;
 use data_components::Read;
 use data_components::ReadWrite;
 use datafusion::datasource::TableProvider;
@@ -168,13 +169,8 @@ impl DataConnector for Dremio {
         &self,
         dataset: &Dataset,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
-        match Read::table_provider(
-            &self.flight_factory,
-            dataset.path().into(),
-            dataset.schema(),
-        )
-        .await
-        {
+        let table_reference = parse_multi_part_table_reference(dataset.path());
+        match Read::table_provider(&self.flight_factory, table_reference, dataset.schema()).await {
             Ok(provider) => Ok(provider),
             Err(e) => {
                 if let Some(data_components::flight::Error::UnableToGetSchema {

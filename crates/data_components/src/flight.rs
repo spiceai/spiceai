@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::{Read, ReadWrite};
+use crate::{table_reference::MultiPartTableReference, Read, ReadWrite};
 use arrow::{array::RecordBatch, datatypes::SchemaRef};
 use arrow_flight::error::FlightError;
 use async_stream::stream;
@@ -156,7 +156,7 @@ pub struct FlightTable {
     client: FlightClient,
     schema: SchemaRef,
     dialect: Arc<dyn Dialect>,
-    table_reference: TableReference,
+    table_reference: MultiPartTableReference,
 }
 
 impl std::fmt::Debug for FlightTable {
@@ -176,13 +176,16 @@ impl FlightTable {
     pub async fn create(
         name: &'static str,
         client: FlightClient,
-        table_reference: impl Into<TableReference>,
+        table_reference: impl Into<MultiPartTableReference>,
         dialect: Arc<dyn Dialect>,
     ) -> Result<Self> {
         let table_reference = table_reference.into();
         let schema = Self::get_query_schema(
             client.clone(),
-            &format!("SELECT * FROM {}", table_reference.to_quoted_string()),
+            &format!(
+                "SELECT * FROM {} LIMIT 0",
+                table_reference.to_quoted_string()
+            ),
         )
         .await?;
         Ok(Self {
@@ -202,11 +205,12 @@ impl FlightTable {
     pub fn create_with_schema(
         name: &'static str,
         client: FlightClient,
-        table_reference: impl Into<TableReference>,
+        table_reference: impl Into<MultiPartTableReference>,
         schema: SchemaRef,
         dialect: Arc<dyn Dialect>,
     ) -> Self {
         let table_reference = table_reference.into();
+        tracing::debug!("table_reference={:?}", table_reference);
         Self {
             name,
             client: client.clone(),
@@ -223,19 +227,25 @@ impl FlightTable {
 
     async fn get_schema(
         client: FlightClient,
-        table_reference: &TableReference,
+        table_reference: impl Into<MultiPartTableReference>,
     ) -> Result<SchemaRef> {
-        let table_paths = match table_reference {
-            TableReference::Bare { table } => vec![table.to_string()],
-            TableReference::Partial { schema, table } => {
-                vec![schema.to_string(), table.to_string()]
-            }
-            TableReference::Full {
-                catalog,
-                schema,
-                table,
-            } => {
-                vec![catalog.to_string(), schema.to_string(), table.to_string()]
+        let table_reference = table_reference.into();
+        let table_paths = match &table_reference {
+            MultiPartTableReference::TableReference(table_reference) => match table_reference {
+                TableReference::Bare { table } => vec![table.to_string()],
+                TableReference::Partial { schema, table } => {
+                    vec![schema.to_string(), table.to_string()]
+                }
+                TableReference::Full {
+                    catalog,
+                    schema,
+                    table,
+                } => {
+                    vec![catalog.to_string(), schema.to_string(), table.to_string()]
+                }
+            },
+            MultiPartTableReference::Multi(parts) => {
+                parts.iter().map(ToString::to_string).collect::<Vec<_>>()
             }
         };
 
@@ -265,10 +275,19 @@ impl FlightTable {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        let table_reference = match &self.table_reference {
+            MultiPartTableReference::TableReference(table_reference) => table_reference.clone(),
+            MultiPartTableReference::Multi(_) => {
+                // This should never happen - it means that we're not federating correctly
+                return Err(DataFusionError::External(
+                    "MultiPartTableReference cannot be converted to TableReference".into(),
+                ));
+            }
+        };
         Ok(Arc::new(FlightExec::new(
             projections,
             schema,
-            &self.table_reference,
+            &table_reference,
             self.client.clone(),
             filters,
             limit,
