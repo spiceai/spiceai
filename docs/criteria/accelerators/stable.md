@@ -66,6 +66,11 @@ Indexes are not required for test coverage, but can be introduced if required fo
   - The test validates that for queries that would return results from the source that are excluded in the accelerator, that they correctly return results through the use of `on_zero_results`.
   - A connector that is currently Release Candidate quality or higher must be used as the acceleration source, to reduce the impact of connector-related issues.
 
+### AI Workloads Support
+
+- [ ] Accelerator supports accelerating datasets with embeddings (including chunking)
+- [ ] Accelerator supports vector-similarity search. Search benchmark includes corresponding configuration.
+
 ### Documentation
 
 - [ ] Documentation includes all known issues/limitations for the accelerator.
