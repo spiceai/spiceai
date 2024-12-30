@@ -127,8 +127,8 @@ Currently supported data stores for local materialization/acceleration. More com
 | ---------- | ------------------------------- | ----------------- | ---------------- |
 | `arrow`    | In-Memory Arrow Records         | Release Candidate | `memory`         |
 | `duckdb`   | Embedded [DuckDB][duckdb]       | Release Candidate | `memory`, `file` |
+| `sqlite`   | Embedded [SQLite][sqlite]       | Release Candidate | `memory`, `file` |
 | `postgres` | Attached [PostgreSQL][postgres] | Beta              |                  |
-| `sqlite`   | Embedded [SQLite][sqlite]       | Beta              | `memory`, `file` |
 
 [duckdb]: https://docs.spiceai.org/data-accelerators/duckdb
 [postgres]: https://github.com/spiceai/cookbook/tree/trunk/postgres/accelerator#postgresql-data-accelerator
@@ -313,7 +313,7 @@ After creating an account, you will need to create an app in order to create to 
 
 ![create_app-1](https://github.com/spiceai/spiceai/assets/112157037/d2446406-1f06-40fb-8373-1b6d692cb5f7)
 
-You will now be able to access datasets from Spice.ai. For this demonstration, we will be using the `taxi_trips` dataset from the https://spice.ai/spiceai/quickstart Spice.ai app.
+You will now be able to access datasets from Spice.ai. For this demonstration, we will be using the `taxi_trips` dataset from the <https://spice.ai/spiceai/quickstart> Spice.ai app.
 
 **Step 1.** Initialize a new project.
 

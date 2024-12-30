@@ -1,1 +1,1 @@
-SELECT MIN(date("EventTime", 'unixepoch')), MAX(date("EventTime", 'unixepoch')) FROM hits;
+SELECT MIN(date_trunc('day', from_unixtime("EventTime"))), MAX(date_trunc('day', from_unixtime("EventTime"))) FROM hits;

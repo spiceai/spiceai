@@ -1,0 +1,19 @@
+---
+source: crates/runtime/benches/bench.rs
+expression: records_pretty
+snapshot_kind: text
+---
++----------+--------------------+---------------+----------------+-----------+
+| brand_id | brand              | i_manufact_id | i_manufact     | ext_price |
++----------+--------------------+---------------+----------------+-----------+
+| 3002002  | importoexporti #2  | 581           | oughteinganti  | 40834.62  |
+| 10011002 | amalgamalgamalg #2 | 112           | ableoughtought | 40338.13  |
+| 3001002  | amalgexporti #2    | 448           | eingeseese     | 39650.24  |
+| 9004011  | edu packmaxi #11   | 241           | oughteseable   | 37510.87  |
+| 10001014 | amalgunivamalg #14 | 207           | ationbarable   | 37413.28  |
+| 2002001  | importoimporto #1  | 134           | esepriought    | 37340.93  |
+| 3002001  | importoexporti #1  | 889           | n steingeing   | 37084.61  |
+| 9005011  | scholarmaxi #11    | 349           | n stesepri     | 36336.24  |
+| 3001001  | amalgexporti #1    | 358           | eingantipri    | 34244.46  |
+| 9004003  | edu packmaxi #3    | 191           | oughtn stought | 32848.04  |
++----------+--------------------+---------------+----------------+-----------+

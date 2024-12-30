@@ -44,6 +44,9 @@ globset.workspace = true
 graph-rs-sdk = { workspace = true, optional = true }
 graphql-parser.workspace = true
 http = { version = "1.1.0" }
+iceberg-catalog-rest.workspace = true
+iceberg.workspace = true
+iceberg-datafusion.workspace = true
 object_store = { workspace = true }
 rdkafka = { version = "0.37.0", features = ["ssl-vendored"], optional = true }
 regex = "1.10.4"
@@ -92,7 +95,6 @@ postgres = [
     "datafusion-table-providers/postgres-federation",
 ]
 sharepoint = ["dep:graph-rs-sdk"]
-#, "dep:http"]
 snowflake = ["dep:snowflake-api"]
 spark_connect = ["dep:spark-connect-rs"]
 sqlite = [

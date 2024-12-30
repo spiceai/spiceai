@@ -44,6 +44,7 @@ on:
           - 'odbc-databricks connector'
           - 'odbc-athena connector'
           - 'delta_lake connector'
+          - 'dremio connector'
           - 'arrow accelerator (memory mode)'
           - 'duckdb accelerator (memory mode)'
           - 'duckdb accelerator (file mode)'
@@ -60,7 +61,7 @@ on:
           - 'no'
 
 env:
-  FEATURES: 'postgres,spark,mysql,mssql,odbc,delta_lake,databricks,duckdb,sqlite'
+  FEATURES: 'postgres,spark,mysql,mssql,odbc,delta_lake,databricks,duckdb,sqlite,dremio'
 
 jobs:
   build-database-bench-binary:
@@ -229,6 +230,12 @@ jobs:
             bench: 'tpch'
           - cmd: '-c delta_lake -b tpcds'
             name: 'delta_lake connector'
+            bench: 'tpcds'
+          - cmd: '-c dremio'
+            name: 'dremio connector'
+            bench: 'tpch'
+          - cmd: '-c dremio -b tpcds'
+            name: 'dremio connector'
             bench: 'tpcds'
           - cmd: '-a arrow'
             name: 'arrow accelerator (memory mode)'
@@ -425,6 +432,8 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_S3_ATHENA_SECRET_ACCESS_KEY }}
           SPICEAI_TPCH_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TPCH_BENCHMARK_KEY }}
           SPICEAI_TPCDS_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TPCDS_BENCHMARK_KEY }}
+          DREMIO_PASSWORD: ${{secrets.DREMIO_PASSWORD}}
+          DREMIO_USERNAME: ${{secrets.DREMIO_USERNAME}}
 
       - name: Remove spice_bench file
         run: |

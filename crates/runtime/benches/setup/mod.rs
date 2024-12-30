@@ -154,6 +154,8 @@ fn build_app(
         "delta_lake" => crate::bench_delta::build_app(app_builder, bench_name),
         #[cfg(feature = "mssql")]
         "mssql" => crate::bench_mssql::build_app(app_builder, bench_name),
+        #[cfg(feature = "dremio")]
+        "dremio" => crate::bench_dremio::build_app(app_builder, bench_name),
         _ => Err(format!("Unknown connector: {connector}")),
     }?;
 
