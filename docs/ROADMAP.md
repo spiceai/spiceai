@@ -59,12 +59,12 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 
 ### v1.0-stable Data Accelerator Support
 
-| Name         | Status |
-| ------------ | ------ |
-| `arrow`      | Stable |
-| `duckdb`     | Stable |
-| `postgresql` | Stable |
-| `sqlite`     | Beta   |
+| Name         | Status            |
+| ------------ | ----------------- |
+| `arrow`      | Stable            |
+| `duckdb`     | Stable            |
+| `postgresql` | Stable            |
+| `sqlite`     | Release Candidate |
 
 ### v1.0-stable Catalog Provider Support
 
