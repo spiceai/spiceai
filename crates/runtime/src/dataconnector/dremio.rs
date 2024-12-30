@@ -34,6 +34,7 @@ use flight_client::Credentials;
 use flight_client::FlightClient;
 use ns_lookup::verify_endpoint_connection;
 use snafu::prelude::*;
+use sqlparser::ast::WindowFrameBound;
 use std::any::Any;
 use std::future::Future;
 use std::pin::Pin;
@@ -83,11 +84,18 @@ impl Dialect for DremioDialect {
         datafusion::sql::sqlparser::ast::DataType::Timestamp(None, TimezoneInfo::None)
     }
 
-    fn window_func_support_window_frame(&self, func_name: &str) -> bool {
-        if matches!(func_name, "rank" | "row_number" | "dense_rank") {
-            return false;
-        }
-        true
+    fn window_func_support_window_frame(
+        &self,
+        func_name: &str,
+        start_bound: &WindowFrameBound,
+        end_bound: &WindowFrameBound,
+    ) -> bool {
+        !((matches!(func_name, "rank" | "row_number" | "dense_rank")
+            && matches!(start_bound, WindowFrameBound::Preceding(None))
+            && matches!(end_bound, WindowFrameBound::CurrentRow))
+            || (matches!(func_name, "sum")
+                && matches!(start_bound, WindowFrameBound::Preceding(None))
+                && matches!(end_bound, WindowFrameBound::Following(None))))
     }
 }
 
