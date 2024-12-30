@@ -8,10 +8,10 @@ All criteria must be met for the Catalog to be considered Stable, with exception
 
 | Catalog       | Stable Quality | DRI Sign-off |
 | ------------- | -------------- | ------------ |
-| Databricks    | ❌             |              |
-| Iceberg       | ❌             |              |
-| Spice.ai      | ❌             |              |
-| Unity Catalog | ❌             |              |
+| Databricks    | ➖             |              |
+| Iceberg       | ➖             |              |
+| Spice.ai      | ➖             |              |
+| Unity Catalog | ➖             |              |
 
 ## Stable Release Criteria
 

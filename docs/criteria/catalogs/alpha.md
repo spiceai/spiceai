@@ -8,10 +8,10 @@ All criteria must be met for the Catalog to be considered Alpha. As Alpha signif
 
 | Catalog       | Alpha Quality | DRI Sign-off |
 | ------------- | ------------- | ------------ |
-| Databricks    | ❌            |              |
-| Iceberg       | ❌            |              |
-| Spice.ai      | ❌            |              |
-| Unity Catalog | ❌            |              |
+| Databricks    | ➖            |              |
+| Iceberg       | ➖            |              |
+| Spice.ai      | ➖            |              |
+| Unity Catalog | ➖            |              |
 
 ## Alpha Release Criteria
 
