@@ -43,7 +43,6 @@ jobs:
           path: .schema/spicepod.schema.json
 
       - name: Create PR
-        if: github.event_name == 'workflow_dispatch'
         run: |
           git config --global user.name 'Spice Schema Bot'
           git config --global user.email 'schema-bot@spice.ai'
@@ -61,7 +60,6 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Commit schema to `spiceai/docs` repository
-        if: github.event_name == 'workflow_dispatch'
         run: |
           git clone https://github.com/spiceai/docs.git
           cd docs
