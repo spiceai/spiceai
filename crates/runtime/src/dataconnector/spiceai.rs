@@ -165,6 +165,7 @@ impl DataConnectorFactory for SpiceAIFactory {
                 "spice.ai",
                 flight_client,
                 Arc::new(SpiceCloudPlatformDialect {}),
+                false,
             );
             let spiceai = SpiceAI { flight_factory };
             Ok(Arc::new(spiceai) as Arc<dyn DataConnector>)
