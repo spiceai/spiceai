@@ -127,7 +127,7 @@ fn get_params(bench_name: &str) -> Params {
 fn get_tpch_test_queries() -> Vec<(&'static str, &'static str)> {
     vec![
         ("tpch_q1", include_str!("../queries/tpch/q1.sql")),
-        // DoGet recv error: rpc error: code = InvalidArgument desc = Correlated scalar subquery can only be used in Projection, Filter, Aggregate plan nodes
+        // Spice.ai Data Platform doesn't support correlated subqueries yet https://github.com/spiceai/spiceai/issues/4024
         // ("tpch_q2", include_str!("../queries/tpch/q2.sql")),
         ("tpch_q3", include_str!("../queries/tpch/q3.sql")),
         ("tpch_q4", include_str!("../queries/tpch/q4.sql")),
@@ -143,13 +143,12 @@ fn get_tpch_test_queries() -> Vec<(&'static str, &'static str)> {
         ("tpch_q14", include_str!("../queries/tpch/q14.sql")),
         // tpch_q15 has a view creation which we don't support by design
         ("tpch_q16", include_str!("../queries/tpch/q16.sql")),
-        // See: https://github.com/spiceai/spiceai/issues/3980
-        // DoGet recv error: rpc error: code = InvalidArgument desc = Correlated scalar subquery can only be used in Projection, Filter, Aggregate plan nodes
+        // Spice.ai Data Platform doesn't support correlated subqueries yet https://github.com/spiceai/spiceai/issues/4024
         // ("tpch_q17", include_str!("../queries/tpch/q17.sql")),
         ("tpch_q18", include_str!("../queries/tpch/q18.sql")),
         ("tpch_q19", include_str!("../queries/tpch/q19.sql")),
         ("tpch_q20", include_str!("../queries/tpch/q20.sql")),
-        // DoGet recv error: rpc error: code = InvalidArgument desc = No field named l1.l_orderkey. Valid fields are __correlated_sq_1.l_orderkey, __correlated_sq_1.l_suppkey.
+        // Spice.ai Data Platform doesn't support correlated subqueries yet https://github.com/spiceai/spiceai/issues/4024
         // ("tpch_q21", include_str!("../queries/tpch/q21.sql")),
         ("tpch_q22", include_str!("../queries/tpch/q22.sql")),
         (
