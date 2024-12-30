@@ -82,6 +82,8 @@ graphql-parser = "0.4.0"
 hf-hub = { version = "0.3.0", features = ["tokio"] }
 http = "1.1.0"
 iceberg = "0.4.0"
+iceberg-datafusion = "0.4.0"
+iceberg-catalog-rest = "0.4.0"
 insta = { version = "1.41.1", features = ["filters"] }
 itertools = "0.13"
 lazy_static = "1.5.0"

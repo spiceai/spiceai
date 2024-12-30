@@ -61,6 +61,7 @@ http-body-util = "0.1.2"
 hyper = "1.5.1"
 hyper-util = { version = "0.1.6", features = ["service"] }
 iceberg.workspace = true
+iceberg-catalog-rest.workspace = true
 indexmap = "2"
 itertools.workspace = true
 jsonwebtoken = "9.3.0"

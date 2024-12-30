@@ -3045,6 +3045,9 @@ dependencies = [
  "graph-rs-sdk",
  "graphql-parser",
  "http 1.2.0",
+ "iceberg",
+ "iceberg-catalog-rest",
+ "iceberg-datafusion",
  "object_store",
  "rdkafka",
  "regex",
@@ -5671,6 +5674,41 @@ dependencies = [
  "url",
  "uuid 1.11.0",
  "zstd",
+]
+
+[[package]]
+name = "iceberg-catalog-rest"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "59608aad36da6061f353bd12efa049bc12ea437032cd4cf67f03696d45557db9"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "http 1.2.0",
+ "iceberg",
+ "itertools 0.13.0",
+ "log",
+ "reqwest 0.12.9",
+ "serde",
+ "serde_derive",
+ "serde_json",
+ "tokio",
+ "typed-builder 0.20.0",
+ "uuid 1.11.0",
+]
+
+[[package]]
+name = "iceberg-datafusion"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "389127b6db8b815e6f7e87b316c80c80058e361d1e9a514b6bb6c28781f371f0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "datafusion",
+ "futures",
+ "iceberg",
+ "tokio",
 ]
 
 [[package]]
@@ -9735,6 +9773,7 @@ dependencies = [
  "hyper 1.5.1",
  "hyper-util",
  "iceberg",
+ "iceberg-catalog-rest",
  "indexmap 2.7.0",
  "insta",
  "itertools 0.13.0",
