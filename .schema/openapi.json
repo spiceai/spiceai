@@ -4,7 +4,8 @@
     "title": "runtime",
     "description": "The spiced runtime",
     "license": {
-      "name": "Apache-2.0"
+      "name": "Apache-2.0",
+      "identifier": "Apache-2.0"
     },
     "version": "1.0.0-rc.3"
   },
@@ -246,78 +247,6 @@
                   "type": "string"
                 },
                 "example": "An unexpected error occurred while processing datasets"
-              }
-            }
-          }
-        }
-      }
-    },
-    "/v1/datasets/sample": {
-      "post": {
-        "tags": [
-          "Datasets"
-        ],
-        "summary": "Sample Dataset",
-        "description": "This endpoint allows for sampling data from a dataset using different methods.\nThe type of sampling method can be specified using the `type` query parameter,\nand the body will be interpreted accordingly.",
-        "operationId": "post_sample_dataset",
-        "parameters": [
-          {
-            "name": "type",
-            "in": "query",
-            "description": "The type of sampling to apply. Possible values: 'distinct_columns', 'random_sample', 'top_n_sample'.",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "requestBody": {
-          "description": "The request body depends on the type of sampling selected.",
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/TopSamplesParams"
-              },
-              "example": {
-                "dataset": "postgres:aidemo_messages",
-                "order_by": "column_a",
-                "limit": 100
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "description": "The sampled data in plain text format.",
-            "content": {
-              "text/plain": {
-                "schema": {
-                  "type": "string"
-                },
-                "example": "\n| column_a | column_b |\n|----------|----------|\n| value1   | 123      |\n| value2   | 456      |\n"
-              }
-            }
-          },
-          "400": {
-            "description": "Invalid request body",
-            "content": {
-              "application/json": {
-                "schema": {},
-                "example": {
-                  "error": "Invalid request body"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Internal server error occurred while sampling the dataset",
-            "content": {
-              "application/json": {
-                "schema": {},
-                "example": {
-                  "error": "An unexpected error occurred while sampling the dataset"
-                }
               }
             }
           }
@@ -3119,34 +3048,6 @@
           }
         }
       },
-      "DistinctColumnsParams": {
-        "type": "object",
-        "required": [
-          "dataset",
-          "limit"
-        ],
-        "properties": {
-          "cols": {
-            "type": [
-              "array",
-              "null"
-            ],
-            "items": {
-              "type": "string"
-            },
-            "description": "The columns to sample distinct values from. If None, all columns are sampled."
-          },
-          "dataset": {
-            "type": "string",
-            "description": "The SQL dataset to sample data from."
-          },
-          "limit": {
-            "type": "integer",
-            "description": "The number of rows, each with distinct values per column, to sample.",
-            "minimum": 0
-          }
-        }
-      },
       "Embedding": {
         "type": "object",
         "description": "Represents an embedding vector returned by embedding endpoint.",
@@ -3731,24 +3632,6 @@
           }
         }
       },
-      "RandomSampleParams": {
-        "type": "object",
-        "required": [
-          "dataset",
-          "limit"
-        ],
-        "properties": {
-          "dataset": {
-            "type": "string",
-            "description": "The SQL dataset to sample data from."
-          },
-          "limit": {
-            "type": "integer",
-            "description": "The number of rows, each with distinct values per column, to sample.",
-            "minimum": 0
-          }
-        }
-      },
       "Request": {
         "type": "object",
         "required": [
@@ -4002,29 +3885,6 @@
           "token": {
             "type": "string",
             "description": "The token."
-          }
-        }
-      },
-      "TopSamplesParams": {
-        "type": "object",
-        "required": [
-          "dataset",
-          "limit",
-          "order_by"
-        ],
-        "properties": {
-          "dataset": {
-            "type": "string",
-            "description": "The SQL dataset to sample data from."
-          },
-          "limit": {
-            "type": "integer",
-            "description": "The number of rows, each with distinct values per column, to sample.",
-            "minimum": 0
-          },
-          "order_by": {
-            "type": "string",
-            "description": "How to order the samples before retrieving the top N."
           }
         }
       }
