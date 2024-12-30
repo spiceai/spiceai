@@ -52,6 +52,8 @@ mod bench_spicecloud;
 
 #[cfg(feature = "delta_lake")]
 mod bench_delta;
+#[cfg(feature = "dremio")]
+mod bench_dremio;
 #[cfg(feature = "duckdb")]
 mod bench_duckdb;
 #[cfg(feature = "mssql")]
@@ -254,6 +256,10 @@ async fn run_connector_bench(
         #[cfg(feature = "mssql")]
         "mssql" => {
             bench_mssql::run(&mut rt, &mut benchmark_results, bench_name).await?;
+        }
+        #[cfg(feature = "dremio")]
+        "dremio" => {
+            bench_dremio::run(&mut rt, &mut benchmark_results, bench_name).await?;
         }
         _ => {}
     }
