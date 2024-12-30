@@ -61,78 +61,56 @@ pub(crate) async fn run(
 pub fn build_app(app_builder: AppBuilder, bench_name: &str) -> Result<AppBuilder, String> {
     match bench_name {
         "tpch" => Ok(app_builder
-            .with_dataset(make_dataset("tpch.customer", "customer", bench_name))
-            .with_dataset(make_dataset("tpch.lineitem", "lineitem", bench_name))
-            .with_dataset(make_dataset("tpch.part", "part", bench_name))
-            .with_dataset(make_dataset("tpch.partsupp", "partsupp", bench_name))
-            .with_dataset(make_dataset("tpch.orders", "orders", bench_name))
-            .with_dataset(make_dataset("tpch.nation", "nation", bench_name))
-            .with_dataset(make_dataset("tpch.region", "region", bench_name))
-            .with_dataset(make_dataset("tpch.supplier", "supplier", bench_name))),
+            .with_dataset(make_dataset("tpch.customer", "customer"))
+            .with_dataset(make_dataset("tpch.lineitem", "lineitem"))
+            .with_dataset(make_dataset("tpch.part", "part"))
+            .with_dataset(make_dataset("tpch.partsupp", "partsupp"))
+            .with_dataset(make_dataset("tpch.orders", "orders"))
+            .with_dataset(make_dataset("tpch.nation", "nation"))
+            .with_dataset(make_dataset("tpch.region", "region"))
+            .with_dataset(make_dataset("tpch.supplier", "supplier"))),
         "tpcds" => Ok(app_builder
-            .with_dataset(make_dataset("tpcds.call_center", "call_center", bench_name))
-            .with_dataset(make_dataset(
-                "tpcds.catalog_page",
-                "catalog_page",
-                bench_name,
-            ))
-            .with_dataset(make_dataset(
-                "tpcds.catalog_sales",
-                "catalog_sales",
-                bench_name,
-            ))
-            .with_dataset(make_dataset(
-                "tpcds.catalog_returns",
-                "catalog_returns",
-                bench_name,
-            ))
-            .with_dataset(make_dataset("tpcds.income_band", "income_band", bench_name))
-            .with_dataset(make_dataset("tpcds.inventory", "inventory", bench_name))
-            .with_dataset(make_dataset("tpcds.store_sales", "store_sales", bench_name))
-            .with_dataset(make_dataset(
-                "tpcds.store_returns",
-                "store_returns",
-                bench_name,
-            ))
-            .with_dataset(make_dataset("tpcds.web_sales", "web_sales", bench_name))
-            .with_dataset(make_dataset("tpcds.web_returns", "web_returns", bench_name))
-            .with_dataset(make_dataset("tpcds.customer", "customer", bench_name))
-            .with_dataset(make_dataset(
-                "tpcds.customer_address",
-                "customer_address",
-                bench_name,
-            ))
+            .with_dataset(make_dataset("tpcds.call_center", "call_center"))
+            .with_dataset(make_dataset("tpcds.catalog_page", "catalog_page"))
+            .with_dataset(make_dataset("tpcds.catalog_sales", "catalog_sales"))
+            .with_dataset(make_dataset("tpcds.catalog_returns", "catalog_returns"))
+            .with_dataset(make_dataset("tpcds.income_band", "income_band"))
+            .with_dataset(make_dataset("tpcds.inventory", "inventory"))
+            .with_dataset(make_dataset("tpcds.store_sales", "store_sales"))
+            .with_dataset(make_dataset("tpcds.store_returns", "store_returns"))
+            .with_dataset(make_dataset("tpcds.web_sales", "web_sales"))
+            .with_dataset(make_dataset("tpcds.web_returns", "web_returns"))
+            .with_dataset(make_dataset("tpcds.customer", "customer"))
+            .with_dataset(make_dataset("tpcds.customer_address", "customer_address"))
             .with_dataset(make_dataset(
                 "tpcds.customer_demographics",
                 "customer_demographics",
-                bench_name,
             ))
-            .with_dataset(make_dataset("tpcds.date_dim", "date_dim", bench_name))
+            .with_dataset(make_dataset("tpcds.date_dim", "date_dim"))
             .with_dataset(make_dataset(
                 "tpcds.household_demographics",
                 "household_demographics",
-                bench_name,
             ))
-            .with_dataset(make_dataset("tpcds.item", "item", bench_name))
-            .with_dataset(make_dataset("tpcds.promotion", "promotion", bench_name))
-            .with_dataset(make_dataset("tpcds.reason", "reason", bench_name))
-            .with_dataset(make_dataset("tpcds.ship_mode", "ship_mode", bench_name))
-            .with_dataset(make_dataset("tpcds.store", "store", bench_name))
-            .with_dataset(make_dataset("tpcds.time_dim", "time_dim", bench_name))
-            .with_dataset(make_dataset("tpcds.warehouse", "warehouse", bench_name))
-            .with_dataset(make_dataset("tpcds.web_page", "web_page", bench_name))
-            .with_dataset(make_dataset("tpcds.web_site", "web_site", bench_name))),
+            .with_dataset(make_dataset("tpcds.item", "item"))
+            .with_dataset(make_dataset("tpcds.promotion", "promotion"))
+            .with_dataset(make_dataset("tpcds.reason", "reason"))
+            .with_dataset(make_dataset("tpcds.ship_mode", "ship_mode"))
+            .with_dataset(make_dataset("tpcds.store", "store"))
+            .with_dataset(make_dataset("tpcds.time_dim", "time_dim"))
+            .with_dataset(make_dataset("tpcds.warehouse", "warehouse"))
+            .with_dataset(make_dataset("tpcds.web_page", "web_page"))
+            .with_dataset(make_dataset("tpcds.web_site", "web_site"))),
         _ => Err("Only tpcds or tpch benchmark suites are supported".to_string()),
     }
 }
 
-fn make_dataset(path: &str, name: &str, bench_name: &str) -> Dataset {
+fn make_dataset(path: &str, name: &str) -> Dataset {
     let mut dataset = Dataset::new(format!("dremio:{path}"), name.to_string());
-    dataset.params = Some(get_params(bench_name));
+    dataset.params = Some(get_params());
     dataset
 }
 
-fn get_params(bench_name: &str) -> Params {
+fn get_params() -> Params {
     Params::from_string_map(
         vec![
             (
