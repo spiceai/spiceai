@@ -16,7 +16,7 @@ limitations under the License.
 
 #![allow(clippy::expect_used)]
 use super::send_embeddings_request;
-use crate::models::sql_to_display;
+use crate::models::{sort_json_keys, sql_to_display, sql_to_single_json_value};
 use crate::{
     init_tracing, init_tracing_with_task_history,
     models::{
@@ -458,6 +458,7 @@ async fn openai_test_chat_messages() -> Result<(), anyhow::Error> {
 }
 
 /// Verifies that the model correctly uses the SQL tool to process user query and return the result
+#[allow(clippy::expect_used)]
 async fn verify_sql_query_chat_completion(
     rt: Arc<Runtime>,
     trace_provider: &TracerProvider,
@@ -490,7 +491,7 @@ async fn verify_sql_query_chat_completion(
         sql_to_display(
             &rt,
             format!(
-                r#"SELECT task, count(1)
+                r#"SELECT task, count(1) > 0 as task_used
                 FROM runtime.task_history
                 WHERE start_time >= '{}'
                 AND task in ('tool_use::list_datasets', 'tool_use::sql', 'tool_use::sql_query')
@@ -505,30 +506,34 @@ async fn verify_sql_query_chat_completion(
         .expect("Failed to execute HTTP SQL query")
     );
 
+    let mut task_input = sql_to_single_json_value(
+        &rt,
+        format!(
+            r#"SELECT input
+        FROM runtime.task_history
+        WHERE start_time >= '{}'
+        AND task='ai_completion'
+        ORDER BY start_time
+        LIMIT 1;
+    "#,
+            Into::<DateTime<Utc>>::into(task_start_time).to_rfc3339()
+        )
+        .as_str(),
+    )
+    .await;
+
+    sort_json_keys(&mut task_input);
+
     insta::assert_snapshot!(
         "chat_1_ai_completion_input",
-        sql_to_display(
-            &rt,
-            format!(
-                r#"SELECT input
-                FROM runtime.task_history
-                WHERE start_time >= '{}'
-                AND task='ai_completion'
-                ORDER BY start_time
-                LIMIT 1;
-            "#,
-                Into::<DateTime<Utc>>::into(task_start_time).to_rfc3339()
-            )
-            .as_str()
-        )
-        .await
-        .expect("Failed to execute HTTP SQL query")
+        serde_json::to_string_pretty(&task_input).expect("Failed to serialize task_input")
     );
 
     Ok(())
 }
 
 /// Verifies that the model correctly uses similirity search tool to process user query and return the result
+#[allow(clippy::expect_used)]
 async fn verify_similarity_search_chat_completion(
     rt: Arc<Runtime>,
     trace_provider: &TracerProvider,
@@ -593,6 +598,20 @@ fn get_openai_model(model: impl Into<String>, name: impl Into<String>) -> Model 
         "openai_api_key".to_string(),
         "${ secrets:SPICE_OPENAI_API_KEY }".into(),
     );
+    model.params.insert("system_prompt".to_string(), r#"
+    When writing SQL queries, do not put double quotes around schema-qualified table names. For example:
+
+    Correct: SELECT * FROM schema.table
+    Correct: SELECT * FROM database.schema.table
+    Incorrect: SELECT * FROM "schema.table"
+    Incorrect: SELECT * FROM "database.schema.table"
+
+    Only use double quotes when you need to preserve case sensitivity or when identifiers contain special characters.
+
+    Prefer quoting column names. For example:
+    Correct: `SELECT COUNT(*) AS "total_records" FROM "spice"."public"."taxi_trips"`
+    Incorrect: `SELECT COUNT(*) AS total_records FROM "spice"."public"."taxi_trips"`
+    "#.to_string().into());
     model
 }
 

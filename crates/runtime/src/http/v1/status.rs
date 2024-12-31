@@ -36,6 +36,7 @@ use super::Format;
 #[serde(rename_all = "lowercase")]
 pub struct QueryParams {
     /// The format of the response, either "json" or "csv". Defaults to "json".
+    #[serde(default)]
     pub format: Format,
 }
 

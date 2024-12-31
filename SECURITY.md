@@ -6,8 +6,8 @@ As Spice.ai is in active development (release candidate), only the latest versio
 
 | Version    | Supported          |
 | ---------- | ------------------ |
-| 1.0.0-rc.2 | :white_check_mark: |
-| 1.0.0-rc.1 | :x:                |
+| 1.0.0-rc.3 | :white_check_mark: |
+| 1.0.0-rc.2 | :x:                |
 | < 1.0.0    | :x:                |
 
 ## Reporting a Vulnerability

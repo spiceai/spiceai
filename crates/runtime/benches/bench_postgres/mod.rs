@@ -238,7 +238,10 @@ pub(crate) fn get_tpcds_test_queries() -> Vec<(&'static str, &'static str)> {
         ("tpcds_q33", include_str!("../queries/tpcds/q33.sql")),
         ("tpcds_q34", include_str!("../queries/tpcds/q34.sql")),
         ("tpcds_q35", include_str!("../queries/tpcds/q35.sql")),
-        ("tpcds_q36", include_str!("../queries/tpcds/q36.sql")),
+        (
+            "tpcds_q36",
+            include_str!("../queries/tpcds/postgres/q36.sql"),
+        ), // Column aliases cannot appear with expressions in ORDER BY in Postgres: https://www.postgresql.org/docs/current/queries-order.html
         ("tpcds_q37", include_str!("../queries/tpcds/q37.sql")),
         // ("tpcds_q38", include_str!("../queries/tpcds/q38.sql")), // EXCEPT and INTERSECT aren't supported
         // ("tpcds_q39", include_str!("../queries/tpcds/q39.sql")), // this query contains multiple queries, which aren't supported
@@ -272,7 +275,11 @@ pub(crate) fn get_tpcds_test_queries() -> Vec<(&'static str, &'static str)> {
         ("tpcds_q67", include_str!("../queries/tpcds/q67.sql")),
         ("tpcds_q68", include_str!("../queries/tpcds/q68.sql")),
         ("tpcds_q69", include_str!("../queries/tpcds/q69.sql")),
-        ("tpcds_q70", include_str!("../queries/tpcds/q70.sql")),
+        (
+            "tpcds_q70",
+            include_str!("../queries/tpcds/postgres/q70.sql"),
+        ), // Column aliases cannot appear with expressions in ORDER BY in Postgres: https://www.postgresql.org/docs/current/queries-order.html
+        // expressions can appear with other expressions, so re-write the query to fit
         ("tpcds_q71", include_str!("../queries/tpcds/q71.sql")),
         ("tpcds_q72", include_str!("../queries/tpcds/q72.sql")),
         ("tpcds_q73", include_str!("../queries/tpcds/q73.sql")),
@@ -288,7 +295,10 @@ pub(crate) fn get_tpcds_test_queries() -> Vec<(&'static str, &'static str)> {
         ("tpcds_q83", include_str!("../queries/tpcds/q83.sql")),
         ("tpcds_q84", include_str!("../queries/tpcds/q84.sql")),
         ("tpcds_q85", include_str!("../queries/tpcds/q85.sql")),
-        ("tpcds_q86", include_str!("../queries/tpcds/q86.sql")),
+        (
+            "tpcds_q86",
+            include_str!("../queries/tpcds/postgres/q86.sql"),
+        ), // Column aliases cannot appear with expressions in ORDER BY in Postgres: https://www.postgresql.org/docs/current/queries-order.html
         // ("tpcds_q87", include_str!("../queries/tpcds/q87.sql")), // EXCEPT and INTERSECT aren't supported
         ("tpcds_q88", include_str!("../queries/tpcds/q88.sql")),
         ("tpcds_q89", include_str!("../queries/tpcds/q89.sql")),

@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use arrow::util::pretty::pretty_format_batches;
+use arrow::{array::StringArray, util::pretty::pretty_format_batches};
 use async_openai::types::EmbeddingInput;
 use futures::TryStreamExt;
 use rand::Rng;
@@ -443,6 +443,34 @@ async fn sql_to_display(
         .await
         .boxed()?;
     pretty_format_batches(&data).map(|d| format!("{d}")).boxed()
+}
+
+#[allow(clippy::expect_used)]
+async fn sql_to_single_json_value(rt: &Arc<Runtime>, query: &str) -> Value {
+    let data = rt
+        .datafusion()
+        .query_builder(query)
+        .build()
+        .run()
+        .await
+        .boxed()
+        .expect("Failed to collect data")
+        .data
+        .try_collect::<Vec<_>>()
+        .await
+        .boxed()
+        .expect("Failed to collect data");
+    assert_eq!(data.len(), 1);
+    assert_eq!(data[0].columns().len(), 1);
+    serde_json::from_str(
+        data[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("column is a StringArray")
+            .value(0),
+    )
+    .expect("value is a JSON string")
 }
 
 async fn get_params_with_secrets_value(
