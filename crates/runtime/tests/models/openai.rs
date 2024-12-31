@@ -67,7 +67,6 @@ mod nsql {
                     primary_keys: None,
                     chunking: None,
                 }];
-            //taxi_trips_with_embeddings.metadata.insert("instructions".to_string(), "Do not put double quotes around `spice.public.taxi_trips`.".to_string().into());
 
             let app = AppBuilder::new("text-to-sql")
                 .with_dataset(taxi_trips_with_embeddings)
