@@ -156,6 +156,7 @@ SELECT a AS b, c FROM tbl ORDER BY b;
 | **Affected queries**     |                          |
 | ------------------------ | ------------------------ |
 | [q36.sql](tpcds/q36.sql) | [q86.sql](tpcds/q86.sql) |
+| [q70.sql](tpcds/q70.sql) |                          |
 
 ### MySQL does not support FULL JOIN
 
