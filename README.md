@@ -107,6 +107,7 @@ Currently supported data connectors for upstream datasets. More coming soon.
 | `dremio`                           | [Dremio][dremio]                      | Alpha             | Arrow Flight                 |
 | `ftp`, `sftp`                      | FTP/SFTP                              | Alpha             | Parquet, CSV                 |
 | `http`, `https`                    | HTTP(s)                               | Alpha             | Parquet, CSV                 |
+| `iceberg`                          | [Apache Iceberg][iceberg]             | Alpha             | Parquet                      |
 | `localpod`                         | [Local dataset replication][localpod] | Alpha             |                              |
 | `sharepoint`                       | Microsoft SharePoint                  | Alpha             | Unstructured UTF-8 documents |
 | `snowflake`                        | Snowflake                             | Alpha             | Arrow                        |
@@ -118,6 +119,7 @@ Currently supported data connectors for upstream datasets. More coming soon.
 [spiceai]: https://github.com/spiceai/cookbook/tree/trunk/spiceai#readme
 [dremio]: https://github.com/spiceai/cookbook/tree/trunk/dremio#readme
 [localpod]: https://github.com/spiceai/cookbook/blob/trunk/localpod/README.md
+[iceberg]: https://github.com/spiceai/cookbook/tree/trunk/catalogs/iceberg#readme
 
 ### Supported Data Stores/Accelerators
 
