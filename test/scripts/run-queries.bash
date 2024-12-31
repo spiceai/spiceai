@@ -37,7 +37,8 @@ fi
 
 query_folder=$1;
 failed_queries=()
-for i in `ls -d $query_folder/**`; do
+# ignore directories, only run queries from files
+for i in `ls -d $query_folder/*.sql`; do
   echo "Running query in $i.."
   sed '/^--/d' < $i > $i.tmp # remove comments because we compact the query into one line
   tr '\n' ' ' <  $i.tmp | $SPICE sql > runqueries.tmp.txt

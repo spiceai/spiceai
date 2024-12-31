@@ -287,15 +287,15 @@ fn get_tpcds_test_queries(engine: Option<&str>) -> Vec<(&'static str, &'static s
         Some("sqlite") => vec![
             (
                 "tpcds_q49",
-                Some(include_str!("../queries/tpcds/q49_sqlite.sql")),
+                Some(include_str!("../queries/tpcds/sqlite/q49.sql")),
             ),
             (
                 "tpcds_q75",
-                Some(include_str!("../queries/tpcds/q75_sqlite.sql")),
+                Some(include_str!("../queries/tpcds/sqlite/q75.sql")),
             ),
             (
                 "tpcds_q90",
-                Some(include_str!("../queries/tpcds/q90_sqlite.sql")),
+                Some(include_str!("../queries/tpcds/sqlite/q90.sql")),
             ),
             // SQLite does not support `stddev`
             ("tpcds_q17", None),
@@ -360,14 +360,47 @@ macro_rules! generate_clickbench_queries {
     }
 }
 
+macro_rules! generate_clickbench_query_overrides {
+    ( $engine:expr, $( $i:literal ),* ) => {
+        vec![
+            $(
+                (
+                    concat!("clickbench_q", stringify!($i)),
+                    include_str!(concat!("../queries/clickbench/", $engine, "/q", stringify!($i), ".sql"))
+                )
+            ),*
+        ]
+    }
+}
+
 fn get_clickbench_test_queries(engine: Option<&str>) -> Vec<(&'static str, &'static str)> {
     let mut queries = generate_clickbench_queries!(
         1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
         26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43
     );
 
-    if let Some("sqlite") = engine {
-        queries.remove(28); // q29 includes regexp_replace which is not supported by sqlite
+    let overrides = match engine {
+        Some("sqlite") => {
+            queries.remove(28); // q29 includes regexp_replace which is not supported by sqlite
+            Some(generate_clickbench_query_overrides!(
+                "sqlite", 7, 19, 24, 25, 27, 37, 38, 39, 40, 41, 42, 43
+            ))
+        }
+        Some("postgres") => {
+            // Column aliases cannot appear with expressions in ORDER BY in Postgres: https://www.postgresql.org/docs/current/queries-order.html
+            // expressions can appear with other expressions, so re-write the query to fit
+            Some(generate_clickbench_query_overrides!("postgres", 43))
+        }
+        _ => None,
+    };
+
+    // replace queries with overrides based on their filename matches
+    if let Some(overrides) = overrides {
+        for (key, value) in overrides {
+            if let Some(query) = queries.iter_mut().find(|(k, _)| *k == key) {
+                *query = (key, value);
+            }
+        }
     }
 
     queries
