@@ -458,6 +458,7 @@ async fn openai_test_chat_messages() -> Result<(), anyhow::Error> {
 }
 
 /// Verifies that the model correctly uses the SQL tool to process user query and return the result
+#[allow(clippy::expect_used)]
 async fn verify_sql_query_chat_completion(
     rt: Arc<Runtime>,
     trace_provider: &TracerProvider,
@@ -532,6 +533,7 @@ async fn verify_sql_query_chat_completion(
 }
 
 /// Verifies that the model correctly uses similirity search tool to process user query and return the result
+#[allow(clippy::expect_used)]
 async fn verify_similarity_search_chat_completion(
     rt: Arc<Runtime>,
     trace_provider: &TracerProvider,
