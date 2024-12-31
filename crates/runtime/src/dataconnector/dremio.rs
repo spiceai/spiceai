@@ -27,6 +27,7 @@ use data_components::Read;
 use data_components::ReadWrite;
 use datafusion::datasource::TableProvider;
 use datafusion::sql::sqlparser::ast::TimezoneInfo;
+use datafusion::sql::sqlparser::ast::WindowFrameBound;
 use datafusion::sql::unparser::dialect::DefaultDialect;
 use datafusion::sql::unparser::dialect::Dialect;
 use datafusion::sql::unparser::dialect::IntervalStyle;
@@ -81,6 +82,20 @@ impl Dialect for DremioDialect {
         _tz: &Option<Arc<str>>,
     ) -> datafusion::sql::sqlparser::ast::DataType {
         datafusion::sql::sqlparser::ast::DataType::Timestamp(None, TimezoneInfo::None)
+    }
+
+    fn window_func_support_window_frame(
+        &self,
+        func_name: &str,
+        start_bound: &WindowFrameBound,
+        end_bound: &WindowFrameBound,
+    ) -> bool {
+        !((matches!(func_name, "rank" | "row_number" | "dense_rank")
+            && matches!(start_bound, WindowFrameBound::Preceding(None))
+            && matches!(end_bound, WindowFrameBound::CurrentRow))
+            || (matches!(func_name, "sum")
+                && matches!(start_bound, WindowFrameBound::Preceding(None))
+                && matches!(end_bound, WindowFrameBound::Following(None))))
     }
 }
 

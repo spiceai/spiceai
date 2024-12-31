@@ -150,10 +150,10 @@ x509-certificate = "0.23.1"
 
 
 [patch.crates-io]
-datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "ffc3ca6bef06a97dbe5c4da1e507ce224511998d" }
-datafusion-common = { git = "https://github.com/spiceai/datafusion.git", rev = "ffc3ca6bef06a97dbe5c4da1e507ce224511998d" }
-datafusion-execution = { git = "https://github.com/spiceai/datafusion.git", rev = "ffc3ca6bef06a97dbe5c4da1e507ce224511998d" }
-datafusion-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "ffc3ca6bef06a97dbe5c4da1e507ce224511998d" }
+datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "4e1290a600233661e28952a42d39563c653c286e" }
+datafusion-common = { git = "https://github.com/spiceai/datafusion.git", rev = "4e1290a600233661e28952a42d39563c653c286e" }
+datafusion-execution = { git = "https://github.com/spiceai/datafusion.git", rev = "4e1290a600233661e28952a42d39563c653c286e" }
+datafusion-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "4e1290a600233661e28952a42d39563c653c286e" }
 
 
 object_store = { git = "https://github.com/spiceai/arrow-rs.git", rev = "cee50b7d2ccf749eac89d0fe26fbd8a06c0bb3c4" }
