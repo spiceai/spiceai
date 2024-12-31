@@ -96,7 +96,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - aws-sdk-secretsmanager 1.54.0, Apache-2.0 
   <br/>https://github.com/awslabs/aws-sdk-rust
 
-- aws-sdk-sts 1.51.0, Apache-2.0 
+- aws-sdk-sts 1.52.0, Apache-2.0 
   <br/>https://github.com/awslabs/aws-sdk-rust
 
 - axum 0.7.9, MIT 
@@ -198,7 +198,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - either 1.13.0, Apache-2.0 OR MIT 
   <br/>https://github.com/rayon-rs/either
 
-- env_logger 0.10.2, Apache-2.0 OR MIT 
+- env_logger 0.11.5, Apache-2.0 OR MIT 
   <br/>https://github.com/rust-cli/env_logger
 
 - evalconverter 0.1.0,  
@@ -252,6 +252,15 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - hyper-util 0.1.10, MIT 
   <br/>https://github.com/hyperium/hyper-util
 
+- iceberg 0.4.0, Apache-2.0 
+  <br/>https://github.com/apache/iceberg-rust
+
+- iceberg-catalog-rest 0.4.0, Apache-2.0 
+  <br/>https://github.com/apache/iceberg-rust
+
+- iceberg-datafusion 0.4.0, Apache-2.0 
+  <br/>https://github.com/apache/iceberg-rust
+
 - indexmap 1.9.3, Apache-2.0 OR MIT 
   <br/>https://github.com/bluss/indexmap
 
@@ -288,7 +297,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - log 0.4.22, Apache-2.0 OR MIT 
   <br/>https://github.com/rust-lang/log
 
-- logos 0.14.4, Apache-2.0 OR MIT 
+- logos 0.15.0, Apache-2.0 OR MIT 
   <br/>https://github.com/maciejhirsz/logos
 
 - lopdf 0.34.0, MIT 
@@ -327,26 +336,20 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - once_cell 1.20.2, Apache-2.0 OR MIT 
   <br/>https://github.com/matklad/once_cell
 
-- opentelemetry 0.26.0, Apache-2.0 
-  <br/>https://github.com/open-telemetry/opentelemetry-rust
-
 - opentelemetry 0.27.1, Apache-2.0 
   <br/>https://github.com/open-telemetry/opentelemetry-rust
 
-- opentelemetry-http 0.26.0, Apache-2.0 
+- opentelemetry-http 0.27.0, Apache-2.0 
   <br/>https://github.com/open-telemetry/opentelemetry-rust
 
-- opentelemetry-prometheus 0.17.0, Apache-2.0 
+- opentelemetry-prometheus 0.27.0, Apache-2.0 
   <br/>https://github.com/open-telemetry/opentelemetry-rust
 
 - opentelemetry-proto 0.27.0, Apache-2.0 
   <br/>https://github.com/open-telemetry/opentelemetry-rust/tree/main/opentelemetry-proto
 
-- opentelemetry-zipkin 0.26.0, Apache-2.0 
+- opentelemetry-zipkin 0.27.0, Apache-2.0 
   <br/>https://github.com/open-telemetry/opentelemetry-rust/tree/main/opentelemetry-zipkin
-
-- opentelemetry_sdk 0.26.0, Apache-2.0 
-  <br/>https://github.com/open-telemetry/opentelemetry-rust
 
 - opentelemetry_sdk 0.27.1, Apache-2.0 
   <br/>https://github.com/open-telemetry/opentelemetry-rust
@@ -414,7 +417,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - rustls 0.21.12, Apache-2.0 OR ISC OR MIT 
   <br/>https://github.com/rustls/rustls
 
-- rustls 0.23.19, Apache-2.0 OR ISC OR MIT 
+- rustls 0.23.20, Apache-2.0 OR ISC OR MIT 
   <br/>https://github.com/rustls/rustls
 
 - rustls-native-certs 0.6.3, Apache-2.0 OR ISC OR MIT 
@@ -441,7 +444,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - secrecy 0.8.0, Apache-2.0 OR MIT 
   <br/>https://github.com/iqlusioninc/crates/tree/main/secrecy
 
-- serde 1.0.215, Apache-2.0 OR MIT 
+- serde 1.0.216, Apache-2.0 OR MIT 
   <br/>https://github.com/serde-rs/serde
 
 - serde-value 0.7.0, MIT 
@@ -531,7 +534,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - tower 0.4.13, MIT 
   <br/>https://github.com/tower-rs/tower
 
-- tower 0.5.1, MIT 
+- tower 0.5.2, MIT 
   <br/>https://github.com/tower-rs/tower
 
 - tower-http 0.6.2, MIT 
@@ -543,7 +546,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - tracing-futures 0.2.5, MIT 
   <br/>https://github.com/tokio-rs/tracing
 
-- tracing-opentelemetry 0.27.0, MIT 
+- tracing-opentelemetry 0.28.0, MIT 
   <br/>https://github.com/tokio-rs/tracing-opentelemetry
 
 - tracing-subscriber 0.3.19, MIT 
@@ -560,6 +563,12 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 
 - url 2.5.4, Apache-2.0 OR MIT 
   <br/>https://github.com/servo/rust-url
+
+- utoipa 5.3.0, Apache-2.0 OR MIT 
+  <br/>https://github.com/juhaku/utoipa
+
+- utoipa-swagger-ui 8.1.0, Apache-2.0 OR MIT 
+  <br/>https://github.com/juhaku/utoipa
 
 - uuid 0.8.2, Apache-2.0 OR MIT 
   <br/>https://github.com/uuid-rs/uuid
