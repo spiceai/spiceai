@@ -73,7 +73,7 @@ pub(crate) async fn list(Extension(rt): Extension<Arc<Runtime>>) -> Response {
 
 /// Run Tool
 ///
-/// The format of the request body and JSON response match the tool's
+/// The request body and JSON response formats match the tool’s specification.
 #[cfg_attr(feature = "openapi", utoipa::path(
     post,
     path = "/v1/tools/{name}",

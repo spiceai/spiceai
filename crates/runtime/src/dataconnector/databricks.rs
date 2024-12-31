@@ -14,28 +14,23 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::component::catalog::Catalog;
 use crate::component::dataset::Dataset;
-use crate::Runtime;
 use async_trait::async_trait;
 use data_components::databricks_delta::DatabricksDelta;
 use data_components::databricks_spark::DatabricksSparkConnect;
-use data_components::delta_lake::DeltaTableFactory;
-use data_components::unity_catalog::provider::UnityCatalogProvider;
-use data_components::unity_catalog::{CatalogId, Endpoint, UCTable, UnityCatalog};
+use data_components::unity_catalog::Endpoint;
 use data_components::Read;
-use datafusion::catalog::CatalogProvider;
 use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
-use secrecy::{ExposeSecret, SecretString};
+use secrecy::ExposeSecret;
 use snafu::prelude::*;
 use std::any::Any;
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::{collections::HashMap, future::Future};
 
 use super::{
-    ConnectorComponent, DataConnector, DataConnectorFactory, DataConnectorParams, ParameterSpec,
+    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorFactory, ParameterSpec,
     Parameters,
 };
 
@@ -57,7 +52,6 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct Databricks {
     read_provider: Arc<dyn Read>,
-    params: Parameters,
 }
 
 impl Databricks {
@@ -79,7 +73,6 @@ impl Databricks {
             );
             Ok(Self {
                 read_provider: Arc::new(databricks_delta.clone()),
-                params,
             })
         } else {
             let mut databricks_use_ssl = true;
@@ -108,113 +101,12 @@ impl Databricks {
             .context(UnableToConstructDatabricksSparkSnafu)?;
             Ok(Self {
                 read_provider: Arc::new(databricks_spark.clone()),
-                params,
             })
         }
     }
 
-    async fn catalog_provider(
-        self: Arc<Self>,
-        runtime: &Runtime,
-        catalog: &Catalog,
-    ) -> super::DataConnectorResult<Arc<dyn CatalogProvider>> {
-        let Some(catalog_id) = catalog.catalog_id.clone() else {
-            return Err(super::DataConnectorError::InvalidConfigurationNoSource {
-                dataconnector: "databricks".into(),
-                message: "A Catalog Name is required for the Databricks Unity Catalog.\nFor details, visit: https://docs.spiceai.org/components/catalogs/databricks#from".into(),
-                connector_component: ConnectorComponent::from(catalog)
-            });
-        };
-
-        let endpoint = self.params.get("endpoint").expose().ok_or_else(|p| {
-            super::DataConnectorError::InvalidConfigurationNoSource {
-                dataconnector: "databricks".into(),
-                message: format!("A required parameter was missing: {}.\nFor details, visit: https://docs.spiceai.org/components/catalogs/databricks#params", p.0),
-                connector_component: ConnectorComponent::from(catalog)
-            }
-        })?;
-        let token = self.params.get("token").ok_or_else(|p| {
-            super::DataConnectorError::InvalidConfigurationNoSource {
-                dataconnector: "databricks".into(),
-                message: format!("A required parameter was missing: {}.\nFor details, visit: https://docs.spiceai.org/components/catalogs/databricks#params", p.0),
-                connector_component: ConnectorComponent::from(catalog)
-            }
-        })?;
-
-        let unity_catalog = UnityCatalog::new(Endpoint(endpoint.to_string()), Some(token.clone()));
-        let client = Arc::new(unity_catalog);
-
-        // Copy the catalog params into the dataset params, and allow user to override
-        let mut dataset_params: HashMap<String, SecretString> =
-            runtime.get_params_with_secrets(&catalog.params).await;
-
-        let secret_dataset_params = runtime
-            .get_params_with_secrets(&catalog.dataset_params)
-            .await;
-
-        for (key, value) in secret_dataset_params {
-            dataset_params.insert(key, value);
-        }
-
-        let factory = DatabricksFactory::new();
-
-        let params = Parameters::try_new(
-            "connector databricks",
-            dataset_params.into_iter().collect(),
-            factory.prefix(),
-            runtime.secrets(),
-            factory.parameters(),
-        )
-        .await
-        .context(super::InternalWithSourceSnafu {
-            dataconnector: "databricks".to_string(),
-            connector_component: ConnectorComponent::from(catalog),
-        })?;
-
-        let mode = self.params.get("mode").expose().ok();
-        let (table_creator, table_reference_creator) = if let Some("delta_lake") = mode {
-            (
-                Arc::new(DeltaTableFactory::new(params.to_secret_map())) as Arc<dyn Read>,
-                table_reference_creator_delta_lake as fn(UCTable) -> Option<TableReference>,
-            )
-        } else {
-            let dataset_databricks = match Databricks::new(params).await.map_err(|source| {
-                super::DataConnectorError::UnableToGetCatalogProvider {
-                    dataconnector: "databricks".to_string(),
-                    source: source.into(),
-                    connector_component: ConnectorComponent::from(catalog),
-                }
-            }) {
-                Ok(dataset_databricks) => dataset_databricks,
-                Err(e) => return Err(e),
-            };
-
-            (
-                dataset_databricks.read_provider,
-                table_reference_creator_spark as fn(UCTable) -> Option<TableReference>,
-            )
-        };
-
-        let catalog_provider = match UnityCatalogProvider::try_new(
-            client,
-            CatalogId(catalog_id),
-            table_creator,
-            table_reference_creator,
-            catalog.include.clone(),
-        )
-        .await
-        {
-            Ok(provider) => provider,
-            Err(e) => {
-                return Err(super::DataConnectorError::UnableToGetCatalogProvider {
-                    dataconnector: "databricks".to_string(),
-                    source: Box::new(e),
-                    connector_component: ConnectorComponent::from(catalog),
-                })
-            }
-        };
-
-        Ok(Arc::new(catalog_provider) as Arc<dyn CatalogProvider>)
+    pub(crate) fn read_provider(&self) -> Arc<dyn Read> {
+        Arc::clone(&self.read_provider)
     }
 }
 
@@ -293,7 +185,7 @@ const PARAMETERS: &[ParameterSpec] = &[
 impl DataConnectorFactory for DatabricksFactory {
     fn create(
         &self,
-        params: DataConnectorParams,
+        params: ConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             let databricks = Databricks::new(params.parameters).await?;
@@ -330,27 +222,4 @@ impl DataConnector for Databricks {
                 connector_component: ConnectorComponent::from(dataset),
             })?)
     }
-
-    async fn catalog_provider(
-        self: Arc<Self>,
-        runtime: &Runtime,
-        catalog: &Catalog,
-    ) -> Option<super::DataConnectorResult<Arc<dyn CatalogProvider>>> {
-        Some(Databricks::catalog_provider(self, runtime, catalog).await)
-    }
-}
-
-#[allow(clippy::unnecessary_wraps)]
-fn table_reference_creator_spark(uc_table: UCTable) -> Option<TableReference> {
-    let table_reference = TableReference::Full {
-        catalog: uc_table.catalog_name.into(),
-        schema: uc_table.schema_name.into(),
-        table: uc_table.name.into(),
-    };
-    Some(table_reference)
-}
-
-fn table_reference_creator_delta_lake(uc_table: UCTable) -> Option<TableReference> {
-    let storage_location = uc_table.storage_location?;
-    Some(TableReference::bare(format!("{storage_location}/")))
 }

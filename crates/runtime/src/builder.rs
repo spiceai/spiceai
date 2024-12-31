@@ -20,7 +20,7 @@ use app::App;
 use tokio::sync::RwLock;
 
 use crate::{
-    dataaccelerator, dataconnector,
+    catalogconnector, dataaccelerator, dataconnector,
     datafusion::DataFusion,
     datasets_health_monitor::DatasetsHealthMonitor,
     extension::{Extension, ExtensionFactory},
@@ -124,6 +124,7 @@ impl RuntimeBuilder {
 
     pub async fn build(self) -> Runtime {
         dataconnector::register_all().await;
+        catalogconnector::register_all().await;
         dataaccelerator::register_all().await;
         tools::factory::register_all_factories().await;
         document_parse::register_all().await;

@@ -57,6 +57,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// An ergonomic wrapper around calling Unity Catalog APIs.
 ///
 /// Could be replaced once <https://crates.io/crates/unitycatalog-client> is available.
+#[derive(Debug)]
 pub struct UnityCatalog {
     endpoint: String,
     token: Option<SecretString>,
@@ -244,7 +245,7 @@ pub struct UCTableEnvelope {
 }
 
 /// Response from `/api/2.1/unity-catalog/tables/{table_name}`
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct UCTable {
     pub name: String,
     pub catalog_name: String,
@@ -259,7 +260,7 @@ pub struct UCTable {
     pub storage_location: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct UCColumn {
     pub name: String,
     pub type_text: String,

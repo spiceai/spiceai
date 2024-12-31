@@ -16,8 +16,8 @@ limitations under the License.
 
 use super::{
     listing::{self, ListingTableConnector},
-    ConnectorComponent, DataConnector, DataConnectorError, DataConnectorFactory,
-    DataConnectorParams, DataConnectorResult, ParameterSpec, Parameters,
+    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
+    DataConnectorResult, ParameterSpec, Parameters,
 };
 
 use crate::component::dataset::Dataset;
@@ -157,7 +157,7 @@ const PARAMETERS: &[ParameterSpec] = &[
 impl DataConnectorFactory for S3Factory {
     fn create(
         &self,
-        mut params: DataConnectorParams,
+        mut params: ConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         if let Some(endpoint) = params.parameters.get("endpoint").expose().ok() {
             if endpoint.ends_with('/') {

@@ -551,7 +551,7 @@ mod tests {
     use std::pin::Pin;
     use url::Url;
 
-    use crate::dataconnector::{DataConnectorFactory, DataConnectorParams};
+    use crate::dataconnector::{ConnectorParams, DataConnectorFactory};
     use crate::parameters::ParameterSpec;
 
     use super::*;
@@ -569,7 +569,7 @@ mod tests {
     impl DataConnectorFactory for TestConnector {
         fn create(
             &self,
-            params: DataConnectorParams,
+            params: ConnectorParams,
         ) -> Pin<Box<dyn Future<Output = crate::dataconnector::NewDataConnectorResult> + Send>>
         {
             Box::pin(async move {

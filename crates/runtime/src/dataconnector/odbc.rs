@@ -33,7 +33,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use super::{
-    ConnectorComponent, DataConnector, DataConnectorFactory, DataConnectorParams, ParameterSpec,
+    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorFactory, ParameterSpec,
 };
 
 #[derive(Debug, Snafu)]
@@ -200,7 +200,7 @@ fn parameter_is_integer(parameters: &Parameters, param: &str) -> Result<()> {
 impl DataConnectorFactory for ODBCFactory {
     fn create(
         &self,
-        params: DataConnectorParams,
+        params: ConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             parameter_is_integer(&params.parameters, "max_binary_size")?;

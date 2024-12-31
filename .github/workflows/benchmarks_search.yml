@@ -26,7 +26,7 @@ on:
           - 'quora_openai-text-embedding-3-small_duckdb_chunking'
 
 env:
-  FEATURES: 'models,duckdb'
+  FEATURES: 'models,duckdb,postgres-write'
 
 jobs:
   build-bench-binary:
@@ -97,8 +97,7 @@ jobs:
       - name: Benchmark ${{ matrix.name }}
         env:
           SPICE_SPICEAI_API_KEY: ${{ secrets.SPICE_SPICEAI_BENCHMARK_API_KEY }}
-          # Disabled until oss_search_benchmarks is enabled for write
-          # SEARCH_BENCHMARK_UPLOAD_RESULTS_DATASET: 'spice.benchmarks.oss_search_benchmarks'
+          SEARCH_BENCHMARK_UPLOAD_RESULTS_DATASET: 'spice.benchmarks.oss_search_benchmarks'
         if: github.event.inputs.selected_configuration == matrix.name || github.event.inputs.run_all == 'true' || github.event_name == 'schedule'
         run: ./spice_bench ${{ matrix.cmd }}
 

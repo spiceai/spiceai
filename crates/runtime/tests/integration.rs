@@ -42,6 +42,7 @@ mod duckdb;
 mod endpoint_auth;
 mod federation;
 mod file;
+mod flight;
 mod github;
 mod graphql;
 #[cfg(feature = "mssql")]

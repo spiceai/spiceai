@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use super::{
-    ConnectorComponent, DataConnector, DataConnectorFactory, DataConnectorParams, ParameterSpec,
+    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorFactory, ParameterSpec,
 };
 use crate::component::dataset::Dataset;
 use arrow_flight::sql::client::FlightSqlServiceClient;
@@ -72,7 +72,7 @@ const PARAMETERS: &[ParameterSpec] = &[
 impl DataConnectorFactory for FlightSQLFactory {
     fn create(
         &self,
-        params: DataConnectorParams,
+        params: ConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             let endpoint: String = params

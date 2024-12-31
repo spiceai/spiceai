@@ -35,7 +35,7 @@ use std::time::Duration;
 use url::Url;
 
 use super::ConnectorComponent;
-use super::DataConnectorParams;
+use super::ConnectorParams;
 use super::{DataConnector, DataConnectorError, DataConnectorFactory, Parameters};
 use crate::parameters::{ParamLookup, ParameterSpec};
 
@@ -133,7 +133,7 @@ const PARAMETERS: &[ParameterSpec] = &[
 impl DataConnectorFactory for ClickhouseFactory {
     fn create(
         &self,
-        params: DataConnectorParams,
+        params: ConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             match get_config_from_params(params.parameters).await {

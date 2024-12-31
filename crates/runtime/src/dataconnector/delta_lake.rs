@@ -26,7 +26,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use super::{
-    ConnectorComponent, DataConnector, DataConnectorFactory, DataConnectorParams, ParameterSpec,
+    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorFactory, ParameterSpec,
     Parameters,
 };
 
@@ -103,7 +103,7 @@ const PARAMETERS: &[ParameterSpec] = &[
 impl DataConnectorFactory for DeltaLakeFactory {
     fn create(
         &self,
-        params: DataConnectorParams,
+        params: ConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             let delta = DeltaLake::new(params.parameters);

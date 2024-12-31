@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use catalog::SpiceAICatalogProvider;
@@ -35,7 +35,7 @@ use runtime::{
     },
     dataaccelerator::{self, create_accelerator_table},
     dataconnector::{
-        create_new_connector, DataConnector, DataConnectorError, DataConnectorParamsBuilder,
+        create_new_connector, ConnectorParamsBuilder, DataConnector, DataConnectorError,
     },
     extension::{Error as ExtensionError, Extension, ExtensionFactory, ExtensionManifest, Result},
     federated_table::FederatedTable,
@@ -318,8 +318,8 @@ async fn get_spiceai_table_provider(
     dataset.mode = Mode::ReadWrite;
     dataset.replication = Some(Replication { enabled: true });
 
-    let params = DataConnectorParamsBuilder::new(name.into(), (&dataset).into())
-        .without_runtime(HashMap::new(), secrets)
+    let params = ConnectorParamsBuilder::new(name.into(), (&dataset).into())
+        .build(secrets)
         .await
         .context(UnableToCreateDataConnectorSnafu)?;
 

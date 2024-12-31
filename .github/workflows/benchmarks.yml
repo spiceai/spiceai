@@ -44,6 +44,7 @@ on:
           - 'odbc-databricks connector'
           - 'odbc-athena connector'
           - 'delta_lake connector'
+          - 'dremio connector'
           - 'arrow accelerator (memory mode)'
           - 'duckdb accelerator (memory mode)'
           - 'duckdb accelerator (file mode)'
@@ -60,7 +61,7 @@ on:
           - 'no'
 
 env:
-  FEATURES: 'postgres,spark,mysql,mssql,odbc,delta_lake,databricks,duckdb,sqlite'
+  FEATURES: 'postgres,spark,mysql,mssql,odbc,delta_lake,databricks,duckdb,sqlite,dremio'
 
 jobs:
   build-database-bench-binary:
@@ -173,6 +174,9 @@ jobs:
           - cmd: '-c spice.ai'
             name: 'spice.ai connector'
             bench: 'tpch'
+          - cmd: '-c spice.ai -b tpcds'
+            name: 'spice.ai connector'
+            bench: 'tpcds'
           - cmd: '-c s3'
             name: 's3 connector'
             bench: 'tpch'
@@ -226,6 +230,12 @@ jobs:
             bench: 'tpch'
           - cmd: '-c delta_lake -b tpcds'
             name: 'delta_lake connector'
+            bench: 'tpcds'
+          - cmd: '-c dremio'
+            name: 'dremio connector'
+            bench: 'tpch'
+          - cmd: '-c dremio -b tpcds'
+            name: 'dremio connector'
             bench: 'tpcds'
           - cmd: '-a arrow'
             name: 'arrow accelerator (memory mode)'
@@ -330,7 +340,7 @@ jobs:
         run: |
           sudo wget https://dl.min.io/client/mc/release/linux-amd64/mc -O /usr/local/bin/mc
           sudo chmod +x /usr/local/bin/mc
-          mc alias set spice-bench-minio ${{ secrets.CLICKBENCH_S3_ENDPOINT }} ${{ secrets.CLICKBENCH_S3_KEY }} ${{ secrets.CLICKBENCH_S3_SECRET }} 
+          mc alias set spice-bench-minio ${{ secrets.CLICKBENCH_S3_ENDPOINT }} ${{ secrets.CLICKBENCH_S3_KEY }} ${{ secrets.CLICKBENCH_S3_SECRET }}
           mc cp spice-bench-minio/benchmarks/duckdb/tpch.db ./
 
       - name: Download DuckDB Connector Data
@@ -338,7 +348,7 @@ jobs:
         run: |
           sudo wget https://dl.min.io/client/mc/release/linux-amd64/mc -O /usr/local/bin/mc
           sudo chmod +x /usr/local/bin/mc
-          mc alias set spice-bench-minio ${{ secrets.CLICKBENCH_S3_ENDPOINT }} ${{ secrets.CLICKBENCH_S3_KEY }} ${{ secrets.CLICKBENCH_S3_SECRET }} 
+          mc alias set spice-bench-minio ${{ secrets.CLICKBENCH_S3_ENDPOINT }} ${{ secrets.CLICKBENCH_S3_KEY }} ${{ secrets.CLICKBENCH_S3_SECRET }}
           mc cp spice-bench-minio/benchmarks/duckdb/tpcds.db ./
 
       - name: Download File Connector TPCH Data
@@ -346,7 +356,7 @@ jobs:
         run: |
           sudo wget https://dl.min.io/client/mc/release/linux-amd64/mc -O /usr/local/bin/mc
           sudo chmod +x /usr/local/bin/mc
-          mc alias set spice-bench-minio ${{ secrets.CLICKBENCH_S3_ENDPOINT }} ${{ secrets.CLICKBENCH_S3_KEY }} ${{ secrets.CLICKBENCH_S3_SECRET }} 
+          mc alias set spice-bench-minio ${{ secrets.CLICKBENCH_S3_ENDPOINT }} ${{ secrets.CLICKBENCH_S3_KEY }} ${{ secrets.CLICKBENCH_S3_SECRET }}
           mc cp spice-bench-minio/benchmarks/tpch_sf1/customer/ ./ --recursive
           mc cp spice-bench-minio/benchmarks/tpch_sf1/lineitem/ ./ --recursive
           mc cp spice-bench-minio/benchmarks/tpch_sf1/nation/ ./ --recursive
@@ -361,7 +371,7 @@ jobs:
         run: |
           sudo wget https://dl.min.io/client/mc/release/linux-amd64/mc -O /usr/local/bin/mc
           sudo chmod +x /usr/local/bin/mc
-          mc alias set spice-bench-minio ${{ secrets.CLICKBENCH_S3_ENDPOINT }} ${{ secrets.CLICKBENCH_S3_KEY }} ${{ secrets.CLICKBENCH_S3_SECRET }} 
+          mc alias set spice-bench-minio ${{ secrets.CLICKBENCH_S3_ENDPOINT }} ${{ secrets.CLICKBENCH_S3_KEY }} ${{ secrets.CLICKBENCH_S3_SECRET }}
           mc cp spice-bench-minio/benchmarks/tpcds_sf1/call_center/ ./ --recursive
           mc cp spice-bench-minio/benchmarks/tpcds_sf1/catalog_page/ ./ --recursive
           mc cp spice-bench-minio/benchmarks/tpcds_sf1/catalog_returns/ ./ --recursive
@@ -422,6 +432,8 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_S3_ATHENA_SECRET_ACCESS_KEY }}
           SPICEAI_TPCH_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TPCH_BENCHMARK_KEY }}
           SPICEAI_TPCDS_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TPCDS_BENCHMARK_KEY }}
+          DREMIO_PASSWORD: ${{secrets.DREMIO_PASSWORD}}
+          DREMIO_USERNAME: ${{secrets.DREMIO_USERNAME}}
 
       - name: Remove spice_bench file
         run: |
