@@ -57,7 +57,7 @@ impl SpiceToolsOptions {
                 "list_datasets",
                 "get_readiness",
                 "random_sample",
-                "distinct_columns",
+                "sample_distinct_columns",
                 "top_n_sample",
             ],
             SpiceToolsOptions::Nsql => vec![
@@ -65,7 +65,7 @@ impl SpiceToolsOptions {
                 "sql",
                 "list_datasets",
                 "random_sample",
-                "distinct_columns",
+                "sample_distinct_columns",
                 "top_n_sample",
             ],
             SpiceToolsOptions::Disabled => vec![],
@@ -117,7 +117,7 @@ mod tests {
                 "sql",
                 "list_datasets",
                 "random_sample",
-                "distinct_columns",
+                "sample_distinct_columns",
                 "top_n_sample",
                 "my_other_tool"
             ]
