@@ -1168,8 +1168,8 @@
         "tags": [
           "SQL"
         ],
-        "summary": "Vector Search",
-        "description": "Perform a vector search operation on a dataset.\n\nThe search operation will return the most relevant matches based on cosine similarity with the input `text`.\nThe datasets queries should have an embedding column, and the appropriate embedding model loaded.",
+        "summary": "Search",
+        "description": "Perform a vector similarity search (VSS) operation on a dataset.\n\nThe search operation will return the most relevant matches based on cosine similarity with the input `text`.\nThe datasets queries should have an embedding column, and the appropriate embedding model loaded.",
         "operationId": "post_search",
         "requestBody": {
           "description": "Search request parameters",
@@ -1549,7 +1549,7 @@
           "Tools"
         ],
         "summary": "Run Tool",
-        "description": "The format of the request body and JSON response match the tool's",
+        "description": "The request body and JSON response formats match the tool’s specification.",
         "operationId": "post",
         "parameters": [
           {
