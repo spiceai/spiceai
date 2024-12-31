@@ -16,7 +16,7 @@ limitations under the License.
 
 #![allow(clippy::expect_used)]
 use super::send_embeddings_request;
-use crate::models::sql_to_display;
+use crate::models::{sort_json_keys, sql_to_display, sql_to_single_json_value};
 use crate::{
     init_tracing, init_tracing_with_task_history,
     models::{
@@ -490,7 +490,7 @@ async fn verify_sql_query_chat_completion(
         sql_to_display(
             &rt,
             format!(
-                r#"SELECT task, count(1)
+                r#"SELECT task, count(1) > 0 as task_used
                 FROM runtime.task_history
                 WHERE start_time >= '{}'
                 AND task in ('tool_use::list_datasets', 'tool_use::sql', 'tool_use::sql_query')
@@ -505,24 +505,27 @@ async fn verify_sql_query_chat_completion(
         .expect("Failed to execute HTTP SQL query")
     );
 
+    let mut task_input = sql_to_single_json_value(
+        &rt,
+        format!(
+            r#"SELECT input
+        FROM runtime.task_history
+        WHERE start_time >= '{}'
+        AND task='ai_completion'
+        ORDER BY start_time
+        LIMIT 1;
+    "#,
+            Into::<DateTime<Utc>>::into(task_start_time).to_rfc3339()
+        )
+        .as_str(),
+    )
+    .await;
+
+    sort_json_keys(&mut task_input);
+
     insta::assert_snapshot!(
         "chat_1_ai_completion_input",
-        sql_to_display(
-            &rt,
-            format!(
-                r#"SELECT input
-                FROM runtime.task_history
-                WHERE start_time >= '{}'
-                AND task='ai_completion'
-                ORDER BY start_time
-                LIMIT 1;
-            "#,
-                Into::<DateTime<Utc>>::into(task_start_time).to_rfc3339()
-            )
-            .as_str()
-        )
-        .await
-        .expect("Failed to execute HTTP SQL query")
+        serde_json::to_string_pretty(&task_input).expect("Failed to serialize task_input")
     );
 
     Ok(())
