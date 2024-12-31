@@ -94,9 +94,9 @@ Currently supported data connectors for upstream datasets. More coming soon.
 | `postgres`                         | PostgreSQL                            | Release Candidate |                              |
 | `s3`                               | [S3][s3]                              | Release Candidate | Parquet, CSV                 |
 | `databricks (mode: delta_lake)`    | [Databricks][databricks]              | Release Candidate | S3/Delta Lake                |
+| `file`                             | File                                  | Release Candidate | Parquet, CSV                 |
 | `databricks (mode: spark_connect)` | [Databricks][databricks]              | Beta              | [Spark Connect][spark]       |
 | `delta_lake`                       | Delta Lake                            | Beta              | Delta Lake                   |
-| `file`                             | File                                  | Beta              | Parquet, CSV                 |
 | `flightsql`                        | FlightSQL                             | Beta              | Arrow Flight SQL             |
 | `mssql`                            | Microsoft SQL Server                  | Beta              | Tabular Data Stream (TDS)    |
 | `odbc`                             | ODBC                                  | Beta              | ODBC                         |
