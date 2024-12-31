@@ -23,6 +23,7 @@ use std::{
 
 use crate::request::{Protocol, RequestContext};
 use app::App;
+use runtime_auth::AuthRequestContext;
 use tower::{Layer, Service};
 
 /// Extracts the request context from the HTTP headers and adds it to the task-local context.
@@ -70,7 +71,7 @@ where
         self.inner.poll_ready(cx)
     }
 
-    fn call(&mut self, req: http::Request<ReqBody>) -> Self::Future {
+    fn call(&mut self, mut req: http::Request<ReqBody>) -> Self::Future {
         let clone = self.inner.clone();
         let mut inner = std::mem::replace(&mut self.inner, clone);
 
@@ -81,6 +82,11 @@ where
                 .from_headers(headers)
                 .build(),
         );
+
+        req.extensions_mut()
+            .insert::<Arc<dyn AuthRequestContext + Send + Sync>>(
+                Arc::clone(&request_context) as Arc<dyn AuthRequestContext + Send + Sync>
+            );
 
         Box::pin(async move { request_context.scope(inner.call(req)).await })
     }

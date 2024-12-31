@@ -23,7 +23,7 @@ use std::{
 use app::App;
 use http::HeaderMap;
 use opentelemetry::KeyValue;
-use runtime_auth::AuthPrincipalRef;
+use runtime_auth::{AuthPrincipalRef, AuthRequestContext};
 use spicepod::component::runtime::UserAgentCollection;
 
 use super::{baggage, Protocol, UserAgent};
@@ -117,18 +117,20 @@ impl RequestContext {
         self.protocol
             .store(protocol as u8, std::sync::atomic::Ordering::Relaxed);
     }
+}
 
-    pub fn set_auth_principal(
+impl AuthRequestContext for RequestContext {
+    fn set_auth_principal(
         &self,
         auth_principal: AuthPrincipalRef,
     ) -> Result<(), super::GenericError> {
         self.auth_principal
             .set(auth_principal)
-            .map_err(|_| "Auth principal already set".into())
+            .map_err(|_| "Failed to set auth principal".into())
     }
 
     #[must_use]
-    pub fn auth_principal(&self) -> Option<&AuthPrincipalRef> {
+    fn auth_principal(&self) -> Option<&AuthPrincipalRef> {
         self.auth_principal.get()
     }
 }

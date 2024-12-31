@@ -39,6 +39,8 @@ use runtime::{
     component::dataset::acceleration::Acceleration, config::Config, datafusion::DataFusion,
     internal_table::create_internal_accelerated_table, secrets::Secrets, Runtime,
 };
+use runtime_auth::{api_key::ApiKeyAuth, FlightBasicAuth};
+use spicepod::component::runtime::ApiKey;
 use tokio::{
     sync::RwLock,
     time::{sleep, timeout},
@@ -54,9 +56,12 @@ async fn test_flight_do_put_basic() -> Result<(), anyhow::Error> {
 
     test_request_context()
         .scope(async {
-            let (channel, df) = start_spice_test_app().await?;
+            let auth = Arc::new(ApiKeyAuth::new(vec![ApiKey::parse_str("valid:rw")]))
+                as Arc<dyn FlightBasicAuth + Send + Sync>;
 
-            let mut client = FlightClient::new(channel);
+            let (channel, df) = start_spice_test_app(Some(auth)).await?;
+
+            let mut client = create_flight_client(channel, Some("valid"))?;
 
             let test_record_batch = test_record_batch()?;
 
@@ -100,7 +105,7 @@ async fn test_flight_do_put_basic() -> Result<(), anyhow::Error> {
 
 #[tokio::test]
 async fn test_do_put_stream_error() -> Result<(), Box<dyn std::error::Error>> {
-    let (channel, df) = start_spice_test_app().await?;
+    let (channel, df) = start_spice_test_app(None).await?;
 
     let mut client = FlightClient::new(channel);
 
@@ -152,7 +157,24 @@ async fn test_do_put_stream_error() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn start_spice_test_app() -> Result<(Channel, Arc<DataFusion>), anyhow::Error> {
+fn create_flight_client(
+    channel: Channel,
+    api_key: Option<&str>,
+) -> Result<FlightClient, anyhow::Error> {
+    let mut client = FlightClient::new(channel);
+
+    if let Some(api_key) = api_key {
+        client
+            .add_header("authorization", &format!("Bearer {api_key}"))
+            .map_err(anyhow::Error::from)?;
+    };
+
+    Ok(client)
+}
+
+async fn start_spice_test_app(
+    flight_auth: Option<Arc<dyn FlightBasicAuth + Send + Sync>>,
+) -> Result<(Channel, Arc<DataFusion>), anyhow::Error> {
     let mut rng = rand::thread_rng();
     let http_port: u16 = rng.gen_range(50000..60000);
     let flight_port: u16 = http_port + 1;
@@ -186,10 +208,14 @@ async fn start_spice_test_app() -> Result<(Channel, Arc<DataFusion>), anyhow::Er
     )
     .await?;
 
+    let mut auth = EndpointAuth::default();
+
+    if let Some(flight_auth) = flight_auth {
+        auth = auth.with_flight_basic_auth(flight_auth);
+    }
+
     // Start the servers
-    tokio::spawn(async move {
-        Box::pin(Arc::new(rt).start_servers(api_config, None, EndpointAuth::default())).await
-    });
+    tokio::spawn(async move { Box::pin(Arc::new(rt).start_servers(api_config, None, auth)).await });
 
     // Wait for the servers to start
     tracing::info!("Waiting for servers to start...");

@@ -26,6 +26,22 @@ pub trait AuthPrincipal {
     fn username(&self) -> &str; // The username as presented during auth
     fn groups(&self) -> &[&str]; // Group memberships
 }
+pub trait AuthRequestContext {
+    /// Sets the current authentication principal for the request context.
+    ///
+    /// # Errors
+    ///
+    /// This function returns an error if the principal cannot be set.
+    fn set_auth_principal(
+        &self,
+        auth_principal: AuthPrincipalRef,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+    /// Retrieves the principal information associated with the request.
+    ///
+    /// Returns `None` if authentication is not set up or has not yet been completed.
+    fn auth_principal(&self) -> Option<&AuthPrincipalRef>;
+}
 
 pub enum AuthVerdict {
     Allow(AuthPrincipalRef),
@@ -71,6 +87,10 @@ pub trait FlightBasicAuth {
     ///
     /// This function will return an error if the validator can't validate the bearer token.
     fn is_valid(&self, bearer_token: &str) -> Result<AuthVerdict, Error>;
+
+    // fn with_set_auth_context(&self, set_auth_context: SetAuthContext) -> Self;
+
+    // fn set_auth_context(&self, principal: &AuthPrincipalRef) -> Pin<Box<dyn Future<Output = ()> + Send>>;
 }
 
 pub trait GrpcAuth {

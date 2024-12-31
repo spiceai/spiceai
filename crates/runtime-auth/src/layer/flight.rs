@@ -21,7 +21,7 @@ use std::{
     task::{Context, Poll},
 };
 
-use crate::{AuthVerdict, FlightBasicAuth};
+use crate::{AuthRequestContext, AuthVerdict, FlightBasicAuth};
 use base64::{prelude::BASE64_STANDARD, Engine};
 use pin_project::pin_project;
 use tonic::{
@@ -113,6 +113,8 @@ pub struct BasicAuthMiddleware<S> {
     auth_verifier: Option<Arc<dyn FlightBasicAuth + Send + Sync>>,
 }
 
+//type BoxFuture<'a, T> = Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
+
 impl<S, ReqBody, ResBody> Service<http::Request<ReqBody>> for BasicAuthMiddleware<S>
 where
     S: Service<http::Request<ReqBody>, Response = http::Response<ResBody>> + Clone + Send + 'static,
@@ -153,8 +155,20 @@ where
         };
 
         match auth_verifier.is_valid(bearer_token) {
-            Ok(AuthVerdict::Allow(_principal)) => {
-                // TODO: RequestContext::current(AsyncMarker::new().await).set_auth_principal(principal);
+            Ok(AuthVerdict::Allow(principal)) => {
+                if let Some(auth_context) = req
+                    .extensions()
+                    .get::<Arc<dyn AuthRequestContext + Send + Sync>>()
+                {
+                    if let Err(e) = auth_context.set_auth_principal(principal) {
+                        tracing::error!(
+                            "Failed to associate authentication information with the request: {e}"
+                        );
+                    }
+                } else {
+                    tracing::error!("Failed to associate authentication information with the request: the flight request is missing an authentication context.");
+                }
+
                 let (metadata, extensions, msg) = req.into_parts();
 
                 // Tonic has an `into_http` method that does this, but its private.

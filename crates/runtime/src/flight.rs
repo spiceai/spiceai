@@ -67,8 +67,7 @@ use arrow_flight::{
 pub struct Service {
     datafusion: Arc<DataFusion>,
     channel_map: Arc<RwLock<HashMap<TableReference, Arc<Sender<DataUpdate>>>>>,
-    // TODO - rework, access via getter or function to check access
-    pub basic_auth: Option<Arc<dyn FlightBasicAuth + Send + Sync>>,
+    basic_auth: Option<Arc<dyn FlightBasicAuth + Send + Sync>>,
 }
 
 #[tonic::async_trait]
@@ -340,8 +339,8 @@ pub async fn start(
         .into_inner();
 
     server
-        .layer(auth_layer)
         .layer(RequestContextLayer::new(app))
+        .layer(auth_layer)
         .add_service(svc)
         .serve(bind_address)
         .await
