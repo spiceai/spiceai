@@ -8,19 +8,10 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 
 - See [Bugs](https://github.com/spiceai/spiceai/labels/bug). Feel free to file a new Issue if you see a bug and let us know on Discord.
 
-## v1.0-rc.3 (Dec 2024)
-
-- Bugfixes and performance improvements
-- Spice.ai Cloud Platform data connector (Release Candidate)
-- Dremio data connector (Release Candidate)
-- File data connector (Release Candidate)
-- Data Accelerators: SQLite & PostgreSQL (Release Candidate)
-- Iceberg Catalog Connector (Alpha)
-- [#3318](https://github.com/spiceai/spiceai/issues/3318) FinanceBench in CI
-
 ## v1.0-stable (Jan 2025)
 
 - Bugfixes and performance improvements
+- [#3318](https://github.com/spiceai/spiceai/issues/3318) FinanceBench in CI
 - Data Accelerators: Arrow, DuckDB, SQLite, PostgreSQL (Stable)
 - Model Providers: OpenAI, Hugging Face, File (Stable)
 - Catalog Providers: Unity Catalog, Spice.ai Cloud Platform (Stable)
@@ -68,12 +59,12 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 
 ### v1.0-stable Data Accelerator Support
 
-| Name         | Status |
-| ------------ | ------ |
-| `arrow`      | Stable |
-| `duckdb`     | Stable |
-| `sqlite`     | Stable |
-| `postgresql` | Stable |
+| Name         | Status            |
+| ------------ | ----------------- |
+| `arrow`      | Stable            |
+| `duckdb`     | Stable            |
+| `postgresql` | Stable            |
+| `sqlite`     | Release Candidate |
 
 ### v1.0-stable Catalog Provider Support
 
