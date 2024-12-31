@@ -38,8 +38,6 @@ This section is required if the Catalog does not use an existing Data Connector.
 ### All Catalogs
 
 - [ ] The Catalog can refresh the list of datasets, and add/remove datasets that are available.
-  - [ ] Catalog refresh is made available via an API endpoint to trigger on-demand Catalog refreshes.
-  - [ ] Catalog refresh is configurable on an interval, disabled by default.
   - [ ] An end-to-end test for catalog refresh is created, testing the addition/removal of datasets.
 - [ ] Known [Major and Minor](../definitions.md) bugs are resolved for the Catalog.
 

@@ -33,11 +33,11 @@ This section is required if the Catalog uses an existing Data Connector.
 
 This section is required if the Catalog does not use an existing Data Connector.
 
-- [ ] The Catalog passes the [Alpha Data Connector release criteria](../connectors/alpha.md)
+- [ ] The datasets created by the Catalog passes the [Alpha Data Connector release criteria](../connectors/alpha.md)
 
 ### All Catalogs
 
-- [ ] The Catalog implements the functionality of a catalog - loading multiple datasets based on the value of an `include` pattern.
+- [ ] The Catalog implements the functionality of a catalog - loading multiple datasets from a catalog provider based on the value of an `include` pattern.
 - [ ] An end-to-end test is created that loads the TPC-H dataset at scale factor 1 using a Catalog, instead of specifying individual datasets.
   - [ ] TPC-H queries pass with a success rate equal to the native connector. For Catalogs without an existing Data Connector, queries pass with a success rate equal or greater than TPC-H execution on Datafusion.
 - [ ] Known [Minor and Major](../definitions.md) bugs are logged, but not required to be fixed unless needed to achieve TPC-H success.
