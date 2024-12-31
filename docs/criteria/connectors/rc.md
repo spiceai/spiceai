@@ -14,7 +14,7 @@ All criteria must be met for the connector to be considered [RC](../definitions.
 | Delta Lake                       | ➖         |              |
 | Dremio                           | ➖         |              |
 | DuckDB                           | ✅         | @peasee      |
-| File                             | ➖✅       | @Sevenannn   |
+| File                             | ✅         | @Sevenannn   |
 | FlightSQL                        | ➖         |              |
 | FTP/SFTP                         | ➖         |              |
 | GraphQL                          | ✅         | @peasee      |
