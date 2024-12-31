@@ -87,10 +87,6 @@ pub trait FlightBasicAuth {
     ///
     /// This function will return an error if the validator can't validate the bearer token.
     fn is_valid(&self, bearer_token: &str) -> Result<AuthVerdict, Error>;
-
-    // fn with_set_auth_context(&self, set_auth_context: SetAuthContext) -> Self;
-
-    // fn set_auth_context(&self, principal: &AuthPrincipalRef) -> Pin<Box<dyn Future<Output = ()> + Send>>;
 }
 
 pub trait GrpcAuth {

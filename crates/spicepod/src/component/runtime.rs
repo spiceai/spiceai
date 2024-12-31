@@ -282,7 +282,6 @@ impl ApiKey {
                 "rw" => ApiKey::ReadWrite {
                     key: key.to_string(),
                 },
-                // _ => Err(format!("Invalid key type suffix: {}", kind)),
                 _ => ApiKey::ReadOnly {
                     key: input.to_string(),
                 },
@@ -332,5 +331,67 @@ impl AsRef<str> for ApiKey {
         match self {
             ApiKey::ReadOnly { key } | ApiKey::ReadWrite { key } => key.as_str(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_yaml;
+
+    #[test]
+    fn test_deserialize_api_keys() {
+        let yaml = r"
+        api_key:
+            enabled: true
+            keys:
+                - api-key-1
+                - api-key-2:ro
+                - api-key-3:rw
+        ";
+
+        let parsed: Auth = serde_yaml::from_str(yaml).expect("Failed to parse Auth");
+
+        let api_key = parsed.api_key.expect("api_key section exists");
+
+        assert_eq!(
+            api_key.keys[0],
+            ApiKey::ReadOnly {
+                key: "api-key-1".to_string()
+            }
+        );
+        assert_eq!(
+            api_key.keys[1],
+            ApiKey::ReadOnly {
+                key: "api-key-2".to_string()
+            }
+        );
+        assert_eq!(
+            api_key.keys[2],
+            ApiKey::ReadWrite {
+                key: "api-key-3".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn test_deserialize_api_key_alternative_name() {
+        let yaml = r"
+        api-key:
+            enabled: true
+            keys:
+                - api-key-1
+        ";
+
+        let parsed: Auth = serde_yaml::from_str(yaml).expect("Failed to parse Auth");
+
+        let api_key = parsed.api_key.expect("api_key section exists");
+
+        assert_eq!(
+            api_key.keys[0],
+            ApiKey::ReadOnly {
+                key: "api-key-1".to_string()
+            }
+        );
     }
 }
