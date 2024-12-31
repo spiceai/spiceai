@@ -67,6 +67,7 @@ mod nsql {
                     primary_keys: None,
                     chunking: None,
                 }];
+            //taxi_trips_with_embeddings.metadata.insert("instructions".to_string(), "Do not put double quotes around `spice.public.taxi_trips`.".to_string().into());
 
             let app = AppBuilder::new("text-to-sql")
                 .with_dataset(taxi_trips_with_embeddings)
@@ -596,6 +597,20 @@ fn get_openai_model(model: impl Into<String>, name: impl Into<String>) -> Model 
         "openai_api_key".to_string(),
         "${ secrets:SPICE_OPENAI_API_KEY }".into(),
     );
+    model.params.insert("system_prompt".to_string(), r#"
+    When writing SQL queries, do not put double quotes around schema-qualified table names. For example:
+
+    Correct: SELECT * FROM schema.table
+    Correct: SELECT * FROM database.schema.table
+    Incorrect: SELECT * FROM "schema.table"
+    Incorrect: SELECT * FROM "database.schema.table"
+
+    Only use double quotes when you need to preserve case sensitivity or when identifiers contain special characters.
+
+    Prefer quoting column names. For example:
+    Correct: `SELECT COUNT(*) AS "total_records" FROM "spice"."public"."taxi_trips"`
+    Incorrect: `SELECT COUNT(*) AS total_records FROM "spice"."public"."taxi_trips"`
+    "#.to_string().into());
     model
 }
 
