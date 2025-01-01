@@ -51,7 +51,7 @@ pub(crate) async fn handle(
                     return Err(Status::permission_denied("Write access denied. Verify that authentication key used has write access and try again."));
                 }
             },
-            None => return Err(Status::unauthenticated("Flight DoPut requires authentication enabled.\nFor auth details, visit https://docs.spiceai.org/api/auth")),
+            None => return Err(Status::unauthenticated("Flight DoPut requires authentication.\nFor auth details, visit https://docs.spiceai.org/api/auth")),
      }
 
     let mut streaming_flight = request.into_inner();
