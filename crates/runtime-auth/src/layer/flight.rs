@@ -113,8 +113,6 @@ pub struct BasicAuthMiddleware<S> {
     auth_verifier: Option<Arc<dyn FlightBasicAuth + Send + Sync>>,
 }
 
-//type BoxFuture<'a, T> = Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
-
 impl<S, ReqBody, ResBody> Service<http::Request<ReqBody>> for BasicAuthMiddleware<S>
 where
     S: Service<http::Request<ReqBody>, Response = http::Response<ResBody>> + Clone + Send + 'static,
