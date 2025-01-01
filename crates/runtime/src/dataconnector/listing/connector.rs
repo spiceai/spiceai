@@ -151,6 +151,10 @@ pub trait ListingTableConnector: DataConnector {
                 Some(self.get_csv_format(dataset, params)?),
                 extension.unwrap_or(".csv".to_string()),
             )),
+            (Some("tsv"), _) | (None, Some("tsv")) => Ok((
+                Some(self.get_tsv_format(dataset, params)?),
+                extension.unwrap_or(".tsv".to_string()),
+            )),
             (Some("jsonl"), _) | (None, Some("jsonl"))=> Ok((
                 Some(self.get_jsonl_format(dataset, params)?),
                 extension.unwrap_or(".jsonl".to_string()),
@@ -266,6 +270,59 @@ pub trait ListingTableConnector: DataConnector {
                         .context(crate::dataconnector::InvalidConfigurationSnafu {
                             dataconnector: format!("{self}"),
                             message: format!("Invalid CSV compression_type: {compression_type}, supported types are: GZIP, BZIP2, XZ, ZSTD, UNCOMPRESSED"),
+                            connector_component: ConnectorComponent::from(dataset)
+                        })?,
+                ),
+        ))
+    }
+
+    fn get_tsv_format(
+        &self,
+        dataset: &Dataset,
+        params: &Parameters,
+    ) -> DataConnectorResult<Arc<CsvFormat>>
+    where
+        Self: Display,
+    {
+        let has_header = params
+            .get("tsv_has_header")
+            .expose()
+            .ok()
+            .map_or(true, |f| f.eq_ignore_ascii_case("true"));
+        let quote = params
+            .get("tsv_quote")
+            .expose()
+            .ok()
+            .map_or(b'"', |f| *f.as_bytes().first().unwrap_or(&b'"'));
+        let escape = params
+            .get("tsv_escape")
+            .expose()
+            .ok()
+            .and_then(|f| f.as_bytes().first().copied());
+        let schema_infer_max_rec = params
+            .get("schema_infer_max_records")
+            .expose()
+            .ok()
+            .map_or_else(|| 1000, |f| usize::from_str(f).map_or(1000, |f| f));
+        let compression_type = params
+            .get("file_compression_type")
+            .expose()
+            .ok()
+            .unwrap_or_default();
+
+        Ok(Arc::new(
+            CsvFormat::default()
+                .with_has_header(has_header)
+                .with_quote(quote)
+                .with_escape(escape)
+                .with_schema_infer_max_rec(schema_infer_max_rec)
+                .with_delimiter(b'\t')
+                .with_file_compression_type(
+                    FileCompressionType::from_str(compression_type)
+                        .boxed()
+                        .context(crate::dataconnector::InvalidConfigurationSnafu {
+                            dataconnector: format!("{self}"),
+                            message: format!("Invalid TSV compression_type: {compression_type}, supported types are: GZIP, BZIP2, XZ, ZSTD, UNCOMPRESSED"),
                             connector_component: ConnectorComponent::from(dataset)
                         })?,
                 ),
@@ -683,6 +740,21 @@ mod tests {
             connector.get_file_format_and_extension(&dataset)
         {
             assert_eq!(extension, ".csv");
+        } else {
+            panic!("Unexpected error");
+        }
+    }
+
+    #[test]
+    fn test_get_file_format_and_extension_tsv_from_params() {
+        let mut params = HashMap::new();
+        params.insert("file_format".to_string(), "tsv".to_string());
+        let (connector, dataset) = setup_connector("test:test.parquet".to_string(), params);
+
+        if let Ok((Some(_file_format), extension)) =
+            connector.get_file_format_and_extension(&dataset)
+        {
+            assert_eq!(extension, ".tsv");
         } else {
             panic!("Unexpected error");
         }

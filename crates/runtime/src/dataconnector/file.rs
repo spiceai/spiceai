@@ -75,6 +75,10 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::runtime("csv_schema_infer_max_records")
         .description("Set a limit in terms of records to scan to infer the schema.")
         .deprecated("use 'schema_infer_max_records' instead"),
+    ParameterSpec::runtime("tsv_has_header")
+        .description("Set true to indicate that the first line is a header."),
+    ParameterSpec::runtime("tsv_quote").description("The quote character in a row."),
+    ParameterSpec::runtime("tsv_escape").description("The escape character in a row."),
     ParameterSpec::runtime("csv_delimiter")
         .description("The character separating values within a row."),
     ParameterSpec::runtime("file_compression_type")
