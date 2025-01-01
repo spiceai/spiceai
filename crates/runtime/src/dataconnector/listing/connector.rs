@@ -675,6 +675,9 @@ mod tests {
         ParameterSpec::runtime("csv_escape"),
         ParameterSpec::runtime("csv_schema_infer_max_records"),
         ParameterSpec::runtime("csv_delimiter"),
+        ParameterSpec::runtime("tsv_has_header"),
+        ParameterSpec::runtime("tsv_quote"),
+        ParameterSpec::runtime("tsv_escape"),
         ParameterSpec::runtime("file_compression_type"),
     ];
 
