@@ -145,7 +145,7 @@ fn build_app(
         #[cfg(feature = "mysql")]
         "mysql" => crate::bench_mysql::build_app(app_builder, bench_name),
         #[cfg(feature = "duckdb")]
-        "duckdb" => crate::bench_duckdb::build_app(app_builder, bench_name),
+        "duckdb" => crate::bench_duckdb::build_app(app_builder, bench_name, acceleration.clone()),
         #[cfg(feature = "odbc")]
         "odbc-databricks" => crate::bench_odbc_databricks::build_app(app_builder, bench_name),
         #[cfg(feature = "odbc")]

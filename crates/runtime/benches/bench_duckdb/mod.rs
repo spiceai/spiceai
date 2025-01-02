@@ -15,15 +15,27 @@ limitations under the License.
 */
 
 use app::AppBuilder;
+use arrow::array::AsArray;
 use runtime::Runtime;
 
-use crate::results::BenchmarkResultsBuilder;
-use spicepod::component::{dataset::Dataset, params::Params};
+use crate::{results::BenchmarkResultsBuilder, run_query};
+use spicepod::component::{
+    dataset::{
+        acceleration::{Acceleration, RefreshMode},
+        Dataset,
+    },
+    params::Params,
+};
+
+use duckdb::Connection;
+use std::time::Duration;
+use tokio::{task::JoinHandle, time::sleep};
 
 pub(crate) async fn run(
     rt: &mut Runtime,
     benchmark_results: &mut BenchmarkResultsBuilder,
     bench_name: &str,
+    accelerator: Option<Acceleration>,
 ) -> Result<(), String> {
     let test_queries = match bench_name {
         "tpch" => get_tpch_test_queries(),
@@ -32,14 +44,79 @@ pub(crate) async fn run(
     };
 
     let mut errors = Vec::new();
+    let is_append = accelerator
+        .clone()
+        .and_then(|a| a.refresh_mode)
+        .is_some_and(|m| m == RefreshMode::Append);
+
+    if is_append {
+        let start_time = std::time::Instant::now();
+
+        loop {
+            sleep(Duration::from_secs(60 * 3)).await; // refresh interval is 5 minutes - check every 6 minutes
+
+            // check if the data has finished loading
+            let res = run_query(
+                rt,
+                "duckdb",
+                "table_count",
+                "SELECT COUNT(*) as l_count FROM lineitem",
+            )
+            .await;
+
+            if let Err(e) = res {
+                return Err(format!(
+                    "Append mode data load failed. Failed to count rows in lineitem table: {e}"
+                ));
+            }
+
+            let count = res
+                .map_err(|e| e.to_string())?
+                .first()
+                .ok_or("No rows returned from count query")?
+                .column_by_name("l_count")
+                .ok_or("No column named l_count")?
+                .as_primitive::<arrow::datatypes::Int64Type>()
+                .value(0);
+            if count < 6_000_000 {
+                if start_time.elapsed() > Duration::from_secs(60 * 60) {
+                    tracing::error!("Append mode data load failed. Expected over 6 million rows in lineitem table, got {count}");
+                    return Err(format!("Append mode data load failed. Expected over 6 million rows in lineitem table, got {count}"));
+                }
+
+                tracing::info!("Append mode data load in progress. Expected over 6 million rows in lineitem table, got {count}");
+            } else {
+                tracing::info!(
+                    "Append mode data load complete. Loaded {count} rows in lineitem table"
+                );
+                break;
+            }
+        }
+    }
+
+    let bench_name = match (accelerator, is_append) {
+        (Some(accelerator), true) => {
+            format!(
+                "{bench_name}_{}_append",
+                accelerator.engine.unwrap_or("arrow".to_string())
+            )
+        }
+        (Some(accelerator), false) => {
+            format!(
+                "{bench_name}_{}",
+                accelerator.engine.unwrap_or("arrow".to_string())
+            )
+        }
+        (None, _) => bench_name.to_string(),
+    };
 
     for (query_name, query) in test_queries {
         let verify_query_results =
-            query_name.starts_with("tpch_q") || query_name.starts_with("tpcds_q");
+            (query_name.starts_with("tpch_q") || query_name.starts_with("tpcds_q")) && !is_append;
         if let Err(e) = super::run_query_and_record_result(
             rt,
             benchmark_results,
-            "duckdb",
+            &bench_name,
             query_name,
             query,
             verify_query_results,
@@ -57,64 +134,142 @@ pub(crate) async fn run(
     Ok(())
 }
 
-pub fn build_app(app_builder: AppBuilder, bench_name: &str) -> Result<AppBuilder, String> {
+#[allow(clippy::too_many_lines)]
+pub fn build_app(
+    app_builder: AppBuilder,
+    bench_name: &str,
+    acceleration: Option<Acceleration>,
+) -> Result<AppBuilder, String> {
+    let is_append = acceleration
+        .and_then(|a| a.refresh_mode)
+        .is_some_and(|m| m == RefreshMode::Append);
+
+    if is_append {
+        tracing::info!(
+            "Running DuckDB connector in append mode - data will be loaded incrementally"
+        );
+    }
+
     match bench_name {
         "tpch" => Ok(app_builder
-            .with_dataset(make_dataset("customer", "customer", bench_name))
-            .with_dataset(make_dataset("lineitem", "lineitem", bench_name))
-            .with_dataset(make_dataset("part", "part", bench_name))
-            .with_dataset(make_dataset("partsupp", "partsupp", bench_name))
-            .with_dataset(make_dataset("orders", "orders", bench_name))
-            .with_dataset(make_dataset("nation", "nation", bench_name))
-            .with_dataset(make_dataset("region", "region", bench_name))
-            .with_dataset(make_dataset("supplier", "supplier", bench_name))),
+            .with_dataset(make_dataset(
+                "customer",
+                "customer",
+                bench_name,
+                is_append.then_some("c_created_at"),
+            ))
+            .with_dataset(make_dataset(
+                "lineitem",
+                "lineitem",
+                bench_name,
+                is_append.then_some("l_created_at"),
+            ))
+            .with_dataset(make_dataset(
+                "part",
+                "part",
+                bench_name,
+                is_append.then_some("p_created_at"),
+            ))
+            .with_dataset(make_dataset(
+                "partsupp",
+                "partsupp",
+                bench_name,
+                is_append.then_some("ps_created_at"),
+            ))
+            .with_dataset(make_dataset(
+                "orders",
+                "orders",
+                bench_name,
+                is_append.then_some("o_created_at"),
+            ))
+            .with_dataset(make_dataset(
+                "nation",
+                "nation",
+                bench_name,
+                is_append.then_some("n_created_at"),
+            ))
+            .with_dataset(make_dataset(
+                "region",
+                "region",
+                bench_name,
+                is_append.then_some("r_created_at"),
+            ))
+            .with_dataset(make_dataset(
+                "supplier",
+                "supplier",
+                bench_name,
+                is_append.then_some("s_created_at"),
+            ))),
         "tpcds" => Ok(app_builder
-            .with_dataset(make_dataset("call_center", "call_center", bench_name))
-            .with_dataset(make_dataset("catalog_page", "catalog_page", bench_name))
-            .with_dataset(make_dataset("catalog_sales", "catalog_sales", bench_name))
+            .with_dataset(make_dataset("call_center", "call_center", bench_name, None))
             .with_dataset(make_dataset(
-                "catalog_returns",
-                "catalog_returns",
+                "catalog_page",
+                "catalog_page",
                 bench_name,
+                None,
             ))
-            .with_dataset(make_dataset("income_band", "income_band", bench_name))
-            .with_dataset(make_dataset("inventory", "inventory", bench_name))
-            .with_dataset(make_dataset("store_sales", "store_sales", bench_name))
-            .with_dataset(make_dataset("store_returns", "store_returns", bench_name))
-            .with_dataset(make_dataset("web_sales", "web_sales", bench_name))
-            .with_dataset(make_dataset("web_returns", "web_returns", bench_name))
-            .with_dataset(make_dataset("customer", "customer", bench_name))
+            .with_dataset(make_dataset(
+                "catalog_sales",
+                "catalog_sales",
+                bench_name,
+                None,
+            ))
+            .with_dataset(make_dataset(
+                "catalog_returns",
+                "catalog_returns",
+                bench_name,
+                None,
+            ))
+            .with_dataset(make_dataset("income_band", "income_band", bench_name, None))
+            .with_dataset(make_dataset("inventory", "inventory", bench_name, None))
+            .with_dataset(make_dataset("store_sales", "store_sales", bench_name, None))
+            .with_dataset(make_dataset(
+                "store_returns",
+                "store_returns",
+                bench_name,
+                None,
+            ))
+            .with_dataset(make_dataset("web_sales", "web_sales", bench_name, None))
+            .with_dataset(make_dataset("web_returns", "web_returns", bench_name, None))
+            .with_dataset(make_dataset("customer", "customer", bench_name, None))
             .with_dataset(make_dataset(
                 "customer_address",
                 "customer_address",
                 bench_name,
+                None,
             ))
             .with_dataset(make_dataset(
                 "customer_demographics",
                 "customer_demographics",
                 bench_name,
+                None,
             ))
-            .with_dataset(make_dataset("date_dim", "date_dim", bench_name))
+            .with_dataset(make_dataset("date_dim", "date_dim", bench_name, None))
             .with_dataset(make_dataset(
                 "household_demographics",
                 "household_demographics",
                 bench_name,
+                None,
             ))
-            .with_dataset(make_dataset("item", "item", bench_name))
-            .with_dataset(make_dataset("promotion", "promotion", bench_name))
-            .with_dataset(make_dataset("reason", "reason", bench_name))
-            .with_dataset(make_dataset("ship_mode", "ship_mode", bench_name))
-            .with_dataset(make_dataset("store", "store", bench_name))
-            .with_dataset(make_dataset("time_dim", "time_dim", bench_name))
-            .with_dataset(make_dataset("warehouse", "warehouse", bench_name))
-            .with_dataset(make_dataset("web_page", "web_page", bench_name))
-            .with_dataset(make_dataset("web_site", "web_site", bench_name))),
+            .with_dataset(make_dataset("item", "item", bench_name, None))
+            .with_dataset(make_dataset("promotion", "promotion", bench_name, None))
+            .with_dataset(make_dataset("reason", "reason", bench_name, None))
+            .with_dataset(make_dataset("ship_mode", "ship_mode", bench_name, None))
+            .with_dataset(make_dataset("store", "store", bench_name, None))
+            .with_dataset(make_dataset("time_dim", "time_dim", bench_name, None))
+            .with_dataset(make_dataset("warehouse", "warehouse", bench_name, None))
+            .with_dataset(make_dataset("web_page", "web_page", bench_name, None))
+            .with_dataset(make_dataset("web_site", "web_site", bench_name, None))),
         _ => Err("Only tpcds or tpch benchmark suites are supported".to_string()),
     }
 }
 
-fn make_dataset(path: &str, name: &str, bench_name: &str) -> Dataset {
+fn make_dataset(path: &str, name: &str, bench_name: &str, time_column: Option<&str>) -> Dataset {
     let mut dataset = Dataset::new(format!("duckdb:{path}"), name.to_string());
+    if let Some(time_column) = time_column {
+        dataset.time_column = Some(time_column.to_string());
+    };
+
     dataset.params = Some(get_params(bench_name));
     dataset
 }
@@ -280,3 +435,123 @@ fn get_tpcds_test_queries() -> Vec<(&'static str, &'static str)> {
         ("tpcds_q99", include_str!("../queries/tpcds/q99.sql")),
     ]
 }
+
+/// Spawn a new thread to load data into the database over a period of time
+/// This is useful for benchmarks that require data changes over time, like append-mode acceleration
+#[allow(clippy::too_many_lines)]
+pub(crate) fn delayed_source_load(
+    bench_name: &str,
+    load_count: usize,
+    load_interval: Duration,
+    scale_factor: f64,
+) -> JoinHandle<Result<(), String>> {
+    let bench_name = bench_name.to_string();
+
+    tokio::spawn(async move {
+        let dest_db_file = format!("./{bench_name}.db");
+        let dest_conn = Connection::open(&dest_db_file).map_err(|e| e.to_string())?;
+
+        for i in 0..load_count {
+            println!("Loading data for {bench_name} benchmark suite, iteration {i}");
+            match bench_name.as_str() {
+                "tpch" => {
+                    let batch_sql = if i == 0 {
+                        format!("
+                        INSTALL tpch;
+                        LOAD tpch;
+                        BEGIN;
+                        CALL dbgen(sf={scale_factor}, children={load_count}, step={i});
+                        ALTER TABLE customer ADD COLUMN c_created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+                        ALTER TABLE lineitem ADD COLUMN l_created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+                        ALTER TABLE nation ADD COLUMN n_created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+                        ALTER TABLE orders ADD COLUMN o_created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+                        ALTER TABLE part ADD COLUMN p_created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+                        ALTER TABLE partsupp ADD COLUMN ps_created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+                        ALTER TABLE region ADD COLUMN r_created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+                        ALTER TABLE supplier ADD COLUMN s_created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+                        COMMIT;
+                        ")
+                    } else {
+                        // nation and region get excluded from subsequent loads
+                        format!(
+                            "
+                        INSTALL tpch;
+                        LOAD tpch;
+                        BEGIN;
+                        CALL dbgen(sf={scale_factor}, suffix='_new', children={load_count}, step={i});
+                        ALTER TABLE customer_new ADD COLUMN c_created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+                        ALTER TABLE lineitem_new ADD COLUMN l_created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+                        ALTER TABLE nation_new ADD COLUMN n_created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+                        ALTER TABLE orders_new ADD COLUMN o_created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+                        ALTER TABLE part_new ADD COLUMN p_created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+                        ALTER TABLE partsupp_new ADD COLUMN ps_created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+                        ALTER TABLE region_new ADD COLUMN r_created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+                        ALTER TABLE supplier_new ADD COLUMN s_created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+                        INSERT INTO customer SELECT * FROM customer_new;
+                        INSERT INTO lineitem SELECT * FROM lineitem_new;
+                        INSERT INTO orders SELECT * FROM orders_new;
+                        INSERT INTO part SELECT * FROM part_new;
+                        INSERT INTO partsupp SELECT * FROM partsupp_new;
+                        INSERT INTO supplier SELECT * FROM supplier_new;
+                        DROP TABLE customer_new;
+                        DROP TABLE lineitem_new;
+                        DROP TABLE nation_new;
+                        DROP TABLE orders_new;
+                        DROP TABLE part_new;
+                        DROP TABLE partsupp_new;
+                        DROP TABLE region_new;
+                        DROP TABLE supplier_new;
+                        COMMIT;
+                        "
+                        )
+                    };
+
+                    dest_conn
+                        .execute_batch(&batch_sql)
+                        .map_err(|e| e.to_string())?;
+                }
+                _ => {
+                    return Err("Only tpch benchmark suites are supported".to_string());
+                }
+            }
+
+            sleep(load_interval).await;
+        }
+
+        Ok::<(), String>(())
+    })
+}
+
+// #[cfg(test)]
+// mod test {
+//     #[tokio::test]
+//     async fn test_delayed_source_load() {
+//         // run the delayed source load
+//         delayed_source_load("tpch", "destination", 3, Duration::from_secs(10), 0.1);
+
+//         // check the destination database has it's first load after a small delay
+//         sleep(Duration::from_secs(3)).await;
+
+//         let conn = Connection::open("./destination.db").unwrap();
+//         let count: i64 = conn
+//             .query_row("SELECT COUNT(*) FROM supplier", [], |row| row.get(0))
+//             .unwrap();
+//         assert_eq!(count, 10_000);
+
+//         // check the destination database has it's second load after a small delay
+//         sleep(Duration::from_secs(10)).await;
+
+//         let count: i64 = conn
+//             .query_row("SELECT COUNT(*) FROM supplier", [], |row| row.get(0))
+//             .unwrap();
+//         assert_eq!(count, 20_000);
+
+//         // check the destination database has it's third load after a small delay
+//         sleep(Duration::from_secs(10)).await;
+
+//         let count: i64 = conn
+//             .query_row("SELECT COUNT(*) FROM supplier", [], |row| row.get(0))
+//             .unwrap();
+//         assert_eq!(count, 30_000);
+//     }
+// }
