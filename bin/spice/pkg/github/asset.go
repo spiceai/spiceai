@@ -67,7 +67,6 @@ func DownloadReleaseAsset(gh *GitHubClient, release *RepoRelease, assetName stri
 	}
 
 	ext := path.Ext(assetName)
-
 	switch ext {
 	case ".zip":
 		return util.ExtractZip(body, downloadDir)

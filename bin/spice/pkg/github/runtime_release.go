@@ -19,7 +19,9 @@ package github
 import (
 	"fmt"
 	"log/slog"
+	"os/exec"
 	"runtime"
+	"strings"
 
 	"github.com/spiceai/spiceai/bin/spice/pkg/constants"
 )
@@ -64,7 +66,11 @@ func DownloadAsset(release *RepoRelease, downloadPath string, assetName string) 
 func GetRuntimeAssetName(flavor string) string {
 	switch {
 	case flavor == "ai":
-		flavor = "_models"
+		if accelerator, exists := get_ai_accelerator(); exists {
+			flavor = fmt.Sprintf("_%s_models", accelerator)
+		} else {
+			flavor = "_models"
+		}
 	case flavor != "":
 		flavor = fmt.Sprintf("_%s", flavor)
 	}
@@ -88,4 +94,34 @@ func getRustArch() string {
 		return "aarch64"
 	}
 	return runtime.GOARCH
+}
+
+// get_ai_accelerator checks for accelerator devices, either GPU devices, or Apple silicon (metal).
+func get_ai_accelerator() (string, bool) {
+	if runtime.GOOS == "darwin" {
+		hasMetal, err := has_metal_device()
+		if err != nil {
+			slog.Error("checking for metal device", "error", err)
+		}
+		if hasMetal {
+			return "metal", true
+		}
+	}
+	return "", false
+}
+
+// has_metal_device checks if the system is running on Apple silicon (metal) via the `system_profiler` command.
+// For non-darwin systems, it does not attempt a `system_profiler` command.
+func has_metal_device() (bool, error) {
+	if runtime.GOOS != "darwin" {
+		return false, nil
+	}
+
+	slog.Debug("On MacOs, running `system_profiler SPDisplaysDataType -detailLevel mini` to determine hardware")
+
+	output, err := exec.Command("system_profiler", "SPDisplaysDataType", "-detailLevel", "mini").Output()
+	if err != nil {
+		return false, fmt.Errorf("failed to run system_profiler: %w", err)
+	}
+	return strings.Contains(string(output), "Metal Support: Metal"), nil
 }
