@@ -83,9 +83,15 @@ async fn start_runtime(args: spiced::Args) -> Result<(), Box<dyn std::error::Err
 ///
 /// Build metadata is always known at compile time, so return a string literal.
 const fn build_metadata() -> &'static str {
-    if cfg!(feature = "models") {
-        "+models"
-    } else {
-        ""
+    match (
+        cfg!(feature = "models"),
+        cfg!(feature = "metal"),
+        cfg!(feature = "cuda"),
+    ) {
+        (true, true, true) => "+models.metal.cuda",
+        (true, true, false) => "+models.metal",
+        (true, false, true) => "+models.cuda",
+        (true, false, false) => "+models",
+        _ => "",
     }
 }

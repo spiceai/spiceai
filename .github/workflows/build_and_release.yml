@@ -8,6 +8,19 @@ on:
       - v*
 
   workflow_dispatch:
+    inputs:
+      desired_os:
+        description: "Which OS do you want to run on? (Default is ALL)"
+        required: false
+        type: choice
+        options:
+          - all
+          - linux-x64
+          - linux-aarch64
+          - windows-x64
+          - macos-aarch64
+          - macos-x64
+        default: "all"
 
 jobs:
   setup-matrix:
@@ -55,6 +68,17 @@ jobs:
                 target_arch_go: "amd64"
               }
             ];
+
+            // If running via workflow_dispatch, filter based on input
+            if (context.eventName === 'workflow_dispatch') {
+              const desiredOs = context.payload.inputs.desired_os;
+
+              if (desiredOs === 'all') {
+                return matrix;
+              }
+
+              return matrix.filter(m => m.key === desiredOs);
+            }
 
             // Filter out macos-14-large runner for trunk pushes
             if (context.eventName === 'push' && context.ref === 'refs/heads/trunk') {
@@ -165,7 +189,7 @@ jobs:
       - name: Print version
         if: matrix.target.target_os != 'windows'
         run: ./spiced --version
-      
+
       - name: Print version (Windows)
         if: matrix.target.target_os == 'windows'
         run: ./spiced.exe --version
@@ -203,7 +227,7 @@ jobs:
       - name: Print version (models)
         if: matrix.target.target_os != 'windows'
         run: ./spiced --version
-      
+
       - name: Print version (models) (Windows)
         if: matrix.target.target_os == 'windows'
         run: ./spiced.exe --version
@@ -219,6 +243,28 @@ jobs:
         with:
           name: spiced.exe_models_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: spiced.exe_models_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz
+
+      ## Models + metal flavor
+      - name: Build spiced (models)
+        if: matrix.target.target_os == 'darwin'
+        run: make -C bin/spiced SPICED_NON_DEFAULT_FEATURES="models,metal"
+
+      - name: tar binary (models,metal)
+        if: matrix.target.target_os == 'darwin'
+        run: |
+          mv target/release/spiced spiced
+          chmod +x spiced
+          tar czf spiced_models_metal_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz spiced
+
+      - name: Print version (models,metal)
+        if: matrix.target.target_os == 'darwin'
+        run: ./spiced --version
+
+      - uses: actions/upload-artifact@v4
+        if: matrix.target.target_os == 'darwin'
+        with:
+          name: spiced_models_metal_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
+          path: spiced_models_metal_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz
 
       ## CLI build
       - name: Build spice
@@ -240,7 +286,7 @@ jobs:
       - name: Print version
         if: matrix.target.target_os != 'windows'
         run: ./spice version
-      
+
       - name: Print version (Windows)
         if: matrix.target.target_os == 'windows'
         run: ./spice.exe version
@@ -256,7 +302,7 @@ jobs:
         with:
           name: spice.exe_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: spice.exe_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz
-      
+
       - name: Update build cache (macOS)
         if: matrix.target.target_os == 'darwin'
         run: |
@@ -312,7 +358,7 @@ jobs:
         with:
           name: spice_${{ matrix.target_os }}_${{ matrix.target_arch }}
           path: ${{ env.ARTIFACT_DIR }}
-      
+
       - name: download artifacts - spice_${{ matrix.target_os }}_${{ matrix.target_arch }}
         if: matrix.target_os == 'windows'
         uses: actions/download-artifact@v4
@@ -346,6 +392,13 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: spiced.exe_models_${{ matrix.target_os }}_${{ matrix.target_arch }}
+          path: ${{ env.ARTIFACT_DIR }}
+
+      - name: download artifacts - spiced_models_metal_${{ matrix.target_os }}_${{ matrix.target_arch }}
+        if: matrix.target.target_os == 'darwin'
+        uses: actions/download-artifact@v4
+        with:
+          name: spiced_models_metal_${{ matrix.target_os }}_${{ matrix.target_arch }}
           path: ${{ env.ARTIFACT_DIR }}
 
       - name: lists artifacts
