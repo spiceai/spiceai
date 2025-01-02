@@ -20,6 +20,7 @@ use crate::datafusion::query::{self, QueryBuilder};
 use crate::datafusion::DataFusion;
 use crate::dataupdate::DataUpdate;
 use crate::metrics as runtime_metrics;
+use crate::rate_limits::RateLimits;
 use crate::tls::TlsConfig;
 use app::App;
 use arrow::array::RecordBatch;
@@ -35,7 +36,7 @@ use datafusion::sql::TableReference;
 use futures::stream::{self, BoxStream, StreamExt};
 use futures::{Stream, TryStreamExt};
 use metrics::track_flight_request;
-use middleware::RequestContextLayer;
+use middleware::{RequestContextLayer, WriteRateLimitLayer};
 use runtime_auth::{layer::flight::BasicAuthLayer, FlightBasicAuth};
 use secrecy::ExposeSecret;
 use snafu::prelude::*;
@@ -301,6 +302,9 @@ pub enum Error {
 
     #[snafu(display("Unable to configure TLS on the Flight server: {source}"))]
     UnableToConfigureTls { source: tonic::transport::Error },
+
+    #[snafu(display("Failed to configure Flight write requests rate limiter: {source}"))]
+    UnableToConfigureFlightWriteRateLimiter { source: ratelimit::Error },
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -311,6 +315,7 @@ pub async fn start(
     df: Arc<DataFusion>,
     tls_config: Option<Arc<TlsConfig>>,
     endpoint_auth: EndpointAuth,
+    rate_limits: Arc<RateLimits>,
 ) -> Result<()> {
     let service = Service {
         datafusion: Arc::clone(&df),
@@ -334,12 +339,22 @@ pub async fn start(
             .context(UnableToConfigureTlsSnafu)?;
     }
 
+    let flight_write_limits = ratelimit::Ratelimiter::builder(
+        rate_limits.flight_write_limit.amount,
+        rate_limits.flight_write_limit.interval,
+    )
+    .initial_available(rate_limits.flight_write_limit.amount)
+    .max_tokens(rate_limits.flight_write_limit.amount)
+    .build()
+    .context(UnableToConfigureFlightWriteRateLimiterSnafu)?;
+
     let auth_layer = tower::ServiceBuilder::new()
         .layer(BasicAuthLayer::new(endpoint_auth.flight_basic_auth))
         .into_inner();
 
     server
         .layer(RequestContextLayer::new(app))
+        .layer(WriteRateLimitLayer::new(flight_write_limits))
         .layer(auth_layer)
         .add_service(svc)
         .serve(bind_address)

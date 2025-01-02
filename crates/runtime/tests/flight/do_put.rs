@@ -35,9 +35,15 @@ use datafusion::sql::TableReference;
 use futures::{stream::TryStreamExt, Stream};
 use rand::Rng;
 use runtime::{
-    accelerated_table::refresh::Refresh, auth::EndpointAuth,
-    component::dataset::acceleration::Acceleration, config::Config, datafusion::DataFusion,
-    internal_table::create_internal_accelerated_table, secrets::Secrets, Runtime,
+    accelerated_table::refresh::Refresh,
+    auth::EndpointAuth,
+    component::dataset::acceleration::Acceleration,
+    config::Config,
+    datafusion::DataFusion,
+    internal_table::create_internal_accelerated_table,
+    rate_limits::{RateLimit, RateLimits},
+    secrets::Secrets,
+    Runtime,
 };
 use runtime_auth::{api_key::ApiKeyAuth, FlightBasicAuth};
 use spicepod::component::runtime::ApiKey;
@@ -59,30 +65,18 @@ async fn test_flight_do_put_basic() -> Result<(), anyhow::Error> {
             let auth = Arc::new(ApiKeyAuth::new(vec![ApiKey::parse_str("valid:rw")]))
                 as Arc<dyn FlightBasicAuth + Send + Sync>;
 
-            let (channel, df) = start_spice_test_app(Some(auth)).await?;
+            let (channel, df) = start_spice_test_app(Some(auth), None).await?;
 
             let mut client = create_flight_client(channel, Some("valid"))?;
 
             let test_record_batch = test_record_batch()?;
 
-            let flight_descriptor = FlightDescriptor::new_path(vec!["my_table".to_string()]);
-            let flight_data_stream = FlightDataEncoderBuilder::new()
-                .with_flight_descriptor(Some(flight_descriptor))
-                .build(futures::stream::iter(
-                    // simulate two record batches / two FlightData messages
-                    [test_record_batch.clone(), test_record_batch]
-                        .into_iter()
-                        .map(Ok)
-                        .collect::<Vec<_>>(),
-                ));
-
-            let response: Vec<PutResult> = client
-                .do_put(flight_data_stream)
-                .await
-                .map_err(anyhow::Error::from)?
-                .try_collect()
-                .await
-                .map_err(anyhow::Error::from)?;
+            let response = write_record_batches(
+                &mut client,
+                // simulate two record batches / two FlightData messages
+                vec![test_record_batch.clone(), test_record_batch].into_iter(),
+            )
+            .await?;
 
             let response_str = format!("{response:?}");
             insta::assert_snapshot!("do_put_basic_reponse", response_str);
@@ -108,7 +102,7 @@ async fn test_do_put_stream_error() -> Result<(), Box<dyn std::error::Error>> {
     let auth = Arc::new(ApiKeyAuth::new(vec![ApiKey::parse_str("valid:rw")]))
         as Arc<dyn FlightBasicAuth + Send + Sync>;
 
-    let (channel, df) = start_spice_test_app(Some(auth)).await?;
+    let (channel, df) = start_spice_test_app(Some(auth), None).await?;
 
     let mut client = create_flight_client(channel, Some("valid"))?;
 
@@ -166,24 +160,12 @@ async fn test_flight_do_put_no_auth() -> Result<(), anyhow::Error> {
 
     test_request_context()
         .scope(async {
-            let (channel, _df) = start_spice_test_app(None).await?;
+            let (channel, _df) = start_spice_test_app(None, None).await?;
 
             let mut client = create_flight_client(channel, None)?;
 
-            let test_record_batch = test_record_batch()?;
-
-            let flight_descriptor = FlightDescriptor::new_path(vec!["my_table".to_string()]);
-            let flight_data_stream = FlightDataEncoderBuilder::new()
-                .with_flight_descriptor(Some(flight_descriptor))
-                .build(futures::stream::iter(
-                    // simulate two record batches / two FlightData messages
-                    [test_record_batch.clone(), test_record_batch]
-                        .into_iter()
-                        .map(Ok)
-                        .collect::<Vec<_>>(),
-                ));
-
-            let response = client.do_put(flight_data_stream).await;
+            let response =
+                write_record_batches(&mut client, vec![test_record_batch()?].into_iter()).await;
 
             assert!(
                 response.is_err(),
@@ -204,24 +186,12 @@ async fn test_flight_do_put_ro_key() -> Result<(), anyhow::Error> {
             let auth = Arc::new(ApiKeyAuth::new(vec![ApiKey::parse_str("valid")]))
                 as Arc<dyn FlightBasicAuth + Send + Sync>;
 
-            let (channel, _df) = start_spice_test_app(Some(auth)).await?;
+            let (channel, _df) = start_spice_test_app(Some(auth), None).await?;
 
             let mut client = create_flight_client(channel, Some("valid"))?;
 
-            let test_record_batch = test_record_batch()?;
-
-            let flight_descriptor = FlightDescriptor::new_path(vec!["my_table".to_string()]);
-            let flight_data_stream = FlightDataEncoderBuilder::new()
-                .with_flight_descriptor(Some(flight_descriptor))
-                .build(futures::stream::iter(
-                    // simulate two record batches / two FlightData messages
-                    [test_record_batch.clone(), test_record_batch]
-                        .into_iter()
-                        .map(Ok)
-                        .collect::<Vec<_>>(),
-                ));
-
-            let response = client.do_put(flight_data_stream).await;
+            let response =
+                write_record_batches(&mut client, vec![test_record_batch()?].into_iter()).await;
 
             assert!(
                 response.is_err(),
@@ -231,6 +201,83 @@ async fn test_flight_do_put_ro_key() -> Result<(), anyhow::Error> {
             Ok(())
         })
         .await
+}
+
+#[tokio::test]
+async fn test_flight_do_put_rate_limit() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    test_request_context()
+        .scope(async {
+            let auth = Arc::new(ApiKeyAuth::new(vec![ApiKey::parse_str("valid:rw")]))
+                as Arc<dyn FlightBasicAuth + Send + Sync>;
+
+            let (channel, df) = start_spice_test_app(
+                Some(auth),
+                Some(
+                    RateLimits::new()
+                        .with_flight_write_limit(RateLimit::new(5, Duration::from_secs(10))),
+                ),
+            )
+            .await?;
+
+            let mut client = create_flight_client(channel, Some("valid"))?;
+
+            let test_record_batch = test_record_batch()?;
+
+            // simulate 5 requests to reach rate limit
+            for _ in 1..=5 {
+                let _ =
+                    write_record_batches(&mut client, vec![test_record_batch.clone()].into_iter())
+                        .await?;
+            }
+
+            // rate limit error is expected next
+            assert!(
+                write_record_batches(&mut client, vec![test_record_batch.clone()].into_iter(),)
+                    .await
+                    .is_err(),
+                "Expected an error but got a successful result"
+            );
+
+            // wait for the rate limit reset and perform another request attempt
+            sleep(Duration::from_secs(10)).await;
+
+            let _ = write_record_batches(&mut client, vec![test_record_batch.clone()].into_iter())
+                .await?;
+
+            let query = df
+                .query_builder("SELECT * from my_table")
+                .build()
+                .run()
+                .await?;
+
+            let results: Vec<RecordBatch> = query.data.try_collect::<Vec<RecordBatch>>().await?;
+            let results_str =
+                arrow::util::pretty::pretty_format_batches(&results).expect("pretty batches");
+            insta::assert_snapshot!("do_put_rate_limit_table_content", results_str);
+
+            Ok(())
+        })
+        .await
+}
+
+async fn write_record_batches(
+    client: &mut FlightClient,
+    batches: impl Iterator<Item = RecordBatch>,
+) -> Result<Vec<PutResult>, FlightError> {
+    let flight_descriptor = FlightDescriptor::new_path(vec!["my_table".to_string()]);
+    let flight_data_stream = FlightDataEncoderBuilder::new()
+        .with_flight_descriptor(Some(flight_descriptor))
+        .build(futures::stream::iter(batches.map(Ok).collect::<Vec<_>>()));
+
+    let response: Vec<PutResult> = client
+        .do_put(flight_data_stream)
+        .await?
+        .try_collect()
+        .await?;
+
+    Ok(response)
 }
 
 fn create_flight_client(
@@ -250,6 +297,7 @@ fn create_flight_client(
 
 async fn start_spice_test_app(
     flight_auth: Option<Arc<dyn FlightBasicAuth + Send + Sync>>,
+    rate_limits: Option<RateLimits>,
 ) -> Result<(Channel, Arc<DataFusion>), anyhow::Error> {
     let mut rng = rand::thread_rng();
     let http_port: u16 = rng.gen_range(50000..60000);
@@ -268,10 +316,14 @@ async fn start_spice_test_app(
 
     let registry = prometheus::Registry::new();
 
-    let rt = Runtime::builder()
-        .with_metrics_server(SocketAddr::new(LOCALHOST, metrics_port), registry)
-        .build()
-        .await;
+    let mut rt_builder =
+        Runtime::builder().with_metrics_server(SocketAddr::new(LOCALHOST, metrics_port), registry);
+
+    if let Some(rate_limits) = rate_limits {
+        rt_builder = rt_builder.with_rate_limits(rate_limits);
+    }
+
+    let rt = rt_builder.build().await;
 
     let df = rt.datafusion();
 

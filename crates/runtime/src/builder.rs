@@ -25,6 +25,7 @@ use crate::{
     datasets_health_monitor::DatasetsHealthMonitor,
     extension::{Extension, ExtensionFactory},
     metrics, podswatcher,
+    rate_limits::RateLimits,
     secrets::{self, Secrets},
     status,
     timing::TimeMeasurement,
@@ -41,6 +42,7 @@ pub struct RuntimeBuilder {
     prometheus_registry: Option<prometheus::Registry>,
     datafusion: Option<Arc<DataFusion>>,
     runtime_status: Option<Arc<status::RuntimeStatus>>,
+    rate_limits: Option<Arc<RateLimits>>,
 }
 
 impl RuntimeBuilder {
@@ -55,6 +57,7 @@ impl RuntimeBuilder {
             datafusion: None,
             autoload_extensions: HashMap::new(),
             runtime_status: None,
+            rate_limits: None,
         }
     }
 
@@ -122,6 +125,11 @@ impl RuntimeBuilder {
         self
     }
 
+    pub fn with_rate_limits(mut self, rate_limits: RateLimits) -> Self {
+        self.rate_limits = Some(Arc::new(rate_limits));
+        self
+    }
+
     pub async fn build(self) -> Runtime {
         dataconnector::register_all().await;
         catalogconnector::register_all().await;
@@ -177,6 +185,7 @@ impl RuntimeBuilder {
             datasets_health_monitor,
             metrics_endpoint: self.metrics_endpoint,
             prometheus_registry: self.prometheus_registry,
+            rate_limits: self.rate_limits.unwrap_or_default(),
             status,
         };
 

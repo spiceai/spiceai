@@ -98,6 +98,7 @@ prost = { version = "0.13.1", default-features = false, features = [
     "prost-derive",
 ] }
 rand = "0.8.5"
+ratelimit = "0.10.0"
 regex.workspace = true
 reqwest.workspace = true
 runtime-auth = { path = "../runtime-auth" }

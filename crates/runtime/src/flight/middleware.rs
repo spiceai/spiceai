@@ -23,6 +23,8 @@ use std::{
 
 use crate::request::{Protocol, RequestContext};
 use app::App;
+use http::HeaderValue;
+use ratelimit::Ratelimiter;
 use runtime_auth::AuthRequestContext;
 use tower::{Layer, Service};
 
@@ -89,5 +91,100 @@ where
             );
 
         Box::pin(async move { request_context.scope(inner.call(req)).await })
+    }
+}
+
+/// Enforces a rate limit on the number of Flight `DoPut` requests the underlying service can handle over a period of time.
+#[derive(Clone)]
+pub struct WriteRateLimitLayer {
+    rate_limiter: Arc<Ratelimiter>,
+}
+
+impl WriteRateLimitLayer {
+    #[must_use]
+    pub fn new(rate_limiter: Ratelimiter) -> Self {
+        Self {
+            rate_limiter: Arc::new(rate_limiter),
+        }
+    }
+}
+
+impl<S> Layer<S> for WriteRateLimitLayer {
+    type Service = WriteRateLimitMiddleware<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        WriteRateLimitMiddleware::new(inner, Arc::clone(&self.rate_limiter))
+    }
+}
+
+#[derive(Clone)]
+pub struct WriteRateLimitMiddleware<S> {
+    inner: S,
+    rate_limiter: Arc<Ratelimiter>,
+}
+
+impl<S> WriteRateLimitMiddleware<S> {
+    fn new(inner: S, rate_limiter: Arc<Ratelimiter>) -> Self {
+        WriteRateLimitMiddleware {
+            inner,
+            rate_limiter,
+        }
+    }
+}
+
+impl<S, ReqBody, ResBody> Service<http::Request<ReqBody>> for WriteRateLimitMiddleware<S>
+where
+    S: Service<http::Request<ReqBody>, Response = http::Response<ResBody>> + Clone + Send + 'static,
+    S::Future: Send + 'static,
+    ResBody: Default,
+    ReqBody: Send + 'static,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<S::Response, S::Error>> + Send>>;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: http::Request<ReqBody>) -> Self::Future {
+        // Apply rate limiting to the Flight DoPut only
+        if req.uri().path() != "/arrow.flight.protocol.FlightService/DoPut" {
+            return Box::pin(self.inner.call(req));
+        }
+
+        if let Err(wait_time) = self.rate_limiter.try_wait() {
+            tracing::trace!(
+                "Request rate-limited, must retry after {} seconds.",
+                wait_time.as_secs()
+            );
+
+            return Box::pin(async move {
+                let mut response = http::Response::new(ResBody::default());
+                *response.status_mut() = http::StatusCode::TOO_MANY_REQUESTS;
+
+                if let Ok(retry_after) = HeaderValue::from_str(&wait_time.as_secs().to_string()) {
+                    response.headers_mut().insert("retry-after", retry_after);
+                }
+
+                if let Ok(grpc_status) =
+                    HeaderValue::from_str(&format!("{}", tonic::Code::ResourceExhausted as i32))
+                {
+                    response.headers_mut().insert("grpc-status", grpc_status);
+                }
+
+                response.headers_mut().insert(
+                    "grpc-message",
+                    HeaderValue::from_static("Too many requests. Please retry later."),
+                );
+
+                Ok(response)
+            });
+        }
+
+        Box::pin(self.inner.call(req))
     }
 }

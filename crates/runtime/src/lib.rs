@@ -35,6 +35,7 @@ pub use http::ApiDoc;
 use model::{EmbeddingModelStore, EvalScorerRegistry, LLMModelStore};
 use model_components::model::Model;
 pub use notify::Error as NotifyError;
+use rate_limits::RateLimits;
 use secrecy::SecretString;
 use secrets::{ParamStr, Secrets};
 use snafu::prelude::*;
@@ -75,6 +76,7 @@ pub mod objectstore;
 mod opentelemetry;
 mod parameters;
 pub mod podswatcher;
+pub mod rate_limits;
 pub mod request;
 pub mod secrets;
 pub mod spice_metrics;
@@ -292,6 +294,7 @@ pub struct Runtime {
     datasets_health_monitor: Option<Arc<DatasetsHealthMonitor>>,
     metrics_endpoint: Option<SocketAddr>,
     prometheus_registry: Option<prometheus::Registry>,
+    rate_limits: Arc<RateLimits>,
 
     autoload_extensions: Arc<HashMap<String, Box<dyn ExtensionFactory>>>,
     extensions: Arc<RwLock<HashMap<String, Arc<dyn Extension>>>>,
@@ -403,6 +406,7 @@ impl Runtime {
             Arc::clone(&self.df),
             tls_config.clone(),
             endpoint_auth.clone(),
+            Arc::clone(&self.rate_limits),
         ));
         let open_telemetry_server_future = tokio::spawn(opentelemetry::start(
             config.open_telemetry_bind_address,
