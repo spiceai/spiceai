@@ -29,6 +29,7 @@ use llms::openai::DEFAULT_LLM_MODEL;
 use llms::{
     anthropic::{Anthropic, AnthropicConfig},
     chat::{nsql::SqlGeneration, Chat, Error as LlmError, Result as ChatResult},
+    xai::Xai,
 };
 use secrecy::{ExposeSecret, SecretString};
 use spicepod::component::model::{Model, ModelFileType, ModelSource};
@@ -106,6 +107,10 @@ pub async fn construct_model(
         ModelSource::File => file(component, params),
         ModelSource::Anthropic => anthropic(model_id.as_deref(), params),
         ModelSource::Azure => azure(model_id, component.name.as_str(), params),
+        ModelSource::Xai => Ok(Box::new(Xai::new(
+            extract_secret!(params, "endpoint"),
+            extract_secret!(params, "xai_api_key"),
+        )) as Box<dyn Chat>),
         ModelSource::OpenAi => Ok(openai(model_id, params)),
         ModelSource::SpiceAI => Err(LlmError::UnsupportedTaskForModel {
             from: "spiceai".into(),

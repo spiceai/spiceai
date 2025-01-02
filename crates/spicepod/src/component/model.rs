@@ -77,6 +77,7 @@ pub enum ModelSource {
     OpenAi,
     Azure,
     Anthropic,
+    Xai,
     HuggingFace,
     SpiceAI,
     File,
@@ -97,6 +98,8 @@ impl TryFrom<&str> for ModelSource {
             Ok(ModelSource::OpenAi)
         } else if value.starts_with("azure") {
             Ok(ModelSource::Azure)
+        } else if value.starts_with("xai") {
+            Ok(ModelSource::Xai)
         } else if value.starts_with("spiceai") {
             Ok(ModelSource::SpiceAI)
         } else {
@@ -111,6 +114,7 @@ impl Display for ModelSource {
         match self {
             ModelSource::OpenAi => write!(f, "openai"),
             ModelSource::Azure => write!(f, "azure"),
+            ModelSource::Xai => write!(f, "xai"),
             ModelSource::Anthropic => write!(f, "anthropic"),
             ModelSource::HuggingFace => write!(f, "huggingface:huggingface.co"),
             ModelSource::File => write!(f, "file"),
@@ -281,10 +285,11 @@ impl Model {
         // Some providers only support either ML or LLMs.
         if matches!(
             source,
-            ModelSource::Azure | ModelSource::OpenAi | ModelSource::Anthropic
+            ModelSource::Azure | ModelSource::OpenAi | ModelSource::Anthropic | ModelSource::Xai
         ) {
             return Some(ModelType::Llm);
         }
+
         if source == ModelSource::SpiceAI {
             return Some(ModelType::Ml);
         };
