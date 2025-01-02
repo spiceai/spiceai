@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use arrow::array::RecordBatch;
 use arrow_flight::{
@@ -27,7 +27,10 @@ use datafusion::{
     physical_plan::stream::RecordBatchStreamAdapter, sql::TableReference,
 };
 use runtime_auth::AuthRequestContext;
-use tokio::sync::mpsc::{self, Sender};
+use tokio::{
+    sync::mpsc::{self, Sender},
+    time::sleep,
+};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 
@@ -126,6 +129,11 @@ fn create_response_stream(
 
         loop {
             tokio::select! {
+                () = sleep(Duration::from_secs(30)) => {
+                    tracing::error!("Timeout: no record batch received within 30 seconds");
+                    yield Err(Status::deadline_exceeded("Timeout: no record batch received within 30 seconds"));
+                    break;
+                }
                 // Poll the writing task to check if it has completed with an error while processing the data
                 write_result = &mut write_future => {
                     match write_result {

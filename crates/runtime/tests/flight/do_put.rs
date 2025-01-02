@@ -32,7 +32,10 @@ use arrow_flight::{
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::sql::TableReference;
-use futures::{stream::TryStreamExt, Stream};
+use futures::{
+    stream::{self, TryStreamExt},
+    Stream,
+};
 use rand::Rng;
 use runtime::{
     accelerated_table::refresh::Refresh,
@@ -255,7 +258,7 @@ async fn test_flight_do_put_rate_limit() -> Result<(), anyhow::Error> {
             let results: Vec<RecordBatch> = query.data.try_collect::<Vec<RecordBatch>>().await?;
             let results_str =
                 arrow::util::pretty::pretty_format_batches(&results).expect("pretty batches");
-            insta::assert_snapshot!("do_put_rate_limit_table_content", results_str);
+            insta::assert_snapshot!("rate_limit_table_content", results_str);
 
             Ok(())
         })
@@ -300,11 +303,65 @@ async fn test_flight_do_put_max_rows_allowed() -> Result<(), anyhow::Error> {
             let results: Vec<RecordBatch> = query.data.try_collect::<Vec<RecordBatch>>().await?;
             let results_str =
                 arrow::util::pretty::pretty_format_batches(&results).expect("pretty batches");
-            insta::assert_snapshot!("do_put_max_rows_allowed_table_content", results_str);
+            insta::assert_snapshot!("max_rows_allowed_table_content", results_str);
 
             Ok(())
         })
         .await
+}
+
+#[tokio::test]
+async fn test_do_put_read_timeout() -> Result<(), Box<dyn std::error::Error>> {
+    let auth = Arc::new(ApiKeyAuth::new(vec![ApiKey::parse_str("valid:rw")]))
+        as Arc<dyn FlightBasicAuth + Send + Sync>;
+
+    let (channel, df) = start_spice_test_app(Some(auth), None).await?;
+
+    let mut client = create_flight_client(channel, Some("valid"))?;
+
+    let record_batch_1 = test_record_batch()?;
+    let record_batch_2 = record_batch_1.clone();
+    let record_batch_3 = record_batch_1.clone();
+
+    let first_batch =
+        stream::once(async { Ok(record_batch_1) as Result<RecordBatch, FlightError> });
+    // batch with 40s delay
+    let second_batch = stream::once(async {
+        sleep(Duration::from_secs(40)).await;
+        Ok(record_batch_2) as Result<RecordBatch, FlightError>
+    });
+    let third_batch =
+        stream::once(async { Ok(record_batch_3) as Result<RecordBatch, FlightError> });
+
+    let flight_descriptor = FlightDescriptor::new_path(vec!["my_table".to_string()]);
+    let flight_data_stream = FlightDataEncoderBuilder::new()
+        .with_flight_descriptor(Some(flight_descriptor))
+        .build(first_batch.chain(second_batch).chain(third_batch));
+
+    let result: Result<Vec<PutResult>, FlightError> = client
+        .do_put(flight_data_stream)
+        .await
+        .expect("to get result stream")
+        .try_collect()
+        .await;
+
+    assert!(
+        result.is_err(),
+        "Expected an error but got a successful result"
+    );
+
+    // Verify that no data was written to the table
+    let query = df
+        .query_builder("SELECT * from my_table")
+        .build()
+        .run()
+        .await?;
+
+    let results: Vec<RecordBatch> = query.data.try_collect::<Vec<RecordBatch>>().await?;
+    let results_str = arrow::util::pretty::pretty_format_batches(&results).expect("pretty batches");
+    insta::assert_snapshot!("read_timeout_table_content", results_str);
+
+    Ok(())
 }
 
 async fn write_record_batches(
