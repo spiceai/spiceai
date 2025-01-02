@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -57,7 +57,7 @@ impl SpiceToolsOptions {
                 "list_datasets",
                 "get_readiness",
                 "random_sample",
-                "distinct_columns",
+                "sample_distinct_columns",
                 "top_n_sample",
             ],
             SpiceToolsOptions::Nsql => vec![
@@ -65,7 +65,7 @@ impl SpiceToolsOptions {
                 "sql",
                 "list_datasets",
                 "random_sample",
-                "distinct_columns",
+                "sample_distinct_columns",
                 "top_n_sample",
             ],
             SpiceToolsOptions::Disabled => vec![],
@@ -117,7 +117,7 @@ mod tests {
                 "sql",
                 "list_datasets",
                 "random_sample",
-                "distinct_columns",
+                "sample_distinct_columns",
                 "top_n_sample",
                 "my_other_tool"
             ]

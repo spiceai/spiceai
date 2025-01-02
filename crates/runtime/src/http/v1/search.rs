@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -34,9 +34,9 @@ struct SearchResponse {
     pub duration_ms: u128,
 }
 
-/// Vector Search
+/// Search
 ///
-/// Perform a vector search operation on a dataset.
+/// Perform a vector similarity search (VSS) operation on a dataset.
 ///
 /// The search operation will return the most relevant matches based on cosine similarity with the input `text`.
 /// The datasets queries should have an embedding column, and the appropriate embedding model loaded.

@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -73,15 +73,22 @@ pub struct FlightFactory {
     name: &'static str,
     client: FlightClient,
     dialect: Arc<dyn Dialect>,
+    subquery_use_partial_path: bool,
 }
 
 impl FlightFactory {
     #[must_use]
-    pub fn new(name: &'static str, client: FlightClient, dialect: Arc<dyn Dialect>) -> Self {
+    pub fn new(
+        name: &'static str,
+        client: FlightClient,
+        dialect: Arc<dyn Dialect>,
+        subquery_use_partial_path: bool,
+    ) -> Self {
         Self {
             name,
             client,
             dialect,
+            subquery_use_partial_path,
         }
     }
 
@@ -111,6 +118,7 @@ impl Read for FlightFactory {
                 table_reference,
                 schema,
                 Arc::clone(&self.dialect),
+                self.subquery_use_partial_path,
             )),
             None => Arc::new(
                 FlightTable::create(
@@ -118,6 +126,7 @@ impl Read for FlightFactory {
                     self.client.clone(),
                     table_reference,
                     Arc::clone(&self.dialect),
+                    self.subquery_use_partial_path,
                 )
                 .await?,
             ),
@@ -157,6 +166,7 @@ pub struct FlightTable {
     schema: SchemaRef,
     dialect: Arc<dyn Dialect>,
     table_reference: MultiPartTableReference,
+    subquery_use_partial_path: bool,
 }
 
 impl std::fmt::Debug for FlightTable {
@@ -178,6 +188,7 @@ impl FlightTable {
         client: FlightClient,
         table_reference: impl Into<MultiPartTableReference>,
         dialect: Arc<dyn Dialect>,
+        subquery_use_partial_path: bool,
     ) -> Result<Self> {
         let table_reference = table_reference.into();
         let schema = Self::get_query_schema(
@@ -199,6 +210,7 @@ impl FlightTable {
                 client.url(),
                 client.username().unwrap_or_default()
             ),
+            subquery_use_partial_path,
         })
     }
 
@@ -208,6 +220,7 @@ impl FlightTable {
         table_reference: impl Into<MultiPartTableReference>,
         schema: SchemaRef,
         dialect: Arc<dyn Dialect>,
+        subquery_use_partial_path: bool,
     ) -> Self {
         let table_reference = table_reference.into();
         tracing::debug!("table_reference={:?}", table_reference);
@@ -222,6 +235,7 @@ impl FlightTable {
                 client.url(),
                 client.username().unwrap_or_default()
             ),
+            subquery_use_partial_path,
         }
     }
 

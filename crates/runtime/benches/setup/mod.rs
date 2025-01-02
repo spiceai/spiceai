@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -154,6 +154,8 @@ fn build_app(
         "delta_lake" => crate::bench_delta::build_app(app_builder, bench_name),
         #[cfg(feature = "mssql")]
         "mssql" => crate::bench_mssql::build_app(app_builder, bench_name),
+        #[cfg(feature = "dremio")]
+        "dremio" => crate::bench_dremio::build_app(app_builder, bench_name),
         _ => Err(format!("Unknown connector: {connector}")),
     }?;
 
@@ -189,10 +191,12 @@ fn get_accelerator_refresh_sql(
     dataset: &str,
     bench_name: &str,
 ) -> Option<String> {
-    if let Some("sqlite") = engine {
+    if let Some("sqlite" | "postgres") = engine {
         if bench_name == "clickbench" {
             // SQLite has troubles loading the whole ClickBench set with indexes enabled
-            // remove this refresh SQL when we support index creation after table load
+            // remove this refresh SQL when we support index creation after table load.
+            //
+            // Postgres also can't load the full dataset within the 3 hour time limit
             return Some(format!("SELECT * FROM {dataset} LIMIT 10000000"));
         }
     }

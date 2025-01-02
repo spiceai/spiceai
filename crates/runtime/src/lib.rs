@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -531,7 +531,10 @@ impl Runtime {
                 #[cfg(feature = "models")]
                 {
                     self_clone.load_eval_scorer().await;
-                    if let Err(err) = self_clone.load_eval_tables().await {
+                    let an_eval_exists = app_lock.as_ref().is_some_and(|app| !app.evals.is_empty());
+                    if !an_eval_exists {
+                        tracing::trace!("No eval spice components defined. Therefore not loading eval tables into database.");
+                    } else if let Err(err) = self_clone.load_eval_tables().await {
                         tracing::warn!("Creating internal eval run table: {err}");
                     }
                 }

@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -339,8 +339,8 @@ pub async fn start(
         .into_inner();
 
     server
-        .layer(auth_layer)
         .layer(RequestContextLayer::new(app))
+        .layer(auth_layer)
         .add_service(svc)
         .serve(bind_address)
         .await

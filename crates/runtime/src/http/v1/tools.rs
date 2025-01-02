@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -73,7 +73,7 @@ pub(crate) async fn list(Extension(rt): Extension<Arc<Runtime>>) -> Response {
 
 /// Run Tool
 ///
-/// The format of the request body and JSON response match the tool's
+/// The request body and JSON response formats match the tool’s specification.
 #[cfg_attr(feature = "openapi", utoipa::path(
     post,
     path = "/v1/tools/{name}",

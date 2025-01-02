@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -52,6 +52,8 @@ mod bench_spicecloud;
 
 #[cfg(feature = "delta_lake")]
 mod bench_delta;
+#[cfg(feature = "dremio")]
+mod bench_dremio;
 #[cfg(feature = "duckdb")]
 mod bench_duckdb;
 #[cfg(feature = "mssql")]
@@ -254,6 +256,10 @@ async fn run_connector_bench(
         #[cfg(feature = "mssql")]
         "mssql" => {
             bench_mssql::run(&mut rt, &mut benchmark_results, bench_name).await?;
+        }
+        #[cfg(feature = "dremio")]
+        "dremio" => {
+            bench_dremio::run(&mut rt, &mut benchmark_results, bench_name).await?;
         }
         _ => {}
     }

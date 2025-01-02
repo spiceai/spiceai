@@ -44,6 +44,7 @@ on:
           - 'odbc-databricks connector'
           - 'odbc-athena connector'
           - 'delta_lake connector'
+          - 'dremio connector'
           - 'arrow accelerator (memory mode)'
           - 'duckdb accelerator (memory mode)'
           - 'duckdb accelerator (file mode)'
@@ -60,7 +61,7 @@ on:
           - 'no'
 
 env:
-  FEATURES: 'postgres,spark,mysql,mssql,odbc,delta_lake,databricks,duckdb,sqlite'
+  FEATURES: 'postgres,spark,mysql,mssql,odbc,delta_lake,databricks,duckdb,sqlite,dremio'
 
 jobs:
   build-database-bench-binary:
@@ -229,6 +230,12 @@ jobs:
             bench: 'tpch'
           - cmd: '-c delta_lake -b tpcds'
             name: 'delta_lake connector'
+            bench: 'tpcds'
+          - cmd: '-c dremio'
+            name: 'dremio connector'
+            bench: 'tpch'
+          - cmd: '-c dremio -b tpcds'
+            name: 'dremio connector'
             bench: 'tpcds'
           - cmd: '-a arrow'
             name: 'arrow accelerator (memory mode)'
@@ -425,6 +432,8 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_S3_ATHENA_SECRET_ACCESS_KEY }}
           SPICEAI_TPCH_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TPCH_BENCHMARK_KEY }}
           SPICEAI_TPCDS_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TPCDS_BENCHMARK_KEY }}
+          DREMIO_PASSWORD: ${{secrets.DREMIO_PASSWORD}}
+          DREMIO_USERNAME: ${{secrets.DREMIO_USERNAME}}
 
       - name: Remove spice_bench file
         run: |
@@ -454,6 +463,20 @@ jobs:
     runs-on: spiceai-large-runners
     needs: build-database-bench-binary
 
+    services:
+      postgres_acc:
+        image: ${{( matrix.cmd == '-a postgres' || matrix.cmd == '-a postgres -b clickbench') && 'ghcr.io/cloudnative-pg/postgresql:16-bookworm' || '' }}
+        options: >-
+          --shm-size=2gb
+          --health-cmd="pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+        env:
+          POSTGRES_PASSWORD: postgres
+
     strategy:
       fail-fast: false
       max-parallel: 1
@@ -473,6 +496,9 @@ jobs:
             bench: 'clickbench'
           - cmd: '-a sqlite -m file -b clickbench'
             name: 'sqlite accelerator (file mode)'
+            bench: 'clickbench'
+          - cmd: '-a postgres -b clickbench'
+            name: 'postgres accelerator'
             bench: 'clickbench'
 
     steps:
@@ -507,6 +533,11 @@ jobs:
           S3_ENDPOINT: ${{ secrets.CLICKBENCH_S3_ENDPOINT}}
           S3_KEY: ${{ secrets.CLICKBENCH_S3_KEY}}
           S3_SECRET: ${{ secrets.CLICKBENCH_S3_SECRET}}
+          PG_BENCHMARK_PG_HOST: localhost
+          PG_BENCHMARK_PG_USER: postgres
+          PG_BENCHMARK_PG_PASS: postgres
+          PG_BENCHMARK_PG_SSLMODE: disable
+          PG_BENCHMARK_ACC_PG_DBNAME: postgres
 
   create-pr:
     runs-on: ubuntu-latest
