@@ -88,9 +88,9 @@ const fn build_metadata() -> &'static str {
         cfg!(feature = "metal"),
         cfg!(feature = "cuda"),
     ) {
-        (true, true, true) => "+models+metal+cuda",
-        (true, true, false) => "+models+metal",
-        (true, false, true) => "+models+cuda",
+        (true, true, true) => "+models.metal.cuda",
+        (true, true, false) => "+models.metal",
+        (true, false, true) => "+models.cuda",
         (true, false, false) => "+models",
         _ => "",
     }
