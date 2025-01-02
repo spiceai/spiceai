@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,12 +14,50 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::sync::Arc;
+
 use crate::error::Error;
+use app::spicepod::component::runtime::ApiKey;
 use axum::http;
 
+pub type AuthPrincipalRef = Arc<dyn AuthPrincipal + Sync + Send>;
+
+pub trait AuthPrincipal {
+    fn username(&self) -> &str; // The username as presented during auth
+    fn groups(&self) -> &[&str]; // Group memberships
+}
+pub trait AuthRequestContext {
+    /// Sets the current authentication principal for the request context.
+    ///
+    /// # Errors
+    ///
+    /// This function returns an error if the principal cannot be set.
+    fn set_auth_principal(
+        &self,
+        auth_principal: AuthPrincipalRef,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+    /// Retrieves the principal information associated with the request.
+    ///
+    /// Returns `None` if authentication is not set up or has not yet been completed.
+    fn auth_principal(&self) -> Option<&AuthPrincipalRef>;
+}
+
 pub enum AuthVerdict {
-    Allow,
+    Allow(AuthPrincipalRef),
     Deny,
+}
+
+impl AuthPrincipal for ApiKey {
+    fn username(&self) -> &str {
+        "api_key_auth"
+    }
+    fn groups(&self) -> &[&str] {
+        match self {
+            ApiKey::ReadOnly { .. } => &["read"],
+            ApiKey::ReadWrite { .. } => &["read_write"],
+        }
+    }
 }
 
 pub trait HttpAuth {

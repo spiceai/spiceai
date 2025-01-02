@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -74,7 +74,7 @@ where
             let (parts, body) = req.into_parts();
 
             match auth_verifier.http_verify(&parts) {
-                Ok(AuthVerdict::Allow) => inner.call(Request::from_parts(parts, body)).await,
+                Ok(AuthVerdict::Allow(_)) => inner.call(Request::from_parts(parts, body)).await,
                 Ok(AuthVerdict::Deny) => Ok(unauthorized_response()),
                 Err(e) => {
                     tracing::error!("{e}");

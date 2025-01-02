@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -25,6 +25,7 @@ use datafusion::{
     error::DataFusionError, execution::SendableRecordBatchStream,
     physical_plan::stream::RecordBatchStreamAdapter, sql::TableReference,
 };
+use runtime_auth::AuthRequestContext;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
@@ -33,15 +34,26 @@ use async_stream::stream;
 
 use crate::{
     dataupdate::{StreamingDataUpdate, UpdateType},
+    request::RequestContext,
     timing::TimedStream,
 };
 
 use super::{metrics, Service};
 
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn handle(
     flight_svc: &Service,
     request: Request<Streaming<FlightData>>,
 ) -> Result<Response<<Service as FlightService>::DoPutStream>, Status> {
+    match RequestContext::current(crate::request::AsyncMarker::new().await).auth_principal() {
+            Some(principal) => {
+                if !principal.groups().iter().any(|group| *group == "write" || *group == "read_write") {
+                    return Err(Status::permission_denied("Write access denied. Verify that authentication key used has write access and try again."));
+                }
+            },
+            None => return Err(Status::unauthenticated("Flight DoPut requires authentication.\nFor auth details, visit https://docs.spiceai.org/api/auth")),
+     }
+
     let mut streaming_flight = request.into_inner();
 
     let Ok(Some(message)) = streaming_flight.message().await else {
