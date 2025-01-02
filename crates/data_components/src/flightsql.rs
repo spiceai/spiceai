@@ -542,10 +542,7 @@ fn query_to_stream(
                         Ok(mut flight_stream) => {
                             while let Some(batch) = flight_stream.next().await {
                                 match batch {
-                                    Ok(batch) => {
-                                        println!("[flightsq] query_to_stream: batch: {:?}", batch);
-                                        yield Ok(batch)
-                                    },
+                                    Ok(batch) => yield Ok(batch),
                                     Err(error) => yield Err(to_execution_error(Error::UnableToQueryArrowFlight { source: error }))
                                 }
                             }
