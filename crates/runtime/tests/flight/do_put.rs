@@ -234,7 +234,7 @@ async fn test_flight_do_put_rate_limit() -> Result<(), anyhow::Error> {
 
             // rate limit error is expected next
             assert!(
-                write_record_batches(&mut client, vec![test_record_batch.clone()].into_iter(),)
+                write_record_batches(&mut client, vec![test_record_batch.clone()].into_iter())
                     .await
                     .is_err(),
                 "Expected an error but got a successful result"
@@ -256,6 +256,51 @@ async fn test_flight_do_put_rate_limit() -> Result<(), anyhow::Error> {
             let results_str =
                 arrow::util::pretty::pretty_format_batches(&results).expect("pretty batches");
             insta::assert_snapshot!("do_put_rate_limit_table_content", results_str);
+
+            Ok(())
+        })
+        .await
+}
+
+#[tokio::test]
+async fn test_flight_do_put_max_rows_allowed() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    test_request_context()
+        .scope(async {
+            let auth = Arc::new(ApiKeyAuth::new(vec![ApiKey::parse_str("valid:rw")]))
+                as Arc<dyn FlightBasicAuth + Send + Sync>;
+
+            let (channel, df) = start_spice_test_app(Some(auth), None).await?;
+
+            let mut client = create_flight_client(channel, Some("valid"))?;
+
+            assert!(
+                // Simulate a normal batch, followed by a batch that exceeds the allowed number of rows, and then another normal batch.
+                write_record_batches(
+                    &mut client,
+                    vec![
+                        test_record_batch()?,
+                        large_test_record_batch()?,
+                        test_record_batch()?
+                    ]
+                    .into_iter()
+                )
+                .await
+                .is_err(),
+                "Expected an error but got a successful result"
+            );
+
+            let query = df
+                .query_builder("SELECT * from my_table")
+                .build()
+                .run()
+                .await?;
+
+            let results: Vec<RecordBatch> = query.data.try_collect::<Vec<RecordBatch>>().await?;
+            let results_str =
+                arrow::util::pretty::pretty_format_batches(&results).expect("pretty batches");
+            insta::assert_snapshot!("do_put_max_rows_allowed_table_content", results_str);
 
             Ok(())
         })
@@ -373,6 +418,28 @@ fn test_record_batch() -> Result<RecordBatch, anyhow::Error> {
         vec![
             Arc::new(Int32Array::from(vec![1, 2, 3])),
             Arc::new(StringArray::from(vec!["a", "b", "c"])),
+        ],
+    )
+    .map_err(anyhow::Error::from)
+}
+
+fn large_test_record_batch() -> Result<RecordBatch, anyhow::Error> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("a", DataType::Int32, false),
+        Field::new("b", DataType::Utf8, false),
+    ]));
+
+    // Generate 11,000 rows of data
+    let int_column = (1..=11_000).collect::<Vec<i32>>();
+    let string_column = (1..=11_000)
+        .map(|i| format!("row_{i}"))
+        .collect::<Vec<String>>();
+
+    RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int32Array::from(int_column)),
+            Arc::new(StringArray::from(string_column)),
         ],
     )
     .map_err(anyhow::Error::from)
