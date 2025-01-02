@@ -215,7 +215,9 @@ spice chat --model <model> --cloud
 				Stream:        true,
 				StreamOptions: &StreamOptions{IncludeUsage: true},
 			}
-
+			var timeAtCompletion time.Time
+			var timeAtFirstToken time.Time
+			startTime := time.Now()
 			response, err := sendChatRequest(rtcontext, body)
 			if err != nil {
 				slog.Error("failed to send chat request to spiced", "error", err)
@@ -227,13 +229,13 @@ spice chat --model <model> --cloud
 
 			/// Usage for the entire stream, and related timing.
 			var usage Usage
-			startTime := time.Now()
-			var endTime time.Time
-
 			doneLoading := false
 
 			for scanner.Scan() {
 				chunk := scanner.Text()
+				if timeAtFirstToken.IsZero() {
+					timeAtFirstToken = time.Now()
+				}
 
 				errorEvent, err := maybeErrorEvent(chunk, scanner)
 
@@ -266,7 +268,7 @@ spice chat --model <model> --cloud
 
 				if chatResponse.Usage != nil {
 					usage = *chatResponse.Usage
-					endTime = time.Now()
+					timeAtCompletion = time.Now()
 				}
 
 				if len(chatResponse.Choices) == 0 {
@@ -291,7 +293,11 @@ spice chat --model <model> --cloud
 				messages = append(messages, Message{Role: "assistant", Content: responseMessage})
 			}
 			if usage != (Usage{}) {
-				cmd.Printf("\n\n%s\n\n", generateUsageMessage(&usage, endTime.Sub(startTime).Abs()))
+				cmd.Printf("\n\n%s\n\n", generateUsageMessage(
+					&usage,
+					timeAtFirstToken.Sub(startTime).Abs(),
+					timeAtCompletion.Sub(timeAtFirstToken).Abs(),
+				))
 			} else {
 				cmd.Print("\n\n")
 			}
@@ -302,24 +308,23 @@ spice chat --model <model> --cloud
 // `generateUsageMessage` generates a boxed summary of the usage statistics.
 //
 // ```shell
-// +-----------------------------------------------------------+
-// | Total tokens: 229 (53.60/s). Completion: 219. Prompt: 10. |
-// +-----------------------------------------------------------+
+// Time: 3.36s (first token 0.45s). Tokens: 1652 (492.25/s). Prompt: 1475. Completion: 177.
 // ```
-func generateUsageMessage(u *Usage, dur time.Duration) string {
+// If no usage data provided:
+// ```shell
+// Time: 3.36s (first token 0.45s).
+// ```
+func generateUsageMessage(u *Usage, timeToFirst time.Duration, streamDuration time.Duration) string {
+	totalTime := (streamDuration + timeToFirst)
+	times := fmt.Sprintf("Time: %.2fs (first token %.2fs).", totalTime.Seconds(), timeToFirst.Seconds())
 	if u == nil {
-		return ""
+		return times
 	}
 
-	tps := float32(dur.Milliseconds()) / 1000.0
-	usage_line := fmt.Sprintf(
-		"Total tokens: %d (%.2f/s). Completion: %d. Prompt: %d.",
-		u.TotalTokens, tps, u.CompletionTokens, u.PromptTokens,
+	tps := float64(u.TotalTokens) / (totalTime.Seconds())
+	return fmt.Sprintf(
+		"%s Tokens: %d (%.2f/s). Prompt: %d. Completion: %d.", times, u.TotalTokens, tps, u.PromptTokens, u.CompletionTokens,
 	)
-
-	// Dynamically generate a line of the same length as the usage line
-	line := strings.Repeat("-", len(usage_line)+2)
-	return fmt.Sprintf("+%s+\n| %s |\n+%s+", line, usage_line, line)
 }
 
 func sendChatRequest(rtcontext *context.RuntimeContext, body *ChatRequestBody) (*http.Response, error) {
