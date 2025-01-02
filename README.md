@@ -129,8 +129,8 @@ Currently supported data stores for local materialization/acceleration. More com
 | ---------- | ------------------------------- | ----------------- | ---------------- |
 | `arrow`    | In-Memory Arrow Records         | Release Candidate | `memory`         |
 | `duckdb`   | Embedded [DuckDB][duckdb]       | Release Candidate | `memory`, `file` |
+| `postgres` | Attached [PostgreSQL][postgres] | Release Candidate |                  |
 | `sqlite`   | Embedded [SQLite][sqlite]       | Release Candidate | `memory`, `file` |
-| `postgres` | Attached [PostgreSQL][postgres] | Beta              |                  |
 
 [duckdb]: https://docs.spiceai.org/data-accelerators/duckdb
 [postgres]: https://github.com/spiceai/cookbook/tree/trunk/postgres/accelerator#postgresql-data-accelerator
