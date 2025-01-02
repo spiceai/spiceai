@@ -486,9 +486,9 @@ fn large_test_record_batch() -> Result<RecordBatch, anyhow::Error> {
         Field::new("b", DataType::Utf8, false),
     ]));
 
-    // Generate 11,000 rows of data
-    let int_column = (1..=11_000).collect::<Vec<i32>>();
-    let string_column = (1..=11_000)
+    // Generate 35,000 rows of data
+    let int_column = (1..=35_000).collect::<Vec<i32>>();
+    let string_column = (1..=35_000)
         .map(|i| format!("row_{i}"))
         .collect::<Vec<String>>();
 

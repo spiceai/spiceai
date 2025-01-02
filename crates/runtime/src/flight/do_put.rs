@@ -194,10 +194,10 @@ async fn handle_record_batch(
 ) -> Result<PutResult, Status> {
     tracing::trace!("Received batch with {} rows", batch.num_rows());
 
-    if batch.num_rows() > 10_000 {
+    if batch.num_rows() > 32_768 {
         return Err(Status::invalid_argument(format!(
             "The provided batch contains too many rows. Maximum allowed: {allowed}, received: {received}.",
-            allowed = 10_000,
+            allowed = 32_768,
             received = batch.num_rows()
         )));
     }
