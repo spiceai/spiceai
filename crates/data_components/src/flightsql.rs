@@ -524,7 +524,6 @@ fn query_to_stream(
     mut client: FlightSqlServiceClient<Channel>,
     sql: &str,
 ) -> impl Stream<Item = DataFusionResult<RecordBatch>> {
-
     let sql = sql.to_string();
 
     stream! {
