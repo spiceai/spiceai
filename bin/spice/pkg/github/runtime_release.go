@@ -119,7 +119,7 @@ func has_metal_device() (bool, error) {
 
 	slog.Debug("On MacOs, running `system_profiler SPDisplaysDataType -detailLevel mini` to determine hardware")
 
-	output, err := exec.Command("system_profiler SPDisplaysDataType -detailLevel mini").Output()
+	output, err := exec.Command("system_profiler", "SPDisplaysDataType", "-detailLevel", "mini").Output()
 	if err != nil {
 		return false, fmt.Errorf("failed to run system_profiler: %w", err)
 	}
