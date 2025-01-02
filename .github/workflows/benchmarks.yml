@@ -463,6 +463,20 @@ jobs:
     runs-on: spiceai-large-runners
     needs: build-database-bench-binary
 
+    services:
+      postgres_acc:
+        image: ${{( matrix.cmd == '-a postgres' || matrix.cmd == '-a postgres -b clickbench') && 'ghcr.io/cloudnative-pg/postgresql:16-bookworm' || '' }}
+        options: >-
+          --shm-size=2gb
+          --health-cmd="pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+        env:
+          POSTGRES_PASSWORD: postgres
+
     strategy:
       fail-fast: false
       max-parallel: 1
@@ -482,6 +496,9 @@ jobs:
             bench: 'clickbench'
           - cmd: '-a sqlite -m file -b clickbench'
             name: 'sqlite accelerator (file mode)'
+            bench: 'clickbench'
+          - cmd: '-a postgres -b clickbench'
+            name: 'postgres accelerator'
             bench: 'clickbench'
 
     steps:
@@ -516,6 +533,11 @@ jobs:
           S3_ENDPOINT: ${{ secrets.CLICKBENCH_S3_ENDPOINT}}
           S3_KEY: ${{ secrets.CLICKBENCH_S3_KEY}}
           S3_SECRET: ${{ secrets.CLICKBENCH_S3_SECRET}}
+          PG_BENCHMARK_PG_HOST: localhost
+          PG_BENCHMARK_PG_USER: postgres
+          PG_BENCHMARK_PG_PASS: postgres
+          PG_BENCHMARK_PG_SSLMODE: disable
+          PG_BENCHMARK_ACC_PG_DBNAME: postgres
 
   create-pr:
     runs-on: ubuntu-latest
