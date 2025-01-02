@@ -53,20 +53,22 @@ impl Xai {
         }
     }
 
+    /// Changes to `req` to accomodate xAi not being `OpenAI` compatible.
     fn alter_request(&self, mut req: CreateChatCompletionRequest) -> CreateChatCompletionRequest {
+        // Use name of xAI model, not spicepod model.
         req.model.clone_from(&self.model);
 
-        // Changes to `req` to accomodate xAi not being OpenAI compatible.
+        // xAI requires content to be set, even if tool calls are present.
         req.messages.iter_mut().for_each(|m| {
             if let ChatCompletionRequestMessage::Assistant(
                 ChatCompletionRequestAssistantMessage {
                     content,
-                    tool_calls,
+                    tool_calls: Some(ref _tool_calls),
                     ..
                 },
             ) = m
             {
-                if tool_calls.is_some() && content.is_none() {
+                if content.is_none() {
                     content.replace(ChatCompletionRequestAssistantMessageContent::Text(
                         String::new(),
                     ));
@@ -74,8 +76,10 @@ impl Xai {
             }
         });
 
+        // xAI should set Option::None parameters to a schema with no inputs, but xAI doesn't.
+        // Must be done explicitly.
         if let Some(ref mut tools) = req.tools {
-            tools.iter_mut().for_each(|t| {
+            for t in tools.iter_mut() {
                 if t.function.parameters.is_none() {
                     t.function.parameters.replace(json!(
                         {
@@ -87,7 +91,7 @@ impl Xai {
                         }
                     ));
                 }
-            });
+            }
         }
 
         req
