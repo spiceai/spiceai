@@ -18,12 +18,14 @@ use super::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorFactory, ParameterSpec,
 };
 use crate::component::dataset::Dataset;
+use arrow_flight::flight_service_client::FlightServiceClient;
 use arrow_flight::sql::client::FlightSqlServiceClient;
 use async_trait::async_trait;
 use data_components::flightsql::FlightSQLFactory as DataComponentFlightSQLFactory;
 use data_components::Read;
 use datafusion::datasource::TableProvider;
 use flight_client::tls::new_tls_flight_channel;
+use flight_client::{MAX_DECODING_MESSAGE_SIZE, MAX_ENCODING_MESSAGE_SIZE};
 use snafu::prelude::*;
 use std::any::Any;
 use std::pin::Pin;
@@ -87,7 +89,11 @@ impl DataConnectorFactory for FlightSQLFactory {
                 .await
                 .context(UnableToConstructTlsChannelSnafu)?;
 
-            let mut client = FlightSqlServiceClient::new(flight_channel);
+            let flight_client = FlightServiceClient::new(flight_channel)
+                .max_encoding_message_size(MAX_ENCODING_MESSAGE_SIZE)
+                .max_decoding_message_size(MAX_DECODING_MESSAGE_SIZE);
+
+            let mut client = FlightSqlServiceClient::new_from_inner(flight_client);
             let username = params.parameters.get("username").expose().ok();
             let password = params.parameters.get("password").expose().ok();
             if let (Some(username), Some(password)) = (username, password) {

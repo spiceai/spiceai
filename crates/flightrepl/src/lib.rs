@@ -33,7 +33,7 @@ use datafusion::dataframe::DataFrame;
 use datafusion::datasource::{provider_as_source, MemTable};
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::{LogicalPlanBuilder, UNNAMED_TABLE};
-use flight_client::TonicStatusError;
+use flight_client::{TonicStatusError, MAX_DECODING_MESSAGE_SIZE, MAX_ENCODING_MESSAGE_SIZE};
 use futures::{StreamExt, TryStreamExt};
 use llms::chat::LlmRuntime;
 use prost::Message;
@@ -175,8 +175,8 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
 
     // The encoder/decoder size is limited to 500MB.
     let client = FlightServiceClient::new(channel)
-        .max_decoding_message_size(500 * 1024 * 1024)
-        .max_encoding_message_size(500 * 1024 * 1024);
+        .max_encoding_message_size(MAX_ENCODING_MESSAGE_SIZE)
+        .max_decoding_message_size(MAX_DECODING_MESSAGE_SIZE);
 
     let mut rl: Editor<(), FileHistory> = Editor::new()?;
     let key_handler = Box::new(KeyEventHandler {});

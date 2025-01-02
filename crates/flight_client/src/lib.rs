@@ -41,6 +41,9 @@ use tonic::IntoStreamingRequest;
 
 pub mod tls;
 
+pub const MAX_ENCODING_MESSAGE_SIZE: usize = 100 * 1024 * 1024;
+pub const MAX_DECODING_MESSAGE_SIZE: usize = 100 * 1024 * 1024;
+
 #[derive(Debug)]
 pub struct TonicStatusError(tonic::Status);
 
@@ -221,8 +224,8 @@ impl FlightClient {
 
         Ok(FlightClient {
             flight_client: FlightServiceClient::new(flight_channel)
-                .max_encoding_message_size(100 * 1024 * 1024)
-                .max_decoding_message_size(100 * 1024 * 1024),
+                .max_encoding_message_size(MAX_ENCODING_MESSAGE_SIZE)
+                .max_decoding_message_size(MAX_DECODING_MESSAGE_SIZE),
             credentials,
             url,
             metadata,
