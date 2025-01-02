@@ -191,10 +191,12 @@ fn get_accelerator_refresh_sql(
     dataset: &str,
     bench_name: &str,
 ) -> Option<String> {
-    if let Some("sqlite") = engine {
+    if let Some("sqlite" | "postgres") = engine {
         if bench_name == "clickbench" {
             // SQLite has troubles loading the whole ClickBench set with indexes enabled
-            // remove this refresh SQL when we support index creation after table load
+            // remove this refresh SQL when we support index creation after table load.
+            //
+            // Postgres also can't load the full dataset within the 3 hour time limit
             return Some(format!("SELECT * FROM {dataset} LIMIT 10000000"));
         }
     }
