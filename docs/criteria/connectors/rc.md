@@ -158,7 +158,7 @@ Indexes are not required for test coverage, but can be introduced if required fo
 
 ##### ClickBench
 
-- [ ] A test script exists that can load ClickBench data into this connector at the [designated scale factor](#rc-release-criteria).
+- [ ] A test script exists that can load ClickBench data into this connector.
 - [ ] All queries are attempted on this connector. No bug fixes are required for ClickBench.
 - [ ] All ClickBench bugs are raised as issues.
 
