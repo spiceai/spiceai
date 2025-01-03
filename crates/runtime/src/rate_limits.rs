@@ -14,22 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::time::Duration;
-
-pub struct RateLimit {
-    pub amount: u64,
-    pub interval: Duration,
-}
-
-impl RateLimit {
-    #[must_use]
-    pub fn new(amount: u64, interval: Duration) -> Self {
-        Self { amount, interval }
-    }
-}
+use governor::Quota;
+use std::num::NonZeroU32;
 
 pub struct RateLimits {
-    pub flight_write_limit: RateLimit,
+    pub flight_write_limit: Quota,
 }
 
 impl RateLimits {
@@ -39,7 +28,7 @@ impl RateLimits {
     }
 
     #[must_use]
-    pub fn with_flight_write_limit(mut self, rate_limit: RateLimit) -> Self {
+    pub fn with_flight_write_limit(mut self, rate_limit: Quota) -> Self {
         self.flight_write_limit = rate_limit;
         self
     }
@@ -49,7 +38,11 @@ impl Default for RateLimits {
     fn default() -> Self {
         Self {
             // Allow 100 Flight DoPut requests every 60 seconds by default
-            flight_write_limit: RateLimit::new(100, Duration::from_secs(60)),
+            #[allow(clippy::expect_used)]
+            flight_write_limit: Quota::per_minute(
+                NonZeroU32::new(100)
+                    .expect("100 is a valid non-zero value and should be converted to NonZeroU32"),
+            ),
         }
     }
 }

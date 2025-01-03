@@ -23,8 +23,11 @@ use std::{
 
 use crate::request::{Protocol, RequestContext};
 use app::App;
+use governor::{
+    state::{InMemoryState, NotKeyed},
+    RateLimiter,
+};
 use http::HeaderValue;
-use ratelimit::Ratelimiter;
 use runtime_auth::AuthRequestContext;
 use tower::{Layer, Service};
 
@@ -94,15 +97,22 @@ where
     }
 }
 
+type DirectRateLimiter = RateLimiter<
+    NotKeyed,
+    InMemoryState,
+    governor::clock::DefaultClock,
+    governor::middleware::NoOpMiddleware,
+>;
+
 /// Enforces a rate limit on the number of Flight `DoPut` requests the underlying service can handle over a period of time.
 #[derive(Clone)]
 pub struct WriteRateLimitLayer {
-    rate_limiter: Arc<Ratelimiter>,
+    rate_limiter: Arc<DirectRateLimiter>,
 }
 
 impl WriteRateLimitLayer {
     #[must_use]
-    pub fn new(rate_limiter: Ratelimiter) -> Self {
+    pub fn new(rate_limiter: DirectRateLimiter) -> Self {
         Self {
             rate_limiter: Arc::new(rate_limiter),
         }
@@ -120,11 +130,11 @@ impl<S> Layer<S> for WriteRateLimitLayer {
 #[derive(Clone)]
 pub struct WriteRateLimitMiddleware<S> {
     inner: S,
-    rate_limiter: Arc<Ratelimiter>,
+    rate_limiter: Arc<DirectRateLimiter>,
 }
 
 impl<S> WriteRateLimitMiddleware<S> {
-    fn new(inner: S, rate_limiter: Arc<Ratelimiter>) -> Self {
+    fn new(inner: S, rate_limiter: Arc<DirectRateLimiter>) -> Self {
         WriteRateLimitMiddleware {
             inner,
             rate_limiter,
@@ -156,17 +166,18 @@ where
             return Box::pin(self.inner.call(req));
         }
 
-        if let Err(wait_time) = self.rate_limiter.try_wait() {
-            tracing::trace!(
-                "Request rate-limited, must retry after {} seconds.",
-                wait_time.as_secs()
-            );
+        if let Err(wait_time) = self.rate_limiter.check() {
+            let retry_after_secs = wait_time
+                .wait_time_from(wait_time.earliest_possible())
+                .as_secs();
+
+            tracing::trace!("Request rate-limited, must retry after {retry_after_secs} seconds.",);
 
             return Box::pin(async move {
                 let mut response = http::Response::new(ResBody::default());
                 *response.status_mut() = http::StatusCode::TOO_MANY_REQUESTS;
 
-                if let Ok(retry_after) = HeaderValue::from_str(&wait_time.as_secs().to_string()) {
+                if let Ok(retry_after) = HeaderValue::from_str(&retry_after_secs.to_string()) {
                     response.headers_mut().insert("retry-after", retry_after);
                 }
 

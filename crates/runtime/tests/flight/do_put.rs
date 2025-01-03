@@ -16,6 +16,7 @@ limitations under the License.
 
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
+    num::NonZeroU32,
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
@@ -36,16 +37,12 @@ use futures::{
     stream::{self, TryStreamExt},
     Stream,
 };
+use governor::Quota;
 use rand::Rng;
 use runtime::{
-    accelerated_table::refresh::Refresh,
-    auth::EndpointAuth,
-    component::dataset::acceleration::Acceleration,
-    config::Config,
-    datafusion::DataFusion,
-    internal_table::create_internal_accelerated_table,
-    rate_limits::{RateLimit, RateLimits},
-    secrets::Secrets,
+    accelerated_table::refresh::Refresh, auth::EndpointAuth,
+    component::dataset::acceleration::Acceleration, config::Config, datafusion::DataFusion,
+    internal_table::create_internal_accelerated_table, rate_limits::RateLimits, secrets::Secrets,
     Runtime,
 };
 use runtime_auth::{api_key::ApiKeyAuth, FlightBasicAuth};
@@ -215,12 +212,13 @@ async fn test_flight_do_put_rate_limit() -> Result<(), anyhow::Error> {
             let auth = Arc::new(ApiKeyAuth::new(vec![ApiKey::parse_str("valid:rw")]))
                 as Arc<dyn FlightBasicAuth + Send + Sync>;
 
+            let write_quota = Quota::with_period(Duration::from_secs(10))
+                .expect("to create quota")
+                .allow_burst(NonZeroU32::new(5).expect("should convert 5 to NonZeroU32"));
+
             let (channel, df) = start_spice_test_app(
                 Some(auth),
-                Some(
-                    RateLimits::new()
-                        .with_flight_write_limit(RateLimit::new(5, Duration::from_secs(10))),
-                ),
+                Some(RateLimits::new().with_flight_write_limit(write_quota)),
             )
             .await?;
 

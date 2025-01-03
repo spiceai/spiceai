@@ -35,6 +35,7 @@ use datafusion::sql::sqlparser::parser::ParserError;
 use datafusion::sql::TableReference;
 use futures::stream::{self, BoxStream, StreamExt};
 use futures::{Stream, TryStreamExt};
+use governor::RateLimiter;
 use metrics::track_flight_request;
 use middleware::{RequestContextLayer, WriteRateLimitLayer};
 use runtime_auth::{layer::flight::BasicAuthLayer, FlightBasicAuth};
@@ -302,9 +303,6 @@ pub enum Error {
 
     #[snafu(display("Unable to configure TLS on the Flight server: {source}"))]
     UnableToConfigureTls { source: tonic::transport::Error },
-
-    #[snafu(display("Failed to configure Flight write requests rate limiter: {source}"))]
-    UnableToConfigureFlightWriteRateLimiter { source: ratelimit::Error },
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -339,22 +337,15 @@ pub async fn start(
             .context(UnableToConfigureTlsSnafu)?;
     }
 
-    let flight_write_limits = ratelimit::Ratelimiter::builder(
-        rate_limits.flight_write_limit.amount,
-        rate_limits.flight_write_limit.interval,
-    )
-    .initial_available(rate_limits.flight_write_limit.amount)
-    .max_tokens(rate_limits.flight_write_limit.amount)
-    .build()
-    .context(UnableToConfigureFlightWriteRateLimiterSnafu)?;
-
     let auth_layer = tower::ServiceBuilder::new()
         .layer(BasicAuthLayer::new(endpoint_auth.flight_basic_auth))
         .into_inner();
 
     server
         .layer(RequestContextLayer::new(app))
-        .layer(WriteRateLimitLayer::new(flight_write_limits))
+        .layer(WriteRateLimitLayer::new(RateLimiter::direct(
+            rate_limits.flight_write_limit,
+        )))
         .layer(auth_layer)
         .add_service(svc)
         .serve(bind_address)
