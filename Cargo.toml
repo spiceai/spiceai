@@ -172,3 +172,5 @@ rusqlite = { git = "https://github.com/spiceai/rusqlite.git", rev = "97054b6af72
 dotenvy = { git = "https://github.com/spiceai/dotenvy.git", rev = "e5cef1871b08003198949dfe2da988633eaad78f" }
 
 iceberg = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "557c79ff2c443c089e09d3ad60d382eb7fdba7bf" }
+iceberg-datafusion = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "557c79ff2c443c089e09d3ad60d382eb7fdba7bf" }
+iceberg-catalog-rest = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "557c79ff2c443c089e09d3ad60d382eb7fdba7bf" }
