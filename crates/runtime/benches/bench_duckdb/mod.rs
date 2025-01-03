@@ -293,10 +293,40 @@ pub(crate) fn delayed_source_load_to_parquet(
     load_count: usize,
     load_interval: Duration,
     scale_factor: f64,
-) -> JoinHandle<Result<(), String>> {
+) -> Result<JoinHandle<Result<(), String>>, String> {
+    if std::fs::exists(format!("./{bench_name}.db"))
+        .map_err(|_| "Should check for existing DB file".to_string())?
+    {
+        std::fs::remove_file(format!("./{bench_name}.db"))
+            .map_err(|_| "Should delete existing DB file".to_string())?;
+    }
+
+    let columns = match bench_name {
+        "tpch" => [
+            ("customer", "c_created_at"),
+            ("lineitem", "l_created_at"),
+            ("nation", "n_created_at"),
+            ("orders", "o_created_at"),
+            ("part", "p_created_at"),
+            ("partsupp", "ps_created_at"),
+            ("region", "r_created_at"),
+            ("supplier", "s_created_at"),
+        ],
+        _ => return Err("Only tpch benchmark suites are supported".to_string()),
+    };
+
+    for (column, _) in &columns {
+        if std::fs::exists(format!("./{column}.parquet"))
+            .map_err(|_| "Should check for existing parquet file".to_string())?
+        {
+            std::fs::remove_file(format!("./{column}.parquet"))
+                .map_err(|_| "Should delete existing parquet file".to_string())?;
+        }
+    }
+
     let bench_name = bench_name.to_string();
 
-    tokio::spawn(async move {
+    Ok(tokio::spawn(async move {
         let dest_db_file = format!("./{bench_name}.db");
         let dest_conn = Connection::open(&dest_db_file).map_err(|e| e.to_string())?;
 
@@ -304,76 +334,35 @@ pub(crate) fn delayed_source_load_to_parquet(
             println!("Loading data for {bench_name} benchmark suite, iteration {i}");
             match bench_name.as_str() {
                 "tpch" => {
-                    let batch_sql = if i == 0 {
-                        format!("
-                        INSTALL tpch;
-                        LOAD tpch;
-                        BEGIN;
-                        CALL dbgen(sf={scale_factor}, children={load_count}, step={i});
-                        ALTER TABLE customer ADD COLUMN c_created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
-                        ALTER TABLE lineitem ADD COLUMN l_created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
-                        ALTER TABLE nation ADD COLUMN n_created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
-                        ALTER TABLE orders ADD COLUMN o_created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
-                        ALTER TABLE part ADD COLUMN p_created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
-                        ALTER TABLE partsupp ADD COLUMN ps_created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
-                        ALTER TABLE region ADD COLUMN r_created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
-                        ALTER TABLE supplier ADD COLUMN s_created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
-                        COMMIT;
-                        COPY customer TO 'customer.parquet' (FORMAT 'parquet');
-                        COPY lineitem TO 'lineitem.parquet' (FORMAT 'parquet');
-                        COPY nation TO 'nation.parquet' (FORMAT 'parquet');
-                        COPY orders TO 'orders.parquet' (FORMAT 'parquet');
-                        COPY part TO 'part.parquet' (FORMAT 'parquet');
-                        COPY partsupp TO 'partsupp.parquet' (FORMAT 'parquet');
-                        COPY region TO 'region.parquet' (FORMAT 'parquet');
-                        COPY supplier TO 'supplier.parquet' (FORMAT 'parquet');
-                        ")
-                    } else {
-                        // nation and region get excluded from subsequent loads
-                        format!(
-                            "
-                        INSTALL tpch;
-                        LOAD tpch;
-                        BEGIN;
-                        CALL dbgen(sf={scale_factor}, suffix='_new', children={load_count}, step={i});
-                        ALTER TABLE customer_new ADD COLUMN c_created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
-                        ALTER TABLE lineitem_new ADD COLUMN l_created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
-                        ALTER TABLE nation_new ADD COLUMN n_created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
-                        ALTER TABLE orders_new ADD COLUMN o_created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
-                        ALTER TABLE part_new ADD COLUMN p_created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
-                        ALTER TABLE partsupp_new ADD COLUMN ps_created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
-                        ALTER TABLE region_new ADD COLUMN r_created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
-                        ALTER TABLE supplier_new ADD COLUMN s_created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
-                        INSERT INTO customer SELECT * FROM customer_new;
-                        INSERT INTO lineitem SELECT * FROM lineitem_new;
-                        INSERT INTO orders SELECT * FROM orders_new;
-                        INSERT INTO part SELECT * FROM part_new;
-                        INSERT INTO partsupp SELECT * FROM partsupp_new;
-                        INSERT INTO supplier SELECT * FROM supplier_new;
-                        DROP TABLE customer_new;
-                        DROP TABLE lineitem_new;
-                        DROP TABLE nation_new;
-                        DROP TABLE orders_new;
-                        DROP TABLE part_new;
-                        DROP TABLE partsupp_new;
-                        DROP TABLE region_new;
-                        DROP TABLE supplier_new;
-                        COMMIT;
-                        COPY customer TO 'customer.parquet' (FORMAT 'parquet');
-                        COPY lineitem TO 'lineitem.parquet' (FORMAT 'parquet');
-                        COPY nation TO 'nation.parquet' (FORMAT 'parquet');
-                        COPY orders TO 'orders.parquet' (FORMAT 'parquet');
-                        COPY part TO 'part.parquet' (FORMAT 'parquet');
-                        COPY partsupp TO 'partsupp.parquet' (FORMAT 'parquet');
-                        COPY region TO 'region.parquet' (FORMAT 'parquet');
-                        COPY supplier TO 'supplier.parquet' (FORMAT 'parquet');
+                    let mut sql = format!(
                         "
-                        )
-                    };
+                    INSTALL tpch;
+                    LOAD tpch;
+                    BEGIN;
+                    CALl dbgen(sf={scale_factor}, children={load_count}, step={i}, suffix={suffix});
+                    ",
+                        suffix = if i == 0 { "''" } else { "'_new'" },
+                    );
 
-                    dest_conn
-                        .execute_batch(&batch_sql)
-                        .map_err(|e| e.to_string())?;
+                    for (table, column) in columns {
+                        if i == 0 {
+                            sql += &format!("
+                            ALTER TABLE {table} ADD COLUMN {column} TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+                            COPY {table} TO '{table}.parquet' (FORMAT 'parquet');
+                            ");
+                        } else {
+                            sql += &format!("
+                            ALTER TABLE {table}_new ADD COLUMN {column} TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+                            INSERT INTO {table} SELECT * FROM {table}_new;
+                            DROP TABLE {table}_new;
+                            COPY {table} TO '{table}.parquet' (FORMAT 'parquet');
+                            ");
+                        }
+                    }
+
+                    sql += "COMMIT;";
+
+                    dest_conn.execute_batch(&sql).map_err(|e| e.to_string())?;
                 }
                 _ => {
                     return Err("Only tpch benchmark suites are supported".to_string());
@@ -384,5 +373,5 @@ pub(crate) fn delayed_source_load_to_parquet(
         }
 
         Ok::<(), String>(())
-    })
+    }))
 }
