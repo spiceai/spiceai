@@ -210,7 +210,7 @@ async fn bench_main() -> Result<(), String> {
                 Some("memory") | None => Mode::Memory,
                 _ => return Err(format!("Invalid mode parameter for {accelerator} accelerator")),
             };
-            
+
             let refresh_mode = RefreshMode::from(args.refresh_mode);
             let acceleration = create_acceleration(accelerator, mode, args.bench_name.as_ref(), refresh_mode.clone());
 
