@@ -106,14 +106,7 @@ pub(crate) async fn run_file_append(
                 accelerator.mode
             )
         }
-        (Some(accelerator), false) => {
-            format!(
-                "file_{}_{}",
-                accelerator.engine.unwrap_or("arrow".to_string()),
-                accelerator.mode
-            )
-        }
-        (None, _) => bench_name.to_string(),
+        _ => "file".to_string(),
     };
 
     for (query_name, query) in test_queries {
