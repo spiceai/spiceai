@@ -289,19 +289,10 @@ impl FlightTable {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        let table_reference = match &self.table_reference {
-            MultiPartTableReference::TableReference(table_reference) => table_reference.clone(),
-            MultiPartTableReference::Multi(_) => {
-                // This should never happen - it means that we're not federating correctly
-                return Err(DataFusionError::External(
-                    "MultiPartTableReference cannot be converted to TableReference".into(),
-                ));
-            }
-        };
         Ok(Arc::new(FlightExec::new(
             projections,
             schema,
-            &table_reference,
+            &self.table_reference,
             self.client.clone(),
             filters,
             limit,
@@ -360,7 +351,7 @@ impl TableProvider for FlightTable {
 #[derive(Clone)]
 struct FlightExec {
     projected_schema: SchemaRef,
-    table_reference: TableReference,
+    table_reference: MultiPartTableReference,
     client: FlightClient,
     filters: Vec<Expr>,
     limit: Option<usize>,
@@ -371,7 +362,7 @@ impl FlightExec {
     fn new(
         projections: Option<&Vec<usize>>,
         schema: &SchemaRef,
-        table_reference: &TableReference,
+        table_reference: &MultiPartTableReference,
         client: FlightClient,
         filters: &[Expr],
         limit: Option<usize>,
