@@ -301,7 +301,7 @@ pub(crate) fn delayed_source_load_to_parquet(
             .map_err(|_| "Should delete existing DB file".to_string())?;
     }
 
-    let columns = match bench_name {
+    let tables = match bench_name {
         "tpch" => [
             ("customer", "c_created_at"),
             ("lineitem", "l_created_at"),
@@ -315,11 +315,11 @@ pub(crate) fn delayed_source_load_to_parquet(
         _ => return Err("Only tpch benchmark suites are supported".to_string()),
     };
 
-    for (column, _) in &columns {
-        if std::fs::exists(format!("./{column}.parquet"))
+    for (table, _) in &tables {
+        if std::fs::exists(format!("./{table}.parquet"))
             .map_err(|_| "Should check for existing parquet file".to_string())?
         {
-            std::fs::remove_file(format!("./{column}.parquet"))
+            std::fs::remove_file(format!("./{table}.parquet"))
                 .map_err(|_| "Should delete existing parquet file".to_string())?;
         }
     }
@@ -344,7 +344,7 @@ pub(crate) fn delayed_source_load_to_parquet(
                         suffix = if i == 0 { "''" } else { "'_new'" },
                     );
 
-                    for (table, column) in columns {
+                    for (table, column) in &tables {
                         if i == 0 {
                             sql += &format!("
                             ALTER TABLE {table} ADD COLUMN {column} TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
