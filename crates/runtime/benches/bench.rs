@@ -26,6 +26,7 @@ limitations under the License.
 // run_id, started_at, finished_at, connector_name, query_name, status, min_duration, max_duration, iterations, commit_sha
 
 use std::panic;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -69,6 +70,34 @@ mod bench_postgres;
 #[cfg(feature = "spark")]
 mod bench_spark;
 
+#[derive(Debug, Default, Clone, Copy)]
+enum AcceleratorRefreshMode {
+    Append,
+    #[default]
+    Full,
+}
+
+impl FromStr for AcceleratorRefreshMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "append" => Ok(AcceleratorRefreshMode::Append),
+            "full" => Ok(AcceleratorRefreshMode::Full),
+            _ => Err(format!("Unsupported accelerator refresh mode: {s}")),
+        }
+    }
+}
+
+impl From<AcceleratorRefreshMode> for acceleration::RefreshMode {
+    fn from(mode: AcceleratorRefreshMode) -> Self {
+        match mode {
+            AcceleratorRefreshMode::Append => acceleration::RefreshMode::Append,
+            AcceleratorRefreshMode::Full => acceleration::RefreshMode::Full,
+        }
+    }
+}
+
 // Define command line arguments for running benchmark test
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -90,7 +119,7 @@ struct BenchArgs {
     mode: Option<String>,
 
     #[arg(long)]
-    append_mode: Option<bool>,
+    refresh_mode: AcceleratorRefreshMode,
 
     /// Set the benchmark to run: TPCH / TPCDS
     #[arg(short, long, default_value = "tpch")]
@@ -153,17 +182,17 @@ async fn bench_main() -> Result<(), String> {
                 run_connector_bench(connector, upload_results_dataset.as_ref(), args.bench_name.as_ref()).await?;
             }
             let accelerators: Vec<Acceleration> = vec![
-                create_acceleration("arrow", acceleration::Mode::Memory, args.bench_name.as_ref(), false),
+                create_acceleration("arrow", acceleration::Mode::Memory, args.bench_name.as_ref(), RefreshMode::Full),
                 #[cfg(feature = "duckdb")]
-                create_acceleration("duckdb", acceleration::Mode::Memory, args.bench_name.as_ref(), false),
+                create_acceleration("duckdb", acceleration::Mode::Memory, args.bench_name.as_ref(), RefreshMode::Full),
                 #[cfg(feature = "duckdb")]
-                create_acceleration("duckdb", acceleration::Mode::File, args.bench_name.as_ref(), false),
+                create_acceleration("duckdb", acceleration::Mode::File, args.bench_name.as_ref(), RefreshMode::Full),
                 #[cfg(feature = "sqlite")]
-                create_acceleration("sqlite", acceleration::Mode::Memory, args.bench_name.as_ref(), false),
+                create_acceleration("sqlite", acceleration::Mode::Memory, args.bench_name.as_ref(), RefreshMode::Full),
                 #[cfg(feature = "sqlite")]
-                create_acceleration("sqlite", acceleration::Mode::File, args.bench_name.as_ref(), false),
+                create_acceleration("sqlite", acceleration::Mode::File, args.bench_name.as_ref(), RefreshMode::Full),
                 #[cfg(feature = "postgres")]
-                create_acceleration("postgres", acceleration::Mode::Memory, args.bench_name.as_ref(), false),
+                create_acceleration("postgres", acceleration::Mode::Memory, args.bench_name.as_ref(), RefreshMode::Full),
             ];
             for accelerator in accelerators {
                 run_accelerator_bench("s3", accelerator.clone(), upload_results_dataset.as_ref(), "tpch").await?;
@@ -181,25 +210,26 @@ async fn bench_main() -> Result<(), String> {
                 Some("memory") | None => Mode::Memory,
                 _ => return Err(format!("Invalid mode parameter for {accelerator} accelerator")),
             };
+            
+            let refresh_mode = RefreshMode::from(args.refresh_mode);
+            let acceleration = create_acceleration(accelerator, mode, args.bench_name.as_ref(), refresh_mode.clone());
 
-            let append_mode = args.append_mode.unwrap_or(false);
-            let acceleration = create_acceleration(accelerator, mode, args.bench_name.as_ref(), append_mode);
-
-            match (append_mode, args.bench_name.as_ref()) {
-                (true, "tpch") => {
+            match (refresh_mode, args.bench_name.as_ref()) {
+                (RefreshMode::Append, "tpch") => {
                     run_accelerator_bench("file", acceleration, upload_results_dataset.as_ref(), "tpch").await?;
                 }
-                (false, "tpch") => {
+                (RefreshMode::Full, "tpch") => {
                     run_accelerator_bench("s3", acceleration, upload_results_dataset.as_ref(), "tpch").await?;
                 }
-                (false, "tpcds") => {
+                (RefreshMode::Full, "tpcds") => {
                     run_accelerator_bench("s3", acceleration, upload_results_dataset.as_ref(), "tpcds").await?;
                 }
-                (false, "clickbench") => {
+                (RefreshMode::Full, "clickbench") => {
                     run_accelerator_bench("s3", acceleration, upload_results_dataset.as_ref(), "clickbench").await?;
                 }
-                (true, benchmark) => return Err(format!("Append mode benchmark is not implemented for {benchmark}")),
-                (false, benchmark) => return Err(format!("Invalid benchmark parameter for accelerator benchmark: {benchmark}")),
+                (RefreshMode::Append, benchmark) => return Err(format!("Append mode benchmark is not implemented for {benchmark}")),
+                (RefreshMode::Changes, benchmark) => return Err(format!("CDC mode benchmark is not implemented for {benchmark}")),
+                (RefreshMode::Full, benchmark) => return Err(format!("Invalid benchmark parameter for accelerator benchmark: {benchmark}")),
             }
         },
         _ => return Err("Invalid command line input: accelerator or mode parameter supplied for connector benchmark".to_string()),
@@ -400,31 +430,33 @@ fn create_acceleration(
     engine: &str,
     mode: acceleration::Mode,
     bench_name: &str,
-    append: bool,
+    append: acceleration::RefreshMode,
 ) -> Acceleration {
     match (engine, append) {
         #[cfg(feature = "postgres")]
-        ("postgres", false) => Acceleration {
+        ("postgres", RefreshMode::Full) => Acceleration {
             engine: Some(engine.to_string()),
             mode,
             params: Some(get_postgres_params(true, bench_name)),
             ..Default::default()
         },
-        ("duckdb", true) => Acceleration {
+        ("duckdb", RefreshMode::Append) => Acceleration {
             engine: Some(engine.to_string()),
             mode,
             params: None,
-            refresh_mode: Some(acceleration::RefreshMode::Append),
+            refresh_mode: Some(RefreshMode::Append),
             refresh_check_interval: Some("3m".to_string()),
             ..Default::default()
         },
-        (_, false) => Acceleration {
+        (_, RefreshMode::Full) => Acceleration {
             engine: Some(engine.to_string()),
             mode,
             params: None,
             ..Default::default()
         },
-        (_, true) => panic!("Append mode benchmark is not implemented for {engine}"),
+        (_, refresh_mode) => {
+            panic!("Refresh mode {refresh_mode:?} is not implemented for {engine}")
+        }
     }
 }
 
