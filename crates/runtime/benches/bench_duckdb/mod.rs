@@ -294,11 +294,8 @@ pub(crate) fn delayed_source_load_to_parquet(
     load_interval: Duration,
     scale_factor: f64,
 ) -> Result<JoinHandle<Result<(), String>>, String> {
-    if std::fs::exists(format!("./{bench_name}.db"))
-        .map_err(|_| "Should check for existing DB file".to_string())?
-    {
-        std::fs::remove_file(format!("./{bench_name}.db"))
-            .map_err(|_| "Should delete existing DB file".to_string())?;
+    if std::fs::exists(format!("./{bench_name}.db")).map_err(|e| e.to_string())? {
+        std::fs::remove_file(format!("./{bench_name}.db")).map_err(|e| e.to_string())?;
     }
 
     let tables = match bench_name {
@@ -316,11 +313,8 @@ pub(crate) fn delayed_source_load_to_parquet(
     };
 
     for (table, _) in &tables {
-        if std::fs::exists(format!("./{table}.parquet"))
-            .map_err(|_| "Should check for existing parquet file".to_string())?
-        {
-            std::fs::remove_file(format!("./{table}.parquet"))
-                .map_err(|_| "Should delete existing parquet file".to_string())?;
+        if std::fs::exists(format!("./{table}.parquet")).map_err(|e| e.to_string())? {
+            std::fs::remove_file(format!("./{table}.parquet")).map_err(|e| e.to_string())?;
         }
     }
 
