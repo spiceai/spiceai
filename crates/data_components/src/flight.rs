@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::{table_reference::MultiPartTableReference, Read, ReadWrite};
+use crate::{Read, ReadWrite};
 use arrow::{array::RecordBatch, datatypes::SchemaRef};
 use arrow_flight::error::FlightError;
 use async_stream::stream;
@@ -33,6 +33,7 @@ use datafusion::{
     },
     sql::unparser::dialect::Dialect,
 };
+use datafusion_federation::table_reference::MultiPartTableReference;
 use datafusion_table_providers::sql::sql_provider_datafusion::expr;
 use flight_client::FlightClient;
 use futures::{Stream, StreamExt};
@@ -102,13 +103,10 @@ impl FlightFactory {
         self.client = self.client.with_metadata(metadata);
         self
     }
-}
 
-#[async_trait]
-impl Read for FlightFactory {
-    async fn table_provider(
+    pub async fn table_provider(
         &self,
-        table_reference: TableReference,
+        table_reference: impl Into<MultiPartTableReference>,
         schema: Option<SchemaRef>,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
         let table_provider = match schema {
@@ -139,6 +137,17 @@ impl Read for FlightFactory {
         );
 
         Ok(table_provider)
+    }
+}
+
+#[async_trait]
+impl Read for FlightFactory {
+    async fn table_provider(
+        &self,
+        table_reference: TableReference,
+        schema: Option<SchemaRef>,
+    ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
+        FlightFactory::table_provider(self, table_reference, schema).await
     }
 }
 

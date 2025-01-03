@@ -23,8 +23,6 @@ use crate::component::dataset::Dataset;
 use crate::dataconnector::DataConnectorError;
 use async_trait::async_trait;
 use data_components::flight::FlightFactory;
-use data_components::table_reference::parse_multi_part_table_reference;
-use data_components::Read;
 use data_components::ReadWrite;
 use datafusion::datasource::TableProvider;
 use datafusion::sql::sqlparser::ast::TimezoneInfo;
@@ -32,6 +30,7 @@ use datafusion::sql::sqlparser::ast::WindowFrameBound;
 use datafusion::sql::unparser::dialect::DefaultDialect;
 use datafusion::sql::unparser::dialect::Dialect;
 use datafusion::sql::unparser::dialect::IntervalStyle;
+use datafusion_federation::table_reference::parse_multi_part_table_reference;
 use flight_client::Credentials;
 use flight_client::FlightClient;
 use ns_lookup::verify_endpoint_connection;
@@ -185,7 +184,9 @@ impl DataConnector for Dremio {
         dataset: &Dataset,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
         let table_reference = parse_multi_part_table_reference(dataset.path());
-        match Read::table_provider(&self.flight_factory, table_reference, dataset.schema()).await {
+        match FlightFactory::table_provider(&self.flight_factory, table_reference, dataset.schema())
+            .await
+        {
             Ok(provider) => Ok(provider),
             Err(e) => {
                 if let Some(data_components::flight::Error::UnableToGetSchema {
