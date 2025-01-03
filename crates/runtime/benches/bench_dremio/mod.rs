@@ -18,7 +18,10 @@ use app::AppBuilder;
 use runtime::Runtime;
 
 use crate::results::BenchmarkResultsBuilder;
-use crate::{generate_tpcds_queries, generate_tpch_queries};
+use crate::{
+    generate_clickbench_queries, generate_clickbench_query_overrides, generate_tpcds_queries,
+    generate_tpch_queries,
+};
 use spicepod::component::{dataset::Dataset, params::Params};
 
 pub(crate) async fn run(
@@ -29,6 +32,7 @@ pub(crate) async fn run(
     let test_queries = match bench_name {
         "tpch" => get_tpch_test_queries(),
         "tpcds" => get_tpcds_test_queries(),
+        "clickbench" => get_clickbench_test_queries(),
         _ => return Err(format!("Invalid benchmark to run {bench_name}")),
     };
 
@@ -100,6 +104,7 @@ pub fn build_app(app_builder: AppBuilder, bench_name: &str) -> Result<AppBuilder
             .with_dataset(make_dataset("tpcds.warehouse", "warehouse"))
             .with_dataset(make_dataset("tpcds.web_page", "web_page"))
             .with_dataset(make_dataset("tpcds.web_site", "web_site"))),
+        "clickbench" => Ok(app_builder.with_dataset(make_dataset("clickbench.hits_12", "hits"))),
         _ => Err("Only tpcds or tpch benchmark suites are supported".to_string()),
     }
 }
@@ -147,4 +152,21 @@ fn get_tpcds_test_queries() -> Vec<(&'static str, &'static str)> {
         72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94,
         95, 96, 97, 98, 99
     )
+}
+
+fn get_clickbench_test_queries() -> Vec<(&'static str, &'static str)> {
+    let mut queries = generate_clickbench_queries!(
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
+        26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43
+    );
+
+    let overrides = generate_clickbench_query_overrides!("dremio", 21, 22, 23, 24);
+
+    for (key, value) in overrides {
+        if let Some(query) = queries.iter_mut().find(|(k, _)| *k == key) {
+            *query = (key, value);
+        }
+    }
+
+    queries
 }

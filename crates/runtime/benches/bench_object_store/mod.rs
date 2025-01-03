@@ -17,6 +17,7 @@ limitations under the License.
 use std::collections::HashMap;
 
 use crate::results::BenchmarkResultsBuilder;
+use crate::{generate_clickbench_queries, generate_clickbench_query_overrides};
 use app::AppBuilder;
 use runtime::Runtime;
 use spicepod::component::dataset::acceleration::{Acceleration, Mode};
@@ -346,32 +347,6 @@ fn get_tpcds_test_queries(engine: Option<&str>) -> Vec<(&'static str, &'static s
             }
         })
         .collect()
-}
-
-macro_rules! generate_clickbench_queries {
-    ( $( $i:literal ),* ) => {
-        vec![
-            $(
-                (
-                    concat!("clickbench_q", stringify!($i)),
-                    include_str!(concat!("../queries/clickbench/q", stringify!($i), ".sql"))
-                )
-            ),*
-        ]
-    }
-}
-
-macro_rules! generate_clickbench_query_overrides {
-    ( $engine:expr, $( $i:literal ),* ) => {
-        vec![
-            $(
-                (
-                    concat!("clickbench_q", stringify!($i)),
-                    include_str!(concat!("../queries/clickbench/", $engine, "/q", stringify!($i), ".sql"))
-                )
-            ),*
-        ]
-    }
 }
 
 fn get_clickbench_test_queries(engine: Option<&str>) -> Vec<(&'static str, &'static str)> {
