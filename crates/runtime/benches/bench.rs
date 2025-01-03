@@ -25,6 +25,7 @@ limitations under the License.
 // schema
 // run_id, started_at, finished_at, connector_name, query_name, status, min_duration, max_duration, iterations, commit_sha
 
+use std::fmt::{Display, Formatter};
 use std::panic;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -89,6 +90,15 @@ impl FromStr for AcceleratorRefreshMode {
     }
 }
 
+impl Display for AcceleratorRefreshMode {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
+        match self {
+            AcceleratorRefreshMode::Append => write!(f, "append"),
+            AcceleratorRefreshMode::Full => write!(f, "full"),
+        }
+    }
+}
+
 impl From<AcceleratorRefreshMode> for acceleration::RefreshMode {
     fn from(mode: AcceleratorRefreshMode) -> Self {
         match mode {
@@ -118,7 +128,7 @@ struct BenchArgs {
     #[arg(short, long)]
     mode: Option<String>,
 
-    #[arg(long)]
+    #[arg(long, default_value_t=AcceleratorRefreshMode::Full)]
     refresh_mode: AcceleratorRefreshMode,
 
     /// Set the benchmark to run: TPCH / TPCDS
