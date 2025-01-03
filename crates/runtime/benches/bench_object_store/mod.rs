@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use crate::results::BenchmarkResultsBuilder;
 use app::AppBuilder;
 use runtime::Runtime;
-use spicepod::component::dataset::acceleration::Mode;
+use spicepod::component::dataset::acceleration::{Acceleration, Mode};
 
 pub(crate) mod abfs;
 pub(crate) mod file;
@@ -29,11 +29,12 @@ pub(crate) fn build_app(
     connector: &str,
     app_builder: AppBuilder,
     bench_name: &str,
+    acceleration: Option<Acceleration>,
 ) -> Result<AppBuilder, String> {
     match connector {
         "s3" => s3::build_app(app_builder, bench_name),
         "abfs" => Ok(abfs::build_app(app_builder, bench_name)),
-        "file" => file::build_app(app_builder, bench_name),
+        "file" => file::build_app(app_builder, bench_name, acceleration),
         _ => Err(format!("Unsupported connector {connector}")),
     }
 }

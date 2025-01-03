@@ -42,8 +42,6 @@ use results::BenchmarkResultsBuilder;
 use runtime::request::{Protocol, RequestContext, UserAgent};
 use runtime::{dataupdate::DataUpdate, Runtime};
 use spicepod::component::dataset::acceleration::{self, Acceleration, Mode, RefreshMode};
-use spicepod::component::params::Params;
-use tract_core::num_traits::ToPrimitive;
 
 mod results;
 mod setup;
@@ -189,7 +187,7 @@ async fn bench_main() -> Result<(), String> {
 
             match (append_mode, args.bench_name.as_ref()) {
                 (true, "tpch") => {
-                    run_accelerator_bench("duckdb", acceleration, upload_results_dataset.as_ref(), "tpch").await?;
+                    run_accelerator_bench("file", acceleration, upload_results_dataset.as_ref(), "tpch").await?;
                 }
                 (false, "tpch") => {
                     run_accelerator_bench("s3", acceleration, upload_results_dataset.as_ref(), "tpch").await?;
@@ -200,7 +198,8 @@ async fn bench_main() -> Result<(), String> {
                 (false, "clickbench") => {
                     run_accelerator_bench("s3", acceleration, upload_results_dataset.as_ref(), "clickbench").await?;
                 }
-                _ => return Err(format!("Invalid mode bench_name parameter {}", args.bench_name)),
+                (true, benchmark) => return Err(format!("Append mode benchmark is not implemented for {benchmark}")),
+                (false, benchmark) => return Err(format!("Invalid benchmark parameter for accelerator benchmark: {benchmark}")),
             }
         },
         _ => return Err("Invalid command line input: accelerator or mode parameter supplied for connector benchmark".to_string()),
@@ -248,7 +247,7 @@ async fn run_connector_bench(
         }
         #[cfg(feature = "duckdb")]
         "duckdb" => {
-            bench_duckdb::run(&mut rt, &mut benchmark_results, bench_name, None).await?;
+            bench_duckdb::run(&mut rt, &mut benchmark_results, bench_name).await?;
         }
         #[cfg(feature = "odbc")]
         "odbc-databricks" => {
@@ -298,12 +297,13 @@ async fn run_accelerator_bench(
     let mode = accelerator.mode.clone();
 
     let (benchmark_results, rt) = match (accelerator.refresh_mode.clone(), connector) {
-        (Some(RefreshMode::Append), "duckdb") => {
-            let scale_factor = 1.0;
-            let handle = bench_duckdb::delayed_source_load(
+        #[cfg(feature = "duckdb")]
+        (Some(RefreshMode::Append), "file") => {
+            let scale_factor = 10.0; // TODO: parameterize this
+            let handle = bench_duckdb::delayed_source_load_to_parquet(
                 bench_name,
-                10,
-                Duration::from_secs(60),
+                10,                       // TODO: parameterize this
+                Duration::from_secs(120), // 2 minutes * 10 = loading over 20 minutes + overhead for data generation
                 scale_factor,
             );
 
@@ -335,7 +335,7 @@ async fn run_accelerator_bench(
             )
             .await?;
 
-            bench_duckdb::run(
+            bench_object_store::file::run_file_append(
                 &mut rt,
                 &mut benchmark_results,
                 bench_name,
@@ -354,7 +354,7 @@ async fn run_accelerator_bench(
                 "Append mode benchmark is not implemented for connector source {connector}"
             ));
         }
-        (None, "s3" | "abfs" | "file") => {
+        (None, "s3" | "abfs") => {
             let (mut benchmark_results, mut rt) = setup::setup_benchmark(
                 upload_results_dataset,
                 connector,
@@ -415,7 +415,7 @@ fn create_acceleration(
             mode,
             params: None,
             refresh_mode: Some(acceleration::RefreshMode::Append),
-            refresh_check_interval: Some("2m".to_string()),
+            refresh_check_interval: Some("3m".to_string()),
             ..Default::default()
         },
         (_, false) => Acceleration {
@@ -436,7 +436,7 @@ fn get_current_unix_ms() -> i64 {
 }
 
 #[allow(clippy::too_many_lines)]
-async fn run_query_and_record_result(
+pub(crate) async fn run_query_and_record_result(
     rt: &mut Runtime,
     benchmark_results: &mut BenchmarkResultsBuilder,
     connector: &str,

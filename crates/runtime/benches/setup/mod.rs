@@ -133,9 +133,19 @@ fn build_app(
                     .as_ref()
                     .is_some_and(|a| a.engine == Some("sqlite".to_string()))
             {
-                crate::bench_object_store::build_app(connector, app_builder, "tpcds_sf0_01")
+                crate::bench_object_store::build_app(
+                    connector,
+                    app_builder,
+                    "tpcds_sf0_01",
+                    acceleration.clone(),
+                )
             } else {
-                crate::bench_object_store::build_app(connector, app_builder, bench_name)
+                crate::bench_object_store::build_app(
+                    connector,
+                    app_builder,
+                    bench_name,
+                    acceleration.clone(),
+                )
             }
         }
         #[cfg(feature = "spark")]
@@ -145,7 +155,7 @@ fn build_app(
         #[cfg(feature = "mysql")]
         "mysql" => crate::bench_mysql::build_app(app_builder, bench_name),
         #[cfg(feature = "duckdb")]
-        "duckdb" => crate::bench_duckdb::build_app(app_builder, bench_name, acceleration.clone()),
+        "duckdb" => crate::bench_duckdb::build_app(app_builder, bench_name),
         #[cfg(feature = "odbc")]
         "odbc-databricks" => crate::bench_odbc_databricks::build_app(app_builder, bench_name),
         #[cfg(feature = "odbc")]
