@@ -550,6 +550,7 @@ jobs:
           PG_BENCHMARK_PG_PASS: postgres
           PG_BENCHMARK_PG_SSLMODE: disable
           PG_BENCHMARK_ACC_PG_DBNAME: postgres
+          SPICEAI_CLICKBENCH_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_CLICKBENCH_BENCHMARK_KEY }}
 
   create-pr:
     runs-on: ubuntu-latest

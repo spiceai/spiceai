@@ -26,6 +26,7 @@ pub(crate) async fn run(
     let test_queries = match bench_name {
         "tpch" => get_tpch_test_queries(),
         "tpcds" => get_tpcds_test_queries(),
+        "clickbench" => get_clickbench_test_queries(),
         _ => return Err(format!("Invalid benchmark to run {bench_name}")),
     };
 
@@ -94,6 +95,8 @@ pub fn build_app(app_builder: AppBuilder, bench_name: &str) -> Result<AppBuilder
             .with_dataset(make_spiceai_dataset("web_page", bench_name))
             .with_dataset(make_spiceai_dataset("web_site", bench_name))),
 
+        "clickbench" => Ok(app_builder.with_dataset(make_spiceai_dataset("hits", bench_name))),
+
         _ => Err("Only tpcds or tpch benchmark suites are supported".to_string()),
     }
 }
@@ -102,6 +105,9 @@ fn make_spiceai_dataset(name: &str, bench_name: &str) -> Dataset {
     let from = match bench_name {
         "tpch" => format!("spice.ai:spiceai/tpch/datasets/{bench_name}.{name}"),
         "tpcds" => format!("spice.ai:spiceai/benchmarks-tpcds/datasets/{bench_name}.{name}"),
+        "clickbench" => {
+            format!("spice.ai:spiceai/benchmarks-clickbench/datasets/{bench_name}.{name}")
+        }
         _ => panic!("Only tpcds or tpch benchmark suites are supported"),
     };
 
@@ -114,6 +120,7 @@ fn get_params(bench_name: &str) -> Params {
     let api_key = match bench_name {
         "tpch" => std::env::var("SPICEAI_TPCH_API_KEY").unwrap_or_default(),
         "tpcds" => std::env::var("SPICEAI_TPCDS_API_KEY").unwrap_or_default(),
+        "clickbench" => std::env::var("SPICEAI_CLICKBENCH_API_KEY").unwrap_or_default(),
         _ => panic!("Only tpcds or tpch benchmark suites are supported"),
     };
 
@@ -311,5 +318,217 @@ fn get_tpcds_test_queries() -> Vec<(&'static str, &'static str)> {
         // Query tpcds_q98 failed with error: Query Error: query `spice.ai` `tpcds_q98` to results: Execution error: This feature is not implemented: Unsupported Interval Expression with last_field Some(Second); Snapshot Test Error: Snapshort assertion failed for spice.ai, tpcds_q98
         // ("tpcds_q98", include_str!("../queries/tpcds/q98.sql")),
         ("tpcds_q99", include_str!("../queries/tpcds/q99.sql")),
+    ]
+}
+
+#[allow(clippy::too_many_lines)]
+fn get_clickbench_test_queries() -> Vec<(&'static str, &'static str)> {
+    vec![
+        (
+            "clickbench_q1",
+            include_str!("../queries/clickbench/q1.sql"),
+        ),
+        // Empty results
+        (
+            "clickbench_q2",
+            include_str!("../queries/clickbench/q2.sql"),
+        ),
+        (
+            "clickbench_q3",
+            include_str!("../queries/clickbench/q3.sql"),
+        ),
+        (
+            "clickbench_q4",
+            include_str!("../queries/clickbench/q4.sql"),
+        ),
+        (
+            "clickbench_q5",
+            include_str!("../queries/clickbench/q5.sql"),
+        ),
+        (
+            "clickbench_q6",
+            include_str!("../queries/clickbench/q6.sql"),
+        ),
+        (
+            "clickbench_q7",
+            include_str!("../queries/clickbench/q7.sql"),
+        ),
+        // Empty results
+        (
+            "clickbench_q8",
+            include_str!("../queries/clickbench/q8.sql"),
+        ),
+        (
+            "clickbench_q9",
+            include_str!("../queries/clickbench/q9.sql"),
+        ),
+        (
+            "clickbench_q10",
+            include_str!("../queries/clickbench/q10.sql"),
+        ),
+        // Empty results
+        (
+            "clickbench_q11",
+            include_str!("../queries/clickbench/q11.sql"),
+        ),
+        // Empty results
+        (
+            "clickbench_q12",
+            include_str!("../queries/clickbench/q12.sql"),
+        ),
+        // Empty results
+        (
+            "clickbench_q13",
+            include_str!("../queries/clickbench/q13.sql"),
+        ),
+        // Empty results
+        (
+            "clickbench_q14",
+            include_str!("../queries/clickbench/q14.sql"),
+        ),
+        // Empty results
+        (
+            "clickbench_q15",
+            include_str!("../queries/clickbench/q15.sql"),
+        ),
+        (
+            "clickbench_q16",
+            include_str!("../queries/clickbench/q16.sql"),
+        ),
+        (
+            "clickbench_q17",
+            include_str!("../queries/clickbench/q17.sql"),
+        ),
+        (
+            "clickbench_q18",
+            include_str!("../queries/clickbench/q18.sql"),
+        ),
+        (
+            "clickbench_q19",
+            include_str!("../queries/clickbench/q19.sql"),
+        ),
+        // Empty results
+        (
+            "clickbench_q20",
+            include_str!("../queries/clickbench/q20.sql"),
+        ),
+        // Empty results
+        (
+            "clickbench_q21",
+            include_str!("../queries/clickbench/q21.sql"),
+        ),
+        // Query clickbench_q22 failed with error: Query Error: query `spice.ai` `clickbench_q22` to results: Execution error: Query execution failed.
+        // Tonic error: status: InvalidArgument, message: "DoGet recv error: rpc error: code = InvalidArgument desc = Failed to execute query.\nBinder Error: Referenced table \"clickbench\" not found!\nCandidate tables: \"clickbench.hits\"\nLINE 1: ...) AS \"c\" FROM \"clickbench.hits\" WHERE (\"clickbench\".\"hits\".\"URL\" LIKE '%google...\n
+        // (
+        //     "clickbench_q22",
+        //     include_str!("../queries/clickbench/q22.sql"),
+        // ),
+        // Query clickbench_q23 failed with error: Query Error: query `spice.ai` `clickbench_q23` to results: Execution error: Query execution failed.
+        // Tonic error: status: InvalidArgument, message: "DoGet recv error: rpc error: code = InvalidArgument desc = Failed to execute query.\nBinder Error: Referenced table \"clickbench\" not found!\nCandidate tables: \"clickbench.hits\"\nLINE 1: ...serID\") FROM \"clickbench.hits\" WHERE ((\"clickbench\".\"hits\".\"Title\" LIKE '%Goog...\n
+        // (
+        //     "clickbench_q23",
+        //     include_str!("../queries/clickbench/q23.sql"),
+        // ),
+        // Empty results
+        (
+            "clickbench_q24",
+            include_str!("../queries/clickbench/q24.sql"),
+        ),
+        // Empty results
+        (
+            "clickbench_q25",
+            include_str!("../queries/clickbench/q25.sql"),
+        ),
+        // Empty results
+        (
+            "clickbench_q26",
+            include_str!("../queries/clickbench/q26.sql"),
+        ),
+        // Empty results
+        (
+            "clickbench_q27",
+            include_str!("../queries/clickbench/q27.sql"),
+        ),
+        // Empty results
+        (
+            "clickbench_q28",
+            include_str!("../queries/clickbench/q28.sql"),
+        ),
+        // Query clickbench_q29 failed with error: Query Error: query `spice.ai` `clickbench_q29` to results: Execution error: Query execution failed.
+        // Tonic error: status: InvalidArgument, message: "DoGet recv error: rpc error: code = InvalidArgument desc = Failed to execute query.\nBinder Error: Referenced table \"clickbench\" not found!\nCandidate tables: \"clickbench.hits\"\nLINE 1: ...eferer\") FROM \"clickbench.hits\" WHERE (\"clickbench\".\"hits\".\"Referer\" <> '') GR...\n
+        // (
+        //     "clickbench_q29",
+        //     include_str!("../queries/clickbench/q29.sql"),
+        // ),
+        (
+            "clickbench_q30",
+            include_str!("../queries/clickbench/q30.sql"),
+        ),
+        // Query clickbench_q31 failed with error: Query Error: query `spice.ai` `clickbench_q31` to results: Execution error: Query execution failed.
+        // Tonic error: status: InvalidArgument, message: "DoGet recv error: rpc error: code = InvalidArgument desc = Failed to execute query.\nBinder Error: Referenced table \"clickbench\" not found!\nCandidate tables: \"clickbench.hits\"\nLINE 1: ...nWidth\") FROM \"clickbench.hits\" WHERE (\"clickbench\".\"hits\".\"SearchPhrase\" <> '...\n
+        // (
+        //     "clickbench_q31",
+        //     include_str!("../queries/clickbench/q31.sql"),
+        // ),
+        // Empty results
+        (
+            "clickbench_q32",
+            include_str!("../queries/clickbench/q32.sql"),
+        ),
+        (
+            "clickbench_q33",
+            include_str!("../queries/clickbench/q33.sql"),
+        ),
+        (
+            "clickbench_q34",
+            include_str!("../queries/clickbench/q34.sql"),
+        ),
+        (
+            "clickbench_q35",
+            include_str!("../queries/clickbench/q35.sql"),
+        ),
+        // Query clickbench_q36 failed with error: Query Error: query `spice.ai` `clickbench_q36` to plan: Failed to execute query: Schema error: No field named "hits.ClientIP - Int64(1)". Valid fields are clickbench.hits."ClientIP", "clickbench.hits.ClientIP - Int64(1)", "clickbench.hits.ClientIP - Int64(2)", "clickbench.hits.ClientIP - Int64(3)", "count(*)".
+        // (
+        //     "clickbench_q36",
+        //     include_str!("../queries/clickbench/q36.sql"),
+        // ),
+        // Empty results
+        (
+            "clickbench_q37",
+            include_str!("../queries/clickbench/q37.sql"),
+        ),
+        // Empty results
+        (
+            "clickbench_q38",
+            include_str!("../queries/clickbench/q38.sql"),
+        ),
+        // Empty results
+        (
+            "clickbench_q39",
+            include_str!("../queries/clickbench/q39.sql"),
+        ),
+        // Query clickbench_q40 failed with error: Query Error: query `spice.ai` `clickbench_q40` to results: Execution error: Query execution failed.
+        // Tonic error: status: InvalidArgument, message: "DoGet recv error: rpc error: code = InvalidArgument desc = Failed to execute query.\nBinder Error: Referenced table \"clickbench\" not found!\nCandidate tables: \"clickbench.hits\"\nLINE 1: ...iews\" FROM \"clickbench.hits\" WHERE ((((\"clickbench\".\"hits\".\"CounterID\" = 62) A...\n
+        // (
+        //     "clickbench_q40",
+        //     include_str!("../queries/clickbench/q40.sql"),
+        // ),
+        // Query clickbench_q41 failed with error: Query Error: query `spice.ai` `clickbench_q41` to results: Execution error: Query execution failed.
+        // Tonic error: status: InvalidArgument, message: "DoGet recv error: rpc error: code = InvalidArgument desc = Failed to execute query.\nBinder Error: Referenced table \"clickbench\" not found!\nCandidate tables: \"clickbench.hits\"\nLINE 1: ...ws\" FROM \"clickbench.hits\" WHERE ((((((\"clickbench\".\"hits\".\"CounterID\" = 62) A...\n
+        // (
+        //     "clickbench_q41",
+        //     include_str!("../queries/clickbench/q41.sql"),
+        //         // ),
+        // Query clickbench_q42 failed with error: Query Error: query `spice.ai` `clickbench_q42` to results: Execution error: Query execution failed.
+        // Tonic error: status: InvalidArgument, message: "DoGet recv error: rpc error: code = InvalidArgument desc = Failed to execute query.\nBinder Error: Referenced table \"clickbench\" not found!\nCandidate tables: \"clickbench.hits\"\nLINE 1: ...ws\" FROM \"clickbench.hits\" WHERE ((((((\"clickbench\".\"hits\".\"CounterID\" = 62) A...\n
+        // (
+        //     "clickbench_q42",
+        //     include_str!("../queries/clickbench/q42.sql"),
+        // ),
+        // Empty results
+        (
+            "clickbench_q43",
+            include_str!("../queries/clickbench/q43.sql"),
+        ),
     ]
 }
