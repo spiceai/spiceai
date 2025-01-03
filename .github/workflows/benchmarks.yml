@@ -461,8 +461,8 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-  run-clickbench:
-    name: Run ${{ matrix.name }} Clickbench
+  run-large-bench:
+    name: Run ${{ matrix.name }} ${{ matrix.bench }}
     runs-on: spiceai-large-runners
     needs: build-database-bench-binary
 
