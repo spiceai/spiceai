@@ -104,7 +104,7 @@ pub fn build_app(app_builder: AppBuilder, bench_name: &str) -> Result<AppBuilder
             .with_dataset(make_dataset("tpcds.warehouse", "warehouse"))
             .with_dataset(make_dataset("tpcds.web_page", "web_page"))
             .with_dataset(make_dataset("tpcds.web_site", "web_site"))),
-        "clickbench" => Ok(app_builder.with_dataset(make_dataset("clickbench.hits_12", "hits"))),
+        "clickbench" => Ok(app_builder.with_dataset(make_dataset("clickbench.hits", "hits"))),
         _ => Err("Only tpcds or tpch benchmark suites are supported".to_string()),
     }
 }
