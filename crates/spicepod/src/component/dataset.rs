@@ -190,7 +190,7 @@ pub mod acceleration {
     #[cfg(feature = "schemars")]
     use schemars::JsonSchema;
     use serde::{Deserialize, Serialize};
-    use std::{collections::HashMap, fmt::Display, str::FromStr};
+    use std::{collections::HashMap, fmt::Display};
 
     use crate::component::params::Params;
 
