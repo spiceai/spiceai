@@ -33,6 +33,7 @@ use datafusion::{
     },
     sql::unparser::dialect::Dialect,
 };
+use datafusion_federation::table_reference::MultiPartTableReference;
 use datafusion_table_providers::sql::sql_provider_datafusion::expr;
 use flight_client::FlightClient;
 use futures::{Stream, StreamExt};
@@ -102,13 +103,10 @@ impl FlightFactory {
         self.client = self.client.with_metadata(metadata);
         self
     }
-}
 
-#[async_trait]
-impl Read for FlightFactory {
-    async fn table_provider(
+    pub async fn table_provider(
         &self,
-        table_reference: TableReference,
+        table_reference: impl Into<MultiPartTableReference>,
         schema: Option<SchemaRef>,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
         let table_provider = match schema {
@@ -143,6 +141,17 @@ impl Read for FlightFactory {
 }
 
 #[async_trait]
+impl Read for FlightFactory {
+    async fn table_provider(
+        &self,
+        table_reference: TableReference,
+        schema: Option<SchemaRef>,
+    ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
+        FlightFactory::table_provider(self, table_reference, schema).await
+    }
+}
+
+#[async_trait]
 impl ReadWrite for FlightFactory {
     async fn table_provider(
         &self,
@@ -165,7 +174,7 @@ pub struct FlightTable {
     client: FlightClient,
     schema: SchemaRef,
     dialect: Arc<dyn Dialect>,
-    table_reference: TableReference,
+    table_reference: MultiPartTableReference,
     subquery_use_partial_path: bool,
 }
 
@@ -186,14 +195,17 @@ impl FlightTable {
     pub async fn create(
         name: &'static str,
         client: FlightClient,
-        table_reference: impl Into<TableReference>,
+        table_reference: impl Into<MultiPartTableReference>,
         dialect: Arc<dyn Dialect>,
         subquery_use_partial_path: bool,
     ) -> Result<Self> {
         let table_reference = table_reference.into();
         let schema = Self::get_query_schema(
             client.clone(),
-            &format!("SELECT * FROM {}", table_reference.to_quoted_string()),
+            &format!(
+                "SELECT * FROM {} LIMIT 0",
+                table_reference.to_quoted_string()
+            ),
         )
         .await?;
         Ok(Self {
@@ -214,12 +226,13 @@ impl FlightTable {
     pub fn create_with_schema(
         name: &'static str,
         client: FlightClient,
-        table_reference: impl Into<TableReference>,
+        table_reference: impl Into<MultiPartTableReference>,
         schema: SchemaRef,
         dialect: Arc<dyn Dialect>,
         subquery_use_partial_path: bool,
     ) -> Self {
         let table_reference = table_reference.into();
+        tracing::debug!("table_reference={:?}", table_reference);
         Self {
             name,
             client: client.clone(),
@@ -237,19 +250,25 @@ impl FlightTable {
 
     async fn get_schema(
         client: FlightClient,
-        table_reference: &TableReference,
+        table_reference: impl Into<MultiPartTableReference>,
     ) -> Result<SchemaRef> {
-        let table_paths = match table_reference {
-            TableReference::Bare { table } => vec![table.to_string()],
-            TableReference::Partial { schema, table } => {
-                vec![schema.to_string(), table.to_string()]
-            }
-            TableReference::Full {
-                catalog,
-                schema,
-                table,
-            } => {
-                vec![catalog.to_string(), schema.to_string(), table.to_string()]
+        let table_reference = table_reference.into();
+        let table_paths = match &table_reference {
+            MultiPartTableReference::TableReference(table_reference) => match table_reference {
+                TableReference::Bare { table } => vec![table.to_string()],
+                TableReference::Partial { schema, table } => {
+                    vec![schema.to_string(), table.to_string()]
+                }
+                TableReference::Full {
+                    catalog,
+                    schema,
+                    table,
+                } => {
+                    vec![catalog.to_string(), schema.to_string(), table.to_string()]
+                }
+            },
+            MultiPartTableReference::Multi(parts) => {
+                parts.iter().map(ToString::to_string).collect::<Vec<_>>()
             }
         };
 
@@ -341,7 +360,7 @@ impl TableProvider for FlightTable {
 #[derive(Clone)]
 struct FlightExec {
     projected_schema: SchemaRef,
-    table_reference: TableReference,
+    table_reference: MultiPartTableReference,
     client: FlightClient,
     filters: Vec<Expr>,
     limit: Option<usize>,
@@ -352,7 +371,7 @@ impl FlightExec {
     fn new(
         projections: Option<&Vec<usize>>,
         schema: &SchemaRef,
-        table_reference: &TableReference,
+        table_reference: &MultiPartTableReference,
         client: FlightClient,
         filters: &[Expr],
         limit: Option<usize>,
