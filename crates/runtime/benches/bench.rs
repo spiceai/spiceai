@@ -493,6 +493,7 @@ pub(crate) async fn run_query_and_record_result(
                     let limited_records: Vec<_> = records
                         .iter()
                         .flat_map(|batch: &RecordBatch| {
+                            // We only take up to 10 records anyway, so avoid iterating over large row results
                             let end = if batch.num_rows() > 10 {
                                 10
                             } else {
