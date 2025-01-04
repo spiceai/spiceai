@@ -36,7 +36,7 @@ pub(crate) async fn run_file_append(
     bench_name: &str,
     accelerator: Option<Acceleration>,
 ) -> Result<(), String> {
-    let test_queries = match bench_name {
+    let mut test_queries = match bench_name {
         "tpch" => get_tpch_test_queries(),
         "tpcds" => match accelerator.clone() {
             Some(Acceleration { engine, .. }) => get_tpcds_test_queries(engine.as_deref()),
@@ -52,6 +52,16 @@ pub(crate) async fn run_file_append(
         .is_some_and(|m| m == RefreshMode::Append);
 
     if is_append {
+        // remove q72 if the engine is arrow in append mode because it uses too much memory for the runner
+        if bench_name == "tpcds"
+            && accelerator
+                .clone()
+                .and_then(|a| a.engine)
+                .is_none_or(|e| e == "arrow")
+        {
+            test_queries.retain(|(query_name, _)| *query_name != "tpcds_q72");
+        }
+
         let start_time = std::time::Instant::now();
 
         loop {
