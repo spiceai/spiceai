@@ -39,10 +39,9 @@ impl Default for RateLimits {
         Self {
             // Allow 100 Flight DoPut requests every 60 seconds by default
             #[allow(clippy::expect_used)]
-            flight_write_limit: Quota::per_minute(
-                NonZeroU32::new(100)
-                    .expect("100 is a valid non-zero value and should be converted to NonZeroU32"),
-            ),
+            flight_write_limit: Quota::per_minute(NonZeroU32::new(100).unwrap_or_else(|| {
+                unreachable!("100 is non-zero and should always successfully convert to NonZeroU32")
+            })),
         }
     }
 }

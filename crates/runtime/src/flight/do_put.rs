@@ -194,6 +194,7 @@ async fn handle_record_batch(
 ) -> Result<PutResult, Status> {
     tracing::trace!("Received batch with {} rows", batch.num_rows());
 
+    // 32,768 is four times the default batch size in DataFusion (`datafusion.execution.batch_size`), which defaults to 8,192.
     if batch.num_rows() > 32_768 {
         return Err(Status::invalid_argument(format!(
             "The provided batch contains too many rows. Maximum allowed: {allowed}, received: {received}.",
