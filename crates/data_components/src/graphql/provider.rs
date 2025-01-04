@@ -24,8 +24,9 @@ use datafusion::{
     logical_expr::{Expr, TableProviderFilterPushDown},
     physical_expr::EquivalenceProperties,
     physical_plan::{
-        stream::RecordBatchStreamAdapter, DisplayAs, DisplayFormatType, ExecutionMode,
-        ExecutionPlan, Partitioning, PlanProperties,
+        expressions::Column, projection::ProjectionExec, stream::RecordBatchStreamAdapter,
+        DisplayAs, DisplayFormatType, ExecutionMode, ExecutionPlan, Partitioning, PhysicalExpr,
+        PlanProperties,
     },
 };
 use futures::StreamExt;
@@ -157,7 +158,7 @@ impl TableProvider for GraphQLTableProvider {
     async fn scan(
         &self,
         _state: &dyn Session,
-        _projection: Option<&Vec<usize>>,
+        projection: Option<&Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
@@ -177,14 +178,30 @@ impl TableProvider for GraphQLTableProvider {
             None
         };
 
-        Ok(Arc::new(GraphQLTableProviderExec::new(
+        let graphql_exec = Arc::new(GraphQLTableProviderExec::new(
             Arc::clone(&self.client),
             query,
             Arc::clone(&self.table_schema),
             limit,
             error_checker,
             self.transform_fn,
-        )))
+        ));
+
+        if let Some(projection) = projection {
+            let mut projection_expr = Vec::with_capacity(projection.len());
+            for idx in projection {
+                let col_name = self.table_schema.field(*idx).name();
+                projection_expr.push((
+                    Arc::new(Column::new(col_name, *idx)) as Arc<dyn PhysicalExpr>,
+                    col_name.to_string(),
+                ));
+            }
+
+            let projection_exec = ProjectionExec::try_new(projection_expr, graphql_exec)?;
+            return Ok(Arc::new(projection_exec));
+        }
+
+        Ok(graphql_exec)
     }
 }
 
