@@ -183,7 +183,7 @@ impl TableProvider for GraphQLTableProvider {
             Arc::clone(&self.table_schema),
             limit,
             error_checker,
-            self.transform_fn.clone(),
+            self.transform_fn,
         )))
     }
 }
@@ -199,6 +199,7 @@ pub struct GraphQLTableProviderExec {
 }
 
 impl GraphQLTableProviderExec {
+    #[must_use]
     pub fn new(
         client: Arc<GraphQLClient>,
         query: GraphQLQuery,

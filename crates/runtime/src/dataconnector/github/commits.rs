@@ -47,7 +47,7 @@ impl GraphQLContext for CommitsTableArgs {
     fn inject_parameters(
         &self,
         filters: &[FilterPushdownResult],
-        query: &mut GraphQLQuery<'_>,
+        query: &mut GraphQLQuery,
     ) -> Result<(), datafusion::error::DataFusionError> {
         inject_parameters("history", commits_inject_parameters, filters, query)
             .map_err(find_datafusion_root)

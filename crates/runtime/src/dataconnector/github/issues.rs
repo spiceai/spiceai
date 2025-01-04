@@ -56,7 +56,7 @@ impl GraphQLContext for IssuesTableArgs {
     fn inject_parameters(
         &self,
         filters: &[FilterPushdownResult],
-        query: &mut GraphQLQuery<'_>,
+        query: &mut GraphQLQuery,
     ) -> Result<(), datafusion::error::DataFusionError> {
         if self.query_mode == GitHubQueryMode::Auto {
             return Ok(());

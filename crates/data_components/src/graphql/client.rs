@@ -615,7 +615,7 @@ pub struct GraphQLClient {
 
 #[derive(Clone)]
 pub struct GraphQLQuery {
-    source_query: Arc<str>,
+    _source_query: Arc<str>,
     ast: Document<'static, String>,
     pub json_pointer: Option<Arc<str>>,
     pub pagination_parameters: Option<PaginationParameters>,
@@ -634,7 +634,7 @@ impl TryFrom<Arc<str>> for GraphQLQuery {
         let query_ref: &'static str = unsafe { std::mem::transmute::<&str, &'static str>(&query) };
 
         let ast =
-            parse_query::<String>(&query_ref).map_err(|_| super::Error::InvalidGraphQLQuery {
+            parse_query::<String>(query_ref).map_err(|_| super::Error::InvalidGraphQLQuery {
                 message: "Failed to parse GraphQL query".to_string(),
                 line: 0,
                 column: 0,
@@ -644,7 +644,7 @@ impl TryFrom<Arc<str>> for GraphQLQuery {
         let (pagination_parameters, json_pointer) = PaginationParameters::parse(&ast);
 
         Ok(Self {
-            source_query: query,
+            _source_query: query,
             ast,
             json_pointer: json_pointer.map(Arc::from),
             pagination_parameters,
@@ -672,6 +672,7 @@ impl GraphQLQuery {
         }
     }
 
+    #[must_use]
     pub fn ast(&self) -> &Document<'_, String> {
         // SAFETY: We can safely transmute back to a shorter lifetime
         unsafe {
@@ -679,6 +680,7 @@ impl GraphQLQuery {
         }
     }
 
+    #[must_use]
     pub fn ast_mut(&mut self) -> &mut Document<'_, String> {
         // SAFETY: We can safely transmute back to a shorter lifetime
         unsafe {
@@ -834,6 +836,7 @@ impl GraphQLClient {
         })
     }
 
+    #[must_use]
     pub fn execute_paginated(
         self: Arc<Self>,
         query: GraphQLQuery,
