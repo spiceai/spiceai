@@ -18,6 +18,7 @@ package github
 
 import (
 	"fmt"
+	"io"
 	"log/slog"
 	"os/exec"
 	"runtime"
@@ -107,6 +108,17 @@ func get_ai_accelerator() (string, bool) {
 			return "metal", true
 		}
 	}
+
+	if runtime.GOOS == "linux" {
+		hasCuda, err := has_cuda_device()
+		if err != nil {
+			slog.Error("checking for CUDA device", "error", err)
+		}
+		if hasCuda {
+			return "cuda", true
+		}
+	}
+
 	return "", false
 }
 
@@ -124,4 +136,32 @@ func has_metal_device() (bool, error) {
 		return false, fmt.Errorf("failed to run system_profiler: %w", err)
 	}
 	return strings.Contains(string(output), "Metal Support: Metal"), nil
+}
+
+func has_cuda_device() (bool, error) {
+	if runtime.GOOS != "linux" {
+		return false, nil
+	}
+
+	slog.Debug("On Linux, running `nvidia-smi --query-gpu=name --format=csv,noheader` to determine hardware")
+	cmd := exec.Command("nvidia-smi --query-gpu=name --format=csv,noheader")
+	if err := cmd.Start(); err != nil {
+		return false, fmt.Errorf("failed to start `nvidia-smi` command: %w", err)
+	}
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return false, fmt.Errorf("failed to get stdout pipe: %w", err)
+	}
+
+	// If command fails, not an error. Just no `nvidia-smi` installed, which is expected.
+	_ = cmd.Wait()
+	cmd_output, err := io.ReadAll(stdout)
+	if err != nil {
+		return false, fmt.Errorf("failed to read output: %w", err)
+	}
+
+	// If the output is empty, there are no CUDA devices
+	// Any output indicates the presence of a CUDA device
+	return len(cmd_output) > 0, nil
 }
