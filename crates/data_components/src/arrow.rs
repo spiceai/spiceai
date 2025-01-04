@@ -55,14 +55,9 @@ impl TableProviderFactory for ArrowFactory {
         cmd: &CreateExternalTable,
     ) -> DataFusionResult<Arc<dyn TableProvider>> {
         let schema: SchemaRef = Arc::new(cmd.schema.as_arrow().clone());
-        let mem_table =
-            MemTable::try_new(schema, vec![])?.with_constraints(cmd.constraints.clone());
-
-        // if let Some(indexes) = cmd.options.get("indexes") {
-        //     // (a,b,c):unique/enabled;
-        //     indexes
-        //     mem_table = mem_table.with(indexes.clone());
-        // }
+        let mem_table = MemTable::try_new(schema, vec![])?
+            .try_with_constraints(cmd.constraints.clone())
+            .await?;
         let delete_adapter = DeletionTableProviderAdapter::new(Arc::new(mem_table));
         Ok(Arc::new(delete_adapter))
     }
