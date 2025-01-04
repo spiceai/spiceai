@@ -220,7 +220,7 @@ impl DataConnector for SpiceAI {
                     self.flight_factory
                         .clone()
                         .with_metadata(map)
-                        .with_compute_context(compute_context),
+                        .with_compute_context(compute_context.as_str()),
                     path,
                 )
             }

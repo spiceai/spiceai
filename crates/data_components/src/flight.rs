@@ -107,8 +107,8 @@ impl FlightFactory {
     }
 
     #[must_use]
-    pub fn with_compute_context(mut self, compute_context: String) -> Self {
-        self.compute_context = Some(Arc::from(compute_context.as_str()));
+    pub fn with_compute_context(mut self, compute_context: &str) -> Self {
+        self.compute_context = Some(Arc::from(compute_context));
         self
     }
 
@@ -338,7 +338,7 @@ impl FlightTable {
 
     fn get_extended_context(base_context: &str, compute_context: Option<Arc<str>>) -> String {
         if let Some(compute_context) = compute_context {
-            format!("{},{}", base_context, compute_context)
+            format!("{base_context},{compute_context}")
         } else {
             base_context.to_string()
         }
