@@ -435,6 +435,20 @@ pub(crate) fn delayed_source_load_to_parquet(
             sleep(load_interval).await;
         }
 
+        if bench_name == "tpcds" {
+            // cleanup _gen data
+            let mut cleanup_sql = "BEGIN;".to_string();
+            for (table, _) in &tables {
+                cleanup_sql += &format!("DROP TABLE {table}_gen;");
+            }
+
+            cleanup_sql += "COMMIT;";
+
+            dest_conn
+                .execute_batch(&cleanup_sql)
+                .map_err(|e| e.to_string())?;
+        }
+
         Ok::<(), String>(())
     }))
 }
