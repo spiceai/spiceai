@@ -207,9 +207,22 @@ impl DataConnector for SpiceAI {
         let (flight_factory, table_reference) = match dataset_path {
             SpiceAIDatasetPath::OrgAppPath { org, app, path } => {
                 let mut map = MetadataMap::new();
+
+                let compute_context = format!(
+                    "org={},app={}",
+                    org.to_str().unwrap_or_default(),
+                    app.to_str().unwrap_or_default()
+                );
+
                 map.insert(HEADER_ORG, org);
                 map.insert(HEADER_APP, app);
-                (self.flight_factory.clone().with_metadata(map), path)
+                (
+                    self.flight_factory
+                        .clone()
+                        .with_metadata(map)
+                        .with_compute_context(compute_context),
+                    path,
+                )
             }
             SpiceAIDatasetPath::Path(path) => (self.flight_factory.clone(), path),
         };
