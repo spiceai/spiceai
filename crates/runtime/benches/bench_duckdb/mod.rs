@@ -417,6 +417,8 @@ pub(crate) fn delayed_source_load_to_parquet(
                     let mut sql = "BEGIN;".to_string();
 
                     for (table, column) in &tables {
+                        // DuckDB's TPCDS generation doesn't support partitioning and generating in steps
+                        // Instead, generate the whole dataset and load it with incrementally increasing OFFSET and LIMIT
                         sql += &format!("
                             INSERT INTO {table} SELECT *, CURRENT_TIMESTAMP AS {column} FROM {table}_gen LIMIT (SELECT COUNT(*) / {load_count} FROM {table}_gen) OFFSET (SELECT COUNT(*) / {load_count} * {i} FROM {table}_gen);
                             COPY {table} TO '{table}.parquet' (FORMAT 'parquet');
