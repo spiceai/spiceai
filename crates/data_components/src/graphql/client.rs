@@ -844,7 +844,7 @@ impl GraphQLClient {
         limit: Option<usize>,
         error_checker: Option<ErrorChecker>,
     ) -> SendableRecordBatchStream {
-        let mut builder = RecordBatchReceiverStream::builder(schema, 2);
+        let mut builder = RecordBatchReceiverStream::builder(Arc::clone(&schema), 2);
         let tx = builder.tx();
 
         // Spawn the task that will fetch and send the GraphQL record batches
@@ -858,7 +858,7 @@ impl GraphQLClient {
                 match self
                     .execute(
                         &mut query,
-                        None, // Schema already provided to builder
+                        Some(Arc::clone(&schema)),
                         limit,
                         current_cursor,
                         error_checker.clone(),
