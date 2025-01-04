@@ -259,27 +259,75 @@ impl MemSink {
     }
 }
 
+/// Check that all primary key ids are non-null and unique.
+///
+/// If `existing_pks` is provided, also check uniqueness of `pks` against `existing_pks`.
+///
+/// Returns a set of unique, non-null primary key ids.
+fn check_and_filter_non_null_unique_primary_keys(
+    pks: Vec<Option<String>>,
+    existing_pks: Option<&HashSet<String>>,
+) -> Result<HashSet<String>> {
+    let num_pks = pks.len();
+
+    // Add (and check uniqueness) of primary keys as we check for nullity.
+    let mut unique_set = HashSet::new();
+    let non_null_pks = pks
+        .into_iter()
+        .filter_map(|id| match id {
+            Some(id) => {
+                if unique_set.insert(id.clone()) {
+                    if existing_pks.is_some_and(|existing| existing.contains(&id)) {
+                        return Some(Err(DataFusionError::Execution(format!(
+                            "Primary key ({id}) already exists and is not unique"
+                        ))));
+                    }
+                    Some(Ok(id))
+                } else {
+                    Some(Err(DataFusionError::Execution(
+                        "Primary key values must be unique".to_string(),
+                    )))
+                }
+            }
+            None => None,
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if num_pks != non_null_pks.len() {
+        return Err(DataFusionError::Execution(
+            "Primary key values must be non-null".to_string(),
+        ));
+    }
+    Ok(unique_set)
+}
+
 /// Create primary key values for a [`RecordBatch`]. For composite keys, values are concatenated with a delimiter '|'.
 ///
 /// `pk_indices_ordered` should be in ascending order.
+///
+/// If any primary key value is `Null`, the entire key is [`Option::None`].
 fn extract_primary_keys_str(
     batch: &RecordBatch,
     pk_indices_ordered: &[usize],
-) -> Result<Vec<String>> {
+) -> Result<Vec<Option<String>>> {
     let num_rows = batch.num_rows();
     let mut keys = Vec::with_capacity(num_rows);
 
-    for row_idx in 0..num_rows {
+    'row: for row_idx in 0..num_rows {
         let mut parts = Vec::with_capacity(pk_indices_ordered.len());
         for &col_idx in pk_indices_ordered {
             let col = batch.column(col_idx);
             let val = ScalarValue::try_from_array(col, row_idx)
                 .map_err(|e| DataFusionError::Execution(e.to_string()))?;
-            parts.push(val.to_string());
+            if val.is_null() {
+                keys.push(None);
+                continue 'row;
+            } else {
+                parts.push(val.to_string());
+            }
         }
         // Join all PK parts with a delimiter
         let key = parts.join("|");
-        keys.push(key);
+        keys.push(Some(key));
     }
 
     Ok(keys)
@@ -306,7 +354,12 @@ fn filter_existing(
 
         let mut keep_row_builder = BooleanBuilder::with_capacity(keys.len());
         for k in keys {
-            keep_row_builder.append_value(!overwriting_primary_keys.contains(&k));
+            // We check non-nullity of primary keys at insertion, so we can safely assume non-null here.
+            if let Some(k) = k {
+                keep_row_builder.append_value(!overwriting_primary_keys.contains(&k));
+            } else {
+                tracing::trace!("Primary keys in `MemSink` record batch contain null. This should be impossible.")
+            }
         }
         let filtered_batch = filter_record_batch(&batch, &keep_row_builder.finish())?;
         if filtered_batch.num_rows() > 0 {
@@ -321,9 +374,9 @@ fn filter_existing(
 fn primary_key_identifier(
     rb: &[Vec<RecordBatch>],
     primary_keys_ordered: &[usize],
-) -> Result<Vec<String>> {
+) -> Result<Vec<Option<String>>> {
     // Create unique string for each primary key across all `new_batches` rows.
-    let new_keys: Vec<String> = rb
+    let new_keys: Vec<_> = rb
         .iter()
         .flat_map(|p| {
             p.iter()
@@ -371,16 +424,11 @@ impl DataSink for MemSink {
         }
 
         // Ensure new data has no primary key conflicts internally, and generate primary key ids for later comparison to existing partition data.
+        // We must also check for null values in primary keys. With that we can safely assume [`self.batches`] has no null primary keys.
         let mut new_key_set: HashSet<String> = HashSet::new();
         if let Some(ref pks) = self.primary_key {
             let new_primary_key_ids = primary_key_identifier(&new_batches, pks)?;
-            let num_new_keys = new_primary_key_ids.len();
-            new_key_set = new_primary_key_ids.into_iter().collect();
-            if new_key_set.len() != num_new_keys {
-                return Err(DataFusionError::Execution(
-                    "Primary key values must be unique".to_string(),
-                ));
-            }
+            new_key_set = check_and_filter_non_null_unique_primary_keys(new_primary_key_ids, None)?;
         }
 
         let mut writable_targets: Vec<_> =
@@ -394,11 +442,10 @@ impl DataSink for MemSink {
                     if let Some(ref pks) = self.primary_key {
                         for rb in &**target {
                             let batch_pks = extract_primary_keys_str(rb, pks)?;
-                            if batch_pks.iter().any(|p| new_key_set.contains(p)) {
-                                return Err(DataFusionError::Execution(
-                                    "Primary key values must be unique".to_string(),
-                                ));
-                            }
+                            let _ = check_and_filter_non_null_unique_primary_keys(
+                                batch_pks,
+                                Some(&new_key_set),
+                            )?;
                         }
                     }
                 }
