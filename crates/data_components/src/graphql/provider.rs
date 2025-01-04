@@ -181,6 +181,7 @@ impl TableProvider for GraphQLTableProvider {
         let graphql_exec = Arc::new(GraphQLTableProviderExec::new(
             Arc::clone(&self.client),
             query,
+            Arc::clone(&self.gql_schema),
             Arc::clone(&self.table_schema),
             limit,
             error_checker,
@@ -208,7 +209,8 @@ impl TableProvider for GraphQLTableProvider {
 pub struct GraphQLTableProviderExec {
     client: Arc<GraphQLClient>,
     query: GraphQLQuery,
-    schema: SchemaRef,
+    gql_schema: SchemaRef,
+    table_schema: SchemaRef,
     limit: Option<usize>,
     error_checker: Option<ErrorChecker>,
     transform_fn: Option<TransformFn>,
@@ -220,7 +222,8 @@ impl GraphQLTableProviderExec {
     pub fn new(
         client: Arc<GraphQLClient>,
         query: GraphQLQuery,
-        schema: SchemaRef,
+        gql_schema: SchemaRef,
+        table_schema: SchemaRef,
         limit: Option<usize>,
         error_checker: Option<ErrorChecker>,
         transform_fn: Option<TransformFn>,
@@ -228,12 +231,13 @@ impl GraphQLTableProviderExec {
         Self {
             client,
             query,
-            schema: Arc::clone(&schema),
+            gql_schema,
+            table_schema: Arc::clone(&table_schema),
             limit,
             error_checker,
             transform_fn,
             properties: PlanProperties::new(
-                EquivalenceProperties::new(schema),
+                EquivalenceProperties::new(table_schema),
                 Partitioning::UnknownPartitioning(1),
                 ExecutionMode::Bounded,
             ),
@@ -263,7 +267,7 @@ impl ExecutionPlan for GraphQLTableProviderExec {
     }
 
     fn schema(&self) -> SchemaRef {
-        Arc::clone(&self.schema)
+        Arc::clone(&self.table_schema)
     }
 
     fn properties(&self) -> &PlanProperties {
@@ -288,7 +292,8 @@ impl ExecutionPlan for GraphQLTableProviderExec {
     ) -> DataFusionResult<SendableRecordBatchStream> {
         let mut stream = Arc::clone(&self.client).execute_paginated(
             self.query.clone(),
-            Arc::clone(&self.schema),
+            Arc::clone(&self.gql_schema),
+            Arc::clone(&self.table_schema),
             self.limit,
             self.error_checker.clone(),
         );

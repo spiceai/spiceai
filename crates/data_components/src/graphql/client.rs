@@ -839,63 +839,65 @@ impl GraphQLClient {
     #[must_use]
     pub fn execute_paginated(
         self: Arc<Self>,
-        query: GraphQLQuery,
-        schema: SchemaRef,
+        mut query: GraphQLQuery,
+        gql_schema: SchemaRef,
+        table_schema: SchemaRef,
         limit: Option<usize>,
         error_checker: Option<ErrorChecker>,
     ) -> SendableRecordBatchStream {
-        let mut builder = RecordBatchReceiverStream::builder(Arc::clone(&schema), 2);
+        let mut builder = RecordBatchReceiverStream::builder(table_schema, 2);
         let tx = builder.tx();
 
         // Spawn the task that will fetch and send the GraphQL record batches
         builder.spawn(async move {
-            let mut current_cursor = None;
-            let mut record_count = 0;
-            let mut query = query;
+            let mut result = self
+                .execute(
+                    &mut query,
+                    Some(Arc::clone(&gql_schema)),
+                    limit,
+                    None,
+                    error_checker.clone(),
+                )
+                .await
+                .map_err(|e| DataFusionError::Execution(e.to_string()))?;
             let mut limit = limit;
 
-            loop {
-                match self
+            for batch in result.records {
+                tx.send(Ok(batch)).await.map_err(|_| {
+                    DataFusionError::Execution("Failed to send record batch".to_string())
+                })?;
+            }
+
+            if result.limit_reached {
+                return Ok(());
+            }
+
+            while let Some(next_cursor_val) = result.cursor {
+                if let Some(p) = query.pagination_parameters.as_ref() {
+                    if limit.is_some() {
+                        limit = Some(p.reduce_limit(result.record_count));
+                    }
+                }
+
+                result = self
                     .execute(
                         &mut query,
-                        Some(Arc::clone(&schema)),
+                        Some(Arc::clone(&gql_schema)),
                         limit,
-                        current_cursor,
+                        Some(next_cursor_val),
                         error_checker.clone(),
                     )
                     .await
-                {
-                    Ok(result) => {
-                        // Send each batch through the channel
-                        for batch in result.records {
-                            tx.send(Ok(batch)).await.map_err(|_| {
-                                DataFusionError::Execution(
-                                    "Failed to send record batch".to_string(),
-                                )
-                            })?;
-                        }
+                    .map_err(|e| DataFusionError::Execution(e.to_string()))?;
 
-                        record_count += result.record_count;
+                for batch in result.records {
+                    tx.send(Ok(batch)).await.map_err(|_| {
+                        DataFusionError::Execution("Failed to send record batch".to_string())
+                    })?;
+                }
 
-                        // Update cursor and check if we should continue
-                        if result.limit_reached || result.cursor.is_none() {
-                            break;
-                        }
-
-                        // Update cursor and limit for next iteration
-                        current_cursor = result.cursor;
-                        if let Some(p) = query.pagination_parameters.as_ref() {
-                            if limit.is_some() {
-                                limit = Some(p.reduce_limit(record_count));
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tx.send(Err(DataFusionError::Execution(e.to_string())))
-                            .await
-                            .ok();
-                        break;
-                    }
+                if result.limit_reached {
+                    break;
                 }
             }
             Ok(())
