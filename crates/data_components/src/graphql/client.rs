@@ -35,6 +35,9 @@ use std::{cmp::min, fmt::Display, io::Cursor, sync::Arc};
 
 use url::Url;
 
+use datafusion::physical_plan::SendableRecordBatchStream;
+use datafusion::{error::DataFusionError, physical_plan::stream::RecordBatchReceiverStream};
+
 pub enum Auth {
     Basic(String, Option<String>),
     Bearer(Arc<dyn TokenProvider>),
@@ -611,26 +614,37 @@ pub struct GraphQLClient {
 }
 
 #[derive(Clone)]
-pub struct GraphQLQuery<'a> {
-    pub ast: Document<'a, String>,
+pub struct GraphQLQuery {
+    source_query: Arc<str>,
+    ast: Document<'static, String>,
     pub json_pointer: Option<Arc<str>>,
     pub pagination_parameters: Option<PaginationParameters>,
 }
 
-impl<'a> TryFrom<&'a str> for GraphQLQuery<'a> {
+impl TryFrom<Arc<str>> for GraphQLQuery {
     type Error = super::Error;
 
-    fn try_from(query: &'a str) -> Result<Self, self::Error> {
-        let ast = parse_query::<String>(query).map_err(|_| super::Error::InvalidGraphQLQuery {
-            message: "Failed to parse GraphQL query".to_string(),
-            line: 0,
-            column: 0,
-            query: query.to_string(),
-        })?;
+    fn try_from(query: Arc<str>) -> Result<Self, self::Error> {
+        // SAFETY: We're transmuting the lifetime to 'static and this is safe because:
+        // 1. The reference won't outlive the GraphQLQuery struct and we don't give it out as a static reference
+        // 2. The source Arc is kept alive as long as the GraphQLQuery exists
+        // 3. Arc guarantees the data remains at the same address
+        //
+        // This wouldn't be required if Rust had proper support for self-referencing structs.
+        let query_ref: &'static str = unsafe { std::mem::transmute::<&str, &'static str>(&query) };
+
+        let ast =
+            parse_query::<String>(&query_ref).map_err(|_| super::Error::InvalidGraphQLQuery {
+                message: "Failed to parse GraphQL query".to_string(),
+                line: 0,
+                column: 0,
+                query: query.to_string(),
+            })?;
 
         let (pagination_parameters, json_pointer) = PaginationParameters::parse(&ast);
 
         Ok(Self {
+            source_query: query,
             ast,
             json_pointer: json_pointer.map(Arc::from),
             pagination_parameters,
@@ -638,7 +652,7 @@ impl<'a> TryFrom<&'a str> for GraphQLQuery<'a> {
     }
 }
 
-impl GraphQLQuery<'_> {
+impl GraphQLQuery {
     #[must_use]
     pub fn to_string(&self, limit: Option<usize>, cursor: Option<String>) -> String {
         let query = self.ast.to_string();
@@ -655,6 +669,22 @@ impl GraphQLQuery<'_> {
             record_count >= limit
         } else {
             false
+        }
+    }
+
+    pub fn ast(&self) -> &Document<'_, String> {
+        // SAFETY: We can safely transmute back to a shorter lifetime
+        unsafe {
+            std::mem::transmute::<&Document<'static, String>, &Document<'_, String>>(&self.ast)
+        }
+    }
+
+    pub fn ast_mut(&mut self) -> &mut Document<'_, String> {
+        // SAFETY: We can safely transmute back to a shorter lifetime
+        unsafe {
+            std::mem::transmute::<&mut Document<'static, String>, &mut Document<'_, String>>(
+                &mut self.ast,
+            )
         }
     }
 }
@@ -704,9 +734,9 @@ impl GraphQLClient {
         })
     }
 
-    pub(crate) async fn execute<'a>(
+    pub(crate) async fn execute(
         &self,
-        query: &mut GraphQLQuery<'a>,
+        query: &mut GraphQLQuery,
         schema: Option<SchemaRef>,
         limit: Option<usize>,
         cursor: Option<String>,
@@ -804,53 +834,71 @@ impl GraphQLClient {
         })
     }
 
-    pub(crate) async fn execute_paginated<'a>(
-        &self,
-        query: &mut GraphQLQuery<'a>,
+    pub fn execute_paginated(
+        self: Arc<Self>,
+        query: GraphQLQuery,
         schema: SchemaRef,
         limit: Option<usize>,
         error_checker: Option<ErrorChecker>,
-    ) -> Result<Vec<Vec<RecordBatch>>> {
-        let mut result = self
-            .execute(
-                query,
-                Some(Arc::clone(&schema)),
-                limit,
-                None,
-                error_checker.clone(),
-            )
-            .await?;
-        let mut res = vec![result.records];
-        let mut limit = limit;
+    ) -> SendableRecordBatchStream {
+        let mut builder = RecordBatchReceiverStream::builder(schema, 2);
+        let tx = builder.tx();
 
-        if result.limit_reached {
-            return Ok(res);
-        }
+        // Spawn the task that will fetch and send the GraphQL record batches
+        builder.spawn(async move {
+            let mut current_cursor = None;
+            let mut record_count = 0;
+            let mut query = query;
+            let mut limit = limit;
 
-        while let Some(next_cursor_val) = result.cursor {
-            if let Some(p) = query.pagination_parameters.as_ref() {
-                if limit.is_some() {
-                    limit = Some(p.reduce_limit(result.record_count));
+            loop {
+                match self
+                    .execute(
+                        &mut query,
+                        None, // Schema already provided to builder
+                        limit,
+                        current_cursor,
+                        error_checker.clone(),
+                    )
+                    .await
+                {
+                    Ok(result) => {
+                        // Send each batch through the channel
+                        for batch in result.records {
+                            tx.send(Ok(batch)).await.map_err(|_| {
+                                DataFusionError::Execution(
+                                    "Failed to send record batch".to_string(),
+                                )
+                            })?;
+                        }
+
+                        record_count += result.record_count;
+
+                        // Update cursor and check if we should continue
+                        if result.limit_reached || result.cursor.is_none() {
+                            break;
+                        }
+
+                        // Update cursor and limit for next iteration
+                        current_cursor = result.cursor;
+                        if let Some(p) = query.pagination_parameters.as_ref() {
+                            if limit.is_some() {
+                                limit = Some(p.reduce_limit(record_count));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tx.send(Err(DataFusionError::Execution(e.to_string())))
+                            .await
+                            .ok();
+                        break;
+                    }
                 }
             }
+            Ok(())
+        });
 
-            result = self
-                .execute(
-                    query,
-                    Some(Arc::clone(&schema)),
-                    limit,
-                    Some(next_cursor_val),
-                    error_checker.clone(),
-                )
-                .await?;
-            res.push(result.records);
-
-            if result.limit_reached {
-                break;
-            }
-        }
-
-        Ok(res)
+        builder.build()
     }
 }
 
@@ -982,6 +1030,8 @@ fn format_query_with_context(query: &str, line: usize, column: usize) -> String 
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use reqwest::StatusCode;
     use serde_json::Value;
 
@@ -1132,7 +1182,7 @@ mod tests {
         ];
 
         for case in test_cases {
-            let query = GraphQLQuery::try_from(case.query).expect("Should parse query");
+            let query = GraphQLQuery::try_from(Arc::from(case.query)).expect("Should parse query");
             let result = PaginationParameters::parse(&query.ast);
             assert_eq!(result, case.expected, "Failed test case: {}", case.name);
         }
@@ -1150,7 +1200,7 @@ mod tests {
             }
         }";
 
-        let query = GraphQLQuery::try_from(query).expect("Should parse query");
+        let query = GraphQLQuery::try_from(Arc::from(query)).expect("Should parse query");
         let (pagination_parameters_opt, _) = PaginationParameters::parse(&query.ast);
         pagination_parameters_opt.expect("Should get pagination params");
         let new_query = query.to_string(None, Some("new_cursor".to_string()));
@@ -1176,7 +1226,7 @@ mod tests {
             }
         }"#;
 
-        let query = GraphQLQuery::try_from(query).expect("Should parse query");
+        let query = GraphQLQuery::try_from(Arc::from(query)).expect("Should parse query");
         let (pagination_parameters_opt, _) = PaginationParameters::parse(&query.ast);
         pagination_parameters_opt.expect("Should get pagination params");
         let new_query = query.to_string(None, Some("new_cursor".to_string()));
@@ -1202,7 +1252,7 @@ mod tests {
             }
         }";
 
-        let query = GraphQLQuery::try_from(query).expect("Should parse query");
+        let query = GraphQLQuery::try_from(Arc::from(query)).expect("Should parse query");
         let (pagination_parameters_opt, _) = PaginationParameters::parse(&query.ast);
         pagination_parameters_opt.expect("Should get pagination params");
         let new_query = query.to_string(Some(5), Some("new_cursor".to_string()));
@@ -1232,7 +1282,7 @@ mod tests {
             }
         }";
 
-        let query = GraphQLQuery::try_from(query).expect("Should parse query");
+        let query = GraphQLQuery::try_from(Arc::from(query)).expect("Should parse query");
         let (pagination_parameters_opt, _) = PaginationParameters::parse(&query.ast);
         let pagination_parameters =
             pagination_parameters_opt.expect("Failed to get pagination params");
@@ -1269,7 +1319,7 @@ mod tests {
             }
         }";
 
-        let query = GraphQLQuery::try_from(query).expect("Should parse query");
+        let query = GraphQLQuery::try_from(Arc::from(query)).expect("Should parse query");
         let (pagination_parameters_opt, _) = PaginationParameters::parse(&query.ast);
         let pagination_parameters =
             pagination_parameters_opt.expect("Failed to get pagination params");

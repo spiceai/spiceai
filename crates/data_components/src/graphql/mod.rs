@@ -113,7 +113,7 @@ pub trait GraphQLContext: Send + Sync + std::fmt::Debug {
     fn inject_parameters(
         &self,
         _filters: &[FilterPushdownResult],
-        _query: &mut GraphQLQuery<'_>,
+        _query: &mut GraphQLQuery,
     ) -> Result<(), datafusion::error::DataFusionError> {
         Ok(())
     }
