@@ -72,7 +72,7 @@ jobs:
             if (context.eventName === 'workflow_dispatch') {
               const desiredOption = context.payload.inputs.desired_option;
 
-              if (desiredOs === 'all') {
+              if (desired_option === 'all') {
                 return matrix;
               }
 
