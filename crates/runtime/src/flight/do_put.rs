@@ -22,6 +22,7 @@ use arrow_flight::{
 };
 use arrow_ipc::convert::try_schema_from_flatbuffer_bytes;
 use arrow_schema::SchemaRef;
+use arrow_tools::schema::verify_schema;
 use datafusion::{
     error::DataFusionError, execution::SendableRecordBatchStream,
     physical_plan::stream::RecordBatchStreamAdapter, sql::TableReference,
@@ -89,6 +90,17 @@ pub(crate) async fn handle(
     let schema = Arc::new(schema);
 
     let df = Arc::clone(&flight_svc.datafusion);
+
+    let target_schema = df
+        .get_arrow_schema(path.clone())
+        .await
+        .map_err(|e| Status::internal(format!("Failed to get target dataset schema: {e}")))?;
+
+    if let Err(e) = verify_schema(target_schema.fields(), schema.fields()) {
+        return Err(Status::invalid_argument(format!(
+            "Schema validation error: the provided data schema does not match the expected schema for dataset `{path}`: {e}",
+        )));
+    }
 
     let response_stream = create_response_stream(path, schema, df, streaming_flight, &message);
 
