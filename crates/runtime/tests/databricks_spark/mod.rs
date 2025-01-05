@@ -31,6 +31,7 @@ fn make_catalog(path: &str, name: &str) -> Catalog {
     catalog
 }
 
+#[allow(clippy::expect_used)]
 fn get_params() -> Params {
     // Verify that the environment variables are set
     let _ = std::env::var("DATABRICKS_HOST").expect("DATABRICKS_HOST is not set");
