@@ -70,13 +70,13 @@ jobs:
 
             // If running via workflow_dispatch, filter based on input
             if (context.eventName === 'workflow_dispatch') {
-              const desiredOs = context.payload.inputs.desired_os;
+              const desiredOption = context.payload.inputs.desired_option;
 
               if (desiredOs === 'all') {
                 return matrix;
               }
 
-              return matrix.filter(m => m.name === desiredOs);
+              return matrix.filter(m => m.name === desired_option);
             }
 
             // Filter out macos-14-large runner for trunk pushes
