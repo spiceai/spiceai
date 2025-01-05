@@ -70,7 +70,7 @@ jobs:
 
             // If running via workflow_dispatch, filter based on input
             if (context.eventName === 'workflow_dispatch') {
-              const desiredOption = context.payload.inputs.desired_option;
+              const desired_option = context.payload.inputs.desired_option;
 
               if (desired_option === 'all') {
                 return matrix;
