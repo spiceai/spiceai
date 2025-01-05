@@ -37,7 +37,7 @@ impl SparkConnectTableProvider {
     fn create_federated_table_source(
         self: Arc<Self>,
     ) -> DataFusionResult<Arc<dyn FederatedTableSource>> {
-        let table_name = self.table_reference.to_string();
+        let table_name = self.table_reference.to_quoted_string();
         tracing::trace!(
             table_name,
             %self.table_reference,
