@@ -75,7 +75,7 @@ pub struct FlightFactory {
     client: FlightClient,
     dialect: Arc<dyn Dialect>,
     subquery_use_partial_path: bool,
-    compute_context: Option<Arc<str>>,
+    extra_compute_context: Option<Arc<str>>,
 }
 
 impl FlightFactory {
@@ -91,7 +91,7 @@ impl FlightFactory {
             client,
             dialect,
             subquery_use_partial_path,
-            compute_context: None,
+            extra_compute_context: None,
         }
     }
 
@@ -107,8 +107,8 @@ impl FlightFactory {
     }
 
     #[must_use]
-    pub fn with_compute_context(mut self, compute_context: &str) -> Self {
-        self.compute_context = Some(Arc::from(compute_context));
+    pub fn with_extra_compute_context(mut self, compute_context: &str) -> Self {
+        self.extra_compute_context = Some(Arc::from(compute_context));
         self
     }
 
@@ -125,7 +125,7 @@ impl FlightFactory {
                 schema,
                 Arc::clone(&self.dialect),
                 self.subquery_use_partial_path,
-                self.compute_context.as_ref().map(Arc::clone),
+                self.extra_compute_context.as_ref().map(Arc::clone),
             )),
             None => Arc::new(
                 FlightTable::create(
@@ -134,7 +134,7 @@ impl FlightFactory {
                     table_reference,
                     Arc::clone(&self.dialect),
                     self.subquery_use_partial_path,
-                    self.compute_context.as_ref().map(Arc::clone),
+                    self.extra_compute_context.as_ref().map(Arc::clone),
                 )
                 .await?,
             ),
@@ -208,7 +208,7 @@ impl FlightTable {
         table_reference: impl Into<MultiPartTableReference>,
         dialect: Arc<dyn Dialect>,
         subquery_use_partial_path: bool,
-        compute_context: Option<Arc<str>>,
+        extra_compute_context: Option<Arc<str>>,
     ) -> Result<Self> {
         let table_reference = table_reference.into();
         let schema = Self::get_query_schema(
@@ -221,7 +221,8 @@ impl FlightTable {
         .await?;
 
         let base_context = Self::get_base_context(&client);
-        let join_push_down_context = Self::get_extended_context(&base_context, compute_context);
+        let join_push_down_context =
+            Self::get_extended_context(&base_context, extra_compute_context);
 
         Ok(Self {
             name,
@@ -241,13 +242,14 @@ impl FlightTable {
         schema: SchemaRef,
         dialect: Arc<dyn Dialect>,
         subquery_use_partial_path: bool,
-        compute_context: Option<Arc<str>>,
+        extra_compute_context: Option<Arc<str>>,
     ) -> Self {
         let table_reference = table_reference.into();
         tracing::debug!("table_reference={:?}", table_reference);
 
         let base_context = Self::get_base_context(&client);
-        let join_push_down_context = Self::get_extended_context(&base_context, compute_context);
+        let join_push_down_context =
+            Self::get_extended_context(&base_context, extra_compute_context);
 
         Self {
             name,

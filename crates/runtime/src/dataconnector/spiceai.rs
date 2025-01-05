@@ -208,7 +208,7 @@ impl DataConnector for SpiceAI {
             SpiceAIDatasetPath::OrgAppPath { org, app, path } => {
                 let mut map = MetadataMap::new();
 
-                let compute_context = format!(
+                let spiceai_context = format!(
                     "org={},app={}",
                     org.to_str().unwrap_or_default(),
                     app.to_str().unwrap_or_default()
@@ -220,7 +220,7 @@ impl DataConnector for SpiceAI {
                     self.flight_factory
                         .clone()
                         .with_metadata(map)
-                        .with_compute_context(compute_context.as_str()),
+                        .with_extra_compute_context(spiceai_context.as_str()),
                     path,
                 )
             }
