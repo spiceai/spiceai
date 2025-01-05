@@ -494,12 +494,21 @@ jobs:
           - cmd: '-a arrow -b tpch --refresh-mode append'
             name: 'arrow accelerator append (memory mode)'
             bench: 'tpch'
+          - cmd: '-a arrow -b tpcds --refresh-mode append'
+            name: 'arrow accelerator append (memory mode)'
+            bench: 'tpcds'
           - cmd: '-a duckdb -m file -b tpch --refresh-mode append'
             name: 'duckdb accelerator append (file mode)'
             bench: 'tpch'
           - cmd: '-a duckdb -m memory -b tpch --refresh-mode append'
             name: 'duckdb accelerator append (memory mode)'
             bench: 'tpch'
+          - cmd: '-a duckdb -m file -b tpcds --refresh-mode append'
+            name: 'duckdb accelerator append (file mode)'
+            bench: 'tpcds'
+          - cmd: '-a duckdb -m memory -b tpcds --refresh-mode append'
+            name: 'duckdb accelerator append (memory mode)'
+            bench: 'tpcds'
           - cmd: '-a duckdb -m memory -b clickbench'
             name: 'duckdb accelerator (memory mode)'
             bench: 'clickbench'
@@ -550,6 +559,7 @@ jobs:
           PG_BENCHMARK_PG_PASS: postgres
           PG_BENCHMARK_PG_SSLMODE: disable
           PG_BENCHMARK_ACC_PG_DBNAME: postgres
+          SPICEAI_CLICKBENCH_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_CLICKBENCH_BENCHMARK_KEY }}
 
   create-pr:
     runs-on: ubuntu-latest

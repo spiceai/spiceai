@@ -308,7 +308,35 @@ pub(crate) fn delayed_source_load_to_parquet(
             ("partsupp", "ps_created_at"),
             ("region", "r_created_at"),
             ("supplier", "s_created_at"),
-        ],
+        ]
+        .to_vec(),
+        "tpcds" => [
+            ("call_center", "cc_created_at"),
+            ("catalog_page", "cp_created_at"),
+            ("catalog_sales", "cs_created_at"),
+            ("catalog_returns", "cr_created_at"),
+            ("income_band", "ib_created_at"),
+            ("inventory", "i_created_at"),
+            ("store_sales", "ss_created_at"),
+            ("store_returns", "sr_created_at"),
+            ("web_sales", "ws_created_at"),
+            ("web_returns", "wr_created_at"),
+            ("customer", "c_created_at"),
+            ("customer_address", "ca_created_at"),
+            ("customer_demographics", "cd_created_at"),
+            ("date_dim", "d_created_at"),
+            ("household_demographics", "hd_created_at"),
+            ("item", "i_created_at"),
+            ("promotion", "p_created_at"),
+            ("reason", "r_created_at"),
+            ("ship_mode", "sm_created_at"),
+            ("store", "s_created_at"),
+            ("time_dim", "t_created_at"),
+            ("warehouse", "w_created_at"),
+            ("web_page", "wp_created_at"),
+            ("web_site", "ws_created_at"),
+        ]
+        .to_vec(),
         _ => return Err("Only tpch benchmark suites are supported".to_string()),
     };
 
@@ -324,6 +352,33 @@ pub(crate) fn delayed_source_load_to_parquet(
         let dest_db_file = format!("./{bench_name}.db");
         let dest_conn = Connection::open(&dest_db_file).map_err(|e| e.to_string())?;
 
+        if bench_name == "tpcds" {
+            let mut setup_sql = format!(
+                "
+                INSTALL tpcds;
+                LOAD tpcds;
+                BEGIN;
+                CALL dsdgen(sf={scale_factor}, suffix='_gen');
+            "
+            );
+
+            for (table, column) in &tables {
+                setup_sql += &format!(
+                    "
+                    CREATE TABLE {table} AS SELECT * FROM {table}_gen WHERE 1=0;
+                    ALTER TABLE {table} ADD COLUMN {column} TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+                "
+                );
+            }
+
+            setup_sql += "COMMIT;";
+
+            println!("Running TPCDS data setup");
+            dest_conn
+                .execute_batch(&setup_sql)
+                .map_err(|e| e.to_string())?;
+        }
+
         for i in 0..load_count {
             println!("Loading data for {bench_name} benchmark suite, iteration {i}");
             match bench_name.as_str() {
@@ -333,7 +388,7 @@ pub(crate) fn delayed_source_load_to_parquet(
                     INSTALL tpch;
                     LOAD tpch;
                     BEGIN;
-                    CALl dbgen(sf={scale_factor}, children={load_count}, step={i}, suffix={suffix});
+                    CALL dbgen(sf={scale_factor}, children={load_count}, step={i}, suffix={suffix});
                     ",
                         suffix = if i == 0 { "''" } else { "'_new'" },
                     );
@@ -358,12 +413,42 @@ pub(crate) fn delayed_source_load_to_parquet(
 
                     dest_conn.execute_batch(&sql).map_err(|e| e.to_string())?;
                 }
+                "tpcds" => {
+                    let mut sql = "BEGIN;".to_string();
+
+                    for (table, column) in &tables {
+                        // DuckDB's TPCDS generation doesn't support partitioning and generating in steps
+                        // Instead, generate the whole dataset and load it with incrementally increasing OFFSET and LIMIT
+                        sql += &format!("
+                            INSERT INTO {table} SELECT *, CURRENT_TIMESTAMP AS {column} FROM {table}_gen LIMIT (SELECT COUNT(*) / {load_count} FROM {table}_gen) OFFSET (SELECT COUNT(*) / {load_count} * {i} FROM {table}_gen);
+                            COPY {table} TO '{table}.parquet' (FORMAT 'parquet');
+                        ");
+                    }
+
+                    sql += "COMMIT;";
+
+                    dest_conn.execute_batch(&sql).map_err(|e| e.to_string())?;
+                }
                 _ => {
                     return Err("Only tpch benchmark suites are supported".to_string());
                 }
             }
 
             sleep(load_interval).await;
+        }
+
+        if bench_name == "tpcds" {
+            // cleanup _gen data
+            let mut cleanup_sql = "BEGIN;".to_string();
+            for (table, _) in &tables {
+                cleanup_sql += &format!("DROP TABLE {table}_gen;");
+            }
+
+            cleanup_sql += "COMMIT;";
+
+            dest_conn
+                .execute_batch(&cleanup_sql)
+                .map_err(|e| e.to_string())?;
         }
 
         Ok::<(), String>(())

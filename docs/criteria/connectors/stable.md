@@ -6,31 +6,31 @@ All criteria must be met for the connector to be considered Stable, with excepti
 
 ## Stable Quality Connectors
 
-| Connector                        | Stable Quality | DRI Sign-off |
-| -------------------------------- | ---------- | ------------ |
-| Clickhouse                       | ➖         |              |
-| Databricks (mode: delta_lake)    | ➖         |              |
-| Databricks (mode: spark_connect) | ➖         |              |
-| Delta Lake                       | ➖         |              |
-| Dremio                           | ➖         |              |
-| DuckDB                           | ➖         |              |
-| File                             | ➖         |              |
-| FlightSQL                        | ➖         |              |
-| FTP/SFTP                         | ➖         |              |
-| GraphQL                          | ➖         |              |
-| GitHub                           | ➖         |              |
-| HTTP/HTTPS                       | ➖         |              |
-| Localpod                         | ➖         |              |
-| MS SQL                           | ➖         |              |
-| MySQL                            | ➖         |              |
-| ODBC                             | ➖         |              |
-| PostgreSQL                       | ➖         |              |
-| Sharepoint                       | ➖         |              |
-| Snowflake                        | ➖         |              |
-| Spice.AI Cloud Platform          | ➖         |              |
-| S3                               | ➖         |              |
-| Azure BlobFS                     | ➖         |              |
-| Spark                            | ➖         |              |
+| Connector                       | Stable Quality | DRI Sign-off      |
+| ------------------------------- | -------------- | ----------------- |
+| Clickhouse                      | ➖             |                   |
+| Databricks (mode: delta_lake)   | ➖             |                   |
+| Databricks (mode: spark_connect)| ➖             |                   |
+| Delta Lake                      | ➖             |                   |
+| Dremio                          | ➖             |                   |
+| DuckDB                          | ➖             |                   |
+| File                            | ➖             |                   |
+| FlightSQL                       | ➖             |                   |
+| FTP/SFTP                        | ➖             |                   |
+| GraphQL                         | ➖             |                   |
+| GitHub                          | ✅             | @phillipleblanc   |
+| HTTP/HTTPS                      | ➖             |                   |
+| Localpod                        | ➖             |                   |
+| MS SQL                          | ➖             |                   |
+| MySQL                           | ➖             |                   |
+| ODBC                            | ➖             |                   |
+| PostgreSQL                      | ➖             |                   |
+| Sharepoint                      | ➖             |                   |
+| Snowflake                       | ➖             |                   |
+| Spice.AI Cloud Platform         | ➖             |                   |
+| S3                              | ➖             |                   |
+| Azure BlobFS                    | ➖             |                   |
+| Spark                           | ➖             |                   |
 
 ## Stable Release Criteria
 

@@ -8,6 +8,6 @@ description: "Query: SELECT * FROM test_graphql"
 | logical_plan  | BytesProcessedNode                                     |
 |               |   TableScan: test_graphql projection=[id, name, posts] |
 | physical_plan | BytesProcessedExec                                     |
-|               |   MemoryExec: partitions=1, partition_sizes=[4]        |
+|               |   GraphQLTableProviderExec                             |
 |               |                                                        |
 +---------------+--------------------------------------------------------+

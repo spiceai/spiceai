@@ -36,7 +36,7 @@ pub(crate) async fn run_file_append(
     bench_name: &str,
     accelerator: Option<Acceleration>,
 ) -> Result<(), String> {
-    let test_queries = match bench_name {
+    let mut test_queries = match bench_name {
         "tpch" => get_tpch_test_queries(),
         "tpcds" => match accelerator.clone() {
             Some(Acceleration { engine, .. }) => get_tpcds_test_queries(engine.as_deref()),
@@ -52,17 +52,34 @@ pub(crate) async fn run_file_append(
         .is_some_and(|m| m == RefreshMode::Append);
 
     if is_append {
+        // remove q72 if the engine is arrow in append mode because it uses too much memory for the runner
+        if bench_name == "tpcds"
+            && accelerator
+                .clone()
+                .and_then(|a| a.engine)
+                .is_none_or(|e| e == "arrow")
+        {
+            test_queries.retain(|(query_name, _)| *query_name != "tpcds_q72");
+        }
+
         let start_time = std::time::Instant::now();
 
         loop {
             sleep(Duration::from_secs(60 * 4)).await; // refresh interval is 3 minutes - check every 4 minutes
+
+            let (target_table, expected_count) = match bench_name {
+                // DuckDB dbgen at scale 10 generates 59.9, not 60, million rows for lineitem when using partitioned generation
+                "tpch" => ("lineitem", 59_900_000),
+                "tpcds" => ("inventory", 130_000_000),
+                _ => return Err(format!("Invalid benchmark to run {bench_name}")),
+            };
 
             // check if the data has finished loading
             let res = run_query(
                 rt,
                 "duckdb",
                 "table_count",
-                "SELECT COUNT(*) as l_count FROM lineitem",
+                &format!("SELECT COUNT(*) as table_count FROM {target_table}"),
             )
             .await;
 
@@ -76,12 +93,11 @@ pub(crate) async fn run_file_append(
                 .map_err(|e| e.to_string())?
                 .first()
                 .ok_or("No rows returned from count query")?
-                .column_by_name("l_count")
-                .ok_or("No column named l_count")?
+                .column_by_name("table_count")
+                .ok_or("No column named table_count")?
                 .as_primitive::<arrow::datatypes::Int64Type>()
                 .value(0);
-            if count < 59_900_000 {
-                // DuckDB dbgen at scale 10 generates 59.9, not 60, million rows for lineitem when using partitioned generation
+            if count < expected_count {
                 if start_time.elapsed() > Duration::from_secs(60 * 60) {
                     // if more than 1 hour has passed, the test has failed
                     tracing::error!("Append mode data load failed. Expected over 59.9 million rows in lineitem table, got {count}");
@@ -202,130 +218,145 @@ pub fn build_app(
                 "call_center.parquet",
                 "call_center",
                 bench_name,
-                None,
+                is_append.then_some("cc_created_at"),
             ))
             .with_dataset(make_dataset(
                 "catalog_page.parquet",
                 "catalog_page",
                 bench_name,
-                None,
+                is_append.then_some("cp_created_at"),
             ))
             .with_dataset(make_dataset(
                 "catalog_returns.parquet",
                 "catalog_returns",
                 bench_name,
-                None,
+                is_append.then_some("cr_created_at"),
             ))
             .with_dataset(make_dataset(
                 "catalog_sales.parquet",
                 "catalog_sales",
                 bench_name,
-                None,
+                is_append.then_some("cs_created_at"),
             ))
             .with_dataset(make_dataset(
                 "customer.parquet",
                 "customer",
                 bench_name,
-                None,
+                is_append.then_some("c_created_at"),
             ))
             .with_dataset(make_dataset(
                 "customer_address.parquet",
                 "customer_address",
                 bench_name,
-                None,
+                is_append.then_some("ca_created_at"),
             ))
             .with_dataset(make_dataset(
                 "customer_demographics.parquet",
                 "customer_demographics",
                 bench_name,
-                None,
+                is_append.then_some("cd_created_at"),
             ))
             .with_dataset(make_dataset(
                 "date_dim.parquet",
                 "date_dim",
                 bench_name,
-                None,
+                is_append.then_some("d_created_at"),
             ))
             .with_dataset(make_dataset(
                 "household_demographics.parquet",
                 "household_demographics",
                 bench_name,
-                None,
+                is_append.then_some("hd_created_at"),
             ))
             .with_dataset(make_dataset(
                 "income_band.parquet",
                 "income_band",
                 bench_name,
-                None,
+                is_append.then_some("ib_created_at"),
             ))
             .with_dataset(make_dataset(
                 "inventory.parquet",
                 "inventory",
                 bench_name,
-                None,
+                is_append.then_some("i_created_at"),
             ))
-            .with_dataset(make_dataset("item.parquet", "item", bench_name, None))
+            .with_dataset(make_dataset(
+                "item.parquet",
+                "item",
+                bench_name,
+                is_append.then_some("i_created_at"),
+            ))
             .with_dataset(make_dataset(
                 "promotion.parquet",
                 "promotion",
                 bench_name,
-                None,
+                is_append.then_some("p_created_at"),
             ))
-            .with_dataset(make_dataset("reason.parquet", "reason", bench_name, None))
+            .with_dataset(make_dataset(
+                "reason.parquet",
+                "reason",
+                bench_name,
+                is_append.then_some("r_created_at"),
+            ))
             .with_dataset(make_dataset(
                 "ship_mode.parquet",
                 "ship_mode",
                 bench_name,
-                None,
+                is_append.then_some("sm_created_at"),
             ))
-            .with_dataset(make_dataset("store.parquet", "store", bench_name, None))
+            .with_dataset(make_dataset(
+                "store.parquet",
+                "store",
+                bench_name,
+                is_append.then_some("s_created_at"),
+            ))
             .with_dataset(make_dataset(
                 "store_returns.parquet",
                 "store_returns",
                 bench_name,
-                None,
+                is_append.then_some("sr_created_at"),
             ))
             .with_dataset(make_dataset(
                 "store_sales.parquet",
                 "store_sales",
                 bench_name,
-                None,
+                is_append.then_some("ss_created_at"),
             ))
             .with_dataset(make_dataset(
                 "time_dim.parquet",
                 "time_dim",
                 bench_name,
-                None,
+                is_append.then_some("t_created_at"),
             ))
             .with_dataset(make_dataset(
                 "warehouse.parquet",
                 "warehouse",
                 bench_name,
-                None,
+                is_append.then_some("w_created_at"),
             ))
             .with_dataset(make_dataset(
                 "web_page.parquet",
                 "web_page",
                 bench_name,
-                None,
+                is_append.then_some("wp_created_at"),
             ))
             .with_dataset(make_dataset(
                 "web_returns.parquet",
                 "web_returns",
                 bench_name,
-                None,
+                is_append.then_some("wr_created_at"),
             ))
             .with_dataset(make_dataset(
                 "web_sales.parquet",
                 "web_sales",
                 bench_name,
-                None,
+                is_append.then_some("ws_created_at"),
             ))
             .with_dataset(make_dataset(
                 "web_site.parquet",
                 "web_site",
                 bench_name,
-                None,
+                is_append.then_some("ws_created_at"),
             ))),
         _ => Err(
             "Only tpch and tpcds benchmark suites are supported for the file connector".to_string(),

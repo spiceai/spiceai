@@ -212,6 +212,7 @@ async fn bench_main() -> Result<(), String> {
             for accelerator in accelerators {
                 if accelerator.refresh_mode == Some(RefreshMode::Append) {
                     run_accelerator_bench("file", accelerator.clone(), upload_results_dataset.as_ref(), "tpch").await?;
+                    run_accelerator_bench("file", accelerator.clone(), upload_results_dataset.as_ref(), "tpcds").await?;
                 } else {
                     run_accelerator_bench("s3", accelerator.clone(), upload_results_dataset.as_ref(), "tpch").await?;
                     run_accelerator_bench("s3", accelerator.clone(), upload_results_dataset.as_ref(), "tpds").await?;
@@ -236,6 +237,9 @@ async fn bench_main() -> Result<(), String> {
             match (refresh_mode, args.bench_name.as_ref()) {
                 (RefreshMode::Append, "tpch") => {
                     run_accelerator_bench("file", acceleration, upload_results_dataset.as_ref(), "tpch").await?;
+                }
+                (RefreshMode::Append, "tpcds") => {
+                    run_accelerator_bench("file", acceleration, upload_results_dataset.as_ref(), "tpcds").await?;
                 }
                 (RefreshMode::Full, "tpch") => {
                     run_accelerator_bench("s3", acceleration, upload_results_dataset.as_ref(), "tpch").await?;
@@ -371,7 +375,7 @@ async fn run_accelerator_bench(
                     return Err("Delayed source load failed - exited with no error".to_string());
                 }
 
-                if append_startup_timer >= 120 {
+                if append_startup_timer >= 180 {
                     break;
                 }
             }
