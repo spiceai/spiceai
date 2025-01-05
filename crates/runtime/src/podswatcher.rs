@@ -69,12 +69,11 @@ impl PodsWatcher {
                         match AppBuilder::build_from_filesystem_path(root_path.clone()) {
                             Ok(app) => {
                                 if let Err(e) = tx.blocking_send(app) {
-                                    tracing::error!("Pods content watcher is unable to notify detected state change: {}", e);
+                                    tracing::error!("Pods content watcher is unable to notify detected state change: {e}");
                                 }
                             }
                             Err(e) => tracing::warn!(
-                                "Invalid app state detected, unable to load pods information: {}",
-                                e
+                                "Invalid app state detected, unable to load pods information: {e}"
                             ),
                         }
                     }
@@ -91,6 +90,19 @@ impl PodsWatcher {
     }
 }
 
+macro_rules! enable_watch_for_component {
+    ($items:expr, $dirs:expr, $root_dir:expr) => {
+        for item in $items {
+            match item {
+                ComponentOrReference::Reference(reference) => {
+                    $dirs.push($root_dir.join(&$root_dir.join(&reference.r#ref)));
+                }
+                ComponentOrReference::Component(_) => { /* ignore component */ }
+            }
+        }
+    };
+}
+
 fn get_watch_paths(app_path: impl Into<PathBuf>) -> Vec<PathBuf> {
     let root_dir: PathBuf = app_path.into();
 
@@ -105,25 +117,10 @@ fn get_watch_paths(app_path: impl Into<PathBuf>) -> Vec<PathBuf> {
             dirs.push(dep_path);
         }
 
-        for dataset in spicepod.datasets {
-            match dataset {
-                ComponentOrReference::Reference(reference) => {
-                    let ref_path = root_dir.join(&reference.r#ref);
-                    dirs.push(root_dir.join(ref_path));
-                }
-                ComponentOrReference::Component(_) => { /* ignore component */ }
-            }
-        }
-
-        for model in spicepod.models {
-            match model {
-                ComponentOrReference::Reference(reference) => {
-                    let ref_path = root_dir.join(&reference.r#ref);
-                    dirs.push(root_dir.join(ref_path));
-                }
-                ComponentOrReference::Component(_) => { /* ignore component */ }
-            }
-        }
+        enable_watch_for_component!(spicepod.datasets, dirs, root_dir);
+        enable_watch_for_component!(spicepod.models, dirs, root_dir);
+        enable_watch_for_component!(spicepod.catalogs, dirs, root_dir);
+        enable_watch_for_component!(spicepod.views, dirs, root_dir);
     }
 
     dirs
