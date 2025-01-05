@@ -42,7 +42,7 @@ use rand::Rng;
 use runtime::{
     accelerated_table::refresh::Refresh, auth::EndpointAuth,
     component::dataset::acceleration::Acceleration, config::Config, datafusion::DataFusion,
-    internal_table::create_internal_accelerated_table, rate_limits::RateLimits, secrets::Secrets,
+    flight::RateLimits, internal_table::create_internal_accelerated_table, secrets::Secrets,
     Runtime,
 };
 use runtime_auth::{api_key::ApiKeyAuth, FlightBasicAuth};
