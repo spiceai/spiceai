@@ -54,7 +54,7 @@ func CreateManifest(name string, spicepodDir string) (string, error) {
 	skeletonPod := &spec.SpicepodSpec{
 		SpicepodSpecFields: spec.SpicepodSpecFields{
 			Name:    name,
-			Version: "v1beta1",
+			Version: "v1",
 			Kind:    "Spicepod",
 		},
 	}
