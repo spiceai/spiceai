@@ -3,17 +3,16 @@ edition.workspace = true
 exclude.workspace = true
 homepage.workspace = true
 license.workspace = true
-name = "test-framework"
+name = "testoperator"
 repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
-spicepod = { path = "../spicepod" }
-tempfile = "3"
-anyhow = "1.0.95"
+test-framework = { path = "../../crates/test-framework" }
+spicepod = { path = "../../crates/spicepod" }
 serde_yaml.workspace = true
-nix = { version = "0.29", features = ["signal"] }
 clap.workspace = true
-
-[features]
+flight_client = { path = "../../crates/flight_client" }
+anyhow = "1"
+tokio.workspace = true

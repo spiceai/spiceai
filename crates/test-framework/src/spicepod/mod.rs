@@ -14,5 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-pub mod spiced;
-pub mod spicepod;
+use std::path::PathBuf;
+
+use spicepod::spec::SpicepodDefinition;
+
+pub fn load_spicepod(path: PathBuf) -> anyhow::Result<SpicepodDefinition> {
+    let spicepod_str = std::fs::read_to_string(path)?;
+    let spicepod: SpicepodDefinition = serde_yaml::from_str(&spicepod_str)?;
+    Ok(spicepod)
+}

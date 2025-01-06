@@ -19,6 +19,7 @@ members = [
     "crates/spicepod",
     "crates/spice_cloud",
     "crates/telemetry",
+    "crates/test-framework",
     "crates/util",
     "tools/flightpublisher/",
     "tools/flightsubscriber/",
@@ -26,6 +27,7 @@ members = [
     "tools/spicepodschema/",
     "tools/evalconverter",
     "tools/spiceschema",
+    "tools/testoperator",
 ]
 
 # Explicitly set the resolver to version 2, which is the default for packages with edition >= 2021
