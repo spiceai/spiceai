@@ -10,10 +10,10 @@ snapshot_kind: text
 | Brand#54 | STANDARD BRUSHED COPPER  | 14     | 27           |
 | Brand#11 | STANDARD BRUSHED TIN     | 23     | 24           |
 | Brand#11 | STANDARD BURNISHED BRASS | 36     | 24           |
-| Brand#14 | PROMO ANODIZED NICKEL    | 45     | 24           |
 | Brand#15 | MEDIUM ANODIZED NICKEL   | 3      | 24           |
 | Brand#15 | SMALL ANODIZED BRASS     | 45     | 24           |
 | Brand#15 | SMALL BURNISHED NICKEL   | 19     | 24           |
 | Brand#21 | MEDIUM ANODIZED COPPER   | 3      | 24           |
 | Brand#22 | SMALL BRUSHED NICKEL     | 3      | 24           |
+| Brand#22 | SMALL BURNISHED BRASS    | 19     | 24           |
 +----------+--------------------------+--------+--------------+
