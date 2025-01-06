@@ -11304,6 +11304,7 @@ name = "test-framework"
 version = "1.0.0-rc.4"
 dependencies = [
  "anyhow",
+ "app",
  "arrow",
  "clap",
  "flight_client",
@@ -11314,6 +11315,7 @@ dependencies = [
  "spicepod",
  "tempfile",
  "tokio",
+ "tonic",
 ]
 
 [[package]]

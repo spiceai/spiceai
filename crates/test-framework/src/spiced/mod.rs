@@ -34,7 +34,14 @@ pub struct SpicedInstance {
 }
 
 impl SpicedInstance {
-    pub fn start(spiced_path: PathBuf, spicepod: SpicepodDefinition) -> Result<Self> {
+    pub async fn start(spiced_path: PathBuf, spicepod: SpicepodDefinition) -> Result<Self> {
+        // Check if spiced is already running
+        let client = reqwest::Client::new();
+        let response = client.get("http://localhost:8090/health").send().await;
+        if response.is_ok() {
+            anyhow::bail!("Spiced instance is already running");
+        }
+
         let tempdir = tempfile::tempdir()?;
         // Serialize spicepod to `spicepod.yaml` in the tempdir
         let spicepod_yaml = serde_yaml::to_string(&spicepod)?;
@@ -44,6 +51,7 @@ impl SpicedInstance {
         // Start the spiced instance
         let mut cmd = Command::new(spiced_path);
         cmd.current_dir(tempdir.path());
+        cmd.arg("--telemetry-enabled=false");
         let child = cmd.spawn()?;
 
         Ok(Self {
@@ -53,20 +61,28 @@ impl SpicedInstance {
     }
 
     pub async fn flight_client(&self) -> Result<FlightClient> {
+        let mut metadata = tonic::metadata::MetadataMap::new();
+        metadata.insert("user-agent", "spice-test-framework/1.0".parse()?);
         Ok(FlightClient::try_new(
             "http://localhost:50051".into(),
             Credentials::UsernamePassword {
                 username: "".into(),
                 password: "".into(),
             },
-            None,
+            Some(metadata),
         )
         .await?)
     }
 
+    pub fn http_client(&self) -> Result<reqwest::Client> {
+        Ok(reqwest::Client::builder()
+            .user_agent("spice-test-framework/1.0")
+            .build()?)
+    }
+
     pub async fn wait_for_ready(&mut self, timeout: Duration) -> Result<()> {
         // Wait for the spiced instance to be ready by polling the `/v1/ready` endpoint
-        let client = reqwest::Client::new();
+        let client = self.http_client()?;
         if !wait_until_true(timeout, || async {
             let response = client.get("http://localhost:8090/v1/ready").send().await;
             response.is_ok()

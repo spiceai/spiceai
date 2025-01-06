@@ -9,6 +9,7 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+app = { path = "../app" }
 spicepod = { path = "../spicepod" }
 tempfile = "3"
 anyhow = "1.0.95"
@@ -20,5 +21,6 @@ tokio.workspace = true
 arrow.workspace = true
 flight_client = { path = "../flight_client" }
 futures.workspace = true
+tonic.workspace = true
 
 [features]

@@ -19,18 +19,20 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
     let mut spiced_instance =
-        SpicedInstance::start(args.spiced_path, load_spicepod(args.spicepod_path)?)?;
+        SpicedInstance::start(args.spiced_path, load_spicepod(args.spicepod_path)?).await?;
 
     spiced_instance
         .wait_for_ready(Duration::from_secs(10))
         .await?;
 
-    std::thread::sleep(std::time::Duration::from_secs(10));
-
     let client = spiced_instance.flight_client().await?;
 
     let batches = query_to_batches(&client, "SELECT 1").await?;
     println!("Batches: {:?}", batches);
+
+    // Wait for input
+    println!("Press Enter to stop");
+    let _ = std::io::stdin().read_line(&mut String::new());
 
     spiced_instance.stop()?;
 

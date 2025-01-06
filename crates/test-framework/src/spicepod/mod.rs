@@ -16,10 +16,64 @@ limitations under the License.
 
 use std::path::PathBuf;
 
-use spicepod::spec::SpicepodDefinition;
+use app::App;
+use spicepod::{
+    component::ComponentOrReference,
+    spec::{SpicepodDefinition, SpicepodKind, SpicepodVersion},
+};
 
 pub fn load_spicepod(path: PathBuf) -> anyhow::Result<SpicepodDefinition> {
     let spicepod_str = std::fs::read_to_string(path)?;
     let spicepod: SpicepodDefinition = serde_yaml::from_str(&spicepod_str)?;
+    Ok(spicepod)
+}
+
+pub fn from_app(app: App) -> anyhow::Result<SpicepodDefinition> {
+    let spicepod = SpicepodDefinition {
+        name: app.name,
+        runtime: app.runtime,
+        extensions: app.extensions,
+        secrets: app.secrets,
+        views: app
+            .views
+            .into_iter()
+            .map(ComponentOrReference::Component)
+            .collect(),
+        models: app
+            .models
+            .into_iter()
+            .map(ComponentOrReference::Component)
+            .collect(),
+        tools: app
+            .tools
+            .into_iter()
+            .map(ComponentOrReference::Component)
+            .collect(),
+        datasets: app
+            .datasets
+            .into_iter()
+            .map(ComponentOrReference::Component)
+            .collect(),
+        evals: app
+            .evals
+            .into_iter()
+            .map(ComponentOrReference::Component)
+            .collect(),
+        catalogs: app
+            .catalogs
+            .into_iter()
+            .map(ComponentOrReference::Component)
+            .collect(),
+        embeddings: app
+            .embeddings
+            .into_iter()
+            .map(ComponentOrReference::Component)
+            .collect(),
+        version: SpicepodVersion::default(),
+        kind: SpicepodKind::default(),
+        metadata: Default::default(),
+        dependencies: Default::default(),
+    };
+
     Ok(spicepod)
 }
