@@ -28,8 +28,9 @@ import (
 )
 
 type GitHubClient struct {
-	Owner string
-	Repo  string
+	Owner       string
+	Repo        string
+	accessToken string
 }
 
 func NewGitHubClientFromPath(path string) (*GitHubClient, error) {
@@ -47,8 +48,9 @@ func NewGitHubClientFromPath(path string) (*GitHubClient, error) {
 
 func NewGitHubClient(owner string, repo string) *GitHubClient {
 	return &GitHubClient{
-		Owner: owner,
-		Repo:  repo,
+		Owner:       owner,
+		Repo:        repo,
+		accessToken: os.Getenv("SPICE_CLI_GITHUB_TOKEN"),
 	}
 }
 
@@ -88,6 +90,11 @@ func (g *GitHubClient) call(method string, url string, payload []byte, accept st
 
 	if accept != "" {
 		req.Header.Add("Accept", accept)
+	}
+
+	// Add Authorization header if GITHUB_TOKEN is present
+	if g.accessToken != "" {
+		req.Header.Add("Authorization", "Bearer "+g.accessToken)
 	}
 
 	response, err := http.DefaultClient.Do(req)
