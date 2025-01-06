@@ -17,12 +17,16 @@ limitations under the License.
 use std::{
     path::PathBuf,
     process::{Child, Command},
+    time::Duration,
 };
 
 use anyhow::Result;
+use flight_client::{Credentials, FlightClient};
 use nix::unistd::Pid;
 use spicepod::spec::SpicepodDefinition;
 use tempfile::TempDir;
+
+use crate::utils::wait_until_true;
 
 pub struct SpicedInstance {
     child: Child,
@@ -46,6 +50,32 @@ impl SpicedInstance {
             child,
             _tempdir: tempdir,
         })
+    }
+
+    pub async fn flight_client(&self) -> Result<FlightClient> {
+        Ok(FlightClient::try_new(
+            "http://localhost:50051".into(),
+            Credentials::UsernamePassword {
+                username: "".into(),
+                password: "".into(),
+            },
+            None,
+        )
+        .await?)
+    }
+
+    pub async fn wait_for_ready(&mut self, timeout: Duration) -> Result<()> {
+        // Wait for the spiced instance to be ready by polling the `/v1/ready` endpoint
+        let client = reqwest::Client::new();
+        if !wait_until_true(timeout, || async {
+            let response = client.get("http://localhost:8090/v1/ready").send().await;
+            response.is_ok()
+        })
+        .await
+        {
+            anyhow::bail!("Spiced instance not ready within {timeout:?}");
+        }
+        Ok(())
     }
 
     pub fn stop(&mut self) -> Result<()> {

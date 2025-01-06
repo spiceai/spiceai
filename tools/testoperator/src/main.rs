@@ -1,7 +1,6 @@
 use clap::Parser;
-use flight_client::{Credentials, FlightClient};
-use std::path::PathBuf;
-use test_framework::{spiced::SpicedInstance, spicepod::load_spicepod};
+use std::{path::PathBuf, time::Duration};
+use test_framework::{flight::query_to_batches, spiced::SpicedInstance, spicepod::load_spicepod};
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -22,17 +21,15 @@ async fn main() -> anyhow::Result<()> {
     let mut spiced_instance =
         SpicedInstance::start(args.spiced_path, load_spicepod(args.spicepod_path)?)?;
 
+    spiced_instance
+        .wait_for_ready(Duration::from_secs(10))
+        .await?;
+
     std::thread::sleep(std::time::Duration::from_secs(10));
 
-    let mut client = FlightClient::try_new(
-        "http://localhost:50051".into(),
-        Credentials::Anonymous,
-        None,
-    )
-    .await?;
+    let client = spiced_instance.flight_client().await?;
 
-    let result = client.query("SELECT 1").await?;
-    let batches = result.into_inner();
+    let batches = query_to_batches(&client, "SELECT 1").await?;
     println!("Batches: {:?}", batches);
 
     spiced_instance.stop()?;

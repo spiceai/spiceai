@@ -14,7 +14,16 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-pub mod flight;
-pub mod spiced;
-pub mod spicepod;
-pub mod utils;
+use anyhow::Result;
+use arrow::record_batch::RecordBatch;
+use flight_client::FlightClient;
+use futures::StreamExt;
+
+pub async fn query_to_batches(client: &FlightClient, sql: &str) -> Result<Vec<RecordBatch>> {
+    let mut stream = client.query(sql).await?;
+    let mut batches = Vec::new();
+    while let Some(batch) = stream.next().await {
+        batches.push(batch?);
+    }
+    Ok(batches)
+}
