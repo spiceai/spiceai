@@ -22,7 +22,6 @@ use std::{
 
 use anyhow::Result;
 use flight_client::{Credentials, FlightClient};
-use nix::unistd::Pid;
 use spicepod::spec::SpicepodDefinition;
 use tempfile::TempDir;
 
@@ -129,8 +128,23 @@ impl SpicedInstance {
         let Ok(pid_i32) = self.child.id().try_into() else {
             anyhow::bail!("Failed to convert pid to i32");
         };
-        nix::sys::signal::kill(Pid::from_raw(pid_i32), nix::sys::signal::Signal::SIGTERM)?;
-        self.child.wait()?;
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(pid_i32),
+                nix::sys::signal::Signal::SIGTERM,
+            )?;
+            self.child.wait()?;
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            // On Windows, we can use the built-in process termination
+            self.child.kill()?;
+            self.child.wait()?;
+        }
+
         Ok(())
     }
 }
