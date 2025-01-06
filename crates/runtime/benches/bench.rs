@@ -324,15 +324,8 @@ async fn run_connector_bench(
             bench_spicecloud::run(&mut rt, &mut benchmark_results, bench_name).await?;
         }
         "s3" | "abfs" | "file" => {
-            bench_object_store::run(
-                connector,
-                &mut rt,
-                &mut benchmark_results,
-                None,
-                None,
-                bench_name,
-            )
-            .await?;
+            bench_object_store::run(connector, &mut rt, &mut benchmark_results, None, bench_name)
+                .await?;
         }
         #[cfg(feature = "spark")]
         "spark" => {
@@ -393,9 +386,6 @@ async fn run_accelerator_bench(
     bench_name: &str,
 ) -> Result<(), String> {
     let mut display_records = vec![];
-
-    let engine = accelerator.engine.clone();
-    let mode = accelerator.mode.clone();
 
     let (benchmark_results, rt) = match (accelerator.refresh_mode.clone(), connector) {
         #[cfg(feature = "duckdb")]
@@ -478,8 +468,7 @@ async fn run_accelerator_bench(
                 connector,
                 &mut rt,
                 &mut benchmark_results,
-                engine,
-                Some(mode),
+                Some(accelerator),
                 bench_name,
             )
             .await?;

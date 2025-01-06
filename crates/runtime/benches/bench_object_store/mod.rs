@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use crate::results::BenchmarkResultsBuilder;
 use app::AppBuilder;
 use runtime::Runtime;
-use spicepod::component::dataset::acceleration::{Acceleration, Mode};
+use spicepod::component::dataset::acceleration::{Acceleration, ZeroResultsAction};
 use test_framework::queries::{get_clickbench_test_queries, get_tpch_test_queries};
 
 pub(crate) mod abfs;
@@ -44,10 +44,13 @@ pub(crate) async fn run(
     connector: &str,
     rt: &mut Runtime,
     benchmark_results: &mut BenchmarkResultsBuilder,
-    engine: Option<String>,
-    mode: Option<Mode>,
+    acceleration: Option<Acceleration>,
     bench_name: &str,
 ) -> Result<(), String> {
+    let engine = acceleration.clone().and_then(|a| a.engine.clone());
+    let mode = acceleration.clone().map(|a| a.mode);
+    let on_zero_results = acceleration.clone().map(|a| a.on_zero_results);
+
     let test_queries = match bench_name {
         "tpch" => get_tpch_test_queries(None),
         "tpcds" => {
@@ -70,11 +73,23 @@ pub(crate) async fn run(
         _ => return Err(format!("Invalid benchmark to run {bench_name}")),
     };
 
-    let bench_name = match mode {
-        Some(mode) => {
-            format!("{}_{}_{}", connector, engine.unwrap_or_default(), mode).to_lowercase()
+    let bench_name = match (mode, on_zero_results) {
+        (None, Some(_)) | (Some(_), None) => {
+            unreachable!("both mode and on_zero_results are set when acceleration is passed")
         }
-        None => connector.to_string(),
+        (Some(mode), Some(ZeroResultsAction::ReturnEmpty)) => {
+            format!("{}_{}_{}", connector, engine.unwrap_or_default(), mode).to_lowercase()
+            // maintain old snapshot names for compatibility
+        }
+        (Some(mode), Some(ZeroResultsAction::UseSource)) => format!(
+            "{}_{}_{}_{}",
+            connector,
+            engine.unwrap_or_default(),
+            mode,
+            ZeroResultsAction::UseSource
+        )
+        .to_lowercase(),
+        (None, None) => connector.to_string(),
     };
 
     let mut errors = Vec::new();
