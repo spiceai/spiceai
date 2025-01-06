@@ -105,6 +105,9 @@ pub(crate) async fn run(
                     | "abfs"
                     | "s3_duckdb_file"
                     | "file"
+                    | "s3_arrow_memory_use_source"
+                    | "s3_duckdb_memory_use_source"
+                    | "s3_duckdb_file_use_source"
             )
         } else if query_name.starts_with("tpcds_q") {
             matches!(
@@ -114,6 +117,9 @@ pub(crate) async fn run(
                     | "s3_duckdb_file"
                     | "s3_sqlite_file"
                     | "file"
+                    | "s3_arrow_memory_use_source"
+                    | "s3_duckdb_memory_use_source"
+                    | "s3_duckdb_file_use_source"
             )
         } else {
             false
