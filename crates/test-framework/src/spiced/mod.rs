@@ -85,7 +85,10 @@ impl SpicedInstance {
         let client = self.http_client()?;
         if !wait_until_true(timeout, || async {
             let response = client.get("http://localhost:8090/v1/ready").send().await;
-            response.is_ok()
+            match response {
+                Ok(response) => response.status().is_success(),
+                Err(_) => false,
+            }
         })
         .await
         {

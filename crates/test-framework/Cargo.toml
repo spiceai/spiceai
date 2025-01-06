@@ -22,5 +22,6 @@ arrow.workspace = true
 flight_client = { path = "../flight_client" }
 futures.workspace = true
 tonic.workspace = true
+rustls.workspace = true
 
 [features]

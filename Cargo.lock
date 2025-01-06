@@ -11311,6 +11311,7 @@ dependencies = [
  "futures",
  "nix",
  "reqwest 0.12.9",
+ "rustls 0.23.20",
  "serde_yaml",
  "spicepod",
  "tempfile",
@@ -11322,12 +11323,7 @@ dependencies = [
 name = "testoperator"
 version = "1.0.0-rc.4"
 dependencies = [
- "anyhow",
  "clap",
- "flight_client",
- "futures",
- "serde_yaml",
- "spicepod",
  "test-framework",
  "tokio",
 ]

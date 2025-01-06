@@ -1,6 +1,8 @@
 use clap::Parser;
 use std::{path::PathBuf, time::Duration};
-use test_framework::{flight::query_to_batches, spiced::SpicedInstance, spicepod::load_spicepod};
+use test_framework::{
+    anyhow, flight::query_to_batches, rustls, spiced::SpicedInstance, spicepod_utils::from_app,
+};
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -16,10 +18,19 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let _ = rustls::crypto::CryptoProvider::install_default(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    );
     let args = Args::parse();
 
-    let mut spiced_instance =
-        SpicedInstance::start(args.spiced_path, load_spicepod(args.spicepod_path)?).await?;
+    let app = test_framework::app::AppBuilder::new("test-operator")
+        // .with_dataset(Dataset::new(
+        //     "github:github.com/spiceai/spiceai/issues",
+        //     "spiceai.issues",
+        // ))
+        .build();
+
+    let mut spiced_instance = SpicedInstance::start(args.spiced_path, from_app(app)?).await?;
 
     spiced_instance
         .wait_for_ready(Duration::from_secs(10))

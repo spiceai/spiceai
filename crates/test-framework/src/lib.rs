@@ -16,5 +16,14 @@ limitations under the License.
 
 pub mod flight;
 pub mod spiced;
-pub mod spicepod;
+pub mod spicepod_utils;
 pub mod utils;
+
+pub use anyhow;
+pub use app;
+pub use arrow;
+pub use flight_client;
+pub use futures;
+pub use rustls;
+pub use serde_yaml;
+pub use spicepod;

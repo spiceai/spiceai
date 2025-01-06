@@ -10,10 +10,5 @@ version.workspace = true
 
 [dependencies]
 test-framework = { path = "../../crates/test-framework" }
-spicepod = { path = "../../crates/spicepod" }
-serde_yaml.workspace = true
 clap.workspace = true
-flight_client = { path = "../../crates/flight_client" }
-anyhow = "1"
 tokio.workspace = true
-futures.workspace = true
