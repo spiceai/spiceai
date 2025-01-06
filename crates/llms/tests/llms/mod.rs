@@ -265,16 +265,19 @@ macro_rules! generate_model_tests {
 
         test_model_case!(anthropic, basic);
         test_model_case!(openai, basic);
+        test_model_case!(xai, basic);
         test_model_case!(hf_phi3, basic);
         test_model_case!(local_phi3, basic);
 
         test_model_case!(anthropic, system_prompt);
         test_model_case!(openai, system_prompt);
+        test_model_case!(xai, system_prompt);
         test_model_case!(hf_phi3, system_prompt);
         test_model_case!(local_phi3, system_prompt);
 
         test_model_case!(anthropic, tool_use);
         test_model_case!(openai, tool_use);
+        test_model_case!(xai, tool_use);
         test_model_case!(hf_phi3, tool_use);
         test_model_case!(local_phi3, tool_use);
     };
