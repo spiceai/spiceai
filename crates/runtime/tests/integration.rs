@@ -59,6 +59,7 @@ mod refresh_retry;
 mod refresh_sql;
 mod results_cache;
 mod s3;
+mod spiceai;
 #[cfg(feature = "sqlite")]
 mod sqlite;
 mod tls;
