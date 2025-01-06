@@ -9,7 +9,7 @@ on:
 
   workflow_dispatch:
     inputs:
-      desired_option:
+      platform_option:
         description: "Which option do you want to run on? (Default is ALL)"
         required: false
         type: choice
@@ -70,13 +70,13 @@ jobs:
 
             // If running via workflow_dispatch, filter based on input
             if (context.eventName === 'workflow_dispatch') {
-              const desired_option = context.payload.inputs.desired_option;
+              const platform_option = context.payload.inputs.platform_option;
 
-              if (desired_option === 'all') {
+              if (platform_option === 'all') {
                 return matrix;
               }
 
-              return matrix.filter(m => m.name === desired_option);
+              return matrix.filter(m => m.name === platform_option);
             }
 
             // Filter out macos-14-large runner for trunk pushes
