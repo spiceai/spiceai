@@ -438,11 +438,10 @@ fn filter_existing(
 
         let mut keep_row_builder = BooleanBuilder::with_capacity(keys.len());
         for k in keys {
-            // We check non-nullity of primary keys at insertion, so we can safely assume non-null here.
             if let Some(k) = k {
                 keep_row_builder.append_value(!overwriting_primary_keys.contains(&k));
             } else {
-                tracing::trace!("Primary keys in `MemSink` record batch contain null. This should be impossible!");
+                unreachable!("Primary keys in `MemSink` record batch contain(s) null(s). This should be impossible, We check non-nullity of primary keys at insertion.");
             }
         }
         let filtered_batch = filter_record_batch(&batch, &keep_row_builder.finish())?;
