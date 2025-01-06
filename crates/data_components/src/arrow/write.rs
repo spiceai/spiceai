@@ -106,11 +106,11 @@ impl MemTable {
     }
 
     async fn ensure_batches_satisfy_constraints(&self, constraints: &Constraints) -> Result<()> {
-        if constraints.is_empty() {
+        if constraints.iter().len() == 0 {
             return Ok(());
         }
         // Keep track of uniquness of rows per constraint.
-        let mut constraint_keys: Vec<HashSet<_>> = Vec::with_capacity(constraints.len());
+        let mut constraint_keys: Vec<HashSet<_>> = Vec::with_capacity(constraints.iter().len());
         for b in &self.batches {
             let p = &*b.read().await;
             let p: Vec<_> = p.iter().collect();
@@ -130,7 +130,7 @@ impl MemTable {
                 if let Some(existing) = constraint_keys.get_mut(i) {
                     existing.extend(valid_ids);
                 } else {
-                    constraint_keys[i] = valid_ids;
+                    constraint_keys.insert(i, valid_ids);
                 }
             }
         }
@@ -147,7 +147,7 @@ impl MemTable {
                 }
                 Some(Constraint::Unique(_)) => {
                     return Err(DataFusionError::Execution(
-                        "Unique constraints are not supported in MemTable".to_string(),
+                        "Unique constraints are not supported for in-memory tables. If possible, consider using a primary key.".to_string(),
                     ));
                 }
                 _ => return Ok(None),
@@ -674,6 +674,31 @@ mod tests {
         )
     }
 
+    fn create_batch_with_nullable_string_columns(
+        data: &[(&str, Vec<Option<&str>>)],
+    ) -> (RecordBatch, SchemaRef) {
+        let fields: Vec<_> = data
+            .iter()
+            .map(|(name, _)| {
+                arrow::datatypes::Field::new((*name).to_string(), DataType::Utf8, true)
+            })
+            .collect();
+        let schema = Arc::new(Schema::new(fields));
+
+        let arrays = data
+            .iter()
+            .map(|(_, values)| {
+                let arr = StringArray::from(values.clone());
+                Arc::new(arr) as Arc<dyn arrow::array::Array>
+            })
+            .collect::<Vec<_>>();
+
+        (
+            RecordBatch::try_new(Arc::clone(&schema), arrays).expect("data should be created"),
+            Arc::clone(&schema),
+        )
+    }
+
     #[tokio::test]
     async fn test_write_all_append_not_primary_key() {
         let (rb, schema) = create_batch_with_string_columns(&[(
@@ -750,6 +775,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_try_with_constraints() {
+        // Primary key constraint
         let (rb, schema) = create_batch_with_string_columns(&[
             (
                 "primary_key",
@@ -766,6 +792,44 @@ mod tests {
                 .await
                 .is_err(),
             "MemTable::try_with_constraints should check constraints on initial data"
+        );
+
+        // Unique constraint
+        let (rb, schema) = create_batch_with_string_columns(&[
+            (
+                "constraint",
+                vec!["1970-01-01", "2012-12-01T11:11:11Z", "1970-01-01"],
+            ),
+            ("value", vec!["a", "b", "c"]),
+        ]);
+        assert!(
+            MemTable::try_new(schema, vec![vec![rb]])
+                .expect("mem table should be created")
+                .try_with_constraints(Constraints::new_unverified(vec![Constraint::Unique(vec![
+                    0
+                ],)]))
+                .await
+                .is_err(),
+            "MemTable::try_with_constraints should check constraints on initial data"
+        );
+
+        // Unique constraint, nullity is not checked.
+        let (rb, schema) = create_batch_with_nullable_string_columns(&[
+            (
+                "constraint",
+                vec![Some("2012-12-01T11:11:11Z"), None, Some("1970-01-01")],
+            ),
+            ("value", vec![Some("a"), Some("b"), Some("c")]),
+        ]);
+        assert!(
+            MemTable::try_new(schema, vec![vec![rb]])
+                .expect("mem table should be created")
+                .try_with_constraints(Constraints::new_unverified(vec![Constraint::Unique(vec![
+                    0
+                ],)]))
+                .await
+                .is_ok(),
+            "MemTable::try_with_constraints should not check nullity on [`Constraint::Unique`]."
         );
     }
 
