@@ -42,7 +42,6 @@ mod docker;
 #[cfg(feature = "duckdb")]
 mod duckdb;
 mod endpoint_auth;
-mod federation;
 mod file;
 mod flight;
 mod github;

@@ -17,7 +17,6 @@ limitations under the License.
 use std::sync::Arc;
 
 use app::AppBuilder;
-use futures::StreamExt;
 use runtime::{status, Runtime};
 use spicepod::component::{dataset::Dataset, params::Params};
 
