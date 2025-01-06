@@ -34,6 +34,13 @@ pub struct SpicedInstance {
 }
 
 impl SpicedInstance {
+    /// Start a spiced instance
+    ///
+    /// # Errors
+    ///
+    /// - If spiced is already running
+    /// - If the spiced instance fails to start
+    /// - If the spicepod definition fails to serialize
     pub async fn start(spiced_path: &Path, spicepod: SpicepodDefinition) -> Result<Self> {
         // Check if spiced is already running
         let client = reqwest::Client::new();
@@ -60,6 +67,11 @@ impl SpicedInstance {
         })
     }
 
+    /// Get a flight client for the spiced instance
+    ///
+    /// # Errors
+    ///
+    /// - If the flight client fails to be created
     pub async fn flight_client(&self) -> Result<FlightClient> {
         let mut metadata = tonic::metadata::MetadataMap::new();
         metadata.insert("user-agent", "spice-test-framework/1.0".parse()?);
@@ -74,12 +86,22 @@ impl SpicedInstance {
         .await?)
     }
 
+    /// Get an http client for the spiced instance
+    ///
+    /// # Errors
+    ///
+    /// - If the http client fails to be created
     pub fn http_client(&self) -> Result<reqwest::Client> {
         Ok(reqwest::Client::builder()
             .user_agent("spice-test-framework/1.0")
             .build()?)
     }
 
+    /// Wait for the spiced instance to be ready
+    ///
+    /// # Errors
+    ///
+    /// - If the spiced instance fails to be ready within the timeout
     pub async fn wait_for_ready(&mut self, timeout: Duration) -> Result<()> {
         // Wait for the spiced instance to be ready by polling the `/v1/ready` endpoint
         let client = self.http_client()?;
@@ -97,6 +119,11 @@ impl SpicedInstance {
         Ok(())
     }
 
+    /// Stop the spiced instance
+    ///
+    /// # Errors
+    ///
+    /// - If the spiced instance fails to exit
     pub fn stop(&mut self) -> Result<()> {
         // Send a SIGTERM to the spiced instance and wait for it to exit
         let Ok(pid_i32) = self.child.id().try_into() else {
@@ -111,8 +138,8 @@ impl SpicedInstance {
 impl Drop for SpicedInstance {
     fn drop(&mut self) {
         match self.child.kill() {
-            Ok(_) => (),
-            Err(e) => eprintln!("Failed to kill spiced instance: {}", e),
+            Ok(()) => (),
+            Err(e) => eprintln!("Failed to kill spiced instance: {e}"),
         }
     }
 }

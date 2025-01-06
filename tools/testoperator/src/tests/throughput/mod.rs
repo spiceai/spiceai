@@ -28,7 +28,7 @@ pub(crate) async fn run(args: &Args) -> anyhow::Result<()> {
         // ))
         .build();
 
-    let mut spiced_instance = SpicedInstance::start(&args.spiced_path, from_app(app)?).await?;
+    let mut spiced_instance = SpicedInstance::start(&args.spiced_path, from_app(app)).await?;
 
     spiced_instance
         .wait_for_ready(Duration::from_secs(10))
@@ -37,7 +37,7 @@ pub(crate) async fn run(args: &Args) -> anyhow::Result<()> {
     let client = spiced_instance.flight_client().await?;
 
     let batches = query_to_batches(&client, "SELECT 1").await?;
-    println!("Batches: {:?}", batches);
+    println!("Batches: {batches:?}");
 
     // Wait for input
     println!("Press Enter to stop");

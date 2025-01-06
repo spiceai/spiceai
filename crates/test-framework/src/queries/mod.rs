@@ -40,6 +40,7 @@ macro_rules! remove_tpch_query {
     };
 }
 
+#[must_use]
 pub fn get_tpch_test_queries(overrides: Option<&str>) -> Vec<(&'static str, &'static str)> {
     let queries = generate_tpch_queries!(
         q1, q2, q3, q4, q5, q6, q7, q8, q9, q10, q11, q12, q13, q14, q16, q17, q18, q19, q20, q21,
@@ -102,6 +103,7 @@ macro_rules! add_tpcds_query_overrides {
     }
 }
 
+#[must_use]
 pub fn get_tpcds_test_queries(overrides: Option<&str>) -> Vec<(&'static str, &'static str)> {
     let queries = generate_tpcds_queries!(
         1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
@@ -182,6 +184,7 @@ macro_rules! generate_clickbench_query_overrides {
   }
 }
 
+#[must_use]
 pub fn get_clickbench_test_queries(overrides: Option<&str>) -> Vec<(&'static str, &'static str)> {
     let mut queries = generate_clickbench_queries!(
         1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,

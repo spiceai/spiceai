@@ -19,6 +19,11 @@ use arrow::record_batch::RecordBatch;
 use flight_client::FlightClient;
 use futures::StreamExt;
 
+/// Query a flight client and return the result as a vector of record batches
+///
+/// # Errors
+///
+/// - If the flight client fails to query
 pub async fn query_to_batches(client: &FlightClient, sql: &str) -> Result<Vec<RecordBatch>> {
     let mut stream = client.query(sql).await?;
     let mut batches = Vec::new();

@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::path::PathBuf;
+use std::{collections::HashMap, path::PathBuf};
 
 use app::App;
 use spicepod::{
@@ -22,14 +22,21 @@ use spicepod::{
     spec::{SpicepodDefinition, SpicepodKind, SpicepodVersion},
 };
 
+/// Load a spicepod definition from a file
+///
+/// # Errors
+///
+/// - If the file fails to be read
+/// - If the file fails to be deserialized
 pub fn load_spicepod(path: PathBuf) -> anyhow::Result<SpicepodDefinition> {
     let spicepod_str = std::fs::read_to_string(path)?;
     let spicepod: SpicepodDefinition = serde_yaml::from_str(&spicepod_str)?;
     Ok(spicepod)
 }
 
-pub fn from_app(app: App) -> anyhow::Result<SpicepodDefinition> {
-    let spicepod = SpicepodDefinition {
+/// Create a spicepod definition from an app
+pub fn from_app(app: App) -> SpicepodDefinition {
+    SpicepodDefinition {
         name: app.name,
         runtime: app.runtime,
         extensions: app.extensions,
@@ -71,9 +78,7 @@ pub fn from_app(app: App) -> anyhow::Result<SpicepodDefinition> {
             .collect(),
         version: SpicepodVersion::default(),
         kind: SpicepodKind::default(),
-        metadata: Default::default(),
-        dependencies: Default::default(),
-    };
-
-    Ok(spicepod)
+        metadata: HashMap::default(),
+        dependencies: Vec::default(),
+    }
 }
