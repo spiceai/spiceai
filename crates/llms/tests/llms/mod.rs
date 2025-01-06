@@ -58,12 +58,13 @@ type ModelFn<'a> = (&'a str, Box<dyn Fn() -> Arc<Box<dyn Chat>>>);
 type ModelDef<'a> = (&'a str, Arc<Box<dyn Chat>>);
 #[allow(clippy::expect_used)]
 static TEST_MODELS: LazyLock<Vec<ModelDef>> = LazyLock::new(|| {
-    let model_creators: [ModelFn; 4] = [
+    let model_creators: [ModelFn; 5] = [
         (
             "anthropic",
             Box::new(|| create::create_anthropic(None).expect("failed to create anthropic model")),
         ),
         ("openai", Box::new(|| create::create_openai("gpt-4o-mini"))),
+        ("xai", Box::new(|| create::create_xai("grok-beta"))),
         (
             "hf_phi3",
             Box::new(|| {
