@@ -18,8 +18,8 @@ use app::AppBuilder;
 use runtime::Runtime;
 
 use crate::results::BenchmarkResultsBuilder;
-use crate::{generate_tpcds_queries, generate_tpch_queries};
 use spicepod::component::{dataset::Dataset, params::Params};
+use test_framework::queries::{get_tpcds_test_queries, get_tpch_test_queries};
 
 pub(crate) async fn run(
     rt: &mut Runtime,
@@ -27,8 +27,8 @@ pub(crate) async fn run(
     bench_name: &str,
 ) -> Result<(), String> {
     let test_queries = match bench_name {
-        "tpch" => get_tpch_test_queries(),
-        "tpcds" => get_tpcds_test_queries(),
+        "tpch" => get_tpch_test_queries(None),
+        "tpcds" => get_tpcds_test_queries(None),
         _ => return Err(format!("Invalid benchmark to run {bench_name}")),
     };
 
@@ -128,23 +128,5 @@ fn get_params() -> Params {
         ]
         .into_iter()
         .collect(),
-    )
-}
-
-fn get_tpch_test_queries() -> Vec<(&'static str, &'static str)> {
-    // tpch_q15 has a view creation which we don't support by design
-    generate_tpch_queries!(
-        q1, q2, q3, q4, q5, q6, q7, q8, q9, q10, q11, q12, q13, q14, q16, q17, q18, q19, q20, q21,
-        q22, simple_q1, simple_q2, simple_q3, simple_q4, simple_q5
-    )
-}
-
-fn get_tpcds_test_queries() -> Vec<(&'static str, &'static str)> {
-    generate_tpcds_queries!(
-        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
-        26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48,
-        49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71,
-        72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94,
-        95, 96, 97, 98, 99
     )
 }

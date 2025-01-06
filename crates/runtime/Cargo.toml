@@ -114,6 +114,7 @@ spicepod = { path = "../spicepod" }
 ssh2 = { workspace = true, optional = true }
 suppaftp = { workspace = true, optional = true }
 telemetry = { path = "../telemetry" }
+test-framework = { path = "../test-framework" }
 tiberius = { workspace = true, optional = true }
 tokio.workspace = true
 tokio-rusqlite = { workspace = true, optional = true }

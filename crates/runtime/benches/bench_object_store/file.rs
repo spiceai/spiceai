@@ -17,6 +17,7 @@ limitations under the License.
 use arrow::array::AsArray;
 use runtime::Runtime;
 use std::time::Duration;
+use test_framework::queries::get_tpch_test_queries;
 use tokio::time::sleep;
 
 use app::AppBuilder;
@@ -28,7 +29,7 @@ use spicepod::component::dataset::{
 
 use crate::run_query;
 
-use super::{get_tpcds_test_queries, get_tpch_test_queries, BenchmarkResultsBuilder};
+use super::{get_tpcds_test_queries, BenchmarkResultsBuilder};
 
 pub(crate) async fn run_file_append(
     rt: &mut Runtime,
@@ -37,7 +38,7 @@ pub(crate) async fn run_file_append(
     accelerator: Option<Acceleration>,
 ) -> Result<(), String> {
     let mut test_queries = match bench_name {
-        "tpch" => get_tpch_test_queries(),
+        "tpch" => get_tpch_test_queries(None),
         "tpcds" => match accelerator.clone() {
             Some(Acceleration { engine, .. }) => get_tpcds_test_queries(engine.as_deref()),
             None => get_tpcds_test_queries(None),

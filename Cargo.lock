@@ -9819,6 +9819,7 @@ dependencies = [
  "ssh2",
  "suppaftp",
  "telemetry",
+ "test-framework",
  "tiberius",
  "tokio",
  "tokio-rusqlite",

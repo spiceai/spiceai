@@ -1,0 +1,1 @@
+select l_comment, l_partkey from lineitem order by l_linenumber desc limit 10;

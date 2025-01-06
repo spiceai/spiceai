@@ -20,6 +20,7 @@ use crate::results::BenchmarkResultsBuilder;
 use app::AppBuilder;
 use runtime::Runtime;
 use spicepod::component::dataset::acceleration::{Acceleration, Mode};
+use test_framework::queries::{get_clickbench_test_queries, get_tpch_test_queries};
 
 pub(crate) mod abfs;
 pub(crate) mod file;
@@ -48,13 +49,13 @@ pub(crate) async fn run(
     bench_name: &str,
 ) -> Result<(), String> {
     let test_queries = match bench_name {
-        "tpch" => get_tpch_test_queries(),
+        "tpch" => get_tpch_test_queries(None),
         "tpcds" => {
             // TPCDS Query 1, 30, 64, 81 are commented out for Postgres accelerator, see details in `get_postgres_tpcds_test_queries` function
             #[cfg(feature = "postgres")]
             {
                 if engine.clone().unwrap_or_default().as_str() == "postgres" {
-                    super::bench_postgres::get_tpcds_test_queries()
+                    test_framework::queries::get_tpcds_test_queries(Some("postgres"))
                 } else {
                     get_tpcds_test_queries(engine.as_deref())
                 }
@@ -122,61 +123,6 @@ pub(crate) async fn run(
     }
 
     Ok(())
-}
-
-fn get_tpch_test_queries() -> Vec<(&'static str, &'static str)> {
-    vec![
-        ("tpch_q1", include_str!("../queries/tpch/q1.sql")),
-        ("tpch_q2", include_str!("../queries/tpch/q2.sql")),
-        ("tpch_q3", include_str!("../queries/tpch/q3.sql")),
-        ("tpch_q4", include_str!("../queries/tpch/q4.sql")),
-        ("tpch_q5", include_str!("../queries/tpch/q5.sql")),
-        ("tpch_q6", include_str!("../queries/tpch/q6.sql")),
-        ("tpch_q7", include_str!("../queries/tpch/q7.sql")),
-        ("tpch_q8", include_str!("../queries/tpch/q8.sql")),
-        ("tpch_q9", include_str!("../queries/tpch/q9.sql")),
-        ("tpch_q10", include_str!("../queries/tpch/q10.sql")),
-        ("tpch_q11", include_str!("../queries/tpch/q11.sql")),
-        ("tpch_q12", include_str!("../queries/tpch/q12.sql")),
-        ("tpch_q13", include_str!("../queries/tpch/q13.sql")),
-        ("tpch_q14", include_str!("../queries/tpch/q14.sql")),
-        // tpch_q15 has a view creation which we don't support by design
-        ("tpch_q16", include_str!("../queries/tpch/q16.sql")),
-        ("tpch_q17", include_str!("../queries/tpch/q17.sql")),
-        ("tpch_q18", include_str!("../queries/tpch/q18.sql")),
-        ("tpch_q19", include_str!("../queries/tpch/q19.sql")),
-        ("tpch_q20", include_str!("../queries/tpch/q20.sql")),
-        ("tpch_q21", include_str!("../queries/tpch/q21.sql")),
-        ("tpch_q22", include_str!("../queries/tpch/q22.sql")),
-        (
-            "tpch_simple_q1",
-            include_str!("../queries/tpch/simple_q1.sql"),
-        ),
-        (
-            "tpch_simple_q2",
-            include_str!("../queries/tpch/simple_q2.sql"),
-        ),
-        (
-            "tpch_simple_q3",
-            include_str!("../queries/tpch/simple_q3.sql"),
-        ),
-        (
-            "tpch_simple_q4",
-            include_str!("../queries/tpch/simple_q4.sql"),
-        ),
-        (
-            "tpch_simple_q5",
-            include_str!("../queries/tpch/simple_q5.sql"),
-        ),
-        (
-            "tpch_simple_q6",
-            include_str!("../queries/tpch/simple_q6.sql"),
-        ),
-        (
-            "tpch_simple_q7",
-            include_str!("../queries/tpch/simple_q7.sql"),
-        ),
-    ]
 }
 
 #[allow(clippy::too_many_lines)]
@@ -346,63 +292,4 @@ fn get_tpcds_test_queries(engine: Option<&str>) -> Vec<(&'static str, &'static s
             }
         })
         .collect()
-}
-
-macro_rules! generate_clickbench_queries {
-    ( $( $i:literal ),* ) => {
-        vec![
-            $(
-                (
-                    concat!("clickbench_q", stringify!($i)),
-                    include_str!(concat!("../queries/clickbench/q", stringify!($i), ".sql"))
-                )
-            ),*
-        ]
-    }
-}
-
-macro_rules! generate_clickbench_query_overrides {
-    ( $engine:expr, $( $i:literal ),* ) => {
-        vec![
-            $(
-                (
-                    concat!("clickbench_q", stringify!($i)),
-                    include_str!(concat!("../queries/clickbench/", $engine, "/q", stringify!($i), ".sql"))
-                )
-            ),*
-        ]
-    }
-}
-
-fn get_clickbench_test_queries(engine: Option<&str>) -> Vec<(&'static str, &'static str)> {
-    let mut queries = generate_clickbench_queries!(
-        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
-        26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43
-    );
-
-    let overrides = match engine {
-        Some("sqlite") => {
-            queries.remove(28); // q29 includes regexp_replace which is not supported by sqlite
-            Some(generate_clickbench_query_overrides!(
-                "sqlite", 7, 19, 24, 25, 27, 37, 38, 39, 40, 41, 42, 43
-            ))
-        }
-        Some("postgres") => {
-            // Column aliases cannot appear with expressions in ORDER BY in Postgres: https://www.postgresql.org/docs/current/queries-order.html
-            // expressions can appear with other expressions, so re-write the query to fit
-            Some(generate_clickbench_query_overrides!("postgres", 43))
-        }
-        _ => None,
-    };
-
-    // replace queries with overrides based on their filename matches
-    if let Some(overrides) = overrides {
-        for (key, value) in overrides {
-            if let Some(query) = queries.iter_mut().find(|(k, _)| *k == key) {
-                *query = (key, value);
-            }
-        }
-    }
-
-    queries
 }

@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 pub mod flight;
+pub mod queries;
 pub mod spiced;
 pub mod spicepod_utils;
 pub mod utils;

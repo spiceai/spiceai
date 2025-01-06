@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use std::{
-    path::PathBuf,
+    path::Path,
     process::{Child, Command},
     time::Duration,
 };
@@ -34,7 +34,7 @@ pub struct SpicedInstance {
 }
 
 impl SpicedInstance {
-    pub async fn start(spiced_path: PathBuf, spicepod: SpicepodDefinition) -> Result<Self> {
+    pub async fn start(spiced_path: &Path, spicepod: SpicepodDefinition) -> Result<Self> {
         // Check if spiced is already running
         let client = reqwest::Client::new();
         let response = client.get("http://localhost:8090/health").send().await;
