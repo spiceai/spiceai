@@ -9,17 +9,16 @@ on:
 
   workflow_dispatch:
     inputs:
-      desired_os:
-        description: "Which OS do you want to run on? (Default is ALL)"
+      platform_option:
+        description: "Which option do you want to run on? (Default is ALL)"
         required: false
         type: choice
         options:
-          - all
-          - linux-x64
-          - linux-aarch64
-          - windows-x64
-          - macos-aarch64
-          - macos-x64
+          - "Linux x64"
+          - "Linux aarch64"
+          - "macOS aarch64 (Apple Silicon)"
+          - "Windows x64"
+          - "macOS x64 (Intel)"
         default: "all"
 
 jobs:
@@ -71,13 +70,13 @@ jobs:
 
             // If running via workflow_dispatch, filter based on input
             if (context.eventName === 'workflow_dispatch') {
-              const desiredOs = context.payload.inputs.desired_os;
+              const platform_option = context.payload.inputs.platform_option;
 
-              if (desiredOs === 'all') {
+              if (platform_option === 'all') {
                 return matrix;
               }
 
-              return matrix.filter(m => m.key === desiredOs);
+              return matrix.filter(m => m.name === platform_option);
             }
 
             // Filter out macos-14-large runner for trunk pushes
