@@ -14,18 +14,5 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::sync::Arc;
-
-use app::AppBuilder;
-use arrow::array::{Int64Array, RecordBatch};
-use datafusion::assert_batches_eq;
-use runtime::{status, Runtime};
-use spicepod::component::dataset::Dataset;
-
-use crate::{
-    get_test_datafusion, init_tracing, run_query_and_check_results, utils::test_request_context,
-    ValidateFn,
-};
-
 #[cfg(feature = "mysql")]
 mod mysql;
