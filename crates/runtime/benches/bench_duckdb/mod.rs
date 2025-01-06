@@ -255,6 +255,7 @@ pub(crate) fn delayed_source_load_to_parquet(
 
         // data generation
         for i in 0..load_count {
+            // hold the connection in the loop so it can get dropped while sleeping, so the DuckDB cache can be flushed
             let dest_conn = Connection::open(&dest_db_file).map_err(|e| e.to_string())?;
             println!("Loading data for {bench_name} benchmark suite, iteration {i}");
             match bench_name.as_str() {
