@@ -119,6 +119,17 @@ impl SpicedInstance {
         Ok(())
     }
 
+    pub async fn is_ready(&self) -> bool {
+        let Ok(client) = self.http_client() else {
+            return false;
+        };
+        let response = client.get("http://localhost:8090/v1/ready").send().await;
+        match response {
+            Ok(response) => response.status().is_success(),
+            Err(_) => false,
+        }
+    }
+
     /// Stop the spiced instance
     ///
     /// # Errors
