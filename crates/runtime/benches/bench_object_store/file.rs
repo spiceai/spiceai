@@ -17,7 +17,6 @@ limitations under the License.
 use arrow::array::AsArray;
 use runtime::Runtime;
 use std::time::Duration;
-use test_framework::queries::get_tpch_test_queries;
 use tokio::time::sleep;
 
 use app::AppBuilder;
@@ -29,7 +28,10 @@ use spicepod::component::dataset::{
 
 use crate::run_query;
 
-use super::{get_tpcds_test_queries, BenchmarkResultsBuilder};
+use super::{
+    get_clickbench_test_queries, get_tpcds_test_queries, get_tpch_test_queries,
+    BenchmarkResultsBuilder,
+};
 
 pub(crate) async fn run_file_append(
     rt: &mut Runtime,
@@ -42,6 +44,10 @@ pub(crate) async fn run_file_append(
         "tpcds" => match accelerator.clone() {
             Some(Acceleration { engine, .. }) => get_tpcds_test_queries(engine.as_deref()),
             None => get_tpcds_test_queries(None),
+        },
+        "clickbench" => match accelerator.clone() {
+            Some(Acceleration { engine, .. }) => get_clickbench_test_queries(engine.as_deref()),
+            None => get_clickbench_test_queries(None),
         },
         _ => return Err(format!("Invalid benchmark to run {bench_name}")),
     };
@@ -72,6 +78,7 @@ pub(crate) async fn run_file_append(
                 // DuckDB dbgen at scale 10 generates 59.9, not 60, million rows for lineitem when using partitioned generation
                 "tpch" => ("lineitem", 59_900_000),
                 "tpcds" => ("inventory", 130_000_000),
+                "clickbench" => ("hits", 39_000_000),
                 _ => return Err(format!("Invalid benchmark to run {bench_name}")),
             };
 
@@ -101,11 +108,11 @@ pub(crate) async fn run_file_append(
             if count < expected_count {
                 if start_time.elapsed() > Duration::from_secs(60 * 60) {
                     // if more than 1 hour has passed, the test has failed
-                    tracing::error!("Append mode data load failed. Expected over 59.9 million rows in lineitem table, got {count}");
-                    return Err(format!("Append mode data load failed. Expected over 59.9 million rows in lineitem table, got {count}"));
+                    tracing::error!("Append mode data load failed. Expected over {expected_count} rows in lineitem table, got {count}");
+                    return Err(format!("Append mode data load failed. Expected over {expected_count} rows in lineitem table, got {count}"));
                 }
 
-                tracing::info!("Append mode data load in progress. Expected over 59.9 million rows in lineitem table, got {count}");
+                tracing::info!("Append mode data load in progress. Expected over {expected_count} rows in lineitem table, got {count}");
             } else {
                 tracing::info!(
                     "Append mode data load complete. Loaded {count} rows in lineitem table"
@@ -359,6 +366,16 @@ pub fn build_app(
                 bench_name,
                 is_append.then_some("ws_created_at"),
             ))),
+        "clickbench" => Ok(app_builder.with_dataset(make_dataset(
+            if is_append {
+                "hits_delayed.parquet"
+            } else {
+                "hits.parquet"
+            },
+            "hits",
+            bench_name,
+            is_append.then_some("created_at"),
+        ))),
         _ => Err(
             "Only tpch and tpcds benchmark suites are supported for the file connector".to_string(),
         ),

@@ -185,7 +185,12 @@ pub(crate) fn delayed_source_load_to_parquet(
             ("web_site", "ws_created_at"),
         ]
         .to_vec(),
-        _ => return Err("Only tpch benchmark suites are supported".to_string()),
+        "clickbench" => vec![("hits_delayed", "created_at")],
+        _ => {
+            return Err(
+                "Only tpch, tpcds and clickbench benchmark suites are supported".to_string(),
+            )
+        }
     };
 
     for (table, _) in &tables {
@@ -198,36 +203,60 @@ pub(crate) fn delayed_source_load_to_parquet(
 
     Ok(tokio::spawn(async move {
         let dest_db_file = format!("./{bench_name}.db");
-        let dest_conn = Connection::open(&dest_db_file).map_err(|e| e.to_string())?;
 
-        if bench_name == "tpcds" {
-            let mut setup_sql = format!(
-                "
+        // setup tasks
+        match bench_name.as_str() {
+            "tpcds" => {
+                let mut setup_sql = format!(
+                    "
                 INSTALL tpcds;
                 LOAD tpcds;
                 BEGIN;
                 CALL dsdgen(sf={scale_factor}, suffix='_gen');
             "
-            );
+                );
 
-            for (table, column) in &tables {
-                setup_sql += &format!(
-                    "
+                for (table, column) in &tables {
+                    setup_sql += &format!(
+                        "
                     CREATE TABLE {table} AS SELECT * FROM {table}_gen WHERE 1=0;
                     ALTER TABLE {table} ADD COLUMN {column} TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
                 "
-                );
+                    );
+                }
+
+                setup_sql += "COMMIT;";
+
+                println!("Running TPCDS data setup");
+                let dest_conn = Connection::open(&dest_db_file).map_err(|e| e.to_string())?;
+                dest_conn
+                    .execute_batch(&setup_sql)
+                    .map_err(|e| e.to_string())?;
             }
+            "clickbench" => {
+                // import the parquet file into the database so we can use it for OFFSET delayed loading
+                // limit to 40 million rows because the file connector goes OOM with the full file
+                let setup_sql = "
+                    BEGIN;
+                    CREATE TABLE hits AS SELECT * FROM read_parquet('hits.parquet') LIMIT 40000000;
+                    CREATE TABLE hits_delayed AS SELECT * FROM hits WHERE 1=0;
+                    ALTER TABLE hits_delayed ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+                    COMMIT;
+                    ";
 
-            setup_sql += "COMMIT;";
+                println!("Running Clickbench data setup");
+                let dest_conn = Connection::open(&dest_db_file).map_err(|e| e.to_string())?;
+                dest_conn
+                    .execute_batch(setup_sql)
+                    .map_err(|e| e.to_string())?;
+            }
+            _ => {}
+        };
 
-            println!("Running TPCDS data setup");
-            dest_conn
-                .execute_batch(&setup_sql)
-                .map_err(|e| e.to_string())?;
-        }
-
+        // data generation
         for i in 0..load_count {
+            // hold the connection in the loop so it can get dropped while sleeping, so the DuckDB cache can be flushed
+            let dest_conn = Connection::open(&dest_db_file).map_err(|e| e.to_string())?;
             println!("Loading data for {bench_name} benchmark suite, iteration {i}");
             match bench_name.as_str() {
                 "tpch" => {
@@ -277,14 +306,27 @@ pub(crate) fn delayed_source_load_to_parquet(
 
                     dest_conn.execute_batch(&sql).map_err(|e| e.to_string())?;
                 }
+                "clickbench" => {
+                    let sql = format!("
+                    BEGIN;
+                    INSERT INTO hits_delayed SELECT *, CURRENT_TIMESTAMP AS created_at FROM hits LIMIT (SELECT COUNT(*) / {load_count} FROM hits) OFFSET (SELECT COUNT(*) / {load_count} * {i} FROM hits);
+                    COPY hits_delayed TO 'hits_delayed.parquet' (FORMAT 'parquet');
+                    COMMIT;
+                    ");
+
+                    dest_conn.execute_batch(&sql).map_err(|e| e.to_string())?;
+                }
                 _ => {
-                    return Err("Only tpch benchmark suites are supported".to_string());
+                    return Err(
+                        "Only tpch, tpcds, clickbench benchmark suites are supported".to_string(),
+                    );
                 }
             }
 
             sleep(load_interval).await;
         }
 
+        // teardown
         if bench_name == "tpcds" {
             // cleanup _gen data
             let mut cleanup_sql = "BEGIN;".to_string();
@@ -294,6 +336,7 @@ pub(crate) fn delayed_source_load_to_parquet(
 
             cleanup_sql += "COMMIT;";
 
+            let dest_conn = Connection::open(&dest_db_file).map_err(|e| e.to_string())?;
             dest_conn
                 .execute_batch(&cleanup_sql)
                 .map_err(|e| e.to_string())?;
