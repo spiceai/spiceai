@@ -154,6 +154,7 @@ async fn main() -> Result<(), String> {
     Box::pin(request_context.scope(bench_main())).await
 }
 
+#[allow(clippy::too_many_lines)]
 async fn bench_main() -> Result<(), String> {
     let mut upload_results_dataset: Option<String> = None;
     if let Ok(env_var) = std::env::var("UPLOAD_RESULTS_DATASET") {
@@ -213,6 +214,7 @@ async fn bench_main() -> Result<(), String> {
                 if accelerator.refresh_mode == Some(RefreshMode::Append) {
                     run_accelerator_bench("file", accelerator.clone(), upload_results_dataset.as_ref(), "tpch").await?;
                     run_accelerator_bench("file", accelerator.clone(), upload_results_dataset.as_ref(), "tpcds").await?;
+                    run_accelerator_bench("file", accelerator.clone(), upload_results_dataset.as_ref(), "clickbench").await?;
                 } else {
                     run_accelerator_bench("s3", accelerator.clone(), upload_results_dataset.as_ref(), "tpch").await?;
                     run_accelerator_bench("s3", accelerator.clone(), upload_results_dataset.as_ref(), "tpds").await?;
@@ -240,6 +242,9 @@ async fn bench_main() -> Result<(), String> {
                 }
                 (RefreshMode::Append, "tpcds") => {
                     run_accelerator_bench("file", acceleration, upload_results_dataset.as_ref(), "tpcds").await?;
+                }
+                (RefreshMode::Append, "clickbench") => {
+                    run_accelerator_bench("file", acceleration, upload_results_dataset.as_ref(), "clickbench").await?;
                 }
                 (RefreshMode::Full, "tpch") => {
                     run_accelerator_bench("s3", acceleration, upload_results_dataset.as_ref(), "tpch").await?;
@@ -364,6 +369,12 @@ async fn run_accelerator_bench(
             println!("Waiting for delayed source load to start...");
 
             let mut append_startup_timer: usize = 0;
+            let append_startup_modifier = match bench_name {
+                "tpcds" => 2,
+                "clickbench" => 3,
+                _ => 1,
+            };
+
             loop {
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 append_startup_timer += 5;
@@ -375,7 +386,11 @@ async fn run_accelerator_bench(
                     return Err("Delayed source load failed - exited with no error".to_string());
                 }
 
-                if append_startup_timer >= 180 {
+                println!(
+                    "Waiting another {} seconds for delayed source load to start.",
+                    120 * append_startup_modifier - append_startup_timer
+                );
+                if append_startup_timer >= 120 * append_startup_modifier {
                     break;
                 }
             }
