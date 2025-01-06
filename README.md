@@ -36,14 +36,22 @@ Spice is built-with industry leading technologies such as [Apache DataFusion](ht
 
 ## Why Spice?
 
-Spice simplifies building data-driven AI applications and agents by making it fast and easy to query, federate, and accelerate data from one or more sources using SQL, while grounding AI in real-time, reliable data. Co-locate datasets with apps and AI models to power AI feedback loops, enable RAG and search, and deliver fast, low-latency data-query and AI-inference with full control over cost and performance.
-
 <div align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="https://github.com/spiceai/spiceai/assets/80174/96b5fcef-a550-4ce8-a74a-83931275e83e">
     <img width="800" alt="Spice.ai" src="https://github.com/spiceai/spiceai/assets/80174/29e4421d-8942-4f2a-8397-e9d4fdeda36b" />
   </picture>
 </div>
+
+Spice simplifies building data-driven AI applications and agents by making it fast and easy to query, federate, and accelerate data from one or more sources using SQL, while grounding AI in real-time, reliable data. Co-locate datasets with apps and AI models to power AI feedback loops, enable RAG and search, and deliver fast, low-latency data-query and AI-inference with full control over cost and performance.
+
+### Used by
+
+<p align="center">
+  <img src="https://upload.wikimedia.org/wikipedia/commons/thumb/4/4e/Barracuda_Networks_logo.svg/2560px-Barracuda_Networks_logo.svg.png" alt="Barracuda Networks" width="200"/>
+  <img src="https://upload.wikimedia.org/wikipedia/commons/thumb/3/3e/NRC_Health_logo.svg/2560px-NRC_Health_logo.svg.png" alt="NRC Health" width="200"/>
+  <img src="https://upload.wikimedia.org/wikipedia/commons/thumb/1/1b/Twilio-logo-red.svg/2560px-Twilio-logo-red.svg.png" alt="Twilio" width="200"/>
+</p>
 
 ### How is Spice different?
 
