@@ -95,35 +95,17 @@ pub(crate) async fn run(
     let mut errors = Vec::new();
 
     for (query_name, query) in test_queries {
-        let verify_query_results = if query_name.starts_with("tpch_q") {
-            matches!(
-                bench_name.as_str(),
-                "s3" | "s3_arrow_memory"
-                    | "s3_sqlite_memory"
-                    | "s3_sqlite_file"
-                    | "s3_duckdb_memory"
-                    | "abfs"
-                    | "s3_duckdb_file"
-                    | "file"
-                    | "s3_arrow_memory_use_source"
-                    | "s3_duckdb_memory_use_source"
-                    | "s3_duckdb_file_use_source"
-            )
-        } else if query_name.starts_with("tpcds_q") {
-            matches!(
-                bench_name.as_str(),
-                "s3" | "s3_postgres_memory"
-                    | "s3_arrow_memory"
-                    | "s3_duckdb_file"
-                    | "s3_sqlite_file"
-                    | "file"
-                    | "s3_arrow_memory_use_source"
-                    | "s3_duckdb_memory_use_source"
-                    | "s3_duckdb_file_use_source"
-            )
-        } else {
-            false
-        };
+        let verify_query_results = matches!(
+            bench_name.as_str(),
+            "s3" | "s3_postgres_memory"
+                | "s3_arrow_memory"
+                | "s3_duckdb_file"
+                | "s3_sqlite_file"
+                | "file"
+                | "s3_arrow_memory_use_source"
+                | "s3_duckdb_memory_use_source"
+                | "s3_duckdb_file_use_source"
+        );
 
         if let Err(e) = super::run_query_and_record_result(
             rt,
