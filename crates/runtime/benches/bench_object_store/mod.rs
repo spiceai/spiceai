@@ -17,7 +17,6 @@ limitations under the License.
 use std::collections::HashMap;
 
 use crate::results::BenchmarkResultsBuilder;
-use crate::{generate_clickbench_queries, generate_clickbench_query_overrides};
 use app::AppBuilder;
 use runtime::Runtime;
 use spicepod::component::dataset::acceleration::{Acceleration, ZeroResultsAction};
