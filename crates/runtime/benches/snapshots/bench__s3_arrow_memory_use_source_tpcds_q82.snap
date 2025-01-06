@@ -1,0 +1,12 @@
+---
+source: crates/runtime/benches/bench.rs
+expression: records_pretty
+snapshot_kind: text
+---
++------------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------+-----------------+
+| i_item_id        | i_item_desc                                                                                                                                                       | i_current_price |
++------------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------+-----------------+
+| AAAAAAAABMGDAAAA | Persiste                                                                                                                                                          | 72.60           |
+| AAAAAAAADNADAAAA | Very capable services compromise in a firms. Never prime firms scrape hardly. Troops may double however. Good, red houses s                                       | 91.62           |
+| AAAAAAAAEEMCAAAA | Thick, positive readers return in the explanations; police sell about perfect groups. Difficult, integrated motives would not allow here at a pubs. Ready marks b | 87.93           |
++------------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------+-----------------+
