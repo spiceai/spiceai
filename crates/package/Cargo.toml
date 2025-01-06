@@ -13,5 +13,5 @@ object_store.workspace = true
 snafu.workspace = true
 serde_yaml.workspace = true
 spicepod = { path = "../spicepod" }
-zip = "2.2.1"
+zip = "2.2.2"
 bytes.workspace = true
