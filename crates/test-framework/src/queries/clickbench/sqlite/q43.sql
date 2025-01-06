@@ -1,0 +1,1 @@
+SELECT date_part('minute', from_unixtime("EventTime")) AS M, COUNT(*) AS PageViews FROM hits WHERE "CounterID" = 62 AND "EventDate" >= '2013-07-14' AND "EventDate" <= '2013-07-15' AND "IsRefresh" = 0 AND "DontCountHits" = 0 GROUP BY date_part('minute', from_unixtime("EventTime")) ORDER BY date_part('minute', from_unixtime("EventTime")) LIMIT 10 OFFSET 1000;

@@ -34,12 +34,14 @@ use datafusion::sql::sqlparser::parser::ParserError;
 use datafusion::sql::TableReference;
 use futures::stream::{self, BoxStream, StreamExt};
 use futures::{Stream, TryStreamExt};
+use governor::{Quota, RateLimiter};
 use metrics::track_flight_request;
-use middleware::RequestContextLayer;
+use middleware::{RequestContextLayer, WriteRateLimitLayer};
 use runtime_auth::{layer::flight::BasicAuthLayer, FlightBasicAuth};
 use secrecy::ExposeSecret;
 use snafu::prelude::*;
 use std::collections::HashMap;
+use std::num::NonZeroU32;
 use std::sync::Arc;
 use tokio::sync::broadcast::Sender;
 use tokio::sync::RwLock;
@@ -311,6 +313,7 @@ pub async fn start(
     df: Arc<DataFusion>,
     tls_config: Option<Arc<TlsConfig>>,
     endpoint_auth: EndpointAuth,
+    rate_limits: Arc<RateLimits>,
 ) -> Result<()> {
     let service = Service {
         datafusion: Arc::clone(&df),
@@ -340,6 +343,9 @@ pub async fn start(
 
     server
         .layer(RequestContextLayer::new(app))
+        .layer(WriteRateLimitLayer::new(RateLimiter::direct(
+            rate_limits.flight_write_limit,
+        )))
         .layer(auth_layer)
         .add_service(svc)
         .serve(bind_address)
@@ -347,4 +353,32 @@ pub async fn start(
         .context(UnableToStartFlightServerSnafu)?;
 
     Ok(())
+}
+
+pub struct RateLimits {
+    pub flight_write_limit: Quota,
+}
+
+impl RateLimits {
+    #[must_use]
+    pub fn new() -> Self {
+        RateLimits::default()
+    }
+
+    #[must_use]
+    pub fn with_flight_write_limit(mut self, rate_limit: Quota) -> Self {
+        self.flight_write_limit = rate_limit;
+        self
+    }
+}
+
+impl Default for RateLimits {
+    fn default() -> Self {
+        Self {
+            // Allow 100 Flight DoPut requests every 60 seconds by default
+            flight_write_limit: Quota::per_minute(NonZeroU32::new(100).unwrap_or_else(|| {
+                unreachable!("100 is non-zero and should always successfully convert to NonZeroU32")
+            })),
+        }
+    }
 }

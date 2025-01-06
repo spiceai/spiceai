@@ -189,5 +189,15 @@ impl Runtime {
                 self.load_catalog(catalog).await;
             }
         }
+
+        // Process catalogs that are no longer in the app
+        for catalog in &existing_catalogs {
+            if !valid_catalogs.iter().any(|c| c.name == catalog.name) {
+                tracing::warn!(
+                    "Failed to deregister catalog '{}'. Removing loaded catalogs is not currently supported.",
+                    catalog.name
+                );
+            }
+        }
     }
 }

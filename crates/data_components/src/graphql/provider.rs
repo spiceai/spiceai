@@ -13,21 +13,27 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use async_trait::async_trait;
-use snafu::ResultExt;
 
-use crate::arrow::write::MemTable;
 use arrow::{array::RecordBatch, datatypes::SchemaRef};
+use async_trait::async_trait;
 use datafusion::{
     catalog::Session,
     datasource::{TableProvider, TableType},
-    error::DataFusionError,
+    error::{DataFusionError, Result as DataFusionResult},
+    execution::{SendableRecordBatchStream, TaskContext},
     logical_expr::{Expr, TableProviderFilterPushDown},
-    physical_plan::ExecutionPlan,
+    physical_expr::EquivalenceProperties,
+    physical_plan::{
+        expressions::Column, projection::ProjectionExec, stream::RecordBatchStreamAdapter,
+        DisplayAs, DisplayFormatType, ExecutionMode, ExecutionPlan, Partitioning, PhysicalExpr,
+        PlanProperties,
+    },
 };
-use std::{any::Any, sync::Arc};
+use futures::StreamExt;
+use snafu::ResultExt;
+use std::{any::Any, fmt, sync::Arc};
 
-use super::{client::GraphQLClient, GraphQLContext, ResultTransformSnafu};
+use super::{client::GraphQLClient, ErrorChecker, GraphQLContext, ResultTransformSnafu};
 use super::{client::GraphQLQuery, Result};
 
 pub type TransformFn =
@@ -62,7 +68,8 @@ impl GraphQLTableProviderBuilder {
     }
 
     pub async fn build(self, query_string: &str) -> Result<GraphQLTableProvider> {
-        let mut query = GraphQLQuery::try_from(query_string)?;
+        let query_string: Arc<str> = Arc::from(query_string);
+        let mut query = GraphQLQuery::try_from(Arc::clone(&query_string))?;
 
         if self.client.json_pointer.is_none() && query.json_pointer.is_none() {
             return Err(super::Error::NoJsonPointerFound {});
@@ -87,8 +94,8 @@ impl GraphQLTableProviderBuilder {
         };
 
         Ok(GraphQLTableProvider {
-            client: self.client,
-            base_query: query_string.to_string(),
+            client: Arc::new(self.client),
+            base_query: query_string,
             gql_schema: Arc::clone(&result.schema),
             table_schema,
             transform_fn: self.transform_fn,
@@ -98,8 +105,8 @@ impl GraphQLTableProviderBuilder {
 }
 
 pub struct GraphQLTableProvider {
-    client: GraphQLClient,
-    base_query: String,
+    client: Arc<GraphQLClient>,
+    base_query: Arc<str>,
     gql_schema: SchemaRef,
     table_schema: SchemaRef,
     transform_fn: Option<TransformFn>,
@@ -150,12 +157,12 @@ impl TableProvider for GraphQLTableProvider {
 
     async fn scan(
         &self,
-        state: &dyn Session,
+        _state: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        let mut query = GraphQLQuery::try_from(self.base_query.as_str())
+        let mut query = GraphQLQuery::try_from(Arc::clone(&self.base_query))
             .map_err(|e| DataFusionError::Execution(format!("{e}")))?;
 
         let error_checker = if let Some(context) = &self.context {
@@ -171,32 +178,136 @@ impl TableProvider for GraphQLTableProvider {
             None
         };
 
-        let mut res = self
-            .client
-            .execute_paginated(
-                &mut query,
-                Arc::clone(&self.gql_schema),
-                limit,
-                error_checker,
-            )
-            .await
-            .boxed()
-            .map_err(DataFusionError::External)?;
+        let graphql_exec = Arc::new(GraphQLTableProviderExec::new(
+            Arc::clone(&self.client),
+            query,
+            Arc::clone(&self.gql_schema),
+            Arc::clone(&self.table_schema),
+            limit,
+            error_checker,
+            self.transform_fn,
+        ));
 
-        if let Some(transform_fn) = &self.transform_fn {
-            res = res
-                .into_iter()
-                .map(|inner_vec| {
-                    inner_vec
-                        .into_iter()
-                        .map(|batch| transform_fn(&batch).map_err(DataFusionError::External))
-                        .collect::<Result<Vec<_>, DataFusionError>>()
-                })
-                .collect::<Result<Vec<Vec<_>>, DataFusionError>>()?;
+        if let Some(projection) = projection {
+            let mut projection_expr = Vec::with_capacity(projection.len());
+            for idx in projection {
+                let col_name = self.table_schema.field(*idx).name();
+                projection_expr.push((
+                    Arc::new(Column::new(col_name, *idx)) as Arc<dyn PhysicalExpr>,
+                    col_name.to_string(),
+                ));
+            }
+
+            let projection_exec = ProjectionExec::try_new(projection_expr, graphql_exec)?;
+            return Ok(Arc::new(projection_exec));
         }
 
-        let table = MemTable::try_new(Arc::clone(&self.table_schema), res)?;
+        Ok(graphql_exec)
+    }
+}
 
-        table.scan(state, projection, filters, limit).await
+pub struct GraphQLTableProviderExec {
+    client: Arc<GraphQLClient>,
+    query: GraphQLQuery,
+    gql_schema: SchemaRef,
+    table_schema: SchemaRef,
+    limit: Option<usize>,
+    error_checker: Option<ErrorChecker>,
+    transform_fn: Option<TransformFn>,
+    properties: PlanProperties,
+}
+
+impl GraphQLTableProviderExec {
+    #[must_use]
+    pub fn new(
+        client: Arc<GraphQLClient>,
+        query: GraphQLQuery,
+        gql_schema: SchemaRef,
+        table_schema: SchemaRef,
+        limit: Option<usize>,
+        error_checker: Option<ErrorChecker>,
+        transform_fn: Option<TransformFn>,
+    ) -> Self {
+        Self {
+            client,
+            query,
+            gql_schema,
+            table_schema: Arc::clone(&table_schema),
+            limit,
+            error_checker,
+            transform_fn,
+            properties: PlanProperties::new(
+                EquivalenceProperties::new(table_schema),
+                Partitioning::UnknownPartitioning(1),
+                ExecutionMode::Bounded,
+            ),
+        }
+    }
+}
+
+impl std::fmt::Debug for GraphQLTableProviderExec {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "GraphQLTableProviderExec")
+    }
+}
+
+impl DisplayAs for GraphQLTableProviderExec {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> std::fmt::Result {
+        write!(f, "GraphQLTableProviderExec")
+    }
+}
+
+impl ExecutionPlan for GraphQLTableProviderExec {
+    fn name(&self) -> &'static str {
+        "GraphQLTableProviderExec"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.table_schema)
+    }
+
+    fn properties(&self) -> &PlanProperties {
+        &self.properties
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        _children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        Ok(self)
+    }
+
+    fn execute(
+        &self,
+        _partition: usize,
+        _context: Arc<TaskContext>,
+    ) -> DataFusionResult<SendableRecordBatchStream> {
+        let mut stream = Arc::clone(&self.client).execute_paginated(
+            self.query.clone(),
+            Arc::clone(&self.gql_schema),
+            Arc::clone(&self.table_schema),
+            self.limit,
+            self.error_checker.clone(),
+        );
+
+        if let Some(transform_fn) = &self.transform_fn {
+            let transform_fn = *transform_fn;
+            let schema = stream.schema();
+            let tx_stream = stream.map(move |batch| {
+                batch.and_then(|b| transform_fn(&b).map_err(DataFusionError::External))
+            });
+
+            stream = Box::pin(RecordBatchStreamAdapter::new(schema, tx_stream));
+        }
+
+        Ok(stream)
     }
 }

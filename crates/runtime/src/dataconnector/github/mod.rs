@@ -884,7 +884,7 @@ pub(crate) fn inject_parameters<F>(
     target_field_name: &str,
     field_modifier: F,
     filters: &[FilterPushdownResult],
-    query: &mut GraphQLQuery<'_>,
+    query: &mut GraphQLQuery,
 ) -> Result<(), datafusion::error::DataFusionError>
 where
     F: Fn(
@@ -904,7 +904,7 @@ where
 
     // find the history() field leaf in the AST
     let mut all_selections: Vec<&mut Selection<'_, String>> = Vec::new();
-    for def in &mut query.ast.definitions {
+    for def in &mut query.ast_mut().definitions {
         let selections = match def {
             Definition::Operation(OperationDefinition::Query(Query { selection_set, .. })) => {
                 &mut selection_set.items
@@ -961,7 +961,7 @@ where
     field_modifier(target_field, &filters)?;
 
     // update any change in JSON pointer and pagination parameters
-    let (pagination_parameters, json_pointer) = PaginationParameters::parse(&query.ast);
+    let (pagination_parameters, json_pointer) = PaginationParameters::parse(query.ast());
     query.pagination_parameters = pagination_parameters;
     query.json_pointer = json_pointer.map(Arc::from);
 

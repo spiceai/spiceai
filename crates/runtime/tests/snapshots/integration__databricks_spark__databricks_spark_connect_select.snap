@@ -1,0 +1,18 @@
+---
+source: crates/runtime/tests/databricks_spark/mod.rs
+description: "Databricks (mode: spark_connect) Integration Test Results"
+---
++-------------------+----------------------------+----------------------------+--------------------------+--------------------------------+---------------------+---------------------+
+| network           | isp                        | organization               | autonomous_system_number | autonomous_system_organization | mobile_country_code | mobile_network_code |
++-------------------+----------------------------+----------------------------+--------------------------+--------------------------------+---------------------+---------------------+
+| 1.0.128.0/17      | TOT Public Company Limited | TOT Public Company Limited |                          |                                |                     |                     |
+| 1.128.0.0/11      | Telstra Internet           | Telstra Internet           | 1221                     | Telstra Pty Ltd                |                     |                     |
+| 100.43.128.0/24   | Firecold_Inc               | Firecold_Inc               |                          |                                |                     |                     |
+| 100.43.129.0/26   | bernice_ulloa              | bernice_ulloa              |                          |                                |                     |                     |
+| 100.43.129.128/28 | dewei_feng                 | dewei_feng                 |                          |                                |                     |                     |
+| 100.43.129.144/28 | radoslav_ja?ar             | radoslav_ja?ar             |                          |                                |                     |                     |
+| 100.43.129.160/28 | jakub_henderson            | jakub_henderson            |                          |                                |                     |                     |
+| 100.43.129.176/28 | elisa_blom                 | elisa_blom                 |                          |                                |                     |                     |
+| 100.43.129.192/29 | gertrude_burnham           | gertrude_burnham           |                          |                                |                     |                     |
+| 100.43.129.200/29 | mariam_lovett              | mariam_lovett              |                          |                                |                     |                     |
++-------------------+----------------------------+----------------------------+--------------------------+--------------------------------+---------------------+---------------------+

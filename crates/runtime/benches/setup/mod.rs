@@ -28,7 +28,7 @@ use runtime::{
 };
 use spicepod::component::{
     dataset::{
-        acceleration::{Acceleration, IndexType},
+        acceleration::{Acceleration, IndexType, ZeroResultsAction},
         replication::Replication,
         Dataset, Mode,
     },
@@ -182,8 +182,7 @@ fn build_app(
         app.datasets.iter_mut().for_each(|ds| {
             let mut accel = accel.clone();
             let indexes = get_accelerator_indexes(accel.engine.clone(), &ds.name, bench_name);
-            accel.refresh_sql =
-                get_accelerator_refresh_sql(accel.engine.as_deref(), &ds.name, bench_name);
+            accel.refresh_sql = get_accelerator_refresh_sql(&accel, &ds.name, bench_name);
             if let Some(indexes) = indexes {
                 accel.indexes = indexes;
             }
@@ -197,21 +196,25 @@ fn build_app(
 }
 
 fn get_accelerator_refresh_sql(
-    engine: Option<&str>,
+    acceleration: &Acceleration,
     dataset: &str,
     bench_name: &str,
 ) -> Option<String> {
-    if let Some("sqlite" | "postgres") = engine {
-        if bench_name == "clickbench" {
+    match (
+        acceleration.engine.as_deref(),
+        &acceleration.on_zero_results,
+        bench_name,
+    ) {
+        (Some("sqlite" | "postgres"), &ZeroResultsAction::ReturnEmpty, "clickbench") => {
             // SQLite has troubles loading the whole ClickBench set with indexes enabled
             // remove this refresh SQL when we support index creation after table load.
             //
             // Postgres also can't load the full dataset within the 3 hour time limit
-            return Some(format!("SELECT * FROM {dataset} LIMIT 10000000"));
+            Some(format!("SELECT * FROM {dataset} LIMIT 10000000"))
         }
+        (_, &ZeroResultsAction::UseSource, _) => Some(format!("SELECT * FROM {dataset} LIMIT 0")),
+        _ => None,
     }
-
-    None
 }
 
 #[allow(clippy::too_many_lines)]

@@ -11,6 +11,7 @@ description: "Query: SELECT posts[1]['title'] from test_graphql"
 | physical_plan | ProjectionExec: expr=[get_field(array_element(posts@0, 1), title) as test_graphql.posts[Int64(1)][title]] |
 |               |   RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                    |
 |               |     BytesProcessedExec                                                                                    |
-|               |       MemoryExec: partitions=1, partition_sizes=[4]                                                       |
+|               |       ProjectionExec: expr=[posts@2 as posts]                                                             |
+|               |         GraphQLTableProviderExec                                                                          |
 |               |                                                                                                           |
 +---------------+-----------------------------------------------------------------------------------------------------------+

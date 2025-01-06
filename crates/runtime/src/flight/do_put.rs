@@ -14,25 +14,31 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use arrow::array::RecordBatch;
 use arrow_flight::{
     flight_service_server::FlightService, utils::flight_data_to_arrow_batch, FlightData, PutResult,
 };
 use arrow_ipc::convert::try_schema_from_flatbuffer_bytes;
+use arrow_schema::SchemaRef;
+use arrow_tools::schema::verify_schema;
 use datafusion::{
     error::DataFusionError, execution::SendableRecordBatchStream,
     physical_plan::stream::RecordBatchStreamAdapter, sql::TableReference,
 };
 use runtime_auth::AuthRequestContext;
-use tokio::sync::mpsc;
+use tokio::{
+    sync::mpsc::{self, Sender},
+    time::sleep,
+};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 
 use async_stream::stream;
 
 use crate::{
+    datafusion::DataFusion,
     dataupdate::{StreamingDataUpdate, UpdateType},
     request::RequestContext,
     timing::TimedStream,
@@ -40,7 +46,6 @@ use crate::{
 
 use super::{metrics, Service};
 
-#[allow(clippy::too_many_lines)]
 pub(crate) async fn handle(
     flight_svc: &Service,
     request: Request<Streaming<FlightData>>,
@@ -83,24 +88,45 @@ pub(crate) async fn handle(
     let schema = try_schema_from_flatbuffer_bytes(&message.data_header)
         .map_err(|e| Status::internal(format!("Failed to get schema from data header: {e}")))?;
     let schema = Arc::new(schema);
+
+    let df = Arc::clone(&flight_svc.datafusion);
+
+    let target_schema = df
+        .get_arrow_schema(path.clone())
+        .await
+        .map_err(|e| Status::internal(format!("Failed to get target dataset schema: {e}")))?;
+
+    if let Err(e) = verify_schema(target_schema.fields(), schema.fields()) {
+        return Err(Status::invalid_argument(format!(
+            "Schema validation error: the provided data schema does not match the expected schema for dataset `{path}`: {e}",
+        )));
+    }
+
+    let response_stream = create_response_stream(path, schema, df, streaming_flight, &message);
+
+    let timed_stream = TimedStream::new(response_stream, move || start);
+
+    Ok(Response::new(Box::pin(timed_stream)))
+}
+
+fn create_response_stream(
+    path: TableReference,
+    schema: SchemaRef,
+    df: Arc<DataFusion>,
+    mut streaming_flight: Streaming<FlightData>,
+    first_message: &FlightData,
+) -> impl futures::Stream<Item = Result<PutResult, Status>> {
     let dictionaries_by_id = Arc::new(HashMap::new());
 
     // Sometimes the first message only contains the schema and no data
     let first_batch = arrow_flight::utils::flight_data_to_arrow_batch(
-        &message,
+        first_message,
         Arc::clone(&schema),
         &dictionaries_by_id,
     )
     .ok();
 
-    let mut batches = vec![];
-    if let Some(first_batch) = first_batch {
-        batches.push(first_batch);
-    }
-
-    let df = Arc::clone(&flight_svc.datafusion);
-
-    let response_stream = stream! {
+    stream! {
         // channel to propogate new record batches to the data writing stream
         let (batch_tx, batch_rx)= mpsc::channel::<Result<RecordBatch, DataFusionError>>(100);
 
@@ -109,8 +135,17 @@ pub(crate) async fn handle(
         let path = path.clone();
         let mut write_future = Box::pin(df.write_streaming_data(&path, streaming_update));
 
+        if let Some(first_batch) = first_batch {
+            yield handle_record_batch(first_batch, &batch_tx).await;
+        }
+
         loop {
             tokio::select! {
+                () = sleep(Duration::from_secs(30)) => {
+                    tracing::error!("Timeout: no record batch received within 30 seconds");
+                    yield Err(Status::deadline_exceeded("Timeout: no record batch received within 30 seconds"));
+                    break;
+                }
                 // Poll the writing task to check if it has completed with an error while processing the data
                 write_result = &mut write_future => {
                     match write_result {
@@ -138,13 +173,7 @@ pub(crate) async fn handle(
                                 }
                             };
 
-                            tracing::trace!("Received batch with {} rows", new_batch.num_rows());
-
-                            if let Err(e) = batch_tx.send(Ok(new_batch)).await {
-                                tracing::error!("Error sending record batch to write channel: {e}");
-                                yield Err(Status::internal(format!("Error sending record batch to write channel: {e}")));
-                            }
-                            yield Ok(PutResult::default());
+                            yield handle_record_batch(new_batch, &batch_tx).await;
                         }
                         Ok(None) => {
                             // End of the stream; signal that stream is completed and data write should be finalized
@@ -168,9 +197,29 @@ pub(crate) async fn handle(
         };
 
         tracing::trace!("Finished writing data to path: {path}");
-    };
+    }
+}
 
-    let timed_stream = TimedStream::new(response_stream, move || start);
+async fn handle_record_batch(
+    batch: RecordBatch,
+    batch_tx: &Sender<Result<RecordBatch, DataFusionError>>,
+) -> Result<PutResult, Status> {
+    tracing::trace!("Received batch with {} rows", batch.num_rows());
 
-    Ok(Response::new(Box::pin(timed_stream)))
+    // 32,768 is four times the default batch size in DataFusion (`datafusion.execution.batch_size`), which defaults to 8,192.
+    if batch.num_rows() > 32_768 {
+        return Err(Status::invalid_argument(format!(
+            "The provided batch contains too many rows. Maximum allowed: {allowed}, received: {received}.",
+            allowed = 32_768,
+            received = batch.num_rows()
+        )));
+    }
+
+    if let Err(e) = batch_tx.send(Ok(batch)).await {
+        tracing::error!("Error sending record batch to write channel: {e}");
+        return Err(Status::internal(format!(
+            "Error sending record batch to write channel: {e}"
+        )));
+    }
+    Ok(PutResult::default())
 }

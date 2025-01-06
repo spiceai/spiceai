@@ -53,6 +53,7 @@ flight_client = { path = "../flight_client" }
 fundu = { workspace = true }
 futures.workspace = true
 globset.workspace = true
+governor = "0.8.0"
 graph-rs-sdk = { workspace = true, optional = true }
 graphql-parser.workspace = true
 headers-accept = "0.1.3"
@@ -114,6 +115,7 @@ spicepod = { path = "../spicepod" }
 ssh2 = { workspace = true, optional = true }
 suppaftp = { workspace = true, optional = true }
 telemetry = { path = "../telemetry" }
+test-framework = { path = "../test-framework" }
 tiberius = { workspace = true, optional = true }
 tokio.workspace = true
 tokio-rusqlite = { workspace = true, optional = true }

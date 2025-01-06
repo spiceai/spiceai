@@ -638,7 +638,7 @@ impl DataFusion {
         Ok(())
     }
 
-    pub async fn get_arrow_schema(&self, dataset: &str) -> Result<Schema> {
+    pub async fn get_arrow_schema(&self, dataset: impl Into<TableReference>) -> Result<Schema> {
         let data_frame = self
             .ctx
             .table(dataset)

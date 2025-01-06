@@ -214,9 +214,9 @@ dependencies = [
 
 [[package]]
 name = "anyhow"
-version = "1.0.94"
+version = "1.0.95"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c1fd03a028ef38ba2276dce7e33fcd6369c158a1bca17946c4b1b701891c1ff7"
+checksum = "34ac096ce696dc2fcabef30516bb13c0a68a11d30131d3df6f04711467681b04"
 dependencies = [
  "backtrace",
 ]
@@ -3496,7 +3496,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=8dc0dd63ae1fadadf0ff5a536a90b30c68d7b2f5#8dc0dd63ae1fadadf0ff5a536a90b30c68d7b2f5"
+source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=c5797b62ff07268a2ee7f386d2d21d50699f494f#c5797b62ff07268a2ee7f386d2d21d50699f494f"
 dependencies = [
  "arrow",
  "arrow-json 53.3.0",
@@ -4888,6 +4888,27 @@ dependencies = [
  "futures-core",
  "js-sys",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "governor"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "842dc78579ce01e6a1576ad896edc92fca002dd60c9c3746b7fc2bec6fb429d0"
+dependencies = [
+ "cfg-if",
+ "dashmap",
+ "futures-sink",
+ "futures-timer",
+ "futures-util",
+ "no-std-compat",
+ "nonzero_ext",
+ "parking_lot 0.12.3",
+ "portable-atomic",
+ "quanta",
+ "rand 0.8.5",
+ "smallvec",
+ "spinning_top",
 ]
 
 [[package]]
@@ -7421,6 +7442,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "no-std-compat"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b93853da6d84c2e3c7d730d6473e8817692dd89be387eb01b94d7f108ecb5b8c"
+
+[[package]]
 name = "nohash-hasher"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7435,6 +7462,12 @@ dependencies = [
  "memchr",
  "minimal-lexical",
 ]
+
+[[package]]
+name = "nonzero_ext"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "38bf9645c8b145698bb0b18a4637dcacbc421ea49bef2317e4fd8065a387cf21"
 
 [[package]]
 name = "notify"
@@ -9762,6 +9795,7 @@ dependencies = [
  "fundu",
  "futures",
  "globset",
+ "governor",
  "graph-rs-sdk",
  "graphql-parser",
  "headers-accept",
@@ -9819,6 +9853,7 @@ dependencies = [
  "ssh2",
  "suppaftp",
  "telemetry",
+ "test-framework",
  "tiberius",
  "tokio",
  "tokio-rusqlite",
@@ -10899,6 +10934,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6980e8d7511241f8acf4aebddbb1ff938df5eebe98691418c4468d0b72a96a67"
 
 [[package]]
+name = "spinning_top"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d96d2d1d716fb500937168cc09353ffdc7a012be8475ac7308e1bdf0e3923300"
+dependencies = [
+ "lock_api",
+]
+
+[[package]]
 name = "spki"
 version = "0.7.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -11297,6 +11341,35 @@ checksum = "5352447f921fda68cf61b4101566c0bdb5104eff6804d0678e5227580ab6a4e9"
 dependencies = [
  "rustix",
  "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "test-framework"
+version = "1.0.0-rc.4"
+dependencies = [
+ "anyhow",
+ "app",
+ "arrow",
+ "clap",
+ "flight_client",
+ "futures",
+ "nix",
+ "reqwest 0.12.9",
+ "rustls 0.23.20",
+ "serde_yaml",
+ "spicepod",
+ "tempfile",
+ "tokio",
+ "tonic",
+]
+
+[[package]]
+name = "testoperator"
+version = "1.0.0-rc.4"
+dependencies = [
+ "clap",
+ "test-framework",
+ "tokio",
 ]
 
 [[package]]
