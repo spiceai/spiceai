@@ -203,6 +203,9 @@ pub fn get_clickbench_test_queries(overrides: Option<&str>) -> Vec<(&'static str
             // expressions can appear with other expressions, so re-write the query to fit
             Some(generate_clickbench_query_overrides!("postgres", 43))
         }
+        Some("dremio") => Some(generate_clickbench_query_overrides!(
+            "dremio", 21, 22, 23, 24
+        )),
         _ => None,
     };
 

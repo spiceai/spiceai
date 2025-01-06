@@ -464,31 +464,3 @@ macro_rules! generate_tpch_queries {
         ]
     }
 }
-
-#[macro_export]
-macro_rules! generate_clickbench_queries {
-    ( $( $i:literal ),* ) => {
-        vec![
-            $(
-                (
-                    concat!("clickbench_q", stringify!($i)),
-                    include_str!(concat!("../queries/clickbench/q", stringify!($i), ".sql"))
-                )
-            ),*
-        ]
-    }
-}
-
-#[macro_export]
-macro_rules! generate_clickbench_query_overrides {
-    ( $engine:expr, $( $i:literal ),* ) => {
-        vec![
-            $(
-                (
-                    concat!("clickbench_q", stringify!($i)),
-                    include_str!(concat!("../queries/clickbench/", $engine, "/q", stringify!($i), ".sql"))
-                )
-            ),*
-        ]
-    }
-}
