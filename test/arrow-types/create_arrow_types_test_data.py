@@ -80,7 +80,7 @@ for field in fields:
     print(conn.execute(f"DESCRIBE arrow_types.{table_name};").fetchall())
 
 # Generate the spicepod.yml that could be used to load the data
-config_content = """version: v1beta1
+config_content = """version: v1
 kind: Spicepod
 name: arrow-data-types
 datasets:

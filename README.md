@@ -200,7 +200,7 @@ spice add spiceai/quickstart
 The `spicepod.yaml` file will be updated with the `spiceai/quickstart` dependency.
 
 ```yaml
-version: v1beta1
+version: v1
 kind: Spicepod
 name: spice_qs
 dependencies:

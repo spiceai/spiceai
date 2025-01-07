@@ -25,6 +25,8 @@ use crate::utils::test_request_context;
 
 pub mod common;
 
+mod federation;
+
 use super::*;
 use app::AppBuilder;
 use mysql_async::{Params, Row};

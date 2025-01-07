@@ -38,6 +38,7 @@ use crate::component::{
 pub enum SpicepodVersion {
     #[default]
     V1Beta1,
+    V1,
 }
 
 impl Display for SpicepodVersion {
