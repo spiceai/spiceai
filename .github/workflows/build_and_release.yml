@@ -254,7 +254,7 @@ jobs:
         run: |
           mv target/release/spiced spiced
           chmod +x spiced
-          tar czf spiced_models_metal_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz spiced
+          tar czf spiced_metal_models_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz spiced
 
       - name: Print version (models,metal)
         if: matrix.target.target_os == 'darwin'
@@ -263,8 +263,8 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: matrix.target.target_os == 'darwin'
         with:
-          name: spiced_models_metal_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-          path: spiced_models_metal_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz
+          name: spiced_metal_models_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
+          path: spiced_metal_models_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz
 
       ## CLI build
       - name: Build spice
@@ -438,11 +438,11 @@ jobs:
           name: spiced.exe_models_${{ matrix.target_os }}_${{ matrix.target_arch }}
           path: ${{ env.ARTIFACT_DIR }}
 
-      - name: download artifacts - spiced_models_metal_${{ matrix.target_os }}_${{ matrix.target_arch }}
-        if: matrix.target.target_os == 'darwin'
+      - name: download artifacts - spiced_metal_models_${{ matrix.target_os }}_${{ matrix.target_arch }}
+        if: matrix.target_os == 'darwin'
         uses: actions/download-artifact@v4
         with:
-          name: spiced_models_metal_${{ matrix.target_os }}_${{ matrix.target_arch }}
+          name: spiced_metal_models_${{ matrix.target_os }}_${{ matrix.target_arch }}
           path: ${{ env.ARTIFACT_DIR }}
 
       - name: lists artifacts
