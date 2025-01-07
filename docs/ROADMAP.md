@@ -38,7 +38,6 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 | `databricks`    | Stable |
 | `delta_lake`    | Stable |
 | `postgres`      | Stable |
-| `spiceai`       | Stable |
 | `s3`            | Stable |
 | `mysql`         | Stable |
 | `file`          | Stable |
@@ -47,6 +46,7 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 | `dremio`        | Stable |
 | `mssql`         | Stable |
 | `odbc`          | Beta   |
+| `spiceai`       | Beta   |
 | `spark`         | Beta   |
 | `snowflake`     | Beta   |
 | `ftp`, `sftp`   | Beta   |
