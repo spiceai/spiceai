@@ -37,6 +37,42 @@ impl std::fmt::Display for Status {
     }
 }
 
+pub(crate) struct BenchmarkResult {
+    start_time: i64,
+    end_time: i64,
+    connector_name: Arc<str>,
+    query_name: Arc<str>,
+    pub status: Status,
+    min_duration_ms: i64,
+    max_duration_ms: i64,
+    iterations: i32,
+}
+
+impl BenchmarkResult {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        start_time: i64,
+        end_time: i64,
+        connector_name: &str,
+        query_name: &str,
+        status: Status,
+        min_duration_ms: i64,
+        max_duration_ms: i64,
+        iterations: i32,
+    ) -> Self {
+        Self {
+            start_time,
+            end_time,
+            connector_name: connector_name.into(),
+            query_name: query_name.into(),
+            status,
+            min_duration_ms,
+            max_duration_ms,
+            iterations,
+        }
+    }
+}
+
 pub(crate) struct BenchmarkResultsBuilder {
     this_run_id: String,
     this_commit_sha: String,
@@ -77,27 +113,16 @@ impl BenchmarkResultsBuilder {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn record_result(
-        &mut self,
-        start_time: i64,
-        end_time: i64,
-        connector_name: &str,
-        query_name: &str,
-        status: Status,
-        min_duration_ms: i64,
-        max_duration_ms: i64,
-        iterations: i32,
-    ) {
+    pub(crate) fn record_result(&mut self, result: BenchmarkResult) {
         self.run_id.append_value(&self.this_run_id);
-        self.started_at.append_value(start_time);
-        self.finished_at.append_value(end_time);
-        self.query_name.append_value(query_name);
-        self.connector_name.append_value(connector_name);
-        self.status.append_value(status.to_string());
-        self.min_duration_ms.append_value(min_duration_ms);
-        self.max_duration_ms.append_value(max_duration_ms);
-        self.iterations.append_value(iterations);
+        self.started_at.append_value(result.start_time);
+        self.finished_at.append_value(result.end_time);
+        self.query_name.append_value(result.query_name);
+        self.connector_name.append_value(result.connector_name);
+        self.status.append_value(result.status.to_string());
+        self.min_duration_ms.append_value(result.min_duration_ms);
+        self.max_duration_ms.append_value(result.max_duration_ms);
+        self.iterations.append_value(result.iterations);
         self.commit_sha.append_value(&self.this_commit_sha);
         self.branch_name.append_value(&self.this_branch_name);
     }

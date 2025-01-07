@@ -60,7 +60,7 @@ lazy_static! {
 /// - insta might update the snapshots which we don't want
 /// - we want to return a boolean instead of any other kind of error/panic
 #[must_use]
-pub fn compare_snapshots(snapshot_a: &str, snapshot_b: &str) -> bool {
+pub fn snapshots_are_equal(snapshot_a: &str, snapshot_b: &str) -> bool {
     // remove insta headers
     let snapshot_a = INSTA_HEADER_RE.replace(snapshot_a, "");
     let snapshot_b = INSTA_HEADER_RE.replace(snapshot_b, "");
