@@ -9,17 +9,17 @@ on:
 
   workflow_dispatch:
     inputs:
-      desired_os:
-        description: "Which OS do you want to run on? (Default is ALL)"
+      platform_option:
+        description: "Which option do you want to run on? (Default is ALL)"
         required: false
         type: choice
         options:
-          - all
-          - linux-x64
-          - linux-aarch64
-          - windows-x64
-          - macos-aarch64
-          - macos-x64
+          - "all"
+          - "Linux x64"
+          - "Linux aarch64"
+          - "macOS aarch64 (Apple Silicon)"
+          - "Windows x64"
+          - "macOS x64 (Intel)"
         default: "all"
 
 jobs:
@@ -71,13 +71,13 @@ jobs:
 
             // If running via workflow_dispatch, filter based on input
             if (context.eventName === 'workflow_dispatch') {
-              const desiredOs = context.payload.inputs.desired_os;
+              const platform_option = context.payload.inputs.platform_option;
 
-              if (desiredOs === 'all') {
+              if (platform_option === 'all') {
                 return matrix;
               }
 
-              return matrix.filter(m => m.key === desiredOs);
+              return matrix.filter(m => m.name === platform_option);
             }
 
             // Filter out macos-14-large runner for trunk pushes
@@ -324,6 +324,50 @@ jobs:
             Copy-Item -Recurse -Force target/* C:/spiceai/build/target
           }
 
+  publish-minio:
+    name: Publish linux-x86_64 binaries to Minio
+    runs-on: spiceai-runners
+    needs: build
+    env:
+      GOVER: 1.23.4
+      ARTIFACT_DIR: ./release
+      MINIO_ENDPOINT: ${{ secrets.MINIO_ENDPOINT }}
+      MINIO_ACCESS_KEY: ${{ secrets.MINIO_ACCESS_KEY }}
+      MINIO_SECRET_KEY: ${{ secrets.MINIO_SECRET_KEY }}
+      COMMIT_SHA: ${{ github.sha }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: download artifacts - spice_linux_x86_64
+        uses: actions/download-artifact@v4
+        with:
+          name: spice_linux_x86_64
+          path: ${{ env.ARTIFACT_DIR }}
+
+      - name: download artifacts - spiced_linux_x86_64
+        uses: actions/download-artifact@v4
+        with:
+          name: spiced_linux_x86_64
+          path: ${{ env.ARTIFACT_DIR }}
+
+      - name: download artifacts - spiced_models_linux_x86_64
+        uses: actions/download-artifact@v4
+        with:
+          name: spiced_models_linux_x86_64
+          path: ${{ env.ARTIFACT_DIR }}
+
+      - name: Upload artifacts to Minio
+        run: |
+          sudo apt-get update
+          sudo apt-get install wget -y
+          sudo wget https://dl.min.io/client/mc/release/linux-amd64/mc -O /usr/local/bin/mc
+          sudo chmod +x /usr/local/bin/mc
+          mc alias set spice-minio ${{ env.MINIO_ENDPOINT }} ${{ env.MINIO_ACCESS_KEY }} ${{ env.MINIO_SECRET_KEY }}
+          mc cp ${{ env.ARTIFACT_DIR }}/spiced_linux_x86_64.tar.gz spice-minio/artifacts/spiced/linux-x86_64/${{ env.COMMIT_SHA }}/
+          mc cp ${{ env.ARTIFACT_DIR }}/spiced_models_linux_x86_64.tar.gz spice-minio/artifacts/spiced/linux-x86_64/${{ env.COMMIT_SHA }}/
+          mc cp ${{ env.ARTIFACT_DIR }}/spice_linux_x86_64.tar.gz spice-minio/artifacts/spice/linux-x86_64/${{ env.COMMIT_SHA }}/
+
   publish:
     name: Publish ${{ matrix.target_os }}-${{ matrix.target_arch }} binaries
     needs: build
@@ -395,7 +439,7 @@ jobs:
           path: ${{ env.ARTIFACT_DIR }}
 
       - name: download artifacts - spiced_models_metal_${{ matrix.target_os }}_${{ matrix.target_arch }}
-        if: matrix.target.target_os == 'darwin'
+        if: matrix.target_os == 'darwin'
         uses: actions/download-artifact@v4
         with:
           name: spiced_models_metal_${{ matrix.target_os }}_${{ matrix.target_arch }}

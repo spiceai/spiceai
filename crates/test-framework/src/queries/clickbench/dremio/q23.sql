@@ -1,0 +1,1 @@
+SELECT "SearchPhrase", MIN("URL"), MIN("Title"), COUNT(*) AS c, COUNT(DISTINCT "UserID") FROM hits WHERE CAST("Title" AS VARCHAR) LIKE '%Google%' AND CAST("URL" AS VARCHAR) NOT LIKE '%.google.%' AND "SearchPhrase" <> '' GROUP BY "SearchPhrase" ORDER BY c DESC LIMIT 10;

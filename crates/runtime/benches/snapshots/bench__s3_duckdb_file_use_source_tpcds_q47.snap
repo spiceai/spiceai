@@ -1,0 +1,19 @@
+---
+source: crates/runtime/benches/bench.rs
+expression: records_pretty
+snapshot_kind: text
+---
++------------+--------------------+--------------+----------------+--------+-------------------+-----------+---------+---------+
+| i_category | i_brand            | s_store_name | s_company_name | d_year | avg_monthly_sales | sum_sales | psum    | nsum    |
++------------+--------------------+--------------+----------------+--------+-------------------+-----------+---------+---------+
+| Shoes      | importoedu pack #2 | able         | Unknown        | 2001   | 7627.086666       | 2936.33   | 5480.07 | 4058.81 |
+| Men        | importoimporto #2  | ese          | Unknown        | 2001   | 7497.674166       | 2924.52   | 4734.38 | 3797.43 |
+| Men        | importoimporto #2  | ation        | Unknown        | 2001   | 7784.624166       | 3216.53   | 4992.67 | 5380.59 |
+| Children   | exportiexporti #2  | eing         | Unknown        | 2001   | 6837.600000       | 2360.39   | 3388.26 | 4503.41 |
+| Music      | importoscholar #2  | ation        | Unknown        | 2001   | 8033.681666       | 3571.12   | 4227.43 | 4608.46 |
+| Shoes      | importoedu pack #2 | ought        | Unknown        | 2001   | 7435.618333       | 2987.39   | 3797.90 | 3572.56 |
+| Music      | importoscholar #2  | ought        | Unknown        | 2001   | 7797.459166       | 3352.52   | 5289.57 | 4423.50 |
+| Music      | importoscholar #2  | able         | Unknown        | 2001   | 7520.386666       | 3184.79   | 4930.06 | 4550.93 |
+| Shoes      | importoedu pack #2 | ese          | Unknown        | 2001   | 8061.617500       | 3749.84   | 4953.00 | 5158.90 |
+| Men        | importoimporto #2  | bar          | Unknown        | 2001   | 7508.208333       | 3202.76   | 4061.76 | 4226.74 |
++------------+--------------------+--------------+----------------+--------+-------------------+-----------+---------+---------+

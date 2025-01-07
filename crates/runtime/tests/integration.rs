@@ -34,13 +34,14 @@ mod catalog;
 mod cors;
 #[cfg(all(feature = "delta_lake", feature = "databricks"))]
 mod databricks_delta;
+#[cfg(all(feature = "spark", feature = "databricks"))]
+mod databricks_spark;
 #[cfg(feature = "delta_lake")]
 mod delta_lake;
 mod docker;
 #[cfg(feature = "duckdb")]
 mod duckdb;
 mod endpoint_auth;
-mod federation;
 mod file;
 mod flight;
 mod github;
@@ -57,6 +58,7 @@ mod refresh_retry;
 mod refresh_sql;
 mod results_cache;
 mod s3;
+mod spiceai;
 #[cfg(feature = "sqlite")]
 mod sqlite;
 mod tls;

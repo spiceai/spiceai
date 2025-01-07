@@ -122,7 +122,7 @@ fn yaml_files_from(dir: &Path) -> Result<Vec<PathBuf>> {
 
 fn spicepod_definition(datasets: Vec<Dataset>, evals: Vec<Eval>) -> SpicepodDefinition {
     SpicepodDefinition {
-        version: SpicepodVersion::V1Beta1,
+        version: SpicepodVersion::V1,
         kind: SpicepodKind::Spicepod,
         name: "spicepod".to_string(),
         datasets: datasets

@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use std::sync::Arc;
+use std::sync::LazyLock;
 
 use app::AppBuilder;
 use async_openai::types::{
@@ -45,14 +46,11 @@ use crate::{
     utils::{runtime_ready_check, test_request_context, verify_env_secret_exists},
 };
 
-use lazy_static::lazy_static;
 use tokio::sync::Mutex;
 
-lazy_static! {
-    // Mistral loads and initializes models sequentially, so Mutex is used to control LLMs initialization.
-    // This also prevents unpredicted behavior when we are attempting to load the same model multiple times in parallel.
-    static ref LOCAL_LLM_INIT_MUTEX: Mutex<()> = Mutex::new(());
-}
+// Mistral loads and initializes models sequentially, so Mutex is used to control LLMs initialization.
+// This also prevents unpredicted behavior when we are attempting to load the same model multiple times in parallel.
+static LOCAL_LLM_INIT_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 const HF_TEST_MODEL: &str = "meta-llama/Llama-3.2-3B-Instruct";
 const HF_TEST_MODEL_TYPE: &str = "llama";

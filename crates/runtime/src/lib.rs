@@ -30,6 +30,7 @@ use config::Config;
 use dataconnector::ConnectorComponent;
 use datasets_health_monitor::DatasetsHealthMonitor;
 use extension::ExtensionFactory;
+use flight::RateLimits;
 #[cfg(feature = "openapi")]
 pub use http::ApiDoc;
 use model::{EmbeddingModelStore, EvalScorerRegistry, LLMModelStore};
@@ -61,7 +62,7 @@ pub mod embeddings;
 pub mod execution_plan;
 pub mod extension;
 pub mod federated_table;
-mod flight;
+pub mod flight;
 mod http;
 mod init;
 pub mod internal_table;
@@ -290,6 +291,7 @@ pub struct Runtime {
     datasets_health_monitor: Option<Arc<DatasetsHealthMonitor>>,
     metrics_endpoint: Option<SocketAddr>,
     prometheus_registry: Option<prometheus::Registry>,
+    rate_limits: Arc<RateLimits>,
 
     autoload_extensions: Arc<HashMap<String, Box<dyn ExtensionFactory>>>,
     extensions: Arc<RwLock<HashMap<String, Arc<dyn Extension>>>>,
@@ -401,6 +403,7 @@ impl Runtime {
             Arc::clone(&self.df),
             tls_config.clone(),
             endpoint_auth.clone(),
+            Arc::clone(&self.rate_limits),
         ));
         let open_telemetry_server_future = tokio::spawn(opentelemetry::start(
             config.open_telemetry_bind_address,

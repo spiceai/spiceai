@@ -1,0 +1,19 @@
+---
+source: crates/runtime/benches/bench.rs
+expression: records_pretty
+snapshot_kind: text
+---
++-----------+--------------------+----------------+-----------+----------------+----------------------------------------+-----------------+-----------------------------------------------------------------------------------------------+
+| s_acctbal | s_name             | n_name         | p_partkey | p_mfgr         | s_address                              | s_phone         | s_comment                                                                                     |
++-----------+--------------------+----------------+-----------+----------------+----------------------------------------+-----------------+-----------------------------------------------------------------------------------------------+
+| 9938.53   | Supplier#000005359 | UNITED KINGDOM | 185358    | Manufacturer#4 | bgxj2K0w1kJvxYl5mhCfou,W               | 33-429-790-6131 | l, ironic instructions cajole                                                                 |
+| 9937.84   | Supplier#000005969 | ROMANIA        | 108438    | Manufacturer#1 | rdnmd9c8EG1EIAYY3LPVa4yUNx6OwyVaQ      | 29-520-692-3537 | es. furiously silent deposits among the deposits haggle furiously a                           |
+| 9936.22   | Supplier#000005250 | UNITED KINGDOM | 249       | Manufacturer#4 | qX AB0vP8mJEWeBuY9jri                  | 33-320-228-2957 | ar, regular requests nag blithely special accounts. final deposits impress carefully. ironic, |
+| 9923.77   | Supplier#000002324 | GERMANY        | 29821     | Manufacturer#4 | uXcnR7tv87dG                           | 17-779-299-1839 | s sleep according to the quick requests. carefully                                            |
+| 9871.22   | Supplier#000006373 | GERMANY        | 43868     | Manufacturer#5 | iSLO35z7Ae                             | 17-813-485-8637 | against the slyly daring requests. unusual accounts wake atop the blithely spe                |
+| 9870.78   | Supplier#000001286 | GERMANY        | 81285     | Manufacturer#2 | 3gq0mZLHI5OTM6 tBYmLTHZaulCYnlECzQ7nj  | 17-516-924-4574 | into beans haggle at the quickly final asymptotes. unusu                                      |
+| 9870.78   | Supplier#000001286 | GERMANY        | 181285    | Manufacturer#4 | 3gq0mZLHI5OTM6 tBYmLTHZaulCYnlECzQ7nj  | 17-516-924-4574 | into beans haggle at the quickly final asymptotes. unusu                                      |
+| 9852.52   | Supplier#000008973 | RUSSIA         | 18972     | Manufacturer#2 | zVfUT3Np22kUC05tYWHBotaR               | 32-188-594-7038 | ly daring excuses unwind carefully above the fu                                               |
+| 9847.83   | Supplier#000008097 | RUSSIA         | 130557    | Manufacturer#2 | veMRTQBmUResNvfD3                      | 32-375-640-3593 |  slyly ironic, special requests. final instructions above the qu                              |
+| 9847.57   | Supplier#000006345 | FRANCE         | 86344     | Manufacturer#1 | 68yX tGXAkVRSxUGNSjJdptw 8O878xaFnaoQK | 16-886-766-7945 | odolites. blithely special requests above the regular foxes sleep unusual sauternes. care     |
++-----------+--------------------+----------------+-----------+----------------+----------------------------------------+-----------------+-----------------------------------------------------------------------------------------------+

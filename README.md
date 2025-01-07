@@ -87,8 +87,8 @@ Currently supported data connectors for upstream datasets. More coming soon.
 
 | Name                               | Description                           | Status            | Protocol/Format              |
 | ---------------------------------- | ------------------------------------- | ----------------- | ---------------------------- |
+| `github`                           | GitHub                                | Stable            |                              |
 | `duckdb`                           | DuckDB                                | Release Candidate |                              |
-| `github`                           | GitHub                                | Release Candidate |                              |
 | `graphql`                          | GraphQL                               | Release Candidate | JSON                         |
 | `mysql`                            | MySQL                                 | Release Candidate |                              |
 | `postgres`                         | PostgreSQL                            | Release Candidate |                              |
@@ -200,7 +200,7 @@ spice add spiceai/quickstart
 The `spicepod.yaml` file will be updated with the `spiceai/quickstart` dependency.
 
 ```yaml
-version: v1beta1
+version: v1
 kind: Spicepod
 name: spice_qs
 dependencies:

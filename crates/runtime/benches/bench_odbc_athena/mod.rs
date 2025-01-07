@@ -19,12 +19,13 @@ use runtime::Runtime;
 
 use crate::results::BenchmarkResultsBuilder;
 use spicepod::component::{dataset::Dataset, params::Params};
+use test_framework::queries::get_tpch_test_queries;
 
 pub(crate) async fn run(
     rt: &mut Runtime,
     benchmark_results: &mut BenchmarkResultsBuilder,
 ) -> Result<(), String> {
-    let test_queries = get_tpch_test_queries();
+    let test_queries = get_tpch_test_queries(Some("odbc_athena"));
     let mut errors = Vec::new();
 
     for (query_name, query) in test_queries {
@@ -71,51 +72,4 @@ fn make_dataset(path: &str, name: &str) -> Dataset {
             .collect(),
     ));
     dataset
-}
-
-fn get_tpch_test_queries() -> Vec<(&'static str, &'static str)> {
-    vec![
-        ("tpch_q1", include_str!("../queries/tpch/q1.sql")),
-        ("tpch_q2", include_str!("../queries/tpch/q2.sql")),
-        ("tpch_q3", include_str!("../queries/tpch/q3.sql")),
-        // ("tpch_q4", include_str!("../queries/tpch/q4.sql")), https://github.com/spiceai/spiceai/issues/2077
-        ("tpch_q5", include_str!("../queries/tpch/q5.sql")),
-        ("tpch_q6", include_str!("../queries/tpch/q6.sql")),
-        ("tpch_q7", include_str!("../queries/tpch/q7.sql")),
-        ("tpch_q8", include_str!("../queries/tpch/q8.sql")),
-        ("tpch_q9", include_str!("../queries/tpch/q9.sql")),
-        ("tpch_q10", include_str!("../queries/tpch/q10.sql")),
-        ("tpch_q11", include_str!("../queries/tpch/q11.sql")),
-        ("tpch_q12", include_str!("../queries/tpch/q12.sql")),
-        ("tpch_q13", include_str!("../queries/tpch/q13.sql")),
-        ("tpch_q14", include_str!("../queries/tpch/q14.sql")),
-        // // tpch_q15 has a view creation which we don't support by design
-        ("tpch_q16", include_str!("../queries/tpch/q16.sql")),
-        ("tpch_q17", include_str!("../queries/tpch/q17.sql")),
-        ("tpch_q18", include_str!("../queries/tpch/q18.sql")),
-        ("tpch_q19", include_str!("../queries/tpch/q19.sql")),
-        // ("tpch_q20", include_str!("../queries/tpch/q20.sql")), https://github.com/spiceai/spiceai/issues/2078
-        ("tpch_q21", include_str!("../queries/tpch/q21.sql")),
-        ("tpch_q22", include_str!("../queries/tpch/q22.sql")),
-        (
-            "tpch_simple_q1",
-            include_str!("../queries/tpch/simple_q1.sql"),
-        ),
-        (
-            "tpch_simple_q2",
-            include_str!("../queries/tpch/simple_q2.sql"),
-        ),
-        (
-            "tpch_simple_q3",
-            include_str!("../queries/tpch/simple_q3.sql"),
-        ),
-        (
-            "tpch_simple_q4",
-            include_str!("../queries/tpch/simple_q4.sql"),
-        ),
-        (
-            "tpch_simple_q5",
-            include_str!("../queries/tpch/simple_q5.sql"),
-        ),
-    ]
 }

@@ -32,11 +32,13 @@ use crate::component::{
     dataset::Dataset, extension::Extension, model::Model, view::View, ComponentOrReference,
 };
 
-#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum SpicepodVersion {
+    #[default]
     V1Beta1,
+    V1,
 }
 
 impl Display for SpicepodVersion {
@@ -48,7 +50,7 @@ impl Display for SpicepodVersion {
 /// # Spicepod Definition
 ///
 /// A Spicepod definition is a YAML file that describes a Spicepod.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub struct SpicepodDefinition {
     /// The name of the Spicepod
@@ -116,8 +118,9 @@ pub struct SpicepodDefinition {
     pub dependencies: Vec<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub enum SpicepodKind {
+    #[default]
     Spicepod,
 }

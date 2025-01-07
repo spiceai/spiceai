@@ -1,0 +1,19 @@
+---
+source: crates/runtime/benches/bench.rs
+expression: records_pretty
+snapshot_kind: text
+---
++------------+----------+----------------+----------------+--------+-------+-------+------------+------------+-----+
+| i_category | i_class  | i_brand        | i_product_name | d_year | d_qoy | d_moy | s_store_id | sumsales   | rk  |
++------------+----------+----------------+----------------+--------+-------+-------+------------+------------+-----+
+| Books      | arts     | amalgmaxi #11  |                |        |       |       |            | 861756.42  | 67  |
+| Books      | arts     | amalgmaxi #2   |                |        |       |       |            | 762167.55  | 81  |
+| Books      | arts     | amalgmaxi #3   |                |        |       |       |            | 823182.27  | 72  |
+| Books      | arts     | amalgmaxi #5   |                |        |       |       |            | 566289.04  | 100 |
+| Books      | arts     | amalgmaxi #8   |                |        |       |       |            | 723892.80  | 83  |
+| Books      | arts     | amalgmaxi #9   |                |        |       |       |            | 798302.74  | 75  |
+| Books      | arts     |                |                |        |       |       |            | 5166331.25 | 16  |
+| Books      | business | importomaxi #2 |                |        |       |       |            | 1088170.08 | 43  |
+| Books      | business | importomaxi #5 |                |        |       |       |            | 583306.06  | 97  |
+| Books      | business | importomaxi #8 |                |        |       |       |            | 992362.81  | 53  |
++------------+----------+----------------+----------------+--------+-------+-------+------------+------------+-----+
