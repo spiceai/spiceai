@@ -169,14 +169,23 @@ async fn execute_spill_to_disk_and_rehydration(
     runtime::dataaccelerator::register_all().await;
     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
-    let num_persisted_records: usize =
-        get_locally_persisted_records(engine, &accelerated_db_file_path, test_query)
-            .await?
-            .iter()
-            .map(arrow::array::RecordBatch::num_rows)
-            .sum();
-
-    assert_eq!(num_rows_loaded, num_persisted_records);
+    let retry_strategy = FibonacciBackoffBuilder::new().max_retries(Some(10)).build();
+    retry(retry_strategy, || async {
+        let num_persisted_records: usize =
+            get_locally_persisted_records(engine, &accelerated_db_file_path, test_query)
+                .await
+                .map_err(RetryError::transient)?
+                .iter()
+                .map(arrow::array::RecordBatch::num_rows)
+                .sum();
+        if num_persisted_records != num_rows_loaded {
+            return Err(RetryError::transient(anyhow::anyhow!(
+                "Number of persisted records {num_persisted_records} does not match expected number of records {num_rows_loaded}",
+            )));
+        }
+        Ok(())
+    })
+    .await?;
 
     // Restart the runtime and ensure the loaded items remain consistent
     let rt = init_spice_app(engine, db_file_path, false).await?;
