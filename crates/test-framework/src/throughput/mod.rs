@@ -111,7 +111,7 @@ impl ThroughputTest<NotStarted> {
         }
 
         let flight_client = self.spiced_instance.flight_client().await?;
-        let query_workers = (0..self.state.parallel_count)
+        let query_workers = (1..self.state.parallel_count)
             .map(|id| {
                 ThroughputQueryWorker::new(
                     id,
