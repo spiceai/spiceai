@@ -312,6 +312,12 @@ impl Dataset {
     }
 
     #[must_use]
+    pub fn with_params(mut self, params: HashMap<String, String>) -> Self {
+        self.params = params;
+        self
+    }
+
+    #[must_use]
     pub fn schema(&self) -> Option<SchemaRef> {
         self.schema.clone()
     }

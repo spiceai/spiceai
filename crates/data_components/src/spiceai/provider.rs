@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Implementation of the `DataFusion` Catalog/Schema providers for Iceberg.
+//! Implementation of the `DataFusion` Catalog/Schema providers for Spice.ai.
 
 use std::any::Any;
 use std::collections::HashMap;
@@ -23,13 +23,30 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use datafusion::catalog::{CatalogProvider, SchemaProvider, TableProvider};
 use datafusion::error::Result as DFResult;
+use datafusion::sql::TableReference;
 use futures::future::try_join_all;
-use iceberg::{Catalog, NamespaceIdent, Result};
-use iceberg_datafusion::IcebergTableProvider;
+use iceberg::{Catalog, NamespaceIdent};
+use snafu::prelude::*;
 
-use crate::RefreshableCatalogProvider;
+use crate::{Read, RefreshableCatalogProvider};
 
-use super::catalog::RestCatalog;
+use crate::iceberg::catalog::RestCatalog;
+
+#[derive(Debug, Snafu)]
+pub enum Error {
+    #[snafu(display("Failed to create Spice.ai table: {source}"))]
+    TableProviderCreation {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display("Failed to list namespaces: {source}"))]
+    ListNamespaces { source: iceberg::Error },
+
+    #[snafu(display("Failed to list tables: {source}"))]
+    ListTables { source: iceberg::Error },
+}
+
+pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// Provides an interface to manage and access multiple schemas
 /// within an Iceberg [`Catalog`].
@@ -37,28 +54,30 @@ use super::catalog::RestCatalog;
 /// Acts as a centralized catalog provider that aggregates
 /// multiple [`SchemaProvider`], each associated with distinct namespaces.
 #[derive(Debug)]
-pub struct IcebergCatalogProvider {
+pub struct SpiceAICatalogProvider {
     /// A `HashMap` where keys are namespace names
     /// and values are dynamic references to objects implementing the
     /// [`SchemaProvider`] trait.
     schemas: HashMap<String, Arc<dyn SchemaProvider>>,
 }
 
-impl IcebergCatalogProvider {
-    /// Asynchronously tries to construct a new [`IcebergCatalogProvider`]
+impl SpiceAICatalogProvider {
+    /// Asynchronously tries to construct a new [`SpiceAICatalogProvider`]
     /// using the given client to fetch and initialize schema providers for
-    /// each namespace in the Iceberg [`Catalog`].
+    /// each namespace in the Spice.ai [`Catalog`].
     ///
     /// This method retrieves the list of namespace names
     /// attempts to create a schema provider for each namespace, and
     /// collects these providers into a `HashMap`.
     pub async fn try_new(
         client: Arc<RestCatalog>,
-        root_namespace: Option<NamespaceIdent>,
+        root_namespace: NamespaceIdent,
+        connector: Arc<dyn Read>,
     ) -> Result<Self> {
         let schema_names: Vec<_> = client
-            .list_namespaces(root_namespace.as_ref())
-            .await?
+            .list_namespaces(Some(&root_namespace))
+            .await
+            .context(ListNamespacesSnafu)?
             .iter()
             .flat_map(|ns| ns.as_ref().clone())
             .collect();
@@ -67,9 +86,15 @@ impl IcebergCatalogProvider {
             schema_names
                 .iter()
                 .map(|name| {
-                    IcebergSchemaProvider::try_new(
+                    let mut child_namespace_vec = root_namespace.clone().inner();
+                    child_namespace_vec.push(name.clone());
+                    let Ok(child_namespace) = NamespaceIdent::from_vec(child_namespace_vec) else {
+                        unreachable!("This only panics if the vec is empty");
+                    };
+                    SpiceAISchemaProvider::try_new(
                         Arc::clone(&client),
-                        NamespaceIdent::new(name.clone()),
+                        child_namespace,
+                        Arc::clone(&connector),
                     )
                 })
                 .collect::<Vec<_>>(),
@@ -85,11 +110,11 @@ impl IcebergCatalogProvider {
             })
             .collect();
 
-        Ok(IcebergCatalogProvider { schemas })
+        Ok(SpiceAICatalogProvider { schemas })
     }
 }
 
-impl CatalogProvider for IcebergCatalogProvider {
+impl CatalogProvider for SpiceAICatalogProvider {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -104,7 +129,7 @@ impl CatalogProvider for IcebergCatalogProvider {
 }
 
 #[async_trait]
-impl RefreshableCatalogProvider for IcebergCatalogProvider {
+impl RefreshableCatalogProvider for SpiceAICatalogProvider {
     async fn refresh(&self) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Will be implemented in a future enhancement.
         Ok(())
@@ -113,18 +138,25 @@ impl RefreshableCatalogProvider for IcebergCatalogProvider {
 
 /// Represents a [`SchemaProvider`] for the Iceberg [`Catalog`], managing
 /// access to table providers within a specific namespace.
-#[derive(Debug)]
-pub(crate) struct IcebergSchemaProvider {
+pub(crate) struct SpiceAISchemaProvider {
     /// A `HashMap` where keys are table names
     /// and values are dynamic references to objects implementing the
     /// [`TableProvider`] trait.
     tables: HashMap<String, Arc<dyn TableProvider>>,
 }
 
-impl IcebergSchemaProvider {
-    /// Asynchronously tries to construct a new [`IcebergSchemaProvider`]
+impl std::fmt::Debug for SpiceAISchemaProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SpiceAISchemaProvider")
+            .field("tables", &self.tables)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SpiceAISchemaProvider {
+    /// Asynchronously tries to construct a new [`SpiceAISchemaProvider`]
     /// using the given client to fetch and initialize table providers for
-    /// the provided namespace in the Iceberg [`Catalog`].
+    /// the provided namespace in the Spice.ai [`Catalog`].
     ///
     /// This method retrieves a list of table names
     /// attempts to create a table provider for each table name, and
@@ -132,40 +164,58 @@ impl IcebergSchemaProvider {
     pub(crate) async fn try_new(
         client: Arc<RestCatalog>,
         namespace: NamespaceIdent,
+        connector: Arc<dyn Read>,
     ) -> Result<Self> {
-        let table_names: Vec<_> = client.list_tables(&namespace).await?;
-
-        let iceberg_tables = try_join_all(
-            table_names
-                .iter()
-                .map(|name| client.load_table(name))
-                .collect::<Vec<_>>(),
-        )
-        .await?;
+        let table_names: Vec<_> = client
+            .list_tables(&namespace)
+            .await
+            .context(ListTablesSnafu)?;
 
         let table_providers: Vec<_> = try_join_all(
-            iceberg_tables
+            table_names
+                .clone()
                 .into_iter()
-                .map(IcebergTableProvider::try_new_from_table)
+                .map(
+                    |ref table_name| match table_name.namespace().clone().inner().as_slice() {
+                        [.., catalog, schema] => {
+                            let table_reference = TableReference::full(
+                                Arc::from(catalog.as_str()),
+                                Arc::from(schema.as_str()),
+                                Arc::from(table_name.name()),
+                            );
+                            connector.table_provider(table_reference, None)
+                        }
+                        [schema] => {
+                            let table_reference = TableReference::partial(
+                                Arc::from(schema.as_str()),
+                                Arc::from(table_name.name()),
+                            );
+                            connector.table_provider(table_reference, None)
+                        }
+                        [] => {
+                            let table_reference =
+                                TableReference::bare(Arc::from(table_name.name()));
+                            connector.table_provider(table_reference, None)
+                        }
+                    },
+                )
                 .collect::<Vec<_>>(),
         )
-        .await?;
+        .await
+        .context(TableProviderCreationSnafu)?;
 
         let tables: HashMap<String, Arc<dyn TableProvider>> = table_names
             .into_iter()
             .zip(table_providers.into_iter())
-            .map(|(name, provider)| {
-                let provider = Arc::new(provider) as Arc<dyn TableProvider>;
-                (name.name().to_string(), provider)
-            })
+            .map(|(name, provider)| (name.name().to_string(), provider))
             .collect();
 
-        Ok(IcebergSchemaProvider { tables })
+        Ok(SpiceAISchemaProvider { tables })
     }
 }
 
 #[async_trait]
-impl SchemaProvider for IcebergSchemaProvider {
+impl SchemaProvider for SpiceAISchemaProvider {
     fn as_any(&self) -> &dyn Any {
         self
     }

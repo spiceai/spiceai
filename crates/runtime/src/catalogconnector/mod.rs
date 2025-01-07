@@ -70,6 +70,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 #[cfg(feature = "databricks")]
 pub mod databricks;
 pub mod iceberg;
+pub mod spiceai;
 #[cfg(feature = "delta_lake")]
 pub mod unity_catalog;
 
@@ -124,6 +125,15 @@ pub async fn register_all() {
             iceberg::IcebergCatalog::new_connector,
             "iceberg",
             iceberg::PARAMETERS,
+        ),
+    );
+
+    registry.insert(
+        "spice.ai".to_string(),
+        CatalogConnectorFactory::new(
+            spiceai::SpiceAICatalog::new_connector,
+            "spiceai",
+            spiceai::PARAMETERS,
         ),
     );
 }
