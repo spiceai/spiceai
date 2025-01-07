@@ -131,21 +131,25 @@ pub(crate) async fn run(
         // compare snapshots of use source to original connector snapshots
         // because the accelerators return nothing, the snapshot contents should be the same
         for (query_name, _) in test_queries {
-            let connector_snapshot = format!("{connector}_{query_name}");
-            let use_source_snapshot = format!("{bench_name}_{query_name}");
+            let connector_snapshot = format!("bench__{connector}_{query_name}.snap");
+            let use_source_snapshot = format!("bench__{bench_name}_{query_name}.snap");
 
-            let connector_snapshot_contents = std::fs::read_to_string(
-                std::path::Path::new("../snapshots")
-                    .join(connector_snapshot.clone())
-                    .with_extension("snap"),
-            )
-            .map_err(|e| format!("Failed to read snapshot {connector_snapshot}: {e}"))?;
-            let use_source_snapshot_contents = std::fs::read_to_string(
-                std::path::Path::new("../snapshots")
-                    .join(use_source_snapshot.clone())
-                    .with_extension("snap"),
-            )
-            .map_err(|e| format!("Failed to read snapshot {use_source_snapshot}: {e}"))?;
+            // get correct path to snapshots directory
+            let snapshots_directory = if let Ok(insta_workspace_root) =
+                std::env::var("INSTA_WORKSPACE_ROOT")
+            {
+                std::path::Path::new(&insta_workspace_root).join("crates/runtime/benches/snapshots")
+            } else {
+                std::path::Path::new("../snapshots").to_path_buf()
+            };
+
+            let connector_snapshot_contents =
+                std::fs::read_to_string(snapshots_directory.join(&connector_snapshot))
+                    .map_err(|e| format!("Failed to read snapshot {connector_snapshot}: {e}"))?;
+
+            let use_source_snapshot_contents =
+                std::fs::read_to_string(snapshots_directory.join(&use_source_snapshot))
+                    .map_err(|e| format!("Failed to read snapshot {use_source_snapshot}: {e}"))?;
 
             println!("{connector_snapshot_contents}");
             println!("{use_source_snapshot_contents}");
