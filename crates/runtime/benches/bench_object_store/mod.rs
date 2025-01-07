@@ -73,7 +73,7 @@ pub(crate) async fn run(
         _ => return Err(format!("Invalid benchmark to run {bench_name}")),
     };
 
-    let bench_name = match (mode, on_zero_results) {
+    let bench_name = match (mode, on_zero_results.clone()) {
         (None, Some(_)) | (Some(_), None) => {
             unreachable!("both mode and on_zero_results are set when acceleration is passed")
         }
@@ -94,7 +94,7 @@ pub(crate) async fn run(
 
     let mut errors = Vec::new();
 
-    for (query_name, query) in test_queries {
+    for (query_name, query) in &test_queries {
         let verify_query_results = matches!(
             bench_name.as_str(),
             "s3" | "s3_postgres_memory"
@@ -125,6 +125,31 @@ pub(crate) async fn run(
 
     if !errors.is_empty() {
         tracing::error!("There are failed queries:\n{}", errors.join("\n"));
+    }
+
+    if Some(ZeroResultsAction::UseSource) == on_zero_results {
+        // compare snapshots of use source to original connector snapshots
+        // because the accelerators return nothing, the snapshot contents should be the same
+        for (query_name, _) in test_queries {
+            let connector_snapshot = format!("{connector}_{query_name}");
+            let use_source_snapshot = format!("{bench_name}_{query_name}");
+
+            let connector_snapshot_contents = std::fs::read_to_string(
+                std::path::Path::new("../snapshots")
+                    .join(connector_snapshot.clone())
+                    .with_extension("snap"),
+            )
+            .map_err(|e| format!("Failed to read snapshot {connector_snapshot}: {e}"))?;
+            let use_source_snapshot_contents = std::fs::read_to_string(
+                std::path::Path::new("../snapshots")
+                    .join(use_source_snapshot.clone())
+                    .with_extension("snap"),
+            )
+            .map_err(|e| format!("Failed to read snapshot {use_source_snapshot}: {e}"))?;
+
+            println!("{connector_snapshot_contents}");
+            println!("{use_source_snapshot_contents}");
+        }
     }
 
     Ok(())
