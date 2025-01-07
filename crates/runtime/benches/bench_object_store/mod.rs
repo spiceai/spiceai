@@ -155,6 +155,8 @@ pub(crate) async fn run(
                         result.status = results::Status::Failed;
                     }
                 }
+
+                benchmark_results.record_result(result);
             }
             Err(e) => {
                 errors.push(format!("Query {query_name} failed with error: {e}"));
