@@ -121,7 +121,7 @@ pub(crate) async fn run(
         .await
         {
             Ok(mut result) => {
-                if Some(ZeroResultsAction::UseSource) == on_zero_results {
+                if verify_query_results && Some(ZeroResultsAction::UseSource) == on_zero_results {
                     // compare snapshots of use source to original connector snapshots
                     // because the accelerators return nothing and force on zero results, the snapshot contents should be the same
                     let connector_snapshot = format!("bench__{connector}_{query_name}.snap");
