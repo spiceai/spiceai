@@ -49,6 +49,7 @@ pub fn hash<T: Hash>(value: &T) -> u64 {
 // replace insta headers with an empty string
 const INSTA_HEADER_REGEX: &str = r"^---\n(([\w\W]*\n)+)---\n";
 lazy_static! {
+    #[allow(clippy::expect_used)] // the regex is valid
     static ref INSTA_HEADER_RE: Regex =
         Regex::new(INSTA_HEADER_REGEX).expect("Insta header replacement regex should build");
 }
