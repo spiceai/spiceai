@@ -14,10 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+#![allow(clippy::missing_errors_doc)]
+
 pub mod flight;
 pub mod queries;
 pub mod spiced;
 pub mod spicepod_utils;
+pub mod throughput;
 pub mod utils;
 
 pub use anyhow;

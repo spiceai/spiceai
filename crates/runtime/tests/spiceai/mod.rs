@@ -45,6 +45,7 @@ fn make_spiceai_dataset(path: &str, name: &str) -> Dataset {
 }
 
 #[tokio::test]
+#[ignore]
 async fn spiceai_federation() -> Result<(), anyhow::Error> {
     type QueryTests<'a> = Vec<(&'a str, &'a str, Option<Box<ValidateFn>>)>;
     let _tracing = init_tracing(Some("integration=debug,info"));

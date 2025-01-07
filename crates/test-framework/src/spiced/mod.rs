@@ -118,19 +118,29 @@ impl SpicedInstance {
         Ok(())
     }
 
+    pub async fn is_ready(&self) -> bool {
+        let Ok(client) = self.http_client() else {
+            return false;
+        };
+        let response = client.get("http://localhost:8090/v1/ready").send().await;
+        match response {
+            Ok(response) => response.status().is_success(),
+            Err(_) => false,
+        }
+    }
+
     /// Stop the spiced instance
     ///
     /// # Errors
     ///
     /// - If the spiced instance fails to exit
     pub fn stop(&mut self) -> Result<()> {
-        // Send a SIGTERM to the spiced instance and wait for it to exit
-        let Ok(pid_i32) = self.child.id().try_into() else {
-            anyhow::bail!("Failed to convert pid to i32");
-        };
-
         #[cfg(not(target_os = "windows"))]
         {
+            // Send a SIGTERM to the spiced instance and wait for it to exit
+            let Ok(pid_i32) = self.child.id().try_into() else {
+                anyhow::bail!("Failed to convert pid to i32");
+            };
             nix::sys::signal::kill(
                 nix::unistd::Pid::from_raw(pid_i32),
                 nix::sys::signal::Signal::SIGTERM,

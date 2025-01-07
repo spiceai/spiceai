@@ -22,6 +22,7 @@ use llms::{
     chat::{create_hf_model, create_local_model, Chat, Error as ChatError},
     embeddings::candle::link_files_into_tmp_dir,
     openai::new_openai_client,
+    xai::Xai,
 };
 use secrecy::Secret;
 use std::{
@@ -30,6 +31,11 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
+
+pub(crate) fn create_xai(model_id: &str) -> Arc<Box<dyn Chat>> {
+    let api_key = std::env::var("SPICE_XAI_API_KEY").ok();
+    Arc::new(Box::new(Xai::new(Some(model_id), api_key.as_deref())))
+}
 
 pub(crate) fn create_openai(model_id: &str) -> Arc<Box<dyn Chat>> {
     let api_key = std::env::var("SPICE_OPENAI_API_KEY").ok();
