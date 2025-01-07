@@ -230,22 +230,18 @@ pub trait ListingTableConnector: DataConnector {
     where
         Self: Display,
     {
-        let has_header_key = format!("{delimiter}_has_header");
-        let quote_key = format!("{delimiter}_quote");
-        let escape_key = format!("{delimiter}_escape");
-
         let has_header = params
-            .get(&has_header_key)
+            .get(&format!("{delimiter}_has_header"))
             .expose()
             .ok()
             .map_or(true, |f| f.eq_ignore_ascii_case("true"));
         let quote = params
-            .get(&quote_key)
+            .get(&format!("{delimiter}_quote"))
             .expose()
             .ok()
             .map_or(b'"', |f| *f.as_bytes().first().unwrap_or(&b'"'));
         let escape = params
-            .get(&escape_key)
+            .get(&format!("{delimiter}_escape"))
             .expose()
             .ok()
             .and_then(|f| f.as_bytes().first().copied());
