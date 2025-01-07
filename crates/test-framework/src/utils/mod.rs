@@ -14,11 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use lazy_static::lazy_static;
 use regex::Regex;
 use std::{
     future::Future,
     hash::{DefaultHasher, Hash, Hasher},
+    sync::LazyLock,
     time::Duration,
 };
 
@@ -48,11 +48,10 @@ pub fn hash<T: Hash>(value: &T) -> u64 {
 
 // replace insta headers with an empty string
 const INSTA_HEADER_REGEX: &str = r"^---\n(([\w\W]*\n)+)---\n";
-lazy_static! {
+static INSTA_HEADER_RE: LazyLock<Regex> = LazyLock::new(|| {
     #[allow(clippy::expect_used)] // the regex is valid
-    static ref INSTA_HEADER_RE: Regex =
-        Regex::new(INSTA_HEADER_REGEX).expect("Insta header replacement regex should build");
-}
+    Regex::new(INSTA_HEADER_REGEX).expect("Insta header replacement regex should build")
+});
 
 /// Compare two insta snapshots by hashing their contents.
 /// Returns true if the snapshots are the same.

@@ -682,7 +682,6 @@ pub(crate) async fn run_query_and_return_result(
     Ok(result)
 }
 
-#[allow(clippy::too_many_lines)]
 pub(crate) async fn run_query_and_record_result(
     rt: &mut Runtime,
     benchmark_results: &mut BenchmarkResultsBuilder,

@@ -11353,7 +11353,6 @@ dependencies = [
  "clap",
  "flight_client",
  "futures",
- "lazy_static",
  "nix",
  "regex",
  "reqwest 0.12.9",
