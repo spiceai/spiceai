@@ -19,6 +19,7 @@ package cmd
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -28,10 +29,12 @@ import (
 	"time"
 
 	"github.com/manifoldco/promptui"
+	"github.com/openai/openai-go"
+	"github.com/openai/openai-go/option"
 	"github.com/peterh/liner"
 	"github.com/spf13/cobra"
 	"github.com/spiceai/spiceai/bin/spice/pkg/api"
-	"github.com/spiceai/spiceai/bin/spice/pkg/context"
+	spiceContext "github.com/spiceai/spiceai/bin/spice/pkg/context"
 	"github.com/spiceai/spiceai/bin/spice/pkg/util"
 )
 
@@ -41,60 +44,6 @@ const (
 	httpEndpointKeyFlag = "http-endpoint"
 	userAgentKeyFlag    = "user-agent"
 )
-
-type Message struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
-}
-
-type ChatRequestBody struct {
-	Messages      []Message      `json:"messages"`
-	Model         string         `json:"model"`
-	Stream        bool           `json:"stream"`
-	StreamOptions *StreamOptions `json:"stream_options"`
-}
-
-type StreamOptions struct {
-	IncludeUsage bool `json:"include_usage"`
-}
-
-type Delta struct {
-	Content      string      `json:"content"`
-	FunctionCall interface{} `json:"function_call"`
-	ToolCalls    interface{} `json:"tool_calls"`
-	Role         interface{} `json:"role"`
-}
-
-type Choice struct {
-	Index        int         `json:"index"`
-	Delta        Delta       `json:"delta"`
-	FinishReason interface{} `json:"finish_reason"`
-	Logprobs     interface{} `json:"logprobs"`
-}
-
-type ChatCompletion struct {
-	ID                string   `json:"id"`
-	Choices           []Choice `json:"choices"`
-	Created           int64    `json:"created"`
-	Model             string   `json:"model"`
-	SystemFingerprint string   `json:"system_fingerprint"`
-	Object            string   `json:"object"`
-	Usage             *Usage   `json:"usage"`
-}
-
-type Usage struct {
-	CompletionTokens int `json:"completion_tokens"`
-	PromptTokens     int `json:"prompt_tokens"`
-	TotalTokens      int `json:"total_tokens"`
-}
-
-type OpenAIError struct {
-	Message string `json:"message"`
-}
-
-type OpenAIErrorResponse struct {
-	Error OpenAIError `json:"error"`
-}
 
 var chatCmd = &cobra.Command{
 	Use:   "chat",
@@ -108,7 +57,7 @@ spice chat --model <model> --cloud
 `,
 	Run: func(cmd *cobra.Command, args []string) {
 		cloud, _ := cmd.Flags().GetBool(cloudKeyFlag)
-		rtcontext := context.NewContext().WithCloud(cloud)
+		rtcontext := spiceContext.NewContext().WithCloud(cloud)
 		err := rtcontext.Init()
 		if err != nil {
 			slog.Error("could not initialize runtime context", "error", err)
@@ -187,7 +136,13 @@ spice chat --model <model> --cloud
 			rtcontext.SetHttpEndpoint(httpEndpoint)
 		}
 
-		var messages []Message = []Message{}
+		client := openai.NewClient(
+			option.WithBaseURL(httpEndpoint),
+			option.WithAPIKey(apiKey),
+			option.WithHeader("User-Agent", userAgent),
+		)
+
+		var messages []openai.ChatCompletionMessageParamUnion
 
 		line := liner.NewLiner()
 		line.SetCtrlCAborts(true)
@@ -202,97 +157,66 @@ spice chat --model <model> --cloud
 			}
 
 			line.AppendHistory(message)
-			messages = append(messages, Message{Role: "user", Content: message})
+			messages = append(messages, openai.UserMessage(message))
 
 			done := make(chan bool)
 			go func() {
 				util.ShowSpinner(done)
 			}()
 
-			body := &ChatRequestBody{
-				Messages:      messages,
-				Model:         model,
-				Stream:        true,
-				StreamOptions: &StreamOptions{IncludeUsage: true},
-			}
 			var timeAtCompletion time.Time
 			var timeAtFirstToken time.Time
 			startTime := time.Now()
-			response, err := sendChatRequest(rtcontext, body)
-			if err != nil {
-				slog.Error("failed to send chat request to spiced", "error", err)
-				continue
-			}
 
-			scanner := bufio.NewScanner(response.Body)
-			var responseMessage = ""
-
-			/// Usage for the entire stream, and related timing.
-			var usage Usage
+			stream := client.Chat.Completions.NewStreaming(
+				context.Background(),
+				openai.ChatCompletionNewParams{
+					Messages: openai.F(messages),
+					Model:    openai.F(model),
+					StreamOptions: openai.F(openai.ChatCompletionStreamOptionsParam{
+						IncludeUsage: openai.F(true),
+					}),
+				},
+			)
+			acc := openai.ChatCompletionAccumulator{}
+			var usage openai.CompletionUsage
 			doneLoading := false
 
-			for scanner.Scan() {
-				chunk := scanner.Text()
+			for stream.Next() {
+				chunk := stream.Current()
 				if timeAtFirstToken.IsZero() {
 					timeAtFirstToken = time.Now()
+					if !doneLoading {
+						done <- true
+						doneLoading = true
+					}
+				}
+				acc.AddChunk(chunk)
+
+				// When this fires, the current chunk value will not contain content data
+				if content, ok := acc.JustFinishedContent(); ok {
+					messages = append(messages, openai.SystemMessage(content))
 				}
 
-				errorEvent, err := maybeErrorEvent(chunk, scanner)
-
-				if err != nil {
-					slog.Error("failed to decode error event", "error", err)
-					continue
+				if tool, ok := acc.JustFinishedToolCall(); ok {
+					println("Tool call stream finished:", tool.Index, tool.Name, tool.Arguments)
+					// TODO: add tool call completion into `messages`.
+					//
+					println()
 				}
 
-				if errorEvent != nil {
-					slog.Error("chat request failed", "error", errorEvent.Message)
-					break
+				if refusal, ok := acc.JustFinishedRefusal(); ok {
+					fmt.Printf("Refusal: %v\n\n", refusal)
+
 				}
 
-				if !strings.HasPrefix(chunk, "data: ") {
-					continue
-				}
-				chunk = strings.TrimPrefix(chunk, "data: ")
-
-				var chatResponse ChatCompletion = ChatCompletion{}
-				err = json.Unmarshal([]byte(chunk), &chatResponse)
-				if err != nil {
-					slog.Error("failed to unmarshal chat response", "error", err)
-					continue
-				}
-
-				if !doneLoading {
-					done <- true
-					doneLoading = true
-				}
-
-				if chatResponse.Usage != nil {
-					usage = *chatResponse.Usage
-					timeAtCompletion = time.Now()
-				}
-
-				if len(chatResponse.Choices) == 0 {
-					continue
-				}
-
-				token := chatResponse.Choices[0].Delta.Content
-				cmd.Printf("%s", token)
-				responseMessage = responseMessage + token
+				println(chunk.Choices[0].Delta.Content)
 			}
 
-			if err := scanner.Err(); err != nil {
-				slog.Error("error occurred while processing the input stream", "error", err)
-			}
+			usage = acc.Usage
+			timeAtCompletion = time.Now()
 
-			if !doneLoading {
-				done <- true
-				doneLoading = true
-			}
-
-			if responseMessage != "" {
-				messages = append(messages, Message{Role: "assistant", Content: responseMessage})
-			}
-			if usage != (Usage{}) {
+			if usage.PromptTokens > 0 && usage.CompletionTokens > 0 {
 				cmd.Printf("\n\n%s\n\n", generateUsageMessage(
 					&usage,
 					timeAtFirstToken.Sub(startTime).Abs(),
