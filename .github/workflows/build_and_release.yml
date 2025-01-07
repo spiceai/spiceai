@@ -439,7 +439,7 @@ jobs:
           path: ${{ env.ARTIFACT_DIR }}
 
       - name: download artifacts - spiced_models_metal_${{ matrix.target_os }}_${{ matrix.target_arch }}
-        if: matrix.target.target_os == 'darwin'
+        if: matrix.target_os == 'darwin'
         uses: actions/download-artifact@v4
         with:
           name: spiced_models_metal_${{ matrix.target_os }}_${{ matrix.target_arch }}
