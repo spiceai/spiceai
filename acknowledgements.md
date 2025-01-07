@@ -45,7 +45,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - ansi_term 0.12.1, MIT 
   <br/>https://github.com/ogham/rust-ansi-term
 
-- anyhow 1.0.94, Apache-2.0 OR MIT 
+- anyhow 1.0.95, Apache-2.0 OR MIT 
   <br/>https://github.com/dtolnay/anyhow
 
 - arrow 53.3.0, Apache-2.0 
@@ -213,6 +213,9 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - globset 0.4.15, MIT OR Unlicense 
   <br/>https://github.com/BurntSushi/ripgrep/tree/master/crates/globset
 
+- governor 0.8.0, MIT 
+  <br/>https://github.com/boinkor-net/governor.git
+
 - graph-rs-sdk 2.0.1, MIT 
   <br/>https://github.com/sreeise/graph-rs-sdk
 
@@ -323,6 +326,9 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 
 - ndarray 0.16.1, Apache-2.0 OR MIT 
   <br/>https://github.com/rust-ndarray/ndarray
+
+- nix 0.29.0, MIT 
+  <br/>https://github.com/nix-rust/nix
 
 - notify 7.0.0, CC0-1.0 
   <br/>https://github.com/notify-rs/notify.git
