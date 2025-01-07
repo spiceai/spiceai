@@ -77,20 +77,25 @@ impl SpiceAICatalogProvider {
         let schema_names: Vec<_> = client
             .list_namespaces(Some(&root_namespace))
             .await
-            .context(ListNamespacesSnafu)?
-            .iter()
-            .flat_map(|ns| ns.as_ref().clone())
-            .collect();
+            .context(ListNamespacesSnafu)?;
 
         let providers = try_join_all(
             schema_names
                 .iter()
                 .map(|name| {
                     let mut child_namespace_vec = root_namespace.clone().inner();
-                    child_namespace_vec.push(name.clone());
+                    let name_inner = name.clone().inner();
+                    let Some(last_name) = name_inner.last() else {
+                        unreachable!("The namespace should have at least one element");
+                    };
+                    child_namespace_vec.push(last_name.to_string());
                     let Ok(child_namespace) = NamespaceIdent::from_vec(child_namespace_vec) else {
                         unreachable!("This only panics if the vec is empty");
                     };
+                    tracing::debug!(
+                        "Creating Spice.ai schema provider for namespace: {:?}",
+                        child_namespace
+                    );
                     SpiceAISchemaProvider::try_new(
                         Arc::clone(&client),
                         child_namespace,
@@ -106,7 +111,11 @@ impl SpiceAICatalogProvider {
             .zip(providers.into_iter())
             .map(|(name, provider)| {
                 let provider = Arc::new(provider) as Arc<dyn SchemaProvider>;
-                (name, provider)
+                let name_inner = name.inner();
+                let Some(last_name) = name_inner.last() else {
+                    unreachable!("The namespace should have at least one element");
+                };
+                (last_name.to_string(), provider)
             })
             .collect();
 
