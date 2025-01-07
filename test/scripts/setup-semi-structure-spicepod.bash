@@ -179,7 +179,7 @@ if [ -f "spicepod.yaml" ]; then
   exit 1
 fi
 
-echo "version: v1beta1" >> spicepod.yaml
+echo "version: v1" >> spicepod.yaml
 echo "kind: Spicepod" >> spicepod.yaml
 echo "name: test" >> spicepod.yaml
 echo "datasets:" >> spicepod.yaml

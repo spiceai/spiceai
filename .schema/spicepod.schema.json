@@ -248,6 +248,50 @@
       },
       "additionalProperties": false
     },
+    "ApiKey": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "ReadOnly"
+          ],
+          "properties": {
+            "ReadOnly": {
+              "type": "object",
+              "required": [
+                "key"
+              ],
+              "properties": {
+                "key": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "ReadWrite"
+          ],
+          "properties": {
+            "ReadWrite": {
+              "type": "object",
+              "required": [
+                "key"
+              ],
+              "properties": {
+                "key": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
     "ApiKeyAuth": {
       "type": "object",
       "required": [
@@ -261,7 +305,7 @@
         "keys": {
           "type": "array",
           "items": {
-            "type": "string"
+            "$ref": "#/definitions/ApiKey"
           }
         }
       },
@@ -270,7 +314,7 @@
     "Auth": {
       "type": "object",
       "properties": {
-        "api-key": {
+        "api_key": {
           "anyOf": [
             {
               "$ref": "#/definitions/ApiKeyAuth"
@@ -1075,7 +1119,8 @@
     "SpicepodVersion": {
       "type": "string",
       "enum": [
-        "v1beta1"
+        "v1beta1",
+        "v1"
       ]
     },
     "TaskHistory": {

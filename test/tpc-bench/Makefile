@@ -231,7 +231,7 @@ file-tpch-load:
 		echo "Loading $$table..."; \
 		cp ./tmp/$$table.parquet ./file-tpch-spicepod/$$table.parquet; \
 	done
-	@echo "version: v1beta1" >> ./file-tpch-spicepod/spicepod.yaml
+	@echo "version: v1" >> ./file-tpch-spicepod/spicepod.yaml
 	@echo "kind: Spicepod" >> ./file-tpch-spicepod/spicepod.yaml
 	@echo "name: file" >> ./file-tpch-spicepod/spicepod.yaml
 	@echo "datasets:" >> ./file-tpch-spicepod/spicepod.yaml
@@ -261,7 +261,7 @@ file-tpcds-load:
 		echo "Loading $$table..."; \
 		cp ./tmp/$$table.parquet ./file-tpcds-spicepod/$$table.parquet; \
 	done
-	@echo "version: v1beta1" >> ./file-tpcds-spicepod/spicepod.yaml
+	@echo "version: v1" >> ./file-tpcds-spicepod/spicepod.yaml
 	@echo "kind: Spicepod" >> ./file-tpcds-spicepod/spicepod.yaml
 	@echo "name: file" >> ./file-tpcds-spicepod/spicepod.yaml
 	@echo "datasets:" >> ./file-tpcds-spicepod/spicepod.yaml

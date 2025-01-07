@@ -1,4 +1,4 @@
-version: v1beta1
+version: v1
 kind: Spicepod
 name: tpch-spicepod
 

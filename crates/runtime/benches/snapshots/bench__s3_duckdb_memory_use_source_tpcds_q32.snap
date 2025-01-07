@@ -1,0 +1,10 @@
+---
+source: crates/runtime/benches/bench.rs
+expression: records_pretty
+snapshot_kind: text
+---
++------------------------+
+| excess discount amount |
++------------------------+
+| 122275.56              |
++------------------------+

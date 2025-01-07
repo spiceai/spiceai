@@ -57,7 +57,7 @@ func convertMap(i interface{}) interface{} {
 
 func TestSpicepodSpec_UnmarshalYAML_KnownFields(t *testing.T) {
 	yamlText := `
-version: v1beta1
+version: v1
 kind: Spicepod
 name: test-pod
 datasets:
@@ -80,8 +80,8 @@ dependencies:
 	}
 
 	// Verify known fields
-	if spicePod.Version != "v1beta1" {
-		t.Errorf("Expected version v1beta1, got %s", spicePod.Version)
+	if spicePod.Version != "v1" {
+		t.Errorf("Expected version v1, got %s", spicePod.Version)
 	}
 	if spicePod.Kind != "Spicepod" {
 		t.Errorf("Expected kind Spicepod, got %s", spicePod.Kind)
@@ -108,7 +108,7 @@ dependencies:
 
 func TestSpicepodSpec_UnmarshalYAML_UnknownFields(t *testing.T) {
 	yamlText := `
-version: v1beta1
+version: v1
 kind: Spicepod
 name: test-pod
 datasets:
@@ -127,8 +127,8 @@ nested_unknown:
 	}
 
 	// Verify known fields
-	if spicePod.Version != "v1beta1" {
-		t.Errorf("Expected version v1beta1, got %s", spicePod.Version)
+	if spicePod.Version != "v1" {
+		t.Errorf("Expected version v1, got %s", spicePod.Version)
 	}
 
 	// Verify unknown fields are preserved in Node
@@ -168,7 +168,7 @@ nested_unknown:
 func TestSpicepodSpec_MarshalYAML(t *testing.T) {
 	// Create a SpicepodSpec with both known and unknown fields
 	yamlText := `
-version: v1beta1
+version: v1
 kind: Spicepod
 name: test-pod
 datasets:
@@ -204,8 +204,8 @@ nested_unknown:
 	result = convertMap(result).(map[string]interface{})
 
 	// Check known fields
-	if result["version"] != "v1beta1" {
-		t.Errorf("Expected version v1beta1, got %v", result["version"])
+	if result["version"] != "v1" {
+		t.Errorf("Expected version v1, got %v", result["version"])
 	}
 	if result["kind"] != "Spicepod" {
 		t.Errorf("Expected kind Spicepod, got %v", result["kind"])
@@ -270,7 +270,7 @@ func TestSpicepodSpec_UnmarshalYAML_EdgeCases(t *testing.T) {
 		},
 		{
 			name:    "minimal valid document",
-			yaml:    "version: v1beta1\nkind: Spicepod\nname: test",
+			yaml:    "version: v1\nkind: Spicepod\nname: test",
 			wantErr: false,
 		},
 		{
@@ -281,7 +281,7 @@ func TestSpicepodSpec_UnmarshalYAML_EdgeCases(t *testing.T) {
 		{
 			name: "duplicate known and unknown fields",
 			yaml: `
-version: v1beta1
+version: v1
 kind: Spicepod
 name: test-pod
 unknown_kind: different
@@ -335,7 +335,7 @@ unknown_version: v2
 
 func TestSpicepodSpec_EmptyDatasets(t *testing.T) {
 	yamlText := `
-version: v1beta1
+version: v1
 kind: Spicepod
 name: test-pod
 datasets: []
@@ -353,7 +353,7 @@ datasets: []
 
 func TestSpicepodSpec_ComplexDatasets(t *testing.T) {
 	yamlText := `
-version: v1beta1
+version: v1
 kind: Spicepod
 name: test-pod
 datasets:
@@ -448,7 +448,7 @@ datasets:
 
 func TestSpicepodSpec_PreserveYAMLStyle(t *testing.T) {
 	yamlText := `
-version: v1beta1
+version: v1
 kind: Spicepod
 name: test-pod
 datasets:
