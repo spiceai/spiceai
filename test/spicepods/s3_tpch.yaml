@@ -5,7 +5,7 @@ runtime:
   results_cache:
     enabled: false
 datasets:
-  - from: s3://benchmarks/tpch_sf1/customer
+  - from: s3://benchmarks/tpch_sf1/customer/
     name: customer
     params: &s3_params
       file_format: parquet
@@ -14,24 +14,24 @@ datasets:
       s3_endpoint: ${secrets:S3_ENDPOINT}
       s3_key: ${secrets:S3_KEY}
       s3_secret: ${secrets:S3_SECRET}
-  - from: s3://benchmarks/tpch_sf1/lineitem
+  - from: s3://benchmarks/tpch_sf1/lineitem/
     name: lineitem
     params: *s3_params
-  - from: s3://benchmarks/tpch_sf1/nation
+  - from: s3://benchmarks/tpch_sf1/nation/
     name: nation
     params: *s3_params
-  - from: s3://benchmarks/tpch_sf1/orders
+  - from: s3://benchmarks/tpch_sf1/orders/
     name: orders
     params: *s3_params
-  - from: s3://benchmarks/tpch_sf1/part
+  - from: s3://benchmarks/tpch_sf1/part/
     name: part
     params: *s3_params
-  - from: s3://benchmarks/tpch_sf1/partsupp
+  - from: s3://benchmarks/tpch_sf1/partsupp/
     name: partsupp
     params: *s3_params
-  - from: s3://benchmarks/tpch_sf1/region
+  - from: s3://benchmarks/tpch_sf1/region/
     name: region
     params: *s3_params
-  - from: s3://benchmarks/tpch_sf1/supplier
+  - from: s3://benchmarks/tpch_sf1/supplier/
     name: supplier
     params: *s3_params
