@@ -32,6 +32,9 @@ pub const LISTING_TABLE_PARAMETERS: &[ParameterSpec] = &[
         .description("Set true to indicate that the first line is a header."),
     ParameterSpec::runtime("tsv_quote").description("The quote character in a row."),
     ParameterSpec::runtime("tsv_escape").description("The escape character in a row."),
+    ParameterSpec::runtime("tsv_schema_infer_max_records")
+        .description("Set a limit in terms of records to scan to infer the schema.")
+        .deprecated("use 'schema_infer_max_records' instead"),
     ParameterSpec::runtime("csv_has_header")
         .description("Set true to indicate that the first line is a header."),
     ParameterSpec::runtime("csv_quote").description("The quote character in a row."),
