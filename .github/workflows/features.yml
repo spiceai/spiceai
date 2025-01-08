@@ -78,3 +78,6 @@ jobs:
 
       - name: Build with only openapi
         run: cargo check --no-default-features --features runtime/openapi
+
+      - name: Build with only dynamodb
+        run: cargo check --no-default-features --features dynamodb
