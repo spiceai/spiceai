@@ -17,6 +17,7 @@ limitations under the License.
 use arrow::array::AsArray;
 use runtime::Runtime;
 use std::time::Duration;
+use test_framework::queries::QueryOverrides;
 use tokio::time::sleep;
 
 use app::AppBuilder;
@@ -33,6 +34,7 @@ use super::{
     BenchmarkResultsBuilder,
 };
 
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn run_file_append(
     rt: &mut Runtime,
     benchmark_results: &mut BenchmarkResultsBuilder,
@@ -46,7 +48,9 @@ pub(crate) async fn run_file_append(
             None => get_tpcds_test_queries(None),
         },
         "clickbench" => match accelerator.clone() {
-            Some(Acceleration { engine, .. }) => get_clickbench_test_queries(engine.as_deref()),
+            Some(Acceleration { engine, .. }) => {
+                get_clickbench_test_queries(engine.as_deref().and_then(QueryOverrides::from_engine))
+            }
             None => get_clickbench_test_queries(None),
         },
         _ => return Err(format!("Invalid benchmark to run {bench_name}")),

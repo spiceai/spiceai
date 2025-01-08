@@ -1,0 +1,19 @@
+---
+source: crates/runtime/benches/bench.rs
+expression: records_pretty
+snapshot_kind: text
+---
++--------+----------+--------------------+-----------+
+| d_year | brand_id | brand              | ext_price |
++--------+----------+--------------------+-----------+
+| 2000   | 2001002  | amalgimporto #2    | 138459.58 |
+| 2000   | 4001002  | amalgedu pack #2   | 75172.77  |
+| 2000   | 2002001  | importoimporto #1  | 73490.38  |
+| 2000   | 4003001  | exportiedu pack #1 | 61509.01  |
+| 2000   | 3004002  | edu packexporti #2 | 61120.99  |
+| 2000   | 1003002  | exportiamalg #2    | 56170.77  |
+| 2000   | 5004002  | edu packscholar #2 | 55076.09  |
+| 2000   | 3002002  | importoexporti #2  | 52911.02  |
+| 2000   | 1001002  | amalgamalg #2      | 51877.12  |
+| 2000   | 1003001  | exportiamalg #1    | 48861.72  |
++--------+----------+--------------------+-----------+

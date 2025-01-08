@@ -40,7 +40,7 @@ use datafusion::datasource::provider_as_source;
 use datafusion::logical_expr::{LogicalPlanBuilder, UNNAMED_TABLE};
 use datafusion::{dataframe::DataFrame, datasource::MemTable, execution::context::SessionContext};
 use futures::TryStreamExt;
-use results::BenchmarkResultsBuilder;
+use results::{BenchmarkResult, BenchmarkResultsBuilder};
 use runtime::request::{Protocol, RequestContext, UserAgent};
 use runtime::{dataupdate::DataUpdate, Runtime};
 use spicepod::component::dataset::acceleration::{
@@ -542,14 +542,14 @@ fn get_current_unix_ms() -> i64 {
 }
 
 #[allow(clippy::too_many_lines)]
-pub(crate) async fn run_query_and_record_result(
+pub(crate) async fn run_query_and_return_result(
     rt: &mut Runtime,
-    benchmark_results: &mut BenchmarkResultsBuilder,
+    iterations: i32,
     connector: &str,
     query_name: &str,
     query: &str,
     verify_query_result: bool,
-) -> Result<(), String> {
+) -> Result<BenchmarkResult, String> {
     // Additional round of query run before recording results.
     // To discard the abnormal results caused by: establishing initial connection / spark cluster startup time
     let _ = run_query(rt, connector, query_name, query).await;
@@ -567,15 +567,14 @@ pub(crate) async fn run_query_and_record_result(
 
     let mut completed_iterations = 0;
 
-    for idx in 0..benchmark_results.iterations() {
+    for idx in 0..iterations {
         completed_iterations += 1;
 
         let start_iter_time = get_current_unix_ms();
 
         tracing::debug!(
-            "Running iteration {} of {} for query `{connector}` `{query_name}`...",
+            "Running iteration {} of {iterations} for query `{connector}` `{query_name}`...",
             idx + 1,
-            benchmark_results.iterations()
         );
         let res = run_query(rt, connector, query_name, query).await;
         let end_iter_time = get_current_unix_ms();
@@ -650,7 +649,7 @@ pub(crate) async fn run_query_and_record_result(
 
     let end_time = get_current_unix_ms();
     // Both query failure and snapshot test failure will cause the result to be written as Status::Failed
-    benchmark_results.record_result(
+    let result = BenchmarkResult::new(
         start_time,
         end_time,
         connector,
@@ -679,6 +678,29 @@ pub(crate) async fn run_query_and_record_result(
         }
         (None, None) => {}
     }
+
+    Ok(result)
+}
+
+pub(crate) async fn run_query_and_record_result(
+    rt: &mut Runtime,
+    benchmark_results: &mut BenchmarkResultsBuilder,
+    connector: &str,
+    query_name: &str,
+    query: &str,
+    verify_query_result: bool,
+) -> Result<(), String> {
+    let result = run_query_and_return_result(
+        rt,
+        benchmark_results.iterations(),
+        connector,
+        query_name,
+        query,
+        verify_query_result,
+    )
+    .await?;
+
+    benchmark_results.record_result(result);
 
     Ok(())
 }

@@ -1,0 +1,19 @@
+---
+source: crates/runtime/benches/bench.rs
+expression: records_pretty
+snapshot_kind: text
+---
++------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+-----------+
+| URL                                                                                                                                                                                                                                                              | pageviews |
++------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+-----------+
+| http://stalker-pub-20087898675494,960948/#page_type%3D0%26pz%3D0%26rleurl%3D%26xpid%3D1216629/0/index.ru/personal/page2/photo.html%3Fhtml?1=1&custom%3D%26xpid%3D278885%26bid%3D2013/detail.ru/GameMain.aspx?atokaya-obl.irr.ru/basketball/search                | 2         |
+| http://masterlitama-lab.com/songs/breed/lexist.aspx?sort                                                                                                                                                                                                         | 2         |
+| http://video.yandex.ru%26bt%3D43%26bn%3D0%26pz                                                                                                                                                                                                                   | 2         |
+| http://stalker-pub-20087898675494,960948/#page_type%3D260117152337&spn=1395,9455989.ya.ru/world/photo/den_sident%3D90%26nid%3D8393588.431413/17#f64053/detail.ru/cars.avtogsm.ru/filmId=John Baner-102-Tat-yah/den_side_black_list_type=category_id=976297927600 | 2         |
+| http://omsk/evential/housession%3D90%26rnd%3D839322%26ntype=0&expand_search/obmeny_new744.ru/cars/page9/#overnazakh.html?1=1&currency=RUR/page/11107865                                                                                                          | 2         |
+| http://povarenok.ru/search=0&city=0&price=19&price=5599319.html%3Fhtml?1=1&cid=556736                                                                                                                                                                            | 2         |
+| http://maps#ru_5_ru_22106.37766/men.aspx#location/topic.php?razdnuyu-komnatalog/27017339/0/&&puid2=24359014426/page=27&referre=all&filmId                                                                                                                        | 2         |
+| http://stalker-pub-20087898675494,960948/#page_type%3D0%26pz%3D0%26rleurl%3D//ad.adriver.ru/photo=0&is_hot=0&auto_id=577&oki=1&op_prodam-1-komn-kvarti-m.ru/allprice=от 9000&with_video.yandex.ru/story.php?r=19981007/29/st30/?from=&fuelRateTo                 | 2         |
+| http://bdsmpeople.ru/index.ua/auto_id=73220511918,432;IC,128;IC,118694baec25-959877/0/3195,940370.html%3Fhtml                                                                                                                                                    | 2         |
+| http://sarator/Paliostry                                                                                                                                                                                                                                         | 2         |
++------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+-----------+

@@ -71,7 +71,6 @@ keyring = { version = "3.6.1", features = [
     "windows-native",
     "linux-native",
 ], optional = true }
-lazy_static.workspace = true
 llms = { path = "../llms" }
 logos = "0.15.0"
 mediatype = "0.19.18"

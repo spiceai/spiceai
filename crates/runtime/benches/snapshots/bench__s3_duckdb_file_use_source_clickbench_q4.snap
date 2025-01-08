@@ -1,0 +1,10 @@
+---
+source: crates/runtime/benches/bench.rs
+expression: records_pretty
+snapshot_kind: text
+---
++----------------------+
+| avg(hits.UserID)     |
++----------------------+
+| 2.528953029789714e18 |
++----------------------+
