@@ -14,9 +14,3 @@ clap.workspace = true
 tokio.workspace = true
 
 [features]
-aws-secrets-manager = []
-duckdb = []
-keyring-secret-store = []
-models = []
-odbc = []
-release = []
