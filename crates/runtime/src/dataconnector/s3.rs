@@ -23,14 +23,13 @@ use super::{
 use crate::parameters::ParamLookup;
 use crate::{component::dataset::Dataset, dataconnector::listing::LISTING_TABLE_PARAMETERS};
 
-use lazy_static::lazy_static;
 use snafu::prelude::*;
 use std::any::Any;
 use std::clone::Clone;
 use std::future::Future;
 use std::pin::Pin;
 use std::string::String;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use url::Url;
 
 // https://docs.aws.amazon.com/general/latest/gr/rande.html
@@ -124,10 +123,9 @@ impl S3Factory {
         Arc::new(Self {}) as Arc<dyn DataConnectorFactory>
     }
 }
-lazy_static! {
-    static ref PARAMETERS: Vec<ParameterSpec> = {
-        let mut all_parameters = Vec::new();
-        all_parameters.extend_from_slice(&[
+static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
+    let mut all_parameters = Vec::new();
+    all_parameters.extend_from_slice(&[
             ParameterSpec::connector("region").secret(),
             ParameterSpec::connector("endpoint").secret(),
             ParameterSpec::connector("key").secret(),
@@ -140,10 +138,9 @@ lazy_static! {
             ParameterSpec::runtime("allow_http")
                 .description("Allow HTTP protocol for S3 endpoint."),
         ]);
-        all_parameters.extend_from_slice(LISTING_TABLE_PARAMETERS);
-        all_parameters
-    };
-}
+    all_parameters.extend_from_slice(LISTING_TABLE_PARAMETERS);
+    all_parameters
+});
 
 impl DataConnectorFactory for S3Factory {
     fn create(

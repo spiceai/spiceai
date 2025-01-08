@@ -16,13 +16,12 @@ limitations under the License.
 
 use crate::component::dataset::Dataset;
 use crate::dataconnector::listing::LISTING_TABLE_PARAMETERS;
-use lazy_static::lazy_static;
 
 use snafu::prelude::*;
 use std::any::Any;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use url::Url;
 
 use super::{
@@ -57,20 +56,18 @@ impl HttpsFactory {
     }
 }
 
-lazy_static! {
-    static ref PARAMETERS: Vec<ParameterSpec> = {
-        let mut all_parameters = Vec::new();
-        all_parameters.extend_from_slice(&[
-            ParameterSpec::connector("username").secret(),
-            ParameterSpec::connector("password").secret(),
-            ParameterSpec::connector("port").description("The port to connect to."),
-            ParameterSpec::runtime("client_timeout")
-                .description("The timeout setting for HTTP(S) client."),
-        ]);
-        all_parameters.extend_from_slice(LISTING_TABLE_PARAMETERS);
-        all_parameters
-    };
-}
+static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
+    let mut all_parameters = Vec::new();
+    all_parameters.extend_from_slice(&[
+        ParameterSpec::connector("username").secret(),
+        ParameterSpec::connector("password").secret(),
+        ParameterSpec::connector("port").description("The port to connect to."),
+        ParameterSpec::runtime("client_timeout")
+            .description("The timeout setting for HTTP(S) client."),
+    ]);
+    all_parameters.extend_from_slice(LISTING_TABLE_PARAMETERS);
+    all_parameters
+});
 
 impl DataConnectorFactory for HttpsFactory {
     fn create(
