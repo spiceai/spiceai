@@ -47,9 +47,9 @@ impl ThroughputQueryWorker {
         }
     }
 
-    pub fn start(self) -> JoinHandle<Result<BTreeMap<String, Duration>>> {
+    pub fn start(self) -> JoinHandle<Result<BTreeMap<String, Vec<Duration>>>> {
         tokio::spawn(async move {
-            let mut query_durations: BTreeMap<String, Duration> = BTreeMap::new();
+            let mut query_durations: BTreeMap<String, Vec<Duration>> = BTreeMap::new();
             let mut query_set_count = 0;
             let start = Instant::now();
 
@@ -66,11 +66,10 @@ impl ThroughputQueryWorker {
                         }
                     };
                     let duration = query_start.elapsed();
-                    if let Some(existing_duration) = query_durations.get_mut(query.0) {
-                        *existing_duration += duration;
-                    } else {
-                        query_durations.insert(query.0.to_string(), duration);
-                    }
+                    query_durations
+                        .entry(query.0.to_string())
+                        .or_default()
+                        .push(duration);
                 }
                 query_set_count += 1;
             }

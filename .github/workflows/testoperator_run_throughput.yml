@@ -1,0 +1,76 @@
+name: throughput tests
+
+on:
+  workflow_dispatch:
+    inputs:
+      spiced_commit:
+        description: 'spiced build commit'
+        required: false
+        type: string
+      spicepod_path:
+        description: 'The spicepod file to test with'
+        required: true
+        type: string
+      query_set:
+        description: 'Query set'
+        required: true
+        default: 'tpch'
+        type: choice
+        options:
+          - 'tpch'
+          - 'tpcds'
+          - 'clickbench'
+      data_dir:
+        description: 'The data directory to use'
+        required: false
+        type: string
+
+jobs:
+  run-throughput:
+    name: Run throughput test
+    runs-on: spiceai-runners
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+        with:
+          os: 'linux'
+      
+      - name: Get latest trunk commit
+        if: ${{ !github.event.inputs.spiced_commit }}
+        run: |
+          git fetch origin
+          echo "SPICED_COMMIT=$(git rev-parse origin/trunk)" >> $GITHUB_ENV
+      
+      - name: Set SPICED_COMMIT from workflow input
+        if: ${{ github.event.inputs.spiced_commit }}
+        run: |
+          echo "SPICED_COMMIT=${{ github.event.inputs.spiced_commit }}" >> $GITHUB_ENV
+      
+      - name: Download spiced from MinIO
+        run: |
+          sudo wget https://dl.min.io/client/mc/release/linux-amd64/mc -O /usr/local/bin/mc
+          sudo chmod +x /usr/local/bin/mc
+          mc alias set spice-minio ${{ secrets.CLICKBENCH_S3_ENDPOINT }} ${{ secrets.CLICKBENCH_S3_KEY }} ${{ secrets.CLICKBENCH_S3_SECRET }}
+          mc cp spice-minio/artifacts/spiced/linux-x86_64/$SPICED_COMMIT/spiced_models_linux_x86_64.tar.gz spiced_models_linux_x86_64.tar.gz
+          tar -xzf spiced_models_linux_x86_64.tar.gz
+          cp spiced_models_linux_x86_64/spiced /usr/local/bin/spiced
+      
+      - name: Run the throughput test (no data directory)
+        if: ${{ !github.event.inputs.data_dir }}
+        run: |
+          cargo run -p testoperator -- run throughput -s /usr/local/bin/spiced -p ${{ github.event.inputs.spicepod_path }} --query-set ${{ github.event.inputs.query_set }}
+        env:
+          S3_ENDPOINT: ${{ secrets.CLICKBENCH_S3_ENDPOINT}}
+          S3_KEY: ${{ secrets.CLICKBENCH_S3_KEY}}
+          S3_SECRET: ${{ secrets.CLICKBENCH_S3_SECRET}}
+        
+      - name: Run the throughput test (data directory)
+        if: ${{ github.event.inputs.data_dir }}
+        run: |
+          cargo run -p testoperator -- run throughput -s /usr/local/bin/spiced -p ${{ github.event.inputs.spicepod_path }} -d ${{ github.event.inputs.data_dir }} --query-set ${{ github.event.inputs.query_set }}
+        env:
+          S3_ENDPOINT: ${{ secrets.CLICKBENCH_S3_ENDPOINT}}
+          S3_KEY: ${{ secrets.CLICKBENCH_S3_KEY}}
+          S3_SECRET: ${{ secrets.CLICKBENCH_S3_SECRET}}

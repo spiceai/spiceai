@@ -17,7 +17,7 @@ limitations under the License.
 use app::AppBuilder;
 use runtime::Runtime;
 use spicepod::component::dataset::Dataset;
-use test_framework::queries::get_tpch_test_queries;
+use test_framework::queries::{get_tpch_test_queries, QueryOverrides};
 
 use crate::results::BenchmarkResultsBuilder;
 
@@ -25,7 +25,7 @@ pub(crate) async fn run(
     rt: &mut Runtime,
     benchmark_results: &mut BenchmarkResultsBuilder,
 ) -> Result<(), String> {
-    let test_queries = get_tpch_test_queries(Some("spark"));
+    let test_queries = get_tpch_test_queries(Some(QueryOverrides::Spark));
 
     let mut errors = Vec::new();
     for (query_name, query) in test_queries {

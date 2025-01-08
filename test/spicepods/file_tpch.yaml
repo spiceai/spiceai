@@ -1,6 +1,9 @@
 version: v1
 kind: Spicepod
 name: file_tpch
+runtime:
+  results_cache:
+    enabled: false
 datasets:
   - from: file:./data/customer.parquet
     name: customer
