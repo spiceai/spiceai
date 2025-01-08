@@ -276,13 +276,13 @@ jobs:
           path: spiced_models_metal_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz
 
       ## Models + CUDA flavor
-      - name: Set up cache for CUDA
-        id: cache-cuda
-        uses: actions/cache@v3
-        with:
-          path: /usr/local/cuda
-          key: cuda-${{ runner.os }}-12.4.1
-          restore-keys: cuda-${{ runner.os }}-
+      # - name: Set up cache for CUDA
+      #   id: cache-cuda
+      #   uses: actions/cache@v3
+      #   with:
+      #     path: /usr/local/cuda
+      #     key: cuda-${{ runner.os }}-12.4.1
+      #     restore-keys: cuda-${{ runner.os }}-
 
       - name: Install CUDA toolkit
         id: cuda-toolkit
