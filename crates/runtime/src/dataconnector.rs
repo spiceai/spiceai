@@ -63,6 +63,8 @@ pub mod delta_lake;
 pub mod dremio;
 #[cfg(feature = "duckdb")]
 pub mod duckdb;
+#[cfg(feature = "dynamodb")]
+pub mod dynamodb;
 pub mod file;
 #[cfg(feature = "flightsql")]
 pub mod flightsql;
@@ -330,6 +332,8 @@ pub async fn register_all() {
     #[cfg(feature = "debezium")]
     register_connector_factory("debezium", debezium::DebeziumFactory::new_arc()).await;
     register_connector_factory("localpod", localpod::LocalPodFactory::new_arc()).await;
+    #[cfg(feature = "dynamodb")]
+    register_connector_factory("dynamodb", dynamodb::DynamoDBFactory::new_arc()).await;
 }
 
 pub trait DataConnectorFactory: Send + Sync {
