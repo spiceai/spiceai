@@ -12,9 +12,9 @@
 
 Spice provides three industry standard APIs in a lightweight, portable runtime (single ~140 MB binary):
 
-1. **SQL Query API**: Arrow Flight, Arrow Flight SQL, ODBC, JDBC, and ADBC.
-2. **OpenAI-Compatible API**: HTTP APIs compatible the OpenAI SDK, AI SDK with local model serving (CUDA/Metal accelerated) and gateway to hosted models.
-3. **Iceberg Catalog REST API**: A unified Iceberg Catalog API.
+1. **SQL Query APIs**: Arrow Flight, Arrow Flight SQL, ODBC, JDBC, and ADBC.
+2. **OpenAI-Compatible APIs**: HTTP APIs compatible the OpenAI SDK, AI SDK with local model serving (CUDA/Metal accelerated) and gateway to hosted models.
+3. **Iceberg Catalog REST APIs**: A unified Iceberg Catalog API.
 
 🎯 Goal: Developers can focus on building data apps and AI agents confidently, knowing they are grounded in data.
 
@@ -23,6 +23,8 @@ Spice is primarily used for:
 - **Data Federation**: SQL query across any database, data warehouse, or data lake. [Learn More](https://docs.spiceai.org/features/federated-queries).
 - **Data Materialization and Acceleration**: Materialize, accelerate, and cache database queries. [Read the MaterializedView interview - Building a CDN for Databases](https://materializedview.io/p/building-a-cdn-for-databases-spice-ai)
 - **AI apps and agents**: An AI-database powering retrieval-augmented generation (RAG) and intelligent agents. [Learn More](https://github.com/spiceai/cookbook/tree/trunk/rag#readme).
+
+If you want to build with DataFusion or using DuckDB, Spice provides a simple, flexible, and production-ready engine you can just use.
 
 📣 Read the [Spice.ai OSS announcement blog post](https://blog.spiceai.org/posts/2024/03/28/adding-spice-the-next-generation-of-spice.ai-oss/).
 
