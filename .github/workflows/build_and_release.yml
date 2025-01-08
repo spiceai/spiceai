@@ -286,7 +286,7 @@ jobs:
 
       - name: Install CUDA toolkit
         if: matrix.target.runner == 'ubuntu-gpu-t4-4-core' && steps.cache-cuda.outputs.cache-hit != 'true'
-        uses: Jimver/cuda-toolkit
+        uses: Jimver/cuda-toolkit@v0.2.19
         with:
           cuda: "12.4.1"
 
