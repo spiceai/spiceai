@@ -47,6 +47,7 @@ use std::collections::HashSet;
 use std::fmt::Display;
 use std::str::FromStr;
 use std::sync::Arc;
+use tract_core::tract_data::itertools::Itertools;
 use url::Url;
 
 use crate::object_store_registry::default_runtime_env;
@@ -560,6 +561,7 @@ mod tests {
     use std::pin::Pin;
     use url::Url;
 
+    use crate::dataconnector::listing::LISTING_TABLE_PARAMETERS;
     use crate::dataconnector::{ConnectorParams, DataConnectorFactory};
     use crate::parameters::ParameterSpec;
 
@@ -618,20 +620,7 @@ mod tests {
         }
     }
 
-    const TEST_PARAMETERS: &[ParameterSpec] = &[
-        ParameterSpec::runtime("file_extension"),
-        ParameterSpec::runtime("file_format"),
-        ParameterSpec::runtime("schema_infer_max_records"),
-        ParameterSpec::runtime("csv_has_header"),
-        ParameterSpec::runtime("csv_quote"),
-        ParameterSpec::runtime("csv_escape"),
-        ParameterSpec::runtime("csv_schema_infer_max_records"),
-        ParameterSpec::runtime("csv_delimiter"),
-        ParameterSpec::runtime("tsv_has_header"),
-        ParameterSpec::runtime("tsv_quote"),
-        ParameterSpec::runtime("tsv_escape"),
-        ParameterSpec::runtime("file_compression_type"),
-    ];
+    const TEST_PARAMETERS: &[ParameterSpec] = LISTING_TABLE_PARAMETERS;
 
     fn setup_connector(path: String, params: HashMap<String, String>) -> (TestConnector, Dataset) {
         let connector = TestConnector {
