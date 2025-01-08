@@ -20,6 +20,7 @@ on:
           - "macOS aarch64 (Apple Silicon)"
           - "Windows x64"
           - "macOS x64 (Intel)"
+          - "GPU T4 Ubuntu"
         default: "all"
 
 jobs:
@@ -66,7 +67,13 @@ jobs:
                 target_os: "darwin",
                 target_arch: "x86_64",
                 target_arch_go: "amd64"
-              }
+              }, {
+                name: "GPU T4 Ubuntu",
+                runner: "ubuntu-gpu-t4-4-core",
+                target_os: "linux",
+                target_arch: "x86_64",
+                target_arch_go: "amd64"
+              },
             ];
 
             // If running via workflow_dispatch, filter based on input
@@ -266,6 +273,28 @@ jobs:
           name: spiced_models_metal_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: spiced_models_metal_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz
 
+      ## Models + CUDA flavor
+      - name: Build spiced (models)
+        if: matrix.target.runner == 'ubuntu-gpu-t4-4-core'
+        run: make -C bin/spiced SPICED_NON_DEFAULT_FEATURES="models,cuda"
+
+      - name: tar binary (models,metal)
+        if: matrix.target.runner == 'ubuntu-gpu-t4-4-core'
+        run: |
+          mv target/release/spiced spiced
+          chmod +x spiced
+          tar czf spiced_models_cuda_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz spiced
+
+      - name: Print version (models,metal)
+        if: matrix.target.runner == 'ubuntu-gpu-t4-4-core'
+        run: ./spiced --version
+
+      - uses: actions/upload-artifact@v4
+        if: matrix.target.runner == 'ubuntu-gpu-t4-4-core'
+        with:
+          name: spiced_models_cuda_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
+          path: spiced_models_cuda_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz
+
       ## CLI build
       - name: Build spice
         run: make -C bin/spice
@@ -443,6 +472,13 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: spiced_models_metal_${{ matrix.target_os }}_${{ matrix.target_arch }}
+          path: ${{ env.ARTIFACT_DIR }}
+
+      - name: download artifacts - spiced_models_cuda_${{ matrix.target_os }}_${{ matrix.target_arch }}
+        if: matrix.target.runner == 'ubuntu-gpu-t4-4-core'
+        uses: actions/download-artifact@v4
+        with:
+          name: spiced_models_cuda_${{ matrix.target_os }}_${{ matrix.target_arch }}
           path: ${{ env.ARTIFACT_DIR }}
 
       - name: lists artifacts
