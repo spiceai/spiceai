@@ -276,6 +276,12 @@ jobs:
           path: spiced_models_metal_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz
 
       ## Models + CUDA flavor
+      - name: Check for CUDA
+        if: matrix.target.runner == 'ubuntu-gpu-t4-4-core'
+        run: |
+          nvidia-smi
+          nvcc --version
+
       - name: Build spiced (models,cuda)
         if: matrix.target.runner == 'ubuntu-gpu-t4-4-core'
         run: make -C bin/spiced SPICED_NON_DEFAULT_FEATURES="models,cuda"
