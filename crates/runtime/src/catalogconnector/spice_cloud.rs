@@ -26,7 +26,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use data_components::{
-    iceberg::catalog::RestCatalog, spiceai::provider::SpiceAICatalogProvider, Read,
+    iceberg::catalog::RestCatalog, spice_cloud::provider::SpiceCloudPlatformCatalogProvider, Read,
     RefreshableCatalogProvider,
 };
 use iceberg::NamespaceIdent;
@@ -43,11 +43,11 @@ pub enum Error {
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Clone)]
-pub struct SpiceAICatalog {
+pub struct SpiceCloudPlatformCatalog {
     params: Parameters,
 }
 
-impl SpiceAICatalog {
+impl SpiceCloudPlatformCatalog {
     #[must_use]
     pub fn new_connector(params: ConnectorParams) -> Arc<dyn CatalogConnector> {
         Arc::new(Self {
@@ -70,7 +70,7 @@ impl SpiceAICatalog {
             unreachable!("This only panics if the vec is empty");
         };
 
-        let catalog_provider = SpiceAICatalogProvider::try_new(
+        let catalog_provider = SpiceCloudPlatformCatalogProvider::try_new(
             Arc::new(catalog_client),
             namespace_ident,
             read_provider,
@@ -225,7 +225,7 @@ pub(crate) const PARAMETERS: &[ParameterSpec] = &[
 ];
 
 #[async_trait]
-impl CatalogConnector for SpiceAICatalog {
+impl CatalogConnector for SpiceCloudPlatformCatalog {
     fn as_any(&self) -> &dyn Any {
         self
     }

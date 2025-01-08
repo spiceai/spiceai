@@ -54,15 +54,15 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// Acts as a centralized catalog provider that aggregates
 /// multiple [`SchemaProvider`], each associated with distinct namespaces.
 #[derive(Debug)]
-pub struct SpiceAICatalogProvider {
+pub struct SpiceCloudPlatformCatalogProvider {
     /// A `HashMap` where keys are namespace names
     /// and values are dynamic references to objects implementing the
     /// [`SchemaProvider`] trait.
     schemas: HashMap<String, Arc<dyn SchemaProvider>>,
 }
 
-impl SpiceAICatalogProvider {
-    /// Asynchronously tries to construct a new [`SpiceAICatalogProvider`]
+impl SpiceCloudPlatformCatalogProvider {
+    /// Asynchronously tries to construct a new [`SpiceCloudPlatformCatalogProvider`]
     /// using the given client to fetch and initialize schema providers for
     /// each namespace in the Spice.ai [`Catalog`].
     ///
@@ -96,7 +96,7 @@ impl SpiceAICatalogProvider {
                         "Creating Spice.ai schema provider for namespace: {:?}",
                         child_namespace
                     );
-                    SpiceAISchemaProvider::try_new(
+                    SpiceCloudPlatformSchemaProvider::try_new(
                         Arc::clone(&client),
                         child_namespace,
                         Arc::clone(&connector),
@@ -119,11 +119,11 @@ impl SpiceAICatalogProvider {
             })
             .collect();
 
-        Ok(SpiceAICatalogProvider { schemas })
+        Ok(SpiceCloudPlatformCatalogProvider { schemas })
     }
 }
 
-impl CatalogProvider for SpiceAICatalogProvider {
+impl CatalogProvider for SpiceCloudPlatformCatalogProvider {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -138,7 +138,7 @@ impl CatalogProvider for SpiceAICatalogProvider {
 }
 
 #[async_trait]
-impl RefreshableCatalogProvider for SpiceAICatalogProvider {
+impl RefreshableCatalogProvider for SpiceCloudPlatformCatalogProvider {
     async fn refresh(&self) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Will be implemented in a future enhancement.
         Ok(())
@@ -147,23 +147,23 @@ impl RefreshableCatalogProvider for SpiceAICatalogProvider {
 
 /// Represents a [`SchemaProvider`] for the Iceberg [`Catalog`], managing
 /// access to table providers within a specific namespace.
-pub(crate) struct SpiceAISchemaProvider {
+pub(crate) struct SpiceCloudPlatformSchemaProvider {
     /// A `HashMap` where keys are table names
     /// and values are dynamic references to objects implementing the
     /// [`TableProvider`] trait.
     tables: HashMap<String, Arc<dyn TableProvider>>,
 }
 
-impl std::fmt::Debug for SpiceAISchemaProvider {
+impl std::fmt::Debug for SpiceCloudPlatformSchemaProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SpiceAISchemaProvider")
+        f.debug_struct("SpiceCloudPlatformSchemaProvider")
             .field("tables", &self.tables)
             .finish_non_exhaustive()
     }
 }
 
-impl SpiceAISchemaProvider {
-    /// Asynchronously tries to construct a new [`SpiceAISchemaProvider`]
+impl SpiceCloudPlatformSchemaProvider {
+    /// Asynchronously tries to construct a new [`SpiceCloudPlatformSchemaProvider`]
     /// using the given client to fetch and initialize table providers for
     /// the provided namespace in the Spice.ai [`Catalog`].
     ///
@@ -219,12 +219,12 @@ impl SpiceAISchemaProvider {
             .map(|(name, provider)| (name.name().to_string(), provider))
             .collect();
 
-        Ok(SpiceAISchemaProvider { tables })
+        Ok(SpiceCloudPlatformSchemaProvider { tables })
     }
 }
 
 #[async_trait]
-impl SchemaProvider for SpiceAISchemaProvider {
+impl SchemaProvider for SpiceCloudPlatformSchemaProvider {
     fn as_any(&self) -> &dyn Any {
         self
     }
