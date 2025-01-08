@@ -14,7 +14,7 @@ Spice provides three industry standard APIs in a single, lightweight runtime (si
 
 1. **SQL Query APIs**: Supporting Arrow Flight, Arrow Flight SQL, ODBC, JDBC, and ADBC.
 2. **OpenAI-Compatible API**: OpenAI SDK and AI SDK compatible local model serving (CUDA/Metal accelerated) and gateway.
-3. **Iceberg Catalog REST API**: A unified Iceberg Catalog API.
+3. **Iceberg Catalog REST APIs**: A unified Iceberg Catalog API.
 
 Spice is primarily used for:
 
