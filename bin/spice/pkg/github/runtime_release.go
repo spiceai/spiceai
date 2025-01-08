@@ -144,7 +144,7 @@ func has_cuda_device() (bool, error) {
 	}
 
 	slog.Debug("On Linux, running `nvidia-smi --query-gpu=name --format=csv,noheader` to determine hardware")
-	cmd := exec.Command("nvidia-smi --query-gpu=name --format=csv,noheader")
+	cmd := exec.Command("nvidia-smi", "--query-gpu=name", "--format=csv,noheader")
 	if err := cmd.Start(); err != nil {
 		return false, fmt.Errorf("failed to start `nvidia-smi` command: %w", err)
 	}
