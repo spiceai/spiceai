@@ -300,8 +300,9 @@ jobs:
           echo $PATH
           echo $LD_LIBRARY_PATH
           nvidia-smi
+          ls -l /usr/local/cuda-12.4/bin || true
+          ls -l /usr/local/cuda/bin || true
           nvcc --version
-          ls -l /usr/local/cuda-12.4
 
       - name: Build spiced (models,cuda)
         if: matrix.target.runner == 'ubuntu-gpu-t4-4-core'
