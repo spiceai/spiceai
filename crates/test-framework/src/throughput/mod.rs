@@ -14,7 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::time::{Duration, Instant};
+use std::{
+    collections::BTreeMap,
+    time::{Duration, Instant},
+};
 
 use crate::spiced::SpicedInstance;
 use anyhow::Result;
@@ -41,16 +44,15 @@ impl EndCondition {
 }
 
 pub struct NotStarted {
-    parallel_count: usize,
     query_set: Vec<(&'static str, &'static str)>,
     end_condition: EndCondition,
 }
 pub struct Running {
     start_time: Instant,
-    query_workers: Vec<JoinHandle<Result<Duration>>>,
+    query_workers: Vec<JoinHandle<Result<BTreeMap<String, Duration>>>>,
 }
 pub struct Completed {
-    cumulative_query_duration: Duration,
+    query_durations: BTreeMap<String, Duration>,
     test_duration: Duration,
 }
 
@@ -65,6 +67,8 @@ impl TestState for Completed {}
 pub struct ThroughputTest<S: TestState> {
     name: String,
     spiced_instance: SpicedInstance,
+    query_count: usize,
+    parallel_count: usize,
 
     state: S,
 }
@@ -75,8 +79,9 @@ impl ThroughputTest<NotStarted> {
         Self {
             name,
             spiced_instance,
+            query_count: 0,
+            parallel_count: 1,
             state: NotStarted {
-                parallel_count: 1,
                 query_set: vec![],
                 end_condition: EndCondition::QuerySetCompleted(1),
             },
@@ -85,12 +90,13 @@ impl ThroughputTest<NotStarted> {
 
     #[must_use]
     pub fn with_parallel_count(mut self, parallel_count: usize) -> Self {
-        self.state.parallel_count = parallel_count;
+        self.parallel_count = parallel_count;
         self
     }
 
     #[must_use]
     pub fn with_query_set(mut self, query_set: Vec<(&'static str, &'static str)>) -> Self {
+        self.query_count = query_set.len();
         self.state.query_set = query_set;
         self
     }
@@ -106,12 +112,12 @@ impl ThroughputTest<NotStarted> {
             return Err(anyhow::anyhow!("Query set is empty"));
         }
 
-        if self.state.parallel_count == 0 {
+        if self.parallel_count == 0 {
             return Err(anyhow::anyhow!("Parallel count must be greater than 0"));
         }
 
         let flight_client = self.spiced_instance.flight_client().await?;
-        let query_workers = (1..self.state.parallel_count)
+        let query_workers = (1..self.parallel_count)
             .map(|id| {
                 ThroughputQueryWorker::new(
                     id,
@@ -126,6 +132,8 @@ impl ThroughputTest<NotStarted> {
         Ok(ThroughputTest {
             name: self.name,
             spiced_instance: self.spiced_instance,
+            query_count: self.query_count,
+            parallel_count: self.parallel_count,
             state: Running {
                 start_time: Instant::now(),
                 query_workers,
@@ -136,15 +144,24 @@ impl ThroughputTest<NotStarted> {
 
 impl ThroughputTest<Running> {
     pub async fn wait(self) -> Result<ThroughputTest<Completed>> {
-        let mut cumulative_query_duration = Duration::ZERO;
+        let mut query_durations = BTreeMap::new();
         for query_duration in join_all(self.state.query_workers).await {
-            cumulative_query_duration += query_duration??;
+            let query_duration = query_duration??;
+            for (query, duration) in query_duration {
+                if let Some(existing_duration) = query_durations.get_mut(&query) {
+                    *existing_duration += duration;
+                } else {
+                    query_durations.insert(query, duration);
+                }
+            }
         }
         Ok(ThroughputTest {
             name: self.name,
             spiced_instance: self.spiced_instance,
+            query_count: self.query_count,
+            parallel_count: self.parallel_count,
             state: Completed {
-                cumulative_query_duration,
+                query_durations,
                 test_duration: self.state.start_time.elapsed(),
             },
         })
@@ -153,13 +170,32 @@ impl ThroughputTest<Running> {
 
 impl ThroughputTest<Completed> {
     #[must_use]
+    pub fn get_query_durations(&self) -> &BTreeMap<String, Duration> {
+        &self.state.query_durations
+    }
+
+    #[must_use]
     pub fn get_cumulative_query_duration(&self) -> Duration {
-        self.state.cumulative_query_duration
+        self.state.query_durations.values().sum()
     }
 
     #[must_use]
     pub fn get_test_duration(&self) -> Duration {
         self.state.test_duration
+    }
+
+    pub fn get_throughput_metric(&self, scale: f64) -> Result<f64> {
+        // metric = (Parallel Query Count * Test Suite Query Count * 3600) / Cs * Scale
+        let lhs = self.parallel_count * self.query_count * 3600;
+        let rhs = self.get_cumulative_query_duration().as_secs_f64() * scale;
+        // u32 is safe because lhs is unlikely to be greater than u32::MAX unless some extreme parameters are used (more than 1000 parallel and query count)
+        Ok(f64::from(u32::try_from(lhs)?) / rhs)
+    }
+
+    /// Once the test has completed, return ownership of the spiced instance
+    #[must_use]
+    pub fn end(self) -> SpicedInstance {
+        self.spiced_instance
     }
 }
 

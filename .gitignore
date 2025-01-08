@@ -54,3 +54,6 @@ venv
 
 .env
 .spice
+.data/
+data/
+testoperator

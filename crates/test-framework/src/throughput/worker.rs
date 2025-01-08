@@ -14,7 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::time::{Duration, Instant};
+use std::{
+    collections::BTreeMap,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result};
 use flight_client::FlightClient;
@@ -44,9 +47,9 @@ impl ThroughputQueryWorker {
         }
     }
 
-    pub fn start(self) -> JoinHandle<Result<Duration>> {
+    pub fn start(self) -> JoinHandle<Result<BTreeMap<String, Duration>>> {
         tokio::spawn(async move {
-            let mut total_query_duration = Duration::ZERO;
+            let mut query_durations: BTreeMap<String, Duration> = BTreeMap::new();
             let mut query_set_count = 0;
             let start = Instant::now();
 
@@ -63,11 +66,15 @@ impl ThroughputQueryWorker {
                         }
                     };
                     let duration = query_start.elapsed();
-                    total_query_duration += duration;
+                    if let Some(existing_duration) = query_durations.get_mut(query.0) {
+                        *existing_duration += duration;
+                    } else {
+                        query_durations.insert(query.0.to_string(), duration);
+                    }
                 }
                 query_set_count += 1;
             }
-            Ok(total_query_duration)
+            Ok(query_durations)
         })
     }
 }
