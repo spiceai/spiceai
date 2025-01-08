@@ -9780,6 +9780,7 @@ dependencies = [
  "async-stream",
  "async-trait",
  "aws-config",
+ "aws-sdk-dynamodb",
  "aws-sdk-secretsmanager",
  "aws-sdk-sts",
  "axum",

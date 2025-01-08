@@ -16,10 +16,17 @@ limitations under the License.
 
 use crate::component::dataset::Dataset;
 use async_trait::async_trait;
+use aws_config::{BehaviorVersion, Region};
+use aws_sdk_dynamodb::Client;
+use aws_sdk_sts::config::Credentials;
+use data_components::dynamodb::provider::DynamoDBTableProvider;
 use datafusion::datasource::TableProvider;
 use std::{any::Any, future::Future, pin::Pin, sync::Arc};
 
-use super::{ConnectorParams, DataConnector, DataConnectorFactory, ParameterSpec, Parameters};
+use super::{
+    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
+    ParameterSpec, Parameters,
+};
 
 pub struct DynamoDB {
     params: Parameters,
@@ -42,24 +49,21 @@ impl DynamoDBFactory {
 
 const PARAMETERS: &[ParameterSpec] = &[
     // Connector parameters
-    ParameterSpec::connector("auth_token")
-        .description("The bearer token to use in the GraphQL requests.")
+    ParameterSpec::connector("aws_region")
+        .description("The AWS region to use for DynamoDB.")
+        .required()
         .secret(),
-    ParameterSpec::connector("auth_user")
-        .description("The username to use for HTTP Basic Auth.")
+    ParameterSpec::connector("aws_access_key_id")
+        .description("The AWS access key ID to use for DynamoDB.")
+        .required()
         .secret(),
-    ParameterSpec::connector("auth_pass")
-        .description("The password to use for HTTP Basic Auth.")
+    ParameterSpec::connector("aws_secret_access_key")
+        .description("The AWS secret access key to use for DynamoDB.")
+        .required()
         .secret(),
-    ParameterSpec::connector("query")
-        .description("The GraphQL query to execute.")
-        .required(),
-    // Runtime parameters
-    ParameterSpec::runtime("json_pointer")
-        .description("The JSON pointer to the data in the GraphQL response."),
-    ParameterSpec::runtime("unnest_depth").description(
-        "Depth level to automatically unnest objects to. By default, disabled if unspecified or 0.",
-    ),
+    ParameterSpec::connector("aws_session_token")
+        .description("The AWS session token to use for DynamoDB.")
+        .secret(),
 ];
 
 impl DataConnectorFactory for DynamoDBFactory {
@@ -92,8 +96,73 @@ impl DataConnector for DynamoDB {
 
     async fn read_provider(
         &self,
-        _dataset: &Dataset,
+        dataset: &Dataset,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
-        todo!()
+        let table_name = dataset.path();
+
+        // Get and own all parameter values upfront
+        let region = self
+            .params
+            .get("aws_region")
+            .expose()
+            .ok_or_else(|_| DataConnectorError::InvalidConfigurationNoSource {
+                dataconnector: "dynamodb".to_string(),
+                connector_component: ConnectorComponent::from(dataset),
+                message: "aws_region is required".to_string(),
+            })?
+            .to_string();
+
+        let access_key_id = self
+            .params
+            .get("aws_access_key_id")
+            .expose()
+            .ok_or_else(|_| DataConnectorError::InvalidConfigurationNoSource {
+                dataconnector: "dynamodb".to_string(),
+                connector_component: ConnectorComponent::from(dataset),
+                message: "aws_access_key_id is required".to_string(),
+            })?
+            .to_string();
+
+        let secret_access_key = self
+            .params
+            .get("aws_secret_access_key")
+            .expose()
+            .ok_or_else(|_| DataConnectorError::InvalidConfigurationNoSource {
+                dataconnector: "dynamodb".to_string(),
+                connector_component: ConnectorComponent::from(dataset),
+                message: "aws_secret_access_key is required".to_string(),
+            })?
+            .to_string();
+
+        let session_token = self
+            .params
+            .get("aws_session_token")
+            .expose()
+            .ok()
+            .map(ToString::to_string);
+
+        let credentials = Credentials::new(
+            access_key_id,
+            secret_access_key,
+            session_token,
+            None,
+            "DynamoDBTableProvider",
+        );
+
+        let config = aws_config::defaults(BehaviorVersion::v2024_03_28())
+            .region(Region::new(region))
+            .credentials_provider(credentials)
+            .load()
+            .await;
+
+        let client = Client::new(&config);
+        let provider = DynamoDBTableProvider::try_new(Arc::new(client), Arc::from(table_name))
+            .await
+            .map_err(|e| DataConnectorError::UnableToGetReadProvider {
+                dataconnector: "dynamodb".to_string(),
+                connector_component: ConnectorComponent::from(dataset),
+                source: Box::new(e),
+            })?;
+        Ok(Arc::new(provider))
     }
 }

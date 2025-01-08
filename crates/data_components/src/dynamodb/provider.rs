@@ -14,9 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{any::Any, collections::HashMap, fmt, sync::Arc};
+use std::{any::Any, collections::HashMap, fmt, io::Cursor, sync::Arc};
 
-use arrow::{datatypes::SchemaRef, json::reader::infer_json_schema_from_iterator};
+use arrow::{
+    datatypes::{Field, SchemaRef},
+    json::{reader::infer_json_schema_from_iterator, ReaderBuilder},
+};
 use async_trait::async_trait;
 use aws_sdk_dynamodb::{
     operation::{
@@ -28,12 +31,14 @@ use aws_sdk_dynamodb::{
 };
 use datafusion::{
     catalog::{Session, TableProvider},
+    common::project_schema,
     datasource::TableType,
-    error::Result as DataFusionResult,
+    error::{DataFusionError, Result as DataFusionResult},
     execution::{SendableRecordBatchStream, TaskContext},
     physical_expr::EquivalenceProperties,
     physical_plan::{
-        DisplayAs, DisplayFormatType, ExecutionMode, ExecutionPlan, Partitioning, PlanProperties,
+        stream::RecordBatchReceiverStream, DisplayAs, DisplayFormatType, ExecutionMode,
+        ExecutionPlan, Partitioning, PlanProperties,
     },
     prelude::Expr,
 };
@@ -59,7 +64,7 @@ pub enum Error {
     #[snafu(display("Table status is not active"))]
     TableStatusIsNotActive,
 
-    #[snafu(display("Failed to infer schema"))]
+    #[snafu(display("Failed to infer schema: {source}"))]
     SchemaInferenceError { source: arrow::error::ArrowError },
 }
 
@@ -71,7 +76,6 @@ pub struct DynamoDBTableProvider {
 }
 
 impl DynamoDBTableProvider {
-    #[must_use]
     pub async fn try_new(client: Arc<Client>, table_name: Arc<str>) -> Result<Self, Error> {
         let status = Self::get_table_status(Arc::clone(&client), Arc::clone(&table_name)).await?;
         if status != TableStatus::Active {
@@ -187,10 +191,8 @@ fn projection_expression(projection: Option<&Vec<usize>>, schema: &SchemaRef) ->
     // Create the comma-separated list of attribute names
     let expr = projection
         .iter()
-        // Get the field name at each index, filtering out invalid indices
         .map(|&idx| schema.field(idx))
-        .map(|field| field.name())
-        // Join the field names with commas
+        .map(Field::name)
         .join(", ");
 
     // If we couldn't find any valid field names, return None
@@ -224,32 +226,33 @@ impl TableProvider for DynamoDBTableProvider {
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
         let mut request = self.client.scan().table_name(self.table_name.to_string());
         if let Some(limit) = limit {
-            request = request.limit(limit as i32);
+            request = request.limit(
+                i32::try_from(limit)
+                    .map_err(|_| DataFusionError::Execution("Limit is too large".to_string()))?,
+            );
         }
         if let Some(projection) = projection_expression(projection, &self.table_schema) {
             request = request.projection_expression(projection);
         }
+        let projected_schema = project_schema(&self.table_schema, projection)?;
         Ok(Arc::new(DynamoDBTableProviderExec::new(
             request,
-            Arc::clone(&self.table_name),
-            Arc::clone(&self.table_schema),
+            projected_schema,
         )))
     }
 }
 
 pub struct DynamoDBTableProviderExec {
     request: ScanFluentBuilder,
-    table_name: Arc<str>,
     table_schema: SchemaRef,
     properties: PlanProperties,
 }
 
 impl DynamoDBTableProviderExec {
     #[must_use]
-    pub fn new(request: ScanFluentBuilder, table_name: Arc<str>, table_schema: SchemaRef) -> Self {
+    pub fn new(request: ScanFluentBuilder, table_schema: SchemaRef) -> Self {
         Self {
             request,
-            table_name,
             table_schema: Arc::clone(&table_schema),
             properties: PlanProperties::new(
                 EquivalenceProperties::new(table_schema),
@@ -305,45 +308,33 @@ impl ExecutionPlan for DynamoDBTableProviderExec {
         _partition: usize,
         _context: Arc<TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
-        let response = self.request.send().await.context(ScanSnafu)?;
-        Ok(SendableRecordBatchStream::new(response.items().iter().map(
-            |item| RecordBatch::try_from_iter(vec![item.clone()]),
-        )))
-    }
-}
+        let mut builder = RecordBatchReceiverStream::builder(Arc::clone(&self.table_schema), 2);
+        let tx = builder.tx();
 
-#[cfg(test)]
-mod tests {
-    use aws_config::{BehaviorVersion, Region};
-    use aws_sdk_dynamodb::config::Credentials;
+        let schema = Arc::clone(&self.table_schema);
+        let request = self.request.clone();
+        builder.spawn(async move {
+            let response = request
+                .send()
+                .await
+                .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+            for item in response.items() {
+                let json_value = attribute_map_to_json(item).to_string();
+                let batches = ReaderBuilder::new(Arc::clone(&schema))
+                    .with_batch_size(1024)
+                    .build(Cursor::new(json_value.as_bytes()))
+                    .map_err(|e| DataFusionError::Execution(e.to_string()))?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+                for batch in batches {
+                    tx.send(Ok(batch)).await.map_err(|_| {
+                        DataFusionError::Execution("Failed to send record batch".to_string())
+                    })?;
+                }
+            }
+            Ok(())
+        });
 
-    use super::*;
-
-    #[tokio::test]
-    async fn test_get_table_status() {
-        let access_key_id = std::env::var("AWS_ACCESS_KEY_ID").expect("AWS_ACCESS_KEY_ID not set");
-        let secret_access_key =
-            std::env::var("AWS_SECRET_ACCESS_KEY").expect("AWS_SECRET_ACCESS_KEY not set");
-        let config = aws_config::defaults(BehaviorVersion::latest())
-            .region(Region::new("us-west-2"))
-            .credentials_provider(Credentials::new(
-                access_key_id,
-                secret_access_key,
-                None,
-                None,
-                "DynamoDBTableProvider",
-            ))
-            .load()
-            .await;
-        let client = Client::new(&config);
-        let provider = DynamoDBTableProvider::new(Arc::new(client), Arc::new("users"));
-        let status = provider.get_table_status().await;
-        println!("{status:?}");
-
-        let schema = provider
-            .schema("users")
-            .await
-            .expect("Failed to infer schema");
-        println!("{schema:?}");
+        Ok(builder.build())
     }
 }
