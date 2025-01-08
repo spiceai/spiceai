@@ -295,8 +295,8 @@ jobs:
       - name: Check for CUDA
         if: matrix.target.runner == 'ubuntu-gpu-t4-4-core'
         run: |
-          ll /usr/local/cuda-12.4/bin
-          ll /usr/local/cuda-12.4
+          ls -l /usr/local/cuda-12.4/bin
+          ls -l /usr/local/cuda-12.4
           echo "Cuda install location: ${{steps.cuda-toolkit.outputs.CUDA_PATH}}"
           echo $PATH
           echo $LD_LIBRARY_PATH
