@@ -70,7 +70,7 @@ pub(crate) async fn run(args: &TestArgs) -> anyhow::Result<()> {
     // baseline run
     println!("Running baseline test");
     let baseline_test = ThroughputTest::new(app.name.clone(), spiced_instance)
-        .with_query_set(query_set.get_queries(query_overrides.clone()))
+        .with_query_set(query_set.get_queries(query_overrides))
         .with_parallel_count(1)
         .with_end_condition(EndCondition::QuerySetCompleted(10))
         .start()
