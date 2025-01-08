@@ -284,21 +284,23 @@ jobs:
       #     key: cuda-${{ runner.os }}-12.4.1
       #     restore-keys: cuda-${{ runner.os }}-
 
-      - name: Install CUDA toolkit
-        id: install-cuda-toolkit
-        if: matrix.target.runner == 'ubuntu-gpu-t4-4-core' # && steps.cache-cuda.outputs.cache-hit != 'true'
-        uses: Jimver/cuda-toolkit@v0.2.19
-        with:
-          cuda: "12.4.1"
-          linux-local-args: '["--toolkit", "--samples", "--driver"]'
+      # - name: Install CUDA toolkit
+      #   id: install-cuda-toolkit
+      #   if: matrix.target.runner == 'ubuntu-gpu-t4-4-core' # && steps.cache-cuda.outputs.cache-hit != 'true'
+      #   uses: Jimver/cuda-toolkit@v0.2.19
+      #   with:
+      #     cuda: "12.4.1"
+      #     linux-local-args: '["--toolkit", "--samples", "--driver"]'
 
       - name: Check for CUDA
         if: matrix.target.runner == 'ubuntu-gpu-t4-4-core'
         run: |
-          export PATH=/usr/local/cuda/bin:$PATH
-          echo "Cuda install location: ${{steps.install-cuda-toolkit.outputs.CUDA_PATH}}"
-          echo $PATH
-          echo $LD_LIBRARY_PATH
+          wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update
+          sudo apt-get -y install cuda-toolkit-12-4
+          sudo apt-get install -y nvidia-open
+          sudo apt-get install -y cuda-drivers
           nvidia-smi
           ls -l /usr/local/cuda-12.4/bin || true
           ls -l /usr/local/cuda/bin || true
