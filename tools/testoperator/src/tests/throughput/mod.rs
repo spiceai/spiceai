@@ -78,7 +78,7 @@ pub(crate) async fn run(args: &TestArgs) -> anyhow::Result<()> {
 
     let test = baseline_test.wait().await?;
     let baseline_percentiles = test.get_duration_percentile(0.99)?;
-    let baseline_durations = test.get_query_durations().clone();
+    let baseline_durations = test.get_statistically_sorted_durations()?.clone();
     let spiced_instance = test.end();
 
     // throughput test
@@ -92,7 +92,7 @@ pub(crate) async fn run(args: &TestArgs) -> anyhow::Result<()> {
 
     let test = throughput_test.wait().await?;
     let percentiles = test.get_duration_percentile(0.99)?;
-    let query_durations = test.get_query_durations().clone();
+    let query_durations = test.get_statistically_sorted_durations()?.clone();
     let throughput_metric = test.get_throughput_metric(args.scale_factor.unwrap_or(1.0))?;
     let mut spiced_instance = test.end();
 
