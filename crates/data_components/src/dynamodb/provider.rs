@@ -312,26 +312,30 @@ impl ExecutionPlan for DynamoDBTableProviderExec {
         let tx = builder.tx();
 
         let schema = Arc::clone(&self.table_schema);
-        let request = self.request.clone();
+        let request = self.request.clone().into_paginator();
+
         builder.spawn(async move {
-            let response = request
-                .send()
-                .await
-                .map_err(|e| DataFusionError::Execution(e.to_string()))?;
-            for item in response.items() {
-                let json_value = attribute_map_to_json(item).to_string();
-                let batches = ReaderBuilder::new(Arc::clone(&schema))
-                    .with_batch_size(1024)
-                    .build(Cursor::new(json_value.as_bytes()))
-                    .map_err(|e| DataFusionError::Execution(e.to_string()))?
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(|e| DataFusionError::Execution(e.to_string()))?;
-                for batch in batches {
-                    tx.send(Ok(batch)).await.map_err(|_| {
-                        DataFusionError::Execution("Failed to send record batch".to_string())
-                    })?;
+            let mut stream = request.send();
+
+            while let Some(item) = stream.next().await {
+                let scan_output = item.map_err(|e| DataFusionError::Execution(e.to_string()))?;
+                for scan_item in scan_output.items() {
+                    let json_value = attribute_map_to_json(scan_item).to_string();
+                    let batches = ReaderBuilder::new(Arc::clone(&schema))
+                        .with_batch_size(1024)
+                        .build(Cursor::new(json_value.as_bytes()))
+                        .map_err(|e| DataFusionError::Execution(e.to_string()))?
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+
+                    for batch in batches {
+                        tx.send(Ok(batch)).await.map_err(|_| {
+                            DataFusionError::Execution("Failed to send record batch".to_string())
+                        })?;
+                    }
                 }
             }
+
             Ok(())
         });
 
