@@ -32,11 +32,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Rust
+      - name: Setup Rust
         uses: ./.github/actions/setup-rust
         with:
           os: 'linux'
       
+      - name: Setup cc
+        uses: ./.github/actions/setup-cc
+
       - name: Get latest trunk commit
         if: ${{ !github.event.inputs.spiced_commit }}
         run: |
@@ -50,6 +53,7 @@ jobs:
       
       - name: Download spiced from MinIO
         run: |
+          sudo apt update && sudo apt install wget -y
           sudo wget https://dl.min.io/client/mc/release/linux-amd64/mc -O /usr/local/bin/mc
           sudo chmod +x /usr/local/bin/mc
           mc alias set spice-minio ${{ secrets.CLICKBENCH_S3_ENDPOINT }} ${{ secrets.CLICKBENCH_S3_KEY }} ${{ secrets.CLICKBENCH_S3_SECRET }}
