@@ -276,9 +276,25 @@ jobs:
           path: spiced_models_metal_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz
 
       ## Models + CUDA flavor
+      - name: Set up cache for CUDA
+        id: cache-cuda
+        uses: actions/cache@v3
+        with:
+          path: /usr/local/cuda
+          key: cuda-${{ runner.os }}-12.4.1
+          restore-keys: cuda-${{ runner.os }}-
+
+      - name: Install CUDA toolkit
+        if: matrix.target.runner == 'ubuntu-gpu-t4-4-core' && steps.cache-cuda.outputs.cache-hit != 'true'
+        uses: Jimver/cuda-toolkit
+        with:
+          cuda: "12.4.1"
+
       - name: Check for CUDA
         if: matrix.target.runner == 'ubuntu-gpu-t4-4-core'
         run: |
+          echo $PATH
+          echo $LD_LIBRARY_PATH
           nvidia-smi
           nvcc --version
 
