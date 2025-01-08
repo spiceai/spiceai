@@ -282,8 +282,8 @@ jobs:
         with:
           cuda: "12.4.1"
           method: "network"
-          sub-packages: '["nvcc","cudart", "cublas", "curand", "nvrtc"]'
           use-github-cache: false
+          # sub-packages: '["nvcc","cudart", "cublas", "curand", "nvrtc"]'
 
       - name: Verify CUDA prerequisites
         if: matrix.target.runner == 'ubuntu-gpu-t4-4-core'
