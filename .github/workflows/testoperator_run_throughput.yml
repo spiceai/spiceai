@@ -1,4 +1,4 @@
-name: benchmark tests
+name: throughput tests
 
 on:
   workflow_dispatch:
