@@ -298,7 +298,7 @@ jobs:
         with:
           cuda: "12.4.1"
           method: "network"
-          sub-packages: '["nvcc","cudart","cusparse","cublas","thrust","nvrtc_dev","cublas_dev","cusparse_dev"]'
+          sub-packages: '["nvcc","cudart"]'
           linux-local-args: '["--toolkit", "--driver"]'
           use-github-cache: false
 
