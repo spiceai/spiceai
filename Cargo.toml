@@ -88,7 +88,6 @@ iceberg-datafusion = "0.4.0"
 iceberg-catalog-rest = "0.4.0"
 insta = { version = "1.41.1", features = ["filters"] }
 itertools = "0.13"
-lazy_static = "1.5.0"
 mysql_async = { version = "0.34.1", features = ["native-tls-tls", "chrono"] }
 object_store = { version = "0.11" }
 odbc-api = { version = "8.1.2" }

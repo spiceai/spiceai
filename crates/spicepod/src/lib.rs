@@ -17,6 +17,7 @@ limitations under the License.
 #![allow(clippy::missing_errors_doc)]
 
 use component::tool::Tool;
+use reader::ReadableYaml;
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
 use std::collections::HashMap;
@@ -104,17 +105,12 @@ impl Spicepod {
         Self::load_from(&reader::StdFileSystem, path)
     }
 
-    pub fn load_from<T>(
+    fn load_from_rdr<T>(
         fs: &impl reader::ReadableYaml<T>,
+        spicepod_rdr: Box<dyn std::io::Read>,
         path: impl Into<PathBuf>,
     ) -> Result<Spicepod> {
         let path = path.into();
-        let path_str = path.to_string_lossy().to_string();
-
-        let spicepod_rdr = fs
-            .open_yaml(&path_str, "spicepod")
-            .ok_or_else(|| Error::SpicepodNotFound { path: path.clone() })?;
-
         let spicepod_definition: SpicepodDefinition =
             serde_yaml::from_reader(spicepod_rdr).context(UnableToParseSpicepodSnafu)?;
 
@@ -180,6 +176,30 @@ impl Spicepod {
             resolved_tools,
             resolved_models,
         ))
+    }
+
+    pub fn load_exact(path: impl Into<PathBuf>) -> Result<Spicepod> {
+        let fs = reader::StdFileSystem;
+        let path = path.into();
+        let spicepod_rdr = fs
+            .open_exact_yaml(&path)
+            .map_err(|_| Error::SpicepodNotFound { path: path.clone() })?;
+
+        Self::load_from_rdr(&fs, spicepod_rdr, path)
+    }
+
+    pub fn load_from<T>(
+        fs: &impl reader::ReadableYaml<T>,
+        path: impl Into<PathBuf>,
+    ) -> Result<Spicepod> {
+        let path = path.into();
+        let path_str = path.to_string_lossy().to_string();
+
+        let spicepod_rdr = fs
+            .open_yaml(&path_str, "spicepod")
+            .ok_or_else(|| Error::SpicepodNotFound { path: path.clone() })?;
+
+        Self::load_from_rdr(fs, spicepod_rdr, path)
     }
 
     pub fn load_definition(path: impl Into<PathBuf>) -> Result<SpicepodDefinition> {

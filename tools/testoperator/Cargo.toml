@@ -12,3 +12,5 @@ version.workspace = true
 test-framework = { path = "../../crates/test-framework" }
 clap.workspace = true
 tokio.workspace = true
+
+[features]

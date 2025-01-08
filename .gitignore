@@ -54,3 +54,7 @@ venv
 
 .env
 .spice
+.data/
+data/
+testoperator
+!test/spicepods/

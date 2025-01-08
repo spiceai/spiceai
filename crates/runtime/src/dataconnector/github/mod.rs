@@ -46,12 +46,12 @@ use graphql_parser::query::{
     Definition, InlineFragment, OperationDefinition, Query, Selection, SelectionSet,
 };
 use issues::IssuesTableArgs;
-use lazy_static::lazy_static;
 use pull_requests::PullRequestTableArgs;
 use rate_limit::GitHubRateLimiter;
 use snafu::ResultExt;
 use stargazers::StargazersTableArgs;
 use std::collections::HashMap;
+use std::sync::LazyLock;
 use std::{any::Any, future::Future, pin::Pin, str::FromStr, sync::Arc};
 use url::Url;
 
@@ -530,15 +530,15 @@ struct GitHubPushdownSupport {
 
 // TODO: add support for IN filters, to support columns like assignees, labels, etc.
 // Table currently doesn't support IN at all though, with or without pushdown, so that needs to be fixed first
-lazy_static! {
-    static ref GITHUB_FILTER_PUSHDOWNS_SUPPORTED: HashMap<&'static str, GitHubPushdownSupport> = {
+static GITHUB_FILTER_PUSHDOWNS_SUPPORTED: LazyLock<HashMap<&'static str, GitHubPushdownSupport>> =
+    LazyLock::new(|| {
         let mut m = HashMap::new();
         m.insert(
             "author",
             GitHubPushdownSupport {
                 ops: vec![Operator::Eq, Operator::NotEq],
                 remaps: None,
-                uses_modifiers: true
+                uses_modifiers: true,
             },
         );
 
@@ -553,7 +553,7 @@ lazy_static! {
                     Operator::NotILikeMatch,
                 ],
                 remaps: None,
-                uses_modifiers: false
+                uses_modifiers: false,
             },
         );
 
@@ -562,7 +562,7 @@ lazy_static! {
             GitHubPushdownSupport {
                 ops: vec![Operator::Eq, Operator::NotEq],
                 remaps: None,
-                uses_modifiers: true
+                uses_modifiers: true,
             },
         );
 
@@ -577,7 +577,7 @@ lazy_static! {
                     Operator::NotILikeMatch,
                 ],
                 remaps: None,
-                uses_modifiers: false
+                uses_modifiers: false,
             },
         );
 
@@ -592,7 +592,7 @@ lazy_static! {
                     Operator::GtEq,
                 ],
                 remaps: Some(vec![GitHubFilterRemap::Column("created")]),
-                uses_modifiers: true
+                uses_modifiers: true,
             },
         );
 
@@ -607,7 +607,7 @@ lazy_static! {
                     Operator::GtEq,
                 ],
                 remaps: Some(vec![GitHubFilterRemap::Column("updated")]),
-                uses_modifiers: true
+                uses_modifiers: true,
             },
         );
 
@@ -622,7 +622,7 @@ lazy_static! {
                     Operator::GtEq,
                 ],
                 remaps: Some(vec![GitHubFilterRemap::Column("closed")]),
-                uses_modifiers: true
+                uses_modifiers: true,
             },
         );
 
@@ -637,7 +637,7 @@ lazy_static! {
                     Operator::GtEq,
                 ],
                 remaps: Some(vec![GitHubFilterRemap::Column("merged")]),
-                uses_modifiers: true
+                uses_modifiers: true,
             },
         );
 
@@ -645,30 +645,28 @@ lazy_static! {
             "committed_date",
             GitHubPushdownSupport {
                 // e.g. committed_date > '2024-09-14'
-                ops: vec![
-                    Operator::Lt,
-                    Operator::LtEq,
-                    Operator::Gt,
-                    Operator::GtEq,
-                ],
+                ops: vec![Operator::Lt, Operator::LtEq, Operator::Gt, Operator::GtEq],
                 remaps: Some(vec![
                     GitHubFilterRemap::Operator((Operator::Gt, "since")),
                     GitHubFilterRemap::Operator((Operator::GtEq, "since")),
                     GitHubFilterRemap::Operator((Operator::Lt, "until")),
-                    GitHubFilterRemap::Operator((Operator::LtEq, "until"))]),
-                uses_modifiers: false
+                    GitHubFilterRemap::Operator((Operator::LtEq, "until")),
+                ]),
+                uses_modifiers: false,
             },
         );
 
-        m.insert("labels", GitHubPushdownSupport {
-            ops: vec![Operator::LikeMatch],
-            remaps: Some(vec![GitHubFilterRemap::Column("label")]),
-            uses_modifiers: false
-        });
+        m.insert(
+            "labels",
+            GitHubPushdownSupport {
+                ops: vec![Operator::LikeMatch],
+                remaps: Some(vec![GitHubFilterRemap::Column("label")]),
+                uses_modifiers: false,
+            },
+        );
 
         m
-    };
-}
+    });
 
 fn expr_to_match(expr: &Expr) -> Option<(Column, ScalarValue, Operator)> {
     match expr {

@@ -14,14 +14,29 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use test_framework::{anyhow, rustls};
 
 mod tests;
+
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
-struct Args {
+struct Cli {
+    #[command(subcommand)]
+    subcommand: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    // Run a test
+    Run(RunArgs),
+    // Export the spicepod environment that would run for a test
+    Export(RunArgs),
+}
+
+#[derive(Parser)]
+struct RunArgs {
     /// Path to the spicepod.yaml file
     #[arg(short('p'), long)]
     spicepod_path: PathBuf,
@@ -29,6 +44,10 @@ struct Args {
     /// Path to the spiced binary
     #[arg(short, long)]
     spiced_path: PathBuf,
+
+    /// An optional data directory, to symlink into the spiced instance
+    #[arg(short, long)]
+    data_dir: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -36,8 +55,12 @@ async fn main() -> anyhow::Result<()> {
     let _ = rustls::crypto::CryptoProvider::install_default(
         rustls::crypto::aws_lc_rs::default_provider(),
     );
-    let args = Args::parse();
+    let cli = Cli::parse();
 
-    tests::throughput::run(&args).await?;
+    match cli.subcommand {
+        Commands::Run(args) => tests::throughput::run(&args).await?,
+        Commands::Export(args) => tests::throughput::export(&args)?,
+    }
+
     Ok(())
 }

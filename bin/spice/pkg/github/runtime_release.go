@@ -67,7 +67,7 @@ func GetRuntimeAssetName(flavor string) string {
 	switch {
 	case flavor == "ai":
 		if accelerator, exists := get_ai_accelerator(); exists {
-			flavor = fmt.Sprintf("_%s_models", accelerator)
+			flavor = fmt.Sprintf("_models_%s", accelerator)
 		} else {
 			flavor = "_models"
 		}
