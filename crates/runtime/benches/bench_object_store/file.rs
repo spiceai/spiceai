@@ -49,7 +49,7 @@ pub(crate) async fn run_file_append(
         },
         "clickbench" => match accelerator.clone() {
             Some(Acceleration { engine, .. }) => {
-                get_clickbench_test_queries(Some(QueryOverrides::try_from(engine.as_deref())?))
+                get_clickbench_test_queries(engine.as_deref().and_then(QueryOverrides::from_engine))
             }
             None => get_clickbench_test_queries(None),
         },

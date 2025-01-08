@@ -35,7 +35,7 @@ impl QuerySet {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 pub enum QueryOverrides {
     SQLite,
     PostgreSQL,
@@ -46,19 +46,18 @@ pub enum QueryOverrides {
     DuckDB,
 }
 
-impl TryFrom<Option<&str>> for QueryOverrides {
-    type Error = String;
-
-    fn try_from(value: Option<&str>) -> Result<Self, Self::Error> {
-        match value {
-            Some("sqlite") => Ok(Self::SQLite),
-            Some("postgres") => Ok(Self::PostgreSQL),
-            Some("mysql") => Ok(Self::MySQL),
-            Some("dremio") => Ok(Self::Dremio),
-            Some("spark") => Ok(Self::Spark),
-            Some("odbc_athena") => Ok(Self::ODBCAthena),
-            Some("duckdb") => Ok(Self::DuckDB),
-            _ => Err(format!("Invalid query override: {value:?}",)),
+impl QueryOverrides {
+    #[must_use]
+    pub fn from_engine(engine: &str) -> Option<Self> {
+        match engine {
+            "sqlite" => Some(Self::SQLite),
+            "postgres" => Some(Self::PostgreSQL),
+            "mysql" => Some(Self::MySQL),
+            "dremio" => Some(Self::Dremio),
+            "spark" => Some(Self::Spark),
+            "odbc_athena" => Some(Self::ODBCAthena),
+            "duckdb" => Some(Self::DuckDB),
+            _ => None,
         }
     }
 }
@@ -90,9 +89,8 @@ macro_rules! remove_tpch_query {
 }
 
 #[must_use]
-#[allow(clippy::needless_pass_by_value)]
 pub fn get_tpch_test_queries(
-    overrides: Option<QueryOverrides>, // we don't consume these, but the way we call this usually creates the value inline so it looks weird doing &Some(QueryOverrides::DuckDB) everywhere and is just unnecessary
+    overrides: Option<QueryOverrides>,
 ) -> Vec<(&'static str, &'static str)> {
     let queries = generate_tpch_queries!(
         q1, q2, q3, q4, q5, q6, q7, q8, q9, q10, q11, q12, q13, q14, q16, q17, q18, q19, q20, q21,
@@ -156,9 +154,8 @@ macro_rules! add_tpcds_query_overrides {
 }
 
 #[must_use]
-#[allow(clippy::needless_pass_by_value)]
 pub fn get_tpcds_test_queries(
-    overrides: Option<QueryOverrides>, // we don't consume these, but the way we call this usually creates the value inline so it looks weird doing &Some(QueryOverrides::DuckDB) everywhere and is just unnecessary
+    overrides: Option<QueryOverrides>,
 ) -> Vec<(&'static str, &'static str)> {
     let queries = generate_tpcds_queries!(
         1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
@@ -240,9 +237,8 @@ macro_rules! generate_clickbench_query_overrides {
 }
 
 #[must_use]
-#[allow(clippy::needless_pass_by_value)]
 pub fn get_clickbench_test_queries(
-    overrides: Option<QueryOverrides>, // we don't consume these, but the way we call this usually creates the value inline so it looks weird doing &Some(QueryOverrides::DuckDB) everywhere and is just unnecessary
+    overrides: Option<QueryOverrides>,
 ) -> Vec<(&'static str, &'static str)> {
     let mut queries = generate_clickbench_queries!(
         1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,

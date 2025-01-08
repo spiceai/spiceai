@@ -73,7 +73,7 @@ pub(crate) async fn run(
             }
         }
         "clickbench" => {
-            get_clickbench_test_queries(Some(QueryOverrides::try_from(engine.as_deref())?))
+            get_clickbench_test_queries(engine.as_deref().and_then(QueryOverrides::from_engine))
         }
         _ => return Err(format!("Invalid benchmark to run {bench_name}")),
     };
