@@ -112,7 +112,7 @@ Limited = Partial or restricted support
 - **Responsive Dashboards**: Enable fast, real-time analytics by accelerating data for frontends and BI tools. [Sales BI Dashboard Demo](https://github.com/spiceai/cookbook/blob/trunk/sales-bi/README.md)
 - **Simplified Legacy Migration**: Use a single endpoint to unify legacy systems with modern infrastructure, including federated SQL querying across multiple sources. [Federated SQL Query Recipe](https://github.com/spiceai/cookbook/blob/trunk/federation/README.md)
 
-### **Retrieval-Augmented Generation (RAG)**
+### Retrieval-Augmented Generation (RAG)
 
 - **Unified Search with Vector Similarity**: Perform efficient vector similarity search across structured and unstructured data sources. [Vector Search over GitHub Files](https://github.com/spiceai/cookbook/blob/trunk/search_github_files/README.md)
 - **Semantic Knowledge Layer**: Define a semantic context model to enrich data for AI. [Semantic Model Feature Documentation](https://docs.spiceai.org/features/semantic-model)
