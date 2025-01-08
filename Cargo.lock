@@ -2120,7 +2120,7 @@ dependencies = [
  "byteorder",
  "candle-kernels 0.8.0",
  "candle-metal-kernels 0.8.0",
- "cudarc 0.12.2",
+ "cudarc",
  "float8",
  "gemm",
  "half",
@@ -2149,7 +2149,7 @@ dependencies = [
  "byteorder",
  "candle-kernels 0.8.1",
  "candle-metal-kernels 0.8.1",
- "cudarc 0.12.2",
+ "cudarc",
  "gemm",
  "half",
  "memmap2",
@@ -2171,10 +2171,21 @@ dependencies = [
 [[package]]
 name = "candle-cublaslt"
 version = "0.2.2"
-source = "git+https://github.com/huggingface/candle-cublaslt?rev=cf789b7dd6d4abb19b03b9556442f94f0588b4a0#cf789b7dd6d4abb19b03b9556442f94f0588b4a0"
+source = "git+https://github.com/spiceai/candle-cublaslt?rev=2606920f137fef2825589015ad846121b8850ac7#2606920f137fef2825589015ad846121b8850ac7"
 dependencies = [
  "candle-core 0.8.1",
- "cudarc 0.10.0",
+ "cudarc",
+ "half",
+]
+
+[[package]]
+name = "candle-flash-attn"
+version = "0.8.0"
+source = "git+https://github.com/EricLBuehler/candle.git?rev=6800496#6800496261a240aa969fdc47cc9814d7914f0862"
+dependencies = [
+ "anyhow",
+ "bindgen_cuda 0.1.5",
+ "candle-core 0.8.0",
  "half",
 ]
 
@@ -2219,7 +2230,7 @@ dependencies = [
 [[package]]
 name = "candle-layer-norm"
 version = "0.0.1"
-source = "git+https://github.com/huggingface/candle-layer-norm?rev=94c2add7d94c2d63aebde77f7534614e04dbaea1#94c2add7d94c2d63aebde77f7534614e04dbaea1"
+source = "git+https://github.com/spiceai/candle-layer-norm?rev=650c1945f235e2543ea4f9c6280123ef0580b692#650c1945f235e2543ea4f9c6280123ef0580b692"
 dependencies = [
  "anyhow",
  "candle-core 0.8.1",
@@ -2287,7 +2298,7 @@ dependencies = [
 [[package]]
 name = "candle-rotary"
 version = "0.0.1"
-source = "git+https://github.com/huggingface/candle-rotary?rev=0a718a0856569a92f3112e64f10d07e4447822e8#0a718a0856569a92f3112e64f10d07e4447822e8"
+source = "git+https://github.com/Jeadie/candle-rotary?rev=9f568592a2078ca0f6944ceda5c07a73cf7ee2fa#9f568592a2078ca0f6944ceda5c07a73cf7ee2fa"
 dependencies = [
  "anyhow",
  "bindgen_cuda 0.1.5",
@@ -2899,17 +2910,8 @@ dependencies = [
 
 [[package]]
 name = "cudarc"
-version = "0.10.0"
-source = "git+https://github.com/coreylowman/cudarc?rev=c388e724af93a3e8fbe484f5ded2d8b3c1badd8e#c388e724af93a3e8fbe484f5ded2d8b3c1badd8e"
-dependencies = [
- "half",
-]
-
-[[package]]
-name = "cudarc"
 version = "0.12.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8cd76de2aa3a7bdb9a65941ea5a3c688d941688f736a81b2fc5beb88747a7f25"
+source = "git+https://github.com/coreylowman/cudarc?rev=d3405fa5ce18068d0362142c5d7b3910ea4039fa#d3405fa5ce18068d0362142c5d7b3910ea4039fa"
 dependencies = [
  "half",
  "libloading",
@@ -4337,7 +4339,7 @@ version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c7c3475274d374d263c4c40c43ad854c5bdf733c7db775bbd3c1ca2ad7427978"
 dependencies = [
- "cudarc 0.12.2",
+ "cudarc",
  "half",
  "num-traits",
  "rand 0.8.5",
@@ -6621,6 +6623,7 @@ dependencies = [
  "async-stream",
  "async-trait",
  "bytes",
+ "cudarc",
  "dotenvy",
  "either",
  "futures",
@@ -7061,6 +7064,7 @@ dependencies = [
  "bytemuck",
  "bytemuck_derive",
  "candle-core 0.8.0",
+ "candle-flash-attn",
  "candle-hf-hub",
  "candle-nn 0.8.0",
  "cfgrammar",
@@ -11374,7 +11378,7 @@ dependencies = [
 [[package]]
 name = "text-embeddings-backend"
 version = "1.5.0"
-source = "git+https://github.com/spiceai/text-embeddings-inference.git?rev=b59b7b62860e75abea9b222de6100b4d1b1fac92#b59b7b62860e75abea9b222de6100b4d1b1fac92"
+source = "git+https://github.com/spiceai/text-embeddings-inference.git?rev=388f3ed4c47ff353f34c34e46a1c6db6a6d841a5#388f3ed4c47ff353f34c34e46a1c6db6a6d841a5"
 dependencies = [
  "hf-hub",
  "serde_json",
@@ -11387,7 +11391,7 @@ dependencies = [
 [[package]]
 name = "text-embeddings-backend-candle"
 version = "1.5.0"
-source = "git+https://github.com/spiceai/text-embeddings-inference.git?rev=b59b7b62860e75abea9b222de6100b4d1b1fac92#b59b7b62860e75abea9b222de6100b4d1b1fac92"
+source = "git+https://github.com/spiceai/text-embeddings-inference.git?rev=388f3ed4c47ff353f34c34e46a1c6db6a6d841a5#388f3ed4c47ff353f34c34e46a1c6db6a6d841a5"
 dependencies = [
  "anyhow",
  "candle-core 0.8.1",
@@ -11396,6 +11400,7 @@ dependencies = [
  "candle-nn 0.8.1",
  "candle-rotary",
  "candle-transformers",
+ "cudarc",
  "memmap2",
  "nohash-hasher",
  "safetensors",
@@ -11410,7 +11415,7 @@ dependencies = [
 [[package]]
 name = "text-embeddings-backend-core"
 version = "1.5.0"
-source = "git+https://github.com/spiceai/text-embeddings-inference.git?rev=b59b7b62860e75abea9b222de6100b4d1b1fac92#b59b7b62860e75abea9b222de6100b4d1b1fac92"
+source = "git+https://github.com/spiceai/text-embeddings-inference.git?rev=388f3ed4c47ff353f34c34e46a1c6db6a6d841a5#388f3ed4c47ff353f34c34e46a1c6db6a6d841a5"
 dependencies = [
  "nohash-hasher",
  "thiserror 1.0.69",
@@ -11419,7 +11424,7 @@ dependencies = [
 [[package]]
 name = "text-embeddings-core"
 version = "1.5.0"
-source = "git+https://github.com/spiceai/text-embeddings-inference.git?rev=b59b7b62860e75abea9b222de6100b4d1b1fac92#b59b7b62860e75abea9b222de6100b4d1b1fac92"
+source = "git+https://github.com/spiceai/text-embeddings-inference.git?rev=388f3ed4c47ff353f34c34e46a1c6db6a6d841a5#388f3ed4c47ff353f34c34e46a1c6db6a6d841a5"
 dependencies = [
  "async-channel 2.3.1",
  "hf-hub",
@@ -12451,7 +12456,7 @@ version = "0.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1c4dcab280ad0ef3957e153a82dcad608c954d02cf253b695322f502d1f8902e"
 dependencies = [
- "cudarc 0.12.2",
+ "cudarc",
  "half",
  "serde",
  "serde_json",
