@@ -14,40 +14,19 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use clap::{Parser, Subcommand};
-use std::path::PathBuf;
+use clap::Parser;
 use test_framework::{anyhow, rustls};
 
+mod commands;
 mod tests;
+
+use commands::{Commands, TestCommands};
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
 struct Cli {
     #[command(subcommand)]
     subcommand: Commands,
-}
-
-#[derive(Subcommand)]
-enum Commands {
-    // Run a test
-    Run(RunArgs),
-    // Export the spicepod environment that would run for a test
-    Export(RunArgs),
-}
-
-#[derive(Parser)]
-struct RunArgs {
-    /// Path to the spicepod.yaml file
-    #[arg(short('p'), long)]
-    spicepod_path: PathBuf,
-
-    /// Path to the spiced binary
-    #[arg(short, long)]
-    spiced_path: PathBuf,
-
-    /// An optional data directory, to symlink into the spiced instance
-    #[arg(short, long)]
-    data_dir: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -58,8 +37,10 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.subcommand {
-        Commands::Run(args) => tests::throughput::run(&args).await?,
-        Commands::Export(args) => tests::throughput::export(&args)?,
+        Commands::Run(TestCommands::Throughput(args)) => tests::throughput::run(&args).await?,
+        Commands::Export(TestCommands::Throughput(args)) => tests::throughput::export(&args)?,
+        Commands::Run(TestCommands::Load(_)) => unimplemented!(),
+        Commands::Export(TestCommands::Load(_)) => unimplemented!(),
     }
 
     Ok(())

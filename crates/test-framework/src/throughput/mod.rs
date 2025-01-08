@@ -47,12 +47,15 @@ pub struct NotStarted {
     query_set: Vec<(&'static str, &'static str)>,
     end_condition: EndCondition,
 }
+
+pub type QueryWorkers = Vec<JoinHandle<Result<BTreeMap<String, Vec<Duration>>>>>;
+
 pub struct Running {
     start_time: Instant,
-    query_workers: Vec<JoinHandle<Result<BTreeMap<String, Duration>>>>,
+    query_workers: QueryWorkers,
 }
 pub struct Completed {
-    query_durations: BTreeMap<String, Duration>,
+    query_durations: BTreeMap<String, Vec<Duration>>,
     test_duration: Duration,
 }
 
@@ -117,7 +120,7 @@ impl ThroughputTest<NotStarted> {
         }
 
         let flight_client = self.spiced_instance.flight_client().await?;
-        let query_workers = (1..self.parallel_count)
+        let query_workers = (0..self.parallel_count)
             .map(|id| {
                 ThroughputQueryWorker::new(
                     id,
@@ -148,11 +151,10 @@ impl ThroughputTest<Running> {
         for query_duration in join_all(self.state.query_workers).await {
             let query_duration = query_duration??;
             for (query, duration) in query_duration {
-                if let Some(existing_duration) = query_durations.get_mut(&query) {
-                    *existing_duration += duration;
-                } else {
-                    query_durations.insert(query, duration);
-                }
+                query_durations
+                    .entry(query)
+                    .or_insert_with(Vec::new)
+                    .extend(duration);
             }
         }
         Ok(ThroughputTest {
@@ -169,14 +171,61 @@ impl ThroughputTest<Running> {
 }
 
 impl ThroughputTest<Completed> {
+    pub fn get_statistically_sorted_durations(&self) -> Result<BTreeMap<String, Vec<Duration>>> {
+        let mut statistically_sorted_durations = BTreeMap::new();
+        for (query, durations) in &self.state.query_durations {
+            let mut sorted_durations = durations.clone();
+            sorted_durations.sort();
+
+            // calculate the inter-quartile range to remove statistical outliers
+            // safety: sorted_durations.len() cannot be negative, and is unlikely to be larger than u32::MAX
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            {
+                let first_quartile_index =
+                    (f64::from(u32::try_from(sorted_durations.len())?) * 0.25).floor();
+                let third_quartile_index =
+                    (f64::from(u32::try_from(sorted_durations.len())?) * 0.75).ceil();
+                let first_quartile_secs =
+                    sorted_durations[first_quartile_index as usize].as_secs_f64();
+                let third_quartile_secs =
+                    sorted_durations[third_quartile_index as usize].as_secs_f64();
+
+                let iqr = third_quartile_secs - first_quartile_secs;
+                let lower_bound = first_quartile_secs - 1.5 * iqr;
+                let upper_bound = third_quartile_secs + 1.5 * iqr;
+
+                sorted_durations.retain(|duration| {
+                    let duration_secs = duration.as_secs_f64();
+                    duration_secs >= lower_bound && duration_secs <= upper_bound
+                });
+            }
+
+            statistically_sorted_durations.insert(query.clone(), sorted_durations);
+        }
+        Ok(statistically_sorted_durations)
+    }
+
+    pub fn get_duration_percentile(&self, percentile: f64) -> Result<BTreeMap<String, Duration>> {
+        let mut slowest_durations = BTreeMap::new();
+        for (query, durations) in &self.get_statistically_sorted_durations()? {
+            // safety: sorted_durations.len() cannot be negative, and is unlikely to be larger than u32::MAX
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let index = ((percentile * f64::from(u32::try_from(durations.len())?)).ceil() as usize)
+                .saturating_sub(1)
+                .min(durations.len() - 1);
+            slowest_durations.insert(query.clone(), durations[index]);
+        }
+        Ok(slowest_durations)
+    }
+
     #[must_use]
-    pub fn get_query_durations(&self) -> &BTreeMap<String, Duration> {
+    pub fn get_query_durations(&self) -> &BTreeMap<String, Vec<Duration>> {
         &self.state.query_durations
     }
 
     #[must_use]
     pub fn get_cumulative_query_duration(&self) -> Duration {
-        self.state.query_durations.values().sum()
+        self.state.query_durations.values().flatten().copied().sum()
     }
 
     #[must_use]

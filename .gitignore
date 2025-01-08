@@ -56,5 +56,5 @@ venv
 .spice
 .data/
 data/
-testoperator
+./testoperator
 !test/spicepods/
