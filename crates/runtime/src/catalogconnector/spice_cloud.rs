@@ -74,6 +74,7 @@ impl SpiceCloudPlatformCatalog {
             Arc::new(catalog_client),
             namespace_ident,
             read_provider,
+            catalog.include.clone(),
         )
         .await
         .map_err(|e| super::Error::UnableToGetCatalogProvider {

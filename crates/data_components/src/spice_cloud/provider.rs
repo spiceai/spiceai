@@ -25,6 +25,7 @@ use datafusion::catalog::{CatalogProvider, SchemaProvider, TableProvider};
 use datafusion::error::Result as DFResult;
 use datafusion::sql::TableReference;
 use futures::future::try_join_all;
+use globset::GlobSet;
 use iceberg::{Catalog, NamespaceIdent};
 use snafu::prelude::*;
 
@@ -73,11 +74,14 @@ impl SpiceCloudPlatformCatalogProvider {
         client: Arc<RestCatalog>,
         root_namespace: NamespaceIdent,
         connector: Arc<dyn Read>,
+        include: Option<GlobSet>,
     ) -> Result<Self> {
         let schema_names: Vec<_> = client
             .list_namespaces(Some(&root_namespace))
             .await
             .context(ListNamespacesSnafu)?;
+
+        let include = include.map(Arc::new);
 
         let providers = try_join_all(
             schema_names
@@ -100,6 +104,7 @@ impl SpiceCloudPlatformCatalogProvider {
                         Arc::clone(&client),
                         child_namespace,
                         Arc::clone(&connector),
+                        include.clone(),
                     )
                 })
                 .collect::<Vec<_>>(),
@@ -174,49 +179,63 @@ impl SpiceCloudPlatformSchemaProvider {
         client: Arc<RestCatalog>,
         namespace: NamespaceIdent,
         connector: Arc<dyn Read>,
+        include: Option<Arc<GlobSet>>,
     ) -> Result<Self> {
         let table_names: Vec<_> = client
             .list_tables(&namespace)
             .await
             .context(ListTablesSnafu)?;
 
-        let table_providers: Vec<_> = try_join_all(
-            table_names
-                .clone()
-                .into_iter()
-                .map(
-                    |ref table_name| match table_name.namespace().clone().inner().as_slice() {
-                        [.., catalog, schema] => {
-                            let table_reference = TableReference::full(
+        let included_table_names: Vec<TableReference> = table_names
+            .clone()
+            .into_iter()
+            .filter_map(|ref table_name| {
+                let (table_reference, schema_and_table) =
+                    match table_name.namespace().clone().inner().as_slice() {
+                        [.., catalog, schema] => (
+                            TableReference::full(
                                 Arc::from(catalog.as_str()),
                                 Arc::from(schema.as_str()),
                                 Arc::from(table_name.name()),
-                            );
-                            connector.table_provider(table_reference, None)
-                        }
-                        [schema] => {
-                            let table_reference = TableReference::partial(
+                            ),
+                            format!("{}.{}", schema, table_name.name()),
+                        ),
+                        [schema] => (
+                            TableReference::partial(
                                 Arc::from(schema.as_str()),
                                 Arc::from(table_name.name()),
-                            );
-                            connector.table_provider(table_reference, None)
-                        }
-                        [] => {
-                            let table_reference =
-                                TableReference::bare(Arc::from(table_name.name()));
-                            connector.table_provider(table_reference, None)
-                        }
-                    },
-                )
+                            ),
+                            format!("{}.{}", schema, table_name.name()),
+                        ),
+                        [] => (
+                            TableReference::bare(Arc::from(table_name.name())),
+                            table_name.name().to_string(),
+                        ),
+                    };
+                if let Some(include) = &include {
+                    if !include.is_match(schema_and_table) {
+                        tracing::debug!("Table {} is not included", table_reference);
+                        return None;
+                    }
+                }
+                Some(table_reference)
+            })
+            .collect();
+
+        let table_providers: Vec<_> = try_join_all(
+            included_table_names
+                .clone()
+                .into_iter()
+                .map(|ref table_name| connector.table_provider(table_name.clone(), None))
                 .collect::<Vec<_>>(),
         )
         .await
         .context(TableProviderCreationSnafu)?;
 
-        let tables: HashMap<String, Arc<dyn TableProvider>> = table_names
+        let tables: HashMap<String, Arc<dyn TableProvider>> = included_table_names
             .into_iter()
             .zip(table_providers.into_iter())
-            .map(|(name, provider)| (name.name().to_string(), provider))
+            .map(|(name, provider)| (name.table().to_string(), provider))
             .collect();
 
         Ok(SpiceCloudPlatformSchemaProvider { tables })
