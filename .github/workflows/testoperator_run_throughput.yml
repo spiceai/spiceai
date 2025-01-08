@@ -59,6 +59,7 @@ jobs:
           mc alias set spice-minio ${{ secrets.CLICKBENCH_S3_ENDPOINT }} ${{ secrets.CLICKBENCH_S3_KEY }} ${{ secrets.CLICKBENCH_S3_SECRET }}
           mc cp spice-minio/artifacts/spiced/linux-x86_64/$SPICED_COMMIT/spiced_models_linux_x86_64.tar.gz spiced_models_linux_x86_64.tar.gz
           tar -xzf spiced_models_linux_x86_64.tar.gz
+          ls -lh ./
           cp spiced_models_linux_x86_64/spiced /usr/local/bin/spiced
       
       - name: Run the throughput test (no data directory)
