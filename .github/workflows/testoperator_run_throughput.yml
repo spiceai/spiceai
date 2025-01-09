@@ -42,8 +42,8 @@ jobs:
       - name: Download the testoperator from MinIO if it exists
         run: |
           if mc stat spice-minio/artifacts/testoperator/linux-x86_64/$TESTOPERATOR_COMMIT/testoperator; then
-            mc cp spice-minio/artifacts/testoperator/linux-x86_64/$TESTOPERATOR_COMMIT/testoperator /usr/local/bin/testoperator
-            chmod +x /usr/local/bin/testoperator
+            sudo mc cp spice-minio/artifacts/testoperator/linux-x86_64/$TESTOPERATOR_COMMIT/testoperator /usr/local/bin/testoperator
+            sudo chmod +x /usr/local/bin/testoperator
             echo "TESTOPERATOR_DOWNLOADED=true" >> $GITHUB_ENV
           else
             echo "TESTOPERATOR_DOWNLOADED=false" >> $GITHUB_ENV
