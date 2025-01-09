@@ -23,11 +23,7 @@ use arrow::{
         UInt64Array, UInt64Builder,
     },
     datatypes::{DataType, Field, Schema, SchemaRef},
-};
-use datafusion::{
-    datasource::{provider_as_source, MemTable},
-    logical_expr::{LogicalPlanBuilder, UNNAMED_TABLE},
-    prelude::{DataFrame, SessionContext},
+    util::pretty::print_batches,
 };
 use uuid::Uuid;
 
@@ -393,19 +389,8 @@ impl<T: ExtendedMetrics> QueryMetrics<T> {
         Ok(vec![RecordBatch::try_new(Self::schema(), columns)?])
     }
 
-    pub async fn show(&self) -> Result<()> {
-        let schema = Self::schema();
-
-        let records = self.build()?;
-        let ctx = SessionContext::new();
-        let provider = MemTable::try_new(schema, vec![records])?;
-        let df = DataFrame::new(
-            ctx.state(),
-            LogicalPlanBuilder::scan(UNNAMED_TABLE, provider_as_source(Arc::new(provider)), None)?
-                .build()?,
-        );
-
-        df.show().await?;
+    pub fn show(&self) -> Result<()> {
+        print_batches(&self.build()?)?;
 
         Ok(())
     }

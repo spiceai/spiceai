@@ -11367,7 +11367,6 @@ dependencies = [
  "app",
  "arrow",
  "clap",
- "datafusion",
  "flight_client",
  "futures",
  "nix",

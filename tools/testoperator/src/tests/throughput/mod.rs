@@ -19,7 +19,7 @@ use std::time::Duration;
 use test_framework::{
     anyhow,
     app::App,
-    metrics::{MetricCollector, StatisticsCollector},
+    metrics::MetricCollector,
     queries::{QueryOverrides, QuerySet},
     spiced::{SpicedInstance, StartRequest},
     spicepod::Spicepod,
@@ -79,8 +79,6 @@ pub(crate) async fn run(args: &TestArgs) -> anyhow::Result<()> {
         .await?;
 
     let test = baseline_test.wait().await?;
-    let baseline_durations = test.get_query_durations().statistical_set()?;
-    let baseline_percentiles = baseline_durations.percentile(0.99)?;
     let spiced_instance = test.end();
 
     // throughput test
@@ -93,42 +91,17 @@ pub(crate) async fn run(args: &TestArgs) -> anyhow::Result<()> {
         .await?;
 
     let test = throughput_test.wait().await?;
-    let query_durations = test.get_query_durations().statistical_set()?;
     let throughput_metric = test.get_throughput_metric(args.scale_factor.unwrap_or(1.0))?;
     let metrics = test.collect()?;
     let mut spiced_instance = test.end();
 
-    metrics.show().await?;
-
-    for (query, _) in queries {
-        let Some(duration) = query_durations.get(query) else {
-            return Err(anyhow::anyhow!("Query {query} not found in durations"));
-        };
-
-        let Some(baseline_percentile) = baseline_percentiles.get(query) else {
-            return Err(anyhow::anyhow!(
-                "Query {query} not found in baseline percentiles"
-            ));
-        };
-
-        // TODO: move this into throughput test metricscollector and add an extended metrics for it
-        let count_slower_than_baseline_percentile = duration
-            .iter()
-            .filter(|d| d.as_millis() > baseline_percentile.as_millis())
-            .count();
-        let percent_slower_than_baseline_percentile =
-            f64::from(u32::try_from(count_slower_than_baseline_percentile)?)
-                / f64::from(u32::try_from(duration.len())?)
-                * 100.0;
-        if percent_slower_than_baseline_percentile > 1.0 {
-            println!(
-                "{query} - {percent_slower_than_baseline_percentile}% of the time it was slower than the baseline 99th percentile"
-            );
-        }
-    }
+    metrics.show()?;
 
     spiced_instance.stop()?;
 
-    println!("Throughput test completed with throughput: {throughput_metric}");
+    println!(
+        "Throughput test completed with throughput: {} Queries per hour * Scale Factor",
+        throughput_metric.round()
+    );
     Ok(())
 }
