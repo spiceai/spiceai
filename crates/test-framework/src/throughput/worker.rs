@@ -76,7 +76,7 @@ impl ThroughputQueryWorker {
             let start = Instant::now();
 
             while !self.end_condition.is_met(&start, query_set_count) {
-                for query in &self.query_set {
+                'query_set: for query in &self.query_set {
                     let mut row_count = 0;
                     let query_start = Instant::now();
                     match self.flight_client.query(query.1).await {
@@ -92,6 +92,7 @@ impl ThroughputQueryWorker {
                                             self.id, query.0, e
                                         );
                                         query_durations.entry(query.0.to_string()).or_default();
+                                        continue 'query_set;
                                     }
                                 }
                             }

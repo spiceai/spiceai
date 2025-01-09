@@ -86,7 +86,6 @@ pub enum QueryOverridesArg {
     Spark,
     ODBCAthena,
     Duckdb,
-    Flight,
 }
 
 impl From<QuerySetArg> for QuerySet {
@@ -109,7 +108,6 @@ impl From<QueryOverridesArg> for QueryOverrides {
             QueryOverridesArg::Spark => QueryOverrides::Spark,
             QueryOverridesArg::ODBCAthena => QueryOverrides::ODBCAthena,
             QueryOverridesArg::Duckdb => QueryOverrides::DuckDB,
-            QueryOverridesArg::Flight => QueryOverrides::Flight,
         }
     }
 }
