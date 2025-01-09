@@ -79,13 +79,14 @@ pub enum QuerySetArg {
 
 #[derive(Clone, ValueEnum)]
 pub enum QueryOverridesArg {
-    SQLite,
-    PostgreSQL,
-    MySQL,
+    Sqlite,
+    Postgresql,
+    Mysql,
     Dremio,
     Spark,
     ODBCAthena,
-    DuckDB,
+    Duckdb,
+    Flight,
 }
 
 impl From<QuerySetArg> for QuerySet {
@@ -101,13 +102,14 @@ impl From<QuerySetArg> for QuerySet {
 impl From<QueryOverridesArg> for QueryOverrides {
     fn from(arg: QueryOverridesArg) -> Self {
         match arg {
-            QueryOverridesArg::SQLite => QueryOverrides::SQLite,
-            QueryOverridesArg::PostgreSQL => QueryOverrides::PostgreSQL,
-            QueryOverridesArg::MySQL => QueryOverrides::MySQL,
+            QueryOverridesArg::Sqlite => QueryOverrides::SQLite,
+            QueryOverridesArg::Postgresql => QueryOverrides::PostgreSQL,
+            QueryOverridesArg::Mysql => QueryOverrides::MySQL,
             QueryOverridesArg::Dremio => QueryOverrides::Dremio,
             QueryOverridesArg::Spark => QueryOverrides::Spark,
             QueryOverridesArg::ODBCAthena => QueryOverrides::ODBCAthena,
-            QueryOverridesArg::DuckDB => QueryOverrides::DuckDB,
+            QueryOverridesArg::Duckdb => QueryOverrides::DuckDB,
+            QueryOverridesArg::Flight => QueryOverrides::Flight,
         }
     }
 }

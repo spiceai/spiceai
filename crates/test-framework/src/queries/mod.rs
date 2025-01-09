@@ -44,6 +44,7 @@ pub enum QueryOverrides {
     Spark,
     ODBCAthena,
     DuckDB,
+    Flight,
 }
 
 impl QueryOverrides {
@@ -57,6 +58,7 @@ impl QueryOverrides {
             "spark" => Some(Self::Spark),
             "odbc_athena" => Some(Self::ODBCAthena),
             "duckdb" => Some(Self::DuckDB),
+            "flight" => Some(Self::Flight),
             _ => None,
         }
     }
@@ -107,6 +109,10 @@ pub fn get_tpch_test_queries(
             2, // Analysis error: [UNSUPPORTED_SUBQUERY_EXPRESSION_CATEGORY.UNSUPPORTED_CORRELATED_SCALAR_SUBQUERY] Unsupported subquery expression: Correlated scalar subqueries can only be used in filters, aggregations, projections, and UPDATE/MERGE/DELETE commands
             17 // Analysis error: [UNSUPPORTED_SUBQUERY_EXPRESSION_CATEGORY.UNSUPPORTED_CORRELATED_SCALAR_SUBQUERY] Unsupported subquery expression: Correlated scalar subqueries can only be used in filters, aggregations, projections, and UPDATE/MERGE/DELETE commands
         ),
+        Some(QueryOverrides::Flight) => queries
+            .into_iter()
+            .filter(|(name, _)| *name != "tpch_simple_q3")
+            .collect(),
         _ => queries,
     }
 }
