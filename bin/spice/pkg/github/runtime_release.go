@@ -145,23 +145,37 @@ func has_cuda_device() (bool, error) {
 
 	slog.Debug("On Linux, running `nvidia-smi --query-gpu=name --format=csv,noheader` to determine hardware")
 	cmd := exec.Command("nvidia-smi", "--query-gpu=name", "--format=csv,noheader")
-	if err := cmd.Start(); err != nil {
-		return false, fmt.Errorf("failed to start `nvidia-smi` command: %w", err)
-	}
-
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return false, fmt.Errorf("failed to get stdout pipe: %w", err)
 	}
 
-	// If command fails, not an error. Just no `nvidia-smi` installed, which is expected.
-	_ = cmd.Wait()
-	cmd_output, err := io.ReadAll(stdout)
-	if err != nil {
-		return false, fmt.Errorf("failed to read output: %w", err)
+	if err := cmd.Start(); err != nil {
+		return false, fmt.Errorf("failed to start `nvidia-smi` command: %w", err)
 	}
 
-	// If the output is empty, there are no CUDA devices
-	// Any output indicates the presence of a CUDA device
-	return len(cmd_output) > 0, nil
+	// Read the output while the command is still running
+	cmd_output, readErr := io.ReadAll(stdout)
+
+	waitErr := cmd.Wait()
+
+	// If `nvidia-smi` exits with a non-zero status, treat it as no GPU available
+	if waitErr != nil {
+		if exitErr, ok := waitErr.(*exec.ExitError); ok {
+			slog.Warn("`nvidia-smi` command failed", "exit_code", exitErr.ExitCode(), "error", exitErr)
+			return false, nil
+		}
+		return false, fmt.Errorf("unexpected error while waiting for `nvidia-smi`: %w", waitErr)
+	}
+
+	// Handle output reading errors separately
+	if readErr != nil {
+		return false, fmt.Errorf("failed to read output: %w", readErr)
+	}
+
+	// Check if the output indicates available GPUs
+	if len(cmd_output) > 0 {
+		return true, nil
+	}
+	return false, nil
 }
