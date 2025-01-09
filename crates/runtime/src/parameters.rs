@@ -306,7 +306,7 @@ impl<'a> ExposedParamLookup<'a> {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ParameterSpec {
     pub name: &'static str,
     pub required: bool,

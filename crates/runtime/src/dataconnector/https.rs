@@ -15,9 +15,6 @@ limitations under the License.
 */
 
 use crate::component::dataset::Dataset;
-use crate::dataconnector::listing::LISTING_TABLE_PARAMETERS;
-use lazy_static::lazy_static;
-
 use snafu::prelude::*;
 use std::any::Any;
 use std::future::Future;
@@ -57,20 +54,30 @@ impl HttpsFactory {
     }
 }
 
-lazy_static! {
-    static ref PARAMETERS: Vec<ParameterSpec> = {
-        let mut all_parameters = Vec::new();
-        all_parameters.extend_from_slice(&[
-            ParameterSpec::connector("username").secret(),
-            ParameterSpec::connector("password").secret(),
-            ParameterSpec::connector("port").description("The port to connect to."),
-            ParameterSpec::runtime("client_timeout")
-                .description("The timeout setting for HTTP(S) client."),
-        ]);
-        all_parameters.extend_from_slice(LISTING_TABLE_PARAMETERS);
-        all_parameters
-    };
-}
+const PARAMETERS: &[ParameterSpec] = &[
+    ParameterSpec::connector("username").secret(),
+    ParameterSpec::connector("password").secret(),
+    ParameterSpec::connector("port").description("The port to connect to."),
+    ParameterSpec::runtime("client_timeout")
+        .description("The timeout setting for HTTP(S) client."),
+
+    // Common listing table parameters
+    ParameterSpec::runtime("file_format"),
+    ParameterSpec::runtime("file_extension"),
+    ParameterSpec::runtime("schema_infer_max_records")
+        .description("Set a limit in terms of records to scan to infer the schema."),
+    ParameterSpec::runtime("csv_has_header")
+        .description("Set true to indicate that the first line is a header."),
+    ParameterSpec::runtime("csv_quote").description("The quote character in a row."),
+    ParameterSpec::runtime("csv_escape").description("The escape character in a row."),
+    ParameterSpec::runtime("csv_schema_infer_max_records")
+        .description("Set a limit in terms of records to scan to infer the schema.")
+        .deprecated("use 'schema_infer_max_records' instead"),
+    ParameterSpec::runtime("csv_delimiter")
+        .description("The character separating values within a row."),
+    ParameterSpec::runtime("file_compression_type")
+        .description("The type of compression used on the file. Supported types are: GZIP, BZIP2, XZ, ZSTD, UNCOMPRESSED"),
+];
 
 impl DataConnectorFactory for HttpsFactory {
     fn as_any(&self) -> &dyn Any {
@@ -93,7 +100,7 @@ impl DataConnectorFactory for HttpsFactory {
     }
 
     fn parameters(&self) -> &'static [ParameterSpec] {
-        &PARAMETERS
+        PARAMETERS
     }
 }
 
