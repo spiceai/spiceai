@@ -179,10 +179,11 @@ jobs:
 
       ## Default flavor
       - name: Build spiced
+        if: matrix.target.runner != 'ubuntu-gpu-t4-4-core'
         run: make -C bin/spiced
 
       - name: tar binary
-        if: matrix.target.target_os != 'windows'
+        if: matrix.target.target_os != 'windows' && matrix.target.runner != 'ubuntu-gpu-t4-4-core'
         run: |
           mv target/release/spiced spiced
           chmod +x spiced
@@ -195,7 +196,7 @@ jobs:
           tar czf spiced.exe_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz spiced.exe
 
       - name: Print version
-        if: matrix.target.target_os != 'windows'
+        if: matrix.target.target_os != 'windows' && matrix.target.runner != 'ubuntu-gpu-t4-4-core'
         run: ./spiced --version
 
       - name: Print version (Windows)
@@ -203,7 +204,7 @@ jobs:
         run: ./spiced.exe --version
 
       - uses: actions/upload-artifact@v4
-        if: matrix.target.target_os != 'windows'
+        if: matrix.target.target_os != 'windows' && matrix.target.runner != 'ubuntu-gpu-t4-4-core'
         with:
           name: spiced_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: spiced_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz
@@ -216,10 +217,11 @@ jobs:
 
       ## Models flavor
       - name: Build spiced (models)
+        if: matrix.target.runner != 'ubuntu-gpu-t4-4-core'
         run: make -C bin/spiced SPICED_NON_DEFAULT_FEATURES="models"
 
       - name: tar binary (models)
-        if: matrix.target.target_os != 'windows'
+        if: matrix.target.target_os != 'windows' && matrix.target.runner != 'ubuntu-gpu-t4-4-core'
         run: |
           mv target/release/spiced spiced
           chmod +x spiced
@@ -233,7 +235,7 @@ jobs:
           tar czf spiced.exe_models_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz spiced.exe
 
       - name: Print version (models)
-        if: matrix.target.target_os != 'windows'
+        if: matrix.target.target_os != 'windows' && matrix.target.runner != 'ubuntu-gpu-t4-4-core'
         run: ./spiced --version
 
       - name: Print version (models) (Windows)
@@ -241,7 +243,7 @@ jobs:
         run: ./spiced.exe --version
 
       - uses: actions/upload-artifact@v4
-        if: matrix.target.target_os != 'windows'
+        if: matrix.target.target_os != 'windows' && matrix.target.runner != 'ubuntu-gpu-t4-4-core'
         with:
           name: spiced_models_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: spiced_models_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz
@@ -274,12 +276,48 @@ jobs:
           name: spiced_models_metal_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: spiced_models_metal_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz
 
+      ## models + cuda flavor
+      - uses: Jimver/cuda-toolkit@v0.2.19
+        id: cuda-toolkit
+        if: matrix.target.runner == 'ubuntu-gpu-t4-4-core'
+        with:
+          cuda: "12.4.1"
+          method: "network"
+          use-github-cache: false
+          #See e.g. https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/
+          non-cuda-sub-packages: '["libcurand-dev", "libcublas","libcublas-dev"]'
+          sub-packages: '["nvcc","compiler","libraries","libraries-dev","cudart","cudart-dev"]'
+
+      - name: Verify CUDA prerequisites
+        if: matrix.target.runner == 'ubuntu-gpu-t4-4-core'
+        run: |
+          nvidia-smi
+          nvcc --version
+
+      - name: Build spiced (models, cuda)
+        if: matrix.target.runner == 'ubuntu-gpu-t4-4-core'
+        run: make -C bin/spiced SPICED_NON_DEFAULT_FEATURES="models,cuda"
+
+      - name: tar binary (models, cuda)
+        if: matrix.target.runner == 'ubuntu-gpu-t4-4-core'
+        run: |
+          mv target/release/spiced spiced
+          chmod +x spiced
+          tar czf spiced_models_cuda_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz spiced
+
+      - uses: actions/upload-artifact@v4
+        if: matrix.target.runner == 'ubuntu-gpu-t4-4-core'
+        with:
+          name: spiced_models_cuda_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
+          path: spiced_models_cuda_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz
+
       ## CLI build
       - name: Build spice
+        if: matrix.target.runner != 'ubuntu-gpu-t4-4-core'
         run: make -C bin/spice
 
       - name: tar binary
-        if: matrix.target.target_os != 'windows'
+        if: matrix.target.target_os != 'windows' && matrix.target.runner != 'ubuntu-gpu-t4-4-core'
         run: |
           mv target/release/spice spice
           chmod +x spice
@@ -292,7 +330,7 @@ jobs:
           tar czf spice.exe_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz spice.exe
 
       - name: Print version
-        if: matrix.target.target_os != 'windows'
+        if: matrix.target.target_os != 'windows'&& matrix.target.runner != 'ubuntu-gpu-t4-4-core'
         run: ./spice version
 
       - name: Print version (Windows)
@@ -300,7 +338,7 @@ jobs:
         run: ./spice.exe version
 
       - uses: actions/upload-artifact@v4
-        if: matrix.target.target_os != 'windows'
+        if: matrix.target.target_os != 'windows' && matrix.target.runner != 'ubuntu-gpu-t4-4-core'
         with:
           name: spice_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: spice_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz
@@ -331,99 +369,6 @@ jobs:
           if (Test-Path C:/spiceai/build/target) {
             Copy-Item -Recurse -Force target/* C:/spiceai/build/target
           }
-
-  build-cuda:
-    name: Build CUDA model binaries
-    runs-on: ${{ matrix.target.runner }}
-    if: matrix.target.runner == 'ubuntu-gpu-t4-4-core'
-    needs: setup-matrix
-    env:
-      GOVER: 1.23.4
-      GOOS: ${{ matrix.target.target_os }}
-      GOARCH: ${{ matrix.target.target_arch_go }}
-
-    strategy:
-      matrix:
-        target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set REL_VERSION from version.txt
-        run: python3 ./.github/scripts/get_release_version.py
-
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: ${{ env.GOVER }}
-
-      - name: Set up Rust
-        uses: ./.github/actions/setup-rust
-        with:
-          os: ${{ matrix.target.target_os }}
-
-      - name: Set up make
-        if: matrix.target.target_os == 'linux'
-        uses: ./.github/actions/setup-make
-
-      - name: Set up cc
-        if: matrix.target.target_os == 'linux'
-        uses: ./.github/actions/setup-cc
-
-      - name: Restore build cache (Linux)
-        if: matrix.target.target_os == 'linux'
-        run: |
-          mkdir -p target
-          if [ -d /home/spiceai/build/target ]; then
-            rsync -av /home/spiceai/build/target/ target/
-          fi
-
-      # The aarch64 runner does not have any tools pre-installed
-      - name: Install missing tools (Linux aarch64)
-        if: matrix.target.target_os == 'linux' && matrix.target.target_arch == 'aarch64'
-        run: |
-          sudo apt-get update
-          sudo apt-get install build-essential libssl-dev pkg-config cmake protobuf-compiler unixodbc unixodbc-dev -y
-
-      - name: Restore build cache (Windows)
-        if: matrix.target.target_os == 'windows'
-        run: |
-          mkdir -p target
-          if (Test-Path C:/spiceai/build/target) {
-            Copy-Item -Recurse -Force C:/spiceai/build/target/* target/
-          }
-
-      - uses: Jimver/cuda-toolkit@v0.2.19
-        id: cuda-toolkit
-        with:
-          cuda: "12.4.1"
-          method: "network"
-          use-github-cache: false
-          #See e.g. https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/
-          non-cuda-sub-packages: '["libcurand-dev", "libcublas","libcublas-dev"]'
-          sub-packages: '["nvcc","compiler","libraries","libraries-dev","cudart","cudart-dev"]'
-
-      - name: Verify CUDA prerequisites
-        run: |
-          nvidia-smi
-          nvcc --version
-
-      - name: Build spiced
-        run: make -C bin/spiced SPICED_NON_DEFAULT_FEATURES="models,cuda"
-
-      - name: tar binary
-        run: |
-          mv target/release/spiced spiced
-          chmod +x spiced
-          tar czf spiced_models_cuda_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz spiced
-
-      - name: Print version
-        run: ./spiced --version
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: spiced_models_cuda_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-          path: spiced_models_cuda_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz
 
   publish-minio:
     name: Publish linux-x86_64 binaries to Minio
@@ -471,7 +416,7 @@ jobs:
 
   publish:
     name: Publish ${{ matrix.target_os }}-${{ matrix.target_arch }} binaries
-    needs: [build, build-cuda]
+    needs: build
     if: startswith(github.ref, 'refs/tags/v') && github.event_name != 'pull_request'
     env:
       ARTIFACT_DIR: ./release
