@@ -225,7 +225,7 @@ jobs:
           path: /tmp/images-amd64-cuda.tar
 
   publish:
-    needs: [setup, build-amd64, build-arm64, build-cuda]
+    needs: [setup, build-amd64, build-arm64]
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts
