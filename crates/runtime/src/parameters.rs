@@ -297,6 +297,13 @@ impl<'a> ExposedParamLookup<'a> {
             ExposedParamLookup::Absent(s) => Err(f(s)),
         }
     }
+
+    pub fn unwrap_or_else(self, f: impl FnOnce(UserParam) -> &'a str) -> &'a str {
+        match self {
+            ExposedParamLookup::Present(s) => s,
+            ExposedParamLookup::Absent(s) => f(s),
+        }
+    }
 }
 
 #[derive(Debug)]

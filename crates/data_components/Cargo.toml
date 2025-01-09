@@ -16,6 +16,8 @@ arrow-buffer.workspace = true
 arrow-flight.workspace = true
 async-stream.workspace = true
 async-trait.workspace = true
+aws-config = { version = "1.5.13", optional = true }
+aws-sdk-dynamodb = { version = "1.59.0", optional = true }
 base64.workspace = true
 bb8 = { workspace = true, optional = true }
 bytes.workspace = true
@@ -47,6 +49,7 @@ http = { version = "1.1.0" }
 iceberg-catalog-rest.workspace = true
 iceberg.workspace = true
 iceberg-datafusion.workspace = true
+itertools.workspace = true
 object_store = { workspace = true }
 rdkafka = { version = "0.37.0", features = ["ssl-vendored"], optional = true }
 regex = "1.10.4"
@@ -85,6 +88,7 @@ duckdb = [
     "datafusion-table-providers/duckdb",
     "datafusion-table-providers/duckdb-federation",
 ]
+dynamodb = ["dep:aws-sdk-dynamodb", "dep:aws-config"]
 flightsql = []
 mssql = ["dep:tiberius", "dep:tokio-util", "dep:bb8"]
 mysql = ["datafusion-table-providers/mysql"]

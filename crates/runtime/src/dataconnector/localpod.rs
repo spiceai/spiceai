@@ -49,6 +49,10 @@ impl LocalPodFactory {
 }
 
 impl DataConnectorFactory for LocalPodFactory {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn create(
         &self,
         params: ConnectorParams,

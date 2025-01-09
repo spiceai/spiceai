@@ -108,6 +108,10 @@ impl DuckDBFactory {
 const PARAMETERS: &[ParameterSpec] = &[ParameterSpec::connector("open")];
 
 impl DataConnectorFactory for DuckDBFactory {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn create(
         &self,
         params: ConnectorParams,

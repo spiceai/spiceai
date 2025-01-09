@@ -624,6 +624,10 @@ mod tests {
     }
 
     impl DataConnectorFactory for TestConnector {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
         fn create(
             &self,
             params: ConnectorParams,

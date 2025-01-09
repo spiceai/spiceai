@@ -15,20 +15,18 @@ limitations under the License.
 */
 
 use clap::Parser;
-use std::path::PathBuf;
 use test_framework::{anyhow, rustls};
 
+mod commands;
 mod tests;
+
+use commands::{Commands, TestCommands};
+
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
-struct Args {
-    /// Path to the spicepod.yaml file
-    #[arg(short('p'), long)]
-    spicepod_path: PathBuf,
-
-    /// Path to the spiced binary
-    #[arg(short, long)]
-    spiced_path: PathBuf,
+struct Cli {
+    #[command(subcommand)]
+    subcommand: Commands,
 }
 
 #[tokio::main]
@@ -36,8 +34,14 @@ async fn main() -> anyhow::Result<()> {
     let _ = rustls::crypto::CryptoProvider::install_default(
         rustls::crypto::aws_lc_rs::default_provider(),
     );
-    let args = Args::parse();
+    let cli = Cli::parse();
 
-    tests::throughput::run(&args).await?;
+    match cli.subcommand {
+        Commands::Run(TestCommands::Throughput(args)) => tests::throughput::run(&args).await?,
+        Commands::Export(TestCommands::Throughput(args)) => tests::throughput::export(&args)?,
+        Commands::Run(TestCommands::Load(_)) => unimplemented!(),
+        Commands::Export(TestCommands::Load(_)) => unimplemented!(),
+    }
+
     Ok(())
 }

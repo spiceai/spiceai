@@ -61,11 +61,13 @@ default = [
   "debezium",
   "anonymous_telemetry",
   "mssql",
+  "dynamodb",
 ]
 delta_lake = ["runtime/delta_lake"]
 dev = ["runtime/dev"]
 dremio = ["runtime/dremio"]
 duckdb = ["runtime/duckdb"]
+dynamodb = ["runtime/dynamodb"]
 flightsql = ["runtime/flightsql"]
 ftp = ["runtime/ftp"]
 keyring-secret-store = ["runtime/keyring-secret-store"]

@@ -66,6 +66,10 @@ pub trait ReadableYaml<T>: ReadablePath<T> {
 
         None
     }
+
+    fn open_exact_yaml(&self, filename: &PathBuf) -> Result<Box<dyn std::io::Read>> {
+        self.open(filename)
+    }
 }
 
 impl<T: ReadablePath<T>> ReadableYaml<T> for T {}

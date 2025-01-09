@@ -36,6 +36,8 @@ pub mod debezium_kafka;
 pub mod delta_lake;
 #[cfg(feature = "duckdb")]
 pub mod duckdb;
+#[cfg(feature = "dynamodb")]
+pub mod dynamodb;
 pub mod flight;
 #[cfg(feature = "flightsql")]
 pub mod flightsql;
@@ -56,6 +58,7 @@ pub mod sharepoint;
 pub mod snowflake;
 #[cfg(feature = "spark_connect")]
 pub mod spark_connect;
+pub mod spice_cloud;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
 pub mod unity_catalog;

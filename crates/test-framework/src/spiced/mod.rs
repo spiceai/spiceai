@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use std::{
-    path::Path,
+    path::PathBuf,
     process::{Child, Command},
     time::Duration,
 };
@@ -32,6 +32,64 @@ pub struct SpicedInstance {
     _tempdir: TempDir,
 }
 
+pub struct StartRequest {
+    spiced_path: PathBuf,
+    spicepod: SpicepodDefinition,
+    tempdir: TempDir,
+    data_dir: Option<PathBuf>,
+    prepared: bool,
+}
+
+impl StartRequest {
+    pub fn new(spiced_path: PathBuf, spicepod: SpicepodDefinition) -> Result<Self> {
+        Ok(Self {
+            spiced_path,
+            spicepod,
+            tempdir: TempDir::new()?,
+            prepared: false,
+            data_dir: None,
+        })
+    }
+
+    #[must_use]
+    pub fn with_data_dir(mut self, data_dir: PathBuf) -> Self {
+        self.data_dir = Some(data_dir);
+        self
+    }
+
+    #[must_use]
+    pub fn get_tempdir_path(&self) -> PathBuf {
+        self.tempdir.path().to_path_buf()
+    }
+
+    pub fn prepare(&mut self) -> Result<()> {
+        // Serialize spicepod to `spicepod.yaml` in the tempdir
+        let spicepod_yaml = serde_yaml::to_string(&self.spicepod)?;
+        let spicepod_yaml_path = self.tempdir.path().join("spicepod.yaml");
+        std::fs::write(spicepod_yaml_path.clone(), spicepod_yaml)?;
+
+        // Create a symlink to the data directory if one is set
+        if let Some(data_dir) = &self.data_dir {
+            // resolve the data directory path to an absolute path
+            let data_dir = data_dir.canonicalize()?;
+
+            let data_dir_symlink = self.tempdir.path().join("data");
+            #[cfg(not(target_os = "windows"))]
+            {
+                std::os::unix::fs::symlink(data_dir, data_dir_symlink)?;
+            }
+            #[cfg(target_os = "windows")]
+            {
+                std::os::windows::fs::symlink_dir(data_dir, data_dir_symlink)?;
+            }
+        }
+
+        self.prepared = true;
+
+        Ok(())
+    }
+}
+
 impl SpicedInstance {
     /// Start a spiced instance
     ///
@@ -40,7 +98,7 @@ impl SpicedInstance {
     /// - If spiced is already running
     /// - If the spiced instance fails to start
     /// - If the spicepod definition fails to serialize
-    pub async fn start(spiced_path: &Path, spicepod: SpicepodDefinition) -> Result<Self> {
+    pub async fn start(mut start_request: StartRequest) -> Result<Self> {
         // Check if spiced is already running
         let client = reqwest::Client::new();
         let response = client.get("http://localhost:8090/health").send().await;
@@ -48,14 +106,14 @@ impl SpicedInstance {
             anyhow::bail!("Spiced instance is already running");
         }
 
-        let tempdir = tempfile::tempdir()?;
-        // Serialize spicepod to `spicepod.yaml` in the tempdir
-        let spicepod_yaml = serde_yaml::to_string(&spicepod)?;
-        let spicepod_yaml_path = tempdir.path().join("spicepod.yaml");
-        std::fs::write(spicepod_yaml_path.clone(), spicepod_yaml)?;
+        if !start_request.prepared {
+            start_request.prepare()?;
+        }
+
+        let tempdir = start_request.tempdir;
 
         // Start the spiced instance
-        let mut cmd = Command::new(spiced_path);
+        let mut cmd = Command::new(start_request.spiced_path);
         cmd.current_dir(tempdir.path());
         cmd.arg("--telemetry-enabled=false");
         let child = cmd.spawn()?;

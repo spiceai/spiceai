@@ -14,12 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::sync::Arc;
-
-use crate::{dataconnector::DataConnector, Runtime};
+use crate::Runtime;
 use async_trait::async_trait;
-use datafusion::catalog::CatalogProvider;
-use globset::GlobSet;
 use snafu::prelude::*;
 use spicepod::component::extension::Extension as ExtensionComponent;
 
@@ -56,14 +52,6 @@ pub trait Extension: Send + Sync {
     async fn initialize(&mut self, runtime: &Runtime) -> Result<()>;
 
     async fn on_start(&self, runtime: &Runtime) -> Result<()>;
-
-    async fn catalog_provider(
-        &self,
-        _data_connector: Arc<dyn DataConnector>,
-        _filter: Option<GlobSet>,
-    ) -> Option<Result<Arc<dyn CatalogProvider>>> {
-        None
-    }
 }
 
 pub trait ExtensionFactory: Send + Sync {
