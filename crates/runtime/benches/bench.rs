@@ -29,7 +29,6 @@ use std::fmt::{Display, Formatter};
 use std::panic;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::Duration;
 
 #[cfg(feature = "postgres")]
 use crate::bench_postgres::get_postgres_params;
@@ -334,7 +333,7 @@ async fn run_connector_bench(
         }
         #[cfg(feature = "spark")]
         "spark" => {
-            bench_spark::run(&mut rt, &mut benchmark_results).await?;
+            bench_spark::run(&mut rt, &mut benchmark_results, bench_name).await?;
         }
         #[cfg(feature = "postgres")]
         "postgres" => {
