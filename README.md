@@ -143,6 +143,7 @@ See more demos on [YouTube](https://www.youtube.com/playlist?list=PLesJrUXEx3U9a
 | `graphql`                          | GraphQL                               | Release Candidate | JSON                         |
 | `databricks (mode: delta_lake)`    | [Databricks][databricks]              | Release Candidate | S3/Delta Lake                |
 | `file`                             | File                                  | Release Candidate | Parquet, CSV                 |
+| `dremio`                           | [Dremio][dremio]                      | Release Candidate | Arrow Flight                 |
 | `iceberg`                          | [Apache Iceberg][iceberg]             | Alpha             | Parquet                      |
 | `delta_lake`                       | Delta Lake                            | Beta              | Delta Lake                   |
 | `mssql`                            | Microsoft SQL Server                  | Beta              | Tabular Data Stream (TDS)    |
@@ -155,7 +156,6 @@ See more demos on [YouTube](https://www.youtube.com/playlist?list=PLesJrUXEx3U9a
 | `debezium`                         | Debezium CDC                          | Alpha             | Kafka + JSON                 |
 | `abfs`                             | Azure BlobFS                          | Alpha             | Parquet, CSV                 |
 | `spark`                            | Spark                                 | Alpha             | [Spark Connect][spark]       |
-| `dremio`                           | [Dremio][dremio]                      | Alpha             | Arrow Flight                 |
 | `ftp`, `sftp`                      | FTP/SFTP                              | Alpha             | Parquet, CSV                 |
 | `http`, `https`                    | HTTP(s)                               | Alpha             | Parquet, CSV                 |
 | `localpod`                         | [Local dataset replication][localpod] | Alpha             |                              |
