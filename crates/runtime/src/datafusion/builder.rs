@@ -171,10 +171,10 @@ fn get_analyzer_rules() -> Vec<Arc<dyn AnalyzerRule + Send + Sync>> {
     vec![
         Arc::new(InlineTableScan::new()),
         Arc::new(ExpandWildcardRule::new()),
-        Arc::new(TypeCoercion::new()),
         Arc::new(FederationAnalyzerRule::new()),
         // The rest of these rules are run after the federation analyzer since they only affect internal DataFusion execution.
         Arc::new(ResolveGroupingFunction::new()),
+        Arc::new(TypeCoercion::new()),
         Arc::new(CountWildcardRule::new()),
     ]
 }
