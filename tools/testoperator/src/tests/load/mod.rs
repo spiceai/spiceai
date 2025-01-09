@@ -63,12 +63,14 @@ pub(crate) async fn run(args: &TestArgs) -> anyhow::Result<()> {
     let baseline_durations = test.get_statistically_sorted_durations()?.clone();
     let spiced_instance = test.end();
 
-    // throughput test
-    println!("Running throughput test");
+    // load test
+    println!("Running load test");
     let throughput_test = ThroughputTest::new(app.name.clone(), spiced_instance)
         .with_query_set(query_set.get_queries(query_overrides))
         .with_parallel_count(args.concurrency.unwrap_or(8))
-        .with_end_condition(EndCondition::QuerySetCompleted(2))
+        .with_end_condition(EndCondition::Duration(Duration::from_secs(
+            args.duration.unwrap_or(60).try_into()?,
+        )))
         .start()
         .await?;
 
