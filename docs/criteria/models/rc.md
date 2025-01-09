@@ -6,15 +6,15 @@ All criteria must be met for the model to be considered RC.
 
 ## RC Quality Models
 
-| Model Type     | RC Quality | DRI Sign-off |
-| -------------- | ---------- | ------------ |
-| File           | ➖         |              |
-| Hugging Face   | ➖         |              |
-| Spice.ai       | ➖         |              |
-| OpenAI         | ➖         |              |
-| Azure          | ➖         |              |
-| Anthropic      | ➖         |              |
-| xAI (Grok)     | ➖         |              |
+|     Model Type          | RC Quality | DRI Sign-off |
+| ----------------------- | ---------- | ------------ |
+| File                    | ➖         |              |
+| Hugging Face            | ➖         |              |
+| Spice.ai Cloud Platform | ➖         |              |
+| OpenAI                  | ➖         |              |
+| Azure                   | ➖         |              |
+| Anthropic               | ➖         |              |
+| xAI (Grok)              | ➖         |              |
 
 ## RC Release Criteria
 

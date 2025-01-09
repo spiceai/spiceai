@@ -6,8 +6,8 @@ All criteria must be met for the embedding component to be considered Stable.
 
 ## Stable Quality Embeddings
 
-| Embedding Type | Stable Quality | DRI Sign-off |
-| -------------- | -------------- | ------------ |
+|     Embedding Type      | Stable Quality | DRI Sign-off |
+| ----------------------- | -------------- | ------------ |
 | File                    | ➖             |              |
 | Hugging Face            | ➖             |              |
 | Spice.ai Cloud Platform | ➖             |              |

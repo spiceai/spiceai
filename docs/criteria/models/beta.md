@@ -6,15 +6,15 @@ All criteria must be met for the model to be considered Beta, with exceptions pe
 
 ## Beta Quality Models
 
-| Model Type     | Beta Quality | DRI Sign-off |
-| -------------- | ------------ | ------------ |
-| File           | ➖           |              |
-| Hugging Face   | ➖           |              |
-| Spice.ai       | ➖           |              |
-| OpenAI         | ➖           |              |
-| Azure          | ➖           |              |
-| Anthropic      | ➖           |              |
-| xAI (Grok)     | ➖           |              |
+|     Model Type          | Beta Quality | DRI Sign-off |
+| ----------------------- | ------------ | ------------ |
+| File                    | ➖           |              |
+| Hugging Face            | ➖           |              |
+| Spice.ai Cloud Platform | ➖           |              |
+| OpenAI                  | ➖           |              |
+| Azure                   | ➖           |              |
+| Anthropic               | ➖           |              |
+| xAI (Grok)              | ➖           |              |
 
 ## Beta Release Criteria
 - All [Alpha release criteria](./alpha.md) pass.

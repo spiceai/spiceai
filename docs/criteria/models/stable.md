@@ -6,15 +6,15 @@ All criteria must be met for the model to be considered Stable.
 
 ## Stable Quality Models
 
-| Model Type     | Stable Quality | DRI Sign-off |
-| -------------- | -------------- | ------------ |
-| File           | ➖             |              |
-| Hugging Face   | ➖             |              |
-| Spice.ai       | ➖             |              |
-| OpenAI         | ➖             |              |
-| Azure          | ➖             |              |
-| Anthropic      | ➖             |              |
-| xAI (Grok)     | ➖             |              |
+|     Model Type          | Stable Quality | DRI Sign-off |
+| ----------------------- | -------------- | ------------ |
+| File                    | ➖             |              |
+| Hugging Face            | ➖             |              |
+| Spice.ai Cloud Platform | ➖             |              |
+| OpenAI                  | ➖             |              |
+| Azure                   | ➖             |              |
+| Anthropic               | ➖             |              |
+| xAI (Grok)              | ➖             |              |
 
 ## Stable Release Criteria
 - All [RC release criteria](./rc.md) pass.

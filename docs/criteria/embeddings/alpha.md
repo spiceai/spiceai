@@ -6,8 +6,8 @@ All criteria must be met for the embedding component to be considered Alpha. As 
 
 ## Alpha Quality Embeddings
 
-| Embedding Type | Alpha Quality | DRI Sign-off |
-| -------------- | ------------- | ------------ |
+|     Embedding Type      | Alpha Quality | DRI Sign-off |
+| ----------------------- | ------------- | ------------ |
 | File                    | ➖            |              |
 | Hugging Face            | ➖            |              |
 | Spice.ai Cloud Platform | ➖            |              |

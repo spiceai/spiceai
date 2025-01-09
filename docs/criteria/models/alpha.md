@@ -6,15 +6,15 @@ All criteria must be met for the model to be considered Alpha. As Alpha signifie
 
 ## Alpha Quality Models
 
-| Model Type     | Alpha Quality | DRI Sign-off |
-| -------------- | ------------- | ------------ |
-| File           | ➖            |              |
-| Hugging Face   | ➖            |              |
-| Spice.ai       | ➖            |              |
-| OpenAI         | ➖            |              |
-| Azure          | ➖            |              |
-| Anthropic      | ➖            |              |
-| xAI (Grok)     | ➖            |              |
+|     Model Type          | Alpha Quality | DRI Sign-off |
+| ----------------------- | ------------- | ------------ |
+| File                    | ➖            |              |
+| Hugging Face            | ➖            |              |
+| Spice.ai Cloud Platform | ➖            |              |
+| OpenAI                  | ➖            |              |
+| Azure                   | ➖            |              |
+| Anthropic               | ➖            |              |
+| xAI (Grok)              | ➖            |              |
 
 ## Alpha Release Criteria
 

@@ -6,8 +6,8 @@ All criteria must be met for the embedding component to be considered RC.
 
 ## RC Quality Embeddings
 
-| Embedding Type | RC Quality | DRI Sign-off |
-| -------------- | ---------- | ------------ |
+|     Embedding Type      | RC Quality | DRI Sign-off |
+| ----------------------- | ---------- | ------------ |
 | File                    | ➖         |              |
 | Hugging Face            | ➖         |              |
 | Spice.ai Cloud Platform | ➖         |              |
