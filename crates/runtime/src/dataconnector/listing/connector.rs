@@ -47,7 +47,6 @@ use std::collections::HashSet;
 use std::fmt::Display;
 use std::str::FromStr;
 use std::sync::Arc;
-use tract_core::tract_data::itertools::Itertools;
 use url::Url;
 
 use crate::object_store_registry::default_runtime_env;
