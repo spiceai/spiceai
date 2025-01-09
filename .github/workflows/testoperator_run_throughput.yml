@@ -28,12 +28,35 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install MinIO
+        run: |
+          sudo apt update && sudo apt install wget -y
+          sudo wget https://dl.min.io/client/mc/release/linux-amd64/mc -O /usr/local/bin/mc
+          sudo chmod +x /usr/local/bin/mc
+          mc alias set spice-minio ${{ secrets.CLICKBENCH_S3_ENDPOINT }} ${{ secrets.CLICKBENCH_S3_KEY }} ${{ secrets.CLICKBENCH_S3_SECRET }}
+
+      - name: Set testoperator commit
+        run: |
+          echo "TESTOPERATOR_COMMIT=$(git rev-parse HEAD)" >> $GITHUB_ENV
+
+      - name: Download the testoperator from MinIO if it exists
+        run: |
+          if mc stat spice-minio/artifacts/testoperator/linux-x86_64/$TESTOPERATOR_COMMIT/testoperator; then
+            mc cp spice-minio/artifacts/testoperator/linux-x86_64/$TESTOPERATOR_COMMIT/testoperator /usr/local/bin/testoperator
+            chmod +x /usr/local/bin/testoperator
+            echo "TESTOPERATOR_DOWNLOADED=true" >> $GITHUB_ENV
+          else
+            echo "TESTOPERATOR_DOWNLOADED=false" >> $GITHUB_ENV
+          fi
+
       - name: Setup Rust
+        if: ${{ env.TESTOPERATOR_DOWNLOADED != 'true' }}
         uses: ./.github/actions/setup-rust
         with:
           os: 'linux'
       
       - name: Setup cc
+        if: ${{ env.TESTOPERATOR_DOWNLOADED != 'true' }}
         uses: ./.github/actions/setup-cc
 
       - name: Get latest trunk commit
@@ -49,14 +72,17 @@ jobs:
       
       - name: Download spiced from MinIO
         run: |
-          sudo apt update && sudo apt install wget -y
-          sudo wget https://dl.min.io/client/mc/release/linux-amd64/mc -O /usr/local/bin/mc
-          sudo chmod +x /usr/local/bin/mc
-          mc alias set spice-minio ${{ secrets.CLICKBENCH_S3_ENDPOINT }} ${{ secrets.CLICKBENCH_S3_KEY }} ${{ secrets.CLICKBENCH_S3_SECRET }}
           mc cp spice-minio/artifacts/spiced/linux-x86_64/$SPICED_COMMIT/spiced_models_linux_x86_64.tar.gz spiced_models_linux_x86_64.tar.gz
           tar -xzf spiced_models_linux_x86_64.tar.gz
           sudo mkdir -p /usr/local/bin
           sudo cp ./spiced /usr/local/bin/spiced
+
+      - name: Build the testoperator if it wasn't downloaded
+        if: ${{ env.TESTOPERATOR_DOWNLOADED != 'true' }}
+        run: |
+          cargo build -p testoperator --release
+          sudo cp target/release/testoperator /usr/local/bin/testoperator
+          sudo chmod +x /usr/local/bin/testoperator
       
       - name: Prepare file-based data directory
         run: |
@@ -98,27 +124,6 @@ jobs:
           mc cp spice-minio/benchmarks/tpcds_sf1/store/ ./ --recursive
           mc cp spice-minio/benchmarks/tpcds_sf1/time_dim/ ./ --recursive
       
-      - name: Set testoperator commit
-        run: |
-          echo "TESTOPERATOR_COMMIT=$(git rev-parse HEAD)" >> $GITHUB_ENV
-
-      - name: Download the testoperator from MinIO if it exists
-        run: |
-          if mc stat spice-minio/artifacts/testoperator/linux-x86_64/$TESTOPERATOR_COMMIT/testoperator; then
-            mc cp spice-minio/artifacts/testoperator/linux-x86_64/$TESTOPERATOR_COMMIT/testoperator /usr/local/bin/testoperator
-            chmod +x /usr/local/bin/testoperator
-            echo "TESTOPERATOR_DOWNLOADED=true" >> $GITHUB_ENV
-          else
-            echo "TESTOPERATOR_DOWNLOADED=false" >> $GITHUB_ENV
-          fi
-      
-      - name: Build the testoperator if it wasn't downloaded
-        if: ${{ env.TESTOPERATOR_DOWNLOADED != 'true' }}
-        run: |
-          cargo build -p testoperator --release
-          sudo cp target/release/testoperator /usr/local/bin/testoperator
-          sudo chmod +x /usr/local/bin/testoperator
-
       - name: Run the throughput test
         run: |
           testoperator run throughput -s /usr/local/bin/spiced -p ${{ github.event.inputs.spicepod_path }} -d /opt/spiced/data --query-set ${{ github.event.inputs.query_set }}
