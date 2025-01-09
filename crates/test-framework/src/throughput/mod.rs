@@ -16,10 +16,13 @@ limitations under the License.
 
 use std::{
     collections::BTreeMap,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
-use crate::spiced::SpicedInstance;
+use crate::{
+    metrics::{MetricCollector, NoExtendedMetrics, QueryMetric, QueryMetrics},
+    spiced::SpicedInstance,
+};
 use anyhow::Result;
 use futures::future::join_all;
 use tokio::task::JoinHandle;
@@ -47,13 +50,17 @@ pub struct NotStarted {
     query_set: Vec<(&'static str, &'static str)>,
     end_condition: EndCondition,
 }
+
+pub type QueryWorkers = Vec<JoinHandle<Result<BTreeMap<String, Vec<Duration>>>>>;
+
 pub struct Running {
     start_time: Instant,
-    query_workers: Vec<JoinHandle<Result<BTreeMap<String, Duration>>>>,
+    query_workers: QueryWorkers,
 }
 pub struct Completed {
-    query_durations: BTreeMap<String, Duration>,
+    query_durations: BTreeMap<String, Vec<Duration>>,
     test_duration: Duration,
+    end_time: SystemTime,
 }
 
 pub trait TestState {}
@@ -69,6 +76,7 @@ pub struct ThroughputTest<S: TestState> {
     spiced_instance: SpicedInstance,
     query_count: usize,
     parallel_count: usize,
+    start_time: SystemTime,
 
     state: S,
 }
@@ -81,6 +89,7 @@ impl ThroughputTest<NotStarted> {
             spiced_instance,
             query_count: 0,
             parallel_count: 1,
+            start_time: SystemTime::now(),
             state: NotStarted {
                 query_set: vec![],
                 end_condition: EndCondition::QuerySetCompleted(1),
@@ -117,7 +126,7 @@ impl ThroughputTest<NotStarted> {
         }
 
         let flight_client = self.spiced_instance.flight_client().await?;
-        let query_workers = (1..self.parallel_count)
+        let query_workers = (0..self.parallel_count)
             .map(|id| {
                 ThroughputQueryWorker::new(
                     id,
@@ -134,6 +143,7 @@ impl ThroughputTest<NotStarted> {
             spiced_instance: self.spiced_instance,
             query_count: self.query_count,
             parallel_count: self.parallel_count,
+            start_time: self.start_time,
             state: Running {
                 start_time: Instant::now(),
                 query_workers,
@@ -148,11 +158,10 @@ impl ThroughputTest<Running> {
         for query_duration in join_all(self.state.query_workers).await {
             let query_duration = query_duration??;
             for (query, duration) in query_duration {
-                if let Some(existing_duration) = query_durations.get_mut(&query) {
-                    *existing_duration += duration;
-                } else {
-                    query_durations.insert(query, duration);
-                }
+                query_durations
+                    .entry(query)
+                    .or_insert_with(Vec::new)
+                    .extend(duration);
             }
         }
         Ok(ThroughputTest {
@@ -160,9 +169,11 @@ impl ThroughputTest<Running> {
             spiced_instance: self.spiced_instance,
             query_count: self.query_count,
             parallel_count: self.parallel_count,
+            start_time: self.start_time,
             state: Completed {
                 query_durations,
                 test_duration: self.state.start_time.elapsed(),
+                end_time: SystemTime::now(),
             },
         })
     }
@@ -170,13 +181,13 @@ impl ThroughputTest<Running> {
 
 impl ThroughputTest<Completed> {
     #[must_use]
-    pub fn get_query_durations(&self) -> &BTreeMap<String, Duration> {
+    pub fn get_query_durations(&self) -> &BTreeMap<String, Vec<Duration>> {
         &self.state.query_durations
     }
 
     #[must_use]
     pub fn get_cumulative_query_duration(&self) -> Duration {
-        self.state.query_durations.values().sum()
+        self.state.query_durations.values().flatten().copied().sum()
     }
 
     #[must_use]
@@ -208,5 +219,35 @@ impl std::fmt::Display for ThroughputTest<Completed> {
             self.get_cumulative_query_duration().as_secs_f32(),
             self.get_test_duration().as_secs_f32()
         )
+    }
+}
+
+impl MetricCollector<NoExtendedMetrics> for ThroughputTest<Completed> {
+    fn collect(&self) -> Result<QueryMetrics<NoExtendedMetrics>> {
+        let query_metrics = self
+            .get_query_durations()
+            .iter()
+            .map(|(query, durations)| QueryMetric::new_from_durations(query, durations))
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(QueryMetrics {
+            run_id: uuid::Uuid::new_v4(),
+            run_name: self.name.clone(),
+            commit_sha: "TODO".to_string(),
+            branch_name: "TODO".to_string(),
+            test_type: crate::TestType::Throughput,
+            started_at: usize::try_from(
+                self.start_time
+                    .duration_since(SystemTime::UNIX_EPOCH)?
+                    .as_secs(),
+            )?,
+            finished_at: usize::try_from(
+                self.state
+                    .end_time
+                    .duration_since(SystemTime::UNIX_EPOCH)?
+                    .as_secs(),
+            )?,
+            metrics: query_metrics,
+        })
     }
 }

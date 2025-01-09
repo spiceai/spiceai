@@ -20,7 +20,7 @@ use crate::results::{self, BenchmarkResultsBuilder};
 use app::AppBuilder;
 use runtime::Runtime;
 use spicepod::component::dataset::acceleration::{Acceleration, ZeroResultsAction};
-use test_framework::queries::{get_clickbench_test_queries, get_tpch_test_queries};
+use test_framework::queries::{get_clickbench_test_queries, get_tpch_test_queries, QueryOverrides};
 
 pub(crate) mod abfs;
 pub(crate) mod file;
@@ -59,7 +59,9 @@ pub(crate) async fn run(
             #[cfg(feature = "postgres")]
             {
                 if engine.clone().unwrap_or_default().as_str() == "postgres" {
-                    test_framework::queries::get_tpcds_test_queries(Some("postgres"))
+                    test_framework::queries::get_tpcds_test_queries(Some(
+                        QueryOverrides::PostgreSQL,
+                    ))
                 } else {
                     get_tpcds_test_queries(engine.as_deref())
                 }
@@ -70,7 +72,9 @@ pub(crate) async fn run(
                 get_tpcds_test_queries(engine.as_deref())
             }
         }
-        "clickbench" => get_clickbench_test_queries(engine.as_deref()),
+        "clickbench" => {
+            get_clickbench_test_queries(engine.as_deref().and_then(QueryOverrides::from_engine))
+        }
         _ => return Err(format!("Invalid benchmark to run {bench_name}")),
     };
 

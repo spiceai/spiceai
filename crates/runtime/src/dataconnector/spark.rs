@@ -92,6 +92,10 @@ impl SparkFactory {
 const PARAMETERS: &[ParameterSpec] = &[ParameterSpec::connector("remote").secret().required()];
 
 impl DataConnectorFactory for SparkFactory {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn create(
         &self,
         params: ConnectorParams,

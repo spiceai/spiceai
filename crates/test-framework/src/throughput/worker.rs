@@ -19,14 +19,14 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use flight_client::FlightClient;
 use tokio::task::JoinHandle;
 
 use super::EndCondition;
 
 pub(crate) struct ThroughputQueryWorker {
-    id: usize,
+    _id: usize,
     query_set: Vec<(&'static str, &'static str)>,
     end_condition: EndCondition,
     flight_client: FlightClient,
@@ -40,16 +40,16 @@ impl ThroughputQueryWorker {
         flight_client: FlightClient,
     ) -> Self {
         Self {
-            id,
+            _id: id,
             query_set,
             end_condition,
             flight_client,
         }
     }
 
-    pub fn start(self) -> JoinHandle<Result<BTreeMap<String, Duration>>> {
+    pub fn start(self) -> JoinHandle<Result<BTreeMap<String, Vec<Duration>>>> {
         tokio::spawn(async move {
-            let mut query_durations: BTreeMap<String, Duration> = BTreeMap::new();
+            let mut query_durations: BTreeMap<String, Vec<Duration>> = BTreeMap::new();
             let mut query_set_count = 0;
             let start = Instant::now();
 
@@ -57,20 +57,18 @@ impl ThroughputQueryWorker {
                 for query in &self.query_set {
                     let query_start = Instant::now();
                     match self.flight_client.query(query.1).await {
-                        Ok(_) => (),
+                        Ok(_) => {
+                            let duration = query_start.elapsed();
+                            query_durations
+                                .entry(query.0.to_string())
+                                .or_default()
+                                .push(duration);
+                        }
                         Err(e) => {
-                            return Err(e).context(format!(
-                                "Query worker {} failed to execute query {}",
-                                self.id, query.0
-                            ));
+                            eprintln!("Query {} failed: {}", query.0, e);
+                            query_durations.entry(query.0.to_string()).or_default();
                         }
                     };
-                    let duration = query_start.elapsed();
-                    if let Some(existing_duration) = query_durations.get_mut(query.0) {
-                        *existing_duration += duration;
-                    } else {
-                        query_durations.insert(query.0.to_string(), duration);
-                    }
                 }
                 query_set_count += 1;
             }

@@ -12,7 +12,7 @@ All criteria must be met for the connector to be considered Alpha. As Alpha sign
 | Databricks (mode: delta_lake)    | ✅            | @Sevenannn   |
 | Databricks (mode: spark_connect) | ➖            |              |
 | Delta Lake                       | ➖            |              |
-| Dremio                           | ➖            |              |
+| Dremio                           | ✅            | @Sevenannn   |
 | DuckDB                           | ✅            | @peasee      |
 | File                             | ✅            | @peasee      |
 | FlightSQL                        | ➖            |              |

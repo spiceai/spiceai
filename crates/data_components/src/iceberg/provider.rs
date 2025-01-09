@@ -29,7 +29,7 @@ use iceberg_datafusion::IcebergTableProvider;
 
 use crate::RefreshableCatalogProvider;
 
-use super::catalog::{IcebergTable, RestCatalog};
+use super::catalog::RestCatalog;
 
 /// Provides an interface to manage and access multiple schemas
 /// within an Iceberg [`Catalog`].
@@ -146,10 +146,7 @@ impl IcebergSchemaProvider {
         let table_providers: Vec<_> = try_join_all(
             iceberg_tables
                 .into_iter()
-                .map(|iceberg_table| match iceberg_table {
-                    IcebergTable::Iceberg(table) => IcebergTableProvider::try_new_from_table(table),
-                    IcebergTable::Spice(_) => todo!(),
-                })
+                .map(IcebergTableProvider::try_new_from_table)
                 .collect::<Vec<_>>(),
         )
         .await?;

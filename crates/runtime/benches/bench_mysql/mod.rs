@@ -16,7 +16,7 @@ limitations under the License.
 
 use app::AppBuilder;
 use runtime::Runtime;
-use test_framework::queries::{get_tpcds_test_queries, get_tpch_test_queries};
+use test_framework::queries::{get_tpcds_test_queries, get_tpch_test_queries, QueryOverrides};
 
 use crate::results::BenchmarkResultsBuilder;
 use spicepod::component::{dataset::Dataset, params::Params};
@@ -28,7 +28,7 @@ pub(crate) async fn run(
 ) -> Result<(), String> {
     let test_queries = match bench_name {
         "tpch" => get_tpch_test_queries(None),
-        "tpcds" => get_tpcds_test_queries(Some("mysql")),
+        "tpcds" => get_tpcds_test_queries(Some(QueryOverrides::MySQL)),
         _ => return Err(format!("Invalid benchmark to run {bench_name}")),
     };
 

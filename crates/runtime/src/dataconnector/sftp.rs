@@ -81,6 +81,10 @@ lazy_static! {
 }
 
 impl DataConnectorFactory for SFTPFactory {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn create(
         &self,
         params: ConnectorParams,

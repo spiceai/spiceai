@@ -198,6 +198,10 @@ fn parameter_is_integer(parameters: &Parameters, param: &str) -> Result<()> {
 }
 
 impl DataConnectorFactory for ODBCFactory {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn create(
         &self,
         params: ConnectorParams,

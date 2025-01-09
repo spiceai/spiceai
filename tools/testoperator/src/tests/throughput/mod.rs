@@ -14,19 +14,20 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::RunArgs;
+use crate::commands::TestArgs;
 use std::time::Duration;
 use test_framework::{
     anyhow,
     app::App,
-    queries::get_tpch_test_queries,
+    metrics::MetricCollector,
+    queries::{QueryOverrides, QuerySet},
     spiced::{SpicedInstance, StartRequest},
     spicepod::Spicepod,
     spicepod_utils::from_app,
-    throughput::ThroughputTest,
+    throughput::{EndCondition, ThroughputTest},
 };
 
-fn get_app_and_start_request(args: &RunArgs) -> anyhow::Result<(App, StartRequest)> {
+fn get_app_and_start_request(args: &TestArgs) -> anyhow::Result<(App, StartRequest)> {
     let spicepod = Spicepod::load_exact(args.spicepod_path.clone())?;
     let app = test_framework::app::AppBuilder::new(spicepod.name.clone())
         .with_spicepod(spicepod)
@@ -42,7 +43,7 @@ fn get_app_and_start_request(args: &RunArgs) -> anyhow::Result<(App, StartReques
     Ok((app, start_request))
 }
 
-pub(crate) fn export(args: &RunArgs) -> anyhow::Result<()> {
+pub(crate) fn export(args: &TestArgs) -> anyhow::Result<()> {
     let (_, mut start_request) = get_app_and_start_request(args)?;
 
     start_request.prepare()?;
@@ -56,7 +57,11 @@ pub(crate) fn export(args: &RunArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub(crate) async fn run(args: &RunArgs) -> anyhow::Result<()> {
+pub(crate) async fn run(args: &TestArgs) -> anyhow::Result<()> {
+    let query_set = QuerySet::from(args.query_set.clone());
+    let query_overrides = args.query_overrides.clone().map(QueryOverrides::from);
+    let queries = query_set.get_queries(query_overrides);
+
     let (app, start_request) = get_app_and_start_request(args)?;
     let mut spiced_instance = SpicedInstance::start(start_request).await?;
 
@@ -64,22 +69,39 @@ pub(crate) async fn run(args: &RunArgs) -> anyhow::Result<()> {
         .wait_for_ready(Duration::from_secs(10))
         .await?;
 
-    let test = ThroughputTest::new(app.name.clone(), spiced_instance)
-        .with_query_set(get_tpch_test_queries(None))
-        .with_parallel_count(10)
+    // baseline run
+    println!("Running baseline test");
+    let baseline_test = ThroughputTest::new(app.name.clone(), spiced_instance)
+        .with_query_set(queries.clone())
+        .with_parallel_count(1)
+        .with_end_condition(EndCondition::QuerySetCompleted(10))
         .start()
         .await?;
 
-    let test = test.wait().await?;
-    let query_durations = test.get_query_durations().clone();
-    let throughput_metric = test.get_throughput_metric(1.0)?;
+    let test = baseline_test.wait().await?;
+    let spiced_instance = test.end();
+
+    // throughput test
+    println!("Running throughput test");
+    let throughput_test = ThroughputTest::new(app.name.clone(), spiced_instance)
+        .with_query_set(queries.clone())
+        .with_parallel_count(args.concurrency.unwrap_or(8))
+        .with_end_condition(EndCondition::QuerySetCompleted(2))
+        .start()
+        .await?;
+
+    let test = throughput_test.wait().await?;
+    let throughput_metric = test.get_throughput_metric(args.scale_factor.unwrap_or(1.0))?;
+    let metrics = test.collect()?;
     let mut spiced_instance = test.end();
+
+    metrics.show()?;
+
     spiced_instance.stop()?;
 
-    for (query, duration) in query_durations {
-        println!("Query {query} took {} milliseconds", duration.as_millis());
-    }
-
-    println!("Throughput test completed with throughput: {throughput_metric}");
+    println!(
+        "Throughput test completed with throughput: {} Queries per hour * Scale Factor",
+        throughput_metric.round()
+    );
     Ok(())
 }

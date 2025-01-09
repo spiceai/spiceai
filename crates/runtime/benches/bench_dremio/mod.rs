@@ -20,7 +20,7 @@ use runtime::Runtime;
 use crate::results::BenchmarkResultsBuilder;
 use spicepod::component::{dataset::Dataset, params::Params};
 use test_framework::queries::{
-    get_clickbench_test_queries, get_tpcds_test_queries, get_tpch_test_queries,
+    get_clickbench_test_queries, get_tpcds_test_queries, get_tpch_test_queries, QueryOverrides,
 };
 
 pub(crate) async fn run(
@@ -31,7 +31,7 @@ pub(crate) async fn run(
     let test_queries = match bench_name {
         "tpch" => get_tpch_test_queries(None),
         "tpcds" => get_tpcds_test_queries(None),
-        "clickbench" => get_clickbench_test_queries(Some("dremio")),
+        "clickbench" => get_clickbench_test_queries(Some(QueryOverrides::Dremio)),
         _ => return Err(format!("Invalid benchmark to run {bench_name}")),
     };
 
