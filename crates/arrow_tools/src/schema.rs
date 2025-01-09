@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use arrow::datatypes::DataType;
 use datafusion::common::DFSchema;
 use snafu::prelude::*;
 
@@ -59,6 +60,12 @@ pub fn verify_schema(
 
         let a_data_type = a.data_type();
         let b_data_type = b.data_type();
+
+        if *a_data_type == DataType::Utf8View && *b_data_type == DataType::LargeUtf8
+            || *a_data_type == DataType::LargeUtf8 && *b_data_type == DataType::Utf8View
+        {
+            continue;
+        }
 
         if !DFSchema::datatype_is_semantically_equal(a_data_type, b_data_type) {
             return SchemaMismatchDataTypeSnafu {

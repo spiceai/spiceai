@@ -65,6 +65,7 @@ impl DataFusionBuilder {
             .options_mut()
             .execution
             .listing_table_ignore_subdirectory = false;
+        df_config.options_mut().optimizer.expand_views_at_output = true;
 
         // There are some unidentified bugs in DataFusion that cause schema checks to fail for aggregate functions.
         // Spice is affected by this - skip the check until all bugs are fixed.
@@ -170,10 +171,10 @@ fn get_analyzer_rules() -> Vec<Arc<dyn AnalyzerRule + Send + Sync>> {
     vec![
         Arc::new(InlineTableScan::new()),
         Arc::new(ExpandWildcardRule::new()),
+        Arc::new(TypeCoercion::new()),
         Arc::new(FederationAnalyzerRule::new()),
         // The rest of these rules are run after the federation analyzer since they only affect internal DataFusion execution.
         Arc::new(ResolveGroupingFunction::new()),
-        Arc::new(TypeCoercion::new()),
         Arc::new(CountWildcardRule::new()),
     ]
 }
