@@ -17,6 +17,7 @@ All criteria must be met for the model to be considered Stable.
 | xAI (Grok)     | ➖             |              |
 
 ## Stable Release Criteria
+- All [RC release criteria](./rc.md) pass.
 
 ### Conditional Criteria
 - For models running in the Spice runtime (as opposed to network-attached models).

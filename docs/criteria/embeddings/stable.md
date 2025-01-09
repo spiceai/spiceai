@@ -16,9 +16,11 @@ All criteria must be met for the embedding component to be considered Stable.
 | xAI (Grok)              | ➖             |              |
 
 ## Stable Release Criteria
+- All [RC release criteria](./rc.md) pass.
 
-For embedding components run in the Spice runtime:
-- Can handle X TPS (Transactions Per Second) and Y tokens per second successfully and without increasing latency for 1 hour.
+### Conditional Criteria
+- For embedding models running in the Spice runtime (as opposed to network-attached models).
+  - Can handle X TPS (Transactions Per Second) and Y tokens per second successfully and without increasing latency for 1 hour.
 
 ### Documentation
 

@@ -17,6 +17,7 @@ All criteria must be met for the model to be considered Beta, with exceptions pe
 | xAI (Grok)     | ➖           |              |
 
 ## Beta Release Criteria
+- All [Alpha release criteria](./alpha.md) pass.
 - Supports `v1/chat/completion` with `"roles"="tool"` or `.messages[*].tool_calls` for `"roles"="assistant"` and `stream=true`.
 - Complete and passing integration testing in:
   - [`llms`](https://github.com/spiceai/spiceai/tree/trunk/crates/llms/tests) crate.

@@ -17,8 +17,11 @@ All criteria must be met for the embedding component to be considered RC.
 
 ## RC Release Criteria
 
-For embedding components run in the Spice runtime:
-- Can handle X TPS (Transactions Per Second) and Y tokens per second successfully and without increasing latency for 1 minute.
+- All [Beta release criteria](./beta.md) pass.
+
+### Conditional Criteria
+- For embedding models running in the Spice runtime (as opposed to network-attached models).
+  - Can handle X TPS (Transactions Per Second) and Y tokens per second successfully and without increasing latency for 1 minute.
 
 ### Documentation
 

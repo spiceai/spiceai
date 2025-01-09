@@ -18,6 +18,7 @@ All criteria must be met for the model to be considered RC.
 
 ## RC Release Criteria
 
+- All [Beta release criteria](./beta.md) pass.
 - Complete and passing integration testing in [`runtime`](https://github.com/spiceai/spiceai/blob/trunk/crates/runtime/tests/models) crate, including:
   - NSQL integration tests.
 - For both synchronous and streaming APIs, usage numbers are reported.

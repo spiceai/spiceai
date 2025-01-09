@@ -17,7 +17,8 @@ All criteria must be met for the embedding component to be considered Beta, with
 
 ## Beta Release Criteria
 
-- Usage of the `v1/embeddings` endpoint is reported back to the user.
+- All [Alpha release criteria](./alpha.md) pass.
+- `.usage` field from the `v1/embeddings` response is non-empty.
 
 ### Documentation
 
