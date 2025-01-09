@@ -1,0 +1,72 @@
+version: v1
+kind: Spicepod
+name: s3_tpch
+runtime:
+  results_cache:
+    enabled: false
+  task_history:
+    enabled: false
+datasets:
+  - from: s3://benchmarks/tpcds_sf1/catalog_sales/
+    name: catalog_sales
+    params: &s3_params
+      file_format: parquet
+      allow_http: true
+      s3_auth: key
+      s3_endpoint: ${secrets:S3_ENDPOINT}
+      s3_key: ${secrets:S3_KEY}
+      s3_secret: ${secrets:S3_SECRET}
+  - from: s3://benchmarks/tpcds_sf1/catalog_returns/
+    name: catalog_returns
+    params: *s3_params
+  - from: s3://benchmarks/tpcds_sf1/inventory/
+    name: inventory
+    params: *s3_params
+  - from: s3://benchmarks/tpcds_sf1/store_sales/
+    name: store_sales
+    params: *s3_params
+  - from: s3://benchmarks/tpcds_sf1/store_returns/
+    name: store_returns
+    params: *s3_params
+  - from: s3://benchmarks/tpcds_sf1/web_sales/
+    name: web_sales
+    params: *s3_params
+  - from: s3://benchmarks/tpcds_sf1/web_returns/
+    name: web_returns
+    params: *s3_params
+  - from: s3://benchmarks/tpcds_sf1/customer/
+    name: customer
+    params: *s3_params
+  - from: s3://benchmarks/tpcds_sf1/customer_address/
+    name: customer_address
+    params: *s3_params
+  - from: s3://benchmarks/tpcds_sf1/customer_demographics/
+    name: customer_demographics
+    params: *s3_params
+  - from: s3://benchmarks/tpcds_sf1/date_dim/
+    name: date_dim
+    params: *s3_params
+  - from: s3://benchmarks/tpcds_sf1/household_demographics/
+    name: household_demographics
+    params: *s3_params
+  - from: s3://benchmarks/tpcds_sf1/item/
+    name: item
+    params: *s3_params
+  - from: s3://benchmarks/tpcds_sf1/promotion/
+    name: promotion
+    params: *s3_params
+  - from: s3://benchmarks/tpcds_sf1/store/
+    name: store
+    params: *s3_params
+  - from: s3://benchmarks/tpcds_sf1/time_dim/
+    name: time_dim
+    params: *s3_params
+  - from: s3://benchmarks/tpcds_sf1/warehouse/
+    name: warehouse
+    params: *s3_params
+  - from: s3://benchmarks/tpcds_sf1/web_page/
+    name: web_page
+    params: *s3_params
+  - from: s3://benchmarks/tpcds_sf1/web_site/
+    name: web_site
+    params: *s3_params

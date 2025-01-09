@@ -20,10 +20,6 @@ on:
           - 'tpch'
           - 'tpcds'
           - 'clickbench'
-      data_dir:
-        description: 'The data directory to use'
-        required: false
-        type: string
 
 jobs:
   run-throughput:
@@ -32,12 +28,37 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install MinIO
+        run: |
+          sudo apt update && sudo apt install wget -y
+          sudo wget https://dl.min.io/client/mc/release/linux-amd64/mc -O /usr/local/bin/mc
+          sudo chmod +x /usr/local/bin/mc
+          mc alias set spice-minio ${{ secrets.MINIO_ENDPOINT }} ${{ secrets.MINIO_ACCESS_KEY }} ${{ secrets.MINIO_SECRET_KEY }}
+
+      - name: Set testoperator commit
+        run: |
+          echo "TESTOPERATOR_COMMIT=$(git rev-parse HEAD)" >> $GITHUB_ENV
+
+      - name: Download the testoperator from MinIO if it exists
+        run: |
+          sudo mkdir -p /usr/local/bin
+          if mc stat spice-minio/artifacts/testoperator/linux-x86_64/$TESTOPERATOR_COMMIT/testoperator; then
+            mc cp spice-minio/artifacts/testoperator/linux-x86_64/$TESTOPERATOR_COMMIT/testoperator ./testoperator
+            sudo cp ./testoperator /usr/local/bin/testoperator
+            sudo chmod +x /usr/local/bin/testoperator
+            echo "TESTOPERATOR_DOWNLOADED=true" >> $GITHUB_ENV
+          else
+            echo "TESTOPERATOR_DOWNLOADED=false" >> $GITHUB_ENV
+          fi
+
       - name: Setup Rust
+        if: ${{ env.TESTOPERATOR_DOWNLOADED != 'true' }}
         uses: ./.github/actions/setup-rust
         with:
           os: 'linux'
       
       - name: Setup cc
+        if: ${{ env.TESTOPERATOR_DOWNLOADED != 'true' }}
         uses: ./.github/actions/setup-cc
 
       - name: Get latest trunk commit
@@ -53,29 +74,66 @@ jobs:
       
       - name: Download spiced from MinIO
         run: |
-          sudo apt update && sudo apt install wget -y
-          sudo wget https://dl.min.io/client/mc/release/linux-amd64/mc -O /usr/local/bin/mc
-          sudo chmod +x /usr/local/bin/mc
-          mc alias set spice-minio ${{ secrets.CLICKBENCH_S3_ENDPOINT }} ${{ secrets.CLICKBENCH_S3_KEY }} ${{ secrets.CLICKBENCH_S3_SECRET }}
           mc cp spice-minio/artifacts/spiced/linux-x86_64/$SPICED_COMMIT/spiced_models_linux_x86_64.tar.gz spiced_models_linux_x86_64.tar.gz
           tar -xzf spiced_models_linux_x86_64.tar.gz
-          sudo mkdir -p /usr/local/bin
           sudo cp ./spiced /usr/local/bin/spiced
+
+      - name: Build the testoperator if it wasn't downloaded
+        if: ${{ env.TESTOPERATOR_DOWNLOADED != 'true' }}
+        run: |
+          cargo build -p testoperator --release
+          sudo cp target/release/testoperator /usr/local/bin/testoperator
+          sudo chmod +x /usr/local/bin/testoperator
       
-      - name: Run the throughput test (no data directory)
-        if: ${{ !github.event.inputs.data_dir }}
+      - name: Prepare file-based data directory
         run: |
-          cargo run -p testoperator -- run throughput -s /usr/local/bin/spiced -p ${{ github.event.inputs.spicepod_path }} --query-set ${{ github.event.inputs.query_set }}
+          sudo rm -rf /opt/spiced/data
+          sudo mkdir -p /opt/spiced/data
+          sudo chown runner:runner -R /opt/spiced/data
+
+      - name: Download File Connector TPCH Data
+        if: ${{ github.event.inputs.query_set == 'tpch' }}
+        run: |
+          cd /opt/spiced/data
+          mc cp spice-minio/benchmarks/tpch_sf1/customer/ ./ --recursive
+          mc cp spice-minio/benchmarks/tpch_sf1/lineitem/ ./ --recursive
+          mc cp spice-minio/benchmarks/tpch_sf1/nation/ ./ --recursive
+          mc cp spice-minio/benchmarks/tpch_sf1/orders/ ./ --recursive
+          mc cp spice-minio/benchmarks/tpch_sf1/part/ ./ --recursive
+          mc cp spice-minio/benchmarks/tpch_sf1/partsupp/ ./ --recursive
+          mc cp spice-minio/benchmarks/tpch_sf1/region/ ./ --recursive
+          mc cp spice-minio/benchmarks/tpch_sf1/supplier/ ./ --recursive
+      
+      - name: Download File Connector TPCDS Data
+        if: ${{ github.event.inputs.query_set == 'tpcds' }}
+        run: |
+          cd /opt/spiced/data
+          mc cp spice-minio/benchmarks/tpcds_sf1/catalog_sales/ ./ --recursive
+          mc cp spice-minio/benchmarks/tpcds_sf1/catalog_returns/ ./ --recursive
+          mc cp spice-minio/benchmarks/tpcds_sf1/inventory/ ./ --recursive
+          mc cp spice-minio/benchmarks/tpcds_sf1/store_sales/ ./ --recursive
+          mc cp spice-minio/benchmarks/tpcds_sf1/store_returns/ ./ --recursive
+          mc cp spice-minio/benchmarks/tpcds_sf1/web_sales/ ./ --recursive
+          mc cp spice-minio/benchmarks/tpcds_sf1/web_returns/ ./ --recursive
+          mc cp spice-minio/benchmarks/tpcds_sf1/customer/ ./ --recursive
+          mc cp spice-minio/benchmarks/tpcds_sf1/customer_address/ ./ --recursive
+          mc cp spice-minio/benchmarks/tpcds_sf1/customer_demographics/ ./ --recursive
+          mc cp spice-minio/benchmarks/tpcds_sf1/date_dim/ ./ --recursive
+          mc cp spice-minio/benchmarks/tpcds_sf1/household_demographics/ ./ --recursive
+          mc cp spice-minio/benchmarks/tpcds_sf1/item/ ./ --recursive
+          mc cp spice-minio/benchmarks/tpcds_sf1/promotion/ ./ --recursive
+          mc cp spice-minio/benchmarks/tpcds_sf1/store/ ./ --recursive
+          mc cp spice-minio/benchmarks/tpcds_sf1/time_dim/ ./ --recursive
+      
+      - name: Run the throughput test
+        run: |
+          testoperator run throughput -s /usr/local/bin/spiced -p ${{ github.event.inputs.spicepod_path }} -d /opt/spiced/data --query-set ${{ github.event.inputs.query_set }}
         env:
           S3_ENDPOINT: ${{ secrets.CLICKBENCH_S3_ENDPOINT}}
           S3_KEY: ${{ secrets.CLICKBENCH_S3_KEY}}
           S3_SECRET: ${{ secrets.CLICKBENCH_S3_SECRET}}
-        
-      - name: Run the throughput test (data directory)
-        if: ${{ github.event.inputs.data_dir }}
+      
+      - name: Upload the testoperator binary
+        if: ${{ env.TESTOPERATOR_DOWNLOADED != 'true' }}
         run: |
-          cargo run -p testoperator -- run throughput -s /usr/local/bin/spiced -p ${{ github.event.inputs.spicepod_path }} -d ${{ github.event.inputs.data_dir }} --query-set ${{ github.event.inputs.query_set }}
-        env:
-          S3_ENDPOINT: ${{ secrets.CLICKBENCH_S3_ENDPOINT}}
-          S3_KEY: ${{ secrets.CLICKBENCH_S3_KEY}}
-          S3_SECRET: ${{ secrets.CLICKBENCH_S3_SECRET}}
+          mc cp /usr/local/bin/testoperator spice-minio/artifacts/testoperator/linux-x86_64/$TESTOPERATOR_COMMIT/testoperator
