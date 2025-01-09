@@ -97,16 +97,16 @@ jobs:
   build:
     name: Build ${{ matrix.target.name }} binaries
     runs-on: ${{ matrix.target.runner }}
+    strategy:
+      matrix:
+        target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
+
     if: ${{ matrix.target.runner != 'ubuntu-gpu-t4-4-core' }}
     needs: setup-matrix
     env:
       GOVER: 1.23.4
       GOOS: ${{ matrix.target.target_os }}
       GOARCH: ${{ matrix.target.target_arch_go }}
-
-    strategy:
-      matrix:
-        target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
       - uses: actions/checkout@v4
