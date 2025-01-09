@@ -1,0 +1,68 @@
+#syntax=docker/dockerfile:1.2
+ARG RUST_VERSION=1.83
+
+FROM nvidia/cuda:12.2.2-cudnn8-devel-ubuntu22.04 AS build
+
+# cache mounts below may already exist and owned by root
+USER root
+
+RUN apt update \
+    && apt install --yes pkg-config libssl-dev build-essential libsqlite3-dev cmake protobuf-compiler unixodbc-dev curl \
+    && rm -rf /var/lib/{apt,dpkg,cache,log}
+
+RUN curl https://sh.rustup.rs -sSf | bash -s -- -y \
+    && echo 'source $HOME/.cargo/env' >> $HOME/.bashrc \
+    && /bin/bash -c "source $HOME/.cargo/env && rustup default ${RUST_VERSION} && rustup update"
+
+# Configurable CUDA compute capability `<https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#compute-capabilities>`.
+ARG CUDA_COMPUTE_CAP=80
+
+# Add environment variables for CUDA
+ENV PATH="/root/.cargo/bin:${PATH}" \
+    CUDA_COMPUTE_CAP=${CUDA_COMPUTE_CAP} \
+    LD_LIBRARY_PATH="/usr/local/cuda/lib64:${LD_LIBRARY_PATH}"
+
+COPY . /build
+WORKDIR /build
+
+ARG CARGO_FEATURES
+ARG CARGO_INCREMENTAL=yes
+ARG CARGO_NET_GIT_FETCH_WITH_CLI=false
+ENV CARGO_FEATURES=$CARGO_FEATURES \
+    CARGO_INCREMENTAL=$CARGO_INCREMENTAL \
+    CARGO_NET_GIT_FETCH_WITH_CLI=$CARGO_NET_GIT_FETCH_WITH_CLI
+
+RUN \
+  --mount=type=cache,id=spiceai_registry,sharing=locked,target=/usr/local/cargo/registry \
+  --mount=type=cache,id=spiceai_git,sharing=locked,target=/usr/local/cargo/git \
+  --mount=type=cache,id=spiceai_target,sharing=locked,target=/build/target \
+  cargo build --release --features ${CARGO_FEATURES:-default} && \
+  cp /build/target/release/spiced /root/spiced
+
+FROM nvidia/cuda:12.2.2-cudnn8-runtime-ubuntu22.04 AS runtime
+ENV CUDA_NVCC_FLAGS=-fPIE
+ARG CARGO_FEATURES
+
+# Allow DuckDB to load extensions
+RUN mkdir /.duckdb/ && chmod 777 /.duckdb/
+
+RUN apt update \
+    && apt install --yes ca-certificates libssl3 --no-install-recommends \
+    && rm -rf /var/lib/{apt,dpkg,cache,log}
+
+RUN if echo "$CARGO_FEATURES" | grep -q "odbc"; then \
+    apt update \
+    && apt install --yes unixodbc --no-install-recommends \
+    && rm -rf /var/lib/{apt,dpkg,cache,log}; \
+fi
+
+COPY --from=build /root/spiced /usr/local/bin/spiced
+
+WORKDIR /app
+
+EXPOSE 8090
+EXPOSE 9090
+EXPOSE 50051
+
+ENTRYPOINT ["/usr/local/bin/spiced"]
+CMD ["--http","0.0.0.0:8090","--metrics", "0.0.0.0:9090","--flight","0.0.0.0:50051"]

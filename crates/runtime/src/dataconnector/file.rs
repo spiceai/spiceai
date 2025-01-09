@@ -16,8 +16,10 @@ limitations under the License.
 
 use crate::accelerated_table::AcceleratedTable;
 use crate::component::dataset::Dataset;
+use crate::dataconnector::listing::LISTING_TABLE_PARAMETERS;
 use crate::dataconnector::ConnectorComponent;
 use async_trait::async_trait;
+
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use snafu::prelude::*;
 use std::future::Future;
@@ -62,31 +64,6 @@ impl FileFactory {
     }
 }
 
-const PARAMETERS: &[ParameterSpec] = &[
-    // Common listing table parameters
-    ParameterSpec::runtime("file_format"),
-    ParameterSpec::runtime("file_extension"),
-    ParameterSpec::runtime("schema_infer_max_records")
-        .description("Set a limit in terms of records to scan to infer the schema."),
-    ParameterSpec::runtime("csv_has_header")
-        .description("Set true to indicate that the first line is a header."),
-    ParameterSpec::runtime("csv_quote").description("The quote character in a row."),
-    ParameterSpec::runtime("csv_escape").description("The escape character in a row."),
-    ParameterSpec::runtime("csv_schema_infer_max_records")
-        .description("Set a limit in terms of records to scan to infer the schema.")
-        .deprecated("use 'schema_infer_max_records' instead"),
-    ParameterSpec::runtime("tsv_has_header")
-        .description("Set true to indicate that the first line is a header."),
-    ParameterSpec::runtime("tsv_quote").description("The quote character in a row."),
-    ParameterSpec::runtime("tsv_escape").description("The escape character in a row."),
-    ParameterSpec::runtime("csv_delimiter")
-        .description("The character separating values within a row."),
-    ParameterSpec::runtime("file_compression_type")
-        .description("The type of compression used on the file. Supported types are: GZIP, BZIP2, XZ, ZSTD, UNCOMPRESSED"),
-    ParameterSpec::runtime("hive_partitioning_enabled")
-        .description("Enable partitioning using hive-style partitioning from the folder structure. Defaults to false."),
-];
-
 impl DataConnectorFactory for FileFactory {
     fn as_any(&self) -> &dyn Any {
         self
@@ -108,7 +85,7 @@ impl DataConnectorFactory for FileFactory {
     }
 
     fn parameters(&self) -> &'static [ParameterSpec] {
-        PARAMETERS
+        LISTING_TABLE_PARAMETERS
     }
 }
 

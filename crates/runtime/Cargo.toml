@@ -115,7 +115,6 @@ spicepod = { path = "../spicepod" }
 ssh2 = { workspace = true, optional = true }
 suppaftp = { workspace = true, optional = true }
 telemetry = { path = "../telemetry" }
-test-framework = { path = "../test-framework" }
 tiberius = { workspace = true, optional = true }
 tokio.workspace = true
 tokio-rusqlite = { workspace = true, optional = true }
@@ -155,6 +154,7 @@ scopeguard = "1.2.0"
 serde_json = { workspace = true, features = ["preserve_order"] }
 spice-cloud = { path = "../spice_cloud" }
 tokio = { workspace = true, features = ["time", "test-util"] }
+test-framework = { path = "../test-framework" }
 tracing-opentelemetry.workspace = true
 tracing-subscriber.workspace = true
 

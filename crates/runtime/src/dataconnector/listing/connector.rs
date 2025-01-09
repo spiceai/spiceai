@@ -52,6 +52,7 @@ use url::Url;
 use crate::object_store_registry::default_runtime_env;
 
 use super::infer::infer_partitions_with_types;
+use super::DelimitedFormat;
 
 #[async_trait]
 pub trait ListingTableConnector: DataConnector {
@@ -148,11 +149,11 @@ pub trait ListingTableConnector: DataConnector {
 
         match (file_format_param, file_extension.as_deref()) {
             (Some("csv"), _) | (None, Some("csv")) => Ok((
-                Some(self.get_csv_format(dataset, params)?),
+                Some(self.delimiter_separated_format(dataset, params, DelimitedFormat::Csv)?),
                 extension.unwrap_or(".csv".to_string()),
             )),
             (Some("tsv"), _) | (None, Some("tsv")) => Ok((
-                Some(self.get_tsv_format(dataset, params)?),
+                Some(self.delimiter_separated_format(dataset, params, DelimitedFormat::Tsv)?),
                 extension.unwrap_or(".tsv".to_string()),
             )),
             (Some("jsonl"), _) | (None, Some("jsonl"))=> Ok((
@@ -217,26 +218,30 @@ pub trait ListingTableConnector: DataConnector {
         Ok(Arc::new(format))
     }
 
-    fn get_csv_format(
+    /// Returns a [`CsvFormat`] based on the provided [`Datasets`] parameters, and choice of delimiter.
+    ///
+    /// Uses the appropriate parameters based on the [`DelimitedFormat`] provided.
+    fn delimiter_separated_format(
         &self,
         dataset: &Dataset,
         params: &Parameters,
+        delimiter: DelimitedFormat,
     ) -> DataConnectorResult<Arc<CsvFormat>>
     where
         Self: Display,
     {
         let has_header = params
-            .get("csv_has_header")
+            .get(&format!("{delimiter}_has_header"))
             .expose()
             .ok()
             .map_or(true, |f| f.eq_ignore_ascii_case("true"));
         let quote = params
-            .get("csv_quote")
+            .get(&format!("{delimiter}_quote"))
             .expose()
             .ok()
             .map_or(b'"', |f| *f.as_bytes().first().unwrap_or(&b'"'));
         let escape = params
-            .get("csv_escape")
+            .get(&format!("{delimiter}_escape"))
             .expose()
             .ok()
             .and_then(|f| f.as_bytes().first().copied());
@@ -244,13 +249,11 @@ pub trait ListingTableConnector: DataConnector {
             .get("schema_infer_max_records")
             .expose()
             .ok()
-            .or(params.get("csv_schema_infer_max_records").expose().ok()) // For backwards compatibility
-            .map_or_else(|| 1000, |f| usize::from_str(f).map_or(1000, |f| f));
-        let delimiter = params
-            .get("csv_delimiter")
-            .expose()
-            .ok()
-            .map_or(b',', |f| *f.as_bytes().first().unwrap_or(&b','));
+            .or(params
+                .get(&format!("{delimiter}_schema_infer_max_records"))
+                .expose()
+                .ok()) // For backwards compatibility
+            .map_or_else(|| 1000, |f| usize::from_str(f).unwrap_or(1000));
         let compression_type = params
             .get("file_compression_type")
             .expose()
@@ -263,67 +266,16 @@ pub trait ListingTableConnector: DataConnector {
                 .with_quote(quote)
                 .with_escape(escape)
                 .with_schema_infer_max_rec(schema_infer_max_rec)
-                .with_delimiter(delimiter)
+                .with_delimiter(delimiter.separator())
                 .with_file_compression_type(
                     FileCompressionType::from_str(compression_type)
                         .boxed()
                         .context(crate::dataconnector::InvalidConfigurationSnafu {
                             dataconnector: format!("{self}"),
-                            message: format!("Invalid CSV compression_type: {compression_type}, supported types are: GZIP, BZIP2, XZ, ZSTD, UNCOMPRESSED"),
-                            connector_component: ConnectorComponent::from(dataset)
-                        })?,
-                ),
-        ))
-    }
-
-    fn get_tsv_format(
-        &self,
-        dataset: &Dataset,
-        params: &Parameters,
-    ) -> DataConnectorResult<Arc<CsvFormat>>
-    where
-        Self: Display,
-    {
-        let has_header = params
-            .get("tsv_has_header")
-            .expose()
-            .ok()
-            .map_or(true, |f| f.eq_ignore_ascii_case("true"));
-        let quote = params
-            .get("tsv_quote")
-            .expose()
-            .ok()
-            .map_or(b'"', |f| *f.as_bytes().first().unwrap_or(&b'"'));
-        let escape = params
-            .get("tsv_escape")
-            .expose()
-            .ok()
-            .and_then(|f| f.as_bytes().first().copied());
-        let schema_infer_max_rec = params
-            .get("schema_infer_max_records")
-            .expose()
-            .ok()
-            .map_or_else(|| 1000, |f| usize::from_str(f).map_or(1000, |f| f));
-        let compression_type = params
-            .get("file_compression_type")
-            .expose()
-            .ok()
-            .unwrap_or_default();
-
-        Ok(Arc::new(
-            CsvFormat::default()
-                .with_has_header(has_header)
-                .with_quote(quote)
-                .with_escape(escape)
-                .with_schema_infer_max_rec(schema_infer_max_rec)
-                .with_delimiter(b'\t')
-                .with_file_compression_type(
-                    FileCompressionType::from_str(compression_type)
-                        .boxed()
-                        .context(crate::dataconnector::InvalidConfigurationSnafu {
-                            dataconnector: format!("{self}"),
-                            message: format!("Invalid TSV compression_type: {compression_type}, supported types are: GZIP, BZIP2, XZ, ZSTD, UNCOMPRESSED"),
-                            connector_component: ConnectorComponent::from(dataset)
+                            message: format!(
+                                "Invalid {} compression_type: {compression_type}, supported types are: GZIP, BZIP2, XZ, ZSTD, UNCOMPRESSED", delimiter.to_string().to_uppercase()
+                            ),
+                            connector_component: ConnectorComponent::from(dataset),
                         })?,
                 ),
         ))
@@ -608,6 +560,7 @@ mod tests {
     use std::pin::Pin;
     use url::Url;
 
+    use crate::dataconnector::listing::LISTING_TABLE_PARAMETERS;
     use crate::dataconnector::{ConnectorParams, DataConnectorFactory};
     use crate::parameters::ParameterSpec;
 
@@ -670,20 +623,7 @@ mod tests {
         }
     }
 
-    const TEST_PARAMETERS: &[ParameterSpec] = &[
-        ParameterSpec::runtime("file_extension"),
-        ParameterSpec::runtime("file_format"),
-        ParameterSpec::runtime("schema_infer_max_records"),
-        ParameterSpec::runtime("csv_has_header"),
-        ParameterSpec::runtime("csv_quote"),
-        ParameterSpec::runtime("csv_escape"),
-        ParameterSpec::runtime("csv_schema_infer_max_records"),
-        ParameterSpec::runtime("csv_delimiter"),
-        ParameterSpec::runtime("tsv_has_header"),
-        ParameterSpec::runtime("tsv_quote"),
-        ParameterSpec::runtime("tsv_escape"),
-        ParameterSpec::runtime("file_compression_type"),
-    ];
+    const TEST_PARAMETERS: &[ParameterSpec] = LISTING_TABLE_PARAMETERS;
 
     fn setup_connector(path: String, params: HashMap<String, String>) -> (TestConnector, Dataset) {
         let connector = TestConnector {
