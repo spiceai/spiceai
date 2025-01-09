@@ -65,6 +65,9 @@ pub struct TestArgs {
 
     #[arg(long)]
     pub(crate) concurrency: Option<usize>,
+
+    #[arg(long)]
+    pub(crate) ready_wait: Option<usize>,
 }
 
 #[derive(Clone, ValueEnum)]

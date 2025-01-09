@@ -127,6 +127,10 @@ impl StatisticsCollector<Duration, Vec<Duration>> for Vec<Duration> {
     }
 
     fn statistical_set(&self) -> Result<Vec<Duration>> {
+        if self.is_empty() {
+            return Ok(vec![]);
+        }
+
         let mut sorted_durations = self.clone();
         sorted_durations.sort();
 
