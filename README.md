@@ -8,6 +8,8 @@
   <a href="https://x.com/intent/follow?screen_name=spice_ai"><img src="https://img.shields.io/twitter/follow/spice_ai.svg?style=social&logo=x" alt="Follow on X"/></a>
 </p>
 
+![GitHub branch status](https://img.shields.io/github/checks-status/spiceai/spiceai/trunk?label=trunk)
+
 **Spice** is a SQL query and AI compute engine, written in Rust, for data-driven apps and agents.
 
 Spice provides three industry standard APIs in a lightweight, portable runtime (single ~140 MB binary):
