@@ -11367,6 +11367,7 @@ dependencies = [
  "app",
  "arrow",
  "clap",
+ "datafusion",
  "flight_client",
  "futures",
  "nix",
@@ -11378,6 +11379,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tonic",
+ "uuid 1.11.0",
 ]
 
 [[package]]

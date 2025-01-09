@@ -16,10 +16,13 @@ limitations under the License.
 
 use std::{
     collections::BTreeMap,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
-use crate::spiced::SpicedInstance;
+use crate::{
+    metrics::{MetricCollector, NoExtendedMetrics, QueryMetric, QueryMetrics},
+    spiced::SpicedInstance,
+};
 use anyhow::Result;
 use futures::future::join_all;
 use tokio::task::JoinHandle;
@@ -57,6 +60,7 @@ pub struct Running {
 pub struct Completed {
     query_durations: BTreeMap<String, Vec<Duration>>,
     test_duration: Duration,
+    end_time: SystemTime,
 }
 
 pub trait TestState {}
@@ -72,6 +76,7 @@ pub struct ThroughputTest<S: TestState> {
     spiced_instance: SpicedInstance,
     query_count: usize,
     parallel_count: usize,
+    start_time: SystemTime,
 
     state: S,
 }
@@ -84,6 +89,7 @@ impl ThroughputTest<NotStarted> {
             spiced_instance,
             query_count: 0,
             parallel_count: 1,
+            start_time: SystemTime::now(),
             state: NotStarted {
                 query_set: vec![],
                 end_condition: EndCondition::QuerySetCompleted(1),
@@ -137,6 +143,7 @@ impl ThroughputTest<NotStarted> {
             spiced_instance: self.spiced_instance,
             query_count: self.query_count,
             parallel_count: self.parallel_count,
+            start_time: self.start_time,
             state: Running {
                 start_time: Instant::now(),
                 query_workers,
@@ -162,62 +169,17 @@ impl ThroughputTest<Running> {
             spiced_instance: self.spiced_instance,
             query_count: self.query_count,
             parallel_count: self.parallel_count,
+            start_time: self.start_time,
             state: Completed {
                 query_durations,
                 test_duration: self.state.start_time.elapsed(),
+                end_time: SystemTime::now(),
             },
         })
     }
 }
 
 impl ThroughputTest<Completed> {
-    pub fn get_statistically_sorted_durations(&self) -> Result<BTreeMap<String, Vec<Duration>>> {
-        let mut statistically_sorted_durations = BTreeMap::new();
-        for (query, durations) in &self.state.query_durations {
-            let mut sorted_durations = durations.clone();
-            sorted_durations.sort();
-
-            // calculate the inter-quartile range to remove statistical outliers
-            // safety: sorted_durations.len() cannot be negative, and is unlikely to be larger than u32::MAX
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            {
-                let first_quartile_index =
-                    (f64::from(u32::try_from(sorted_durations.len())?) * 0.25).floor();
-                let third_quartile_index =
-                    (f64::from(u32::try_from(sorted_durations.len())?) * 0.75).ceil();
-                let first_quartile_secs =
-                    sorted_durations[first_quartile_index as usize].as_secs_f64();
-                let third_quartile_secs =
-                    sorted_durations[third_quartile_index as usize].as_secs_f64();
-
-                let iqr = third_quartile_secs - first_quartile_secs;
-                let lower_bound = first_quartile_secs - 1.5 * iqr;
-                let upper_bound = third_quartile_secs + 1.5 * iqr;
-
-                sorted_durations.retain(|duration| {
-                    let duration_secs = duration.as_secs_f64();
-                    duration_secs >= lower_bound && duration_secs <= upper_bound
-                });
-            }
-
-            statistically_sorted_durations.insert(query.clone(), sorted_durations);
-        }
-        Ok(statistically_sorted_durations)
-    }
-
-    pub fn get_duration_percentile(&self, percentile: f64) -> Result<BTreeMap<String, Duration>> {
-        let mut slowest_durations = BTreeMap::new();
-        for (query, durations) in &self.get_statistically_sorted_durations()? {
-            // safety: sorted_durations.len() cannot be negative, and is unlikely to be larger than u32::MAX
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let index = ((percentile * f64::from(u32::try_from(durations.len())?)).ceil() as usize)
-                .saturating_sub(1)
-                .min(durations.len() - 1);
-            slowest_durations.insert(query.clone(), durations[index]);
-        }
-        Ok(slowest_durations)
-    }
-
     #[must_use]
     pub fn get_query_durations(&self) -> &BTreeMap<String, Vec<Duration>> {
         &self.state.query_durations
@@ -257,5 +219,35 @@ impl std::fmt::Display for ThroughputTest<Completed> {
             self.get_cumulative_query_duration().as_secs_f32(),
             self.get_test_duration().as_secs_f32()
         )
+    }
+}
+
+impl MetricCollector<NoExtendedMetrics> for ThroughputTest<Completed> {
+    fn collect(&self) -> Result<QueryMetrics<NoExtendedMetrics>> {
+        let query_metrics = self
+            .get_query_durations()
+            .iter()
+            .map(|(query, durations)| QueryMetric::new_from_durations(query, durations))
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(QueryMetrics {
+            run_id: uuid::Uuid::new_v4(),
+            run_name: self.name.clone(),
+            commit_sha: "TODO".to_string(),
+            branch_name: "TODO".to_string(),
+            test_type: crate::TestType::Throughput,
+            started_at: usize::try_from(
+                self.start_time
+                    .duration_since(SystemTime::UNIX_EPOCH)?
+                    .as_secs(),
+            )?,
+            finished_at: usize::try_from(
+                self.state
+                    .end_time
+                    .duration_since(SystemTime::UNIX_EPOCH)?
+                    .as_secs(),
+            )?,
+            metrics: query_metrics,
+        })
     }
 }
