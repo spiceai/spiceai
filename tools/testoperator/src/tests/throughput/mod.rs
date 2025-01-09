@@ -14,34 +14,16 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use super::get_app_and_start_request;
 use crate::commands::TestArgs;
 use std::time::Duration;
 use test_framework::{
     anyhow,
-    app::App,
     metrics::MetricCollector,
     queries::{QueryOverrides, QuerySet},
-    spiced::{SpicedInstance, StartRequest},
-    spicepod::Spicepod,
-    spicepod_utils::from_app,
+    spiced::SpicedInstance,
     throughput::{EndCondition, ThroughputTest},
 };
-
-fn get_app_and_start_request(args: &TestArgs) -> anyhow::Result<(App, StartRequest)> {
-    let spicepod = Spicepod::load_exact(args.spicepod_path.clone())?;
-    let app = test_framework::app::AppBuilder::new(spicepod.name.clone())
-        .with_spicepod(spicepod)
-        .build();
-
-    let start_request = StartRequest::new(args.spiced_path.clone(), from_app(app.clone()))?;
-    let start_request = if let Some(data_dir) = &args.data_dir {
-        start_request.with_data_dir(data_dir.clone())
-    } else {
-        start_request
-    };
-
-    Ok((app, start_request))
-}
 
 pub(crate) fn export(args: &TestArgs) -> anyhow::Result<()> {
     let (_, mut start_request) = get_app_and_start_request(args)?;
