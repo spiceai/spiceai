@@ -97,7 +97,7 @@ jobs:
   build:
     name: Build ${{ matrix.target.name }} binaries
     runs-on: ${{ matrix.target.runner }}
-    if: matrix.target.runner != 'ubuntu-gpu-t4-4-core'
+    if: ${{ matrix.target.runner != 'ubuntu-gpu-t4-4-core' }}
     needs: setup-matrix
     env:
       GOVER: 1.23.4
