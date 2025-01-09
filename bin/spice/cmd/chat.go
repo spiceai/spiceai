@@ -308,7 +308,7 @@ spice chat --model <model> --cloud
 // `generateUsageMessage` generates a boxed summary of the usage statistics.
 //
 // ```shell
-// Time: 3.36s (first token 0.45s). Tokens: 1652 (492.25/s). Prompt: 1475. Completion: 177.
+// Time: 3.36s (first token 0.45s). Tokens: 1652. Prompt: 1475. Completion: 177 (292.25/s).
 // ```
 // If no usage data provided:
 // ```shell
@@ -321,9 +321,9 @@ func generateUsageMessage(u *Usage, timeToFirst time.Duration, streamDuration ti
 		return times
 	}
 
-	tps := float64(u.TotalTokens) / (totalTime.Seconds())
+	tps := float64(u.CompletionTokens) / (streamDuration.Seconds())
 	return fmt.Sprintf(
-		"%s Tokens: %d (%.2f/s). Prompt: %d. Completion: %d.", times, u.TotalTokens, tps, u.PromptTokens, u.CompletionTokens,
+		"%s Tokens: %d. Prompt: %d. Completion: %d (%.2f/s).", times, u.TotalTokens, u.PromptTokens, u.CompletionTokens, tps,
 	)
 }
 
