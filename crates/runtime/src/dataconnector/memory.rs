@@ -60,6 +60,10 @@ impl MemoryConnectorFactory {
 }
 
 impl DataConnectorFactory for MemoryConnectorFactory {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn create(
         &self,
         _params: ConnectorParams,

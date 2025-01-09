@@ -88,6 +88,10 @@ const PARAMETERS: &[ParameterSpec] = &[
 ];
 
 impl DataConnectorFactory for FileFactory {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn create(
         &self,
         params: ConnectorParams,

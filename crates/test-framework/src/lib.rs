@@ -17,11 +17,14 @@ limitations under the License.
 #![allow(clippy::missing_errors_doc)]
 
 pub mod flight;
+pub mod metrics;
 pub mod queries;
 pub mod spiced;
 pub mod spicepod_utils;
 pub mod throughput;
 pub mod utils;
+
+use std::fmt::Display;
 
 pub use anyhow;
 pub use app;
@@ -31,3 +34,20 @@ pub use futures;
 pub use rustls;
 pub use serde_yaml;
 pub use spicepod;
+
+#[derive(Debug, Clone, Copy)]
+pub enum TestType {
+    Throughput,
+    Load,
+    Benchmark,
+}
+
+impl Display for TestType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TestType::Throughput => write!(f, "throughput"),
+            TestType::Load => write!(f, "load"),
+            TestType::Benchmark => write!(f, "benchmark"),
+        }
+    }
+}

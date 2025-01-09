@@ -25,10 +25,8 @@ use crate::get_params_with_secrets;
 use crate::parameters::ParameterSpec;
 use crate::parameters::Parameters;
 use crate::secrets::Secrets;
-use crate::Runtime;
 use async_trait::async_trait;
 use data_components::cdc::ChangesStream;
-use datafusion::catalog::CatalogProvider;
 use datafusion::dataframe::DataFrame;
 use datafusion::datasource::{DefaultTableSource, TableProvider};
 use datafusion::error::DataFusionError;
@@ -337,6 +335,8 @@ pub async fn register_all() {
 }
 
 pub trait DataConnectorFactory: Send + Sync {
+    fn as_any(&self) -> &dyn Any;
+
     fn create(
         &self,
         params: ConnectorParams,
@@ -408,15 +408,6 @@ pub trait DataConnector: Send + Sync {
         &self,
         _dataset: &Dataset,
     ) -> Option<DataConnectorResult<Arc<dyn TableProvider>>> {
-        None
-    }
-
-    /// Returns a DataFusion `CatalogProvider` which can automatically populate tables from a remote catalog.
-    async fn catalog_provider(
-        self: Arc<Self>,
-        _runtime: &Runtime,
-        _catalog: &Catalog,
-    ) -> Option<DataConnectorResult<Arc<dyn CatalogProvider>>> {
         None
     }
 

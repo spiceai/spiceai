@@ -17,9 +17,7 @@ limitations under the License.
 use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
-use catalog::SpiceAICatalogProvider;
-use datafusion::{catalog::CatalogProvider, datasource::TableProvider, sql::TableReference};
-use globset::GlobSet;
+use datafusion::{datasource::TableProvider, sql::TableReference};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::json;
 use snafu::prelude::*;
@@ -34,9 +32,7 @@ use runtime::{
         Dataset, Mode, TimeFormat,
     },
     dataaccelerator::{self, create_accelerator_table},
-    dataconnector::{
-        create_new_connector, ConnectorParamsBuilder, DataConnector, DataConnectorError,
-    },
+    dataconnector::{create_new_connector, ConnectorParamsBuilder, DataConnectorError},
     extension::{Error as ExtensionError, Extension, ExtensionFactory, ExtensionManifest, Result},
     federated_table::FederatedTable,
     secrets::{ExposeSecret, Secrets},
@@ -44,9 +40,6 @@ use runtime::{
     status, Runtime,
 };
 use tokio::sync::RwLock;
-
-pub mod catalog;
-pub mod schema;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -156,23 +149,6 @@ impl SpiceExtension {
         Ok(response)
     }
 
-    async fn get_json<T: DeserializeOwned>(&self, path: &str) -> Result<T, Error> {
-        let client = reqwest::Client::new();
-        let response = client
-            .get(format!("{}{path}", self.spice_http_url()))
-            .header("X-API-Key", &self.api_key)
-            .send()
-            .await
-            .context(UnableToConnectToSpiceCloudSnafu)?;
-
-        let response: T = response
-            .json()
-            .await
-            .context(UnableToConnectToSpiceCloudSnafu)?;
-
-        Ok(response)
-    }
-
     async fn register_runtime_metrics_table(&self, runtime: &Runtime, from: String) -> Result<()> {
         let retention = Retention::new(
             Some("timestamp".to_string()),
@@ -268,20 +244,6 @@ impl Extension for SpiceExtension {
         self.start_metrics(runtime).await?;
 
         Ok(())
-    }
-
-    async fn catalog_provider(
-        &self,
-        data_connector: Arc<dyn DataConnector>,
-        filters: Option<GlobSet>,
-    ) -> Option<Result<Arc<dyn CatalogProvider>>> {
-        Some(
-            SpiceAICatalogProvider::try_new(self, data_connector, filters)
-                .await
-                .map(|c| Arc::new(c) as Arc<dyn CatalogProvider>)
-                .boxed()
-                .map_err(|source| ExtensionError::UnableToGetCatalogProvider { source }),
-        )
     }
 }
 

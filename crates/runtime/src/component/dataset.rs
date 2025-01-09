@@ -34,7 +34,7 @@ use std::{collections::HashMap, fmt::Display, str::FromStr, sync::Arc, time::Dur
 
 use crate::dataaccelerator::get_accelerator_engine;
 
-use super::validate_identifier;
+use super::{find_first_delimiter, validate_identifier};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -312,6 +312,12 @@ impl Dataset {
     }
 
     #[must_use]
+    pub fn with_params(mut self, params: HashMap<String, String>) -> Self {
+        self.params = params;
+        self
+    }
+
+    #[must_use]
     pub fn schema(&self) -> Option<SchemaRef> {
         self.schema.clone()
     }
@@ -337,33 +343,6 @@ impl Dataset {
         }
     }
 
-    /// Helper function that finds the position and length of the first delimiter ('://', ':', or '/')
-    fn find_first_delimiter(&self) -> Option<(usize, usize)> {
-        // Find the earliest occurrence of each delimiter
-        let colon_slash_slash = self.from.find("://");
-        let colon = self.from.find(':');
-        let slash = self.from.find('/');
-
-        // Get the position and length of the first delimiter
-        match (colon_slash_slash, colon, slash) {
-            (Some(css), Some(c), Some(s)) => {
-                let min_pos = css.min(c).min(s);
-                Some(if min_pos == css {
-                    (css, 3)
-                } else {
-                    (min_pos, 1)
-                })
-            }
-            (Some(css), Some(c), None) => Some(if css < c { (css, 3) } else { (c, 1) }),
-            (Some(css), None, Some(s)) => Some(if css < s { (css, 3) } else { (s, 1) }),
-            (None, Some(c), Some(s)) => Some(if c < s { (c, 1) } else { (s, 1) }),
-            (Some(css), None, None) => Some((css, 3)),
-            (None, Some(c), None) => Some((c, 1)),
-            (None, None, Some(s)) => Some((s, 1)),
-            (None, None, None) => None,
-        }
-    }
-
     /// Returns the dataset source - the first part of the `from` field before the first '://', ':', or '/'
     #[must_use]
     pub fn source(&self) -> &str {
@@ -371,7 +350,7 @@ impl Dataset {
             return "sink";
         }
 
-        match self.find_first_delimiter() {
+        match find_first_delimiter(&self.from) {
             Some((0, _)) => "",
             Some((pos, _)) => &self.from[..pos],
             None => "spice.ai",
@@ -381,7 +360,7 @@ impl Dataset {
     /// Returns the dataset path - the remainder of the `from` field after the first '://', ':', or '/'
     #[must_use]
     pub fn path(&self) -> &str {
-        match self.find_first_delimiter() {
+        match find_first_delimiter(&self.from) {
             Some((pos, len)) => &self.from[pos + len..],
             None => &self.from,
         }

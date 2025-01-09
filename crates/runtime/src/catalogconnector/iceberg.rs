@@ -21,10 +21,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use data_components::{
-    iceberg::{
-        catalog::{IcebergTableKind, RestCatalog},
-        provider::IcebergCatalogProvider,
-    },
+    iceberg::{catalog::RestCatalog, provider::IcebergCatalogProvider},
     RefreshableCatalogProvider,
 };
 use iceberg::{Namespace, NamespaceIdent};
@@ -182,7 +179,7 @@ impl CatalogConnector for IcebergCatalog {
             .props(props)
             .build();
 
-        let catalog_client = RestCatalog::new(catalog_config, IcebergTableKind::Iceberg);
+        let catalog_client = RestCatalog::new(catalog_config);
 
         let catalog_provider = IcebergCatalogProvider::try_new(
             Arc::new(catalog_client),
