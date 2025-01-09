@@ -372,6 +372,7 @@ jobs:
   publish-minio:
     name: Publish linux-x86_64 binaries to Minio
     runs-on: spiceai-runners
+    if: github.event_name != 'workflow_dispatch' || context.payload.inputs.platform_option == 'all'
     needs: build
     env:
       GOVER: 1.23.4
