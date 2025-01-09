@@ -9,12 +9,12 @@
 </p>
 
 <p align="center">
-  ![GitHub Actions Workflow Status - build](https://img.shields.io/github/actions/workflow/status/spiceai/spiceai/build_and_release.yml?branch=trunk)
-  ![GitHub Actions Workflow Status - docker build](https://img.shields.io/github/actions/workflow/status/spiceai/spiceai/spiced_docker_nightly.yml?label=docker%20build)
-  ![GitHub Actions Workflow Status - unit tests](https://img.shields.io/github/actions/workflow/status/spiceai/spiceai/pr.yml?event=merge_group&label=unit%20tests)
-  ![GitHub Actions Workflow Status - integration tests](https://img.shields.io/github/actions/workflow/status/spiceai/spiceai/integration.yml?event=pull_request&label=integration%20tests)
-  ![GitHub Actions Workflow Status - integration tests (models)](https://img.shields.io/github/actions/workflow/status/spiceai/spiceai/integration_models.yml?branch=trunk&label=integration%20tests%20(models))
-  ![GitHub Actions Workflow Status - benchmark tests](https://img.shields.io/github/actions/workflow/status/spiceai/spiceai/benchmarks.yml?branch=trunk&label=benchmark%20tests)
+  <a href="https://github.com/spiceai/spiceai/actions/workflows/build_and_release.yml"><img alt="GitHub Actions Workflow Status - build" src="https://img.shields.io/github/actions/workflow/status/spiceai/spiceai/build_and_release.yml?branch=trunk" /></a>
+  <a href="https://github.com/spiceai/spiceai/actions/workflows/spiced_docker_nightly.yml"><img alt="GitHub Actions Workflow Status - docker build" src="https://img.shields.io/github/actions/workflow/status/spiceai/spiceai/spiced_docker_nightly.yml?label=docker%20build" /></a>
+  <a href="https://github.com/spiceai/spiceai/actions/workflows/pr.yml"><img alt="GitHub Actions Workflow Status - unit tests" src="https://img.shields.io/github/actions/workflow/status/spiceai/spiceai/pr.yml?event=merge_group&label=unit%20tests" /></a>
+  <a href="https://github.com/spiceai/spiceai/actions/workflows/integration.yml"><img alt="GitHub Actions Workflow Status - integration tests" src="https://img.shields.io/github/actions/workflow/status/spiceai/spiceai/integration.yml?event=pull_request&label=integration%20tests" /></a>
+  <a href="https://github.com/spiceai/spiceai/actions/workflows/integration_models.yml"><img alt="GitHub Actions Workflow Status - integration tests (models)" src="https://img.shields.io/github/actions/workflow/status/spiceai/spiceai/integration_models.yml?branch=trunk&label=integration%20tests%20(models)" /></a>
+  <a href="https://github.com/spiceai/spiceai/actions/workflows/benchmarks.yml"><img alt="GitHub Actions Workflow Status - benchmark tests" src="https://img.shields.io/github/actions/workflow/status/spiceai/spiceai/benchmarks.yml?branch=trunk&label=benchmark%20tests" /></a>
 </p>
 
 **Spice** is a SQL query and AI compute engine, written in Rust, for data-driven apps and agents.
