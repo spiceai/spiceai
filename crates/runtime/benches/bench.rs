@@ -29,6 +29,7 @@ use std::fmt::{Display, Formatter};
 use std::panic;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 
 #[cfg(feature = "postgres")]
 use crate::bench_postgres::get_postgres_params;
