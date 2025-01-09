@@ -202,7 +202,7 @@ impl SpicedInstance {
             };
             nix::sys::signal::kill(
                 nix::unistd::Pid::from_raw(pid_i32),
-                nix::sys::signal::Signal::SIGKILL,
+                nix::sys::signal::Signal::SIGTERM,
             )?;
             self.child.wait()?;
         }
