@@ -116,8 +116,8 @@ jobs:
         if: ${{ env.TESTOPERATOR_DOWNLOADED != 'true' }}
         run: |
           cargo build -p testoperator --release
-          cp target/release/testoperator /usr/local/bin/testoperator
-          chmod +x /usr/local/bin/testoperator
+          sudo cp target/release/testoperator /usr/local/bin/testoperator
+          sudo chmod +x /usr/local/bin/testoperator
 
       - name: Run the throughput test
         run: |
