@@ -60,8 +60,9 @@ jobs:
       
       - name: Prepare file-based data directory
         run: |
-          rm -rf /opt/spiced/data
-          mkdir -p /opt/spiced/data
+          sudo rm -rf /opt/spiced/data
+          sudo mkdir -p /opt/spiced/data
+          sudo chown runner:runner -R /opt/spiced/data
 
       - name: Download File Connector TPCH Data
         if: ${{ github.event.inputs.query_set == 'tpch' }}
