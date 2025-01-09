@@ -26,10 +26,24 @@ use tokio::task::JoinHandle;
 use super::EndCondition;
 
 pub(crate) struct ThroughputQueryWorker {
-    _id: usize,
+    id: usize,
     query_set: Vec<(&'static str, &'static str)>,
     end_condition: EndCondition,
     flight_client: FlightClient,
+}
+
+pub struct ThroughputQueryWorkerResult {
+    pub query_durations: BTreeMap<String, Vec<Duration>>,
+    pub connection_failed: bool,
+}
+
+impl ThroughputQueryWorkerResult {
+    pub fn new(query_durations: BTreeMap<String, Vec<Duration>>, connection_failed: bool) -> Self {
+        Self {
+            query_durations,
+            connection_failed,
+        }
+    }
 }
 
 impl ThroughputQueryWorker {
@@ -40,14 +54,14 @@ impl ThroughputQueryWorker {
         flight_client: FlightClient,
     ) -> Self {
         Self {
-            _id: id,
+            id,
             query_set,
             end_condition,
             flight_client,
         }
     }
 
-    pub fn start(self) -> JoinHandle<Result<BTreeMap<String, Vec<Duration>>>> {
+    pub fn start(self) -> JoinHandle<Result<ThroughputQueryWorkerResult>> {
         tokio::spawn(async move {
             let mut query_durations: BTreeMap<String, Vec<Duration>> = BTreeMap::new();
             let mut query_set_count = 0;
@@ -64,15 +78,28 @@ impl ThroughputQueryWorker {
                                 .or_default()
                                 .push(duration);
                         }
-                        Err(e) => {
-                            eprintln!("Query {} failed: {}", query.0, e);
-                            query_durations.entry(query.0.to_string()).or_default();
-                        }
+                        Err(e) => match e {
+                            flight_client::Error::UnableToConnectToServer { .. }
+                            | flight_client::Error::UnableToPerformHandshake { .. } => {
+                                eprintln!(
+                                    "FAIL - EARLY EXIT - Worker {} - Query '{}' failed: {}",
+                                    self.id, query.0, e
+                                );
+                                return Ok(ThroughputQueryWorkerResult::new(query_durations, true));
+                            }
+                            _ => {
+                                eprintln!(
+                                    "FAIL - Worker {} - Query '{}' failed: {}",
+                                    self.id, query.0, e
+                                );
+                                query_durations.entry(query.0.to_string()).or_default();
+                            }
+                        },
                     };
                 }
                 query_set_count += 1;
             }
-            Ok(query_durations)
+            Ok(ThroughputQueryWorkerResult::new(query_durations, false))
         })
     }
 }

@@ -19,6 +19,7 @@ use crate::commands::TestArgs;
 use std::time::Duration;
 use test_framework::{
     anyhow,
+    metrics::MetricCollector,
     queries::{QueryOverrides, QuerySet},
     spiced::SpicedInstance,
     throughput::{EndCondition, ThroughputTest},

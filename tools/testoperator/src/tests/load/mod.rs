@@ -19,6 +19,7 @@ use crate::commands::TestArgs;
 use std::time::Duration;
 use test_framework::{
     anyhow,
+    metrics::{MetricCollector, StatisticsCollector},
     queries::{QueryOverrides, QuerySet},
     spiced::SpicedInstance,
     throughput::{EndCondition, ThroughputTest},
@@ -41,6 +42,7 @@ pub(crate) fn export(args: &TestArgs) -> anyhow::Result<()> {
 pub(crate) async fn run(args: &TestArgs) -> anyhow::Result<()> {
     let query_set = QuerySet::from(args.query_set.clone());
     let query_overrides = args.query_overrides.clone().map(QueryOverrides::from);
+    let queries = query_set.get_queries(query_overrides);
 
     let (app, start_request) = get_app_and_start_request(args)?;
     let mut spiced_instance = SpicedInstance::start(start_request).await?;
@@ -50,23 +52,26 @@ pub(crate) async fn run(args: &TestArgs) -> anyhow::Result<()> {
         .await?;
 
     // baseline run
-    println!("Running baseline test");
+    println!("Running baseline throughput test");
     let baseline_test = ThroughputTest::new(app.name.clone(), spiced_instance)
-        .with_query_set(query_set.get_queries(query_overrides))
-        .with_parallel_count(1)
-        .with_end_condition(EndCondition::QuerySetCompleted(10))
+        .with_query_set(queries.clone())
+        .with_parallel_count(args.concurrency.unwrap_or(8))
+        .with_end_condition(EndCondition::QuerySetCompleted(2))
         .start()
         .await?;
 
     let test = baseline_test.wait().await?;
-    let baseline_percentiles = test.get_duration_percentile(0.99)?;
-    let baseline_durations = test.get_statistically_sorted_durations()?.clone();
+    let baseline_percentiles = test
+        .get_query_durations()
+        .statistical_set()?
+        .percentile(0.99)?;
+    let baseline_metrics = test.collect()?;
     let spiced_instance = test.end();
 
     // load test
     println!("Running load test");
     let throughput_test = ThroughputTest::new(app.name.clone(), spiced_instance)
-        .with_query_set(query_set.get_queries(query_overrides))
+        .with_query_set(queries.clone())
         .with_parallel_count(args.concurrency.unwrap_or(8))
         .with_end_condition(EndCondition::Duration(Duration::from_secs(
             args.duration.unwrap_or(60).try_into()?,
@@ -75,57 +80,61 @@ pub(crate) async fn run(args: &TestArgs) -> anyhow::Result<()> {
         .await?;
 
     let test = throughput_test.wait().await?;
-    let percentiles = test.get_duration_percentile(0.99)?;
-    let query_durations = test.get_statistically_sorted_durations()?.clone();
-    let throughput_metric = test.get_throughput_metric(args.scale_factor.unwrap_or(1.0))?;
+    let test_durations = test.get_query_durations().statistical_set()?;
+    let metrics = test.collect()?;
     let mut spiced_instance = test.end();
 
-    for (query, duration) in query_durations {
-        let Some(baseline_duration) = baseline_durations.get(&query) else {
-            return Err(anyhow::anyhow!("Query {query} not found in baseline"));
-        };
+    println!("Baseline metrics:");
+    baseline_metrics.show()?;
+    println!("{}", vec!["-"; 30].join(""));
+    println!("Load test metrics:");
+    metrics.show()?;
 
-        let Some(baseline_percentile) = baseline_percentiles.get(&query) else {
-            return Err(anyhow::anyhow!(
-                "Query {query} not found in baseline percentiles"
-            ));
-        };
-
-        let Some(percentile) = percentiles.get(&query) else {
-            return Err(anyhow::anyhow!("Query {query} not found in percentiles"));
-        };
-
-        println!("---");
-        println!(
-            "Query {query} took on average {} milliseconds (baseline: {} milliseconds)",
-            duration.iter().sum::<Duration>().as_millis() / duration.len() as u128,
-            baseline_duration.iter().sum::<Duration>().as_millis()
-                / baseline_duration.len() as u128
-        );
-
-        println!(
-            "99% of the time it was faster than {} milliseconds (baseline: {} milliseconds)",
-            percentile.as_millis(),
-            baseline_percentile.as_millis()
-        );
-
-        let count_slower_than_baseline_percentile = duration
-            .iter()
-            .filter(|d| d.as_millis() > baseline_percentile.as_millis())
-            .count();
-        let percent_slower_than_baseline_percentile =
-            f64::from(u32::try_from(count_slower_than_baseline_percentile)?)
-                / f64::from(u32::try_from(duration.len())?)
-                * 100.0;
-        if percent_slower_than_baseline_percentile > 1.0 {
-            println!(
-                "{percent_slower_than_baseline_percentile}% of the time it was slower than the baseline 99th percentile"
-            );
-        }
-    }
+    // collect memory usage before stopping the instance
+    let memory_usage = spiced_instance.memory_usage()?;
+    // drop memory usage to MB as a u32 before converting to GB as a float
+    // we don't really care about the fractional memory usage of KB/MB
+    let memory_usage_gb = f64::from(u32::try_from(memory_usage / 1024 / 1024)?) / 1024.0;
+    println!("Memory usage: {memory_usage_gb:.2} GB");
 
     spiced_instance.stop()?;
 
-    println!("Throughput test completed with throughput: {throughput_metric}");
+    let mut test_passed = true;
+    for (query, _) in queries {
+        let Some(duration) = test_durations.get(query) else {
+            return Err(anyhow::anyhow!(
+                "Query {} not found in test durations",
+                query
+            ));
+        };
+
+        let median_duration = duration.median()?;
+        if median_duration.as_millis() < 500 {
+            continue; // skip queries that are too fast for percentile comparisons to be meaningful
+        }
+
+        let Some(baseline_percentile) = baseline_percentiles.get(query) else {
+            return Err(anyhow::anyhow!(
+                "Query {} not found in baseline percentiles",
+                query
+            ));
+        };
+
+        let percentile_99th = duration.percentile(0.99)?;
+        let percentile_ratio = percentile_99th.as_secs_f64() / baseline_percentile.as_secs_f64();
+
+        if percentile_ratio > 1.1 {
+            println!(
+                "FAIL - Query {query} has a 99th percentile that is {percentile_ratio}% of the baseline 99th percentile",
+            );
+            test_passed = false;
+        }
+    }
+
+    if !test_passed {
+        return Err(anyhow::anyhow!("Load test failed."));
+    }
+
+    println!("Load test completed");
     Ok(())
 }

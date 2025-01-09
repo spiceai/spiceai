@@ -26,7 +26,7 @@ use crate::{
 use anyhow::Result;
 use futures::future::join_all;
 use tokio::task::JoinHandle;
-use worker::ThroughputQueryWorker;
+use worker::{ThroughputQueryWorker, ThroughputQueryWorkerResult};
 
 mod worker;
 
@@ -51,7 +51,7 @@ pub struct NotStarted {
     end_condition: EndCondition,
 }
 
-pub type QueryWorkers = Vec<JoinHandle<Result<BTreeMap<String, Vec<Duration>>>>>;
+pub type QueryWorkers = Vec<JoinHandle<Result<ThroughputQueryWorkerResult>>>;
 
 pub struct Running {
     start_time: Instant,
@@ -156,8 +156,14 @@ impl ThroughputTest<Running> {
     pub async fn wait(self) -> Result<ThroughputTest<Completed>> {
         let mut query_durations = BTreeMap::new();
         for query_duration in join_all(self.state.query_workers).await {
-            let query_duration = query_duration??;
-            for (query, duration) in query_duration {
+            let worker_result = query_duration??;
+            if worker_result.connection_failed {
+                return Err(anyhow::anyhow!(
+                    "Test failed - a connection failed during the test"
+                ));
+            }
+
+            for (query, duration) in worker_result.query_durations {
                 query_durations
                     .entry(query)
                     .or_insert_with(Vec::new)
