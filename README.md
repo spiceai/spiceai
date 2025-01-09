@@ -98,28 +98,26 @@ Limited = Partial or restricted support
 
 ## Example Use-Cases
 
-### **Data-grounded Agentic AI Applications**
+### Data-grounded Agentic AI Applications
 
-- **Federated SQL Query**: Query data across databases, warehouses, and lakes with advanced push-down optimizations for reduced latency. [Learn More](https://github.com/spiceai/cookbook/blob/trunk/federation/README.md).
-- **AI Gateway**: Integrate hosted models (OpenAI, Anthropic) or local ones (Llama, NVIDIA NIM) with ease. [Learn More](https://github.com/spiceai/cookbook/blob/trunk/openai_sdk/README.md).
-- **Vector Similarity Search**: Retrieve embeddings and unstructured data efficiently, enabling RAG workflows. [Learn More](https://github.com/spiceai/cookbook/blob/trunk/search_github_files/README.md).
-- **LLM Memory**: Store and retrieve conversation history and context for AI agents. [Learn More](https://github.com/spiceai/cookbook/blob/trunk/llm-memory/README.md).
-- **Monitoring & Observability**: Gain deep visibility into data flows, model performance, and compliance audits. [Learn More](https://docs.spiceai.org/features/monitoring).
+- **OpenAI-compatible API**: Connect to hosted models (OpenAI, Anthropic, xAI) or deploy locally (Llama, NVIDIA NIM). [AI Gateway Recipe](https://github.com/spiceai/cookbook/blob/trunk/openai_sdk/README.md)
+- **Federated Data Access**: Query using SQL and NSQL (text-to-SQL) across databases, data warehouses, and data lakes with advanced query push-down for fast retrieval across disparate data sources. [Federated SQL Query Recipe](https://github.com/spiceai/cookbook/blob/trunk/federation/README.md)
+- **Search and RAG**: Search and retrieve context with accelerated embeddings for retrieval-augmented generation (RAG) workflows. [Vector Search over GitHub Files](https://github.com/spiceai/cookbook/blob/trunk/search_github_files/README.md)
+- **LLM Memory and Observability**: Store and retrieve history and context for AI agents while gaining deep visibility into data flows, model performance, and traces. [LLM Memory Recipe](https://github.com/spiceai/cookbook/blob/trunk/llm-memory/README.md) | [Monitoring Features Documentation](https://docs.spiceai.org/features/monitoring)
 
-### **Database CDN and Query Mesh**
+### Database CDN and Query Mesh
 
-- **Data Acceleration & CDC**: Materialize datasets in Arrow, SQLite, and DuckDB close to applications with real-time updates and minimal overhead. [Learn More](https://github.com/spiceai/cookbook/blob/trunk/duckdb/accelerator/README.md).
-- **Responsive Dashboards**: Materialize data for BI tools like Superset, enabling fast, real-time analytics. [Watch the Demo](https://github.com/spiceai/cookbook/blob/trunk/sales-bi/README.md).
-- **Reliability & Resilience**: Maintain application availability with local replicas of critical datasets. [Learn More](https://github.com/spiceai/cookbook/blob/trunk/localpod/README.md).
-- **Access Disparate Data**: Federate SQL queries across multiple databases, warehouses, and lakes for seamless integration. [Learn More](https://github.com/spiceai/cookbook/blob/trunk/federation/README.md).
-- **Simplified Legacy Migration**: Use a single endpoint to unify legacy systems with modern infrastructure. [Learn More](https://github.com/spiceai/cookbook/blob/trunk/federation/README.md).
+- **Data Acceleration**: Co-locate materialized datasets in Arrow, SQLite, and DuckDB with applications for sub-second query. [DuckDB Data Accelerator Recipe](https://github.com/spiceai/cookbook/blob/trunk/duckdb/accelerator/README.md)
+- **Resiliency and Local Dataset Replication**: Maintain application availability with local replicas of critical datasets. [Local Dataset Replication Recipe](https://github.com/spiceai/cookbook/blob/trunk/localpod/README.md)
+- **Responsive Dashboards**: Enable fast, real-time analytics by accelerating data for frontends and BI tools. [Sales BI Dashboard Demo](https://github.com/spiceai/cookbook/blob/trunk/sales-bi/README.md)
+- **Simplified Legacy Migration**: Use a single endpoint to unify legacy systems with modern infrastructure, including federated SQL querying across multiple sources. [Federated SQL Query Recipe](https://github.com/spiceai/cookbook/blob/trunk/federation/README.md)
 
-### **Retrieval-Augmented Generation (RAG)**
+### Retrieval-Augmented Generation (RAG)
 
-- **Unified Search**: Perform vector similarity search across structured and unstructured data sources. [Learn More](https://github.com/spiceai/cookbook/blob/trunk/search_github_files/README.md).
-- **Semantic Model**: Build an indexed, fast-access knowledge layer spanning legacy and modern systems. [Learn More](https://docs.spiceai.org/features/semantic-model).
-- **Text-to-SQL/NSQL**: Convert natural language queries to SQL with sampling using built-in tools. [Learn More](https://github.com/spiceai/cookbook/blob/trunk/text-to-sql/README.md).
-- **Evals**: Evaluate model performance and data quality with built-in evaluation tools. [Learn More](https://github.com/spiceai/cookbook/blob/trunk/evals/README.md).
+- **Unified Search with Vector Similarity**: Perform efficient vector similarity search across structured and unstructured data sources. [Vector Search over GitHub Files](https://github.com/spiceai/cookbook/blob/trunk/search_github_files/README.md)
+- **Semantic Knowledge Layer**: Define a semantic context model to enrich data for AI. [Semantic Model Feature Documentation](https://docs.spiceai.org/features/semantic-model)
+- **Text-to-SQL**: Convert natural language queries into SQL using built-in NSQL and sampling tools for accurate query. [Text-to-SQL Recipe](https://github.com/spiceai/cookbook/blob/trunk/text-to-sql/README.md)
+- **Model and Data Evaluations**: Assess model performance and data quality with integrated evaluation tools. [Language Model Evaluations Recipe](https://github.com/spiceai/cookbook/blob/trunk/evals/README.md)
 
 ## FAQ
 

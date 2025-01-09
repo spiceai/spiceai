@@ -60,12 +60,6 @@ jobs:
                 target_os: "windows",
                 target_arch: "x86_64",
                 target_arch_go: "amd64"
-              }, {
-                name: "macOS x64 (Intel)",
-                runner: "macos-14-large",
-                target_os: "darwin",
-                target_arch: "x86_64",
-                target_arch_go: "amd64"
               }
             ];
 
@@ -78,11 +72,6 @@ jobs:
               }
 
               return matrix.filter(m => m.name === platform_option);
-            }
-
-            // Filter out macos-14-large runner for trunk pushes
-            if (context.eventName === 'push' && context.ref === 'refs/heads/trunk') {
-              return matrix.filter(target => target.runner !== 'macos-14-large');
             }
 
             return matrix;
@@ -384,8 +373,6 @@ jobs:
             target_arch: aarch64
           - target_os: darwin
             target_arch: aarch64
-          - target_os: darwin
-            target_arch: x86_64
           - target_os: windows
             target_arch: x86_64
 
