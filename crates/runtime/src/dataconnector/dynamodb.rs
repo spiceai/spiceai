@@ -55,11 +55,9 @@ const PARAMETERS: &[ParameterSpec] = &[
         .secret(),
     ParameterSpec::connector("aws_access_key_id")
         .description("The AWS access key ID to use for DynamoDB.")
-        .required()
         .secret(),
     ParameterSpec::connector("aws_secret_access_key")
         .description("The AWS secret access key to use for DynamoDB.")
-        .required()
         .secret(),
     ParameterSpec::connector("aws_session_token")
         .description("The AWS session token to use for DynamoDB.")
@@ -116,23 +114,15 @@ impl DataConnector for DynamoDB {
             .params
             .get("aws_access_key_id")
             .expose()
-            .ok_or_else(|_| DataConnectorError::InvalidConfigurationNoSource {
-                dataconnector: "dynamodb".to_string(),
-                connector_component: ConnectorComponent::from(dataset),
-                message: "aws_access_key_id is required".to_string(),
-            })?
-            .to_string();
+            .ok()
+            .map(ToString::to_string);
 
         let secret_access_key = self
             .params
             .get("aws_secret_access_key")
             .expose()
-            .ok_or_else(|_| DataConnectorError::InvalidConfigurationNoSource {
-                dataconnector: "dynamodb".to_string(),
-                connector_component: ConnectorComponent::from(dataset),
-                message: "aws_secret_access_key is required".to_string(),
-            })?
-            .to_string();
+            .ok()
+            .map(ToString::to_string);
 
         let session_token = self
             .params
@@ -141,19 +131,30 @@ impl DataConnector for DynamoDB {
             .ok()
             .map(ToString::to_string);
 
-        let credentials = Credentials::new(
-            access_key_id,
-            secret_access_key,
-            session_token,
-            None,
-            "DynamoDBTableProvider",
-        );
+        let config = match (access_key_id, secret_access_key) {
+            (Some(access_key_id), Some(secret_access_key)) => {
+                let credentials = Credentials::new(
+                    access_key_id,
+                    secret_access_key,
+                    session_token,
+                    None,
+                    "DynamoDBTableProvider",
+                );
 
-        let config = aws_config::defaults(BehaviorVersion::v2024_03_28())
-            .region(Region::new(region))
-            .credentials_provider(credentials)
-            .load()
-            .await;
+                aws_config::defaults(BehaviorVersion::v2024_03_28())
+                    .region(Region::new(region))
+                    .credentials_provider(credentials)
+                    .load()
+                    .await
+            }
+            _ => {
+                // This will automatically load AWS credentials from the environment, via IAM roles if configured.
+                aws_config::defaults(BehaviorVersion::v2024_03_28())
+                    .region(Region::new(region))
+                    .load()
+                    .await
+            }
+        };
 
         let client = Client::new(&config);
         let provider = DynamoDBTableProvider::try_new(Arc::new(client), Arc::from(table_name))
