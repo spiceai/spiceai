@@ -14,7 +14,7 @@ All criteria must be met for the model to be considered Beta, with exceptions pe
 | OpenAI         | ➖           |              |
 | Azure          | ➖           |              |
 | Anthropic      | ➖           |              |
-| Grok           | ➖           |              |
+| xAI (Grok)     | ➖           |              |
 
 ## Beta Release Criteria
 - Supports `v1/chat/completion` with `"roles"="tool"` or `.messages[*].tool_calls` for `"roles"="assistant"` and `stream=true`.

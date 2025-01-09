@@ -14,7 +14,7 @@ All criteria must be met for the model to be considered Alpha. As Alpha signifie
 | OpenAI         | ➖            |              |
 | Azure          | ➖            |              |
 | Anthropic      | ➖            |              |
-| Grok           | ➖            |              |
+| xAI (Grok)     | ➖            |              |
 
 ## Alpha Release Criteria
 

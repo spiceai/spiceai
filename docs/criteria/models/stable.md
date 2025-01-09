@@ -14,7 +14,7 @@ All criteria must be met for the model to be considered Stable.
 | OpenAI         | ➖             |              |
 | Azure          | ➖             |              |
 | Anthropic      | ➖             |              |
-| Grok           | ➖             |              |
+| xAI (Grok)     | ➖             |              |
 
 ## Stable Release Criteria
 

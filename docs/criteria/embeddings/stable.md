@@ -8,12 +8,12 @@ All criteria must be met for the embedding component to be considered Stable.
 
 | Embedding Type | Stable Quality | DRI Sign-off |
 | -------------- | -------------- | ------------ |
-| File           | ➖             |              |
-| Hugging Face   | ➖             |              |
-| Spice.ai       | ➖             |              |
-| OpenAI         | ➖             |              |
-| Azure          | ➖             |              |
-| Grok           | ➖             |              |
+| File                    | ➖             |              |
+| Hugging Face            | ➖             |              |
+| Spice.ai Cloud Platform | ➖             |              |
+| OpenAI                  | ➖             |              |
+| Azure                   | ➖             |              |
+| xAI (Grok)              | ➖             |              |
 
 ## Stable Release Criteria
 
@@ -25,5 +25,5 @@ For embedding components run in the Spice runtime:
 - [ ] Documentation includes all steps to set up the embedding component.
 - [ ] Documentation includes known limitations or issues for the embedding component.
 - [ ] Documentation includes any exceptions made for Stable quality.
-- [ ] The embedding component has an easy-to-follow quickstart.
+- [ ] The embedding component has an easy-to-follow cookbook.
 - [ ] The embedding component status is updated in the table of components in [spiceai/docs](https://github.com/spiceai/docs).

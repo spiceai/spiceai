@@ -14,7 +14,7 @@ All criteria must be met for the model to be considered RC.
 | OpenAI         | ➖         |              |
 | Azure          | ➖         |              |
 | Anthropic      | ➖         |              |
-| Grok           | ➖         |              |
+| xAI (Grok)     | ➖         |              |
 
 ## RC Release Criteria
 

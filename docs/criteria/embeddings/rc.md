@@ -8,12 +8,12 @@ All criteria must be met for the embedding component to be considered RC.
 
 | Embedding Type | RC Quality | DRI Sign-off |
 | -------------- | ---------- | ------------ |
-| File           | ➖         |              |
-| Hugging Face   | ➖         |              |
-| Spice.ai       | ➖         |              |
-| OpenAI         | ➖         |              |
-| Azure          | ➖         |              |
-| Grok           | ➖         |              |
+| File                    | ➖         |              |
+| Hugging Face            | ➖         |              |
+| Spice.ai Cloud Platform | ➖         |              |
+| OpenAI                  | ➖         |              |
+| Azure                   | ➖         |              |
+| xAI (Grok)              | ➖         |              |
 
 ## RC Release Criteria
 
