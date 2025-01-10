@@ -485,24 +485,26 @@ impl Runtime {
                 .update_dataset(&ds.name, ComponentStatus::Initializing);
         }
 
-        for embedding in &app.embeddings {
-            self.status
-                .update_embedding(&embedding.name, ComponentStatus::Initializing);
-        }
+        if cfg!(feature = "models") {
+            for embedding in &app.embeddings {
+                self.status
+                    .update_embedding(&embedding.name, ComponentStatus::Initializing);
+            }
 
-        for model in &app.models {
-            self.status
-                .update_model(&model.name, ComponentStatus::Initializing);
-        }
+            for model in &app.models {
+                self.status
+                    .update_model(&model.name, ComponentStatus::Initializing);
+            }
 
-        for tool in &app.tools {
-            self.status
-                .update_tool(&tool.name, ComponentStatus::Initializing);
-        }
+            for tool in &app.tools {
+                self.status
+                    .update_tool(&tool.name, ComponentStatus::Initializing);
+            }
 
-        for tool_catalog in default_available_catalogs() {
-            self.status
-                .update_tool_catalog(tool_catalog.name(), ComponentStatus::Initializing);
+            for tool_catalog in default_available_catalogs() {
+                self.status
+                    .update_tool_catalog(tool_catalog.name(), ComponentStatus::Initializing);
+            }
         }
 
         let valid_catalogs = Self::get_valid_catalogs(app, LogErrors(false));
