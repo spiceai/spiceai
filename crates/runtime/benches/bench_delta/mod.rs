@@ -58,7 +58,6 @@ pub(crate) async fn run(
     Ok(())
 }
 
-#[allow(clippy::too_many_lines)]
 pub fn build_app(app_builder: AppBuilder, bench_name: &str) -> Result<AppBuilder, String> {
     match bench_name {
         "tpch" => Ok(app_builder
