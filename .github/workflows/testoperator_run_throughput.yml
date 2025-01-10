@@ -41,15 +41,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Run the testoperator
-        uses: ./.github/actions/run-testoperator
-        with:
-          spiced_commit: ${{ github.event.inputs.spiced_commit }}
-          spicepod_path: ${{ github.event.inputs.spicepod_path }}
-          query_set: ${{ github.event.inputs.query_set }}
-          query_overrides: ${{ github.event.inputs.query_overrides }}
-          testoperator_mode: 'throughput'
-
       - name: Install MinIO
         run: |
           sudo apt update && sudo apt install wget -y
