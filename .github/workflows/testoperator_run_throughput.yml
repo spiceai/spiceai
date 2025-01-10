@@ -127,6 +127,7 @@ jobs:
       
       - name: Run the throughput test
         run: |
+          rm -rf .spice/data
           testoperator run throughput -s /usr/local/bin/spiced -p ${{ github.event.inputs.spicepod_path }} -d /opt/spiced/data --query-set ${{ github.event.inputs.query_set }}
         env:
           S3_ENDPOINT: ${{ secrets.CLICKBENCH_S3_ENDPOINT}}
