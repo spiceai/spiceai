@@ -28,8 +28,10 @@ on:
       query_overrides:
         description: 'Query overrides'
         required: false
+        default: ''
         type: choice
         options:
+          - ''
           - 'sqlite'
           - 'postgresql'
           - 'mysql'

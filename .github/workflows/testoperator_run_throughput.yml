@@ -24,7 +24,9 @@ on:
         description: 'Query overrides'
         required: false
         type: choice
+        default: ''
         options:
+          - ''
           - 'sqlite'
           - 'postgresql'
           - 'mysql'
