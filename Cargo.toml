@@ -160,7 +160,7 @@ datafusion-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "4e
 object_store = { git = "https://github.com/spiceai/arrow-rs.git", rev = "cee50b7d2ccf749eac89d0fe26fbd8a06c0bb3c4" }
 
 datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "16ade95352582b3bf5f0ed3e450de63e57600237" }
-datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "7dc094e158ffb72e1c5699d6441ce48babae28ad" }
+datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "3d5336e53ab2aca94267343149e9276716d1a941" }
 
 duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "c7421f30d8ff2d39ed6df01a9ec51bc8781cfaae" }
 
