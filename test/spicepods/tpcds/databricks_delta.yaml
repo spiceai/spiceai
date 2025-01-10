@@ -1,11 +1,6 @@
 version: v1
 kind: Spicepod
 name: databricks_delta_tpcds
-runtime:
-  results_cache:
-    enabled: false
-  task_history:
-    enabled: false
 datasets:
   - from: databricks:spiceai_sandbox.tpcds.item
     name: item
