@@ -75,7 +75,7 @@ pub fn verify_schema(
 }
 
 #[must_use]
-pub fn transform_schema(schema: &Schema) -> Schema {
+pub fn expand_views_schema(schema: &Schema) -> Schema {
     let transformed_fields: Vec<Field> = schema
         .fields()
         .iter()
