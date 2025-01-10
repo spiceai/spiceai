@@ -32,7 +32,7 @@ use crate::{
 };
 
 fn make_spiceai_dataset(path: &str, name: &str, refresh_sql: String) -> Dataset {
-    let mut ds = Dataset::new(format!("spice.ai:{path}"), name.to_string());
+    let mut ds = Dataset::new(format!("spice.ai/{path}"), name.to_string());
     ds.acceleration = Some(Acceleration {
         enabled: true,
         refresh_sql: Some(refresh_sql),
