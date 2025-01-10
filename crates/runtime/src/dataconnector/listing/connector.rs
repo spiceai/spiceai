@@ -422,7 +422,7 @@ impl<T: ListingTableConnector + Display> DataConnector for T {
                         },
                     })?;
 
-                let transformed_schema = Arc::new(expand_views_schema(&resolved_schema));
+                let expanded_schema = Arc::new(expand_views_schema(&resolved_schema));
 
                 // If we should infer partitions and the path is a folder, infer the partitions from the folder structure.
                 if dataset.get_param("hive_partitioning_enabled", false)
@@ -451,7 +451,7 @@ impl<T: ListingTableConnector + Display> DataConnector for T {
 
                 let config = ListingTableConfig::new(table_path)
                     .with_listing_options(options)
-                    .with_schema(transformed_schema);
+                    .with_schema(expanded_schema);
 
                 // This shouldn't error because we're passing the schema and options correctly.
                 let table = ListingTable::try_new(config).boxed().context(

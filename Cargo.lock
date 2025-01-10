@@ -3041,6 +3041,7 @@ dependencies = [
  "arrow",
  "arrow-buffer",
  "arrow-flight",
+ "arrow_tools",
  "async-stream",
  "async-trait",
  "aws-config",
