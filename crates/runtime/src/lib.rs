@@ -44,6 +44,7 @@ use spicepod::component::eval::Eval;
 use status::ComponentStatus;
 use tls::TlsConfig;
 use tokio::sync::{oneshot::error::RecvError, RwLock};
+use tools::factory::default_available_catalogs;
 use tools::{catalog::SpiceToolCatalog, SpiceModelTool, Tooling};
 pub use util::shutdown_signal;
 
@@ -471,19 +472,49 @@ impl Runtime {
         }
     }
 
-    /// Updates all of the dataset statuses to `Initializing`.
-    /// Dataset statuses get set first, as they are the most likely to cause spiced to be in a non-ready state.
-    pub async fn set_datasets_initializing(&self) {
+    /// Updates all of the component statuses to `Initializing`.
+    pub async fn set_components_initializing(&self) {
         let app_lock = self.app.read().await;
         let Some(app) = app_lock.as_ref() else {
             return;
         };
 
         let valid_datasets = Self::get_valid_datasets(app, LogErrors(false));
-
         for ds in &valid_datasets {
             self.status
                 .update_dataset(&ds.name, ComponentStatus::Initializing);
+        }
+
+        for embedding in &app.embeddings {
+            self.status
+                .update_embedding(&embedding.name, ComponentStatus::Initializing);
+        }
+
+        for model in &app.models {
+            self.status
+                .update_model(&model.name, ComponentStatus::Initializing);
+        }
+
+        for tool in &app.tools {
+            self.status
+                .update_tool(&tool.name, ComponentStatus::Initializing);
+        }
+
+        for tool_catalog in default_available_catalogs() {
+            self.status
+                .update_tool_catalog(tool_catalog.name(), ComponentStatus::Initializing);
+        }
+
+        let valid_catalogs = Self::get_valid_catalogs(app, LogErrors(false));
+        for catalog in valid_catalogs {
+            self.status
+                .update_catalog(&catalog.name, ComponentStatus::Initializing);
+        }
+
+        let valid_views = Self::get_valid_views(app, LogErrors(false));
+        for view in valid_views {
+            self.status
+                .update_view(&view.name, ComponentStatus::Initializing);
         }
     }
 
@@ -492,7 +523,7 @@ impl Runtime {
     /// The future returned by this function will not resolve until all components have been loaded and marked as ready.
     /// This includes waiting for the first refresh of any accelerated tables to complete.
     pub async fn load_components(&self) {
-        self.set_datasets_initializing().await;
+        self.set_components_initializing().await;
 
         self.start_extensions().await;
 
