@@ -9,41 +9,64 @@ runtime:
 datasets:
   - from: file:data/catalog_sales.parquet
     name: catalog_sales
+    acceleration: &acceleration
+      engine: duckdb
+      mode: memory
+      enabled: true
   - from: file:data/catalog_returns.parquet
     name: catalog_returns
+    acceleration: *acceleration
   - from: file:data/inventory.parquet
     name: inventory
+    acceleration: *acceleration
   - from: file:data/store_sales.parquet
     name: store_sales
+    acceleration: *acceleration
   - from: file:data/store_returns.parquet
     name: store_returns
+    acceleration: *acceleration
   - from: file:data/web_sales.parquet
     name: web_sales
+    acceleration: *acceleration
   - from: file:data/web_returns.parquet
     name: web_returns
+    acceleration: *acceleration
   - from: file:data/customer.parquet
     name: customer
+    acceleration: *acceleration
   - from: file:data/customer_address.parquet
     name: customer_address
+    acceleration: *acceleration
   - from: file:data/customer_demographics.parquet
     name: customer_demographics
+    acceleration: *acceleration
   - from: file:data/date_dim.parquet
     name: date_dim
+    acceleration: *acceleration
   - from: file:data/household_demographics.parquet
     name: household_demographics
+    acceleration: *acceleration
   - from: file:data/item.parquet
     name: item
+    acceleration: *acceleration
   - from: file:data/promotion.parquet
     name: promotion
+    acceleration: *acceleration
   - from: file:data/ship_mode.parquet
     name: ship_mode
+    acceleration: *acceleration
   - from: file:data/store.parquet
     name: store
+    acceleration: *acceleration
   - from: file:data/time_dim.parquet
     name: time_dim
+    acceleration: *acceleration
   - from: file:data/warehouse.parquet
     name: warehouse
+    acceleration: *acceleration
   - from: file:data/web_page.parquet
     name: web_page
+    acceleration: *acceleration
   - from: file:data/web_site.parquet
     name: web_site
+    acceleration: *acceleration

@@ -132,6 +132,7 @@ jobs:
       
       - name: Run the load test
         run: |
+          rm -rf .spice/data
           testoperator run load -s /usr/local/bin/spiced -p ${{ github.event.inputs.spicepod_path }} -d /opt/spiced/data --query-set ${{ github.event.inputs.query_set }} --duration ${{ github.event.inputs.duration }}
         env:
           S3_ENDPOINT: ${{ secrets.CLICKBENCH_S3_ENDPOINT}}
