@@ -17,7 +17,6 @@ limitations under the License.
 use crate::{Read, ReadWrite};
 use arrow::{array::RecordBatch, datatypes::SchemaRef};
 use arrow_flight::error::FlightError;
-use arrow_tools::schema::expand_views_schema;
 use async_stream::stream;
 use async_trait::async_trait;
 use datafusion::{
@@ -119,18 +118,15 @@ impl FlightFactory {
         schema: Option<SchemaRef>,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
         let table_provider = match schema {
-            Some(schema) => {
-                let expanded_schema = Arc::new(expand_views_schema(&schema));
-                Arc::new(FlightTable::create_with_schema(
-                    self.name,
-                    self.client.clone(),
-                    table_reference,
-                    expanded_schema,
-                    Arc::clone(&self.dialect),
-                    self.subquery_use_partial_path,
-                    self.extra_compute_context.as_ref().map(Arc::clone),
-                ))
-            }
+            Some(schema) => Arc::new(FlightTable::create_with_schema(
+                self.name,
+                self.client.clone(),
+                table_reference,
+                schema,
+                Arc::clone(&self.dialect),
+                self.subquery_use_partial_path,
+                self.extra_compute_context.as_ref().map(Arc::clone),
+            )),
             None => Arc::new(
                 FlightTable::create(
                     self.name,
