@@ -99,7 +99,7 @@ jobs:
       - name: Setup Testoperator
         uses: ./.github/actions/setup-testoperator
         with:
-          build_testoperator: ${{ env.TESTOPERATOR_DOWNLOADED != 'true' }}
+          build_testoperator: ${{ env.TESTOPERATOR_DOWNLOADED }}
           query_set: ${{ github.event.inputs.query_set }}
       
       - name: Run the load test
