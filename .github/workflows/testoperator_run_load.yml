@@ -43,6 +43,7 @@ jobs:
   run-load:
     name: Run load test
     runs-on: spiceai-runners
+    timeout-minutes: 600
     steps:
       - uses: actions/checkout@v4
 
