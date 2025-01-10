@@ -21,7 +21,8 @@ All criteria must be met for the embedding component to be considered RC.
 
 ### Conditional Criteria
 - For embedding models running in the Spice runtime (as opposed to network-attached models).
-  - Can handle X TPS (Transactions Per Second) and Y tokens per second successfully and without increasing latency for 1 minute.
+  - For a period of 1 minute, can handle N clients consistently sending embedding requests (i.e. instantly send another request upon reciept of prior request), each with Y tokens, without increasing round trip (to client) latency for 5 minute. An increase in latency is defined as a 10% increase in both the 50th & 95th percentile between the first and last minute.
+
 
 ### Documentation
 

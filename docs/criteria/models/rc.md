@@ -25,8 +25,12 @@ All criteria must be met for the model to be considered RC.
 - W3 [TraceContext](https://www.w3.org/TR/trace-context/) headers are supported, and when used, the internal tool recursion is maintained.
 
 ### Conditional Criteria
-- For models running in the Spice runtime (as opposed to network-attached models).
-  - Can handle X TPS and Y tokens per second successfully for 1 minute without increasing latency.
+- A language model running in the Spice runtime (as opposed to network-attached models), can handle consistent requests from several clients without an adverse impact on latency.
+  - N clients consistently sending requests (i.e. sending another request upon reciept of prior request)
+  - A duration of 5 minutes.
+  - The body must have at least Y tokens (number of prompt tokens in the templated input string).
+  - An increase in latency is defined as a 10% increase in both the 50th & 95th percentile between the first and last minute.
+
 
 ### Documentation
 

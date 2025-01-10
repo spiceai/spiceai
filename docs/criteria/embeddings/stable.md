@@ -19,8 +19,11 @@ All criteria must be met for the embedding component to be considered Stable.
 - All [RC release criteria](./rc.md) pass.
 
 ### Conditional Criteria
-- For embedding models running in the Spice runtime (as opposed to network-attached models).
-  - Can handle X TPS (Transactions Per Second) and Y tokens per second successfully and without increasing latency for 1 hour.
+- An embedding model running in the Spice runtime (as opposed to network-attached models), can handle consistent requests from several clients without an adverse impact on latency.
+  - N clients consistently sending requests (i.e. sending another request upon reciept of prior request)
+  - A duration of 60 minutes.
+  - The body must have at least Y tokens.
+  - An increase in latency is defined as a 10% increase in both the 50th & 95th percentile between the first and last minute.
 
 ### Documentation
 
