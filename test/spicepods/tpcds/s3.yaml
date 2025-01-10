@@ -1,11 +1,6 @@
 version: v1
 kind: Spicepod
 name: s3_tpch
-runtime:
-  results_cache:
-    enabled: false
-  task_history:
-    enabled: false
 datasets:
   - from: s3://benchmarks/tpcds_sf1/catalog_sales/
     name: catalog_sales

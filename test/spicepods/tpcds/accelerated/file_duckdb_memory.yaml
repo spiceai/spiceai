@@ -1,11 +1,6 @@
 version: v1
 kind: Spicepod
 name: file_tpcds
-runtime:
-  results_cache:
-    enabled: false
-  task_history:
-    enabled: false
 datasets:
   - from: file:data/catalog_sales.parquet
     name: catalog_sales

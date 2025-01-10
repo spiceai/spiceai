@@ -1,11 +1,6 @@
 version: v1
 kind: Spicepod
 name: s3_tpch_duckdb_memory
-runtime:
-  results_cache:
-    enabled: false
-  task_history:
-    enabled: false
 datasets:
   - from: s3://benchmarks/tpch_sf1/customer/
     name: customer

@@ -1,11 +1,6 @@
 version: v1
 kind: Spicepod
 name: file_tpch_duckdb_file
-runtime:
-  results_cache:
-    enabled: false
-  task_history:
-    enabled: false
 datasets:
   - from: file:data/customer.parquet
     name: customer
