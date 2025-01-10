@@ -27,6 +27,7 @@ use super::EndCondition;
 
 pub(crate) struct ThroughputQueryWorker {
     id: usize,
+    iterations: usize,
     query_set: Vec<(&'static str, &'static str)>,
     end_condition: EndCondition,
     flight_client: FlightClient,
@@ -49,12 +50,14 @@ impl ThroughputQueryWorkerResult {
 impl ThroughputQueryWorker {
     pub fn new(
         id: usize,
+        iterations: usize,
         query_set: Vec<(&'static str, &'static str)>,
         end_condition: EndCondition,
         flight_client: FlightClient,
     ) -> Self {
         Self {
             id,
+            iterations,
             query_set,
             end_condition,
             flight_client,
@@ -69,33 +72,38 @@ impl ThroughputQueryWorker {
 
             while !self.end_condition.is_met(&start, query_set_count) {
                 for query in &self.query_set {
-                    let query_start = Instant::now();
-                    match self.flight_client.query(query.1).await {
-                        Ok(_) => {
-                            let duration = query_start.elapsed();
-                            query_durations
-                                .entry(query.0.to_string())
-                                .or_default()
-                                .push(duration);
-                        }
-                        Err(e) => match e {
-                            flight_client::Error::UnableToConnectToServer { .. }
-                            | flight_client::Error::UnableToPerformHandshake { .. } => {
-                                eprintln!(
-                                    "FAIL - EARLY EXIT - Worker {} - Query '{}' failed: {}",
-                                    self.id, query.0, e
-                                );
-                                return Ok(ThroughputQueryWorkerResult::new(query_durations, true));
+                    for idx in 0..self.iterations {
+                        let query_start = Instant::now();
+                        match self.flight_client.query(query.1).await {
+                            Ok(_) => {
+                                let duration = query_start.elapsed();
+                                query_durations
+                                    .entry(query.0.to_string())
+                                    .or_default()
+                                    .push(duration);
                             }
-                            _ => {
-                                eprintln!(
-                                    "FAIL - Worker {} - Query '{}' failed: {}",
-                                    self.id, query.0, e
-                                );
-                                query_durations.entry(query.0.to_string()).or_default();
-                            }
-                        },
-                    };
+                            Err(e) => match e {
+                                flight_client::Error::UnableToConnectToServer { .. }
+                                | flight_client::Error::UnableToPerformHandshake { .. } => {
+                                    eprintln!(
+                                        "FAIL - EARLY EXIT - Worker {} - Query '{}' failed: {}",
+                                        self.id, query.0, e
+                                    );
+                                    return Ok(ThroughputQueryWorkerResult::new(
+                                        query_durations,
+                                        true,
+                                    ));
+                                }
+                                _ => {
+                                    eprintln!(
+                                        "FAIL - Worker {} - Query '{}' failed: {}",
+                                        self.id, query.0, e
+                                    );
+                                    query_durations.entry(query.0.to_string()).or_default();
+                                }
+                            },
+                        };
+                    }
                 }
                 query_set_count += 1;
             }
