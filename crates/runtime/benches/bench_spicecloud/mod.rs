@@ -17,7 +17,7 @@ use crate::results::BenchmarkResultsBuilder;
 use app::AppBuilder;
 use runtime::Runtime;
 use spicepod::component::{dataset::Dataset, params::Params};
-use test_framework::queries::{get_tpch_test_queries, QueryOverrides};
+use test_framework::queries::get_tpch_test_queries;
 
 pub(crate) async fn run(
     rt: &mut Runtime,
@@ -25,7 +25,7 @@ pub(crate) async fn run(
     bench_name: &str,
 ) -> Result<(), String> {
     let test_queries = match bench_name {
-        "tpch" => get_tpch_test_queries(Some(QueryOverrides::SpiceAI)),
+        "tpch" => get_tpch_test_queries(None),
         "tpcds" => get_tpcds_test_queries(),
         "clickbench" => get_clickbench_test_queries(),
         _ => return Err(format!("Invalid benchmark to run {bench_name}")),
