@@ -103,6 +103,7 @@ jobs:
           query_set: ${{ github.event.inputs.query_set }}
       
       - name: Run the load test
+        if: ${{ github.event.inputs.query_overrides == '' }}
         run: |
           rm -rf .spice/data
           testoperator run load -s /usr/local/bin/spiced -p ${{ github.event.inputs.spicepod_path }} -d /opt/spiced/data --query-set ${{ github.event.inputs.query_set }} --duration ${{ github.event.inputs.duration }}
@@ -112,6 +113,7 @@ jobs:
           S3_SECRET: ${{ secrets.CLICKBENCH_S3_SECRET}}
       
       - name: Run the load test (with overrides)
+        if: ${{ github.event.inputs.query_overrides != '' }}
         run: |
           rm -rf .spice/data
           testoperator run load -s /usr/local/bin/spiced -p ${{ github.event.inputs.spicepod_path }} -d /opt/spiced/data --query-set ${{ github.event.inputs.query_set }} --duration ${{ github.event.inputs.duration }} --query-overrides ${{ github.event.inputs.query_overrides }}
