@@ -47,3 +47,11 @@ datasets:
     name: web_page
   - from: file:data/web_site.parquet
     name: web_site
+  - from: file:data/reason.parquet
+    name: reason
+  - from: file:data/call_center.parquet
+    name: call_center
+  - from: file:data/income_band.parquet
+    name: income_band
+  - from: file:data/catalog_page.parquet
+    name: catalog_page
