@@ -52,7 +52,7 @@ async fn spiceai_integration_test_refresh_sql_override_append() -> Result<(), an
         .scope(async {
             let app = AppBuilder::new("refresh_sql_override_append")
                 .with_dataset(make_spiceai_dataset(
-                    "tpch.nation",
+                    "spiceai/tpch/datasets/tpch.nation",
                     "nation",
                     "SELECT * FROM nation WHERE n_regionkey != 0".to_string(),
                 ))
