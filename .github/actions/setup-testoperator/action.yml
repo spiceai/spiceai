@@ -18,6 +18,7 @@ runs:
   using: 'composite'
   steps:
     - name: Build the testoperator if it wasn't downloaded
+      shell: bash
       if: inputs.build_testoperator
       run: |
         cargo build -p testoperator --release
@@ -25,12 +26,14 @@ runs:
         sudo chmod +x /usr/local/bin/testoperator
     
     - name: Prepare file-based data directory
+      shell: bash
       run: |
         sudo rm -rf /opt/spiced/data
         sudo mkdir -p /opt/spiced/data
         sudo chown runner:runner -R /opt/spiced/data
 
     - name: Download File Connector TPCH Data
+      shell: bash
       if: inputs.query_set == 'tpch'
       run: |
         cd /opt/spiced/data
@@ -44,6 +47,7 @@ runs:
         mc cp spice-minio/benchmarks/tpch_sf1/supplier/ ./ --recursive
     
     - name: Download File Connector TPCDS Data
+      shell: bash
       if: inputs.query_set == 'tpcds'
       run: |
         cd /opt/spiced/data
