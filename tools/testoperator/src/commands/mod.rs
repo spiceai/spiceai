@@ -32,6 +32,7 @@ pub enum Commands {
 pub enum TestCommands {
     Throughput(TestArgs),
     Load(TestArgs),
+    Bench(TestArgs),
 }
 
 #[derive(Parser)]
