@@ -44,6 +44,7 @@ pub enum QueryOverrides {
     Spark,
     ODBCAthena,
     DuckDB,
+    SpiceAI,
 }
 
 impl QueryOverrides {
@@ -57,6 +58,7 @@ impl QueryOverrides {
             "spark" => Some(Self::Spark),
             "odbc_athena" => Some(Self::ODBCAthena),
             "duckdb" => Some(Self::DuckDB),
+            "spiceai" => Some(Self::SpiceAI),
             _ => None,
         }
     }
@@ -106,6 +108,12 @@ pub fn get_tpch_test_queries(
             queries,
             2, // Analysis error: [UNSUPPORTED_SUBQUERY_EXPRESSION_CATEGORY.UNSUPPORTED_CORRELATED_SCALAR_SUBQUERY] Unsupported subquery expression: Correlated scalar subqueries can only be used in filters, aggregations, projections, and UPDATE/MERGE/DELETE commands
             17 // Analysis error: [UNSUPPORTED_SUBQUERY_EXPRESSION_CATEGORY.UNSUPPORTED_CORRELATED_SCALAR_SUBQUERY] Unsupported subquery expression: Correlated scalar subqueries can only be used in filters, aggregations, projections, and UPDATE/MERGE/DELETE commands
+        ),
+        Some(QueryOverrides::SpiceAI) => remove_tpch_query!(
+            queries,
+            2, // Spice.ai Data Platform doesn't support correlated subqueries yet https://github.com/spiceai/spiceai/issues/4024
+            17, // Spice.ai Data Platform doesn't support correlated subqueries yet https://github.com/spiceai/spiceai/issues/4024
+            21 // Spice.ai Data Platform doesn't support correlated subqueries yet https://github.com/spiceai/spiceai/issues/4024
         ),
         _ => queries,
     }
