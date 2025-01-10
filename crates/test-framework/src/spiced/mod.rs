@@ -23,6 +23,7 @@ use std::{
 use anyhow::Result;
 use flight_client::{Credentials, FlightClient};
 use spicepod::spec::SpicepodDefinition;
+use sysinfo::{Pid, ProcessesToUpdate, System};
 use tempfile::TempDir;
 
 use crate::utils::wait_until_true;
@@ -214,6 +215,19 @@ impl SpicedInstance {
         }
 
         Ok(())
+    }
+
+    /// Returns the memory usage in bytes for the process
+    pub fn memory_usage(&self) -> Result<u64> {
+        let mut system = System::new();
+        let pid = Pid::from_u32(self.child.id());
+        system.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
+
+        let Some(process) = system.process(pid) else {
+            return Err(anyhow::anyhow!("Failed to get process"));
+        };
+
+        Ok(process.memory())
     }
 }
 

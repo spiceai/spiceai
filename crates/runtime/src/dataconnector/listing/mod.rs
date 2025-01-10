@@ -16,11 +16,62 @@ limitations under the License.
 
 use url::form_urlencoded;
 
-use crate::parameters::Parameters;
+use crate::parameters::{ParameterSpec, Parameters};
 
 mod connector;
 mod infer;
 pub use connector::ListingTableConnector;
+
+/// All [`super::DataConnectorFactory`] that create [`ListingTableConnector`]s should have at least these parameters returned from the associated [`super::DataConnectorFactory::parameters`].
+pub const LISTING_TABLE_PARAMETERS: &[ParameterSpec] = &[
+    ParameterSpec::runtime("file_format"),
+    ParameterSpec::runtime("file_extension"),
+    ParameterSpec::runtime("schema_infer_max_records")
+        .description("Set a limit in terms of records to scan to infer the schema."),
+    ParameterSpec::runtime("tsv_has_header")
+        .description("Set true to indicate that the first line is a header."),
+    ParameterSpec::runtime("tsv_quote").description("The quote character in a row."),
+    ParameterSpec::runtime("tsv_escape").description("The escape character in a row."),
+    ParameterSpec::runtime("tsv_schema_infer_max_records")
+        .description("Set a limit in terms of records to scan to infer the schema.")
+        .deprecated("use 'schema_infer_max_records' instead"),
+    ParameterSpec::runtime("csv_has_header")
+        .description("Set true to indicate that the first line is a header."),
+    ParameterSpec::runtime("csv_quote").description("The quote character in a row."),
+    ParameterSpec::runtime("csv_escape").description("The escape character in a row."),
+    ParameterSpec::runtime("csv_schema_infer_max_records")
+        .description("Set a limit in terms of records to scan to infer the schema.")
+        .deprecated("use 'schema_infer_max_records' instead"),
+    ParameterSpec::runtime("csv_delimiter")
+        .description("The character separating values within a row."),
+    ParameterSpec::runtime("file_compression_type")
+        .description("The type of compression used on the file. Supported types are: GZIP, BZIP2, XZ, ZSTD, UNCOMPRESSED"),
+    ParameterSpec::runtime("hive_partitioning_enabled")
+        .description("Enable partitioning using hive-style partitioning from the folder structure. Defaults to false."),
+];
+
+pub enum DelimitedFormat {
+    Tsv,
+    Csv,
+}
+
+impl std::fmt::Display for DelimitedFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DelimitedFormat::Tsv => write!(f, "tsv"),
+            DelimitedFormat::Csv => write!(f, "csv"),
+        }
+    }
+}
+
+impl DelimitedFormat {
+    fn separator(&self) -> u8 {
+        match self {
+            DelimitedFormat::Tsv => b'\t',
+            DelimitedFormat::Csv => b',',
+        }
+    }
+}
 
 #[must_use]
 pub fn build_fragments(params: &Parameters, keys: Vec<&str>) -> String {

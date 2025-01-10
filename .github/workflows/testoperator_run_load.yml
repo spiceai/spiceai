@@ -1,4 +1,4 @@
-name: throughput tests
+name: load tests
 
 on:
   workflow_dispatch:
@@ -6,6 +6,11 @@ on:
       spiced_commit:
         description: 'spiced build commit'
         required: false
+        type: string
+      duration:
+        description: 'The test duration in seconds'
+        required: true
+        default: '28800'
         type: string
       spicepod_path:
         description: 'The spicepod file to test with'
@@ -22,8 +27,8 @@ on:
           - 'clickbench'
 
 jobs:
-  run-throughput:
-    name: Run throughput test
+  run-load:
+    name: Run load test
     runs-on: spiceai-runners
     steps:
       - uses: actions/checkout@v4
@@ -133,10 +138,10 @@ jobs:
           mc cp spice-minio/benchmarks/tpcds_sf1/web_sales/ ./ --recursive
           mc cp spice-minio/benchmarks/tpcds_sf1/web_site/ ./ --recursive
       
-      - name: Run the throughput test
+      - name: Run the load test
         run: |
           rm -rf .spice/data
-          testoperator run throughput -s /usr/local/bin/spiced -p ${{ github.event.inputs.spicepod_path }} -d /opt/spiced/data --query-set ${{ github.event.inputs.query_set }}
+          testoperator run load -s /usr/local/bin/spiced -p ${{ github.event.inputs.spicepod_path }} -d /opt/spiced/data --query-set ${{ github.event.inputs.query_set }} --duration ${{ github.event.inputs.duration }}
         env:
           S3_ENDPOINT: ${{ secrets.CLICKBENCH_S3_ENDPOINT}}
           S3_KEY: ${{ secrets.CLICKBENCH_S3_KEY}}

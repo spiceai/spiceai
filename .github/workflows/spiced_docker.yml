@@ -9,7 +9,17 @@ on:
       publish:
         description: Publish the Docker images to the registry
         required: false
-        default: 'false'
+        default: "false"
+      target:
+        description: Build docker images for specific target(s)
+        required: false
+        type: choice
+        options:
+          - "all"
+          - "amd64"
+          - "arm64"
+          - "cuda"
+        default: "all"
 
 jobs:
   setup:
@@ -28,18 +38,19 @@ jobs:
           echo "rel_version=${{ env.REL_VERSION }}" >> $GITHUB_OUTPUT
 
   build-amd64:
+    if: ${{ github.event_name == 'push' || inputs.target == 'amd64' || inputs.target == 'all' }}
     needs: setup
     runs-on: spiceai-runners
     steps:
       - uses: actions/checkout@v4
-      
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
         with:
           # Enable docker driver for layer caching
           driver-opts: |
             image=moby/buildkit:latest
-      
+
       - name: Build AMD64 default image
         uses: docker/build-push-action@v6
         with:
@@ -86,6 +97,7 @@ jobs:
           path: /tmp/image-amd64-*.tar
 
   build-arm64:
+    if: ${{ github.event_name == 'push' || inputs.target == 'arm64' || inputs.target == 'all' }}
     needs: setup
     runs-on: hosted-linux-arm-runner-16-cores
     steps:
@@ -161,6 +173,57 @@ jobs:
           name: images-arm64
           path: /tmp/image-arm64-*.tar
 
+  build-cuda:
+    if: ${{ github.event_name == 'push' || inputs.target == 'cuda' || inputs.target == 'all' }}
+    needs: setup
+    runs-on: "ubuntu-gpu-t4-4-core"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install docker
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ca-certificates curl gnupg lsb-release
+          sudo mkdir -m 0755 -p /etc/apt/keyrings
+          curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/$(lsb_release -i | awk '{ print tolower($3) }') $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+          sudo apt-get update
+          sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+
+      - name: Start Docker service
+        run: |
+          sudo systemctl start docker
+          sudo systemctl status docker
+
+      - name: chown /var/run/docker.sock to current user
+        run: |
+          sudo chown $USER /var/run/docker.sock
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: |
+            image=moby/buildkit:latest
+
+      - name: Build CUDA models image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile-cuda
+          platforms: linux/amd64
+          outputs: type=docker,name=localhost:5000/spiceai:models-cuda-amd64,dest=/tmp/images-amd64-cuda.tar
+          cache-from: type=gha,scope=build-cuda
+          cache-to: type=gha,scope=build-cuda,mode=max
+          build-args: |
+            REL_VERSION=${{ needs.setup.outputs.rel_version }}
+            CARGO_FEATURES=release,cuda
+
+      - name: Upload CUDA artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: images-amd64-cuda
+          path: /tmp/images-amd64-cuda.tar
+
   publish:
     needs: [setup, build-amd64, build-arm64]
     runs-on: ubuntu-latest
@@ -212,13 +275,14 @@ jobs:
             if [ "$variant" != "default" ]; then
               suffix="-${variant}"
             fi
-            
+
             # Load both architecture images
             echo "Loading AMD64 image"
             docker load -i /tmp/images-amd64/image-amd64-${variant}.tar
+
             echo "Loading ARM64 image"
             docker load -i /tmp/images-arm64/image-arm64-${variant}.tar
-            
+
             # Push images to local registry
             echo "Pushing images to local registry"
             docker push localhost:5000/spiceai:${variant}-amd64
@@ -232,7 +296,7 @@ jobs:
                 -t ghcr.io/spiceai/spiceai:latest${suffix} \
                 localhost:5000/spiceai:${variant}-amd64 \
                 localhost:5000/spiceai:${variant}-arm64
-              
+
               # Push to DockerHub
               echo "Pushing to DockerHub"
               docker buildx imagetools create \
@@ -240,10 +304,10 @@ jobs:
                 -t spiceai/spiceai:latest${suffix} \
                 localhost:5000/spiceai:${variant}-amd64 \
                 localhost:5000/spiceai:${variant}-arm64
-              
+
               echo "Verifying GHCR image:"
               docker buildx imagetools inspect ghcr.io/spiceai/spiceai:${REL_VERSION}${suffix}
-              
+
               echo "Verifying DockerHub image:"
               docker buildx imagetools inspect spiceai/spiceai:${REL_VERSION}${suffix}
             else
@@ -253,7 +317,77 @@ jobs:
                 -t localhost:5000/spiceai:latest${suffix} \
                 localhost:5000/spiceai:${variant}-amd64 \
                 localhost:5000/spiceai:${variant}-arm64
-              
+
               docker buildx imagetools inspect localhost:5000/spiceai:latest${suffix}
             fi
           done
+
+  publish-cuda:
+    if: ${{ github.event_name == 'push' || inputs.target == 'cuda' || inputs.target == 'all' }}
+    needs: build-cuda
+    runs-on: "ubuntu-gpu-t4-4-core"
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp
+          pattern: images-amd64-cuda
+
+      - name: Verify artifacts
+        run: |
+          ls -l /tmp/images-amd64-cuda
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Start local registry
+        run: |
+          docker run -d -p 5000:5000 --restart=always --name registry registry:2
+
+      - name: Login to GitHub Package Registry
+        if: startsWith(github.ref, 'refs/tags/v') || inputs.publish == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Login to DockerHub
+        if: startsWith(github.ref, 'refs/tags/v') || inputs.publish == 'true'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Import images and create manifests
+        env:
+          REL_VERSION: ${{ needs.setup.outputs.rel_version }}
+          PUBLISH: ${{ startsWith(github.ref, 'refs/tags/v') || inputs.publish == 'true' }}
+        run: |
+          echo "Handling CUDA models..."
+
+          docker load -i /tmp/images-amd64-cuda/images-amd64-cuda.tar
+          docker push localhost:5000/spiceai:models-cuda-amd64
+
+          if [[ "${PUBLISH}" == "true" ]]; then
+            echo "Pushing CUDA models to GHCR and DockerHub"
+            docker buildx imagetools create \
+              -t spiceai/spiceai:${REL_VERSION}-models-cuda \
+              -t spiceai/spiceai:latest-models-cuda \
+              -t ghcr.io/spiceai/spiceai:${REL_VERSION}-models-cuda \
+              -t ghcr.io/spiceai/spiceai:latest-models-cuda \
+              localhost:5000/spiceai:models-cuda-amd64
+
+            echo "Verifying CUDA GHCR image:"
+            docker buildx imagetools inspect ghcr.io/spiceai/spiceai:${REL_VERSION}-models-cuda
+
+            echo "Verifying CUDA DockerHub image:"
+            docker buildx imagetools inspect spiceai/spiceai:${REL_VERSION}-models-cuda
+          else
+            echo "Skipping push for non-tag CUDA build"
+            docker buildx imagetools create \
+              -t localhost:5000/spiceai:latest-models-cuda \
+              localhost:5000/spiceai:models-cuda-amd64
+
+            docker buildx imagetools inspect localhost:5000/spiceai:latest-models-cuda
+          fi

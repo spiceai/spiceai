@@ -40,7 +40,8 @@ Indexes are not required for test coverage, but can be introduced if required fo
   - [ ] End-to-end tests should perform [Throughput Tests](../definitions.md) at the required [parallel query count](../definitions.md)
   - [ ] [Throughput Metric](../definitions.md) is calculated and reported as a metric with a parallel query count of 1 to serve as a baseline metric.
   - [ ] [Throughput Metric](../definitions.md) is calculated and reported as a metric at the required [parallel query count](../definitions.md).
-  - [ ] A [Load Test](../definitions.md) runs for a minimum of 8 hours as part of the end-to-end test. At least 99% of the time, query [timing measurements](../definitions.md) during the load test must remain below the 1% highest [timing measurements](../definitions.md) of the first throughput test, and the service must not become unavailable for the entire duration of the test.
+  - [ ] A [Load Test](../definitions.md) runs for a minimum of 8 hours as part of the end-to-end test. The 99th percentile of load test query [timing measurements](../definitions.md) must be no more than 10% higher than the 99th percentile of the baseline throughput test timing measurements. The service must not become unavailable for the entire duration of the test.
+    - Queries that have a median execution time faster than 500ms are excluded from this check, as they complete so fast that this check is not meaningful.
   - [ ] Memory usage is collected at the end of the end-to-end test and reported as a metric on the overall connector.
 
 #### TPC-DS
@@ -54,7 +55,8 @@ Indexes are not required for test coverage, but can be introduced if required fo
   - [ ] End-to-end tests should perform [Throughput Tests](../definitions.md) at the required [parallel query count](../definitions.md)
   - [ ] [Throughput Metric](../definitions.md) is calculated and reported as a metric with a parallel query count of 1 to serve as a baseline metric.
   - [ ] [Throughput Metric](../definitions.md) is calculated and reported as a metric at the required [parallel query count](../definitions.md).
-  - [ ] A [Load Test](../definitions.md) runs for a minimum of 8 hours as part of the end-to-end test. At least 99% of the time, query [timing measurements](../definitions.md) during the load test must remain below the 1% highest [timing measurements](../definitions.md) of the first throughput test, and the service must not become unavailable for the entire duration of the test.
+  - [ ] A [Load Test](../definitions.md) runs for a minimum of 8 hours as part of the end-to-end test. The 99th percentile of load test query [timing measurements](../definitions.md) must be no more than 10% higher than the 99th percentile of the baseline throughput test timing measurements. The service must not become unavailable for the entire duration of the test.
+    - Queries that have a median execution time faster than 500ms are excluded from this check, as they complete so fast that this check is not meaningful.
   - [ ] Memory usage is collected at the end of the end-to-end test and reported as a metric on the overall connector.
 
 #### ClickBench

@@ -1,5 +1,53 @@
 # Spice.ai OSS Benchmarks
 
+## TPC-H
+
+### `Correlated scalar subquery can only be used in Projection, Filter, Aggregate plan nodes` or `No field named l1.l_orderkey. Valid fields are __correlated_sq_1.l_orderkey, __correlated_sq_1.l_suppkey.`
+
+This occurs when the query contains a correlated subquery in a WHERE clause that is rewritten to contain a correlated subquery in the JOIN filter clause. This happens when federating queries to any DataFusion-backed source, including Spice.ai.
+
+**Limitation**: DataFusion does not support correlated subqueries in the filter clause of a JOIN.
+
+i.e. this query:
+
+```sql
+select s_name, p_partkey
+from part, supplier, partsupp
+where p_partkey = ps_partkey
+  and s_suppkey = ps_suppkey
+  and ps_supplycost = (
+    select min(ps_supplycost)
+    from partsupp
+    where p_partkey = ps_partkey
+)
+```
+
+Has a correlated subquery in the WHERE clause that is rewritten to contain a correlated subquery in the JOIN filter clause:
+
+```sql
+SELECT 
+    "tpch"."supplier"."s_name",
+    "tpch"."part"."p_partkey"
+FROM 
+    "tpch"."part"
+    JOIN "tpch"."supplier" ON true
+    JOIN "tpch"."partsupp" ON (
+        "tpch"."part"."p_partkey" = "tpch"."partsupp"."ps_partkey"
+        AND "tpch"."supplier"."s_suppkey" = "tpch"."partsupp"."ps_suppkey"
+        AND "tpch"."partsupp"."ps_supplycost" = (
+            SELECT min("tpch"."partsupp"."ps_supplycost")
+            FROM "tpch"."partsupp"
+            WHERE "tpch"."part"."p_partkey" = "tpch"."partsupp"."ps_partkey"
+        )
+    )
+```
+
+**Solution**: If the datasets are accelerated with the DuckDB engine in the remote Spice.ai instance, the query will succeed.
+
+| **Affected queries**     |                          |                          |
+| ------------------------ | ------------------------ | ------------------------ |
+| [q2.sql](tpch/q2.sql)   | [q17.sql](tpch/q17.sql) | [q21.sql](tpch/q21.sql) |
+
 ## TPC-DS (Decision Support Benchmark)
 
 ### Intervals like `date + 30 days` or `date + 5` are not supported
