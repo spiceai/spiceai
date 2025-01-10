@@ -128,6 +128,8 @@ pub struct TelemetryConfig {
     pub enabled: bool,
     #[serde(default)]
     pub user_agent_collection: UserAgentCollection,
+    #[serde(default)]
+    pub extra_properties: HashMap<String, String>,
 }
 
 impl Default for TelemetryConfig {
@@ -135,6 +137,7 @@ impl Default for TelemetryConfig {
         Self {
             enabled: true,
             user_agent_collection: UserAgentCollection::default(),
+            extra_properties: HashMap::new(),
         }
     }
 }
