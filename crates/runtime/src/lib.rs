@@ -41,6 +41,7 @@ use secrecy::SecretString;
 use secrets::{ParamStr, Secrets};
 use snafu::prelude::*;
 use spicepod::component::eval::Eval;
+use status::ComponentStatus;
 use tls::TlsConfig;
 use tokio::sync::{oneshot::error::RecvError, RwLock};
 use tools::{catalog::SpiceToolCatalog, SpiceModelTool, Tooling};
@@ -470,11 +471,29 @@ impl Runtime {
         }
     }
 
+    /// Updates all of the dataset statuses to `Initializing`.
+    /// Dataset statuses get set first, as they are the most likely to cause spiced to be in a non-ready state.
+    pub async fn set_datasets_initializing(&self) {
+        let app_lock = self.app.read().await;
+        let Some(app) = app_lock.as_ref() else {
+            return;
+        };
+
+        let valid_datasets = Self::get_valid_datasets(app, LogErrors(false));
+
+        for ds in &valid_datasets {
+            self.status
+                .update_dataset(&ds.name, ComponentStatus::Initializing);
+        }
+    }
+
     /// Will load all of the components of the Runtime, including `secret_stores`, `catalogs`, `datasets`, `models`, and `embeddings`.
     ///
     /// The future returned by this function will not resolve until all components have been loaded and marked as ready.
     /// This includes waiting for the first refresh of any accelerated tables to complete.
     pub async fn load_components(&self) {
+        self.set_datasets_initializing().await;
+
         self.start_extensions().await;
 
         // Must be loaded before datasets

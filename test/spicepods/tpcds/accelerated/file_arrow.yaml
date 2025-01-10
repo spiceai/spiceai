@@ -69,3 +69,15 @@ datasets:
   - from: file:data/web_site.parquet
     name: web_site
     acceleration: *acceleration
+  - from: file:data/reason.parquet
+    name: reason
+    acceleration: *acceleration
+  - from: file:data/call_center.parquet
+    name: call_center
+    acceleration: *acceleration
+  - from: file:data/income_band.parquet
+    name: income_band
+    acceleration: *acceleration
+  - from: file:data/catalog_page.parquet
+    name: catalog_page
+    acceleration: *acceleration

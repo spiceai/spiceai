@@ -108,22 +108,30 @@ jobs:
         if: ${{ github.event.inputs.query_set == 'tpcds' }}
         run: |
           cd /opt/spiced/data
-          mc cp spice-minio/benchmarks/tpcds_sf1/catalog_sales/ ./ --recursive
+          mc cp spice-minio/benchmarks/tpcds_sf1/call_center/ ./ --recursive
+          mc cp spice-minio/benchmarks/tpcds_sf1/catalog_page/ ./ --recursive
           mc cp spice-minio/benchmarks/tpcds_sf1/catalog_returns/ ./ --recursive
-          mc cp spice-minio/benchmarks/tpcds_sf1/inventory/ ./ --recursive
-          mc cp spice-minio/benchmarks/tpcds_sf1/store_sales/ ./ --recursive
-          mc cp spice-minio/benchmarks/tpcds_sf1/store_returns/ ./ --recursive
-          mc cp spice-minio/benchmarks/tpcds_sf1/web_sales/ ./ --recursive
-          mc cp spice-minio/benchmarks/tpcds_sf1/web_returns/ ./ --recursive
+          mc cp spice-minio/benchmarks/tpcds_sf1/catalog_sales/ ./ --recursive
           mc cp spice-minio/benchmarks/tpcds_sf1/customer/ ./ --recursive
           mc cp spice-minio/benchmarks/tpcds_sf1/customer_address/ ./ --recursive
           mc cp spice-minio/benchmarks/tpcds_sf1/customer_demographics/ ./ --recursive
           mc cp spice-minio/benchmarks/tpcds_sf1/date_dim/ ./ --recursive
           mc cp spice-minio/benchmarks/tpcds_sf1/household_demographics/ ./ --recursive
+          mc cp spice-minio/benchmarks/tpcds_sf1/income_band/ ./ --recursive
+          mc cp spice-minio/benchmarks/tpcds_sf1/inventory/ ./ --recursive
           mc cp spice-minio/benchmarks/tpcds_sf1/item/ ./ --recursive
           mc cp spice-minio/benchmarks/tpcds_sf1/promotion/ ./ --recursive
+          mc cp spice-minio/benchmarks/tpcds_sf1/reason/ ./ --recursive
+          mc cp spice-minio/benchmarks/tpcds_sf1/ship_mode/ ./ --recursive
           mc cp spice-minio/benchmarks/tpcds_sf1/store/ ./ --recursive
+          mc cp spice-minio/benchmarks/tpcds_sf1/store_returns/ ./ --recursive
+          mc cp spice-minio/benchmarks/tpcds_sf1/store_sales/ ./ --recursive
           mc cp spice-minio/benchmarks/tpcds_sf1/time_dim/ ./ --recursive
+          mc cp spice-minio/benchmarks/tpcds_sf1/warehouse/ ./ --recursive
+          mc cp spice-minio/benchmarks/tpcds_sf1/web_page/ ./ --recursive
+          mc cp spice-minio/benchmarks/tpcds_sf1/web_returns/ ./ --recursive
+          mc cp spice-minio/benchmarks/tpcds_sf1/web_sales/ ./ --recursive
+          mc cp spice-minio/benchmarks/tpcds_sf1/web_site/ ./ --recursive
       
       - name: Run the throughput test
         run: |
