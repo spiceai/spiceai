@@ -22,7 +22,7 @@ use crate::dataconnector::DataConnectorError;
 use crate::dataconnector::DataConnectorResult;
 use crate::parameters::ExposedParamLookup;
 use crate::parameters::Parameters;
-use arrow_tools::schema::transform_schema;
+use arrow_tools::schema::expand_views_schema;
 use async_trait::async_trait;
 use data_components::object::metadata::ObjectStoreMetadataTable;
 use data_components::object::text::ObjectStoreTextTable;
@@ -422,7 +422,7 @@ impl<T: ListingTableConnector + Display> DataConnector for T {
                         },
                     })?;
 
-                let transformed_schema = Arc::new(transform_schema(&resolved_schema));
+                let transformed_schema = Arc::new(expand_views_schema(&resolved_schema));
 
                 // If we should infer partitions and the path is a folder, infer the partitions from the folder structure.
                 if dataset.get_param("hive_partitioning_enabled", false)
