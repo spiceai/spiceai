@@ -16,7 +16,6 @@ arrow-buffer.workspace = true
 arrow-flight.workspace = true
 async-stream.workspace = true
 async-trait.workspace = true
-arrow_tools = { path = "../arrow_tools" }
 aws-config = { version = "1.5.13", optional = true }
 aws-sdk-dynamodb = { version = "1.59.0", optional = true }
 base64.workspace = true
