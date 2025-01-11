@@ -44,7 +44,7 @@ static ENDPOINT: LazyLock<Arc<str>> = LazyLock::new(|| {
         .into()
 });
 
-fn resource(spicepod_name: &str, extra_properties: Vec<KeyValue>) -> Resource {
+fn resource(spicepod_name: &str, telemetry_properties: Vec<KeyValue>) -> Resource {
     let hostname = hostname::get()
         .unwrap_or_else(|_| "unknown".into())
         .into_encoded_bytes();
@@ -60,7 +60,7 @@ fn resource(spicepod_name: &str, extra_properties: Vec<KeyValue>) -> Resource {
     spicepod_id_hasher.update(spicepod_name);
     let spicepod_id = format!("{:x}", spicepod_id_hasher.finalize());
 
-    Resource::new(extra_properties.into_iter().chain(vec![
+    Resource::new(telemetry_properties.into_iter().chain(vec![
         KeyValue::new("service.name", "spiced"), // May be overridden by setting OTEL_SERVICE_NAME env variable
         KeyValue::new("name", "spiced"),
         KeyValue::new("service.version", env!("CARGO_PKG_VERSION")),
@@ -69,8 +69,8 @@ fn resource(spicepod_name: &str, extra_properties: Vec<KeyValue>) -> Resource {
     ]))
 }
 
-pub async fn start(spicepod_name: &str, extra_properties: Vec<KeyValue>) {
-    let resource = resource(spicepod_name, extra_properties);
+pub async fn start(spicepod_name: &str, telemetry_properties: Vec<KeyValue>) {
+    let resource = resource(spicepod_name, telemetry_properties);
 
     let oss_telemetry_exporter =
         OtelArrowExporter::new(AnonymousTelemetryExporter::new(Arc::clone(&ENDPOINT)).await);

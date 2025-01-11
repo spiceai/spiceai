@@ -306,9 +306,9 @@ async fn start_anonymous_telemetry(
     let explicitly_disabled = args.telemetry_enabled == Some(false)
         || spicepod_telemetry_config.is_some_and(|c| !c.enabled);
 
-    let extra_properties = match spicepod_telemetry_config {
+    let telemetry_properties = match spicepod_telemetry_config {
         Some(config) => config
-            .extra_properties
+            .properties
             .clone()
             .into_iter()
             .map(|(k, v)| KeyValue::new(k, v))
@@ -320,7 +320,7 @@ async fn start_anonymous_telemetry(
         #[cfg(feature = "anonymous_telemetry")]
         telemetry::anonymous::start(
             spicepod_name.map_or_else(|| "unknown", String::as_str),
-            extra_properties,
+            telemetry_properties,
         )
         .await;
     }
