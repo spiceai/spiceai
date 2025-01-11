@@ -1454,3 +1454,90 @@ jobs:
             echo "Failures detected in spice.log"
             exit 1
           fi
+
+  databricks_delta_catalog_connector_quickstart:
+    name: 'Test Databricks catalog connector (mode: delta_lake) on ${{ matrix.target.name }}'
+    runs-on: ${{ matrix.target.runner }}
+    needs:
+      - build
+      - setup-matrix
+    timeout-minutes: 5
+
+    strategy:
+      matrix:
+        target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
+        uses: actions/download-artifact@v4
+        with:
+          name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
+          path: ./build
+
+      - name: Install spice
+        uses: ./.github/actions/install-spice
+        with:
+          build-path: ./build
+
+      - name: Init spice app
+        run: |
+          spice init test_app
+
+      - name: Spice configure
+        working-directory: test_app
+        run: |
+
+          echo "catalogs:" >> spicepod.yaml
+          echo "  - from: databricks:spiceai_sandbox" >> spicepod.yaml
+          echo "    name: db_uc" >> spicepod.yaml
+          echo "    include:" >> spicepod.yaml
+          echo "      - 'tpcds.*'" >> spicepod.yaml
+          echo "      - 'tpch.*'" >> spicepod.yaml
+          echo "    params:" >> spicepod.yaml
+          echo "      mode: delta_lake" >> spicepod.yaml
+          echo "      databricks_aws_access_key_id: \${ secrets:AWS_DATABRICKS_DELTA_ACCESS_KEY_ID }" >> spicepod.yaml
+          echo "      databricks_aws_secret_access_key: \${ secrets:AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY }" >> spicepod.yaml
+          echo "      databricks_endpoint: \${ secrets:DATABRICKS_ENDPOINT }" >> spicepod.yaml
+          echo "      databricks_token: \${ secrets:DATABRICKS_TOKEN }" >> spicepod.yaml
+
+
+          cat spicepod.yaml
+
+      - name: Start spice runtime
+        working-directory: test_app
+        env:
+          AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ secrets.AWS_DATABRICKS_DELTA_ACCESS_KEY_ID }}
+          AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ secrets.AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY }}
+          DATABRICKS_ENDPOINT: ${{ secrets.DATABRICKS_ENDPOINT }}
+          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+        run: |
+          spice run &> spice.log &
+          # time to initialize added datasets
+          sleep 20
+
+      - name: Wait for dataset to be ready
+        working-directory: test_app
+        timeout-minutes: 1
+        run: |
+          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
+
+      - name: Run test query (tpch)
+        uses: ./.github/actions/run-query
+        with:
+          fail-on-error: true
+          query: 'select * from db_uc.tpch.lineitem limit 1;'
+
+      - name: Run test query (tpcds)
+        uses: ./.github/actions/run-query
+        with:
+          fail-on-error: true
+          query: 'select * from db_uc.tpcds.store limit 1;'
+
+      - name: Stop spice and check logs
+        working-directory: test_app
+        if: always()
+        run: |
+          killall spice || true
+          cat spice.log

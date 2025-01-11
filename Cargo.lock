@@ -600,6 +600,7 @@ name = "arrow_tools"
 version = "1.0.0"
 dependencies = [
  "arrow",
+ "arrow-schema",
  "datafusion",
  "snafu",
 ]

@@ -45,6 +45,7 @@ on:
           - 'odbc-athena connector'
           - 'delta_lake connector'
           - 'dremio connector'
+          - 'spark connector'
           - 'arrow accelerator (memory mode)'
           - 'arrow accelerator append (memory mode)'
           - 'arrow accelerator on_zero_results (memory mode)'
@@ -306,6 +307,12 @@ jobs:
           - cmd: '-a duckdb -m file -b clickbench --zero-results use_source'
             name: 'duckdb accelerator on_zero_results (file mode)'
             bench: 'clickbench'
+          - cmd: '-c spark'
+            name: 'spark connector'
+            bench: 'tpch'
+          - cmd: '-c spark -b tpcds'
+            name: 'spark connector'
+            bench: 'tpcds'
 
     steps:
       - name: Checkout repository
@@ -459,6 +466,8 @@ jobs:
           DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
           DATABRICKS_ODBC_PATH: ${{ secrets.DATABRICKS_ODBC_PATH }}
           DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+          DATABRICKS_ENDPOINT: ${{ secrets.DATABRICKS_ENDPOINT }}
+          DATABRICKS_CLUSTER_ID: ${{ secrets.DATABRICKS_CLUSTER_ID }}
           AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ secrets.AWS_DATABRICKS_DELTA_ACCESS_KEY_ID }}
           AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ secrets.AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY }}
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_S3_ATHENA_ACCESS_KEY_ID }}
