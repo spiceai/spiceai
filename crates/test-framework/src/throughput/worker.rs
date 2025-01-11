@@ -21,6 +21,7 @@ use std::{
 
 use anyhow::Result;
 use flight_client::FlightClient;
+use futures::StreamExt;
 use tokio::task::JoinHandle;
 
 use super::EndCondition;
@@ -36,13 +37,19 @@ pub(crate) struct SpiceTestQueryWorker {
 pub struct SpiceTestQueryWorkerResult {
     pub query_durations: BTreeMap<String, Vec<Duration>>,
     pub connection_failed: bool,
+    pub row_counts: BTreeMap<String, usize>,
 }
 
 impl SpiceTestQueryWorkerResult {
-    pub fn new(query_durations: BTreeMap<String, Vec<Duration>>, connection_failed: bool) -> Self {
+    pub fn new(
+        query_durations: BTreeMap<String, Vec<Duration>>,
+        connection_failed: bool,
+        row_counts: BTreeMap<String, usize>,
+    ) -> Self {
         Self {
             query_durations,
             connection_failed,
+            row_counts,
         }
     }
 }
@@ -67,47 +74,70 @@ impl SpiceTestQueryWorker {
     pub fn start(self) -> JoinHandle<Result<SpiceTestQueryWorkerResult>> {
         tokio::spawn(async move {
             let mut query_durations: BTreeMap<String, Vec<Duration>> = BTreeMap::new();
+            let mut row_counts: BTreeMap<String, usize> = BTreeMap::new();
             let mut query_set_count = 0;
             let start = Instant::now();
 
             while !self.end_condition.is_met(&start, query_set_count) {
-                for query in &self.query_set {
-                    for idx in 0..self.iterations {
-                        let query_start = Instant::now();
-                        match self.flight_client.query(query.1).await {
-                            Ok(_) => {
-                                let duration = query_start.elapsed();
-                                query_durations
-                                    .entry(query.0.to_string())
-                                    .or_default()
-                                    .push(duration);
+                'query_set: for query in &self.query_set {
+                    let mut row_count = 0;
+                    let query_start = Instant::now();
+                    match self.flight_client.query(query.1).await {
+                        Ok(mut result_stream) => {
+                            while let Some(batch) = result_stream.next().await {
+                                match batch {
+                                    Ok(batch) => {
+                                        row_count += batch.num_rows();
+                                    }
+                                    Err(e) => {
+                                        eprintln!(
+                                            "FAIL - Worker {} - Query '{}' failed: {}",
+                                            self.id, query.0, e
+                                        );
+                                        query_durations.entry(query.0.to_string()).or_default();
+                                        continue 'query_set;
+                                    }
+                                }
                             }
-                            Err(e) => match e {
-                                flight_client::Error::UnableToConnectToServer { .. }
-                                | flight_client::Error::UnableToPerformHandshake { .. } => {
-                                    eprintln!(
-                                        "FAIL - EARLY EXIT - Worker {} - Query '{}' failed: {}",
-                                        self.id, query.0, e
-                                    );
-                                    return Ok(SpiceTestQueryWorkerResult::new(
-                                        query_durations,
-                                        true,
-                                    ));
-                                }
-                                _ => {
-                                    eprintln!(
-                                        "FAIL - Worker {} - Query '{}' failed: {}",
-                                        self.id, query.0, e
-                                    );
-                                    query_durations.entry(query.0.to_string()).or_default();
-                                }
-                            },
-                        };
-                    }
+
+                            let duration = query_start.elapsed();
+                            query_durations
+                                .entry(query.0.to_string())
+                                .or_default()
+                                .push(duration);
+
+                            *row_counts.entry(query.0.to_string()).or_default() += row_count;
+                        }
+                        Err(e) => match e {
+                            flight_client::Error::UnableToConnectToServer { .. }
+                            | flight_client::Error::UnableToPerformHandshake { .. } => {
+                                eprintln!(
+                                    "FAIL - EARLY EXIT - Worker {} - Query '{}' failed: {}",
+                                    self.id, query.0, e
+                                );
+                                return Ok(ThroughputQueryWorkerResult::new(
+                                    query_durations,
+                                    true,
+                                    row_counts,
+                                ));
+                            }
+                            _ => {
+                                eprintln!(
+                                    "FAIL - Worker {} - Query '{}' failed: {}",
+                                    self.id, query.0, e
+                                );
+                                query_durations.entry(query.0.to_string()).or_default();
+                            }
+                        },
+                    };
                 }
                 query_set_count += 1;
             }
-            Ok(SpiceTestQueryWorkerResult::new(query_durations, false))
+            Ok(SpiceTestQueryWorkerResult::new(
+                query_durations,
+                false,
+                row_counts,
+            ))
         })
     }
 }

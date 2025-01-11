@@ -20,6 +20,19 @@ on:
           - 'tpch'
           - 'tpcds'
           - 'clickbench'
+      query_overrides:
+        description: 'Query overrides'
+        required: false
+        type: choice
+        default: ''
+        options:
+          - ''
+          - 'sqlite'
+          - 'postgresql'
+          - 'mysql'
+          - 'dremio'
+          - 'odbc-athena'
+          - 'duckdb'
 
 jobs:
   run-throughput:
@@ -78,56 +91,31 @@ jobs:
           tar -xzf spiced_models_linux_x86_64.tar.gz
           sudo cp ./spiced /usr/local/bin/spiced
 
-      - name: Build the testoperator if it wasn't downloaded
-        if: ${{ env.TESTOPERATOR_DOWNLOADED != 'true' }}
-        run: |
-          cargo build -p testoperator --release
-          sudo cp target/release/testoperator /usr/local/bin/testoperator
-          sudo chmod +x /usr/local/bin/testoperator
-      
-      - name: Prepare file-based data directory
-        run: |
-          sudo rm -rf /opt/spiced/data
-          sudo mkdir -p /opt/spiced/data
-          sudo chown runner:runner -R /opt/spiced/data
-
-      - name: Download File Connector TPCH Data
-        if: ${{ github.event.inputs.query_set == 'tpch' }}
-        run: |
-          cd /opt/spiced/data
-          mc cp spice-minio/benchmarks/tpch_sf1/customer/ ./ --recursive
-          mc cp spice-minio/benchmarks/tpch_sf1/lineitem/ ./ --recursive
-          mc cp spice-minio/benchmarks/tpch_sf1/nation/ ./ --recursive
-          mc cp spice-minio/benchmarks/tpch_sf1/orders/ ./ --recursive
-          mc cp spice-minio/benchmarks/tpch_sf1/part/ ./ --recursive
-          mc cp spice-minio/benchmarks/tpch_sf1/partsupp/ ./ --recursive
-          mc cp spice-minio/benchmarks/tpch_sf1/region/ ./ --recursive
-          mc cp spice-minio/benchmarks/tpch_sf1/supplier/ ./ --recursive
-      
-      - name: Download File Connector TPCDS Data
-        if: ${{ github.event.inputs.query_set == 'tpcds' }}
-        run: |
-          cd /opt/spiced/data
-          mc cp spice-minio/benchmarks/tpcds_sf1/catalog_sales/ ./ --recursive
-          mc cp spice-minio/benchmarks/tpcds_sf1/catalog_returns/ ./ --recursive
-          mc cp spice-minio/benchmarks/tpcds_sf1/inventory/ ./ --recursive
-          mc cp spice-minio/benchmarks/tpcds_sf1/store_sales/ ./ --recursive
-          mc cp spice-minio/benchmarks/tpcds_sf1/store_returns/ ./ --recursive
-          mc cp spice-minio/benchmarks/tpcds_sf1/web_sales/ ./ --recursive
-          mc cp spice-minio/benchmarks/tpcds_sf1/web_returns/ ./ --recursive
-          mc cp spice-minio/benchmarks/tpcds_sf1/customer/ ./ --recursive
-          mc cp spice-minio/benchmarks/tpcds_sf1/customer_address/ ./ --recursive
-          mc cp spice-minio/benchmarks/tpcds_sf1/customer_demographics/ ./ --recursive
-          mc cp spice-minio/benchmarks/tpcds_sf1/date_dim/ ./ --recursive
-          mc cp spice-minio/benchmarks/tpcds_sf1/household_demographics/ ./ --recursive
-          mc cp spice-minio/benchmarks/tpcds_sf1/item/ ./ --recursive
-          mc cp spice-minio/benchmarks/tpcds_sf1/promotion/ ./ --recursive
-          mc cp spice-minio/benchmarks/tpcds_sf1/store/ ./ --recursive
-          mc cp spice-minio/benchmarks/tpcds_sf1/time_dim/ ./ --recursive
+      - name: Setup Testoperator
+        uses: ./.github/actions/setup-testoperator
+        with:
+          build_testoperator: ${{ env.TESTOPERATOR_DOWNLOADED != 'true' }}
+          query_set: ${{ github.event.inputs.query_set }}
       
       - name: Run the throughput test
+        if: ${{ github.event.inputs.query_overrides == '' }}
         run: |
+          rm -rf .spice/data
           testoperator run throughput -s /usr/local/bin/spiced -p ${{ github.event.inputs.spicepod_path }} -d /opt/spiced/data --query-set ${{ github.event.inputs.query_set }}
+        env:
+          S3_ENDPOINT: ${{ secrets.CLICKBENCH_S3_ENDPOINT}}
+          S3_KEY: ${{ secrets.CLICKBENCH_S3_KEY}}
+          S3_SECRET: ${{ secrets.CLICKBENCH_S3_SECRET}}
+          DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+          AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ secrets.AWS_DATABRICKS_DELTA_ACCESS_KEY_ID }}
+          AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ secrets.AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY }}
+      
+      - name: Run the throughput test (with overrides)
+        if: ${{ github.event.inputs.query_overrides != '' }}
+        run: |
+          rm -rf .spice/data
+          testoperator run throughput -s /usr/local/bin/spiced -p ${{ github.event.inputs.spicepod_path }} -d /opt/spiced/data --query-set ${{ github.event.inputs.query_set }} --query-overrides ${{ github.event.inputs.query_overrides }}
         env:
           S3_ENDPOINT: ${{ secrets.CLICKBENCH_S3_ENDPOINT}}
           S3_KEY: ${{ secrets.CLICKBENCH_S3_KEY}}

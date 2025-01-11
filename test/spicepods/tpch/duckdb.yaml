@@ -1,11 +1,6 @@
 version: v1
 kind: Spicepod
 name: duckdb_tpch
-runtime:
-  results_cache:
-    enabled: false
-  task_history:
-    enabled: false
 datasets:
   - from: duckdb:customer
     name: customer

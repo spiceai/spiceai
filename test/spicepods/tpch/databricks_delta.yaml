@@ -1,0 +1,34 @@
+version: v1
+kind: Spicepod
+name: databricks_delta_tpch
+datasets:
+  - from: databricks:spiceai_sandbox.tpch.partsupp
+    name: partsupp
+    params: &databricks_delta_params
+      mode: delta_lake
+      client_timeout: 600s
+      databricks_aws_access_key_id: ${ secrets:AWS_DATABRICKS_DELTA_ACCESS_KEY_ID }
+      databricks_aws_secret_access_key: ${ secrets:AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY }
+      databricks_token: ${ secrets:DATABRICKS_TOKEN }
+      databricks_endpoint: ${ secrets:DATABRICKS_HOST }
+  - from: databricks:spiceai_sandbox.tpch.customer
+    name: customer
+    params: *databricks_delta_params
+  - from: databricks:spiceai_sandbox.tpch.lineitem
+    name: lineitem
+    params: *databricks_delta_params
+  - from: databricks:spiceai_sandbox.tpch.nation
+    name: nation
+    params: *databricks_delta_params
+  - from: databricks:spiceai_sandbox.tpch.orders
+    name: orders
+    params: *databricks_delta_params
+  - from: databricks:spiceai_sandbox.tpch.region
+    name: region
+    params: *databricks_delta_params
+  - from: databricks:spiceai_sandbox.tpch.supplier
+    name: supplier
+    params: *databricks_delta_params
+  - from: databricks:spiceai_sandbox.tpch.part
+    name: part
+    params: *databricks_delta_params

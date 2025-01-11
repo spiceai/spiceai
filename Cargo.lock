@@ -600,6 +600,7 @@ name = "arrow_tools"
 version = "1.0.0"
 dependencies = [
  "arrow",
+ "arrow-schema",
  "datafusion",
  "snafu",
 ]
@@ -7048,7 +7049,7 @@ dependencies = [
 [[package]]
 name = "mistralrs"
 version = "0.3.4"
-source = "git+https://github.com/spiceai/mistral.rs?rev=048827a2fb9a18820334ec324266568f1203ac86#048827a2fb9a18820334ec324266568f1203ac86"
+source = "git+https://github.com/spiceai/mistral.rs?rev=9584cb22b177ce2e6fcae4a98fdd860f0b08711c#9584cb22b177ce2e6fcae4a98fdd860f0b08711c"
 dependencies = [
  "anyhow",
  "candle-core 0.8.0",
@@ -7069,7 +7070,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-core"
 version = "0.3.4"
-source = "git+https://github.com/spiceai/mistral.rs?rev=048827a2fb9a18820334ec324266568f1203ac86#048827a2fb9a18820334ec324266568f1203ac86"
+source = "git+https://github.com/spiceai/mistral.rs?rev=9584cb22b177ce2e6fcae4a98fdd860f0b08711c#9584cb22b177ce2e6fcae4a98fdd860f0b08711c"
 dependencies = [
  "akin",
  "anyhow",
@@ -7142,7 +7143,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-paged-attn"
 version = "0.3.4"
-source = "git+https://github.com/spiceai/mistral.rs?rev=048827a2fb9a18820334ec324266568f1203ac86#048827a2fb9a18820334ec324266568f1203ac86"
+source = "git+https://github.com/spiceai/mistral.rs?rev=9584cb22b177ce2e6fcae4a98fdd860f0b08711c#9584cb22b177ce2e6fcae4a98fdd860f0b08711c"
 dependencies = [
  "anyhow",
  "bindgen_cuda 0.1.6",
@@ -7154,7 +7155,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-quant"
 version = "0.3.4"
-source = "git+https://github.com/spiceai/mistral.rs?rev=048827a2fb9a18820334ec324266568f1203ac86#048827a2fb9a18820334ec324266568f1203ac86"
+source = "git+https://github.com/spiceai/mistral.rs?rev=9584cb22b177ce2e6fcae4a98fdd860f0b08711c#9584cb22b177ce2e6fcae4a98fdd860f0b08711c"
 dependencies = [
  "bindgen_cuda 0.1.5",
  "byteorder",
@@ -7175,7 +7176,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-vision"
 version = "0.3.4"
-source = "git+https://github.com/spiceai/mistral.rs?rev=048827a2fb9a18820334ec324266568f1203ac86#048827a2fb9a18820334ec324266568f1203ac86"
+source = "git+https://github.com/spiceai/mistral.rs?rev=9584cb22b177ce2e6fcae4a98fdd860f0b08711c#9584cb22b177ce2e6fcae4a98fdd860f0b08711c"
 dependencies = [
  "candle-core 0.8.0",
  "image 0.25.5",

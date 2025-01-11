@@ -22,6 +22,7 @@ use crate::dataconnector::DataConnectorError;
 use crate::dataconnector::DataConnectorResult;
 use crate::parameters::ExposedParamLookup;
 use crate::parameters::Parameters;
+use arrow_tools::schema::expand_views_schema;
 use async_trait::async_trait;
 use data_components::object::metadata::ObjectStoreMetadataTable;
 use data_components::object::text::ObjectStoreTextTable;
@@ -421,6 +422,8 @@ impl<T: ListingTableConnector + Display> DataConnector for T {
                         },
                     })?;
 
+                let expanded_schema = Arc::new(expand_views_schema(&resolved_schema));
+
                 // If we should infer partitions and the path is a folder, infer the partitions from the folder structure.
                 if dataset.get_param("hive_partitioning_enabled", false)
                     && table_path.is_collection()
@@ -448,7 +451,7 @@ impl<T: ListingTableConnector + Display> DataConnector for T {
 
                 let config = ListingTableConfig::new(table_path)
                     .with_listing_options(options)
-                    .with_schema(resolved_schema);
+                    .with_schema(expanded_schema);
 
                 // This shouldn't error because we're passing the schema and options correctly.
                 let table = ListingTable::try_new(config).boxed().context(

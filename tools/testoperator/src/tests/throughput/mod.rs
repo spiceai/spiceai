@@ -48,7 +48,7 @@ pub(crate) async fn run(args: &TestArgs) -> anyhow::Result<()> {
     let mut spiced_instance = SpicedInstance::start(start_request).await?;
 
     spiced_instance
-        .wait_for_ready(Duration::from_secs(10))
+        .wait_for_ready(Duration::from_secs(args.ready_wait.unwrap_or(30) as u64))
         .await?;
 
     // baseline run
@@ -56,7 +56,7 @@ pub(crate) async fn run(args: &TestArgs) -> anyhow::Result<()> {
     let baseline_test = SpiceTest::new(app.name.clone(), spiced_instance)
         .with_query_set(queries.clone())
         .with_parallel_count(1)
-        .with_end_condition(EndCondition::QuerySetCompleted(10))
+        .with_end_condition(EndCondition::QuerySetCompleted(6))
         .start()
         .await?;
 

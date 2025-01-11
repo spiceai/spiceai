@@ -246,6 +246,7 @@ pub async fn run(args: Args) -> Result<()> {
         Some(app) => EndpointAuth::new(rt.secrets(), app).await,
         None => EndpointAuth::no_auth(),
     };
+
     let server_thread = tokio::spawn(async move {
         Box::pin(Arc::new(cloned_rt).start_servers(args.runtime, tls_config, endpoint_auth)).await
     });
