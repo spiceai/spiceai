@@ -142,7 +142,7 @@ impl SpiceTest<NotStarted> {
             .map(|id| {
                 SpiceTestQueryWorker::new(
                     id,
-                    self.iterations.clone(),
+                    self.iterations,
                     self.state.query_set.clone(),
                     self.state.end_condition,
                     flight_client.clone(),
