@@ -19,10 +19,9 @@ use crate::commands::TestArgs;
 use std::time::Duration;
 use test_framework::{
     anyhow,
-    metrics::{MetricCollector, StatisticsCollector},
     queries::{QueryOverrides, QuerySet},
     spiced::SpicedInstance,
-    throughput::{EndCondition, SpiceTest},
+    spicetest::{EndCondition, SpiceTest},
 };
 
 pub(crate) fn export(args: &TestArgs) -> anyhow::Result<()> {

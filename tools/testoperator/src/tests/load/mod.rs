@@ -22,7 +22,7 @@ use test_framework::{
     metrics::{MetricCollector, StatisticsCollector},
     queries::{QueryOverrides, QuerySet},
     spiced::SpicedInstance,
-    throughput::{EndCondition, SpiceTest},
+    spicetest::{EndCondition, SpiceTest},
 };
 
 pub(crate) fn export(args: &TestArgs) -> anyhow::Result<()> {
