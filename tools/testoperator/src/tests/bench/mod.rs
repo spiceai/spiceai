@@ -19,10 +19,10 @@ use crate::commands::TestArgs;
 use std::time::Duration;
 use test_framework::{
     anyhow,
-    bench::BenchTest,
     metrics::{MetricCollector, StatisticsCollector},
     queries::{QueryOverrides, QuerySet},
     spiced::SpicedInstance,
+    throughput::{EndCondition, SpiceTest},
 };
 
 pub(crate) fn export(args: &TestArgs) -> anyhow::Result<()> {
@@ -53,8 +53,9 @@ pub(crate) async fn run(args: &TestArgs) -> anyhow::Result<()> {
 
     // baseline run
     println!("Running benchmark test");
-    let benchmark_test = BenchTest::new(app.name.clone(), spiced_instance)
+    let benchmark_test = SpiceTest::new(app.name.clone(), spiced_instance)
         .with_query_set(queries.clone())
+        .with_end_condition(EndCondition::QuerySetCompleted(1))
         .with_iterations(5)
         .start()
         .await?;

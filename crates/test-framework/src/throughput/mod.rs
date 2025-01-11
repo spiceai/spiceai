@@ -26,7 +26,7 @@ use crate::{
 use anyhow::Result;
 use futures::future::join_all;
 use tokio::task::JoinHandle;
-use worker::{ThroughputQueryWorker, ThroughputQueryWorkerResult};
+use worker::{SpiceTestQueryWorker, SpiceTestQueryWorkerResult};
 
 mod worker;
 
@@ -51,11 +51,11 @@ pub struct NotStarted {
     end_condition: EndCondition,
 }
 
-pub type QueryWorkers = Vec<JoinHandle<Result<ThroughputQueryWorkerResult>>>;
+pub type SpiceTestQueryWorkers = Vec<JoinHandle<Result<SpiceTestQueryWorkerResult>>>;
 
 pub struct Running {
     start_time: Instant,
-    query_workers: QueryWorkers,
+    query_workers: SpiceTestQueryWorkers,
 }
 pub struct Completed {
     query_durations: BTreeMap<String, Vec<Duration>>,
@@ -71,17 +71,18 @@ impl TestState for Completed {}
 
 /// A throughput test is a test that runs a set of queries in a loop until a condition is met
 /// The test queries can also be run in parallel, each with the same end condition.
-pub struct ThroughputTest<S: TestState> {
+pub struct SpiceTest<S: TestState> {
     name: String,
     spiced_instance: SpicedInstance,
     query_count: usize,
     parallel_count: usize,
+    iterations: usize,
     start_time: SystemTime,
 
     state: S,
 }
 
-impl ThroughputTest<NotStarted> {
+impl SpiceTest<NotStarted> {
     #[must_use]
     pub fn new(name: String, spiced_instance: SpicedInstance) -> Self {
         Self {
@@ -89,6 +90,7 @@ impl ThroughputTest<NotStarted> {
             spiced_instance,
             query_count: 0,
             parallel_count: 1,
+            iterations: 1,
             start_time: SystemTime::now(),
             state: NotStarted {
                 query_set: vec![],
@@ -100,6 +102,12 @@ impl ThroughputTest<NotStarted> {
     #[must_use]
     pub fn with_parallel_count(mut self, parallel_count: usize) -> Self {
         self.parallel_count = parallel_count;
+        self
+    }
+
+    #[must_use]
+    pub fn with_iterations(mut self, iterations: usize) -> Self {
+        self.iterations = iterations;
         self
     }
 
@@ -116,7 +124,7 @@ impl ThroughputTest<NotStarted> {
         self
     }
 
-    pub async fn start(self) -> Result<ThroughputTest<Running>> {
+    pub async fn start(self) -> Result<SpiceTest<Running>> {
         if self.state.query_set.is_empty() {
             return Err(anyhow::anyhow!("Query set is empty"));
         }
@@ -125,25 +133,31 @@ impl ThroughputTest<NotStarted> {
             return Err(anyhow::anyhow!("Parallel count must be greater than 0"));
         }
 
+        if self.iterations == 0 {
+            return Err(anyhow::anyhow!("Iterations count must be greater than 0"));
+        }
+
         let flight_client = self.spiced_instance.flight_client().await?;
         let query_workers = (0..self.parallel_count)
             .map(|id| {
-                ThroughputQueryWorker::new(
+                SpiceTestQueryWorker::new(
                     id,
+                    self.iterations.clone(),
                     self.state.query_set.clone(),
                     self.state.end_condition,
                     flight_client.clone(),
                 )
             })
-            .map(ThroughputQueryWorker::start)
+            .map(SpiceTestQueryWorker::start)
             .collect();
 
-        Ok(ThroughputTest {
+        Ok(SpiceTest {
             name: self.name,
             spiced_instance: self.spiced_instance,
             query_count: self.query_count,
             parallel_count: self.parallel_count,
             start_time: self.start_time,
+            iterations: self.iterations,
             state: Running {
                 start_time: Instant::now(),
                 query_workers,
@@ -152,8 +166,8 @@ impl ThroughputTest<NotStarted> {
     }
 }
 
-impl ThroughputTest<Running> {
-    pub async fn wait(self) -> Result<ThroughputTest<Completed>> {
+impl SpiceTest<Running> {
+    pub async fn wait(self) -> Result<SpiceTest<Completed>> {
         let mut query_durations = BTreeMap::new();
         for query_duration in join_all(self.state.query_workers).await {
             let worker_result = query_duration??;
@@ -170,12 +184,13 @@ impl ThroughputTest<Running> {
                     .extend(duration);
             }
         }
-        Ok(ThroughputTest {
+        Ok(SpiceTest {
             name: self.name,
             spiced_instance: self.spiced_instance,
             query_count: self.query_count,
             parallel_count: self.parallel_count,
             start_time: self.start_time,
+            iterations: self.iterations,
             state: Completed {
                 query_durations,
                 test_duration: self.state.start_time.elapsed(),
@@ -185,7 +200,7 @@ impl ThroughputTest<Running> {
     }
 }
 
-impl ThroughputTest<Completed> {
+impl SpiceTest<Completed> {
     #[must_use]
     pub fn get_query_durations(&self) -> &BTreeMap<String, Vec<Duration>> {
         &self.state.query_durations
@@ -216,11 +231,11 @@ impl ThroughputTest<Completed> {
     }
 }
 
-impl std::fmt::Display for ThroughputTest<Completed> {
+impl std::fmt::Display for SpiceTest<Completed> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "ThroughputTest: {} - Cumulative query duration: {} seconds, Test duration: {} seconds",
+            "SpiceTest: {} - Cumulative query duration: {} seconds, Test duration: {} seconds",
             self.name,
             self.get_cumulative_query_duration().as_secs_f32(),
             self.get_test_duration().as_secs_f32()
@@ -228,7 +243,7 @@ impl std::fmt::Display for ThroughputTest<Completed> {
     }
 }
 
-impl MetricCollector<NoExtendedMetrics> for ThroughputTest<Completed> {
+impl MetricCollector<NoExtendedMetrics> for SpiceTest<Completed> {
     fn collect(&self) -> Result<QueryMetrics<NoExtendedMetrics>> {
         let query_metrics = self
             .get_query_durations()

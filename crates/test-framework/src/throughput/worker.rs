@@ -25,7 +25,7 @@ use tokio::task::JoinHandle;
 
 use super::EndCondition;
 
-pub(crate) struct ThroughputQueryWorker {
+pub(crate) struct SpiceTestQueryWorker {
     id: usize,
     iterations: usize,
     query_set: Vec<(&'static str, &'static str)>,
@@ -33,12 +33,12 @@ pub(crate) struct ThroughputQueryWorker {
     flight_client: FlightClient,
 }
 
-pub struct ThroughputQueryWorkerResult {
+pub struct SpiceTestQueryWorkerResult {
     pub query_durations: BTreeMap<String, Vec<Duration>>,
     pub connection_failed: bool,
 }
 
-impl ThroughputQueryWorkerResult {
+impl SpiceTestQueryWorkerResult {
     pub fn new(query_durations: BTreeMap<String, Vec<Duration>>, connection_failed: bool) -> Self {
         Self {
             query_durations,
@@ -47,7 +47,7 @@ impl ThroughputQueryWorkerResult {
     }
 }
 
-impl ThroughputQueryWorker {
+impl SpiceTestQueryWorker {
     pub fn new(
         id: usize,
         iterations: usize,
@@ -64,7 +64,7 @@ impl ThroughputQueryWorker {
         }
     }
 
-    pub fn start(self) -> JoinHandle<Result<ThroughputQueryWorkerResult>> {
+    pub fn start(self) -> JoinHandle<Result<SpiceTestQueryWorkerResult>> {
         tokio::spawn(async move {
             let mut query_durations: BTreeMap<String, Vec<Duration>> = BTreeMap::new();
             let mut query_set_count = 0;
@@ -89,7 +89,7 @@ impl ThroughputQueryWorker {
                                         "FAIL - EARLY EXIT - Worker {} - Query '{}' failed: {}",
                                         self.id, query.0, e
                                     );
-                                    return Ok(ThroughputQueryWorkerResult::new(
+                                    return Ok(SpiceTestQueryWorkerResult::new(
                                         query_durations,
                                         true,
                                     ));
@@ -107,7 +107,7 @@ impl ThroughputQueryWorker {
                 }
                 query_set_count += 1;
             }
-            Ok(ThroughputQueryWorkerResult::new(query_durations, false))
+            Ok(SpiceTestQueryWorkerResult::new(query_durations, false))
         })
     }
 }

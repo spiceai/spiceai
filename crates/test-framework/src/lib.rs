@@ -16,7 +16,6 @@ limitations under the License.
 
 #![allow(clippy::missing_errors_doc)]
 
-pub mod bench;
 pub mod flight;
 pub mod metrics;
 pub mod queries;
