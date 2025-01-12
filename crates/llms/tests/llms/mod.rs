@@ -22,10 +22,12 @@ use std::{
     str::FromStr,
     sync::{Arc, LazyLock},
 };
+use util::accumulate;
 
 use crate::{init_tracing, TEST_ARGS};
 
 mod create;
+mod util;
 
 #[derive(Clone)]
 pub struct TestCase {
@@ -247,7 +249,11 @@ static TEST_CASES: LazyLock<Vec<TestCase>> = LazyLock::new(|| {
 });
 
 #[allow(clippy::expect_used, clippy::expect_fun_call)]
-async fn run_single_test(test_name: &str, model_name: &str) -> Result<(), anyhow::Error> {
+async fn run_single_test(
+    test_name: &str,
+    model_name: &str,
+    as_stream: bool,
+) -> Result<(), anyhow::Error> {
     let _ = dotenvy::from_filename(".env").expect("failed to load .env file");
     init_tracing(None);
 
@@ -278,13 +284,23 @@ async fn run_single_test(test_name: &str, model_name: &str) -> Result<(), anyhow
 
     tracing::info!("Running test {test_name}/{model_name} with {:?}", test.req);
 
-    let actual_resp = model
-        .chat_request(test.req.clone())
-        .await
-        .unwrap_or_else(|e| {
+    let actual_resp = if as_stream {
+        let mut req = test.req.clone();
+        req.stream = Some(true);
+        accumulate(model.chat_stream(req).await.unwrap_or_else(|e| {
             panic!("For test {test_name}/{model_name}, chat_request failed. Error: {e:#?}")
-        });
-    tracing::trace!("Response for {test_name}/{model_name}: {actual_resp:?}");
+        }))
+        .await
+    } else {
+        model
+            .chat_request(test.req.clone())
+            .await
+            .unwrap_or_else(|e| {
+                panic!("For test {test_name}/{model_name}, chat_request failed. Error: {e:#?}")
+            })
+    };
+    println!("Response for {test_name}/{model_name}: {actual_resp:#?}");
+    tracing::warn!("Response for {test_name}/{model_name}: {actual_resp:?}");
 
     // Perform snapshot test from JSONPaths into the response.
     let resp_value =
@@ -307,12 +323,27 @@ async fn run_single_test(test_name: &str, model_name: &str) -> Result<(), anyhow
 macro_rules! generate_model_tests {
     () => {
         macro_rules! test_model_case {
+            ($model_name_expr:expr, $test_case_expr:expr, true) => {
+                paste::paste! {
+                    #[tokio::test]
+                    async fn [<test_ $model_name_expr _ $test_case_expr _stream>]() {
+                        run_single_test(
+                            stringify!($test_case_expr),
+                            stringify!($model_name_expr),
+                            true
+                        ).await.expect("test failed");
+                    }
+                }
+            };
             ($model_name_expr:expr, $test_case_expr:expr) => {
                 paste::paste! {
                     #[tokio::test]
                     async fn [<test_ $model_name_expr _ $test_case_expr>]() {
-                        run_single_test(stringify!($test_case_expr), stringify!($model_name_expr)).await
-                            .expect("test failed");
+                        run_single_test(
+                            stringify!($test_case_expr),
+                            stringify!($model_name_expr),
+                            false
+                        ).await.expect("test failed");
                     }
                 }
             };
@@ -321,17 +352,23 @@ macro_rules! generate_model_tests {
         test_model_case!(anthropic, basic);
         test_model_case!(anthropic, system_prompt);
         test_model_case!(anthropic, tool_use);
+        test_model_case!(anthropic, tool_use, true);
         test_model_case!(anthropic, supports_all_message_roles);
+        test_model_case!(anthropic, supports_all_message_roles, true);
 
         test_model_case!(openai, basic);
         test_model_case!(openai, system_prompt);
         test_model_case!(openai, tool_use);
+        test_model_case!(openai, tool_use, true);
         test_model_case!(openai, supports_all_message_roles);
+        test_model_case!(openai, supports_all_message_roles, true);
 
         test_model_case!(xai, basic);
         test_model_case!(xai, system_prompt);
         test_model_case!(xai, tool_use);
+        test_model_case!(xai, tool_use, true);
         test_model_case!(xai, supports_all_message_roles);
+        test_model_case!(xai, supports_all_message_roles, true);
 
         test_model_case!(local_phi3, basic);
         test_model_case!(local_phi3, system_prompt);
