@@ -76,7 +76,6 @@ pub struct SpiceTest<S: TestState> {
     spiced_instance: SpicedInstance,
     query_count: usize,
     parallel_count: usize,
-    iterations: usize,
     start_time: SystemTime,
 
     state: S,
@@ -90,7 +89,6 @@ impl SpiceTest<NotStarted> {
             spiced_instance,
             query_count: 0,
             parallel_count: 1,
-            iterations: 1,
             start_time: SystemTime::now(),
             state: NotStarted {
                 query_set: vec![],
@@ -102,12 +100,6 @@ impl SpiceTest<NotStarted> {
     #[must_use]
     pub fn with_parallel_count(mut self, parallel_count: usize) -> Self {
         self.parallel_count = parallel_count;
-        self
-    }
-
-    #[must_use]
-    pub fn with_iterations(mut self, iterations: usize) -> Self {
-        self.iterations = iterations;
         self
     }
 
@@ -133,16 +125,11 @@ impl SpiceTest<NotStarted> {
             return Err(anyhow::anyhow!("Parallel count must be greater than 0"));
         }
 
-        if self.iterations == 0 {
-            return Err(anyhow::anyhow!("Iterations count must be greater than 0"));
-        }
-
         let flight_client = self.spiced_instance.flight_client().await?;
         let query_workers = (0..self.parallel_count)
             .map(|id| {
                 SpiceTestQueryWorker::new(
                     id,
-                    self.iterations,
                     self.state.query_set.clone(),
                     self.state.end_condition,
                     flight_client.clone(),
@@ -157,7 +144,6 @@ impl SpiceTest<NotStarted> {
             query_count: self.query_count,
             parallel_count: self.parallel_count,
             start_time: self.start_time,
-            iterations: self.iterations,
             state: Running {
                 start_time: Instant::now(),
                 query_workers,
@@ -190,7 +176,6 @@ impl SpiceTest<Running> {
             query_count: self.query_count,
             parallel_count: self.parallel_count,
             start_time: self.start_time,
-            iterations: self.iterations,
             state: Completed {
                 query_durations,
                 test_duration: self.state.start_time.elapsed(),

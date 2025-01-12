@@ -54,8 +54,7 @@ pub(crate) async fn run(args: &TestArgs) -> anyhow::Result<()> {
     println!("Running benchmark test");
     let benchmark_test = SpiceTest::new(app.name.clone(), spiced_instance)
         .with_query_set(queries.clone())
-        .with_end_condition(EndCondition::QuerySetCompleted(1))
-        .with_iterations(5)
+        .with_end_condition(EndCondition::QuerySetCompleted(5))
         .start()
         .await?;
 

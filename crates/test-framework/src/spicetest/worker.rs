@@ -28,7 +28,6 @@ use super::EndCondition;
 
 pub(crate) struct SpiceTestQueryWorker {
     id: usize,
-    iterations: usize,
     query_set: Vec<(&'static str, &'static str)>,
     end_condition: EndCondition,
     flight_client: FlightClient,
@@ -57,14 +56,12 @@ impl SpiceTestQueryWorkerResult {
 impl SpiceTestQueryWorker {
     pub fn new(
         id: usize,
-        iterations: usize,
         query_set: Vec<(&'static str, &'static str)>,
         end_condition: EndCondition,
         flight_client: FlightClient,
     ) -> Self {
         Self {
             id,
-            iterations,
             query_set,
             end_condition,
             flight_client,
@@ -80,62 +77,57 @@ impl SpiceTestQueryWorker {
 
             while !self.end_condition.is_met(&start, query_set_count) {
                 'query_set: for query in &self.query_set {
-                    for idx in 0..self.iterations {
-                        eprintln!(
-                            "Running: Worker {} - Query '{}' - Iteration {}",
-                            self.id, query.0, idx
-                        );
-                        let mut row_count = 0;
-                        let query_start = Instant::now();
-                        match self.flight_client.query(query.1).await {
-                            Ok(mut result_stream) => {
-                                while let Some(batch) = result_stream.next().await {
-                                    match batch {
-                                        Ok(batch) => {
-                                            row_count += batch.num_rows();
-                                        }
-                                        Err(e) => {
-                                            eprintln!(
-                                                "FAIL - Worker {} - Query '{}' failed: {}",
-                                                self.id, query.0, e
-                                            );
-                                            query_durations.entry(query.0.to_string()).or_default();
-                                            continue 'query_set;
-                                        }
+                    eprintln!("Running: Worker {} - Query '{}'", self.id, query.0,);
+                    let mut row_count = 0;
+                    let query_start = Instant::now();
+                    match self.flight_client.query(query.1).await {
+                        Ok(mut result_stream) => {
+                            while let Some(batch) = result_stream.next().await {
+                                match batch {
+                                    Ok(batch) => {
+                                        row_count += batch.num_rows();
+                                    }
+                                    Err(e) => {
+                                        eprintln!(
+                                            "FAIL - Worker {} - Query '{}' failed: {}",
+                                            self.id, query.0, e
+                                        );
+                                        query_durations.entry(query.0.to_string()).or_default();
+                                        continue 'query_set;
                                     }
                                 }
-
-                                let duration = query_start.elapsed();
-                                query_durations
-                                    .entry(query.0.to_string())
-                                    .or_default()
-                                    .push(duration);
-
-                                *row_counts.entry(query.0.to_string()).or_default() += row_count;
                             }
-                            Err(e) => match e {
-                                flight_client::Error::UnableToConnectToServer { .. }
-                                | flight_client::Error::UnableToPerformHandshake { .. } => {
-                                    eprintln!(
-                                        "FAIL - EARLY EXIT - Worker {} - Query '{}' failed: {}",
-                                        self.id, query.0, e
-                                    );
-                                    return Ok(SpiceTestQueryWorkerResult::new(
-                                        query_durations,
-                                        true,
-                                        row_counts,
-                                    ));
-                                }
-                                _ => {
-                                    eprintln!(
-                                        "FAIL - Worker {} - Query '{}' failed: {}",
-                                        self.id, query.0, e
-                                    );
-                                    query_durations.entry(query.0.to_string()).or_default();
-                                }
-                            },
-                        };
-                    }
+
+                            let duration = query_start.elapsed();
+                            query_durations
+                                .entry(query.0.to_string())
+                                .or_default()
+                                .push(duration);
+
+                            *row_counts.entry(query.0.to_string()).or_default() += row_count;
+                        }
+                        Err(e) => match e {
+                            flight_client::Error::UnableToConnectToServer { .. }
+                            | flight_client::Error::UnableToPerformHandshake { .. } => {
+                                eprintln!(
+                                    "FAIL - EARLY EXIT - Worker {} - Query '{}' failed: {}",
+                                    self.id, query.0, e
+                                );
+                                return Ok(SpiceTestQueryWorkerResult::new(
+                                    query_durations,
+                                    true,
+                                    row_counts,
+                                ));
+                            }
+                            _ => {
+                                eprintln!(
+                                    "FAIL - Worker {} - Query '{}' failed: {}",
+                                    self.id, query.0, e
+                                );
+                                query_durations.entry(query.0.to_string()).or_default();
+                            }
+                        },
+                    };
                 }
                 query_set_count += 1;
             }
