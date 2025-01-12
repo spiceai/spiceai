@@ -38,6 +38,11 @@ on:
           - 'dremio'
           - 'odbc-athena'
           - 'duckdb'
+      ready_wait:
+        description: 'How long (in seconds) to wait for spiced to start'
+        required: true
+        default: '30'
+        type: string
 
 jobs:
   run-load:
@@ -107,7 +112,7 @@ jobs:
         if: ${{ github.event.inputs.query_overrides == '' }}
         run: |
           rm -rf .spice/data
-          testoperator run load -s /usr/local/bin/spiced -p ${{ github.event.inputs.spicepod_path }} -d /opt/spiced/data --query-set ${{ github.event.inputs.query_set }} --duration ${{ github.event.inputs.duration }}
+          testoperator run load -s /usr/local/bin/spiced -p ${{ github.event.inputs.spicepod_path }} -d /opt/spiced/data --query-set ${{ github.event.inputs.query_set }} --duration ${{ github.event.inputs.duration }} --ready-wait ${{ github.event.inputs.ready_wait }}
         env:
           S3_ENDPOINT: ${{ secrets.CLICKBENCH_S3_ENDPOINT}}
           S3_KEY: ${{ secrets.CLICKBENCH_S3_KEY}}
@@ -117,7 +122,7 @@ jobs:
         if: ${{ github.event.inputs.query_overrides != '' }}
         run: |
           rm -rf .spice/data
-          testoperator run load -s /usr/local/bin/spiced -p ${{ github.event.inputs.spicepod_path }} -d /opt/spiced/data --query-set ${{ github.event.inputs.query_set }} --duration ${{ github.event.inputs.duration }} --query-overrides ${{ github.event.inputs.query_overrides }}
+          testoperator run load -s /usr/local/bin/spiced -p ${{ github.event.inputs.spicepod_path }} -d /opt/spiced/data --query-set ${{ github.event.inputs.query_set }} --duration ${{ github.event.inputs.duration }} --query-overrides ${{ github.event.inputs.query_overrides }} --ready-wait ${{ github.event.inputs.ready_wait }}
         env:
           S3_ENDPOINT: ${{ secrets.CLICKBENCH_S3_ENDPOINT}}
           S3_KEY: ${{ secrets.CLICKBENCH_S3_KEY}}
