@@ -1,11 +1,6 @@
 version: v1
 kind: Spicepod
 name: dremio_tpcds
-runtime:
-  results_cache:
-    enabled: false
-  task_history:
-    enabled: false
 datasets:
   - from: dremio:tpcds.call_center
     name: call_center
