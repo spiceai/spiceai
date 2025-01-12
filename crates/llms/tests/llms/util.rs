@@ -20,8 +20,10 @@ use async_openai::types::{
     CreateChatCompletionResponse, FunctionCall,
 };
 use futures::StreamExt;
-
 /// Accumulate a [`ChatCompletionResponseStream`] into a single [`CreateChatCompletionResponse`].
+///
+/// This enables comparing the output from [`super::Chat::chat_stream`] as if it was a [`super::Chat::chat_request`].
+#[allow(deprecated, clippy::cast_possible_truncation)]
 pub(crate) async fn accumulate(
     stream: ChatCompletionResponseStream,
 ) -> CreateChatCompletionResponse {
@@ -135,7 +137,7 @@ fn update_chat_choice(acc: &mut ChatChoice, update: ChatChoiceStream) {
                 }
 
                 if let Some(id) = &tool.id {
-                    acc_tools[i].id = id.clone();
+                    acc_tools[i].id.clone_from(id);
                 }
                 if let Some(r#type) = tool.r#type {
                     acc_tools[i].r#type = r#type;
@@ -188,7 +190,8 @@ pub mod tests {
 
         let resp = accumulate(stream).await;
         assert_eq!(
-            serde_json::to_value(&resp).unwrap(),
+            serde_json::to_value(&resp)
+                .expect("Output of `accumulate` should be serializable to serde_json::Value"),
             json!({
                 "id":"chatcmpl-Ap1hqCfgxosk7rTVtDHee6aFff0wd",
                 "choices":[
@@ -214,12 +217,12 @@ pub mod tests {
                         "logprobs":null
                     }
                 ],
-                "created":1736724650,
+                "created":1_736_724_650,
                 "model":"not_needed",
                 "service_tier":"default",
                 "system_fingerprint":"fp_72ed7ab54c",
                 "object":"chat.completion.chunk"
             })
-        )
+        );
     }
 }
