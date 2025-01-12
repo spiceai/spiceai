@@ -10,5 +10,6 @@ version.workspace = true
 
 [dependencies]
 arrow.workspace = true
+arrow-schema.workspace = true
 snafu.workspace = true
 datafusion.workspace = true

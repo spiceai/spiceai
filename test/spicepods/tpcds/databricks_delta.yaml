@@ -1,0 +1,82 @@
+version: v1
+kind: Spicepod
+name: databricks_delta_tpcds
+datasets:
+  - from: databricks:spiceai_sandbox.tpcds.item
+    name: item
+    params: &databricks_delta_params
+      mode: delta_lake
+      client_timeout: 600s
+      databricks_aws_access_key_id: ${ env:AWS_DATABRICKS_DELTA_ACCESS_KEY_ID }
+      databricks_aws_secret_access_key: ${ env:AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY }
+      databricks_token: ${ env:DATABRICKS_TOKEN }
+      databricks_endpoint: ${ env:DATABRICKS_HOST }
+  - from: databricks:spiceai_sandbox.tpcds.call_center
+    name: call_center
+    params: *databricks_delta_params
+  - from: databricks:spiceai_sandbox.tpcds.catalog_page
+    name: catalog_page
+    params: *databricks_delta_params
+  - from: databricks:spiceai_sandbox.tpcds.catalog_sales
+    name: catalog_sales
+    params: *databricks_delta_params
+  - from: databricks:spiceai_sandbox.tpcds.catalog_returns
+    name: catalog_returns
+    params: *databricks_delta_params
+  - from: databricks:spiceai_sandbox.tpcds.income_band
+    name: income_band
+    params: *databricks_delta_params
+  - from: databricks:spiceai_sandbox.tpcds.inventory
+    name: inventory
+    params: *databricks_delta_params
+  - from: databricks:spiceai_sandbox.tpcds.store_sales
+    name: store_sales
+    params: *databricks_delta_params
+  - from: databricks:spiceai_sandbox.tpcds.store_returns
+    name: store_returns
+    params: *databricks_delta_params
+  - from: databricks:spiceai_sandbox.tpcds.web_sales
+    name: web_sales
+    params: *databricks_delta_params
+  - from: databricks:spiceai_sandbox.tpcds.web_returns
+    name: web_returns
+    params: *databricks_delta_params
+  - from: databricks:spiceai_sandbox.tpcds.customer
+    name: customer
+    params: *databricks_delta_params
+  - from: databricks:spiceai_sandbox.tpcds.customer_address
+    name: customer_address
+    params: *databricks_delta_params
+  - from: databricks:spiceai_sandbox.tpcds.customer_demographics
+    name: customer_demographics
+    params: *databricks_delta_params
+  - from: databricks:spiceai_sandbox.tpcds.date_dim
+    name: date_dim
+    params: *databricks_delta_params
+  - from: databricks:spiceai_sandbox.tpcds.household_demographics
+    name: household_demographics
+    params: *databricks_delta_params
+  - from: databricks:spiceai_sandbox.tpcds.promotion
+    name: promotion
+    params: *databricks_delta_params
+  - from: databricks:spiceai_sandbox.tpcds.reason
+    name: reason
+    params: *databricks_delta_params
+  - from: databricks:spiceai_sandbox.tpcds.ship_mode
+    name: ship_mode
+    params: *databricks_delta_params
+  - from: databricks:spiceai_sandbox.tpcds.store
+    name: store
+    params: *databricks_delta_params
+  - from: databricks:spiceai_sandbox.tpcds.time_dim
+    name: time_dim
+    params: *databricks_delta_params
+  - from: databricks:spiceai_sandbox.tpcds.warehouse
+    name: warehouse
+    params: *databricks_delta_params
+  - from: databricks:spiceai_sandbox.tpcds.web_page
+    name: web_page
+    params: *databricks_delta_params
+  - from: databricks:spiceai_sandbox.tpcds.web_site
+    name: web_site
+    params: *databricks_delta_params

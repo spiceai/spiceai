@@ -149,7 +149,7 @@ fn build_app(
             }
         }
         #[cfg(feature = "spark")]
-        "spark" => Ok(crate::bench_spark::build_app(app_builder)),
+        "spark" => crate::bench_spark::build_app(app_builder, bench_name),
         #[cfg(feature = "postgres")]
         "postgres" => crate::bench_postgres::build_app(app_builder, bench_name),
         #[cfg(feature = "mysql")]

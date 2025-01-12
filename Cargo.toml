@@ -84,8 +84,8 @@ graphql-parser = "0.4.0"
 hf-hub = { version = "0.3.0", features = ["tokio"] }
 http = "1.1.0"
 iceberg = "0.4.0"
-iceberg-datafusion = "0.4.0"
 iceberg-catalog-rest = "0.4.0"
+iceberg-datafusion = "0.4.0"
 insta = { version = "1.41.1", features = ["filters"] }
 itertools = "0.13"
 mysql_async = { version = "0.34.1", features = ["native-tls-tls", "chrono"] }
@@ -175,3 +175,5 @@ dotenvy = { git = "https://github.com/spiceai/dotenvy.git", rev = "e5cef1871b080
 iceberg = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "557c79ff2c443c089e09d3ad60d382eb7fdba7bf" }
 iceberg-datafusion = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "557c79ff2c443c089e09d3ad60d382eb7fdba7bf" }
 iceberg-catalog-rest = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "557c79ff2c443c089e09d3ad60d382eb7fdba7bf" }
+
+cudarc = { git = "https://github.com/coreylowman/cudarc", rev = "d3405fa5ce18068d0362142c5d7b3910ea4039fa" }

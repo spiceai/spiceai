@@ -15,11 +15,12 @@ limitations under the License.
 */
 
 use crate::component::dataset::Dataset;
+use crate::dataconnector::listing::LISTING_TABLE_PARAMETERS;
 use snafu::prelude::*;
 use std::any::Any;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use url::Url;
 
 use super::{listing, ConnectorComponent, ConnectorParams};
@@ -53,32 +54,17 @@ impl FTPFactory {
     }
 }
 
-const PARAMETERS: &[ParameterSpec] = &[
-    ParameterSpec::connector("user").secret(),
-    ParameterSpec::connector("pass").secret(),
-    ParameterSpec::connector("port").description("The port to connect to."),
-    ParameterSpec::runtime("client_timeout")
-        .description("The timeout setting for FTP client."),
-
-    // Common listing table parameters
-    ParameterSpec::runtime("file_format"),
-    ParameterSpec::runtime("file_extension"),
-    ParameterSpec::runtime("schema_infer_max_records")
-        .description("Set a limit in terms of records to scan to infer the schema."),
-    ParameterSpec::runtime("csv_has_header")
-        .description("Set true to indicate that the first line is a header."),
-    ParameterSpec::runtime("csv_quote").description("The quote character in a row."),
-    ParameterSpec::runtime("csv_escape").description("The escape character in a row."),
-    ParameterSpec::runtime("csv_schema_infer_max_records")
-        .description("Set a limit in terms of records to scan to infer the schema.")
-        .deprecated("use 'schema_infer_max_records' instead"),
-    ParameterSpec::runtime("csv_delimiter")
-        .description("The character separating values within a row."),
-    ParameterSpec::runtime("file_compression_type")
-        .description("The type of compression used on the file. Supported types are: GZIP, BZIP2, XZ, ZSTD, UNCOMPRESSED"),
-    ParameterSpec::runtime("hive_partitioning_enabled")
-        .description("Enable partitioning using hive-style partitioning from the folder structure. Defaults to false."),
-];
+static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
+    let mut all_parameters = Vec::new();
+    all_parameters.extend_from_slice(&[
+        ParameterSpec::connector("user").secret(),
+        ParameterSpec::connector("pass").secret(),
+        ParameterSpec::connector("port").description("The port to connect to."),
+        ParameterSpec::runtime("client_timeout").description("The timeout setting for FTP client."),
+    ]);
+    all_parameters.extend_from_slice(LISTING_TABLE_PARAMETERS);
+    all_parameters
+});
 
 impl DataConnectorFactory for FTPFactory {
     fn as_any(&self) -> &dyn Any {
@@ -102,7 +88,7 @@ impl DataConnectorFactory for FTPFactory {
     }
 
     fn parameters(&self) -> &'static [ParameterSpec] {
-        PARAMETERS
+        &PARAMETERS
     }
 }
 

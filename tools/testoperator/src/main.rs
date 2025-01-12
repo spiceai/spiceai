@@ -39,8 +39,8 @@ async fn main() -> anyhow::Result<()> {
     match cli.subcommand {
         Commands::Run(TestCommands::Throughput(args)) => tests::throughput::run(&args).await?,
         Commands::Export(TestCommands::Throughput(args)) => tests::throughput::export(&args)?,
-        Commands::Run(TestCommands::Load(_)) => unimplemented!(),
-        Commands::Export(TestCommands::Load(_)) => unimplemented!(),
+        Commands::Run(TestCommands::Load(args)) => tests::load::run(&args).await?,
+        Commands::Export(TestCommands::Load(args)) => tests::load::export(&args)?,
     }
 
     Ok(())

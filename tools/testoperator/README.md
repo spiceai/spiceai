@@ -24,6 +24,7 @@ testoperator run [OPTIONS]
 - `--query-set <QUERY_SET>`: The query set to use for the test. Possible values: `tpch`, `tpcds`, `clickbench`.
 - `--query-overrides <QUERY_OVERRIDES>`: Optional query overrides. Possible values: `sqlite`, `postgresql`, `mysql`, `dremio`, `spark`, `odbcathena`, `duckdb`.
 - `--concurrency <CONCURRENCY>`: The concurrency level for the test.
+- `--ready-wait <WAIT TIME>`: How long to wait before spiced is ready.
 
 ### Export
 
@@ -43,6 +44,7 @@ testoperator export [OPTIONS]
 - `--query-set <QUERY_SET>`: The query set to use for the test. Possible values: `tpch`, `tpcds`, `clickbench`.
 - `--query-overrides <QUERY_OVERRIDES>`: Optional query overrides. Possible values: `sqlite`, `postgresql`, `mysql`, `dremio`, `spark`, `odbcathena`, `duckdb`.
 - `--concurrency <CONCURRENCY>`: The concurrency level for the test.
+- `--ready-wait <WAIT TIME>`: How long to wait before spiced is ready.
 
 ## Examples
 

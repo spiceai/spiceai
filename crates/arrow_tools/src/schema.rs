@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use arrow_schema::{DataType, Field, Schema};
 use datafusion::common::DFSchema;
 use snafu::prelude::*;
 
@@ -71,4 +72,22 @@ pub fn verify_schema(
     }
 
     Ok(())
+}
+
+#[must_use]
+pub fn expand_views_schema(schema: &Schema) -> Schema {
+    let transformed_fields: Vec<Field> = schema
+        .fields()
+        .iter()
+        .map(|field| {
+            let new_type = match field.data_type() {
+                DataType::Utf8View => DataType::LargeUtf8,
+                DataType::BinaryView => DataType::LargeBinary,
+                t => t.clone(),
+            };
+            Field::new(field.name(), new_type, field.is_nullable())
+        })
+        .collect();
+
+    Schema::new(transformed_fields)
 }

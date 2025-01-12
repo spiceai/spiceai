@@ -1,11 +1,6 @@
 version: v1
 kind: Spicepod
 name: s3_tpch
-runtime:
-  results_cache:
-    enabled: false
-  task_history:
-    enabled: false
 datasets:
   - from: s3://benchmarks/tpcds_sf1/catalog_sales/
     name: catalog_sales
@@ -69,4 +64,16 @@ datasets:
     params: *s3_params
   - from: s3://benchmarks/tpcds_sf1/web_site/
     name: web_site
+    params: *s3_params
+  - from: s3://benchmarks/tpcds_sf1/reason/
+    name: reason
+    params: *s3_params
+  - from: s3://benchmarks/tpcds_sf1/call_center/
+    name: call_center
+    params: *s3_params
+  - from: s3://benchmarks/tpcds_sf1/income_band/
+    name: income_band
+    params: *s3_params
+  - from: s3://benchmarks/tpcds_sf1/catalog_page/
+    name: catalog_page
     params: *s3_params

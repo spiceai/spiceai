@@ -42,6 +42,7 @@ use delta_kernel::scan::state::{DvInfo, GlobalScanState, Stats};
 use delta_kernel::scan::ScanBuilder;
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::Table;
+use itertools::Itertools;
 use secrecy::{ExposeSecret, SecretString};
 use snafu::prelude::*;
 use std::collections::HashSet;
@@ -296,6 +297,7 @@ impl TableProvider for DeltaTable {
         Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn scan(
         &self,
         state: &dyn Session,
@@ -360,18 +362,18 @@ impl TableProvider for DeltaTable {
         }
 
         let mut partitioned_files: Vec<PartitionedFile> = vec![];
-        let mut uniq_partition_columns = HashSet::new();
-        let mut partition_cols = HashSet::new();
+        let mut partition_column_counts = HashSet::new();
+        let mut all_partition_columns = HashSet::new();
         for file in scan_context.files {
             let mut partitioned_file = file.partitioned_file;
-            uniq_partition_columns.insert(file.partition_values.len());
+            partition_column_counts.insert(file.partition_values.len());
             partitioned_file.partition_values = file
                 .partition_values
                 .iter()
                 .map(|(k, v)| {
                     let schema = self.schema();
                     let field = schema.field_with_name(k)?;
-                    partition_cols.insert(field.clone());
+                    all_partition_columns.insert(field.clone());
                     ScalarValue::try_from_string(v.clone(), field.data_type())
                 })
                 .collect::<Result<Vec<_>, DataFusionError>>()?;
@@ -390,16 +392,21 @@ impl TableProvider for DeltaTable {
             partitioned_files.push(partitioned_file);
         }
 
-        if !uniq_partition_columns.is_empty()
-            && (uniq_partition_columns.len() != 1
-                || !uniq_partition_columns.contains(&partition_cols.len()))
-        {
+        if partition_column_counts.len() > 1 {
             return Err(DataFusionError::Execution(format!(
-                "various number of partition values from the partitioned files: {uniq_partition_columns:?}"
+                "Inconsistent partitioning detected for Delta table {}: Some files have {} partition columns while others have {}. \
+                All files in a Delta table must use the same partitioning scheme. \
+                Expected partition columns: {}",
+                self.table.location(),
+                partition_column_counts.iter().max().unwrap_or(&0),
+                partition_column_counts.iter().min().unwrap_or(&0),
+                all_partition_columns.iter()
+                    .map(Field::name)
+                    .join(", ")
             )));
         }
 
-        let partition_cols = &partition_cols.into_iter().collect::<Vec<_>>();
+        let partition_cols = &all_partition_columns.into_iter().collect::<Vec<_>>();
         let schema = self.arrow_schema.project(
             &self
                 .arrow_schema

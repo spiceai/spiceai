@@ -14,4 +14,26 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::commands::TestArgs;
+use test_framework::{
+    anyhow, app::App, spiced::StartRequest, spicepod::Spicepod, spicepod_utils::from_app,
+};
+
+pub(crate) mod load;
 pub(crate) mod throughput;
+
+pub(crate) fn get_app_and_start_request(args: &TestArgs) -> anyhow::Result<(App, StartRequest)> {
+    let spicepod = Spicepod::load_exact(args.spicepod_path.clone())?;
+    let app = test_framework::app::AppBuilder::new(spicepod.name.clone())
+        .with_spicepod(spicepod)
+        .build();
+
+    let start_request = StartRequest::new(args.spiced_path.clone(), from_app(app.clone()))?;
+    let start_request = if let Some(data_dir) = &args.data_dir {
+        start_request.with_data_dir(data_dir.clone())
+    } else {
+        start_request
+    };
+
+    Ok((app, start_request))
+}
