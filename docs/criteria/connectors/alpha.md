@@ -30,7 +30,7 @@ All criteria must be met for the connector to be considered Alpha. As Alpha sign
 | Spice.ai Cloud Platform          | ✅            | @phillipleblanc |
 | S3                               | ✅            | @Sevenannn      |
 | Azure BlobFS                     | ➖            |                 |
-| Spark                            | ➖            |                 |
+| Spark                            | ✅            | @ewgenius       |
 
 ## Alpha Release Criteria
 

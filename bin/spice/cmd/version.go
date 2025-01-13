@@ -107,7 +107,7 @@ func checkLatestCliReleaseVersion() error {
 
 	cliVersion := version.Version()
 
-	cliIsPreRelease := strings.HasPrefix(cliVersion, "local") || strings.Contains(cliVersion, "rc")
+	cliIsPreRelease := strings.HasPrefix(cliVersion, "local") || strings.Contains(cliVersion, "build")
 
 	if !cliIsPreRelease && semver.Compare(cliVersion, latestReleaseVersion) < 0 {
 		slog.Info(fmt.Sprintf("\nCLI version %s is now available!\nTo upgrade, run \"spice upgrade\".\n", aurora.BrightGreen(latestReleaseVersion)))

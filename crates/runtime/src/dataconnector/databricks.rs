@@ -46,6 +46,9 @@ pub enum Error {
     UnableToConstructDatabricksSpark {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+
+    #[snafu(display("Invalid `mode` value: '{value}'. Use 'delta_lake' or 'spark_connect'.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/databricks#parameters"))]
+    InvalidMode { value: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -65,43 +68,49 @@ impl Databricks {
             .get("token")
             .ok_or_else(|p| MissingParameterSnafu { parameter: p.0 }.build())?;
 
-        if mode == "delta_lake" {
-            let databricks_delta = DatabricksDelta::new(
-                Endpoint(endpoint.to_string()),
-                token.clone(),
-                params.to_secret_map(),
-            );
-            Ok(Self {
-                read_provider: Arc::new(databricks_delta.clone()),
-            })
-        } else {
-            let mut databricks_use_ssl = true;
-            if let Some(databricks_use_ssl_value) = params.get("use_ssl").expose().ok() {
-                databricks_use_ssl = match databricks_use_ssl_value {
-                    "true" => true,
-                    "false" => false,
-                    _ => {
-                        return InvalidUsesslSnafu {
-                            value: databricks_use_ssl_value,
-                        }
-                        .fail()
-                    }
-                };
+        match mode {
+            "delta_lake" => {
+                let databricks_delta = DatabricksDelta::new(
+                    Endpoint(endpoint.to_string()),
+                    token.clone(),
+                    params.to_secret_map(),
+                );
+                Ok(Self {
+                    read_provider: Arc::new(databricks_delta.clone()),
+                })
             }
-            let cluster_id = params
-                .get("cluster_id")
-                .ok_or_else(|p| MissingParameterSnafu { parameter: p.0 }.build())?;
-            let databricks_spark = DatabricksSparkConnect::new(
-                endpoint.to_string(),
-                cluster_id.expose_secret().to_string(),
-                token.expose_secret().to_string(),
-                databricks_use_ssl,
-            )
-            .await
-            .context(UnableToConstructDatabricksSparkSnafu)?;
-            Ok(Self {
-                read_provider: Arc::new(databricks_spark.clone()),
-            })
+            "spark_connect" => {
+                let mut databricks_use_ssl = true;
+                if let Some(databricks_use_ssl_value) = params.get("use_ssl").expose().ok() {
+                    databricks_use_ssl = match databricks_use_ssl_value {
+                        "true" => true,
+                        "false" => false,
+                        _ => {
+                            return InvalidUsesslSnafu {
+                                value: databricks_use_ssl_value,
+                            }
+                            .fail()
+                        }
+                    };
+                }
+                let cluster_id = params
+                    .get("cluster_id")
+                    .ok_or_else(|p| MissingParameterSnafu { parameter: p.0 }.build())?;
+                let databricks_spark = DatabricksSparkConnect::new(
+                    endpoint.to_string(),
+                    cluster_id.expose_secret().to_string(),
+                    token.expose_secret().to_string(),
+                    databricks_use_ssl,
+                )
+                .await
+                .context(UnableToConstructDatabricksSparkSnafu)?;
+                Ok(Self {
+                    read_provider: Arc::new(databricks_spark.clone()),
+                })
+            }
+            _ => Err(Error::InvalidMode {
+                value: mode.to_string(),
+            }),
         }
     }
 
