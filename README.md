@@ -156,7 +156,7 @@ See more demos on [YouTube](https://www.youtube.com/playlist?list=PLesJrUXEx3U9a
 | `delta_lake`                       | Delta Lake                            | Beta              | Delta Lake                   |
 | `mssql`                            | Microsoft SQL Server                  | Beta              | Tabular Data Stream (TDS)    |
 | `flightsql`                        | FlightSQL                             | Beta              | Arrow Flight SQL             |
-| `spiceai`                          | [Spice.ai][spiceai]                   | Beta              | Arrow Flight                 |
+| `spice.ai`                         | [Spice.ai][spiceai]                   | Beta              | Arrow Flight                 |
 | `odbc`                             | ODBC                                  | Beta              | ODBC                         |
 | `databricks (mode: spark_connect)` | [Databricks][databricks]              | Beta              | [Spark Connect][spark]       |
 | `snowflake`                        | Snowflake                             | Beta              | Arrow                        |

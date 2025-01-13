@@ -27,7 +27,7 @@ All criteria must be met for the connector to be considered Beta, with exception
 | PostgreSQL                       | ✅           | @Sevenannn      |
 | Sharepoint                       | ➖           |                 |
 | Snowflake                        | ✅           | @phillipleblanc |
-| Spice.AI Cloud Platform          | ➖           |                 |
+| Spice.ai Cloud Platform          | ✅           | @phillipleblanc |
 | S3                               | ✅           | @Sevenannn      |
 | Azure BlobFS                     | ➖           |                 |
 | Spark                            | ➖           |                 |
@@ -60,7 +60,7 @@ This table defines the required features and/or tests for each connector:
 | PostgreSQL                       | ✅ (100)              | ➖             | ☑️                | ➖                       | ✅                  | ➖                         |
 | Sharepoint                       | ➖                    | ➖             | ➖                | ➖                       | ➖                  | ☑️                         |
 | Snowflake                        | ✅ (100)              | ➖             | ☑️                | ➖                       | ✅                  | ➖                         |
-| Spice.AI Cloud Platform          | ✅ (100)              | ➖             | ☑️                | ➖                       | ✅                  | ➖                         |
+| Spice.ai Cloud Platform          | ✅ (100)              | ➖             | ☑️                | ➖                       | ✅                  | ➖                         |
 | S3                               | ✅ (1)                | ➖             | ➖                | ➖                       | ✅                  | ☑️                         |
 | Azure BlobFS                     | ✅ (1)                | ➖             | ➖                | ➖                       | ✅                  | ☑️                         |
 | Spark                            | ✅ (1)                | ➖             | ☑️                | ➖                       | ✅                  | ➖                         |

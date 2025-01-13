@@ -27,7 +27,7 @@ All criteria must be met for the connector to be considered Alpha. As Alpha sign
 | PostgreSQL                       | ✅            | @Sevenannn      |
 | Sharepoint                       | ➖            |                 |
 | Snowflake                        | ✅            | @phillipleblanc |
-| Spice.AI Cloud Platform          | ➖            |                 |
+| Spice.ai Cloud Platform          | ✅            | @phillipleblanc |
 | S3                               | ✅            | @Sevenannn      |
 | Azure BlobFS                     | ➖            |                 |
 | Spark                            | ➖            |                 |
