@@ -42,7 +42,7 @@ use std::fmt;
 use tokio::sync::RwLock;
 
 use crate::model::EmbeddingModelStore;
-use crate::{embedding_col, offset_col};
+use crate::{convert_to_iterator, embedding_col, offset_col};
 
 use super::table::EmbeddingColumnConfig;
 
@@ -270,15 +270,7 @@ pub(crate) async fn compute_additional_embedding_columns(
             continue;
         };
 
-        let arr_iter: Box<dyn Iterator<Item = Option<&str>> + Send> = if let Some(arr) =
-            raw_data.as_any().downcast_ref::<StringArray>()
-        {
-            Box::new(arr.iter())
-        } else if let Some(arr) = raw_data.as_any().downcast_ref::<StringViewArray>() {
-            Box::new(arr.iter())
-        } else if let Some(arr) = raw_data.as_any().downcast_ref::<LargeStringArray>() {
-            Box::new(arr.iter())
-        } else {
+        let Some(arr_iter) = convert_to_iterator!(raw_data) else {
             tracing::warn!(
                     "Expected 'StringArray', 'StringViewArray' or 'LargeStringArray' for column '{}', but got {}",
                     col,
