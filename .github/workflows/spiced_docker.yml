@@ -216,7 +216,7 @@ jobs:
           cache-to: type=gha,scope=build-cuda,mode=max
           build-args: |
             REL_VERSION=${{ needs.setup.outputs.rel_version }}
-            CARGO_FEATURES=release,cuda
+            CARGO_FEATURES=release,models,cuda
 
       - name: Upload CUDA artifacts
         uses: actions/upload-artifact@v4
