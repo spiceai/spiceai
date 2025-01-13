@@ -6,31 +6,31 @@ All criteria must be met for the connector to be considered Beta, with exception
 
 ## Beta Quality Connectors
 
-| Connector                        | Beta Quality | DRI Sign-off |
-| -------------------------------- | ------------ | ------------ |
-| Clickhouse                       | ➖           |              |
-| Databricks (mode: delta_lake)    | ✅           | @Sevenannn   |
-| Databricks (mode: spark_connect) | ➖           |              |
-| Delta Lake                       | ➖           |              |
-| Dremio                           | ✅           | @Sevenannn   |
-| DuckDB                           | ✅           | @peasee      |
-| File                             | ✅           | @peasee      |
-| FlightSQL                        | ➖           |              |
-| FTP/SFTP                         | ➖           |              |
-| GraphQL                          | ➖           |              |
-| GitHub                           | ✅           | @peasee      |
-| HTTP/HTTPS                       | ➖           |              |
-| Localpod                         | ➖           |              |
-| MS SQL                           | ✅           | @peasee      |
-| MySQL                            | ✅           | @peasee      |
-| ODBC                             | ➖           |              |
-| PostgreSQL                       | ✅           | @Sevenannn   |
-| Sharepoint                       | ➖           |              |
-| Snowflake                        | ➖           |              |
-| Spice.AI Cloud Platform          | ➖           |              |
-| S3                               | ✅           | @Sevenannn   |
-| Azure BlobFS                     | ➖           |              |
-| Spark                            | ➖           |              |
+| Connector                        | Beta Quality | DRI Sign-off    |
+| -------------------------------- | ------------ | --------------- |
+| Clickhouse                       | ➖           |                 |
+| Databricks (mode: delta_lake)    | ✅           | @Sevenannn      |
+| Databricks (mode: spark_connect) | ➖           |                 |
+| Delta Lake                       | ➖           |                 |
+| Dremio                           | ✅           | @Sevenannn      |
+| DuckDB                           | ✅           | @peasee         |
+| File                             | ✅           | @peasee         |
+| FlightSQL                        | ➖           |                 |
+| FTP/SFTP                         | ➖           |                 |
+| GraphQL                          | ➖           |                 |
+| GitHub                           | ✅           | @peasee         |
+| HTTP/HTTPS                       | ➖           |                 |
+| Localpod                         | ➖           |                 |
+| MS SQL                           | ✅           | @peasee         |
+| MySQL                            | ✅           | @peasee         |
+| ODBC                             | ➖           |                 |
+| PostgreSQL                       | ✅           | @Sevenannn      |
+| Sharepoint                       | ➖           |                 |
+| Snowflake                        | ✅           | @phillipleblanc |
+| Spice.AI Cloud Platform          | ➖           |                 |
+| S3                               | ✅           | @Sevenannn      |
+| Azure BlobFS                     | ➖           |                 |
+| Spark                            | ➖           |                 |
 
 ## Beta Release Criteria
 
