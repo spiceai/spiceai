@@ -40,7 +40,7 @@ use tracing::{Instrument, Span};
 use crate::accelerated_table::AcceleratedTable;
 use crate::datafusion::query::write_to_json_string;
 use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
-use crate::{convert_to_iterator, embedding_col, offset_col};
+use crate::{convert_string_arrow_to_iterator, embedding_col, offset_col};
 use crate::{datafusion::DataFusion, model::EmbeddingModelStore};
 
 use super::table::EmbeddingTable;
@@ -352,7 +352,7 @@ impl VectorSearchTableResult {
         let result = embedding_records
             .iter()
             .flat_map(|v| {
-                convert_to_iterator!(v.column(0))
+                convert_string_arrow_to_iterator!(v.column(0))
                     .map(|v| v.map(|vv| vv.unwrap_or_default().to_string()).collect_vec())
                     .unwrap_or_default()
             })
