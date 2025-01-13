@@ -371,7 +371,6 @@ impl TableProvider for DeltaTable {
         //
         // In the above example, the partition columns are `user_id` and `day`.
         // The `user_id` column has a NULL value for the first file and a value of `123` for the second file.
-        // The `day` column has a NULL value for both files.
         //
         // The `delta_kernel` library skips returning the partition columns for files that have a NULL value for the partition columns.
         // Which means that the partition columns will not be returned in the `partition_values` field of the `PartitionedFile` object.
