@@ -149,7 +149,9 @@ pub fn get_tpch_test_queries(
             simple_q2,
             simple_q3,
             simple_q4,
-            simple_q5
+            simple_q5,
+            simple_q6,
+            simple_q7
         ),
         _ => queries,
     }
