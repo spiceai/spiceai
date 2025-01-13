@@ -108,11 +108,9 @@ impl Databricks {
                     read_provider: Arc::new(databricks_spark.clone()),
                 })
             }
-            _ => {
-                return Err(Error::InvalidMode {
-                    value: mode.to_string(),
-                })
-            }
+            _ => Err(Error::InvalidMode {
+                value: mode.to_string(),
+            }),
         }
     }
 
