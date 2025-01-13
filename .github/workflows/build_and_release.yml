@@ -377,29 +377,31 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Don't fail if artifact not found. logic to check expected artifacts is done when
+      # publishing (last step).
       - name: download artifacts - spice_linux_x86_64
-        if: matrix.target.runner != 'ubuntu-gpu-t4-4-core'
+        continue-on-error: true
         uses: actions/download-artifact@v4
         with:
           name: spice_linux_x86_64
           path: ${{ env.ARTIFACT_DIR }}
 
       - name: download artifacts - spiced_linux_x86_64
-        if: matrix.target.runner != 'ubuntu-gpu-t4-4-core'
+        continue-on-error: true
         uses: actions/download-artifact@v4
         with:
           name: spiced_linux_x86_64
           path: ${{ env.ARTIFACT_DIR }}
 
       - name: download artifacts - spiced_models_linux_x86_64
-        if: matrix.target.runner != 'ubuntu-gpu-t4-4-core'
+        continue-on-error: true
         uses: actions/download-artifact@v4
         with:
           name: spiced_models_linux_x86_64
           path: ${{ env.ARTIFACT_DIR }}
 
       - name: download artifacts - spiced_models_linux_x86_64
-        if: matrix.target.runner == 'ubuntu-gpu-t4-4-core'
+        continue-on-error: true
         uses: actions/download-artifact@v4
         with:
           name: spiced_models_cuda_linux_x86_64
