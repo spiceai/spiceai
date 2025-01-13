@@ -58,7 +58,7 @@ impl Catalog for RestCatalog {
     ) -> IcebergResult<Namespace> {
         return Err(IcebergError::new(
             ErrorKind::FeatureUnsupported,
-            "Not implemented",
+            "Create namespace is not implemented",
         ));
     }
 
@@ -84,7 +84,7 @@ impl Catalog for RestCatalog {
     ) -> IcebergResult<()> {
         return Err(IcebergError::new(
             ErrorKind::FeatureUnsupported,
-            "Not implemented",
+            "Update namespace is not implemented",
         ));
     }
 
@@ -92,7 +92,7 @@ impl Catalog for RestCatalog {
     async fn drop_namespace(&self, _namespace: &NamespaceIdent) -> IcebergResult<()> {
         return Err(IcebergError::new(
             ErrorKind::FeatureUnsupported,
-            "Not implemented",
+            "Drop namespace is not implemented",
         ));
     }
 
@@ -109,24 +109,20 @@ impl Catalog for RestCatalog {
     ) -> IcebergResult<Table> {
         return Err(IcebergError::new(
             ErrorKind::FeatureUnsupported,
-            "Not implemented",
+            "Create table is not implemented",
         ));
     }
 
     /// Load table from the catalog.
-    async fn load_table(&self, _table: &TableIdent) -> IcebergResult<Table> {
-        // We use the load table implementation from our RestCatalog, not this trait's version.
-        return Err(IcebergError::new(
-            ErrorKind::FeatureUnsupported,
-            "Not implemented",
-        ));
+    async fn load_table(&self, table: &TableIdent) -> IcebergResult<Table> {
+        self.inner.load_table(table).await
     }
 
     /// Drop a table from the catalog.
     async fn drop_table(&self, _table: &TableIdent) -> IcebergResult<()> {
         return Err(IcebergError::new(
             ErrorKind::FeatureUnsupported,
-            "Not implemented",
+            "Drop table is not implemented",
         ));
     }
 
@@ -139,7 +135,7 @@ impl Catalog for RestCatalog {
     async fn rename_table(&self, _src: &TableIdent, _dest: &TableIdent) -> IcebergResult<()> {
         return Err(IcebergError::new(
             ErrorKind::FeatureUnsupported,
-            "Not implemented",
+            "Rename table is not implemented",
         ));
     }
 
@@ -147,7 +143,7 @@ impl Catalog for RestCatalog {
     async fn update_table(&self, _commit: TableCommit) -> IcebergResult<Table> {
         return Err(IcebergError::new(
             ErrorKind::FeatureUnsupported,
-            "Not implemented",
+            "Update table is not implemented",
         ));
     }
 }
