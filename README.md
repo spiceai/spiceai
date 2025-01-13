@@ -160,11 +160,11 @@ See more demos on [YouTube](https://www.youtube.com/playlist?list=PLesJrUXEx3U9a
 | `odbc`                             | ODBC                                  | Beta              | ODBC                         |
 | `databricks (mode: spark_connect)` | [Databricks][databricks]              | Beta              | [Spark Connect][spark]       |
 | `snowflake`                        | Snowflake                             | Beta              | Arrow                        |
+| `spark`                            | Spark                                 | Beta              | [Spark Connect][spark]       |
 | `iceberg`                          | [Apache Iceberg][iceberg]             | Alpha             | Parquet                      |
 | `clickhouse`                       | Clickhouse                            | Alpha             |                              |
 | `debezium`                         | Debezium CDC                          | Alpha             | Kafka + JSON                 |
 | `abfs`                             | Azure BlobFS                          | Alpha             | Parquet, CSV                 |
-| `spark`                            | Spark                                 | Alpha             | [Spark Connect][spark]       |
 | `ftp`, `sftp`                      | FTP/SFTP                              | Alpha             | Parquet, CSV                 |
 | `http`, `https`                    | HTTP(s)                               | Alpha             | Parquet, CSV                 |
 | `localpod`                         | [Local dataset replication][localpod] | Alpha             |                              |
