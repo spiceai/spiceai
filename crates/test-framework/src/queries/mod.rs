@@ -44,6 +44,7 @@ pub enum QueryOverrides {
     Spark,
     ODBCAthena,
     DuckDB,
+    Snowflake,
 }
 
 impl QueryOverrides {
@@ -70,6 +71,20 @@ macro_rules! generate_tpch_queries {
                 (
                     concat!("tpch_", stringify!($i)),
                     include_str!(concat!("./tpch/", stringify!($i), ".sql"))
+                )
+            ),*
+        ]
+    }
+}
+
+#[macro_export]
+macro_rules! generate_tpch_queries_override {
+    ( $override:expr, $( $i:tt ),* ) => {
+        vec![
+            $(
+                (
+                    concat!("tpch_", stringify!($i)),
+                    include_str!(concat!("./tpch/", $override, "/", stringify!($i), ".sql"))
                 )
             ),*
         ]
@@ -106,6 +121,35 @@ pub fn get_tpch_test_queries(
             queries,
             2, // Analysis error: [UNSUPPORTED_SUBQUERY_EXPRESSION_CATEGORY.UNSUPPORTED_CORRELATED_SCALAR_SUBQUERY] Unsupported subquery expression: Correlated scalar subqueries can only be used in filters, aggregations, projections, and UPDATE/MERGE/DELETE commands
             17 // Analysis error: [UNSUPPORTED_SUBQUERY_EXPRESSION_CATEGORY.UNSUPPORTED_CORRELATED_SCALAR_SUBQUERY] Unsupported subquery expression: Correlated scalar subqueries can only be used in filters, aggregations, projections, and UPDATE/MERGE/DELETE commands
+        ),
+        Some(QueryOverrides::Snowflake) => generate_tpch_queries_override!(
+            "snowflake",
+            q1,
+            q2,
+            q3,
+            q4,
+            q5,
+            q6,
+            q7,
+            q8,
+            q9,
+            q10,
+            q11,
+            q12,
+            q13,
+            q14,
+            q16,
+            q17,
+            q18,
+            q19,
+            q20,
+            q21,
+            q22,
+            simple_q1,
+            simple_q2,
+            simple_q3,
+            simple_q4,
+            simple_q5
         ),
         _ => queries,
     }
