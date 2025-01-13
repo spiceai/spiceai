@@ -14,7 +14,7 @@ All criteria must be met for the connector to be considered Stable, with excepti
 | Delta Lake                       | ➖             |                 |
 | Dremio                           | ➖             |                 |
 | DuckDB                           | ➖             |                 |
-| File                             | ➖             |                 |
+| File                             | ✅             | @ewgenius       |
 | FlightSQL                        | ➖             |                 |
 | FTP/SFTP                         | ➖             |                 |
 | GraphQL                          | ➖             |                 |
