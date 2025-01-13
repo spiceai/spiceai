@@ -79,7 +79,10 @@ async fn spiceai_federation() -> Result<(), anyhow::Error> {
             }
 
             let queries: QueryTests = vec![(
-                "SELECT * FROM taxi_trips ORDER BY tpep_pickup_datetime DESC LIMIT 10",
+                r#"
+                    SELECT * FROM taxi_trips
+                    WHERE taxi_trips."Airport_fee" > 0
+                    ORDER BY tpep_pickup_datetime DESC, tpep_dropoff_datetime DESC, passenger_count DESC LIMIT 10"#,
                 "select",
                 Some(Box::new(|result_batches| {
                     let results = arrow::util::pretty::pretty_format_batches(&result_batches)
