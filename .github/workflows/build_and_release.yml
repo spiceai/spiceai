@@ -81,6 +81,10 @@ jobs:
               return matrix.filter(m => m.name === platform_option);
             }
 
+            // Do not run GPU builds for all PRs to trunk. 
+            if (context.eventName === 'push' && context.ref === 'refs/heads/trunk') {
+              return matrix.filter(m => m.runner === "ubuntu-gpu-t4-4-core")
+            }
             return matrix;
 
   build:
