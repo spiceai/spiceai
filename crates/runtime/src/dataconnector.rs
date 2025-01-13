@@ -518,6 +518,7 @@ impl ConnectorParamsBuilder {
         secrets: Arc<RwLock<Secrets>>,
     ) -> Result<ConnectorParams, Box<dyn std::error::Error + Send + Sync>> {
         let name = self.connector.to_string();
+        let mut invalid_type_action = None;
         let (params, prefix, parameters) = match &self.component {
             ConnectorComponent::Catalog(catalog) => {
                 let guard = CATALOG_CONNECTOR_FACTORY_REGISTRY.lock().await;
@@ -538,6 +539,8 @@ impl ConnectorParamsBuilder {
             ConnectorComponent::Dataset(dataset) => {
                 let guard = DATA_CONNECTOR_FACTORY_REGISTRY.lock().await;
                 let connector_factory = guard.get(&name);
+
+                invalid_type_action = dataset.invalid_type_action;
 
                 let factory = connector_factory.ok_or_else(|| {
                     if name == ODBC_DATACONNECTOR {
@@ -569,8 +572,82 @@ impl ConnectorParamsBuilder {
 
         Ok(ConnectorParams {
             parameters,
-            invalid_type_action: None,
+            invalid_type_action: invalid_type_action.map(InvalidTypeAction::from),
             component: self.component.clone(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::component::dataset::InvalidTypeAction as DatasetInvalidTypeAction;
+
+    #[tokio::test]
+    async fn test_connector_params_builder_invalid_type_action() {
+        // Register a test connector factory
+        struct TestConnectorFactory;
+        impl DataConnectorFactory for TestConnectorFactory {
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+
+            fn create(
+                &self,
+                _params: ConnectorParams,
+            ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
+                Box::pin(async { Ok(Arc::new(TestConnector) as Arc<dyn DataConnector>) })
+            }
+
+            fn prefix(&self) -> &'static str {
+                "test"
+            }
+
+            fn parameters(&self) -> &'static [ParameterSpec] {
+                &[]
+            }
+
+            fn supports_invalid_type_action(&self) -> bool {
+                true
+            }
+        }
+
+        struct TestConnector;
+        #[async_trait]
+        impl DataConnector for TestConnector {
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+
+            async fn read_provider(
+                &self,
+                _dataset: &Dataset,
+            ) -> DataConnectorResult<Arc<dyn TableProvider>> {
+                unimplemented!()
+            }
+        }
+
+        register_connector_factory("test", Arc::new(TestConnectorFactory)).await;
+
+        // Create a test dataset with invalid_type_action
+        let mut dataset = Dataset::try_new("test:test_dataset".to_string(), "test_dataset")
+            .expect("failed to create dataset");
+        dataset.invalid_type_action = Some(DatasetInvalidTypeAction::Ignore);
+
+        let secrets = Arc::new(RwLock::new(Secrets::default()));
+        let builder = ConnectorParamsBuilder::new(
+            "test".into(),
+            ConnectorComponent::Dataset(Arc::new(dataset)),
+        );
+
+        let result = builder.build(secrets).await;
+        assert!(result.is_ok());
+
+        let params = result.expect("failed to build connector params");
+        assert_eq!(
+            params.invalid_type_action,
+            Some(InvalidTypeAction::Ignore),
+            "Invalid type action should be properly set in connector params"
+        );
     }
 }

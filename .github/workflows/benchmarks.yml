@@ -202,6 +202,9 @@ jobs:
           - cmd: '-c spark'
             name: 'spark connector'
             bench: 'tpch'
+          - cmd: '-c spark -b tpcds'
+            name: 'spark connector'
+            bench: 'tpcds'
           - cmd: '-c postgres'
             name: 'postgres connector'
             bench: 'tpch'
@@ -307,12 +310,6 @@ jobs:
           - cmd: '-a duckdb -m file -b clickbench --zero-results use_source'
             name: 'duckdb accelerator on_zero_results (file mode)'
             bench: 'clickbench'
-          - cmd: '-c spark'
-            name: 'spark connector'
-            bench: 'tpch'
-          - cmd: '-c spark -b tpcds'
-            name: 'spark connector'
-            bench: 'tpcds'
 
     steps:
       - name: Checkout repository

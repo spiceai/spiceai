@@ -49,7 +49,6 @@ assignees: ''
   - [ ] [MSSQL Data Connector](https://github.com/spiceai/cookbook/blob/trunk/mssql/README.md)
   - [ ] [MySQL Data Connector](https://github.com/spiceai/cookbook/blob/trunk/mysql/connector/README.md)
   - [ ] [ODBC Data Connector](https://github.com/spiceai/cookbook/blob/trunk/odbc/README.md)
-  - [ ] [Planetscale Recipe](https://github.com/spiceai/cookbook/blob/trunk/mysql/planetscale/README.md)
   - [ ] [PostgreSQL Data Connector](https://github.com/spiceai/cookbook/blob/trunk/postgres/connector/README.md)
   - [ ] [S3 Data Connector](https://github.com/spiceai/cookbook/blob/trunk/s3/README.md)
   - [ ] [SharePoint Data Connector](https://github.com/spiceai/cookbook/blob/trunk/sharepoint/README.md)
@@ -70,9 +69,9 @@ assignees: ''
   - [ ] [Databricks Unity Catalog Connector](https://github.com/spiceai/cookbook/blob/trunk/catalogs/databricks/README.md)
   - [ ] [Spice.ai Cloud Platform Catalog Connector](https://github.com/spiceai/cookbook/blob/trunk/catalogs/spiceai/README.md)
   - [ ] [Unity Catalog Connector](https://github.com/spiceai/cookbook/blob/trunk/catalogs/unity_catalog/README.md)
+  - [ ] [Iceberg Catalog Connector](https://github.com/spiceai/cookbook/blob/trunk/catalogs/iceberg/README.md)
   - **AI/ML Models:**
   - [ ] [Searching GitHub files with Spice](https://github.com/spiceai/cookbook/tree/trunk/search_github_files)
-  - [ ] [Text-to-SQL (NSQL)](https://github.com/spiceai/cookbook/tree/trunk/nsql)
   - [ ] [Text-to-SQL (Tools)](https://github.com/spiceai/cookbook/tree/trunk/text-to-sql)
   - [ ] [Spice with Azure OpenAI](https://github.com/spiceai/cookbook/tree/trunk/azure_openai)
   - [ ] [OpenAI SDK](https://github.com/spiceai/cookbook/tree/trunk/openai_sdk)
