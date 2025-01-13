@@ -22,7 +22,7 @@ use arrow::{
 };
 use datafusion::execution::context::SessionContext;
 use datafusion_table_providers::{
-    postgres::DynPostgresConnectionPool, sql::sql_provider_datafusion::SqlTable,
+    postgres::DynPostgresConnectionPool, sql::sql_provider_datafusion::SqlTable, InvalidTypeAction,
 };
 
 use crate::{init_tracing, utils::test_request_context};
@@ -38,7 +38,7 @@ async fn test_postgres_types() -> Result<(), anyhow::Error> {
         let running_container = common::start_postgres_docker_container(port).await?;
 
         let ctx = SessionContext::new();
-        let pool = common::get_postgres_connection_pool(port).await?;
+        let pool = common::get_postgres_connection_pool(port, None).await?;
         let db_conn = pool
             .connect_direct()
             .await
@@ -122,7 +122,7 @@ async fn test_postgres_chunking_performance() -> Result<(), anyhow::Error> {
             let running_container = common::start_postgres_docker_container(port).await?;
 
             let ctx = SessionContext::new();
-            let pool = common::get_postgres_connection_pool(port).await?;
+            let pool = common::get_postgres_connection_pool(port, None).await?;
             let db_conn = pool
                 .connect_direct()
                 .await
@@ -178,6 +178,61 @@ CREATE TABLE test (
                 duration_ms < 2000,
                 "Duration {duration_ms}ms was higher than 2000ms",
             );
+
+            running_container.remove().await?;
+
+            Ok(())
+        })
+        .await
+}
+
+#[tokio::test]
+async fn test_postgres_invalid_type_action() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    test_request_context()
+        .scope(async {
+            let port = common::get_random_port();
+            let running_container = common::start_postgres_docker_container(port).await?;
+
+            let ctx = SessionContext::new();
+            let pool =
+                common::get_postgres_connection_pool(port, Some(InvalidTypeAction::Warn)).await?;
+            let db_conn = pool
+                .connect_direct()
+                .await
+                .expect("connection can be established");
+            db_conn
+                .conn
+                .execute(
+                    "
+CREATE TABLE test_jsonb (
+    id INTEGER PRIMARY KEY,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    metadata JSONB
+);",
+                    &[],
+                )
+                .await
+                .expect("table is created");
+
+            let sqltable_pool: Arc<DynPostgresConnectionPool> = Arc::new(pool);
+            let table = SqlTable::new("postgres", &sqltable_pool, "test_jsonb", None)
+                .await
+                .expect("table can be created");
+            ctx.register_table("test_datafusion", Arc::new(table))
+                .expect("Table should be registered");
+            let sql = "SELECT id, created_at FROM test_datafusion";
+            let df = ctx
+                .sql(sql)
+                .await
+                .expect("DataFrame can be created from query");
+            let record_batch = df.collect().await.expect("RecordBatch can be collected");
+            let num_rows = record_batch
+                .iter()
+                .map(arrow::array::RecordBatch::num_rows)
+                .sum::<usize>();
+            assert_eq!(num_rows, 0);
 
             running_container.remove().await?;
 
