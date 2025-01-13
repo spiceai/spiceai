@@ -30,7 +30,7 @@ All criteria must be met for the connector to be considered Beta, with exception
 | Spice.ai Cloud Platform          | ✅           | @phillipleblanc |
 | S3                               | ✅           | @Sevenannn      |
 | Azure BlobFS                     | ➖           |                 |
-| Spark                            | ➖           |                 |
+| Spark                            | ✅           | @ewgenius       |
 
 ## Beta Release Criteria
 
