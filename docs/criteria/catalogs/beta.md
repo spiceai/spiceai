@@ -6,12 +6,13 @@ All criteria must be met for the Catalog to be considered Beta, with exceptions 
 
 ## Beta Quality Catalogs
 
-| Catalog       | Beta Quality | DRI Sign-off |
-| ------------- | ------------ | ------------ |
-| Databricks    | ➖           |              |
-| Iceberg       | ➖           |              |
-| Spice.ai      | ➖           |              |
-| Unity Catalog | ➖           |              |
+| Catalog                          | Beta Quality | DRI Sign-off |
+| -------------------------------- | ------------ | ------------ |
+| Databricks (mode: delta_lake)    | ✅           | @Sevenannn   |
+| Databricks (mode: spark_connect) | ➖           |              |
+| Iceberg                          | ➖           |              |
+| Spice.ai                         | ➖           |              |
+| Unity Catalog                    | ➖           |              |
 
 ## Beta Release Criteria
 
