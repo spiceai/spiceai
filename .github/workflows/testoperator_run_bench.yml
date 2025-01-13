@@ -1,0 +1,151 @@
+name: benchmark e2e tests
+
+on:
+  workflow_dispatch:
+    inputs:
+      spiced_commit:
+        description: 'spiced build commit'
+        required: false
+        type: string
+      spicepod_path:
+        description: 'The spicepod file to test with'
+        required: true
+        type: string
+      query_set:
+        description: 'Query set'
+        required: true
+        default: 'tpch'
+        type: choice
+        options:
+          - 'tpch'
+          - 'tpcds'
+          - 'clickbench'
+      query_overrides:
+        description: 'Query overrides'
+        required: false
+        type: choice
+        default: ''
+        options:
+          - ''
+          - 'sqlite'
+          - 'postgresql'
+          - 'mysql'
+          - 'dremio'
+          - 'odbc-athena'
+          - 'duckdb'
+      ready_wait:
+        description: 'How long (in seconds) to wait for spiced to start'
+        required: true
+        default: '30'
+        type: string
+      runner_type:
+        description: 'Runner type'
+        required: true
+        default: 'spiceai-runners'
+        type: choice
+        options:
+          - 'spiceai-runners'
+          - 'spiceai-large-runners'
+
+jobs:
+  run-bench:
+    name: Run benchmark e2e tests
+    runs-on: ${{ github.event.inputs.runner_type }}
+    timeout-minutes: 600
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install MinIO
+        run: |
+          sudo apt update && sudo apt install wget -y
+          sudo wget https://dl.min.io/client/mc/release/linux-amd64/mc -O /usr/local/bin/mc
+          sudo chmod +x /usr/local/bin/mc
+          mc alias set spice-minio ${{ secrets.MINIO_ENDPOINT }} ${{ secrets.MINIO_ACCESS_KEY }} ${{ secrets.MINIO_SECRET_KEY }}
+
+      - name: Set testoperator commit
+        run: |
+          echo "TESTOPERATOR_COMMIT=$(git rev-parse HEAD)" >> $GITHUB_ENV
+
+      - name: Download the testoperator from MinIO if it exists
+        run: |
+          sudo mkdir -p /usr/local/bin
+          if mc stat spice-minio/artifacts/testoperator/linux-x86_64/$TESTOPERATOR_COMMIT/testoperator; then
+            mc cp spice-minio/artifacts/testoperator/linux-x86_64/$TESTOPERATOR_COMMIT/testoperator ./testoperator
+            sudo cp ./testoperator /usr/local/bin/testoperator
+            sudo chmod +x /usr/local/bin/testoperator
+            echo "TESTOPERATOR_DOWNLOADED=true" >> $GITHUB_ENV
+          else
+            echo "TESTOPERATOR_DOWNLOADED=false" >> $GITHUB_ENV
+          fi
+
+      - name: Setup Rust
+        if: ${{ env.TESTOPERATOR_DOWNLOADED != 'true' }}
+        uses: ./.github/actions/setup-rust
+        with:
+          os: 'linux'
+
+      - name: Setup cc
+        if: ${{ env.TESTOPERATOR_DOWNLOADED != 'true' }}
+        uses: ./.github/actions/setup-cc
+
+      - name: Get latest trunk commit
+        if: ${{ !github.event.inputs.spiced_commit }}
+        run: |
+          git fetch origin
+          echo "SPICED_COMMIT=$(git rev-parse origin/trunk)" >> $GITHUB_ENV
+
+      - name: Set SPICED_COMMIT from workflow input
+        if: ${{ github.event.inputs.spiced_commit }}
+        run: |
+          echo "SPICED_COMMIT=${{ github.event.inputs.spiced_commit }}" >> $GITHUB_ENV
+
+      - name: Download spiced from MinIO
+        run: |
+          mc cp spice-minio/artifacts/spiced/linux-x86_64/$SPICED_COMMIT/spiced_models_linux_x86_64.tar.gz spiced_models_linux_x86_64.tar.gz
+          tar -xzf spiced_models_linux_x86_64.tar.gz
+          sudo cp ./spiced /usr/local/bin/spiced
+
+      - name: Setup Testoperator
+        uses: ./.github/actions/setup-testoperator
+        with:
+          build_testoperator: ${{ env.TESTOPERATOR_DOWNLOADED != 'true' }}
+          query_set: ${{ github.event.inputs.query_set }}
+
+      - name: Run the benchmark test
+        if: ${{ github.event.inputs.query_overrides == '' }}
+        run: |
+          rm -rf .spice/data
+          testoperator run bench -s /usr/local/bin/spiced -p ${{ github.event.inputs.spicepod_path }} -d /opt/spiced/data --query-set ${{ github.event.inputs.query_set }} --ready-wait ${{ github.event.inputs.ready_wait }}
+        env:
+          S3_ENDPOINT: ${{ secrets.CLICKBENCH_S3_ENDPOINT}}
+          S3_KEY: ${{ secrets.CLICKBENCH_S3_KEY}}
+          S3_SECRET: ${{ secrets.CLICKBENCH_S3_SECRET}}
+          DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+          AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ secrets.AWS_DATABRICKS_DELTA_ACCESS_KEY_ID }}
+          AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ secrets.AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY }}
+          SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+          SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
+          SNOWFLAKE_USERNAME: ${{ secrets.SNOWFLAKE_USERNAME }}
+
+      - name: Run the benchmark test (with overrides)
+        if: ${{ github.event.inputs.query_overrides != '' }}
+        run: |
+          rm -rf .spice/data
+          testoperator run bench -s /usr/local/bin/spiced -p ${{ github.event.inputs.spicepod_path }} -d /opt/spiced/data --query-set ${{ github.event.inputs.query_set }} --query-overrides ${{ github.event.inputs.query_overrides }} --ready-wait ${{ github.event.inputs.ready_wait }}
+        env:
+          S3_ENDPOINT: ${{ secrets.CLICKBENCH_S3_ENDPOINT}}
+          S3_KEY: ${{ secrets.CLICKBENCH_S3_KEY}}
+          S3_SECRET: ${{ secrets.CLICKBENCH_S3_SECRET}}
+          DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+          AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ secrets.AWS_DATABRICKS_DELTA_ACCESS_KEY_ID }}
+          AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ secrets.AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY }}
+          SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+          SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
+          SNOWFLAKE_USERNAME: ${{ secrets.SNOWFLAKE_USERNAME }}
+
+      - name: Upload the testoperator binary
+        if: ${{ env.TESTOPERATOR_DOWNLOADED != 'true' }}
+        run: |
+          mc cp /usr/local/bin/testoperator spice-minio/artifacts/testoperator/linux-x86_64/$TESTOPERATOR_COMMIT/testoperator
