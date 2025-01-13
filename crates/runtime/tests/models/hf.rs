@@ -188,7 +188,7 @@ mod search {
 
         test_request_context()
             .scope(async {
-                let mut ds_tpcds_item = get_tpcds_dataset("item", None);
+                let mut ds_tpcds_item = get_tpcds_dataset("item", None, None);
                 ds_tpcds_item.embeddings = vec![ColumnEmbeddingConfig {
                     column: "i_item_desc".to_string(),
                     model: "hf_minilm".to_string(),
@@ -197,7 +197,7 @@ mod search {
                 }];
 
                 let mut ds_tpcds_cp_with_chunking =
-                    get_tpcds_dataset("catalog_page", Some("catalog_page_with_chunking"));
+                    get_tpcds_dataset("catalog_page", Some("catalog_page_with_chunking"), Some("select cp_description, cp_catalog_page_sk from catalog_page_with_chunking limit 20"));
                 ds_tpcds_cp_with_chunking.embeddings = vec![ColumnEmbeddingConfig {
                     column: "cp_description".to_string(),
                     model: "hf_minilm".to_string(),

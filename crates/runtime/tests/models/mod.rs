@@ -188,7 +188,11 @@ fn get_taxi_trips_dataset() -> Dataset {
     dataset
 }
 
-fn get_tpcds_dataset(ds_name: &str, spice_name: Option<&str>) -> Dataset {
+fn get_tpcds_dataset(
+    ds_name: &str,
+    spice_name: Option<&str>,
+    refresh_sql: Option<&str>,
+) -> Dataset {
     let mut dataset = Dataset::new(
         format!("s3://spiceai-public-datasets/tpcds/{ds_name}/"),
         spice_name.unwrap_or(ds_name),
@@ -203,10 +207,14 @@ fn get_tpcds_dataset(ds_name: &str, spice_name: Option<&str>) -> Dataset {
     ));
     dataset.acceleration = Some(Acceleration {
         enabled: true,
-        refresh_sql: Some(format!(
-            "SELECT * FROM {} LIMIT 20",
-            spice_name.unwrap_or(ds_name)
-        )),
+        refresh_sql: Some(
+            refresh_sql
+                .unwrap_or(&format!(
+                    "SELECT * FROM {} LIMIT 20",
+                    spice_name.unwrap_or(ds_name)
+                ))
+                .to_string(),
+        ),
         ..Default::default()
     });
     dataset

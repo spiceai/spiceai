@@ -596,7 +596,7 @@ impl TableProvider for EmbeddingTable {
 /// Ensures that for each column with embeddings (`col_name`), the `LogicalPlan::Projection` node
 /// includes the associated Spice internal columns (`col_name_embeddings`, `col_name_offset`).
 /// If any required columns are missing, they are automatically added to the projection.
-pub fn include_embeddings_internal_columns(
+pub(crate) fn include_embeddings_internal_columns(
     plan: LogicalPlan,
     table: &EmbeddingTable,
 ) -> DataFusionResult<LogicalPlan> {
