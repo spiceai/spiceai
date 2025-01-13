@@ -17,7 +17,7 @@ limitations under the License.
 use std::{collections::HashMap, fmt::Display, sync::Arc};
 
 use app::App;
-use arrow::array::{RecordBatch, StringArray, StringViewArray};
+use arrow::array::{LargeStringArray, RecordBatch, StringArray, StringViewArray};
 use arrow::error::ArrowError;
 use arrow::util::pretty::pretty_format_batches;
 use arrow_schema::{Schema, SchemaRef};
@@ -40,8 +40,8 @@ use tracing::{Instrument, Span};
 use crate::accelerated_table::AcceleratedTable;
 use crate::datafusion::query::write_to_json_string;
 use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
+use crate::{convert_string_arrow_to_iterator, embedding_col, offset_col};
 use crate::{datafusion::DataFusion, model::EmbeddingModelStore};
-use crate::{embedding_col, offset_col};
 
 use super::table::EmbeddingTable;
 use snafu::prelude::*;
@@ -352,19 +352,9 @@ impl VectorSearchTableResult {
         let result = embedding_records
             .iter()
             .flat_map(|v| {
-                let embedded_column = v.column(0);
-                if let Some(col) = embedded_column.as_any().downcast_ref::<StringArray>() {
-                    col.iter()
-                        .map(|v| v.unwrap_or_default().to_string())
-                        .collect::<Vec<String>>()
-                } else if let Some(col) = embedded_column.as_any().downcast_ref::<StringViewArray>()
-                {
-                    col.iter()
-                        .map(|v| v.unwrap_or_default().to_string())
-                        .collect::<Vec<String>>()
-                } else {
-                    vec![]
-                }
+                convert_string_arrow_to_iterator!(v.column(0))
+                    .map(|v| v.map(|vv| vv.unwrap_or_default().to_string()).collect_vec())
+                    .unwrap_or_default()
             })
             .collect();
 
@@ -383,7 +373,6 @@ impl VectorSearchTableResult {
         if self.data.first().is_none_or(|d| d.num_rows() == 0) {
             return Ok(vec![]);
         }
-
         let primary_keys_json = self.primary_keys_json()?;
         let additional_columns_json = self.addition_columns_json()?;
         let values = self.embedding_columns_list()?;
@@ -476,7 +465,6 @@ pub fn to_matches_sorted(result: &VectorSearchResult, limit: usize) -> Result<Ve
     });
 
     matches.truncate(limit);
-
     Ok(matches)
 }
 

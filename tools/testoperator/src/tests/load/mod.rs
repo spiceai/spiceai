@@ -22,7 +22,7 @@ use test_framework::{
     metrics::{MetricCollector, StatisticsCollector},
     queries::{QueryOverrides, QuerySet},
     spiced::SpicedInstance,
-    throughput::{EndCondition, ThroughputTest},
+    spicetest::{EndCondition, SpiceTest},
 };
 
 pub(crate) fn export(args: &TestArgs) -> anyhow::Result<()> {
@@ -53,7 +53,7 @@ pub(crate) async fn run(args: &TestArgs) -> anyhow::Result<()> {
 
     // baseline run
     println!("Running baseline throughput test");
-    let baseline_test = ThroughputTest::new(app.name.clone(), spiced_instance)
+    let baseline_test = SpiceTest::new(app.name.clone(), spiced_instance)
         .with_query_set(queries.clone())
         .with_parallel_count(args.concurrency.unwrap_or(8))
         .with_end_condition(EndCondition::QuerySetCompleted(2))
@@ -70,7 +70,7 @@ pub(crate) async fn run(args: &TestArgs) -> anyhow::Result<()> {
 
     // load test
     println!("Running load test");
-    let throughput_test = ThroughputTest::new(app.name.clone(), spiced_instance)
+    let throughput_test = SpiceTest::new(app.name.clone(), spiced_instance)
         .with_query_set(queries.clone())
         .with_parallel_count(args.concurrency.unwrap_or(8))
         .with_end_condition(EndCondition::Duration(Duration::from_secs(

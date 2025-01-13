@@ -19,6 +19,7 @@ use test_framework::{
     anyhow, app::App, spiced::StartRequest, spicepod::Spicepod, spicepod_utils::from_app,
 };
 
+pub(crate) mod bench;
 pub(crate) mod load;
 pub(crate) mod throughput;
 

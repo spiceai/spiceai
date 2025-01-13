@@ -26,20 +26,20 @@ use tokio::task::JoinHandle;
 
 use super::EndCondition;
 
-pub(crate) struct ThroughputQueryWorker {
+pub(crate) struct SpiceTestQueryWorker {
     id: usize,
     query_set: Vec<(&'static str, &'static str)>,
     end_condition: EndCondition,
     flight_client: FlightClient,
 }
 
-pub struct ThroughputQueryWorkerResult {
+pub struct SpiceTestQueryWorkerResult {
     pub query_durations: BTreeMap<String, Vec<Duration>>,
     pub connection_failed: bool,
     pub row_counts: BTreeMap<String, usize>,
 }
 
-impl ThroughputQueryWorkerResult {
+impl SpiceTestQueryWorkerResult {
     pub fn new(
         query_durations: BTreeMap<String, Vec<Duration>>,
         connection_failed: bool,
@@ -53,7 +53,7 @@ impl ThroughputQueryWorkerResult {
     }
 }
 
-impl ThroughputQueryWorker {
+impl SpiceTestQueryWorker {
     pub fn new(
         id: usize,
         query_set: Vec<(&'static str, &'static str)>,
@@ -68,7 +68,7 @@ impl ThroughputQueryWorker {
         }
     }
 
-    pub fn start(self) -> JoinHandle<Result<ThroughputQueryWorkerResult>> {
+    pub fn start(self) -> JoinHandle<Result<SpiceTestQueryWorkerResult>> {
         tokio::spawn(async move {
             let mut query_durations: BTreeMap<String, Vec<Duration>> = BTreeMap::new();
             let mut row_counts: BTreeMap<String, usize> = BTreeMap::new();
@@ -77,6 +77,7 @@ impl ThroughputQueryWorker {
 
             while !self.end_condition.is_met(&start, query_set_count) {
                 'query_set: for query in &self.query_set {
+                    eprintln!("Running: Worker {} - Query '{}'", self.id, query.0,);
                     let mut row_count = 0;
                     let query_start = Instant::now();
                     match self.flight_client.query(query.1).await {
@@ -112,7 +113,7 @@ impl ThroughputQueryWorker {
                                     "FAIL - EARLY EXIT - Worker {} - Query '{}' failed: {}",
                                     self.id, query.0, e
                                 );
-                                return Ok(ThroughputQueryWorkerResult::new(
+                                return Ok(SpiceTestQueryWorkerResult::new(
                                     query_durations,
                                     true,
                                     row_counts,
@@ -130,7 +131,7 @@ impl ThroughputQueryWorker {
                 }
                 query_set_count += 1;
             }
-            Ok(ThroughputQueryWorkerResult::new(
+            Ok(SpiceTestQueryWorkerResult::new(
                 query_durations,
                 false,
                 row_counts,

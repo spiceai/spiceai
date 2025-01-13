@@ -27,7 +27,7 @@ use app::spicepod::component::runtime::{Runtime as SpicepodRuntime, TelemetryCon
 use app::{App, AppBuilder};
 use clap::{ArgAction, Parser};
 use flightrepl::ReplConfig;
-use opentelemetry::global;
+use opentelemetry::{global, KeyValue};
 use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
 use opentelemetry_sdk::runtime::Tokio;
 use opentelemetry_sdk::Resource;
@@ -306,9 +306,23 @@ async fn start_anonymous_telemetry(
     let explicitly_disabled = args.telemetry_enabled == Some(false)
         || spicepod_telemetry_config.is_some_and(|c| !c.enabled);
 
+    let telemetry_properties = match spicepod_telemetry_config {
+        Some(config) => config
+            .properties
+            .clone()
+            .into_iter()
+            .map(|(k, v)| KeyValue::new(k, v))
+            .collect(),
+        None => Vec::new(),
+    };
+
     if !explicitly_disabled {
         #[cfg(feature = "anonymous_telemetry")]
-        telemetry::anonymous::start(spicepod_name.map_or_else(|| "unknown", String::as_str)).await;
+        telemetry::anonymous::start(
+            spicepod_name.map_or_else(|| "unknown", String::as_str),
+            telemetry_properties,
+        )
+        .await;
     }
 }
 

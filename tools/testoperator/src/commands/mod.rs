@@ -32,6 +32,7 @@ pub enum Commands {
 pub enum TestCommands {
     Throughput(TestArgs),
     Load(TestArgs),
+    Bench(TestArgs),
 }
 
 #[derive(Parser)]
@@ -86,6 +87,7 @@ pub enum QueryOverridesArg {
     Spark,
     ODBCAthena,
     Duckdb,
+    Snowflake,
 }
 
 impl From<QuerySetArg> for QuerySet {
@@ -108,6 +110,7 @@ impl From<QueryOverridesArg> for QueryOverrides {
             QueryOverridesArg::Spark => QueryOverrides::Spark,
             QueryOverridesArg::ODBCAthena => QueryOverrides::ODBCAthena,
             QueryOverridesArg::Duckdb => QueryOverrides::DuckDB,
+            QueryOverridesArg::Snowflake => QueryOverrides::Snowflake,
         }
     }
 }

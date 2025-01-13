@@ -101,8 +101,8 @@ Spice simplifies building data-driven AI applications and agents by making it fa
 | **Caching**                   | ✅ (Query and results caching)       | Limited            | ―          | ―                | ―                             |
 | **Embeddings**                | ✅ (Built-in & pluggable models/DBs) | ✅                 | ✅         | Limited          | ―                             |
 
-✅ = Fully supported  
-❌ = Not supported  
+✅ = Fully supported
+❌ = Not supported
 Limited = Partial or restricted support
 
 ## Example Use-Cases
@@ -145,23 +145,23 @@ See more demos on [YouTube](https://www.youtube.com/playlist?list=PLesJrUXEx3U9a
 | Name                               | Description                           | Status            | Protocol/Format              |
 | ---------------------------------- | ------------------------------------- | ----------------- | ---------------------------- |
 | `github`                           | GitHub                                | Stable            | GitHub API                   |
+| `file`                             | File                                  | Stable            | Parquet, CSV                 |
 | `s3`                               | [S3][s3]                              | Release Candidate | Parquet, CSV                 |
 | `postgres`                         | PostgreSQL                            | Release Candidate |                              |
 | `mysql`                            | MySQL                                 | Release Candidate |                              |
 | `duckdb`                           | DuckDB                                | Release Candidate | Embedded                     |
 | `graphql`                          | GraphQL                               | Release Candidate | JSON                         |
 | `databricks (mode: delta_lake)`    | [Databricks][databricks]              | Release Candidate | S3/Delta Lake                |
-| `file`                             | File                                  | Release Candidate | Parquet, CSV                 |
 | `dremio`                           | [Dremio][dremio]                      | Release Candidate | Arrow Flight                 |
-| `iceberg`                          | [Apache Iceberg][iceberg]             | Alpha             | Parquet                      |
 | `delta_lake`                       | Delta Lake                            | Beta              | Delta Lake                   |
 | `mssql`                            | Microsoft SQL Server                  | Beta              | Tabular Data Stream (TDS)    |
 | `flightsql`                        | FlightSQL                             | Beta              | Arrow Flight SQL             |
-| `spiceai`                          | [Spice.ai][spiceai]                   | Beta              | Arrow Flight                 |
+| `spice.ai`                         | [Spice.ai][spiceai]                   | Beta              | Arrow Flight                 |
 | `odbc`                             | ODBC                                  | Beta              | ODBC                         |
 | `databricks (mode: spark_connect)` | [Databricks][databricks]              | Beta              | [Spark Connect][spark]       |
+| `snowflake`                        | Snowflake                             | Beta              | Arrow                        |
+| `iceberg`                          | [Apache Iceberg][iceberg]             | Alpha             | Parquet                      |
 | `clickhouse`                       | Clickhouse                            | Alpha             |                              |
-| `snowflake`                        | Snowflake                             | Alpha             | Arrow                        |
 | `debezium`                         | Debezium CDC                          | Alpha             | Kafka + JSON                 |
 | `abfs`                             | Azure BlobFS                          | Alpha             | Parquet, CSV                 |
 | `spark`                            | Spark                                 | Alpha             | [Spark Connect][spark]       |
@@ -215,6 +215,7 @@ Catalog Connectors connect to external catalog providers and make their tables a
 | `databricks`    | Databricks              | Alpha       | Spark Connect, S3/Delta Lake |
 | `unity_catalog` | Unity Catalog           | Alpha       | Delta Lake                   |
 | `spice.ai`      | Spice.ai Cloud Platform | Alpha       | Arrow Flight                 |
+| `iceberg`       | Apache Iceberg          | Alpha       | Parquet                      |
 | `glue`          | AWS Glue                | Coming Soon | JSON, Parquet, Iceberg       |
 
 ## ⚡️ Quickstart (Local Machine)
@@ -386,10 +387,10 @@ Access ready-to-use Spicepods and datasets hosted on the Spice.ai Cloud Platform
 
 To use public datasets, create a free account on Spice.ai:
 
-1. Visit [spice.ai](https://spice.ai/) and click **Try for Free**.  
+1. Visit [spice.ai](https://spice.ai/) and click **Try for Free**.
    ![Try for Free](https://github.com/spiceai/spiceai/assets/112157037/27fb47ed-4825-4fa8-94bd-48197406cfaa)
 
-2. After creating an account, create an app to generate an API key.  
+2. After creating an account, create an app to generate an API key.
    ![Create App](https://github.com/spiceai/spiceai/assets/112157037/d2446406-1f06-40fb-8373-1b6d692cb5f7)
 
 Once set up, you can access ready-to-use Spicepods including datasets. For this demonstration, use the `taxi_trips` dataset from the [Spice.ai Quickstart](https://spice.ai/spiceai/quickstart).

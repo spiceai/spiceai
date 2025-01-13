@@ -1,0 +1,33 @@
+version: v1
+kind: Spicepod
+name: snowflake_tpch_sf100
+datasets:
+  - from: snowflake:SNOWFLAKE_SAMPLE_DATA.TPCH_SF100.CUSTOMER
+    name: customer
+    params: &snowflake_params
+      snowflake_warehouse: COMPUTE_WH
+      snowflake_role: accountadmin
+      snowflake_account: ${secrets:snowflake_account}
+      snowflake_password: ${secrets:snowflake_password}
+      snowflake_username: ${secrets:snowflake_username}
+  - from: snowflake:SNOWFLAKE_SAMPLE_DATA.TPCH_SF100.LINEITEM
+    name: lineitem
+    params: *snowflake_params
+  - from: snowflake:SNOWFLAKE_SAMPLE_DATA.TPCH_SF100.NATION
+    name: nation
+    params: *snowflake_params
+  - from: snowflake:SNOWFLAKE_SAMPLE_DATA.TPCH_SF100.ORDERS
+    name: orders
+    params: *snowflake_params
+  - from: snowflake:SNOWFLAKE_SAMPLE_DATA.TPCH_SF100.PART
+    name: part
+    params: *snowflake_params
+  - from: snowflake:SNOWFLAKE_SAMPLE_DATA.TPCH_SF100.PARTSUPP
+    name: partsupp
+    params: *snowflake_params
+  - from: snowflake:SNOWFLAKE_SAMPLE_DATA.TPCH_SF100.REGION
+    name: region
+    params: *snowflake_params
+  - from: snowflake:SNOWFLAKE_SAMPLE_DATA.TPCH_SF100.SUPPLIER
+    name: supplier
+    params: *snowflake_params
