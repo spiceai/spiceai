@@ -3067,6 +3067,7 @@ dependencies = [
  "iceberg",
  "iceberg-catalog-rest",
  "iceberg-datafusion",
+ "indexmap 2.7.0",
  "itertools 0.13.0",
  "object_store",
  "rdkafka",

@@ -86,6 +86,7 @@ http = "1.1.0"
 iceberg = "0.4.0"
 iceberg-catalog-rest = "0.4.0"
 iceberg-datafusion = "0.4.0"
+indexmap = "2.7.0"
 insta = { version = "1.41.1", features = ["filters"] }
 itertools = "0.13"
 mysql_async = { version = "0.34.1", features = ["native-tls-tls", "chrono"] }

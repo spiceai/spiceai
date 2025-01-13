@@ -43,11 +43,19 @@ on:
         required: true
         default: '30'
         type: string
+      runner_type:
+        description: 'Runner type'
+        required: true
+        default: 'spiceai-runners'
+        type: choice
+        options:
+          - 'spiceai-runners'
+          - 'spiceai-large-runners'
 
 jobs:
   run-load:
     name: Run load test
-    runs-on: spiceai-runners
+    runs-on: ${{ github.event.inputs.runner_type }}
     timeout-minutes: 600
     steps:
       - uses: actions/checkout@v4
@@ -80,7 +88,7 @@ jobs:
         uses: ./.github/actions/setup-rust
         with:
           os: 'linux'
-      
+
       - name: Setup cc
         if: ${{ env.TESTOPERATOR_DOWNLOADED != 'true' }}
         uses: ./.github/actions/setup-cc
@@ -90,12 +98,12 @@ jobs:
         run: |
           git fetch origin
           echo "SPICED_COMMIT=$(git rev-parse origin/trunk)" >> $GITHUB_ENV
-      
+
       - name: Set SPICED_COMMIT from workflow input
         if: ${{ github.event.inputs.spiced_commit }}
         run: |
           echo "SPICED_COMMIT=${{ github.event.inputs.spiced_commit }}" >> $GITHUB_ENV
-      
+
       - name: Download spiced from MinIO
         run: |
           mc cp spice-minio/artifacts/spiced/linux-x86_64/$SPICED_COMMIT/spiced_models_linux_x86_64.tar.gz spiced_models_linux_x86_64.tar.gz
@@ -107,7 +115,7 @@ jobs:
         with:
           build_testoperator: ${{ env.TESTOPERATOR_DOWNLOADED != 'true' }}
           query_set: ${{ github.event.inputs.query_set }}
-      
+
       - name: Run the load test
         if: ${{ github.event.inputs.query_overrides == '' }}
         run: |
@@ -121,7 +129,7 @@ jobs:
           DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
           AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ secrets.AWS_DATABRICKS_DELTA_ACCESS_KEY_ID }}
           AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ secrets.AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY }}
-      
+
       - name: Run the load test (with overrides)
         if: ${{ github.event.inputs.query_overrides != '' }}
         run: |
@@ -135,7 +143,7 @@ jobs:
           DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
           AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ secrets.AWS_DATABRICKS_DELTA_ACCESS_KEY_ID }}
           AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ secrets.AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY }}
-          
+
       - name: Upload the testoperator binary
         if: ${{ env.TESTOPERATOR_DOWNLOADED != 'true' }}
         run: |
