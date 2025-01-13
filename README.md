@@ -215,6 +215,7 @@ Catalog Connectors connect to external catalog providers and make their tables a
 | `databricks`    | Databricks              | Alpha       | Spark Connect, S3/Delta Lake |
 | `unity_catalog` | Unity Catalog           | Alpha       | Delta Lake                   |
 | `spice.ai`      | Spice.ai Cloud Platform | Alpha       | Arrow Flight                 |
+| `iceberg`       | Apache Iceberg          | Alpha       | Parquet                      |
 | `glue`          | AWS Glue                | Coming Soon | JSON, Parquet, Iceberg       |
 
 ## ⚡️ Quickstart (Local Machine)
