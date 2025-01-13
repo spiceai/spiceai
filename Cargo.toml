@@ -147,7 +147,7 @@ tracing = "0.1.41"
 tracing-futures = { version = "0.2.5", features = ["futures-03"] }
 tracing-opentelemetry = "0.28"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
-uuid = "1.9.1"
+uuid = "1.11.1"
 x509-certificate = "0.23.1"
 
 

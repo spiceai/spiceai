@@ -254,7 +254,7 @@ dependencies = [
  "strum_macros 0.26.4",
  "thiserror 1.0.69",
  "typed-builder 0.19.1",
- "uuid 1.11.0",
+ "uuid 1.11.1",
 ]
 
 [[package]]
@@ -592,7 +592,7 @@ dependencies = [
  "clickhouse-rs",
  "datafusion-table-providers",
  "snafu",
- "uuid 1.11.0",
+ "uuid 1.11.1",
 ]
 
 [[package]]
@@ -1083,7 +1083,7 @@ dependencies = [
  "percent-encoding",
  "pin-project-lite",
  "tracing",
- "uuid 1.11.0",
+ "uuid 1.11.1",
 ]
 
 [[package]]
@@ -1486,7 +1486,7 @@ dependencies = [
  "time",
  "tracing",
  "url",
- "uuid 1.11.0",
+ "uuid 1.11.1",
 ]
 
 [[package]]
@@ -1505,7 +1505,7 @@ dependencies = [
  "time",
  "tracing",
  "url",
- "uuid 1.11.0",
+ "uuid 1.11.1",
 ]
 
 [[package]]
@@ -1526,7 +1526,7 @@ dependencies = [
  "time",
  "tracing",
  "url",
- "uuid 1.11.0",
+ "uuid 1.11.1",
 ]
 
 [[package]]
@@ -2573,7 +2573,7 @@ dependencies = [
  "tokio",
  "tokio-native-tls",
  "url",
- "uuid 1.11.0",
+ "uuid 1.11.1",
 ]
 
 [[package]]
@@ -3088,7 +3088,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
- "uuid 1.11.0",
+ "uuid 1.11.1",
 ]
 
 [[package]]
@@ -3142,7 +3142,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "url",
- "uuid 1.11.0",
+ "uuid 1.11.1",
  "xz2",
  "zstd",
 ]
@@ -3296,7 +3296,7 @@ dependencies = [
  "regex",
  "sha2",
  "unicode-segmentation",
- "uuid 1.11.0",
+ "uuid 1.11.1",
 ]
 
 [[package]]
@@ -3559,7 +3559,7 @@ dependencies = [
  "tracing",
  "trust-dns-resolver",
  "url",
- "uuid 1.11.0",
+ "uuid 1.11.1",
 ]
 
 [[package]]
@@ -3635,7 +3635,7 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
- "uuid 1.11.0",
+ "uuid 1.11.1",
  "visibility",
  "z85",
 ]
@@ -4976,7 +4976,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "url",
- "uuid 1.11.0",
+ "uuid 1.11.1",
  "x509-parser",
 ]
 
@@ -5030,7 +5030,7 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
- "uuid 1.11.0",
+ "uuid 1.11.1",
 ]
 
 [[package]]
@@ -5226,7 +5226,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "url",
- "uuid 1.11.0",
+ "uuid 1.11.1",
  "whoami",
 ]
 
@@ -5714,7 +5714,7 @@ dependencies = [
  "tokio",
  "typed-builder 0.20.0",
  "url",
- "uuid 1.11.0",
+ "uuid 1.11.1",
  "zstd",
 ]
 
@@ -5735,7 +5735,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "typed-builder 0.20.0",
- "uuid 1.11.0",
+ "uuid 1.11.1",
 ]
 
 [[package]]
@@ -7136,7 +7136,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "ureq",
- "uuid 1.11.0",
+ "uuid 1.11.1",
  "variantly",
  "vob",
 ]
@@ -7225,7 +7225,7 @@ dependencies = [
  "tagptr",
  "thiserror 1.0.69",
  "triomphe",
- "uuid 1.11.0",
+ "uuid 1.11.1",
 ]
 
 [[package]]
@@ -7363,7 +7363,7 @@ dependencies = [
  "subprocess",
  "thiserror 1.0.69",
  "time",
- "uuid 1.11.0",
+ "uuid 1.11.1",
  "zstd",
 ]
 
@@ -8037,7 +8037,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
- "uuid 1.11.0",
+ "uuid 1.11.1",
 ]
 
 [[package]]
@@ -8710,7 +8710,7 @@ dependencies = [
  "postgres-protocol",
  "serde",
  "serde_json",
- "uuid 1.11.0",
+ "uuid 1.11.1",
 ]
 
 [[package]]
@@ -9707,7 +9707,7 @@ dependencies = [
  "rkyv_derive",
  "seahash",
  "tinyvec",
- "uuid 1.11.0",
+ "uuid 1.11.1",
 ]
 
 [[package]]
@@ -9895,7 +9895,7 @@ dependencies = [
  "util",
  "utoipa",
  "utoipa-swagger-ui",
- "uuid 1.11.0",
+ "uuid 1.11.1",
  "winver",
  "x509-certificate",
 ]
@@ -10786,7 +10786,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "url",
- "uuid 1.11.0",
+ "uuid 1.11.1",
 ]
 
 [[package]]
@@ -10842,7 +10842,7 @@ dependencies = [
  "tonic",
  "tonic-build",
  "url",
- "uuid 1.11.0",
+ "uuid 1.11.1",
 ]
 
 [[package]]
@@ -11399,7 +11399,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tonic",
- "uuid 1.11.0",
+ "uuid 1.11.1",
 ]
 
 [[package]]
@@ -11580,7 +11580,7 @@ dependencies = [
  "tokio-rustls 0.24.1",
  "tokio-util",
  "tracing",
- "uuid 1.11.0",
+ "uuid 1.11.1",
 ]
 
 [[package]]
@@ -12737,9 +12737,9 @@ dependencies = [
 
 [[package]]
 name = "uuid"
-version = "1.11.0"
+version = "1.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f8c5f0a0af699448548ad1a2fbf920fb4bee257eae39953ba95cb84891a0446a"
+checksum = "b913a3b5fe84142e269d63cc62b64319ccaf89b748fc31fe025177f767a756c4"
 dependencies = [
  "getrandom 0.2.15",
  "rand 0.8.5",
