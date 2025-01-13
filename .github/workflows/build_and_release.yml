@@ -415,14 +415,18 @@ jobs:
           sudo chmod +x /usr/local/bin/mc
           mc alias set spice-minio ${{ env.MINIO_ENDPOINT }} ${{ env.MINIO_ACCESS_KEY }} ${{ env.MINIO_SECRET_KEY }}
 
-          # If 'spiced_linux_x86_64.tar.gz' exists, assume all other standard artifacts exist.
           if [ -f "${ARTIFACT_DIR}/spiced_linux_x86_64.tar.gz" ]; then
             mc cp ${{ env.ARTIFACT_DIR }}/spiced_linux_x86_64.tar.gz spice-minio/artifacts/spiced/linux-x86_64/${{ env.COMMIT_SHA }}/
+          fi;
+
+          if [ -f "${ARTIFACT_DIR}/spiced_models_linux_x86_64.tar.gz" ]; then
             mc cp ${{ env.ARTIFACT_DIR }}/spiced_models_linux_x86_64.tar.gz spice-minio/artifacts/spiced/linux-x86_64/${{ env.COMMIT_SHA }}/
+          fi;
+
+          if [ -f "${ARTIFACT_DIR}/spice_linux_x86_64.tar.gz" ]; then
             mc cp ${{ env.ARTIFACT_DIR }}/spice_linux_x86_64.tar.gz spice-minio/artifacts/spice/linux-x86_64/${{ env.COMMIT_SHA }}/
           fi;
 
-          # Upload CUDA models if they exist
           if [ -f "${ARTIFACT_DIR}/spiced_models_cuda_linux_x86_64.tar.gz" ]; then
             mc cp ${{ env.ARTIFACT_DIR }}/spiced_models_cuda_linux_x86_64.tar.gz spice-minio/artifacts/spiced/linux-x86_64/${{ env.COMMIT_SHA }}/
           fi
