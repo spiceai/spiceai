@@ -10,7 +10,7 @@ expression: normalize_search_response(response)
       "primary_key": {
         "cp_catalog_page_sk": 1
       },
-      "score": "0.6891",
+      "score": "0.6892",
       "value": "In general basic characters welcome. Clearly lively friends con"
     }
   ]
