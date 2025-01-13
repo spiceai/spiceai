@@ -153,15 +153,15 @@ See more demos on [YouTube](https://www.youtube.com/playlist?list=PLesJrUXEx3U9a
 | `databricks (mode: delta_lake)`    | [Databricks][databricks]              | Release Candidate | S3/Delta Lake                |
 | `file`                             | File                                  | Release Candidate | Parquet, CSV                 |
 | `dremio`                           | [Dremio][dremio]                      | Release Candidate | Arrow Flight                 |
-| `iceberg`                          | [Apache Iceberg][iceberg]             | Alpha             | Parquet                      |
 | `delta_lake`                       | Delta Lake                            | Beta              | Delta Lake                   |
 | `mssql`                            | Microsoft SQL Server                  | Beta              | Tabular Data Stream (TDS)    |
 | `flightsql`                        | FlightSQL                             | Beta              | Arrow Flight SQL             |
 | `spiceai`                          | [Spice.ai][spiceai]                   | Beta              | Arrow Flight                 |
 | `odbc`                             | ODBC                                  | Beta              | ODBC                         |
 | `databricks (mode: spark_connect)` | [Databricks][databricks]              | Beta              | [Spark Connect][spark]       |
+| `snowflake`                        | Snowflake                             | Beta              | Arrow                        |
+| `iceberg`                          | [Apache Iceberg][iceberg]             | Alpha             | Parquet                      |
 | `clickhouse`                       | Clickhouse                            | Alpha             |                              |
-| `snowflake`                        | Snowflake                             | Alpha             | Arrow                        |
 | `debezium`                         | Debezium CDC                          | Alpha             | Kafka + JSON                 |
 | `abfs`                             | Azure BlobFS                          | Alpha             | Parquet, CSV                 |
 | `spark`                            | Spark                                 | Alpha             | [Spark Connect][spark]       |
