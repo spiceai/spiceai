@@ -1,0 +1,79 @@
+version: v1
+kind: Spicepod
+name: dremio_tpcds
+datasets:
+  - from: dremio:tpcds.call_center
+    name: call_center
+    params: &dremio_params
+      dremio_endpoint: ${secrets:DREMIO_ENDPOINT}
+      dremio_username: ${secrets:DREMIO_USERNAME}
+      dremio_password: ${secrets:DREMIO_PASSWORD}
+  - from: dremio:tpcds.catalog_page
+    name: catalog_page
+    params: *dremio_params
+  - from: dremio:tpcds.catalog_returns
+    name: catalog_returns
+    params: *dremio_params
+  - from: dremio:tpcds.catalog_sales
+    name: catalog_sales
+    params: *dremio_params
+  - from: dremio:tpcds.customer
+    name: customer
+    params: *dremio_params
+  - from: dremio:tpcds.customer_address
+    name: customer_address
+    params: *dremio_params
+  - from: dremio:tpcds.customer_demographics
+    name: customer_demographics
+    params: *dremio_params
+  - from: dremio:tpcds.date_dim
+    name: date_dim
+    params: *dremio_params
+  - from: dremio:tpcds.household_demographics
+    name: household_demographics
+    params: *dremio_params
+  - from: dremio:tpcds.income_band
+    name: income_band
+    params: *dremio_params
+  - from: dremio:tpcds.inventory
+    name: inventory
+    params: *dremio_params
+  - from: dremio:tpcds.item
+    name: item
+    params: *dremio_params
+  - from: dremio:tpcds.promotion
+    name: promotion
+    params: *dremio_params
+  - from: dremio:tpcds.reason
+    name: reason
+    params: *dremio_params
+  - from: dremio:tpcds.ship_mode
+    name: ship_mode
+    params: *dremio_params
+  - from: dremio:tpcds.store
+    name: store
+    params: *dremio_params
+  - from: dremio:tpcds.store_returns
+    name: store_returns
+    params: *dremio_params
+  - from: dremio:tpcds.store_sales
+    name: store_sales
+    params: *dremio_params
+  - from: dremio:tpcds.time_dim
+    name: time_dim
+    params: *dremio_params
+  - from: dremio:tpcds.warehouse
+    name: warehouse
+    params: *dremio_params
+  - from: dremio:tpcds.web_page
+    name: web_page
+    params: *dremio_params
+  - from: dremio:tpcds.web_returns
+    name: web_returns
+    params: *dremio_params
+  - from: dremio:tpcds.web_sales
+    name: web_sales
+    params: *dremio_params
+  - from: dremio:tpcds.web_site
+    name: web_site
+    params: *dremio_params
