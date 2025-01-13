@@ -21,10 +21,11 @@ use arrow::datatypes::{DataType, Schema, SchemaRef};
 use arrow_schema::Field;
 use async_trait::async_trait;
 use datafusion::catalog::Session;
-use datafusion::common::{project_schema, Constraints, Statistics};
+use datafusion::common::tree_node::{Transformed, TreeNode};
+use datafusion::common::{project_schema, Column, Constraints, Statistics};
 use datafusion::error::Result as DataFusionResult;
 use datafusion::logical_expr::dml::InsertOp;
-use datafusion::logical_expr::TableProviderFilterPushDown;
+use datafusion::logical_expr::{LogicalPlan, TableProviderFilterPushDown};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::{
     datasource::{TableProvider, TableType},
@@ -590,6 +591,54 @@ impl TableProvider for EmbeddingTable {
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         self.base_table.insert_into(state, input, overwrite).await
     }
+}
+
+/// Ensures that for each column with embeddings (`col_name`), the `LogicalPlan::Projection` node
+/// includes the associated Spice internal columns (`col_name_embeddings`, `col_name_offset`).
+/// If any required columns are missing, they are automatically added to the projection.
+pub fn include_embeddings_internal_columns(
+    plan: LogicalPlan,
+    table: &EmbeddingTable,
+) -> DataFusionResult<LogicalPlan> {
+    let plan = plan
+        .transform_down(|plan| {
+            match plan {
+                LogicalPlan::Projection(mut proj) => {
+                    for col_with_embeddings in table.get_embedding_columns() {
+                        // Ensure that for each included column with embeddings, the associated Spice internal
+                        // embedding columns are present in the projection.
+                        if let Some(idx) = proj
+                            .schema
+                            .index_of_column_by_name(None, &col_with_embeddings)
+                        {
+                            let mut spice_embedding_columns =
+                                vec![embedding_col!(col_with_embeddings)];
+                            if table.is_chunked(&col_with_embeddings) {
+                                spice_embedding_columns.push(offset_col!(col_with_embeddings));
+                            }
+
+                            for spice_embedding_column in spice_embedding_columns {
+                                if !proj
+                                    .schema
+                                    .has_column_with_unqualified_name(&spice_embedding_column)
+                                {
+                                    proj.expr.push(Expr::Column(Column::new(
+                                        proj.schema.qualified_field(idx).0.cloned(),
+                                        spice_embedding_column,
+                                    )));
+                                }
+                            }
+                        }
+                    }
+                    // The Transformed flag is not used, so we always specify it as transformed for simplicity.
+                    Ok(Transformed::yes(LogicalPlan::Projection(proj)))
+                }
+                _ => Ok(Transformed::no(plan)),
+            }
+        })?
+        .data;
+
+    Ok(plan)
 }
 
 #[cfg(test)]

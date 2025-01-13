@@ -20,6 +20,8 @@ use crate::component::catalog::Catalog;
 use crate::component::dataset::acceleration::RefreshMode;
 use crate::component::dataset::Dataset;
 use crate::datafusion::error::find_datafusion_root;
+use crate::embeddings::table::include_embeddings_internal_columns;
+use crate::embeddings::table::EmbeddingTable;
 use crate::federated_table::FederatedTable;
 use crate::get_params_with_secrets;
 use crate::parameters::ParameterSpec;
@@ -444,7 +446,22 @@ pub async fn get_data(
 
             DataFrame::new(ctx.state(), logical_plan)
         }
-        Some(sql) => ctx.sql(&sql).await.map_err(find_datafusion_root)?,
+        Some(sql) => {
+            let session = ctx.state();
+            let mut plan = session
+                .create_logical_plan(&sql)
+                .await
+                .map_err(find_datafusion_root)?;
+
+            // If the refresh SQL defines a subset of columns to fetch, the internal embedding columns
+            // are not included automatically so we verify their presence and add them manually.
+            if let Some(embedding_table) = table_provider.as_any().downcast_ref::<EmbeddingTable>()
+            {
+                plan = include_embeddings_internal_columns(plan, embedding_table)?;
+            };
+
+            DataFrame::new(session, plan)
+        }
     };
 
     for filter in filters {
