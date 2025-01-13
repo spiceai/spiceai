@@ -41,70 +41,86 @@ impl Drop for FileCleanup {
     }
 }
 
+#[allow(clippy::expect_used)]
+async fn setup_test_data(zip_url: &str, dir_name: &str) -> Result<String, String> {
+    let tmp_dir = std::env::temp_dir();
+    let path = format!("{}/{}", tmp_dir.display(), dir_name);
+    let _ = std::fs::remove_dir_all(&path);
+    let _ = std::fs::create_dir(&path);
+
+    // Download and extract the test data
+    let resp = reqwest::get(zip_url).await.expect("request failed");
+    let mut out = File::create(format!("{path}/{dir_name}.zip")).expect("failed to create file");
+    let _ = out.write_all(&resp.bytes().await.expect("failed to read bytes"));
+    let _ = std::process::Command::new("unzip")
+        .stdin(std::process::Stdio::null())
+        .arg(format!("{path}/{dir_name}.zip"))
+        .arg("-d")
+        .arg(&path)
+        .spawn()
+        .expect("unzip failed")
+        .wait()
+        .expect("unzip failed");
+
+    Ok(path)
+}
+
+async fn run_delta_lake_test(
+    app_name: &str,
+    dataset_path: &str,
+    dataset_name: &str,
+    query: &str,
+    expected_results: &[&str],
+) -> Result<(), String> {
+    let app = AppBuilder::new(app_name)
+        .with_dataset(make_delta_lake_dataset(dataset_path, dataset_name, false))
+        .build();
+
+    let status = runtime::status::RuntimeStatus::new();
+    let df = crate::get_test_datafusion(Arc::clone(&status));
+    let rt = Runtime::builder()
+        .with_app(app)
+        .with_datafusion(df)
+        .build()
+        .await;
+
+    // Set a timeout for the test
+    tokio::select! {
+        () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+            return Err("Timed out waiting for datasets to load".to_string());
+        }
+        () = rt.load_components() => {}
+    }
+
+    let query_result = rt
+        .datafusion()
+        .query_builder(query)
+        .build()
+        .run()
+        .await
+        .map_err(|e| format!("query `{query}` to plan: {e}"))?;
+
+    let data = query_result
+        .data
+        .try_collect::<Vec<RecordBatch>>()
+        .await
+        .map_err(|e| format!("query `{query}` to results: {e}"))?;
+
+    assert_batches_eq!(expected_results, &data);
+    Ok(())
+}
+
 #[tokio::test]
 async fn query_delta_lake_with_partitions() -> Result<(), String> {
     test_request_context().scope(async {
-        let tmp_dir = std::env::temp_dir();
-        let path = format!("{}/nation", tmp_dir.display());
+        let path = setup_test_data(
+            "https://public-data.spiceai.org/delta-lake-nation-with-partitionkey.zip",
+            "nation",
+        )
+        .await?;
         let _hook = FileCleanup { path: path.clone() };
-        let _ = std::fs::remove_dir_all(&path);
-        let _ = std::fs::create_dir(&path);
-
-        let resp =
-            reqwest::get("https://public-data.spiceai.org/delta-lake-nation-with-partitionkey.zip")
-                .await
-                .expect("request failed");
-        let mut out = File::create(format!("{path}/nation.zip")).expect("failed to create file");
-        let _ = out.write_all(&resp.bytes().await.expect("failed to read bytes"));
-        let _ = std::process::Command::new("unzip")
-            .stdin(std::process::Stdio::null())
-            .arg(format!("{path}/nation.zip"))
-            .arg("-d")
-            .arg(&path)
-            .spawn()
-            .expect("unzip failed")
-            .wait()
-            .expect("unzip failed");
-
-        let app = AppBuilder::new("delta_lake_partition_test")
-            .with_dataset(make_delta_lake_dataset(
-                &format!("{path}/nation"),
-                "test",
-                false,
-            ))
-            .build();
-
-        let status = runtime::status::RuntimeStatus::new();
-        let df = crate::get_test_datafusion(Arc::clone(&status));
-        let rt = Runtime::builder()
-            .with_app(app)
-            .with_datafusion(df)
-            .build()
-            .await;
-
-        // Set a timeout for the test
-        tokio::select! {
-            () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
-                return Err("Timed out waiting for datasets to load".to_string());
-            }
-            () = rt.load_components() => {}
-        }
 
         let query = "SELECT * from test order by n_nationkey";
-        let query_result = rt
-            .datafusion()
-            .query_builder(query)
-            .build()
-            .run()
-            .await
-            .map_err(|e| format!("query `{query}` to plan: {e}"))?;
-
-        let data = query_result
-            .data
-            .try_collect::<Vec<RecordBatch>>()
-            .await
-            .map_err(|e| format!("query `{query}` to results: {e}"))?;
-
         let expected_results = [
         "+-------------+----------------+-------------+--------------------------------------------------------------------------------------------------------------------+",
         "| n_nationkey | n_name         | n_regionkey | n_comment                                                                                                          |",
@@ -136,8 +152,68 @@ async fn query_delta_lake_with_partitions() -> Result<(), String> {
         "| 24          | UNITED STATES  | 1           | ly ironic requests along the slyly bold ideas hang after the blithely special notornis; blithely even accounts     |",
         "+-------------+----------------+-------------+--------------------------------------------------------------------------------------------------------------------+",
         ];
-        assert_batches_eq!(expected_results, &data);
 
-        Ok(())
-    }).await
+        run_delta_lake_test(
+            "delta_lake_partition_test",
+            &format!("{path}/nation"),
+            "test",
+            query,
+            &expected_results,
+        )
+        .await
+    })
+    .await
+}
+
+#[tokio::test]
+async fn query_delta_lake_with_null_partitions() -> Result<(), String> {
+    test_request_context()
+        .scope(async {
+            let path = setup_test_data(
+                "https://public-data.spiceai.org/delta-lake-null-partition.zip",
+                "delta_partition",
+            )
+            .await?;
+            let _hook = FileCleanup { path: path.clone() };
+
+            let test_cases = [
+                (
+                    "SELECT tenant_id, day FROM test ORDER BY tenant_id, day",
+                    vec![
+                        "+-----------+------------+",
+                        "| tenant_id | day        |",
+                        "+-----------+------------+",
+                        "| tenant1   | 2024-01-01 |",
+                        "| tenant1   | 2024-01-01 |",
+                        "|           | 2024-01-02 |",
+                        "+-----------+------------+",
+                    ],
+                ),
+                (
+                    "SELECT * FROM test ORDER BY tenant_id, day, document_id",
+                    vec![
+                        "+-----------+------------+-------------+--------------------------+-------------+-------------------+-----------------------------+",
+                        "| tenant_id | day        | document_id | raw_email                | compression | compression_level | ingested_at                 |",
+                        "+-----------+------------+-------------+--------------------------+-------------+-------------------+-----------------------------+",
+                        "| tenant1   | 2024-01-01 | doc1        | 7465737420656d61696c     | gzip        | 6                 | 2025-01-11T03:14:44.193684Z |",
+                        "| tenant1   | 2024-01-01 | doc3        | 7465737420656d61696c2033 | gzip        | 6                 | 2025-01-11T03:14:44.193688Z |",
+                        "|           | 2024-01-02 | doc2        | 7465737420656d61696c2032 | gzip        | 6                 | 2025-01-11T03:14:44.193687Z |",
+                        "+-----------+------------+-------------+--------------------------+-------------+-------------------+-----------------------------+",
+                    ],
+                ),
+            ];
+
+            for (query, expected_results) in test_cases {
+                run_delta_lake_test(
+                    "delta_lake_null_partition_test",
+                    &format!("{path}/delta_partition"),
+                    "test",
+                    query,
+                    &expected_results,
+                )
+                .await?;
+            }
+            Ok(())
+        })
+        .await
 }

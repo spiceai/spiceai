@@ -15,8 +15,8 @@ limitations under the License.
 */
 
 use arrow::array::{
-    Array, ArrayRef, FixedSizeListArray, FixedSizeListBuilder, ListArray, PrimitiveBuilder,
-    RecordBatch, StringArray, StringViewArray,
+    Array, ArrayRef, FixedSizeListArray, FixedSizeListBuilder, LargeStringArray, ListArray,
+    PrimitiveBuilder, RecordBatch, StringArray, StringViewArray,
 };
 use arrow::buffer::OffsetBuffer;
 use arrow::datatypes::{DataType, Field, Float32Type, Int32Type, SchemaRef};
@@ -42,7 +42,7 @@ use std::fmt;
 use tokio::sync::RwLock;
 
 use crate::model::EmbeddingModelStore;
-use crate::{embedding_col, offset_col};
+use crate::{convert_string_arrow_to_iterator, embedding_col, offset_col};
 
 use super::table::EmbeddingColumnConfig;
 
@@ -270,19 +270,14 @@ pub(crate) async fn compute_additional_embedding_columns(
             continue;
         };
 
-        let arr_iter: Box<dyn Iterator<Item = Option<&str>> + Send> =
-            if let Some(arr) = raw_data.as_any().downcast_ref::<StringArray>() {
-                Box::new(arr.iter())
-            } else if let Some(arr) = raw_data.as_any().downcast_ref::<StringViewArray>() {
-                Box::new(arr.iter())
-            } else {
-                tracing::debug!(
-                    "Expected StringArray or StringViewArray for column '{}', but got {}",
+        let Some(arr_iter) = convert_string_arrow_to_iterator!(raw_data) else {
+            tracing::warn!(
+                    "Expected 'StringArray', 'StringViewArray' or 'LargeStringArray' for column '{}', but got {}",
                     col,
                     raw_data.data_type()
                 );
-                continue;
-            };
+            continue;
+        };
 
         let list_array = if let Some(chunker) = chunker_opt {
             let (vectors, offsets) =

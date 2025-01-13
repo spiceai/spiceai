@@ -1,0 +1,18 @@
+---
+source: crates/runtime/tests/spark/mod.rs
+description: Spark Integration Test Results
+---
++------------------------------------------+-----------+
+| l_comment                                | l_partkey |
++------------------------------------------+-----------+
+| t the quickly specia                     | 51489     |
+| heodolites integ                         | 48159     |
+| arefully permanent requests. carefully r | 133593    |
+| ttainments haggle furio                  | 181660    |
+| e slyly pending instructions s           | 124020    |
+| bold ideas. quickly pend                 | 112121    |
+| al platelets. asymptotes                 | 19527     |
+| sual requests!                           | 174767    |
+| packages boost blithely. req             | 85953     |
+| ithely special notornis use slyly. unusu | 142067    |
++------------------------------------------+-----------+

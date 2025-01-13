@@ -21,7 +21,7 @@ pub mod metrics;
 pub mod queries;
 pub mod spiced;
 pub mod spicepod_utils;
-pub mod throughput;
+pub mod spicetest;
 pub mod utils;
 
 use std::fmt::Display;
