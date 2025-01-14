@@ -18,8 +18,8 @@ All criteria must be met for the model to be considered Alpha. As Alpha signifie
 
 ## Alpha Release Criteria
 
-- Supports `v1/chat/completion` for roles: `user`, `assistant`, `system` with `stream=false`.
-- Supports `v1/chat/completion` for roles: `user`, `assistant`, `system` with `stream=true`.
+- [ ] Supports `v1/chat/completion` for roles: `user`, `assistant`, `system` with `stream=false`.
+- [ ] Supports `v1/chat/completion` for roles: `user`, `assistant`, `system` with `stream=true`.
 
 ### Documentation
 

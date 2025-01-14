@@ -17,12 +17,17 @@ All criteria must be met for the embedding component to be considered RC.
 
 ## RC Release Criteria
 
-- All [Beta release criteria](./beta.md) pass.
+- [ ] All [Beta release criteria](./beta.md) pass.
+- [ ] An embedding model running in the Spice runtime (as opposed to network-attached models), can handle consistent requests from several clients without an adverse impact on latency.
+  - 8 clients consistently sending requests (i.e. sending another request upon receipt of prior request)
+  - A duration of 60 minutes.
+  - The body must have at least 128 tokens.
+  - An increase in latency is defined as a 10% increase in both the 50th & 95th percentile between the first and last minute.
 
 ### Conditional Criteria
-- For embedding models running in the Spice runtime (as opposed to network-attached models).
-  - For a period of 1 minute, can handle N clients consistently sending embedding requests (i.e. instantly send another request upon receipt of prior request), each with Y tokens, without increasing round trip (to client) latency for 5 minute. An increase in latency is defined as a 10% increase in both the 50th & 95th percentile between the first and last minute.
-
+- For hosted models in the Spice runtime:
+ - [ ] Does not excessively increase the latency of the underlying hosted model.
+   - An increase in latency is defined as a 15% increase in either the 50th & 95th percentile above the underlying model.
 
 ### Documentation
 
