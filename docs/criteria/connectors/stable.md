@@ -9,7 +9,7 @@ All criteria must be met for the connector to be considered Stable, with excepti
 | Connector                        | Stable Quality | DRI Sign-off    |
 | -------------------------------- | -------------- | --------------- |
 | Clickhouse                       | ➖             |                 |
-| Databricks (mode: delta_lake)    | ➖             |                 |
+| Databricks (mode: delta_lake)    | ✅             | @Sevenannn      |
 | Databricks (mode: spark_connect) | ➖             |                 |
 | Delta Lake                       | ➖             |                 |
 | Dremio                           | ➖             |                 |
