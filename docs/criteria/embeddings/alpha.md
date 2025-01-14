@@ -17,7 +17,7 @@ All criteria must be met for the embedding component to be considered Alpha. As 
 
 ## Alpha Release Criteria
 
-- Functional `v1/embeddings` endpoint, with support for both float and base64 inputs.
+- [ ] Functional `v1/embeddings` endpoint, with support for both float and base64 inputs.
 
 ### Documentation
 

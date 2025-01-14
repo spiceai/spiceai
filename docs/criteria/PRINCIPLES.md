@@ -9,7 +9,7 @@
 - Limitations & edge case failures expected.
 
 ### Beta
-  - Functionly complete.
+  - Functionally complete.
   - Satisfies minimal performance bar. Resource efficiency (memory, CPU, and I/O usage) is measured.
   - Metrics & tracing in place for observability.
 
