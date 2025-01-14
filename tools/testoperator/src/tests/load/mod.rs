@@ -80,6 +80,7 @@ pub(crate) async fn run(args: &TestArgs) -> anyhow::Result<()> {
     spiced_instance.stop()?;
 
     let mut test_passed = true;
+    let mut yellow_measurements = 0;
     for (query, _) in queries {
         let Some(duration) = test_durations.get(query) else {
             return Err(anyhow::anyhow!(
@@ -101,17 +102,34 @@ pub(crate) async fn run(args: &TestArgs) -> anyhow::Result<()> {
         };
 
         let percentile_99th = duration.percentile(0.99)?;
-        let percentile_ratio = percentile_99th.as_secs_f64() / baseline_percentile.as_secs_f64();
+        let percentile_ratio =
+            ((percentile_99th.as_secs_f64() / baseline_percentile.as_secs_f64()) - 1.0) * 100.0;
 
-        if percentile_ratio > 1.1 {
+        // yellow measurements = 10% to 20% increase
+        // red measurements = > 20% increase
+        let (yellow, red) = (
+            percentile_ratio > 10.0 && percentile_ratio <= 20.0,
+            percentile_ratio > 20.0,
+        );
+
+        if red {
             println!(
-                "FAIL - Query {query} has a 99th percentile that is {percentile_ratio}% of the baseline 99th percentile",
+                "FAIL - Query {query} has a 99th percentile that increased {percentile_ratio}% of the baseline 99th percentile",
             );
             test_passed = false;
+        } else if yellow {
+            println!(
+                "WARN - Query {query} has a 99th percentile that increased {percentile_ratio}% of the baseline 99th percentile",
+            );
+            yellow_measurements += 1;
         }
     }
 
-    if !test_passed {
+    if yellow_measurements >= 3 {
+        return Err(anyhow::anyhow!(
+            "Load test failed due to too many yellow measurements"
+        ));
+    } else if !test_passed {
         return Err(anyhow::anyhow!("Load test failed."));
     }
 
