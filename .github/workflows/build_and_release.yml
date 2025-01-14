@@ -278,7 +278,7 @@ jobs:
 
       ## models + cuda flavor
       - name: Run Spiced CUDA Build (COMPUTE_CAP=86).
-        uses: ./github/actions/spiced-cuda-action
+        uses: ./.github/actions/spiced-cuda-build
         if: matrix.target.runner == 'ubuntu-gpu-t4-4-core' || matrix.target.runner == 'windows-gpu-t4-4-core'
         with:
           cuda-version: "12.4.1"
@@ -286,7 +286,7 @@ jobs:
           artifact-tag: ${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
 
       - name: Run Spiced CUDA Build (COMPUTE_CAP=75).
-        uses: ./github/actions/spiced-cuda-action
+        uses: ./github/actions/spiced-cuda-build
         if: matrix.target.runner == 'ubuntu-gpu-t4-4-core' || matrix.target.runner == 'windows-gpu-t4-4-core'
         with:
           cuda-version: "12.4.1"
