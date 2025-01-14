@@ -90,13 +90,16 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - async-trait 0.1.83, Apache-2.0 OR MIT 
   <br/>https://github.com/dtolnay/async-trait
 
-- aws-config 1.5.10, Apache-2.0 
+- aws-config 1.5.13, Apache-2.0 
   <br/>https://github.com/smithy-lang/smithy-rs
+
+- aws-sdk-dynamodb 1.59.0, Apache-2.0 
+  <br/>https://github.com/awslabs/aws-sdk-rust
 
 - aws-sdk-secretsmanager 1.54.0, Apache-2.0 
   <br/>https://github.com/awslabs/aws-sdk-rust
 
-- aws-sdk-sts 1.52.0, Apache-2.0 
+- aws-sdk-sts 1.54.0, Apache-2.0 
   <br/>https://github.com/awslabs/aws-sdk-rust
 
 - axum 0.7.9, MIT 
@@ -158,6 +161,9 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 
 - csv 1.3.1, MIT OR Unlicense 
   <br/>https://github.com/BurntSushi/rust-csv
+
+- cudarc 0.12.2, Apache-2.0 OR MIT 
+  <br/>https://github.com/coreylowman/cudarc
 
 - dashmap 6.1.0, MIT 
   <br/>https://github.com/xacrimon/dashmap
@@ -293,9 +299,6 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 
 - keyring 3.6.1, Apache-2.0 OR MIT 
   <br/>https://github.com/hwchen/keyring-rs.git
-
-- lazy_static 1.5.0, Apache-2.0 OR MIT 
-  <br/>https://github.com/rust-lang-nursery/lazy-static.rs
 
 - log 0.4.22, Apache-2.0 OR MIT 
   <br/>https://github.com/rust-lang/log
@@ -482,6 +485,12 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 
 - suppaftp 5.4.0, Apache-2.0 
   <br/>https://github.com/veeso/suppaftp
+
+- sysinfo 0.30.13, MIT 
+  <br/>https://github.com/GuillaumeGomez/sysinfo
+
+- sysinfo 0.33.1, MIT 
+  <br/>https://github.com/GuillaumeGomez/sysinfo
 
 - tempfile 3.14.0, Apache-2.0 OR MIT 
   <br/>https://github.com/Stebalien/tempfile
