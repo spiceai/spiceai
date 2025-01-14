@@ -48,8 +48,8 @@ async fn main() -> anyhow::Result<()> {
         Commands::Run(TestCommands::DataConsistency(args)) => {
             tests::data_consistency::run(&args).await?;
         }
-        Commands::Export(TestCommands::DataConsistency(_)) => {
-            unimplemented!("Export not implemented for data consistency")
+        Commands::Export(TestCommands::DataConsistency(args)) => {
+            tests::env_export(&args.test_args)?;
         }
     }
 
