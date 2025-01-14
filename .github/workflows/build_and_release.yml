@@ -21,6 +21,7 @@ on:
           - "Windows x64"
           - "macOS x64 (Intel)"
           - "GPU T4 Ubuntu"
+          - "GPU T4 Windows"
         default: "all"
 
 jobs:
@@ -68,6 +69,13 @@ jobs:
                 target_arch: "x86_64",
                 target_arch_go: "amd64"
               },
+              {
+                name: "GPU T4 Windows",
+                runner: "windows-gpu-t4-4-core",
+                target_os: "windows",
+                target_arch: "x86_64",
+                target_arch_go: "amd64"
+              },
             ];
 
             // If running via workflow_dispatch, filter based on input
@@ -81,9 +89,9 @@ jobs:
               return matrix.filter(m => m.name === platform_option);
             }
 
-            // Do not run GPU builds for all PRs to trunk. 
+            // Do not run GPU builds for all PRs to trunk.
             if (context.eventName === 'push' && context.ref === 'refs/heads/trunk') {
-              return matrix.filter(m => m.runner != "ubuntu-gpu-t4-4-core")
+              return matrix.filter(m => m.runner != "ubuntu-gpu-t4-4-core" && m.runner != "windows-gpu-t4-4-core" )
             }
             return matrix;
 
@@ -175,34 +183,34 @@ jobs:
         run: make -C bin/spiced
 
       - name: tar binary
-        if: matrix.target.target_os != 'windows' && matrix.target.runner != 'ubuntu-gpu-t4-4-core'
+        if: matrix.target.runner != 'rust-windows-x64' && matrix.target.runner != 'ubuntu-gpu-t4-4-core'
         run: |
           mv target/release/spiced spiced
           chmod +x spiced
           tar czf spiced_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz spiced
 
       - name: tar binary (Windows)
-        if: matrix.target.target_os == 'windows'
+        if: matrix.target.runner == 'rust-windows-x64'
         run: |
           mv target/release/spiced.exe spiced.exe
           tar czf spiced.exe_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz spiced.exe
 
       - name: Print version
-        if: matrix.target.target_os != 'windows' && matrix.target.runner != 'ubuntu-gpu-t4-4-core'
+        if: matrix.target.runner != 'rust-windows-x64' && matrix.target.runner != 'ubuntu-gpu-t4-4-core'
         run: ./spiced --version
 
       - name: Print version (Windows)
-        if: matrix.target.target_os == 'windows'
+        if: matrix.target.runner == 'rust-windows-x64'
         run: ./spiced.exe --version
 
       - uses: actions/upload-artifact@v4
-        if: matrix.target.target_os != 'windows' && matrix.target.runner != 'ubuntu-gpu-t4-4-core'
+        if: matrix.target.runner != 'rust-windows-x64' && matrix.target.runner != 'ubuntu-gpu-t4-4-core'
         with:
           name: spiced_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: spiced_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz
 
       - uses: actions/upload-artifact@v4
-        if: matrix.target.target_os == 'windows'
+        if: matrix.target.runner == 'rust-windows-x64'
         with:
           name: spiced.exe_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: spiced.exe_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz
@@ -213,35 +221,35 @@ jobs:
         run: make -C bin/spiced SPICED_NON_DEFAULT_FEATURES="models"
 
       - name: tar binary (models)
-        if: matrix.target.target_os != 'windows' && matrix.target.runner != 'ubuntu-gpu-t4-4-core'
+        if: matrix.target.runner != 'rust-windows-x64' && matrix.target.runner != 'ubuntu-gpu-t4-4-core'
         run: |
           mv target/release/spiced spiced
           chmod +x spiced
           tar czf spiced_models_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz spiced
 
       - name: tar binary (models) (Windows)
-        if: matrix.target.target_os == 'windows'
+        if: matrix.target.runner == 'rust-windows-x64'
         run: |
           rm spiced.exe
           mv target/release/spiced.exe spiced.exe
           tar czf spiced.exe_models_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz spiced.exe
 
       - name: Print version (models)
-        if: matrix.target.target_os != 'windows' && matrix.target.runner != 'ubuntu-gpu-t4-4-core'
+        if: matrix.target.runner != 'rust-windows-x64' && matrix.target.runner != 'ubuntu-gpu-t4-4-core'
         run: ./spiced --version
 
       - name: Print version (models) (Windows)
-        if: matrix.target.target_os == 'windows'
+        if: matrix.target.runner == 'rust-windows-x64'
         run: ./spiced.exe --version
 
       - uses: actions/upload-artifact@v4
-        if: matrix.target.target_os != 'windows' && matrix.target.runner != 'ubuntu-gpu-t4-4-core'
+        if: matrix.target.runner != 'rust-windows-x64' && matrix.target.runner != 'ubuntu-gpu-t4-4-core'
         with:
           name: spiced_models_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: spiced_models_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz
 
       - uses: actions/upload-artifact@v4
-        if: matrix.target.target_os == 'windows'
+        if: matrix.target.runner == 'rust-windows-x64'
         with:
           name: spiced.exe_models_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: spiced.exe_models_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz
@@ -269,39 +277,21 @@ jobs:
           path: spiced_models_metal_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz
 
       ## models + cuda flavor
-      - uses: Jimver/cuda-toolkit@v0.2.19
-        id: cuda-toolkit
-        if: matrix.target.runner == 'ubuntu-gpu-t4-4-core'
+      - name: Run Spiced CUDA Build (COMPUTE_CAP=86).
+        uses: ./github/actions/spiced-cuda-action
+        if: matrix.target.runner == 'ubuntu-gpu-t4-4-core' || matrix.target.runner == 'windows-gpu-t4-4-core'
         with:
-          cuda: "12.4.1"
-          method: "network"
-          use-github-cache: false
-          #See e.g. https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/
-          non-cuda-sub-packages: '["libcurand-dev", "libcublas","libcublas-dev"]'
-          sub-packages: '["nvcc","compiler","libraries","libraries-dev","cudart","cudart-dev"]'
+          cuda-version: "12.4.1"
+          cuda-compute-capability: "86"
+          artifact-tag: ${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
 
-      - name: Verify CUDA prerequisites
-        if: matrix.target.runner == 'ubuntu-gpu-t4-4-core'
-        run: |
-          nvidia-smi
-          nvcc --version
-
-      - name: Build spiced (models, cuda)
-        if: matrix.target.runner == 'ubuntu-gpu-t4-4-core'
-        run: make -C bin/spiced SPICED_NON_DEFAULT_FEATURES="models,cuda"
-
-      - name: tar binary (models, cuda)
-        if: matrix.target.runner == 'ubuntu-gpu-t4-4-core'
-        run: |
-          mv target/release/spiced spiced
-          chmod +x spiced
-          tar czf spiced_models_cuda_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz spiced
-
-      - uses: actions/upload-artifact@v4
-        if: matrix.target.runner == 'ubuntu-gpu-t4-4-core'
+      - name: Run Spiced CUDA Build (COMPUTE_CAP=75).
+        uses: ./github/actions/spiced-cuda-action
+        if: matrix.target.runner == 'ubuntu-gpu-t4-4-core' || matrix.target.runner == 'windows-gpu-t4-4-core'
         with:
-          name: spiced_models_cuda_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-          path: spiced_models_cuda_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz
+          cuda-version: "12.4.1"
+          cuda-compute-capability: "75"
+          artifact-tag: ${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
 
       ## CLI build
       - name: Build spice
@@ -309,34 +299,34 @@ jobs:
         run: make -C bin/spice
 
       - name: tar binary
-        if: matrix.target.target_os != 'windows' && matrix.target.runner != 'ubuntu-gpu-t4-4-core'
+        if: matrix.target.runner != 'rust-windows-x64' && matrix.target.runner != 'ubuntu-gpu-t4-4-core'
         run: |
           mv target/release/spice spice
           chmod +x spice
           tar czf spice_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz spice
 
       - name: tar binary (Windows)
-        if: matrix.target.target_os == 'windows'
+        if: matrix.target.runner == 'rust-windows-x64'
         run: |
           mv target/release/spice.exe spice.exe
           tar czf spice.exe_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz spice.exe
 
       - name: Print version
-        if: matrix.target.target_os != 'windows'&& matrix.target.runner != 'ubuntu-gpu-t4-4-core'
+        if: matrix.target.runner != 'rust-windows-x64'&& matrix.target.runner != 'ubuntu-gpu-t4-4-core'
         run: ./spice version
 
       - name: Print version (Windows)
-        if: matrix.target.target_os == 'windows'
+        if: matrix.target.runner == 'rust-windows-x64'
         run: ./spice.exe version
 
       - uses: actions/upload-artifact@v4
-        if: matrix.target.target_os != 'windows' && matrix.target.runner != 'ubuntu-gpu-t4-4-core'
+        if: matrix.target.runner != 'rust-windows-x64' && matrix.target.runner != 'ubuntu-gpu-t4-4-core'
         with:
           name: spice_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: spice_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz
 
       - uses: actions/upload-artifact@v4
-        if: matrix.target.target_os == 'windows'
+        if: matrix.target.runner == 'rust-windows-x64'
         with:
           name: spice.exe_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: spice.exe_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz
@@ -356,7 +346,7 @@ jobs:
           fi
 
       - name: Update build cache (Windows)
-        if: matrix.target.target_os == 'windows'
+        if: matrix.target.runner == 'rust-windows-x64'
         run: |
           if (Test-Path C:/spiceai/build/target) {
             Copy-Item -Recurse -Force target/* C:/spiceai/build/target
@@ -400,11 +390,18 @@ jobs:
           name: spiced_models_linux_x86_64
           path: ${{ env.ARTIFACT_DIR }}
 
-      - name: download artifacts - spiced_models_linux_x86_64
+      - name: download artifacts - spiced_models_cuda_86_linux_x86_64
         continue-on-error: true
         uses: actions/download-artifact@v4
         with:
-          name: spiced_models_cuda_linux_x86_64
+          name: spiced_models_cuda_86_linux_x86_64
+          path: ${{ env.ARTIFACT_DIR }}
+
+      - name: download artifacts - spiced_models_cuda_75_linux_x86_64
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: spiced_models_cuda_75_linux_x86_64
           path: ${{ env.ARTIFACT_DIR }}
 
       - name: Upload artifacts to Minio
@@ -427,8 +424,12 @@ jobs:
             mc cp ${{ env.ARTIFACT_DIR }}/spice_linux_x86_64.tar.gz spice-minio/artifacts/spice/linux-x86_64/${{ env.COMMIT_SHA }}/
           fi;
 
-          if [ -f "${ARTIFACT_DIR}/spiced_models_cuda_linux_x86_64.tar.gz" ]; then
-            mc cp ${{ env.ARTIFACT_DIR }}/spiced_models_cuda_linux_x86_64.tar.gz spice-minio/artifacts/spiced/linux-x86_64/${{ env.COMMIT_SHA }}/
+          if [ -f "${ARTIFACT_DIR}/spiced_models_cuda_86_linux_x86_64.tar.gz" ]; then
+            mc cp ${{ env.ARTIFACT_DIR }}/spiced_models_cuda_86_linux_x86_64.tar.gz spice-minio/artifacts/spiced/linux-x86_64/${{ env.COMMIT_SHA }}/
+          fi
+
+          if [ -f "${ARTIFACT_DIR}/spiced_models_cuda_75_linux_x86_64.tar.gz" ]; then
+            mc cp ${{ env.ARTIFACT_DIR }}/spiced_models_cuda_75_linux_x86_64.tar.gz spice-minio/artifacts/spiced/linux-x86_64/${{ env.COMMIT_SHA }}/
           fi
 
   publish:
