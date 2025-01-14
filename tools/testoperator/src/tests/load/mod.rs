@@ -89,11 +89,6 @@ pub(crate) async fn run(args: &TestArgs) -> anyhow::Result<()> {
             ));
         };
 
-        let median_duration = duration.median()?;
-        if median_duration.as_millis() < 500 {
-            continue; // skip queries that are too fast for percentile comparisons to be meaningful
-        }
-
         let Some(baseline_percentile) = baseline_percentiles.get(query) else {
             return Err(anyhow::anyhow!(
                 "Query {} not found in baseline percentiles",
@@ -102,6 +97,10 @@ pub(crate) async fn run(args: &TestArgs) -> anyhow::Result<()> {
         };
 
         let percentile_99th = duration.percentile(0.99)?;
+        if percentile_99th.as_millis() < 1000 {
+            continue; // skip queries that are too fast to be meaningful
+        }
+
         let percentile_ratio =
             ((percentile_99th.as_secs_f64() / baseline_percentile.as_secs_f64()) - 1.0) * 100.0;
 
