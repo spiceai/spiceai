@@ -14,6 +14,55 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+#[derive(Clone)]
+pub enum QuerySet {
+    Tpch,
+    Tpcds,
+    ClickBench,
+}
+
+impl QuerySet {
+    #[must_use]
+    pub fn get_queries(
+        &self,
+        overrides: Option<QueryOverrides>,
+    ) -> Vec<(&'static str, &'static str)> {
+        match self {
+            QuerySet::Tpch => get_tpch_test_queries(overrides),
+            QuerySet::Tpcds => get_tpcds_test_queries(overrides),
+            QuerySet::ClickBench => get_clickbench_test_queries(overrides),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub enum QueryOverrides {
+    SQLite,
+    PostgreSQL,
+    MySQL,
+    Dremio,
+    Spark,
+    ODBCAthena,
+    DuckDB,
+    Snowflake,
+}
+
+impl QueryOverrides {
+    #[must_use]
+    pub fn from_engine(engine: &str) -> Option<Self> {
+        match engine {
+            "sqlite" => Some(Self::SQLite),
+            "postgres" => Some(Self::PostgreSQL),
+            "mysql" => Some(Self::MySQL),
+            "dremio" => Some(Self::Dremio),
+            "spark" => Some(Self::Spark),
+            "odbc_athena" => Some(Self::ODBCAthena),
+            "duckdb" => Some(Self::DuckDB),
+            _ => None,
+        }
+    }
+}
+
 #[macro_export]
 macro_rules! generate_tpch_queries {
     ( $( $i:tt ),* ) => {
@@ -22,6 +71,20 @@ macro_rules! generate_tpch_queries {
                 (
                     concat!("tpch_", stringify!($i)),
                     include_str!(concat!("./tpch/", stringify!($i), ".sql"))
+                )
+            ),*
+        ]
+    }
+}
+
+#[macro_export]
+macro_rules! generate_tpch_queries_override {
+    ( $override:expr, $( $i:tt ),* ) => {
+        vec![
+            $(
+                (
+                    concat!("tpch_", stringify!($i)),
+                    include_str!(concat!("./tpch/", $override, "/", stringify!($i), ".sql"))
                 )
             ),*
         ]
@@ -41,21 +104,54 @@ macro_rules! remove_tpch_query {
 }
 
 #[must_use]
-pub fn get_tpch_test_queries(overrides: Option<&str>) -> Vec<(&'static str, &'static str)> {
+pub fn get_tpch_test_queries(
+    overrides: Option<QueryOverrides>,
+) -> Vec<(&'static str, &'static str)> {
     let queries = generate_tpch_queries!(
         q1, q2, q3, q4, q5, q6, q7, q8, q9, q10, q11, q12, q13, q14, q16, q17, q18, q19, q20, q21,
         q22, simple_q1, simple_q2, simple_q3, simple_q4, simple_q5
     );
 
     match overrides {
-        Some("odbc_athena") => remove_tpch_query!(
+        Some(QueryOverrides::ODBCAthena) => remove_tpch_query!(
             queries, 4,  // https://github.com/spiceai/spiceai/issues/2077
             20  // https://github.com/spiceai/spiceai/issues/2078
         ),
-        Some("spark") => remove_tpch_query!(
+        Some(QueryOverrides::Spark) => remove_tpch_query!(
             queries,
             2, // Analysis error: [UNSUPPORTED_SUBQUERY_EXPRESSION_CATEGORY.UNSUPPORTED_CORRELATED_SCALAR_SUBQUERY] Unsupported subquery expression: Correlated scalar subqueries can only be used in filters, aggregations, projections, and UPDATE/MERGE/DELETE commands
             17 // Analysis error: [UNSUPPORTED_SUBQUERY_EXPRESSION_CATEGORY.UNSUPPORTED_CORRELATED_SCALAR_SUBQUERY] Unsupported subquery expression: Correlated scalar subqueries can only be used in filters, aggregations, projections, and UPDATE/MERGE/DELETE commands
+        ),
+        Some(QueryOverrides::Snowflake) => generate_tpch_queries_override!(
+            "snowflake",
+            q1,
+            q2,
+            q3,
+            q4,
+            q5,
+            q6,
+            q7,
+            q8,
+            q9,
+            q10,
+            q11,
+            q12,
+            q13,
+            q14,
+            q16,
+            q17,
+            q18,
+            q19,
+            q20,
+            q21,
+            q22,
+            simple_q1,
+            simple_q2,
+            simple_q3,
+            simple_q4,
+            simple_q5,
+            simple_q6,
+            simple_q7
         ),
         _ => queries,
     }
@@ -104,48 +200,39 @@ macro_rules! add_tpcds_query_overrides {
 }
 
 #[must_use]
-pub fn get_tpcds_test_queries(overrides: Option<&str>) -> Vec<(&'static str, &'static str)> {
+pub fn get_tpcds_test_queries(
+    overrides: Option<QueryOverrides>,
+) -> Vec<(&'static str, &'static str)> {
     let queries = generate_tpcds_queries!(
-        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
-        26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48,
-        49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71,
-        72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94,
-        95, 96, 97, 98, 99
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16, 17, 18, 19, 20, 21, 22, 25, 26, 27, 28,
+        29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52,
+        53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75,
+        76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98,
+        99
     );
+    // q14, q23, q24 and q39 removed by default as they contain multiple queries, which aren't supported
 
     match overrides {
-        Some("duckdb") => remove_tpcds_query!(
+        Some(QueryOverrides::DuckDB) => remove_tpcds_query!(
             queries, 8,  // EXCEPT and INTERSECT aren't supported
-            14, // EXCEPT and INTERSECT aren't supported
-            23, // this query contains multiple queries, which aren't supported
-            24, // this query contains multiple queries, which aren't supported
             38, // EXCEPT and INTERSECT aren't supported
-            39, // this query contains multiple queries, which aren't supported
             87  // EXCEPT and INTERSECT aren't supported
         ),
-        Some("mysql") => remove_tpcds_query!(
+        Some(QueryOverrides::MySQL) => remove_tpcds_query!(
             queries, 8,  // EXCEPT and INTERSECT aren't supported
-            14, // EXCEPT and INTERSECT aren't supported
-            23, // this query contains multiple queries, which aren't supported
-            24, // this query contains multiple queries, which aren't supported
             38, // EXCEPT and INTERSECT aren't supported
-            39, // this query contains multiple queries, which aren't supported
             51, // MySQL does not support FULL JOIN
             87, // EXCEPT and INTERSECT aren't supported
             97  // MySQL does not support FULL JOIN
         ),
-        Some("postgres") => {
+        Some(QueryOverrides::PostgreSQL) => {
             // Query 1, 30, 64, 81 commented out due to rewritten query's expensive plan in Postgres
             // Issue: https://github.com/spiceai/spiceai/issues/2939
             let queries: Vec<(&'static str, &'static str)> = remove_tpcds_query!(
                 queries, 1, 8,  // EXCEPT and INTERSECT aren't supported
-                14, // EXCEPT and INTERSECT aren't supported
-                23, // this query contains multiple queries, which aren't supported
-                24, // this query contains multiple queries, which aren't supported
                 30, // https://github.com/spiceai/spiceai/issues/2939
                 36, // overridden below
                 38, // EXCEPT and INTERSECT aren't supported
-                39, // this query contains multiple queries, which aren't supported
                 64, // https://github.com/spiceai/spiceai/issues/2939
                 70, // overridden below
                 81, // https://github.com/spiceai/spiceai/issues/2939
@@ -185,23 +272,32 @@ macro_rules! generate_clickbench_query_overrides {
 }
 
 #[must_use]
-pub fn get_clickbench_test_queries(overrides: Option<&str>) -> Vec<(&'static str, &'static str)> {
+pub fn get_clickbench_test_queries(
+    overrides: Option<QueryOverrides>,
+) -> Vec<(&'static str, &'static str)> {
     let mut queries = generate_clickbench_queries!(
         1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
         26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43
     );
 
     let overrides = match overrides {
-        Some("sqlite") => {
+        Some(QueryOverrides::SQLite) => {
             queries.remove(28); // q29 includes regexp_replace which is not supported by sqlite
             Some(generate_clickbench_query_overrides!(
                 "sqlite", 7, 19, 24, 25, 27, 37, 38, 39, 40, 41, 42, 43
             ))
         }
-        Some("postgres") => {
+        Some(QueryOverrides::PostgreSQL) => {
             // Column aliases cannot appear with expressions in ORDER BY in Postgres: https://www.postgresql.org/docs/current/queries-order.html
             // expressions can appear with other expressions, so re-write the query to fit
             Some(generate_clickbench_query_overrides!("postgres", 43))
+        }
+        Some(QueryOverrides::Dremio) => {
+            // Column aliases cannot appear with expressions in ORDER BY in Postgres: https://www.postgresql.org/docs/current/queries-order.html
+            // expressions can appear with other expressions, so re-write the query to fit
+            Some(generate_clickbench_query_overrides!(
+                "dremio", 21, 22, 23, 24
+            ))
         }
         _ => None,
     };

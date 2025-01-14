@@ -42,9 +42,9 @@ use delta_kernel::scan::state::{DvInfo, GlobalScanState, Stats};
 use delta_kernel::scan::ScanBuilder;
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::Table;
+use indexmap::IndexMap;
 use secrecy::{ExposeSecret, SecretString};
 use snafu::prelude::*;
-use std::collections::HashSet;
 use std::{collections::HashMap, sync::Arc};
 use url::Url;
 
@@ -296,6 +296,7 @@ impl TableProvider for DeltaTable {
         Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn scan(
         &self,
         state: &dyn Session,
@@ -309,7 +310,6 @@ impl TableProvider for DeltaTable {
             .map_err(map_delta_error_to_datafusion_err)?;
 
         let df_schema = DFSchema::try_from(Arc::clone(&self.arrow_schema))?;
-
         let filter = conjunction(filters.to_vec()).unwrap_or_else(|| lit(true));
         let physical_expr = state.create_physical_expr(filter, &df_schema)?;
 
@@ -359,20 +359,53 @@ impl TableProvider for DeltaTable {
             return Err(err);
         }
 
+        // In Delta Lake, all files must have the same partition columns,
+        // but Delta allows NULL values for the partition columns, represented in the filesystem as `__HIVE_DEFAULT_PARTITION__`.
+        //
+        // user_id=__HIVE_DEFAULT_PARTITION__/
+        //   day=2024-01-01/
+        //     part-00000.parquet
+        // user_id=123/
+        //   day=2024-01-01/
+        //     part-00001.parquet
+        //
+        // In the above example, the partition columns are `user_id` and `day`.
+        // The `user_id` column has a NULL value for the first file and a value of `123` for the second file.
+        //
+        // The `delta_kernel` library skips returning the partition columns for files that have a NULL value for the partition columns.
+        // Which means that the partition columns will not be returned in the `partition_values` field of the `PartitionedFile` object.
+        // We handle this by keeping track of all the partition columns we find in the `all_partition_columns` variable and if one
+        // doesn't have a value, we add a NULL value for that field to the `partition_values` field of the `PartitionedFile` object.
         let mut partitioned_files: Vec<PartitionedFile> = vec![];
-        let mut uniq_partition_columns = HashSet::new();
-        let mut partition_cols = HashSet::new();
+        let all_partition_columns = scan_context
+            .files
+            .iter()
+            .flat_map(|file| {
+                file.partition_values.iter().filter_map(|(k, _)| {
+                    let schema = self.schema();
+                    schema.field_with_name(k).ok().cloned()
+                })
+            })
+            // Use an IndexMap to preserve insertion order
+            .fold(IndexMap::new(), |mut acc, field| {
+                acc.insert(field, ());
+                acc
+            });
         for file in scan_context.files {
             let mut partitioned_file = file.partitioned_file;
-            uniq_partition_columns.insert(file.partition_values.len());
-            partitioned_file.partition_values = file
-                .partition_values
+            partitioned_file.partition_values = all_partition_columns
                 .iter()
-                .map(|(k, v)| {
-                    let schema = self.schema();
-                    let field = schema.field_with_name(k)?;
-                    partition_cols.insert(field.clone());
-                    ScalarValue::try_from_string(v.clone(), field.data_type())
+                .map(|(field, ())| {
+                    if let Some((_, value)) = file
+                        .partition_values
+                        .iter()
+                        .find(|(k, _)| *k == field.name())
+                    {
+                        ScalarValue::try_from_string(value.clone(), field.data_type())
+                    } else {
+                        // This will create a null value typed for the field
+                        Ok(ScalarValue::try_from(field.data_type())?)
+                    }
                 })
                 .collect::<Result<Vec<_>, DataFusionError>>()?;
 
@@ -390,16 +423,10 @@ impl TableProvider for DeltaTable {
             partitioned_files.push(partitioned_file);
         }
 
-        if !uniq_partition_columns.is_empty()
-            && (uniq_partition_columns.len() != 1
-                || !uniq_partition_columns.contains(&partition_cols.len()))
-        {
-            return Err(DataFusionError::Execution(format!(
-                "various number of partition values from the partitioned files: {uniq_partition_columns:?}"
-            )));
-        }
-
-        let partition_cols = &partition_cols.into_iter().collect::<Vec<_>>();
+        let partition_cols = &all_partition_columns
+            .into_iter()
+            .map(|(field, ())| field)
+            .collect::<Vec<_>>();
         let schema = self.arrow_schema.project(
             &self
                 .arrow_schema

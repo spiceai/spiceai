@@ -6,12 +6,13 @@ All criteria must be met for the Catalog to be considered [RC](../definitions.md
 
 ## RC Quality Catalogs
 
-| Catalog       | RC Quality | DRI Sign-off |
-| ------------- | ------------ | ------------ |
-| Databricks    | ➖           |              |
-| Iceberg       | ➖           |              |
-| Spice.ai      | ➖           |              |
-| Unity Catalog | ➖           |              |
+| Catalog                          | RC Quality | DRI Sign-off |
+| -------------------------------- | ---------- | ------------ |
+| Databricks (mode: delta_lake)    | ➖         |              |
+| Databricks (mode: spark_connect) | ➖         |              |
+| Iceberg                          | ➖         |              |
+| Spice.ai                         | ➖         |              |
+| Unity Catalog                    | ➖         |              |
 
 ## RC Criteria
 

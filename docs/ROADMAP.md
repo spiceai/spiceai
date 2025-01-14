@@ -11,7 +11,6 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 ## v1.0-stable (Jan 2025)
 
 - Bugfixes and performance improvements
-- [#3318](https://github.com/spiceai/spiceai/issues/3318) FinanceBench in CI
 - Data Accelerators: Arrow, DuckDB, SQLite, PostgreSQL (Stable)
 - Model Providers: OpenAI, Hugging Face, File (Stable)
 - Catalog Providers: Unity Catalog, Spice.ai Cloud Platform (Stable)
@@ -22,6 +21,7 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 - MySQL Data Connector (Stable)
 - GitHub Data Connector (Stable)
 - MS SQL data connector (Stable)
+- DuckDB data connector (Stable)
 - File data connector (Stable)
 - Dremio data connector (Stable)
 - Model Providers: Anthropic, Groq, Grok (Beta)
@@ -38,7 +38,6 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 | `databricks`    | Stable |
 | `delta_lake`    | Stable |
 | `postgres`      | Stable |
-| `spiceai`       | Stable |
 | `s3`            | Stable |
 | `mysql`         | Stable |
 | `file`          | Stable |
@@ -47,6 +46,7 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 | `dremio`        | Stable |
 | `mssql`         | Stable |
 | `odbc`          | Beta   |
+| `spiceai`       | Beta   |
 | `spark`         | Beta   |
 | `snowflake`     | Beta   |
 | `ftp`, `sftp`   | Beta   |
@@ -63,7 +63,7 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 | ------------ | ----------------- |
 | `arrow`      | Stable            |
 | `duckdb`     | Stable            |
-| `postgresql` | Stable            |
+| `postgresql` | Release Candidate |
 | `sqlite`     | Release Candidate |
 
 ### v1.0-stable Catalog Provider Support
@@ -77,35 +77,41 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 
 ### v1.0-stable Model Provider Support
 
-| Name          | Status |
-| ------------- | ------ |
-| `openai`      | Stable |
-| `huggingface` | Stable |
-| `file`        | Stable |
-| `anthropic`   | Beta   |
-| `azure`       | Beta   |
-| `groq`        | Beta   |
-| `grok`        | Alpha  |
+| Name          | Status            |
+| ------------- | ----------------- |
+| `openai`      | Release Candidate |
+| `huggingface` | Release Candidate |
+| `file`        | Release Candidate |
+| `anthropic`   | Alpha             |
+| `azure`       | Alpha             |
+| `groq`        | Alpha             |
+| `grok`        | Alpha             |
 
 ## v1.1 (Feb 2025)
 
-- Bugfixes
-- DuckDB Data Connector (Stable)
-- [#3018](https://github.com/spiceai/spiceai/issues/3018) Results caching for embeddings and search
 - Enterprise Search improvements
   - [#3006](https://github.com/spiceai/spiceai/issues/3006) Search with keyword filtering
   - [#3016](https://github.com/spiceai/spiceai/issues/3016) Hybrid-Search (DB + Vector)
   - [#3015](https://github.com/spiceai/spiceai/issues/3015) DataFusion Search
+- [#3318](https://github.com/spiceai/spiceai/issues/3318) FinanceBench in CI
+- Model Providers: OpenAI, HuggingFace, File (Stable)
+- Model Providers: Anthropic, Azure, Groq, Grok (Beta)
+- Data Accelerators: PostgreSQL (Stable)
 
 ## v1.2 (Mar 2025)
 
+- AWS Glue Catalog Connector (Alpha)
+- [#3018](https://github.com/spiceai/spiceai/issues/3018) Results caching for embeddings and search
+
 ## v1.3 (April 2025)
+
+- Ingestion
+  - PostgreSQL write
+  - Delta Lake write
+  - Iceberg write
 
 ## v2 (2025)
 
-- Ingestion
-  - Delta Lake write
-  - Iceberg write
 - Policy
   - Security
   - Data Access
@@ -115,17 +121,20 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 ## Features being considered
 
 - Data Connectors
+
+  - ElasticSearch
   - MotherDuck
   - BigQuery
   - Kafka
   - Google Docs
-- Catalog Providers
-
-  - AWS Glue
 
 - APIs
+
   - GraphQL API
   - Key/Value API
     - SlateDB data accelerator
     - RocksDB data accelerator
   - PostgreSQL API
+
+- AI
+  - Vision

@@ -51,7 +51,7 @@ async fn acceleration_with_and_without_federation() -> Result<(), anyhow::Error>
             let port: usize = 20962;
             let running_container = common::start_postgres_docker_container(port).await?;
 
-            let pool = common::get_postgres_connection_pool(port).await?;
+            let pool = common::get_postgres_connection_pool(port, None).await?;
             let db_conn = pool
                 .connect_direct()
                 .await

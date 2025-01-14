@@ -98,10 +98,44 @@ impl MemTable {
         })
     }
 
-    #[must_use]
-    pub fn with_constraints(mut self, constraints: Constraints) -> Self {
+    pub async fn try_with_constraints(mut self, constraints: Constraints) -> Result<Self> {
+        self.ensure_batches_satisfy_constraints(&constraints)
+            .await?;
         self.constraints = constraints;
-        self
+        Ok(self)
+    }
+
+    async fn ensure_batches_satisfy_constraints(&self, constraints: &Constraints) -> Result<()> {
+        if constraints.iter().len() == 0 {
+            return Ok(());
+        }
+        // Keep track of uniquness of rows per constraint.
+        let mut constraint_keys: Vec<HashSet<_>> = Vec::with_capacity(constraints.iter().len());
+        for b in &self.batches {
+            let p = &*b.read().await;
+            let p: Vec<_> = p.iter().collect();
+            for (i, c) in constraints.iter().enumerate() {
+                let valid_ids = match c {
+                    Constraint::PrimaryKey(pk) => {
+                        let pks = primary_key_identifier(&p, pk)?;
+                        check_and_filter_non_null_unique_primary_keys(&pks, constraint_keys.get(i))?
+                    }
+                    Constraint::Unique(u) => {
+                        let ids = constraint_identifiers(&p, u)?;
+                        let as_str: Vec<_> = ids.iter().map(String::as_str).collect();
+                        check_and_filter_unique_constraint(&as_str, constraint_keys.get(i))?
+                    }
+                };
+                // Keep track of ids to ensure uniqueness across all partitions.
+                if let Some(existing) = constraint_keys.get_mut(i) {
+                    existing.extend(valid_ids);
+                } else {
+                    constraint_keys.insert(i, valid_ids);
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// Attempt to retrieve the primary key from the constraints, and ensure that there are no unsupported [`Constraint::Unique`].
@@ -113,7 +147,7 @@ impl MemTable {
                 }
                 Some(Constraint::Unique(_)) => {
                     return Err(DataFusionError::Execution(
-                        "Unique constraints are not supported in MemTable".to_string(),
+                        "Unique constraints are not supported for in-memory tables. If possible, consider using a primary key.".to_string(),
                     ));
                 }
                 _ => return Ok(None),
@@ -259,10 +293,95 @@ impl MemSink {
     }
 }
 
+/// Check that all primary key ids are non-null and unique.
+///
+/// If `existing_pks` is provided, also check uniqueness of `pks` against `existing_pks`.
+///
+/// Returns a set of unique, non-null primary key ids.
+fn check_and_filter_non_null_unique_primary_keys(
+    pks: &[Option<String>],
+    existing_pks: Option<&HashSet<String>>,
+) -> Result<HashSet<String>> {
+    let num_pks = pks.len();
+
+    // First check uniqueness
+    let non_null_pks: Vec<&str> = pks.iter().filter_map(|opt| opt.as_deref()).collect();
+    let unique_set = check_and_filter_unique_constraint(&non_null_pks, existing_pks)?;
+
+    if num_pks != non_null_pks.len() {
+        return Err(DataFusionError::Execution(
+            "Primary key values must be non-null".to_string(),
+        ));
+    }
+    Ok(unique_set)
+}
+
+/// Check that all non-null primary key ids are unique.
+///
+/// If `existing_ids` is provided, also check uniqueness of `ids` against `existing_ids`. Do
+/// not check for nullity, or uniqueness of null values.
+///
+/// Returns a set of unique ids.
+fn check_and_filter_unique_constraint(
+    ids: &[&str],
+    existing_ids: Option<&HashSet<String>>,
+) -> Result<HashSet<String>> {
+    let mut unique_set = HashSet::<String>::new();
+    ids.iter()
+        .map(|&id| {
+            if unique_set.insert(id.to_string()) {
+                if existing_ids.is_some_and(|existing| existing.contains(id)) {
+                    return Err(DataFusionError::Execution(format!(
+                        "Primary key ({id}) already exists and is not unique"
+                    )));
+                }
+                Ok(())
+            } else {
+                Err(DataFusionError::Execution(
+                    "Primary key values must be unique".to_string(),
+                ))
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(unique_set)
+}
+
 /// Create primary key values for a [`RecordBatch`]. For composite keys, values are concatenated with a delimiter '|'.
 ///
 /// `pk_indices_ordered` should be in ascending order.
+///
+/// If any primary key value is `Null`, the entire key is [`Option::None`].
 fn extract_primary_keys_str(
+    batch: &RecordBatch,
+    pk_indices_ordered: &[usize],
+) -> Result<Vec<Option<String>>> {
+    let num_rows = batch.num_rows();
+    let mut keys = Vec::with_capacity(num_rows);
+
+    'row: for row_idx in 0..num_rows {
+        let mut parts = Vec::with_capacity(pk_indices_ordered.len());
+        for &col_idx in pk_indices_ordered {
+            let col = batch.column(col_idx);
+            let val = ScalarValue::try_from_array(col, row_idx)
+                .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+
+            // Early exit creating the entire row if any part is null.
+            if val.is_null() {
+                keys.push(None);
+                continue 'row;
+            }
+            parts.push(val.to_string());
+        }
+        // Join all PK parts with a delimiter
+        let key = parts.join("|");
+        keys.push(Some(key));
+    }
+
+    Ok(keys)
+}
+
+fn extract_constraint_keys_str(
     batch: &RecordBatch,
     pk_indices_ordered: &[usize],
 ) -> Result<Vec<String>> {
@@ -277,12 +396,25 @@ fn extract_primary_keys_str(
                 .map_err(|e| DataFusionError::Execution(e.to_string()))?;
             parts.push(val.to_string());
         }
-        // Join all PK parts with a delimiter
+        // Join all parts with a delimiter
         let key = parts.join("|");
         keys.push(key);
     }
 
     Ok(keys)
+}
+
+fn constraint_identifiers(rb: &[&RecordBatch], constraint_idx: &[usize]) -> Result<Vec<String>> {
+    // Create unique string for each constraint columns across all `new_batches` rows.
+    let new_keys: Vec<_> = rb
+        .iter()
+        .map(|b| extract_constraint_keys_str(b, constraint_idx))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .flatten()
+        .collect();
+
+    Ok(new_keys)
 }
 
 /// Filter elements of `existing_batches` that have primary keys from `overwriting_primary_keys`.
@@ -306,7 +438,11 @@ fn filter_existing(
 
         let mut keep_row_builder = BooleanBuilder::with_capacity(keys.len());
         for k in keys {
-            keep_row_builder.append_value(!overwriting_primary_keys.contains(&k));
+            if let Some(k) = k {
+                keep_row_builder.append_value(!overwriting_primary_keys.contains(&k));
+            } else {
+                unreachable!("Primary keys in `MemSink` record batch contain(s) null(s). This should be impossible, We check non-nullity of primary keys at insertion.");
+            }
         }
         let filtered_batch = filter_record_batch(&batch, &keep_row_builder.finish())?;
         if filtered_batch.num_rows() > 0 {
@@ -319,16 +455,13 @@ fn filter_existing(
 }
 
 fn primary_key_identifier(
-    rb: &[Vec<RecordBatch>],
+    rb: &[&RecordBatch],
     primary_keys_ordered: &[usize],
-) -> Result<Vec<String>> {
+) -> Result<Vec<Option<String>>> {
     // Create unique string for each primary key across all `new_batches` rows.
-    let new_keys: Vec<String> = rb
+    let new_keys: Vec<_> = rb
         .iter()
-        .flat_map(|p| {
-            p.iter()
-                .map(|b| extract_primary_keys_str(b, primary_keys_ordered))
-        })
+        .map(|b| extract_primary_keys_str(b, primary_keys_ordered))
         .collect::<Result<Vec<_>, _>>()?
         .into_iter()
         .flatten()
@@ -371,16 +504,13 @@ impl DataSink for MemSink {
         }
 
         // Ensure new data has no primary key conflicts internally, and generate primary key ids for later comparison to existing partition data.
+        // We must also check for null values in primary keys. With that we can safely assume [`self.batches`] has no null primary keys.
         let mut new_key_set: HashSet<String> = HashSet::new();
         if let Some(ref pks) = self.primary_key {
-            let new_primary_key_ids = primary_key_identifier(&new_batches, pks)?;
-            let num_new_keys = new_primary_key_ids.len();
-            new_key_set = new_primary_key_ids.into_iter().collect();
-            if new_key_set.len() != num_new_keys {
-                return Err(DataFusionError::Execution(
-                    "Primary key values must be unique".to_string(),
-                ));
-            }
+            let batch_flat: Vec<_> = new_batches.iter().flatten().collect();
+            let new_primary_key_ids = primary_key_identifier(&batch_flat, pks)?;
+            new_key_set =
+                check_and_filter_non_null_unique_primary_keys(&new_primary_key_ids, None)?;
         }
 
         let mut writable_targets: Vec<_> =
@@ -394,11 +524,10 @@ impl DataSink for MemSink {
                     if let Some(ref pks) = self.primary_key {
                         for rb in &**target {
                             let batch_pks = extract_primary_keys_str(rb, pks)?;
-                            if batch_pks.iter().any(|p| new_key_set.contains(p)) {
-                                return Err(DataFusionError::Execution(
-                                    "Primary key values must be unique".to_string(),
-                                ));
-                            }
+                            let _ = check_and_filter_non_null_unique_primary_keys(
+                                &batch_pks,
+                                Some(&new_key_set),
+                            )?;
                         }
                     }
                 }
@@ -544,6 +673,31 @@ mod tests {
         )
     }
 
+    fn create_batch_with_nullable_string_columns(
+        data: &[(&str, Vec<Option<&str>>)],
+    ) -> (RecordBatch, SchemaRef) {
+        let fields: Vec<_> = data
+            .iter()
+            .map(|(name, _)| {
+                arrow::datatypes::Field::new((*name).to_string(), DataType::Utf8, true)
+            })
+            .collect();
+        let schema = Arc::new(Schema::new(fields));
+
+        let arrays = data
+            .iter()
+            .map(|(_, values)| {
+                let arr = StringArray::from(values.clone());
+                Arc::new(arr) as Arc<dyn arrow::array::Array>
+            })
+            .collect::<Vec<_>>();
+
+        (
+            RecordBatch::try_new(Arc::clone(&schema), arrays).expect("data should be created"),
+            Arc::clone(&schema),
+        )
+    }
+
     #[tokio::test]
     async fn test_write_all_append_not_primary_key() {
         let (rb, schema) = create_batch_with_string_columns(&[(
@@ -619,6 +773,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_try_with_constraints() {
+        // Primary key constraint
+        let (rb, schema) = create_batch_with_string_columns(&[
+            (
+                "primary_key",
+                vec!["1970-01-01", "2012-12-01T11:11:11Z", "1970-01-01"],
+            ),
+            ("value", vec!["a", "b", "c"]),
+        ]);
+        assert!(
+            MemTable::try_new(schema, vec![vec![rb]])
+                .expect("mem table should be created")
+                .try_with_constraints(Constraints::new_unverified(vec![Constraint::PrimaryKey(
+                    vec![0],
+                )]))
+                .await
+                .is_err(),
+            "MemTable::try_with_constraints should check constraints on initial data"
+        );
+
+        // Unique constraint
+        let (rb, schema) = create_batch_with_string_columns(&[
+            (
+                "constraint",
+                vec!["1970-01-01", "2012-12-01T11:11:11Z", "1970-01-01"],
+            ),
+            ("value", vec!["a", "b", "c"]),
+        ]);
+        assert!(
+            MemTable::try_new(schema, vec![vec![rb]])
+                .expect("mem table should be created")
+                .try_with_constraints(Constraints::new_unverified(vec![Constraint::Unique(vec![
+                    0
+                ],)]))
+                .await
+                .is_err(),
+            "MemTable::try_with_constraints should check constraints on initial data"
+        );
+
+        // Unique constraint, nullity is not checked.
+        let (rb, schema) = create_batch_with_nullable_string_columns(&[
+            (
+                "constraint",
+                vec![Some("2012-12-01T11:11:11Z"), None, Some("1970-01-01")],
+            ),
+            ("value", vec![Some("a"), Some("b"), Some("c")]),
+        ]);
+        assert!(
+            MemTable::try_new(schema, vec![vec![rb]])
+                .expect("mem table should be created")
+                .try_with_constraints(Constraints::new_unverified(vec![Constraint::Unique(vec![
+                    0
+                ],)]))
+                .await
+                .is_ok(),
+            "MemTable::try_with_constraints should not check nullity on [`Constraint::Unique`]."
+        );
+    }
+
+    #[tokio::test]
     async fn test_write_all_replace_primary_key() {
         let (rb, schema) = create_batch_with_string_columns(&[
             (
@@ -629,9 +843,11 @@ mod tests {
         ]);
         let table = MemTable::try_new(schema, vec![vec![rb]])
             .expect("mem table should be created")
-            .with_constraints(Constraints::new_unverified(vec![Constraint::PrimaryKey(
+            .try_with_constraints(Constraints::new_unverified(vec![Constraint::PrimaryKey(
                 vec![0],
-            )]));
+            )]))
+            .await
+            .expect("satisfy primary key constraints");
         let ctx = SessionContext::new();
         let state = ctx.state();
 
@@ -699,9 +915,11 @@ mod tests {
         ]);
         let table = MemTable::try_new(schema, vec![vec![rb]])
             .expect("mem table should be created")
-            .with_constraints(Constraints::new_unverified(vec![Constraint::PrimaryKey(
+            .try_with_constraints(Constraints::new_unverified(vec![Constraint::PrimaryKey(
                 vec![0],
-            )]));
+            )]))
+            .await
+            .expect("satisfy primary key constraints");
         let ctx = SessionContext::new();
         let state = ctx.state();
         let (insert_rb, new_schema) = create_batch_with_string_columns(&[
@@ -769,9 +987,11 @@ mod tests {
         )]);
         let table = MemTable::try_new(schema, vec![vec![rb]])
             .expect("mem table should be created")
-            .with_constraints(Constraints::new_unverified(vec![Constraint::PrimaryKey(
+            .try_with_constraints(Constraints::new_unverified(vec![Constraint::PrimaryKey(
                 vec![0],
-            )]));
+            )]))
+            .await
+            .expect("satisfy primary key constraints");
         let ctx = SessionContext::new();
         let state = ctx.state();
 
@@ -803,9 +1023,11 @@ mod tests {
         ]);
         let table = MemTable::try_new(schema, vec![vec![rb]])
             .expect("mem table should be created")
-            .with_constraints(Constraints::new_unverified(vec![Constraint::PrimaryKey(
+            .try_with_constraints(Constraints::new_unverified(vec![Constraint::PrimaryKey(
                 vec![0],
-            )]));
+            )]))
+            .await
+            .expect("satisfy primary key constraints");
         let ctx = SessionContext::new();
         let state = ctx.state();
 

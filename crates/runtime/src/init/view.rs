@@ -38,7 +38,7 @@ impl Runtime {
     }
 
     /// Returns a list of valid views from the given App, skipping any that fail to parse and logging an error for them.
-    fn get_valid_views(app: &Arc<App>, log_errors: LogErrors) -> Vec<View> {
+    pub(crate) fn get_valid_views(app: &Arc<App>, log_errors: LogErrors) -> Vec<View> {
         let datasets = Self::get_valid_datasets(app, log_errors)
             .iter()
             .map(|ds| ds.name.clone())

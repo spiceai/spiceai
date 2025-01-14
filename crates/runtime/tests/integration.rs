@@ -42,7 +42,6 @@ mod docker;
 #[cfg(feature = "duckdb")]
 mod duckdb;
 mod endpoint_auth;
-mod federation;
 mod file;
 mod flight;
 mod github;
@@ -59,6 +58,11 @@ mod refresh_retry;
 mod refresh_sql;
 mod results_cache;
 mod s3;
+#[cfg(feature = "snowflake")]
+mod snowflake;
+#[cfg(feature = "spark")]
+mod spark;
+mod spiceai;
 #[cfg(feature = "sqlite")]
 mod sqlite;
 mod tls;

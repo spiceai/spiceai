@@ -17,7 +17,9 @@ limitations under the License.
 use std::collections::HashMap;
 
 use bollard::secret::HealthConfig;
-use datafusion_table_providers::sql::db_connection_pool::postgrespool::PostgresConnectionPool;
+use datafusion_table_providers::{
+    sql::db_connection_pool::postgrespool::PostgresConnectionPool, InvalidTypeAction,
+};
 use rand::Rng;
 use secrecy::SecretString;
 use tracing::instrument;
@@ -94,8 +96,12 @@ pub async fn start_postgres_docker_container(
 #[instrument]
 pub async fn get_postgres_connection_pool(
     port: usize,
+    action: Option<InvalidTypeAction>,
 ) -> Result<PostgresConnectionPool, anyhow::Error> {
-    let pool = PostgresConnectionPool::new(get_pg_params(port)).await?;
+    let action = action.unwrap_or_default();
+    let pool = PostgresConnectionPool::new(get_pg_params(port))
+        .await?
+        .with_invalid_type_action(action);
 
     Ok(pool)
 }

@@ -1,0 +1,30 @@
+version: v1
+kind: Spicepod
+name: file_tpch_arrow
+datasets:
+  - from: file:data/customer.parquet
+    name: customer
+    acceleration: &acceleration
+      enabled: true
+      engine: arrow
+  - from: file:data/lineitem.parquet
+    name: lineitem
+    acceleration: *acceleration
+  - from: file:data/nation.parquet
+    name: nation
+    acceleration: *acceleration
+  - from: file:data/orders.parquet
+    name: orders
+    acceleration: *acceleration
+  - from: file:data/part.parquet
+    name: part
+    acceleration: *acceleration
+  - from: file:data/partsupp.parquet
+    name: partsupp
+    acceleration: *acceleration
+  - from: file:data/region.parquet
+    name: region
+    acceleration: *acceleration
+  - from: file:data/supplier.parquet
+    name: supplier
+    acceleration: *acceleration

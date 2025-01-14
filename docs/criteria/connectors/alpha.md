@@ -6,31 +6,31 @@ All criteria must be met for the connector to be considered Alpha. As Alpha sign
 
 ## Alpha Quality Connectors
 
-| Connector                        | Alpha Quality | DRI Sign-off |
-| -------------------------------- | ------------- | ------------ |
-| Clickhouse                       | ➖            |              |
-| Databricks (mode: delta_lake)    | ✅            | @Sevenannn   |
-| Databricks (mode: spark_connect) | ➖            |              |
-| Delta Lake                       | ➖            |              |
-| Dremio                           | ➖            |              |
-| DuckDB                           | ✅            | @peasee      |
-| File                             | ✅            | @peasee      |
-| FlightSQL                        | ➖            |              |
-| FTP/SFTP                         | ➖            |              |
-| GraphQL                          | ➖            |              |
-| GitHub                           | ✅            | @peasee      |
-| HTTP/HTTPS                       | ➖            |              |
-| Localpod                         | ➖            |              |
-| MS SQL                           | ✅            | @peasee      |
-| MySQL                            | ✅            | @peasee      |
-| ODBC                             | ➖            |              |
-| PostgreSQL                       | ✅            | @Sevenannn   |
-| Sharepoint                       | ➖            |              |
-| Snowflake                        | ➖            |              |
-| Spice.AI Cloud Platform          | ➖            |              |
-| S3                               | ✅            | @Sevenannn   |
-| Azure BlobFS                     | ➖            |              |
-| Spark                            | ➖            |              |
+| Connector                        | Alpha Quality | DRI Sign-off    |
+| -------------------------------- | ------------- | --------------- |
+| Clickhouse                       | ➖            |                 |
+| Databricks (mode: delta_lake)    | ✅            | @Sevenannn      |
+| Databricks (mode: spark_connect) | ➖            |                 |
+| Delta Lake                       | ➖            |                 |
+| Dremio                           | ✅            | @Sevenannn      |
+| DuckDB                           | ✅            | @peasee         |
+| File                             | ✅            | @peasee         |
+| FlightSQL                        | ➖            |                 |
+| FTP/SFTP                         | ➖            |                 |
+| GraphQL                          | ➖            |                 |
+| GitHub                           | ✅            | @peasee         |
+| HTTP/HTTPS                       | ➖            |                 |
+| Localpod                         | ➖            |                 |
+| MS SQL                           | ✅            | @peasee         |
+| MySQL                            | ✅            | @peasee         |
+| ODBC                             | ➖            |                 |
+| PostgreSQL                       | ✅            | @Sevenannn      |
+| Sharepoint                       | ➖            |                 |
+| Snowflake                        | ✅            | @phillipleblanc |
+| Spice.ai Cloud Platform          | ✅            | @phillipleblanc |
+| S3                               | ✅            | @Sevenannn      |
+| Azure BlobFS                     | ➖            |                 |
+| Spark                            | ✅            | @ewgenius       |
 
 ## Alpha Release Criteria
 

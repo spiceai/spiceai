@@ -22,7 +22,7 @@ use async_openai::{
     types::{
         ChatChoiceStream, ChatCompletionNamedToolChoice, ChatCompletionRequestUserMessageArgs,
         ChatCompletionResponseStream, ChatCompletionStreamResponseDelta, ChatCompletionTool,
-        ChatCompletionToolChoiceOption, CreateChatCompletionRequest,
+        ChatCompletionToolChoiceOption, CompletionUsage, CreateChatCompletionRequest,
         CreateChatCompletionRequestArgs, CreateChatCompletionResponse,
         CreateChatCompletionStreamResponse, FinishReason, Role, Stop,
     },
@@ -645,7 +645,13 @@ fn chunk_to_openai_stream(
         // mistralrs uses milliseconds, OpenAI uses seconds
         created: (c.created / 1000) as u32,
         service_tier: None,
-        usage: None,
+        usage: c.usage.map(|u| CompletionUsage {
+            prompt_tokens: u.prompt_tokens as u32,
+            completion_tokens: u.completion_tokens as u32,
+            total_tokens: u.total_tokens as u32,
+            prompt_tokens_details: None,
+            completion_tokens_details: None,
+        }),
         choices,
     })
 }

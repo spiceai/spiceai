@@ -12,7 +12,7 @@ All criteria must be met for the connector to be considered [RC](../definitions.
 | Databricks (mode: delta_lake)    | ✅         | @Sevenannn   |
 | Databricks (mode: spark_connect) | ➖         |              |
 | Delta Lake                       | ➖         |              |
-| Dremio                           | ➖         |              |
+| Dremio                           | ✅         | @Sevenannn   |
 | DuckDB                           | ✅         | @peasee      |
 | File                             | ✅         | @Sevenannn   |
 | FlightSQL                        | ➖         |              |
@@ -27,7 +27,7 @@ All criteria must be met for the connector to be considered [RC](../definitions.
 | PostgreSQL                       | ✅         | @Sevenannn   |
 | Sharepoint                       | ➖         |              |
 | Snowflake                        | ➖         |              |
-| Spice.AI Cloud Platform          | ➖         |              |
+| Spice.ai Cloud Platform          | ➖         |              |
 | S3                               | ✅         | @Sevenannn   |
 | Azure BlobFS                     | ➖         |              |
 | Spark                            | ➖         |              |

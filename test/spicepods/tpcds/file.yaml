@@ -1,0 +1,52 @@
+version: v1
+kind: Spicepod
+name: file_tpcds
+datasets:
+  - from: file:data/catalog_sales.parquet
+    name: catalog_sales
+  - from: file:data/catalog_returns.parquet
+    name: catalog_returns
+  - from: file:data/inventory.parquet
+    name: inventory
+  - from: file:data/store_sales.parquet
+    name: store_sales
+  - from: file:data/store_returns.parquet
+    name: store_returns
+  - from: file:data/web_sales.parquet
+    name: web_sales
+  - from: file:data/web_returns.parquet
+    name: web_returns
+  - from: file:data/customer.parquet
+    name: customer
+  - from: file:data/customer_address.parquet
+    name: customer_address
+  - from: file:data/customer_demographics.parquet
+    name: customer_demographics
+  - from: file:data/date_dim.parquet
+    name: date_dim
+  - from: file:data/household_demographics.parquet
+    name: household_demographics
+  - from: file:data/item.parquet
+    name: item
+  - from: file:data/promotion.parquet
+    name: promotion
+  - from: file:data/ship_mode.parquet
+    name: ship_mode
+  - from: file:data/store.parquet
+    name: store
+  - from: file:data/time_dim.parquet
+    name: time_dim
+  - from: file:data/warehouse.parquet
+    name: warehouse
+  - from: file:data/web_page.parquet
+    name: web_page
+  - from: file:data/web_site.parquet
+    name: web_site
+  - from: file:data/reason.parquet
+    name: reason
+  - from: file:data/call_center.parquet
+    name: call_center
+  - from: file:data/income_band.parquet
+    name: income_band
+  - from: file:data/catalog_page.parquet
+    name: catalog_page

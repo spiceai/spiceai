@@ -192,14 +192,15 @@ pub(crate) fn max_seq_length_from_st_config(
 ///
 /// ```rust
 /// use std::collections::HashMap;
-/// use std::path::Path;
+/// use std::path::PathBuf;
+/// use llms::embeddings::candle::link_files_into_tmp_dir;
 ///
-/// let files: HashMap<String, &Path> = vec![
-///    ("model.safetensors".to_string(), Path::new("path/to/model.safetensors")),
-///   ("config.json".to_string(), Path::new("path/to/irrelevant_filename.json")),
+/// let files: HashMap<String, PathBuf> = vec![
+///    ("model.safetensors".to_string(), PathBuf::from("path/to/model.safetensors")),
+///   ("config.json".to_string(), PathBuf::from("path/to/irrelevant_filename.json")),
 /// ].into_iter().collect();
 ///
-/// let temp_dir = link_files_into_tmp_dir(files).unwrap();
+/// let temp_dir = link_files_into_tmp_dir(files);
 ///
 /// ```
 ///

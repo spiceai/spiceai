@@ -16,11 +16,11 @@ limitations under the License.
 
 use std::collections::HashMap;
 
-use crate::results::BenchmarkResultsBuilder;
+use crate::results::{self, BenchmarkResultsBuilder};
 use app::AppBuilder;
 use runtime::Runtime;
 use spicepod::component::dataset::acceleration::{Acceleration, ZeroResultsAction};
-use test_framework::queries::{get_clickbench_test_queries, get_tpch_test_queries};
+use test_framework::queries::{get_clickbench_test_queries, get_tpch_test_queries, QueryOverrides};
 
 pub(crate) mod abfs;
 pub(crate) mod file;
@@ -40,6 +40,7 @@ pub(crate) fn build_app(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn run(
     connector: &str,
     rt: &mut Runtime,
@@ -58,7 +59,9 @@ pub(crate) async fn run(
             #[cfg(feature = "postgres")]
             {
                 if engine.clone().unwrap_or_default().as_str() == "postgres" {
-                    test_framework::queries::get_tpcds_test_queries(Some("postgres"))
+                    test_framework::queries::get_tpcds_test_queries(Some(
+                        QueryOverrides::PostgreSQL,
+                    ))
                 } else {
                     get_tpcds_test_queries(engine.as_deref())
                 }
@@ -69,11 +72,13 @@ pub(crate) async fn run(
                 get_tpcds_test_queries(engine.as_deref())
             }
         }
-        "clickbench" => get_clickbench_test_queries(engine.as_deref()),
+        "clickbench" => {
+            get_clickbench_test_queries(engine.as_deref().and_then(QueryOverrides::from_engine))
+        }
         _ => return Err(format!("Invalid benchmark to run {bench_name}")),
     };
 
-    let bench_name = match (mode, on_zero_results) {
+    let bench_name = match (mode, on_zero_results.clone()) {
         (None, Some(_)) | (Some(_), None) => {
             unreachable!("both mode and on_zero_results are set when acceleration is passed")
         }
@@ -94,7 +99,7 @@ pub(crate) async fn run(
 
     let mut errors = Vec::new();
 
-    for (query_name, query) in test_queries {
+    for (query_name, query) in &test_queries {
         let verify_query_results = matches!(
             bench_name.as_str(),
             "s3" | "s3_postgres_memory"
@@ -109,9 +114,9 @@ pub(crate) async fn run(
             || query_name.starts_with("tpch_q")
             || query_name.starts_with("tpcds_q"));
 
-        if let Err(e) = super::run_query_and_record_result(
+        match super::run_query_and_return_result(
             rt,
-            benchmark_results,
+            benchmark_results.iterations(),
             bench_name.as_str(),
             query_name,
             query,
@@ -119,7 +124,47 @@ pub(crate) async fn run(
         )
         .await
         {
-            errors.push(format!("Query {query_name} failed with error: {e}"));
+            Ok(mut result) => {
+                if verify_query_results && Some(ZeroResultsAction::UseSource) == on_zero_results {
+                    // compare snapshots of use source to original connector snapshots
+                    // because the accelerators return nothing and force on zero results, the snapshot contents should be the same
+                    let connector_snapshot = format!("bench__{connector}_{query_name}.snap");
+                    let use_source_snapshot = format!("bench__{bench_name}_{query_name}.snap");
+
+                    // get correct path to snapshots directory
+                    let snapshots_directory =
+                        if let Ok(insta_workspace_root) = std::env::var("INSTA_WORKSPACE_ROOT") {
+                            std::path::Path::new(&insta_workspace_root)
+                                .join("crates/runtime/benches/snapshots")
+                        } else {
+                            std::path::Path::new("../snapshots").to_path_buf()
+                        };
+
+                    let connector_snapshot_contents =
+                        std::fs::read_to_string(snapshots_directory.join(&connector_snapshot))
+                            .map_err(|e| {
+                                format!("Failed to read snapshot {connector_snapshot}: {e}")
+                            })?;
+
+                    let use_source_snapshot_contents =
+                        std::fs::read_to_string(snapshots_directory.join(&use_source_snapshot))
+                            .map_err(|e| {
+                                format!("Failed to read snapshot {use_source_snapshot}: {e}")
+                            })?;
+
+                    if !test_framework::utils::snapshots_are_equal(
+                        &connector_snapshot_contents,
+                        &use_source_snapshot_contents,
+                    ) {
+                        result.status = results::Status::Failed;
+                    }
+                }
+
+                benchmark_results.record_result(result);
+            }
+            Err(e) => {
+                errors.push(format!("Query {query_name} failed with error: {e}"));
+            }
         }
     }
 

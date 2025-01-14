@@ -27,7 +27,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 #[tokio::test]
-#[ignore]
 async fn spiceai_integration_test_catalog() -> Result<(), anyhow::Error> {
     let _ = rustls::crypto::CryptoProvider::install_default(
         rustls::crypto::aws_lc_rs::default_provider(),
@@ -37,7 +36,10 @@ async fn spiceai_integration_test_catalog() -> Result<(), anyhow::Error> {
     test_request_context()
         .scope(async {
             let app = AppBuilder::new("spiceai_catalog_test")
-                .with_catalog(Catalog::new("spice.ai".to_string(), "spiceai".to_string()))
+                .with_catalog(Catalog::new(
+                    "spice.ai/spiceai/tpch".to_string(),
+                    "spc".to_string(),
+                ))
                 .build();
 
             let status = status::RuntimeStatus::new();
@@ -47,10 +49,6 @@ async fn spiceai_integration_test_catalog() -> Result<(), anyhow::Error> {
                 .with_app(app)
                 .with_datafusion(df)
                 .with_runtime_status(status)
-                .with_autoload_extensions(HashMap::from([(
-                    "spice_cloud".to_string(),
-                    Box::new(SpiceExtensionFactory::default()) as Box<dyn ExtensionFactory>,
-                )]))
                 .build()
                 .await;
 
@@ -63,7 +61,7 @@ async fn spiceai_integration_test_catalog() -> Result<(), anyhow::Error> {
 
             let mut result = rt
                 .datafusion()
-                .query_builder("SELECT * FROM spiceai.eth.recent_blocks LIMIT 10")
+                .query_builder("SELECT * FROM spc.tpch.customer LIMIT 10")
                 .build()
                 .run()
                 .await?;
@@ -82,7 +80,6 @@ async fn spiceai_integration_test_catalog() -> Result<(), anyhow::Error> {
 }
 
 #[tokio::test]
-#[ignore]
 async fn spiceai_integration_test_catalog_include() -> Result<(), anyhow::Error> {
     let _ = rustls::crypto::CryptoProvider::install_default(
         rustls::crypto::aws_lc_rs::default_provider(),
@@ -91,11 +88,8 @@ async fn spiceai_integration_test_catalog_include() -> Result<(), anyhow::Error>
 
     test_request_context()
         .scope(async {
-            let mut catalog = Catalog::new("spice.ai".to_string(), "spiceai".to_string());
-            catalog.include = vec![
-                "eth.recent_bl*".to_string(),
-                "eth.recent_transactions".to_string(),
-            ];
+            let mut catalog = Catalog::new("spice.ai/spiceai/tpch".to_string(), "spc".to_string());
+            catalog.include = vec!["tpch.customer".to_string(), "tpch.part*".to_string()];
             let app = AppBuilder::new("spiceai_catalog_test")
                 .with_catalog(catalog)
                 .build();
@@ -126,7 +120,7 @@ async fn spiceai_integration_test_catalog_include() -> Result<(), anyhow::Error>
                     "SELECT table_catalog, table_schema, table_name, table_type 
              FROM information_schema.tables 
              WHERE table_schema != 'information_schema' 
-               AND table_catalog = 'spiceai' 
+               AND table_catalog = 'spc' 
              ORDER BY table_name",
                 )
                 .build()
@@ -141,12 +135,13 @@ async fn spiceai_integration_test_catalog_include() -> Result<(), anyhow::Error>
             assert_eq!(results.len(), 1);
             assert_batches_eq!(
                 &[
-                    "+---------------+--------------+---------------------+------------+",
-                    "| table_catalog | table_schema | table_name          | table_type |",
-                    "+---------------+--------------+---------------------+------------+",
-                    "| spiceai       | eth          | recent_blocks       | BASE TABLE |",
-                    "| spiceai       | eth          | recent_transactions | BASE TABLE |",
-                    "+---------------+--------------+---------------------+------------+",
+                    "+---------------+--------------+------------+------------+",
+                    "| table_catalog | table_schema | table_name | table_type |",
+                    "+---------------+--------------+------------+------------+",
+                    "| spc           | tpch         | customer   | BASE TABLE |",
+                    "| spc           | tpch         | part       | BASE TABLE |",
+                    "| spc           | tpch         | partsupp   | BASE TABLE |",
+                    "+---------------+--------------+------------+------------+",
                 ],
                 &results
             );

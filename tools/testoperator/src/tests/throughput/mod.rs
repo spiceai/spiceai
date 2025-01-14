@@ -14,37 +14,76 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::Args;
+use super::get_app_and_start_request;
+use crate::commands::TestArgs;
 use std::time::Duration;
 use test_framework::{
-    anyhow, flight::query_to_batches, spiced::SpicedInstance, spicepod_utils::from_app,
+    anyhow,
+    metrics::MetricCollector,
+    queries::{QueryOverrides, QuerySet},
+    spiced::SpicedInstance,
+    spicetest::{EndCondition, SpiceTest},
 };
 
-pub(crate) async fn run(args: &Args) -> anyhow::Result<()> {
-    let app = test_framework::app::AppBuilder::new("test-operator")
-        // .with_dataset(Dataset::new(
-        //     "github:github.com/spiceai/spiceai/issues",
-        //     "spiceai.issues",
-        // ))
-        .build();
+pub(crate) fn export(args: &TestArgs) -> anyhow::Result<()> {
+    let (_, mut start_request) = get_app_and_start_request(args)?;
 
-    let mut spiced_instance = SpicedInstance::start(&args.spiced_path, from_app(app)).await?;
+    start_request.prepare()?;
+    let tempdir_path = start_request.get_tempdir_path();
+
+    println!(
+        "Exported spicepod environment to: {}",
+        tempdir_path.to_string_lossy()
+    );
+
+    Ok(())
+}
+
+pub(crate) async fn run(args: &TestArgs) -> anyhow::Result<()> {
+    let query_set = QuerySet::from(args.query_set.clone());
+    let query_overrides = args.query_overrides.clone().map(QueryOverrides::from);
+    let queries = query_set.get_queries(query_overrides);
+
+    let (app, start_request) = get_app_and_start_request(args)?;
+    let mut spiced_instance = SpicedInstance::start(start_request).await?;
 
     spiced_instance
-        .wait_for_ready(Duration::from_secs(10))
+        .wait_for_ready(Duration::from_secs(args.ready_wait.unwrap_or(30) as u64))
         .await?;
 
-    let client = spiced_instance.flight_client().await?;
+    // baseline run
+    println!("Running baseline test");
+    let baseline_test = SpiceTest::new(app.name.clone(), spiced_instance)
+        .with_query_set(queries.clone())
+        .with_parallel_count(1)
+        .with_end_condition(EndCondition::QuerySetCompleted(6))
+        .start()
+        .await?;
 
-    let batches = query_to_batches(&client, "SELECT 1").await?;
-    println!("Batches: {batches:?}");
+    let test = baseline_test.wait().await?;
+    let spiced_instance = test.end();
 
-    // Wait for input
-    println!("Press Enter to stop");
-    let _ = std::io::stdin().read_line(&mut String::new());
+    // throughput test
+    println!("Running throughput test");
+    let throughput_test = SpiceTest::new(app.name.clone(), spiced_instance)
+        .with_query_set(queries.clone())
+        .with_parallel_count(args.concurrency.unwrap_or(8))
+        .with_end_condition(EndCondition::QuerySetCompleted(2))
+        .start()
+        .await?;
+
+    let test = throughput_test.wait().await?;
+    let throughput_metric = test.get_throughput_metric(args.scale_factor.unwrap_or(1.0))?;
+    let metrics = test.collect()?;
+    let mut spiced_instance = test.end();
+
+    metrics.show()?;
 
     spiced_instance.stop()?;
 
-    println!("Spiced instance stopped");
+    println!(
+        "Throughput test completed with throughput: {} Queries per hour * Scale Factor",
+        throughput_metric.round()
+    );
     Ok(())
 }

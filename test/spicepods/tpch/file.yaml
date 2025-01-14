@@ -1,0 +1,20 @@
+version: v1
+kind: Spicepod
+name: file_tpch
+datasets:
+  - from: file:data/customer.parquet
+    name: customer
+  - from: file:data/lineitem.parquet
+    name: lineitem
+  - from: file:data/nation.parquet
+    name: nation
+  - from: file:data/orders.parquet
+    name: orders
+  - from: file:data/part.parquet
+    name: part
+  - from: file:data/partsupp.parquet
+    name: partsupp
+  - from: file:data/region.parquet
+    name: region
+  - from: file:data/supplier.parquet
+    name: supplier

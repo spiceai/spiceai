@@ -1,0 +1,18 @@
+---
+source: crates/runtime/benches/bench.rs
+expression: records_pretty
+---
++--------------------+------------+-----------+-----------------+----------------+------------+-------+-----------------+---------------+----------------+-------+-------+-----+-------+--------+--------+-------+--------+---------+-------+-----+
+| product_name       | store_name | store_zip | b_street_number | b_street_name  | b_city     | b_zip | c_street_number | c_street_name | c_city         | c_zip | syear | cnt | s11   | s21    | s31    | s12   | s22    | s32     | syear | cnt |
++--------------------+------------+-----------+-----------------+----------------+------------+-------+-----------------+---------------+----------------+-------+-------+-----+-------+--------+--------+-------+--------+---------+-------+-----+
+| antiablecallycally | bar        | 31904     | 652             | 4th Oak        | Highland   | 29454 | 311             | Maple Valley  | Arlington      | 86557 | 2001  | 1   | 4.11  | 4.11   | 0.00   | 23.01 | 26.46  | 0.00    | 2002  | 1   |
+| antiablecallycally | bar        | 31904     | 728             | Jackson Spring | Woodlawn   | 54098 | 634             | Hillcrest     | Harmon         | 95623 | 2001  | 1   | 19.99 | 22.18  | 0.00   | 23.01 | 26.46  | 0.00    | 2002  | 1   |
+| antiablecallycally | eing       | 35709     | 708             | Forest         | Liberty    | 73451 | 687             | West          | Concord        | 34107 | 2001  | 1   | 37.88 | 66.29  | 0.00   | 57.24 | 109.32 | 0.00    | 2002  | 1   |
+| antiablecallycally | eing       | 35709     | 708             | Forest         | Liberty    | 73451 | 687             | West          | Concord        | 34107 | 2001  | 1   | 37.88 | 66.29  | 0.00   | 67.64 | 126.48 | 3235.75 | 2002  | 1   |
+| antiablecallycally | eing       | 35709     | 708             | Forest         | Liberty    | 73451 | 687             | West          | Concord        | 34107 | 2001  | 1   | 37.88 | 66.29  | 0.00   | 89.78 | 107.73 | 0.00    | 2002  | 1   |
+| antiablecallycally | ought      | 31904     | 720             | Hill Walnut    | Glendale   | 43951 | 673             | Walnut South  | Green Acres    | 57683 | 2001  | 1   | 88.62 | 114.31 | 0.00   | 83.45 | 161.89 | 0.00    | 2002  | 1   |
+| antiationcallyese  | eing       | 35709     | 465             | 4th Hickory    | Clifton    | 48014 | 165             | Sunset Church | Pleasant Grove | 34136 | 2001  | 1   | 13.41 | 18.77  | 101.20 | 49.69 | 62.11  | 0.00    | 2002  | 1   |
+| antiationcallyese  | eing       | 35709     | 465             | 4th Hickory    | Clifton    | 48014 | 165             | Sunset Church | Pleasant Grove | 34136 | 2001  | 1   | 13.41 | 18.77  | 101.20 | 86.32 | 138.97 | 5332.03 | 2002  | 1   |
+| antiationcallyese  | eing       | 35709     | 213             | Washington 8th | White Hall | 36955 | 84              | 8th Maple     | Oakwood        | 60169 | 2001  | 1   | 21.08 | 32.88  | 277.55 | 49.69 | 62.11  | 0.00    | 2002  | 1   |
+| antiationcallyese  | eing       | 35709     | 213             | Washington 8th | White Hall | 36955 | 84              | 8th Maple     | Oakwood        | 60169 | 2001  | 1   | 21.08 | 32.88  | 277.55 | 86.32 | 138.97 | 5332.03 | 2002  | 1   |
++--------------------+------------+-----------+-----------------+----------------+------------+-------+-----------------+---------------+----------------+-------+-------+-----+-------+--------+--------+-------+--------+---------+-------+-----+

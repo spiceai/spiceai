@@ -42,7 +42,7 @@ async fn test_acceleration_postgres_checkpoint() -> Result<(), anyhow::Error> {
             let port: usize = get_random_port();
             let running_container = common::start_postgres_docker_container(port).await?;
 
-            let pool = common::get_postgres_connection_pool(port).await?;
+            let pool = common::get_postgres_connection_pool(port, None).await?;
 
             let status = status::RuntimeStatus::new();
             let df = get_test_datafusion(Arc::clone(&status));

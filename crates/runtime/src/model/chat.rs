@@ -108,7 +108,7 @@ pub async fn construct_model(
         ModelSource::Anthropic => anthropic(model_id.as_deref(), params),
         ModelSource::Azure => azure(model_id, component.name.as_str(), params),
         ModelSource::Xai => Ok(Box::new(Xai::new(
-            extract_secret!(params, "endpoint"),
+            model_id.as_deref(),
             extract_secret!(params, "xai_api_key"),
         )) as Box<dyn Chat>),
         ModelSource::OpenAi => Ok(openai(model_id, params)),
