@@ -115,7 +115,7 @@ jobs:
         if: ${{ github.event.inputs.query_overrides == '' }}
         run: |
           rm -rf .spice/data
-          testoperator run throughput -s /usr/local/bin/spiced -p ${{ github.event.inputs.spicepod_path }} -d /opt/spiced/data --query-set ${{ github.event.inputs.query_set }} --ready-wait ${{ github.event.inputs.ready_wait }}
+          testoperator run throughput -s /usr/local/bin/spiced -p ${{ github.event.inputs.spicepod_path }} -d /opt/spiced/data --query-set ${{ github.event.inputs.query_set }} --ready-wait ${{ github.event.inputs.ready_wait }} --disable-progress-bars
         env:
           S3_ENDPOINT: ${{ secrets.CLICKBENCH_S3_ENDPOINT}}
           S3_KEY: ${{ secrets.CLICKBENCH_S3_KEY}}
@@ -129,7 +129,7 @@ jobs:
         if: ${{ github.event.inputs.query_overrides != '' }}
         run: |
           rm -rf .spice/data
-          testoperator run throughput -s /usr/local/bin/spiced -p ${{ github.event.inputs.spicepod_path }} -d /opt/spiced/data --query-set ${{ github.event.inputs.query_set }} --query-overrides ${{ github.event.inputs.query_overrides }} --ready-wait ${{ github.event.inputs.ready_wait }}
+          testoperator run throughput -s /usr/local/bin/spiced -p ${{ github.event.inputs.spicepod_path }} -d /opt/spiced/data --query-set ${{ github.event.inputs.query_set }} --query-overrides ${{ github.event.inputs.query_overrides }} --ready-wait ${{ github.event.inputs.ready_wait }} --disable-progress-bars
         env:
           S3_ENDPOINT: ${{ secrets.CLICKBENCH_S3_ENDPOINT}}
           S3_KEY: ${{ secrets.CLICKBENCH_S3_KEY}}
