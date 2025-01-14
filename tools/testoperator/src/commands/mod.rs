@@ -99,7 +99,7 @@ impl From<QuerySetArg> for QuerySet {
         match arg {
             QuerySetArg::Tpch => QuerySet::Tpch,
             QuerySetArg::Tpcds => QuerySet::Tpcds,
-            QuerySetArg::Clickbench => QuerySet::ClickBench,
+            QuerySetArg::Clickbench => QuerySet::Clickbench,
         }
     }
 }
