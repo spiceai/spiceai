@@ -284,6 +284,7 @@ jobs:
           cuda-version: "12.4.1"
           cuda-compute-capability: "86"
           artifact-tag: ${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
+          target_os: ${{ matrix.target.target_os }}
 
       - name: Run Spiced CUDA Build (COMPUTE_CAP=75).
         uses: ./github/actions/spiced-cuda-build
@@ -292,6 +293,7 @@ jobs:
           cuda-version: "12.4.1"
           cuda-compute-capability: "75"
           artifact-tag: ${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
+          target_os: ${{ matrix.target.target_os }}
 
       ## CLI build
       - name: Build spice
