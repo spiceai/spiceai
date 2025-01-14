@@ -61,6 +61,7 @@ pub struct Running {
 }
 pub struct Completed {
     query_durations: BTreeMap<String, Vec<Duration>>,
+    row_counts: BTreeMap<String, Vec<usize>>,
     test_duration: Duration,
     end_time: SystemTime,
 }
@@ -131,17 +132,11 @@ impl SpiceTest<NotStarted> {
             EndCondition::Duration(duration) => {
                 // refresh the progress bar every 10 seconds, or every 1/1000th of the duration
                 // for an 8 hour test, this would be every ~28 seconds
-                let pb =
-                    ProgressBar::new(duration.as_secs() / self.state.query_set.len() as u64 * 2); // this isn't 100% representative of the progress bar count, but it's close enough (2s per query)
-                pb.enable_steady_tick(Duration::from_secs((duration.as_secs() / 1000).max(10)));
-
-                pb
+                ProgressBar::new((duration.as_secs() / self.state.query_set.len() as u64) * 2)
+                // this isn't 100% representative of the progress bar count, but it's close enough (2s per query)
             }
             EndCondition::QuerySetCompleted(count) => {
-                let pb = ProgressBar::new((self.state.query_set.len() * count) as u64);
-                pb.enable_steady_tick(Duration::from_secs(1));
-
-                pb
+                ProgressBar::new((self.state.query_set.len() * count) as u64)
             }
         }
     }
@@ -199,6 +194,7 @@ impl SpiceTest<NotStarted> {
 impl SpiceTest<Running> {
     pub async fn wait(self) -> Result<SpiceTest<Completed>> {
         let mut query_durations = BTreeMap::new();
+        let mut row_counts = BTreeMap::new();
         for query_duration in join_all(self.state.query_workers).await {
             let worker_result = query_duration??;
             if worker_result.connection_failed {
@@ -212,6 +208,13 @@ impl SpiceTest<Running> {
                     .entry(query)
                     .or_insert_with(Vec::new)
                     .extend(duration);
+            }
+
+            for (query, query_row_counts) in worker_result.row_counts {
+                row_counts
+                    .entry(query)
+                    .or_insert_with(Vec::new)
+                    .extend(query_row_counts);
             }
         }
 
@@ -228,6 +231,7 @@ impl SpiceTest<Running> {
             use_progress_bars: self.use_progress_bars,
             state: Completed {
                 query_durations,
+                row_counts,
                 test_duration: self.state.start_time.elapsed(),
                 end_time: SystemTime::now(),
             },
@@ -257,6 +261,28 @@ impl SpiceTest<Completed> {
         let rhs = self.get_cumulative_query_duration().as_secs_f64() * scale;
         // u32 is safe because lhs is unlikely to be greater than u32::MAX unless some extreme parameters are used (more than 1000 parallel and query count)
         Ok(f64::from(u32::try_from(lhs)?) / rhs)
+    }
+
+    /// Validates that row counts are consistent across queries
+    /// Each query should return the same number of rows
+    pub fn validate_returned_row_counts(&self) -> Result<BTreeMap<String, usize>> {
+        // validate that row counts are consistent across queries - each query should return the same number of rows
+        let mut returned_row_counts = BTreeMap::new();
+        for (query, counts) in &self.state.row_counts {
+            let first = counts
+                .first()
+                .ok_or_else(|| anyhow::anyhow!("No row counts found for query {}", query))?;
+            if !counts.iter().all(|count| count == first) {
+                return Err(anyhow::anyhow!(
+                    "Row counts for query {} are inconsistent",
+                    query
+                ));
+            }
+
+            returned_row_counts.insert(query.clone(), *first);
+        }
+
+        Ok(returned_row_counts)
     }
 
     /// Once the test has completed, return ownership of the spiced instance

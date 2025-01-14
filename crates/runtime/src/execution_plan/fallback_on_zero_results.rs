@@ -191,7 +191,7 @@ impl ExecutionPlan for FallbackOnZeroResultsScanExec {
                 Box::pin(stream_adapter) as SendableRecordBatchStream
             } else {
                 tracing::trace!("FallbackOnZeroResultsScanExec input_stream.next() returned None");
-                tracing::info!("{fallback_msg}");
+                tracing::debug!("{fallback_msg}");
                 metrics::FEDERATED_FALLBACK.add(1, &[KeyValue::new("dataset_name", table_name.to_string())]);
                 let federated_provider = fallback_provider.table_provider().await;
                 let fallback_plan = match federated_provider

@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::get_app_and_start_request;
+use super::{get_app_and_start_request, RowCounts};
 use crate::commands::TestArgs;
 use std::time::Duration;
 use test_framework::{
@@ -25,7 +25,7 @@ use test_framework::{
     spicetest::{EndCondition, SpiceTest},
 };
 
-pub(crate) async fn run(args: &TestArgs) -> anyhow::Result<()> {
+pub(crate) async fn run(args: &TestArgs) -> anyhow::Result<RowCounts> {
     let query_set = QuerySet::from(args.query_set.clone());
     let query_overrides = args.query_overrides.clone().map(QueryOverrides::from);
     let queries = query_set.get_queries(query_overrides);
@@ -47,6 +47,7 @@ pub(crate) async fn run(args: &TestArgs) -> anyhow::Result<()> {
         .await?;
 
     let test = benchmark_test.wait().await?;
+    let row_counts = test.validate_returned_row_counts()?;
     let metrics = test.collect()?;
     let mut spiced_instance = test.end();
 
@@ -54,5 +55,5 @@ pub(crate) async fn run(args: &TestArgs) -> anyhow::Result<()> {
 
     spiced_instance.show_memory_usage()?;
     spiced_instance.stop()?;
-    Ok(())
+    Ok(row_counts)
 }

@@ -14,14 +14,19 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::collections::BTreeMap;
+
 use crate::commands::TestArgs;
 use test_framework::{
     anyhow, app::App, spiced::StartRequest, spicepod::Spicepod, spicepod_utils::from_app,
 };
 
 pub(crate) mod bench;
+pub(crate) mod data_consistency;
 pub(crate) mod load;
 pub(crate) mod throughput;
+
+pub(crate) type RowCounts = BTreeMap<String, usize>;
 
 pub(crate) fn get_app_and_start_request(args: &TestArgs) -> anyhow::Result<(App, StartRequest)> {
     let spicepod = Spicepod::load_exact(args.spicepod_path.clone())?;
