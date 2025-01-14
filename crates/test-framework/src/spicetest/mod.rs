@@ -57,7 +57,7 @@ pub type SpiceTestQueryWorkers = Vec<JoinHandle<Result<SpiceTestQueryWorkerResul
 pub struct Running {
     start_time: Instant,
     query_workers: SpiceTestQueryWorkers,
-    progress_bar: MultiProgress,
+    progress_bar: Option<MultiProgress>,
 }
 pub struct Completed {
     query_durations: BTreeMap<String, Vec<Duration>>,
@@ -79,6 +79,7 @@ pub struct SpiceTest<S: TestState> {
     query_count: usize,
     parallel_count: usize,
     start_time: SystemTime,
+    use_progress_bars: bool,
 
     state: S,
 }
@@ -92,11 +93,18 @@ impl SpiceTest<NotStarted> {
             query_count: 0,
             parallel_count: 1,
             start_time: SystemTime::now(),
+            use_progress_bars: true,
             state: NotStarted {
                 query_set: vec![],
                 end_condition: EndCondition::QuerySetCompleted(1),
             },
         }
+    }
+
+    #[must_use]
+    pub fn with_progress_bars(mut self, use_progress_bars: bool) -> Self {
+        self.use_progress_bars = use_progress_bars;
+        self
     }
 
     #[must_use]
@@ -147,18 +155,27 @@ impl SpiceTest<NotStarted> {
             return Err(anyhow::anyhow!("Parallel count must be greater than 0"));
         }
 
-        let multi = MultiProgress::new();
+        let multi = if self.use_progress_bars {
+            Some(MultiProgress::new())
+        } else {
+            None
+        };
 
         let flight_client = self.spiced_instance.flight_client().await?;
         let query_workers = (0..self.parallel_count)
             .map(|id| {
-                SpiceTestQueryWorker::new(
+                let worker = SpiceTestQueryWorker::new(
                     id,
                     self.state.query_set.clone(),
                     self.state.end_condition,
                     flight_client.clone(),
-                )
-                .with_progress_bar(multi.add(self.get_new_progress_bar()))
+                );
+
+                if let Some(multi) = &multi {
+                    worker.with_progress_bar(multi.add(self.get_new_progress_bar()))
+                } else {
+                    worker
+                }
             })
             .map(SpiceTestQueryWorker::start)
             .collect();
@@ -169,6 +186,7 @@ impl SpiceTest<NotStarted> {
             query_count: self.query_count,
             parallel_count: self.parallel_count,
             start_time: self.start_time,
+            use_progress_bars: self.use_progress_bars,
             state: Running {
                 start_time: Instant::now(),
                 query_workers,
@@ -197,7 +215,9 @@ impl SpiceTest<Running> {
             }
         }
 
-        self.state.progress_bar.clear()?;
+        if let Some(multi) = self.state.progress_bar {
+            multi.clear()?;
+        }
 
         Ok(SpiceTest {
             name: self.name,
@@ -205,6 +225,7 @@ impl SpiceTest<Running> {
             query_count: self.query_count,
             parallel_count: self.parallel_count,
             start_time: self.start_time,
+            use_progress_bars: self.use_progress_bars,
             state: Completed {
                 query_durations,
                 test_duration: self.state.start_time.elapsed(),

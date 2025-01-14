@@ -84,6 +84,15 @@ impl SpiceTestQueryWorker {
             let start = Instant::now();
 
             while !self.end_condition.is_met(&start, query_set_count) {
+                if self.progress_bar.is_none() && self.id == 0 {
+                    println!(
+                        "Worker {} - Query set count: {} - Elapsed time: {:?}",
+                        self.id,
+                        query_set_count,
+                        start.elapsed()
+                    );
+                }
+
                 'query_set: for query in &self.query_set {
                     let mut row_count = 0;
                     let query_start = Instant::now();

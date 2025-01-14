@@ -43,6 +43,7 @@ pub(crate) async fn run(args: &TestArgs) -> anyhow::Result<()> {
         .with_query_set(queries.clone())
         .with_parallel_count(args.concurrency.unwrap_or(8))
         .with_end_condition(EndCondition::QuerySetCompleted(2))
+        .with_progress_bars(!args.disable_progress_bars)
         .start()
         .await?;
 
@@ -62,6 +63,7 @@ pub(crate) async fn run(args: &TestArgs) -> anyhow::Result<()> {
         .with_end_condition(EndCondition::Duration(Duration::from_secs(
             args.duration.unwrap_or(60).try_into()?,
         )))
+        .with_progress_bars(!args.disable_progress_bars)
         .start()
         .await?;
 
