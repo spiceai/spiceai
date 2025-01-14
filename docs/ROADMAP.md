@@ -21,6 +21,7 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 - MySQL Data Connector (Stable)
 - GitHub Data Connector (Stable)
 - MS SQL data connector (Stable)
+- DuckDB data connector (Stable)
 - File data connector (Stable)
 - Dremio data connector (Stable)
 - Model Providers: Anthropic, Groq, Grok (Beta)
@@ -62,7 +63,7 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 | ------------ | ----------------- |
 | `arrow`      | Stable            |
 | `duckdb`     | Stable            |
-| `postgresql` | Stable            |
+| `postgresql` | Release Candidate |
 | `sqlite`     | Release Candidate |
 
 ### v1.0-stable Catalog Provider Support
@@ -76,24 +77,26 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 
 ### v1.0-stable Model Provider Support
 
-| Name          | Status |
-| ------------- | ------ |
-| `openai`      | Stable |
-| `huggingface` | Stable |
-| `file`        | Stable |
-| `anthropic`   | Beta   |
-| `azure`       | Beta   |
-| `groq`        | Beta   |
-| `grok`        | Alpha  |
+| Name          | Status            |
+| ------------- | ----------------- |
+| `openai`      | Release Candidate |
+| `huggingface` | Release Candidate |
+| `file`        | Release Candidate |
+| `anthropic`   | Alpha             |
+| `azure`       | Alpha             |
+| `groq`        | Alpha             |
+| `grok`        | Alpha             |
 
 ## v1.1 (Feb 2025)
 
-- DuckDB Data Connector (Stable)
 - Enterprise Search improvements
   - [#3006](https://github.com/spiceai/spiceai/issues/3006) Search with keyword filtering
   - [#3016](https://github.com/spiceai/spiceai/issues/3016) Hybrid-Search (DB + Vector)
   - [#3015](https://github.com/spiceai/spiceai/issues/3015) DataFusion Search
 - [#3318](https://github.com/spiceai/spiceai/issues/3318) FinanceBench in CI
+- Model Providers: OpenAI, HuggingFace, File (Stable)
+- Model Providers: Anthropic, Azure, Groq, Grok (Beta)
+- Data Accelerators: PostgreSQL (Stable)
 
 ## v1.2 (Mar 2025)
 
