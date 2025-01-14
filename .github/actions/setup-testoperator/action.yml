@@ -32,6 +32,20 @@ runs:
         sudo mkdir -p /opt/spiced/data
         sudo chown runner:runner -R /opt/spiced/data
 
+    - name: Download DuckDB TPCH Data
+      shell: bash
+      if: inputs.query_set == 'tpch'
+      run: |
+        cd /opt/spiced/data
+        mc cp spice-minio/benchmarks/duckdb/tpch.db ./
+
+    - name: Download DuckDB TPCDS Data
+      shell: bash
+      if: inputs.query_set == 'tpcds'
+      run: |
+        cd /opt/spiced/data
+        mc cp spice-minio/benchmarks/duckdb/tpcds.db ./
+
     - name: Download File Connector TPCH Data
       shell: bash
       if: inputs.query_set == 'tpch'
