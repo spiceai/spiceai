@@ -25,20 +25,6 @@ use test_framework::{
     spicetest::{EndCondition, SpiceTest},
 };
 
-pub(crate) fn export(args: &TestArgs) -> anyhow::Result<()> {
-    let (_, mut start_request) = get_app_and_start_request(args)?;
-
-    start_request.prepare()?;
-    let tempdir_path = start_request.get_tempdir_path();
-
-    println!(
-        "Exported spicepod environment to: {}",
-        tempdir_path.to_string_lossy()
-    );
-
-    Ok(())
-}
-
 pub(crate) async fn run(args: &TestArgs) -> anyhow::Result<()> {
     let query_set = QuerySet::from(args.query_set.clone());
     let query_overrides = args.query_overrides.clone().map(QueryOverrides::from);
@@ -90,13 +76,7 @@ pub(crate) async fn run(args: &TestArgs) -> anyhow::Result<()> {
     println!("Load test metrics:");
     metrics.show()?;
 
-    // collect memory usage before stopping the instance
-    let memory_usage = spiced_instance.memory_usage()?;
-    // drop memory usage to MB as a u32 before converting to GB as a float
-    // we don't really care about the fractional memory usage of KB/MB
-    let memory_usage_gb = f64::from(u32::try_from(memory_usage / 1024 / 1024)?) / 1024.0;
-    println!("Memory usage: {memory_usage_gb:.2} GB");
-
+    spiced_instance.show_memory_usage()?;
     spiced_instance.stop()?;
 
     let mut test_passed = true;

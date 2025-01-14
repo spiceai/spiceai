@@ -11389,6 +11389,7 @@ dependencies = [
  "clap",
  "flight_client",
  "futures",
+ "indicatif",
  "nix",
  "regex",
  "reqwest 0.12.9",

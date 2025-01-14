@@ -25,20 +25,6 @@ use test_framework::{
     spicetest::{EndCondition, SpiceTest},
 };
 
-pub(crate) fn export(args: &TestArgs) -> anyhow::Result<()> {
-    let (_, mut start_request) = get_app_and_start_request(args)?;
-
-    start_request.prepare()?;
-    let tempdir_path = start_request.get_tempdir_path();
-
-    println!(
-        "Exported spicepod environment to: {}",
-        tempdir_path.to_string_lossy()
-    );
-
-    Ok(())
-}
-
 pub(crate) async fn run(args: &TestArgs) -> anyhow::Result<()> {
     let query_set = QuerySet::from(args.query_set.clone());
     let query_overrides = args.query_overrides.clone().map(QueryOverrides::from);
@@ -79,6 +65,7 @@ pub(crate) async fn run(args: &TestArgs) -> anyhow::Result<()> {
 
     metrics.show()?;
 
+    spiced_instance.show_memory_usage()?;
     spiced_instance.stop()?;
 
     println!(

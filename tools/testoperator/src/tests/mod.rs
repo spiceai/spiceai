@@ -38,3 +38,17 @@ pub(crate) fn get_app_and_start_request(args: &TestArgs) -> anyhow::Result<(App,
 
     Ok((app, start_request))
 }
+
+pub(crate) fn env_export(args: &TestArgs) -> anyhow::Result<()> {
+    let (_, mut start_request) = get_app_and_start_request(args)?;
+
+    start_request.prepare()?;
+    let tempdir_path = start_request.get_tempdir_path();
+
+    println!(
+        "Exported spicepod environment to: {}",
+        tempdir_path.to_string_lossy()
+    );
+
+    Ok(())
+}

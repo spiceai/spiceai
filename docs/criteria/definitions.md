@@ -106,3 +106,11 @@ The following table defines how many parallel queries are required at a given sc
 A load test refers to an extended duration throughput test. For a given throughput test, a load test is where the throughput test is repeated for a set number of hours.
 
 The system is provided with no delays or pauses between throughput test repetitions, resulting in a sustained high-load test.
+
+### Stop-light percentile measurements
+
+The load test uses a stop-light system to determine severity of timing measurements compared against the baseline:
+
+- 🟢: Green - an increase of the 99th percentile of less than 10% compared to the baseline
+- 🟡: Yellow - an increase of the 99th percentile between 10-20% compared to the baseline
+- 🔴: Red - an increase of the 99th percentile of more then 20% compared to the baseline

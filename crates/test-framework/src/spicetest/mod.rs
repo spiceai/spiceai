@@ -25,6 +25,7 @@ use crate::{
 };
 use anyhow::Result;
 use futures::future::join_all;
+use indicatif::{MultiProgress, ProgressBar};
 use tokio::task::JoinHandle;
 use worker::{SpiceTestQueryWorker, SpiceTestQueryWorkerResult};
 
@@ -56,6 +57,7 @@ pub type SpiceTestQueryWorkers = Vec<JoinHandle<Result<SpiceTestQueryWorkerResul
 pub struct Running {
     start_time: Instant,
     query_workers: SpiceTestQueryWorkers,
+    progress_bar: MultiProgress,
 }
 pub struct Completed {
     query_durations: BTreeMap<String, Vec<Duration>>,
@@ -116,6 +118,25 @@ impl SpiceTest<NotStarted> {
         self
     }
 
+    fn get_new_progress_bar(&self) -> ProgressBar {
+        match self.state.end_condition {
+            EndCondition::Duration(duration) => {
+                // refresh the progress bar every 10 seconds, or every 1/1000th of the duration
+                // for an 8 hour test, this would be every ~28 seconds
+                let pb = ProgressBar::new(duration.as_secs());
+                pb.enable_steady_tick(Duration::from_secs((duration.as_secs() / 1000).max(10)));
+
+                pb
+            }
+            EndCondition::QuerySetCompleted(count) => {
+                let pb = ProgressBar::new((self.state.query_set.len() * count) as u64);
+                pb.enable_steady_tick(Duration::from_secs(1));
+
+                pb
+            }
+        }
+    }
+
     pub async fn start(self) -> Result<SpiceTest<Running>> {
         if self.state.query_set.is_empty() {
             return Err(anyhow::anyhow!("Query set is empty"));
@@ -124,6 +145,8 @@ impl SpiceTest<NotStarted> {
         if self.parallel_count == 0 {
             return Err(anyhow::anyhow!("Parallel count must be greater than 0"));
         }
+
+        let multi = MultiProgress::new();
 
         let flight_client = self.spiced_instance.flight_client().await?;
         let query_workers = (0..self.parallel_count)
@@ -134,6 +157,7 @@ impl SpiceTest<NotStarted> {
                     self.state.end_condition,
                     flight_client.clone(),
                 )
+                .with_progress_bar(multi.add(self.get_new_progress_bar()))
             })
             .map(SpiceTestQueryWorker::start)
             .collect();
@@ -147,6 +171,7 @@ impl SpiceTest<NotStarted> {
             state: Running {
                 start_time: Instant::now(),
                 query_workers,
+                progress_bar: multi,
             },
         })
     }
@@ -170,6 +195,9 @@ impl SpiceTest<Running> {
                     .extend(duration);
             }
         }
+
+        self.state.progress_bar.clear()?;
+
         Ok(SpiceTest {
             name: self.name,
             spiced_instance: self.spiced_instance,

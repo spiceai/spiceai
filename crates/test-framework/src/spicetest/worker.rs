@@ -22,6 +22,7 @@ use std::{
 use anyhow::Result;
 use flight_client::FlightClient;
 use futures::StreamExt;
+use indicatif::ProgressBar;
 use tokio::task::JoinHandle;
 
 use super::EndCondition;
@@ -31,6 +32,7 @@ pub(crate) struct SpiceTestQueryWorker {
     query_set: Vec<(&'static str, &'static str)>,
     end_condition: EndCondition,
     flight_client: FlightClient,
+    pub progress_bar: Option<ProgressBar>,
 }
 
 pub struct SpiceTestQueryWorkerResult {
@@ -65,7 +67,13 @@ impl SpiceTestQueryWorker {
             query_set,
             end_condition,
             flight_client,
+            progress_bar: None,
         }
+    }
+
+    pub fn with_progress_bar(mut self, progress_bar: ProgressBar) -> Self {
+        self.progress_bar = Some(progress_bar);
+        self
     }
 
     pub fn start(self) -> JoinHandle<Result<SpiceTestQueryWorkerResult>> {
@@ -77,7 +85,6 @@ impl SpiceTestQueryWorker {
 
             while !self.end_condition.is_met(&start, query_set_count) {
                 'query_set: for query in &self.query_set {
-                    eprintln!("Running: Worker {} - Query '{}'", self.id, query.0,);
                     let mut row_count = 0;
                     let query_start = Instant::now();
                     match self.flight_client.query(query.1).await {
@@ -105,6 +112,10 @@ impl SpiceTestQueryWorker {
                                 .push(duration);
 
                             *row_counts.entry(query.0.to_string()).or_default() += row_count;
+
+                            if let Some(pb) = self.progress_bar.as_ref() {
+                                pb.inc(1);
+                            }
                         }
                         Err(e) => match e {
                             flight_client::Error::UnableToConnectToServer { .. }
