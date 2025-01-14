@@ -12,7 +12,7 @@ All criteria must be met for the embedding component to be considered RC.
 | Hugging Face            | ➖         |              |
 | Spice.ai Cloud Platform | ➖         |              |
 | OpenAI                  | ➖         |              |
-| Azure                   | ➖         |              |
+| Azure Openai            | ➖         |              |
 | xAI (Grok)              | ➖         |              |
 
 ## RC Release Criteria
@@ -21,7 +21,7 @@ All criteria must be met for the embedding component to be considered RC.
 
 ### Conditional Criteria
 - For embedding models running in the Spice runtime (as opposed to network-attached models).
-  - For a period of 1 minute, can handle N clients consistently sending embedding requests (i.e. instantly send another request upon reciept of prior request), each with Y tokens, without increasing round trip (to client) latency for 5 minute. An increase in latency is defined as a 10% increase in both the 50th & 95th percentile between the first and last minute.
+  - For a period of 1 minute, can handle N clients consistently sending embedding requests (i.e. instantly send another request upon receipt of prior request), each with Y tokens, without increasing round trip (to client) latency for 5 minute. An increase in latency is defined as a 10% increase in both the 50th & 95th percentile between the first and last minute.
 
 
 ### Documentation

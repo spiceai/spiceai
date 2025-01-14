@@ -12,7 +12,7 @@ All criteria must be met for the model to be considered Alpha. As Alpha signifie
 | Hugging Face            | ➖            |              |
 | Spice.ai Cloud Platform | ➖            |              |
 | OpenAI                  | ➖            |              |
-| Azure                   | ➖            |              |
+| Azure Openai            | ➖            |              |
 | Anthropic               | ➖            |              |
 | xAI (Grok)              | ➖            |              |
 
