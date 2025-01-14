@@ -124,7 +124,7 @@ impl SpiceTest<NotStarted> {
                 // refresh the progress bar every 10 seconds, or every 1/1000th of the duration
                 // for an 8 hour test, this would be every ~28 seconds
                 let pb =
-                    ProgressBar::new(duration.as_secs() / self.state.query_set.len() as u64 * 2); // this isn't 100% representative of the progress bar count, but it's close enough (500ms per query)
+                    ProgressBar::new(duration.as_secs() / self.state.query_set.len() as u64 * 2); // this isn't 100% representative of the progress bar count, but it's close enough (2s per query)
                 pb.enable_steady_tick(Duration::from_secs((duration.as_secs() / 1000).max(10)));
 
                 pb
