@@ -169,6 +169,9 @@ impl StatisticsCollector<BTreeMap<String, Duration>, BTreeMap<String, Vec<Durati
     fn percentile(&self, percentile: f64) -> Result<BTreeMap<String, Duration>> {
         let mut percentiles = BTreeMap::new();
         for (query, durations) in self {
+            if durations.is_empty() {
+                continue;
+            }
             percentiles.insert(query.clone(), durations.percentile(percentile)?);
         }
         Ok(percentiles)
@@ -177,6 +180,9 @@ impl StatisticsCollector<BTreeMap<String, Duration>, BTreeMap<String, Vec<Durati
     fn median(&self) -> Result<BTreeMap<String, Duration>> {
         let mut medians = BTreeMap::new();
         for (query, durations) in self {
+            if durations.is_empty() {
+                continue;
+            }
             medians.insert(query.clone(), durations.median()?);
         }
         Ok(medians)
@@ -185,6 +191,9 @@ impl StatisticsCollector<BTreeMap<String, Duration>, BTreeMap<String, Vec<Durati
     fn average(&self) -> Result<BTreeMap<String, Duration>> {
         let mut averages = BTreeMap::new();
         for (query, durations) in self {
+            if durations.is_empty() {
+                continue;
+            }
             averages.insert(query.clone(), durations.average()?);
         }
         Ok(averages)
@@ -193,6 +202,9 @@ impl StatisticsCollector<BTreeMap<String, Duration>, BTreeMap<String, Vec<Durati
     fn statistical_set(&self) -> Result<BTreeMap<String, Vec<Duration>>> {
         let mut statistical_sets = BTreeMap::new();
         for (query, durations) in self {
+            if durations.is_empty() {
+                continue;
+            }
             statistical_sets.insert(query.clone(), durations.statistical_set()?);
         }
         Ok(statistical_sets)

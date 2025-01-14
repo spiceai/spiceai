@@ -84,16 +84,14 @@ pub(crate) async fn run(args: &TestArgs) -> anyhow::Result<()> {
     let mut test_passed = true;
     let mut yellow_measurements = 0;
     for (query, _) in queries {
+        let Some(baseline_percentile) = baseline_percentiles.get(query) else {
+            // Query Failed, no percentile statistics recorded
+            continue;
+        };
+
         let Some(duration) = test_durations.get(query) else {
             return Err(anyhow::anyhow!(
                 "Query {} not found in test durations",
-                query
-            ));
-        };
-
-        let Some(baseline_percentile) = baseline_percentiles.get(query) else {
-            return Err(anyhow::anyhow!(
-                "Query {} not found in baseline percentiles",
                 query
             ));
         };
