@@ -144,32 +144,32 @@ See more demos on [YouTube](https://www.youtube.com/playlist?list=PLesJrUXEx3U9a
 
 | Name                               | Description                           | Status            | Protocol/Format              |
 | ---------------------------------- | ------------------------------------- | ----------------- | ---------------------------- |
-| `github`                           | GitHub                                | Stable            | GitHub API                   |
-| `file`                             | File                                  | Stable            | Parquet, CSV                 |
 | `databricks (mode: delta_lake)`    | [Databricks][databricks]              | Stable            | S3/Delta Lake                |
-| `s3`                               | [S3][s3]                              | Release Candidate | Parquet, CSV                 |
-| `postgres`                         | PostgreSQL                            | Release Candidate |                              |
-| `mysql`                            | MySQL                                 | Release Candidate |                              |
-| `duckdb`                           | DuckDB                                | Release Candidate | Embedded                     |
-| `graphql`                          | GraphQL                               | Release Candidate | JSON                         |
+| `duckdb`                           | DuckDB                                | Stable            | Embedded                     |
+| `file`                             | File                                  | Stable            | Parquet, CSV                 |
+| `github`                           | GitHub                                | Stable            | GitHub API                   |
 | `dremio`                           | [Dremio][dremio]                      | Release Candidate | Arrow Flight                 |
-| `delta_lake`                       | Delta Lake                            | Beta              | Delta Lake                   |
-| `mssql`                            | Microsoft SQL Server                  | Beta              | Tabular Data Stream (TDS)    |
-| `flightsql`                        | FlightSQL                             | Beta              | Arrow Flight SQL             |
-| `spice.ai`                         | [Spice.ai][spiceai]                   | Beta              | Arrow Flight                 |
-| `odbc`                             | ODBC                                  | Beta              | ODBC                         |
+| `graphql`                          | GraphQL                               | Release Candidate | JSON                         |
+| `mysql`                            | MySQL                                 | Release Candidate |                              |
+| `postgres`                         | PostgreSQL                            | Release Candidate |                              |
+| `s3`                               | [S3][s3]                              | Release Candidate | Parquet, CSV                 |
 | `databricks (mode: spark_connect)` | [Databricks][databricks]              | Beta              | [Spark Connect][spark]       |
+| `delta_lake`                       | Delta Lake                            | Beta              | Delta Lake                   |
+| `flightsql`                        | FlightSQL                             | Beta              | Arrow Flight SQL             |
+| `mssql`                            | Microsoft SQL Server                  | Beta              | Tabular Data Stream (TDS)    |
+| `odbc`                             | ODBC                                  | Beta              | ODBC                         |
 | `snowflake`                        | Snowflake                             | Beta              | Arrow                        |
 | `spark`                            | Spark                                 | Beta              | [Spark Connect][spark]       |
-| `iceberg`                          | [Apache Iceberg][iceberg]             | Alpha             | Parquet                      |
+| `spice.ai`                         | [Spice.ai][spiceai]                   | Beta              | Arrow Flight                 |
+| `abfs`                             | Azure BlobFS                          | Alpha             | Parquet, CSV                 |
 | `clickhouse`                       | Clickhouse                            | Alpha             |                              |
 | `debezium`                         | Debezium CDC                          | Alpha             | Kafka + JSON                 |
-| `abfs`                             | Azure BlobFS                          | Alpha             | Parquet, CSV                 |
+| `documentdb`                       | DocumentDB                            | Alpha             |                              |
 | `ftp`, `sftp`                      | FTP/SFTP                              | Alpha             | Parquet, CSV                 |
 | `http`, `https`                    | HTTP(s)                               | Alpha             | Parquet, CSV                 |
+| `iceberg`                          | [Apache Iceberg][iceberg]             | Alpha             | Parquet                      |
 | `localpod`                         | [Local dataset replication][localpod] | Alpha             |                              |
 | `sharepoint`                       | Microsoft SharePoint                  | Alpha             | Unstructured UTF-8 documents |
-| `documentdb`                       | DocumentDB                            | Alpha             |                              |
 | `mongodb`                          | MongoDB                               | Coming Soon       |                              |
 | `elasticsearch`                    | ElasticSearch                         | Roadmap           |                              |
 

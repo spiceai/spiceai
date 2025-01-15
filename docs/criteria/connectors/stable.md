@@ -13,7 +13,7 @@ All criteria must be met for the connector to be considered Stable, with excepti
 | Databricks (mode: spark_connect) | ➖             |                 |
 | Delta Lake                       | ➖             |                 |
 | Dremio                           | ➖             |                 |
-| DuckDB                           | ➖             |                 |
+| DuckDB                           | ✅             | @peasee         |
 | File                             | ✅             | @ewgenius       |
 | FlightSQL                        | ➖             |                 |
 | FTP/SFTP                         | ➖             |                 |
