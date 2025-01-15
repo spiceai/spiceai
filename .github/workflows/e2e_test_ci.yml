@@ -1415,7 +1415,7 @@ jobs:
 
       - name: Setup MS SQL test database
         run: |
-          /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P 1StrongPwd!! -i ./test/scripts/setup-data-mssql.sql
+          /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P 1StrongPwd!! -C -i ./test/scripts/setup-data-mssql.sql
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
         uses: actions/download-artifact@v4
