@@ -45,7 +45,7 @@ This table defines the required features and/or tests for each connector:
 | -------------------------------- | --------------------- | -------------- | ----------------- | ------------------------ | ------------------- | -------------------------- |
 | Clickhouse                       | ✅ (100)              | ➖             | ☑️                | ➖                       | ✅                  | ➖                         |
 | Databricks (mode: delta_lake)    | ✅ (1)                | ➖             | ☑️                | ➖                       | ✅                  | ➖                         |
-| Databricks (mode: spark_connect) | ✅ (100)              | ➖             | ☑️                | ➖                       | ✅                  | ➖                         |
+| Databricks (mode: spark_connect) | ✅ (100)              | ➖             | ☑️                | ➖                       | ➖                  | ➖                         |
 | Delta Lake                       | ✅ (1)                | ➖             | ☑️                | ➖                       | ✅                  | ➖                         |
 | Dremio                           | ✅ (100)              | ➖             | ☑️                | ➖                       | ✅                  | ➖                         |
 | DuckDB                           | ✅ (100)              | ➖             | ☑️                | ➖                       | ✅                  | ➖                         |
