@@ -55,6 +55,8 @@ runs:
       shell: ${{ env.SHELL }}
 
     - name: Build spiced (models, cuda)
+      env:
+          CUDA_COMPUTE_CAP: ${{ inputs.cuda-compute-capability }}
       run: ${{ env.BUILD_CMD }}
       shell: ${{ env.SHELL }}
 
