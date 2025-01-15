@@ -288,6 +288,7 @@ async fn hf_embeddings_beta_requirements() -> Result<(), anyhow::Error> {
                 get_huggingface_embeddings("sentence-transformers/all-MiniLM-L6-v2", "hf_minilm"),
                 Duration::from_secs(2 * 60),
             )
+            .await
         })
         .await;
 

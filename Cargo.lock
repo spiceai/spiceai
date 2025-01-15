@@ -9810,6 +9810,7 @@ dependencies = [
  "datafusion-functions-json",
  "datafusion-table-providers",
  "db_connection_pool",
+ "dirs",
  "document_parse",
  "dotenvy",
  "duckdb",

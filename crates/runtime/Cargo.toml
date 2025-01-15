@@ -144,6 +144,7 @@ azure_core = "0.21.0"
 azure_storage = "0.21.0"
 azure_storage_blobs = "0.21.0"
 bollard = "0.18.1"
+dirs = "5.0.1"
 flightrepl = { path = "../flightrepl" }
 hf-hub = { workspace = true }
 insta.workspace = true
@@ -153,8 +154,8 @@ paste.workspace = true
 scopeguard = "1.2.0"
 serde_json = { workspace = true, features = ["preserve_order"] }
 spice-cloud = { path = "../spice_cloud" }
-tokio = { workspace = true, features = ["time", "test-util"] }
 test-framework = { path = "../test-framework" }
+tokio = { workspace = true, features = ["time", "test-util"] }
 tracing-opentelemetry.workspace = true
 tracing-subscriber.workspace = true
 
@@ -193,6 +194,7 @@ postgres = [
     "data_components/postgres",
     "datafusion-table-providers/postgres",
 ]
+postgres-write = []
 sharepoint = ["data_components/sharepoint", "dep:graph-rs-sdk"]
 snowflake = [
     "dep:snowflake-api",
@@ -206,7 +208,6 @@ sqlite = [
     "data_components/sqlite",
     "dep:rusqlite",
 ]
-postgres-write = []
 
 [[bench]]
 harness = false

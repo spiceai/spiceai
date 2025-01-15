@@ -14,7 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 mod embeddings {
-    use std::{fs::File, io::Write, path::PathBuf, time::Duration};
+    use std::{
+        fs::{create_dir_all, File},
+        io::Write,
+        path::PathBuf,
+        time::Duration,
+    };
 
     use spicepod::component::{embeddings::Embeddings, model::ModelFile};
 
@@ -23,44 +28,55 @@ mod embeddings {
         utils::test_request_context,
     };
 
-    use super::*;
+    /// Create a local embedding model by downloading the `model_id` from HuggingFace if it doesn't exist.
+    ///
+    /// Currently expects model to only need `tokenizer.json`, `config.json`, and `model.safetensors` files.
+    async fn create_local_embedding_from_hf(model_id: &str, name: &str) -> Embeddings {
+        let mut model_path = dirs::home_dir().expect("Failed to find home directory");
+        model_path.push(".spice/models");
+        model_path.push(name);
+        create_dir_all(&model_path).expect(format!("failed to create {:?}", model_path).as_str());
 
-    /// Create a local embedding model by downloading `intfloat/e5-small-v2` from HuggingFace, finding the
-    /// directory where the model was downloaded, and creating a local `Embeddings` component from it.
-    async fn create_local_embedding_from_hf(name: impl Into<String>) -> Embeddings {
-        let root_dir = std::env::temp_dir();
-        download_to_temp_dir(
-            root_dir.join("tokenizer.json"),
-            "https://huggingface.co/intfloat/e5-small-v2/resolve/main/tokenizer.json?download=true",
+        check_and_download_to_temp_dir(
+            model_path.join("tokenizer.json"),
+            format!("https://huggingface.co/{model_id}/resolve/main/tokenizer.json?download=true")
+                .as_str(),
         )
         .await;
-        download_to_temp_dir(
-            root_dir.join("config.json"),
-            "https://huggingface.co/intfloat/e5-small-v2/resolve/main/config.json?download=true",
+        check_and_download_to_temp_dir(
+            model_path.join("config.json"),
+            format!("https://huggingface.co/{model_id}/resolve/main/config.json?download=true")
+                .as_str(),
         )
         .await;
-        download_to_temp_dir(
-            root_dir.join("model.safetensors"),
-            "https://huggingface.co/intfloat/e5-small-v2/resolve/main/model.safetensors?download=true",
-        ).await;
+        check_and_download_to_temp_dir(
+            model_path.join("model.safetensors"),
+            format!(
+                "https://huggingface.co/{model_id}/resolve/main/model.safetensors?download=true"
+            )
+            .as_str(),
+        )
+        .await;
 
-        tracing::warn!("Foort: {}", root_dir.display());
         let mut embedding = Embeddings::new(
             format!(
                 "file:/{}",
-                root_dir.join("model.safetensors").display().to_string()
+                model_path.join("model.safetensors").display().to_string()
             ),
             name,
         );
         embedding.files = vec![
-            ModelFile::from_path(&root_dir.join("tokenizer.json")),
-            ModelFile::from_path(&root_dir.join("config.json")),
+            ModelFile::from_path(&model_path.join("tokenizer.json")),
+            ModelFile::from_path(&model_path.join("config.json")),
         ];
-        tracing::warn!("Embedding: {:?}", embedding);
         embedding
     }
 
-    async fn download_to_temp_dir(filename: PathBuf, url: &str) {
+    async fn check_and_download_to_temp_dir(filename: PathBuf, url: &str) {
+        if filename.exists() {
+            tracing::debug!("File {filename:?} already exists.");
+            return;
+        }
         let resp = reqwest::get(url)
             .await
             .expect(format!("Failed to get url={url}").as_str());
@@ -82,7 +98,7 @@ mod embeddings {
         test_request_context()
             .scope(async {
                 run_beta_functionality_criteria_test(
-                    create_local_embedding_from_hf("hf_e5").await,
+                    create_local_embedding_from_hf("intfloat/e5-small-v2", "hf_e5").await,
                     Duration::from_secs(3 * 60),
                 )
                 .await

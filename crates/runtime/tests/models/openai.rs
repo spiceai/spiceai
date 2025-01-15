@@ -265,6 +265,7 @@ mod embeddings {
                     get_openai_embeddings(Some("text-embedding-3-small"), "openai_embeddings"),
                     Duration::from_secs(30),
                 )
+                .await
             })
             .await;
 

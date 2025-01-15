@@ -16,8 +16,6 @@ limitations under the License.
 
 #![allow(clippy::expect_used)]
 use super::send_embeddings_request;
-use crate::models::{sort_json_keys, sql_to_display, sql_to_single_json_value};
-use crate::utils::runtime_ready_check_with_timeout;
 use crate::{
     init_tracing, init_tracing_with_task_history,
     models::{
@@ -25,7 +23,10 @@ use crate::{
         get_tpcds_dataset, normalize_chat_completion_response, normalize_embeddings_response,
         send_chat_completions_request,
     },
-    utils::{runtime_ready_check, test_request_context, verify_env_secret_exists},
+    utils::{
+        runtime_ready_check, runtime_ready_check_with_timeout, test_request_context,
+        verify_env_secret_exists,
+    },
 };
 use app::AppBuilder;
 use arrow::array::RecordBatch;
