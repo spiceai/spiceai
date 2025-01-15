@@ -17,6 +17,7 @@ limitations under the License.
 use std::sync::Arc;
 
 use arrow_schema::SchemaRef;
+use arrow_tools::schema::schema_meta_get_computed_columns;
 use datafusion::arrow::datatypes::Schema;
 use datafusion::sql::parser::{DFParser, Statement};
 use datafusion::sql::sqlparser::ast::{Expr, GroupByExpr, SelectItem, SetExpr};
@@ -25,8 +26,6 @@ use datafusion::sql::{sqlparser, TableReference};
 use itertools::Itertools;
 use snafu::prelude::*;
 use sqlparser::ast::Statement as SQLStatement;
-
-use crate::{embedding_col, offset_col};
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -237,27 +236,29 @@ fn validate_select_columns(
         }
     }
 
-    // If the refresh SQL defines a subset of columns to fetch, the internal embedding columns
-    // are not included automatically. We check their presence in the source schema and add them manually.
-    fields = include_embeddings_columns(&fields, &source_schema);
+    // If the refresh SQL defines a subset of columns to fetch, computed columns (e.g., embeddings)
+    // are not included automatically. We verify their presence in the source schema and add them manually if needed.
+    fields = include_computed_columns(&fields, &source_schema);
 
     Ok(Arc::new(Schema::new(fields)))
 }
 
-/// Checks the source schema for internal embedding columns corresponding to the
-/// provided fields. Adds any missing embedding-related fields to the schema if they are found.
-fn include_embeddings_columns(
+/// Checks the source schema for associated computed columns (e.g., embeddings)
+/// and adds any missing computed fields to the target schema if they are found.
+fn include_computed_columns(
     fields: &[arrow_schema::Field],
     source_schema: &SchemaRef,
 ) -> Vec<arrow_schema::Field> {
     let mut extended_fields = fields.to_owned();
     for field in fields {
-        let field_name = field.name();
-        for internal_col in [embedding_col!(field_name), offset_col!(field_name)] {
-            // Add the field if it's found in the source schema and does not exist in target schema
-            if let Ok(field) = source_schema.field_with_name(&internal_col) {
-                if !extended_fields.iter().any(|f| f.name() == &internal_col) {
-                    extended_fields.push(field.clone());
+        if let Some(computed_cols) = schema_meta_get_computed_columns(source_schema, field.name()) {
+            for computed_col in computed_cols {
+                // Add field only if it does not exist in target schema
+                if !extended_fields
+                    .iter()
+                    .any(|f| f.name() == computed_col.name())
+                {
+                    extended_fields.push((*computed_col).clone());
                 }
             }
         }

@@ -19,13 +19,13 @@ use std::{any::Any, sync::Arc};
 
 use arrow::datatypes::{DataType, Schema, SchemaRef};
 use arrow_schema::Field;
+use arrow_tools::schema;
 use async_trait::async_trait;
 use datafusion::catalog::Session;
-use datafusion::common::tree_node::{Transformed, TreeNode};
-use datafusion::common::{project_schema, Column, Constraints, Statistics};
+use datafusion::common::{project_schema, Constraints, Statistics};
 use datafusion::error::Result as DataFusionResult;
 use datafusion::logical_expr::dml::InsertOp;
-use datafusion::logical_expr::{LogicalPlan, TableProviderFilterPushDown};
+use datafusion::logical_expr::TableProviderFilterPushDown;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::{
     datasource::{TableProvider, TableType},
@@ -446,21 +446,37 @@ impl TableProvider for EmbeddingTable {
             .filter_map(|i| base_schema.fields.get(i).cloned())
             .collect();
 
+        let mut computed_columns_meta: HashMap<String, Vec<String>> = HashMap::new();
+
         // Important to be kept alphabetical for fast lookup in [`EmbeddingTable::columns_to_embed`]
         let mut embedding_fields: Vec<_> = self
             .get_additional_embedding_columns_sorted()
             .iter()
-            .filter_map(|k| {
+            .filter_map(|base_column_name| {
                 base_schema
-                    .column_with_name(k)
-                    .map(|(_, field)| self.embedding_fields(field))
+                    .column_with_name(base_column_name)
+                    .map(|(_, field)| {
+                        let embedding_fields = self.embedding_fields(field);
+                        computed_columns_meta.insert(
+                            base_column_name.clone(),
+                            embedding_fields
+                                .iter()
+                                .map(|f| f.name().to_string())
+                                .collect(),
+                        );
+                        embedding_fields
+                    })
             })
             .flatten()
             .collect();
 
         base_fields.append(&mut embedding_fields);
 
-        Arc::new(Schema::new(base_fields))
+        let mut schema = Schema::new(base_fields);
+
+        schema::set_computed_columns_meta(&mut schema, &computed_columns_meta);
+
+        Arc::new(schema)
     }
 
     async fn scan(
@@ -591,54 +607,6 @@ impl TableProvider for EmbeddingTable {
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         self.base_table.insert_into(state, input, overwrite).await
     }
-}
-
-/// Ensures that for each column with embeddings (`col_name`), the `LogicalPlan::Projection` node
-/// includes the associated Spice internal columns (`col_name_embeddings`, `col_name_offset`).
-/// If any required columns are missing, they are automatically added to the projection.
-pub(crate) fn include_embeddings_internal_columns(
-    plan: LogicalPlan,
-    table: &EmbeddingTable,
-) -> DataFusionResult<LogicalPlan> {
-    let plan = plan
-        .transform_down(|plan| {
-            match plan {
-                LogicalPlan::Projection(mut proj) => {
-                    for col_with_embeddings in table.get_embedding_columns() {
-                        // Ensure that for each included column with embeddings, the associated Spice internal
-                        // embedding columns are present in the projection.
-                        if let Some(idx) = proj
-                            .schema
-                            .index_of_column_by_name(None, &col_with_embeddings)
-                        {
-                            let mut spice_embedding_columns =
-                                vec![embedding_col!(col_with_embeddings)];
-                            if table.is_chunked(&col_with_embeddings) {
-                                spice_embedding_columns.push(offset_col!(col_with_embeddings));
-                            }
-
-                            for spice_embedding_column in spice_embedding_columns {
-                                if !proj
-                                    .schema
-                                    .has_column_with_unqualified_name(&spice_embedding_column)
-                                {
-                                    proj.expr.push(Expr::Column(Column::new(
-                                        proj.schema.qualified_field(idx).0.cloned(),
-                                        spice_embedding_column,
-                                    )));
-                                }
-                            }
-                        }
-                    }
-                    // The Transformed flag is not used, so we always specify it as transformed for simplicity.
-                    Ok(Transformed::yes(LogicalPlan::Projection(proj)))
-                }
-                _ => Ok(Transformed::no(plan)),
-            }
-        })?
-        .data;
-
-    Ok(plan)
 }
 
 #[cfg(test)]

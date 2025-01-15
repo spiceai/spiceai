@@ -20,20 +20,25 @@ use crate::component::catalog::Catalog;
 use crate::component::dataset::acceleration::RefreshMode;
 use crate::component::dataset::Dataset;
 use crate::datafusion::error::find_datafusion_root;
-use crate::embeddings::table::include_embeddings_internal_columns;
-use crate::embeddings::table::EmbeddingTable;
 use crate::federated_table::FederatedTable;
 use crate::get_params_with_secrets;
 use crate::parameters::ParameterSpec;
 use crate::parameters::Parameters;
 use crate::secrets::Secrets;
+use arrow_schema::SchemaRef;
+use arrow_tools::schema::schema_meta_get_computed_columns;
 use async_trait::async_trait;
 use data_components::cdc::ChangesStream;
+use datafusion::common::tree_node::Transformed;
+use datafusion::common::tree_node::TreeNode;
+use datafusion::common::Column;
 use datafusion::dataframe::DataFrame;
 use datafusion::datasource::{DefaultTableSource, TableProvider};
 use datafusion::error::DataFusionError;
+use datafusion::error::Result as DataFusionResult;
 use datafusion::execution::context::SessionContext;
 use datafusion::execution::SendableRecordBatchStream;
+use datafusion::logical_expr::LogicalPlan;
 use datafusion::logical_expr::{Expr, LogicalPlanBuilder};
 use datafusion::sql::unparser::Unparser;
 use datafusion::sql::TableReference;
@@ -453,12 +458,9 @@ pub async fn get_data(
                 .await
                 .map_err(find_datafusion_root)?;
 
-            // If the refresh SQL defines a subset of columns to fetch, the internal embedding columns
-            // are not included automatically so we verify their presence and add them manually.
-            if let Some(embedding_table) = table_provider.as_any().downcast_ref::<EmbeddingTable>()
-            {
-                plan = include_embeddings_internal_columns(plan, embedding_table)?;
-            };
+            // If the refresh SQL defines a subset of columns to fetch, computed columns such as embeddings
+            // are not included automatically, so we verify their presence and add them manually if needed.
+            plan = include_computed_columns(plan, &table_provider.schema())?;
 
             DataFrame::new(session, plan)
         }
@@ -593,6 +595,46 @@ impl ConnectorParamsBuilder {
             component: self.component.clone(),
         })
     }
+}
+
+/// Ensures that the associated computed columns (e.g., embeddings) are included
+/// in the `LogicalPlan::Projection` node.
+/// If any required computed columns are missing, they are automatically added to the projection.
+fn include_computed_columns(
+    plan: LogicalPlan,
+    source_table_schema: &SchemaRef,
+) -> DataFusionResult<LogicalPlan> {
+    let plan = plan
+        .transform_down(|plan| {
+            match plan {
+                LogicalPlan::Projection(mut proj) => {
+                    for (idx, col) in proj.schema.columns().iter().enumerate() {
+                        if let Some(computed_columns) = schema_meta_get_computed_columns(
+                            source_table_schema.as_ref(),
+                            col.name(),
+                        ) {
+                            for computed_column in computed_columns {
+                                if !proj
+                                    .schema
+                                    .has_column_with_unqualified_name(computed_column.name())
+                                {
+                                    proj.expr.push(Expr::Column(Column::new(
+                                        proj.schema.qualified_field(idx).0.cloned(),
+                                        computed_column.name().to_string(),
+                                    )));
+                                }
+                            }
+                        }
+                    }
+                    // The Transformed flag is not used, so we always specify it as transformed for simplicity.
+                    Ok(Transformed::yes(LogicalPlan::Projection(proj)))
+                }
+                _ => Ok(Transformed::no(plan)),
+            }
+        })?
+        .data;
+
+    Ok(plan)
 }
 
 #[cfg(test)]
