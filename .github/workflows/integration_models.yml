@@ -7,10 +7,23 @@ on:
       - trunk
       - release-*
     paths-ignore:
-      - "docs/**"
-      - "README.md"
-      - "version.txt"
-      - "acknowledgements.md"
+      - '**/*.md'
+      - 'docs/**'
+      - 'README.md'
+      - 'Makefile'
+      - 'CONTRIBUTING.md'
+      - 'SECURITY.md'
+      - 'LICENSE'
+      - '.github/**'
+      - 'version.txt'
+      - '.schema/**'
+      - '.vscode/**'
+      - 'deploy/**'
+      - 'install/**'
+      - 'media/**'
+      - 'monitoring/**'
+      - 'acknowledgements.md'
+      - 'Dockerfile*'
 
   workflow_dispatch:
 
