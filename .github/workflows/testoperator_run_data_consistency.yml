@@ -1,4 +1,4 @@
-name: throughput tests
+name: benchmark e2e tests
 
 on:
   workflow_dispatch:
@@ -9,6 +9,10 @@ on:
         type: string
       spicepod_path:
         description: 'The spicepod file to test with'
+        required: true
+        type: string
+      compare_spicepod_path:
+        description: 'The spicepod file to compare against'
         required: true
         type: string
       query_set:
@@ -50,9 +54,10 @@ on:
           - 'spiceai-large-runners'
 
 jobs:
-  run-throughput:
-    name: Run throughput test
+  run-bench:
+    name: Run benchmark e2e tests
     runs-on: ${{ github.event.inputs.runner_type }}
+    timeout-minutes: 600
     steps:
       - uses: actions/checkout@v4
 
@@ -88,49 +93,51 @@ jobs:
         with:
           query_set: ${{ github.event.inputs.query_set }}
 
-      - name: Run the throughput test
+      - name: Run the data consistency test
         if: ${{ github.event.inputs.query_overrides == '' }}
         run: |
           rm -rf .spice/data
-          testoperator run throughput \
-            -s /usr/local/bin/spiced \
-            -p ${{ github.event.inputs.spicepod_path }} \
-            -d /opt/spiced/data \
-            --query-set ${{ github.event.inputs.query_set }} \
-            --ready-wait ${{ github.event.inputs.ready_wait }} \
-            --disable-progress-bars
-        env:
-          S3_ENDPOINT: ${{ secrets.CLICKBENCH_S3_ENDPOINT}}
-          S3_KEY: ${{ secrets.CLICKBENCH_S3_KEY}}
-          S3_SECRET: ${{ secrets.CLICKBENCH_S3_SECRET}}
-          DREMIO_ENDPOINT: ${{ secrets.SPICE_DREMIO_ENDPOINT}}
-          DREMIO_USERNAME: ${{ secrets.SPICE_DREMIO_USERNAME}}
-          DREMIO_PASSWORD: ${{ secrets.SPICE_DREMIO_PASSWORD}}
-          DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
-          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
-          AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ secrets.AWS_DATABRICKS_DELTA_ACCESS_KEY_ID }}
-          AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ secrets.AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY }}
-
-      - name: Run the throughput test (with overrides)
-        if: ${{ github.event.inputs.query_overrides != '' }}
-        run: |
-          rm -rf .spice/data
-          testoperator run throughput \
+          testoperator run data-consistency \
             -s /usr/local/bin/spiced \
             -p ${{ github.event.inputs.spicepod_path }} \
             -d /opt/spiced/data \
             --query-set ${{ github.event.inputs.query_set }} \
             --ready-wait ${{ github.event.inputs.ready_wait }} \
             --disable-progress-bars \
-            --query-overrides ${{ github.event.inputs.query_overrides }}
+            --compare-spicepod-path ${{ github.event.inputs.compare_spicepod_path }}
         env:
           S3_ENDPOINT: ${{ secrets.CLICKBENCH_S3_ENDPOINT}}
           S3_KEY: ${{ secrets.CLICKBENCH_S3_KEY}}
           S3_SECRET: ${{ secrets.CLICKBENCH_S3_SECRET}}
-          DREMIO_ENDPOINT: ${{ secrets.SPICE_DREMIO_ENDPOINT}}
-          DREMIO_USERNAME: ${{ secrets.SPICE_DREMIO_USERNAME}}
-          DREMIO_PASSWORD: ${{ secrets.SPICE_DREMIO_PASSWORD}}
           DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
           DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
           AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ secrets.AWS_DATABRICKS_DELTA_ACCESS_KEY_ID }}
           AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ secrets.AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY }}
+          SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+          SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
+          SNOWFLAKE_USERNAME: ${{ secrets.SNOWFLAKE_USERNAME }}
+
+      - name: Run the data consistency test (with overrides)
+        if: ${{ github.event.inputs.query_overrides != '' }}
+        run: |
+          rm -rf .spice/data
+          testoperator run data-consistency \
+            -s /usr/local/bin/spiced \
+            -p ${{ github.event.inputs.spicepod_path }} \
+            -d /opt/spiced/data \
+            --query-set ${{ github.event.inputs.query_set }} \
+            --query-overrides ${{ github.event.inputs.query_overrides }} \
+            --ready-wait ${{ github.event.inputs.ready_wait }} \
+            --disable-progress-bars \
+            --compare-spicepod-path ${{ github.event.inputs.compare_spicepod_path }}
+        env:
+          S3_ENDPOINT: ${{ secrets.CLICKBENCH_S3_ENDPOINT}}
+          S3_KEY: ${{ secrets.CLICKBENCH_S3_KEY}}
+          S3_SECRET: ${{ secrets.CLICKBENCH_S3_SECRET}}
+          DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+          AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ secrets.AWS_DATABRICKS_DELTA_ACCESS_KEY_ID }}
+          AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ secrets.AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY }}
+          SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+          SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
+          SNOWFLAKE_USERNAME: ${{ secrets.SNOWFLAKE_USERNAME }}
