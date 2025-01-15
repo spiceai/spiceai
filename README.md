@@ -156,6 +156,7 @@ See more demos on [YouTube](https://www.youtube.com/playlist?list=PLesJrUXEx3U9a
 | `databricks (mode: spark_connect)` | [Databricks][databricks]              | Beta              | [Spark Connect][spark]       |
 | `delta_lake`                       | Delta Lake                            | Beta              | Delta Lake                   |
 | `flightsql`                        | FlightSQL                             | Beta              | Arrow Flight SQL             |
+| `iceberg`                          | [Apache Iceberg][iceberg]             | Beta              | Parquet                      |
 | `mssql`                            | Microsoft SQL Server                  | Beta              | Tabular Data Stream (TDS)    |
 | `odbc`                             | ODBC                                  | Beta              | ODBC                         |
 | `snowflake`                        | Snowflake                             | Beta              | Arrow                        |
@@ -167,7 +168,6 @@ See more demos on [YouTube](https://www.youtube.com/playlist?list=PLesJrUXEx3U9a
 | `dynamodb`                         | Amazon DynamoDB                       | Alpha             |                              |
 | `ftp`, `sftp`                      | FTP/SFTP                              | Alpha             | Parquet, CSV                 |
 | `http`, `https`                    | HTTP(s)                               | Alpha             | Parquet, CSV                 |
-| `iceberg`                          | [Apache Iceberg][iceberg]             | Alpha             | Parquet                      |
 | `localpod`                         | [Local dataset replication][localpod] | Alpha             |                              |
 | `sharepoint`                       | Microsoft SharePoint                  | Alpha             | Unstructured UTF-8 documents |
 | `mongodb`                          | MongoDB                               | Coming Soon       |                              |
@@ -212,10 +212,10 @@ Catalog Connectors connect to external catalog providers and make their tables a
 
 | Name            | Description             | Status      | Protocol/Format              |
 | --------------- | ----------------------- | ----------- | ---------------------------- |
+| `iceberg`       | Apache Iceberg          | Beta        | Parquet                      |
 | `databricks`    | Databricks              | Alpha       | Spark Connect, S3/Delta Lake |
 | `unity_catalog` | Unity Catalog           | Alpha       | Delta Lake                   |
 | `spice.ai`      | Spice.ai Cloud Platform | Alpha       | Arrow Flight                 |
-| `iceberg`       | Apache Iceberg          | Alpha       | Parquet                      |
 | `glue`          | AWS Glue                | Coming Soon | JSON, Parquet, Iceberg       |
 
 ## ⚡️ Quickstart (Local Machine)
