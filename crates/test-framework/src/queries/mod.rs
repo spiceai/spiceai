@@ -299,6 +299,13 @@ pub fn get_clickbench_test_queries(
                 "dremio", 21, 22, 23, 24
             ))
         }
+        Some(QueryOverrides::DuckDB) => {
+            // specific to the DuckDB accelerator when used with on_zero_results: use_source
+            // the unparser does not support binary scalar literals, so cast the binary columns to text
+            Some(generate_clickbench_query_overrides!(
+                "duckdb", 11, 12, 13, 14, 15, 22, 23, 25, 26, 27, 28, 29, 31, 32, 37, 38
+            ))
+        }
         _ => None,
     };
 
