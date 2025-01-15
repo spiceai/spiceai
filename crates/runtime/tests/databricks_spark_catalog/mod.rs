@@ -20,19 +20,17 @@ use crate::{
     ValidateFn,
 };
 use app::AppBuilder;
-use futures::StreamExt;
 use runtime::{status, Runtime};
 use spicepod::component::{catalog::Catalog, params::Params};
 use std::sync::Arc;
 
 #[tokio::test]
 async fn databricks_spark_connect_integration_test_catalog() -> Result<(), anyhow::Error> {
+    type QueryTests<'a> = Vec<(&'a str, &'a str, Option<Box<ValidateFn>>)>;
+    let _tracing = init_tracing(None);
     let _ = rustls::crypto::CryptoProvider::install_default(
         rustls::crypto::aws_lc_rs::default_provider(),
     );
-
-    type QueryTests<'a> = Vec<(&'a str, &'a str, Option<Box<ValidateFn>>)>;
-    let _tracing = init_tracing(None);
 
     test_request_context()
         .scope(async {
