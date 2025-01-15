@@ -290,7 +290,7 @@ async fn hf_embeddings_beta_requirements() -> Result<(), anyhow::Error> {
             )
             .await
         })
-        .await;
+        .await?;
 
     Ok(())
 }
@@ -345,7 +345,7 @@ async fn huggingface_test_embeddings() -> Result<(), anyhow::Error> {
             )
             .await
         })
-        .await;
+        .await?;
 
     Ok(())
 }

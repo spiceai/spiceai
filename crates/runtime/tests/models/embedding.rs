@@ -17,36 +17,16 @@ limitations under the License.
 #![allow(clippy::expect_used)]
 use super::send_embeddings_request;
 use crate::{
-    init_tracing, init_tracing_with_task_history,
-    models::{
-        create_api_bindings_config, get_params_with_secrets_value, get_taxi_trips_dataset,
-        get_tpcds_dataset, normalize_chat_completion_response, normalize_embeddings_response,
-        send_chat_completions_request,
-    },
-    utils::{
-        runtime_ready_check, runtime_ready_check_with_timeout, test_request_context,
-        verify_env_secret_exists,
-    },
+    models::{create_api_bindings_config, normalize_embeddings_response},
+    utils::{runtime_ready_check, runtime_ready_check_with_timeout},
 };
 use app::AppBuilder;
 use arrow::array::RecordBatch;
-use async_openai::types::{
-    ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestUserMessageArgs,
-    CreateChatCompletionRequestArgs, CreateEmbeddingResponse, EmbeddingInput,
-};
-use chrono::{DateTime, Utc};
+use async_openai::types::{CreateEmbeddingResponse, EmbeddingInput};
 use core::time;
 use futures::TryStreamExt;
-use jsonpath_rust::JsonPath;
-use llms::chat::Chat;
-use opentelemetry_sdk::trace::TracerProvider;
-use runtime::{auth::EndpointAuth, model::try_to_chat_model, Runtime};
-use serde_json::json;
-use spicepod::component::{
-    embeddings::{ColumnEmbeddingConfig, Embeddings},
-    model::Model,
-};
-use std::str::FromStr;
+use runtime::{auth::EndpointAuth, Runtime};
+use spicepod::component::embeddings::Embeddings;
 use std::sync::Arc;
 
 pub(crate) struct EmbeddingTestCase<'a> {
@@ -75,7 +55,7 @@ pub(crate) async fn run_embedding_tests(
         model_name,
         dimensions,
         test_id,
-    } in tests.into_iter()
+    } in tests
     {
         let response = send_embeddings_request(
             http_base_url.as_str(),
@@ -158,11 +138,11 @@ pub(crate) async fn run_beta_functionality_criteria_test(
     for EmbeddingTestCase {
         input,
         encoding_format,
-        user,
+        user: _,
         model_name,
         dimensions,
         test_id,
-    } in tests.into_iter()
+    } in tests
     {
         let response_raw = send_embeddings_request(
             http_base_url.as_str(),
@@ -175,23 +155,18 @@ pub(crate) async fn run_beta_functionality_criteria_test(
         .await?;
 
         let response: CreateEmbeddingResponse = serde_json::from_value(response_raw.clone())
-            .expect(
-                format!("Failed to parse response for test {test_id} for model {model_name}.")
-                    .as_str(),
-            );
+            .unwrap_or_else(|_| {
+                panic!("Failed to parse response for test {test_id} for model {model_name}.")
+            });
 
         // Beta: Check for usage
         assert!(
             response.usage.prompt_tokens > 0,
-            "Prompt tokens in usage should not be empty in response for test {} and model {}.",
-            test_id,
-            model_name
+            "Prompt tokens in usage should not be empty in response for test {test_id} and model {model_name}."
         );
         assert!(
             response.usage.total_tokens > 0,
-            "Total tokens in usage should not be empty in response for test {} and model {}.",
-            test_id,
-            model_name
+            "Total tokens in usage should not be empty in response for test {test_id} and model {model_name}."
         );
 
         // Beta: Check for tracing
@@ -205,7 +180,7 @@ pub(crate) async fn run_beta_functionality_criteria_test(
                 .data.try_collect::<Vec<RecordBatch>>().await.expect("");
         assert!(
             q.first().is_some_and(|rb| rb.num_rows() > 0),
-            "Embedding request did not create tracing in 'runtime.task_history' for test {} and model {}.", test_id, model_name
+            "Embedding request did not create tracing in 'runtime.task_history' for test {test_id} and model {model_name}."
         );
 
         // Beta (TODO): Check for metrics
@@ -222,13 +197,12 @@ async fn start_runtime_with_embedding(
 ) -> Result<Arc<Runtime>, anyhow::Error> {
     let mut app_builder = AppBuilder::new("embedding_app");
 
-    for m in models.into_iter() {
+    for m in models {
         app_builder = app_builder.with_embedding(m);
     }
     let app = app_builder.build();
 
     let api_config = create_api_bindings_config();
-    let http_base_url = format!("http://{}", api_config.http_bind_address);
     let rt = Arc::new(Runtime::builder().with_app(app).build().await);
 
     let rt_ref_copy = Arc::clone(&rt);

@@ -15,14 +15,12 @@ limitations under the License.
 */
 
 #![allow(clippy::expect_used)]
-use super::send_embeddings_request;
 use crate::models::{sort_json_keys, sql_to_display, sql_to_single_json_value};
 use crate::{
     init_tracing, init_tracing_with_task_history,
     models::{
         create_api_bindings_config, get_params_with_secrets_value, get_taxi_trips_dataset,
-        get_tpcds_dataset, normalize_chat_completion_response, normalize_embeddings_response,
-        send_chat_completions_request,
+        get_tpcds_dataset, normalize_chat_completion_response, send_chat_completions_request,
     },
     utils::{runtime_ready_check, test_request_context, verify_env_secret_exists},
 };
@@ -130,7 +128,8 @@ mod nsql {
             }
 
             Ok(())
-        }).await
+        }).await?;
+        Ok(())
     }
 }
 
@@ -267,7 +266,7 @@ mod embeddings {
                 )
                 .await
             })
-            .await;
+            .await?;
 
         Ok(())
     }

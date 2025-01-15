@@ -21,6 +21,7 @@ mod embeddings {
         time::Duration,
     };
 
+    use anyhow::Result;
     use spicepod::component::{embeddings::Embeddings, model::ModelFile};
 
     use crate::{
@@ -28,27 +29,28 @@ mod embeddings {
         utils::test_request_context,
     };
 
-    /// Create a local embedding model by downloading the `model_id` from HuggingFace if it doesn't exist.
+    /// Create a local embedding model by downloading the `model_id` from `HuggingFace` if it doesn't exist.
     ///
     /// Currently expects model to only need `tokenizer.json`, `config.json`, and `model.safetensors` files.
-    async fn create_local_embedding_from_hf(model_id: &str, name: &str) -> Embeddings {
-        let mut model_path = dirs::home_dir().expect("Failed to find home directory");
+    async fn create_local_embedding_from_hf(model_id: &str, name: &str) -> Result<Embeddings> {
+        let mut model_path =
+            dirs::home_dir().ok_or(anyhow::anyhow!("Could not find home directory"))?;
         model_path.push(".spice/models");
         model_path.push(name);
-        create_dir_all(&model_path).expect(format!("failed to create {:?}", model_path).as_str());
+        create_dir_all(&model_path)?;
 
         check_and_download_to_temp_dir(
             model_path.join("tokenizer.json"),
             format!("https://huggingface.co/{model_id}/resolve/main/tokenizer.json?download=true")
                 .as_str(),
         )
-        .await;
+        .await?;
         check_and_download_to_temp_dir(
             model_path.join("config.json"),
             format!("https://huggingface.co/{model_id}/resolve/main/config.json?download=true")
                 .as_str(),
         )
-        .await;
+        .await?;
         check_and_download_to_temp_dir(
             model_path.join("model.safetensors"),
             format!(
@@ -56,39 +58,32 @@ mod embeddings {
             )
             .as_str(),
         )
-        .await;
+        .await?;
 
         let mut embedding = Embeddings::new(
-            format!(
-                "file:/{}",
-                model_path.join("model.safetensors").display().to_string()
-            ),
+            format!("file:/{}", model_path.join("model.safetensors").display()),
             name,
         );
         embedding.files = vec![
             ModelFile::from_path(&model_path.join("tokenizer.json")),
             ModelFile::from_path(&model_path.join("config.json")),
         ];
-        embedding
+        Ok(embedding)
     }
 
-    async fn check_and_download_to_temp_dir(filename: PathBuf, url: &str) {
+    async fn check_and_download_to_temp_dir(filename: PathBuf, url: &str) -> Result<()> {
         if filename.exists() {
             tracing::debug!("File {filename:?} already exists.");
-            return;
+            return Ok(());
         }
-        let resp = reqwest::get(url)
-            .await
-            .expect(format!("Failed to get url={url}").as_str());
-        let mut out = File::create(filename.clone())
-            .expect(format!("Failed to download to file={filename:?}").as_str());
+        let resp = reqwest::get(url).await?;
+        let mut out = File::create(filename.clone())?;
 
-        let bytz = resp
-            .bytes()
-            .await
-            .expect(format!("Failed to read bytes from url={url}").as_str());
+        let bytz = resp.bytes().await?;
         let _ = out.write_all(&bytz);
-        out.flush().expect("Failed to flush file");
+        out.flush()?;
+
+        Ok(())
     }
 
     #[tokio::test]
@@ -98,12 +93,12 @@ mod embeddings {
         test_request_context()
             .scope(async {
                 run_beta_functionality_criteria_test(
-                    create_local_embedding_from_hf("intfloat/e5-small-v2", "hf_e5").await,
+                    create_local_embedding_from_hf("intfloat/e5-small-v2", "hf_e5").await?,
                     Duration::from_secs(3 * 60),
                 )
                 .await
             })
-            .await;
+            .await?;
 
         Ok(())
     }
