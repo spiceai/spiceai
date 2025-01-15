@@ -63,7 +63,7 @@ This table defines the required features and/or tests for each connector:
 | Spice.ai Cloud Platform          | ✅ (100)              | ➖             | ☑️                | ➖                       | ✅                  | ➖                         |
 | S3                               | ✅ (1)                | ➖             | ➖                | ➖                       | ✅                  | ☑️                         |
 | Azure BlobFS                     | ✅ (1)                | ➖             | ➖                | ➖                       | ✅                  | ☑️                         |
-| Spark                            | ✅ (1)                | ➖             | ☑️                | ➖                       | ✅                  | ➖                         |
+| Spark                            | ✅ (1)                | ➖             | ☑️                | ➖                       | ➖                  | ➖                         |
 
 [tpch]: #tpc-h
 [fed]: #federation
