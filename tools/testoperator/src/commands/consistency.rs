@@ -18,7 +18,7 @@ use clap::Parser;
 use std::path::PathBuf;
 
 #[derive(Parser)]
-pub struct ConsistencyTestArgs {
+pub struct HttpConsistencyTestArgs {
     /// Path to the spicepod.yaml file
     #[arg(short('p'), long, default_value = "spicepod.yaml")]
     pub(crate) spicepod_path: PathBuf,

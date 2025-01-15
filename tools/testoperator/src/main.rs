@@ -52,9 +52,11 @@ async fn main() -> anyhow::Result<()> {
             tests::env_export(&args.test_args)?;
         }
 
-        Commands::Run(TestCommands::Consistency(args)) => tests::consistency::run(&args).await?,
+        Commands::Run(TestCommands::HttpConsistency(args)) => {
+            tests::http_consistency::run(&args).await?
+        }
 
-        Commands::Export(TestCommands::Consistency(_args)) => {
+        Commands::Export(TestCommands::HttpConsistency(_args)) => {
             unimplemented!("Exporting consistency tests is not yet supported")
         }
     }

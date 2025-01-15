@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::commands::ConsistencyTestArgs;
+use crate::commands::HttpConsistencyTestArgs;
 use std::time::Duration;
 use test_framework::{
     anyhow,
@@ -28,21 +28,9 @@ use test_framework::{
 
 const DEFAULT_API_BASE: &str = "http://localhost:8090/v1";
 
-fn get_consistency_app_and_start_request(
-    args: &ConsistencyTestArgs,
-) -> anyhow::Result<(App, StartRequest)> {
-    let spicepod = Spicepod::load_exact(args.spicepod_path.clone())?;
-    let app = test_framework::app::AppBuilder::new(spicepod.name.clone())
-        .with_spicepod(spicepod)
-        .build();
-
-    let start_req = StartRequest::new(args.spiced_path.clone(), from_app(app.clone()))?;
-    Ok((app, start_req))
-}
-
 /// Runs a test to ensure the P50 & p90 latencies do not increase by some threshold over the
 /// duration of the test when N clients are sending queries concurrently.
-pub(crate) async fn run(args: &ConsistencyTestArgs) -> anyhow::Result<()> {
+pub(crate) async fn run(args: &HttpConsistencyTestArgs) -> anyhow::Result<()> {
     let (_app, start_request) = get_consistency_app_and_start_request(args)?;
     let component = match (&args.model, &args.embedding) {
         (Some(_), Some(_)) => {
@@ -111,4 +99,16 @@ pub(crate) async fn run(args: &ConsistencyTestArgs) -> anyhow::Result<()> {
 
     println!("Consistency test completed!");
     Ok(())
+}
+
+fn get_consistency_app_and_start_request(
+    args: &HttpConsistencyTestArgs,
+) -> anyhow::Result<(App, StartRequest)> {
+    let spicepod = Spicepod::load_exact(args.spicepod_path.clone())?;
+    let app = test_framework::app::AppBuilder::new(spicepod.name.clone())
+        .with_spicepod(spicepod)
+        .build();
+
+    let start_req = StartRequest::new(args.spiced_path.clone(), from_app(app.clone()))?;
+    Ok((app, start_req))
 }

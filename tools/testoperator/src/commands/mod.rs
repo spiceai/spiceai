@@ -18,7 +18,7 @@ use clap::Subcommand;
 pub use dataset::{DataConsistencyArgs, DatasetTestArgs};
 
 mod consistency;
-pub use consistency::ConsistencyTestArgs;
+pub use consistency::HttpConsistencyTestArgs;
 mod dataset;
 
 #[derive(Subcommand)]
@@ -37,5 +37,5 @@ pub enum TestCommands {
     Load(DatasetTestArgs),
     Bench(DatasetTestArgs),
     DataConsistency(DataConsistencyArgs),
-    Consistency(ConsistencyTestArgs),
+    HttpConsistency(HttpConsistencyTestArgs),
 }
