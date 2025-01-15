@@ -318,7 +318,7 @@ async fn huggingface_test_embeddings() -> Result<(), anyhow::Error> {
                         encoding_format: Some("float"),
                         user: None,
                         dimensions: None,
-                        test_id: "0",
+                        test_id: "basic",
                     },
                     EmbeddingTestCase {
                         input: EmbeddingInput::StringArray(vec![
@@ -329,7 +329,7 @@ async fn huggingface_test_embeddings() -> Result<(), anyhow::Error> {
                         model_name: "hf_minilm",
                         user: None,
                         dimensions: Some(256),
-                        test_id: "1",
+                        test_id: "mulitple_inputs",
                     },
                     EmbeddingTestCase {
                         input: EmbeddingInput::String(
@@ -339,7 +339,7 @@ async fn huggingface_test_embeddings() -> Result<(), anyhow::Error> {
                         encoding_format: None,
                         user: None,
                         dimensions: Some(384),
-                        test_id: "2",
+                        test_id: "basic",
                     },
                 ],
             )

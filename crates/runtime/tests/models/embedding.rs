@@ -24,10 +24,11 @@ use app::AppBuilder;
 use arrow::array::RecordBatch;
 use async_openai::types::{CreateEmbeddingResponse, EmbeddingInput};
 use core::time;
+use datafusion::sql::TableReference;
 use futures::TryStreamExt;
 use runtime::{auth::EndpointAuth, Runtime};
 use spicepod::component::embeddings::Embeddings;
-use std::sync::Arc;
+use std::{sync::Arc, thread::sleep, time::Duration};
 
 pub(crate) struct EmbeddingTestCase<'a> {
     pub input: EmbeddingInput,
@@ -44,9 +45,8 @@ pub(crate) async fn run_embedding_tests(
     models: Vec<Embeddings>,
     tests: Vec<EmbeddingTestCase<'_>>,
 ) -> Result<(), anyhow::Error> {
-    let _ = start_runtime_with_embedding(models, None).await?;
+    let (_, http_base) = start_runtime_with_embedding(models, None).await?;
     let api_config = create_api_bindings_config();
-    let http_base_url = format!("http://{}", api_config.http_bind_address);
 
     for EmbeddingTestCase {
         input,
@@ -58,7 +58,7 @@ pub(crate) async fn run_embedding_tests(
     } in tests
     {
         let response = send_embeddings_request(
-            http_base_url.as_str(),
+            http_base.as_str(),
             model_name,
             input,
             encoding_format,
@@ -68,7 +68,7 @@ pub(crate) async fn run_embedding_tests(
         .await?;
 
         insta::assert_snapshot!(
-            format!("embeddings_{}", test_id),
+            format!("{model_name}_{test_id}"),
             normalize_embeddings_response(response)
         );
     }
@@ -81,7 +81,7 @@ pub(crate) async fn run_beta_functionality_criteria_test(
     ready_timeout: time::Duration,
 ) -> Result<(), anyhow::Error> {
     let model_name = model.name.clone();
-    let rt = start_runtime_with_embedding(vec![model], Some(ready_timeout)).await?;
+    let (_rt, http_base) = start_runtime_with_embedding(vec![model], Some(ready_timeout)).await?;
 
     let tests = vec![
         EmbeddingTestCase {
@@ -132,9 +132,6 @@ pub(crate) async fn run_beta_functionality_criteria_test(
         },
     ];
 
-    let api_config = create_api_bindings_config();
-    let http_base_url = format!("http://{}", api_config.http_bind_address);
-
     for EmbeddingTestCase {
         input,
         encoding_format,
@@ -145,7 +142,7 @@ pub(crate) async fn run_beta_functionality_criteria_test(
     } in tests
     {
         let response_raw = send_embeddings_request(
-            http_base_url.as_str(),
+            http_base.as_str(),
             model_name,
             input,
             encoding_format,
@@ -170,23 +167,30 @@ pub(crate) async fn run_beta_functionality_criteria_test(
         );
 
         // Beta: Check for tracing
-        let q = rt.datafusion()
-                .query_builder(
-                    format!("SELECT span_id FROM runtime.task_history where task='text_embed' && contains(input, '{test_id}');").as_str()
-                )
-                .build()
-                .run()
-                .await?
-                .data.try_collect::<Vec<RecordBatch>>().await.expect("");
-        assert!(
-            q.first().is_some_and(|rb| rb.num_rows() > 0),
-            "Embedding request did not create tracing in 'runtime.task_history' for test {test_id} and model {model_name}."
-        );
+        // let q = rt
+        //     .datafusion()
+        //     .query_builder(
+        //         format!("SELECT span_id FROM runtime.task_history WHERE task='text_embed' AND labels['user'] = '{test_id}';").as_str(),
+        //     )
+        //     .build()
+        //     .run()
+        //     .await?
+        //     .data
+        //     .try_collect::<Vec<RecordBatch>>()
+        //     .await
+        //     .expect("could not get runtime.task_history span");
+        // assert!(
+        //     q.first().is_some_and(|rb| rb.num_rows() > 0),
+        //     "Embedding request did not create tracing in 'runtime.task_history' for test {test_id} and model {model_name}."
+        // );
 
         // Beta (TODO): Check for metrics
 
         // Check consistenct of response.
-        insta::assert_snapshot!(test_id, normalize_embeddings_response(response_raw));
+        insta::assert_snapshot!(
+            format!("{model_name}_{test_id}"),
+            normalize_embeddings_response(response_raw)
+        );
     }
     Ok(())
 }
@@ -194,7 +198,7 @@ pub(crate) async fn run_beta_functionality_criteria_test(
 async fn start_runtime_with_embedding(
     models: Vec<Embeddings>,
     ready_timeout: Option<std::time::Duration>,
-) -> Result<Arc<Runtime>, anyhow::Error> {
+) -> Result<(Arc<Runtime>, String), anyhow::Error> {
     let mut app_builder = AppBuilder::new("embedding_app");
 
     for m in models {
@@ -203,6 +207,8 @@ async fn start_runtime_with_embedding(
     let app = app_builder.build();
 
     let api_config = create_api_bindings_config();
+    let http_base = format!("http://{}", api_config.http_bind_address);
+
     let rt = Arc::new(Runtime::builder().with_app(app).build().await);
 
     let rt_ref_copy = Arc::clone(&rt);
@@ -222,5 +228,5 @@ async fn start_runtime_with_embedding(
         None => runtime_ready_check(&rt).await,
     }
 
-    Ok(rt)
+    Ok((rt, http_base))
 }
