@@ -21,6 +21,7 @@ All criteria must be met for the connector to be considered Beta, with exception
 | GitHub                           | ✅           | @peasee         |
 | HTTP/HTTPS                       | ➖           |                 |
 | Localpod                         | ➖           |                 |
+| Iceberg                          | ✅           | @phillipleblanc |
 | MS SQL                           | ✅           | @peasee         |
 | MySQL                            | ✅           | @peasee         |
 | ODBC                             | ➖           |                 |
@@ -54,6 +55,7 @@ This table defines the required features and/or tests for each connector:
 | GraphQL                          | ➖                    | ➖             | ➖                | ➖                       | ➖                  | ☑️                         |
 | GitHub                           | ➖                    | ➖             | ➖                | ➖                       | ➖                  | ☑️                         |
 | HTTP/HTTPS                       | ➖                    | ➖             | ➖                | ➖                       | ➖                  | ☑️                         |
+| Iceberg                          | ✅ (1)                | ➖             | ☑️                | ➖                       | ✅                  | ➖                         |
 | MS SQL                           | ✅ (100)              | ➖             | ☑️                | ➖                       | ✅                  | ➖                         |
 | MySQL                            | ✅ (100)              | ➖             | ☑️                | ➖                       | ✅                  | ➖                         |
 | ODBC                             | ✅ (100)              | ➖             | ☑️                | ➖                       | ✅                  | ➖                         |

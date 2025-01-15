@@ -7,11 +7,11 @@ All criteria must be met for the Catalog to be considered Beta, with exceptions 
 ## Beta Quality Catalogs
 
 | Catalog       | Beta Quality | DRI Sign-off |
-| ------------- | ------------ | ------------ |
-| Databricks    | ➖           |              |
-| Iceberg       | ➖           |              |
-| Spice.ai      | ➖           |              |
-| Unity Catalog | ➖           |              |
+| ------------- | ------------ | -------------- |
+| Databricks    | ➖           |                 |
+| Iceberg       | ✅            | @phillipleblanc |
+| Spice.ai      | ➖           |                 |
+| Unity Catalog | ➖           |                 |
 
 ## Beta Release Criteria
 
@@ -37,8 +37,8 @@ This section is required if the Catalog does not use an existing Data Connector.
 
 ### All Catalogs
 
-- [ ] An end-to-end test is created that loads the TPC-DS dataset at scale factor 1 using a Catalog, instead of specifying individual datasets.
-  - [ ] TPC-DS queries pass with a success rate equal to the native connector. For Catalogs without an existing Data Connector, queries pass with a success rate equal or greater than TPC-DS execution on Datafusion.
+- [ ] An end-to-end test is created that loads the TPC-H dataset at scale factor 1 using a Catalog, instead of specifying individual datasets.
+  - [ ] TPC-H queries pass with a success rate equal to the native connector. For Catalogs without an existing Data Connector, queries pass with a success rate equal or greater than TPC-H execution on Datafusion.
 - [ ] The Catalog can load the schema of a dataset without performing a data query at dataset registration time.
 - [ ] Known [Major](../definitions.md) bugs are resolved for the Catalog.
 - [ ] Known [Minor](../definitions.md) bugs are logged, but not required to be fixed unless needed to achieve TPC-H success.

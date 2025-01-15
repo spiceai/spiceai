@@ -54,6 +54,7 @@ This table defines the required features and/or tests for each connector:
 | GraphQL                          | ➖                    | ➖                      | ➖                | ✅                       | ✅                  | ☑️                         |
 | GitHub                           | ➖                    | ➖                      | ☑️                | ✅                       | ✅                  | ☑️                         |
 | HTTP/HTTPS                       | ✅ (5)                | ✅ (5)                  | ➖                | ✅                       | ✅                  | ☑️                         |
+| Iceberg                          | ✅ (5)                | ✅ (5)                  | ☑️                | ✅                       | ✅                  | ✅                         |
 | MS SQL                           | ✅ (100)              | ✅ (100)                | ✅                | ✅                       | ✅                  | ✅                         |
 | MySQL                            | ✅ (100)              | ✅ (100)                | ✅                | ✅                       | ✅                  | ✅                         |
 | ODBC                             | ✅ (100)              | ✅ (100)                | ✅                | ✅                       | ✅                  | ✅                         |

@@ -20,6 +20,7 @@ All criteria must be met for the connector to be considered Alpha. As Alpha sign
 | GraphQL                          | ➖            |                 |
 | GitHub                           | ✅            | @peasee         |
 | HTTP/HTTPS                       | ➖            |                 |
+| Iceberg                          | ✅            | @phillipleblanc |
 | Localpod                         | ➖            |                 |
 | MS SQL                           | ✅            | @peasee         |
 | MySQL                            | ✅            | @peasee         |
