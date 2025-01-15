@@ -47,9 +47,9 @@ impl Display for QueryStatus {
 pub struct QueryMetric<T: ExtendedMetrics> {
     pub query_name: String,
     pub query_status: QueryStatus,
-    pub average_duration: f64,
     pub median_duration: f64,
     pub percentile_99_duration: f64,
+    pub percentile_95_duration: f64,
     pub percentile_90_duration: f64,
     pub run_count: usize,
     pub extended_metrics: Option<T>,
@@ -65,9 +65,9 @@ impl<T: ExtendedMetrics> QueryMetric<T> {
         Ok(Self {
             query_name: name.to_string(),
             query_status: QueryStatus::Passed,
-            average_duration: durations.average()?.as_secs_f64(),
             median_duration: durations.median()?.as_secs_f64(),
             percentile_99_duration: durations.percentile(0.99)?.as_secs_f64(),
+            percentile_95_duration: durations.percentile(0.95)?.as_secs_f64(),
             percentile_90_duration: durations.percentile(0.90)?.as_secs_f64(),
             run_count: durations.len(),
             extended_metrics: None,
@@ -85,9 +85,9 @@ impl<T: ExtendedMetrics> QueryMetric<T> {
         Self {
             query_name: name.to_string(),
             query_status: QueryStatus::Passed,
-            average_duration: 0.0,
             median_duration: 0.0,
             percentile_99_duration: 0.0,
+            percentile_95_duration: 0.0,
             percentile_90_duration: 0.0,
             run_count: 0,
             extended_metrics: None,
@@ -98,7 +98,6 @@ impl<T: ExtendedMetrics> QueryMetric<T> {
 pub trait StatisticsCollector<T, C> {
     fn percentile(&self, percentile: f64) -> Result<T>;
     fn median(&self) -> Result<T>;
-    fn average(&self) -> Result<T>;
     fn statistical_set(&self) -> Result<C>;
 }
 
@@ -119,11 +118,6 @@ impl StatisticsCollector<Duration, Vec<Duration>> for Vec<Duration> {
         } else {
             Ok(self[half])
         }
-    }
-
-    fn average(&self) -> Result<Duration> {
-        let total: Duration = self.iter().sum();
-        Ok(total / u32::try_from(self.len())?)
     }
 
     fn statistical_set(&self) -> Result<Vec<Duration>> {
@@ -188,17 +182,6 @@ impl StatisticsCollector<BTreeMap<String, Duration>, BTreeMap<String, Vec<Durati
         Ok(medians)
     }
 
-    fn average(&self) -> Result<BTreeMap<String, Duration>> {
-        let mut averages = BTreeMap::new();
-        for (query, durations) in self {
-            if durations.is_empty() {
-                continue;
-            }
-            averages.insert(query.clone(), durations.average()?);
-        }
-        Ok(averages)
-    }
-
     fn statistical_set(&self) -> Result<BTreeMap<String, Vec<Duration>>> {
         let mut statistical_sets = BTreeMap::new();
         for (query, durations) in self {
@@ -237,9 +220,9 @@ impl<T: ExtendedMetrics> QueryMetrics<T> {
             Field::new("finished_at", DataType::UInt64, false),
             Field::new("query_name", DataType::Utf8, false),
             Field::new("query_status", DataType::Utf8, false),
-            Field::new("average_duration", DataType::Float64, false),
             Field::new("median_duration", DataType::Float64, false),
             Field::new("percentile_99_duration", DataType::Float64, false),
+            Field::new("percentile_95_duration", DataType::Float64, false),
             Field::new("percentile_90_duration", DataType::Float64, false),
             Field::new("run_count", DataType::UInt64, false),
         ];
@@ -336,11 +319,6 @@ impl<T: ExtendedMetrics> QueryMetrics<T> {
             .iter()
             .map(|metric| metric.query_status.to_string())
             .collect::<Vec<_>>();
-        let average_duration = self
-            .metrics
-            .iter()
-            .map(|metric| metric.average_duration)
-            .collect::<Vec<_>>();
         let median_duration = self
             .metrics
             .iter()
@@ -350,6 +328,11 @@ impl<T: ExtendedMetrics> QueryMetrics<T> {
             .metrics
             .iter()
             .map(|metric| metric.percentile_99_duration)
+            .collect::<Vec<_>>();
+        let percentile_95_duration = self
+            .metrics
+            .iter()
+            .map(|metric| metric.percentile_95_duration)
             .collect::<Vec<_>>();
         let percentile_90_duration = self
             .metrics
@@ -378,9 +361,9 @@ impl<T: ExtendedMetrics> QueryMetrics<T> {
             Arc::new(UInt64Array::from(finished_at)),
             Arc::new(StringArray::from(query_name)),
             Arc::new(StringArray::from(query_status)),
-            Arc::new(Float64Array::from(average_duration)),
             Arc::new(Float64Array::from(median_duration)),
             Arc::new(Float64Array::from(percentile_99_duration)),
+            Arc::new(Float64Array::from(percentile_95_duration)),
             Arc::new(Float64Array::from(percentile_90_duration)),
             Arc::new(UInt64Array::from(run_count)),
         ];
