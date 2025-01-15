@@ -41,8 +41,16 @@ async fn main() -> anyhow::Result<()> {
         Commands::Export(TestCommands::Throughput(args)) => tests::env_export(&args)?,
         Commands::Run(TestCommands::Load(args)) => tests::load::run(&args).await?,
         Commands::Export(TestCommands::Load(args)) => tests::env_export(&args)?,
-        Commands::Run(TestCommands::Bench(args)) => tests::bench::run(&args).await?,
+        Commands::Run(TestCommands::Bench(args)) => {
+            tests::bench::run(&args).await?;
+        }
         Commands::Export(TestCommands::Bench(args)) => tests::env_export(&args)?,
+        Commands::Run(TestCommands::DataConsistency(args)) => {
+            tests::data_consistency::run(&args).await?;
+        }
+        Commands::Export(TestCommands::DataConsistency(args)) => {
+            tests::env_export(&args.test_args)?;
+        }
     }
 
     Ok(())

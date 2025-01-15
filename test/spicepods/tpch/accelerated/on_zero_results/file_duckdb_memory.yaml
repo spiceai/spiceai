@@ -1,0 +1,68 @@
+version: v1
+kind: Spicepod
+name: file_tpch_duckdb_memory_on_zero_results
+datasets:
+  - from: file:data/customer.parquet
+    name: customer
+    acceleration:
+      enabled: true
+      engine: duckdb
+      mode: memory
+      refresh_sql: "SELECT * FROM customer LIMIT 0"
+      on_zero_results: use_source
+  - from: file:data/lineitem.parquet
+    name: lineitem
+    acceleration:
+      enabled: true
+      engine: duckdb
+      mode: memory
+      refresh_sql: "SELECT * FROM lineitem LIMIT 0"
+      on_zero_results: use_source
+  - from: file:data/nation.parquet
+    name: nation
+    acceleration:
+      enabled: true
+      engine: duckdb
+      mode: memory
+      refresh_sql: "SELECT * FROM nation LIMIT 0"
+      on_zero_results: use_source
+  - from: file:data/orders.parquet
+    name: orders
+    acceleration:
+      enabled: true
+      engine: duckdb
+      mode: memory
+      refresh_sql: "SELECT * FROM orders LIMIT 0"
+      on_zero_results: use_source
+  - from: file:data/part.parquet
+    name: part
+    acceleration:
+      enabled: true
+      engine: duckdb
+      mode: memory
+      refresh_sql: "SELECT * FROM part LIMIT 0"
+      on_zero_results: use_source
+  - from: file:data/partsupp.parquet
+    name: partsupp
+    acceleration:
+      enabled: true
+      engine: duckdb
+      mode: memory
+      refresh_sql: "SELECT * FROM partsupp LIMIT 0"
+      on_zero_results: use_source
+  - from: file:data/region.parquet
+    name: region
+    acceleration:
+      enabled: true
+      engine: duckdb
+      mode: memory
+      refresh_sql: "SELECT * FROM region LIMIT 0"
+      on_zero_results: use_source
+  - from: file:data/supplier.parquet
+    name: supplier
+    acceleration:
+      enabled: true
+      engine: duckdb
+      mode: memory
+      refresh_sql: "SELECT * FROM supplier LIMIT 0"
+      on_zero_results: use_source

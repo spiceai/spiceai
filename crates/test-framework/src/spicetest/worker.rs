@@ -38,14 +38,14 @@ pub(crate) struct SpiceTestQueryWorker {
 pub struct SpiceTestQueryWorkerResult {
     pub query_durations: BTreeMap<String, Vec<Duration>>,
     pub connection_failed: bool,
-    pub row_counts: BTreeMap<String, usize>,
+    pub row_counts: BTreeMap<String, Vec<usize>>,
 }
 
 impl SpiceTestQueryWorkerResult {
     pub fn new(
         query_durations: BTreeMap<String, Vec<Duration>>,
         connection_failed: bool,
-        row_counts: BTreeMap<String, usize>,
+        row_counts: BTreeMap<String, Vec<usize>>,
     ) -> Self {
         Self {
             query_durations,
@@ -79,7 +79,7 @@ impl SpiceTestQueryWorker {
     pub fn start(self) -> JoinHandle<Result<SpiceTestQueryWorkerResult>> {
         tokio::spawn(async move {
             let mut query_durations: BTreeMap<String, Vec<Duration>> = BTreeMap::new();
-            let mut row_counts: BTreeMap<String, usize> = BTreeMap::new();
+            let mut row_counts: BTreeMap<String, Vec<usize>> = BTreeMap::new();
             let mut query_set_count = 0;
             let start = Instant::now();
 
@@ -120,7 +120,10 @@ impl SpiceTestQueryWorker {
                                 .or_default()
                                 .push(duration);
 
-                            *row_counts.entry(query.0.to_string()).or_default() += row_count;
+                            row_counts
+                                .entry(query.0.to_string())
+                                .or_default()
+                                .push(row_count);
 
                             if let Some(pb) = self.progress_bar.as_ref() {
                                 pb.inc(1);

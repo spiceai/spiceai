@@ -18,7 +18,7 @@ limitations under the License.
 pub enum QuerySet {
     Tpch,
     Tpcds,
-    ClickBench,
+    Clickbench,
 }
 
 impl QuerySet {
@@ -30,7 +30,7 @@ impl QuerySet {
         match self {
             QuerySet::Tpch => get_tpch_test_queries(overrides),
             QuerySet::Tpcds => get_tpcds_test_queries(overrides),
-            QuerySet::ClickBench => get_clickbench_test_queries(overrides),
+            QuerySet::Clickbench => get_clickbench_test_queries(overrides),
         }
     }
 }

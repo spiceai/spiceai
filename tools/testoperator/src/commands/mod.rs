@@ -33,9 +33,10 @@ pub enum TestCommands {
     Throughput(TestArgs),
     Load(TestArgs),
     Bench(TestArgs),
+    DataConsistency(DataConsistencyArgs),
 }
 
-#[derive(Parser)]
+#[derive(Parser, Debug, Clone)]
 pub struct TestArgs {
     /// Path to the spicepod.yaml file
     #[arg(short('p'), long)]
@@ -74,14 +75,14 @@ pub struct TestArgs {
     pub(crate) disable_progress_bars: bool,
 }
 
-#[derive(Clone, ValueEnum)]
+#[derive(Clone, ValueEnum, Debug)]
 pub enum QuerySetArg {
     Tpch,
     Tpcds,
-    ClickBench,
+    Clickbench,
 }
 
-#[derive(Clone, ValueEnum)]
+#[derive(Clone, ValueEnum, Debug)]
 pub enum QueryOverridesArg {
     Sqlite,
     Postgresql,
@@ -98,7 +99,7 @@ impl From<QuerySetArg> for QuerySet {
         match arg {
             QuerySetArg::Tpch => QuerySet::Tpch,
             QuerySetArg::Tpcds => QuerySet::Tpcds,
-            QuerySetArg::ClickBench => QuerySet::ClickBench,
+            QuerySetArg::Clickbench => QuerySet::Clickbench,
         }
     }
 }
@@ -116,4 +117,13 @@ impl From<QueryOverridesArg> for QueryOverrides {
             QueryOverridesArg::Snowflake => QueryOverrides::Snowflake,
         }
     }
+}
+
+#[derive(Parser, Debug)]
+pub struct DataConsistencyArgs {
+    #[command(flatten)]
+    pub(crate) test_args: TestArgs,
+
+    #[arg(long)]
+    pub(crate) compare_spicepod: PathBuf,
 }

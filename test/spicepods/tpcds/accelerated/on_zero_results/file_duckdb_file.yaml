@@ -1,0 +1,196 @@
+version: v1
+kind: Spicepod
+name: file_tpcds_duckdb_file_on_zero_results
+datasets:
+  - from: file:data/catalog_sales.parquet
+    name: catalog_sales
+    acceleration:
+      engine: duckdb
+      mode: file
+      enabled: true
+      refresh_sql: "SELECT * FROM catalog_sales LIMIT 0"
+      on_zero_results: use_source
+  - from: file:data/catalog_returns.parquet
+    name: catalog_returns
+    acceleration:
+      engine: duckdb
+      mode: file
+      enabled: true
+      refresh_sql: "SELECT * FROM catalog_returns LIMIT 0"
+      on_zero_results: use_source
+  - from: file:data/inventory.parquet
+    name: inventory
+    acceleration:
+      engine: duckdb
+      mode: file
+      enabled: true
+      refresh_sql: "SELECT * FROM inventory LIMIT 0"
+      on_zero_results: use_source
+  - from: file:data/store_sales.parquet
+    name: store_sales
+    acceleration:
+      engine: duckdb
+      mode: file
+      enabled: true
+      refresh_sql: "SELECT * FROM store_sales LIMIT 0"
+      on_zero_results: use_source
+  - from: file:data/store_returns.parquet
+    name: store_returns
+    acceleration:
+      engine: duckdb
+      mode: file
+      enabled: true
+      refresh_sql: "SELECT * FROM store_returns LIMIT 0"
+      on_zero_results: use_source
+  - from: file:data/web_sales.parquet
+    name: web_sales
+    acceleration:
+      engine: duckdb
+      mode: file
+      enabled: true
+      refresh_sql: "SELECT * FROM web_sales LIMIT 0"
+      on_zero_results: use_source
+  - from: file:data/web_returns.parquet
+    name: web_returns
+    acceleration:
+      engine: duckdb
+      mode: file
+      enabled: true
+      refresh_sql: "SELECT * FROM web_returns LIMIT 0"
+      on_zero_results: use_source
+  - from: file:data/customer.parquet
+    name: customer
+    acceleration:
+      engine: duckdb
+      mode: file
+      enabled: true
+      refresh_sql: "SELECT * FROM customer LIMIT 0"
+      on_zero_results: use_source
+  - from: file:data/customer_address.parquet
+    name: customer_address
+    acceleration:
+      engine: duckdb
+      mode: file
+      enabled: true
+      refresh_sql: "SELECT * FROM customer_address LIMIT 0"
+      on_zero_results: use_source
+  - from: file:data/customer_demographics.parquet
+    name: customer_demographics
+    acceleration:
+      engine: duckdb
+      mode: file
+      enabled: true
+      refresh_sql: "SELECT * FROM customer_demographics LIMIT 0"
+      on_zero_results: use_source
+  - from: file:data/date_dim.parquet
+    name: date_dim
+    acceleration:
+      engine: duckdb
+      mode: file
+      enabled: true
+      refresh_sql: "SELECT * FROM date_dim LIMIT 0"
+      on_zero_results: use_source
+  - from: file:data/household_demographics.parquet
+    name: household_demographics
+    acceleration:
+      engine: duckdb
+      mode: file
+      enabled: true
+      refresh_sql: "SELECT * FROM household_demographics LIMIT 0"
+      on_zero_results: use_source
+  - from: file:data/item.parquet
+    name: item
+    acceleration:
+      engine: duckdb
+      mode: file
+      enabled: true
+      refresh_sql: "SELECT * FROM item LIMIT 0"
+      on_zero_results: use_source
+  - from: file:data/promotion.parquet
+    name: promotion
+    acceleration:
+      engine: duckdb
+      mode: file
+      enabled: true
+      refresh_sql: "SELECT * FROM promotion LIMIT 0"
+      on_zero_results: use_source
+  - from: file:data/ship_mode.parquet
+    name: ship_mode
+    acceleration:
+      engine: duckdb
+      mode: file
+      enabled: true
+      refresh_sql: "SELECT * FROM ship_mode LIMIT 0"
+      on_zero_results: use_source
+  - from: file:data/store.parquet
+    name: store
+    acceleration:
+      engine: duckdb
+      mode: file
+      enabled: true
+      refresh_sql: "SELECT * FROM store LIMIT 0"
+      on_zero_results: use_source
+  - from: file:data/time_dim.parquet
+    name: time_dim
+    acceleration:
+      engine: duckdb
+      mode: file
+      enabled: true
+      refresh_sql: "SELECT * FROM time_dim LIMIT 0"
+      on_zero_results: use_source
+  - from: file:data/warehouse.parquet
+    name: warehouse
+    acceleration:
+      engine: duckdb
+      mode: file
+      enabled: true
+      refresh_sql: "SELECT * FROM warehouse LIMIT 0"
+      on_zero_results: use_source
+  - from: file:data/web_page.parquet
+    name: web_page
+    acceleration:
+      engine: duckdb
+      mode: file
+      enabled: true
+      refresh_sql: "SELECT * FROM web_page LIMIT 0"
+      on_zero_results: use_source
+  - from: file:data/web_site.parquet
+    name: web_site
+    acceleration:
+      engine: duckdb
+      mode: file
+      enabled: true
+      refresh_sql: "SELECT * FROM web_site LIMIT 0"
+      on_zero_results: use_source
+  - from: file:data/reason.parquet
+    name: reason
+    acceleration:
+      engine: duckdb
+      mode: file
+      enabled: true
+      refresh_sql: "SELECT * FROM reason LIMIT 0"
+      on_zero_results: use_source
+  - from: file:data/call_center.parquet
+    name: call_center
+    acceleration:
+      engine: duckdb
+      mode: file
+      enabled: true
+      refresh_sql: "SELECT * FROM call_center LIMIT 0"
+      on_zero_results: use_source
+  - from: file:data/income_band.parquet
+    name: income_band
+    acceleration:
+      engine: duckdb
+      mode: file
+      enabled: true
+      refresh_sql: "SELECT * FROM income_band LIMIT 0"
+      on_zero_results: use_source
+  - from: file:data/catalog_page.parquet
+    name: catalog_page
+    acceleration:
+      engine: duckdb
+      mode: file
+      enabled: true
+      refresh_sql: "SELECT * FROM catalog_page LIMIT 0"
+      on_zero_results: use_source
