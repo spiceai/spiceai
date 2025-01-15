@@ -37,12 +37,15 @@ pub(crate) async fn run(args: &TestArgs) -> anyhow::Result<()> {
         .wait_for_ready(Duration::from_secs(args.ready_wait.unwrap_or(30) as u64))
         .await?;
 
+    let test_duration = Duration::from_secs(args.duration.unwrap_or(60).try_into()?);
+    let test_hours = (test_duration.as_secs() / 60 / 60).min(1);
+
     // baseline run
     println!("Running baseline throughput test");
     let baseline_test = SpiceTest::new(app.name.clone(), spiced_instance)
         .with_query_set(queries.clone())
         .with_parallel_count(args.concurrency.unwrap_or(8))
-        .with_end_condition(EndCondition::QuerySetCompleted(2))
+        .with_end_condition(EndCondition::QuerySetCompleted(test_hours.try_into()?))
         .with_progress_bars(!args.disable_progress_bars)
         .start()
         .await?;
