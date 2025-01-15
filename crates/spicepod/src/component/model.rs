@@ -355,6 +355,16 @@ pub struct ModelFile {
 }
 
 impl ModelFile {
+    #[must_use]
+    pub fn from_path(p: &Path) -> Self {
+        Self {
+            path: p.display().to_string(),
+            name: None,
+            r#type: None,
+            params: None,
+        }
+    }
+
     /// Returns the [`ModelFileType`] if explicitly set, otherwise attempts to determine the file
     /// type for the [`ModelFile`] based on the file path.
     #[must_use]

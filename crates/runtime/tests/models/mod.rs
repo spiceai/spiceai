@@ -33,7 +33,9 @@ use std::{
 };
 
 use serde_json::{json, Value};
+mod embedding;
 mod hf;
+mod local;
 mod openai;
 
 mod nsql {
