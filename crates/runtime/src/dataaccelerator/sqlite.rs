@@ -420,7 +420,7 @@ mod tests {
             .as_any()
             .downcast_ref::<UInt64Array>()
             .expect("result should be UInt64Array");
-        let expected = UInt64Array::from(vec![2]);
+        let expected = UInt64Array::from(vec![1]);
         assert_eq!(actual, &expected);
 
         let filter = col("time_int").lt(lit(1354360273));
