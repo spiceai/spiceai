@@ -51,6 +51,15 @@ async fn main() -> anyhow::Result<()> {
         Commands::Export(TestCommands::DataConsistency(args)) => {
             tests::env_export(&args.test_args)?;
         }
+        #[cfg(feature = "models")]
+        Commands::Run(TestCommands::EmbeddingConsistency(args)) => {
+            tests::embedding::run(&args).await?
+        }
+
+        #[cfg(feature = "models")]
+        Commands::Export(TestCommands::EmbeddingConsistency(_args)) => {
+            unimplemented!("Exporting embedding consistency tests is not yet supported")
+        }
     }
 
     Ok(())

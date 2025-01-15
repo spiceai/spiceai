@@ -16,19 +16,22 @@ limitations under the License.
 
 use std::collections::BTreeMap;
 
-use crate::commands::TestArgs;
+use crate::commands::DatasetTestArgs;
 use test_framework::{
     anyhow, app::App, spiced::StartRequest, spicepod::Spicepod, spicepod_utils::from_app,
 };
 
 pub(crate) mod bench;
 pub(crate) mod data_consistency;
+pub(crate) mod embedding;
 pub(crate) mod load;
 pub(crate) mod throughput;
 
 pub(crate) type RowCounts = BTreeMap<String, usize>;
 
-pub(crate) fn get_app_and_start_request(args: &TestArgs) -> anyhow::Result<(App, StartRequest)> {
+pub(crate) fn get_app_and_start_request(
+    args: &DatasetTestArgs,
+) -> anyhow::Result<(App, StartRequest)> {
     let spicepod = Spicepod::load_exact(args.spicepod_path.clone())?;
     let app = test_framework::app::AppBuilder::new(spicepod.name.clone())
         .with_spicepod(spicepod)
@@ -44,7 +47,7 @@ pub(crate) fn get_app_and_start_request(args: &TestArgs) -> anyhow::Result<(App,
     Ok((app, start_request))
 }
 
-pub(crate) fn env_export(args: &TestArgs) -> anyhow::Result<()> {
+pub(crate) fn env_export(args: &DatasetTestArgs) -> anyhow::Result<()> {
     let (_, mut start_request) = get_app_and_start_request(args)?;
 
     start_request.prepare()?;

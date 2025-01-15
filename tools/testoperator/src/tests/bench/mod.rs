@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use super::{get_app_and_start_request, RowCounts};
-use crate::commands::TestArgs;
+use crate::commands::DatasetTestArgs;
 use std::time::Duration;
 use test_framework::{
     anyhow,
@@ -25,7 +25,7 @@ use test_framework::{
     spicetest::{EndCondition, SpiceTest},
 };
 
-pub(crate) async fn run(args: &TestArgs) -> anyhow::Result<RowCounts> {
+pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
     let query_set = QuerySet::from(args.query_set.clone());
     let query_overrides = args.query_overrides.clone().map(QueryOverrides::from);
     let queries = query_set.get_queries(query_overrides);
