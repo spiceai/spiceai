@@ -21,14 +21,11 @@ use crate::{
     utils::{runtime_ready_check, runtime_ready_check_with_timeout},
 };
 use app::AppBuilder;
-use arrow::array::RecordBatch;
 use async_openai::types::{CreateEmbeddingResponse, EmbeddingInput};
 use core::time;
-use datafusion::sql::TableReference;
-use futures::TryStreamExt;
 use runtime::{auth::EndpointAuth, Runtime};
 use spicepod::component::embeddings::Embeddings;
-use std::{sync::Arc, thread::sleep, time::Duration};
+use std::sync::Arc;
 
 pub(crate) struct EmbeddingTestCase<'a> {
     pub input: EmbeddingInput,
@@ -46,7 +43,6 @@ pub(crate) async fn run_embedding_tests(
     tests: Vec<EmbeddingTestCase<'_>>,
 ) -> Result<(), anyhow::Error> {
     let (_, http_base) = start_runtime_with_embedding(models, None).await?;
-    let api_config = create_api_bindings_config();
 
     for EmbeddingTestCase {
         input,
