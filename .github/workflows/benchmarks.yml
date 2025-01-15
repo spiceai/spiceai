@@ -566,6 +566,9 @@ jobs:
           - cmd: '-a postgres -b clickbench'
             name: 'postgres accelerator'
             bench: 'clickbench'
+          - cmd: '-c s3 -b clickbench'
+            name: 's3 connector'
+            bench: 'clickbench'
 
     steps:
       - name: Checkout repository
@@ -585,6 +588,13 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: spice_bench
+
+      - name: Download File Connector Data
+        run: |
+          sudo wget https://dl.min.io/client/mc/release/linux-amd64/mc -O /usr/local/bin/mc
+          sudo chmod +x /usr/local/bin/mc
+          mc alias set spice-bench-minio ${{ secrets.CLICKBENCH_S3_ENDPOINT }} ${{ secrets.CLICKBENCH_S3_KEY }} ${{ secrets.CLICKBENCH_S3_SECRET }}
+          mc cp spice-bench-minio/benchmarks/clickbench/hits/hits.parquet ./
 
       - name: Make benchmark binary executable
         if: (github.event.inputs.selected_benchmark == matrix.name && (github.event.inputs.bench_name == matrix.bench || github.event.inputs.bench_name == 'all')) || github.event.inputs.run_all == 'true' || github.event_name == 'schedule'

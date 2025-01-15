@@ -164,7 +164,7 @@ See more demos on [YouTube](https://www.youtube.com/playlist?list=PLesJrUXEx3U9a
 | `abfs`                             | Azure BlobFS                          | Alpha             | Parquet, CSV                 |
 | `clickhouse`                       | Clickhouse                            | Alpha             |                              |
 | `debezium`                         | Debezium CDC                          | Alpha             | Kafka + JSON                 |
-| `documentdb`                       | DocumentDB                            | Alpha             |                              |
+| `dynamodb`                         | Amazon DynamoDB                       | Alpha             |                              |
 | `ftp`, `sftp`                      | FTP/SFTP                              | Alpha             | Parquet, CSV                 |
 | `http`, `https`                    | HTTP(s)                               | Alpha             | Parquet, CSV                 |
 | `iceberg`                          | [Apache Iceberg][iceberg]             | Alpha             | Parquet                      |
