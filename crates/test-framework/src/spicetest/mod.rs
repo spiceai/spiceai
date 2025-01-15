@@ -86,6 +86,14 @@ impl Default for ThroughputConfig {
 }
 
 impl TestState for NotStarted {}
+impl Default for NotStarted {
+    fn default() -> Self {
+        Self {
+            query_set: vec![],
+            end_condition: EndCondition::QuerySetCompleted(1),
+        }
+    }
+}
 impl TestState for Running {}
 impl TestState for Completed {}
 
@@ -99,21 +107,20 @@ pub struct SpiceTest<S: TestState, C: TestConfig + Default> {
     state: S,
 }
 
-impl SpiceTest<NotStarted, ThroughputConfig> {
+impl<S: TestState + Default, C: TestConfig + Default> SpiceTest<S, C> {
     #[must_use]
     pub fn new(name: String, spiced_instance: SpicedInstance) -> Self {
         Self {
             name,
             spiced_instance,
             start_time: Some(SystemTime::now()),
-            config: ThroughputConfig::default(),
-            state: NotStarted {
-                query_set: vec![],
-                end_condition: EndCondition::QuerySetCompleted(1),
-            },
+            config: C::default(),
+            state: S::default(),
         }
     }
+}
 
+impl SpiceTest<NotStarted, ThroughputConfig> {
     #[must_use]
     pub fn with_progress_bars(mut self, use_progress_bars: bool) -> Self {
         self.config.use_progress_bars = use_progress_bars;
@@ -153,7 +160,6 @@ impl SpiceTest<NotStarted, ThroughputConfig> {
         }
     }
 
-    // parallel_count, use_progress_bars, get_new_progress_bar, self.name, self.query_count, self.start_time, self.config.use_progress_bars,
     pub async fn start(
         self,
         instance: &SpicedInstance,
