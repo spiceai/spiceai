@@ -67,6 +67,23 @@ pub struct Completed {
 }
 
 pub trait TestState {}
+pub trait TestConfig {}
+
+pub struct ThroughputConfig {
+    query_count: usize,
+    parallel_count: usize,
+    use_progress_bars: bool,
+}
+impl TestConfig for ThroughputConfig {}
+impl Default for ThroughputConfig {
+    fn default() -> Self {
+        Self {
+            query_count: 0,
+            parallel_count: 1,
+            use_progress_bars: true,
+        }
+    }
+}
 
 impl TestState for NotStarted {}
 impl TestState for Running {}
@@ -74,27 +91,22 @@ impl TestState for Completed {}
 
 /// A throughput test is a test that runs a set of queries in a loop until a condition is met
 /// The test queries can also be run in parallel, each with the same end condition.
-pub struct SpiceTest<S: TestState> {
+pub struct SpiceTest<S: TestState, C: TestConfig + Default> {
     name: String,
+    start_time: Option<SystemTime>,
     spiced_instance: SpicedInstance,
-    query_count: usize,
-    parallel_count: usize,
-    start_time: SystemTime,
-    use_progress_bars: bool,
-
+    config: C,
     state: S,
 }
 
-impl SpiceTest<NotStarted> {
+impl SpiceTest<NotStarted, ThroughputConfig> {
     #[must_use]
     pub fn new(name: String, spiced_instance: SpicedInstance) -> Self {
         Self {
             name,
             spiced_instance,
-            query_count: 0,
-            parallel_count: 1,
-            start_time: SystemTime::now(),
-            use_progress_bars: true,
+            start_time: Some(SystemTime::now()),
+            config: ThroughputConfig::default(),
             state: NotStarted {
                 query_set: vec![],
                 end_condition: EndCondition::QuerySetCompleted(1),
@@ -104,19 +116,19 @@ impl SpiceTest<NotStarted> {
 
     #[must_use]
     pub fn with_progress_bars(mut self, use_progress_bars: bool) -> Self {
-        self.use_progress_bars = use_progress_bars;
+        self.config.use_progress_bars = use_progress_bars;
         self
     }
 
     #[must_use]
     pub fn with_parallel_count(mut self, parallel_count: usize) -> Self {
-        self.parallel_count = parallel_count;
+        self.config.parallel_count = parallel_count;
         self
     }
 
     #[must_use]
     pub fn with_query_set(mut self, query_set: Vec<(&'static str, &'static str)>) -> Self {
-        self.query_count = query_set.len();
+        self.config.query_count = query_set.len();
         self.state.query_set = query_set;
         self
     }
@@ -141,23 +153,27 @@ impl SpiceTest<NotStarted> {
         }
     }
 
-    pub async fn start(self) -> Result<SpiceTest<Running>> {
+    // parallel_count, use_progress_bars, get_new_progress_bar, self.name, self.query_count, self.start_time, self.config.use_progress_bars,
+    pub async fn start(
+        self,
+        instance: &SpicedInstance,
+    ) -> Result<SpiceTest<Running, ThroughputConfig>> {
         if self.state.query_set.is_empty() {
             return Err(anyhow::anyhow!("Query set is empty"));
         }
 
-        if self.parallel_count == 0 {
+        if self.config.parallel_count == 0 {
             return Err(anyhow::anyhow!("Parallel count must be greater than 0"));
         }
 
-        let multi = if self.use_progress_bars {
+        let multi = if self.config.use_progress_bars {
             Some(MultiProgress::new())
         } else {
             None
         };
 
-        let flight_client = self.spiced_instance.flight_client().await?;
-        let query_workers = (0..self.parallel_count)
+        let flight_client = instance.flight_client().await?;
+        let query_workers = (0..self.config.parallel_count)
             .map(|id| {
                 let worker = SpiceTestQueryWorker::new(
                     id,
@@ -178,10 +194,12 @@ impl SpiceTest<NotStarted> {
         Ok(SpiceTest {
             name: self.name,
             spiced_instance: self.spiced_instance,
-            query_count: self.query_count,
-            parallel_count: self.parallel_count,
             start_time: self.start_time,
-            use_progress_bars: self.use_progress_bars,
+            config: ThroughputConfig {
+                query_count: self.config.query_count,
+                parallel_count: self.config.parallel_count,
+                use_progress_bars: self.config.use_progress_bars,
+            },
             state: Running {
                 start_time: Instant::now(),
                 query_workers,
@@ -191,8 +209,8 @@ impl SpiceTest<NotStarted> {
     }
 }
 
-impl SpiceTest<Running> {
-    pub async fn wait(self) -> Result<SpiceTest<Completed>> {
+impl SpiceTest<Running, ThroughputConfig> {
+    pub async fn wait(self) -> Result<SpiceTest<Completed, ThroughputConfig>> {
         let mut query_durations = BTreeMap::new();
         let mut row_counts = BTreeMap::new();
         for query_duration in join_all(self.state.query_workers).await {
@@ -225,10 +243,12 @@ impl SpiceTest<Running> {
         Ok(SpiceTest {
             name: self.name,
             spiced_instance: self.spiced_instance,
-            query_count: self.query_count,
-            parallel_count: self.parallel_count,
             start_time: self.start_time,
-            use_progress_bars: self.use_progress_bars,
+            config: ThroughputConfig {
+                query_count: self.config.query_count,
+                parallel_count: self.config.parallel_count,
+                use_progress_bars: self.config.use_progress_bars,
+            },
             state: Completed {
                 query_durations,
                 row_counts,
@@ -239,7 +259,7 @@ impl SpiceTest<Running> {
     }
 }
 
-impl SpiceTest<Completed> {
+impl SpiceTest<Completed, ThroughputConfig> {
     #[must_use]
     pub fn get_query_durations(&self) -> &BTreeMap<String, Vec<Duration>> {
         &self.state.query_durations
@@ -257,7 +277,7 @@ impl SpiceTest<Completed> {
 
     pub fn get_throughput_metric(&self, scale: f64) -> Result<f64> {
         // metric = (Parallel Query Count * Test Suite Query Count * 3600) / Cs * Scale
-        let lhs = self.parallel_count * self.query_count * 3600;
+        let lhs = self.config.parallel_count * self.config.query_count * 3600;
         let rhs = self.get_cumulative_query_duration().as_secs_f64() * scale;
         // u32 is safe because lhs is unlikely to be greater than u32::MAX unless some extreme parameters are used (more than 1000 parallel and query count)
         Ok(f64::from(u32::try_from(lhs)?) / rhs)
@@ -292,7 +312,7 @@ impl SpiceTest<Completed> {
     }
 }
 
-impl std::fmt::Display for SpiceTest<Completed> {
+impl std::fmt::Display for SpiceTest<Completed, ThroughputConfig> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
@@ -304,13 +324,19 @@ impl std::fmt::Display for SpiceTest<Completed> {
     }
 }
 
-impl MetricCollector<NoExtendedMetrics> for SpiceTest<Completed> {
+impl MetricCollector<NoExtendedMetrics> for SpiceTest<Completed, ThroughputConfig> {
     fn collect(&self) -> Result<QueryMetrics<NoExtendedMetrics>> {
         let query_metrics = self
             .get_query_durations()
             .iter()
             .map(|(query, durations)| QueryMetric::new_from_durations(query, durations))
             .collect::<Result<Vec<_>>>()?;
+
+        let Some(start_time) = self.start_time else {
+            return Err(anyhow::anyhow!(
+                "For Completed spice test, start time was not set"
+            ));
+        };
 
         Ok(QueryMetrics {
             run_id: uuid::Uuid::new_v4(),
@@ -319,9 +345,7 @@ impl MetricCollector<NoExtendedMetrics> for SpiceTest<Completed> {
             branch_name: "TODO".to_string(),
             test_type: crate::TestType::Throughput,
             started_at: usize::try_from(
-                self.start_time
-                    .duration_since(SystemTime::UNIX_EPOCH)?
-                    .as_secs(),
+                start_time.duration_since(SystemTime::UNIX_EPOCH)?.as_secs(),
             )?,
             finished_at: usize::try_from(
                 self.state
