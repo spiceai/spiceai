@@ -1,0 +1,1 @@
+SELECT MAX(l_orderkey) FROM ice.tpch_sf1.lineitem;

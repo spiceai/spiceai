@@ -1,0 +1,12 @@
+version: v1beta1
+kind: Spicepod
+name: iceberg_catalog
+
+catalogs:
+  - from: iceberg:http://iceberg-rest.dataplatform.svc.cluster.local:8181/v1/namespaces
+    name: ice
+    params:
+      iceberg_s3_endpoint: ${secrets:S3_ENDPOINT}
+      iceberg_s3_access_key_id: ${secrets:S3_KEY}
+      iceberg_s3_secret_access_key: ${secrets:S3_SECRET}
+      iceberg_s3_region: us-east-1

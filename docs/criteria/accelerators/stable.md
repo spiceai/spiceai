@@ -53,7 +53,7 @@ Indexes are not required for test coverage, but can be introduced if required fo
   - [ ] End-to-end tests should perform [Throughput Tests](../definitions.md) at the required [parallel query count](../definitions.md)
   - [ ] [Throughput Metric](../definitions.md) is calculated and reported as a metric with a parallel query count of 1 to serve as a baseline metric.
   - [ ] [Throughput Metric](../definitions.md) is calculated and reported as a metric at the required [parallel query count](../definitions.md).
-  - [ ] A [Load Test](../definitions.md) runs for a minimum of 8 hours as part of the end-to-end test. The 99th percentile of load test query [timing measurements](../definitions.md) must be compared against than the 99th percentile of the baseline throughput test timing measurements.
+  - [ ] A [Load Test](../definitions.md) runs for a minimum of 8 hours at scale factor 1 as part of the end-to-end test. The 99th percentile of load test query [timing measurements](../definitions.md) must be compared against than the 99th percentile of the baseline throughput test timing measurements.
     - Three or more [Yellow percentile measurements](../definitions.md#stop-light-percentile-measurements) are considered a test failure.
     - One or more [Red percentile measurements](../definitions.md#stop-light-percentile-measurements) are considered a test failure.
     - The service must not become unavailable for the entire duration of the test. A connection failure is considered a test failure.

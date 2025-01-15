@@ -92,6 +92,7 @@ pub enum QueryOverridesArg {
     ODBCAthena,
     Duckdb,
     Snowflake,
+    IcebergSF1,
 }
 
 impl From<QuerySetArg> for QuerySet {
@@ -115,6 +116,7 @@ impl From<QueryOverridesArg> for QueryOverrides {
             QueryOverridesArg::ODBCAthena => QueryOverrides::ODBCAthena,
             QueryOverridesArg::Duckdb => QueryOverrides::DuckDB,
             QueryOverridesArg::Snowflake => QueryOverrides::Snowflake,
+            QueryOverridesArg::IcebergSF1 => QueryOverrides::IcebergSF1,
         }
     }
 }

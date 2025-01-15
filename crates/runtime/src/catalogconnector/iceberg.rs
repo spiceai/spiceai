@@ -26,6 +26,7 @@ use data_components::{
 };
 use iceberg::{Namespace, NamespaceIdent};
 use iceberg_catalog_rest::RestCatalogConfig;
+use ns_lookup::verify_ns_lookup_and_tcp_connect;
 use secrecy::ExposeSecret;
 use snafu::prelude::*;
 use std::{any::Any, collections::HashMap, sync::Arc};
@@ -53,6 +54,9 @@ pub enum Error {
 
     #[snafu(display("Failed to parse URL: {}", source))]
     UrlParse { source: url::ParseError },
+
+    #[snafu(display("Failed to connect to the S3 endpoint at {url}, please check whether the S3 endpoint is accessible and try again."))]
+    FailedToConnectS3Endpoint { url: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -174,6 +178,17 @@ impl CatalogConnector for IcebergCatalog {
             }
         }
 
+        if let Some(endpoint) = props.get("s3.endpoint") {
+            verify_s3_endpoint(endpoint)
+                .await
+                .map_err(|e| super::Error::InvalidConfiguration {
+                    connector: "iceberg".into(),
+                    message: e.to_string(),
+                    connector_component: ConnectorComponent::from(catalog),
+                    source: Box::new(e),
+                })?;
+        }
+
         let catalog_config = RestCatalogConfig::builder()
             .uri(base_uri)
             .props(props)
@@ -194,6 +209,27 @@ impl CatalogConnector for IcebergCatalog {
 
         Ok(Arc::new(catalog_provider) as Arc<dyn RefreshableCatalogProvider>)
     }
+}
+
+async fn verify_s3_endpoint(endpoint: &str) -> Result<()> {
+    let url = Url::parse(endpoint).context(UrlParseSnafu)?;
+    let host = url.host_str().context(MissingHostSnafu)?;
+    let port = url.port().unwrap_or_else(|| {
+        if url.scheme() == "http" {
+            80
+        } else if url.scheme() == "https" {
+            443
+        } else {
+            return 0;
+        }
+    });
+
+    verify_ns_lookup_and_tcp_connect(host, port)
+        .await
+        .map_err(|_| Error::FailedToConnectS3Endpoint {
+            url: endpoint.to_string(),
+        })?;
+    Ok(())
 }
 
 /// Parses a catalog URL into an Iceberg `RestCatalogConfig` (catalog URI + optional properties)

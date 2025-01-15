@@ -5,15 +5,46 @@ on:
     branches:
       - trunk
       - release-*
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - 'README.md'
+      - 'Makefile'
+      - 'CONTRIBUTING.md'
+      - 'SECURITY.md'
+      - 'LICENSE'
+      - '.github/**'
+      - 'version.txt'
+      - '.schema/**'
+      - '.vscode/**'
+      - 'deploy/**'
+      - 'install/**'
+      - 'media/**'
+      - 'monitoring/**'
+      - 'acknowledgements.md'
+      - 'Dockerfile*'
 
   pull_request:
     branches:
       - trunk
     paths-ignore:
+      - '**/*.md'
       - 'docs/**'
       - 'README.md'
+      - 'Makefile'
+      - 'CONTRIBUTING.md'
+      - 'SECURITY.md'
+      - 'LICENSE'
+      - '.github/**'
       - 'version.txt'
+      - '.schema/**'
+      - '.vscode/**'
+      - 'deploy/**'
+      - 'install/**'
+      - 'media/**'
+      - 'monitoring/**'
       - 'acknowledgements.md'
+      - 'Dockerfile*'
 
   workflow_dispatch:
 
@@ -1375,14 +1406,16 @@ jobs:
 
       - name: Install mssql-tools
         run: |
+          curl https://packages.microsoft.com/keys/microsoft.asc | sudo tee /etc/apt/trusted.gpg.d/microsoft.asc
+          curl https://packages.microsoft.com/config/ubuntu/22.04/prod.list | sudo tee /etc/apt/sources.list.d/mssql-release.list
           sudo apt-get update
-          sudo apt-get install -y mssql-tools unixodbc-dev
-          # echo 'export PATH="$PATH:/opt/mssql-tools/bin"' >> ~/.bashrc
+          sudo apt-get install -y mssql-tools18 unixodbc-dev
+          # echo 'export PATH="$PATH:/opt/mssql-tools18/bin"' >> ~/.bashrc
           # source ~/.bashrc
 
       - name: Setup MS SQL test database
         run: |
-          /opt/mssql-tools/bin/sqlcmd -S localhost -U sa -P 1StrongPwd!! -i ./test/scripts/setup-data-mssql.sql
+          /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P 1StrongPwd!! -C -i ./test/scripts/setup-data-mssql.sql
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
         uses: actions/download-artifact@v4
