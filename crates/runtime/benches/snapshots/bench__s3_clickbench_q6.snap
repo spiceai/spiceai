@@ -1,0 +1,9 @@
+---
+source: crates/runtime/benches/bench.rs
+expression: records_pretty
+---
++-----------------------------------+
+| count(DISTINCT hits.SearchPhrase) |
++-----------------------------------+
+| 6019103                           |
++-----------------------------------+
