@@ -78,5 +78,5 @@ datasets:
     name: catalog_page
     params: *s3_params
   - from: s3://benchmarks/tpcds_sf1/ship_mode/
-    name: catalog_page
+    name: ship_mode
     params: *s3_params
