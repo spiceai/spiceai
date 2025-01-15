@@ -18,7 +18,7 @@ use clap::Parser;
 use std::path::PathBuf;
 
 #[derive(Parser)]
-pub struct EmbeddingTestArgs {
+pub struct ConsistencyTestArgs {
     /// Path to the spicepod.yaml file
     #[arg(short('p'), long, default_value = "spicepod.yaml")]
     pub(crate) spicepod_path: PathBuf,
@@ -29,16 +29,29 @@ pub struct EmbeddingTestArgs {
 
     /// The duration of the test in seconds
     #[arg(long)]
-    pub(crate) duration: Option<usize>,
+    pub(crate) duration: u64,
+
+    /// The number of buckets to divide the test duration into.
+    #[arg(long, default_value = "10")]
+    pub(crate) buckets: usize,
+
+    /// The embedding model (named in spicepod) to test against. Cannot be used in conjunction with `model`.
+    #[arg(long)]
+    pub(crate) embedding: Option<String>,
+
+    /// The language model (named in spicepod) to test against. Cannot be used in conjunction with `embedding`.
+    #[arg(long)]
+    pub(crate) model: Option<String>,
+
+    /// The threshold for the increase in percentile latency between the first and last bucket of the test.
+    #[arg(long, default_value = "1.1")]
+    pub(crate) increase_threshold: f64,
 
     /// The number of clients to run simultaneously. Each client will send a query, wait for a response, then send another query.
-    #[arg(long)]
-    pub(crate) concurrency: Option<usize>,
+    #[arg(long, default_value = "1")]
+    pub(crate) concurrency: usize,
 
     /// The number of seconds to wait for the spiced instance to become ready
     #[arg(long, default_value = "30")]
     pub(crate) ready_wait: u64,
-
-    #[arg(long)]
-    pub(crate) disable_progress_bars: bool,
 }

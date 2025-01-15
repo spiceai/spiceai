@@ -29,6 +29,9 @@ use indicatif::{MultiProgress, ProgressBar};
 use tokio::task::JoinHandle;
 use worker::{SpiceTestQueryWorker, SpiceTestQueryWorkerResult};
 
+#[cfg(feature = "models")]
+mod consistency;
+pub use consistency::{ConsistencyComponent, ConsistencyConfig, ConsistencySpiceTest};
 mod worker;
 
 #[derive(Debug, Clone, Copy)]

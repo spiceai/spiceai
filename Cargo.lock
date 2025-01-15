@@ -11386,6 +11386,7 @@ dependencies = [
  "anyhow",
  "app",
  "arrow",
+ "async-openai",
  "clap",
  "flight_client",
  "futures",
