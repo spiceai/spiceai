@@ -281,7 +281,7 @@ mod tests {
     }
 
     fn create_test_schema_with_enmbeddings() -> Arc<Schema> {
-        Arc::new(Schema::new(vec![
+        let mut schema = Schema::new(vec![
             Field::new("id", DataType::Int64, false),
             Field::new("name", DataType::Utf8, false),
             Field::new("value", DataType::Float64, true),
@@ -309,7 +309,17 @@ mod tests {
                 ))),
                 false,
             ),
-        ]))
+        ]);
+
+        // mark `name_embedding` and `name_offset` as computed columns for `name`
+        let mut computed_columns_meta = std::collections::HashMap::new();
+        computed_columns_meta.insert(
+            "name".to_string(),
+            vec!["name_embedding".to_string(), "name_offset".to_string()],
+        );
+        arrow_tools::schema::set_computed_columns_meta(&mut schema, &computed_columns_meta);
+
+        Arc::new(schema)
     }
 
     #[test]
