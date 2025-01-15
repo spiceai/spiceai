@@ -13,19 +13,13 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-
-use llms::embeddings::candle::{download_hf_artifacts, tei::TeiEmbed};
-use spicepod::component::embeddings::Embeddings;
-
 mod embeddings {
     use std::{fs::File, io::Write, path::PathBuf, time::Duration};
 
-    use datafusion::parquet::data_type::AsBytes;
-    use spicepod::component::model::ModelFile;
+    use spicepod::component::{embeddings::Embeddings, model::ModelFile};
 
     use crate::{
-        init_tracing,
-        models::embedding::{run_beta_functionality_criteria_test, run_embedding_tests},
+        init_tracing, models::embedding::run_beta_functionality_criteria_test,
         utils::test_request_context,
     };
 
