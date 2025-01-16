@@ -89,6 +89,14 @@ jobs:
         with:
           query_set: ${{ github.event.inputs.query_set }}
 
+      - name: Setup MySQL
+        run: |
+          if [[ ${{ github.event.inputs.query_set }} == "tpcds" ]]; then
+            echo "MYSQL_DB=tpcds_sf1" >> $GITHUB_ENV
+          elif [[ ${{ github.event.inputs.query_set }} == "tpch" ]]; then
+            echo "MYSQL_DB=tpch_sf1" >> $GITHUB_ENV
+          fi
+
       - name: Run the benchmark test
         if: ${{ github.event.inputs.query_overrides == '' }}
         run: |
@@ -111,6 +119,10 @@ jobs:
           SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
           SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
           SNOWFLAKE_USERNAME: ${{ secrets.SNOWFLAKE_USERNAME }}
+          MYSQL_HOST: ${{ secrets.MYSQL_HOST }}
+          MYSQL_TCP_PORT: 3306
+          MYSQL_USER: root
+          MYSQL_PASSWORD: ${{ secrets.MYSQL_PASSWORD }}
 
       - name: Run the benchmark test (with overrides)
         if: ${{ github.event.inputs.query_overrides != '' }}
@@ -128,3 +140,7 @@ jobs:
           SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
           SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
           SNOWFLAKE_USERNAME: ${{ secrets.SNOWFLAKE_USERNAME }}
+          MYSQL_HOST: ${{ secrets.MYSQL_HOST }}
+          MYSQL_TCP_PORT: 3306
+          MYSQL_USER: root
+          MYSQL_PASSWORD: ${{ secrets.MYSQL_PASSWORD }}

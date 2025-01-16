@@ -88,6 +88,14 @@ jobs:
         with:
           query_set: ${{ github.event.inputs.query_set }}
 
+      - name: Setup MySQL
+        run: |
+          if [[ ${{ github.event.inputs.query_set }} == "tpcds" ]]; then
+            echo "MYSQL_DB=tpcds_sf1" >> $GITHUB_ENV
+          elif [[ ${{ github.event.inputs.query_set }} == "tpch" ]]; then
+            echo "MYSQL_DB=tpch_sf1" >> $GITHUB_ENV
+          fi
+
       - name: Run the throughput test
         if: ${{ github.event.inputs.query_overrides == '' }}
         run: |
@@ -110,6 +118,10 @@ jobs:
           DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
           AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ secrets.AWS_DATABRICKS_DELTA_ACCESS_KEY_ID }}
           AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ secrets.AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY }}
+          MYSQL_HOST: ${{ secrets.MYSQL_HOST }}
+          MYSQL_TCP_PORT: 3306
+          MYSQL_USER: root
+          MYSQL_PASSWORD: ${{ secrets.MYSQL_PASSWORD }}
 
       - name: Run the throughput test (with overrides)
         if: ${{ github.event.inputs.query_overrides != '' }}
@@ -134,3 +146,7 @@ jobs:
           DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
           AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ secrets.AWS_DATABRICKS_DELTA_ACCESS_KEY_ID }}
           AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ secrets.AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY }}
+          MYSQL_HOST: ${{ secrets.MYSQL_HOST }}
+          MYSQL_TCP_PORT: 3306
+          MYSQL_USER: root
+          MYSQL_PASSWORD: ${{ secrets.MYSQL_PASSWORD }}
