@@ -19,7 +19,7 @@ use crate::metrics::{MetricCollector, NoExtendedMetrics, QueryMetric};
 use anyhow::Result;
 use component::{HttpComponent, HttpConfig};
 use std::time::{Duration, SystemTime};
-use worker::{HTTPWorker, HTTPWorkerResult, WorkerHandle};
+use worker::{HttpWorker, HttpWorkerResult, WorkerHandle};
 
 pub mod component;
 mod worker;
@@ -41,7 +41,7 @@ pub struct Running {
 }
 
 pub struct Completed {
-    result: HTTPWorkerResult,
+    result: HttpWorkerResult,
     end_time: SystemTime,
 }
 
@@ -61,7 +61,7 @@ impl SpiceTest<NotStarted> {
 
         let worker_handles = (0..self.state.config.concurrency)
             .map(|id| {
-                let worker = HTTPWorker::new(id, self.state.config.clone(), client.clone());
+                let worker = HttpWorker::new(id, self.state.config.clone(), client.clone());
                 worker.start()
             })
             .collect::<Vec<_>>();
@@ -105,7 +105,7 @@ impl SpiceTest<Running> {
             spiced_instance: self.spiced_instance,
             use_progress_bars: self.use_progress_bars,
             state: Completed {
-                result: HTTPWorkerResult {
+                result: HttpWorkerResult {
                     durations,
                     error_count,
                 },
