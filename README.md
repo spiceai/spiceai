@@ -185,8 +185,8 @@ See more demos on [YouTube](https://www.youtube.com/playlist?list=PLesJrUXEx3U9a
 
 | Name       | Description                     | Status            | Engine Modes     |
 | ---------- | ------------------------------- | ----------------- | ---------------- |
-| `arrow`    | In-Memory Arrow Records         | Release Candidate | `memory`         |
-| `duckdb`   | Embedded [DuckDB][duckdb]       | Release Candidate | `memory`, `file` |
+| `arrow`    | In-Memory Arrow Records         | Stable            | `memory`         |
+| `duckdb`   | Embedded [DuckDB][duckdb]       | Stable            | `memory`, `file` |
 | `postgres` | Attached [PostgreSQL][postgres] | Release Candidate | N/A              |
 | `sqlite`   | Embedded [SQLite][sqlite]       | Release Candidate | `memory`, `file` |
 
