@@ -57,4 +57,16 @@ pub struct CommonArgs {
     /// The number of seconds to wait for the spiced instance to become ready
     #[arg(long, default_value = "30")]
     pub(crate) ready_wait: u64,
+
+    /// The number of clients to run simultaneously. Each client will send a query, wait for a response, then send another query.
+    #[arg(long, default_value = "1")]
+    pub(crate) concurrency: usize,
+
+    /// The duration of the test in seconds
+    #[arg(long, default_value = "60")]
+    pub(crate) duration: u64,
+
+    /// Whether to disable progress bars, for CI or non-interactive environments
+    #[arg(long)]
+    pub(crate) disable_progress_bars: bool,
 }

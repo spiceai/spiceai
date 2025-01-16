@@ -24,10 +24,6 @@ pub struct HttpTestArgs {
     #[clap(flatten)]
     pub(crate) common: CommonArgs,
 
-    /// The duration of the test in seconds
-    #[arg(long)]
-    pub(crate) duration: u64,
-
     /// The embedding model (named in spicepod) to test against. Cannot be used in conjunction with `model`.
     #[arg(long)]
     pub(crate) embedding: Option<String>,
@@ -35,10 +31,6 @@ pub struct HttpTestArgs {
     /// The language model (named in spicepod) to test against. Cannot be used in conjunction with `embedding`.
     #[arg(long)]
     pub(crate) model: Option<String>,
-
-    /// The number of clients to run simultaneously. Each client will send a query, wait for a response, then send another query.
-    #[arg(long, default_value = "1")]
-    pub(crate) concurrency: usize,
 
     /// The path to a file containing payloads to use in testing. Either JSONL of compatible request bodies, or individual string payloads. Cannot not be used in conjunction with `payload`.
     #[arg(long)]
@@ -51,7 +43,7 @@ pub struct HttpTestArgs {
 
 #[derive(Parser)]
 pub struct HttpConsistencyTestArgs {
-    #[clap(flatten)]
+    #[command(flatten)]
     pub(crate) http: HttpTestArgs,
 
     /// The number of buckets to divide the test duration into.

@@ -38,18 +38,24 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.subcommand {
         Commands::Run(TestCommands::Throughput(args)) => tests::throughput::run(&args).await?,
-        Commands::Export(TestCommands::Throughput(args)) => tests::env_export(&args)?,
+        Commands::Export(TestCommands::Throughput(args)) => {
+            tests::env_export(&args.common, args.data_dir)?
+        }
         Commands::Run(TestCommands::Load(args)) => tests::load::run(&args).await?,
-        Commands::Export(TestCommands::Load(args)) => tests::env_export(&args)?,
+        Commands::Export(TestCommands::Load(args)) => {
+            tests::env_export(&args.common, args.data_dir)?
+        }
         Commands::Run(TestCommands::Bench(args)) => {
             tests::bench::run(&args).await?;
         }
-        Commands::Export(TestCommands::Bench(args)) => tests::env_export(&args)?,
+        Commands::Export(TestCommands::Bench(args)) => {
+            tests::env_export(&args.common, args.data_dir)?
+        }
         Commands::Run(TestCommands::DataConsistency(args)) => {
             tests::data_consistency::run(&args).await?;
         }
         Commands::Export(TestCommands::DataConsistency(args)) => {
-            tests::env_export(&args.test_args)?;
+            tests::env_export(&args.test_args.common, args.test_args.data_dir)?;
         }
 
         Commands::Run(TestCommands::HttpOverhead(args)) => {
@@ -59,11 +65,11 @@ async fn main() -> anyhow::Result<()> {
             tests::http::consistency_run(&args).await?;
         }
 
-        Commands::Export(TestCommands::HttpConsistency(_args)) => {
-            unimplemented!("Exporting consistency tests is not yet supported")
+        Commands::Export(TestCommands::HttpConsistency(args)) => {
+            tests::env_export(&args.http.common, None)?;
         }
-        Commands::Export(TestCommands::HttpOverhead(_args)) => {
-            unimplemented!("Exporting overhead tests is not yet supported")
+        Commands::Export(TestCommands::HttpOverhead(args)) => {
+            tests::env_export(&args.http.common, None)?;
         }
     }
 

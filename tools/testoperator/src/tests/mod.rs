@@ -14,9 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::BTreeMap, path::Path};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+};
 
-use crate::commands::{CommonArgs, DatasetTestArgs};
+use crate::commands::CommonArgs;
 use test_framework::{
     anyhow, app::App, spiced::StartRequest, spicepod::Spicepod, spicepod_utils::from_app,
 };
@@ -48,8 +51,8 @@ pub(crate) fn get_app_and_start_request(
     Ok((app, start_request))
 }
 
-pub(crate) fn env_export(args: &DatasetTestArgs) -> anyhow::Result<()> {
-    let (_, mut start_request) = get_app_and_start_request(&args.common, args.data_dir.as_deref())?;
+pub(crate) fn env_export(args: &CommonArgs, data_dir: Option<PathBuf>) -> anyhow::Result<()> {
+    let (_, mut start_request) = get_app_and_start_request(args, data_dir.as_deref())?;
 
     start_request.prepare()?;
     let tempdir_path = start_request.get_tempdir_path();

@@ -22,7 +22,11 @@ use test_framework::{
     metrics::MetricCollector,
     queries::{QueryOverrides, QuerySet},
     spiced::SpicedInstance,
-    spicetest::{EndCondition, SpiceTest},
+    spicetest::{
+        datasets::{EndCondition, NotStarted},
+        SpiceTest,
+    },
+    TestType,
 };
 
 pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
@@ -39,16 +43,22 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
 
     // baseline run
     println!("Running benchmark test");
-    let benchmark_test = SpiceTest::new(app.name.clone(), spiced_instance)
-        .with_query_set(queries.clone())
-        .with_end_condition(EndCondition::QuerySetCompleted(5))
-        .with_progress_bars(!args.disable_progress_bars)
-        .start()
-        .await?;
+
+    let benchmark_test = SpiceTest::new(
+        app.name.clone(),
+        spiced_instance,
+        NotStarted::new()
+            .with_query_set(queries.clone())
+            .with_parallel_count(1)
+            .with_end_condition(EndCondition::QuerySetCompleted(5)),
+    )
+    .with_progress_bars(!args.common.disable_progress_bars)
+    .start()
+    .await?;
 
     let test = benchmark_test.wait().await?;
     let row_counts = test.validate_returned_row_counts()?;
-    let metrics = test.collect()?;
+    let metrics = test.collect(TestType::Benchmark)?;
     let mut spiced_instance = test.end();
 
     metrics.show()?;

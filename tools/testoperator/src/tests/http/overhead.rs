@@ -22,12 +22,7 @@ use crate::{
     },
 };
 use std::{sync::Arc, time::Duration};
-use test_framework::{
-    anyhow,
-    arrow::array::ArrowNativeTypeOp,
-    spiced::SpicedInstance,
-    spicetest::{ConsistencyConfig, ConsistencySpiceTest},
-};
+use test_framework::{anyhow, spiced::SpicedInstance};
 
 /// Runs a test to ensure the P50 & p90 latencies do not increase by some threshold over the
 /// duration of the test when N clients are sending queries concurrently.

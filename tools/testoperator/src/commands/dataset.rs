@@ -22,20 +22,12 @@ use super::CommonArgs;
 
 #[derive(Parser, Debug, Clone)]
 pub struct DatasetTestArgs {
-    #[clap(flatten)]
+    #[command(flatten)]
     pub(crate) common: CommonArgs,
-
-    /// An optional data directory, to symlink into the spiced instance
-    #[arg(short, long)]
-    pub(crate) data_dir: Option<PathBuf>,
 
     /// The expected scale factor for the test, used in metrics calculation
     #[arg(long)]
     pub(crate) scale_factor: Option<f64>,
-
-    /// The duration of the test in seconds
-    #[arg(long)]
-    pub(crate) duration: Option<usize>,
 
     /// The query set to use for the test
     #[arg(long)]
@@ -44,11 +36,9 @@ pub struct DatasetTestArgs {
     #[arg(long)]
     pub(crate) query_overrides: Option<QueryOverridesArg>,
 
-    #[arg(long)]
-    pub(crate) concurrency: Option<usize>,
-
-    #[arg(long)]
-    pub(crate) disable_progress_bars: bool,
+    /// An optional data directory, to symlink into the spiced instance
+    #[arg(short, long)]
+    pub(crate) data_dir: Option<PathBuf>,
 }
 
 #[derive(Clone, ValueEnum, Debug)]

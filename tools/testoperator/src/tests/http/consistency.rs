@@ -25,8 +25,12 @@ use std::{sync::Arc, time::Duration};
 use test_framework::{
     anyhow,
     arrow::array::ArrowNativeTypeOp,
+    metrics::MetricCollector,
     spiced::SpicedInstance,
-    spicetest::{ConsistencyConfig, ConsistencySpiceTest},
+    spicetest::{
+        http::{component::HttpConfig, NotStarted},
+        SpiceTest,
+    },
 };
 
 /// Runs a test to ensure the P50 & p90 latencies do not increase by some threshold over the
@@ -45,17 +49,19 @@ pub async fn consistency_run(args: &HttpConsistencyTestArgs) -> anyhow::Result<(
         .wait_for_ready(Duration::from_secs(args.http.common.ready_wait))
         .await?;
 
-    let test = ConsistencySpiceTest::new(
+    let test = SpiceTest::new(
+        "Consistency Test".to_string(),
         spiced_instance,
-        ConsistencyConfig {
-            duration: Duration::from_secs(args.http.duration),
+        NotStarted::new(HttpConfig {
+            duration: Duration::from_secs(args.http.common.duration),
             buckets: args.buckets,
-            concurrency: args.http.concurrency,
+            concurrency: args.http.common.concurrency,
             component,
             payloads,
-        },
+        }),
     );
-    let results = test.start().await?.wait().await?.get_result()?;
+
+    let results = test.start()?.wait().await?.metrics()?;
 
     let (p50, p90): (Vec<f64>, Vec<f64>) = results
         .iter()

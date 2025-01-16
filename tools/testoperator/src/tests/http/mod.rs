@@ -14,11 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::commands::{CommonArgs, HttpTestArgs};
-use test_framework::{
-    anyhow, app::App, spiced::StartRequest, spicepod::Spicepod, spicepod_utils::from_app,
-    spicetest::HttpConsistencyComponent,
-};
+use crate::commands::HttpTestArgs;
+use test_framework::{anyhow, spicetest::http::component::HttpComponent};
 
 const DEFAULT_API_BASE: &str = "http://localhost:8090/v1";
 
@@ -28,17 +25,7 @@ pub(crate) use consistency::consistency_run;
 mod overhead;
 pub(crate) use overhead::overhead_run;
 
-fn get_consistency_app_and_start_request(args: &CommonArgs) -> anyhow::Result<(App, StartRequest)> {
-    let spicepod = Spicepod::load_exact(args.spicepod_path.clone())?;
-    let app = test_framework::app::AppBuilder::new(spicepod.name.clone())
-        .with_spicepod(spicepod)
-        .build();
-
-    let start_req = StartRequest::new(args.spiced_path.clone(), from_app(app.clone()))?;
-    Ok((app, start_req))
-}
-
-fn get_http_component(args: &HttpTestArgs) -> anyhow::Result<HttpConsistencyComponent> {
+fn get_http_component(args: &HttpTestArgs) -> anyhow::Result<HttpComponent> {
     match (&args.model, &args.embedding) {
         (Some(_), Some(_)) => Err(anyhow::anyhow!(
             "Cannot specify both --model and --embedding"
@@ -46,11 +33,11 @@ fn get_http_component(args: &HttpTestArgs) -> anyhow::Result<HttpConsistencyComp
         (None, None) => Err(anyhow::anyhow!(
             "Must specify either --model or --embedding"
         )),
-        (Some(model), None) => Ok(HttpConsistencyComponent::Model {
+        (Some(model), None) => Ok(HttpComponent::Model {
             model: model.clone(),
             api_base: DEFAULT_API_BASE.to_string(),
         }),
-        (None, Some(embedding)) => Ok(HttpConsistencyComponent::Embedding {
+        (None, Some(embedding)) => Ok(HttpComponent::Embedding {
             embedding: embedding.clone(),
             api_base: DEFAULT_API_BASE.to_string(),
         }),

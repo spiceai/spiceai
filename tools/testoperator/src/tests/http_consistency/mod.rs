@@ -1,0 +1,151 @@
+/*
+Copyright 2024-2025 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+use crate::commands::HttpConsistencyTestArgs;
+use std::{sync::Arc, time::Duration};
+use test_framework::{
+    anyhow,
+    app::App,
+    arrow::array::ArrowNativeTypeOp,
+    metrics::MetricCollector,
+    spiced::{SpicedInstance, StartRequest},
+    spicepod::Spicepod,
+    spicepod_utils::from_app,
+    spicetest::{
+        http::{
+            component::{HttpComponent, HttpConfig},
+            NotStarted,
+        },
+        SpiceTest,
+    },
+    TestType,
+};
+
+const DEFAULT_API_BASE: &str = "http://localhost:8090/v1";
+
+/// Runs a test to ensure the P50 & p90 latencies do not increase by some threshold over the
+/// duration of the test when N clients are sending queries concurrently.
+pub(crate) async fn run(args: &HttpConsistencyTestArgs) -> anyhow::Result<()> {
+    let (app, start_request) = get_consistency_app_and_start_request(args)?;
+    let component = get_http_component(args)?;
+    let payloads: Vec<_> = get_payloads(args)?.into_iter().map(Arc::from).collect();
+
+    let mut spiced_instance = SpicedInstance::start(start_request).await?;
+
+    spiced_instance
+        .wait_for_ready(Duration::from_secs(args.common.ready_wait))
+        .await?;
+
+    let http_config = HttpConfig {
+        duration: Duration::from_secs(args.common.duration),
+        buckets: args.buckets,
+        concurrency: args.common.concurrency,
+        component,
+        payloads,
+    };
+
+    let test = SpiceTest::new(
+        app.name.clone(),
+        spiced_instance,
+        NotStarted::new(http_config),
+    );
+
+    let test = test.start()?;
+    let test = test.wait().await?;
+    let metrics = test.collect(TestType::HTTP)?;
+    metrics.show()?;
+
+    let mut spiced_instance = test.end();
+    spiced_instance.stop()?;
+
+    let (p50, p90): (Vec<f64>, Vec<f64>) = metrics
+        .metrics
+        .iter()
+        .map(|minute| (minute.median_duration, minute.percentile_90_duration))
+        .unzip();
+
+    if p50.len() >= 2 {
+        let increase = p50.last().expect("no p50 data").div_checked(p50[0])?;
+        if increase > args.increase_threshold {
+            return Err(anyhow::anyhow!(
+                "p50 increase threshold exceeded: {} > {}",
+                increase,
+                args.increase_threshold
+            ));
+        }
+    }
+
+    if p90.len() >= 2 {
+        let increase = p90.last().expect("no p90 data").div_checked(p90[0])?;
+        if increase > args.increase_threshold {
+            return Err(anyhow::anyhow!(
+                "p90 increase threshold exceeded: {} > {}",
+                increase,
+                args.increase_threshold
+            ));
+        }
+    }
+
+    println!("Consistency test completed!");
+    Ok(())
+}
+
+fn get_consistency_app_and_start_request(
+    args: &HttpConsistencyTestArgs,
+) -> anyhow::Result<(App, StartRequest)> {
+    let spicepod = Spicepod::load_exact(args.common.spicepod_path.clone())?;
+    let app = test_framework::app::AppBuilder::new(spicepod.name.clone())
+        .with_spicepod(spicepod)
+        .build();
+
+    let start_req = StartRequest::new(args.common.spiced_path.clone(), from_app(app.clone()))?;
+    Ok((app, start_req))
+}
+
+fn get_http_component(args: &HttpConsistencyTestArgs) -> anyhow::Result<HttpComponent> {
+    match (&args.model, &args.embedding) {
+        (Some(_), Some(_)) => Err(anyhow::anyhow!(
+            "Cannot specify both --model and --embedding"
+        )),
+        (None, None) => Err(anyhow::anyhow!(
+            "Must specify either --model or --embedding"
+        )),
+        (Some(model), None) => Ok(HttpComponent::Model {
+            model: model.clone(),
+            api_base: DEFAULT_API_BASE.to_string(),
+        }),
+        (None, Some(embedding)) => Ok(HttpComponent::Embedding {
+            embedding: embedding.clone(),
+            api_base: DEFAULT_API_BASE.to_string(),
+        }),
+    }
+}
+
+fn get_payloads(args: &HttpConsistencyTestArgs) -> anyhow::Result<Vec<String>> {
+    match (&args.payload_file, &args.payload) {
+        (Some(_), Some(_)) => Err(anyhow::anyhow!(
+            "Cannot specify both --payload-file and --payload"
+        )),
+        (None, None) => Err(anyhow::anyhow!(
+            "Must specify either --payload-file or --payload"
+        )),
+        (Some(file), None) => Ok(std::fs::read_to_string(file)?
+            .lines()
+            .map(std::string::ToString::to_string)
+            .collect()),
+        (None, Some(payload)) => Ok(payload.clone()),
+    }
+}
