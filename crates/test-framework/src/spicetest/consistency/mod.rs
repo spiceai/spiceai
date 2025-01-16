@@ -83,32 +83,42 @@ impl HttpConsistencyComponent {
         let start_time = SystemTime::now();
         match self {
             HttpConsistencyComponent::Model { model, .. } => {
-                let req: CreateChatCompletionRequest = match serde_json::from_str(payload) {
-                    Ok(req) => req,
-                    Err(_) => CreateChatCompletionRequestArgs::default()
-                        .model(model.clone())
-                        .messages(vec![ChatCompletionRequestMessage::User(
-                            ChatCompletionRequestUserMessageArgs::default()
-                                .content(payload.to_string())
-                                .build()
-                                .expect("failed to build user message"),
-                        )])
-                        .build()
-                        .expect("failed to build model request"),
-                };
+                let req: CreateChatCompletionRequest =
+                    match serde_json::from_str::<CreateChatCompletionRequest>(payload) {
+                        Ok(mut req) => {
+                            // Ensure the model is overriden.
+                            req.model = model.clone();
+                            req
+                        }
+                        Err(_) => CreateChatCompletionRequestArgs::default()
+                            .model(model.clone())
+                            .messages(vec![ChatCompletionRequestMessage::User(
+                                ChatCompletionRequestUserMessageArgs::default()
+                                    .content(payload.to_string())
+                                    .build()
+                                    .expect("failed to build user message"),
+                            )])
+                            .build()
+                            .expect("failed to build model request"),
+                    };
                 let _ = c.chat().create(req).await?;
             }
             HttpConsistencyComponent::Embedding { embedding, .. } => {
-                let req: CreateEmbeddingRequest = match serde_json::from_str(payload) {
-                    Ok(req) => req,
-                    Err(_) => CreateEmbeddingRequest {
-                        model: embedding.clone(),
-                        input: async_openai::types::EmbeddingInput::String(payload.to_string()),
-                        encoding_format: Some(EncodingFormat::Float),
-                        user: None,
-                        dimensions: None,
-                    },
-                };
+                let req: CreateEmbeddingRequest =
+                    match serde_json::from_str::<CreateEmbeddingRequest>(payload) {
+                        Ok(mut req) => {
+                            // Ensure the model is overriden.
+                            req.model = embedding.clone();
+                            req
+                        }
+                        Err(_) => CreateEmbeddingRequest {
+                            model: embedding.clone(),
+                            input: async_openai::types::EmbeddingInput::String(payload.to_string()),
+                            encoding_format: Some(EncodingFormat::Float),
+                            user: None,
+                            dimensions: None,
+                        },
+                    };
                 c.embeddings().create(req).await?;
             }
         }
@@ -130,7 +140,8 @@ pub struct ConsistencySpiceTest {
 }
 
 impl ConsistencySpiceTest {
-    #[must_use] pub fn new(spiced_instance: SpicedInstance, config: ConsistencyConfig) -> Self {
+    #[must_use]
+    pub fn new(spiced_instance: SpicedInstance, config: ConsistencyConfig) -> Self {
         Self {
             start_time: None,
             spiced_instance,
