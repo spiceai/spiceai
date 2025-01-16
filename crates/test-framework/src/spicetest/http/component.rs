@@ -41,7 +41,8 @@ pub enum HttpComponent {
         api_base: String,
     },
     Generic {
-        http_base: String,
+        // For a generic component, must know full URL.
+        http_url: String,
         component_name: String,
     },
 }
@@ -50,8 +51,7 @@ impl HttpComponent {
     fn api_base(&self) -> String {
         match self {
             HttpComponent::Generic {
-                http_base: api_base,
-                ..
+                http_url: api_base, ..
             }
             | HttpComponent::Model { api_base, .. }
             | HttpComponent::Embedding { api_base, .. } => api_base.clone(),
@@ -77,7 +77,7 @@ impl HttpComponent {
                 api_base,
             },
             HttpComponent::Generic { component_name, .. } => HttpComponent::Generic {
-                http_base: api_base,
+                http_url: api_base,
                 component_name,
             },
         }
@@ -93,8 +93,11 @@ impl HttpComponent {
                 embedding: component_name,
                 api_base,
             },
-            HttpComponent::Generic { http_base, .. } => HttpComponent::Generic {
-                http_base,
+            HttpComponent::Generic {
+                http_url: http_base,
+                ..
+            } => HttpComponent::Generic {
+                http_url: http_base,
                 component_name,
             },
         }
@@ -105,7 +108,10 @@ impl HttpComponent {
     pub async fn send_request(&self, client: &Client, payload: &str) -> Result<Duration> {
         let start_time = Instant::now();
         match self {
-            HttpComponent::Generic { http_base, .. } => {
+            HttpComponent::Generic {
+                http_url: http_base,
+                ..
+            } => {
                 let req = client.post(http_base.clone())
                     .body(payload.to_string()).send()
                     .await

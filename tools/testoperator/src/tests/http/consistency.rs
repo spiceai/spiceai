@@ -14,7 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::{commands::HttpConsistencyTestArgs, tests::get_app_and_start_request};
+use crate::{
+    commands::HttpConsistencyTestArgs,
+    tests::{get_app_and_start_request, util::Color},
+    with_color,
+};
 use std::{sync::Arc, time::Duration};
 use test_framework::{
     anyhow::{self, anyhow},
@@ -70,11 +74,12 @@ pub async fn consistency_run(args: &HttpConsistencyTestArgs) -> anyhow::Result<(
             .ok_or(anyhow!("no p50 data"))?
             .div_checked(p50[0])?;
         if increase > args.increase_threshold {
-            return Err(anyhow::anyhow!(
+            return Err(anyhow::anyhow!(with_color!(
+                Color::RedBold,
                 "p50 increase threshold exceeded: {} > {}",
                 increase,
                 args.increase_threshold
-            ));
+            )));
         }
     }
 
@@ -84,14 +89,18 @@ pub async fn consistency_run(args: &HttpConsistencyTestArgs) -> anyhow::Result<(
             .ok_or(anyhow!("no p90 data"))?
             .div_checked(p90[0])?;
         if increase > args.increase_threshold {
-            return Err(anyhow::anyhow!(
+            return Err(anyhow::anyhow!(with_color!(
+                Color::RedBold,
                 "p90 increase threshold exceeded: {} > {}",
                 increase,
                 args.increase_threshold
-            ));
+            )));
         }
     }
 
-    println!("Consistency test completed!");
+    println!(
+        "{}",
+        with_color!(Color::Green, "Consistency test completed!")
+    );
     Ok(())
 }

@@ -101,6 +101,12 @@ pub(crate) async fn overhead_run(args: &HttpOverheadTestArgs) -> anyhow::Result<
     Ok(())
 }
 
+/// Ensure that the relative increase in the spice duration compared to the baseline duration is less than the threshold.
+/// Example
+/// ```
+/// check_threshold(10.0, 5.0, 1.1, "p50") // Ok
+/// check_threshold(12.0, 5.0, 1.1, "p50") // Err
+/// ```
 fn check_threshold(
     spice_duration: f64,
     baseline_duration: f64,
@@ -152,35 +158,14 @@ fn construct_baseline_cfg(
             .with_component_name(baseline_component_name)
     } else {
         HttpComponent::Generic {
-            http_base: args.base_url.clone(),
+            http_url: args.base_url.clone(),
             component_name: baseline_component_name,
         }
     };
 
     let baseline_client = if let Some(headers) = args.base_header.clone() {
-        let mut header_map = HeaderMap::new();
-        for h in headers {
-            if let Some((key, value)) = h.split_once(':') {
-                let key = key.trim().to_string();
-                let value = value.trim().to_string();
-
-                let header_name = key
-                    .parse::<HeaderName>()
-                    .map_err(|_| anyhow!("Invalid header key: {}", key))?;
-                let header_value = HeaderValue::from_str(&value)
-                    .map_err(|_| anyhow!("Invalid header value for key: {}", key))?;
-
-                header_map.insert(header_name, header_value);
-            } else {
-                return Err(anyhow!(
-                    "Invalid header format: {}. Expected format: 'Key: Value'",
-                    h
-                ));
-            }
-        }
-
         reqwest::Client::builder()
-            .default_headers(header_map)
+            .default_headers(parse_headers(&headers)?)
             .build()
             .map_err(|_| anyhow!("Invalid headers in `--base-headers`."))?
     } else {
@@ -191,4 +176,29 @@ fn construct_baseline_cfg(
         baseline_client,
         base_payloads.unwrap_or(spice_payloads.to_vec()),
     ))
+}
+
+/// Parse headers from a list of strings (with format: `Key: Value`) into a `HeaderMap`.
+fn parse_headers(headers: &[String]) -> Result<HeaderMap, anyhow::Error> {
+    let mut header_map = HeaderMap::new();
+    for h in headers {
+        if let Some((key, value)) = h.split_once(':') {
+            let key = key.trim().to_string();
+            let value = value.trim().to_string();
+
+            let header_name = key
+                .parse::<HeaderName>()
+                .map_err(|_| anyhow!("Invalid header key: {}", key))?;
+            let header_value = HeaderValue::from_str(&value)
+                .map_err(|_| anyhow!("Invalid header value for key: {}", key))?;
+
+            header_map.insert(header_name, header_value);
+        } else {
+            return Err(anyhow!(
+                "Invalid header format: {}. Expected format: 'Key: Value'",
+                h
+            ));
+        }
+    }
+    Ok(header_map)
 }

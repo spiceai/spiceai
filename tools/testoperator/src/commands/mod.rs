@@ -50,6 +50,10 @@ pub struct CommonArgs {
     #[arg(short('p'), long, default_value = "spicepod.yaml")]
     pub(crate) spicepod_path: PathBuf,
 
+    /// The number of clients to run simultaneously. Each client will send a query, wait for a response, then send another query.
+    #[arg(long, default_value = "1")]
+    pub(crate) concurrency: usize,
+
     /// Path to the spiced binary
     #[arg(short, long, default_value = "spiced")]
     pub(crate) spiced_path: PathBuf,
@@ -57,10 +61,6 @@ pub struct CommonArgs {
     /// The number of seconds to wait for the spiced instance to become ready
     #[arg(long, default_value = "30")]
     pub(crate) ready_wait: u64,
-
-    /// The number of clients to run simultaneously. Each client will send a query, wait for a response, then send another query.
-    #[arg(long, default_value = "1")]
-    pub(crate) concurrency: usize,
 
     /// The duration of the test in seconds
     #[arg(long, default_value = "60")]
