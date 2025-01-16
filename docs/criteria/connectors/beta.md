@@ -10,7 +10,7 @@ All criteria must be met for the connector to be considered Beta, with exception
 | -------------------------------- | ------------ | --------------- |
 | Clickhouse                       | ➖           |                 |
 | Databricks (mode: delta_lake)    | ✅           | @Sevenannn      |
-| Databricks (mode: spark_connect) | ➖           |                 |
+| Databricks (mode: spark_connect) | ✅           | @Sevenannn      |
 | Delta Lake                       | ➖           |                 |
 | Dremio                           | ✅           | @Sevenannn      |
 | DuckDB                           | ✅           | @peasee         |
