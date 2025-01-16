@@ -52,4 +52,24 @@ pub struct CommonArgs {
     /// Path to the spiced binary
     #[arg(short, long, default_value = "spiced")]
     pub(crate) spiced_path: PathBuf,
+
+    /// The number of clients to run simultaneously. Each client will send a query, wait for a response, then send another query.
+    #[arg(long, default_value = "1")]
+    pub(crate) concurrency: usize,
+
+    /// The number of seconds to wait for the spiced instance to become ready
+    #[arg(long, default_value = "30")]
+    pub(crate) ready_wait: u64,
+
+    /// The duration of the test in seconds
+    #[arg(long, default_value = "60")]
+    pub(crate) duration: u64,
+
+    /// Whether to disable progress bars, for CI or non-interactive environments
+    #[arg(long)]
+    pub(crate) disable_progress_bars: bool,
+
+    /// An optional data directory, to symlink into the spiced instance
+    #[arg(short, long)]
+    pub(crate) data_dir: Option<PathBuf>,
 }

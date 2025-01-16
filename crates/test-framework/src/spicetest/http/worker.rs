@@ -19,13 +19,14 @@ use std::{
     time::{Duration, Instant},
 };
 
+use anyhow::Result;
 use rand::Rng;
 use reqwest::Client;
 use tokio::task::JoinHandle;
 
-use super::{ConsistencyConfig, HttpConsistencyComponent};
+use super::{HttpComponent, HttpConfig};
 
-pub type WorkerHandle = JoinHandle<ConsistencyWorkerResult>;
+pub type WorkerHandle = JoinHandle<Result<ConsistencyWorkerResult>>;
 
 #[derive(Default)]
 pub struct ConsistencyWorkerResult {
@@ -41,13 +42,13 @@ pub(crate) struct ConsistencyWorker {
     client: Client,
 
     /// The component to test against.
-    component: HttpConsistencyComponent,
+    component: HttpComponent,
 
     payload: Vec<Arc<str>>,
 }
 
 impl ConsistencyWorker {
-    pub fn new(id: usize, cfg: ConsistencyConfig, client: Client) -> Self {
+    pub fn new(id: usize, cfg: HttpConfig, client: Client) -> Self {
         Self {
             id,
             duration: cfg.duration,
@@ -57,7 +58,8 @@ impl ConsistencyWorker {
             payload: cfg.payloads,
         }
     }
-    pub fn start(self) -> JoinHandle<ConsistencyWorkerResult> {
+
+    pub fn start(self) -> WorkerHandle {
         tokio::spawn(async move {
             let mut durations: Vec<Vec<Duration>> = vec![vec![]; self.buckets];
             let bucket_duration = self.duration.as_secs() / self.buckets as u64;
@@ -68,7 +70,7 @@ impl ConsistencyWorker {
                 let start_request = Instant::now();
                 let Some(p) = get_random_element(&self.payload) else {
                     eprintln!("Worker {} - No payload found. Exiting...", self.id);
-                    return ConsistencyWorkerResult::default();
+                    return Ok(ConsistencyWorkerResult::default());
                 };
                 match self
                     .component
@@ -76,10 +78,12 @@ impl ConsistencyWorker {
                     .await
                 {
                     Ok(request_duration) => {
-                        let idx = start_request
-                            .duration_since(start)
-                            .as_secs()
-                            .div_euclid(bucket_duration) as usize;
+                        let idx = usize::try_from(
+                            start_request
+                                .duration_since(start)
+                                .as_secs()
+                                .div_euclid(bucket_duration),
+                        )?;
                         durations[idx].push(request_duration);
                     }
                     Err(e) => {
@@ -90,10 +94,10 @@ impl ConsistencyWorker {
                 }
             }
 
-            ConsistencyWorkerResult {
+            Ok(ConsistencyWorkerResult {
                 durations,
                 error_count,
-            }
+            })
         })
     }
 }

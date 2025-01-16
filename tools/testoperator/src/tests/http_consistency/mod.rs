@@ -20,10 +20,15 @@ use test_framework::{
     anyhow,
     app::App,
     arrow::array::ArrowNativeTypeOp,
+    metrics::MetricCollector,
     spiced::{SpicedInstance, StartRequest},
     spicepod::Spicepod,
     spicepod_utils::from_app,
-    spicetest::{ConsistencyConfig, ConsistencySpiceTest, HttpConsistencyComponent},
+    spicetest::{
+        http::{component::HttpComponent, HttpConfig, NotStarted},
+        SpiceTest,
+    },
+    TestType,
 };
 
 const DEFAULT_API_BASE: &str = "http://localhost:8090/v1";
@@ -31,29 +36,40 @@ const DEFAULT_API_BASE: &str = "http://localhost:8090/v1";
 /// Runs a test to ensure the P50 & p90 latencies do not increase by some threshold over the
 /// duration of the test when N clients are sending queries concurrently.
 pub(crate) async fn run(args: &HttpConsistencyTestArgs) -> anyhow::Result<()> {
-    let (_app, start_request) = get_consistency_app_and_start_request(args)?;
+    let (app, start_request) = get_consistency_app_and_start_request(args)?;
     let component = get_http_component(args)?;
     let payloads: Vec<_> = get_payloads(args)?.into_iter().map(Arc::from).collect();
 
     let mut spiced_instance = SpicedInstance::start(start_request).await?;
 
     spiced_instance
-        .wait_for_ready(Duration::from_secs(args.ready_wait))
+        .wait_for_ready(Duration::from_secs(args.common.ready_wait))
         .await?;
 
-    let test = ConsistencySpiceTest::new(
-        spiced_instance,
-        ConsistencyConfig {
-            duration: Duration::from_secs(args.duration),
-            buckets: args.buckets,
-            concurrency: args.concurrency,
-            component,
-            payloads,
-        },
-    );
-    let results = test.start().await?.wait().await?.get_result()?;
+    let http_config = HttpConfig {
+        duration: Duration::from_secs(args.common.duration),
+        buckets: args.buckets,
+        concurrency: args.common.concurrency,
+        component,
+        payloads,
+    };
 
-    let (p50, p90): (Vec<f64>, Vec<f64>) = results
+    let test = SpiceTest::new(
+        app.name.clone(),
+        spiced_instance,
+        NotStarted::new(http_config),
+    );
+
+    let test = test.start()?;
+    let test = test.wait().await?;
+    let metrics = test.collect(TestType::HTTP)?;
+    metrics.show()?;
+
+    let mut spiced_instance = test.end();
+    spiced_instance.stop()?;
+
+    let (p50, p90): (Vec<f64>, Vec<f64>) = metrics
+        .metrics
         .iter()
         .map(|minute| (minute.median_duration, minute.percentile_90_duration))
         .unzip();
@@ -96,7 +112,7 @@ fn get_consistency_app_and_start_request(
     Ok((app, start_req))
 }
 
-fn get_http_component(args: &HttpConsistencyTestArgs) -> anyhow::Result<HttpConsistencyComponent> {
+fn get_http_component(args: &HttpConsistencyTestArgs) -> anyhow::Result<HttpComponent> {
     match (&args.model, &args.embedding) {
         (Some(_), Some(_)) => Err(anyhow::anyhow!(
             "Cannot specify both --model and --embedding"
@@ -104,11 +120,11 @@ fn get_http_component(args: &HttpConsistencyTestArgs) -> anyhow::Result<HttpCons
         (None, None) => Err(anyhow::anyhow!(
             "Must specify either --model or --embedding"
         )),
-        (Some(model), None) => Ok(HttpConsistencyComponent::Model {
+        (Some(model), None) => Ok(HttpComponent::Model {
             model: model.clone(),
             api_base: DEFAULT_API_BASE.to_string(),
         }),
-        (None, Some(embedding)) => Ok(HttpConsistencyComponent::Embedding {
+        (None, Some(embedding)) => Ok(HttpComponent::Embedding {
             embedding: embedding.clone(),
             api_base: DEFAULT_API_BASE.to_string(),
         }),
