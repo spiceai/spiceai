@@ -11,7 +11,7 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 ## v1.0-stable (Jan 2025)
 
 - Bugfixes and performance improvements
-- Data Accelerators: Arrow, DuckDB, SQLite, PostgreSQL (Stable)
+- Data Accelerators: Arrow, DuckDB (Stable)
 - Model Providers: OpenAI, Hugging Face, File (Stable)
 - Catalog Providers: Unity Catalog, Spice.ai Cloud Platform (Stable)
 - Databricks DeltaLake data connector (Stable)
@@ -20,42 +20,41 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 - PostgreSQL Data Connector (Stable)
 - MySQL Data Connector (Stable)
 - GitHub Data Connector (Stable)
-- MS SQL data connector (Stable)
 - DuckDB data connector (Stable)
 - File data connector (Stable)
 - Dremio data connector (Stable)
 - Model Providers: Anthropic, Groq, Grok (Beta)
 - Catalog Providers: Databricks, Iceberg Tables (Beta)
-- FTP/SFTP Data Connector (Beta)
 - Snowflake Data Connector (Beta)
 - Spark Data Connector (Beta)
 - DynamoDB data connector (Alpha)
 
 ### v1.0-stable Data Connector Support
 
-| Name            | Status |
-| --------------- | ------ |
-| `databricks`    | Stable |
-| `delta_lake`    | Stable |
-| `postgres`      | Stable |
-| `s3`            | Stable |
-| `mysql`         | Stable |
-| `file`          | Stable |
-| `duckdb`        | Stable |
-| `github`        | Stable |
-| `dremio`        | Stable |
-| `mssql`         | Stable |
-| `odbc`          | Beta   |
-| `spiceai`       | Beta   |
-| `spark`         | Beta   |
-| `snowflake`     | Beta   |
-| `ftp`, `sftp`   | Beta   |
-| `http`, `https` | Beta   |
-| `clickhouse`    | Alpha  |
-| `flightsql`     | Alpha  |
-| `debezium`      | Alpha  |
-| `sharepoint`    | Alpha  |
-| `dynamodb`      | Alpha  |
+| Name                            | Status |
+| ------------------------------- | ------ |
+| `databricks (mode: delta_lake)` | Stable |
+| `delta_lake`                    | Stable |
+| `dremio`                        | Stable |
+| `duckdb`                        | Stable |
+| `file`                          | Stable |
+| `github`                        | Stable |
+| `mysql`                         | Stable |
+| `postgres`                      | Stable |
+| `s3`                            | Stable |
+| `databricks (mode: spark)`      | Beta   |
+| `mssql`                         | Beta   |
+| `odbc`                          | Beta   |
+| `snowflake`                     | Beta   |
+| `spiceai`                       | Beta   |
+| `spark`                         | Beta   |
+| `clickhouse`                    | Alpha  |
+| `debezium`                      | Alpha  |
+| `dynamodb`                      | Alpha  |
+| `flightsql`                     | Alpha  |
+| `ftp`, `sftp`                   | Alpha  |
+| `http`, `https`                 | Alpha  |
+| `sharepoint`                    | Alpha  |
 
 ### v1.0-stable Data Accelerator Support
 

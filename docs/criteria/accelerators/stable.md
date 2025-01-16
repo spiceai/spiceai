@@ -8,8 +8,8 @@ All criteria must be met for the accelerator to be considered Stable, with excep
 
 | Accelerator | Stable Quality | DRI Sign-off |
 | ----------- | -------------- | ------------ |
-| Arrow       | ❌            |              |
-| DuckDB      | ❌            |              |
+| Arrow       | ✅            | @peasee      |
+| DuckDB      | ✅            | @peasee      |
 | SQLite      | ❌            |              |
 | PostgreSQL  | ❌            |              |
 

@@ -103,6 +103,9 @@ pub enum Error {
     InvalidIAMRoleAuthentication {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+
+    #[snafu(display("The '{endpoint}' is a HTTP URL, but `allow_http` is not enabled. Set the parameter `allow_http: true` and retry.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/abfs#params"))]
+    InsecureEndpointWithoutAllowHTTP { endpoint: String },
 }
 
 pub struct S3 {
@@ -165,6 +168,15 @@ impl DataConnectorFactory for S3Factory {
             if let Some(endpoint) = params.parameters.get("endpoint").expose().ok() {
                 if !(endpoint.starts_with("https://") || endpoint.starts_with("http://")) {
                     return Err(Box::new(Error::InvalidEndpoint {
+                        endpoint: endpoint.to_string(),
+                    })
+                        as Box<dyn std::error::Error + Send + Sync>);
+                }
+
+                if endpoint.starts_with("http://")
+                    && params.parameters.get("allow_http").expose().ok() != Some("true")
+                {
+                    return Err(Box::new(Error::InsecureEndpointWithoutAllowHTTP {
                         endpoint: endpoint.to_string(),
                     })
                         as Box<dyn std::error::Error + Send + Sync>);

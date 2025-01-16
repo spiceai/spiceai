@@ -16,10 +16,10 @@ limitations under the License.
 
 use std::collections::HashMap;
 
-use crate::results::{self, BenchmarkResultsBuilder};
+use crate::results::BenchmarkResultsBuilder;
 use app::AppBuilder;
 use runtime::Runtime;
-use spicepod::component::dataset::acceleration::{Acceleration, ZeroResultsAction};
+use spicepod::component::dataset::acceleration::Acceleration;
 use test_framework::queries::{get_clickbench_test_queries, get_tpch_test_queries, QueryOverrides};
 
 pub(crate) mod abfs;
@@ -50,7 +50,6 @@ pub(crate) async fn run(
 ) -> Result<(), String> {
     let engine = acceleration.clone().and_then(|a| a.engine.clone());
     let mode = acceleration.clone().map(|a| a.mode);
-    let on_zero_results = acceleration.clone().map(|a| a.on_zero_results);
 
     let test_queries = match bench_name {
         "tpch" => get_tpch_test_queries(None),
@@ -78,23 +77,11 @@ pub(crate) async fn run(
         _ => return Err(format!("Invalid benchmark to run {bench_name}")),
     };
 
-    let bench_name = match (mode, on_zero_results.clone()) {
-        (None, Some(_)) | (Some(_), None) => {
-            unreachable!("both mode and on_zero_results are set when acceleration is passed")
-        }
-        (Some(mode), Some(ZeroResultsAction::ReturnEmpty)) => {
+    let bench_name = match mode {
+        Some(mode) => {
             format!("{}_{}_{}", connector, engine.unwrap_or_default(), mode).to_lowercase()
-            // maintain old snapshot names for compatibility
         }
-        (Some(mode), Some(ZeroResultsAction::UseSource)) => format!(
-            "{}_{}_{}_{}",
-            connector,
-            engine.unwrap_or_default(),
-            mode,
-            ZeroResultsAction::UseSource
-        )
-        .to_lowercase(),
-        (None, None) => connector.to_string(),
+        None => connector.to_string(),
     };
 
     let mut errors = Vec::new();
@@ -124,42 +111,7 @@ pub(crate) async fn run(
         )
         .await
         {
-            Ok(mut result) => {
-                if verify_query_results && Some(ZeroResultsAction::UseSource) == on_zero_results {
-                    // compare snapshots of use source to original connector snapshots
-                    // because the accelerators return nothing and force on zero results, the snapshot contents should be the same
-                    let connector_snapshot = format!("bench__{connector}_{query_name}.snap");
-                    let use_source_snapshot = format!("bench__{bench_name}_{query_name}.snap");
-
-                    // get correct path to snapshots directory
-                    let snapshots_directory =
-                        if let Ok(insta_workspace_root) = std::env::var("INSTA_WORKSPACE_ROOT") {
-                            std::path::Path::new(&insta_workspace_root)
-                                .join("crates/runtime/benches/snapshots")
-                        } else {
-                            std::path::Path::new("../snapshots").to_path_buf()
-                        };
-
-                    let connector_snapshot_contents =
-                        std::fs::read_to_string(snapshots_directory.join(&connector_snapshot))
-                            .map_err(|e| {
-                                format!("Failed to read snapshot {connector_snapshot}: {e}")
-                            })?;
-
-                    let use_source_snapshot_contents =
-                        std::fs::read_to_string(snapshots_directory.join(&use_source_snapshot))
-                            .map_err(|e| {
-                                format!("Failed to read snapshot {use_source_snapshot}: {e}")
-                            })?;
-
-                    if !test_framework::utils::snapshots_are_equal(
-                        &connector_snapshot_contents,
-                        &use_source_snapshot_contents,
-                    ) {
-                        result.status = results::Status::Failed;
-                    }
-                }
-
+            Ok(result) => {
                 benchmark_results.record_result(result);
             }
             Err(e) => {

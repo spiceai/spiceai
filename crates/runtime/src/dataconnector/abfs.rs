@@ -50,6 +50,9 @@ pub enum Error {
         "The 'abfs_endpoint' parameter must be a HTTP/S URL, but '{endpoint}' was provided.\nSpecify a valid HTTP/S URL."
     ))]
     InvalidEndpoint { endpoint: String },
+
+    #[snafu(display("The '{endpoint}' is a HTTP URL, but `allow_http` is not enabled. Set the parameter `allow_http: true` and retry.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/abfs#params"))]
+    InsecureEndpointWithoutAllowHTTP { endpoint: String },
 }
 
 pub struct AzureBlobFS {
@@ -107,7 +110,7 @@ static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
         ParameterSpec::connector("use_fabric_endpoint")
             .description("Use the Azure Storage fabric endpoint.")
             .default("false"),
-        ParameterSpec::connector("allow_http")
+        ParameterSpec::runtime("allow_http")
             .description("Allow insecure HTTP connections.")
             .default("false"),
         ParameterSpec::connector("authority_host")
@@ -168,6 +171,15 @@ impl DataConnectorFactory for AzureBlobFSFactory {
             if let Some(endpoint) = params.parameters.get("endpoint").expose().ok() {
                 if !(endpoint.starts_with("https://") || endpoint.starts_with("http://")) {
                     return Err(Box::new(Error::InvalidEndpoint {
+                        endpoint: endpoint.to_string(),
+                    })
+                        as Box<dyn std::error::Error + Send + Sync>);
+                }
+
+                if endpoint.starts_with("http://")
+                    && params.parameters.get("allow_http").expose().ok() != Some("true")
+                {
+                    return Err(Box::new(Error::InsecureEndpointWithoutAllowHTTP {
                         endpoint: endpoint.to_string(),
                     })
                         as Box<dyn std::error::Error + Send + Sync>);
