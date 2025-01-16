@@ -26,16 +26,16 @@ use tokio::task::JoinHandle;
 
 use super::{HttpComponent, HttpConfig};
 
-pub type WorkerHandle = JoinHandle<Result<HTTPWorkerResult>>;
+pub type WorkerHandle = JoinHandle<Result<HttpWorkerResult>>;
 
 #[derive(Default)]
-pub struct HTTPWorkerResult {
+pub struct HttpWorkerResult {
     /// The duration of requests, per bucket.
     pub durations: Vec<Vec<Duration>>,
     pub error_count: usize,
 }
 
-pub(crate) struct HTTPWorker {
+pub(crate) struct HttpWorker {
     id: usize,
     duration: Duration,
     buckets: usize,
@@ -47,7 +47,7 @@ pub(crate) struct HTTPWorker {
     payload: Vec<Arc<str>>,
 }
 
-impl HTTPWorker {
+impl HttpWorker {
     pub fn new(id: usize, cfg: HttpConfig, client: Client) -> Self {
         Self {
             id,
@@ -70,7 +70,7 @@ impl HTTPWorker {
                 let start_request = Instant::now();
                 let Some(p) = get_random_element(&self.payload) else {
                     eprintln!("Worker {} - No payload found. Exiting...", self.id);
-                    return Ok(HTTPWorkerResult::default());
+                    return Ok(HttpWorkerResult::default());
                 };
                 match self
                     .component
@@ -94,7 +94,7 @@ impl HTTPWorker {
                 }
             }
 
-            Ok(HTTPWorkerResult {
+            Ok(HttpWorkerResult {
                 durations,
                 error_count,
             })
