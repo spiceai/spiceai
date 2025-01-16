@@ -104,7 +104,7 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("The '{endpoint}' is an insecure HTTP URL, but `allow_http` is not enabled.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/s3#params"))]
+    #[snafu(display("The '{endpoint}' is a HTTP URL, but `allow_http` is not enabled. Set the parameter `allow_http: true` and retry.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/abfs#params"))]
     InsecureEndpointWithoutAllowHTTP { endpoint: String },
 }
 
