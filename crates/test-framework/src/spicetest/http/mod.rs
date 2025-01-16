@@ -17,33 +17,12 @@ limitations under the License.
 use super::{SpiceTest, TestCompleted, TestNotStarted, TestState};
 use crate::metrics::{MetricCollector, NoExtendedMetrics, QueryMetric};
 use anyhow::Result;
-use component::HttpComponent;
-use std::{
-    sync::Arc,
-    time::{Duration, SystemTime},
-};
-use worker::{ConsistencyWorker, ConsistencyWorkerResult, WorkerHandle};
+use component::{HttpComponent, HttpConfig};
+use std::time::{Duration, SystemTime};
+use worker::{HTTPWorker, HTTPWorkerResult, WorkerHandle};
 
 pub mod component;
 mod worker;
-
-#[derive(Clone)]
-pub struct HttpConfig {
-    /// The total duration of the test.
-    pub duration: Duration,
-
-    /// The number of buckets to divide the test duration into.
-    pub buckets: usize,
-
-    /// The number of individial HTTP clients to make requests in parallel.
-    pub concurrency: usize,
-
-    /// The payloads to send to the component, specifically to be used in [`HttpComponent::send_request`].
-    pub payloads: Vec<Arc<str>>,
-
-    /// The HTTP component, within the Spiced instance, to test.
-    pub component: HttpComponent,
-}
 
 pub struct NotStarted {
     config: HttpConfig,
@@ -62,7 +41,7 @@ pub struct Running {
 }
 
 pub struct Completed {
-    result: ConsistencyWorkerResult,
+    result: HTTPWorkerResult,
     end_time: SystemTime,
 }
 
@@ -82,7 +61,7 @@ impl SpiceTest<NotStarted> {
 
         let worker_handles = (0..self.state.config.concurrency)
             .map(|id| {
-                let worker = ConsistencyWorker::new(id, self.state.config.clone(), client.clone());
+                let worker = HTTPWorker::new(id, self.state.config.clone(), client.clone());
                 worker.start()
             })
             .collect::<Vec<_>>();
@@ -126,7 +105,7 @@ impl SpiceTest<Running> {
             spiced_instance: self.spiced_instance,
             use_progress_bars: self.use_progress_bars,
             state: Completed {
-                result: ConsistencyWorkerResult {
+                result: HTTPWorkerResult {
                     durations,
                     error_count,
                 },

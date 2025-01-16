@@ -25,7 +25,10 @@ use test_framework::{
     spicepod::Spicepod,
     spicepod_utils::from_app,
     spicetest::{
-        http::{component::HttpComponent, HttpConfig, NotStarted},
+        http::{
+            component::{HttpComponent, HttpConfig},
+            NotStarted,
+        },
         SpiceTest,
     },
     TestType,
