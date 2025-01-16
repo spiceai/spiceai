@@ -52,12 +52,18 @@ async fn main() -> anyhow::Result<()> {
             tests::env_export(&args.test_args)?;
         }
 
+        Commands::Run(TestCommands::HttpOverhead(args)) => {
+            tests::http::overhead_run(&args).await?;
+        }
         Commands::Run(TestCommands::HttpConsistency(args)) => {
-            tests::http_consistency::run(&args).await?;
+            tests::http::consistency_run(&args).await?;
         }
 
         Commands::Export(TestCommands::HttpConsistency(_args)) => {
             unimplemented!("Exporting consistency tests is not yet supported")
+        }
+        Commands::Export(TestCommands::HttpOverhead(_args)) => {
+            unimplemented!("Exporting overhead tests is not yet supported")
         }
     }
 

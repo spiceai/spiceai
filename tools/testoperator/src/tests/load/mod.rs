@@ -30,11 +30,11 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
     let query_overrides = args.query_overrides.clone().map(QueryOverrides::from);
     let queries = query_set.get_queries(query_overrides);
 
-    let (app, start_request) = get_app_and_start_request(args)?;
+    let (app, start_request) = get_app_and_start_request(&args.common, args.data_dir.as_deref())?;
     let mut spiced_instance = SpicedInstance::start(start_request).await?;
 
     spiced_instance
-        .wait_for_ready(Duration::from_secs(args.ready_wait.unwrap_or(30) as u64))
+        .wait_for_ready(Duration::from_secs(args.common.ready_wait))
         .await?;
 
     let test_duration = Duration::from_secs(args.duration.unwrap_or(60).try_into()?);

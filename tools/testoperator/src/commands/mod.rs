@@ -19,8 +19,8 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 pub use dataset::{DataConsistencyArgs, DatasetTestArgs};
 
-mod consistency;
-pub use consistency::HttpConsistencyTestArgs;
+mod http;
+pub use http::{HttpConsistencyTestArgs, HttpOverheadTestArgs, HttpTestArgs};
 mod dataset;
 
 #[derive(Subcommand)]
@@ -40,6 +40,7 @@ pub enum TestCommands {
     Bench(DatasetTestArgs),
     DataConsistency(DataConsistencyArgs),
     HttpConsistency(HttpConsistencyTestArgs),
+    HttpOverhead(HttpOverheadTestArgs),
 }
 
 /// Arguments Common to all [`TestCommands`].
@@ -52,4 +53,8 @@ pub struct CommonArgs {
     /// Path to the spiced binary
     #[arg(short, long, default_value = "spiced")]
     pub(crate) spiced_path: PathBuf,
+
+    /// The number of seconds to wait for the spiced instance to become ready
+    #[arg(long, default_value = "30")]
+    pub(crate) ready_wait: u64,
 }

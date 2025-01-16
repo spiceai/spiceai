@@ -20,17 +20,13 @@ use std::path::PathBuf;
 use super::CommonArgs;
 
 #[derive(Parser)]
-pub struct HttpConsistencyTestArgs {
+pub struct HttpTestArgs {
     #[clap(flatten)]
     pub(crate) common: CommonArgs,
 
     /// The duration of the test in seconds
     #[arg(long)]
     pub(crate) duration: u64,
-
-    /// The number of buckets to divide the test duration into.
-    #[arg(long, default_value = "10")]
-    pub(crate) buckets: usize,
 
     /// The embedding model (named in spicepod) to test against. Cannot be used in conjunction with `model`.
     #[arg(long)]
@@ -40,17 +36,9 @@ pub struct HttpConsistencyTestArgs {
     #[arg(long)]
     pub(crate) model: Option<String>,
 
-    /// The threshold for the increase in percentile latency between the first and last bucket of the test.
-    #[arg(long, default_value = "1.1")]
-    pub(crate) increase_threshold: f64,
-
     /// The number of clients to run simultaneously. Each client will send a query, wait for a response, then send another query.
     #[arg(long, default_value = "1")]
     pub(crate) concurrency: usize,
-
-    /// The number of seconds to wait for the spiced instance to become ready
-    #[arg(long, default_value = "30")]
-    pub(crate) ready_wait: u64,
 
     /// The path to a file containing payloads to use in testing. Either JSONL of compatible request bodies, or individual string payloads. Cannot not be used in conjunction with `payload`.
     #[arg(long)]
@@ -59,4 +47,36 @@ pub struct HttpConsistencyTestArgs {
     /// The payload to use in testing. Either JSONL of compatible request bodies, or individual string payloads. Cannot not be used in conjunction with `payload_file`.
     #[arg(long)]
     pub(crate) payload: Option<Vec<String>>,
+}
+
+#[derive(Parser)]
+pub struct HttpConsistencyTestArgs {
+    #[clap(flatten)]
+    pub(crate) http: HttpTestArgs,
+
+    /// The number of buckets to divide the test duration into.
+    #[arg(long, default_value = "10")]
+    pub(crate) buckets: usize,
+
+    /// The threshold for the increase in percentile latency between the first and last bucket of the test.
+    #[arg(long, default_value = "1.1")]
+    pub(crate) increase_threshold: f64,
+}
+
+#[derive(Parser)]
+pub struct HttpOverheadTestArgs {
+    #[clap(flatten)]
+    pub(crate) http: HttpTestArgs,
+
+    /// The threshold for the increase in percentile latency between the spice component and the underlying HTTP connection.
+    #[arg(long, default_value = "1.1")]
+    pub(crate) increase_threshold: f64,
+
+    /// The base URL of the underlying HTTP service to test against.
+    #[arg(long)]
+    pub(crate) http_base: String,
+
+    /// If the component has a different name between the spicepod and the HTTP service, specify the name of the component in the HTTP service.
+    #[arg(long)]
+    pub(crate) component_override: Option<String>,
 }

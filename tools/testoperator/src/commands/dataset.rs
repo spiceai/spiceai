@@ -48,9 +48,6 @@ pub struct DatasetTestArgs {
     pub(crate) concurrency: Option<usize>,
 
     #[arg(long)]
-    pub(crate) ready_wait: Option<usize>,
-
-    #[arg(long)]
     pub(crate) disable_progress_bars: bool,
 }
 
