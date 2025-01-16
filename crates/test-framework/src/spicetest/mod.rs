@@ -29,6 +29,9 @@ use indicatif::{MultiProgress, ProgressBar};
 use tokio::task::JoinHandle;
 use worker::{SpiceTestQueryWorker, SpiceTestQueryWorkerResult};
 
+pub use consistency::{ConsistencyConfig, ConsistencySpiceTest, HttpConsistencyComponent};
+
+mod consistency;
 mod worker;
 
 #[derive(Debug, Clone, Copy)]

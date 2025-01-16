@@ -24,7 +24,10 @@ pub(crate) async fn run(args: &DataConsistencyArgs) -> anyhow::Result<()> {
     let first_row_counts = bench::run(&test_args).await?;
 
     // second benchmark run using the second spicepod
-    test_args.spicepod_path.clone_from(&args.compare_spicepod);
+    test_args
+        .common
+        .spicepod_path
+        .clone_from(&args.compare_spicepod);
     let second_row_counts = bench::run(&test_args).await?;
 
     // compare the results
@@ -41,7 +44,7 @@ pub(crate) async fn run(args: &DataConsistencyArgs) -> anyhow::Result<()> {
         if *count == 0 {
             println!(
                 "WARN - No data returned for query '{query}' for {:#?}",
-                args.test_args.spicepod_path
+                args.test_args.common.spicepod_path
             );
         }
 
