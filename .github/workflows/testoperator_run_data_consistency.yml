@@ -1,4 +1,4 @@
-name: benchmark e2e tests
+name: data consistency tests
 
 on:
   workflow_dispatch:
@@ -54,8 +54,8 @@ on:
           - 'spiceai-large-runners'
 
 jobs:
-  run-bench:
-    name: Run benchmark e2e tests
+  run-data-consistency:
+    name: Run data consistency tests
     runs-on: ${{ github.event.inputs.runner_type }}
     timeout-minutes: 600
     steps:
