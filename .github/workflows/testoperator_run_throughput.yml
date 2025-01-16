@@ -106,7 +106,8 @@ jobs:
             -d /opt/spiced/data \
             --query-set ${{ github.event.inputs.query_set }} \
             --ready-wait ${{ github.event.inputs.ready_wait }} \
-            --disable-progress-bars
+            --disable-progress-bars \
+            --concurrency 8
         env:
           S3_ENDPOINT: ${{ secrets.CLICKBENCH_S3_ENDPOINT}}
           S3_KEY: ${{ secrets.CLICKBENCH_S3_KEY}}
@@ -134,7 +135,8 @@ jobs:
             --query-set ${{ github.event.inputs.query_set }} \
             --ready-wait ${{ github.event.inputs.ready_wait }} \
             --disable-progress-bars \
-            --query-overrides ${{ github.event.inputs.query_overrides }}
+            --query-overrides ${{ github.event.inputs.query_overrides }} \
+            --concurrency 8
         env:
           S3_ENDPOINT: ${{ secrets.CLICKBENCH_S3_ENDPOINT}}
           S3_KEY: ${{ secrets.CLICKBENCH_S3_KEY}}

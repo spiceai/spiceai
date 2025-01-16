@@ -14,7 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::BTreeMap, fmt::Display, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    fmt::Display,
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
 
 use anyhow::Result;
 use arrow::{
@@ -396,7 +401,30 @@ impl<T: ExtendedMetrics> QueryMetrics<T> {
 }
 
 pub trait MetricCollector<T: ExtendedMetrics> {
-    fn collect(&self) -> Result<QueryMetrics<T>>;
+    fn start_time(&self) -> SystemTime;
+    fn end_time(&self) -> SystemTime;
+    fn name(&self) -> String;
+    fn metrics(&self) -> Result<Vec<QueryMetric<T>>>;
+    fn collect(&self, test_type: TestType) -> Result<QueryMetrics<T>> {
+        Ok(QueryMetrics {
+            run_id: uuid::Uuid::new_v4(),
+            run_name: self.name(),
+            commit_sha: "TODO".to_string(),
+            branch_name: "TODO".to_string(),
+            test_type,
+            started_at: usize::try_from(
+                self.start_time()
+                    .duration_since(SystemTime::UNIX_EPOCH)?
+                    .as_secs(),
+            )?,
+            finished_at: usize::try_from(
+                self.end_time()
+                    .duration_since(SystemTime::UNIX_EPOCH)?
+                    .as_secs(),
+            )?,
+            metrics: self.metrics()?,
+        })
+    }
 }
 
 #[derive(Debug)]

@@ -38,26 +38,26 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.subcommand {
         Commands::Run(TestCommands::Throughput(args)) => tests::throughput::run(&args).await?,
-        Commands::Export(TestCommands::Throughput(args)) => tests::env_export(&args)?,
+        Commands::Export(TestCommands::Throughput(args)) => tests::env_export(&args.common)?,
         Commands::Run(TestCommands::Load(args)) => tests::load::run(&args).await?,
-        Commands::Export(TestCommands::Load(args)) => tests::env_export(&args)?,
+        Commands::Export(TestCommands::Load(args)) => tests::env_export(&args.common)?,
         Commands::Run(TestCommands::Bench(args)) => {
             tests::bench::run(&args).await?;
         }
-        Commands::Export(TestCommands::Bench(args)) => tests::env_export(&args)?,
+        Commands::Export(TestCommands::Bench(args)) => tests::env_export(&args.common)?,
         Commands::Run(TestCommands::DataConsistency(args)) => {
             tests::data_consistency::run(&args).await?;
         }
         Commands::Export(TestCommands::DataConsistency(args)) => {
-            tests::env_export(&args.test_args)?;
+            tests::env_export(&args.test_args.common)?;
         }
 
         Commands::Run(TestCommands::HttpConsistency(args)) => {
             tests::http_consistency::run(&args).await?;
         }
 
-        Commands::Export(TestCommands::HttpConsistency(_args)) => {
-            unimplemented!("Exporting consistency tests is not yet supported")
+        Commands::Export(TestCommands::HttpConsistency(args)) => {
+            tests::env_export(&args.common)?;
         }
     }
 

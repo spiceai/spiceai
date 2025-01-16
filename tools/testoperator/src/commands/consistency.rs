@@ -21,12 +21,8 @@ use super::CommonArgs;
 
 #[derive(Parser)]
 pub struct HttpConsistencyTestArgs {
-    #[clap(flatten)]
+    #[command(flatten)]
     pub(crate) common: CommonArgs,
-
-    /// The duration of the test in seconds
-    #[arg(long)]
-    pub(crate) duration: u64,
 
     /// The number of buckets to divide the test duration into.
     #[arg(long, default_value = "10")]
@@ -43,14 +39,6 @@ pub struct HttpConsistencyTestArgs {
     /// The threshold for the increase in percentile latency between the first and last bucket of the test.
     #[arg(long, default_value = "1.1")]
     pub(crate) increase_threshold: f64,
-
-    /// The number of clients to run simultaneously. Each client will send a query, wait for a response, then send another query.
-    #[arg(long, default_value = "1")]
-    pub(crate) concurrency: usize,
-
-    /// The number of seconds to wait for the spiced instance to become ready
-    #[arg(long, default_value = "30")]
-    pub(crate) ready_wait: u64,
 
     /// The path to a file containing payloads to use in testing. Either JSONL of compatible request bodies, or individual string payloads. Cannot not be used in conjunction with `payload`.
     #[arg(long)]
