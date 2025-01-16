@@ -20,6 +20,7 @@ testoperator run [COMMAND] [OPTIONS]
 - `load`: Run a load test.
 - `bench`: Run a benchmark test.
 - `data-consistency`: Run a data consistency test.
+- `http-consistency`: Runs a test to compare the latency performance of a HTTP enabled component as the component is persistently queried.
 
 ### Export
 
@@ -76,4 +77,28 @@ testoperator export throughput -p ./benchmarks/file_tpch.yaml -s spiced -d ./.da
 
 ```sh
 testoperator run throughput -p spicepod.yaml -s ./target/debug/spiced --query-set tpch
+```
+
+#### Run a HTTP consistency test against an embedding model
+```sh
+testoperator run http-consistency \
+    --duration 300 \
+    --buckets 5 \
+    --embedding openai-ada \
+    --payload "A nice string to embed" \
+    --payload "{
+        \"input\": \"The food was delicious and the waiter...\",
+        \"model\": \"text-embedding-ada-002\",
+        \"encoding_format\": \"float\"
+      }"
+```
+Note: The `.model` field in the payload will be overriden.
+
+#### Run a HTTP consistency test against an LLM model
+```sh
+testoperator run http-consistency \
+    --duration 300 \
+    --buckets 5 \
+    --model openai-gpt5 \
+    --payload-file payloads.txt  #Use JSONL-like format for JSON payloads
 ```
