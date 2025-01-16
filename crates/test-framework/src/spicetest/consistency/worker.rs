@@ -14,15 +14,20 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::time::{Duration, Instant};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
-use anyhow::Result;
+use rand::Rng;
 use reqwest::Client;
 use tokio::task::JoinHandle;
 
-use super::ConsistencyComponent;
+use super::{ConsistencyConfig, HttpConsistencyComponent};
 
 pub type WorkerHandle = JoinHandle<ConsistencyWorkerResult>;
+
+#[derive(Default)]
 pub struct ConsistencyWorkerResult {
     /// The duration of requests, per bucket.
     pub durations: Vec<Vec<Duration>>,
@@ -36,23 +41,20 @@ pub(crate) struct ConsistencyWorker {
     client: Client,
 
     /// The component to test against.
-    component: ConsistencyComponent,
+    component: HttpConsistencyComponent,
+
+    payload: Vec<Arc<str>>,
 }
 
 impl ConsistencyWorker {
-    pub fn new(
-        id: usize,
-        duration: Duration,
-        buckets: usize,
-        client: Client,
-        component: ConsistencyComponent,
-    ) -> Self {
+    pub fn new(id: usize, cfg: ConsistencyConfig, client: Client) -> Self {
         Self {
             id,
-            duration,
-            buckets,
+            duration: cfg.duration,
+            buckets: cfg.buckets,
             client,
-            component,
+            component: cfg.component,
+            payload: cfg.payloads,
         }
     }
     pub fn start(self) -> JoinHandle<ConsistencyWorkerResult> {
@@ -64,10 +66,16 @@ impl ConsistencyWorker {
 
             while start.elapsed() < self.duration {
                 let start_request = Instant::now();
-                println!("Starting req..");
-                match self.component.send_request(&self.client, "payload").await {
+                let Some(p) = get_random_element(&self.payload) else {
+                    eprintln!("Worker {} - No payload found. Exiting...", self.id);
+                    return ConsistencyWorkerResult::default();
+                };
+                match self
+                    .component
+                    .send_request(&self.client, &Arc::clone(p))
+                    .await
+                {
                     Ok(request_duration) => {
-                        println!("Rook some time: {:?}", request_duration);
                         let idx = start_request
                             .duration_since(start)
                             .as_secs()
@@ -87,5 +95,15 @@ impl ConsistencyWorker {
                 error_count,
             }
         })
+    }
+}
+
+fn get_random_element<T>(vec: &[T]) -> Option<&T> {
+    if vec.is_empty() {
+        None
+    } else {
+        let mut rng = rand::thread_rng();
+        let index = rng.gen_range(0..vec.len());
+        Some(&vec[index])
     }
 }

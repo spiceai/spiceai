@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use crate::commands::HttpConsistencyTestArgs;
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 use test_framework::{
     anyhow,
     app::App,
@@ -23,7 +23,7 @@ use test_framework::{
     spiced::{SpicedInstance, StartRequest},
     spicepod::Spicepod,
     spicepod_utils::from_app,
-    spicetest::{ConsistencyComponent, ConsistencyConfig, ConsistencySpiceTest},
+    spicetest::{ConsistencyConfig, ConsistencySpiceTest, HttpConsistencyComponent},
 };
 
 const DEFAULT_API_BASE: &str = "http://localhost:8090/v1";
@@ -32,26 +32,8 @@ const DEFAULT_API_BASE: &str = "http://localhost:8090/v1";
 /// duration of the test when N clients are sending queries concurrently.
 pub(crate) async fn run(args: &HttpConsistencyTestArgs) -> anyhow::Result<()> {
     let (_app, start_request) = get_consistency_app_and_start_request(args)?;
-    let component = match (&args.model, &args.embedding) {
-        (Some(_), Some(_)) => {
-            return Err(anyhow::anyhow!(
-                "Cannot specify both --model and --embedding"
-            ));
-        }
-        (None, None) => {
-            return Err(anyhow::anyhow!(
-                "Must specify either --model or --embedding"
-            ));
-        }
-        (Some(model), None) => ConsistencyComponent::Model {
-            model: model.clone(),
-            api_base: DEFAULT_API_BASE.to_string(),
-        },
-        (None, Some(embedding)) => ConsistencyComponent::Embedding {
-            embedding: embedding.clone(),
-            api_base: DEFAULT_API_BASE.to_string(),
-        },
-    };
+    let component = get_http_component(args)?;
+    let payloads: Vec<_> = get_payloads(args)?.into_iter().map(Arc::from).collect();
 
     let mut spiced_instance = SpicedInstance::start(start_request).await?;
 
@@ -66,6 +48,7 @@ pub(crate) async fn run(args: &HttpConsistencyTestArgs) -> anyhow::Result<()> {
             buckets: args.buckets,
             concurrency: args.concurrency,
             component,
+            payloads,
         },
     );
     let results = test.start().await?.wait().await?.get_result()?;
@@ -111,4 +94,39 @@ fn get_consistency_app_and_start_request(
 
     let start_req = StartRequest::new(args.spiced_path.clone(), from_app(app.clone()))?;
     Ok((app, start_req))
+}
+
+fn get_http_component(args: &HttpConsistencyTestArgs) -> anyhow::Result<HttpConsistencyComponent> {
+    match (&args.model, &args.embedding) {
+        (Some(_), Some(_)) => Err(anyhow::anyhow!(
+            "Cannot specify both --model and --embedding"
+        )),
+        (None, None) => Err(anyhow::anyhow!(
+            "Must specify either --model or --embedding"
+        )),
+        (Some(model), None) => Ok(HttpConsistencyComponent::Model {
+            model: model.clone(),
+            api_base: DEFAULT_API_BASE.to_string(),
+        }),
+        (None, Some(embedding)) => Ok(HttpConsistencyComponent::Embedding {
+            embedding: embedding.clone(),
+            api_base: DEFAULT_API_BASE.to_string(),
+        }),
+    }
+}
+
+fn get_payloads(args: &HttpConsistencyTestArgs) -> anyhow::Result<Vec<String>> {
+    match (&args.payload_file, &args.payload) {
+        (Some(_), Some(_)) => Err(anyhow::anyhow!(
+            "Cannot specify both --payload-file and --payload"
+        )),
+        (None, None) => Err(anyhow::anyhow!(
+            "Must specify either --payload-file or --payload"
+        )),
+        (Some(file), None) => Ok(std::fs::read_to_string(file)?
+            .lines()
+            .map(std::string::ToString::to_string)
+            .collect()),
+        (None, Some(payload)) => Ok(payload.clone()),
+    }
 }

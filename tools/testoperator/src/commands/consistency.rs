@@ -54,4 +54,12 @@ pub struct HttpConsistencyTestArgs {
     /// The number of seconds to wait for the spiced instance to become ready
     #[arg(long, default_value = "30")]
     pub(crate) ready_wait: u64,
+
+    /// The path to a file containing payloads to use in testing. Either JSONL of compatible request bodies, or individual string payloads. Cannot not be used in conjunction with `payload`.
+    #[arg(long)]
+    pub(crate) payload_file: Option<PathBuf>,
+
+    /// The payload to use in testing. Either JSONL of compatible request bodies, or individual string payloads. Cannot not be used in conjunction with `payload_file`.
+    #[arg(long)]
+    pub(crate) payload: Option<Vec<String>>,
 }

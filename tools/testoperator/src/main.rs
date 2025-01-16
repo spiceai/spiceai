@@ -53,7 +53,7 @@ async fn main() -> anyhow::Result<()> {
         }
 
         Commands::Run(TestCommands::HttpConsistency(args)) => {
-            tests::http_consistency::run(&args).await?
+            tests::http_consistency::run(&args).await?;
         }
 
         Commands::Export(TestCommands::HttpConsistency(_args)) => {

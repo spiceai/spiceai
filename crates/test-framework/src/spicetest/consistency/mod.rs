@@ -14,7 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::time::{Duration, SystemTime};
+use std::{
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
 
 use async_openai::{
     config::OpenAIConfig,
@@ -33,29 +36,45 @@ use crate::{
     spiced::SpicedInstance,
 };
 
-pub trait TestConfig {}
 mod worker;
 
+#[derive(Clone)]
 pub struct ConsistencyConfig {
+    /// The total duration of the test.
     pub duration: Duration,
+
+    /// The number of buckets to divide the test duration into.
     pub buckets: usize,
+
+    /// The number of individial HTTP clients to make requests in parallel.
     pub concurrency: usize,
-    pub component: ConsistencyComponent,
+
+    /// The payloads to send to the component, specifically to be used in [`HttpConsistencyComponent::send_request`].
+    pub payloads: Vec<Arc<str>>,
+
+    /// The HTTP component, within the Spiced instance, to test.
+    pub component: HttpConsistencyComponent,
 }
 
+/// A component within the Spiced instance to test for consistency.
+///
+/// This component must be accessible over HTTP.
 #[derive(Clone)]
-pub enum ConsistencyComponent {
+pub enum HttpConsistencyComponent {
     Model { model: String, api_base: String },
     Embedding { embedding: String, api_base: String },
 }
 
-impl ConsistencyComponent {
+impl HttpConsistencyComponent {
     fn api_base(&self) -> String {
         match self {
-            ConsistencyComponent::Model { api_base, .. } => api_base.clone(),
-            ConsistencyComponent::Embedding { api_base, .. } => api_base.clone(),
+            HttpConsistencyComponent::Model { api_base, .. } => api_base.clone(),
+            HttpConsistencyComponent::Embedding { api_base, .. } => api_base.clone(),
         }
     }
+
+    /// Sends a request to the component and returns the duration of the request.
+    /// Payload may be the entire HTTP request body, or a portion of it (dependent of the component).
     pub async fn send_request(&self, client: &Client, payload: &str) -> anyhow::Result<Duration> {
         let c = OpenAIClient::with_config(OpenAIConfig::default().with_api_base(self.api_base()))
             .with_http_client(client.clone())
@@ -63,30 +82,34 @@ impl ConsistencyComponent {
 
         let start_time = SystemTime::now();
         match self {
-            ConsistencyComponent::Model { model, .. } => {
-                let req = CreateChatCompletionRequestArgs::default()
-                    .model(model.clone())
-                    .messages(vec![ChatCompletionRequestMessage::User(
-                        ChatCompletionRequestUserMessageArgs::default()
-                            .content(payload.to_string())
-                            .build()
-                            .expect("failed to build user message"),
-                    )])
-                    .build()
-                    .expect("failed to build model request");
+            HttpConsistencyComponent::Model { model, .. } => {
+                let req: CreateChatCompletionRequest = match serde_json::from_str(payload) {
+                    Ok(req) => req,
+                    Err(_) => CreateChatCompletionRequestArgs::default()
+                        .model(model.clone())
+                        .messages(vec![ChatCompletionRequestMessage::User(
+                            ChatCompletionRequestUserMessageArgs::default()
+                                .content(payload.to_string())
+                                .build()
+                                .expect("failed to build user message"),
+                        )])
+                        .build()
+                        .expect("failed to build model request"),
+                };
                 let _ = c.chat().create(req).await?;
             }
-            ConsistencyComponent::Embedding { embedding, .. } => {
-                let _ = c
-                    .embeddings()
-                    .create(CreateEmbeddingRequest {
+            HttpConsistencyComponent::Embedding { embedding, .. } => {
+                let req: CreateEmbeddingRequest = match serde_json::from_str(payload) {
+                    Ok(req) => req,
+                    Err(_) => CreateEmbeddingRequest {
                         model: embedding.clone(),
                         input: async_openai::types::EmbeddingInput::String(payload.to_string()),
                         encoding_format: Some(EncodingFormat::Float),
                         user: None,
                         dimensions: None,
-                    })
-                    .await?;
+                    },
+                };
+                c.embeddings().create(req).await?;
             }
         }
         Ok(start_time.elapsed()?)
@@ -107,7 +130,7 @@ pub struct ConsistencySpiceTest {
 }
 
 impl ConsistencySpiceTest {
-    pub fn new(spiced_instance: SpicedInstance, config: ConsistencyConfig) -> Self {
+    #[must_use] pub fn new(spiced_instance: SpicedInstance, config: ConsistencyConfig) -> Self {
         Self {
             start_time: None,
             spiced_instance,
@@ -126,13 +149,7 @@ impl ConsistencySpiceTest {
         let start_time = SystemTime::now();
         let worker_handles = (0..self.config.concurrency)
             .map(|id| {
-                let worker = ConsistencyWorker::new(
-                    id,
-                    self.config.duration.clone(),
-                    self.config.buckets.clone(),
-                    client.clone(),
-                    self.config.component.clone(),
-                );
+                let worker = ConsistencyWorker::new(id, self.config.clone(), client.clone());
                 worker.start()
             })
             .collect();

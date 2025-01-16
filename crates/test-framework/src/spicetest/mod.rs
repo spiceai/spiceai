@@ -31,7 +31,7 @@ use worker::{SpiceTestQueryWorker, SpiceTestQueryWorkerResult};
 
 #[cfg(feature = "models")]
 mod consistency;
-pub use consistency::{ConsistencyComponent, ConsistencyConfig, ConsistencySpiceTest};
+pub use consistency::{ConsistencyConfig, ConsistencySpiceTest, HttpConsistencyComponent};
 mod worker;
 
 #[derive(Debug, Clone, Copy)]
