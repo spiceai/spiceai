@@ -18,10 +18,10 @@ use crate::{
     commands::HttpOverheadTestArgs,
     tests::{
         get_app_and_start_request,
-        http::{get_http_component, get_payloads},
+        http::get_http_component,
     },
 };
-use std::{sync::Arc, time::Duration};
+use std::time::Duration;
 use test_framework::{anyhow, spiced::SpicedInstance};
 
 /// Runs a test to ensure the P50 & p90 latencies do not increase by some threshold over the
@@ -29,10 +29,10 @@ use test_framework::{anyhow, spiced::SpicedInstance};
 pub(crate) async fn overhead_run(args: &HttpOverheadTestArgs) -> anyhow::Result<()> {
     let (_app, start_request) = get_app_and_start_request(&args.http.common, None)?;
     let component = get_http_component(&args.http)?;
-    let payloads: Vec<_> = get_payloads(&args.http)?
-        .into_iter()
-        .map(Arc::from)
-        .collect();
+    // let payloads: Vec<_> = get_payloads(&args.http)?
+    //     .into_iter()
+    //     .map(Arc::from)
+    //     .collect();
 
     let mut spiced_instance = SpicedInstance::start(start_request).await?;
 

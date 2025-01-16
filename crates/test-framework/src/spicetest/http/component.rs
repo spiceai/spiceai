@@ -25,28 +25,7 @@ use async_openai::{
     Client as OpenAIClient,
 };
 use reqwest::Client;
-use std::{
-    sync::Arc,
-    time::{Duration, Instant},
-};
-
-#[derive(Clone)]
-pub struct HttpConfig {
-    /// The total duration of the test.
-    pub duration: Duration,
-
-    /// The number of buckets to divide the test duration into.
-    pub buckets: usize,
-
-    /// The number of individial HTTP clients to make requests in parallel.
-    pub concurrency: usize,
-
-    /// The payloads to send to the component, specifically to be used in [`HttpComponent::send_request`].
-    pub payloads: Vec<Arc<str>>,
-
-    /// The HTTP component, within the Spiced instance, to test.
-    pub component: HttpComponent,
-}
+use std::time::{Duration, Instant};
 
 /// A component within the Spiced instance to test for consistency.
 ///

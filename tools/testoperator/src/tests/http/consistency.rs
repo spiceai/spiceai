@@ -23,12 +23,12 @@ use crate::{
 };
 use std::{sync::Arc, time::Duration};
 use test_framework::{
-    anyhow,
+    anyhow::{self, anyhow},
     arrow::array::ArrowNativeTypeOp,
     metrics::MetricCollector,
     spiced::SpicedInstance,
     spicetest::{
-        http::{component::HttpConfig, NotStarted},
+        http::consistency::{self, ConsistencyConfig},
         SpiceTest,
     },
 };
@@ -52,7 +52,7 @@ pub async fn consistency_run(args: &HttpConsistencyTestArgs) -> anyhow::Result<(
     let test = SpiceTest::new(
         "Consistency Test".to_string(),
         spiced_instance,
-        NotStarted::new(HttpConfig {
+        consistency::NotStarted::new(ConsistencyConfig {
             duration: Duration::from_secs(args.http.common.duration),
             buckets: args.buckets,
             concurrency: args.http.common.concurrency,
@@ -69,7 +69,10 @@ pub async fn consistency_run(args: &HttpConsistencyTestArgs) -> anyhow::Result<(
         .unzip();
 
     if p50.len() >= 2 {
-        let increase = p50.last().expect("no p50 data").div_checked(p50[0])?;
+        let increase = p50
+            .last()
+            .ok_or(anyhow!("no p50 data"))?
+            .div_checked(p50[0])?;
         if increase > args.increase_threshold {
             return Err(anyhow::anyhow!(
                 "p50 increase threshold exceeded: {} > {}",
@@ -80,7 +83,10 @@ pub async fn consistency_run(args: &HttpConsistencyTestArgs) -> anyhow::Result<(
     }
 
     if p90.len() >= 2 {
-        let increase = p90.last().expect("no p90 data").div_checked(p90[0])?;
+        let increase = p90
+            .last()
+            .ok_or(anyhow!("no p90 data"))?
+            .div_checked(p90[0])?;
         if increase > args.increase_threshold {
             return Err(anyhow::anyhow!(
                 "p90 increase threshold exceeded: {} > {}",

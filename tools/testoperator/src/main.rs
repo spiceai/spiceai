@@ -39,23 +39,23 @@ async fn main() -> anyhow::Result<()> {
     match cli.subcommand {
         Commands::Run(TestCommands::Throughput(args)) => tests::throughput::run(&args).await?,
         Commands::Export(TestCommands::Throughput(args)) => {
-            tests::env_export(&args.common, args.data_dir)?
+            tests::env_export(&args.common, args.data_dir.as_deref())?;
         }
         Commands::Run(TestCommands::Load(args)) => tests::load::run(&args).await?,
         Commands::Export(TestCommands::Load(args)) => {
-            tests::env_export(&args.common, args.data_dir)?
+            tests::env_export(&args.common, args.data_dir.as_deref())?;
         }
         Commands::Run(TestCommands::Bench(args)) => {
             tests::bench::run(&args).await?;
         }
         Commands::Export(TestCommands::Bench(args)) => {
-            tests::env_export(&args.common, args.data_dir)?
+            tests::env_export(&args.common, args.data_dir.as_deref())?;
         }
         Commands::Run(TestCommands::DataConsistency(args)) => {
             tests::data_consistency::run(&args).await?;
         }
         Commands::Export(TestCommands::DataConsistency(args)) => {
-            tests::env_export(&args.test_args.common, args.test_args.data_dir)?;
+            tests::env_export(&args.test_args.common, args.test_args.data_dir.as_deref())?;
         }
 
         Commands::Run(TestCommands::HttpOverhead(args)) => {

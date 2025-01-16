@@ -51,8 +51,8 @@ pub(crate) fn get_app_and_start_request(
     Ok((app, start_request))
 }
 
-pub(crate) fn env_export(args: &CommonArgs, data_dir: Option<PathBuf>) -> anyhow::Result<()> {
-    let (_, mut start_request) = get_app_and_start_request(args, data_dir.as_deref())?;
+pub(crate) fn env_export(args: &CommonArgs, data_dir: Option<&Path>) -> anyhow::Result<()> {
+    let (_, mut start_request) = get_app_and_start_request(args, data_dir)?;
 
     start_request.prepare()?;
     let tempdir_path = start_request.get_tempdir_path();
