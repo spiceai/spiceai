@@ -24,7 +24,7 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 - File data connector (Stable)
 - Dremio data connector (Stable)
 - Model Providers: Anthropic, Groq, Grok (Beta)
-- Catalog Providers: Databricks, Iceberg Tables (Beta)
+- Catalog Providers: Databricks (Beta), Iceberg Tables (Alpha)
 - Snowflake Data Connector (Beta)
 - Spark Data Connector (Beta)
 - DynamoDB data connector (Alpha)
