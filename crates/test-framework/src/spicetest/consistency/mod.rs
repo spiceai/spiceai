@@ -14,9 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use anyhow::anyhow;
 use std::{
     sync::Arc,
-    time::{Duration, SystemTime},
+    time::{Duration, Instant},
 };
 
 use async_openai::{
@@ -80,7 +81,7 @@ impl HttpConsistencyComponent {
             .with_http_client(client.clone())
             .clone();
 
-        let start_time = SystemTime::now();
+        let start_time = Instant::now();
         match self {
             HttpConsistencyComponent::Model { model, .. } => {
                 let req: CreateChatCompletionRequest =
@@ -96,10 +97,12 @@ impl HttpConsistencyComponent {
                                 ChatCompletionRequestUserMessageArgs::default()
                                     .content(payload.to_string())
                                     .build()
-                                    .expect("failed to build user message"),
+                                    .map_err(|e| {
+                                        anyhow!("failed to build user message. Error: {e:?}")
+                                    })?,
                             )])
                             .build()
-                            .expect("failed to build model request"),
+                            .map_err(|e| anyhow!("Failed to build model request. Error: {e:?}"))?,
                     };
                 let _ = c.chat().create(req).await?;
             }
@@ -122,7 +125,7 @@ impl HttpConsistencyComponent {
                 c.embeddings().create(req).await?;
             }
         }
-        Ok(start_time.elapsed()?)
+        Ok(start_time.elapsed())
     }
 }
 
@@ -133,7 +136,7 @@ pub enum ConsistencyState {
 }
 
 pub struct ConsistencySpiceTest {
-    start_time: Option<SystemTime>,
+    start_time: Option<Instant>,
     spiced_instance: SpicedInstance,
     config: ConsistencyConfig,
     state: ConsistencyState,
@@ -157,7 +160,6 @@ impl ConsistencySpiceTest {
 
         let client = self.spiced_instance.http_client()?;
 
-        let start_time = SystemTime::now();
         let worker_handles = (0..self.config.concurrency)
             .map(|id| {
                 let worker = ConsistencyWorker::new(id, self.config.clone(), client.clone());
@@ -166,7 +168,7 @@ impl ConsistencySpiceTest {
             .collect();
 
         Ok(ConsistencySpiceTest {
-            start_time: Some(start_time),
+            start_time: Some(Instant::now()),
             spiced_instance: self.spiced_instance,
             config: self.config,
             state: ConsistencyState::Running { worker_handles },

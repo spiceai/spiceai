@@ -18,15 +18,12 @@ use clap::{Parser, ValueEnum};
 use std::path::PathBuf;
 use test_framework::queries::{QueryOverrides, QuerySet};
 
+use super::CommonArgs;
+
 #[derive(Parser, Debug, Clone)]
 pub struct DatasetTestArgs {
-    /// Path to the spicepod.yaml file
-    #[arg(short('p'), long)]
-    pub(crate) spicepod_path: PathBuf,
-
-    /// Path to the spiced binary
-    #[arg(short, long)]
-    pub(crate) spiced_path: PathBuf,
+    #[clap(flatten)]
+    pub(crate) common: CommonArgs,
 
     /// An optional data directory, to symlink into the spiced instance
     #[arg(short, long)]

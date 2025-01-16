@@ -17,15 +17,12 @@ limitations under the License.
 use clap::Parser;
 use std::path::PathBuf;
 
+use super::CommonArgs;
+
 #[derive(Parser)]
 pub struct HttpConsistencyTestArgs {
-    /// Path to the spicepod.yaml file
-    #[arg(short('p'), long, default_value = "spicepod.yaml")]
-    pub(crate) spicepod_path: PathBuf,
-
-    /// Path to the spiced binary
-    #[arg(short, long, default_value = "spiced")]
-    pub(crate) spiced_path: PathBuf,
+    #[clap(flatten)]
+    pub(crate) common: CommonArgs,
 
     /// The duration of the test in seconds
     #[arg(long)]

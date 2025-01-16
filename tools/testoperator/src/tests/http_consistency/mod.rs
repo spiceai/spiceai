@@ -87,12 +87,12 @@ pub(crate) async fn run(args: &HttpConsistencyTestArgs) -> anyhow::Result<()> {
 fn get_consistency_app_and_start_request(
     args: &HttpConsistencyTestArgs,
 ) -> anyhow::Result<(App, StartRequest)> {
-    let spicepod = Spicepod::load_exact(args.spicepod_path.clone())?;
+    let spicepod = Spicepod::load_exact(args.common.spicepod_path.clone())?;
     let app = test_framework::app::AppBuilder::new(spicepod.name.clone())
         .with_spicepod(spicepod)
         .build();
 
-    let start_req = StartRequest::new(args.spiced_path.clone(), from_app(app.clone()))?;
+    let start_req = StartRequest::new(args.common.spiced_path.clone(), from_app(app.clone()))?;
     Ok((app, start_req))
 }
 

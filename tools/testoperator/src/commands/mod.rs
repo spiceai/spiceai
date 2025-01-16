@@ -14,7 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use clap::Subcommand;
+use std::path::PathBuf;
+
+use clap::{Parser, Subcommand};
 pub use dataset::{DataConsistencyArgs, DatasetTestArgs};
 
 mod consistency;
@@ -38,4 +40,16 @@ pub enum TestCommands {
     Bench(DatasetTestArgs),
     DataConsistency(DataConsistencyArgs),
     HttpConsistency(HttpConsistencyTestArgs),
+}
+
+/// Arguments Common to all [`TestCommands`].
+#[derive(Parser, Debug, Clone)]
+pub struct CommonArgs {
+    /// Path to the spicepod.yaml file
+    #[arg(short('p'), long, default_value = "spicepod.yaml")]
+    pub(crate) spicepod_path: PathBuf,
+
+    /// Path to the spiced binary
+    #[arg(short, long, default_value = "spiced")]
+    pub(crate) spiced_path: PathBuf,
 }
