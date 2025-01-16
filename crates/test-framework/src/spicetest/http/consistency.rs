@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::get_random_element;
+use super::{get_random_element, HttpConfig};
 use crate::metrics::{MetricCollector, NoExtendedMetrics, QueryMetric};
 use crate::spicetest::{SpiceTest, TestCompleted, TestNotStarted, TestState};
 use anyhow::Result;
@@ -37,20 +37,30 @@ pub struct ConsistencyResult {
 
 #[derive(Clone)]
 pub struct ConsistencyConfig {
-    /// The total duration of the test.
-    pub duration: Duration,
+    pub http: HttpConfig,
 
     /// The number of buckets to divide the test duration into.
     pub buckets: usize,
-
-    /// The number of individial HTTP clients to make requests in parallel.
-    pub concurrency: usize,
-
-    /// The payloads to send to the component, specifically to be used in [`HttpComponent::send_request`].
-    pub payloads: Vec<Arc<str>>,
-
-    /// The HTTP component, within the Spiced instance, to test.
-    pub component: HttpComponent,
+}
+impl ConsistencyConfig {
+    #[must_use]
+    pub fn new(
+        duration: Duration,
+        concurrency: usize,
+        payloads: Vec<Arc<str>>,
+        component: HttpComponent,
+        buckets: usize,
+    ) -> Self {
+        Self {
+            http: HttpConfig {
+                duration,
+                concurrency,
+                payloads,
+                component,
+            },
+            buckets,
+        }
+    }
 }
 
 pub struct NotStarted {
@@ -88,7 +98,7 @@ impl SpiceTest<NotStarted> {
     pub fn start(self) -> Result<SpiceTest<Running>> {
         let client = self.spiced_instance.http_client()?;
 
-        let worker_handles = (0..self.state.config.concurrency)
+        let worker_handles = (0..self.state.config.http.concurrency)
             .map(|id| {
                 let worker = ConsistencyWorker::new(id, self.state.config.clone(), client.clone());
                 worker.start()
@@ -193,11 +203,11 @@ impl ConsistencyWorker {
     pub fn new(id: usize, cfg: ConsistencyConfig, client: Client) -> Self {
         Self {
             id,
-            duration: cfg.duration,
+            duration: cfg.http.duration,
             buckets: cfg.buckets,
             client,
-            component: cfg.component,
-            payload: cfg.payloads,
+            component: cfg.http.component,
+            payload: cfg.http.payloads,
         }
     }
 

@@ -14,10 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{
-    collections::BTreeMap,
-    path::{Path, PathBuf},
-};
+use std::{collections::BTreeMap, path::Path};
 
 use crate::commands::CommonArgs;
 use test_framework::{
@@ -29,7 +26,7 @@ pub(crate) mod data_consistency;
 pub(crate) mod http;
 pub(crate) mod load;
 pub(crate) mod throughput;
-
+mod util;
 pub(crate) type RowCounts = BTreeMap<String, usize>;
 
 pub(crate) fn get_app_and_start_request(

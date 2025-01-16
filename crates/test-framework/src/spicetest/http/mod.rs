@@ -14,10 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::{sync::Arc, time::Duration};
+
+use component::HttpComponent;
 use rand::Rng;
 
 pub mod component;
 pub mod consistency;
+pub mod overhead;
 
 fn get_random_element<T>(vec: &[T]) -> Option<&T> {
     if vec.is_empty() {
@@ -27,4 +31,19 @@ fn get_random_element<T>(vec: &[T]) -> Option<&T> {
         let index = rng.gen_range(0..vec.len());
         Some(&vec[index])
     }
+}
+
+#[derive(Clone)]
+pub struct HttpConfig {
+    /// The total duration of the test.
+    pub duration: Duration,
+
+    /// The number of individial HTTP clients to make requests in parallel.
+    pub concurrency: usize,
+
+    /// The payloads to send to the component, specifically to be used in [`HttpComponent::send_request`].
+    pub payloads: Vec<Arc<str>>,
+
+    /// The HTTP component, within the Spiced instance, to test.
+    pub component: HttpComponent,
 }

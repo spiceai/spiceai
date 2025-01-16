@@ -20,7 +20,7 @@ use clap::{Parser, Subcommand};
 pub use dataset::{DataConsistencyArgs, DatasetTestArgs};
 
 mod http;
-pub use http::{HttpConsistencyTestArgs, HttpOverheadTestArgs, HttpTestArgs};
+pub use http::{HttpConsistencyTestArgs, HttpOverheadTestArgs};
 mod dataset;
 
 #[derive(Subcommand)]

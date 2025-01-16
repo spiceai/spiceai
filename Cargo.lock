@@ -859,7 +859,7 @@ dependencies = [
 [[package]]
 name = "async-openai"
 version = "0.26.0"
-source = "git+https://github.com/spiceai/async-openai?rev=a0a9ae00570f47580a8059b378921728ef7fe6f2#a0a9ae00570f47580a8059b378921728ef7fe6f2"
+source = "git+https://github.com/spiceai/async-openai?rev=b9068b2fad8f51e4b12e22d314ccc24d4cb8345d#b9068b2fad8f51e4b12e22d314ccc24d4cb8345d"
 dependencies = [
  "async-convert",
  "backoff",
@@ -11411,6 +11411,7 @@ name = "testoperator"
 version = "1.0.0"
 dependencies = [
  "clap",
+ "reqwest 0.12.9",
  "test-framework",
  "tokio",
 ]

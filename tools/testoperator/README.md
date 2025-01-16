@@ -102,3 +102,48 @@ testoperator run http-consistency \
     --model openai-gpt5 \
     --payload-file payloads.txt  #Use JSONL-like format for JSON payloads
 ```
+
+
+#### Run a HTTP overhead test against an embedding model
+```sh
+testoperator run http-overhead \
+  --duration 10 \
+  --embedding oai \
+  --base-url "https://api.openai.com/v1" \
+  --base-component "text-embedding-3-small" \
+  --base-header "Content-Type: application/json" \
+  --base-header "Authorization: Bearer $MY_OPENAI_API_KEY" \
+  --payload "A nice string to embed" \
+  --payload "{
+      \"input\": \"The food was delicious and the waiter...\",
+      \"model\": \"text-embedding-ada-002\",
+      \"encoding_format\": \"float\"
+    }"
+```
+
+#### Run a HTTP overhead test against an LLM model with incompatible API (e.g. Anthropic)
+```sh
+cargo run run http-overhead \
+  --duration 10 \
+  # These fields are for the spice component
+  --model claude-tool \
+  --payload "A nice string to embed" \
+  --payload "{
+      \"input\": \"The food was delicious and the waiter...\",
+      \"model\": \"text-embedding-ada-002\",
+      \"encoding_format\": \"float\"
+    }" \
+
+  # These fields are for the base/underlying component
+  --base-url "https://api.anthropic.com/v1/messages" \
+  --base-header "Content-Type: application/json" \
+  --base-header "anthropic-version: 2023-06-01" \
+  --base-header ""x-api-key: $ANTHROPIC_API_KEY" \
+  --base-payload-file bodies.jsonl
+```
+
+Where `bodies.jsonl` might look like
+```jsonl
+{"model": "claude-3-5-sonnet-20241022","max_tokens": 1024,"messages": [{"role": "user", "content": "Hello, world"}]}
+{"model": "claude-3-5-sonnet-20241022","max_tokens": 512,"messages": [{"role": "system", "content": "You are god"}, {"role": "user", "content": "Is god real?"}]}
+```

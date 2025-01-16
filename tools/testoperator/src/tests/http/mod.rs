@@ -14,48 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::commands::HttpTestArgs;
-use test_framework::{anyhow, spicetest::http::component::HttpComponent};
-
-const DEFAULT_API_BASE: &str = "http://localhost:8090/v1";
-
 mod consistency;
 pub(crate) use consistency::consistency_run;
 
 mod overhead;
 pub(crate) use overhead::overhead_run;
-
-fn get_http_component(args: &HttpTestArgs) -> anyhow::Result<HttpComponent> {
-    match (&args.model, &args.embedding) {
-        (Some(_), Some(_)) => Err(anyhow::anyhow!(
-            "Cannot specify both --model and --embedding"
-        )),
-        (None, None) => Err(anyhow::anyhow!(
-            "Must specify either --model or --embedding"
-        )),
-        (Some(model), None) => Ok(HttpComponent::Model {
-            model: model.clone(),
-            api_base: DEFAULT_API_BASE.to_string(),
-        }),
-        (None, Some(embedding)) => Ok(HttpComponent::Embedding {
-            embedding: embedding.clone(),
-            api_base: DEFAULT_API_BASE.to_string(),
-        }),
-    }
-}
-
-fn get_payloads(args: &HttpTestArgs) -> anyhow::Result<Vec<String>> {
-    match (&args.payload_file, &args.payload) {
-        (Some(_), Some(_)) => Err(anyhow::anyhow!(
-            "Cannot specify both --payload-file and --payload"
-        )),
-        (None, None) => Err(anyhow::anyhow!(
-            "Must specify either --payload-file or --payload"
-        )),
-        (Some(file), None) => Ok(std::fs::read_to_string(file)?
-            .lines()
-            .map(std::string::ToString::to_string)
-            .collect()),
-        (None, Some(payload)) => Ok(payload.clone()),
-    }
-}

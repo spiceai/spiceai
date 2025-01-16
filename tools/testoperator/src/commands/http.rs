@@ -16,6 +16,7 @@ limitations under the License.
 
 use clap::Parser;
 use std::path::PathBuf;
+use test_framework::{anyhow, spicetest::http::component::HttpComponent};
 
 use super::CommonArgs;
 
@@ -39,6 +40,45 @@ pub struct HttpTestArgs {
     /// The payload to use in testing. Either JSONL of compatible request bodies, or individual string payloads. Cannot not be used in conjunction with `payload_file`.
     #[arg(long)]
     pub(crate) payload: Option<Vec<String>>,
+}
+
+const DEFAULT_API_BASE: &str = "http://localhost:8090/v1";
+
+impl HttpTestArgs {
+    pub(crate) fn get_http_component(&self) -> anyhow::Result<HttpComponent> {
+        match (&self.model, &self.embedding) {
+            (Some(_), Some(_)) => Err(anyhow::anyhow!(
+                "Cannot specify both --model and --embedding"
+            )),
+            (None, None) => Err(anyhow::anyhow!(
+                "Must specify either --model or --embedding"
+            )),
+            (Some(model), None) => Ok(HttpComponent::Model {
+                model: model.clone(),
+                api_base: DEFAULT_API_BASE.to_string(),
+            }),
+            (None, Some(embedding)) => Ok(HttpComponent::Embedding {
+                embedding: embedding.clone(),
+                api_base: DEFAULT_API_BASE.to_string(),
+            }),
+        }
+    }
+
+    pub(crate) fn get_payloads(&self) -> anyhow::Result<Vec<String>> {
+        match (&self.payload_file, &self.payload) {
+            (Some(_), Some(_)) => Err(anyhow::anyhow!(
+                "Cannot specify both --payload-file and --payload"
+            )),
+            (None, None) => Err(anyhow::anyhow!(
+                "Must specify either --payload-file or --payload"
+            )),
+            (Some(file), None) => Ok(std::fs::read_to_string(file)?
+                .lines()
+                .map(std::string::ToString::to_string)
+                .collect()),
+            (None, Some(payload)) => Ok(payload.clone()),
+        }
+    }
 }
 
 #[derive(Parser)]
@@ -66,9 +106,39 @@ pub struct HttpOverheadTestArgs {
 
     /// The base URL of the underlying HTTP service to test against.
     #[arg(long)]
-    pub(crate) http_base: String,
+    pub(crate) base_url: String,
+
+    /// Headers to use when making requests to the base URL.
+    #[arg(long)]
+    pub(crate) base_header: Option<Vec<String>>,
 
     /// If the component has a different name between the spicepod and the HTTP service, specify the name of the component in the HTTP service.
     #[arg(long)]
-    pub(crate) component_override: Option<String>,
+    pub(crate) base_component: Option<String>,
+
+    /// The path to a file containing request body to use in testing the baseline component. Expects a request body compatible payloads. Cannot not be used in conjunction with `base_payload`.
+    #[arg(long)]
+    pub(crate) base_payload_file: Option<PathBuf>,
+
+    /// The request body(s) to use in testing. Expects a request body compatible payloads.Cannot not be used in conjunction with `base_payload_file`.
+    #[arg(long)]
+    pub(crate) base_payload: Option<Vec<String>>,
+}
+
+impl HttpOverheadTestArgs {
+    pub(crate) fn base_payload(&self) -> anyhow::Result<Option<Vec<String>>> {
+        match (&self.base_payload_file, &self.base_payload) {
+            (Some(_), Some(_)) => Err(anyhow::anyhow!(
+                "Cannot specify both --payload-file and --payload"
+            )),
+            (None, None) => Ok(None),
+            (Some(file), None) => Ok(Some(
+                std::fs::read_to_string(file)?
+                    .lines()
+                    .map(std::string::ToString::to_string)
+                    .collect(),
+            )),
+            (None, Some(payload)) => Ok(Some(payload.clone())),
+        }
+    }
 }

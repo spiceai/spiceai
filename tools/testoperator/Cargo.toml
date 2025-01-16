@@ -10,6 +10,7 @@ version.workspace = true
 
 [dependencies]
 clap.workspace = true
+reqwest.workspace = true
 test-framework = { path = "../../crates/test-framework" }
 tokio.workspace = true
 
