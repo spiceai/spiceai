@@ -14,136 +14,25 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::{SpiceTest, TestCompleted, TestNotStarted, TestState};
-use crate::metrics::{MetricCollector, NoExtendedMetrics, QueryMetric};
-use anyhow::Result;
-use component::{HttpComponent, HttpConfig};
-use std::time::{Duration, SystemTime};
-use worker::{HttpWorker, HttpWorkerResult, WorkerHandle};
+use std::{sync::Arc, time::Duration};
+
+use component::HttpComponent;
 
 pub mod component;
-mod worker;
+pub mod consistency;
+pub mod overhead;
 
-pub struct NotStarted {
-    config: HttpConfig,
-}
+#[derive(Clone)]
+pub struct HttpConfig {
+    /// The total duration of the test.
+    pub duration: Duration,
 
-impl NotStarted {
-    #[must_use]
-    pub fn new(config: HttpConfig) -> Self {
-        Self { config }
-    }
-}
+    /// The number of individial HTTP clients to make requests in parallel.
+    pub concurrency: usize,
 
-pub struct Running {
-    config: HttpConfig,
-    worker_handles: Vec<WorkerHandle>,
-}
+    /// The payloads to send to the component, specifically to be used in [`HttpComponent::send_request`].
+    pub payloads: Vec<Arc<str>>,
 
-pub struct Completed {
-    result: HttpWorkerResult,
-    end_time: SystemTime,
-}
-
-impl TestState for NotStarted {}
-impl TestState for Running {}
-impl TestState for Completed {}
-impl TestNotStarted for NotStarted {}
-impl TestCompleted for Completed {
-    fn end_time(&self) -> SystemTime {
-        self.end_time
-    }
-}
-
-impl SpiceTest<NotStarted> {
-    pub fn start(self) -> Result<SpiceTest<Running>> {
-        let client = self.spiced_instance.http_client()?;
-
-        let worker_handles = (0..self.state.config.concurrency)
-            .map(|id| {
-                let worker = HttpWorker::new(id, self.state.config.clone(), client.clone());
-                worker.start()
-            })
-            .collect::<Vec<_>>();
-
-        Ok(SpiceTest {
-            name: self.name,
-            start_time: self.start_time,
-            spiced_instance: self.spiced_instance,
-            use_progress_bars: self.use_progress_bars,
-            state: Running {
-                worker_handles,
-                config: self.state.config,
-            },
-        })
-    }
-}
-
-impl SpiceTest<Running> {
-    pub async fn wait(self) -> Result<SpiceTest<Completed>> {
-        let mut error_count = 0;
-
-        let mut durations: Vec<Vec<Duration>> = vec![vec![]; self.state.config.buckets];
-
-        for worker_handle in self.state.worker_handles {
-            match worker_handle.await? {
-                Ok(worker_result) => {
-                    for (i, minute) in worker_result.durations.iter().enumerate() {
-                        durations[i].extend(minute);
-                    }
-                    error_count += worker_result.error_count;
-                }
-                Err(_) => {
-                    return Err(anyhow::anyhow!("Worker failed"));
-                }
-            }
-        }
-
-        Ok(SpiceTest {
-            name: self.name,
-            start_time: self.start_time,
-            spiced_instance: self.spiced_instance,
-            use_progress_bars: self.use_progress_bars,
-            state: Completed {
-                result: HttpWorkerResult {
-                    durations,
-                    error_count,
-                },
-                end_time: SystemTime::now(),
-            },
-        })
-    }
-}
-
-impl SpiceTest<Completed> {
-    #[must_use]
-    pub fn get_durations(&self) -> &Vec<Vec<Duration>> {
-        &self.state.result.durations
-    }
-}
-
-impl MetricCollector<NoExtendedMetrics> for SpiceTest<Completed> {
-    fn start_time(&self) -> SystemTime {
-        self.start_time
-    }
-
-    fn end_time(&self) -> SystemTime {
-        self.state.end_time()
-    }
-
-    fn name(&self) -> String {
-        self.name.clone()
-    }
-
-    fn metrics(&self) -> Result<Vec<QueryMetric<NoExtendedMetrics>>> {
-        self.state
-            .result
-            .durations
-            .iter()
-            .enumerate()
-            .map(|(i, durations)| {
-                QueryMetric::new_from_durations(format!("Minute {i}").as_str(), durations)
-            })
-            .collect()
-    }
+    /// The HTTP component, within the Spiced instance, to test.
+    pub component: HttpComponent,
 }

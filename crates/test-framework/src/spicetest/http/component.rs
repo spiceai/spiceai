@@ -25,57 +25,111 @@ use async_openai::{
     Client as OpenAIClient,
 };
 use reqwest::Client;
-use std::{
-    sync::Arc,
-    time::{Duration, Instant},
-};
-
-#[derive(Clone)]
-pub struct HttpConfig {
-    /// The total duration of the test.
-    pub duration: Duration,
-
-    /// The number of buckets to divide the test duration into.
-    pub buckets: usize,
-
-    /// The number of individial HTTP clients to make requests in parallel.
-    pub concurrency: usize,
-
-    /// The payloads to send to the component, specifically to be used in [`HttpComponent::send_request`].
-    pub payloads: Vec<Arc<str>>,
-
-    /// The HTTP component, within the Spiced instance, to test.
-    pub component: HttpComponent,
-}
+use std::time::{Duration, Instant};
 
 /// A component within the Spiced instance to test for consistency.
 ///
 /// This component must be accessible over HTTP.
 #[derive(Clone)]
 pub enum HttpComponent {
-    Model { model: String, api_base: String },
-    Embedding { embedding: String, api_base: String },
+    Model {
+        model: String,
+        api_base: String,
+    },
+    Embedding {
+        embedding: String,
+        api_base: String,
+    },
+    Generic {
+        // For a generic component, must know full URL.
+        http_url: String,
+        component_name: String,
+    },
 }
 
 impl HttpComponent {
     fn api_base(&self) -> String {
         match self {
-            HttpComponent::Model { api_base, .. } | HttpComponent::Embedding { api_base, .. } => {
-                api_base.clone()
+            HttpComponent::Generic {
+                http_url: api_base, ..
             }
+            | HttpComponent::Model { api_base, .. }
+            | HttpComponent::Embedding { api_base, .. } => api_base.clone(),
+        }
+    }
+
+    #[must_use]
+    pub fn component_name(&self) -> String {
+        match self {
+            HttpComponent::Generic {
+                component_name: model,
+                ..
+            }
+            | HttpComponent::Model { model, .. } => model.clone(),
+            HttpComponent::Embedding { embedding, .. } => embedding.clone(),
+        }
+    }
+
+    #[must_use]
+    pub fn with_api_base(self, api_base: String) -> Self {
+        match self {
+            HttpComponent::Model { model, .. } => HttpComponent::Model { model, api_base },
+            HttpComponent::Embedding { embedding, .. } => HttpComponent::Embedding {
+                embedding,
+                api_base,
+            },
+            HttpComponent::Generic { component_name, .. } => HttpComponent::Generic {
+                http_url: api_base,
+                component_name,
+            },
+        }
+    }
+
+    #[must_use]
+    pub fn with_component_name(self, component_name: String) -> Self {
+        match self {
+            HttpComponent::Model { api_base, .. } => HttpComponent::Model {
+                model: component_name,
+                api_base,
+            },
+            HttpComponent::Embedding { api_base, .. } => HttpComponent::Embedding {
+                embedding: component_name,
+                api_base,
+            },
+            HttpComponent::Generic {
+                http_url: http_base,
+                ..
+            } => HttpComponent::Generic {
+                http_url: http_base,
+                component_name,
+            },
         }
     }
 
     /// Sends a request to the component and returns the duration of the request.
     /// Payload may be the entire HTTP request body, or a portion of it (dependent of the component).
     pub async fn send_request(&self, client: &Client, payload: &str) -> Result<Duration> {
-        let c = OpenAIClient::with_config(OpenAIConfig::default().with_api_base(self.api_base()))
-            .with_http_client(client.clone())
-            .clone();
-
         let start_time = Instant::now();
         match self {
+            HttpComponent::Generic {
+                http_url: http_base,
+                ..
+            } => {
+                let req = client.post(http_base.clone())
+                    .body(payload.to_string()).send()
+                    .await
+                    .map_err(|e| anyhow!("Error received from generic HTTP POST request to {http_base}. Error: {e:?}"))?;
+
+                req.error_for_status()
+                    .map_err(|e| anyhow!("Received error status from {http_base}. Error: {e:?}"))?;
+            }
             HttpComponent::Model { model, .. } => {
+                let c = OpenAIClient::with_config(
+                    OpenAIConfig::default().with_api_base(self.api_base()),
+                )
+                .with_http_client(client.clone())
+                .clone();
+
                 let req: CreateChatCompletionRequest =
                     match serde_json::from_str::<CreateChatCompletionRequest>(payload) {
                         Ok(mut req) => {
@@ -99,6 +153,11 @@ impl HttpComponent {
                 let _ = c.chat().create(req).await?;
             }
             HttpComponent::Embedding { embedding, .. } => {
+                let c = OpenAIClient::with_config(
+                    OpenAIConfig::default().with_api_base(self.api_base()),
+                )
+                .with_http_client(client.clone())
+                .clone();
                 let req: CreateEmbeddingRequest =
                     match serde_json::from_str::<CreateEmbeddingRequest>(payload) {
                         Ok(mut req) => {

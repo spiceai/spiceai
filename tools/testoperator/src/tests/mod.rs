@@ -23,10 +23,10 @@ use test_framework::{
 
 pub(crate) mod bench;
 pub(crate) mod data_consistency;
-pub(crate) mod http_consistency;
+pub(crate) mod http;
 pub(crate) mod load;
 pub(crate) mod throughput;
-
+mod util;
 pub(crate) type RowCounts = BTreeMap<String, usize>;
 
 pub(crate) fn get_app_and_start_request(args: &CommonArgs) -> anyhow::Result<(App, StartRequest)> {
@@ -36,7 +36,7 @@ pub(crate) fn get_app_and_start_request(args: &CommonArgs) -> anyhow::Result<(Ap
         .build();
 
     let start_request = StartRequest::new(args.spiced_path.clone(), from_app(app.clone()))?;
-    let start_request = if let Some(data_dir) = &args.data_dir {
+    let start_request = if let Some(ref data_dir) = args.data_dir {
         start_request.with_data_dir(data_dir.clone())
     } else {
         start_request
