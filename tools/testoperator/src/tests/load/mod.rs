@@ -69,7 +69,7 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
     let baseline_percentiles = test
         .get_query_durations()
         .statistical_set()?
-        .percentile(0.99)?;
+        .percentile(99.0)?;
 
     let baseline_metrics = test.collect(TestType::Load)?;
     println!("Baseline metrics:");
@@ -121,7 +121,7 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
             ));
         };
 
-        let percentile_99th = duration.percentile(0.99)?;
+        let percentile_99th = duration.percentile(99.0)?;
         if percentile_99th.as_millis() < 1000 {
             continue; // skip queries that are too fast to be meaningful
         }
