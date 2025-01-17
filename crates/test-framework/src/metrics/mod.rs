@@ -116,12 +116,13 @@ impl StatisticsCollector<Duration, Vec<Duration>> for Vec<Duration> {
         // safety: sorted_durations.len() cannot be negative, and is unlikely to be larger than u32::MAX
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         {
-            let rank = (percentile / 100.0) * (f64::from(u32::try_from(self.len() - 1)?));
+            let rank =
+                (percentile / 100.0) * (f64::from(u32::try_from(sorted_durations.len() - 1)?));
             if (rank - rank.floor()).abs() < FLOAT_ERROR_MARGIN {
-                Ok(self[rank as usize])
+                Ok(sorted_durations[rank as usize])
             } else {
-                let lower_duration = self[rank.floor() as usize];
-                let upper_duration = self[rank.ceil() as usize];
+                let lower_duration = sorted_durations[rank.floor() as usize];
+                let upper_duration = sorted_durations[rank.ceil() as usize];
                 Ok((lower_duration + upper_duration) / 2)
             }
         }
@@ -513,6 +514,42 @@ mod test {
             std::time::Duration::from_secs(3),
             std::time::Duration::from_secs(4),
             std::time::Duration::from_secs(5),
+        ];
+
+        let third_percentile = durations
+            .percentile(75.0)
+            .expect("percentile should calculate");
+        assert_eq!(third_percentile, std::time::Duration::from_secs(4));
+
+        let second_percentile = durations
+            .percentile(50.0)
+            .expect("percentile should calculate");
+        assert_eq!(second_percentile, std::time::Duration::from_secs(3));
+
+        let first_percentile = durations
+            .percentile(25.0)
+            .expect("percentile should calculate");
+        assert_eq!(first_percentile, std::time::Duration::from_secs(2));
+
+        let zero_percentile = durations
+            .percentile(0.0)
+            .expect("percentile should calculate");
+        assert_eq!(zero_percentile, std::time::Duration::from_secs(1));
+
+        let hundred_percentile = durations
+            .percentile(100.0)
+            .expect("percentile should calculate");
+        assert_eq!(hundred_percentile, std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn test_unordered_percentiles() {
+        let durations = vec![
+            std::time::Duration::from_secs(4),
+            std::time::Duration::from_secs(3),
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(2),
+            std::time::Duration::from_secs(1),
         ];
 
         let third_percentile = durations
