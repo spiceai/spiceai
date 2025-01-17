@@ -29,7 +29,7 @@ on:
 jobs:
   run-http-consistency:
     name: Run data consistency tests
-    runs-on: ${{ github.event.inputs.runner_type }}
+    runs-on: ${{ github.event.inputs.runner_type || 'spiceai-runners' }}
     timeout-minutes: 600
     steps:
       - uses: actions/checkout@v4
