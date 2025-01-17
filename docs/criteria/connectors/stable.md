@@ -160,7 +160,7 @@ Indexes are not required for test coverage, but can be introduced if required fo
     - One or more [Red percentile measurements](../definitions.md#stop-light-percentile-measurements) are considered a test failure.
     - The service must not become unavailable for the entire duration of the test. A connection failure is considered a test failure.
     - Queries that have a 99th percentile execution time faster than 1000ms are excluded from this check, as they complete so fast that this check is not meaningful.
-  - **Conditional Criteria** - Object store-based connectors (`S3`, `ABFS`, `File`, `FTP`/`SFTP`, `HTTPS`) loading data from Parquet, CSV, TSV and JSON files are an exception to the common criteria and have reduced requirements.
+  - **Conditional Criteria** - Object store based connectors (`S3`, `ABFS`, `File`, `FTP`/`SFTP`, `HTTPS`) loading data from Parquet, CSV, TSV and JSON files are an exception to the common criteria and have reduced requirements.
     - Load test should run all queries with no [Major or Minor Bugs](../definitions.md) at scale factor 1.
     - Connector documentation includes any performance limitations and exceptions noted from the load test run (e.g., high CPU and/or memory usage, high network bandwidth consumtion, etc.).
 - [ ] Memory usage is collected at the end of the end-to-end test and reported as a metric on the overall connector.
