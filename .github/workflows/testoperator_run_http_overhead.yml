@@ -79,22 +79,22 @@ jobs:
         uses: ./.github/actions/build-testoperator
 
       - name: Set base parameters
-        id: base_params
         run: |
           if [[ "${{ github.event.inputs.base }}" == "openai" ]]; then
-            echo "base_url=https://api.openai.com/v1" >> $GITHUB_ENV
-            echo "base_header=Authorization: Bearer ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}" >> $GITHUB_ENV
+            echo "BASE_URL=https://api.openai.com/v1" >> $GITHUB_ENV
+            echo "BASE_HEADER=Authorization: Bearer ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}" >> $GITHUB_ENV
           elif [[ "${{ github.event.inputs.base }}" == "anthropic" ]]; then
-            echo "base_url=https://api.anthropic.com/v1" >> $GITHUB_ENV
-            echo "base_header=x-api-key: ${{ secrets.SPICE_SECRET_ANTHROPIC_API_KEY }}" >> $GITHUB_ENV
+            echo "BASE_URL=https://api.anthropic.com/v1" >> $GITHUB_ENV
+            echo "BASE_HEADER=x-api-key: ${{ secrets.SPICE_SECRET_ANTHROPIC_API_KEY }}" >> $GITHUB_ENV
           elif [[ "${{ github.event.inputs.base }}" == "xai" ]]; then
-            echo "base_url=https://api.xai.com/v1" >> $GITHUB_ENV
-            echo "base_header=Authorization: Bearer ${{ secrets.SPICE_SECRET_XAI_API_KEY }}" >> $GITHUB_ENV
+            echo "BASE_URL=https://api.xai.com/v1" >> $GITHUB_ENV
+            echo "BASE_HEADER=Authorization: Bearer ${{ secrets.SPICE_SECRET_XAI_API_KEY }}" >> $GITHUB_ENV
           fi
 
       - name: Run model http consistency test
         if: ${{ github.event.inputs.model }}
         run: |
+          echo "using base url ${{ env.BASE_URL }}"
           testoperator run http-overhead \
             -s /usr/local/bin/spiced \
             -p ${{ github.event.inputs.spicepod_path }} \
@@ -103,8 +103,8 @@ jobs:
             --disable-progress-bars \
             --duration ${{ github.event.inputs.duration }} \
             --payload-file ${{ github.event.inputs.payload_file }}
-            --base-url ${{ env.base_url }}
-            --base-header ${{ env.base_header }}
+            --base-url ${{ env.BASE_URL }}
+            --base-header ${{ env.BASE_HEADER }}
             --base-component ${{ github.event.inputs.base_component }}
         env:
           SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
@@ -122,8 +122,8 @@ jobs:
             --disable-progress-bars \
             --duration ${{ github.event.inputs.duration }} \
             --payload-file ${{ github.event.inputs.payload_file }}
-            --base-url ${{ env.base_url }}
-            --base-header ${{ env.base_header }}
+            --base-url ${{ env.BASE_URL }}
+            --base-header ${{ env.BASE_HEADER }}
             --base-component ${{ github.event.inputs.base_component }}
         env:
           SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
