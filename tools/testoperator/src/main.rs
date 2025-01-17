@@ -40,15 +40,23 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.subcommand {
-        Commands::Export(TestCommands::Throughput(DatasetTestArgs { common, .. }) |
-TestCommands::Bench(DatasetTestArgs { common, .. }) |
-TestCommands::Load(DatasetTestArgs { common, .. }) |
-TestCommands::HttpConsistency(HttpConsistencyTestArgs {
-http: HttpTestArgs { common, .. }, .. }) |
-TestCommands::HttpOverhead(HttpOverheadTestArgs {
-http: HttpTestArgs { common, .. }, .. }) |
-TestCommands::DataConsistency(DataConsistencyArgs {
-test_args: DatasetTestArgs { common, .. }, .. })) => {
+        Commands::Export(
+            TestCommands::Throughput(DatasetTestArgs { common, .. })
+            | TestCommands::Bench(DatasetTestArgs { common, .. })
+            | TestCommands::Load(DatasetTestArgs { common, .. })
+            | TestCommands::HttpConsistency(HttpConsistencyTestArgs {
+                http: HttpTestArgs { common, .. },
+                ..
+            })
+            | TestCommands::HttpOverhead(HttpOverheadTestArgs {
+                http: HttpTestArgs { common, .. },
+                ..
+            })
+            | TestCommands::DataConsistency(DataConsistencyArgs {
+                test_args: DatasetTestArgs { common, .. },
+                ..
+            }),
+        ) => {
             tests::env_export(&common)?;
         }
         Commands::Run(TestCommands::Throughput(args)) => tests::throughput::run(&args).await?,
