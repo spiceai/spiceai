@@ -1,0 +1,111 @@
+name: http consistency tests
+
+on:
+  workflow_dispatch:
+    inputs:
+      spiced_commit:
+        description: 'spiced build commit'
+        required: false
+        type: string
+      spicepod_path:
+        description: 'The spicepod file to test with'
+        required: true
+        type: string
+      payload_file:
+        description: 'The path to a file containing payloads to use in testing. Either JSONL of compatible request bodies, or individual string payloads. Cannot not be used in conjunction with `payload`'
+        required: false
+        type: string
+      embedding:
+        description: 'The embedding model (named in spicepod) to test against. Cannot be used in conjunction with `model`'
+        required: false
+        type: string
+      model:
+        description: 'The language model (named in spicepod) to test against. Cannot be used in conjunction with `embedding`'
+        required: false
+        type: string
+      ready_wait:
+        description: 'How long (in seconds) to wait for spiced to start'
+        required: true
+        default: '30'
+        type: string
+      buckets:
+        description: 'The number of buckets to divide the test duration into'
+        required: true
+        default: 10
+        type: number
+      runner_type:
+        description: 'Runner type'
+        required: true
+        default: 'spiceai-runners'
+        type: choice
+        options:
+          - 'spiceai-runners'
+          - 'spiceai-large-runners'
+
+jobs:
+  run-http-consistency:
+    name: Run http consistency tests
+    runs-on: ${{ github.event.inputs.runner_type || 'spiceai-runners' }}
+    timeout-minutes: 600
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install MinIO
+        run: |
+          sudo apt update && sudo apt install wget -y
+          sudo wget https://dl.min.io/client/mc/release/linux-amd64/mc -O /usr/local/bin/mc
+          sudo chmod +x /usr/local/bin/mc
+          mc alias set spice-minio ${{ secrets.MINIO_ENDPOINT }} ${{ secrets.MINIO_ACCESS_KEY }} ${{ secrets.MINIO_SECRET_KEY }}
+
+      - name: Get latest trunk commit
+        if: ${{ !github.event.inputs.spiced_commit }}
+        run: |
+          git fetch origin
+          echo "SPICED_COMMIT=$(git rev-parse origin/trunk)" >> $GITHUB_ENV
+
+      - name: Set SPICED_COMMIT from workflow input
+        if: ${{ github.event.inputs.spiced_commit }}
+        run: |
+          echo "SPICED_COMMIT=${{ github.event.inputs.spiced_commit }}" >> $GITHUB_ENV
+
+      - name: Download spiced from MinIO
+        run: |
+          mc cp spice-minio/artifacts/spiced/linux-x86_64/$SPICED_COMMIT/spiced_models_linux_x86_64.tar.gz spiced_models_linux_x86_64.tar.gz
+          tar -xzf spiced_models_linux_x86_64.tar.gz
+          sudo cp ./spiced /usr/local/bin/spiced
+
+      - name: Build Testoperator
+        uses: ./.github/actions/build-testoperator
+
+      - name: Run model http consistency test
+        if: ${{ github.event.inputs.model }}
+        run: |
+          rm -rf .spice/data
+          testoperator run http-consistency \
+            -s /usr/local/bin/spiced \
+            -p ${{ github.event.inputs.spicepod_path }} \
+            -d /opt/spiced/data \
+            --ready-wait ${{ github.event.inputs.ready_wait }} \
+            --model ${{ github.event.inputs.model }} \
+            --disable-progress-bars \
+            --payload-file ${{ github.event.inputs.payload_file }}
+        env:
+          SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
+          SPICE_SECRET_ANTHROPIC_API_KEY: ${{ secrets.SPICE_SECRET_ANTHROPIC_API_KEY }}
+          SPICE_SECRET_XAI_API_KEY: ${{ secrets.SPICE_SECRET_XAI_API_KEY }}
+
+      - name: Run embedding http consistency test
+        if: ${{ github.event.inputs.embedding }}
+        run: |
+          rm -rf .spice/data
+          testoperator run http-consistency \
+            -s /usr/local/bin/spiced \
+            -p ${{ github.event.inputs.spicepod_path }} \
+            --ready-wait ${{ github.event.inputs.ready_wait }} \
+            --embedding ${{ github.event.inputs.embedding }} \
+            --disable-progress-bars \
+            --payload-file ${{ github.event.inputs.payload_file }}
+        env:
+          SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
+          SPICE_SECRET_ANTHROPIC_API_KEY: ${{ secrets.SPICE_SECRET_ANTHROPIC_API_KEY }}
+          SPICE_SECRET_XAI_API_KEY: ${{ secrets.SPICE_SECRET_XAI_API_KEY }}

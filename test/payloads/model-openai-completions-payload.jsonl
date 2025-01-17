@@ -1,0 +1,1 @@
+{ "model": "model-llm", "stream": false, "messages": [{ "role": "system", "content": "You are a helpful assistant." },{ "role": "assistant", "content": "How can I help you?" },{ "role": "user", "content": "Hello! Tell me a joke." }]}

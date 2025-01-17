@@ -34,6 +34,8 @@ use uuid::Uuid;
 
 use crate::TestType;
 
+const FLOAT_ERROR_MARGIN: f64 = 0.0001;
+
 #[derive(Copy, Clone)]
 pub enum QueryStatus {
     Passed,
@@ -71,9 +73,9 @@ impl<T: ExtendedMetrics> QueryMetric<T> {
             query_name: name.to_string(),
             query_status: QueryStatus::Passed,
             median_duration: durations.median()?.as_secs_f64(),
-            percentile_99_duration: durations.percentile(0.99)?.as_secs_f64(),
-            percentile_95_duration: durations.percentile(0.95)?.as_secs_f64(),
-            percentile_90_duration: durations.percentile(0.90)?.as_secs_f64(),
+            percentile_99_duration: durations.percentile(99.0)?.as_secs_f64(),
+            percentile_95_duration: durations.percentile(95.0)?.as_secs_f64(),
+            percentile_90_duration: durations.percentile(90.0)?.as_secs_f64(),
             run_count: durations.len(),
             extended_metrics: None,
         })
@@ -108,12 +110,21 @@ pub trait StatisticsCollector<T, C> {
 
 impl StatisticsCollector<Duration, Vec<Duration>> for Vec<Duration> {
     fn percentile(&self, percentile: f64) -> Result<Duration> {
+        let mut sorted_durations = self.clone();
+        sorted_durations.sort();
+
         // safety: sorted_durations.len() cannot be negative, and is unlikely to be larger than u32::MAX
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let index = ((percentile * f64::from(u32::try_from(self.len())?)).ceil() as usize)
-            .saturating_sub(1)
-            .min(self.len() - 1);
-        Ok(self[index])
+        {
+            let rank = (percentile / 100.0) * (f64::from(u32::try_from(self.len() - 1)?));
+            if (rank - rank.floor()).abs() < FLOAT_ERROR_MARGIN {
+                Ok(self[rank as usize])
+            } else {
+                let lower_duration = self[rank.floor() as usize];
+                let upper_duration = self[rank.ceil() as usize];
+                Ok((lower_duration + upper_duration) / 2)
+            }
+        }
     }
 
     fn median(&self) -> Result<Duration> {
@@ -137,12 +148,8 @@ impl StatisticsCollector<Duration, Vec<Duration>> for Vec<Duration> {
         // safety: sorted_durations.len() cannot be negative, and is unlikely to be larger than u32::MAX
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         {
-            let first_quartile_index =
-                (f64::from(u32::try_from(sorted_durations.len())?) * 0.25).floor();
-            let third_quartile_index =
-                (f64::from(u32::try_from(sorted_durations.len())?) * 0.75).ceil();
-            let first_quartile_secs = sorted_durations[first_quartile_index as usize].as_secs_f64();
-            let third_quartile_secs = sorted_durations[third_quartile_index as usize].as_secs_f64();
+            let first_quartile_secs = sorted_durations.percentile(25.0)?.as_secs_f64();
+            let third_quartile_secs = sorted_durations.percentile(75.0)?.as_secs_f64();
 
             let iqr = third_quartile_secs - first_quartile_secs;
             let lower_bound = first_quartile_secs - 1.5 * iqr;
@@ -491,5 +498,70 @@ impl ExtendedMetrics for ExampleHelloWorldMetrics {
             "hello".to_string(),
             self.world.clone(),
         ))])
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use crate::metrics::StatisticsCollector;
+
+    #[test]
+    fn test_normal_percentiles_are_correct() {
+        let durations = vec![
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(2),
+            std::time::Duration::from_secs(3),
+            std::time::Duration::from_secs(4),
+            std::time::Duration::from_secs(5),
+        ];
+
+        let third_percentile = durations
+            .percentile(75.0)
+            .expect("percentile should calculate");
+        assert_eq!(third_percentile, std::time::Duration::from_secs(4));
+
+        let second_percentile = durations
+            .percentile(50.0)
+            .expect("percentile should calculate");
+        assert_eq!(second_percentile, std::time::Duration::from_secs(3));
+
+        let first_percentile = durations
+            .percentile(25.0)
+            .expect("percentile should calculate");
+        assert_eq!(first_percentile, std::time::Duration::from_secs(2));
+
+        let zero_percentile = durations
+            .percentile(0.0)
+            .expect("percentile should calculate");
+        assert_eq!(zero_percentile, std::time::Duration::from_secs(1));
+
+        let hundred_percentile = durations
+            .percentile(100.0)
+            .expect("percentile should calculate");
+        assert_eq!(hundred_percentile, std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn test_midpoint_percentiles_are_correct() {
+        let durations = vec![
+            std::time::Duration::from_secs(1), // Q0 - Q1 is 1.5
+            std::time::Duration::from_secs(2), // Q2 - Q3 is 2.5
+            std::time::Duration::from_secs(3), // Q4
+        ];
+
+        let second_percentile = durations
+            .percentile(50.0)
+            .expect("percentile should calculate");
+        assert_eq!(second_percentile, std::time::Duration::from_secs(2));
+
+        let first_percentile = durations
+            .percentile(25.0)
+            .expect("percentile should calculate");
+        assert_eq!(first_percentile, std::time::Duration::from_millis(1500));
+
+        let third_percentile = durations
+            .percentile(75.0)
+            .expect("percentile should calculate");
+        assert_eq!(third_percentile, std::time::Duration::from_millis(2500));
     }
 }
