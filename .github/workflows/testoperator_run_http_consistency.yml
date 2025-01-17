@@ -55,8 +55,6 @@ jobs:
           echo "  model: ${{ github.event.inputs.model }}"
           echo "  embedding: ${{ github.event.inputs.embedding }}"
           echo "  ready_wait: ${{ github.event.inputs.ready_wait }}"
-          echo "  base: ${{ github.event.inputs.base }}"
-          echo "  base_component: ${{ github.event.inputs.base_component }}"
 
       - uses: actions/checkout@v4
 
