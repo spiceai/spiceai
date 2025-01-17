@@ -1,0 +1,8 @@
+version: v1
+kind: Spicepod
+name: openai
+models:
+  - from: openai:gpt-4o-mini
+    name: model
+    params:
+      openai_api_key: ${ secrets.SPICE_SECRET_OPENAI_API_KEY }
