@@ -137,12 +137,22 @@ impl StatisticsCollector<Duration, Vec<Duration>> for Vec<Duration> {
         // safety: sorted_durations.len() cannot be negative, and is unlikely to be larger than u32::MAX
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         {
-            let first_quartile_index =
-                (f64::from(u32::try_from(sorted_durations.len())?) * 0.25).floor();
-            let third_quartile_index =
-                (f64::from(u32::try_from(sorted_durations.len())?) * 0.75).ceil();
-            let first_quartile_secs = sorted_durations[first_quartile_index as usize].as_secs_f64();
-            let third_quartile_secs = sorted_durations[third_quartile_index as usize].as_secs_f64();
+            let len = sorted_durations.len();
+
+            let (first_quartile_index, third_quartile_index) = if len <= 3 {
+                // Simplified calculation for small arrays
+                let first = ((len - 1) as f64 * 0.25).floor() as usize;
+                let third = ((len - 1) as f64 * 0.75).floor() as usize;
+                (first, third)
+            } else {
+                // Original calculation for larger arrays
+                let first = (f64::from(u32::try_from(len)?) * 0.25).floor();
+                let third = (f64::from(u32::try_from(len)?) * 0.75).ceil();
+                (first as usize, third as usize)
+            };
+
+            let first_quartile_secs = sorted_durations[first_quartile_index].as_secs_f64();
+            let third_quartile_secs = sorted_durations[third_quartile_index].as_secs_f64();
 
             let iqr = third_quartile_secs - first_quartile_secs;
             let lower_bound = first_quartile_secs - 1.5 * iqr;

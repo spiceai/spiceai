@@ -61,7 +61,7 @@ pub async fn consistency_run(args: &HttpConsistencyTestArgs) -> anyhow::Result<(
         )),
     );
 
-    println!("{}", with_color!(Color::Blue, "Starting overhead test"));
+    println!("{}", with_color!(Color::Blue, "Starting consistency test"));
     let test = test.start()?.wait().await?;
     let results = test.metrics()?;
 

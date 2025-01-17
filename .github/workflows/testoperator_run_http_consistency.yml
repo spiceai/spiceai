@@ -1,7 +1,6 @@
 name: http consistency tests
 
 on:
-  push:
   workflow_dispatch:
     inputs:
       spiced_commit:
@@ -12,11 +11,28 @@ on:
         description: 'The spicepod file to test with'
         required: true
         type: string
+      payload_file:
+        description: 'The path to a file containing payloads to use in testing. Either JSONL of compatible request bodies, or individual string payloads. Cannot not be used in conjunction with `payload`'
+        required: false
+        type: string
+      embedding:
+        description: 'The embedding model (named in spicepod) to test against. Cannot be used in conjunction with `model`'
+        required: false
+        type: string
+      model:
+        description: 'The language model (named in spicepod) to test against. Cannot be used in conjunction with `embedding`'
+        required: false
+        type: string
       ready_wait:
         description: 'How long (in seconds) to wait for spiced to start'
         required: true
         default: '30'
         type: string
+      buckets:
+        description: 'The number of buckets to divide the test duration into'
+        required: true
+        default: 10
+        type: number
       runner_type:
         description: 'Runner type'
         required: true
@@ -45,8 +61,7 @@ jobs:
         if: ${{ !github.event.inputs.spiced_commit }}
         run: |
           git fetch origin
-          echo "SPICED_COMMIT=6db0fd479fefe6d04b5fa6ce9da5bfa3907c45c7" >> $GITHUB_ENV
-          # echo "SPICED_COMMIT=$(git rev-parse origin/trunk)" >> $GITHUB_ENV
+          echo "SPICED_COMMIT=$(git rev-parse origin/trunk)" >> $GITHUB_ENV
 
       - name: Set SPICED_COMMIT from workflow input
         if: ${{ github.event.inputs.spiced_commit }}
@@ -67,7 +82,8 @@ jobs:
         with:
           query_set: ${{ github.event.inputs.query_set }}
 
-      - name: Run the http consistency test
+      - name: Run model http consistency test
+        if: ${{ github.event.inputs.model }}
         run: |
           rm -rf .spice/data
           testoperator run http-consistency \
@@ -75,13 +91,26 @@ jobs:
             -p ${{ github.event.inputs.spicepod_path }} \
             -d /opt/spiced/data \
             --ready-wait ${{ github.event.inputs.ready_wait }} \
-            --model model \
+            --model ${{ github.event.inputs.model }} \
             --disable-progress-bars \
-            --payload '{ "model": "model", "messages": [
-                { "role": "system", "content": "You are a helpful assistant." },
-                { "role": "assistant", "content": "How can I help you?" },
-                { "role": "user", "content": "Hello! Tell me a joke." }
-              ]}'
+            --payload-file ${{ github.event.inputs.payload_file }}
+        env:
+          SPICE_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
+          SPICE_ANTHROPIC_API_KEY: ${{ secrets.SPICE_SECRET_ANTHROPIC_API_KEY }}
+          SPICE_XAI_API_KEY: ${{ secrets.SPICE_SECRET_XAI_API_KEY }}
+
+      - name: Run embedding http consistency test
+        if: ${{ github.event.inputs.embedding }}
+        run: |
+          rm -rf .spice/data
+          testoperator run http-consistency \
+            -s /usr/local/bin/spiced \
+            -p ${{ github.event.inputs.spicepod_path }} \
+            -d /opt/spiced/data \
+            --ready-wait ${{ github.event.inputs.ready_wait }} \
+            --embedding ${{ github.event.inputs.embedding }} \
+            --disable-progress-bars \
+            --payload-file ${{ github.event.inputs.payload_file }}
         env:
           SPICE_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
           SPICE_ANTHROPIC_API_KEY: ${{ secrets.SPICE_SECRET_ANTHROPIC_API_KEY }}
