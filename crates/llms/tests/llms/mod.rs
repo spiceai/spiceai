@@ -348,7 +348,6 @@ async fn run_single_test(
     // Perform snapshot test from JSONPaths into the response.
     let resp_value =
         serde_json::to_value(&actual_resp).expect("failed to serialize response to JSON");
-    println!("resp_value: {resp_value:#?}");
     for (id, json_ptr) in &test.json_path {
         let resp_ptr = JsonPath::from_str(json_ptr)
             .expect("invalid JSONPath selector")
