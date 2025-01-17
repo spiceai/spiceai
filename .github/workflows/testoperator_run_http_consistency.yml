@@ -45,7 +45,8 @@ jobs:
         if: ${{ !github.event.inputs.spiced_commit }}
         run: |
           git fetch origin
-          echo "SPICED_COMMIT=$(git rev-parse origin/trunk)" >> $GITHUB_ENV
+          echo "SPICED_COMMIT=6db0fd479fefe6d04b5fa6ce9da5bfa3907c45c7" >> $GITHUB_ENV
+          # echo "SPICED_COMMIT=$(git rev-parse origin/trunk)" >> $GITHUB_ENV
 
       - name: Set SPICED_COMMIT from workflow input
         if: ${{ github.event.inputs.spiced_commit }}
