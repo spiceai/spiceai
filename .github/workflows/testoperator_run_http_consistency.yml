@@ -81,19 +81,9 @@ jobs:
       - name: Run model http consistency test
         if: ${{ github.event.inputs.model }}
         run: |
-          which testoperator
-          ls /usr/local/bin/spiced
-
-          echo ${{ github.event.inputs.spicepod_path }}
-          cat ${{ github.event.inputs.spicepod_path }}
-
-          echo ${{ github.event.inputs.payload_file }}
-          cat ${{ github.event.inputs.payload_file }}
-
           testoperator run http-consistency \
             -s /usr/local/bin/spiced \
             -p ${{ github.event.inputs.spicepod_path }} \
-            -d /opt/spiced/data \
             --ready-wait ${{ github.event.inputs.ready_wait }} \
             --model ${{ github.event.inputs.model }} \
             --disable-progress-bars \
