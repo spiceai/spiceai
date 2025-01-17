@@ -4,7 +4,5 @@ expression: "serde_json::to_string_pretty(&resp_ptr).expect(\"Failed to serializ
 snapshot_kind: text
 ---
 [
-  "assistant",
-  [],
-  null
+  1
 ]
