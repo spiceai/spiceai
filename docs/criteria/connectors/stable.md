@@ -155,19 +155,24 @@ Indexes are not required for test coverage, but can be introduced if required fo
 - [ ] [Throughput Metric](../definitions.md) is calculated and reported as a metric with a parallel query count of 1 to serve as a baseline metric.
 - [ ] [Throughput Metric](../definitions.md) is calculated and reported as a metric at the required [parallel query count](../definitions.md).
 - [ ] A [Load Test](../definitions.md) runs for a minimum of 8 hours at scale factor 1 as part of the end-to-end test. The 99th percentile of load test query [timing measurements](../definitions.md) must be compared against than the 99th percentile of the baseline throughput test timing measurements.
-  - **Common Criteria**
-    - Three or more [Yellow percentile measurements](../definitions.md#stop-light-percentile-measurements) are considered a test failure.
-    - One or more [Red percentile measurements](../definitions.md#stop-light-percentile-measurements) are considered a test failure.
-    - The service must not become unavailable for the entire duration of the test. A connection failure is considered a test failure.
-    - Queries that have a 99th percentile execution time faster than 1000ms are excluded from this check, as they complete so fast that this check is not meaningful.
-  - **Conditional Criteria** - Object store based connectors (`S3`, `ABFS`, `File`, `FTP`/`SFTP`, `HTTPS`) loading data from Parquet, CSV, TSV and JSON files are an exception to the common criteria and have reduced requirements.
-    - Load test should run all queries with no [Major or Minor Bugs](../definitions.md) at scale factor 1.
-    - Connector documentation includes any performance limitations and exceptions noted from the load test run (e.g., high CPU and/or memory usage, high network bandwidth consumtion, etc.).
+  - Three or more [Yellow percentile measurements](../definitions.md#stop-light-percentile-measurements) are considered a test failure.
+  - One or more [Red percentile measurements](../definitions.md#stop-light-percentile-measurements) are considered a test failure.
+  - The service must not become unavailable for the entire duration of the test. A connection failure is considered a test failure.
+  - Queries that have a 99th percentile execution time faster than 1000ms are excluded from this check, as they complete so fast that this check is not meaningful.
 - [ ] Memory usage is collected at the end of the end-to-end test and reported as a metric on the overall connector.
 - [ ] At the scale factor required by the connector criteria:
   - [ ] A test script exists that can load TPC-DS data at the [designated scale factor](#stable-release-criteria) into this connector.
   - [ ] The connector can load TPC-DS at the [designated scale factor](#stable-release-criteria), and can run all queries with no [Major or Minor Bugs](../definitions.md).
   - [ ] TPC-DS queries that execute successfully on Datafusion, should execute successfully on the connector.
+
+> **[Load Test](../definitions.md) exceptions for Object Store based connectors**
+>
+> `S3`, `ABFS`, `File`, `FTP`/`SFTP` and `HTTPS` connectors loading data from Parquet, CSV, TSV and JSON files have reduced requirements for the load test.
+> 
+>  - [ ] Load test should run all queries with no [Major or Minor Bugs](../definitions.md) at scale factor 1.
+>  - [ ] Connector documentation includes any performance limitations and exceptions noted from the load test run (e.g., high CPU and/or memory usage, high network bandwidth consumtion, etc.).
+>
+> Percentile measurements and service availability requirements omitted.
 
 ##### ClickBench
 
