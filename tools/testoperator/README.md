@@ -21,6 +21,7 @@ testoperator run [COMMAND] [OPTIONS]
 - `bench`: Run a benchmark test.
 - `data-consistency`: Run a data consistency test.
 - `http-consistency`: Runs a test to compare the latency performance of a HTTP enabled component as the component is persistently queried.
+- `http-overhead`: Runs a test to ensure the P50 & p90 latencies do not increase by some threshold over the duration of the test when N clients are sending queries concurrently.
 
 ### Export
 
