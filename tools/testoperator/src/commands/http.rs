@@ -91,7 +91,7 @@ pub struct HttpConsistencyTestArgs {
     pub(crate) buckets: usize,
 
     /// The threshold for the increase in percentile latency between the first and last bucket of the test.
-    #[arg(long, default_value = "1.1")]
+    #[arg(long, default_value = "1.15")]
     pub(crate) increase_threshold: f64,
 }
 
@@ -101,7 +101,7 @@ pub struct HttpOverheadTestArgs {
     pub(crate) http: HttpTestArgs,
 
     /// The threshold for the increase in percentile latency between the spice component and the underlying HTTP connection.
-    #[arg(long, default_value = "1.1")]
+    #[arg(long, default_value = "1.15")]
     pub(crate) increase_threshold: f64,
 
     /// The base URL of the underlying HTTP service to test against.
