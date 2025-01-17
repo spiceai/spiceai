@@ -169,9 +169,6 @@ Indexes are not required for test coverage, but can be introduced if required fo
   - [ ] The connector can load TPC-DS at the [designated scale factor](#stable-release-criteria), and can run all queries with no [Major or Minor Bugs](../definitions.md).
   - [ ] TPC-DS queries that execute successfully on Datafusion, should execute successfully on the connector.
 
-
-- [ ] 
-
 ##### ClickBench
 
 - [ ] A test script exists that can load ClickBench data into this connector.
