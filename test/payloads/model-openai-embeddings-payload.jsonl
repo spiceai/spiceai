@@ -1,1 +1,1 @@
-{ "input": "The food was delicious and the waiter...", "model": "model-embedding" }
+{ "input": "The food was delicious and the waiter...", "model": "text-embedding-3-small" }

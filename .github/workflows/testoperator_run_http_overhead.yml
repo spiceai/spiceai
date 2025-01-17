@@ -1,7 +1,6 @@
 name: http overhead tests
 
 on:
-  push:
   workflow_dispatch:
     inputs:
       spiced_commit:
@@ -83,13 +82,13 @@ jobs:
         id: base_params
         run: |
           if [[ "${{ github.event.inputs.base }}" == "openai" ]]; then
-            echo "base_url=https://api.openai.com" >> $GITHUB_ENV
+            echo "base_url=https://api.openai.com/v1" >> $GITHUB_ENV
             echo "base_header=Authorization: Bearer ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}" >> $GITHUB_ENV
           elif [[ "${{ github.event.inputs.base }}" == "anthropic" ]]; then
-            echo "base_url=https://api.anthropic.com" >> $GITHUB_ENV
+            echo "base_url=https://api.anthropic.com/v1" >> $GITHUB_ENV
             echo "base_header=x-api-key: ${{ secrets.SPICE_SECRET_ANTHROPIC_API_KEY }}" >> $GITHUB_ENV
           elif [[ "${{ github.event.inputs.base }}" == "xai" ]]; then
-            echo "base_url=https://api.xai.com" >> $GITHUB_ENV
+            echo "base_url=https://api.xai.com/v1" >> $GITHUB_ENV
             echo "base_header=Authorization: Bearer ${{ secrets.SPICE_SECRET_XAI_API_KEY }}" >> $GITHUB_ENV
           fi
 
