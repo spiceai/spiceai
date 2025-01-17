@@ -21,7 +21,11 @@ on:
         required: false
         type: string
       model:
-        description: 'Model name (LLM or Embedding)'
+        description: 'Model name'
+        required: false
+        type: string
+      embedding:
+        description: 'Embedding name'
         required: false
         type: string
       ready_wait:
@@ -93,7 +97,7 @@ jobs:
             -s /usr/local/bin/spiced \
             -p ${{ github.event.inputs.spicepod_path }} \
             --ready-wait ${{ github.event.inputs.ready_wait }} \
-            --embedding ${{ github.event.inputs.model }} \
+            --embedding ${{ github.event.inputs.embedding }} \
             --disable-progress-bars \
             --duration ${{ github.event.inputs.duration }} \
             --payload-file ${{ github.event.inputs.payload_file }}
