@@ -182,7 +182,7 @@ impl MetricCollector<NoExtendedMetrics> for SpiceTest<Completed> {
             .iter()
             .enumerate()
             .map(|(i, durations)| {
-                QueryMetric::new_from_durations(format!("Minute {i}").as_str(), durations)
+                QueryMetric::new_from_durations(format!("{i}").as_str(), durations)
             })
             .collect()
     }
