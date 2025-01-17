@@ -103,8 +103,8 @@ jobs:
             --disable-progress-bars \
             --duration ${{ github.event.inputs.duration }} \
             --payload-file ${{ github.event.inputs.payload_file }}
-            --base-url ${{ env.BASE_URL }}
-            --base-header ${{ env.BASE_HEADER }}
+            --base-url $BASE_URL
+            --base-header $BASE_HEADER
             --base-component ${{ github.event.inputs.base_component }}
         env:
           SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
@@ -122,8 +122,8 @@ jobs:
             --disable-progress-bars \
             --duration ${{ github.event.inputs.duration }} \
             --payload-file ${{ github.event.inputs.payload_file }}
-            --base-url ${{ env.BASE_URL }}
-            --base-header ${{ env.BASE_HEADER }}
+            --base-url $BASE_URL
+            --base-header $BASE_HEADER
             --base-component ${{ github.event.inputs.base_component }}
         env:
           SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
