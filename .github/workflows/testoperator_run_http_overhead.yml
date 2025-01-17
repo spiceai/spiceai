@@ -1,6 +1,7 @@
-name: http consistency tests
+name: http overhead tests
 
 on:
+  push:
   workflow_dispatch:
     inputs:
       spiced_commit:
@@ -29,11 +30,19 @@ on:
         required: true
         default: '30'
         type: string
-      buckets:
-        description: 'The number of buckets to divide the test duration into'
+      base:
+        description: Underlying HTTP service to test against
         required: true
-        default: 10
-        type: number
+        default: 'openai'
+        type: choice
+        options:
+          - 'openai'
+          - 'anthropic'
+          - 'xai'
+      base_component:
+        description: 'Base component'
+        required: true
+        type: string
 
 jobs:
   run-http-consistency:
@@ -70,10 +79,24 @@ jobs:
       - name: Build Testoperator
         uses: ./.github/actions/build-testoperator
 
+      - name: Set base parameters
+        id: base_params
+        run: |
+          if [[ "${{ github.event.inputs.base }}" == "openai" ]]; then
+            echo "base_url=https://api.openai.com" >> $GITHUB_ENV
+            echo "base_header=Authorization: Bearer ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}" >> $GITHUB_ENV
+          elif [[ "${{ github.event.inputs.base }}" == "anthropic" ]]; then
+            echo "base_url=https://api.anthropic.com" >> $GITHUB_ENV
+            echo "base_header=x-api-key: ${{ secrets.SPICE_SECRET_ANTHROPIC_API_KEY }}" >> $GITHUB_ENV
+          elif [[ "${{ github.event.inputs.base }}" == "xai" ]]; then
+            echo "base_url=https://api.xai.com" >> $GITHUB_ENV
+            echo "base_header=Authorization: Bearer ${{ secrets.SPICE_SECRET_XAI_API_KEY }}" >> $GITHUB_ENV
+          fi
+
       - name: Run model http consistency test
         if: ${{ github.event.inputs.model }}
         run: |
-          testoperator run http-consistency \
+          testoperator run http-overhead \
             -s /usr/local/bin/spiced \
             -p ${{ github.event.inputs.spicepod_path }} \
             --ready-wait ${{ github.event.inputs.ready_wait }} \
@@ -81,6 +104,9 @@ jobs:
             --disable-progress-bars \
             --duration ${{ github.event.inputs.duration }} \
             --payload-file ${{ github.event.inputs.payload_file }}
+            --base-url ${{ env.base_url }}
+            --base-header ${{ env.base_header }}
+            --base-component ${{ github.event.inputs.base_component }}
         env:
           SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
           SPICE_SECRET_ANTHROPIC_API_KEY: ${{ secrets.SPICE_SECRET_ANTHROPIC_API_KEY }}
@@ -89,7 +115,7 @@ jobs:
       - name: Run embedding http consistency test
         if: ${{ github.event.inputs.embedding }}
         run: |
-          testoperator run http-consistency \
+          testoperator run http-overhead \
             -s /usr/local/bin/spiced \
             -p ${{ github.event.inputs.spicepod_path }} \
             --ready-wait ${{ github.event.inputs.ready_wait }} \
@@ -97,6 +123,9 @@ jobs:
             --disable-progress-bars \
             --duration ${{ github.event.inputs.duration }} \
             --payload-file ${{ github.event.inputs.payload_file }}
+            --base-url ${{ env.base_url }}
+            --base-header ${{ env.base_header }}
+            --base-component ${{ github.event.inputs.base_component }}
         env:
           SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
           SPICE_SECRET_ANTHROPIC_API_KEY: ${{ secrets.SPICE_SECRET_ANTHROPIC_API_KEY }}
