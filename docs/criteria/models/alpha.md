@@ -6,7 +6,7 @@ All criteria must be met for the model to be considered Alpha. As Alpha signifie
 
 ## Alpha Quality Models
 
-|     Model Type          | Alpha Quality | DRI Sign-off    |
+| Model Type              | Alpha Quality | DRI Sign-off    |
 | ----------------------- | ------------- | --------------- |
 | File                    | ➖            |                 |
 | Hugging Face            | ➖            |                 |
@@ -15,7 +15,7 @@ All criteria must be met for the model to be considered Alpha. As Alpha signifie
 | Azure Openai            | ➖            |                 |
 | Anthropic               | ➖            |                 |
 | Nvidia NIM              | ✅            | @phillipleblanc |
-| xAI (Grok)              | ➖            |                 |
+| xAI (Grok)              | ✅            | @Sevenannn      |
 
 ## Alpha Release Criteria
 
