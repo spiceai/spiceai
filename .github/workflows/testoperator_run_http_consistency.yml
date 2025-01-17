@@ -101,7 +101,6 @@ jobs:
           testoperator run http-consistency \
             -s /usr/local/bin/spiced \
             -p ${{ github.event.inputs.spicepod_path }} \
-            -d /opt/spiced/data \
             --ready-wait ${{ github.event.inputs.ready_wait }} \
             --embedding ${{ github.event.inputs.embedding }} \
             --disable-progress-bars \
