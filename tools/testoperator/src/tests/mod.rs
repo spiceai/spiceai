@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::BTreeMap, path::Path};
+use std::collections::BTreeMap;
 
 use crate::commands::CommonArgs;
 use test_framework::{
@@ -29,18 +29,15 @@ pub(crate) mod throughput;
 mod util;
 pub(crate) type RowCounts = BTreeMap<String, usize>;
 
-pub(crate) fn get_app_and_start_request(
-    args: &CommonArgs,
-    data_dir: Option<&Path>,
-) -> anyhow::Result<(App, StartRequest)> {
+pub(crate) fn get_app_and_start_request(args: &CommonArgs) -> anyhow::Result<(App, StartRequest)> {
     let spicepod = Spicepod::load_exact(args.spicepod_path.clone())?;
     let app = test_framework::app::AppBuilder::new(spicepod.name.clone())
         .with_spicepod(spicepod)
         .build();
 
     let start_request = StartRequest::new(args.spiced_path.clone(), from_app(app.clone()))?;
-    let start_request = if let Some(data_dir) = data_dir {
-        start_request.with_data_dir(data_dir.to_path_buf())
+    let start_request = if let Some(ref data_dir) = args.data_dir {
+        start_request.with_data_dir(data_dir.clone())
     } else {
         start_request
     };
@@ -48,8 +45,8 @@ pub(crate) fn get_app_and_start_request(
     Ok((app, start_request))
 }
 
-pub(crate) fn env_export(args: &CommonArgs, data_dir: Option<&Path>) -> anyhow::Result<()> {
-    let (_, mut start_request) = get_app_and_start_request(args, data_dir)?;
+pub(crate) fn env_export(args: &CommonArgs) -> anyhow::Result<()> {
+    let (_, mut start_request) = get_app_and_start_request(args)?;
 
     start_request.prepare()?;
     let tempdir_path = start_request.get_tempdir_path();

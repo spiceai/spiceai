@@ -34,7 +34,7 @@ use test_framework::{
 /// Runs a test to ensure the P50 & p90 latencies do not increase by some threshold over the
 /// duration of the test when N clients are sending queries concurrently.
 pub async fn consistency_run(args: &HttpConsistencyTestArgs) -> anyhow::Result<()> {
-    let (app, start_request) = get_app_and_start_request(&args.http.common, None)?;
+    let (app, start_request) = get_app_and_start_request(&args.http.common)?;
     let component = args.http.get_http_component()?;
     let payloads: Vec<_> = args
         .http

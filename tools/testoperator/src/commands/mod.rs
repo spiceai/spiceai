@@ -20,7 +20,7 @@ use clap::{Parser, Subcommand};
 pub use dataset::{DataConsistencyArgs, DatasetTestArgs};
 
 mod http;
-pub use http::{HttpConsistencyTestArgs, HttpOverheadTestArgs};
+pub use http::{HttpConsistencyTestArgs, HttpOverheadTestArgs, HttpTestArgs};
 mod dataset;
 
 #[derive(Subcommand)]
@@ -69,4 +69,8 @@ pub struct CommonArgs {
     /// Whether to disable progress bars, for CI or non-interactive environments
     #[arg(long)]
     pub(crate) disable_progress_bars: bool,
+
+    /// An optional data directory, to symlink into the spiced instance
+    #[arg(short, long)]
+    pub(crate) data_dir: Option<PathBuf>,
 }

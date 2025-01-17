@@ -35,10 +35,6 @@ pub struct DatasetTestArgs {
 
     #[arg(long)]
     pub(crate) query_overrides: Option<QueryOverridesArg>,
-
-    /// An optional data directory, to symlink into the spiced instance
-    #[arg(short, long)]
-    pub(crate) data_dir: Option<PathBuf>,
 }
 
 #[derive(Clone, ValueEnum, Debug)]
