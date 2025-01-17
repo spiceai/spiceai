@@ -262,6 +262,7 @@ pub fn get_tpcds_test_queries(
             // Issue: https://github.com/spiceai/spiceai/issues/2939
             let queries: Vec<(&'static str, &'static str)> = remove_tpcds_query!(
                 queries, 1, 8,  // EXCEPT and INTERSECT aren't supported
+                4, // slow postgresql performance: https://www.postgresql.org/message-id/9A28C8860F777E439AA12E8AEA7694F801133F57%40BPXM15GP.gisp.nec.co.jp
                 30, // https://github.com/spiceai/spiceai/issues/2939
                 36, // overridden below
                 38, // EXCEPT and INTERSECT aren't supported

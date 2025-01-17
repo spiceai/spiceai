@@ -26,3 +26,8 @@ CREATE INDEX idx_date_dim ON date_dim (d_year);
 CREATE INDEX idx_store_sales_customer_sold_date ON store_sales (ss_customer_sk, ss_sold_date_sk);
 CREATE INDEX idx_catalog_sales_customer_bill ON catalog_sales (cs_bill_customer_sk, cs_sold_date_sk);
 CREATE INDEX idx_web_sales_customer_bill ON web_sales (ws_bill_customer_sk, ws_sold_date_sk);
+CREATE INDEX idx_store_returns_returned_date_store ON public.store_returns (sr_returned_date_sk, sr_store_sk);
+CREATE INDEX idx_catalog_returns_returned_date_catalog_page ON public.catalog_returns (cr_returned_date_sk, cr_catalog_page_sk);
+CREATE INDEX idx_store_sales_sold_date_store ON public.store_sales (ss_sold_date_sk, ss_store_sk);
+CREATE INDEX idx_catalog_sales_sold_date_catalog_page ON public.catalog_sales (cs_sold_date_sk, cs_catalog_page_sk);
+CREATE INDEX idx_web_sales_sold_date_web_site ON public.web_sales (ws_sold_date_sk, ws_web_site_sk);
