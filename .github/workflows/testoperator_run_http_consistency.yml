@@ -11,16 +11,21 @@ on:
         description: 'The spicepod file to test with'
         required: true
         type: string
+      duration:
+        description: 'The test duration in seconds'
+        required: true
+        default: '3600'
+        type: string
       payload_file:
-        description: 'The path to a file containing payloads to use in testing. Either JSONL of compatible request bodies, or individual string payloads. Cannot not be used in conjunction with `payload`'
+        description: 'Payload file'
         required: false
         type: string
       embedding:
-        description: 'The embedding model (named in spicepod) to test against. Cannot be used in conjunction with `model`'
+        description: 'The embedding model (named in spicepod).'
         required: false
         type: string
       model:
-        description: 'The language model (named in spicepod) to test against. Cannot be used in conjunction with `embedding`'
+        description: 'The language model (named in spicepod).'
         required: false
         type: string
       ready_wait:
@@ -80,7 +85,6 @@ jobs:
       - name: Run model http consistency test
         if: ${{ github.event.inputs.model }}
         run: |
-          rm -rf .spice/data
           testoperator run http-consistency \
             -s /usr/local/bin/spiced \
             -p ${{ github.event.inputs.spicepod_path }} \
@@ -88,6 +92,7 @@ jobs:
             --ready-wait ${{ github.event.inputs.ready_wait }} \
             --model ${{ github.event.inputs.model }} \
             --disable-progress-bars \
+            --duration ${{ github.event.inputs.duration }} \
             --payload-file ${{ github.event.inputs.payload_file }}
         env:
           SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
@@ -97,13 +102,13 @@ jobs:
       - name: Run embedding http consistency test
         if: ${{ github.event.inputs.embedding }}
         run: |
-          rm -rf .spice/data
           testoperator run http-consistency \
             -s /usr/local/bin/spiced \
             -p ${{ github.event.inputs.spicepod_path }} \
             --ready-wait ${{ github.event.inputs.ready_wait }} \
             --embedding ${{ github.event.inputs.embedding }} \
             --disable-progress-bars \
+            --duration ${{ github.event.inputs.duration }} \
             --payload-file ${{ github.event.inputs.payload_file }}
         env:
           SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
