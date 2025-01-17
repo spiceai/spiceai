@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use async_openai::types::CreateChatCompletionRequest;
+use async_openai::types::{ChatCompletionStreamOptions, CreateChatCompletionRequest};
 use jsonpath_rust::JsonPath;
 use llms::chat::Chat;
 use serde_json::{json, Value};
@@ -125,6 +125,22 @@ static TEST_CASES: LazyLock<Vec<TestCase>> = LazyLock::new(|| {
             ]
         ),
         test_case!(
+            "usage",
+            json!({
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "Say Hello"
+                    }
+                ]
+            }),
+            vec![
+                ("has_prompt_tokens", "$.usage.prompt_tokens"),
+                ("has_completion_tokens", "$.usage.completion_tokens"),
+                ("has_total_tokens", "$.usage.total_tokens"),
+            ]
+        ),
+        test_case!(
             "system_prompt",
             json!({
                 "messages": [
@@ -150,6 +166,32 @@ static TEST_CASES: LazyLock<Vec<TestCase>> = LazyLock::new(|| {
             ]
         ),
         test_case!(
+            "supports_basic_message_roles",
+            json!({
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": "Quote back the exact message from the user"
+                    },
+                    {
+                        "role": "user",
+                        "content": "call a tool"
+                    },
+                    {
+                        "role": "assistant",
+                        "content": "Sorry I, can't call a tool. ",
+                    },
+                    {
+                        "role": "user",
+                        "content": "That's fine. Tell me a joke."
+                    }
+                ],
+            }),
+            // This test is just to ensure that the model can handle all message roles.
+            // We don't need to check the response.
+            vec![]
+        ),
+        test_case!(
             "supports_all_message_roles",
             json!({
                 "messages": [
@@ -163,7 +205,6 @@ static TEST_CASES: LazyLock<Vec<TestCase>> = LazyLock::new(|| {
                     },
                     {
                         "role": "assistant",
-                        // "content": "Sure, calling the tool",
                         "tool_calls": [
                             {
                                 "id": "1",
@@ -287,6 +328,9 @@ async fn run_single_test(
     let actual_resp = if as_stream {
         let mut req = test.req.clone();
         req.stream = Some(true);
+        req.stream_options = Some(ChatCompletionStreamOptions {
+            include_usage: true,
+        });
         accumulate(model.chat_stream(req).await.unwrap_or_else(|e| {
             panic!("For test {test_name}/{model_name}, chat_request failed. Error: {e:#?}")
         }))
@@ -304,7 +348,7 @@ async fn run_single_test(
     // Perform snapshot test from JSONPaths into the response.
     let resp_value =
         serde_json::to_value(&actual_resp).expect("failed to serialize response to JSON");
-
+    println!("resp_value: {resp_value:#?}");
     for (id, json_ptr) in &test.json_path {
         let resp_ptr = JsonPath::from_str(json_ptr)
             .expect("invalid JSONPath selector")
@@ -348,36 +392,77 @@ macro_rules! generate_model_tests {
             };
         }
 
+        // Alpha Criteria
         test_model_case!(anthropic, basic);
         test_model_case!(anthropic, system_prompt);
-        test_model_case!(anthropic, tool_use);
-        test_model_case!(anthropic, tool_use, true);
-        test_model_case!(anthropic, supports_all_message_roles);
-        test_model_case!(anthropic, supports_all_message_roles, true);
+        test_model_case!(anthropic, supports_basic_message_roles);
+        test_model_case!(anthropic, basic, true);
+        test_model_case!(anthropic, system_prompt, true);
+        test_model_case!(anthropic, supports_basic_message_roles, true);
 
         test_model_case!(openai, basic);
         test_model_case!(openai, system_prompt);
-        test_model_case!(openai, tool_use);
-        test_model_case!(openai, tool_use, true);
-        test_model_case!(openai, supports_all_message_roles);
-        test_model_case!(openai, supports_all_message_roles, true);
+        test_model_case!(openai, supports_basic_message_roles);
+        test_model_case!(openai, basic, true);
+        test_model_case!(openai, system_prompt, true);
+        test_model_case!(openai, supports_basic_message_roles, true);
 
         test_model_case!(xai, basic);
         test_model_case!(xai, system_prompt);
-        test_model_case!(xai, tool_use);
-        test_model_case!(xai, tool_use, true);
-        test_model_case!(xai, supports_all_message_roles);
-        test_model_case!(xai, supports_all_message_roles, true);
+        test_model_case!(xai, supports_basic_message_roles);
+        test_model_case!(xai, basic, true);
+        test_model_case!(xai, system_prompt, true);
+        test_model_case!(xai, supports_basic_message_roles, true);
 
         test_model_case!(local_phi3, basic);
         test_model_case!(local_phi3, system_prompt);
-        test_model_case!(local_phi3, tool_use);
-        test_model_case!(local_phi3, supports_all_message_roles);
+        test_model_case!(local_phi3, supports_basic_message_roles);
+        test_model_case!(local_phi3, basic, true);
+        test_model_case!(local_phi3, system_prompt, true);
+        test_model_case!(local_phi3, supports_basic_message_roles, true);
 
         test_model_case!(hf_phi3, basic);
         test_model_case!(hf_phi3, system_prompt);
+        test_model_case!(hf_phi3, supports_basic_message_roles);
+        test_model_case!(hf_phi3, basic, true);
+        test_model_case!(hf_phi3, system_prompt, true);
+        test_model_case!(hf_phi3, supports_basic_message_roles, true);
+
+        // Beta
+        test_model_case!(anthropic, tool_use);
+        test_model_case!(anthropic, tool_use, true);
+        test_model_case!(anthropic, usage);
+        test_model_case!(anthropic, usage, true);
+        test_model_case!(anthropic, supports_all_message_roles);
+        test_model_case!(anthropic, supports_all_message_roles, true);
+
+        test_model_case!(openai, tool_use);
+        test_model_case!(openai, tool_use, true);
+        test_model_case!(openai, usage);
+        test_model_case!(openai, usage, true);
+        test_model_case!(openai, supports_all_message_roles);
+        test_model_case!(openai, supports_all_message_roles, true);
+
+        test_model_case!(xai, tool_use);
+        test_model_case!(xai, tool_use, true);
+        test_model_case!(xai, usage);
+        test_model_case!(xai, usage, true);
+        test_model_case!(xai, supports_all_message_roles);
+        test_model_case!(xai, supports_all_message_roles, true);
+
+        test_model_case!(local_phi3, tool_use);
+        test_model_case!(local_phi3, tool_use, true);
+        test_model_case!(local_phi3, usage);
+        test_model_case!(local_phi3, usage, true);
+        test_model_case!(local_phi3, supports_all_message_roles);
+        test_model_case!(local_phi3, supports_all_message_roles, true);
+
         test_model_case!(hf_phi3, tool_use);
+        test_model_case!(hf_phi3, tool_use, true);
+        test_model_case!(hf_phi3, usage);
+        test_model_case!(hf_phi3, usage, true);
         test_model_case!(hf_phi3, supports_all_message_roles);
+        test_model_case!(hf_phi3, supports_all_message_roles, true);
     };
 }
 #[cfg(test)]
