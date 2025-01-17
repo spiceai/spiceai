@@ -20,12 +20,8 @@ on:
         description: 'Payload file'
         required: false
         type: string
-      embedding:
-        description: 'The embedding model (named in spicepod).'
-        required: false
-        type: string
       model:
-        description: 'The language model (named in spicepod).'
+        description: 'Model name (LLM or Embedding)'
         required: false
         type: string
       ready_wait:
@@ -85,6 +81,15 @@ jobs:
       - name: Run model http consistency test
         if: ${{ github.event.inputs.model }}
         run: |
+          which testoperator
+          ls /usr/local/bin/spiced
+
+          echo ${{ github.event.inputs.spicepod_path }}
+          cat ${{ github.event.inputs.spicepod_path }}
+
+          echo ${{ github.event.inputs.payload_file }}
+          cat ${{ github.event.inputs.payload_file }}
+
           testoperator run http-consistency \
             -s /usr/local/bin/spiced \
             -p ${{ github.event.inputs.spicepod_path }} \
@@ -106,7 +111,7 @@ jobs:
             -s /usr/local/bin/spiced \
             -p ${{ github.event.inputs.spicepod_path }} \
             --ready-wait ${{ github.event.inputs.ready_wait }} \
-            --embedding ${{ github.event.inputs.embedding }} \
+            --embedding ${{ github.event.inputs.model }} \
             --disable-progress-bars \
             --duration ${{ github.event.inputs.duration }} \
             --payload-file ${{ github.event.inputs.payload_file }}
