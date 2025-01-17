@@ -72,7 +72,7 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 | `unity_catalog` | Stable |
 | `spice.ai`      | Stable |
 | `databricks`    | Beta   |
-| `iceberg`       | Alpha  |
+| `iceberg`       | Beta   |
 
 ### v1.0-stable Model Provider Support
 
@@ -88,13 +88,13 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 
 ## v1.1 (Feb 2025)
 
-- Enterprise Search improvements
+- Enterprise Search and Retrieval improvements
   - [#3006](https://github.com/spiceai/spiceai/issues/3006) Search with keyword filtering
   - [#3016](https://github.com/spiceai/spiceai/issues/3016) Hybrid-Search (DB + Vector)
   - [#3015](https://github.com/spiceai/spiceai/issues/3015) DataFusion Search
 - [#3318](https://github.com/spiceai/spiceai/issues/3318) FinanceBench in CI
 - Model Providers: OpenAI, HuggingFace, File (Stable)
-- Model Providers: Anthropic, Azure, Groq, Grok (Beta)
+- Model Providers: Anthropic, Azure OpenAI, Grok (Beta)
 - Data Accelerators: PostgreSQL (Stable)
 
 ## v1.2 (Mar 2025)
@@ -102,25 +102,26 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 - AWS Glue Catalog Connector (Alpha)
 - [#3018](https://github.com/spiceai/spiceai/issues/3018) Results caching for embeddings and search
 
-## v1.3 (April 2025)
+## v1.3 (Q1 2025)
 
 - Ingestion
   - PostgreSQL write
   - Delta Lake write
   - Iceberg write
 
-## v2 (2025)
+## v2 (H2 2025)
 
 - Policy
   - Security
   - Data Access
 - Extensible Middleware
-  - AuthN Providers
+- AuthN Providers
 
 ## Features being considered
 
 - Data Connectors
 
+  - S3 Tables
   - ElasticSearch
   - MotherDuck
   - BigQuery
