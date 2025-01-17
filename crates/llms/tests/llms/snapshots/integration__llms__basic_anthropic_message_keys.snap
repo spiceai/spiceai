@@ -5,6 +5,6 @@ snapshot_kind: text
 ---
 [
   "assistant",
-  [],
+  null,
   null
 ]

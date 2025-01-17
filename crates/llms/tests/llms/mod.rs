@@ -135,9 +135,26 @@ static TEST_CASES: LazyLock<Vec<TestCase>> = LazyLock::new(|| {
                 ]
             }),
             vec![
-                ("has_prompt_tokens", "$.usage.prompt_tokens"),
-                ("has_completion_tokens", "$.usage.completion_tokens"),
-                ("has_total_tokens", "$.usage.total_tokens"),
+                (
+                    "has_prompt_tokens",
+                    "$.usage[?(@.prompt_tokens > 0)].length()"
+                ),
+                (
+                    "has_completion_tokens",
+                    "$.usage[?(@.completion_tokens > 0)].length()"
+                ),
+                (
+                    "has_total_tokens",
+                    "$.usage[?(@.total_tokens > 0)].length()"
+                ),
+                (
+                    "total_tokens_gt_prompt_tokens",
+                    "$.usage[?(@.total_tokens >= @.prompt_tokens)].length()"
+                ),
+                (
+                    "total_tokens_gt_completion_tokens",
+                    "$.usage[?(@.total_tokens >= @.completion_tokens)].length()"
+                )
             ]
         ),
         test_case!(
