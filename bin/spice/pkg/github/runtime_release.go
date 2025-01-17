@@ -110,12 +110,12 @@ func get_ai_accelerator() (string, bool) {
 	}
 
 	if runtime.GOOS == "linux" {
-		hasCuda, err := has_cuda_device()
+		version, err := get_cuda_version()
 		if err != nil {
 			slog.Error("checking for CUDA device", "error", err)
 		}
-		if hasCuda {
-			return "cuda", true
+		if version != nil {
+			return "cuda_" + *version, true
 		}
 	}
 
@@ -138,24 +138,24 @@ func has_metal_device() (bool, error) {
 	return strings.Contains(string(output), "Metal Support: Metal"), nil
 }
 
-func has_cuda_device() (bool, error) {
+func get_cuda_version() (*string, error) {
 	if runtime.GOOS != "linux" {
-		return false, nil
+		return nil, nil
 	}
 
-	slog.Debug("On Linux, running `nvidia-smi --query-gpu=name --format=csv,noheader` to determine hardware")
-	cmd := exec.Command("nvidia-smi", "--query-gpu=name", "--format=csv,noheader")
+	slog.Debug("On Linux, running `nvidia-smi --query-gpu=compute_cap --format=csv,noheader` to determine hardware")
+	cmd := exec.Command("nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader")
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return false, fmt.Errorf("failed to get stdout pipe: %w", err)
+		return nil, fmt.Errorf("failed to get stdout pipe: %w", err)
 	}
 
 	if err := cmd.Start(); err != nil {
-		return false, fmt.Errorf("failed to start `nvidia-smi` command: %w", err)
+		return nil, fmt.Errorf("failed to start `nvidia-smi` command: %w", err)
 	}
 
 	// Read the output while the command is still running
-	cmd_output, readErr := io.ReadAll(stdout)
+	cmdOutput, readErr := io.ReadAll(stdout)
 
 	waitErr := cmd.Wait()
 
@@ -163,19 +163,22 @@ func has_cuda_device() (bool, error) {
 	if waitErr != nil {
 		if exitErr, ok := waitErr.(*exec.ExitError); ok {
 			slog.Warn("`nvidia-smi` command failed", "exit_code", exitErr.ExitCode(), "error", exitErr)
-			return false, nil
+			return nil, nil
 		}
-		return false, fmt.Errorf("unexpected error while waiting for `nvidia-smi`: %w", waitErr)
+		return nil, fmt.Errorf("unexpected error while waiting for `nvidia-smi`: %w", waitErr)
 	}
 
 	// Handle output reading errors separately
 	if readErr != nil {
-		return false, fmt.Errorf("failed to read output: %w", readErr)
+		return nil, fmt.Errorf("failed to read output: %w", readErr)
 	}
 
-	// Check if the output indicates available GPUs
-	if len(cmd_output) > 0 {
-		return true, nil
+	// Get CUDA version, if available: e.g., "8.6" will be returned as "86"
+	version := strings.ReplaceAll(strings.TrimSpace(string(cmdOutput)), ".", "")
+
+	if version == "" {
+		return nil, nil
 	}
-	return false, nil
+
+	return &version, nil
 }

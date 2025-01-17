@@ -52,7 +52,7 @@ arrow-ipc = "53"
 arrow-json = { git = "https://github.com/spiceai/arrow-rs.git", rev = "63d05723107d6dc5f08acc5461417ee42937adcc" }
 arrow-odbc = "11.2.0"
 arrow-schema = "53"
-async-openai = { git = "https://github.com/spiceai/async-openai", rev = "a0a9ae00570f47580a8059b378921728ef7fe6f2" }
+async-openai = { git = "https://github.com/spiceai/async-openai", rev = "b9068b2fad8f51e4b12e22d314ccc24d4cb8345d" }
 async-stream = "0.3.5"
 async-trait = "0.1.83"
 axum = { version = "0.7.9", features = ["macros"] }
@@ -71,7 +71,7 @@ datafusion-common = "43"
 datafusion-execution = "43"
 datafusion-expr = "43"
 datafusion-federation = "0.1"
-datafusion-federation-sql = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "d8697414cd59b4d6fce64a9899d7bcc6b26f27c9" }
+datafusion-federation-sql = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "a889f4bd47cba6b96d24a63a03891c64dadb6e15" }
 datafusion-functions-json = "0.43"
 datafusion-table-providers = "0.1"
 dotenvy = "0.15"
@@ -157,11 +157,10 @@ datafusion-common = { git = "https://github.com/spiceai/datafusion.git", rev = "
 datafusion-execution = { git = "https://github.com/spiceai/datafusion.git", rev = "4e1290a600233661e28952a42d39563c653c286e" }
 datafusion-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "4e1290a600233661e28952a42d39563c653c286e" }
 
-
 object_store = { git = "https://github.com/spiceai/arrow-rs.git", rev = "cee50b7d2ccf749eac89d0fe26fbd8a06c0bb3c4" }
 
-datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "d8697414cd59b4d6fce64a9899d7bcc6b26f27c9" }
-datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "5567f09f8154e484c6e73336e32875bd25a9a1fa" }
+datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "a889f4bd47cba6b96d24a63a03891c64dadb6e15" }
+datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "47f096b1551ccd4a21adf51084fa03b0bc518288" }
 
 duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "c7421f30d8ff2d39ed6df01a9ec51bc8781cfaae" }
 
@@ -174,7 +173,7 @@ rusqlite = { git = "https://github.com/spiceai/rusqlite.git", rev = "97054b6af72
 dotenvy = { git = "https://github.com/spiceai/dotenvy.git", rev = "e5cef1871b08003198949dfe2da988633eaad78f" }
 
 iceberg = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "557c79ff2c443c089e09d3ad60d382eb7fdba7bf" }
-iceberg-datafusion = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "557c79ff2c443c089e09d3ad60d382eb7fdba7bf" }
 iceberg-catalog-rest = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "557c79ff2c443c089e09d3ad60d382eb7fdba7bf" }
+iceberg-datafusion = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "557c79ff2c443c089e09d3ad60d382eb7fdba7bf" }
 
 cudarc = { git = "https://github.com/coreylowman/cudarc", rev = "d3405fa5ce18068d0362142c5d7b3910ea4039fa" }

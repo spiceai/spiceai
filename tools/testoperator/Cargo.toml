@@ -9,28 +9,29 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
-test-framework = { path = "../../crates/test-framework" }
 clap.workspace = true
+reqwest.workspace = true
+test-framework = { path = "../../crates/test-framework" }
 tokio.workspace = true
 
 [features]
-default = []
-duckdb = []
-postgres = []
-sqlite = []
-mysql = []
-flightsql = []
-delta_lake = []
-databricks = []
-dremio = []
+anonymous_telemetry = []
+aws-secrets-manager = []
 clickhouse = []
+databricks = []
+debezium = []
+delta_lake = []
+dremio = []
+duckdb = []
+flightsql = []
+ftp = []
+keyring-secret-store = []
+models = []
+mssql = []
+mysql = []
+odbc = []
+postgres = []
 sharepoint = []
 snowflake = []
 spark = []
-ftp = []
-debezium = []
-anonymous_telemetry = []
-mssql = []
-keyring-secret-store = []
-aws-secrets-manager = []
-odbc = []
+sqlite = []

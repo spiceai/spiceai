@@ -14,9 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
-use test_framework::queries::{QueryOverrides, QuerySet};
+
+use clap::{Parser, Subcommand};
+pub use dataset::{DataConsistencyArgs, DatasetTestArgs};
+
+mod http;
+pub use http::{HttpConsistencyTestArgs, HttpOverheadTestArgs, HttpTestArgs};
+mod dataset;
 
 #[derive(Subcommand)]
 pub enum Commands {
@@ -30,102 +35,42 @@ pub enum Commands {
 
 #[derive(Subcommand)]
 pub enum TestCommands {
-    Throughput(TestArgs),
-    Load(TestArgs),
-    Bench(TestArgs),
+    Throughput(DatasetTestArgs),
+    Load(DatasetTestArgs),
+    Bench(DatasetTestArgs),
     DataConsistency(DataConsistencyArgs),
+    HttpConsistency(HttpConsistencyTestArgs),
+    HttpOverhead(HttpOverheadTestArgs),
 }
 
+/// Arguments Common to all [`TestCommands`].
 #[derive(Parser, Debug, Clone)]
-pub struct TestArgs {
+pub struct CommonArgs {
     /// Path to the spicepod.yaml file
-    #[arg(short('p'), long)]
+    #[arg(short('p'), long, default_value = "spicepod.yaml")]
     pub(crate) spicepod_path: PathBuf,
 
+    /// The number of clients to run simultaneously. Each client will send a query, wait for a response, then send another query.
+    #[arg(long, default_value = "1")]
+    pub(crate) concurrency: usize,
+
     /// Path to the spiced binary
-    #[arg(short, long)]
+    #[arg(short, long, default_value = "spiced")]
     pub(crate) spiced_path: PathBuf,
+
+    /// The number of seconds to wait for the spiced instance to become ready
+    #[arg(long, default_value = "30")]
+    pub(crate) ready_wait: u64,
+
+    /// The duration of the test in seconds
+    #[arg(long, default_value = "60")]
+    pub(crate) duration: u64,
+
+    /// Whether to disable progress bars, for CI or non-interactive environments
+    #[arg(long)]
+    pub(crate) disable_progress_bars: bool,
 
     /// An optional data directory, to symlink into the spiced instance
     #[arg(short, long)]
     pub(crate) data_dir: Option<PathBuf>,
-
-    /// The expected scale factor for the test, used in metrics calculation
-    #[arg(long)]
-    pub(crate) scale_factor: Option<f64>,
-
-    /// The duration of the test in seconds
-    #[arg(long)]
-    pub(crate) duration: Option<usize>,
-
-    /// The query set to use for the test
-    #[arg(long)]
-    pub(crate) query_set: QuerySetArg,
-
-    #[arg(long)]
-    pub(crate) query_overrides: Option<QueryOverridesArg>,
-
-    #[arg(long)]
-    pub(crate) concurrency: Option<usize>,
-
-    #[arg(long)]
-    pub(crate) ready_wait: Option<usize>,
-
-    #[arg(long)]
-    pub(crate) disable_progress_bars: bool,
-}
-
-#[derive(Clone, ValueEnum, Debug)]
-pub enum QuerySetArg {
-    Tpch,
-    Tpcds,
-    Clickbench,
-}
-
-#[derive(Clone, ValueEnum, Debug)]
-pub enum QueryOverridesArg {
-    Sqlite,
-    Postgresql,
-    Mysql,
-    Dremio,
-    Spark,
-    ODBCAthena,
-    Duckdb,
-    Snowflake,
-    IcebergSF1,
-}
-
-impl From<QuerySetArg> for QuerySet {
-    fn from(arg: QuerySetArg) -> Self {
-        match arg {
-            QuerySetArg::Tpch => QuerySet::Tpch,
-            QuerySetArg::Tpcds => QuerySet::Tpcds,
-            QuerySetArg::Clickbench => QuerySet::Clickbench,
-        }
-    }
-}
-
-impl From<QueryOverridesArg> for QueryOverrides {
-    fn from(arg: QueryOverridesArg) -> Self {
-        match arg {
-            QueryOverridesArg::Sqlite => QueryOverrides::SQLite,
-            QueryOverridesArg::Postgresql => QueryOverrides::PostgreSQL,
-            QueryOverridesArg::Mysql => QueryOverrides::MySQL,
-            QueryOverridesArg::Dremio => QueryOverrides::Dremio,
-            QueryOverridesArg::Spark => QueryOverrides::Spark,
-            QueryOverridesArg::ODBCAthena => QueryOverrides::ODBCAthena,
-            QueryOverridesArg::Duckdb => QueryOverrides::DuckDB,
-            QueryOverridesArg::Snowflake => QueryOverrides::Snowflake,
-            QueryOverridesArg::IcebergSF1 => QueryOverrides::IcebergSF1,
-        }
-    }
-}
-
-#[derive(Parser, Debug)]
-pub struct DataConsistencyArgs {
-    #[command(flatten)]
-    pub(crate) test_args: TestArgs,
-
-    #[arg(long)]
-    pub(crate) compare_spicepod: PathBuf,
 }

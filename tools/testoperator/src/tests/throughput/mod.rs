@@ -15,54 +15,72 @@ limitations under the License.
 */
 
 use super::get_app_and_start_request;
-use crate::commands::TestArgs;
+use crate::commands::DatasetTestArgs;
 use std::time::Duration;
 use test_framework::{
     anyhow,
     metrics::MetricCollector,
     queries::{QueryOverrides, QuerySet},
     spiced::SpicedInstance,
-    spicetest::{EndCondition, SpiceTest},
+    spicetest::{
+        datasets::{EndCondition, NotStarted},
+        SpiceTest,
+    },
+    TestType,
 };
 
-pub(crate) async fn run(args: &TestArgs) -> anyhow::Result<()> {
+pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
+    if args.common.concurrency < 2 {
+        return Err(anyhow::anyhow!(
+            "Concurrency should be greater than 1 for a throughput test"
+        ));
+    }
+
     let query_set = QuerySet::from(args.query_set.clone());
     let query_overrides = args.query_overrides.clone().map(QueryOverrides::from);
     let queries = query_set.get_queries(query_overrides);
 
-    let (app, start_request) = get_app_and_start_request(args)?;
+    let (app, start_request) = get_app_and_start_request(&args.common)?;
     let mut spiced_instance = SpicedInstance::start(start_request).await?;
 
     spiced_instance
-        .wait_for_ready(Duration::from_secs(args.ready_wait.unwrap_or(30) as u64))
+        .wait_for_ready(Duration::from_secs(args.common.ready_wait))
         .await?;
 
     // baseline run
     println!("Running baseline test");
-    let baseline_test = SpiceTest::new(app.name.clone(), spiced_instance)
-        .with_query_set(queries.clone())
-        .with_parallel_count(1)
-        .with_end_condition(EndCondition::QuerySetCompleted(6))
-        .with_progress_bars(!args.disable_progress_bars)
-        .start()
-        .await?;
+    let baseline_test = SpiceTest::new(
+        app.name.clone(),
+        spiced_instance,
+        NotStarted::new()
+            .with_parallel_count(1)
+            .with_query_set(queries.clone())
+            .with_end_condition(EndCondition::QuerySetCompleted(6)),
+    )
+    .with_progress_bars(!args.common.disable_progress_bars)
+    .start()
+    .await?;
 
     let test = baseline_test.wait().await?;
     let spiced_instance = test.end();
 
     // throughput test
     println!("Running throughput test");
-    let throughput_test = SpiceTest::new(app.name.clone(), spiced_instance)
-        .with_query_set(queries.clone())
-        .with_parallel_count(args.concurrency.unwrap_or(8))
-        .with_end_condition(EndCondition::QuerySetCompleted(2))
-        .with_progress_bars(!args.disable_progress_bars)
-        .start()
-        .await?;
+    let throughput_test = SpiceTest::new(
+        app.name.clone(),
+        spiced_instance,
+        NotStarted::new()
+            .with_parallel_count(args.common.concurrency)
+            .with_query_set(queries.clone())
+            .with_end_condition(EndCondition::QuerySetCompleted(2)),
+    )
+    .with_progress_bars(!args.common.disable_progress_bars)
+    .start()
+    .await?;
 
     let test = throughput_test.wait().await?;
     let throughput_metric = test.get_throughput_metric(args.scale_factor.unwrap_or(1.0))?;
-    let metrics = test.collect()?;
+    let metrics = test.collect(TestType::Throughput)?;
     let mut spiced_instance = test.end();
 
     metrics.show()?;

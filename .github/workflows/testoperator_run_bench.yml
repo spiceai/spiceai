@@ -123,6 +123,8 @@ jobs:
           MYSQL_TCP_PORT: 3306
           MYSQL_USER: root
           MYSQL_PASSWORD: ${{ secrets.MYSQL_PASSWORD }}
+          POSTGRES_HOST: ${{ secrets.POSTGRES_HOST }}
+          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
 
       - name: Run the benchmark test (with overrides)
         if: ${{ github.event.inputs.query_overrides != '' }}
@@ -144,3 +146,5 @@ jobs:
           MYSQL_TCP_PORT: 3306
           MYSQL_USER: root
           MYSQL_PASSWORD: ${{ secrets.MYSQL_PASSWORD }}
+          POSTGRES_HOST: ${{ secrets.POSTGRES_HOST }}
+          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}

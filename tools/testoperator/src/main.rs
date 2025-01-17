@@ -20,7 +20,10 @@ use test_framework::{anyhow, rustls};
 mod commands;
 mod tests;
 
-use commands::{Commands, TestCommands};
+use commands::{
+    Commands, DataConsistencyArgs, DatasetTestArgs, HttpConsistencyTestArgs, HttpOverheadTestArgs,
+    HttpTestArgs, TestCommands,
+};
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -37,19 +40,38 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.subcommand {
+        Commands::Export(
+            TestCommands::Throughput(DatasetTestArgs { common, .. })
+            | TestCommands::Bench(DatasetTestArgs { common, .. })
+            | TestCommands::Load(DatasetTestArgs { common, .. })
+            | TestCommands::HttpConsistency(HttpConsistencyTestArgs {
+                http: HttpTestArgs { common, .. },
+                ..
+            })
+            | TestCommands::HttpOverhead(HttpOverheadTestArgs {
+                http: HttpTestArgs { common, .. },
+                ..
+            })
+            | TestCommands::DataConsistency(DataConsistencyArgs {
+                test_args: DatasetTestArgs { common, .. },
+                ..
+            }),
+        ) => {
+            tests::env_export(&common)?;
+        }
         Commands::Run(TestCommands::Throughput(args)) => tests::throughput::run(&args).await?,
-        Commands::Export(TestCommands::Throughput(args)) => tests::env_export(&args)?,
         Commands::Run(TestCommands::Load(args)) => tests::load::run(&args).await?,
-        Commands::Export(TestCommands::Load(args)) => tests::env_export(&args)?,
         Commands::Run(TestCommands::Bench(args)) => {
             tests::bench::run(&args).await?;
         }
-        Commands::Export(TestCommands::Bench(args)) => tests::env_export(&args)?,
         Commands::Run(TestCommands::DataConsistency(args)) => {
             tests::data_consistency::run(&args).await?;
         }
-        Commands::Export(TestCommands::DataConsistency(args)) => {
-            tests::env_export(&args.test_args)?;
+        Commands::Run(TestCommands::HttpOverhead(args)) => {
+            tests::http::overhead_run(&args).await?;
+        }
+        Commands::Run(TestCommands::HttpConsistency(args)) => {
+            tests::http::consistency_run(&args).await?;
         }
     }
 

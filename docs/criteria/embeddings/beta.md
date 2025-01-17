@@ -23,7 +23,7 @@ All criteria must be met for the embedding component to be considered Beta, with
 - [ ] Embedding requests emit runtime tracing, including linkage to parent tasks when used internally.
 - [ ] An embedding model running in the Spice runtime (as opposed to network-attached models), can handle consistent requests from several clients without an adverse impact on latency.
   - 8 clients consistently sending requests (i.e. sending another request upon receipt of prior request)
-  - A duration of 1 minutes.
+  - A duration of 5 minutes.
   - The body must have at least 128 tokens.
   - An increase in latency is defined as a 10% increase in both the 50th & 95th percentile between the first and last minute.
 

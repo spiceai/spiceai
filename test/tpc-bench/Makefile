@@ -213,6 +213,8 @@ pg-tpcds-load:
 		sed 's/|$$//' tpcds-kit/tools/tmp/data/$$table.dat > ./tmp/$$table.dat; \
 		psql -h $(DB_HOST) -p $(DB_PORT) -U $(DB_USER) $(DB_NAME) -c "\\copy $$table FROM './tmp/$$table.dat' CSV DELIMITER '|';"; \
 	done
+	@echo "Applying foreign keys from tpcds_ri.sql..."
+	@psql -h $(DB_HOST) -p $(DB_PORT) -U $(DB_USER) $(DB_NAME) -f ./tpcds-kit/tools/tpcds_ri.sql
 	@echo "Benchmark dataset has been successfully loaded to '$(DB_NAME)' database."
 
 file-tpch-init:

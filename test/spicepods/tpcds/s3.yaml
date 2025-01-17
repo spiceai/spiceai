@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: s3_tpch
+name: s3_tpcds
 datasets:
   - from: s3://benchmarks/tpcds_sf1/catalog_sales/
     name: catalog_sales

@@ -113,7 +113,8 @@ jobs:
             --query-set ${{ github.event.inputs.query_set }} \
             --ready-wait ${{ github.event.inputs.ready_wait }} \
             --disable-progress-bars \
-            --duration ${{ github.event.inputs.duration }}
+            --duration ${{ github.event.inputs.duration }} \
+            --concurrency 8
         env:
           S3_ENDPOINT: ${{ secrets.CLICKBENCH_S3_ENDPOINT}}
           S3_KEY: ${{ secrets.CLICKBENCH_S3_KEY}}
@@ -129,6 +130,8 @@ jobs:
           MYSQL_TCP_PORT: 3306
           MYSQL_USER: root
           MYSQL_PASSWORD: ${{ secrets.MYSQL_PASSWORD }}
+          POSTGRES_HOST: ${{ secrets.POSTGRES_HOST }}
+          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
 
       - name: Run the load test (with overrides)
         if: ${{ github.event.inputs.query_overrides != '' }}
@@ -142,7 +145,8 @@ jobs:
             --ready-wait ${{ github.event.inputs.ready_wait }} \
             --disable-progress-bars \
             --duration ${{ github.event.inputs.duration }} \
-            --query-overrides ${{ github.event.inputs.query_overrides }}
+            --query-overrides ${{ github.event.inputs.query_overrides }} \
+            --concurrency 8
         env:
           S3_ENDPOINT: ${{ secrets.CLICKBENCH_S3_ENDPOINT}}
           S3_KEY: ${{ secrets.CLICKBENCH_S3_KEY}}
@@ -158,3 +162,5 @@ jobs:
           MYSQL_TCP_PORT: 3306
           MYSQL_USER: root
           MYSQL_PASSWORD: ${{ secrets.MYSQL_PASSWORD }}
+          POSTGRES_HOST: ${{ secrets.POSTGRES_HOST }}
+          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}

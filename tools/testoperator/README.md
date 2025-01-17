@@ -20,6 +20,8 @@ testoperator run [COMMAND] [OPTIONS]
 - `load`: Run a load test.
 - `bench`: Run a benchmark test.
 - `data-consistency`: Run a data consistency test.
+- `http-consistency`: Runs a test to compare the latency performance of a HTTP enabled component as the component is persistently queried.
+- `http-overhead`: Runs a test to ensure the P50 & p90 latencies do not increase by some threshold over the duration of the test when N clients are sending queries concurrently.
 
 ### Export
 
@@ -76,4 +78,73 @@ testoperator export throughput -p ./benchmarks/file_tpch.yaml -s spiced -d ./.da
 
 ```sh
 testoperator run throughput -p spicepod.yaml -s ./target/debug/spiced --query-set tpch
+```
+
+#### Run a HTTP consistency test against an embedding model
+```sh
+testoperator run http-consistency \
+    --duration 300 \
+    --buckets 5 \
+    --embedding openai-ada \
+    --payload "A nice string to embed" \
+    --payload "{
+        \"input\": \"The food was delicious and the waiter...\",
+        \"model\": \"text-embedding-ada-002\",
+        \"encoding_format\": \"float\"
+      }"
+```
+Note: The `.model` field in the payload will be overriden.
+
+#### Run a HTTP consistency test against an LLM model
+```sh
+testoperator run http-consistency \
+    --duration 300 \
+    --buckets 5 \
+    --model openai-gpt5 \
+    --payload-file payloads.txt  #Use JSONL-like format for JSON payloads
+```
+
+
+#### Run a HTTP overhead test against an embedding model
+```sh
+testoperator run http-overhead \
+  --duration 10 \
+  --embedding oai \
+  --base-url "https://api.openai.com/v1" \
+  --base-component "text-embedding-3-small" \
+  --base-header "Content-Type: application/json" \
+  --base-header "Authorization: Bearer $MY_OPENAI_API_KEY" \
+  --payload "A nice string to embed" \
+  --payload "{
+      \"input\": \"The food was delicious and the waiter...\",
+      \"model\": \"text-embedding-ada-002\",
+      \"encoding_format\": \"float\"
+    }"
+```
+
+#### Run a HTTP overhead test against an LLM model with incompatible API (e.g. Anthropic)
+```sh
+cargo run run http-overhead \
+  --duration 10 \
+  # These fields are for the spice component
+  --model claude-tool \
+  --payload "A nice string to embed" \
+  --payload "{
+      \"input\": \"The food was delicious and the waiter...\",
+      \"model\": \"text-embedding-ada-002\",
+      \"encoding_format\": \"float\"
+    }" \
+
+  # These fields are for the base/underlying component
+  --base-url "https://api.anthropic.com/v1/messages" \
+  --base-header "Content-Type: application/json" \
+  --base-header "anthropic-version: 2023-06-01" \
+  --base-header ""x-api-key: $ANTHROPIC_API_KEY" \
+  --base-payload-file bodies.jsonl
+```
+
+Where `bodies.jsonl` might look like
+```jsonl
+{"model": "claude-3-5-sonnet-20241022","max_tokens": 1024,"messages": [{"role": "user", "content": "Hello, world"}]}
+{"model": "claude-3-5-sonnet-20241022","max_tokens": 512,"messages": [{"role": "system", "content": "You are god"}, {"role": "user", "content": "Is god real?"}]}
 ```

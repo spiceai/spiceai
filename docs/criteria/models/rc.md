@@ -19,10 +19,6 @@ All criteria must be met for the model to be considered RC.
 ## RC Release Criteria
 
 - [ ] All [Beta release criteria](./beta.md) pass.
-- [ ] Complete and passing integration testing in [`runtime`](https://github.com/spiceai/spiceai/blob/trunk/crates/runtime/tests/models) crate, including:
-  - [ ] NSQL integration tests.
-  - [ ] Chat completion integration tests (model defined in SpicePod runtime).
-  - [ ] Tool usage integration tests.
 - [ ] Can handle consistent requests from several clients without an adverse impact on latency. Resource efficiency (memory, CPU, and I/O usage) is measured.
   - 8 clients consistently sending requests (i.e. sending another request upon receipt of prior request)
   - A duration of 60 minutes.
