@@ -6,10 +6,10 @@ All criteria must be met for the Catalog to be considered Beta, with exceptions 
 
 ## Beta Quality Catalogs
 
-| Catalog       | Beta Quality | DRI Sign-off |
-| ------------- | ------------ | -------------- |
-| Databricks    | ➖           |                 |
-| Iceberg       | ✅            | @phillipleblanc |
+| Catalog       | Beta Quality | DRI Sign-off    |
+| ------------- | ------------ | --------------- |
+| Databricks    | ✅           | @Sevenannn      |
+| Iceberg       | ✅           | @phillipleblanc |
 | Spice.ai      | ➖           |                 |
 | Unity Catalog | ➖           |                 |
 

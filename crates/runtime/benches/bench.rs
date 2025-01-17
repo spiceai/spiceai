@@ -43,9 +43,7 @@ use futures::TryStreamExt;
 use results::{BenchmarkResult, BenchmarkResultsBuilder};
 use runtime::request::{Protocol, RequestContext, UserAgent};
 use runtime::{dataupdate::DataUpdate, Runtime};
-use spicepod::component::dataset::acceleration::{
-    self, Acceleration, Mode, RefreshMode, ZeroResultsAction,
-};
+use spicepod::component::dataset::acceleration::{self, Acceleration, Mode, RefreshMode};
 
 mod results;
 mod setup;
@@ -110,43 +108,6 @@ impl From<AcceleratorRefreshMode> for acceleration::RefreshMode {
     }
 }
 
-#[derive(Debug, Default, Clone, Copy)]
-enum AcceleratorZeroResults {
-    UseSource,
-    #[default]
-    ReturnEmpty,
-}
-
-impl FromStr for AcceleratorZeroResults {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "use_source" => Ok(AcceleratorZeroResults::UseSource),
-            "return_empty" => Ok(AcceleratorZeroResults::ReturnEmpty),
-            _ => Err(format!("Unsupported accelerator zero results mode: {s}")),
-        }
-    }
-}
-
-impl Display for AcceleratorZeroResults {
-    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
-        match self {
-            AcceleratorZeroResults::UseSource => write!(f, "use_source"),
-            AcceleratorZeroResults::ReturnEmpty => write!(f, "return_empty"),
-        }
-    }
-}
-
-impl From<AcceleratorZeroResults> for acceleration::ZeroResultsAction {
-    fn from(mode: AcceleratorZeroResults) -> Self {
-        match mode {
-            AcceleratorZeroResults::UseSource => acceleration::ZeroResultsAction::UseSource,
-            AcceleratorZeroResults::ReturnEmpty => acceleration::ZeroResultsAction::ReturnEmpty,
-        }
-    }
-}
-
 // Define command line arguments for running benchmark test
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -169,9 +130,6 @@ struct BenchArgs {
 
     #[arg(long, default_value_t=AcceleratorRefreshMode::Full)]
     refresh_mode: AcceleratorRefreshMode,
-
-    #[arg(long, default_value_t=AcceleratorZeroResults::ReturnEmpty)]
-    zero_results: AcceleratorZeroResults,
 
     /// Set the benchmark to run: TPCH / TPCDS
     #[arg(short, long, default_value = "tpch")]
@@ -235,27 +193,22 @@ async fn bench_main() -> Result<(), String> {
                 run_connector_bench(connector, upload_results_dataset.as_ref(), args.bench_name.as_ref()).await?;
             }
             let accelerators: Vec<Acceleration> = vec![
-                create_acceleration("arrow", acceleration::Mode::Memory, args.bench_name.as_ref(), RefreshMode::Full, ZeroResultsAction::ReturnEmpty),
-                create_acceleration("arrow", acceleration::Mode::Memory, args.bench_name.as_ref(), RefreshMode::Full, ZeroResultsAction::UseSource),
-                create_acceleration("arrow", acceleration::Mode::Memory, args.bench_name.as_ref(), RefreshMode::Append, ZeroResultsAction::ReturnEmpty),
+                create_acceleration("arrow", acceleration::Mode::Memory, args.bench_name.as_ref(), RefreshMode::Full),
+                create_acceleration("arrow", acceleration::Mode::Memory, args.bench_name.as_ref(), RefreshMode::Append),
                 #[cfg(feature = "duckdb")]
-                create_acceleration("duckdb", acceleration::Mode::Memory, args.bench_name.as_ref(), RefreshMode::Full, ZeroResultsAction::ReturnEmpty),
+                create_acceleration("duckdb", acceleration::Mode::Memory, args.bench_name.as_ref(), RefreshMode::Full),
                 #[cfg(feature = "duckdb")]
-                create_acceleration("duckdb", acceleration::Mode::Memory, args.bench_name.as_ref(), RefreshMode::Full, ZeroResultsAction::UseSource),
+                create_acceleration("duckdb", acceleration::Mode::File, args.bench_name.as_ref(), RefreshMode::Full),
                 #[cfg(feature = "duckdb")]
-                create_acceleration("duckdb", acceleration::Mode::File, args.bench_name.as_ref(), RefreshMode::Full, ZeroResultsAction::ReturnEmpty),
+                create_acceleration("duckdb", acceleration::Mode::Memory, args.bench_name.as_ref(), RefreshMode::Append),
                 #[cfg(feature = "duckdb")]
-                create_acceleration("duckdb", acceleration::Mode::File, args.bench_name.as_ref(), RefreshMode::Full, ZeroResultsAction::UseSource),
-                #[cfg(feature = "duckdb")]
-                create_acceleration("duckdb", acceleration::Mode::Memory, args.bench_name.as_ref(), RefreshMode::Append, ZeroResultsAction::ReturnEmpty),
-                #[cfg(feature = "duckdb")]
-                create_acceleration("duckdb", acceleration::Mode::File, args.bench_name.as_ref(), RefreshMode::Append, ZeroResultsAction::ReturnEmpty),
+                create_acceleration("duckdb", acceleration::Mode::File, args.bench_name.as_ref(), RefreshMode::Append),
                 #[cfg(feature = "sqlite")]
-                create_acceleration("sqlite", acceleration::Mode::Memory, args.bench_name.as_ref(), RefreshMode::Full, ZeroResultsAction::ReturnEmpty),
+                create_acceleration("sqlite", acceleration::Mode::Memory, args.bench_name.as_ref(), RefreshMode::Full),
                 #[cfg(feature = "sqlite")]
-                create_acceleration("sqlite", acceleration::Mode::File, args.bench_name.as_ref(), RefreshMode::Full, ZeroResultsAction::ReturnEmpty),
+                create_acceleration("sqlite", acceleration::Mode::File, args.bench_name.as_ref(), RefreshMode::Full),
                 #[cfg(feature = "postgres")]
-                create_acceleration("postgres", acceleration::Mode::Memory, args.bench_name.as_ref(), RefreshMode::Full, ZeroResultsAction::ReturnEmpty),
+                create_acceleration("postgres", acceleration::Mode::Memory, args.bench_name.as_ref(), RefreshMode::Full),
             ];
             for accelerator in accelerators {
                 if accelerator.refresh_mode == Some(RefreshMode::Append) {
@@ -281,31 +234,30 @@ async fn bench_main() -> Result<(), String> {
             };
 
             let refresh_mode = RefreshMode::from(args.refresh_mode);
-            let zero_results = ZeroResultsAction::from(args.zero_results);
-            let acceleration = create_acceleration(accelerator, mode, args.bench_name.as_ref(), refresh_mode.clone(), zero_results.clone());
+            let acceleration = create_acceleration(accelerator, mode, args.bench_name.as_ref(), refresh_mode.clone());
 
-            match (zero_results, refresh_mode, args.bench_name.as_ref()) {
-                (ZeroResultsAction::ReturnEmpty, RefreshMode::Append, "tpch") => {
+            match (refresh_mode, args.bench_name.as_ref()) {
+                (RefreshMode::Append, "tpch") => {
                     run_accelerator_bench("file", acceleration, upload_results_dataset.as_ref(), "tpch").await?;
                 }
-                (ZeroResultsAction::ReturnEmpty, RefreshMode::Append, "tpcds") => {
+                (RefreshMode::Append, "tpcds") => {
                     run_accelerator_bench("file", acceleration, upload_results_dataset.as_ref(), "tpcds").await?;
                 }
-                (ZeroResultsAction::ReturnEmpty, RefreshMode::Append, "clickbench") => {
+                (RefreshMode::Append, "clickbench") => {
                     run_accelerator_bench("file", acceleration, upload_results_dataset.as_ref(), "clickbench").await?;
                 }
-                (_, RefreshMode::Full, "tpch") => {
+                (RefreshMode::Full, "tpch") => {
                     run_accelerator_bench("s3", acceleration, upload_results_dataset.as_ref(), "tpch").await?;
                 }
-                (_, RefreshMode::Full, "tpcds") => {
+                (RefreshMode::Full, "tpcds") => {
                     run_accelerator_bench("s3", acceleration, upload_results_dataset.as_ref(), "tpcds").await?;
                 }
-                (_, RefreshMode::Full, "clickbench") => {
+                (RefreshMode::Full, "clickbench") => {
                     run_accelerator_bench("s3", acceleration, upload_results_dataset.as_ref(), "clickbench").await?;
                 }
-                (_, RefreshMode::Append, benchmark) => return Err(format!("Append mode benchmark is not implemented for {benchmark}")),
-                (_, RefreshMode::Changes, benchmark) => return Err(format!("CDC mode benchmark is not implemented for {benchmark}")),
-                (_, RefreshMode::Full, benchmark) => return Err(format!("Invalid benchmark parameter for accelerator benchmark: {benchmark}")),
+                (RefreshMode::Append, benchmark) => return Err(format!("Append mode benchmark is not implemented for {benchmark}")),
+                (RefreshMode::Changes, benchmark) => return Err(format!("CDC mode benchmark is not implemented for {benchmark}")),
+                (RefreshMode::Full, benchmark) => return Err(format!("Invalid benchmark parameter for accelerator benchmark: {benchmark}")),
             }
         },
         _ => return Err("Invalid command line input: accelerator or mode parameter supplied for connector benchmark".to_string()),
@@ -506,7 +458,6 @@ fn create_acceleration(
     mode: acceleration::Mode,
     bench_name: &str,
     append: acceleration::RefreshMode,
-    zero_results: acceleration::ZeroResultsAction,
 ) -> Acceleration {
     let mut acceleration = match engine {
         #[cfg(feature = "postgres")]
@@ -514,14 +465,12 @@ fn create_acceleration(
             engine: Some(engine.to_string()),
             mode,
             params: Some(get_postgres_params(true, bench_name)),
-            on_zero_results: zero_results,
             ..Default::default()
         },
         _ => Acceleration {
             engine: Some(engine.to_string()),
             mode,
             params: None,
-            on_zero_results: zero_results,
             ..Default::default()
         },
     };

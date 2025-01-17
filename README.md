@@ -185,8 +185,8 @@ See more demos on [YouTube](https://www.youtube.com/playlist?list=PLesJrUXEx3U9a
 
 | Name       | Description                     | Status            | Engine Modes     |
 | ---------- | ------------------------------- | ----------------- | ---------------- |
-| `arrow`    | In-Memory Arrow Records         | Release Candidate | `memory`         |
-| `duckdb`   | Embedded [DuckDB][duckdb]       | Release Candidate | `memory`, `file` |
+| `arrow`    | In-Memory Arrow Records         | Stable            | `memory`         |
+| `duckdb`   | Embedded [DuckDB][duckdb]       | Stable            | `memory`, `file` |
 | `postgres` | Attached [PostgreSQL][postgres] | Release Candidate | N/A              |
 | `sqlite`   | Embedded [SQLite][sqlite]       | Release Candidate | `memory`, `file` |
 
@@ -213,7 +213,7 @@ Catalog Connectors connect to external catalog providers and make their tables a
 | Name            | Description             | Status      | Protocol/Format              |
 | --------------- | ----------------------- | ----------- | ---------------------------- |
 | `iceberg`       | Apache Iceberg          | Beta        | Parquet                      |
-| `databricks`    | Databricks              | Alpha       | Spark Connect, S3/Delta Lake |
+| `databricks`    | Databricks              | Beta        | Spark Connect, S3/Delta Lake |
 | `unity_catalog` | Unity Catalog           | Alpha       | Delta Lake                   |
 | `spice.ai`      | Spice.ai Cloud Platform | Alpha       | Arrow Flight                 |
 | `glue`          | AWS Glue                | Coming Soon | JSON, Parquet, Iceberg       |

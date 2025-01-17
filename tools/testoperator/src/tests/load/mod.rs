@@ -38,7 +38,7 @@ pub(crate) async fn run(args: &TestArgs) -> anyhow::Result<()> {
         .await?;
 
     let test_duration = Duration::from_secs(args.duration.unwrap_or(60).try_into()?);
-    let test_hours = (test_duration.as_secs() / 60 / 60).min(1);
+    let test_hours = (test_duration.as_secs() / 60 / 60).max(1);
 
     // baseline run
     println!("Running baseline throughput test");
@@ -56,6 +56,8 @@ pub(crate) async fn run(args: &TestArgs) -> anyhow::Result<()> {
         .statistical_set()?
         .percentile(0.99)?;
     let baseline_metrics = test.collect()?;
+    println!("Baseline metrics:");
+    baseline_metrics.show()?;
     let spiced_instance = test.end();
 
     // load test

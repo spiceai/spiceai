@@ -1,0 +1,112 @@
+version: v1
+kind: Spicepod
+name: mysql_tpcds
+
+# Define common anchors
+definitions:
+  
+  # Common mysql parameters
+  - &mysql_params
+    mysql_host: ${env:MYSQL_HOST}
+    mysql_tcp_port: ${env:MYSQL_TCP_PORT}
+    mysql_db: ${env:MYSQL_DB}
+    mysql_user: ${env:MYSQL_USER}
+    mysql_pass: ${env:MYSQL_PASSWORD}
+    mysql_sslmode: disabled
+
+datasets:
+  - from: mysql:call_center
+    name: call_center
+    params: *mysql_params
+
+  - from: mysql:catalog_page
+    name: catalog_page
+    params: *mysql_params
+
+  - from: mysql:catalog_returns
+    name: catalog_returns
+    params: *mysql_params
+
+  - from: mysql:catalog_sales
+    name: catalog_sales
+    params: *mysql_params
+
+  - from: mysql:customer
+    name: customer
+    params: *mysql_params
+
+  - from: mysql:customer_address
+    name: customer_address
+    params: *mysql_params
+
+  - from: mysql:customer_demographics
+    name: customer_demographics
+    params: *mysql_params
+
+  - from: mysql:date_dim
+    name: date_dim
+    params: *mysql_params
+
+  - from: mysql:household_demographics
+    name: household_demographics
+    params: *mysql_params
+
+  - from: mysql:income_band
+    name: income_band
+    params: *mysql_params
+
+  - from: mysql:inventory
+    name: inventory
+    params: *mysql_params
+
+  - from: mysql:item
+    name: item
+    params: *mysql_params
+
+  - from: mysql:promotion
+    name: promotion
+    params: *mysql_params
+
+  - from: mysql:reason
+    name: reason
+    params: *mysql_params
+
+  - from: mysql:ship_mode
+    name: ship_mode
+    params: *mysql_params
+
+  - from: mysql:store
+    name: store
+    params: *mysql_params
+
+  - from: mysql:store_returns
+    name: store_returns
+    params: *mysql_params
+
+  - from: mysql:store_sales
+    name: store_sales
+    params: *mysql_params
+
+  - from: mysql:time_dim
+    name: time_dim
+    params: *mysql_params
+
+  - from: mysql:warehouse
+    name: warehouse
+    params: *mysql_params
+
+  - from: mysql:web_page
+    name: web_page
+    params: *mysql_params
+
+  - from: mysql:web_returns
+    name: web_returns
+    params: *mysql_params
+
+  - from: mysql:web_sales
+    name: web_sales
+    params: *mysql_params
+
+  - from: mysql:web_site
+    name: web_site
+    params: *mysql_params

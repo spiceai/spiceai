@@ -1,9 +1,6 @@
 name: Setup testoperator
 description: 'composite action'
 inputs:
-  build_testoperator:
-    description: 'whether to build testoperator'
-    type: string
   query_set:
     description: 'Query set'
     required: true
@@ -17,14 +14,6 @@ inputs:
 runs:
   using: 'composite'
   steps:
-    - name: Build the testoperator if it wasn't downloaded
-      shell: bash
-      if: inputs.build_testoperator == 'true'
-      run: |
-        cargo build -p testoperator --release
-        sudo cp target/release/testoperator /usr/local/bin/testoperator
-        sudo chmod +x /usr/local/bin/testoperator
-    
     - name: Prepare file-based data directory
       shell: bash
       run: |

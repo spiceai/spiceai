@@ -16,6 +16,8 @@ limitations under the License.
 
 use std::sync::Arc;
 
+use arrow_schema::SchemaRef;
+use arrow_tools::schema::schema_meta_get_computed_columns;
 use datafusion::arrow::datatypes::Schema;
 use datafusion::sql::parser::{DFParser, Statement};
 use datafusion::sql::sqlparser::ast::{Expr, GroupByExpr, SelectItem, SetExpr};
@@ -234,7 +236,35 @@ fn validate_select_columns(
         }
     }
 
+    // If the refresh SQL defines a subset of columns to fetch, computed columns (e.g., embeddings)
+    // are not included automatically. We verify their presence in the source schema and add them manually if needed.
+    fields = include_computed_columns(&fields, &source_schema);
+
     Ok(Arc::new(Schema::new(fields)))
+}
+
+/// Checks the source schema for associated computed columns (e.g., embeddings)
+/// and adds any missing computed fields to the target schema if they are found.
+fn include_computed_columns(
+    fields: &[arrow_schema::Field],
+    source_schema: &SchemaRef,
+) -> Vec<arrow_schema::Field> {
+    let mut extended_fields = fields.to_owned();
+    for field in fields {
+        if let Some(computed_cols) = schema_meta_get_computed_columns(source_schema, field.name()) {
+            for computed_col in computed_cols {
+                // Add field only if it does not exist in target schema
+                if !extended_fields
+                    .iter()
+                    .any(|f| f.name() == computed_col.name())
+                {
+                    extended_fields.push((*computed_col).clone());
+                }
+            }
+        }
+    }
+
+    extended_fields
 }
 
 #[cfg(test)]
@@ -248,6 +278,48 @@ mod tests {
             Field::new("name", DataType::Utf8, false),
             Field::new("value", DataType::Float64, true),
         ]))
+    }
+
+    fn create_test_schema_with_enmbeddings() -> Arc<Schema> {
+        let mut schema = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+            Field::new("value", DataType::Float64, true),
+            Field::new(
+                "name_embedding",
+                DataType::List(Arc::new(Field::new(
+                    "item",
+                    DataType::FixedSizeList(
+                        Arc::new(Field::new("item", DataType::Float32, false)),
+                        1536,
+                    ),
+                    false,
+                ))),
+                false,
+            ),
+            Field::new(
+                "name_offset",
+                DataType::List(Arc::new(Field::new(
+                    "item",
+                    DataType::FixedSizeList(
+                        Arc::new(Field::new("item", DataType::Int32, false)),
+                        2,
+                    ),
+                    false,
+                ))),
+                false,
+            ),
+        ]);
+
+        // mark `name_embedding` and `name_offset` as computed columns for `name`
+        let mut computed_columns_meta = std::collections::HashMap::new();
+        computed_columns_meta.insert(
+            "name".to_string(),
+            vec!["name_embedding".to_string(), "name_offset".to_string()],
+        );
+        arrow_tools::schema::set_computed_columns_meta(&mut schema, &computed_columns_meta);
+
+        Arc::new(schema)
     }
 
     #[test]
@@ -335,5 +407,20 @@ mod tests {
             result,
             Err(Error::ExpectedSingleSqlStatement { .. })
         ));
+    }
+
+    #[test]
+    fn test_valid_select_columns_with_embeddings() -> Result<()> {
+        let schema = create_test_schema_with_enmbeddings();
+        let table = TableReference::parse_str("test_table");
+        let sql = "SELECT id, name FROM test_table";
+
+        let result = validate_refresh_sql(table, sql, Arc::clone(&schema))?;
+        assert_eq!(result.fields().len(), 4);
+        assert_eq!(result.field(0).name(), "id");
+        assert_eq!(result.field(1).name(), "name");
+        assert_eq!(result.field(2).name(), "name_embedding");
+        assert_eq!(result.field(3).name(), "name_offset");
+        Ok(())
     }
 }

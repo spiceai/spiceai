@@ -19,6 +19,7 @@ use std::{any::Any, sync::Arc};
 
 use arrow::datatypes::{DataType, Schema, SchemaRef};
 use arrow_schema::Field;
+use arrow_tools::schema;
 use async_trait::async_trait;
 use datafusion::catalog::Session;
 use datafusion::common::{project_schema, Constraints, Statistics};
@@ -445,21 +446,37 @@ impl TableProvider for EmbeddingTable {
             .filter_map(|i| base_schema.fields.get(i).cloned())
             .collect();
 
+        let mut computed_columns_meta: HashMap<String, Vec<String>> = HashMap::new();
+
         // Important to be kept alphabetical for fast lookup in [`EmbeddingTable::columns_to_embed`]
         let mut embedding_fields: Vec<_> = self
             .get_additional_embedding_columns_sorted()
             .iter()
-            .filter_map(|k| {
+            .filter_map(|base_column_name| {
                 base_schema
-                    .column_with_name(k)
-                    .map(|(_, field)| self.embedding_fields(field))
+                    .column_with_name(base_column_name)
+                    .map(|(_, field)| {
+                        let embedding_fields = self.embedding_fields(field);
+                        computed_columns_meta.insert(
+                            base_column_name.clone(),
+                            embedding_fields
+                                .iter()
+                                .map(|f| f.name().to_string())
+                                .collect(),
+                        );
+                        embedding_fields
+                    })
             })
             .flatten()
             .collect();
 
         base_fields.append(&mut embedding_fields);
 
-        Arc::new(Schema::new(base_fields))
+        let mut schema = Schema::new(base_fields);
+
+        schema::set_computed_columns_meta(&mut schema, &computed_columns_meta);
+
+        Arc::new(schema)
     }
 
     async fn scan(

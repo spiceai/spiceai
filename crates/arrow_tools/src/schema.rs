@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::{collections::HashMap, sync::Arc};
+
 use arrow_schema::{DataType, Field, Schema};
 use datafusion::common::DFSchema;
 use snafu::prelude::*;
@@ -90,4 +92,107 @@ pub fn expand_views_schema(schema: &Schema) -> Schema {
         .collect();
 
     Schema::new(transformed_fields)
+}
+
+pub fn set_computed_columns_meta<S: ::std::hash::BuildHasher>(
+    schema: &mut Schema,
+    computed_columns_meta: &HashMap<String, Vec<String>, S>,
+) {
+    for (base_column, computed_columns) in computed_columns_meta {
+        set_computed_columns_meta_for_base_column(schema, base_column, computed_columns);
+    }
+}
+
+pub fn set_computed_columns_meta_for_base_column(
+    schema: &mut Schema,
+    base_column: &str,
+    computed_columns: &[String],
+) {
+    schema.metadata.insert(
+        format!("{base_column}_computed_columns"),
+        computed_columns.join(","),
+    );
+}
+
+#[must_use]
+pub fn schema_meta_get_computed_columns(
+    schema: &Schema,
+    base_column: &str,
+) -> Option<Vec<Arc<Field>>> {
+    let key = format!("{base_column}_computed_columns");
+
+    if let Some(computed_columns_str) = schema.metadata.get(&key) {
+        let computed_column_names: Vec<&str> = computed_columns_str.split(',').collect();
+
+        Some(
+            schema
+                .fields()
+                .iter()
+                .filter(|field| computed_column_names.contains(&field.name().as_str()))
+                .cloned()
+                .collect(),
+        )
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+
+    fn create_test_schema_with_embeddings() -> Schema {
+        Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+            Field::new("value", DataType::Float64, true),
+            Field::new(
+                "name_embedding",
+                DataType::List(Arc::new(Field::new(
+                    "item",
+                    DataType::FixedSizeList(
+                        Arc::new(Field::new("item", DataType::Float32, false)),
+                        1536,
+                    ),
+                    false,
+                ))),
+                false,
+            ),
+            Field::new(
+                "name_offset",
+                DataType::List(Arc::new(Field::new(
+                    "item",
+                    DataType::FixedSizeList(
+                        Arc::new(Field::new("item", DataType::Int32, false)),
+                        2,
+                    ),
+                    false,
+                ))),
+                false,
+            ),
+        ])
+    }
+
+    #[test]
+    fn test_computed_columns_meta() {
+        let mut schema = create_test_schema_with_embeddings();
+
+        let mut computed_columns_meta = HashMap::new();
+        computed_columns_meta.insert(
+            "name".to_string(),
+            vec!["name_embedding".to_string(), "name_offset".to_string()],
+        );
+
+        // Set metadata
+        set_computed_columns_meta(&mut schema, &computed_columns_meta);
+
+        // Retrieve computed columns metadata
+        let computed_columns = schema_meta_get_computed_columns(&schema, "name")
+            .expect("should return computed columns");
+
+        assert_eq!(computed_columns.len(), 2);
+        assert_eq!(computed_columns[0].name(), "name_embedding");
+        assert_eq!(computed_columns[1].name(), "name_offset");
+    }
 }
