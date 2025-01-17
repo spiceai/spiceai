@@ -15,9 +15,10 @@ limitations under the License.
 */
 
 use super::component::HttpComponent;
-use super::{get_random_element, HttpConfig};
+use super::HttpConfig;
 use crate::metrics::{MetricCollector, NoExtendedMetrics, QueryMetric};
 use crate::spicetest::{SpiceTest, TestCompleted, TestNotStarted, TestState};
+use crate::utils::get_random_element;
 use anyhow::Result;
 use futures::future::try_join_all;
 use reqwest::Client;
@@ -64,7 +65,10 @@ impl NotStarted {
 }
 
 pub struct Running {
+    /// Workers sending traffic to the baseline HTTP component
     baseline_handles: Vec<OverheadJobHandle>,
+
+    /// Workers sending traffic to the Spice HTTP component
     spice_handles: Vec<OverheadJobHandle>,
 }
 
@@ -85,6 +89,9 @@ impl TestCompleted for Completed {
 }
 
 impl SpiceTest<NotStarted> {
+    // On start, we create:
+    //  - N workers to send requests to the baseline component
+    //  - N (separate) workers to send requests the spice component.
     pub fn start(self) -> Result<SpiceTest<Running>> {
         let spiced_client = self.spiced_instance.http_client()?;
 

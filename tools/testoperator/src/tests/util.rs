@@ -17,23 +17,17 @@ limitations under the License.
 use std::fmt::Display;
 
 pub enum Color {
-    Red,
     RedBold,
     Green,
-    GreenBold,
     Blue,
-    BlueBold,
 }
 
 impl Display for Color {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let color = match self {
-            Color::Red => "\x1b[31m",
             Color::RedBold => "\x1b[1;31m",
             Color::Green => "\x1b[32m",
-            Color::GreenBold => "\x1b[1;32m",
             Color::Blue => "\x1b[34m",
-            Color::BlueBold => "\x1b[1;34m",
         };
         write!(f, "{color}")
     }

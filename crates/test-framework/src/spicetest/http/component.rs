@@ -58,7 +58,7 @@ impl HttpComponent {
         }
     }
 
-    pub fn component_name(&self) -> String {
+    #[must_use] pub fn component_name(&self) -> String {
         match self {
             HttpComponent::Generic {
                 component_name: model,
@@ -69,7 +69,7 @@ impl HttpComponent {
         }
     }
 
-    pub fn with_api_base(self, api_base: String) -> Self {
+    #[must_use] pub fn with_api_base(self, api_base: String) -> Self {
         match self {
             HttpComponent::Model { model, .. } => HttpComponent::Model { model, api_base },
             HttpComponent::Embedding { embedding, .. } => HttpComponent::Embedding {
@@ -83,7 +83,7 @@ impl HttpComponent {
         }
     }
 
-    pub fn with_component_name(self, component_name: String) -> Self {
+    #[must_use] pub fn with_component_name(self, component_name: String) -> Self {
         match self {
             HttpComponent::Model { api_base, .. } => HttpComponent::Model {
                 model: component_name,

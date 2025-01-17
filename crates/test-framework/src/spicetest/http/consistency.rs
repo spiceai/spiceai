@@ -14,9 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::{get_random_element, HttpConfig};
+use super::HttpConfig;
 use crate::metrics::{MetricCollector, NoExtendedMetrics, QueryMetric};
 use crate::spicetest::{SpiceTest, TestCompleted, TestNotStarted, TestState};
+use crate::utils::get_random_element;
 use anyhow::Result;
 use reqwest::Client;
 use std::time::{Duration, Instant, SystemTime};

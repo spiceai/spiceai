@@ -34,7 +34,7 @@ use test_framework::{
 /// Runs a test to ensure the P50 & p90 latencies do not increase by some threshold over the
 /// duration of the test when N clients are sending queries concurrently.
 pub async fn consistency_run(args: &HttpConsistencyTestArgs) -> anyhow::Result<()> {
-    let (_app, start_request) = get_app_and_start_request(&args.http.common, None)?;
+    let (app, start_request) = get_app_and_start_request(&args.http.common, None)?;
     let component = args.http.get_http_component()?;
     let payloads: Vec<_> = args
         .http
@@ -50,7 +50,7 @@ pub async fn consistency_run(args: &HttpConsistencyTestArgs) -> anyhow::Result<(
         .await?;
 
     let test = SpiceTest::new(
-        "Consistency Test".to_string(),
+        app.name.clone(),
         spiced_instance,
         consistency::NotStarted::new(ConsistencyConfig::new(
             Duration::from_secs(args.http.common.duration),
@@ -61,7 +61,12 @@ pub async fn consistency_run(args: &HttpConsistencyTestArgs) -> anyhow::Result<(
         )),
     );
 
-    let results = test.start()?.wait().await?.metrics()?;
+    println!("{}", with_color!(Color::Blue, "Starting overhead test"));
+    let test = test.start()?.wait().await?;
+    let results = test.metrics()?;
+
+    let mut spiced_instance = test.end();
+    spiced_instance.stop()?;
 
     let (p50, p90): (Vec<f64>, Vec<f64>) = results
         .iter()

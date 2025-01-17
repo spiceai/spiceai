@@ -39,7 +39,7 @@ use test_framework::{
 /// Runs a test to ensure the P50 & p90 latencies do not increase by some threshold over the
 /// duration of the test when N clients are sending queries concurrently.
 pub(crate) async fn overhead_run(args: &HttpOverheadTestArgs) -> anyhow::Result<()> {
-    let (_app, start_request) = get_app_and_start_request(&args.http.common, None)?;
+    let (app, start_request) = get_app_and_start_request(&args.http.common, None)?;
     let component = args.http.get_http_component()?;
     let payloads: Vec<_> = args
         .http
@@ -56,7 +56,7 @@ pub(crate) async fn overhead_run(args: &HttpOverheadTestArgs) -> anyhow::Result<
     let baseline_cfg = construct_baseline_cfg(args, &component, &payloads)?;
 
     let test = SpiceTest::new(
-        "Overhead Test".to_string(),
+        app.name.clone(),
         spiced_instance,
         overhead::NotStarted::new(
             HttpConfig {
@@ -70,7 +70,11 @@ pub(crate) async fn overhead_run(args: &HttpOverheadTestArgs) -> anyhow::Result<
     );
 
     println!("{}", with_color!(Color::Blue, "Starting overhead test"));
-    let results = test.start()?.wait().await?.metrics()?;
+    let test = test.start()?.wait().await?;
+    let results = test.metrics()?;
+
+    let mut spiced_instance = test.end();
+    spiced_instance.stop()?;
 
     let Some(baseline) = results.iter().find(|q| q.query_name == "baseline") else {
         return Err(anyhow::anyhow!("Baseline results not found"));

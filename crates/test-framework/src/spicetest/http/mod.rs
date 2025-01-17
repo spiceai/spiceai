@@ -17,21 +17,10 @@ limitations under the License.
 use std::{sync::Arc, time::Duration};
 
 use component::HttpComponent;
-use rand::Rng;
 
 pub mod component;
 pub mod consistency;
 pub mod overhead;
-
-fn get_random_element<T>(vec: &[T]) -> Option<&T> {
-    if vec.is_empty() {
-        None
-    } else {
-        let mut rng = rand::thread_rng();
-        let index = rng.gen_range(0..vec.len());
-        Some(&vec[index])
-    }
-}
 
 #[derive(Clone)]
 pub struct HttpConfig {
