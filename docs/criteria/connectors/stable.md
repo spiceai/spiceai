@@ -12,7 +12,7 @@ All criteria must be met for the connector to be considered Stable, with excepti
 | Databricks (mode: delta_lake)    | ✅             | @Sevenannn      |
 | Databricks (mode: spark_connect) | ➖             |                 |
 | Delta Lake                       | ➖             |                 |
-| Dremio                           | ➖             |                 |
+| Dremio                           | ✅             | @Sevenannn      |
 | DuckDB                           | ✅             | @peasee         |
 | File                             | ✅             | @ewgenius       |
 | FlightSQL                        | ➖             |                 |
@@ -169,9 +169,9 @@ Indexes are not required for test coverage, but can be introduced if required fo
 > **[Load Test](../definitions.md) exceptions for Object Store based connectors**
 >
 > `S3`, `ABFS`, `File`, `FTP`/`SFTP` and `HTTPS` connectors loading data from Parquet, CSV, TSV and JSON files have reduced requirements for the load test.
-> 
->  - [ ] Load test should run all queries with no [Major or Minor Bugs](../definitions.md) at scale factor 1.
->  - [ ] Connector documentation includes any performance limitations and exceptions noted from the load test run (e.g., high CPU and/or memory usage, high network bandwidth consumption, etc.).
+>
+> - [ ] Load test should run all queries with no [Major or Minor Bugs](../definitions.md) at scale factor 1.
+> - [ ] Connector documentation includes any performance limitations and exceptions noted from the load test run (e.g., high CPU and/or memory usage, high network bandwidth consumption, etc.).
 >
 > Percentile measurements and service availability requirements omitted.
 
