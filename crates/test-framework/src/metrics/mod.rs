@@ -141,13 +141,15 @@ impl StatisticsCollector<Duration, Vec<Duration>> for Vec<Duration> {
 
             let (first_quartile_index, third_quartile_index) = if len <= 3 {
                 // Simplified calculation for small arrays
-                let first = ((len - 1) as f64 * 0.25).floor() as usize;
-                let third = ((len - 1) as f64 * 0.75).floor() as usize;
+                // Use integer arithmetic instead of floating point
+                let first = (len - 1) / 4; // 25%
+                let third = (len - 1) * 3 / 4; // 75%
                 (first, third)
             } else {
                 // Original calculation for larger arrays
-                let first = (f64::from(u32::try_from(len)?) * 0.25).floor();
-                let third = (f64::from(u32::try_from(len)?) * 0.75).ceil();
+                let len_u32 = u32::try_from(len)?;
+                let first = (f64::from(len_u32) * 0.25).floor();
+                let third = (f64::from(len_u32) * 0.75).ceil();
                 (first as usize, third as usize)
             };
 
