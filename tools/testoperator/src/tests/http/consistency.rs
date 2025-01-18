@@ -71,9 +71,9 @@ pub async fn consistency_run(args: &HttpConsistencyTestArgs) -> anyhow::Result<(
 
     print_ascii_table(&results);
 
-    let (p50, p90): (Vec<f64>, Vec<f64>) = results
+    let (p50, p95): (Vec<f64>, Vec<f64>) = results
         .iter()
-        .map(|bucket| (bucket.median_duration, bucket.percentile_90_duration))
+        .map(|minute| (minute.median_duration, minute.percentile_95_duration))
         .unzip();
     if p50.len() >= 2 {
         let increase = p50
@@ -90,15 +90,15 @@ pub async fn consistency_run(args: &HttpConsistencyTestArgs) -> anyhow::Result<(
         }
     }
 
-    if p90.len() >= 2 {
-        let increase = p90
+    if p95.len() >= 2 {
+        let increase = p95
             .last()
-            .ok_or(anyhow!("no p90 data"))?
-            .div_checked(p90[0])?;
+            .ok_or(anyhow!("no p95 data"))?
+            .div_checked(p95[0])?;
         if increase > args.increase_threshold {
             return Err(anyhow::anyhow!(with_color!(
                 Color::RedBold,
-                "p90 increase threshold exceeded: {} > {}",
+                "p95 increase threshold exceeded: {} > {}",
                 increase,
                 args.increase_threshold
             )));

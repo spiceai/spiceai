@@ -1,0 +1,34 @@
+version: v1
+kind: Spicepod
+name: postgres_tpch
+datasets:
+  - from: postgres:customer
+    name: customer
+    params: &postgres_params
+      pg_host: ${secrets:POSTGRES_HOST}
+      pg_port: 5432
+      pg_user: postgres
+      pg_pass: ${secrets:POSTGRES_PASSWORD}
+      pg_db: tpch
+      pg_sslmode: disable
+  - from: postgres:lineitem
+    name: lineitem
+    params: *postgres_params
+  - from: postgres:nation
+    name: nation
+    params: *postgres_params
+  - from: postgres:orders
+    name: orders
+    params: *postgres_params
+  - from: postgres:part
+    name: part
+    params: *postgres_params
+  - from: postgres:partsupp
+    name: partsupp
+    params: *postgres_params
+  - from: postgres:region
+    name: region
+    params: *postgres_params
+  - from: postgres:supplier
+    name: supplier
+    params: *postgres_params

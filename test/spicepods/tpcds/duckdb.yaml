@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: duckdb_tpch
+name: duckdb_tpcds
 datasets:
   - from: duckdb:catalog_sales
     name: catalog_sales
