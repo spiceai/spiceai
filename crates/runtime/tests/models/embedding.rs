@@ -162,24 +162,7 @@ pub(crate) async fn run_beta_functionality_criteria_test(
             "Total tokens in usage should not be empty in response for test {test_id} and model {model_name}."
         );
 
-        // Beta: Check for tracing
-        // let q = rt
-        //     .datafusion()
-        //     .query_builder(
-        //         format!("SELECT span_id FROM runtime.task_history WHERE task='text_embed' AND labels['user'] = '{test_id}';").as_str(),
-        //     )
-        //     .build()
-        //     .run()
-        //     .await?
-        //     .data
-        //     .try_collect::<Vec<RecordBatch>>()
-        //     .await
-        //     .expect("could not get runtime.task_history span");
-        // assert!(
-        //     q.first().is_some_and(|rb| rb.num_rows() > 0),
-        //     "Embedding request did not create tracing in 'runtime.task_history' for test {test_id} and model {model_name}."
-        // );
-
+        // Beta (TODO): Check for tracing
         // Beta (TODO): Check for metrics
 
         // Check consistenct of response.
