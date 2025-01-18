@@ -3,5 +3,5 @@ kind: Spicepod
 name: huggingface-llm
 
 models:
-  - from: huggingface:huggingface.co/Qwen/Qwen2.5-0.5B-Instruct
+  - from: file:data/models/Qwen/Qwen2.5-0.5B-Instruct/
     name: model-llm

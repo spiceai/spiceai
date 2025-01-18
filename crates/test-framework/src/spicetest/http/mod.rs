@@ -35,4 +35,10 @@ pub struct HttpConfig {
 
     /// The HTTP component, within the Spiced instance, to test.
     pub component: HttpComponent,
+
+    /// Duration to send requests before starting the test.
+    pub warmup: Duration,
+
+    /// If true, do not show a progress bar showing the duration of the test.
+    pub disable_progress_bars: bool,
 }

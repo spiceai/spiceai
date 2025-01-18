@@ -57,7 +57,9 @@ pub async fn consistency_run(args: &HttpConsistencyTestArgs) -> anyhow::Result<(
             args.http.common.concurrency,
             payloads,
             component,
+            Duration::from_secs(args.http.warmup),
             args.buckets,
+            args.http.common.disable_progress_bars,
         )),
     );
 
@@ -67,11 +69,12 @@ pub async fn consistency_run(args: &HttpConsistencyTestArgs) -> anyhow::Result<(
 
     let mut spiced_instance = test.end();
 
+    print_ascii_table(&results);
+
     let (p50, p90): (Vec<f64>, Vec<f64>) = results
         .iter()
         .map(|bucket| (bucket.median_duration, bucket.percentile_90_duration))
         .unzip();
-
     if p50.len() >= 2 {
         let increase = p50
             .last()
@@ -101,8 +104,6 @@ pub async fn consistency_run(args: &HttpConsistencyTestArgs) -> anyhow::Result<(
             )));
         }
     }
-
-    print_ascii_table(&results);
 
     println!(
         "{}",
