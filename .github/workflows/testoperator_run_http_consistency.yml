@@ -38,6 +38,11 @@ on:
         required: true
         default: 10
         type: number
+      warmup:
+        description: "The number of seconds to send requests, before starting the test"
+        required: false
+        default: 0
+        type: number
       runner_type:
         description: "Runner type"
         required: true
@@ -145,6 +150,7 @@ jobs:
             --model ${{ github.event.inputs.model }} \
             --disable-progress-bars \
             --duration ${{ github.event.inputs.duration }} \
+            --warmup ${{ github.event.inputs.warmup }} \
             --payload-file ${{ github.event.inputs.payload_file }}
         env:
           SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
@@ -161,6 +167,7 @@ jobs:
             --embedding ${{ github.event.inputs.embedding }} \
             --disable-progress-bars \
             --duration ${{ github.event.inputs.duration }} \
+            --warmup ${{ github.event.inputs.warmup }} \
             --payload-file ${{ github.event.inputs.payload_file }}
         env:
           SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
