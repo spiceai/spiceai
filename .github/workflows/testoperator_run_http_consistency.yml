@@ -4,51 +4,63 @@ on:
   workflow_dispatch:
     inputs:
       spiced_commit:
-        description: 'spiced build commit'
+        description: "spiced build commit"
         required: false
         type: string
       spicepod_path:
-        description: 'The spicepod file to test with'
+        description: "The spicepod file to test with"
         required: true
         type: string
       payload_file:
-        description: 'The path to a file containing payloads to use in testing. Either JSONL of compatible request bodies, or individual string payloads. Cannot not be used in conjunction with `payload`'
+        description: "The path to a file containing payloads to use in testing. Either JSONL of compatible request bodies, or individual string payloads. Cannot not be used in conjunction with `payload`"
         required: false
         type: string
       embedding:
-        description: 'The embedding model (named in spicepod) to test against. Cannot be used in conjunction with `model`'
+        description: "The embedding model (named in spicepod) to test against. Cannot be used in conjunction with `model`"
         required: false
         type: string
       model:
-        description: 'The language model (named in spicepod) to test against. Cannot be used in conjunction with `embedding`'
+        description: "The language model (named in spicepod) to test against. Cannot be used in conjunction with `embedding`"
         required: false
         type: string
       ready_wait:
-        description: 'How long (in seconds) to wait for spiced to start'
+        description: "How long (in seconds) to wait for spiced to start"
         required: true
-        default: '30'
+        default: "30"
         type: string
       buckets:
-        description: 'The number of buckets to divide the test duration into'
+        description: "The number of buckets to divide the test duration into"
         required: true
         default: 10
         type: number
       runner_type:
-        description: 'Runner type'
+        description: "Runner type"
         required: true
-        default: 'spiceai-runners'
+        default: "spiceai-runners"
         type: choice
         options:
-          - 'spiceai-runners'
-          - 'spiceai-large-runners'
+          - "spiceai-runners"
+          - "spiceai-large-runners"
+          - "ubuntu-gpu-t4-4-core"
 
 jobs:
-  run-http-consistency:
-    name: Run http consistency tests
-    runs-on: ${{ github.event.inputs.runner_type || 'spiceai-runners' }}
+  download-spiced:
+    name: Download spiced from Minio
+    runs-on: "spiceai-runners"
     timeout-minutes: 600
     steps:
       - uses: actions/checkout@v4
+
+      - name: Get latest trunk commit
+        if: ${{ !github.event.inputs.spiced_commit }}
+        run: |
+          git fetch origin
+          echo "SPICED_COMMIT=$(git rev-parse origin/trunk)" >> $GITHUB_ENV
+
+      - name: Set SPICED_COMMIT from workflow input
+        if: ${{ github.event.inputs.spiced_commit }}
+        run: |
+          echo "SPICED_COMMIT=${{ github.event.inputs.spiced_commit }}" >> $GITHUB_ENV
 
       - name: Install MinIO
         run: |
@@ -69,8 +81,37 @@ jobs:
           echo "SPICED_COMMIT=${{ github.event.inputs.spiced_commit }}" >> $GITHUB_ENV
 
       - name: Download spiced from MinIO
+        if: ${{ github.event.inputs.runner_type != 'ubuntu-gpu-t4-4-core' }}
         run: |
           mc cp spice-minio/artifacts/spiced/linux-x86_64/$SPICED_COMMIT/spiced_models_linux_x86_64.tar.gz spiced_models_linux_x86_64.tar.gz
+
+      - name: Download spiced from MinIO (CUDA)
+        if: ${{ github.event.inputs.runner_type == 'ubuntu-gpu-t4-4-core' }}
+        # 'ubuntu-gpu-t4-4-core' runs T4, needs COMPUTE CAP 75
+        run: |
+          mc cp spice-minio/artifacts/spiced/linux-x86_64/$SPICED_COMMIT/spiced_models_cuda_75_linux_x86_64.tar.gz spiced_models_linux_x86_64.tar.gz
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: spiced_models_linux_x86_64.tar.gz
+          path: spiced_models_linux_x86_64.tar.gz
+
+  run-http-consistency:
+    name: Run http consistency tests
+    runs-on: ${{ github.event.inputs.runner_type }}
+    timeout-minutes: 600
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: download spiced tarbell
+        uses: actions/download-artifact@v4
+        with:
+          name: spiced_models_linux_x86_64.tar.gz
+          path: spiced_models_linux_x86_64.tar.gz
+
+      - name: Extract spiced tarbell
+        run: |
           tar -xzf spiced_models_linux_x86_64.tar.gz
           sudo cp ./spiced /usr/local/bin/spiced
 
