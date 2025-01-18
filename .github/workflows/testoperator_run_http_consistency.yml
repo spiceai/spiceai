@@ -131,11 +131,11 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: spiced_models_linux_x86_64.tar.gz
-          path: spiced_models_linux_x86_64.tar.gz
+          path: ./build
 
       - name: Extract spiced tarbell
         run: |
-          tar -xzf spiced_models_linux_x86_64.tar.gz
+          tar -xzf ./build/spiced_models_linux_x86_64.tar.gz
           sudo cp ./spiced /usr/local/bin/spiced
 
       - name: Build Testoperator
