@@ -121,6 +121,7 @@ jobs:
 
   run-http-consistency:
     name: Run http consistency tests
+    needs: download-spiced
     runs-on: ${{ github.event.inputs.runner_type }}
     timeout-minutes: 600
     steps:
