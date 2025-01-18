@@ -143,7 +143,7 @@ jobs:
           sudo apt update && sudo apt install wget -y
           sudo wget https://dl.min.io/client/mc/release/linux-amd64/mc -O /usr/local/bin/mc
           sudo chmod +x /usr/local/bin/mc
-          mc alias set spice-minio ${{ secrets.MINIO_ENDPOINT }} ${{ secrets.MINIO_ACCESS_KEY }} ${{ secrets.MINIO_SECRET_KEY }}
+          /usr/local/bin/mc alias set spice-minio ${{ secrets.MINIO_ENDPOINT }} ${{ secrets.MINIO_ACCESS_KEY }} ${{ secrets.MINIO_SECRET_KEY }}
 
       - name: Build Testoperator
         uses: ./.github/actions/build-testoperator
