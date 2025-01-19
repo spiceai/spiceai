@@ -22,7 +22,7 @@ All criteria must be met for the connector to be considered Stable, with excepti
 | HTTP/HTTPS                       | ➖             |                 |
 | Localpod                         | ➖             |                 |
 | MS SQL                           | ➖             |                 |
-| MySQL                            | ➖             |                 |
+| MySQL                            | ✅             | @phillipleblanc |
 | ODBC                             | ➖             |                 |
 | PostgreSQL                       | ✅             | @peasee         |
 | Sharepoint                       | ➖             |                 |
