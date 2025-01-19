@@ -4,12 +4,12 @@ name: openai
 
 models:
   - from: openai:gpt-4o-mini
-    name: model-llm
+    name: gpt-4o-mini
     params:
       openai_api_key: ${ secrets:SPICE_SECRET_OPENAI_API_KEY }
 
 embeddings:
   - from: openai:text-embedding-3-small
-    name: model-embeddings
+    name: text-embedding-3-small
     params:
       openai_api_key: ${ secrets:SPICE_SECRET_OPENAI_API_KEY }

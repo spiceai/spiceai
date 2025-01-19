@@ -33,7 +33,9 @@ use std::{
 };
 
 use serde_json::{json, Value};
+mod embedding;
 mod hf;
+mod local;
 mod openai;
 
 mod nsql {
@@ -359,7 +361,7 @@ async fn send_embeddings_request(
     }
 
     if let Some(u) = user {
-        request_body["user"] = json!(u);
+        request_body["user"] = Value::String(u.to_string());
     }
 
     if let Some(d) = dimensions {

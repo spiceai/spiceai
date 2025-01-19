@@ -4,33 +4,37 @@ on:
   workflow_dispatch:
     inputs:
       spiced_commit:
-        description: 'spiced build commit'
+        description: "spiced build commit"
         required: false
         type: string
       spicepod_path:
-        description: 'The spicepod file to test with'
+        description: "The spicepod file to test with"
         required: true
         type: string
       duration:
-        description: 'The test duration in seconds'
+        description: "The test duration in seconds"
         required: true
-        default: '3600'
+        default: "3600"
         type: string
       payload_file:
-        description: 'Payload file'
+        description: "Payload file"
         required: false
         type: string
       model:
-        description: 'Model name (LLM or Embedding)'
+        description: "Model name"
+        required: false
+        type: string
+      embedding:
+        description: "Embedding name"
         required: false
         type: string
       ready_wait:
-        description: 'How long (in seconds) to wait for spiced to start'
+        description: "How long (in seconds) to wait for spiced to start"
         required: true
-        default: '30'
+        default: "30"
         type: string
       buckets:
-        description: 'The number of buckets to divide the test duration into'
+        description: "The number of buckets to divide the test duration into"
         required: true
         default: 10
         type: number
@@ -41,6 +45,18 @@ jobs:
     runs-on: spiceai-runners
     timeout-minutes: 600
     steps:
+      - name: Run details
+        run: |
+          echo "Running http overhead test with:"
+          echo "  spiced_commit=${{ github.event.inputs.spiced_commit || 'latest trunk' }}"
+          echo "  spicepod_path=${{ github.event.inputs.spicepod_path }}"
+          echo "  duration=${{ github.event.inputs.duration }}"
+          echo "  payload_file=${{ github.event.inputs.payload_file }}"
+          echo "  model=${{ github.event.inputs.model }}"
+          echo "  embedding=${{ github.event.inputs.embedding }}"
+          echo "  ready_wait=${{ github.event.inputs.ready_wait }}"
+          echo "  buckets=${{ github.event.inputs.buckets }}"
+
       - uses: actions/checkout@v4
 
       - name: Install MinIO
@@ -93,7 +109,7 @@ jobs:
             -s /usr/local/bin/spiced \
             -p ${{ github.event.inputs.spicepod_path }} \
             --ready-wait ${{ github.event.inputs.ready_wait }} \
-            --embedding ${{ github.event.inputs.model }} \
+            --embedding ${{ github.event.inputs.embedding }} \
             --disable-progress-bars \
             --duration ${{ github.event.inputs.duration }} \
             --payload-file ${{ github.event.inputs.payload_file }}

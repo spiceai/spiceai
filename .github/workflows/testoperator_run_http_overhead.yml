@@ -1,46 +1,49 @@
 name: http overhead tests
 
 on:
-  push:
   workflow_dispatch:
     inputs:
       spiced_commit:
-        description: 'spiced build commit'
+        description: "spiced build commit"
         required: false
         type: string
       spicepod_path:
-        description: 'The spicepod file to test with'
+        description: "The spicepod file to test with"
         required: true
         type: string
       duration:
-        description: 'The test duration in seconds'
+        description: "The test duration in seconds"
         required: true
-        default: '3600'
+        default: "3600"
         type: string
       payload_file:
-        description: 'Payload file'
+        description: "Payload file"
         required: false
         type: string
       model:
-        description: 'Model name (LLM or Embedding)'
+        description: "Model name"
+        required: false
+        type: string
+      embedding:
+        description: "Embedding name"
         required: false
         type: string
       ready_wait:
-        description: 'How long (in seconds) to wait for spiced to start'
+        description: "How long (in seconds) to wait for spiced to start"
         required: true
-        default: '30'
+        default: "30"
         type: string
       base:
         description: Underlying HTTP service to test against
         required: true
-        default: 'openai'
+        default: "openai"
         type: choice
         options:
-          - 'openai'
-          - 'anthropic'
-          - 'xai'
+          - "openai"
+          - "anthropic"
+          - "xai"
       base_component:
-        description: 'Base component'
+        description: "Base component"
         required: true
         type: string
 
@@ -50,6 +53,19 @@ jobs:
     runs-on: spiceai-runners
     timeout-minutes: 600
     steps:
+      - name: Run details
+        run: |
+          echo "Running http overhead test with:"
+          echo "  spiced_commit=${{ github.event.inputs.spiced_commit || 'latest trunk' }}"
+          echo "  spicepod_path=${{ github.event.inputs.spicepod_path }}"
+          echo "  duration=${{ github.event.inputs.duration }}"
+          echo "  payload_file=${{ github.event.inputs.payload_file }}"
+          echo "  model=${{ github.event.inputs.model }}"
+          echo "  embedding=${{ github.event.inputs.embedding }}"
+          echo "  ready_wait=${{ github.event.inputs.ready_wait }}"
+          echo "  base=${{ github.event.inputs.base }}"
+          echo "  base_component=${{ github.event.inputs.base_component }}"
+
       - uses: actions/checkout@v4
 
       - name: Install MinIO
@@ -80,17 +96,16 @@ jobs:
         uses: ./.github/actions/build-testoperator
 
       - name: Set base parameters
-        id: base_params
         run: |
           if [[ "${{ github.event.inputs.base }}" == "openai" ]]; then
-            echo "base_url=https://api.openai.com" >> $GITHUB_ENV
-            echo "base_header=Authorization: Bearer ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}" >> $GITHUB_ENV
+            echo "BASE_URL=https://api.openai.com/v1" >> $GITHUB_ENV
+            echo "BASE_HEADER=Authorization: Bearer ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}" >> $GITHUB_ENV
           elif [[ "${{ github.event.inputs.base }}" == "anthropic" ]]; then
-            echo "base_url=https://api.anthropic.com" >> $GITHUB_ENV
-            echo "base_header=x-api-key: ${{ secrets.SPICE_SECRET_ANTHROPIC_API_KEY }}" >> $GITHUB_ENV
+            echo "BASE_URL=https://api.anthropic.com/v1" >> $GITHUB_ENV
+            echo "BASE_HEADER=x-api-key: ${{ secrets.SPICE_SECRET_ANTHROPIC_API_KEY }}" >> $GITHUB_ENV
           elif [[ "${{ github.event.inputs.base }}" == "xai" ]]; then
-            echo "base_url=https://api.xai.com" >> $GITHUB_ENV
-            echo "base_header=Authorization: Bearer ${{ secrets.SPICE_SECRET_XAI_API_KEY }}" >> $GITHUB_ENV
+            echo "BASE_URL=https://api.xai.com/v1" >> $GITHUB_ENV
+            echo "BASE_HEADER=Authorization: Bearer ${{ secrets.SPICE_SECRET_XAI_API_KEY }}" >> $GITHUB_ENV
           fi
 
       - name: Run model http consistency test
@@ -103,9 +118,9 @@ jobs:
             --model ${{ github.event.inputs.model }} \
             --disable-progress-bars \
             --duration ${{ github.event.inputs.duration }} \
-            --payload-file ${{ github.event.inputs.payload_file }}
-            --base-url ${{ env.base_url }}
-            --base-header ${{ env.base_header }}
+            --payload-file ${{ github.event.inputs.payload_file }} \
+            --base-url ${{ env.BASE_URL }} \
+            --base-header "${{ env.BASE_HEADER }}" \
             --base-component ${{ github.event.inputs.base_component }}
         env:
           SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
@@ -119,12 +134,12 @@ jobs:
             -s /usr/local/bin/spiced \
             -p ${{ github.event.inputs.spicepod_path }} \
             --ready-wait ${{ github.event.inputs.ready_wait }} \
-            --embedding ${{ github.event.inputs.model }} \
+            --embedding ${{ github.event.inputs.embedding }} \
             --disable-progress-bars \
             --duration ${{ github.event.inputs.duration }} \
-            --payload-file ${{ github.event.inputs.payload_file }}
-            --base-url ${{ env.base_url }}
-            --base-header ${{ env.base_header }}
+            --payload-file ${{ github.event.inputs.payload_file }} \
+            --base-url ${{ env.BASE_URL }} \
+            --base-header "${{ env.BASE_HEADER }}" \
             --base-component ${{ github.event.inputs.base_component }}
         env:
           SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
