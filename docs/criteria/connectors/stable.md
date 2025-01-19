@@ -24,7 +24,7 @@ All criteria must be met for the connector to be considered Stable, with excepti
 | MS SQL                           | ➖             |                 |
 | MySQL                            | ➖             |                 |
 | ODBC                             | ➖             |                 |
-| PostgreSQL                       | ➖             |                 |
+| PostgreSQL                       | ✅             | @peasee         |
 | Sharepoint                       | ➖             |                 |
 | Snowflake                        | ➖             |                 |
 | Spice.ai Cloud Platform          | ➖             |                 |
