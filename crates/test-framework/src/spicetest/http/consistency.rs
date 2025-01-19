@@ -162,8 +162,8 @@ impl SpiceTest<Running> {
                     }
                     error_count += worker_result.error_count;
                 }
-                Err(_) => {
-                    return Err(anyhow::anyhow!("Worker failed"));
+                Err(e) => {
+                    return Err(anyhow::anyhow!("Worker failed: {e:?}"));
                 }
             }
         }

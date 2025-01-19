@@ -50,8 +50,8 @@ runs:
         cargo build -p testoperator --release
         sudo cp target/release/testoperator /usr/local/bin/testoperator
         sudo chmod +x /usr/local/bin/testoperator
-    # - name: Upload the testoperator binary
-    #   shell: bash
-    #   if: ${{ env.TESTOPERATOR_DOWNLOADED != 'true' && inputs.upload_to_minio }}
-    #   run: |
-    #     mc cp /usr/local/bin/testoperator spice-minio/artifacts/testoperator/linux-x86_64/$TESTOPERATOR_COMMIT/testoperator
+    - name: Upload the testoperator binary
+      shell: bash
+      if: ${{ env.TESTOPERATOR_DOWNLOADED != 'true' && inputs.upload_to_minio }}
+      run: |
+        mc cp /usr/local/bin/testoperator spice-minio/artifacts/testoperator/linux-x86_64/$TESTOPERATOR_COMMIT/testoperator

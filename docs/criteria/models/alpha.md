@@ -24,7 +24,6 @@ All criteria must be met for the model to be considered Alpha. As Alpha signifie
 
 ### Documentation
 
-- [ ] Documentation includes all steps to set up the model.
+- [ ] Documentation includes all steps to set  up the model.
 - [ ] Documentation includes known limitations or issues for the model.
-- [ ] The model has an easy-to-follow cookbook recipe.
-- [ ] The model is listed in the table of models in [spiceai/docs](https://github.com/spiceai/docs).
+- [ ] The embedding component is listed in the table of components in [spiceai/docs](https://github.com/spiceai/docs).
