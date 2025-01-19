@@ -11,7 +11,7 @@ All criteria must be met for the Catalog to be considered [RC](../definitions.md
 | Databricks    | ➖           |              |
 | Iceberg       | ➖           |              |
 | Spice.ai      | ➖           |              |
-| Unity Catalog | ➖           |              |
+| Unity Catalog | ✅           | @Sevenannn   |
 
 ## RC Criteria
 
