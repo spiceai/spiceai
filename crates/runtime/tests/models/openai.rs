@@ -15,14 +15,12 @@ limitations under the License.
 */
 
 #![allow(clippy::expect_used)]
-use super::send_embeddings_request;
 use crate::models::{sort_json_keys, sql_to_display, sql_to_single_json_value};
 use crate::{
     init_tracing, init_tracing_with_task_history,
     models::{
         create_api_bindings_config, get_params_with_secrets_value, get_taxi_trips_dataset,
-        get_tpcds_dataset, normalize_chat_completion_response, normalize_embeddings_response,
-        send_chat_completions_request,
+        get_tpcds_dataset, normalize_chat_completion_response, send_chat_completions_request,
     },
     utils::{runtime_ready_check, test_request_context, verify_env_secret_exists},
 };
@@ -130,7 +128,8 @@ mod nsql {
             }
 
             Ok(())
-        }).await
+        }).await?;
+        Ok(())
     }
 }
 
@@ -244,109 +243,84 @@ mod search {
 
 #[allow(clippy::expect_used)]
 mod embeddings {
+    use std::time::Duration;
+
+    use crate::models::embedding::{
+        run_beta_functionality_criteria_test, run_embedding_tests, EmbeddingTestCase,
+    };
+
     use super::*;
-    struct EmbeddingTestCase {
-        pub input: EmbeddingInput,
-        pub encoding_format: Option<&'static str>,
-        pub user: Option<&'static str>,
-        pub dimensions: Option<u32>,
-        pub test_id: &'static str,
+
+    #[tokio::test]
+    async fn openai_embeddings_beta_requirements() -> Result<(), anyhow::Error> {
+        let _tracing = init_tracing(None);
+        verify_env_secret_exists("SPICE_OPENAI_API_KEY")
+            .await
+            .map_err(anyhow::Error::msg)?;
+
+        test_request_context()
+            .scope(async {
+                run_beta_functionality_criteria_test(
+                    get_openai_embeddings(Some("text-embedding-3-small"), "openai_embeddings"),
+                    Duration::from_secs(30),
+                )
+                .await
+            })
+            .await?;
+
+        Ok(())
     }
 
     #[tokio::test]
     async fn openai_test_embeddings() -> Result<(), anyhow::Error> {
         let _tracing = init_tracing(None);
+        verify_env_secret_exists("SPICE_OPENAI_API_KEY")
+            .await
+            .map_err(anyhow::Error::msg)?;
 
         test_request_context()
             .scope(async {
-                verify_env_secret_exists("SPICE_OPENAI_API_KEY")
-                    .await
-                    .map_err(anyhow::Error::msg)?;
-
-                let app = AppBuilder::new("search_app")
-                    .with_embedding(get_openai_embeddings(
+                run_embedding_tests(
+                    vec![get_openai_embeddings(
                         Some("text-embedding-3-small"),
                         "openai_embeddings",
-                    ))
-                    .build();
-
-                let api_config = create_api_bindings_config();
-                let http_base_url = format!("http://{}", api_config.http_bind_address);
-                let rt = Arc::new(Runtime::builder().with_app(app).build().await);
-
-                let rt_ref_copy = Arc::clone(&rt);
-                tokio::spawn(async move {
-                    Box::pin(rt_ref_copy.start_servers(api_config, None, EndpointAuth::no_auth()))
-                        .await
-                });
-
-                tokio::select! {
-                    () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
-                        return Err(anyhow::anyhow!("Timed out waiting for components to load"));
-                    }
-                    () = rt.load_components() => {}
-                }
-
-                runtime_ready_check(&rt).await;
-
-                let embeddins_test = vec![
-                    EmbeddingTestCase {
-                        input: EmbeddingInput::String(
-                            "The food was delicious and the waiter...".to_string(),
-                        ),
-                        encoding_format: Some("float"),
-                        user: None,
-                        dimensions: None,
-                        test_id: "basic",
-                    },
-                    EmbeddingTestCase {
-                        input: EmbeddingInput::StringArray(vec![
-                            "The food was delicious".to_string(),
-                            "and the waiter...".to_string(),
-                        ]),
-                        encoding_format: None,
-                        user: Some("test_user_id"),
-                        dimensions: Some(256),
-                        test_id: "multiple_inputs",
-                    },
-                    EmbeddingTestCase {
-                        input: EmbeddingInput::StringArray(vec![
-                            "The food was delicious".to_string(),
-                            "and the waiter...".to_string(),
-                        ]),
-                        encoding_format: Some("base64"),
-                        user: Some("test_user_id"),
-                        dimensions: Some(128),
-                        test_id: "base64_format",
-                    },
-                ];
-
-                for EmbeddingTestCase {
-                    input,
-                    encoding_format,
-                    user,
-                    dimensions,
-                    test_id,
-                } in embeddins_test
-                {
-                    let response = send_embeddings_request(
-                        http_base_url.as_str(),
-                        "openai_embeddings",
-                        input,
-                        encoding_format,
-                        user,
-                        dimensions,
-                    )
-                    .await?;
-
-                    insta::assert_snapshot!(
-                        test_id,
-                        // OpenAI's embeddings response is not deterministic (values vary for the same input, model version, and parameters) so
-                        // we normalize the response before snapshotting
-                        normalize_embeddings_response(response)
-                    );
-                }
-
+                    )],
+                    vec![
+                        EmbeddingTestCase {
+                            input: EmbeddingInput::String(
+                                "The food was delicious and the waiter...".to_string(),
+                            ),
+                            model_name: "openai_embeddings",
+                            encoding_format: Some("float"),
+                            user: None,
+                            dimensions: None,
+                            test_id: "basic",
+                        },
+                        EmbeddingTestCase {
+                            input: EmbeddingInput::StringArray(vec![
+                                "The food was delicious".to_string(),
+                                "and the waiter...".to_string(),
+                            ]),
+                            model_name: "openai_embeddings",
+                            encoding_format: None,
+                            user: Some("test_user_id"),
+                            dimensions: Some(256),
+                            test_id: "multiple_inputs",
+                        },
+                        EmbeddingTestCase {
+                            input: EmbeddingInput::StringArray(vec![
+                                "The food was delicious".to_string(),
+                                "and the waiter...".to_string(),
+                            ]),
+                            model_name: "openai_embeddings",
+                            encoding_format: Some("base64"),
+                            user: Some("test_user_id"),
+                            dimensions: Some(128),
+                            test_id: "base64_format",
+                        },
+                    ],
+                )
+                .await?;
                 Ok(())
             })
             .await

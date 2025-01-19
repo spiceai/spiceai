@@ -16,6 +16,7 @@ limitations under the License.
 
 use std::sync::Arc;
 use std::sync::LazyLock;
+use std::time::Duration;
 
 use app::AppBuilder;
 use async_openai::types::{
@@ -36,12 +37,14 @@ use spicepod::component::{
 
 use llms::chat::Chat;
 
+use crate::models::embedding::run_beta_functionality_criteria_test;
 use crate::{
     init_tracing, init_tracing_with_task_history,
     models::{
-        create_api_bindings_config, get_taxi_trips_dataset, get_tpcds_dataset,
-        normalize_chat_completion_response, normalize_embeddings_response,
-        send_chat_completions_request, send_embeddings_request,
+        create_api_bindings_config,
+        embedding::{run_embedding_tests, EmbeddingTestCase},
+        get_taxi_trips_dataset, get_tpcds_dataset, normalize_chat_completion_response,
+        send_chat_completions_request,
     },
     utils::{runtime_ready_check, test_request_context, verify_env_secret_exists},
 };
@@ -276,87 +279,75 @@ mod search {
 }
 
 #[tokio::test]
+async fn hf_embeddings_beta_requirements() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(None);
+
+    test_request_context()
+        .scope(async {
+            run_beta_functionality_criteria_test(
+                get_huggingface_embeddings("sentence-transformers/all-MiniLM-L6-v2", "hf_minilm"),
+                Duration::from_secs(2 * 60),
+            )
+            .await
+        })
+        .await?;
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn huggingface_test_embeddings() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(None);
 
     test_request_context()
         .scope(async {
-            let app = AppBuilder::new("text-to-sql")
-                .with_embedding(get_huggingface_embeddings(
-                    "sentence-transformers/all-MiniLM-L6-v2",
-                    "hf_minilm",
-                ))
-                .with_embedding(get_huggingface_embeddings("intfloat/e5-small-v2", "hf_e5"))
-                .build();
-
-            let api_config = create_api_bindings_config();
-            let http_base_url = format!("http://{}", api_config.http_bind_address);
-
-            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
-
-            let rt_ref_copy = Arc::clone(&rt);
-            tokio::spawn(async move {
-                Box::pin(rt_ref_copy.start_servers(api_config, None, EndpointAuth::no_auth())).await
-            });
-
-            tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
-                    return Err(anyhow::anyhow!("Timed out waiting for components to load"));
-                }
-                () = rt.load_components() => {}
-            }
-
-            runtime_ready_check(&rt).await;
-
-            let embeddins_test = vec![
-                (
-                    "hf_minilm",
-                    EmbeddingInput::String("The food was delicious and the waiter...".to_string()),
-                    Some("float"),
-                    None,
-                ),
-                (
-                    "hf_minilm",
-                    EmbeddingInput::StringArray(vec![
-                        "The food was delicious".to_string(),
-                        "and the waiter...".to_string(),
-                    ]),
-                    None, // `base64` paramerter is not supported when using local model
-                    Some(256),
-                ),
-                (
-                    "hf_e5",
-                    EmbeddingInput::String("The food was delicious and the waiter...".to_string()),
-                    None,
-                    Some(384),
-                ),
-            ];
-
-            let mut test_id = 0;
-
-            for (model, input, encoding_format, dimensions) in embeddins_test {
-                test_id += 1;
-                let response = send_embeddings_request(
-                    http_base_url.as_str(),
-                    model,
-                    input,
-                    encoding_format,
-                    None, // `user` parameter is not supported when using local model
-                    dimensions,
-                )
-                .await?;
-
-                insta::assert_snapshot!(
-                    format!("embeddings_{}", test_id),
-                    // Embeddingsare are not deterministic (values vary for the same input, model version, and parameters) so
-                    // we normalize the response before snapshotting
-                    normalize_embeddings_response(response)
-                );
-            }
-
-            Ok(())
+            run_embedding_tests(
+                vec![
+                    get_huggingface_embeddings(
+                        "sentence-transformers/all-MiniLM-L6-v2",
+                        "hf_minilm",
+                    ),
+                    get_huggingface_embeddings("intfloat/e5-small-v2", "hf_e5"),
+                ],
+                vec![
+                    EmbeddingTestCase {
+                        input: EmbeddingInput::String(
+                            "The food was delicious and the waiter...".to_string(),
+                        ),
+                        model_name: "hf_minilm",
+                        encoding_format: Some("float"),
+                        user: None,
+                        dimensions: None,
+                        test_id: "basic",
+                    },
+                    EmbeddingTestCase {
+                        input: EmbeddingInput::StringArray(vec![
+                            "The food was delicious".to_string(),
+                            "and the waiter...".to_string(),
+                        ]),
+                        encoding_format: None,
+                        model_name: "hf_minilm",
+                        user: None,
+                        dimensions: Some(256),
+                        test_id: "mulitple_inputs",
+                    },
+                    EmbeddingTestCase {
+                        input: EmbeddingInput::String(
+                            "The food was delicious and the waiter...".to_string(),
+                        ),
+                        model_name: "hf_e5",
+                        encoding_format: None,
+                        user: None,
+                        dimensions: Some(384),
+                        test_id: "basic",
+                    },
+                ],
+            )
+            .await
         })
-        .await
+        .await?;
+
+    Ok(())
 }
 
 #[tokio::test]

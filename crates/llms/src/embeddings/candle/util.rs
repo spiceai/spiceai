@@ -14,12 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{
-    collections::HashMap,
-    fs,
-    path::{self, Path, PathBuf},
-};
-
 use crate::embeddings::{
     candle::ModelConfig, Error, FailedToInstantiateEmbeddingModelSnafu, FailedWithHFApiSnafu,
     Result,
@@ -31,6 +25,11 @@ use hf_hub::{
 };
 use serde::Deserialize;
 use snafu::ResultExt;
+use std::{
+    collections::HashMap,
+    fs,
+    path::{self, Path, PathBuf},
+};
 use tei_backend::Pool;
 use tei_core::{
     download::{download_artifacts, download_pool_config, download_st_config, ST_CONFIG_NAMES},
@@ -41,6 +40,10 @@ use tempfile::tempdir;
 use tokenizers::Tokenizer;
 
 pub(crate) fn load_tokenizer(model_root: &Path) -> Result<Tokenizer> {
+    tracing::trace!(
+        "Loading model tokenizer from {:?}",
+        model_root.join("tokenizer.json")
+    );
     let tokenizer = Tokenizer::from_file(model_root.join("tokenizer.json"))
         .context(FailedToInstantiateEmbeddingModelSnafu)?;
 
