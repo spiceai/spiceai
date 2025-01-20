@@ -34,6 +34,18 @@ on:
           - "Linux x64"
           - "Windows x64"
         default: "all"
+      compute_cap:
+        description: "Which CUDA compute capability to build for? (Default is ALL)"
+        required: false
+        type: choice
+        options:
+          - "all"
+          - "75"
+          - "80"
+          - "86"
+          - "89"
+          - "90"
+        default: "all"
 
 jobs:
   setup-matrix:
@@ -114,20 +126,21 @@ jobs:
             // If running via workflow_dispatch, filter based on input
             if (context.eventName === 'workflow_dispatch') {
               const platform_option = context.payload.inputs.platform_option;
+              const compute_cap = context.payload.inputs.compute_cap;
+              let filtered = matrix;
 
-              if (platform_option === 'all') {
-                return matrix;
+              // Filter by platform if specified
+              if (platform_option !== 'all') {
+                const target_os = platform_option === 'Linux x64' ? 'linux' : 'windows';
+                filtered = filtered.filter(m => m.target_os === target_os);
               }
 
-              if (platform_option === 'Linux x64') {
-                return matrix.filter(m => m.target_os === 'linux');
+              // Filter by compute capability if specified
+              if (compute_cap !== 'all') {
+                filtered = filtered.filter(m => m.compute_cap === compute_cap);
               }
 
-              if (platform_option === 'Windows x64') {
-                return matrix.filter(m => m.target_os === 'windows');
-              }
-
-              return [];
+              return filtered;
             }
 
             return matrix;
