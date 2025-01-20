@@ -219,6 +219,8 @@ jobs:
 
       - name: Start spice runtime
         working-directory: test_app
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           spice run &> spice.log &
           # time to initialize added dataset
@@ -290,6 +292,7 @@ jobs:
 
       - name: Start spice runtime
         env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICE_SPICEAI_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_KEY }}
         working-directory: test_app
         run: |
@@ -383,6 +386,7 @@ jobs:
 
       - name: Start spice runtime
         env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICE_SPICEAI_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_KEY }}
         working-directory: test_app
         run: |
@@ -555,6 +559,7 @@ jobs:
 
       - name: Start spice runtime
         env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICE_PG_PASS: postgres
         working-directory: test_app
         run: |
@@ -760,6 +765,7 @@ jobs:
 
       - name: Start spice runtime
         env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICE_MYSQL_PASS: password
         working-directory: test_app
         run: |
@@ -870,6 +876,7 @@ jobs:
 
       - name: Start spice runtime
         env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICE_CLICKHOUSE_PASS: password
         working-directory: test_app
         run: |
@@ -955,6 +962,8 @@ jobs:
 
       - name: Start Spice runtime
         working-directory: duckdb-app
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           spice run &> spice.log &
           # time to initialize added dataset
@@ -1065,6 +1074,7 @@ jobs:
 
       - name: Start spice runtime
         env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICE_PG_PASS: postgres
         working-directory: test_app
         run: |
@@ -1174,6 +1184,8 @@ jobs:
 
       - name: Start spice runtime
         working-directory: test_app
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           spice run &> spice.log &
           # time to initialize added dataset
@@ -1455,6 +1467,8 @@ jobs:
 
       - name: Start spice runtime
         working-directory: test_app
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           spice run &> spice.log &
           # time to accelerate added datasets
@@ -1541,6 +1555,7 @@ jobs:
       - name: Start spice runtime
         working-directory: test_app
         env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ secrets.AWS_DATABRICKS_DELTA_ACCESS_KEY_ID }}
           AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ secrets.AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY }}
           DATABRICKS_ENDPOINT: ${{ secrets.DATABRICKS_ENDPOINT }}
