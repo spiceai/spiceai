@@ -132,8 +132,7 @@ func get_ai_accelerator() (string, bool) {
 		}
 
 		if !checkCudaVersionSupported(*version) {
-			slog.Warn(fmt.Sprintf("The GPU Compute Capability '%s' is not supported by Spice GPU builds. Supported versions are: %v. Falling back to CPU.",
-				*version, supportedCudaVersionsBinaries))
+			slog.Warn(fmt.Sprintf("GPU version is not supported. Spice will run but without GPU acceleration. Detected GPU version: '%s'", *version))
 			return "", false
 		}
 
