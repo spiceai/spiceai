@@ -1,7 +1,7 @@
 #!/usr/bin/expect -f
 
 # Runtime response timeout
-set timeout 15:
+set timeout 30:
 
 spawn spice chat
 

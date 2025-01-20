@@ -31,7 +31,7 @@ fn init_tracing(default_level: Option<&str>) -> DefaultGuard {
     let filter = match (default_level, std::env::var("SPICED_LOG").ok()) {
         (_, Some(log)) => EnvFilter::new(log),
         (Some(level), None) => EnvFilter::new(level),
-        _ => EnvFilter::new("runtime=TRACE,llms=TRACE,model_components=TRACE,INFO"),
+        _ => EnvFilter::new("runtime=TRACE,llms=TRACE,model_components=TRACE,task_history=WARN,runtime::embeddings=INFO,INFO"),
     };
 
     let subscriber = tracing_subscriber::FmtSubscriber::builder()

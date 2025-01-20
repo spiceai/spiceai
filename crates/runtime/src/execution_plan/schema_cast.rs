@@ -86,19 +86,22 @@ impl ExecutionPlan for SchemaCastScanExec {
     }
 
     fn schema(&self) -> SchemaRef {
-        Arc::new(Schema::new(
-            self.input
-                .schema()
-                .fields()
-                .into_iter()
-                .map(|field| {
-                    self.schema
-                        .field_with_name(field.name())
-                        .ok()
-                        .map_or(field.deref().clone(), Clone::clone)
-                })
-                .collect::<Vec<Field>>(),
-        ))
+        Arc::new(
+            Schema::new(
+                self.input
+                    .schema()
+                    .fields()
+                    .into_iter()
+                    .map(|field| {
+                        self.schema
+                            .field_with_name(field.name())
+                            .ok()
+                            .map_or(field.deref().clone(), Clone::clone)
+                    })
+                    .collect::<Vec<Field>>(),
+            )
+            .with_metadata(self.input.schema().metadata().clone()),
+        )
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {

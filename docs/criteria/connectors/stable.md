@@ -11,7 +11,7 @@ All criteria must be met for the connector to be considered Stable, with excepti
 | Clickhouse                       | ➖             |                 |
 | Databricks (mode: delta_lake)    | ✅             | @Sevenannn      |
 | Databricks (mode: spark_connect) | ➖             |                 |
-| Delta Lake                       | ➖             |                 |
+| Delta Lake                       | ✅             | @Sevenannn      |
 | Dremio                           | ✅             | @Sevenannn      |
 | DuckDB                           | ✅             | @peasee         |
 | File                             | ✅             | @ewgenius       |
@@ -22,7 +22,7 @@ All criteria must be met for the connector to be considered Stable, with excepti
 | HTTP/HTTPS                       | ➖             |                 |
 | Localpod                         | ➖             |                 |
 | MS SQL                           | ➖             |                 |
-| MySQL                            | ➖             |                 |
+| MySQL                            | ✅             | @phillipleblanc |
 | ODBC                             | ➖             |                 |
 | PostgreSQL                       | ✅             | @peasee         |
 | Sharepoint                       | ➖             |                 |

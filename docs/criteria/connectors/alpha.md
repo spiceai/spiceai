@@ -11,7 +11,7 @@ All criteria must be met for the connector to be considered Alpha. As Alpha sign
 | Clickhouse                       | ➖            |                 |
 | Databricks (mode: delta_lake)    | ✅            | @Sevenannn      |
 | Databricks (mode: spark_connect) | ✅            | @Sevenannn      |
-| Delta Lake                       | ➖            |                 |
+| Delta Lake                       | ✅            | @Sevenannn      |
 | Dremio                           | ✅            | @Sevenannn      |
 | DuckDB                           | ✅            | @peasee         |
 | File                             | ✅            | @peasee         |

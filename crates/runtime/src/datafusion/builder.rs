@@ -58,6 +58,12 @@ impl DataFusionBuilder {
             .with_information_schema(true)
             .with_create_default_catalog_and_schema(false);
 
+        // Prevents DataFusion from lowercasing identifiers, i.e. "SELECT MyColumn FROM my_table" would be "SELECT mycolumn FROM mytable" without this.
+        // This improves the UX for data sources where column names are case-sensitive, since they no longer need to be quoted.
+        df_config
+            .options_mut()
+            .sql_parser
+            .enable_ident_normalization = false;
         df_config.options_mut().optimizer.expand_views_at_output = true;
         df_config.options_mut().sql_parser.dialect = "PostgreSQL".to_string();
         df_config.options_mut().catalog.default_catalog = SPICE_DEFAULT_CATALOG.to_string();
