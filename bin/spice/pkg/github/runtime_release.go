@@ -97,6 +97,18 @@ func getRustArch() string {
 	return runtime.GOARCH
 }
 
+// GPU versions that are supported via dedicated CUDA builds
+var supportedCudaVersionsBinaries = []string{"75", "80", "86", "89", "90"}
+
+func checkCudaVersionSupported(computeCap string) bool {
+	for _, version := range supportedCudaVersionsBinaries {
+		if computeCap == version {
+			return true
+		}
+	}
+	return false
+}
+
 // get_ai_accelerator checks for accelerator devices, either GPU devices, or Apple silicon (metal).
 func get_ai_accelerator() (string, bool) {
 	if runtime.GOOS == "darwin" {
@@ -114,9 +126,18 @@ func get_ai_accelerator() (string, bool) {
 		if err != nil {
 			slog.Error("checking for CUDA device", "error", err)
 		}
-		if version != nil {
-			return "cuda_" + *version, true
+
+		if version == nil {
+			return "", false
 		}
+
+		if !checkCudaVersionSupported(*version) {
+			slog.Warn(fmt.Sprintf("The GPU Compute Capability '%s' is not supported by Spice GPU builds. Supported versions are: %v. Falling back to CPU.",
+				*version, supportedCudaVersionsBinaries))
+			return "", false
+		}
+
+		return "cuda_" + *version, true
 	}
 
 	return "", false
