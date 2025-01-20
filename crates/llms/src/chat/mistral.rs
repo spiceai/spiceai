@@ -658,7 +658,11 @@ fn chunk_to_openai_stream(
     })
 }
 
-#[allow(deprecated, clippy::cast_possible_truncation)]
+#[allow(
+    deprecated,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap
+)]
 fn chunk_choices_to_openai(choice: &ChunkChoice) -> Result<ChatChoiceStream, OpenAIError> {
     let ChunkChoice {
         index,
