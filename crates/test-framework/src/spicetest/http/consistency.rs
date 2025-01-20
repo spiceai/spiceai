@@ -57,14 +57,7 @@ impl ConsistencyConfig {
         disable_progress_bars: bool,
     ) -> Self {
         Self {
-            http: HttpConfig {
-                duration,
-                concurrency,
-                payloads,
-                warmup,
-                component,
-                disable_progress_bars,
-            },
+            http: HttpConfig { duration, concurrency, payloads, component, warmup, disable_progress_bars },
             buckets,
         }
     }
