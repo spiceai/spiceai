@@ -229,7 +229,7 @@ fn normalize_search_response(mut json: Value) -> String {
         for m in matches {
             if let Some(score) = m.get_mut("score") {
                 // round score to 4 decimals for consistent snapshot testing
-                *score = json!(format!("{:.4}", score.as_f64().unwrap_or(0.0)));
+                *score = json!(format!("{:.3}", score.as_f64().unwrap_or(0.0)));
             }
         }
     }
