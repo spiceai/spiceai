@@ -198,13 +198,22 @@ See more demos on [YouTube](https://www.youtube.com/playlist?list=PLesJrUXEx3U9a
 
 | Name          | Description                                  | Status            | ML Format(s) | LLM Format(s)                   |
 | ------------- | -------------------------------------------- | ----------------- | ------------ | ------------------------------- |
+| `openai`      | OpenAI (or compatible) LLM endpoint          | Release Candidate | -            | OpenAI-compatible HTTP endpoint |
 | `file`        | Local filesystem                             |                   | ONNX         | GGUF, GGML, SafeTensor          |
 | `huggingface` | Models hosted on HuggingFace                 |                   | ONNX         | GGUF, GGML, SafeTensor          |
 | `spice.ai`    | Models hosted on the Spice.ai Cloud Platform |                   | ONNX         | OpenAI-compatible HTTP endpoint |
-| `openai`      | OpenAI (or compatible) LLM endpoint          | Release Candidate | -            | OpenAI-compatible HTTP endpoint |
 | `azure`       | Azure OpenAI                                 |                   | -            | OpenAI-compatible HTTP endpoint |
 | `anthropic`   | Models hosted on Anthropic                   |                   | -            | OpenAI-compatible HTTP endpoint |
 | `xai`         | Models hosted on xAI                         |                   | -            | OpenAI-compatible HTTP endpoint |
+
+## Supported Embeddings Providers
+
+| Name                | Description                                  | Status            | ML Format(s) | LLM Format(s)\*                 |
+| ------------------- | -------------------------------------------- | ----------------- | ------------ | ------------------------------- |
+| [`openai`][openai]  | OpenAI (or compatible) LLM endpoint          | Release Candidate | -            | OpenAI-compatible HTTP endpoint |
+| [`file`][file]      | Local filesystem                             | Alpha             | ONNX         | GGUF, GGML, SafeTensor          |
+| [`huggingface`][hf] | Models hosted on HuggingFace                 | Alpha             | ONNX         | GGUF, GGML, SafeTensor          |
+| [`azure`][azure]    | Azure OpenAI                                 | Alpha             | -            | OpenAI-compatible HTTP endpoint |
 
 ## Supported Catalogs
 
