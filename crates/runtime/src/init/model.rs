@@ -29,13 +29,13 @@ use spicepod::component::model::{Model as SpicepodModel, ModelType};
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Failed to load LLM: {}. Verify configuration and try again.\nError: {}\nFor details, visit https://spiceai.org/docs/components/models", name, source))]
-    LlmLoadError {
+    FailedToLoadLLM {
         name: String,
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
     #[snafu(display("Failed to load runnable model: {}. Verify configuration and try again.\nError: {}\nFor details, visit https://spiceai.org/docs/components/models", name, source))]
-    RunnableModelLoadError {
+    FailedToLoadModelError {
         name: String,
         source: Box<dyn std::error::Error + Send + Sync>,
     },
@@ -108,7 +108,7 @@ impl Runtime {
                     llm_map.insert(m.name.clone(), l);
                     Ok(())
                 }
-                Err(e) => Err(Error::LlmLoadError {
+                Err(e) => Err(Error::FailedToLoadLLM {
                     name: m.name.clone(),
                     source: Box::new(e),
                 }),
@@ -119,7 +119,7 @@ impl Runtime {
                     model_map.insert(m.name.clone(), in_m);
                     Ok(())
                 }
-                Err(e) => Err(Error::RunnableModelLoadError {
+                Err(e) => Err(Error::FailedToLoadModelError {
                     name: m.name.clone(),
                     source: Box::new(e),
                 }),
