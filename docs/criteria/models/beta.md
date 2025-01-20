@@ -11,7 +11,7 @@ All criteria must be met for the model to be considered Beta, with exceptions pe
 | File                    | ➖           |              |
 | Hugging Face            | ➖           |              |
 | Spice.ai Cloud Platform | ➖           |              |
-| OpenAI                  | ➖           |              |
+| OpenAI                  | ✅            | @ewgenius   |
 | Azure Openai            | ➖           |              |
 | Anthropic               | ➖           |              |
 | xAI (Grok)              | ➖           |              |

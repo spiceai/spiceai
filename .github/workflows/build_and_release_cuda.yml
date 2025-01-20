@@ -1,0 +1,309 @@
+name: build_and_release_cuda
+
+on:
+  push:
+    tags:
+      - v*
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - 'README.md'
+      - 'Makefile'
+      - 'CONTRIBUTING.md'
+      - 'SECURITY.md'
+      - 'LICENSE'
+      - '.github/**'
+      - 'version.txt'
+      - '.schema/**'
+      - '.vscode/**'
+      - 'deploy/**'
+      - 'install/**'
+      - 'media/**'
+      - 'monitoring/**'
+      - 'acknowledgements.md'
+      - 'Dockerfile*'
+
+  workflow_dispatch:
+    inputs:
+      platform_option:
+        description: "Which platform do you want to run on? (Default is ALL)"
+        required: false
+        type: choice
+        options:
+          - "all"
+          - "Linux x64"
+          - "Windows x64"
+        default: "all"
+      compute_cap:
+        description: "Which CUDA compute capability to build for? (Default is ALL)"
+        required: false
+        type: choice
+        options:
+          - "all"
+          - "75"
+          - "80"
+          - "86"
+          - "89"
+          - "90"
+        default: "all"
+
+jobs:
+  setup-matrix:
+    name: Setup CUDA matrix
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.setup-matrix.outputs.result }}
+
+    steps:
+      - name: Set up matrix
+        uses: actions/github-script@v7
+        id: setup-matrix
+        with:
+          script: |
+            const matrix = [
+              {
+                compute_cap: "75",
+                runner: "ubuntu-gpu-t4-4-core",
+                target_os: "linux",
+                target_arch: "x86_64"
+              },
+              {
+                compute_cap: "80",
+                runner: "ubuntu-gpu-t4-4-core",
+                target_os: "linux",
+                target_arch: "x86_64"
+              },
+              {
+                compute_cap: "86",
+                runner: "ubuntu-gpu-t4-4-core",
+                target_os: "linux",
+                target_arch: "x86_64"
+              },
+              {
+                compute_cap: "89",
+                runner: "ubuntu-gpu-t4-4-core",
+                target_os: "linux",
+                target_arch: "x86_64"
+              },
+              {
+                compute_cap: "90",
+                runner: "ubuntu-gpu-t4-4-core",
+                target_os: "linux",
+                target_arch: "x86_64"
+              },
+              {
+                compute_cap: "75",
+                runner: "windows-gpu-t4-4-core",
+                target_os: "windows",
+                target_arch: "x86_64"
+              },
+              {
+                compute_cap: "80",
+                runner: "windows-gpu-t4-4-core",
+                target_os: "windows",
+                target_arch: "x86_64"
+              },
+              {
+                compute_cap: "86",
+                runner: "windows-gpu-t4-4-core",
+                target_os: "windows",
+                target_arch: "x86_64"
+              },
+              {
+                compute_cap: "89",
+                runner: "windows-gpu-t4-4-core",
+                target_os: "windows",
+                target_arch: "x86_64"
+              },
+              {
+                compute_cap: "90",
+                runner: "windows-gpu-t4-4-core",
+                target_os: "windows",
+                target_arch: "x86_64"
+              }
+            ];
+
+            // If running via workflow_dispatch, filter based on input
+            if (context.eventName === 'workflow_dispatch') {
+              const platform_option = context.payload.inputs.platform_option;
+              const compute_cap = context.payload.inputs.compute_cap;
+              let filtered = matrix;
+
+              // Filter by platform if specified
+              if (platform_option !== 'all') {
+                const target_os = platform_option === 'Linux x64' ? 'linux' : 'windows';
+                filtered = filtered.filter(m => m.target_os === target_os);
+              }
+
+              // Filter by compute capability if specified
+              if (compute_cap !== 'all') {
+                filtered = filtered.filter(m => m.compute_cap === compute_cap);
+              }
+
+              return filtered;
+            }
+
+            return matrix;
+
+  build:
+    name: Build CUDA ${{ matrix.target.compute_cap }} binaries
+    runs-on: ${{ matrix.target.runner }}
+    needs: setup-matrix
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # The `windows-gpu-t4-4-core` does not have Python installed
+      - name: Set up Python3
+        if: matrix.target.target_os == 'windows'
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.x'
+
+      - name: Set REL_VERSION from version.txt
+        run: python3 ./.github/scripts/get_release_version.py
+
+      # The `windows-gpu-t4-4-core` does not have modern PowerShell installed
+      - name: Install PowerShell
+        if: matrix.target.target_os == 'windows'
+        uses: ./.github/actions/install-pwsh
+
+      # The `windows-gpu-t4-4-core` requires Visual Studio Build Tools
+      - name: Install Visual Studio Build Tools
+        if: matrix.target.target_os == 'windows'
+        uses: ./.github/actions/install-vs-buildtools
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+        with:
+          os: ${{ matrix.target.target_os }}
+
+      - name: Set up make
+        if: matrix.target.target_os == 'linux' || matrix.target.runner == 'windows-gpu-t4-4-core'
+        uses: ./.github/actions/setup-make
+        with:
+          os: ${{ matrix.target.target_os }}
+
+      - name: Set up cc
+        if: matrix.target.target_os == 'linux'
+        uses: ./.github/actions/setup-cc
+
+      - name: Run Spiced CUDA Build
+        uses: ./.github/actions/spiced-cuda-build
+        with:
+          cuda-version: "12.4.1"
+          cuda-compute-capability: ${{ matrix.target.compute_cap }}
+          artifact-tag: ${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
+          target_os: ${{ matrix.target.target_os }}
+
+  publish-minio:
+    name: Publish linux-x86_64 CUDA binaries to Minio
+    runs-on: spiceai-runners
+    needs: build
+    env:
+      ARTIFACT_DIR: ./release
+      MINIO_ENDPOINT: ${{ secrets.MINIO_ENDPOINT }}
+      MINIO_ACCESS_KEY: ${{ secrets.MINIO_ACCESS_KEY }}
+      MINIO_SECRET_KEY: ${{ secrets.MINIO_SECRET_KEY }}
+      COMMIT_SHA: ${{ github.sha }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create artifact directory
+        run: mkdir -p ${{ env.ARTIFACT_DIR }}
+
+      # Download all Linux CUDA artifacts
+      - name: Download Linux CUDA artifacts
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          pattern: spiced_models_cuda_*_linux_x86_64
+          path: ${{ env.ARTIFACT_DIR }}
+          merge-multiple: true
+
+      - name: Upload artifacts to Minio
+        run: |
+          sudo apt-get update
+          sudo apt-get install wget -y
+          sudo wget https://dl.min.io/client/mc/release/linux-amd64/mc -O /usr/local/bin/mc
+          sudo chmod +x /usr/local/bin/mc
+          mc alias set spice-minio ${{ env.MINIO_ENDPOINT }} ${{ env.MINIO_ACCESS_KEY }} ${{ env.MINIO_SECRET_KEY }}
+
+          # Upload any CUDA artifacts that were successfully built
+          for file in ${{ env.ARTIFACT_DIR }}/spiced_models_cuda_*_linux_x86_64.tar.gz; do
+            if [ -f "$file" ]; then
+              echo "Uploading $file to Minio..."
+              mc cp "$file" spice-minio/artifacts/spiced/linux-x86_64/${{ env.COMMIT_SHA }}/
+            fi
+          done
+
+  publish:
+    name: Publish CUDA binaries
+    needs: build
+    if: startswith(github.ref, 'refs/tags/v') && github.event_name != 'pull_request'
+    env:
+      ARTIFACT_DIR: ./release
+
+    strategy:
+      matrix:
+        include:
+          - target_os: linux
+            target_arch: x86_64
+          - target_os: windows
+            target_arch: x86_64
+
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create artifact directory
+        run: mkdir -p ${{ env.ARTIFACT_DIR }}
+
+      - name: Set REL_VERSION from version.txt
+        run: python3 ./.github/scripts/get_release_version.py
+
+      # Download all CUDA artifacts for this platform
+      - name: Download CUDA artifacts
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          pattern: |
+            spiced_models_cuda_*_${{ matrix.target_os }}_${{ matrix.target_arch }}
+            spiced.exe_models_cuda_*_${{ matrix.target_os }}_${{ matrix.target_arch }}
+          path: ${{ env.ARTIFACT_DIR }}
+          merge-multiple: true
+
+      - name: lists artifacts
+        run: ls -l ${{ env.ARTIFACT_DIR }}
+
+      - name: publish CUDA binaries to github
+        run: |
+          # Parse repository to get owner and repo names
+          OWNER_NAME="${GITHUB_REPOSITORY%%/*}"
+          REPO_NAME="${GITHUB_REPOSITORY#*/}"
+          export GITHUB_TOKEN=${{ secrets.GITHUB_TOKEN }}
+          # Get the list of files
+          RELEASE_ARTIFACT=(${ARTIFACT_DIR}/*)
+          # Delete existing release artifact
+          python ./.github/scripts/github_release.py delete \
+            --owner $OWNER_NAME --repo $REPO_NAME \
+            --tag "v${{ env.REL_VERSION }}" \
+            ${RELEASE_ARTIFACT[*]}
+          if [ "$LATEST_RELEASE" = "true" ]; then
+            export RELEASE_BODY=`cat ./docs/release_notes/v${{ env.REL_VERSION }}.md`
+          else
+            export RELEASE_BODY="This is the release candidate ${{ env.REL_VERSION }}"
+          fi
+          echo "Uploading Spice.ai CUDA Binaries to GitHub Release"
+          python ./.github/scripts/github_release.py upload \
+            --owner $OWNER_NAME --repo $REPO_NAME \
+            --tag "v${{ env.REL_VERSION }}" \
+            --release-name "v${{ env.REL_VERSION }}" \
+            --body "${RELEASE_BODY}" \
+            --prerelease "$PRE_RELEASE" \
+            ${RELEASE_ARTIFACT[*]} 

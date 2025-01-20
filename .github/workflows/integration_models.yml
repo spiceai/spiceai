@@ -2,10 +2,11 @@
 name: integration tests (models)
 
 on:
-  push:
+  pull_request:
     branches:
       - trunk
       - release-*
+      - feature-*
     paths-ignore:
       - '**/*.md'
       - 'docs/**'

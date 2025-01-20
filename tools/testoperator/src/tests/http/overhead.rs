@@ -64,6 +64,8 @@ pub(crate) async fn overhead_run(args: &HttpOverheadTestArgs) -> anyhow::Result<
                 concurrency: args.http.common.concurrency,
                 payloads,
                 component,
+                warmup: Duration::from_secs(args.http.warmup),
+                disable_progress_bars: args.http.common.disable_progress_bars,
             },
             baseline_cfg,
         ),

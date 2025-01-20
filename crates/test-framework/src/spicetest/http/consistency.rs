@@ -19,8 +19,10 @@ use crate::metrics::{MetricCollector, NoExtendedMetrics, QueryMetric};
 use crate::spicetest::{SpiceTest, TestCompleted, TestNotStarted, TestState};
 use crate::utils::get_random_element;
 use anyhow::Result;
+use indicatif::ProgressBar;
 use reqwest::Client;
 use std::time::{Duration, Instant, SystemTime};
+use tokio::time::timeout;
 
 use std::sync::Arc;
 use tokio::task::JoinHandle;
@@ -50,7 +52,9 @@ impl ConsistencyConfig {
         concurrency: usize,
         payloads: Vec<Arc<str>>,
         component: HttpComponent,
+        warmup: Duration,
         buckets: usize,
+        disable_progress_bars: bool,
     ) -> Self {
         Self {
             http: HttpConfig {
@@ -58,6 +62,8 @@ impl ConsistencyConfig {
                 concurrency,
                 payloads,
                 component,
+                warmup,
+                disable_progress_bars,
             },
             buckets,
         }
@@ -99,9 +105,32 @@ impl SpiceTest<NotStarted> {
     pub fn start(self) -> Result<SpiceTest<Running>> {
         let client = self.spiced_instance.http_client()?;
 
-        let worker_handles = (0..self.state.config.http.concurrency)
+        let ConsistencyConfig {
+            http:
+                HttpConfig {
+                    duration,
+                    concurrency,
+                    payloads,
+                    component,
+                    warmup,
+                    disable_progress_bars,
+                },
+            buckets,
+        } = self.state.config.clone();
+
+        let worker_handles = (0..concurrency)
             .map(|id| {
-                let worker = ConsistencyWorker::new(id, self.state.config.clone(), client.clone());
+                let worker = ConsistencyWorker::new(
+                    id,
+                    duration,
+                    warmup,
+                    buckets,
+                    client.clone(),
+                    component.clone(),
+                    payloads.clone(),
+                )
+                .with_show_progress(!disable_progress_bars && id == 0);
+
                 worker.start()
             })
             .collect::<Vec<_>>();
@@ -133,8 +162,8 @@ impl SpiceTest<Running> {
                     }
                     error_count += worker_result.error_count;
                 }
-                Err(_) => {
-                    return Err(anyhow::anyhow!("Worker failed"));
+                Err(e) => {
+                    return Err(anyhow::anyhow!("Worker failed: {e:?}"));
                 }
             }
         }
@@ -182,7 +211,7 @@ impl MetricCollector<NoExtendedMetrics> for SpiceTest<Completed> {
             .iter()
             .enumerate()
             .map(|(i, durations)| {
-                QueryMetric::new_from_durations(format!("Minute {i}").as_str(), durations)
+                QueryMetric::new_from_durations(format!("{i}").as_str(), durations)
             })
             .collect()
     }
@@ -191,8 +220,11 @@ impl MetricCollector<NoExtendedMetrics> for SpiceTest<Completed> {
 pub(crate) struct ConsistencyWorker {
     id: usize,
     duration: Duration,
+    warmup: Duration,
     buckets: usize,
     client: Client,
+
+    show_progress: bool,
 
     /// The component to test against.
     component: HttpComponent,
@@ -201,36 +233,65 @@ pub(crate) struct ConsistencyWorker {
 }
 
 impl ConsistencyWorker {
-    pub fn new(id: usize, cfg: ConsistencyConfig, client: Client) -> Self {
+    pub fn new(
+        id: usize,
+        duration: Duration,
+        warmup: Duration,
+        buckets: usize,
+        client: Client,
+        component: HttpComponent,
+        payload: Vec<Arc<str>>,
+    ) -> Self {
         Self {
             id,
-            duration: cfg.http.duration,
-            buckets: cfg.buckets,
             client,
-            component: cfg.http.component,
-            payload: cfg.http.payloads,
+            duration,
+            buckets,
+            warmup,
+            component,
+            payload,
+            show_progress: false,
         }
+    }
+
+    pub fn with_show_progress(mut self, show_progress: bool) -> Self {
+        self.show_progress = show_progress;
+        self
     }
 
     pub fn start(self) -> ConsistencyJobHandle {
         tokio::spawn(async move {
+            let warmup_start = Instant::now();
+            if !self.warmup.is_zero() && self.show_progress {
+                println!("Warming up...");
+            }
+            while warmup_start.elapsed() < self.warmup {
+                self.send_request().await?;
+            }
+
             let mut durations: Vec<Vec<Duration>> = vec![vec![]; self.buckets];
             let bucket_duration = self.duration.as_secs() / self.buckets as u64;
             let mut error_count = 0;
             let start = Instant::now();
 
+            let mut bar = if self.show_progress {
+                println!("Commencing testing...");
+                ProgressBar::new(self.duration.as_secs())
+            } else {
+                ProgressBar::hidden()
+            };
+
             while start.elapsed() < self.duration {
+                bar = bar.with_position(start.elapsed().as_secs());
+                bar.tick();
                 let start_request = Instant::now();
-                let Some(p) = get_random_element(&self.payload) else {
-                    eprintln!("Worker {} - No payload found. Exiting...", self.id);
-                    return Ok(ConsistencyResult::default());
-                };
-                match self
-                    .component
-                    .send_request(&self.client, &Arc::clone(p))
-                    .await
-                {
-                    Ok(request_duration) => {
+                let remaining = self
+                    .duration
+                    .checked_sub(start.elapsed())
+                    .unwrap_or(Duration::from_secs(0));
+
+                match timeout(remaining, self.send_request()).await {
+                    Ok(Ok(request_duration)) => {
                         let idx = usize::try_from(
                             start_request
                                 .duration_since(start)
@@ -239,18 +300,32 @@ impl ConsistencyWorker {
                         )?;
                         durations[idx].push(request_duration);
                     }
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         eprintln!("Worker {} - Request failed: {}", self.id, e);
                         error_count += 1;
+                        continue;
+                    }
+                    Err(_) => {
+                        eprintln!("Worker {} - Request timed out.", self.id);
                         continue;
                     }
                 }
             }
 
+            bar.finish();
             Ok(ConsistencyResult {
                 durations,
                 error_count,
             })
         })
+    }
+    async fn send_request(&self) -> Result<Duration> {
+        let Some(p) = get_random_element(&self.payload) else {
+            eprintln!("Worker {} - No payload found. Exiting...", self.id);
+            return Err(anyhow::anyhow!("No payload found"));
+        };
+        self.component
+            .send_request(&self.client, &Arc::clone(p))
+            .await
     }
 }

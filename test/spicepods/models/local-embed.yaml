@@ -1,0 +1,10 @@
+version: v1
+kind: Spicepod
+name: local-embed
+
+embeddings:
+  - from: file:data/models/sentence-transformers/all-MiniLM-L6-v2/model.safetensors
+    name: all_minilm_l6_v2
+    files:
+      - path: data/models/sentence-transformers/all-MiniLM-L6-v2/config.json
+      - path: data/models/sentence-transformers/all-MiniLM-L6-v2/tokenizer.json

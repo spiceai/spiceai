@@ -13,7 +13,7 @@
   <a href="https://github.com/spiceai/spiceai/actions/workflows/spiced_docker_nightly.yml"><img alt="GitHub Actions Workflow Status - docker build" src="https://img.shields.io/github/actions/workflow/status/spiceai/spiceai/spiced_docker_nightly.yml?label=docker%20build" /></a>
   <a href="https://github.com/spiceai/spiceai/actions/workflows/pr.yml"><img alt="GitHub Actions Workflow Status - unit tests" src="https://img.shields.io/github/actions/workflow/status/spiceai/spiceai/pr.yml?event=merge_group&label=unit%20tests" /></a>
   <a href="https://github.com/spiceai/spiceai/actions/workflows/integration.yml"><img alt="GitHub Actions Workflow Status - integration tests" src="https://img.shields.io/github/actions/workflow/status/spiceai/spiceai/integration.yml?event=pull_request&label=integration%20tests" /></a>
-  <a href="https://github.com/spiceai/spiceai/actions/workflows/integration_models.yml"><img alt="GitHub Actions Workflow Status - integration tests (models)" src="https://img.shields.io/github/actions/workflow/status/spiceai/spiceai/integration_models.yml?branch=trunk&label=integration%20tests%20(models)" /></a>
+  <a href="https://github.com/spiceai/spiceai/actions/workflows/integration_models.yml"><img alt="GitHub Actions Workflow Status - integration tests (models)" src="https://img.shields.io/github/actions/workflow/status/spiceai/spiceai/integration_models.yml?event=pull_request&label=integration%20tests%20(models)" /></a>
   <a href="https://github.com/spiceai/spiceai/actions/workflows/benchmarks.yml"><img alt="GitHub Actions Workflow Status - benchmark tests" src="https://img.shields.io/github/actions/workflow/status/spiceai/spiceai/benchmarks.yml?branch=trunk&label=benchmark%20tests" /></a>
 </p>
 
@@ -196,15 +196,24 @@ See more demos on [YouTube](https://www.youtube.com/playlist?list=PLesJrUXEx3U9a
 
 ## Supported Model Providers
 
-| Name          | Description                                  | ML Format(s) | LLM Format(s)                   |
-| ------------- | -------------------------------------------- | ------------ | ------------------------------- |
-| `file`        | Local filesystem                             | ONNX         | GGUF, GGML, SafeTensor          |
-| `huggingface` | Models hosted on HuggingFace                 | ONNX         | GGUF, GGML, SafeTensor          |
-| `spice.ai`    | Models hosted on the Spice.ai Cloud Platform | ONNX         | OpenAI-compatible HTTP endpoint |
-| `openai`      | OpenAI (or compatible) LLM endpoint          | -            | OpenAI-compatible HTTP endpoint |
-| `azure`       | Azure OpenAI                                 | -            | OpenAI-compatible HTTP endpoint |
-| `anthropic`   | Models hosted on Anthropic                   | -            | OpenAI-compatible HTTP endpoint |
-| `xai`         | Models hosted on xAI                         | -            | OpenAI-compatible HTTP endpoint |
+| Name          | Description                                  | Status            | ML Format(s) | LLM Format(s)                   |
+| ------------- | -------------------------------------------- | ----------------- | ------------ | ------------------------------- |
+| `openai`      | OpenAI (or compatible) LLM endpoint          | Release Candidate | -            | OpenAI-compatible HTTP endpoint |
+| `file`        | Local filesystem                             |                   | ONNX         | GGUF, GGML, SafeTensor          |
+| `huggingface` | Models hosted on HuggingFace                 |                   | ONNX         | GGUF, GGML, SafeTensor          |
+| `spice.ai`    | Models hosted on the Spice.ai Cloud Platform |                   | ONNX         | OpenAI-compatible HTTP endpoint |
+| `azure`       | Azure OpenAI                                 |                   | -            | OpenAI-compatible HTTP endpoint |
+| `anthropic`   | Models hosted on Anthropic                   |                   | -            | OpenAI-compatible HTTP endpoint |
+| `xai`         | Models hosted on xAI                         |                   | -            | OpenAI-compatible HTTP endpoint |
+
+## Supported Embeddings Providers
+
+| Name                | Description                                  | Status            | ML Format(s) | LLM Format(s)\*                 |
+| ------------------- | -------------------------------------------- | ----------------- | ------------ | ------------------------------- |
+| [`openai`][openai]  | OpenAI (or compatible) LLM endpoint          | Release Candidate | -            | OpenAI-compatible HTTP endpoint |
+| [`file`][file]      | Local filesystem                             | Alpha             | ONNX         | GGUF, GGML, SafeTensor          |
+| [`huggingface`][hf] | Models hosted on HuggingFace                 | Alpha             | ONNX         | GGUF, GGML, SafeTensor          |
+| [`azure`][azure]    | Azure OpenAI                                 | Alpha             | -            | OpenAI-compatible HTTP endpoint |
 
 ## Supported Catalogs
 

@@ -38,8 +38,6 @@ on:
           - "macOS aarch64 (Apple Silicon)"
           - "Windows x64"
           - "macOS x64 (Intel)"
-          - "GPU T4 Ubuntu"
-          - "GPU T4 Windows"
         default: "all"
 
 jobs:
@@ -84,22 +82,7 @@ jobs:
                 target_arch: "x86_64",
                 target_arch_go: "amd64",
                 tags: ["default", "models"],
-              }, {
-                name: "GPU T4 Ubuntu",
-                runner: "ubuntu-gpu-t4-4-core",
-                target_os: "linux",
-                target_arch: "x86_64",
-                target_arch_go: "amd64",
-                tags: ["cuda"]
-              },
-              {
-                name: "GPU T4 Windows",
-                runner: "windows-gpu-t4-4-core",
-                target_os: "windows",
-                target_arch: "x86_64",
-                target_arch_go: "amd64",
-                tags: ["cuda"]
-              },
+              }
             ];
 
             // If running via workflow_dispatch, filter based on input
@@ -113,10 +96,6 @@ jobs:
               return matrix.filter(m => m.name === platform_option);
             }
 
-            // Do not run GPU builds automatically on PRs
-            if (context.eventName === 'push' && context.ref === 'refs/heads/trunk') {
-              return matrix.filter(m => !m.tags.includes("cuda"));
-            }
             return matrix;
 
   build:
@@ -321,52 +300,6 @@ jobs:
           name: spiced_models_metal_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: spiced_models_metal_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz
 
-      ## Models + CUDA flavor: 90, 89, 86, 80, 75 
-      - name: Run Spiced CUDA Build (COMPUTE_CAP=75).
-        uses: ./.github/actions/spiced-cuda-build
-        if: contains(matrix.target.tags, 'cuda')
-        with:
-          cuda-version: "12.4.1"
-          cuda-compute-capability: "75"
-          artifact-tag: ${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-          target_os: ${{ matrix.target.target_os }}
-
-      - name: Run Spiced CUDA Build (COMPUTE_CAP=80).
-        uses: ./.github/actions/spiced-cuda-build
-        if: contains(matrix.target.tags, 'cuda')
-        with:
-          cuda-version: "12.4.1"
-          cuda-compute-capability: "80"
-          artifact-tag: ${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-          target_os: ${{ matrix.target.target_os }}
-
-      - name: Run Spiced CUDA Build (COMPUTE_CAP=86).
-        uses: ./.github/actions/spiced-cuda-build
-        if: contains(matrix.target.tags, 'cuda')
-        with:
-          cuda-version: "12.4.1"
-          cuda-compute-capability: "86"
-          artifact-tag: ${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-          target_os: ${{ matrix.target.target_os }}
-
-      - name: Run Spiced CUDA Build (COMPUTE_CAP=89).
-        uses: ./.github/actions/spiced-cuda-build
-        if: contains(matrix.target.tags, 'cuda')
-        with:
-          cuda-version: "12.4.1"
-          cuda-compute-capability: "89"
-          artifact-tag: ${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-          target_os: ${{ matrix.target.target_os }}
-
-      - name: Run Spiced CUDA Build (COMPUTE_CAP=90).
-        uses: ./.github/actions/spiced-cuda-build
-        if: contains(matrix.target.tags, 'cuda')
-        with:
-          cuda-version: "12.4.1"
-          cuda-compute-capability: "90"
-          artifact-tag: ${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-          target_os: ${{ matrix.target.target_os }}
-
       ## CLI build
       - name: Build spice
         if: contains(matrix.target.tags, 'default')
@@ -464,43 +397,6 @@ jobs:
           name: spiced_models_linux_x86_64
           path: ${{ env.ARTIFACT_DIR }}
 
-
-      #  CUDA flavors: 90, 89, 86, 80, 75 
-      - name: download artifacts - spiced_models_cuda_75_linux_x86_64
-        continue-on-error: true
-        uses: actions/download-artifact@v4
-        with:
-          name: spiced_models_cuda_75_linux_x86_64
-          path: ${{ env.ARTIFACT_DIR }}
-
-      - name: download artifacts - spiced_models_cuda_80_linux_x86_64
-        continue-on-error: true
-        uses: actions/download-artifact@v4
-        with:
-          name: spiced_models_cuda_80_linux_x86_64
-          path: ${{ env.ARTIFACT_DIR }}
-
-      - name: download artifacts - spiced_models_cuda_86_linux_x86_64
-        continue-on-error: true
-        uses: actions/download-artifact@v4
-        with:
-          name: spiced_models_cuda_86_linux_x86_64
-          path: ${{ env.ARTIFACT_DIR }}
-
-      - name: download artifacts - spiced_models_cuda_89_linux_x86_64
-        continue-on-error: true
-        uses: actions/download-artifact@v4
-        with:
-          name: spiced_models_cuda_89_linux_x86_64
-          path: ${{ env.ARTIFACT_DIR }}
-
-      - name: download artifacts - spiced_models_cuda_90_linux_x86_64
-        continue-on-error: true
-        uses: actions/download-artifact@v4
-        with:
-          name: spiced_models_cuda_90_linux_x86_64
-          path: ${{ env.ARTIFACT_DIR }}
-
       - name: Upload artifacts to Minio
         run: |
           sudo apt-get update
@@ -520,28 +416,6 @@ jobs:
           if [ -f "${ARTIFACT_DIR}/spice_linux_x86_64.tar.gz" ]; then
             mc cp ${{ env.ARTIFACT_DIR }}/spice_linux_x86_64.tar.gz spice-minio/artifacts/spice/linux-x86_64/${{ env.COMMIT_SHA }}/
           fi;
-
-          # CUDA flavors: 90, 89, 86, 80, 75 
-
-          if [ -f "${ARTIFACT_DIR}/spiced_models_cuda_75_linux_x86_64.tar.gz" ]; then
-            mc cp ${{ env.ARTIFACT_DIR }}/spiced_models_cuda_75_linux_x86_64.tar.gz spice-minio/artifacts/spiced/linux-x86_64/${{ env.COMMIT_SHA }}/
-          fi
-
-          if [ -f "${ARTIFACT_DIR}/spiced_models_cuda_80_linux_x86_64.tar.gz" ]; then
-            mc cp ${{ env.ARTIFACT_DIR }}/spiced_models_cuda_80_linux_x86_64.tar.gz spice-minio/artifacts/spiced/linux-x86_64/${{ env.COMMIT_SHA }}/
-          fi
-
-          if [ -f "${ARTIFACT_DIR}/spiced_models_cuda_86_linux_x86_64.tar.gz" ]; then
-            mc cp ${{ env.ARTIFACT_DIR }}/spiced_models_cuda_86_linux_x86_64.tar.gz spice-minio/artifacts/spiced/linux-x86_64/${{ env.COMMIT_SHA }}/
-          fi
-
-          if [ -f "${ARTIFACT_DIR}/spiced_models_cuda_89_linux_x86_64.tar.gz" ]; then
-            mc cp ${{ env.ARTIFACT_DIR }}/spiced_models_cuda_89_linux_x86_64.tar.gz spice-minio/artifacts/spiced/linux-x86_64/${{ env.COMMIT_SHA }}/
-          fi
-
-          if [ -f "${ARTIFACT_DIR}/spiced_models_cuda_90_linux_x86_64.tar.gz" ]; then
-            mc cp ${{ env.ARTIFACT_DIR }}/spiced_models_cuda_90_linux_x86_64.tar.gz spice-minio/artifacts/spiced/linux-x86_64/${{ env.COMMIT_SHA }}/
-          fi
 
   publish:
     name: Publish ${{ matrix.target_os }}-${{ matrix.target_arch }} binaries

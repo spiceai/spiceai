@@ -75,6 +75,8 @@ jobs:
 
     - name: start Spice runtime
       if: matrix.target_os != 'windows'
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
         spice init app
         cd app
@@ -82,6 +84,8 @@ jobs:
   
     - name: start Spice runtime (Windows)
       if: matrix.target_os == 'windows'
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
         spice init app
         cd app
