@@ -48,7 +48,7 @@ pub enum Error {
     #[snafu(display("The namespace '{namespace}' does not exist in the Iceberg catalog, please check the namespace name and try again."))]
     NamespaceDoesNotExist { namespace: String },
 
-    #[snafu(display("Failed to connect to the Iceberg catalog or object store at {url}, please check whether the Iceberg catalog is accessible and try again."))]
+    #[snafu(display("Failed to connect to the Iceberg catalog or object store at {url}, please check the Iceberg catalog is accessible and try again."))]
     FailedToConnect { url: String, source: iceberg::Error },
 }
 
