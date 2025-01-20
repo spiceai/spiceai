@@ -275,6 +275,7 @@ impl ConsistencyWorker {
             let start = Instant::now();
 
             let mut bar = if self.show_progress {
+                println!("Commencing testing...");
                 ProgressBar::new(self.duration.as_secs())
             } else {
                 ProgressBar::hidden()
