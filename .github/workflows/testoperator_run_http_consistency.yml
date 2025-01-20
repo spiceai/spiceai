@@ -17,15 +17,15 @@ on:
         default: "3600"
         type: string
       payload_file:
-        description: "The path to a file containing payloads to use in testing. Either JSONL of compatible request bodies, or individual string payloads. Cannot not be used in conjunction with `payload`"
-        required: false
-        type: string
-      embedding:
-        description: "The embedding model (named in spicepod) to test against. Cannot be used in conjunction with `model`"
+        description: "Payload file"
         required: false
         type: string
       model:
-        description: "The language model (named in spicepod) to test against. Cannot be used in conjunction with `embedding`"
+        description: "Model name"
+        required: false
+        type: string
+      embedding:
+        description: "Embedding name"
         required: false
         type: string
       ready_wait:
@@ -38,25 +38,11 @@ on:
         required: true
         default: 10
         type: number
-      warmup:
-        description: "The number of seconds to send requests, before starting the test"
-        required: false
-        default: 0
-        type: number
-      runner_type:
-        description: "Runner type"
-        required: true
-        default: "spiceai-runners"
-        type: choice
-        options:
-          - "spiceai-runners"
-          - "spiceai-large-runners"
-          - "ubuntu-gpu-t4-4-core"
 
 jobs:
-  download-spiced:
-    name: Download spiced from Minio
-    runs-on: "spiceai-runners"
+  run-http-consistency:
+    name: Run http consistency tests
+    runs-on: spiceai-runners
     timeout-minutes: 600
     steps:
       - name: Run details
@@ -72,17 +58,6 @@ jobs:
           echo "  buckets=${{ github.event.inputs.buckets }}"
 
       - uses: actions/checkout@v4
-
-      - name: Get latest trunk commit
-        if: ${{ !github.event.inputs.spiced_commit }}
-        run: |
-          git fetch origin
-          echo "SPICED_COMMIT=$(git rev-parse origin/trunk)" >> $GITHUB_ENV
-
-      - name: Set SPICED_COMMIT from workflow input
-        if: ${{ github.event.inputs.spiced_commit }}
-        run: |
-          echo "SPICED_COMMIT=${{ github.event.inputs.spiced_commit }}" >> $GITHUB_ENV
 
       - name: Install MinIO
         run: |
@@ -103,53 +78,13 @@ jobs:
           echo "SPICED_COMMIT=${{ github.event.inputs.spiced_commit }}" >> $GITHUB_ENV
 
       - name: Download spiced from MinIO
-        if: ${{ github.event.inputs.runner_type != 'ubuntu-gpu-t4-4-core' }}
         run: |
           mc cp spice-minio/artifacts/spiced/linux-x86_64/$SPICED_COMMIT/spiced_models_linux_x86_64.tar.gz spiced_models_linux_x86_64.tar.gz
-
-      - name: Download spiced from MinIO (CUDA)
-        if: ${{ github.event.inputs.runner_type == 'ubuntu-gpu-t4-4-core' }}
-        # 'ubuntu-gpu-t4-4-core' runs T4, needs COMPUTE CAP 75
-        run: |
-          mc cp spice-minio/artifacts/spiced/linux-x86_64/$SPICED_COMMIT/spiced_models_cuda_75_linux_x86_64.tar.gz spiced_models_linux_x86_64.tar.gz
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: spiced_models_linux_x86_64.tar.gz
-          path: spiced_models_linux_x86_64.tar.gz
-
-  run-http-consistency:
-    name: Run http consistency tests
-    needs: download-spiced
-    runs-on: ${{ github.event.inputs.runner_type }}
-    timeout-minutes: 600
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: download spiced tarbell
-        uses: actions/download-artifact@v4
-        with:
-          name: spiced_models_linux_x86_64.tar.gz
-          path: ./build
-
-      - name: Extract spiced tarbell
-        run: |
-          tar -xzf ./build/spiced_models_linux_x86_64.tar.gz
+          tar -xzf spiced_models_linux_x86_64.tar.gz
           sudo cp ./spiced /usr/local/bin/spiced
-
-      - name: Install MinIO
-        if: ${{ github.event.inputs.runner_type != 'ubuntu-gpu-t4-4-core' }}
-        run: |
-          sudo apt update && sudo apt install wget -y
-          sudo wget https://dl.min.io/client/mc/release/linux-amd64/mc -O /usr/local/bin/mc
-          sudo chmod +x /usr/local/bin/mc
-          mc alias set spice-minio ${{ secrets.MINIO_ENDPOINT }} ${{ secrets.MINIO_ACCESS_KEY }} ${{ secrets.MINIO_SECRET_KEY }}
 
       - name: Build Testoperator
         uses: ./.github/actions/build-testoperator
-        with:
-          upload_to_minio: ${{ github.event.inputs.runner_type != 'ubuntu-gpu-t4-4-core' }}
 
       - name: Run model http consistency test
         if: ${{ github.event.inputs.model }}
@@ -161,7 +96,6 @@ jobs:
             --model ${{ github.event.inputs.model }} \
             --disable-progress-bars \
             --duration ${{ github.event.inputs.duration }} \
-            --warmup ${{ github.event.inputs.warmup }} \
             --payload-file ${{ github.event.inputs.payload_file }}
         env:
           SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
@@ -178,7 +112,6 @@ jobs:
             --embedding ${{ github.event.inputs.embedding }} \
             --disable-progress-bars \
             --duration ${{ github.event.inputs.duration }} \
-            --warmup ${{ github.event.inputs.warmup }} \
             --payload-file ${{ github.event.inputs.payload_file }}
         env:
           SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}

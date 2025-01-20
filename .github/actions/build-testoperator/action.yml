@@ -1,19 +1,13 @@
 name: Setup testoperator
-description: "composite action"
+description: 'composite action'
 
 # Builds the testoperator if it doesn't exist in MinIO
 # Downloads it based on the commit from the HEAD of the current branch
 # Uploads the testoperator binary to MinIO if built
 #
 # Requires the MinIO CLI to be installed and configured to use this action
-#
-inputs:
-  upload_to_minio:
-    description: "Upload the testoperator to MinIO"
-    required: true
-
 runs:
-  using: "composite"
+  using: 'composite'
   steps:
     - name: Set testoperator commit
       shell: bash
@@ -32,12 +26,12 @@ runs:
         else
           echo "TESTOPERATOR_DOWNLOADED=false" >> $GITHUB_ENV
         fi
-
+    
     - name: Setup Rust
       if: ${{ env.TESTOPERATOR_DOWNLOADED != 'true' }}
       uses: spiceai/spiceai/.github/actions/setup-rust@trunk
       with:
-        os: "linux"
+        os: 'linux'
 
     - name: Setup cc
       if: ${{ env.TESTOPERATOR_DOWNLOADED != 'true' }}
@@ -50,8 +44,9 @@ runs:
         cargo build -p testoperator --release
         sudo cp target/release/testoperator /usr/local/bin/testoperator
         sudo chmod +x /usr/local/bin/testoperator
+      
     - name: Upload the testoperator binary
       shell: bash
-      if: ${{ env.TESTOPERATOR_DOWNLOADED != 'true' && inputs.upload_to_minio }}
+      if: ${{ env.TESTOPERATOR_DOWNLOADED != 'true' }}
       run: |
         mc cp /usr/local/bin/testoperator spice-minio/artifacts/testoperator/linux-x86_64/$TESTOPERATOR_COMMIT/testoperator
