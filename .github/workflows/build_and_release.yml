@@ -38,8 +38,6 @@ on:
           - "macOS aarch64 (Apple Silicon)"
           - "Windows x64"
           - "macOS x64 (Intel)"
-          - "GPU T4 Ubuntu"
-          - "GPU T4 Windows"
         default: "all"
 
 jobs:
@@ -96,102 +94,6 @@ jobs:
               }
 
               return matrix.filter(m => m.name === platform_option);
-            }
-
-            return matrix;
-
-  setup-cuda-matrix:
-    name: Setup CUDA matrix
-    runs-on: spiceai-runners
-    outputs:
-      matrix: ${{ steps.setup-matrix.outputs.result }}
-
-    steps:
-      - name: Set up matrix
-        uses: actions/github-script@v7
-        id: setup-matrix
-        with:
-          script: |
-            const matrix = [
-              {
-                compute_cap: "75",
-                runner: "ubuntu-gpu-t4-4-core",
-                target_os: "linux",
-                target_arch: "x86_64"
-              },
-              {
-                compute_cap: "80",
-                runner: "ubuntu-gpu-t4-4-core",
-                target_os: "linux",
-                target_arch: "x86_64"
-              },
-              {
-                compute_cap: "86",
-                runner: "ubuntu-gpu-t4-4-core",
-                target_os: "linux",
-                target_arch: "x86_64"
-              },
-              {
-                compute_cap: "89",
-                runner: "ubuntu-gpu-t4-4-core",
-                target_os: "linux",
-                target_arch: "x86_64"
-              },
-              {
-                compute_cap: "90",
-                runner: "ubuntu-gpu-t4-4-core",
-                target_os: "linux",
-                target_arch: "x86_64"
-              },
-              {
-                compute_cap: "75",
-                runner: "windows-gpu-t4-4-core",
-                target_os: "windows",
-                target_arch: "x86_64"
-              },
-              {
-                compute_cap: "80",
-                runner: "windows-gpu-t4-4-core",
-                target_os: "windows",
-                target_arch: "x86_64"
-              },
-              {
-                compute_cap: "86",
-                runner: "windows-gpu-t4-4-core",
-                target_os: "windows",
-                target_arch: "x86_64"
-              },
-              {
-                compute_cap: "89",
-                runner: "windows-gpu-t4-4-core",
-                target_os: "windows",
-                target_arch: "x86_64"
-              },
-              {
-                compute_cap: "90",
-                runner: "windows-gpu-t4-4-core",
-                target_os: "windows",
-                target_arch: "x86_64"
-              }
-            ];
-
-            // If running via workflow_dispatch, filter based on input
-            if (context.eventName === 'workflow_dispatch') {
-              const platform_option = context.payload.inputs.platform_option;
-
-              if (platform_option === 'all') {
-                return matrix;
-              }
-
-              if (platform_option === 'GPU T4 Ubuntu') {
-                return matrix.filter(m => m.target_os === 'linux');
-              }
-
-              if (platform_option === 'GPU T4 Windows') {
-                return matrix.filter(m => m.target_os === 'windows');
-              }
-
-              return [];
             }
 
             return matrix;
@@ -457,64 +359,10 @@ jobs:
             Copy-Item -Recurse -Force target/* C:/spiceai/build/target
           }
 
-  cuda-build:
-    name: Build CUDA ${{ matrix.target.compute_cap }} binaries
-    runs-on: ${{ matrix.target.runner }}
-    needs: setup-cuda-matrix
-    strategy:
-      matrix:
-        target: ${{ fromJson(needs.setup-cuda-matrix.outputs.matrix) }}
-
-    steps:
-      - uses: actions/checkout@v4
-
-      # The `windows-gpu-t4-4-core` does not have Python installed
-      - name: Set up Python3
-        if: matrix.target.target_os == 'windows'
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.x'
-
-      - name: Set REL_VERSION from version.txt
-        run: python3 ./.github/scripts/get_release_version.py
-
-      # The `windows-gpu-t4-4-core` does not have modern PowerShell installed
-      - name: Install PowerShell
-        if: matrix.target.target_os == 'windows'
-        uses: ./.github/actions/install-pwsh
-
-      # The `windows-gpu-t4-4-core` requires Visual Studio Build Tools
-      - name: Install Visual Studio Build Tools
-        if: matrix.target.target_os == 'windows'
-        uses: ./.github/actions/install-vs-buildtools
-
-      - name: Set up Rust
-        uses: ./.github/actions/setup-rust
-        with:
-          os: ${{ matrix.target.target_os }}
-
-      - name: Set up make
-        if: matrix.target.target_os == 'linux' || matrix.target.runner == 'windows-gpu-t4-4-core'
-        uses: ./.github/actions/setup-make
-        with:
-          os: ${{ matrix.target.target_os }}
-
-      - name: Set up cc
-        if: matrix.target.target_os == 'linux'
-        uses: ./.github/actions/setup-cc
-
-      - name: Run Spiced CUDA Build
-        uses: ./.github/actions/spiced-cuda-build
-        with:
-          cuda-version: "12.4.1"
-          cuda-compute-capability: ${{ matrix.target.compute_cap }}
-          artifact-tag: ${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-          target_os: ${{ matrix.target.target_os }}
-
   publish-minio:
     name: Publish linux-x86_64 binaries to Minio
     runs-on: spiceai-runners
-    needs: [build, cuda-build]
+    needs: build
     env:
       GOVER: 1.23.4
       ARTIFACT_DIR: ./release
@@ -549,43 +397,6 @@ jobs:
           name: spiced_models_linux_x86_64
           path: ${{ env.ARTIFACT_DIR }}
 
-
-      #  CUDA flavors: 90, 89, 86, 80, 75 
-      - name: download artifacts - spiced_models_cuda_75_linux_x86_64
-        continue-on-error: true
-        uses: actions/download-artifact@v4
-        with:
-          name: spiced_models_cuda_75_linux_x86_64
-          path: ${{ env.ARTIFACT_DIR }}
-
-      - name: download artifacts - spiced_models_cuda_80_linux_x86_64
-        continue-on-error: true
-        uses: actions/download-artifact@v4
-        with:
-          name: spiced_models_cuda_80_linux_x86_64
-          path: ${{ env.ARTIFACT_DIR }}
-
-      - name: download artifacts - spiced_models_cuda_86_linux_x86_64
-        continue-on-error: true
-        uses: actions/download-artifact@v4
-        with:
-          name: spiced_models_cuda_86_linux_x86_64
-          path: ${{ env.ARTIFACT_DIR }}
-
-      - name: download artifacts - spiced_models_cuda_89_linux_x86_64
-        continue-on-error: true
-        uses: actions/download-artifact@v4
-        with:
-          name: spiced_models_cuda_89_linux_x86_64
-          path: ${{ env.ARTIFACT_DIR }}
-
-      - name: download artifacts - spiced_models_cuda_90_linux_x86_64
-        continue-on-error: true
-        uses: actions/download-artifact@v4
-        with:
-          name: spiced_models_cuda_90_linux_x86_64
-          path: ${{ env.ARTIFACT_DIR }}
-
       - name: Upload artifacts to Minio
         run: |
           sudo apt-get update
@@ -606,31 +417,9 @@ jobs:
             mc cp ${{ env.ARTIFACT_DIR }}/spice_linux_x86_64.tar.gz spice-minio/artifacts/spice/linux-x86_64/${{ env.COMMIT_SHA }}/
           fi;
 
-          # CUDA flavors: 90, 89, 86, 80, 75 
-
-          if [ -f "${ARTIFACT_DIR}/spiced_models_cuda_75_linux_x86_64.tar.gz" ]; then
-            mc cp ${{ env.ARTIFACT_DIR }}/spiced_models_cuda_75_linux_x86_64.tar.gz spice-minio/artifacts/spiced/linux-x86_64/${{ env.COMMIT_SHA }}/
-          fi
-
-          if [ -f "${ARTIFACT_DIR}/spiced_models_cuda_80_linux_x86_64.tar.gz" ]; then
-            mc cp ${{ env.ARTIFACT_DIR }}/spiced_models_cuda_80_linux_x86_64.tar.gz spice-minio/artifacts/spiced/linux-x86_64/${{ env.COMMIT_SHA }}/
-          fi
-
-          if [ -f "${ARTIFACT_DIR}/spiced_models_cuda_86_linux_x86_64.tar.gz" ]; then
-            mc cp ${{ env.ARTIFACT_DIR }}/spiced_models_cuda_86_linux_x86_64.tar.gz spice-minio/artifacts/spiced/linux-x86_64/${{ env.COMMIT_SHA }}/
-          fi
-
-          if [ -f "${ARTIFACT_DIR}/spiced_models_cuda_89_linux_x86_64.tar.gz" ]; then
-            mc cp ${{ env.ARTIFACT_DIR }}/spiced_models_cuda_89_linux_x86_64.tar.gz spice-minio/artifacts/spiced/linux-x86_64/${{ env.COMMIT_SHA }}/
-          fi
-
-          if [ -f "${ARTIFACT_DIR}/spiced_models_cuda_90_linux_x86_64.tar.gz" ]; then
-            mc cp ${{ env.ARTIFACT_DIR }}/spiced_models_cuda_90_linux_x86_64.tar.gz spice-minio/artifacts/spiced/linux-x86_64/${{ env.COMMIT_SHA }}/
-          fi
-
   publish:
     name: Publish ${{ matrix.target_os }}-${{ matrix.target_arch }} binaries
-    needs: [build, cuda-build]
+    needs: build
     if: startswith(github.ref, 'refs/tags/v') && github.event_name != 'pull_request'
     env:
       ARTIFACT_DIR: ./release
