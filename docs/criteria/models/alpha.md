@@ -11,7 +11,7 @@ All criteria must be met for the model to be considered Alpha. As Alpha signifie
 | File                    | ➖            |                 |
 | Hugging Face            | ➖            |                 |
 | Spice.ai Cloud Platform | ➖            |                 |
-| OpenAI                  | ➖            |                 |
+| OpenAI                  | ✅            | @ewgenius       |
 | Azure Openai            | ➖            |                 |
 | Anthropic               | ➖            |                 |
 | Nvidia NIM              | ✅            | @phillipleblanc |

@@ -11,7 +11,7 @@ All criteria must be met for the embedding component to be considered Alpha. As 
 | File                    | ➖            |              |
 | Hugging Face            | ➖            |              |
 | Spice.ai Cloud Platform | ➖            |              |
-| OpenAI                  | ➖            |              |
+| OpenAI                  | ✅            | @ewgenius    |
 | Azure Openai            | ➖            |              |
 | xAI (Grok)              | ➖            |              |
 
