@@ -28,7 +28,7 @@ runs:
       run: |
         echo "SHELL=pwsh" >> $env:GITHUB_ENV
         echo "BUILD_CMD=cd bin\\spiced && cargo build --release --features models,cuda --target-dir ../../target" >> $env:GITHUB_ENV
-        echo "PACKAGE_CMD=move /Y target\\release\\spiced.exe spiced.exe && tar -czf spiced.exe_models_cuda_${{ inputs.cuda-compute-capability }}_${{ inputs.artifact-tag }}.tar.gz spiced.exe" >> $env:GITHUB_ENV
+        echo "PACKAGE_CMD=move target\\release\\spiced.exe spiced.exe -Force && tar -czf spiced.exe_models_cuda_${{ inputs.cuda-compute-capability }}_${{ inputs.artifact-tag }}.tar.gz spiced.exe" >> $env:GITHUB_ENV
       shell: pwsh
 
     - name: Define Shell and Commands
