@@ -33,13 +33,13 @@ use super::{
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Missing required parameter: {parameter}. Specify a value.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/sharepoint#parameters"))]
+    #[snafu(display("Missing required parameter: {parameter}. Specify a value.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/sharepoint#parameters"))]
     MissingParameter { parameter: String },
 
-    #[snafu(display("No authentication was specified.\nProvide either an 'bearer_token' or 'client_secret'.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/sharepoint#parameters"))]
+    #[snafu(display("No authentication was specified.\nProvide either an 'bearer_token' or 'client_secret'.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/sharepoint#parameters"))]
     InvalidAuthentication,
 
-    #[snafu(display("Both `bearer_token` and `client_secret` were specified.\nProvide only one of either an 'bearer_token' or 'client_secret'.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/sharepoint#parameters"))]
+    #[snafu(display("Both `bearer_token` and `client_secret` were specified.\nProvide only one of either an 'bearer_token' or 'client_secret'.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/sharepoint#parameters"))]
     DuplicateAuthentication,
 
     #[snafu(display(

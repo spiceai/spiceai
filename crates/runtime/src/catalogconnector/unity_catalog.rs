@@ -106,7 +106,7 @@ impl CatalogConnector for UnityCatalog {
             return Err(
                 super::Error::InvalidConfigurationNoSource {
                     connector: "unity_catalog".into(),
-                    message: "A Catalog Path is required for Unity Catalog.\nFor details, visit: https://docs.spiceai.org/components/catalogs/unity-catalog#from".into(),
+                    message: "A Catalog Path is required for Unity Catalog.\nFor details, visit: https://spiceai.org/docs/components/catalogs/unity-catalog#from".into(),
                     connector_component: ConnectorComponent::from(catalog),
                 },
             );

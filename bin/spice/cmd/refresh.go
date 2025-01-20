@@ -70,7 +70,7 @@ var refreshCmd = &cobra.Command{
 	Example: `
 spice refresh taxi_trips
 
-# See more at: https://docs.spiceai.org/
+# See more at: https://spiceai.org/docs/
 `,
 	Run: func(cmd *cobra.Command, args []string) {
 		dataset := args[0]

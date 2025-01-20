@@ -33,7 +33,7 @@ use std::{future::Future, sync::Arc};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Missing required parameter: {parameter}. Specify a value.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/flightsql#params"))]
+    #[snafu(display("Missing required parameter: {parameter}. Specify a value.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/flightsql#params"))]
     MissingParameter { parameter: String },
 
     #[snafu(display("Failed to connect to the Flight server. A TLS error occurred.\n{source}"))]

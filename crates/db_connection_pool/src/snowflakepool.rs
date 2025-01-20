@@ -28,7 +28,7 @@ use crate::dbconnection::snowflakeconn::SnowflakeConnection;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Missing required secret: {name}. Specify a value.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/snowflake#auth"))]
+    #[snafu(display("Missing required secret: {name}. Specify a value.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/snowflake#auth"))]
     MissingRequiredSecret { name: String },
 
     #[snafu(display("Failed to connect to Snowflake.\nVerify your Snowflake configuration, and try again.\n{source}"))]
@@ -52,7 +52,7 @@ pub enum Error {
         file_path: String,
     },
 
-    #[snafu(display("Invalid value for parameter '{param_key}': {param_value}.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/snowflake#parameters"))]
+    #[snafu(display("Invalid value for parameter '{param_key}': {param_value}.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/snowflake#parameters"))]
     InvalidParameterValue {
         param_key: String,
         param_value: String,

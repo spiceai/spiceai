@@ -63,7 +63,7 @@ pub enum Error {
     UnableToSanitizeConnectionString,
 
     #[snafu(display(
-        "Failed to authenticate with the ClickHouse.\nEnsure that the username and password are correctly configured.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/clickhouse#configuration"
+        "Failed to authenticate with the ClickHouse.\nEnsure that the username and password are correctly configured.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/clickhouse#configuration"
     ))]
     InvalidUsernameOrPasswordError {
         source: clickhouse_rs::errors::Error,
@@ -76,10 +76,10 @@ pub enum Error {
         port: String,
     },
 
-    #[snafu(display("Missing required parameter: '{parameter_name}'. Specify a value.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/clickhouse#configuration"))]
+    #[snafu(display("Missing required parameter: '{parameter_name}'. Specify a value.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/clickhouse#configuration"))]
     MissingRequiredParameterForConnection { parameter_name: String },
 
-    #[snafu(display("An invalid value was provided for the parameter '{parameter_name}'.\nSpecify a value of 'true' or 'false'.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/clickhouse#configuration"))]
+    #[snafu(display("An invalid value was provided for the parameter '{parameter_name}'.\nSpecify a value of 'true' or 'false'.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/clickhouse#configuration"))]
     InvalidSecureParameterValueError {
         parameter_name: String,
         source: ParseBoolError,

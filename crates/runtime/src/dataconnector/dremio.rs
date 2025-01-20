@@ -42,7 +42,7 @@ use std::sync::Arc;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Missing required parameter: {parameter}. Specify a value.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/dremio#configuration"))]
+    #[snafu(display("Missing required parameter: {parameter}. Specify a value.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/dremio#configuration"))]
     MissingParameter { parameter: String },
 
     #[snafu(display("Failed to connect to endpoint '{endpoint}'.\nVerify the endpoint is valid/online, and try again.\n{source}"))]

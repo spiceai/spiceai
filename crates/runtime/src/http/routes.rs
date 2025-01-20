@@ -62,7 +62,7 @@ use tower_http::cors::{AllowOrigin, Any, CorsLayer};
         ("api_key" = [])
     ),
     paths(
-        // Order here will be preserved in sidebar at https://docs.spiceai.org/api/http/runtime.
+        // Order here will be preserved in sidebar at https://spiceai.org/docs/api/http/runtime.
         v1::query::post,
         v1::datasets::get,
         v1::datasets::acceleration,

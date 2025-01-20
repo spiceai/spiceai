@@ -25,7 +25,7 @@ pub enum Error {
     #[snafu(display("Expected and actual number of fields in the query result don't match: expected {expected}, received {actual}"))]
     SchemaMismatchNumFields { expected: usize, actual: usize },
 
-    #[snafu(display("Query returned an unexpected data type for column {name}: expected {expected}, received {actual}. Is the column data type supported by the data accelerator (https://docs.spiceai.org/reference/datatypes)?"))]
+    #[snafu(display("Query returned an unexpected data type for column {name}: expected {expected}, received {actual}. Is the column data type supported by the data accelerator (https://spiceai.org/docs/reference/datatypes)?"))]
     SchemaMismatchDataType {
         name: String,
         expected: String,

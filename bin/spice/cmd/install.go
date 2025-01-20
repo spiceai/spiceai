@@ -34,7 +34,7 @@ var installCmd = &cobra.Command{
 spice install
 spice install ai
 
-# See more at: https://docs.spiceai.org/
+# See more at: https://spiceai.org/docs/
 `,
 	Run: func(cmd *cobra.Command, args []string) {
 		slog.Info("Checking for latest Spice runtime release...")

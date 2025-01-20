@@ -34,7 +34,7 @@ use super::{
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Missing required parameter: '{parameter}'. Specify a value.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/mssql#configuration"))]
+    #[snafu(display("Missing required parameter: '{parameter}'. Specify a value.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/mssql#configuration"))]
     MissingParameter { parameter: String },
 
     #[snafu(display("Failed to connect to the MS SQL Server.\nVerify your connection configuration, and try again.\n{source}"))]
@@ -43,10 +43,10 @@ pub enum Error {
     #[snafu(display("Invalid connection string.\nVerify the connection string is valid, and try again.\n{source}"))]
     InvalidConnectionStringError { source: tiberius::error::Error },
 
-    #[snafu(display("Invalid value provided for the 'port' parameter: {port}.\nSpecify a valid port, and try again.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/mssql#configuration"))]
+    #[snafu(display("Invalid value provided for the 'port' parameter: {port}.\nSpecify a valid port, and try again.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/mssql#configuration"))]
     FailedToParsePort { port: String },
 
-    #[snafu(display("Invalid value provided for parameter '{parameter}'\nSpecify a valid value, and try again.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/mssql#configuration"))]
+    #[snafu(display("Invalid value provided for parameter '{parameter}'\nSpecify a valid value, and try again.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/mssql#configuration"))]
     InvalidParameterValue { parameter: String },
 }
 

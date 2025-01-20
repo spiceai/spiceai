@@ -143,13 +143,13 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Unknown data connector: {data_connector}.\nSpecify a valid data connector and retry. For details, visit: https://docs.spiceai.org/components/data-connectors"))]
+    #[snafu(display("Unknown data connector: {data_connector}.\nSpecify a valid data connector and retry. For details, visit: https://spiceai.org/docs/components/data-connectors"))]
     UnknownDataConnector { data_connector: String },
 
-    #[snafu(display("Unknown catalog connector: {catalog_connector}.\nSpecify a valid catalog connector and retry. For details, visit: https://docs.spiceai.org/components/catalogs"))]
+    #[snafu(display("Unknown catalog connector: {catalog_connector}.\nSpecify a valid catalog connector and retry. For details, visit: https://spiceai.org/docs/components/catalogs"))]
     UnknownCatalogConnector { catalog_connector: String },
 
-    #[snafu(display("The runtime is built without ODBC support.\nBuild Spice.ai OSS with the `odbc` feature enabled or use the Docker image that includes ODBC support.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/odbc"))]
+    #[snafu(display("The runtime is built without ODBC support.\nBuild Spice.ai OSS with the `odbc` feature enabled or use the Docker image that includes ODBC support.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/odbc"))]
     OdbcNotInstalled,
 
     #[snafu(display("Unable to load secrets for data connector: {data_connector}"))]

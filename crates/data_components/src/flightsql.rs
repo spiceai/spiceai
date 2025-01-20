@@ -57,7 +57,7 @@ pub mod federation;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Failed to connect to the Flight server.\n{source}\nVerify configuration and try again. For details, visit https://docs.spiceai.org/components/data-connectors/flightsql#params"))]
+    #[snafu(display("Failed to connect to the Flight server.\n{source}\nVerify configuration and try again. For details, visit https://spiceai.org/docs/components/data-connectors/flightsql#params"))]
     UnableToConnectToServer { source: tonic::transport::Error },
 
     #[snafu(display("Failed to create SQL query (flightsql).\n{source}\nAn unexpected error occurred. Please report a bug on GitHub: https://github.com/spiceai/spiceai/issues"))]

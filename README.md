@@ -29,7 +29,7 @@ Spice provides three industry standard APIs in a lightweight, portable runtime (
 
 Spice is primarily used for:
 
-- **Data Federation**: SQL query across any database, data warehouse, or data lake. [Learn More](https://docs.spiceai.org/features/federated-queries).
+- **Data Federation**: SQL query across any database, data warehouse, or data lake. [Learn More](https://spiceai.org/docs/features/federated-queries).
 - **Data Materialization and Acceleration**: Materialize, accelerate, and cache database queries. [Read the MaterializedView interview - Building a CDN for Databases](https://materializedview.io/p/building-a-cdn-for-databases-spice-ai)
 - **AI apps and agents**: An AI-database powering retrieval-augmented generation (RAG) and intelligent agents. [Learn More](https://github.com/spiceai/cookbook/tree/trunk/rag#readme).
 
@@ -112,7 +112,7 @@ Limited = Partial or restricted support
 - **OpenAI-compatible API**: Connect to hosted models (OpenAI, Anthropic, xAI) or deploy locally (Llama, NVIDIA NIM). [AI Gateway Recipe](https://github.com/spiceai/cookbook/blob/trunk/openai_sdk/README.md)
 - **Federated Data Access**: Query using SQL and NSQL (text-to-SQL) across databases, data warehouses, and data lakes with advanced query push-down for fast retrieval across disparate data sources. [Federated SQL Query Recipe](https://github.com/spiceai/cookbook/blob/trunk/federation/README.md)
 - **Search and RAG**: Search and retrieve context with accelerated embeddings for retrieval-augmented generation (RAG) workflows. [Vector Search over GitHub Files](https://github.com/spiceai/cookbook/blob/trunk/search_github_files/README.md)
-- **LLM Memory and Observability**: Store and retrieve history and context for AI agents while gaining deep visibility into data flows, model performance, and traces. [LLM Memory Recipe](https://github.com/spiceai/cookbook/blob/trunk/llm-memory/README.md) | [Monitoring Features Documentation](https://docs.spiceai.org/features/monitoring)
+- **LLM Memory and Observability**: Store and retrieve history and context for AI agents while gaining deep visibility into data flows, model performance, and traces. [LLM Memory Recipe](https://github.com/spiceai/cookbook/blob/trunk/llm-memory/README.md) | [Monitoring Features Documentation](https://spiceai.org/docs/features/monitoring)
 
 ### Database CDN and Query Mesh
 
@@ -124,13 +124,13 @@ Limited = Partial or restricted support
 ### Retrieval-Augmented Generation (RAG)
 
 - **Unified Search with Vector Similarity**: Perform efficient vector similarity search across structured and unstructured data sources. [Vector Search over GitHub Files](https://github.com/spiceai/cookbook/blob/trunk/search_github_files/README.md)
-- **Semantic Knowledge Layer**: Define a semantic context model to enrich data for AI. [Semantic Model Feature Documentation](https://docs.spiceai.org/features/semantic-model)
+- **Semantic Knowledge Layer**: Define a semantic context model to enrich data for AI. [Semantic Model Feature Documentation](https://spiceai.org/docs/features/semantic-model)
 - **Text-to-SQL**: Convert natural language queries into SQL using built-in NSQL and sampling tools for accurate query. [Text-to-SQL Recipe](https://github.com/spiceai/cookbook/blob/trunk/text-to-sql/README.md)
 - **Model and Data Evaluations**: Assess model performance and data quality with integrated evaluation tools. [Language Model Evaluations Recipe](https://github.com/spiceai/cookbook/blob/trunk/evals/README.md)
 
 ## FAQ
 
-- **Is Spice a cache?** No specifically; you can think of Spice data acceleration as an _active_ cache, materialization, or data prefetcher. A cache would fetch data on a cache-miss while Spice prefetches and materializes filtered data on an interval, trigger, or as data changes using CDC. In addition to acceleration Spice supports [results caching](https://docs.spiceai.org/features/caching).
+- **Is Spice a cache?** No specifically; you can think of Spice data acceleration as an _active_ cache, materialization, or data prefetcher. A cache would fetch data on a cache-miss while Spice prefetches and materializes filtered data on an interval, trigger, or as data changes using CDC. In addition to acceleration Spice supports [results caching](https://spiceai.org/docs/features/caching).
 
 - **Is Spice a CDN for databases?** Yes, a common use-case for Spice is as a CDN for different data sources. Using CDN concepts, Spice enables you to ship (load) a working set of your database (or data lake, or data warehouse) where it's most frequently accessed, like from a data-intensive application or for AI context.
 
@@ -190,9 +190,9 @@ See more demos on [YouTube](https://www.youtube.com/playlist?list=PLesJrUXEx3U9a
 | `postgres` | Attached [PostgreSQL][postgres] | Release Candidate | N/A              |
 | `sqlite`   | Embedded [SQLite][sqlite]       | Release Candidate | `memory`, `file` |
 
-[duckdb]: https://docs.spiceai.org/data-accelerators/duckdb
+[duckdb]: https://spiceai.org/docs/data-accelerators/duckdb
 [postgres]: https://github.com/spiceai/cookbook/tree/trunk/postgres/accelerator#postgresql-data-accelerator
-[sqlite]: https://docs.spiceai.org/data-accelerators/sqlite
+[sqlite]: https://spiceai.org/docs/data-accelerators/sqlite
 
 ## Supported Model Providers
 
@@ -493,13 +493,13 @@ You can experiment with the time it takes to generate queries when using non-acc
 
 ### 📄 Documentation
 
-Comprehensive documentation is available at [docs.spiceai.org](https://docs.spiceai.org/).
+Comprehensive documentation is available at [spiceai.org/docs](https://spiceai.org/docs/).
 
 Over 45 quickstarts and samples available in the [Spice Cookbook](https://github.com/spiceai/cookbook#spiceai-oss-cookbook).
 
 ### 🔌 Extensibility
 
-Spice.ai is designed to be extensible with extension points documented at [EXTENSIBILITY.md](./docs/EXTENSIBILITY.md). Build custom [Data Connectors](https://docs.spiceai.org/components/data-connectors), [Data Accelerators](https://docs.spiceai.org/components/data-accelerators), [Catalog Connectors](https://docs.spiceai.org/components/catalogs), [Secret Stores](https://docs.spiceai.org/components/secret-stores), [Models](https://docs.spiceai.org/components/models), or [Embeddings](https://docs.spiceai.org/components/embeddings).
+Spice.ai is designed to be extensible with extension points documented at [EXTENSIBILITY.md](./docs/EXTENSIBILITY.md). Build custom [Data Connectors](https://spiceai.org/docs/components/data-connectors), [Data Accelerators](https://spiceai.org/docs/components/data-accelerators), [Catalog Connectors](https://spiceai.org/docs/components/catalogs), [Secret Stores](https://spiceai.org/docs/components/secret-stores), [Models](https://spiceai.org/docs/components/models), or [Embeddings](https://spiceai.org/docs/components/embeddings).
 
 ### 🔨 Upcoming Features
 

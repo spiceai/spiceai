@@ -154,7 +154,7 @@ impl CatalogConnector for IcebergCatalog {
             return Err(
                 super::Error::InvalidConfigurationNoSource {
                     connector: "iceberg".into(),
-                    message: "A Catalog Path is required for Iceberg in the format of: http://<host_and_port>/v1/namespaces/<namespace>.\nFor details, visit: https://docs.spiceai.org/components/catalogs/iceberg#from".into(),
+                    message: "A Catalog Path is required for Iceberg in the format of: http://<host_and_port>/v1/namespaces/<namespace>.\nFor details, visit: https://spiceai.org/docs/components/catalogs/iceberg#from".into(),
                     connector_component: ConnectorComponent::from(catalog),
                 },
             );
@@ -165,7 +165,7 @@ impl CatalogConnector for IcebergCatalog {
             Err(e) => {
                 return Err(super::Error::InvalidConfiguration {
                     connector: "iceberg".into(),
-                    message: format!("A Catalog Path is required for Iceberg in the format of: http://<host_and_port>/v1/namespaces/<namespace>.\nFor details, visit: https://docs.spiceai.org/components/catalogs/iceberg#from\n{e}"),
+                    message: format!("A Catalog Path is required for Iceberg in the format of: http://<host_and_port>/v1/namespaces/<namespace>.\nFor details, visit: https://spiceai.org/docs/components/catalogs/iceberg#from\n{e}"),
                     connector_component: ConnectorComponent::from(catalog),
                     source: Box::new(e),
                 });

@@ -221,7 +221,7 @@ fn azure(
     let Some(model_name) = model_id else {
         return Err(LlmError::FailedToLoadModel {
             source: format!(
-    "Azure model '{model_name}' requires a model ID in the format `from:azure:<model_id>`. See https://docs.spiceai.org/components/models/azure for details."
+    "Azure model '{model_name}' requires a model ID in the format `from:azure:<model_id>`. See https://spiceai.org/docs/components/models/azure for details."
 ).into(),
         });
     };
@@ -234,7 +234,7 @@ fn azure(
     if api_base.is_none() {
         return Err(LlmError::FailedToLoadModel {
             source: format!(
-    "Azure model '{model_name}' requires the 'endpoint' parameter. See https://docs.spiceai.org/components/models/azure for details."
+    "Azure model '{model_name}' requires the 'endpoint' parameter. See https://spiceai.org/docs/components/models/azure for details."
 ).into(),
         });
     }
@@ -242,7 +242,7 @@ fn azure(
     if api_key.is_some() && entra_token.is_some() {
         return Err(LlmError::FailedToLoadModel {
             source: format!(
-                "Azure model '{model_name}' allows only one of 'azure_api_key' or 'azure_entra_token'. See https://docs.spiceai.org/components/models/azure for details."
+                "Azure model '{model_name}' allows only one of 'azure_api_key' or 'azure_entra_token'. See https://spiceai.org/docs/components/models/azure for details."
             )
             .into(),
         });
@@ -251,7 +251,7 @@ fn azure(
     if api_key.is_none() && entra_token.is_none() {
         return Err(LlmError::FailedToLoadModel {
             source: format!(
-                "Azure model '{model_name}' requires either 'azure_api_key' or 'azure_entra_token'. See https://docs.spiceai.org/components/models/azure for details."
+                "Azure model '{model_name}' requires either 'azure_api_key' or 'azure_entra_token'. See https://spiceai.org/docs/components/models/azure for details."
             )
             .into(),
         });

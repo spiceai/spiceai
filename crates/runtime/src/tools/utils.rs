@@ -104,7 +104,7 @@ pub async fn get_tools(rt: Arc<Runtime>, opts: &SpiceToolsOptions) -> Vec<Arc<dy
             .collect::<Vec<&str>>()
             .join(", ");
 
-        tracing::warn!("The following tools were not found in the registry: {}.\nAvailable tools are: {available_tools}.\nFor details, visit https://docs.spiceai.org/features/large-language-models/tools", missing_tools.join(", "));
+        tracing::warn!("The following tools were not found in the registry: {}.\nAvailable tools are: {available_tools}.\nFor details, visit https://spiceai.org/docs/features/large-language-models/tools", missing_tools.join(", "));
     }
 
     tools

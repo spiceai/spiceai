@@ -105,7 +105,7 @@ pub enum Error {
     #[snafu(display("Failed to write data into accelerated table.\n{source}"))]
     FailedToWriteData { source: DataFusionError },
 
-    #[snafu(display("The accelerated table does not support delete operations.\nUse a different acceleration engine which supports delete operations.\nFor details, visit: https://docs.spiceai.org/components/data-accelerators"))]
+    #[snafu(display("The accelerated table does not support delete operations.\nUse a different acceleration engine which supports delete operations.\nFor details, visit: https://spiceai.org/docs/components/data-accelerators"))]
     AcceleratedTableDoesntSupportDelete {},
 
     #[snafu(display("Expected the schema to have field '{field_name}', but it did not.\nSpice found the schema: {schema}\nIs the primary key configuration correct?"))]
@@ -134,10 +134,10 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Debug, Snafu)]
 pub enum AcceleratedTableBuilderError {
-    #[snafu(display("A changes stream is required when `refresh_mode` is set to `changes`.\nFor details, visit: https://docs.spiceai.org/features/cdc"))]
+    #[snafu(display("A changes stream is required when `refresh_mode` is set to `changes`.\nFor details, visit: https://spiceai.org/docs/features/cdc"))]
     ExpectedChangesStream,
 
-    #[snafu(display("An append stream is required when `refresh_mode` is set to `append` without a `time_column`.\nFor details, visit: https://docs.spiceai.org/components/data-accelerators/data-refresh#append"))]
+    #[snafu(display("An append stream is required when `refresh_mode` is set to `append` without a `time_column`.\nFor details, visit: https://spiceai.org/docs/components/data-accelerators/data-refresh#append"))]
     AppendStreamRequired,
 
     #[snafu(display("A synchronized accelerated table requires full refresh mode.\nSet `refresh_mode` to 'full', and try again."))]

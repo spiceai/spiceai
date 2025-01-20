@@ -86,7 +86,7 @@ Related reading:
         Cannot setup the dataset taxi_trips (s3) with an invalid configuration.
         Failed to find any files matching the extension '.csv'.
         Is your `file_format` parameter correct? Spice found the following file extensions: '.parquet'.
-        For details, visit: <https://docs.spiceai.org/components/data-connectors#object-store-file-formats>
+        For details, visit: <https://spiceai.org/docs/components/data-connectors#object-store-file-formats>
     ```
 
     *Bad:*
@@ -130,7 +130,7 @@ Related reading:
         Cannot setup the dataset taxi_trips (s3) with an invalid configuration.
         Failed to find any files matching the extension '.csv'.
         Is your `file_format` parameter correct? Spice found the following file extensions: '.parquet'.
-        For details, visit: <https://docs.spiceai.org/components/data-connectors#object-store-file-formats>
+        For details, visit: <https://spiceai.org/docs/components/data-connectors#object-store-file-formats>
     ```
 
     *Bad:*
@@ -156,13 +156,13 @@ Related reading:
     ```bash
         Error initializing dataset taxi_trips.
         The `s3_key` parameter cannot be set unless the `s3_auth` parameter is set to `key`.
-        For more information, visit: https://docs.spiceai.org/components/data-connectors/s3#auth
+        For more information, visit: https://spiceai.org/docs/components/data-connectors/s3#auth
     ```
 
     *Bad:*
 
     ```bash
-        Error initializing dataset taxi_trips. The `s3_key` parameter cannot be set unless the `s3_auth` parameter is set to `key`. For more information, visit: https://docs.spiceai.org/components/data-connectors/s3#auth`
+        Error initializing dataset taxi_trips. The `s3_key` parameter cannot be set unless the `s3_auth` parameter is set to `key`. For more information, visit: https://spiceai.org/docs/components/data-connectors/s3#auth`
     ```
 
 7. **Do not use internal concepts in error messages**

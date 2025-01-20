@@ -63,7 +63,7 @@ var loginCmd = &cobra.Command{
 	Example: `
 spice login
 
-# See more at: https://docs.spiceai.org/
+# See more at: https://spiceai.org/docs/
 `,
 	Run: func(cmd *cobra.Command, args []string) {
 		authCode := generateAuthCode()
@@ -145,7 +145,7 @@ var dremioCmd = &cobra.Command{
 	Example: `
 spice login dremio --username <username> --password <password>
 
-# See more at: https://docs.spiceai.org/
+# See more at: https://spiceai.org/docs/
 `,
 	Run: CreateLoginRunFunc(api.AUTH_TYPE_DREMIO, map[string]string{
 		usernameFlag: fmt.Sprintf("No username provided, use --%s or -u to provide a username", usernameFlag),
@@ -162,7 +162,7 @@ var s3Cmd = &cobra.Command{
 	Example: `
 spice login s3 --access-key <key> --access-secret <secret>
 
-# See more at: https://docs.spiceai.org/
+# See more at: https://spiceai.org/docs/
 `,
 	Run: CreateLoginRunFunc(api.AUTH_TYPE_S3, map[string]string{
 		accessKeyFlag:    fmt.Sprintf("No access key provided, use --%s or -k to provide a key", accessKeyFlag),
@@ -179,7 +179,7 @@ var postgresCmd = &cobra.Command{
 	Example: `
 spice login postgres --password <password>
 
-# See more at: https://docs.spiceai.org/
+# See more at: https://spiceai.org/docs/
 `,
 	Run: CreateLoginRunFunc(api.AUTH_TYPE_POSTGRES, map[string]string{
 		passwordFlag: fmt.Sprintf("No password provided, use --%s or -p to provide a password", passwordFlag),
@@ -195,7 +195,7 @@ var snowflakeCmd = &cobra.Command{
 spice login snowflake --account <account-identifier> --username <username> --password <password>
 spice login snowflake --account <account-identifier> --username <username> --private-key-path <private-key-path> --passphrase <passphrase>
 
-# See more at: https://docs.spiceai.org/
+# See more at: https://spiceai.org/docs/
 `,
 	Run: func(cmd *cobra.Command, args []string) {
 
@@ -237,7 +237,7 @@ var sharepointCmd = &cobra.Command{
 	Example: `
 	spice login sharepoint --tenant-id <tenant-id> --client-id <client-id>
 
-# See more at: https://docs.spiceai.org/
+# See more at: https://spiceai.org/docs/
 `,
 	Run: func(cmd *cobra.Command, args []string) {
 		tenant_id, err := cmd.Flags().GetString(m365TenantId)
@@ -280,7 +280,7 @@ var abfsCmd = &cobra.Command{
 	Example: `
 	spice login abfs --tenant-id <tenant-id> --client-id <client-id>
 
-# See more at: https://docs.spiceai.org/
+# See more at: https://spiceai.org/docs/
 `,
 	Run: func(cmd *cobra.Command, args []string) {
 		tenant_id, err := cmd.Flags().GetString(m365TenantId)
@@ -323,7 +323,7 @@ var sparkCmd = &cobra.Command{
 	Example: `
 spice login spark --spark_remote <remote>
 
-# See more at: https://docs.spiceai.org/
+# See more at: https://spiceai.org/docs/
 `,
 	Run: CreateLoginRunFunc(api.AUTH_TYPE_SPARK, map[string]string{
 		sparkRemoteFlag: "No spark_remote provided, use --spark_remote to provide",
@@ -403,7 +403,7 @@ spice login databricks --token <access-token> --azure-storage-account-name <acco
 # Using Delta Lake directly against Google Cloud Storage
 spice login databricks --token <access-token> --google-service-account-path /path/to/service-account.json
 
-# See more at: https://docs.spiceai.org/
+# See more at: https://spiceai.org/docs/
 `,
 	Run: func(cmd *cobra.Command, args []string) {
 		db_token, err := cmd.Flags().GetString(token)
@@ -494,7 +494,7 @@ spice login delta_lake --azure-storage-account-name <account-name> --azure-stora
 # Using Delta Lake with Google Cloud Storage
 spice login delta_lake --google-service-account-path /path/to/service-account.json
 
-# See more at: https://docs.spiceai.org/
+# See more at: https://spiceai.org/docs/
 `,
 	Run: func(cmd *cobra.Command, args []string) {
 		params := map[string]string{}
