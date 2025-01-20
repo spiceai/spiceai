@@ -35,7 +35,7 @@ pub enum Error {
     },
 
     #[snafu(display("Failed to load runnable model: {}. Verify configuration and try again.\nError: {}\nFor details, visit https://spiceai.org/docs/components/models", name, source))]
-    FailedToLoadModelError {
+    FailedToLoadRunnableModel {
         name: String,
         source: Box<dyn std::error::Error + Send + Sync>,
     },
@@ -119,7 +119,7 @@ impl Runtime {
                     model_map.insert(m.name.clone(), in_m);
                     Ok(())
                 }
-                Err(e) => Err(Error::FailedToLoadModelError {
+                Err(e) => Err(Error::FailedToLoadRunnableModel {
                     name: m.name.clone(),
                     source: Box::new(e),
                 }),
