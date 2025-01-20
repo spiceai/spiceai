@@ -23,7 +23,29 @@ use crate::{
 use app::App;
 use model_components::model::Model;
 use opentelemetry::KeyValue;
+use snafu::prelude::*;
 use spicepod::component::model::{Model as SpicepodModel, ModelType};
+
+#[derive(Debug, Snafu)]
+pub enum Error {
+    #[snafu(display("Failed to load LLM: {}. Verify configuration and try again.\nError: {}\nFor details, visit https://spiceai.org/docs/components/models", name, source))]
+    LlmLoadError {
+        name: String,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display("Failed to load runnable model: {}. Verify configuration and try again.\nError: {}\nFor details, visit https://spiceai.org/docs/components/models", name, source))]
+    RunnableModelLoadError {
+        name: String,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display(
+        "Failed to load model {} from spicepod. Unable to determine model type. Verify configuration and try again.\nFor details, visit https://spiceai.org/docs/components/models",
+        name
+    ))]
+    UnableToDetermineModelType { name: String },
+}
 
 impl Runtime {
     pub(crate) async fn load_models(&self) {
@@ -79,17 +101,17 @@ impl Runtime {
 
         let model_type = m.model_type();
         tracing::trace!("Model type for {} is {:#?}", m.name, model_type.clone());
-        let result: Result<(), String> = match model_type {
+        let result: Result<(), Error> = match model_type {
             Some(ModelType::Llm) => match self.load_llm(m.clone(), params).await {
                 Ok(l) => {
                     let mut llm_map = self.llms.write().await;
                     llm_map.insert(m.name.clone(), l);
                     Ok(())
                 }
-                Err(e) => Err(format!(
-                    "Unable to load LLM from spicepod {}, error: {}",
-                    m.name, e,
-                )),
+                Err(e) => Err(Error::LlmLoadError {
+                    name: m.name.clone(),
+                    source: Box::new(e),
+                }),
             },
             Some(ModelType::Ml) => match Model::load(m.clone(), params).await {
                 Ok(in_m) => {
@@ -97,15 +119,14 @@ impl Runtime {
                     model_map.insert(m.name.clone(), in_m);
                     Ok(())
                 }
-                Err(e) => Err(format!(
-                    "Unable to load runnable model from spicepod {}, error: {}",
-                    m.name, e,
-                )),
+                Err(e) => Err(Error::RunnableModelLoadError {
+                    name: m.name.clone(),
+                    source: Box::new(e),
+                }),
             },
-            None => Err(format!(
-                "Unable to load model {} from spicepod. Unable to determine model type.",
-                m.name,
-            )),
+            None => Err(Error::UnableToDetermineModelType {
+                name: m.name.clone(),
+            }),
         };
         match result {
             Ok(()) => {
@@ -124,7 +145,7 @@ impl Runtime {
                 metrics::models::LOAD_ERROR.add(1, &[]);
                 self.status
                     .update_model(&model.name, status::ComponentStatus::Error);
-                tracing::warn!(e);
+                tracing::warn!("{e}");
             }
         }
     }

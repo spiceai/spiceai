@@ -68,11 +68,7 @@ impl Runtime {
                         metrics::embeddings::LOAD_ERROR.add(1, &[]);
                         self.status
                             .update_embedding(&in_embed.name, status::ComponentStatus::Error);
-                        tracing::warn!(
-                            "Unable to load embedding from spicepod {}, error: {}",
-                            in_embed.name,
-                            e,
-                        );
+                        tracing::warn!("Failed to load embedding {}.\nError: {}\nVerify configuration and try again.\nFor details, visit https://spiceai.org/docs/components/embeddings", in_embed.name, e);
                     }
                 }
             }
