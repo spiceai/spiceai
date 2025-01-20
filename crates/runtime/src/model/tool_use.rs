@@ -681,7 +681,7 @@ fn make_a_stream(
                         }
                     }
 
-                    // When there are no [`ChatChoiceStream`]s, but the model has usage, send the response (with not choices).
+                    // When there are no [`ChatChoiceStream`]s, but the model has usage, send the response (with no choices).
                     if response.choices.is_empty() && response.usage.is_some() {
                         if let Err(e) = sender_clone.send(Ok(response)).await {
                             if !sender_clone.is_closed() {
