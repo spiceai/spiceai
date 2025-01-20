@@ -100,7 +100,7 @@ pub async fn get_tools(rt: Arc<Runtime>, opts: &SpiceToolsOptions) -> Vec<Arc<dy
     if !missing_tools.is_empty() {
         let available_tools = all_tools
             .keys()
-            .map(|k| k.as_str())
+            .map(String::as_str)
             .collect::<Vec<&str>>()
             .join(", ");
 
