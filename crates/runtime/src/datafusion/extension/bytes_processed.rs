@@ -277,7 +277,7 @@ impl ExecutionPlan for BytesProcessedExec {
         let Some(request_context) = context.session_config().get_extension::<RequestContext>()
         else {
             // This should never happen if all queries are run through the query builder, so if it does its a bug we need to catch in development.
-            panic!("The request context was not provided to BytesProcessedExec, please file a bug at https://github.com/spiceai/spiceai/issues")
+            panic!("The request context was not provided to BytesProcessedExec, report a bug at https://github.com/spiceai/spiceai/issues")
         };
 
         let bytes_processed_stream = stream! {

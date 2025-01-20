@@ -955,10 +955,10 @@ fn handle_http_error(status: StatusCode, response: &Value) -> Result<()> {
 
         return match status {
             StatusCode::UNAUTHORIZED => {
-                Err(Error::InvalidCredentialsOrPermissions { message: format!("The API failed with status code {status}; Please check if provided credentials are correct.") })
+                Err(Error::InvalidCredentialsOrPermissions { message: format!("The API failed with status code {status}.\nVerify the provided credentials are correct.") })
             },
             StatusCode::FORBIDDEN => {
-                Err(Error::InvalidCredentialsOrPermissions { message: format!("The API failed with status code {status}; Please check if provided credentials have the necessary permissions.") })
+                Err(Error::InvalidCredentialsOrPermissions { message: format!("The API failed with status code {status}.\nVerify the provided credentials have the necessary permissions.") })
             },
             _ => Err(Error::InvalidReqwestStatus { status, message })
         };
@@ -992,7 +992,7 @@ fn handle_graphql_query_error(response: &Value, query: &str) -> Result<()> {
 
         if let Some(error_type) = error_type {
             if error_type.to_lowercase() == "forbidden" {
-                return Err(Error::InvalidCredentialsOrPermissions { message: format!("The API returned a 'FORBIDDEN' error. Please check if the credentials have the necessary permissions. {message}") });
+                return Err(Error::InvalidCredentialsOrPermissions { message: format!("The API returned a 'FORBIDDEN' error.\nVerify the credentials have the necessary permissions.\n{message}") });
             }
         }
 

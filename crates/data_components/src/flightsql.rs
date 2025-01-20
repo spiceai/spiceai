@@ -60,25 +60,25 @@ pub enum Error {
     #[snafu(display("Failed to connect to the Flight server.\n{source}\nVerify configuration and try again. For details, visit https://spiceai.org/docs/components/data-connectors/flightsql#params"))]
     UnableToConnectToServer { source: tonic::transport::Error },
 
-    #[snafu(display("Failed to create SQL query (flightsql).\n{source}\nAn unexpected error occurred. Please report a bug on GitHub: https://github.com/spiceai/spiceai/issues"))]
+    #[snafu(display("Failed to create SQL query (flightsql).\n{source}\nAn unexpected error occurred. Report a bug on GitHub: https://github.com/spiceai/spiceai/issues"))]
     UnableToGenerateSQL { source: expr::Error },
 
     #[snafu(display("Query execution failed (flightsql).\n{source}"))]
     UnableToQueryArrowFlight { source: FlightError },
 
-    #[snafu(display("Failed to retrieve table {table_name} schema (flightsql).\n{source}\nAn internal error occurred. Please report a bug on GitHub: https://github.com/spiceai/spiceai/issues"))]
+    #[snafu(display("Failed to retrieve table {table_name} schema (flightsql).\n{source}\nAn internal error occurred. Report a bug on GitHub: https://github.com/spiceai/spiceai/issues"))]
     UnableToRetrieveSchemaFromIpcMessage {
         source: arrow::error::ArrowError,
         table_name: String,
     },
 
-    #[snafu(display("Failed to detect table '{table_name}' schema (flightsql).\n{source}\nVerify the connection and try again. If the issue persists, please report a bug on GitHub: https://github.com/spiceai/spiceai/issues"))]
+    #[snafu(display("Failed to detect table '{table_name}' schema (flightsql).\n{source}\nVerify the connection and try again. If the issue persists, report a bug on GitHub: https://github.com/spiceai/spiceai/issues"))]
     UnableToRetrieveSchemaArrow {
         source: arrow::error::ArrowError,
         table_name: String,
     },
 
-    #[snafu(display("Failed to detect table '{table_name}' schema (flightsql).\n{source}\nVerify the connection and try again. If the issue persists, please report a bug on GitHub: https://github.com/spiceai/spiceai/issues"))]
+    #[snafu(display("Failed to detect table '{table_name}' schema (flightsql).\n{source}\nVerify the connection and try again. If the issue persists, report a bug on GitHub: https://github.com/spiceai/spiceai/issues"))]
     UnableToRetrieveSchemaFlight {
         source: FlightError,
         table_name: String,
