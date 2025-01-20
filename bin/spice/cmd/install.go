@@ -30,6 +30,7 @@ var installCmd = &cobra.Command{
 	Use:     "install [flavor]",
 	Aliases: []string{"i"},
 	Short:   "Install the Spice.ai runtime",
+	Args:    cobra.MaximumNArgs(1), // only one positional argument (flavor)
 	Example: `
 spice install
 spice install ai
@@ -56,6 +57,17 @@ spice install ai
 			os.Exit(1)
 		}
 
+		cpu, err := cmd.Flags().GetBool("cpu")
+		if err != nil {
+			slog.Error("getting CPU flag", "error", err)
+			os.Exit(1)
+		}
+
+		if cpu && flavor != "ai" {
+			slog.Error("CPU flag is only allowed when installing the 'ai' flavor. Try: `spice install ai --cpu`")
+			os.Exit(1)
+		}
+
 		if force {
 			rtcontext := context.NewContext()
 			err := rtcontext.Init()
@@ -63,14 +75,14 @@ spice install ai
 				slog.Error("initializing runtime context", "error", err)
 				os.Exit(1)
 			}
-			err = rtcontext.InstallOrUpgradeRuntime(flavor)
+			err = rtcontext.InstallOrUpgradeRuntime(flavor, !cpu)
 			if err != nil {
 				slog.Error("installing runtime", "error", err)
 				os.Exit(1)
 			}
 			installed = true
 		} else {
-			installed, err = runtime.EnsureInstalled(flavor, true)
+			installed, err = runtime.EnsureInstalled(flavor, true, !cpu)
 			if err != nil {
 				slog.Error("verifying runtime install", "error", err)
 				os.Exit(1)
@@ -85,5 +97,6 @@ spice install ai
 
 func init() {
 	installCmd.Flags().BoolP("force", "f", false, "Force installation of the latest released runtime")
+	installCmd.Flags().BoolP("cpu", "c", false, "Install the CPU accelerated version of the AI runtime")
 	RootCmd.AddCommand(installCmd)
 }

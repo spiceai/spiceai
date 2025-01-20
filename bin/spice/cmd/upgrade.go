@@ -128,11 +128,12 @@ spice upgrade
 		slog.Info(fmt.Sprintf("Spice.ai CLI upgraded to %s successfully.", release.TagName))
 
 		flavor := ""
-		if rtcontext.ModelsFlavorInstalled() {
+		models, accelerated := rtcontext.ModelsFlavorInstalled()
+		if models {
 			flavor = "ai"
 		}
 
-		err = rtcontext.InstallOrUpgradeRuntime(flavor)
+		err = rtcontext.InstallOrUpgradeRuntime(flavor, accelerated) // retain the current accelerator setting for upgrades
 		if err != nil {
 			slog.Error("installing runtime", "error", err)
 			os.Exit(1)

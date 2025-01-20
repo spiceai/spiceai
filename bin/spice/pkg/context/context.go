@@ -170,7 +170,7 @@ func (c *RuntimeContext) Version() (string, error) {
 }
 
 func (c *RuntimeContext) RequireModelsFlavor(cmd *cobra.Command) {
-	if c.ModelsFlavorInstalled() {
+	if models, _ := c.ModelsFlavorInstalled(); models {
 		return
 	}
 	slog.Info("This feature requires a runtime version with models enabled. Install (y/n)? ")
@@ -181,38 +181,45 @@ func (c *RuntimeContext) RequireModelsFlavor(cmd *cobra.Command) {
 		os.Exit(0)
 	}
 	slog.Info("Installing models runtime...")
-	err := c.InstallOrUpgradeRuntime("models")
+	err := c.InstallOrUpgradeRuntime("models", true) // default to using an accelerator for prompted installs
 	if err != nil {
 		slog.Error("installing models runtime", "error", err)
 		os.Exit(1)
 	}
 }
 
-func (c *RuntimeContext) ModelsFlavorInstalled() bool {
+// Return type = (models, accelerated)
+func (c *RuntimeContext) ModelsFlavorInstalled() (models bool, accelerated bool) {
 	version, err := c.Version()
 	if err != nil {
-		return false
+		return false, false
 	}
 
 	// Split the semver string by '+', the part after '+' is the build metadata
 	parts := strings.Split(version, "+")
 	if len(parts) < 2 {
 		// No build metadata present
-		return false
+		return false, false
 	}
 
 	// Split build metadata by '.'
 	buildMetadata := parts[1]
 	metadataParts := strings.Split(buildMetadata, ".")
 
+	models = false
+	accelerated = false
 	// Check if any of the metadata parts is 'models'
 	for _, part := range metadataParts {
 		if part == "models" {
-			return true
+			models = true
+		}
+
+		if part == "cuda" || part == "metal" {
+			accelerated = true
 		}
 	}
 
-	return false
+	return
 }
 
 func (c *RuntimeContext) RuntimeUnavailableError() error {
@@ -227,7 +234,7 @@ func (c *RuntimeContext) IsRuntimeInstallRequired() bool {
 	return errors.Is(err, os.ErrNotExist)
 }
 
-func (c *RuntimeContext) InstallOrUpgradeRuntime(flavor string) error {
+func (c *RuntimeContext) InstallOrUpgradeRuntime(flavor string, allowAccelerator bool) error {
 	err := c.prepareInstallDir()
 	if err != nil {
 		return err
@@ -242,7 +249,7 @@ func (c *RuntimeContext) InstallOrUpgradeRuntime(flavor string) error {
 
 	slog.Info(fmt.Sprintf("Downloading and installing Spice.ai Runtime %s ...\n", runtimeVersion))
 
-	err = github.DownloadRuntimeAsset(flavor, release, c.spiceBinDir)
+	err = github.DownloadRuntimeAsset(flavor, release, c.spiceBinDir, allowAccelerator)
 	if err != nil {
 		slog.Error("downloading Spice.ai runtime binaries", "error", err)
 		return err

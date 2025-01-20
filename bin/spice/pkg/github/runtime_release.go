@@ -54,8 +54,8 @@ func GetLatestCliRelease() (*RepoRelease, error) {
 	return release, nil
 }
 
-func DownloadRuntimeAsset(flavor string, release *RepoRelease, downloadPath string) error {
-	assetName := GetRuntimeAssetName(flavor)
+func DownloadRuntimeAsset(flavor string, release *RepoRelease, downloadPath string, allowAccelerator bool) error {
+	assetName := GetRuntimeAssetName(flavor, allowAccelerator)
 	slog.Info(fmt.Sprintf("Downloading the Spice runtime..., %s", assetName))
 	return DownloadReleaseAsset(githubClient, release, assetName, downloadPath)
 }
@@ -64,10 +64,10 @@ func DownloadAsset(release *RepoRelease, downloadPath string, assetName string) 
 	return DownloadReleaseAsset(githubClient, release, assetName, downloadPath)
 }
 
-func GetRuntimeAssetName(flavor string) string {
+func GetRuntimeAssetName(flavor string, allowAccelerator bool) string {
 	switch {
 	case flavor == "ai":
-		if accelerator, exists := get_ai_accelerator(); exists {
+		if accelerator, exists := get_ai_accelerator(); exists && allowAccelerator {
 			flavor = fmt.Sprintf("_models_%s", accelerator)
 		} else {
 			flavor = "_models"
