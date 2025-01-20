@@ -86,12 +86,26 @@ pub async fn get_tools(rt: Arc<Runtime>, opts: &SpiceToolsOptions) -> Vec<Arc<dy
     let all_tools = rt.tools.read().await;
 
     let mut tools = vec![];
+
+    let mut missing_tools = vec![];
+
     for tt in opts.tools_by_name() {
         if let Some(tool) = all_tools.get(tt) {
             tools.extend(tool.tools().await);
         } else {
-            tracing::warn!("Tool {tt} not found in registry");
+            missing_tools.push(tt);
         }
     }
+
+    if !missing_tools.is_empty() {
+        let available_tools = all_tools
+            .keys()
+            .map(|k| k.as_str())
+            .collect::<Vec<&str>>()
+            .join(", ");
+
+        tracing::warn!("The following tools were not found in the registry: {}.\nAvailable tools are: {available_tools}.\nFor details, visit https://docs.spiceai.org/features/large-language-models/tools", missing_tools.join(", "));
+    }
+
     tools
 }
