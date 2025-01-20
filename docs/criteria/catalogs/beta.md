@@ -11,7 +11,7 @@ All criteria must be met for the Catalog to be considered Beta, with exceptions 
 | Databricks    | ✅           | @Sevenannn      |
 | Iceberg       | ✅           | @phillipleblanc |
 | Spice.ai      | ➖           |                 |
-| Unity Catalog | ➖           |                 |
+| Unity Catalog | ✅           | @Sevenannn      |
 
 ## Beta Release Criteria
 

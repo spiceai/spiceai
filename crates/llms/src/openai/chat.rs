@@ -31,12 +31,6 @@ use tracing_futures::Instrument;
 
 use super::Openai;
 
-pub const MAX_COMPLETION_TOKENS: u16 = 1024_u16; // Avoid accidentally using infinite tokens. Should think about this more.
-
-pub(crate) const GPT3_5_TURBO_INSTRUCT: &str = "gpt-3.5-turbo";
-
-pub const DEFAULT_LLM_MODEL: &str = GPT3_5_TURBO_INSTRUCT;
-
 #[async_trait]
 impl<C: Config + Send + Sync> Chat for Openai<C> {
     fn as_sql(&self) -> Option<&dyn SqlGeneration> {

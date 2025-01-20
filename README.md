@@ -145,16 +145,16 @@ See more demos on [YouTube](https://www.youtube.com/playlist?list=PLesJrUXEx3U9a
 | Name                               | Description                           | Status            | Protocol/Format              |
 | ---------------------------------- | ------------------------------------- | ----------------- | ---------------------------- |
 | `databricks (mode: delta_lake)`    | [Databricks][databricks]              | Stable            | S3/Delta Lake                |
+| `delta_lake`                       | Delta Lake                            | Stable            | Delta Lake                   |
 | `dremio`                           | [Dremio][dremio]                      | Stable            | Arrow Flight                 |
 | `duckdb`                           | DuckDB                                | Stable            | Embedded                     |
 | `file`                             | File                                  | Stable            | Parquet, CSV                 |
 | `github`                           | GitHub                                | Stable            | GitHub API                   |
 | `postgres`                         | PostgreSQL                            | Stable            |                              |
 | `s3`                               | [S3][s3]                              | Stable            | Parquet, CSV                 |
+| `mysql`                            | MySQL                                 | Stable            |                              |
 | `graphql`                          | GraphQL                               | Release Candidate | JSON                         |
-| `mysql`                            | MySQL                                 | Release Candidate |                              |
 | `databricks (mode: spark_connect)` | [Databricks][databricks]              | Beta              | [Spark Connect][spark]       |
-| `delta_lake`                       | Delta Lake                            | Beta              | Delta Lake                   |
 | `flightsql`                        | FlightSQL                             | Beta              | Arrow Flight SQL             |
 | `iceberg`                          | [Apache Iceberg][iceberg]             | Beta              | Parquet                      |
 | `mssql`                            | Microsoft SQL Server                  | Beta              | Tabular Data Stream (TDS)    |
@@ -212,9 +212,9 @@ Catalog Connectors connect to external catalog providers and make their tables a
 
 | Name            | Description             | Status      | Protocol/Format              |
 | --------------- | ----------------------- | ----------- | ---------------------------- |
-| `iceberg`       | Apache Iceberg          | Beta        | Parquet                      |
+| `unity_catalog` | Unity Catalog           | Stable      | Delta Lake                   |
 | `databricks`    | Databricks              | Beta        | Spark Connect, S3/Delta Lake |
-| `unity_catalog` | Unity Catalog           | Alpha       | Delta Lake                   |
+| `iceberg`       | Apache Iceberg          | Beta        | Parquet                      |
 | `spice.ai`      | Spice.ai Cloud Platform | Alpha       | Arrow Flight                 |
 | `glue`          | AWS Glue                | Coming Soon | JSON, Parquet, Iceberg       |
 
