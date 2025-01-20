@@ -406,9 +406,9 @@ macro_rules! generate_model_tests {
         test_model_case!(anthropic, basic);
         test_model_case!(anthropic, system_prompt);
         test_model_case!(anthropic, supports_basic_message_roles);
-        // test_model_case!(anthropic, basic, true);
-        // test_model_case!(anthropic, system_prompt, true);
-        // test_model_case!(anthropic, supports_basic_message_roles, true);
+        test_model_case!(anthropic, basic, true);
+        test_model_case!(anthropic, system_prompt, true);
+        test_model_case!(anthropic, supports_basic_message_roles, true);
 
         test_model_case!(openai, basic);
         test_model_case!(openai, system_prompt);
@@ -442,9 +442,9 @@ macro_rules! generate_model_tests {
         test_model_case!(anthropic, tool_use);
         test_model_case!(anthropic, usage);
         test_model_case!(anthropic, supports_all_message_roles);
-        // test_model_case!(anthropic, tool_use, true);
-        // test_model_case!(anthropic, usage, true);
-        // test_model_case!(anthropic, supports_all_message_roles, true);
+        test_model_case!(anthropic, tool_use, true);
+        test_model_case!(anthropic, usage, true);
+        test_model_case!(anthropic, supports_all_message_roles, true);
 
         test_model_case!(openai, tool_use);
         test_model_case!(openai, tool_use, true);

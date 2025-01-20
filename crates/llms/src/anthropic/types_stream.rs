@@ -22,7 +22,7 @@ use async_openai::{
         CreateChatCompletionStreamResponse, FinishReason, FunctionCallStream, Role,
     },
 };
-use futures::{future, Stream, StreamExt};
+use futures::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{collections::HashMap, fmt, pin::Pin, sync::Arc, time::SystemTime};
@@ -142,7 +142,9 @@ impl Delta {
             },
             (
                 Delta::InputJsonDelta { partial_json },
-                Some(ContentBlockToolUse { id, name, .. }),
+                Some(ContentBlockToolUse {
+                    id, name: _name, ..
+                }),
             ) => ChatCompletionStreamResponseDelta {
                 content: None,
                 function_call: None,
@@ -151,7 +153,7 @@ impl Delta {
                     id: Some(id.clone()),
                     r#type: Some(ChatCompletionToolType::Function),
                     function: Some(FunctionCallStream {
-                        name: Some(name.clone()),
+                        name: None, // Intentially leave empty to match OpenAI's format.
                         arguments: Some(partial_json),
                     }),
                 }]),
@@ -272,21 +274,10 @@ pub fn transform_stream(
     let state = Arc::new(Mutex::new(StreamState::default()));
 
     let transformed_stream = stream
-        // Must filter out unneeded messages early to avoid the below [`Stream::scan`] returning early
-        .filter(|m| {
-            future::ready(!matches!(
-                m,
-                Ok(MessageCreateStreamResponse::Ping
-                    | MessageCreateStreamResponse::ContentBlockStop { .. }
-                    | MessageCreateStreamResponse::MessageStop)
-            ))
-        })
-        .then(move |item| {
+        .filter_map(move |item| {
             let inner_state = Arc::clone(&state);
-
             async move {
                 let mut state = inner_state.lock().await;
-
                 match item {
                     Ok(MessageCreateStreamResponse::MessageStart {
                         message:
@@ -393,18 +384,23 @@ pub fn transform_stream(
                         MessageCreateStreamResponse::Ping
                         | MessageCreateStreamResponse::ContentBlockStop { .. }
                         | MessageCreateStreamResponse::MessageStop,
-                    ) => unreachable!("Filtered out"),
+                    ) => None,
                     Err(e) => {
                         tracing::debug!("Received an anthropic error stream packet: {:?}", e);
-                        Err(OpenAIError::ApiError(ApiError {
-                            message: e.to_string(),
+                        Some(Err(OpenAIError::ApiError(ApiError {
+                            message: e.error.message,
                             r#type: Some("AnthropicStreamError".to_string()),
                             param: None,
                             code: None,
-                        }))
+                        })))
                     }
                 }
             }
+        })
+        // Because we don't early exit on [`MessageCreateStreamResponse::MessageStop`], we need to handle stream end explicitly, otherwise we will infinite loop on the stream.
+        .take_while(|item| {
+            let keep_going = !matches!(item, Err(OpenAIError::ApiError(ApiError { message, .. })) if message == "Stream ended");
+            futures::future::ready(keep_going)
         });
 
     Box::pin(transformed_stream)
@@ -417,24 +413,26 @@ fn create_stream_response(
     model: &str,
     usage: Option<CompletionUsage>,
     choice: Option<ChatChoiceStream>,
-) -> Result<CreateChatCompletionStreamResponse, OpenAIError> {
+) -> Option<Result<CreateChatCompletionStreamResponse, OpenAIError>> {
     let choices = match choice {
         Some(c) => vec![c],
         None => vec![],
     };
-    let created = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map_err(|e| OpenAIError::InvalidArgument(e.to_string()))?
-        .as_secs() as u32;
 
-    Ok(CreateChatCompletionStreamResponse {
+    let Ok(created_time) = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH) else {
+        return Some(Err(OpenAIError::InvalidArgument(
+            "Failed to get current time".to_string(),
+        )));
+    };
+
+    Some(Ok(CreateChatCompletionStreamResponse {
         id: id.to_string(),
-        created,
+        created: created_time.as_secs() as u32,
         model: model.to_string(),
         service_tier: None,
         system_fingerprint: None,
         object: "chat.completion.chunk".to_string(),
         usage,
         choices,
-    })
+    }))
 }

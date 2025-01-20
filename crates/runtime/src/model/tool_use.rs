@@ -680,6 +680,15 @@ fn make_a_stream(
                             }
                         }
                     }
+
+                    // When there are no [`ChatChoiceStream`]s, but the model has usage, send the response (with not choices).
+                    if response.choices.is_empty() && response.usage.is_some() {
+                        if let Err(e) = sender_clone.send(Ok(response)).await {
+                            if !sender_clone.is_closed() {
+                                tracing::error!("Error sending error: {}", e);
+                            }
+                        }
+                    }
                 }
 
                 tracing::info!(target: "task_history", captured_output = %chat_output);
