@@ -84,22 +84,7 @@ jobs:
                 target_arch: "x86_64",
                 target_arch_go: "amd64",
                 tags: ["default", "models"],
-              }, {
-                name: "GPU T4 Ubuntu",
-                runner: "ubuntu-gpu-t4-4-core",
-                target_os: "linux",
-                target_arch: "x86_64",
-                target_arch_go: "amd64",
-                tags: ["cuda"]
-              },
-              {
-                name: "GPU T4 Windows",
-                runner: "windows-gpu-t4-4-core",
-                target_os: "windows",
-                target_arch: "x86_64",
-                target_arch_go: "amd64",
-                tags: ["cuda"]
-              },
+              }
             ];
 
             // If running via workflow_dispatch, filter based on input
@@ -113,10 +98,6 @@ jobs:
               return matrix.filter(m => m.name === platform_option);
             }
 
-            // Do not run GPU builds automatically on PRs
-            if (context.eventName === 'push' && context.ref === 'refs/heads/trunk') {
-              return matrix.filter(m => !m.tags.includes("cuda"));
-            }
             return matrix;
 
   build:
@@ -321,52 +302,6 @@ jobs:
           name: spiced_models_metal_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: spiced_models_metal_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz
 
-      ## Models + CUDA flavor: 90, 89, 86, 80, 75 
-      - name: Run Spiced CUDA Build (COMPUTE_CAP=75).
-        uses: ./.github/actions/spiced-cuda-build
-        if: contains(matrix.target.tags, 'cuda')
-        with:
-          cuda-version: "12.4.1"
-          cuda-compute-capability: "75"
-          artifact-tag: ${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-          target_os: ${{ matrix.target.target_os }}
-
-      - name: Run Spiced CUDA Build (COMPUTE_CAP=80).
-        uses: ./.github/actions/spiced-cuda-build
-        if: contains(matrix.target.tags, 'cuda')
-        with:
-          cuda-version: "12.4.1"
-          cuda-compute-capability: "80"
-          artifact-tag: ${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-          target_os: ${{ matrix.target.target_os }}
-
-      - name: Run Spiced CUDA Build (COMPUTE_CAP=86).
-        uses: ./.github/actions/spiced-cuda-build
-        if: contains(matrix.target.tags, 'cuda')
-        with:
-          cuda-version: "12.4.1"
-          cuda-compute-capability: "86"
-          artifact-tag: ${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-          target_os: ${{ matrix.target.target_os }}
-
-      - name: Run Spiced CUDA Build (COMPUTE_CAP=89).
-        uses: ./.github/actions/spiced-cuda-build
-        if: contains(matrix.target.tags, 'cuda')
-        with:
-          cuda-version: "12.4.1"
-          cuda-compute-capability: "89"
-          artifact-tag: ${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-          target_os: ${{ matrix.target.target_os }}
-
-      - name: Run Spiced CUDA Build (COMPUTE_CAP=90).
-        uses: ./.github/actions/spiced-cuda-build
-        if: contains(matrix.target.tags, 'cuda')
-        with:
-          cuda-version: "12.4.1"
-          cuda-compute-capability: "90"
-          artifact-tag: ${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-          target_os: ${{ matrix.target.target_os }}
-
       ## CLI build
       - name: Build spice
         if: contains(matrix.target.tags, 'default')
@@ -426,10 +361,104 @@ jobs:
             Copy-Item -Recurse -Force target/* C:/spiceai/build/target
           }
 
+  cuda-build:
+    name: Build CUDA ${{ matrix.compute_cap }} binaries
+    runs-on: ${{ matrix.runner }}
+    needs: setup-matrix
+    strategy:
+      matrix:
+        include:
+          - compute_cap: "75"
+            runner: "ubuntu-gpu-t4-4-core"
+            target_os: "linux"
+            target_arch: "x86_64"
+          - compute_cap: "80"
+            runner: "ubuntu-gpu-t4-4-core"
+            target_os: "linux"
+            target_arch: "x86_64"
+          - compute_cap: "86"
+            runner: "ubuntu-gpu-t4-4-core"
+            target_os: "linux"
+            target_arch: "x86_64"
+          - compute_cap: "89"
+            runner: "ubuntu-gpu-t4-4-core"
+            target_os: "linux"
+            target_arch: "x86_64"
+          - compute_cap: "90"
+            runner: "ubuntu-gpu-t4-4-core"
+            target_os: "linux"
+            target_arch: "x86_64"
+          - compute_cap: "75"
+            runner: "windows-gpu-t4-4-core"
+            target_os: "windows"
+            target_arch: "x86_64"
+          - compute_cap: "80"
+            runner: "windows-gpu-t4-4-core"
+            target_os: "windows"
+            target_arch: "x86_64"
+          - compute_cap: "86"
+            runner: "windows-gpu-t4-4-core"
+            target_os: "windows"
+            target_arch: "x86_64"
+          - compute_cap: "89"
+            runner: "windows-gpu-t4-4-core"
+            target_os: "windows"
+            target_arch: "x86_64"
+          - compute_cap: "90"
+            runner: "windows-gpu-t4-4-core"
+            target_os: "windows"
+            target_arch: "x86_64"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # The `windows-gpu-t4-4-core` does not have Python installed
+      - name: Set up Python3
+        if: matrix.target_os == 'windows'
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.x'
+
+      - name: Set REL_VERSION from version.txt
+        run: python3 ./.github/scripts/get_release_version.py
+
+      # The `windows-gpu-t4-4-core` does not have modern PowerShell installed
+      - name: Install PowerShell
+        if: matrix.target_os == 'windows'
+        uses: ./.github/actions/install-pwsh
+
+      # The `windows-gpu-t4-4-core` requires Visual Studio Build Tools
+      - name: Install Visual Studio Build Tools
+        if: matrix.target_os == 'windows'
+        uses: ./.github/actions/install-vs-buildtools
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+        with:
+          os: ${{ matrix.target_os }}
+
+      - name: Set up make
+        if: matrix.target_os == 'linux' || matrix.runner == 'windows-gpu-t4-4-core'
+        uses: ./.github/actions/setup-make
+        with:
+          os: ${{ matrix.target_os }}
+
+      - name: Set up cc
+        if: matrix.target_os == 'linux'
+        uses: ./.github/actions/setup-cc
+
+      - name: Run Spiced CUDA Build
+        uses: ./.github/actions/spiced-cuda-build
+        with:
+          cuda-version: "12.4.1"
+          cuda-compute-capability: ${{ matrix.compute_cap }}
+          artifact-tag: ${{ matrix.target_os }}_${{ matrix.target_arch }}
+          target_os: ${{ matrix.target_os }}
+
   publish-minio:
     name: Publish linux-x86_64 binaries to Minio
     runs-on: spiceai-runners
-    needs: build
+    needs: [build, cuda-build]
     env:
       GOVER: 1.23.4
       ARTIFACT_DIR: ./release
@@ -545,7 +574,7 @@ jobs:
 
   publish:
     name: Publish ${{ matrix.target_os }}-${{ matrix.target_arch }} binaries
-    needs: build
+    needs: [build, cuda-build]
     if: startswith(github.ref, 'refs/tags/v') && github.event_name != 'pull_request'
     env:
       ARTIFACT_DIR: ./release
