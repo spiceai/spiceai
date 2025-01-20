@@ -91,7 +91,7 @@ impl Runtime {
             .boxed()
             .context(UnableToInitializeEmbeddingModelSnafu)?;
 
-        TaskEmbed::new(l)
+        TaskEmbed::new(in_embed.name.as_str(), l)
             .await
             .boxed()
             .context(UnableToInitializeEmbeddingModelSnafu)

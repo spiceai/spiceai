@@ -33,11 +33,14 @@ use llms::{
 };
 use secrecy::{ExposeSecret, SecretString};
 use spicepod::component::model::{Model, ModelFileType, ModelSource};
-use std::pin::Pin;
 use std::{collections::HashMap, path::PathBuf, str::FromStr, sync::Arc};
+use std::{pin::Pin, time::Instant};
 use tracing_futures::Instrument;
 
-use super::tool_use::ToolUsingChat;
+use super::{
+    metrics::{handle_metrics, request_labels},
+    tool_use::ToolUsingChat,
+};
 use crate::{
     tools::{options::SpiceToolsOptions, utils::get_tools},
     Runtime,
@@ -451,6 +454,7 @@ impl Chat for ChatWrapper {
         &self,
         req: CreateChatCompletionRequest,
     ) -> Result<ChatCompletionResponseStream, OpenAIError> {
+        let start = Instant::now();
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "ai_completion", stream=true, model = %req.model, input = %serde_json::to_string(&req).unwrap_or_default());
         let req = self.prepare_req(req)?;
 
@@ -458,6 +462,7 @@ impl Chat for ChatWrapper {
             tracing::info!(target: "task_history", metadata = %metadata);
         }
 
+        let labels = request_labels(&req);
         match self.chat.chat_stream(req).instrument(span.clone()).await {
             Ok(resp) => {
                 let public_name = self.public_name.clone();
@@ -468,6 +473,7 @@ impl Chat for ChatWrapper {
                         // not incremental; provider only emits usage on last chunk.
                         if let Some(usage) = item.usage.clone() {
                             tracing::info!(target: "task_history", parent: &stream_span.clone(), completion_tokens = %usage.completion_tokens, total_tokens = %usage.total_tokens, prompt_tokens = %usage.prompt_tokens, "labels");
+                            handle_metrics(start.elapsed(), false, &labels)
                         }
                     }
                 }).instrument(span.clone());
@@ -475,6 +481,7 @@ impl Chat for ChatWrapper {
             }
             Err(e) => {
                 tracing::error!(target: "task_history", parent: &span, "Failed to run chat model: {}", e);
+                handle_metrics(start.elapsed(), true, &labels);
                 Err(e)
             }
         }
@@ -489,14 +496,17 @@ impl Chat for ChatWrapper {
         &self,
         req: CreateChatCompletionRequest,
     ) -> Result<CreateChatCompletionResponse, OpenAIError> {
+        let start = Instant::now();
+
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "ai_completion", stream=false, model = %req.model, input = %serde_json::to_string(&req).unwrap_or_default());
         let req = self.prepare_req(req)?;
 
+        let labels = request_labels(&req);
         if let Some(metadata) = &req.metadata {
             tracing::info!(target: "task_history", parent: &span, metadata = %metadata, "labels");
         }
 
-        match self.chat.chat_request(req).instrument(span.clone()).await {
+        let result = match self.chat.chat_request(req).instrument(span.clone()).await {
             Ok(mut resp) => {
                 if let Some(usage) = resp.usage.clone() {
                     tracing::info!(target: "task_history", parent: &span, completion_tokens = %usage.completion_tokens, total_tokens = %usage.total_tokens, prompt_tokens = %usage.prompt_tokens, "labels");
@@ -515,7 +525,9 @@ impl Chat for ChatWrapper {
                 tracing::error!(target: "task_history", parent: &span, "Failed to run chat model: {}", e);
                 Err(e)
             }
-        }
+        };
+        handle_metrics(start.elapsed(), result.is_err(), &labels);
+        result
     }
 
     async fn run(&self, prompt: String) -> ChatResult<Option<String>> {

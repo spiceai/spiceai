@@ -23,6 +23,7 @@ use std::sync::Arc;
 mod chat;
 mod embed;
 mod eval;
+mod metrics;
 mod tool_use;
 
 pub use chat::{try_to_chat_model, LLMModelStore};
