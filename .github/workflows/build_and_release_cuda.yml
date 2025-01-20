@@ -150,6 +150,7 @@ jobs:
     runs-on: ${{ matrix.target.runner }}
     needs: setup-matrix
     strategy:
+      fail-fast: false
       matrix:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
@@ -213,41 +214,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      #  CUDA flavors: 90, 89, 86, 80, 75 
-      - name: download artifacts - spiced_models_cuda_75_linux_x86_64
-        continue-on-error: true
-        uses: actions/download-artifact@v4
-        with:
-          name: spiced_models_cuda_75_linux_x86_64
-          path: ${{ env.ARTIFACT_DIR }}
+      - name: Create artifact directory
+        run: mkdir -p ${{ env.ARTIFACT_DIR }}
 
-      - name: download artifacts - spiced_models_cuda_80_linux_x86_64
-        continue-on-error: true
+      # Download all Linux CUDA artifacts
+      - name: Download Linux CUDA artifacts
         uses: actions/download-artifact@v4
-        with:
-          name: spiced_models_cuda_80_linux_x86_64
-          path: ${{ env.ARTIFACT_DIR }}
-
-      - name: download artifacts - spiced_models_cuda_86_linux_x86_64
         continue-on-error: true
-        uses: actions/download-artifact@v4
         with:
-          name: spiced_models_cuda_86_linux_x86_64
+          pattern: spiced_models_cuda_*_linux_x86_64
           path: ${{ env.ARTIFACT_DIR }}
-
-      - name: download artifacts - spiced_models_cuda_89_linux_x86_64
-        continue-on-error: true
-        uses: actions/download-artifact@v4
-        with:
-          name: spiced_models_cuda_89_linux_x86_64
-          path: ${{ env.ARTIFACT_DIR }}
-
-      - name: download artifacts - spiced_models_cuda_90_linux_x86_64
-        continue-on-error: true
-        uses: actions/download-artifact@v4
-        with:
-          name: spiced_models_cuda_90_linux_x86_64
-          path: ${{ env.ARTIFACT_DIR }}
+          merge-multiple: true
 
       - name: Upload artifacts to Minio
         run: |
@@ -257,26 +234,13 @@ jobs:
           sudo chmod +x /usr/local/bin/mc
           mc alias set spice-minio ${{ env.MINIO_ENDPOINT }} ${{ env.MINIO_ACCESS_KEY }} ${{ env.MINIO_SECRET_KEY }}
 
-          # CUDA flavors: 90, 89, 86, 80, 75 
-          if [ -f "${ARTIFACT_DIR}/spiced_models_cuda_75_linux_x86_64.tar.gz" ]; then
-            mc cp ${{ env.ARTIFACT_DIR }}/spiced_models_cuda_75_linux_x86_64.tar.gz spice-minio/artifacts/spiced/linux-x86_64/${{ env.COMMIT_SHA }}/
-          fi
-
-          if [ -f "${ARTIFACT_DIR}/spiced_models_cuda_80_linux_x86_64.tar.gz" ]; then
-            mc cp ${{ env.ARTIFACT_DIR }}/spiced_models_cuda_80_linux_x86_64.tar.gz spice-minio/artifacts/spiced/linux-x86_64/${{ env.COMMIT_SHA }}/
-          fi
-
-          if [ -f "${ARTIFACT_DIR}/spiced_models_cuda_86_linux_x86_64.tar.gz" ]; then
-            mc cp ${{ env.ARTIFACT_DIR }}/spiced_models_cuda_86_linux_x86_64.tar.gz spice-minio/artifacts/spiced/linux-x86_64/${{ env.COMMIT_SHA }}/
-          fi
-
-          if [ -f "${ARTIFACT_DIR}/spiced_models_cuda_89_linux_x86_64.tar.gz" ]; then
-            mc cp ${{ env.ARTIFACT_DIR }}/spiced_models_cuda_89_linux_x86_64.tar.gz spice-minio/artifacts/spiced/linux-x86_64/${{ env.COMMIT_SHA }}/
-          fi
-
-          if [ -f "${ARTIFACT_DIR}/spiced_models_cuda_90_linux_x86_64.tar.gz" ]; then
-            mc cp ${{ env.ARTIFACT_DIR }}/spiced_models_cuda_90_linux_x86_64.tar.gz spice-minio/artifacts/spiced/linux-x86_64/${{ env.COMMIT_SHA }}/
-          fi
+          # Upload any CUDA artifacts that were successfully built
+          for file in ${{ env.ARTIFACT_DIR }}/spiced_models_cuda_*_linux_x86_64.tar.gz; do
+            if [ -f "$file" ]; then
+              echo "Uploading $file to Minio..."
+              mc cp "$file" spice-minio/artifacts/spiced/linux-x86_64/${{ env.COMMIT_SHA }}/
+            fi
+          done
 
   publish:
     name: Publish CUDA binaries
@@ -297,79 +261,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Create artifact directory
+        run: mkdir -p ${{ env.ARTIFACT_DIR }}
+
       - name: Set REL_VERSION from version.txt
         run: python3 ./.github/scripts/get_release_version.py
 
-      # CUDA flavors: 90, 89, 86, 80, 75 
-      - name: download artifacts - spiced_models_cuda_75_${{ matrix.target_os }}_${{ matrix.target_arch }}
-        if: matrix.target_os != 'windows'
+      # Download all CUDA artifacts for this platform
+      - name: Download CUDA artifacts
         uses: actions/download-artifact@v4
+        continue-on-error: true
         with:
-          name: spiced_models_cuda_75_${{ matrix.target_os }}_${{ matrix.target_arch }}
+          pattern: |
+            spiced_models_cuda_*_${{ matrix.target_os }}_${{ matrix.target_arch }}
+            spiced.exe_models_cuda_*_${{ matrix.target_os }}_${{ matrix.target_arch }}
           path: ${{ env.ARTIFACT_DIR }}
-
-      - name: download artifacts - spiced_models_cuda_75_${{ matrix.target_os }}_${{ matrix.target_arch }}
-        if: matrix.target_os == 'windows'
-        uses: actions/download-artifact@v4
-        with:
-          name: spiced.exe_models_cuda_75_${{ matrix.target_os }}_${{ matrix.target_arch }}
-          path: ${{ env.ARTIFACT_DIR }}
-
-      - name: download artifacts - spiced_models_cuda_80_${{ matrix.target_os }}_${{ matrix.target_arch }}
-        if: matrix.target_os != 'windows'
-        uses: actions/download-artifact@v4
-        with:
-          name: spiced_models_cuda_80_${{ matrix.target_os }}_${{ matrix.target_arch }}
-          path: ${{ env.ARTIFACT_DIR }}
-
-      - name: download artifacts - spiced_models_cuda_80_${{ matrix.target_os }}_${{ matrix.target_arch }}
-        if: matrix.target_os == 'windows'
-        uses: actions/download-artifact@v4
-        with:
-          name: spiced.exe_models_cuda_80_${{ matrix.target_os }}_${{ matrix.target_arch }}
-          path: ${{ env.ARTIFACT_DIR }}
-
-      - name: download artifacts - spiced_models_cuda_86_${{ matrix.target_os }}_${{ matrix.target_arch }}
-        if: matrix.target_os != 'windows'
-        uses: actions/download-artifact@v4
-        with:
-          name: spiced_models_cuda_86_${{ matrix.target_os }}_${{ matrix.target_arch }}
-          path: ${{ env.ARTIFACT_DIR }}
-
-      - name: download artifacts - spiced_models_cuda_86_${{ matrix.target_os }}_${{ matrix.target_arch }}
-        if: matrix.target_os == 'windows'
-        uses: actions/download-artifact@v4
-        with:
-          name: spiced.exe_models_cuda_86_${{ matrix.target_os }}_${{ matrix.target_arch }}
-          path: ${{ env.ARTIFACT_DIR }}
-
-      - name: download artifacts - spiced_models_cuda_89_${{ matrix.target_os }}_${{ matrix.target_arch }}
-        if: matrix.target_os != 'windows'
-        uses: actions/download-artifact@v4
-        with:
-          name: spiced_models_cuda_89_${{ matrix.target_os }}_${{ matrix.target_arch }}
-          path: ${{ env.ARTIFACT_DIR }}
-
-      - name: download artifacts - spiced_models_cuda_89_${{ matrix.target_os }}_${{ matrix.target_arch }}
-        if: matrix.target_os == 'windows'
-        uses: actions/download-artifact@v4
-        with:
-          name: spiced.exe_models_cuda_89_${{ matrix.target_os }}_${{ matrix.target_arch }}
-          path: ${{ env.ARTIFACT_DIR }}
-
-      - name: download artifacts - spiced_models_cuda_90_${{ matrix.target_os }}_${{ matrix.target_arch }}
-        if: matrix.target_os != 'windows'
-        uses: actions/download-artifact@v4
-        with:
-          name: spiced_models_cuda_90_${{ matrix.target_os }}_${{ matrix.target_arch }}
-          path: ${{ env.ARTIFACT_DIR }}
-
-      - name: download artifacts - spiced_models_cuda_90_${{ matrix.target_os }}_${{ matrix.target_arch }}
-        if: matrix.target_os == 'windows'
-        uses: actions/download-artifact@v4
-        with:
-          name: spiced.exe_models_cuda_90_${{ matrix.target_os }}_${{ matrix.target_arch }}
-          path: ${{ env.ARTIFACT_DIR }}
+          merge-multiple: true
 
       - name: lists artifacts
         run: ls -l ${{ env.ARTIFACT_DIR }}
