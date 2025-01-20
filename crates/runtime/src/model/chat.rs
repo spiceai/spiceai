@@ -473,7 +473,7 @@ impl Chat for ChatWrapper {
                         // not incremental; provider only emits usage on last chunk.
                         if let Some(usage) = item.usage.clone() {
                             tracing::info!(target: "task_history", parent: &stream_span.clone(), completion_tokens = %usage.completion_tokens, total_tokens = %usage.total_tokens, prompt_tokens = %usage.prompt_tokens, "labels");
-                            handle_metrics(start.elapsed(), false, &labels)
+                            handle_metrics(start.elapsed(), false, &labels);
                         }
                     }
                 }).instrument(span.clone());

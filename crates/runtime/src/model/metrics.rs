@@ -46,6 +46,7 @@ pub(crate) static LLM_INTERNAL_DURATION_MS: LazyLock<Histogram<f64>> = LazyLock:
 });
 
 pub(crate) fn request_labels(req: &CreateChatCompletionRequest) -> Vec<KeyValue> {
+    #[allow(clippy::cast_possible_wrap)]
     let mut labels = vec![
         KeyValue::new(
             Key::new("stream"),

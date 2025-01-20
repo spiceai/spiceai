@@ -76,7 +76,7 @@ pub(crate) fn request_labels(req: &CreateEmbeddingRequest) -> Vec<KeyValue> {
     if let Some(ref dim) = req.dimensions {
         labels.push(KeyValue::new(
             Key::new("dimensions"),
-            Value::I64(*dim as i64),
+            Value::I64(i64::from(*dim)),
         ));
     }
 
