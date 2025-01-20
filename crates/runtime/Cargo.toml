@@ -127,7 +127,7 @@ tower.workspace = true
 tower-http.workspace = true
 tracing.workspace = true
 tracing-futures.workspace = true
-tract-core = "0.21.0"
+tract-core = "0.21.9"
 url = "2.5.4"
 util = { path = "../util" }
 utoipa = { version = "5.2.0", features = ["axum_extras"], optional = true }

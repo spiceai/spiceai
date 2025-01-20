@@ -12157,9 +12157,9 @@ dependencies = [
 
 [[package]]
 name = "tract-core"
-version = "0.21.8"
+version = "0.21.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bad467da9f9af958e8e79fc970e60efe6c53af91bdf770ef4f8bc7328cd1692e"
+checksum = "b33bf0168c6db6208bfc5939dd18b057045b73376457e7211fc6764735456af1"
 dependencies = [
  "anyhow",
  "anymap",
@@ -12183,9 +12183,9 @@ dependencies = [
 
 [[package]]
 name = "tract-data"
-version = "0.21.8"
+version = "0.21.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "24e1b72469023cd441e233e2c0b0cdfe223c3bffccaa13f9ef4656cae1c4bdaa"
+checksum = "36c9b41db9c208ed114496eb48d9c937e2efb4fbcc60d64102681935bf2f361a"
 dependencies = [
  "anyhow",
  "downcast-rs",
@@ -12218,9 +12218,9 @@ dependencies = [
 
 [[package]]
 name = "tract-linalg"
-version = "0.21.8"
+version = "0.21.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a77effa098a0cf5b63de86b4f494f9444815df4c0cff6ca6b4d25d34574a8aa1"
+checksum = "2f879dd55037da99682f8766d170e3c74d772665bb26b00d035b257dfa13c277"
 dependencies = [
  "byteorder",
  "cc",
