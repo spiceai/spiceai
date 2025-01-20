@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 #![allow(deprecated)] // `function_call` argument is deprecated but no builder pattern alternative is available.
+use super::types::{MessageRole, StopReason, Usage};
 use async_openai::{
     error::{ApiError, OpenAIError},
     types::{
@@ -23,12 +24,11 @@ use async_openai::{
     },
 };
 use futures::{Stream, StreamExt};
+use reqwest_eventsource::Error as SseError;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{collections::HashMap, fmt, pin::Pin, sync::Arc, time::SystemTime};
 use tokio::sync::Mutex;
-
-use super::types::{MessageRole, StopReason, Usage};
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "type")]
@@ -299,12 +299,12 @@ pub fn transform_stream(
                             completion_tokens_details: None,
                         });
                         state.model = Some(model);
-                        create_stream_response(
+                        Some(create_stream_response(
                             &state.id.clone().unwrap_or_default(),
                             &state.model.clone().unwrap_or_default(),
                             None,
                             None,
-                        )
+                        ))
                     }
                     Ok(MessageCreateStreamResponse::ContentBlockStart {
                         index,
@@ -314,7 +314,7 @@ pub fn transform_stream(
                             state.tool_id_to_content_block.insert(index, t.clone());
                             state.tool_id_to_tool_delta_idx.insert(index, 0);
                         };
-                        create_stream_response(
+                        Some(create_stream_response(
                             &state.id.clone().unwrap_or_default(),
                             &state.model.clone().unwrap_or_default(),
                             None,
@@ -324,13 +324,13 @@ pub fn transform_stream(
                                 finish_reason: None,
                                 logprobs: None,
                             }),
-                        )
+                        ))
                     }
                     Ok(MessageCreateStreamResponse::ContentBlockDelta { index, delta }) => {
                         let tool_idx = *state.tool_id_to_tool_delta_idx.get(&index).unwrap_or(&0);
                         state.tool_id_to_tool_delta_idx.insert(index, tool_idx + 1);
 
-                        create_stream_response(
+                        Some(create_stream_response(
                             &state.id.clone().unwrap_or_default(),
                             &state.model.clone().unwrap_or_default(),
                             None,
@@ -343,7 +343,7 @@ pub fn transform_stream(
                                     state.tool_id_to_content_block.get(&index),
                                 ),
                             }),
-                        )
+                        ))
                     }
                     Ok(MessageCreateStreamResponse::MessageDelta {
                         delta: MessageDelta { stop_reason, .. },
@@ -355,7 +355,7 @@ pub fn transform_stream(
                             u.completion_tokens += inner_usage.output_tokens;
                             u.total_tokens += inner_usage.input_tokens + inner_usage.output_tokens;
                         }
-                        create_stream_response(
+                        Some(create_stream_response(
                             &state.id.clone().unwrap_or_default(),
                             &state.model.clone().unwrap_or_default(),
                             state.usage.clone(),
@@ -378,7 +378,7 @@ pub fn transform_stream(
                                     refusal: None,
                                 },
                             }),
-                        )
+                        ))
                     }
                     Ok(
                         MessageCreateStreamResponse::Ping
@@ -399,7 +399,7 @@ pub fn transform_stream(
         })
         // Because we don't early exit on [`MessageCreateStreamResponse::MessageStop`], we need to handle stream end explicitly, otherwise we will infinite loop on the stream.
         .take_while(|item| {
-            let keep_going = !matches!(item, Err(OpenAIError::ApiError(ApiError { message, .. })) if message == "Stream ended");
+            let keep_going = !matches!(item, Err(OpenAIError::ApiError(ApiError { message, .. })) if SseError::StreamEnded{}.to_string().eq(message));
             futures::future::ready(keep_going)
         });
 
@@ -413,26 +413,25 @@ fn create_stream_response(
     model: &str,
     usage: Option<CompletionUsage>,
     choice: Option<ChatChoiceStream>,
-) -> Option<Result<CreateChatCompletionStreamResponse, OpenAIError>> {
+) -> Result<CreateChatCompletionStreamResponse, OpenAIError> {
     let choices = match choice {
         Some(c) => vec![c],
         None => vec![],
     };
 
-    let Ok(created_time) = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH) else {
-        return Some(Err(OpenAIError::InvalidArgument(
-            "Failed to get current time".to_string(),
-        )));
-    };
+    let created = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_err(|e| OpenAIError::InvalidArgument(e.to_string()))?
+        .as_secs() as u32;
 
-    Some(Ok(CreateChatCompletionStreamResponse {
+    Ok(CreateChatCompletionStreamResponse {
         id: id.to_string(),
-        created: created_time.as_secs() as u32,
+        created,
         model: model.to_string(),
         service_tier: None,
         system_fingerprint: None,
         object: "chat.completion.chunk".to_string(),
         usage,
         choices,
-    }))
+    })
 }
