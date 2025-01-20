@@ -319,7 +319,7 @@ async fn start_anonymous_telemetry(
     if !explicitly_disabled {
         #[cfg(feature = "anonymous_telemetry")]
         telemetry::anonymous::start(
-            spicepod_name.map_or_else(|| "unknown", w),
+            spicepod_name.map_or_else(|| "unknown", String::as_str),
             telemetry_properties,
         )
         .await;
