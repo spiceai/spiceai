@@ -227,8 +227,8 @@ impl OpenaiErrorEvent {
     }
 }
 
-/// Converts OpenAI errors to HTTP responses
-/// Preserve the original OpenAI error structure to maintain compatibility with OpenAI's documentation
+/// Converts `OpenAI` errors to HTTP responses
+/// Preserve the original `OpenAI` error structure to maintain compatibility with `OpenAI` documentation
 #[must_use]
 pub fn openai_error_to_response(e: OpenAIError) -> Response {
     match e {
