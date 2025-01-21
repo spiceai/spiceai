@@ -47,6 +47,7 @@ jobs:
             spiced_models_cuda_*_${{ matrix.target_os }}_${{ matrix.target_arch }}
             spiced.exe_models_cuda_*_${{ matrix.target_os }}_${{ matrix.target_arch }}
           path: ${{ env.ARTIFACT_DIR }}
+          github-token: ${{ secrets.DOWNLOAD_ARTIFACT_TOKEN }}
           merge-multiple: true
           run-id: ${{ inputs.run_id }}
 
