@@ -173,15 +173,15 @@ func (c *RuntimeContext) RequireModelsFlavor(cmd *cobra.Command) {
 	if models, _ := c.ModelsFlavorInstalled(); models {
 		return
 	}
-	slog.Info("This feature requires a runtime version with models enabled. Install (y/n)? ")
+	slog.Info("This feature requires a runtime version with AI features enabled. Install (y/n)? ")
 	var confirm string
 	_, _ = fmt.Scanf("%s", &confirm)
 	if strings.ToLower(strings.TrimSpace(confirm)) != "y" {
-		slog.Warn("Models runtime not installed, exiting...")
+		slog.Warn("AI-enabled runtime not installed, exiting...")
 		os.Exit(0)
 	}
-	slog.Info("Installing models runtime...")
-	err := c.InstallOrUpgradeRuntime("models", true) // default to using an accelerator for prompted installs
+	slog.Info("Installing AI-enabled runtime...")
+	err := c.InstallOrUpgradeRuntime(constants.FlavorAI, true) // default to using an accelerator for prompted installs
 	if err != nil {
 		slog.Error("installing models runtime", "error", err)
 		os.Exit(1)
@@ -234,7 +234,7 @@ func (c *RuntimeContext) IsRuntimeInstallRequired() bool {
 	return errors.Is(err, os.ErrNotExist)
 }
 
-func (c *RuntimeContext) InstallOrUpgradeRuntime(flavor string, allowAccelerator bool) error {
+func (c *RuntimeContext) InstallOrUpgradeRuntime(flavor constants.Flavor, allowAccelerator bool) error {
 	err := c.prepareInstallDir()
 	if err != nil {
 		return err

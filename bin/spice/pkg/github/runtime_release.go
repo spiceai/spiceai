@@ -54,7 +54,7 @@ func GetLatestCliRelease() (*RepoRelease, error) {
 	return release, nil
 }
 
-func DownloadRuntimeAsset(flavor string, release *RepoRelease, downloadPath string, allowAccelerator bool) error {
+func DownloadRuntimeAsset(flavor constants.Flavor, release *RepoRelease, downloadPath string, allowAccelerator bool) error {
 	assetName := GetRuntimeAssetName(flavor, allowAccelerator)
 	slog.Info(fmt.Sprintf("Downloading the Spice runtime..., %s", assetName))
 	return DownloadReleaseAsset(githubClient, release, assetName, downloadPath)
@@ -64,19 +64,17 @@ func DownloadAsset(release *RepoRelease, downloadPath string, assetName string) 
 	return DownloadReleaseAsset(githubClient, release, assetName, downloadPath)
 }
 
-func GetRuntimeAssetName(flavor string, allowAccelerator bool) string {
-	switch {
-	case flavor == "ai":
+func GetRuntimeAssetName(flavor constants.Flavor, allowAccelerator bool) string {
+	var downloadFlavor string
+	if flavor == constants.FlavorAI || flavor == constants.FlavorDefault {
 		if accelerator, exists := get_ai_accelerator(); exists && allowAccelerator {
-			flavor = fmt.Sprintf("_models_%s", accelerator)
+			downloadFlavor = fmt.Sprintf("_models_%s", accelerator)
 		} else {
-			flavor = "_models"
+			downloadFlavor = "_models"
 		}
-	case flavor != "":
-		flavor = fmt.Sprintf("_%s", flavor)
 	}
 
-	assetName := fmt.Sprintf("%s%s_%s_%s.tar.gz", constants.SpiceRuntimeFilename, flavor, runtime.GOOS, getRustArch())
+	assetName := fmt.Sprintf("%s%s_%s_%s.tar.gz", constants.SpiceRuntimeFilename, downloadFlavor, runtime.GOOS, getRustArch())
 
 	return assetName
 }
