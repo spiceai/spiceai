@@ -39,28 +39,32 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Unable to load the model: {source}"))]
+    #[snafu(display(
+        "Unable to load the model.\n{source}\nVerify that the model is available and accessible."
+    ))]
     UnableToFetchModel { source: reqwest::Error },
 
-    #[snafu(display("Unable to download model file"))]
+    #[snafu(display(
+        "Unable to download model file.\nVerify that the model is available and accessible."
+    ))]
     UnableToDownloadModelFile {},
 
-    #[snafu(display("Unable to parse metadata"))]
+    #[snafu(display("Unable to parse metadata.\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"))]
     UnableToParseMetadata {},
 
-    #[snafu(display("Unable to find home directory"))]
+    #[snafu(display("Unable to find home directory.\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"))]
     UnableToFindHomeDir {},
 
-    #[snafu(display("Unable to create model path: {source}"))]
+    #[snafu(display("Unable to create model path.\n{source}\nVerify you have the necessary permissions to access the model path."))]
     UnableToCreateModelPath { source: std::io::Error },
 
-    #[snafu(display("Unable to load the configuration: {reason}"))]
+    #[snafu(display("Unable to load the configuration.\n{reason}\nVerify the configuration is valid, and try again."))]
     UnableToLoadConfig { reason: String },
 
-    #[snafu(display("Unknown data source: {model_source}"))]
-    UnknownModelSource { model_source: String },
+    #[snafu(display("An unsupported model source was specified in the 'from' parameter: '{from}'.\nSpecify a valid source, like 'openai', and try again.\nFor details, visit: https://spiceai.org/docs/components/models"))]
+    UnknownModelSource { from: String },
 
-    #[snafu(display("No runtime supported for model format: {model_format}"))]
+    #[snafu(display("The specified model format, '{model_format}', is not supported.\nSpecify a supported model format and try again.\nFor details, visit: https://spiceai.org/docs/components/models"))]
     UnsupportedModelFormat { model_format: ModelFormat },
 }
 

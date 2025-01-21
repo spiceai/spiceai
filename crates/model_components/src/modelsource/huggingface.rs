@@ -61,7 +61,7 @@ impl ModelSource for Huggingface {
 
         let Some(name) = name else {
             return Err(super::UnableToLoadConfigSnafu {
-                reason: "Name is required",
+                reason: "The 'name' parameter is required, and was not provided.",
             }
             .build());
         };
@@ -86,14 +86,16 @@ impl ModelSource for Huggingface {
 
         let Some(remote_path) = remote_path else {
             return Err(super::UnableToLoadConfigSnafu {
-                reason: "From is required",
+                reason: "The 'from' parameter is required, and was not provided.",
             }
             .build());
         };
 
         let Some(caps) = HUGGINGFACE_PATH_REGEX.captures(remote_path.as_str()) else {
             return Err(super::UnableToLoadConfigSnafu {
-                reason: format!("from is invalid for huggingface source: {remote_path}"),
+                reason: format!(
+                    "The 'from' parameter is invalid for a huggingface source: {remote_path}"
+                ),
             }
             .build());
         };

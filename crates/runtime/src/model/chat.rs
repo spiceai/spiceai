@@ -68,7 +68,7 @@ pub async fn try_to_chat_model(
         .or(extract_secret!(params, "spice_tools"))
         .map(str::parse)
         .transpose()
-        .map_err(|_| LlmError::UnsupportedSpiceToolUseParameterError {})?;
+        .map_err(|_| unreachable!("SpiceToolsOptions::from_str has no error condition"))?;
 
     let spice_recursion_limit: Option<usize> = extract_secret!(params, "tool_recursion_limit")
         .map(|x| {
@@ -99,12 +99,9 @@ pub async fn construct_model(
 ) -> Result<Box<dyn Chat>, LlmError> {
     let model_id = component.get_model_id();
     let prefix = component.get_source().ok_or(LlmError::UnknownModelSource {
-        source: format!(
-            "Unknown model source for spicepod component from: {}",
-            component.from.clone()
-        )
-        .into(),
+        from: component.from.clone(),
     })?;
+
     let model = match prefix {
         ModelSource::HuggingFace => huggingface(model_id, component, params).await,
         ModelSource::File => file(component, params),
