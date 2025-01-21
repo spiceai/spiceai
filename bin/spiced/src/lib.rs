@@ -178,7 +178,10 @@ pub async fn run(args: Args) -> Result<()> {
         }
         Err(e) => {
             in_tracing_context(|| {
-                tracing::error!("{e}");
+                tracing::warn!(
+                    "No spicepod.yaml detected in the current directory: {}\nRun `spice init <name>` to initialize spicepod.yaml and restart the runtime.",
+                    current_dir.display()
+                );
             });
             None
         }
