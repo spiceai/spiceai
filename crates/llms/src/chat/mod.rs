@@ -49,6 +49,8 @@ use mistralrs::MessageContent;
 
 use crate::embeddings::candle::download_hf_file;
 
+static TENSOR_EXTENSIONS: [&str; 4] = [".safetensors", ".pth", ".pt", ".bin"];
+
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone, Copy)]
 #[serde(rename_all = "lowercase")]
 pub enum LlmRuntime {
@@ -106,9 +108,37 @@ pub enum Error {
 
     #[snafu(display("Runtime does not currently support the {modality} modality"))]
     UnsupportedModalityType { modality: String },
+
+    #[snafu(display("Failed to find tensors for the model.\nExpected tensors with a file extension of: {extensions}.\nVerify the model is correctly configured, and try again."))]
+    ModelMissingTensors { extensions: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+/// Attempts to string match a model error to a known error type.
+/// Returns None if no match is found.
+#[must_use]
+pub fn try_map_boxed_error(e: &(dyn std::error::Error + Send + Sync)) -> Option<Error> {
+    let err_string = e.to_string().to_ascii_lowercase();
+    if err_string.contains("expected file with extension")
+        && TENSOR_EXTENSIONS.iter().any(|ext| err_string.contains(ext))
+    {
+        Some(Error::ModelMissingTensors {
+            extensions: TENSOR_EXTENSIONS.join(", "),
+        })
+    } else {
+        None
+    }
+}
+
+/// Re-writes a boxed error to a known error type, if possible.
+/// Always returns a boxed error. Returns the original error if no match is found.
+#[must_use]
+pub fn try_map_boxed_error_to_box(
+    e: Box<dyn std::error::Error + Send + Sync>,
+) -> Box<dyn std::error::Error + Send + Sync> {
+    try_map_boxed_error(&*e).map_or_else(|| e, std::convert::Into::into)
+}
 
 /// Convert a structured [`ChatCompletionRequestMessage`] to a basic string. Useful for basic
 /// [`Chat::run`] but reduces optional configuration provided by callers.

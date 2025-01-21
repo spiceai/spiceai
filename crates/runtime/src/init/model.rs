@@ -28,21 +28,20 @@ use spicepod::component::model::{Model as SpicepodModel, ModelType};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Failed to load LLM: {}. Verify configuration and try again.\nError: {}\nFor details, visit https://spiceai.org/docs/components/models", name, source))]
+    #[snafu(display("Failed to load LLM: {name}.\n{source}"))]
     FailedToLoadLLM {
         name: String,
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Failed to load runnable model: {}. Verify configuration and try again.\nError: {}\nFor details, visit https://spiceai.org/docs/components/models", name, source))]
+    #[snafu(display("Failed to load runnable model: {name}.\n{source}"))]
     FailedToLoadRunnableModel {
         name: String,
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
     #[snafu(display(
-        "Failed to load model {} from spicepod. Unable to determine model type. Verify configuration and try again.\nFor details, visit https://spiceai.org/docs/components/models",
-        name
+        "Failed to load model {name} from spicepod.\nUnable to determine model type. Verify the model source and try again.\nFor details, visit https://spiceai.org/docs/components/models",
     ))]
     UnableToDetermineModelType { name: String },
 }
