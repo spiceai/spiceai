@@ -485,84 +485,12 @@ jobs:
           name: spiced.exe_models_${{ matrix.target_os }}_${{ matrix.target_arch }}
           path: ${{ env.ARTIFACT_DIR }}
       
-      # CUDA Windows flavors: 90, 89, 86, 80, 75
-      - name: download artifacts - spiced_models_cuda_75_${{ matrix.target_os }}_${{ matrix.target_arch }}
-        if: matrix.target_os == 'windows'
-        uses: actions/download-artifact@v4
-        with:
-          name: spiced.exe_models_cuda_75_${{ matrix.target_os }}_${{ matrix.target_arch }}
-          path: ${{ env.ARTIFACT_DIR }}
-    
-      - name: download artifacts - spiced_models_cuda_80_${{ matrix.target_os }}_${{ matrix.target_arch }}
-        if: matrix.target_os == 'windows'
-        uses: actions/download-artifact@v4
-        with:
-          name: spiced.exe_models_cuda_80_${{ matrix.target_os }}_${{ matrix.target_arch }}
-          path: ${{ env.ARTIFACT_DIR }}
-
-      - name: download artifacts - spiced_models_cuda_86_${{ matrix.target_os }}_${{ matrix.target_arch }}
-        if: matrix.target_os == 'windows'
-        uses: actions/download-artifact@v4
-        with:
-          name: spiced.exe_models_cuda_86_${{ matrix.target_os }}_${{ matrix.target_arch }}
-          path: ${{ env.ARTIFACT_DIR }}
-
-      - name: download artifacts - spiced_models_cuda_89_${{ matrix.target_os }}_${{ matrix.target_arch }}
-        if: matrix.target_os == 'windows'
-        uses: actions/download-artifact@v4
-        with:
-          name: spiced.exe_models_cuda_89_${{ matrix.target_os }}_${{ matrix.target_arch }}
-          path: ${{ env.ARTIFACT_DIR }}
-
-      - name: download artifacts - spiced_models_cuda_90_${{ matrix.target_os }}_${{ matrix.target_arch }}
-        if: matrix.target_os == 'windows'
-        uses: actions/download-artifact@v4
-        with:
-          name: spiced.exe_models_cuda_90_${{ matrix.target_os }}_${{ matrix.target_arch }}
-          path: ${{ env.ARTIFACT_DIR }}
-
       # macOS metal 
       - name: download artifacts - spiced_models_metal_${{ matrix.target_os }}_${{ matrix.target_arch }}
         if: matrix.target_os == 'darwin'
         uses: actions/download-artifact@v4
         with:
           name: spiced_models_metal_${{ matrix.target_os }}_${{ matrix.target_arch }}
-          path: ${{ env.ARTIFACT_DIR }}
-
-      # CUDA Linux flavors: 90, 89, 86, 80, 75 
-      - name: download artifacts - spiced_models_cuda_75_${{ matrix.target_os }}_${{ matrix.target_arch }}
-        if: matrix.target_os == 'linux' && matrix.target_arch == 'x86_64'
-        uses: actions/download-artifact@v4
-        with:
-          name: spiced_models_cuda_75_${{ matrix.target_os }}_${{ matrix.target_arch }}
-          path: ${{ env.ARTIFACT_DIR }}
-  
-      - name: download artifacts - spiced_models_cuda_80_${{ matrix.target_os }}_${{ matrix.target_arch }}
-        if: matrix.target_os == 'linux' && matrix.target_arch == 'x86_64'
-        uses: actions/download-artifact@v4
-        with:
-          name: spiced_models_cuda_80_${{ matrix.target_os }}_${{ matrix.target_arch }}
-          path: ${{ env.ARTIFACT_DIR }}
-
-      - name: download artifacts - spiced_models_cuda_86_${{ matrix.target_os }}_${{ matrix.target_arch }}
-        if: matrix.target_os == 'linux' && matrix.target_arch == 'x86_64'
-        uses: actions/download-artifact@v4
-        with:
-          name: spiced_models_cuda_86_${{ matrix.target_os }}_${{ matrix.target_arch }}
-          path: ${{ env.ARTIFACT_DIR }}
-
-      - name: download artifacts - spiced_models_cuda_89_${{ matrix.target_os }}_${{ matrix.target_arch }}
-        if: matrix.target_os == 'linux' && matrix.target_arch == 'x86_64'
-        uses: actions/download-artifact@v4
-        with:
-          name: spiced_models_cuda_89_${{ matrix.target_os }}_${{ matrix.target_arch }}
-          path: ${{ env.ARTIFACT_DIR }}
-
-      - name: download artifacts - spiced_models_cuda_90_${{ matrix.target_os }}_${{ matrix.target_arch }}
-        if: matrix.target_os == 'linux' && matrix.target_arch == 'x86_64'
-        uses: actions/download-artifact@v4
-        with:
-          name: spiced_models_cuda_90_${{ matrix.target_os }}_${{ matrix.target_arch }}
           path: ${{ env.ARTIFACT_DIR }}
 
       - name: lists artifacts
