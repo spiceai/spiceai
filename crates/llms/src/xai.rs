@@ -119,11 +119,9 @@ impl Chat for Xai {
             Ok(_) => Ok(()),
             Err(e) => {
                 tracing::error!(target: "task_history", parent: &span, "{e}");
-                Err(Error::HealthCheckError {
-                    source: Box::<dyn std::error::Error + Send + Sync>::from(format!(
-                        "Model {} not found",
-                        self.model
-                    )),
+                Err(Error::ModelNotFound {
+                    model: self.model.clone(),
+                    model_source: "xai".to_string(),
                 })
             }
         }

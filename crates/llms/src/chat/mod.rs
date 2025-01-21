@@ -83,6 +83,9 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
+    #[snafu(display("The specified model identifier '{model}' is not valid for the source '{model_source}'.\nVerify the model exists, and try again."))]
+    ModelNotFound { model: String, model_source: String },
+
     #[snafu(display("Failed to load model tokenizer: {source}"))]
     FailedToLoadTokenizer {
         source: Box<dyn std::error::Error + Send + Sync>,
