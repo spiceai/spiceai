@@ -125,7 +125,7 @@ spice search --cloud
 			}
 
 			if strings.Trim(message, " ") == "" {
-				cmd.Println("Please enter a search query.")
+				cmd.Println("Enter a search query.")
 				continue
 			}
 

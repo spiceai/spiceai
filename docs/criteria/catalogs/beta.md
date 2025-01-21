@@ -43,6 +43,10 @@ This section is required if the Catalog does not use an existing Data Connector.
 - [ ] Known [Major](../definitions.md) bugs are resolved for the Catalog.
 - [ ] Known [Minor](../definitions.md) bugs are logged, but not required to be fixed unless needed to achieve TPC-H success.
 
+#### UX
+
+- [ ] All of the connector's error messages follow the [error handling guidelines](../../dev/error_handling.md)
+
 ### Documentation
 
 - [ ] Documentation includes all information and steps for a user to set up the Catalog.

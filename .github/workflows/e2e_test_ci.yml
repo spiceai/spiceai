@@ -578,7 +578,7 @@ jobs:
         with:
           name: test_postgresql_table
           expected-rows-count: ${{ matrix.acceleration.engine != '' && 2 || 3 }}
-      
+
       - name: Verify dataset2
         uses: ./.github/actions/verify-dataset
         with:
@@ -1106,7 +1106,7 @@ jobs:
         with:
           name: eth.recent_blocks
           expected-rows-count: 1
-      
+
       - name: Manually refresh dataset (with params)
         working-directory: test_app
         run: |
@@ -1352,30 +1352,40 @@ jobs:
           while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
 
       - name: Run test query (issues)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         uses: ./.github/actions/run-query
         with:
           fail-on-error: true
           query: 'select number, title, state, labels, updated_at from spiceai.issues order by updated_at desc limit 10;'
 
       - name: Run test query (pulls)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         uses: ./.github/actions/run-query
         with:
           fail-on-error: true
           query: "select number, title, state, merged_at from spiceai.pulls where state = 'MERGED' order by merged_at desc limit 10;"
 
       - name: Run test query (commits)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         uses: ./.github/actions/run-query
         with:
           fail-on-error: true
           query: 'select message_head_line, author_name, sha from spiceai.commits order by committed_date desc limit 10;'
 
       - name: Run test query (files)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         uses: ./.github/actions/run-query
         with:
           fail-on-error: true
           query: 'select name, path, download_url, content from spiceai.files limit 1;'
 
       - name: Run test query (stargazers)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         uses: ./.github/actions/run-query
         with:
           fail-on-error: true
@@ -1486,6 +1496,8 @@ jobs:
           name: test_mssql_table
 
       - name: Run test query (issues)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         uses: ./.github/actions/run-query
         with:
           fail-on-error: true
@@ -1572,12 +1584,16 @@ jobs:
           while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
 
       - name: Run test query (tpch)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         uses: ./.github/actions/run-query
         with:
           fail-on-error: true
           query: 'select * from db_uc.tpch.lineitem limit 1;'
 
       - name: Run test query (tpcds)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         uses: ./.github/actions/run-query
         with:
           fail-on-error: true

@@ -34,6 +34,7 @@ use test_framework::{
         },
         SpiceTest,
     },
+    TestType,
 };
 
 /// Runs a test to ensure the P50 & p90 latencies do not increase by some threshold over the
@@ -73,15 +74,16 @@ pub(crate) async fn overhead_run(args: &HttpOverheadTestArgs) -> anyhow::Result<
 
     println!("{}", with_color!(Color::Blue, "Starting overhead test"));
     let test = test.start()?.wait().await?;
-    let results = test.metrics()?;
+    let results = test.collect(TestType::HTTPOverhead)?;
+    results.show()?;
 
     let mut spiced_instance = test.end();
     spiced_instance.stop()?;
 
-    let Some(baseline) = results.iter().find(|q| q.query_name == "baseline") else {
+    let Some(baseline) = results.metrics.iter().find(|q| q.query_name == "baseline") else {
         return Err(anyhow::anyhow!("Baseline results not found"));
     };
-    let Some(spice) = results.iter().find(|q| q.query_name == "spice") else {
+    let Some(spice) = results.metrics.iter().find(|q| q.query_name == "spice") else {
         return Err(anyhow::anyhow!("Spice results not found"));
     };
 

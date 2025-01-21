@@ -208,7 +208,7 @@ pub enum DataConnectorError {
         table_name: String,
     },
 
-    #[snafu(display("Failed to load the {connector_component} ({dataconnector}).\nAn unknown Data Connector Error occurred: {source}\nPlease report a bug on GitHub: https://github.com/spiceai/spiceai/issues"))]
+    #[snafu(display("Failed to load the {connector_component} ({dataconnector}).\nAn unknown Data Connector Error occurred: {source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"))]
     InternalWithSource {
         dataconnector: String,
         connector_component: ConnectorComponent,

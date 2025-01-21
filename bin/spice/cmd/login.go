@@ -79,7 +79,7 @@ spice login
 
 		cmd.Println("Attempting to open Spice.ai authorization page in your default browser")
 		cmd.Printf("\nYour auth code:\n\n%s-%s\n", authCode[:4], authCode[4:])
-		cmd.Println("\nIf the browser does not open, please visit the following URL manually:")
+		cmd.Println("\nIf the browser does not open, visit the following URL manually:")
 		cmd.Printf("\n%s\n\n", spiceAuthUrl)
 
 		_ = browser.OpenURL(spiceApiClient.GetAuthUrl(authCode))

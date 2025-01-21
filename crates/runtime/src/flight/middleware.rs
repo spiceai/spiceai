@@ -189,7 +189,7 @@ where
 
                 response.headers_mut().insert(
                     "grpc-message",
-                    HeaderValue::from_static("Too many requests. Please retry later."),
+                    HeaderValue::from_static("Too many requests. Try again later."),
                 );
 
                 Ok(response)
