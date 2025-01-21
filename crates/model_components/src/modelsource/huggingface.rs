@@ -36,7 +36,7 @@ impl ModelSource for Huggingface {
 
         let Some(name) = name else {
             return Err(super::UnableToLoadConfigSnafu {
-                reason: "Name is required",
+                reason: "The 'name' parameter is required, and was not provided.",
             }
             .build());
         };
@@ -61,7 +61,7 @@ impl ModelSource for Huggingface {
 
         let Some(remote_path) = remote_path else {
             return Err(super::UnableToLoadConfigSnafu {
-                reason: "From is required",
+                reason: "The 'from' parameter is required, and was not provided.",
             }
             .build());
         };
@@ -69,14 +69,14 @@ impl ModelSource for Huggingface {
         let Ok(re) = Regex::new(
             r"\A(huggingface:)(huggingface\.co\/)?(?<org>[\w\-]+)\/(?<model>[\w\-]+)(:(?<revision>[\w\d\-\.]+))?\z",
         ) else {
-            return Err(super::UnableToLoadConfigSnafu {
-                reason: "Invalid regex",
-            }
-            .build());
+            unreachable!("Invalid regex for huggingface source");
         };
+
         let Some(caps) = re.captures(remote_path.as_str()) else {
             return Err(super::UnableToLoadConfigSnafu {
-                reason: format!("from is invalid for huggingface source: {remote_path}"),
+                reason: format!(
+                    "The 'from' parameter is invalid for a huggingface source: {remote_path}"
+                ),
             }
             .build());
         };
