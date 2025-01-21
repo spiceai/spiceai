@@ -107,10 +107,7 @@ pub async fn construct_model(
         ModelSource::File => file(component, params),
         ModelSource::Anthropic => anthropic(model_id.as_deref(), params),
         ModelSource::Azure => azure(model_id, component.name.as_str(), params),
-        ModelSource::Xai => Ok(Box::new(Xai::new(
-            model_id.as_deref(),
-            extract_secret!(params, "xai_api_key"),
-        )) as Box<dyn Chat>),
+        ModelSource::Xai => xai(model_id.as_deref(), params),
         ModelSource::OpenAi => openai(model_id, params),
         ModelSource::SpiceAI => Err(LlmError::UnsupportedTaskForModel {
             from: "spiceai".into(),
@@ -131,6 +128,18 @@ pub async fn construct_model(
         component.get_openai_request_overrides(),
     );
     Ok(Box::new(wrapper))
+}
+
+fn xai(
+    model_id: Option<&str>,
+    params: &HashMap<String, SecretString>,
+) -> Result<Box<dyn Chat>, LlmError> {
+    let Some(api_key) = extract_secret!(params, "xai_api_key") else {
+        return Err(LlmError::FailedToLoadModel {
+            source: "No `xai_api_key` provided for xAI model.".into(),
+        });
+    };
+    Ok(Box::new(Xai::new(model_id, api_key)) as Box<dyn Chat>)
 }
 
 fn anthropic(

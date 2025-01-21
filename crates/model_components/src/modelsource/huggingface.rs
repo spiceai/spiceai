@@ -22,7 +22,34 @@ use secrecy::{ExposeSecret, Secret, SecretString};
 use snafu::prelude::*;
 use std::collections::HashMap;
 use std::io::Cursor;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
+
+// Matches model paths in these formats:
+// - organization/model-name
+// - organization/model-name:revision
+// - huggingface:organization/model-name
+// - hf:organization/model-name
+// - huggingface:organization/model-name:revision
+// - hf:organization/model-name:revision
+// - huggingface.co/organization/model-name
+// - huggingface.co/organization/model-name:revision
+// - huggingface:huggingface.co/organization/model-name
+// - hf:huggingface.co/organization/model-name
+//
+// Captures three named groups:
+// - org: Organization name (allows word chars and hyphens)
+// - model: Model name (allows word chars, hyphens, and dots)
+// - revision: Optional revision/version (allows word chars, digits, hyphens, and dots)
+static HUGGINGFACE_PATH_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    match Regex::new(
+        r"\A(?:(?:huggingface|hf):)?(huggingface\.co\/)?(?<org>[\w\-]+)\/(?<model>[\w\-\.]+)(:(?<revision>[\w\d\-\.]+))?\z",
+    ) {
+        Ok(regex) => regex,
+        Err(e) => {
+            panic!("Regex is invalid: {e}");
+        }
+    }
+});
 
 pub struct Huggingface {}
 
@@ -66,13 +93,7 @@ impl ModelSource for Huggingface {
             .build());
         };
 
-        let Ok(re) = Regex::new(
-            r"\A(huggingface:)(huggingface\.co\/)?(?<org>[\w\-]+)\/(?<model>[\w\-]+)(:(?<revision>[\w\d\-\.]+))?\z",
-        ) else {
-            unreachable!("Invalid regex for huggingface source");
-        };
-
-        let Some(caps) = re.captures(remote_path.as_str()) else {
+        let Some(caps) = HUGGINGFACE_PATH_REGEX.captures(remote_path.as_str()) else {
             return Err(super::UnableToLoadConfigSnafu {
                 reason: format!(
                     "The 'from' parameter is invalid for a huggingface source: {remote_path}"
@@ -147,5 +168,138 @@ impl ModelSource for Huggingface {
         }
 
         Ok(onnx_file_name)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_huggingface_path_regex() {
+        let test_cases = vec![
+            // Basic format
+            (
+                "organization/model-name",
+                ("organization", "model-name", ""),
+            ),
+            // With revision
+            (
+                "organization/model-name:v1.0",
+                ("organization", "model-name", "v1.0"),
+            ),
+            // With huggingface: prefix
+            (
+                "huggingface:organization/model-name",
+                ("organization", "model-name", ""),
+            ),
+            // With hf: prefix
+            (
+                "hf:organization/model-name",
+                ("organization", "model-name", ""),
+            ),
+            // With huggingface: prefix and revision
+            (
+                "huggingface:organization/model-name:v1.0",
+                ("organization", "model-name", "v1.0"),
+            ),
+            // With hf: prefix and revision
+            (
+                "hf:organization/model-name:v1.0",
+                ("organization", "model-name", "v1.0"),
+            ),
+            // With huggingface.co domain
+            (
+                "huggingface.co/organization/model-name",
+                ("organization", "model-name", ""),
+            ),
+            // With huggingface.co domain and revision
+            (
+                "huggingface.co/organization/model-name:v1.0",
+                ("organization", "model-name", "v1.0"),
+            ),
+            // With huggingface: prefix and huggingface.co domain
+            (
+                "huggingface:huggingface.co/organization/model-name",
+                ("organization", "model-name", ""),
+            ),
+            // With hf: prefix and huggingface.co domain
+            (
+                "hf:huggingface.co/organization/model-name",
+                ("organization", "model-name", ""),
+            ),
+            // With huggingface: prefix, huggingface.co domain, and revision
+            (
+                "huggingface:huggingface.co/organization/model-name:v1.0",
+                ("organization", "model-name", "v1.0"),
+            ),
+            // With hf: prefix, huggingface.co domain, and revision
+            (
+                "hf:huggingface.co/organization/model-name:v1.0",
+                ("organization", "model-name", "v1.0"),
+            ),
+            // Test hyphens in organization name
+            ("my-org/model-name", ("my-org", "model-name", "")),
+            // Test hyphens and dots in model name
+            (
+                "organization/my-model.v2",
+                ("organization", "my-model.v2", ""),
+            ),
+            // Test complex revision with hyphens, dots, and numbers
+            (
+                "organization/model-name:v1.2-beta.3",
+                ("organization", "model-name", "v1.2-beta.3"),
+            ),
+            // Test 'latest' revision (handled in code)
+            (
+                "organization/model-name:latest",
+                ("organization", "model-name", "latest"),
+            ),
+        ];
+
+        for (input, expected) in test_cases {
+            let caps = HUGGINGFACE_PATH_REGEX
+                .captures(input)
+                .unwrap_or_else(|| panic!("Failed to match valid input: {input}"));
+
+            assert_eq!(&caps["org"], expected.0, "org mismatch for input: {input}");
+            assert_eq!(
+                &caps["model"], expected.1,
+                "model mismatch for input: {input}"
+            );
+
+            let revision = caps.name("revision").map_or("", |m| m.as_str());
+            assert_eq!(revision, expected.2, "revision mismatch for input: {input}");
+        }
+    }
+
+    #[test]
+    fn test_invalid_huggingface_paths() {
+        let invalid_paths = vec![
+            "",                   // Empty string
+            "invalid",            // No slash
+            "/",                  // Just a slash
+            "org/",               // Missing model name
+            "/model",             // Missing organization
+            "org/model:",         // Empty revision
+            "org/model::",        // Double colon
+            "huggingface:",       // Missing path
+            "hf:",                // Missing path
+            "huggingface:/",      // Invalid path
+            "hf:/",               // Invalid path
+            "huggingface.co",     // Missing path
+            "huggingface.co/",    // Missing org and model
+            "org/model/extra",    // Extra path component
+            "@org/model",         // Invalid character in org
+            "org/@model",         // Invalid character in model
+            "org/model:@version", // Invalid character in revision
+        ];
+
+        for path in invalid_paths {
+            assert!(
+                HUGGINGFACE_PATH_REGEX.captures(path).is_none(),
+                "Should not match invalid path: {path}"
+            );
+        }
     }
 }

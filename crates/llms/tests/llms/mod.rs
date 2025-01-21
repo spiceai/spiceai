@@ -68,7 +68,12 @@ static TEST_MODELS: LazyLock<Vec<ModelDef>> = LazyLock::new(|| {
             Box::new(|| create::create_anthropic(None).expect("failed to create anthropic model")),
         ),
         ("openai", Box::new(|| create::create_openai("gpt-4o-mini"))),
-        ("xai", Box::new(|| create::create_xai("grok-beta"))),
+        (
+            "xai",
+            Box::new(|| {
+                create::create_xai("grok-beta").expect("failed to create 'grok-beta' from xAI")
+            }),
+        ),
         (
             "hf_phi3",
             Box::new(|| {

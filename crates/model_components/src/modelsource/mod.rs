@@ -114,7 +114,12 @@ impl FromStr for ModelSourceType {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             s if s.starts_with("spiceai:") => Ok(ModelSourceType::SpiceAI),
-            s if s.starts_with("huggingface:") => Ok(ModelSourceType::Huggingface),
+            s if s.starts_with("huggingface:")
+                || s.starts_with("huggingface.co")
+                || s.starts_with("hf:") =>
+            {
+                Ok(ModelSourceType::Huggingface)
+            }
             s if s.starts_with("file:/") => Ok(ModelSourceType::Local),
             _ => Err(ParseError {
                 message: "Unrecognized model source type prefix".to_string(),

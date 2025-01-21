@@ -40,12 +40,10 @@ pub struct Xai {
 
 impl Xai {
     #[must_use]
-    pub fn new(model: Option<&str>, api_key: Option<&str>) -> Self {
-        let mut cfg = OpenAIConfig::default().with_api_base(DEFAULT_ENDPOINT);
-
-        if let Some(api_key) = api_key {
-            cfg = cfg.with_api_key(api_key);
-        }
+    pub fn new(model: Option<&str>, api_key: &str) -> Self {
+        let cfg = OpenAIConfig::default()
+            .with_api_base(DEFAULT_ENDPOINT)
+            .with_api_key(api_key);
 
         Self {
             model: model.unwrap_or(DEFAULT_MODEL).to_string(),
