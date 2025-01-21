@@ -34,19 +34,19 @@ pub struct Model {
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Unknown model source: {source}"))]
+    #[snafu(display("{source}"))]
     UnknownModelSource { source: ModelSourceError },
 
-    #[snafu(display("Unable to load model from path: {source}"))]
+    #[snafu(display("{source}"))]
     UnableToLoadModel { source: ModelSourceError },
 
-    #[snafu(display("Unable to init model: {source}"))]
+    #[snafu(display("{source}"))]
     UnableToInitModel { source: ModelRuntimeError },
 
-    #[snafu(display("Unable to run model: {source}"))]
+    #[snafu(display("{source}"))]
     UnableToRunModel { source: ModelRuntimeError },
 
-    #[snafu(display("Unable to load required secrets"))]
+    #[snafu(display("Unable to load required secrets.\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"))]
     UnableToLoadRequiredSecrets {},
 }
 
@@ -57,9 +57,7 @@ impl Model {
     ) -> Result<Self> {
         let Ok(source) = model.from.parse::<ModelSourceType>() else {
             return Err(Error::UnknownModelSource {
-                source: ModelSourceError::UnknownModelSource {
-                    model_source: model.from,
-                },
+                source: ModelSourceError::UnknownModelSource { from: model.from },
             });
         };
 
@@ -97,15 +95,13 @@ impl Model {
                     }),
                 },
                 None => Err(Error::UnknownModelSource {
-                    source: ModelSourceError::UnknownModelSource {
-                        model_source: model.from,
-                    },
+                    source: ModelSourceError::UnknownModelSource { from: model.from },
                 }),
             }
         } else {
             Err(Error::UnknownModelSource {
                 source: ModelSourceError::UnknownModelSource {
-                    model_source: source.to_string(),
+                    from: source.to_string(),
                 },
             })
         }

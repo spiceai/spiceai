@@ -59,53 +59,40 @@ pub enum LlmRuntime {
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Failed to run LLM health check: {source}"))]
+    #[snafu(display("Failed to check the status of the model.\nAn error occurred: {source}\nVerify the model configuration."))]
     HealthCheckError {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Failed to run the LLM chat model: {source}"))]
+    #[snafu(display("Failed to run the model.\nAn error occurred: {source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"))]
     FailedToRunModel {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Local model, expected at {expected_path}, not found"))]
+    #[snafu(display("Failed to find the Local model at '{expected_path}'.\nVerify the model exists, and try again."))]
     LocalModelNotFound { expected_path: String },
 
-    #[snafu(display("Local model config, expected at {expected_path}, not found"))]
+    #[snafu(display("Failed to find the Local model config at '{expected_path}'.\nVerify the model config exists, and try again."))]
     LocalModelConfigNotFound { expected_path: String },
 
-    #[snafu(display("Local tokenizer, expected at {expected_path}, not found"))]
+    #[snafu(display("Failed to find the Local tokenizer at '{expected_path}'.\nVerify the tokenizer exists, and try again."))]
     LocalTokenizerNotFound { expected_path: String },
 
-    #[snafu(display("Failed to load model: {source}"))]
+    #[snafu(display("Failed to load the model.\nAn error occurred: {source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"))]
     FailedToLoadModel {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Failed to load model tokenizer: {source}"))]
+    #[snafu(display("Failed to load model tokenizer.\nAn error occurred: {source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"))]
     FailedToLoadTokenizer {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Failed to tokenize: {source}"))]
-    FailedToTokenize {
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
+    #[snafu(display("An unsupported model source was specified in the 'from' parameter: '{from}'.\nSpecify a valid source, like 'openai', and try again.\nFor details, visit: https://spiceai.org/docs/components/models"))]
+    UnknownModelSource { from: String },
 
-    #[snafu(display("Unsupported source of model: {source}"))]
-    UnknownModelSource {
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-
-    #[snafu(display("No model from {from} currently supports {task}"))]
+    #[snafu(display("The specified model, '{from}', does not support executing the task '{task}'.\nSelect a different model or task, and try again."))]
     UnsupportedTaskForModel { from: String, task: String },
-
-    #[snafu(display("Invalid value for 'params.tools'"))]
-    UnsupportedSpiceToolUseParameterError {},
-
-    #[snafu(display("Runtime does not currently support the {modality} modality"))]
-    UnsupportedModalityType { modality: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

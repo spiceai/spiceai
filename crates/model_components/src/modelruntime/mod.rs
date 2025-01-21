@@ -32,10 +32,10 @@ pub fn supported_runtime_for_path(path: &str) -> Result<Box<dyn ModelRuntime>, S
                     path: path.to_string(),
                 }));
             }
-            Err(format!("Unsupported model format for path: {format}"))
+            Err(format!("Unsupported model format for path: {format}.\nSpecify a valid model path or check the model format.\nFor details, visit: https://spiceai.org/docs/components/models"))
         }
         None => Err(format!(
-            "Model format for path={path} could not be inferred"
+            "Model format for path '{path}' could not be inferred.\nSpecify a valid model path or check the model format.\nFor details, visit: https://spiceai.org/docs/components/models"
         )),
     }
 }
