@@ -249,14 +249,6 @@ jobs:
     env:
       ARTIFACT_DIR: ./release
 
-    strategy:
-      matrix:
-        include:
-          - target_os: linux
-            target_arch: x86_64
-          - target_os: windows
-            target_arch: x86_64
-
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -272,9 +264,6 @@ jobs:
         uses: actions/download-artifact@v4
         continue-on-error: true
         with:
-          pattern: |
-            spiced_models_cuda_*_${{ matrix.target_os }}_${{ matrix.target_arch }}
-            spiced.exe_models_cuda_*_${{ matrix.target_os }}_${{ matrix.target_arch }}
           path: ${{ env.ARTIFACT_DIR }}
           merge-multiple: true
 
@@ -287,18 +276,33 @@ jobs:
           OWNER_NAME="${GITHUB_REPOSITORY%%/*}"
           REPO_NAME="${GITHUB_REPOSITORY#*/}"
           export GITHUB_TOKEN=${{ secrets.GITHUB_TOKEN }}
-          # Get the list of files
-          RELEASE_ARTIFACT=(${ARTIFACT_DIR}/*)
+          
+          # First check if we have any files to upload
+          if [ -z "$(ls -A ${ARTIFACT_DIR})" ]; then
+            echo "No artifacts found in ${ARTIFACT_DIR}"
+            exit 1
+          fi
+          
+          # Create an array of actual files (no globs)
+          RELEASE_ARTIFACTS=()
+          for file in ${ARTIFACT_DIR}/*; do
+            if [ -f "$file" ]; then
+              RELEASE_ARTIFACTS+=("$file")
+            fi
+          done
+          
           # Delete existing release artifact
           python ./.github/scripts/github_release.py delete \
             --owner $OWNER_NAME --repo $REPO_NAME \
             --tag "v${{ env.REL_VERSION }}" \
-            ${RELEASE_ARTIFACT[*]}
+            "${RELEASE_ARTIFACTS[@]}"
+            
           if [ "$LATEST_RELEASE" = "true" ]; then
             export RELEASE_BODY=`cat ./docs/release_notes/v${{ env.REL_VERSION }}.md`
           else
             export RELEASE_BODY="This is the release candidate ${{ env.REL_VERSION }}"
           fi
+          
           echo "Uploading Spice.ai CUDA Binaries to GitHub Release"
           python ./.github/scripts/github_release.py upload \
             --owner $OWNER_NAME --repo $REPO_NAME \
@@ -306,4 +310,4 @@ jobs:
             --release-name "v${{ env.REL_VERSION }}" \
             --body "${RELEASE_BODY}" \
             --prerelease "$PRE_RELEASE" \
-            ${RELEASE_ARTIFACT[*]} 
+            "${RELEASE_ARTIFACTS[@]}"
