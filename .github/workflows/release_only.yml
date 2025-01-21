@@ -46,6 +46,7 @@ jobs:
         with:
           name: spice_${{ matrix.target_os }}_${{ matrix.target_arch }}
           path: ${{ env.ARTIFACT_DIR }}
+          github-token: ${{ secrets.DOWNLOAD_ARTIFACT_TOKEN }}
           run-id: ${{ inputs.run_id }}
 
       - name: Download spice.exe artifact
@@ -54,6 +55,7 @@ jobs:
         with:
           name: spice.exe_${{ matrix.target_os }}_${{ matrix.target_arch }}
           path: ${{ env.ARTIFACT_DIR }}
+          github-token: ${{ secrets.DOWNLOAD_ARTIFACT_TOKEN }}
           run-id: ${{ inputs.run_id }}
 
       # Download spiced artifacts
@@ -63,6 +65,7 @@ jobs:
         with:
           name: spiced_${{ matrix.target_os }}_${{ matrix.target_arch }}
           path: ${{ env.ARTIFACT_DIR }}
+          github-token: ${{ secrets.DOWNLOAD_ARTIFACT_TOKEN }}
           run-id: ${{ inputs.run_id }}
 
       - name: Download spiced.exe artifact
@@ -71,6 +74,7 @@ jobs:
         with:
           name: spiced.exe_${{ matrix.target_os }}_${{ matrix.target_arch }}
           path: ${{ env.ARTIFACT_DIR }}
+          github-token: ${{ secrets.DOWNLOAD_ARTIFACT_TOKEN }}
           run-id: ${{ inputs.run_id }}
 
       # Download spiced models artifacts
@@ -80,6 +84,7 @@ jobs:
         with:
           name: spiced_models_${{ matrix.target_os }}_${{ matrix.target_arch }}
           path: ${{ env.ARTIFACT_DIR }}
+          github-token: ${{ secrets.DOWNLOAD_ARTIFACT_TOKEN }}
           run-id: ${{ inputs.run_id }}
 
       - name: Download spiced.exe models artifact
@@ -88,6 +93,7 @@ jobs:
         with:
           name: spiced.exe_models_${{ matrix.target_os }}_${{ matrix.target_arch }}
           path: ${{ env.ARTIFACT_DIR }}
+          github-token: ${{ secrets.DOWNLOAD_ARTIFACT_TOKEN }}
           run-id: ${{ inputs.run_id }}
       
       # Download macOS metal artifacts
@@ -97,6 +103,7 @@ jobs:
         with:
           name: spiced_models_metal_${{ matrix.target_os }}_${{ matrix.target_arch }}
           path: ${{ env.ARTIFACT_DIR }}
+          github-token: ${{ secrets.DOWNLOAD_ARTIFACT_TOKEN }}
           run-id: ${{ inputs.run_id }}
 
       - name: List artifacts
