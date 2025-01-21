@@ -115,7 +115,7 @@ func (g *GitHubClient) call(method string, url string, payload []byte, accept st
 	}
 
 	if response.StatusCode == 401 {
-		return nil, NewGitHubCallError("Detected GitHub token from GH_TOKEN or GITHUB_TOKEN environment variable is invalid. Please check the token and try again.", response.StatusCode)
+		return nil, NewGitHubCallError("Detected GitHub token from GH_TOKEN or GITHUB_TOKEN environment variable is invalid. Check the token and try again.", response.StatusCode)
 	}
 
 	if response.StatusCode != 200 {
