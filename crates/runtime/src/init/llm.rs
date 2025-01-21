@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::{model::try_to_chat_model, Result, Runtime, UnableToInitializeLlmSnafu};
-use llms::chat::Chat;
+use llms::chat::{try_map_boxed_error_to_box, Chat};
 use secrecy::SecretString;
 use snafu::ResultExt;
 use spicepod::component::model::Model as SpicepodModel;
@@ -33,11 +33,13 @@ impl Runtime {
         let l = try_to_chat_model(&m, &params, Arc::new(self.clone()))
             .await
             .boxed()
+            .map_err(try_map_boxed_error_to_box)
             .context(UnableToInitializeLlmSnafu)?;
 
         l.health()
             .await
             .boxed()
+            .map_err(try_map_boxed_error_to_box)
             .context(UnableToInitializeLlmSnafu)?;
         Ok(l)
     }
