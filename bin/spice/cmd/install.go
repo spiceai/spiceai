@@ -21,6 +21,7 @@ import (
 	"os"
 
 	"github.com/spf13/cobra"
+	"github.com/spiceai/spiceai/bin/spice/pkg/constants"
 	"github.com/spiceai/spiceai/bin/spice/pkg/context"
 	"github.com/spiceai/spiceai/bin/spice/pkg/runtime"
 	"github.com/spiceai/spiceai/bin/spice/pkg/util"
@@ -45,9 +46,14 @@ spice install ai
 			slog.Error("failed to check for latest CLI release version", "error", err)
 		}
 
-		flavor := ""
+		flavor := constants.FlavorDefault
 		if len(args) > 0 {
-			flavor = args[0]
+			var err error
+			flavor, err = constants.ParseFlavor(args[0])
+			if err != nil {
+				slog.Error("Invalid command specified. Try: `spice install` or `spice install ai`")
+				os.Exit(1)
+			}
 		}
 
 		var installed bool
@@ -63,7 +69,7 @@ spice install ai
 			os.Exit(1)
 		}
 
-		if cpu && flavor != "ai" {
+		if cpu && flavor != constants.FlavorAI {
 			slog.Error("CPU flag is only allowed when installing the 'ai' flavor. Try: `spice install ai --cpu`")
 			os.Exit(1)
 		}

@@ -23,12 +23,13 @@ use std::{sync::Arc, time::Duration};
 use test_framework::{
     anyhow::{self, anyhow},
     arrow::array::ArrowNativeTypeOp,
-    metrics::{ExtendedMetrics, MetricCollector, QueryMetric},
+    metrics::MetricCollector,
     spiced::SpicedInstance,
     spicetest::{
         http::consistency::{self, ConsistencyConfig},
         SpiceTest,
     },
+    TestType,
 };
 
 /// Runs a test to ensure the P50 & p90 latencies do not increase by some threshold over the
@@ -65,13 +66,14 @@ pub async fn consistency_run(args: &HttpConsistencyTestArgs) -> anyhow::Result<(
 
     println!("{}", with_color!(Color::Blue, "Starting consistency test"));
     let test = test.start()?.wait().await?;
-    let results = test.metrics()?;
+    let results = test.collect(TestType::HTTPConsistency)?;
 
     let mut spiced_instance = test.end();
 
-    print_ascii_table(&results);
+    results.show()?;
 
     let (p50, p95): (Vec<f64>, Vec<f64>) = results
+        .metrics
         .iter()
         .map(|minute| (minute.median_duration, minute.percentile_95_duration))
         .unzip();
@@ -111,26 +113,4 @@ pub async fn consistency_run(args: &HttpConsistencyTestArgs) -> anyhow::Result<(
     );
     spiced_instance.stop()?;
     Ok(())
-}
-
-fn print_ascii_table<T: ExtendedMetrics>(minutes: &[QueryMetric<T>]) {
-    println!(
-        "{:<13} | {:<10} | {:<10} | {:<10} | {:<10}",
-        "Num Requests", "P50 (ms)", "P90 (ms)", "P95 (ms)", "P99 (ms)"
-    );
-    println!(
-        "{:-<13}-+-{:-<10}-+-{:-<10}-+-{:-<10}-+-{:-<10}",
-        "", "", "", "", ""
-    );
-
-    for minute in minutes {
-        println!(
-            "{:<13} | {:<10.2} | {:<10.2} | {:<10.2} | {:<10.2}",
-            minute.run_count,
-            1000.0 * minute.median_duration,
-            1000.0 * minute.percentile_90_duration,
-            1000.0 * minute.percentile_95_duration,
-            1000.0 * minute.percentile_99_duration
-        );
-    }
 }

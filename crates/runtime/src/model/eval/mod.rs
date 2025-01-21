@@ -43,14 +43,14 @@ pub(crate) mod scorer;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Failed to query eval dataset '{dataset_name}': {source}. Ensure the dataset is available and has the correct schema."))]
+    #[snafu(display("Failed to query evaluation dataset '{dataset_name}'.\n{source}\nEnsure the dataset is available and has the correct schema."))]
     FailedToQueryDataset {
         dataset_name: String,
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
     #[snafu(display(
-        "Column '{column}' in eval dataset '{dataset}' could not be parsed: {source}"
+        "Failed to parse the column '{column}' in evaluation dataset '{dataset}'.\n{source}\nEnsure the column is available and has the correct schema."
     ))]
     FailedToParseColumn {
         column: String,
@@ -58,14 +58,14 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Failed to prepare data for eval '{eval_name}': {source}"))]
+    #[snafu(display("Failed to prepare data for evaluation '{eval_name}'\n{source}\nVerify the dataset and model configuration, and try again."))]
     FailedToPrepareData {
         eval_name: String,
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
     #[snafu(display(
-        "During evaluation '{eval_name}', an error occured when running the model: {source}"
+        "Failed to run the model during evaluation '{eval_name}'.\n{source}\nVerify the model configuration and try again."
     ))]
     FailedToRunModel {
         eval_name: String,
@@ -73,7 +73,7 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "The model {model_name}, during eval '{eval_name}' did not produce the expected number of rows."
+        "Failed to produce the number of expected rows from the model {model_name}, during evaluation '{eval_name}'.\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
     ))]
     ModelProducedFewerRows {
         model_name: String,
@@ -81,48 +81,48 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "During evaluation '{eval_name}', the model '{model_name}' could not be acquired"
+        "Failed to acquire the model '{model_name}' during evaluation '{eval_name}'.\nEnsure the model is available and has been successfully loaded."
     ))]
     FailedToGetModel {
         eval_name: String,
         model_name: String,
     },
 
-    #[snafu(display("Scorer '{scorer_name}' needed for eval '{eval_name}' is not available. Ensure '{scorer_name}' is defined in the spicepod and has been sucessfully loaded."))]
+    #[snafu(display("Failed to load the scorer '{scorer_name}' needed for evaluation '{eval_name}'.\nVerify the scorer '{scorer_name}' is defined in the spicepod and has been sucessfully loaded."))]
     EvalScorerUnavailable {
         eval_name: String,
         scorer_name: String,
     },
 
-    #[snafu(display("Failed to create score outputs: {source}"))]
+    #[snafu(display("Failed to create score outputs.\n{source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"))]
     FailedToCreateScoreOutputs { source: ArrowError },
 
-    #[snafu(display("Failed to write eval results to {} for '{eval_run_id}': {source}", EVAL_RESULTS_TABLE_REFERENCE.clone()))]
+    #[snafu(display("Failed to write evaluation results to {} for '{eval_run_id}'.\n{source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues", EVAL_RESULTS_TABLE_REFERENCE.clone()))]
     FailedToWriteEvalResults {
         eval_run_id: EvalRunId,
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Failed to start an eval run for {eval_name}: {source}"))]
+    #[snafu(display("Failed to start an evaluation run for {eval_name}.\n{source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"))]
     FailedToStartEvalRun {
         eval_name: String,
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Failed to update eval run table '{eval_run_id}': {source}"))]
+    #[snafu(display("Failed to update evaluation run table '{eval_run_id}'.\n{source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"))]
     FailedToUpdateEvalRunTable {
         eval_run_id: EvalRunId,
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Failed to send eval run '{eval_run_id}' to background workers: {source}"))]
+    #[snafu(display("Failed to start the evaluation run '{eval_run_id}'.\n{source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"))]
     FailedToOffloadEvalRun {
         eval_run_id: EvalRunId,
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
     #[snafu(display(
-        "Failed to update the status of an eval run '{eval_id}' to status '{status}': {source}"
+        "Failed to update the status of an evaluation run '{eval_id}' to status '{status}'.\n{source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
     ))]
     FailedToUpdateEvalRunStatus {
         eval_id: EvalRunId,
@@ -130,15 +130,21 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Failed to parse the input column from the eval dataset because {reason}. Check that the values in the input column are of valid eval format."))]
+    #[snafu(display("Failed to parse the input column from the evaluation dataset.\n{reason}\nCheck that the values in the input column are of valid evaluation format."))]
     InvalidInputFormat { reason: String },
 
-    #[snafu(display("Failed to parse the output column from the eval dataset because {reason}. Check that the values in the output column are of valid eval format."))]
+    #[snafu(display("Failed to parse the input column from the evaluation dataset.\n{reason}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"))]
+    InvalidInputFormatReport { reason: String },
+
+    #[snafu(display("Failed to parse the output column from the evaluation dataset.\n{reason}\nCheck that the values in the output column are of valid evaluation format."))]
     InvalidOutputFormat { reason: String },
+
+    #[snafu(display("Failed to parse the output column from the evaluation dataset.\n{reason}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"))]
+    InvalidOutputFormatReport { reason: String },
 }
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-/// Handles both running the eval, tracking the `eval_run` `task_history`,  and updating the status of the eval run in `eval.runs`. Error is returned if the eval run fails or the eval run status/metrics could not be updated.
+/// Handles both running the eval, tracking the `eval_run` `task_history`,  and updating the status of the evaluation run in `eval.runs`. Error is returned if the evaluation run fails or the evaluation run status/metrics could not be updated.
 pub async fn handle_eval_run(
     eval: &Eval,
     model_name: String,
@@ -188,13 +194,13 @@ async fn run_eval(
     df: Arc<DataFusion>,
     scorer_registry: EvalScorerRegistry,
 ) -> Result<()> {
-    // Get & prepare the eval dataset
+    // Get & prepare the evaluation dataset
     let (input, ideal) = get_eval_data(Arc::clone(&df), eval).await?;
     if input.len() != ideal.len() {
         return Err(Error::FailedToPrepareData {
             eval_name: eval.name.clone(),
             source: Box::<dyn std::error::Error + Send + Sync>::from(format!(
-                "input ({}) and ideal ({}) in eval dataset '{}' do not have the same length",
+                "input ({}) and ideal ({}) in evaluation dataset '{}' do not have the same length",
                 input.len(),
                 ideal.len(),
                 eval.dataset.clone()
@@ -202,7 +208,7 @@ async fn run_eval(
         });
     }
 
-    // Run the model against the eval dataset.
+    // Run the model against the evaluation dataset.
     let llms = llm_store.read().await;
     let model = llms
         .get(&model_name)

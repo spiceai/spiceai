@@ -57,7 +57,7 @@ pub enum Error {
         message: String,
     },
 
-    #[snafu(display("Failed to load the {connector_component} ({connector}).\nAn unknown Catalog Connector Error occurred: {source}\nPlease report a bug on GitHub: https://github.com/spiceai/spiceai/issues"))]
+    #[snafu(display("Failed to load the {connector_component} ({connector}).\nAn unknown Catalog Connector Error occurred: {source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"))]
     InternalWithSource {
         connector: String,
         connector_component: ConnectorComponent,

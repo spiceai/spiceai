@@ -71,7 +71,7 @@ Details:
 
 {query}
 
-Please verify the syntax of your GraphQL query."#
+Verify the syntax of your GraphQL query."#
     ))]
     InvalidGraphQLQuery {
         message: String,

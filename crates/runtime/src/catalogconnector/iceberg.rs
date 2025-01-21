@@ -55,7 +55,7 @@ pub enum Error {
     #[snafu(display("Failed to parse URL: {}", source))]
     UrlParse { source: url::ParseError },
 
-    #[snafu(display("Failed to connect to the S3 endpoint at {url}, please check whether the S3 endpoint is accessible and try again."))]
+    #[snafu(display("Failed to connect to the S3 endpoint at '{url}'.\nVerify the S3 endpoint is accessible and try again."))]
     FailedToConnectS3Endpoint { url: String },
 }
 

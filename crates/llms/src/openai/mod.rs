@@ -75,7 +75,8 @@ pub fn new_openai_client(
     org_id: Option<&str>,
     project_id: Option<&str>,
 ) -> Openai<OpenAIConfig> {
-    let mut cfg = OpenAIConfig::new();
+    // Default to empty API key to avoid picking up ENV variable in downstream library.
+    let mut cfg = OpenAIConfig::new().with_api_key("");
 
     if let Some(org_id) = org_id {
         cfg = cfg.with_org_id(org_id);
@@ -85,7 +86,6 @@ pub fn new_openai_client(
         cfg = cfg.with_project_id(project_id);
     }
 
-    // If an API key is provided, use it. Otherwise use default from env variables.
     if let Some(api_key) = api_key {
         cfg = cfg.with_api_key(api_key);
     }

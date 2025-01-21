@@ -68,7 +68,7 @@ pub async fn try_to_chat_model(
         .or(extract_secret!(params, "spice_tools"))
         .map(str::parse)
         .transpose()
-        .map_err(|_| LlmError::UnsupportedSpiceToolUseParameterError {})?;
+        .map_err(|_| unreachable!("SpiceToolsOptions::from_str has no error condition"))?;
 
     let spice_recursion_limit: Option<usize> = extract_secret!(params, "tool_recursion_limit")
         .map(|x| {
@@ -99,21 +99,15 @@ pub async fn construct_model(
 ) -> Result<Box<dyn Chat>, LlmError> {
     let model_id = component.get_model_id();
     let prefix = component.get_source().ok_or(LlmError::UnknownModelSource {
-        source: format!(
-            "Unknown model source for spicepod component from: {}",
-            component.from.clone()
-        )
-        .into(),
+        from: component.from.clone(),
     })?;
+
     let model = match prefix {
         ModelSource::HuggingFace => huggingface(model_id, component, params).await,
         ModelSource::File => file(component, params),
         ModelSource::Anthropic => anthropic(model_id.as_deref(), params),
         ModelSource::Azure => azure(model_id, component.name.as_str(), params),
-        ModelSource::Xai => Ok(Box::new(Xai::new(
-            model_id.as_deref(),
-            extract_secret!(params, "xai_api_key"),
-        )) as Box<dyn Chat>),
+        ModelSource::Xai => xai(model_id.as_deref(), params),
         ModelSource::OpenAi => Ok(openai(model_id, params)),
         ModelSource::SpiceAI => Err(LlmError::UnsupportedTaskForModel {
             from: "spiceai".into(),
@@ -134,6 +128,18 @@ pub async fn construct_model(
         component.get_openai_request_overrides(),
     );
     Ok(Box::new(wrapper))
+}
+
+fn xai(
+    model_id: Option<&str>,
+    params: &HashMap<String, SecretString>,
+) -> Result<Box<dyn Chat>, LlmError> {
+    let Some(api_key) = extract_secret!(params, "xai_api_key") else {
+        return Err(LlmError::FailedToLoadModel {
+            source: "No `xai_api_key` provided for xAI model.".into(),
+        });
+    };
+    Ok(Box::new(Xai::new(model_id, api_key)) as Box<dyn Chat>)
 }
 
 fn anthropic(

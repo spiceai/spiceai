@@ -30,8 +30,6 @@ runs:
       shell: bash
       if: inputs.start-runtime == 'true'
       working-directory: ${{ inputs.working-directory }}
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
         spice run &> spice.log &
         sleep 3

@@ -40,7 +40,8 @@ pub enum TestType {
     Throughput,
     Load,
     Benchmark,
-    HTTP,
+    HTTPConsistency,
+    HTTPOverhead,
 }
 
 impl Display for TestType {
@@ -49,7 +50,8 @@ impl Display for TestType {
             TestType::Throughput => write!(f, "throughput"),
             TestType::Load => write!(f, "load"),
             TestType::Benchmark => write!(f, "benchmark"),
-            TestType::HTTP => write!(f, "http"),
+            TestType::HTTPConsistency => write!(f, "http_consistency"),
+            TestType::HTTPOverhead => write!(f, "http_overhead"),
         }
     }
 }
