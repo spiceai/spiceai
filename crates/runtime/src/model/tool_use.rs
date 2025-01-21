@@ -151,7 +151,10 @@ impl ToolUsingChat {
                     .await
                 {
                     Ok(v) => v,
-                    Err(e) => Value::String(format!("Error calling tool {}. Error: {e}", t.name())),
+                    Err(e) => Value::String(format!(
+                        "Failed to call the tool {}.\nAn error occurred: {e}",
+                        t.name()
+                    )),
                 }
             }
             None => Value::Null,

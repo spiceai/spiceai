@@ -160,7 +160,7 @@ impl DatasetInput {
     pub(crate) fn try_serialize(&self) -> Result<String> {
         match self {
             Self::Messages(m) => serde_json::to_string(m).map_err(|_| Error::InvalidInputFormat {
-                reason: "could not serialize input messages".to_string(),
+                reason: "Failed to serialize input messages.".to_string(),
             }),
             Self::UserInput(s) => Ok(s.clone()),
         }
@@ -211,36 +211,38 @@ impl DatasetInput {
             arr.as_any()
                 .downcast_ref::<ListArray>()
                 .ok_or_else(|| Error::InvalidInputFormat {
-                    reason: "must be a string or list, but was neither".to_string(),
+                    reason: "The input must be a string or list, but was neither.".to_string(),
                 })?;
 
         let mut result = Vec::with_capacity(list_arr.len());
         for i in 0..list_arr.len() {
             if list_arr.is_null(i) {
                 return Err(Error::InvalidInputFormat {
-                    reason: "elements cannot be null".to_string(),
+                    reason: "Elements of the input list cannot be null.".to_string(),
                 });
             }
             let arr = list_arr.value(i);
             let struct_arr = arr.as_any().downcast_ref::<StructArray>().ok_or_else(|| {
                 Error::InvalidInputFormat {
-                    reason: "must be a string or list, but was neither".to_string(),
+                    reason: "The input must be a string or list, but was neither.".to_string(),
                 }
             })?;
 
             let json_value = rb_to_json_value(&RecordBatch::from(struct_arr)).map_err(|e| {
-                Error::InvalidInputFormat {
-                    reason: format!("could not convert input format into JSON representation: {e}"),
+                Error::InvalidInputFormatReport {
+                    reason: format!(
+                        "Failed to convert the input format into JSON representation.\n{e}"
+                    ),
                 }
             })?;
 
             match Self::try_from_value(json_value) {
                 Ok(Some(v)) => result.push(v),
                 Ok(None) => {
-                    return Err(Error::InvalidInputFormat { reason: "could not convert valid list-type input element into a known model input format".to_string() });
+                    return Err(Error::InvalidInputFormatReport { reason: "Failed to convert valid list-type input element into a known model input format.".to_string() });
                 }
                 Err(e) => {
-                    return Err(Error::InvalidInputFormat { reason: format!("could not convert JSON format of input  into a known model input format: {e}") });
+                    return Err(Error::InvalidInputFormatReport { reason: format!("Failed to convert JSON format of input into a known model input format.\n{e}") });
                 }
             };
         }
@@ -261,7 +263,7 @@ impl DatasetOutput {
     pub(crate) fn try_serialize(&self) -> Result<String> {
         match self {
             Self::Choices(c) => serde_json::to_string(c).map_err(|_| Error::InvalidOutputFormat {
-                reason: "could not serialize output choices".to_string(),
+                reason: "Failed to serialize output choices.".to_string(),
             }),
             Self::AssistantResponse(s) => Ok(s.clone()),
         }
@@ -312,36 +314,38 @@ impl DatasetOutput {
             arr.as_any()
                 .downcast_ref::<ListArray>()
                 .ok_or_else(|| Error::InvalidOutputFormat {
-                    reason: "must be a string or list, but was neither".to_string(),
+                    reason: "The output must be a string or list, but was neither.".to_string(),
                 })?;
 
         let mut result = Vec::with_capacity(list_arr.len());
         for i in 0..list_arr.len() {
             if list_arr.is_null(i) {
                 return Err(Error::InvalidOutputFormat {
-                    reason: "elements cannot be null".to_string(),
+                    reason: "Elements of the output list cannot be null.".to_string(),
                 });
             }
             let arr = list_arr.value(i);
             let struct_arr = arr.as_any().downcast_ref::<StructArray>().ok_or_else(|| {
                 Error::InvalidOutputFormat {
-                    reason: "must be a string or list, but was neither".to_string(),
+                    reason: "The output must be a string or list, but was neither.".to_string(),
                 }
             })?;
 
             let json_value = rb_to_json_value(&RecordBatch::from(struct_arr)).map_err(|e| {
-                Error::InvalidOutputFormat {
-                    reason: format!("could not convert element into JSON representation: {e}"),
+                Error::InvalidOutputFormatReport {
+                    reason: format!(
+                        "Failed to convert output element into JSON representation.\n{e}"
+                    ),
                 }
             })?;
 
             match Self::try_from_value(json_value) {
                 Ok(Some(v)) => result.push(v),
                 Ok(None) => {
-                    return Err(Error::InvalidOutputFormat { reason: "could not convert valid list-type elements into a known model output format".to_string() });
+                    return Err(Error::InvalidOutputFormatReport { reason: "Failed to convert valid list-type elements into a known model output format.".to_string() });
                 }
                 Err(e) => {
-                    return Err(Error::InvalidOutputFormat { reason: format!("could not convert JSON format of an element into a known model output format: {e}") });
+                    return Err(Error::InvalidOutputFormatReport { reason: format!("Failed to convert JSON format of an element into a known model output format.\n{e}") });
                 }
             };
         }
