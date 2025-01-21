@@ -28,11 +28,13 @@ use std::sync::{Arc, LazyLock};
 // - organization/model-name
 // - organization/model-name:revision
 // - huggingface:organization/model-name
+// - hf:organization/model-name
 // - huggingface:organization/model-name:revision
+// - hf:organization/model-name:revision
 // - huggingface.co/organization/model-name
 // - huggingface.co/organization/model-name:revision
 // - huggingface:huggingface.co/organization/model-name
-// - huggingface:huggingface.co/organization/model-name:revision
+// - hf:huggingface.co/organization/model-name
 //
 // Captures three named groups:
 // - org: Organization name (allows word chars and hyphens)
@@ -40,7 +42,7 @@ use std::sync::{Arc, LazyLock};
 // - revision: Optional revision/version (allows word chars, digits, hyphens, and dots)
 static HUGGINGFACE_PATH_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     match Regex::new(
-        r"\A(?:huggingface:)?(huggingface\.co\/)?(?<org>[\w\-]+)\/(?<model>[\w\-\.]+)(:(?<revision>[\w\d\-\.]+))?\z",
+        r"\A(?:(?:huggingface|hf):)?(huggingface\.co\/)?(?<org>[\w\-]+)\/(?<model>[\w\-\.]+)(:(?<revision>[\w\d\-\.]+))?\z",
     ) {
         Ok(regex) => regex,
         Err(e) => {
@@ -191,9 +193,19 @@ mod tests {
                 "huggingface:organization/model-name",
                 ("organization", "model-name", ""),
             ),
+            // With hf: prefix
+            (
+                "hf:organization/model-name",
+                ("organization", "model-name", ""),
+            ),
             // With huggingface: prefix and revision
             (
                 "huggingface:organization/model-name:v1.0",
+                ("organization", "model-name", "v1.0"),
+            ),
+            // With hf: prefix and revision
+            (
+                "hf:organization/model-name:v1.0",
                 ("organization", "model-name", "v1.0"),
             ),
             // With huggingface.co domain
@@ -211,9 +223,19 @@ mod tests {
                 "huggingface:huggingface.co/organization/model-name",
                 ("organization", "model-name", ""),
             ),
+            // With hf: prefix and huggingface.co domain
+            (
+                "hf:huggingface.co/organization/model-name",
+                ("organization", "model-name", ""),
+            ),
             // With huggingface: prefix, huggingface.co domain, and revision
             (
                 "huggingface:huggingface.co/organization/model-name:v1.0",
+                ("organization", "model-name", "v1.0"),
+            ),
+            // With hf: prefix, huggingface.co domain, and revision
+            (
+                "hf:huggingface.co/organization/model-name:v1.0",
                 ("organization", "model-name", "v1.0"),
             ),
             // Test hyphens in organization name
@@ -262,7 +284,9 @@ mod tests {
             "org/model:",         // Empty revision
             "org/model::",        // Double colon
             "huggingface:",       // Missing path
+            "hf:",                // Missing path
             "huggingface:/",      // Invalid path
+            "hf:/",               // Invalid path
             "huggingface.co",     // Missing path
             "huggingface.co/",    // Missing org and model
             "org/model/extra",    // Extra path component
