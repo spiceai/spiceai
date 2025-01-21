@@ -183,16 +183,17 @@ See more demos on [YouTube](https://www.youtube.com/playlist?list=PLesJrUXEx3U9a
 
 ## Supported Data Accelerators
 
-| Name       | Description                     | Status            | Engine Modes     |
-| ---------- | ------------------------------- | ----------------- | ---------------- |
-| `arrow`    | In-Memory Arrow Records         | Stable            | `memory`         |
-| `duckdb`   | Embedded [DuckDB][duckdb]       | Stable            | `memory`, `file` |
-| `postgres` | Attached [PostgreSQL][postgres] | Release Candidate | N/A              |
-| `sqlite`   | Embedded [SQLite][sqlite]       | Release Candidate | `memory`, `file` |
+| Name       | Description                      | Status            | Engine Modes     |
+| ---------- | -------------------------------- | ----------------- | ---------------- |
+| `arrow`    | [In-Memory Arrow Records][arrow] | Stable            | `memory`         |
+| `duckdb`   | Embedded [DuckDB][duckdb]        | Stable            | `memory`, `file` |
+| `postgres` | Attached [PostgreSQL][postgres]  | Release Candidate | N/A              |
+| `sqlite`   | Embedded [SQLite][sqlite]        | Release Candidate | `memory`, `file` |
 
-[duckdb]: https://spiceai.org/docs/data-accelerators/duckdb
-[postgres]: https://github.com/spiceai/cookbook/tree/trunk/postgres/accelerator#postgresql-data-accelerator
-[sqlite]: https://spiceai.org/docs/data-accelerators/sqlite
+[arrow]: https://spiceai.org/docs/components/data-accelerators/arrow
+[duckdb]: https://spiceai.org/docs/components/data-accelerators/duckdb
+[postgres]: https://spiceai.org/docs/components/data-accelerators/postgres
+[sqlite]: https://spiceai.org/docs/components/data-accelerators/sqlite
 
 ## Supported Model Providers
 
