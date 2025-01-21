@@ -1,8 +1,6 @@
 name: release_only_cuda
 
 on:
-  pull_request:
-
   workflow_dispatch:
     inputs:
       run_id:
