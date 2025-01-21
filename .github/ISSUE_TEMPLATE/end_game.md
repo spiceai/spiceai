@@ -97,7 +97,7 @@ assignees: ''
   - [ ] [Spice with spice.js sdk sample](https://github.com/spiceai/cookbook/blob/trunk/client-sdk/spice.js-sdk-sample/README.md)
   - [ ] [Spice with spicepy sdk sample](https://github.com/spiceai/cookbook/blob/trunk/client-sdk/spicepy-sdk-sample/README.md)
 - [ ] Merge [Docs PRs](https://github.com/spiceai/docs/pulls)
-  - [ ] Update spice version in [docs banner](https://github.com/spiceai/docs/blob/trunk/spiceaidocs/docusaurus.config.ts#L60)
+  - [ ] Update spice version in [docs banner](https://github.com/spiceai/docs/blob/trunk/website/docusaurus.config.ts#L95)
 - [ ] Merge [Cookbook PRs](https://github.com/spiceai/cookbook/pulls)
 - [ ] Update release notes
   - [ ] Ensure any external contributors have been acknowledged.
@@ -111,11 +111,12 @@ assignees: ''
   - [ ] [spice-dotnet](https://github.com/spiceai/spice-dotnet/releases)
   - [ ] [gospice](https://github.com/spiceai/gospice/releases)
 - [ ] Update acknowledgements by triggering [Generate Acknowledgements](https://github.com/spiceai/spiceai/actions/workflows/generate_acknowledgements.yml) workflow
-  - [ ] Update acknowledgements in [docs](https://github.com/spiceai/docs/blob/trunk/spiceaidocs/docs/acknowledgements/index.md)
+  - [ ] Update acknowledgements in [docs](https://github.com/spiceai/docs/blob/trunk/website/docs/acknowledgements/index.md)
 - [ ] Verify `version.txt` and version in `Cargo.toml` are correct using [docs/RELEASE.md](https://github.com/spiceai/spiceai/blob/trunk/docs/RELEASE.md#version-update)
 - [ ] Ensure [E2E Test CI](https://github.com/spiceai/spiceai/actions/workflows/e2e_test_ci.yml) is green on the trunk branch.
 - [ ] QA DRI sign-off
 - [ ] Docs DRI sign-off
+- [ ] Release notes have been cherry-picked onto the release branch.
 - [ ] Release the new version by creating a `pre-release` [GitHub Release](https://github.com/spiceai/spiceai/releases/new) with the tag from the release branch. E.g. `v1.0.0-rc.1`. Leave the release note empty; the automation will fill it in from the checked in release note.
 - [ ] Release any docs updates by creating a `v[semver]` tag.
       **Note**: Docs should be released only after the [binaries have finished building](https://github.com/spiceai/spiceai/actions/workflows/build_and_release.yml).
