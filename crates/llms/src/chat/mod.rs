@@ -111,6 +111,9 @@ pub enum Error {
 
     #[snafu(display("Failed to find tensors for the model.\nExpected tensors with a file extension of: {extensions}.\nVerify the model is correctly configured, and try again."))]
     ModelMissingTensors { extensions: String },
+
+    #[snafu(display("Failed to load a file specified for the model.\nCould not find the file: {file_url}.\nVerify the `files` parameters for the model, and try again."))]
+    ModelFileMissing { file_url: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -126,6 +129,23 @@ pub fn try_map_boxed_error(e: &(dyn std::error::Error + Send + Sync)) -> Option<
         Some(Error::ModelMissingTensors {
             extensions: TENSOR_EXTENSIONS.join(", "),
         })
+    } else if err_string.contains("hf api error") && err_string.contains("status: 404") {
+        let file_url = err_string
+            .split("url: ")
+            .last()
+            .map(|url| {
+                url.split(' ')
+                    .next()
+                    .unwrap_or_default()
+                    .replace([']', ')'], "")
+            })
+            .unwrap_or_default();
+
+        if file_url.is_empty() {
+            None
+        } else {
+            Some(Error::ModelFileMissing { file_url })
+        }
     } else {
         None
     }
