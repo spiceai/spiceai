@@ -139,7 +139,7 @@ fn xai(
 ) -> Result<Box<dyn Chat>, LlmError> {
     let Some(api_key) = extract_secret!(params, "xai_api_key") else {
         return Err(LlmError::FailedToLoadModel {
-            source: ""Missing required paramter 'xai_api_key'. Specify a value.\nFor details, visit: https://spiceai.org/docs/components/models/xai"".into(),
+            source: "No `xai_api_key` provided for xAI model.".into(),
         });
     };
     Ok(Box::new(Xai::new(model_id, api_key)) as Box<dyn Chat>)
