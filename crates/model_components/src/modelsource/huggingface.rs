@@ -22,7 +22,32 @@ use secrecy::{ExposeSecret, Secret, SecretString};
 use snafu::prelude::*;
 use std::collections::HashMap;
 use std::io::Cursor;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
+
+// Matches model paths in these formats:
+// - organization/model-name
+// - organization/model-name:revision
+// - huggingface:organization/model-name
+// - huggingface:organization/model-name:revision
+// - huggingface.co/organization/model-name
+// - huggingface.co/organization/model-name:revision
+// - huggingface:huggingface.co/organization/model-name
+// - huggingface:huggingface.co/organization/model-name:revision
+//
+// Captures three named groups:
+// - org: Organization name (allows word chars and hyphens)
+// - model: Model name (allows word chars, hyphens, and dots)
+// - revision: Optional revision/version (allows word chars, digits, hyphens, and dots)
+static HUGGINGFACE_PATH_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    match Regex::new(
+        r"\A(?:huggingface:)?(huggingface\.co\/)?(?<org>[\w\-]+)\/(?<model>[\w\-\.]+)(:(?<revision>[\w\d\-\.]+))?\z",
+    ) {
+        Ok(regex) => regex,
+        Err(e) => {
+            panic!("Regex is invalid: {e}");
+        }
+    }
+});
 
 pub struct Huggingface {}
 
@@ -66,15 +91,7 @@ impl ModelSource for Huggingface {
             .build());
         };
 
-        let Ok(re) = Regex::new(
-            r"\A(huggingface:)(huggingface\.co\/)?(?<org>[\w\-]+)\/(?<model>[\w\-]+)(:(?<revision>[\w\d\-\.]+))?\z",
-        ) else {
-            return Err(super::UnableToLoadConfigSnafu {
-                reason: "Invalid regex",
-            }
-            .build());
-        };
-        let Some(caps) = re.captures(remote_path.as_str()) else {
+        let Some(caps) = HUGGINGFACE_PATH_REGEX.captures(remote_path.as_str()) else {
             return Err(super::UnableToLoadConfigSnafu {
                 reason: format!("from is invalid for huggingface source: {remote_path}"),
             }
