@@ -119,15 +119,21 @@ impl EmbeddingConnector {
             })
             .collect::<HashMap<_, _>>();
 
-        Ok(Arc::new(
-            EmbeddingTable::new(
-                inner_table_provider,
-                embed_columns,
-                Arc::clone(&self.embedding_models),
-                embed_chunker_config,
-            )
-            .await,
-        ) as Arc<dyn TableProvider>)
+        let embedding_table = EmbeddingTable::try_new(
+            inner_table_provider,
+            embed_columns,
+            Arc::clone(&self.embedding_models),
+            embed_chunker_config,
+        )
+        .await
+        .map_err(|e| DataConnectorError::InvalidConfiguration {
+            dataconnector: dataset.source().to_string(),
+            message: e.to_string(),
+            connector_component: dataset.into(),
+            source: Box::new(e),
+        })?;
+
+        Ok(Arc::new(embedding_table) as Arc<dyn TableProvider>)
     }
 }
 
