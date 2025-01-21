@@ -199,20 +199,20 @@ See more demos on [YouTube](https://www.youtube.com/playlist?list=PLesJrUXEx3U9a
 | Name          | Description                                  | Status            | ML Format(s) | LLM Format(s)                   |
 | ------------- | -------------------------------------------- | ----------------- | ------------ | ------------------------------- |
 | `openai`      | OpenAI (or compatible) LLM endpoint          | Release Candidate | -            | OpenAI-compatible HTTP endpoint |
-| `file`        | Local filesystem                             |                   | ONNX         | GGUF, GGML, SafeTensor          |
-| `huggingface` | Models hosted on HuggingFace                 |                   | ONNX         | GGUF, GGML, SafeTensor          |
+| `file`        | Local filesystem                             | Beta              | ONNX         | GGUF, GGML, SafeTensor          |
+| `huggingface` | Models hosted on HuggingFace                 | Beta              | ONNX         | GGUF, GGML, SafeTensor          |
 | `spice.ai`    | Models hosted on the Spice.ai Cloud Platform |                   | ONNX         | OpenAI-compatible HTTP endpoint |
 | `azure`       | Azure OpenAI                                 |                   | -            | OpenAI-compatible HTTP endpoint |
-| `anthropic`   | Models hosted on Anthropic                   |                   | -            | OpenAI-compatible HTTP endpoint |
-| `xai`         | Models hosted on xAI                         |                   | -            | OpenAI-compatible HTTP endpoint |
+| `anthropic`   | Models hosted on Anthropic                   | Alpha             | -            | OpenAI-compatible HTTP endpoint |
+| `xai`         | Models hosted on xAI                         | Alpha             | -            | OpenAI-compatible HTTP endpoint |
 
 ## Supported Embeddings Providers
 
 | Name          | Description                                  | Status            | ML Format(s) | LLM Format(s)\*                 |
 | --------------| -------------------------------------------- | ----------------- | ------------ | ------------------------------- |
 | `openai`      | OpenAI (or compatible) LLM endpoint          | Release Candidate | -            | OpenAI-compatible HTTP endpoint |
-| `file`        | Local filesystem                             | Alpha             | ONNX         | GGUF, GGML, SafeTensor          |
-| `huggingface` | Models hosted on HuggingFace                 | Alpha             | ONNX         | GGUF, GGML, SafeTensor          |
+| `file`        | Local filesystem                             | Release Candidate | ONNX         | GGUF, GGML, SafeTensor          |
+| `huggingface` | Models hosted on HuggingFace                 | Release Candidate | ONNX         | GGUF, GGML, SafeTensor          |
 | `azure`       | Azure OpenAI                                 | Alpha             | -            | OpenAI-compatible HTTP endpoint |
 
 ## Supported Catalogs

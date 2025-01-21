@@ -8,8 +8,8 @@ All criteria must be met for the embedding component to be considered Beta, with
 
 |     Embedding Type      | Beta Quality | DRI Sign-off |
 | ----------------------- | ------------ | ------------ |
-| File                    | ➖           |              |
-| Hugging Face            | ➖           |              |
+| File                    | ✅           | @Jeadie      |
+| Hugging Face            | ✅           | @Jeadie      |
 | Spice.ai Cloud Platform | ➖           |              |
 | OpenAI                  | ✅           | @ewgenius    |
 | Azure Openai            | ➖           |              |
@@ -27,11 +27,11 @@ All criteria must be met for the embedding component to be considered Beta, with
   - The body must have at least 128 tokens.
   - An increase in latency is defined as a 10% increase in both the 50th & 95th percentile between the first and last minute.
 
-
 ### UX
+
 - [ ] All of the embedding model's error messages follow the [error handling guidelines](../../dev/error_handling.md)
 
-
 ### Documentation
+
 - [ ] All documentation meets alpha criteria.
 - [ ] Documentation includes any exceptions made for Beta quality.

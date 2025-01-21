@@ -8,8 +8,8 @@ All criteria must be met for the model to be considered Beta, with exceptions pe
 
 |     Model Type          | Beta Quality | DRI Sign-off |
 | ----------------------- | ------------ | ------------ |
-| File                    | ➖           |              |
-| Hugging Face            | ➖           |              |
+| File                    | ✅           | @Jeadie      |
+| Hugging Face            | ✅           | @Jeadie      |
 | Spice.ai Cloud Platform | ➖           |              |
 | OpenAI                  | ✅            | @ewgenius   |
 | Azure Openai            | ➖           |              |
@@ -17,6 +17,7 @@ All criteria must be met for the model to be considered Beta, with exceptions pe
 | xAI (Grok)              | ➖           |              |
 
 ## Beta Release Criteria
+
 - [ ] All [Alpha release criteria](./alpha.md) pass.
 - [ ] Supports `v1/chat/completion` with `"roles"="tool"` or `.messages[*].tool_calls` for `"roles"="assistant"` and `stream=true`.
 - [ ] Loads and runs `params.tools: auto` tools.
@@ -30,8 +31,10 @@ All criteria must be met for the model to be considered Beta, with exceptions pe
   - An increase in latency is defined as a 10% increase in both the 50th & 95th percentile between the first and last minute.
 
 ### UX
+
 - [ ] All of the model's error messages follow the [error handling guidelines](../../dev/error_handling.md)
 
 ### Documentation
+
 - [ ] All documentation meets alpha criteria.
 - [ ] Documentation includes any exceptions made for Beta quality.
