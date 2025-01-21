@@ -39,7 +39,7 @@ impl ModelSource for SpiceAI {
 
         let Some(name) = name else {
             return Err(super::UnableToLoadConfigSnafu {
-                reason: "Name is required",
+                reason: "The 'name' parameter is required, and was not provided.",
             }
             .build());
         };
@@ -54,7 +54,7 @@ impl ModelSource for SpiceAI {
 
         let Some(remote_path) = remote_path else {
             return Err(super::UnableToLoadConfigSnafu {
-                reason: "From is required",
+                reason: "The 'from' parameter is required, and was not provided.",
             }
             .build());
         };
@@ -62,14 +62,14 @@ impl ModelSource for SpiceAI {
         let Ok(re) = Regex::new(
             r"\A(?:spice\.ai\/)?(?<org>[\w\-]+)\/(?<app>[\w\-]+)(?:\/models)?\/(?<model>[\w\-]+):(?<version>[\w\d\-\.]+)\z",
         ) else {
-            return Err(super::UnableToLoadConfigSnafu {
-                reason: "Invalid regex",
-            }
-            .build());
+            unreachable!("Invalid regex for the spice.ai source");
         };
+
         let Some(caps) = re.captures(remote_path.as_str()) else {
             return Err(super::UnableToLoadConfigSnafu {
-                reason: format!("from is invalid for spice.ai source: {remote_path}"),
+                reason: format!(
+                    "The 'from' parameter is invalid for a spice.ai source: {remote_path}"
+                ),
             }
             .build());
         };
