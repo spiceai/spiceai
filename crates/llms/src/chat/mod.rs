@@ -49,7 +49,15 @@ use mistralrs::MessageContent;
 
 use crate::embeddings::candle::download_hf_file;
 
-static TENSOR_EXTENSIONS: [&str; 4] = [".safetensors", ".pth", ".pt", ".bin"];
+static WEIGHTS_EXTENSIONS: [&str; 7] = [
+    ".safetensors",
+    ".pth",
+    ".pt",
+    ".bin",
+    ".onyx",
+    ".gguf",
+    ".ggml",
+];
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone, Copy)]
 #[serde(rename_all = "lowercase")]
@@ -96,8 +104,8 @@ pub enum Error {
     #[snafu(display("The specified model, '{from}', does not support executing the task '{task}'.\nSelect a different model or task, and try again."))]
     UnsupportedTaskForModel { from: String, task: String },
 
-    #[snafu(display("Failed to find tensors for the model.\nExpected tensors with a file extension of: {extensions}.\nVerify the model is correctly configured, and try again."))]
-    ModelMissingTensors { extensions: String },
+    #[snafu(display("Failed to find weights for the model.\nExpected tensors with a file extension of: {extensions}.\nVerify the model is correctly configured, and try again."))]
+    ModelMissingWeights { extensions: String },
 
     #[snafu(display("Failed to load a file specified for the model.\nCould not find the file: {file_url}.\nVerify the `files` parameters for the model, and try again."))]
     ModelFileMissing { file_url: String },
@@ -111,10 +119,12 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 pub fn try_map_boxed_error(e: &(dyn std::error::Error + Send + Sync)) -> Option<Error> {
     let err_string = e.to_string().to_ascii_lowercase();
     if err_string.contains("expected file with extension")
-        && TENSOR_EXTENSIONS.iter().any(|ext| err_string.contains(ext))
+        && WEIGHTS_EXTENSIONS
+            .iter()
+            .any(|ext| err_string.contains(ext))
     {
-        Some(Error::ModelMissingTensors {
-            extensions: TENSOR_EXTENSIONS.join(", "),
+        Some(Error::ModelMissingWeights {
+            extensions: WEIGHTS_EXTENSIONS.join(", "),
         })
     } else if err_string.contains("hf api error") && err_string.contains("status: 404") {
         let file_url = err_string
