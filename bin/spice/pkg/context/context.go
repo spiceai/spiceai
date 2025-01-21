@@ -173,7 +173,7 @@ func (c *RuntimeContext) RequireModelsFlavor(cmd *cobra.Command) {
 	if models, _ := c.ModelsFlavorInstalled(); models {
 		return
 	}
-	slog.Info("This feature requires a runtime version with AI features enabled. Install (y/n)? ")
+	slog.Info("This feature requires a runtime version with AI capabilities enabled. Install (y/n)? ")
 	var confirm string
 	_, _ = fmt.Scanf("%s", &confirm)
 	if strings.ToLower(strings.TrimSpace(confirm)) != "y" {
