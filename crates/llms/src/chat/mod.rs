@@ -49,6 +49,16 @@ use mistralrs::MessageContent;
 
 use crate::embeddings::candle::download_hf_file;
 
+static WEIGHTS_EXTENSIONS: [&str; 7] = [
+    ".safetensors",
+    ".pth",
+    ".pt",
+    ".bin",
+    ".onyx",
+    ".gguf",
+    ".ggml",
+];
+
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone, Copy)]
 #[serde(rename_all = "lowercase")]
 pub enum LlmRuntime {
@@ -83,6 +93,9 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
+    #[snafu(display("The specified model identifier '{model}' is not valid for the source '{model_source}'.\nVerify the model exists, and try again."))]
+    ModelNotFound { model: String, model_source: String },
+
     #[snafu(display("Failed to load model tokenizer.\nAn error occurred: {source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"))]
     FailedToLoadTokenizer {
         source: Box<dyn std::error::Error + Send + Sync>,
@@ -96,9 +109,59 @@ pub enum Error {
 
     #[snafu(display("Invalid value for parameter {param}. {message}"))]
     InvalidParamError { param: String, message: String },
+
+    #[snafu(display("Failed to find weights for the model.\nExpected tensors with a file extension of: {extensions}.\nVerify the model is correctly configured, and try again."))]
+    ModelMissingWeights { extensions: String },
+
+    #[snafu(display("Failed to load a file specified for the model.\nCould not find the file: {file_url}.\nVerify the `files` parameters for the model, and try again."))]
+    ModelFileMissing { file_url: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+/// Attempts to string match a model error to a known error type.
+/// Returns None if no match is found.
+#[must_use]
+pub fn try_map_boxed_error(e: &(dyn std::error::Error + Send + Sync)) -> Option<Error> {
+    let err_string = e.to_string().to_ascii_lowercase();
+    if err_string.contains("expected file with extension")
+        && WEIGHTS_EXTENSIONS
+            .iter()
+            .any(|ext| err_string.contains(ext))
+    {
+        Some(Error::ModelMissingWeights {
+            extensions: WEIGHTS_EXTENSIONS.join(", "),
+        })
+    } else if err_string.contains("hf api error") && err_string.contains("status: 404") {
+        let file_url = err_string
+            .split("url: ")
+            .last()
+            .map(|url| {
+                url.split(' ')
+                    .next()
+                    .unwrap_or_default()
+                    .replace([']', ')'], "")
+            })
+            .unwrap_or_default();
+
+        if file_url.is_empty() {
+            None
+        } else {
+            Some(Error::ModelFileMissing { file_url })
+        }
+    } else {
+        None
+    }
+}
+
+/// Re-writes a boxed error to a known error type, if possible.
+/// Always returns a boxed error. Returns the original error if no match is found.
+#[must_use]
+pub fn try_map_boxed_error_to_box(
+    e: Box<dyn std::error::Error + Send + Sync>,
+) -> Box<dyn std::error::Error + Send + Sync> {
+    try_map_boxed_error(&*e).map_or_else(|| e, std::convert::Into::into)
+}
 
 /// Convert a structured [`ChatCompletionRequestMessage`] to a basic string. Useful for basic
 /// [`Chat::run`] but reduces optional configuration provided by callers.
