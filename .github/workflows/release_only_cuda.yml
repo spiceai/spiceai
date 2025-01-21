@@ -18,14 +18,6 @@ jobs:
     env:
       ARTIFACT_DIR: ./release
 
-    strategy:
-      matrix:
-        include:
-          - target_os: linux
-            target_arch: x86_64
-          - target_os: windows
-            target_arch: x86_64
-
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
