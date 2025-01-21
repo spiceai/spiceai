@@ -54,11 +54,7 @@ pub async fn try_to_embedding(
     let prefix = component
         .get_prefix()
         .ok_or(EmbedError::UnknownModelSource {
-            source: format!(
-                "Unknown model source for spicepod component from: {}",
-                component.from.clone()
-            )
-            .into(),
+            from: component.from.clone(),
         })?;
 
     match prefix {

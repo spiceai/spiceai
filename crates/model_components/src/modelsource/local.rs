@@ -33,7 +33,7 @@ impl ModelSource for Local {
 
         let Some(name) = name else {
             return Err(super::UnableToLoadConfigSnafu {
-                reason: "Name is required",
+                reason: "The 'name' parameter is required, and was not provided.",
             }
             .build());
         };
@@ -48,7 +48,7 @@ impl ModelSource for Local {
 
         let Some(path) = path else {
             return Err(super::UnableToLoadConfigSnafu {
-                reason: "From is required",
+                reason: "The 'from' parameter is required, and was not provided.",
             }
             .build());
         };
