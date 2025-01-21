@@ -1,0 +1,201 @@
+name: E2E Test Release Installation(AI)
+on:
+  workflow_dispatch:
+
+jobs:
+  test-install:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x64 (GPU T4)
+            runner: ubuntu-gpu-t4-4-core
+            target_os: linux
+            target_arch: x86_64
+            tags: ['cuda']
+          - name: macOS aarch64 (GPU M4)
+            runner: spiceai-macos
+            target_os: darwin
+            target_arch: aarch64
+            tags: ['metal']
+          - name: Windows x64 (GPU T4)
+            runner: windows-gpu-t4-4-core
+            target_os: windows
+            target_arch: x86_64,
+            tags: ['cuda']
+          - name: 'Linux aarch64'
+            runner: 'hosted-linux-arm-runner'
+            target_os: 'linux'
+            target_arch: 'aarch64'
+            tags: []
+          - name: 'macOS aarch64'
+            runner: 'macos-14'
+            target_os: 'darwin'
+            target_arch: 'aarch64'
+            tags: []
+          - name: 'Windows x64'
+            runner: 'windows-latest'
+            target_os: 'windows'
+            target_arch: 'x86_64'
+            tags: []
+    steps:
+      - name: system info
+        if: matrix.target_os != 'windows'
+        run: uname -m
+
+      - name: checkout code
+        uses: actions/checkout@v4
+
+      # The aarch64 Linux runner does not have tools pre-installed
+      - name: Install missing tools
+        if: matrix.target_os == 'linux' && matrix.target_arch == 'aarch64'
+        run: |
+          sudo apt-get update
+          sudo apt install jq -y
+
+      # The `windows-gpu-t4-4-core` does not have PowerShell installed
+      - name: Install PowerShell
+        if: matrix.runner == 'windows-gpu-t4-4-core'
+        uses: ./.github/actions/install-pwsh
+
+      # nvidia-smi is not available on windows-gpu-t4-4-core, installing CUDA Toolkit
+      - name: Install CUDA Toolkit (Windows)
+        if: matrix.runner == 'windows-gpu-t4-4-core'
+        uses: Jimver/cuda-toolkit@v0.2.19
+        id: cuda-toolkit
+        with:
+          method: network
+          sub-packages: '[]'
+          cuda: '12.4.1'
+          use-github-cache: false
+          use-local-cache: false
+
+      - name: CUDA version
+        if: contains(matrix.tags, 'cuda')
+        run: |
+          nvidia-smi
+          nvidia-smi --query-gpu=compute_cap --format=csv
+
+      - name: install Spice (https://install.spiceai.org)
+        if: matrix.target_os != 'windows'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          curl https://install.spiceai.org | /bin/bash
+
+      - name: install Spice (Windows)
+        if: matrix.target_os == 'windows'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          curl -L "https://install.spiceai.org/Install.ps1" -o Install.ps1 && PowerShell -ExecutionPolicy Bypass -File ./Install.ps1
+
+      - name: add Spice bin to PATH
+        if: matrix.target_os != 'windows'
+        run: |
+          echo "$HOME/.spice/bin" >> $GITHUB_PATH
+
+      - name: add Spice bin to PATH (Windows)
+        if: matrix.target_os == 'windows'
+        run: |
+          Add-Content $env:GITHUB_PATH (Join-Path $HOME ".spice\bin")
+        shell: pwsh
+
+      - name: install AI runtime version
+        run: |
+          spice install ai
+
+      - name: check installation
+        run: |
+          spice version
+
+      - name: Init Spice app (OpenAI model)
+        if: "!contains(matrix.tags, 'metal')"
+        run: |
+          cp ./test/models/spicepod_openai.yml ./spicepod.yaml
+          cat ./spicepod.yaml
+
+      # acceleration is currently supported for metal target only
+      - name: Init Spice app (Huggingface model)
+        if: contains(matrix.tags, 'metal')
+        run: |
+          cp ./test/models/spicepod_hf.yml ./spicepod.yaml
+          cat ./spicepod.yaml
+
+      - name: Start Spice runtime
+        if: matrix.target_os != 'windows'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SPICE_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
+        run: |
+          spice run &> spice.log &
+
+      - name: Wait for Spice runtime is ready
+        if: matrix.target_os != 'windows'
+        timeout-minutes: 3
+        run: |
+          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
+
+      - name: start Spice runtime (Windows)
+        if: matrix.target_os == 'windows'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SPICE_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
+        run: |
+          Start-Process -FilePath spice -ArgumentList run -RedirectStandardOutput stdout.log -RedirectStandardError stderr.log
+          echo "Waiting for Spice runtime to be ready..."
+          do {
+            try {
+              Start-Sleep -Seconds 1
+              $response = Invoke-WebRequest -Uri "http://127.0.0.1:8090/v1/ready" -UseBasicParsing
+              $res = $response.Content.Trim()
+
+              Write-Host "Status: $($response.StatusCode)"
+              Write-Host "Reponse: $res"
+            } catch {
+              Write-Host "Failed to reach /health endpoint. Error: $($_.Exception.Message)"
+            }
+          } while ($res -ne "ready")
+        shell: pwsh
+        timeout-minutes: 3
+
+      - name: Install expect (linux)
+        if: matrix.target_os == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y expect
+
+      - name: Install expect (macOS)
+        if: matrix.target_os == 'darwin'
+        run: |
+          brew install expect
+
+      - name: Test vector search
+        if: matrix.target_os != 'windows' # pending `expect`` tool installation on Windows
+        run: |
+          ./test/models/search_01.exp
+
+      - name: Test chat
+        if: matrix.target_os != 'windows' # pending `expect` tool installation on Windows
+        run: |
+          ./test/models/chat_01_simple.exp
+
+      - name: Stop spice and check logs
+        if: always() && matrix.target_os != 'windows'
+        run: |
+          killall spice || true
+          cat spice.log
+
+      - name: Stop spice and check logs (Windows)
+        if: always() && matrix.target_os == 'windows'
+        run: |
+          Get-Process spice -ErrorAction SilentlyContinue | Stop-Process -Force
+          if (Test-Path stdout.log) {
+            Get-Content stdout.log
+          }
+          if (Test-Path stderr.log) {
+            Get-Content stderr.log
+          }
+        shell: pwsh
