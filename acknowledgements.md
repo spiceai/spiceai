@@ -276,6 +276,9 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - indexmap 2.7.0, Apache-2.0 OR MIT 
   <br/>https://github.com/indexmap-rs/indexmap
 
+- indicatif 0.17.9, MIT 
+  <br/>https://github.com/console-rs/indicatif
+
 - insta 1.41.1, Apache-2.0 
   <br/>https://github.com/mitsuhiko/insta
 
