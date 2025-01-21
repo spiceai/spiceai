@@ -114,7 +114,7 @@ pub async fn construct_model(
             model_id.as_deref(),
             extract_secret!(params, "xai_api_key"),
         )) as Box<dyn Chat>),
-        ModelSource::OpenAi => Ok(openai(model_id, params)),
+        ModelSource::OpenAi => openai(model_id, params),
         ModelSource::SpiceAI => Err(LlmError::UnsupportedTaskForModel {
             from: "spiceai".into(),
             task: "llm".into(),
@@ -201,19 +201,41 @@ async fn huggingface(
     llms::chat::create_hf_model(&id, model_type, hf_token)
 }
 
-fn openai(model_id: Option<String>, params: &HashMap<String, SecretString>) -> Box<dyn Chat> {
+fn openai(
+    model_id: Option<String>,
+    params: &HashMap<String, SecretString>,
+) -> Result<Box<dyn Chat>, LlmError> {
     let api_base = extract_secret!(params, "endpoint");
     let api_key = extract_secret!(params, "openai_api_key");
     let org_id = extract_secret!(params, "openai_org_id");
     let project_id = extract_secret!(params, "openai_project_id");
 
-    Box::new(llms::openai::new_openai_client(
+    if let Some(temperature_str) = extract_secret!(params, "openai_temperature") {
+        match temperature_str.parse::<f64>() {
+            Ok(temperature) => {
+                if temperature < 0.0 {
+                    return Err(LlmError::InvalidParamError {
+                        param: "openai_temperature".to_string(),
+                        message: "Ensure it is a non-negative number.".to_string(),
+                    });
+                }
+            }
+            Err(_) => {
+                return Err(LlmError::InvalidParamError {
+                    param: "openai_temperature".to_string(),
+                    message: "Ensure it is a non-negative number.".to_string(),
+                })
+            }
+        }
+    }
+
+    Ok(Box::new(llms::openai::new_openai_client(
         model_id.unwrap_or(DEFAULT_LLM_MODEL.to_string()),
         api_base,
         api_key,
         org_id,
         project_id,
-    )) as Box<dyn Chat>
+    )) as Box<dyn Chat>)
 }
 
 fn azure(

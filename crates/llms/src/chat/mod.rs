@@ -106,6 +106,9 @@ pub enum Error {
 
     #[snafu(display("Runtime does not currently support the {modality} modality"))]
     UnsupportedModalityType { modality: String },
+
+    #[snafu(display("Invalid value for parameter {param}. {message}"))]
+    InvalidParamError { param: String, message: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
