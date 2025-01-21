@@ -21,14 +21,15 @@ import (
 	"log/slog"
 	"os"
 
+	"github.com/spiceai/spiceai/bin/spice/pkg/constants"
 	"github.com/spiceai/spiceai/bin/spice/pkg/context"
 	"github.com/spiceai/spiceai/bin/spice/pkg/util"
 )
 
 // Ensures the runtime is installed. Returns true if the runtime was installed or upgraded, false if it was already installed.
-func EnsureInstalled(flavor string, autoUpgrade bool, allowAccelerator bool) (bool, error) {
-	if flavor != "ai" && flavor != "" {
-		return false, fmt.Errorf("invalid flavor: %s", flavor)
+func EnsureInstalled(flavor constants.Flavor, autoUpgrade bool, allowAccelerator bool) (bool, error) {
+	if !flavor.IsValid() {
+		return false, fmt.Errorf("invalid flavor")
 	}
 
 	rtcontext := context.NewContext()
@@ -52,7 +53,7 @@ func EnsureInstalled(flavor string, autoUpgrade bool, allowAccelerator bool) (bo
 		}
 	}
 
-	if models, _ := rtcontext.ModelsFlavorInstalled(); !models && flavor == "ai" {
+	if models, _ := rtcontext.ModelsFlavorInstalled(); !models && flavor == constants.FlavorAI {
 		shouldInstall = true
 	}
 
@@ -76,7 +77,7 @@ func Run(args []string) error {
 		os.Exit(1)
 	}
 
-	_, err = EnsureInstalled("", false, false) // base runtime without ai has no need for accelerator
+	_, err = EnsureInstalled(constants.FlavorDefault, false, true)
 	if err != nil {
 		return err
 	}

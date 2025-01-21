@@ -20,11 +20,12 @@ use super::{nsql::SqlGeneration, Chat, Error as ChatError, FailedToRunModelSnafu
 use async_openai::{
     error::{ApiError, OpenAIError},
     types::{
-        ChatChoiceStream, ChatCompletionNamedToolChoice, ChatCompletionRequestUserMessageArgs,
-        ChatCompletionResponseStream, ChatCompletionStreamResponseDelta, ChatCompletionTool,
-        ChatCompletionToolChoiceOption, CompletionUsage, CreateChatCompletionRequest,
+        ChatChoiceStream, ChatCompletionMessageToolCallChunk, ChatCompletionNamedToolChoice,
+        ChatCompletionRequestUserMessageArgs, ChatCompletionResponseStream,
+        ChatCompletionStreamResponseDelta, ChatCompletionTool, ChatCompletionToolChoiceOption,
+        ChatCompletionToolType, CompletionUsage, CreateChatCompletionRequest,
         CreateChatCompletionRequestArgs, CreateChatCompletionResponse,
-        CreateChatCompletionStreamResponse, FinishReason, Role, Stop,
+        CreateChatCompletionStreamResponse, FinishReason, FunctionCallStream, Role, Stop,
     },
 };
 use async_stream::stream;
@@ -35,7 +36,8 @@ use mistralrs::{
     DeviceMapMetadata, Function, GGMLLoaderBuilder, GGMLSpecificConfig, GGUFLoaderBuilder,
     GGUFSpecificConfig, LocalModelPaths, MistralRs, MistralRsBuilder, ModelDType, ModelPaths,
     NormalLoaderBuilder, NormalRequest, Pipeline, Request as MistralRequest, RequestMessage,
-    Response as MistralResponse, SamplingParams, TokenSource, Tool, ToolChoice, ToolType,
+    Response as MistralResponse, SamplingParams, TokenSource, Tool, ToolCallResponse, ToolChoice,
+    ToolType,
 };
 
 use secrecy::{ExposeSecret, Secret};
@@ -656,24 +658,37 @@ fn chunk_to_openai_stream(
     })
 }
 
-#[allow(deprecated, clippy::cast_possible_truncation)]
+#[allow(
+    deprecated,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap
+)]
 fn chunk_choices_to_openai(choice: &ChunkChoice) -> Result<ChatChoiceStream, OpenAIError> {
-    let role: Role = serde_json::from_str(&format!("\"{}\"", &choice.delta.role))
+    let ChunkChoice {
+        index,
+        delta,
+        finish_reason,
+        ..
+    } = choice;
+    let role: Role = serde_json::from_str(&format!("\"{}\"", delta.role))
         .map_err(OpenAIError::JSONDeserialize)?;
 
-    let finish_reason: Option<FinishReason> = choice
-        .finish_reason
+    let finish_reason: Option<FinishReason> = finish_reason
         .as_ref()
         .map(|f| serde_json::from_str(&format!("\"{f}\"")))
         .transpose()
         .map_err(OpenAIError::JSONDeserialize)?;
 
     Ok(ChatChoiceStream {
-        index: choice.index as u32,
+        index: *index as u32,
         delta: ChatCompletionStreamResponseDelta {
-            content: Some(choice.delta.content.clone()),
+            content: delta.content.clone(),
             function_call: None,
-            tool_calls: None,
+            tool_calls: delta.tool_calls.as_ref().map(|t| {
+                t.iter()
+                    .map(|x| parse_tool_call_response(*index as i32, x))
+                    .collect()
+            }),
             role: Some(role),
             refusal: None,
         },
@@ -718,5 +733,20 @@ fn convert_tool(x: &ChatCompletionTool) -> Tool {
                 .clone()
                 .and_then(|p| p.as_object().map(|p| HashMap::from_iter(p.clone()))),
         },
+    }
+}
+
+fn parse_tool_call_response(
+    index: i32,
+    r: &ToolCallResponse,
+) -> ChatCompletionMessageToolCallChunk {
+    ChatCompletionMessageToolCallChunk {
+        id: Some(r.id.clone()),
+        index,
+        r#type: Some(ChatCompletionToolType::Function),
+        function: Some(FunctionCallStream {
+            name: Some(r.function.name.clone()),
+            arguments: Some(r.function.arguments.clone()),
+        }),
     }
 }
