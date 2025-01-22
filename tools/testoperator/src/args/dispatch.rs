@@ -64,7 +64,7 @@ pub struct DispatchTestFile {
 #[derive(Debug, Clone, Deserialize)]
 pub struct DispatchTests {
     pub bench: Option<BenchArgs>,
-    pub throughput: Option<ThroughputArgs>,
+    pub throughput: Option<BenchArgs>,
     pub load: Option<LoadArgs>,
     // TODO: add data consistency, http consistency, http overhead
 }
@@ -74,22 +74,15 @@ pub struct BenchArgs {
     pub spicepod_path: PathBuf,
     pub query_set: QuerySet,
     pub query_overrides: Option<QueryOverrides>,
-    pub ready_wait: Option<u64>,
+    pub ready_wait: Option<String>, // GH workflow inputs require strings, not numbers
     pub runner_type: RunnerType,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct ThroughputArgs {
-    #[serde(flatten)]
-    pub bench_args: BenchArgs,
-    pub concurrency: Option<u64>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct LoadArgs {
     #[serde(flatten)]
     pub bench_args: BenchArgs,
-    pub duration: Option<u64>,
+    pub duration: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -104,5 +97,12 @@ pub enum RunnerType {
 pub struct BenchWorkflowArgs {
     #[serde(flatten)]
     pub bench_args: BenchArgs,
+    pub spiced_commit: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LoadWorkflowArgs {
+    #[serde(flatten)]
+    pub load_args: LoadArgs,
     pub spiced_commit: String,
 }

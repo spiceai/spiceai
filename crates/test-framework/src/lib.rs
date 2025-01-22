@@ -50,7 +50,14 @@ pub enum TestType {
 impl TestType {
     #[must_use]
     pub fn workflow(&self) -> &str {
-        "testoperator_run_bench.yml" // TODO: set the rest of the action workflow types
+        match self {
+            TestType::Throughput => "testoperator_run_throughput.yml",
+            TestType::Load => "testoperator_run_load.yml",
+            TestType::Benchmark => "testoperator_run_bench.yml",
+            TestType::DataConsistency => "testoperator_run_data_consistency.yml",
+            TestType::HTTPConsistency => "testoperator_run_http_consistency.yml",
+            TestType::HTTPOverhead => "testoperator_run_http_overhead.yml",
+        }
     }
 }
 

@@ -37,3 +37,12 @@ jobs:
       
       - name: Display spiced commit
         run: echo "SPICED_COMMIT=${{ steps.setup-spiced.outputs.SPICED_COMMIT }}"
+
+      - name: Build Testoperator
+        uses: ./.github/actions/build-testoperator
+      
+      - name: Dispatch Testoperator - ${{ github.event.inputs.workflow_type }}
+        run: |
+          testoperator dispatch \
+            ${{ github.event.inputs.test_files_path }} \
+            --workflow ${{ github.event.inputs.workflow_type }}

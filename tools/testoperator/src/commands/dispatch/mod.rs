@@ -21,7 +21,7 @@ use test_framework::{
     octocrab, TestType,
 };
 
-use crate::args::dispatch::{BenchWorkflowArgs, DispatchArgs, DispatchTestFile};
+use crate::args::dispatch::{BenchWorkflowArgs, DispatchArgs, DispatchTestFile, LoadWorkflowArgs};
 
 /// Recursively scan a directory for YAML files
 fn scan_directory_for_yamls(path: &PathBuf) -> Result<Vec<PathBuf>> {
@@ -68,34 +68,45 @@ pub async fn dispatch(args: DispatchArgs) -> Result<()> {
             let file = std::fs::File::open(path)?;
             let tests: DispatchTestFile = serde_yaml::from_reader(file)?;
 
-            Ok::<_, anyhow::Error>(tests)
+            Ok::<_, anyhow::Error>((path, tests))
         })
         .collect::<Result<Vec<_>>>()?;
 
-    for test in tests {
-        match test_type {
+    let spiced_commit = std::env::var("SPICED_COMMIT").ok().unwrap_or_default();
+
+    for (path, test) in tests {
+        let payload = match test_type {
             TestType::Benchmark => {
                 if let Some(bench) = test.tests.bench {
-                    println!("Running benchmark test: {bench:?}");
-                    GitHubWorkflow::new("spiceai", "spiceai", test_type.workflow(), "trunk")
-                        .send(
-                            octo_client.actions(),
-                            Some(serde_json::json!(BenchWorkflowArgs {
-                                bench_args: bench,
-                                spiced_commit: String::new(), // TODO: source spiced commit from env
-                            })),
-                        )
-                        .await?;
+                    serde_json::json!(BenchWorkflowArgs {
+                        bench_args: bench,
+                        spiced_commit: spiced_commit.clone(),
+                    })
+                } else {
+                    println!("Test file {path:#?} does not contain a benchmark test");
+                    continue;
                 }
             }
             TestType::Throughput => {
                 if let Some(throughput) = test.tests.throughput {
-                    println!("Running throughput test: {throughput:?}");
+                    serde_json::json!(BenchWorkflowArgs {
+                        bench_args: throughput,
+                        spiced_commit: spiced_commit.clone(),
+                    })
+                } else {
+                    println!("Test file {path:#?} does not contain a throughput test");
+                    continue;
                 }
             }
             TestType::Load => {
                 if let Some(load) = test.tests.load {
-                    println!("Running load test: {load:?}");
+                    serde_json::json!(LoadWorkflowArgs {
+                        load_args: load.clone(),
+                        spiced_commit: spiced_commit.clone(),
+                    })
+                } else {
+                    println!("Test file {path:#?} does not contain a load test");
+                    continue;
                 }
             }
             _ => {
@@ -103,7 +114,12 @@ pub async fn dispatch(args: DispatchArgs) -> Result<()> {
                     "Test type {test_type} not supported for dispatching"
                 ))
             }
-        }
+        };
+
+        println!("Dispatching {test_type} test from {path:#?}");
+        GitHubWorkflow::new("spiceai", "spiceai", test_type.workflow(), "trunk")
+            .send(octo_client.actions(), Some(payload))
+            .await?;
     }
 
     Ok(())
