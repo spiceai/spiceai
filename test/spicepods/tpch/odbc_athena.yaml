@@ -1,0 +1,38 @@
+version: v1
+kind: Spicepod
+name: odbc_athena_tpch
+datasets:
+  - from: odbc:tpch.customer
+    name: customer
+    params: &odbc_params
+      odbc_connection_string: |
+        Driver={Amazon Athena ODBC Driver};
+        Catalog=AwsDataCatalog;
+        AwsRegion=us-east-2;
+        Schema=tpch;
+        Workgroup=primary;
+        S3OutputLocation=s3://aws-athena-query-results-211125479522-us-east-2/;
+        AuthenticationType=IAM Credentials;
+        UID=${ env:AWS_ACCESS_KEY_ID };
+        PWD=${ env:AWS_SECRET_ACCESS_KEY };
+  - from: odbc:tpch.lineitem
+    name: lineitem
+    params: *odbc_params
+  - from: odbc:tpch.nation
+    name: nation
+    params: *odbc_params
+  - from: odbc:tpch.orders
+    name: orders
+    params: *odbc_params
+  - from: odbc:tpch.part
+    name: part
+    params: *odbc_params
+  - from: odbc:tpch.partsupp
+    name: partsupp
+    params: *odbc_params
+  - from: odbc:tpch.region
+    name: region
+    params: *odbc_params
+  - from: odbc:tpch.supplier
+    name: supplier
+    params: *odbc_params

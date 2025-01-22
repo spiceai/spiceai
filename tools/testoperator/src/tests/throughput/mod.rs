@@ -19,7 +19,7 @@ use crate::commands::DatasetTestArgs;
 use std::time::Duration;
 use test_framework::{
     anyhow,
-    metrics::MetricCollector,
+    metrics::{MetricCollector, QueryMetrics, QueryStatus, ThroughputMetrics},
     queries::{QueryOverrides, QuerySet},
     spiced::SpicedInstance,
     spicetest::{
@@ -80,12 +80,14 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
 
     let test = throughput_test.wait().await?;
     let throughput_metric = test.get_throughput_metric(args.scale_factor.unwrap_or(1.0))?;
-    let metrics = test.collect(TestType::Throughput)?;
+    let metrics: QueryMetrics<_, ThroughputMetrics> = test
+        .collect(TestType::Throughput)?
+        .with_run_metric(ThroughputMetrics::new(throughput_metric));
     let mut spiced_instance = test.end();
+    let memory_usage = spiced_instance.show_memory_usage()?;
 
-    metrics.show()?;
-
-    spiced_instance.show_memory_usage()?;
+    metrics.show_records()?;
+    metrics.with_memory_usage(memory_usage).show_run(None)?; // no additional test pass logic applies
     spiced_instance.stop()?;
 
     println!(

@@ -19,7 +19,7 @@ use crate::commands::DatasetTestArgs;
 use std::time::Duration;
 use test_framework::{
     anyhow,
-    metrics::{MetricCollector, StatisticsCollector},
+    metrics::{MetricCollector, NoExtendedMetrics, QueryMetrics, StatisticsCollector},
     queries::{QueryOverrides, QuerySet},
     spiced::SpicedInstance,
     spicetest::{
@@ -71,9 +71,9 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
         .statistical_set()?
         .percentile(99.0)?;
 
-    let baseline_metrics = test.collect(TestType::Load)?;
+    let baseline_metrics: QueryMetrics<_, NoExtendedMetrics> = test.collect(TestType::Load)?;
     println!("Baseline metrics:");
-    baseline_metrics.show()?;
+    baseline_metrics.show_records()?;
     let spiced_instance = test.end();
 
     // load test
@@ -94,14 +94,14 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
 
     let test = throughput_test.wait().await?;
     let test_durations = test.get_query_durations().statistical_set()?;
-    let metrics = test.collect(TestType::Load)?;
+    let metrics: QueryMetrics<_, NoExtendedMetrics> = test.collect(TestType::Load)?;
     let mut spiced_instance = test.end();
 
     println!("Baseline metrics:");
-    baseline_metrics.show()?;
+    baseline_metrics.show_records()?;
     println!("{}", vec!["-"; 30].join(""));
     println!("Load test metrics:");
-    metrics.show()?;
+    metrics.show_records()?;
 
     spiced_instance.show_memory_usage()?;
     spiced_instance.stop()?;

@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: postgres_tpch_duckdb_memory
+name: postgres_tpch_sqlite_file
 datasets:
   - from: postgres:customer
     name: customer
@@ -13,8 +13,8 @@ datasets:
       pg_sslmode: disable
     acceleration: &acceleration
       enabled: true
-      engine: duckdb
-      mode: memory
+      engine: sqlite
+      mode: file
   - from: postgres:lineitem
     name: lineitem
     params: *postgres_params

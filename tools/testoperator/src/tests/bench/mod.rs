@@ -19,7 +19,7 @@ use crate::commands::DatasetTestArgs;
 use std::time::Duration;
 use test_framework::{
     anyhow,
-    metrics::MetricCollector,
+    metrics::{MetricCollector, NoExtendedMetrics, QueryMetrics},
     queries::{QueryOverrides, QuerySet},
     spiced::SpicedInstance,
     spicetest::{
@@ -58,10 +58,10 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
 
     let test = benchmark_test.wait().await?;
     let row_counts = test.validate_returned_row_counts()?;
-    let metrics = test.collect(TestType::Benchmark)?;
+    let metrics: QueryMetrics<_, NoExtendedMetrics> = test.collect(TestType::Benchmark)?;
     let mut spiced_instance = test.end();
 
-    metrics.show()?;
+    metrics.show_records()?;
 
     spiced_instance.show_memory_usage()?;
     spiced_instance.stop()?;

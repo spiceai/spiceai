@@ -75,7 +75,7 @@ pub(crate) async fn overhead_run(args: &HttpOverheadTestArgs) -> anyhow::Result<
     println!("{}", with_color!(Color::Blue, "Starting overhead test"));
     let test = test.start()?.wait().await?;
     let results = test.collect(TestType::HTTPOverhead)?;
-    results.show()?;
+    results.show_records()?;
 
     let mut spiced_instance = test.end();
     spiced_instance.stop()?;

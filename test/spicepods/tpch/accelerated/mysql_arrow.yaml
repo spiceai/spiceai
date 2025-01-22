@@ -1,0 +1,59 @@
+version: v1
+kind: Spicepod
+name: mysql_tpch_arrow
+
+# Define common anchors
+definitions:
+  
+  # Common mysql parameters
+  - &mysql_params
+    mysql_host: ${env:MYSQL_HOST}
+    mysql_tcp_port: ${env:MYSQL_TCP_PORT}
+    mysql_db: ${env:MYSQL_DB}
+    mysql_user: ${env:MYSQL_USER}
+    mysql_pass: ${env:MYSQL_PASSWORD}
+    mysql_sslmode: disabled
+  - &acceleration
+    enabled: true
+    engine: arrow
+
+datasets:
+  - from: mysql:customer
+    name: customer
+    params: *mysql_params
+    acceleration: *acceleration
+
+  - from: mysql:lineitem
+    name: lineitem
+    params: *mysql_params
+    acceleration: *acceleration
+
+  - from: mysql:nation
+    name: nation
+    params: *mysql_params
+    acceleration: *acceleration
+
+  - from: mysql:orders
+    name: orders
+    params: *mysql_params
+    acceleration: *acceleration
+
+  - from: mysql:part
+    name: part
+    params: *mysql_params
+    acceleration: *acceleration
+
+  - from: mysql:partsupp
+    name: partsupp
+    params: *mysql_params
+    acceleration: *acceleration
+
+  - from: mysql:region
+    name: region
+    params: *mysql_params
+    acceleration: *acceleration
+  
+  - from: mysql:supplier
+    name: supplier
+    params: *mysql_params
+    acceleration: *acceleration
