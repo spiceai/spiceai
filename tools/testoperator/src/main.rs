@@ -17,10 +17,10 @@ limitations under the License.
 use clap::Parser;
 use test_framework::{anyhow, rustls};
 
+mod args;
 mod commands;
-mod tests;
 
-use commands::{
+use args::{
     Commands, DataConsistencyArgs, DatasetTestArgs, HttpConsistencyTestArgs, HttpOverheadTestArgs,
     HttpTestArgs, TestCommands,
 };
@@ -57,21 +57,24 @@ async fn main() -> anyhow::Result<()> {
                 ..
             }),
         ) => {
-            tests::env_export(&common)?;
+            commands::env_export(&common)?;
         }
-        Commands::Run(TestCommands::Throughput(args)) => tests::throughput::run(&args).await?,
-        Commands::Run(TestCommands::Load(args)) => tests::load::run(&args).await?,
+        Commands::Run(TestCommands::Throughput(args)) => commands::throughput::run(&args).await?,
+        Commands::Run(TestCommands::Load(args)) => commands::load::run(&args).await?,
         Commands::Run(TestCommands::Bench(args)) => {
-            tests::bench::run(&args).await?;
+            commands::bench::run(&args).await?;
         }
         Commands::Run(TestCommands::DataConsistency(args)) => {
-            tests::data_consistency::run(&args).await?;
+            commands::data_consistency::run(&args).await?;
         }
         Commands::Run(TestCommands::HttpOverhead(args)) => {
-            tests::http::overhead_run(&args).await?;
+            commands::http::overhead_run(&args).await?;
         }
         Commands::Run(TestCommands::HttpConsistency(args)) => {
-            tests::http::consistency_run(&args).await?;
+            commands::http::consistency_run(&args).await?;
+        }
+        Commands::Dispatch(args) => {
+            commands::dispatch::dispatch(args).await?;
         }
     }
 

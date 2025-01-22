@@ -15,8 +15,8 @@ limitations under the License.
 */
 
 use crate::{
-    commands::HttpOverheadTestArgs,
-    tests::{get_app_and_start_request, util::Color},
+    args::HttpOverheadTestArgs,
+    commands::{get_app_and_start_request, util::Color},
     with_color,
 };
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};

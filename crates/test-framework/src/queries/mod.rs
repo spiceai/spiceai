@@ -14,10 +14,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-#[derive(Clone)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub enum QuerySet {
+    #[serde(rename = "tpch")]
     Tpch,
+    #[serde(rename = "tpcds")]
     Tpcds,
+    #[serde(rename = "clickbench")]
     Clickbench,
 }
 
@@ -35,16 +40,25 @@ impl QuerySet {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
 pub enum QueryOverrides {
+    #[serde(rename = "sqlite")]
     SQLite,
+    #[serde(rename = "postgres")]
     PostgreSQL,
+    #[serde(rename = "mysql")]
     MySQL,
+    #[serde(rename = "dremio")]
     Dremio,
+    #[serde(rename = "spark")]
     Spark,
+    #[serde(rename = "odbc-athena")]
     ODBCAthena,
+    #[serde(rename = "duckdb")]
     DuckDB,
+    #[serde(rename = "snowflake")]
     Snowflake,
+    #[serde(rename = "iceberg-sf1")]
     IcebergSF1,
 }
 

@@ -17,10 +17,12 @@ clap.workspace = true
 flight_client = { path = "../flight_client" }
 futures.workspace = true
 indicatif = "0.17.9"
+octocrab = "0.43.0"
 rand = "0.8.4"
 regex.workspace = true
 reqwest.workspace = true
 rustls.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
 spicepod = { path = "../spicepod" }

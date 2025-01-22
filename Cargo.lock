@@ -284,6 +284,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "arc-swap"
+version = "1.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "69f7f8c3906b62b754cd5326047894316021dcfe5a194c8ea52bdd94934a3457"
+
+[[package]]
 name = "array-init"
 version = "2.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -871,7 +877,7 @@ dependencies = [
  "rand 0.8.5",
  "reqwest 0.12.9",
  "reqwest-eventsource",
- "secrecy",
+ "secrecy 0.8.0",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
@@ -3071,7 +3077,7 @@ dependencies = [
  "regex",
  "reqwest 0.12.9",
  "rusqlite",
- "secrecy",
+ "secrecy 0.8.0",
  "serde",
  "serde_json",
  "snafu",
@@ -3545,7 +3551,7 @@ dependencies = [
  "rand 0.8.5",
  "rusqlite",
  "sea-query",
- "secrecy",
+ "secrecy 0.8.0",
  "serde",
  "serde_json",
  "snafu",
@@ -3575,7 +3581,7 @@ dependencies = [
  "futures",
  "odbc-api",
  "pkcs8",
- "secrecy",
+ "secrecy 0.8.0",
  "serde_json",
  "sha2",
  "snafu",
@@ -5559,6 +5565,7 @@ dependencies = [
  "http 1.2.0",
  "hyper 1.5.1",
  "hyper-util",
+ "log",
  "rustls 0.23.20",
  "rustls-native-certs 0.8.1",
  "rustls-pki-types",
@@ -6080,6 +6087,16 @@ name = "ipnet"
 version = "2.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ddc24109865250148c2e0f3d25d4f0f479571723792d3802153c60922a4fb708"
+
+[[package]]
+name = "iri-string"
+version = "0.7.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dc0f0a572e8ffe56e2ff4f769f32ffe919282c3916799f8b68688b6030063bea"
+dependencies = [
+ "memchr",
+ "serde",
+]
 
 [[package]]
 name = "is_terminal_polyfill"
@@ -6656,7 +6673,7 @@ dependencies = [
  "reqwest 0.12.9",
  "reqwest-eventsource",
  "schemars",
- "secrecy",
+ "secrecy 0.8.0",
  "serde",
  "serde_json",
  "snafu",
@@ -7201,7 +7218,7 @@ dependencies = [
  "ndarray 0.15.6",
  "regex",
  "reqwest 0.12.9",
- "secrecy",
+ "secrecy 0.8.0",
  "serde",
  "serde_json",
  "snafu",
@@ -7959,6 +7976,46 @@ dependencies = [
  "tracing",
  "url",
  "walkdir",
+]
+
+[[package]]
+name = "octocrab"
+version = "0.43.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "27527d68322f4c603319f7958973db8f9fa4be62c0e3fafe084f5562cf6353df"
+dependencies = [
+ "arc-swap",
+ "async-trait",
+ "base64 0.22.1",
+ "bytes",
+ "cfg-if",
+ "chrono",
+ "either",
+ "futures",
+ "futures-util",
+ "http 1.2.0",
+ "http-body 1.0.1",
+ "http-body-util",
+ "hyper 1.5.1",
+ "hyper-rustls 0.27.3",
+ "hyper-timeout",
+ "hyper-util",
+ "jsonwebtoken",
+ "once_cell",
+ "percent-encoding",
+ "pin-project",
+ "secrecy 0.10.3",
+ "serde",
+ "serde_json",
+ "serde_path_to_error",
+ "serde_urlencoded",
+ "snafu",
+ "tokio",
+ "tower 0.5.2",
+ "tower-http",
+ "tracing",
+ "url",
+ "web-time",
 ]
 
 [[package]]
@@ -9873,7 +9930,7 @@ dependencies = [
  "rustls-pemfile 2.2.0",
  "schemars",
  "scopeguard",
- "secrecy",
+ "secrecy 0.8.0",
  "serde",
  "serde_json",
  "snafu",
@@ -10358,6 +10415,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9bd1c54ea06cfd2f6b63219704de0b9b4f72dcc2b8fdef820be6cd799780e91e"
 dependencies = [
  "serde",
+ "zeroize",
+]
+
+[[package]]
+name = "secrecy"
+version = "0.10.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e891af845473308773346dc847b2c23ee78fe442e0472ac50e22a18a93d3ae5a"
+dependencies = [
  "zeroize",
 ]
 
@@ -11400,10 +11466,12 @@ dependencies = [
  "futures",
  "indicatif",
  "nix",
+ "octocrab",
  "rand 0.8.5",
  "regex",
  "reqwest 0.12.9",
  "rustls 0.23.20",
+ "serde",
  "serde_json",
  "serde_yaml",
  "spicepod",
@@ -11420,6 +11488,9 @@ version = "1.1.0"
 dependencies = [
  "clap",
  "reqwest 0.12.9",
+ "serde",
+ "serde_json",
+ "serde_yaml",
  "test-framework",
  "tokio",
 ]
@@ -12021,6 +12092,7 @@ dependencies = [
  "pin-project-lite",
  "sync_wrapper 1.0.2",
  "tokio",
+ "tokio-util",
  "tower-layer",
  "tower-service",
  "tracing",
@@ -12034,10 +12106,15 @@ checksum = "403fa3b783d4b626a8ad51d766ab03cb6d2dbfc46b1c5d4448395e6628dc9697"
 dependencies = [
  "bitflags 2.6.0",
  "bytes",
+ "futures-util",
  "http 1.2.0",
+ "http-body 1.0.1",
+ "iri-string",
  "pin-project-lite",
+ "tower 0.5.2",
  "tower-layer",
  "tower-service",
+ "tracing",
 ]
 
 [[package]]
@@ -12980,6 +13057,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5a6580f308b1fad9207618087a65c04e7a10bc77e02c8e84e9b00dd4b12fa0bb"
 dependencies = [
  "js-sys",
+ "serde",
  "wasm-bindgen",
 ]
 

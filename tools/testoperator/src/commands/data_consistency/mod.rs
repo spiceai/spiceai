@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use super::bench;
-use crate::commands::DataConsistencyArgs;
+use crate::args::DataConsistencyArgs;
 use test_framework::anyhow;
 
 pub(crate) async fn run(args: &DataConsistencyArgs) -> anyhow::Result<()> {

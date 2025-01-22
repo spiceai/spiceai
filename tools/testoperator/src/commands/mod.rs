@@ -14,63 +14,48 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::path::PathBuf;
+use std::collections::BTreeMap;
 
-use clap::{Parser, Subcommand};
-pub use dataset::{DataConsistencyArgs, DatasetTestArgs};
+use crate::args::CommonArgs;
+use test_framework::{
+    anyhow, app::App, spiced::StartRequest, spicepod::Spicepod, spicepod_utils::from_app,
+};
 
-mod http;
-pub use http::{HttpConsistencyTestArgs, HttpOverheadTestArgs, HttpTestArgs};
-mod dataset;
+pub(crate) mod bench;
+pub(crate) mod data_consistency;
+pub(crate) mod dispatch;
+pub(crate) mod http;
+pub(crate) mod load;
+pub(crate) mod throughput;
+mod util;
+pub(crate) type RowCounts = BTreeMap<String, usize>;
 
-#[derive(Subcommand)]
-pub enum Commands {
-    // Run a test
-    #[command(subcommand)]
-    Run(TestCommands),
-    // Export the spicepod environment that would run for a test
-    #[command(subcommand)]
-    Export(TestCommands),
+pub(crate) fn get_app_and_start_request(args: &CommonArgs) -> anyhow::Result<(App, StartRequest)> {
+    let spicepod = Spicepod::load_exact(args.spicepod_path.clone())?;
+    let app = test_framework::app::AppBuilder::new(spicepod.name.clone())
+        .with_spicepod(spicepod)
+        .build();
+
+    let start_request = StartRequest::new(args.spiced_path.clone(), from_app(app.clone()))?;
+    let start_request = if let Some(ref data_dir) = args.data_dir {
+        start_request.with_data_dir(data_dir.clone())
+    } else {
+        start_request
+    };
+
+    Ok((app, start_request))
 }
 
-#[derive(Subcommand)]
-pub enum TestCommands {
-    Throughput(DatasetTestArgs),
-    Load(DatasetTestArgs),
-    Bench(DatasetTestArgs),
-    DataConsistency(DataConsistencyArgs),
-    HttpConsistency(HttpConsistencyTestArgs),
-    HttpOverhead(HttpOverheadTestArgs),
-}
+pub(crate) fn env_export(args: &CommonArgs) -> anyhow::Result<()> {
+    let (_, mut start_request) = get_app_and_start_request(args)?;
 
-/// Arguments Common to all [`TestCommands`].
-#[derive(Parser, Debug, Clone)]
-pub struct CommonArgs {
-    /// Path to the spicepod.yaml file
-    #[arg(short('p'), long, default_value = "spicepod.yaml")]
-    pub(crate) spicepod_path: PathBuf,
+    start_request.prepare()?;
+    let tempdir_path = start_request.get_tempdir_path();
 
-    /// The number of clients to run simultaneously. Each client will send a query, wait for a response, then send another query.
-    #[arg(long, default_value = "1")]
-    pub(crate) concurrency: usize,
+    println!(
+        "Exported spicepod environment to: {}",
+        tempdir_path.to_string_lossy()
+    );
 
-    /// Path to the spiced binary
-    #[arg(short, long, default_value = "spiced")]
-    pub(crate) spiced_path: PathBuf,
-
-    /// The number of seconds to wait for the spiced instance to become ready
-    #[arg(long, default_value = "30")]
-    pub(crate) ready_wait: u64,
-
-    /// The duration of the test in seconds
-    #[arg(long, default_value = "60")]
-    pub(crate) duration: u64,
-
-    /// Whether to disable progress bars, for CI or non-interactive environments
-    #[arg(long)]
-    pub(crate) disable_progress_bars: bool,
-
-    /// An optional data directory, to symlink into the spiced instance
-    #[arg(short, long)]
-    pub(crate) data_dir: Option<PathBuf>,
+    Ok(())
 }

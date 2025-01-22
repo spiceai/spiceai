@@ -15,8 +15,8 @@ limitations under the License.
 */
 
 use crate::{
-    commands::HttpConsistencyTestArgs,
-    tests::{get_app_and_start_request, util::Color},
+    args::HttpConsistencyTestArgs,
+    commands::{get_app_and_start_request, util::Color},
     with_color,
 };
 use std::{sync::Arc, time::Duration};

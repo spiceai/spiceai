@@ -17,6 +17,7 @@ limitations under the License.
 #![allow(clippy::missing_errors_doc)]
 
 pub mod flight;
+pub mod gh_utils;
 pub mod metrics;
 pub mod queries;
 pub mod spiced;
@@ -31,6 +32,7 @@ pub use app;
 pub use arrow;
 pub use flight_client;
 pub use futures;
+pub use octocrab;
 pub use rustls;
 pub use serde_yaml;
 pub use spicepod;
@@ -40,8 +42,16 @@ pub enum TestType {
     Throughput,
     Load,
     Benchmark,
+    DataConsistency,
     HTTPConsistency,
     HTTPOverhead,
+}
+
+impl TestType {
+    #[must_use]
+    pub fn workflow(&self) -> &str {
+        "testoperator_run_bench.yml" // TODO: set the rest of the action workflow types
+    }
 }
 
 impl Display for TestType {
@@ -50,6 +60,7 @@ impl Display for TestType {
             TestType::Throughput => write!(f, "throughput"),
             TestType::Load => write!(f, "load"),
             TestType::Benchmark => write!(f, "benchmark"),
+            TestType::DataConsistency => write!(f, "data_consistency"),
             TestType::HTTPConsistency => write!(f, "http_consistency"),
             TestType::HTTPOverhead => write!(f, "http_overhead"),
         }

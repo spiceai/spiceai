@@ -1,0 +1,59 @@
+/*
+Copyright 2024-2025 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+use octocrab::actions::ActionsHandler;
+use serde_json::Value;
+
+pub struct GitHubWorkflow {
+    pub org: String,
+    pub repo: String,
+    pub workflow_file: String,
+    pub r#ref: String,
+}
+
+impl GitHubWorkflow {
+    #[must_use]
+    pub fn new(org: &str, repo: &str, workflow_file: &str, r#ref: &str) -> Self {
+        Self {
+            org: org.to_string(),
+            repo: repo.to_string(),
+            workflow_file: workflow_file.to_string(),
+            r#ref: r#ref.to_string(),
+        }
+    }
+
+    pub async fn send(
+        &self,
+        handler: ActionsHandler<'_>,
+        input: Option<Value>,
+    ) -> anyhow::Result<()> {
+        let action = handler.create_workflow_dispatch(
+            self.org.clone(),
+            self.repo.clone(),
+            self.workflow_file.clone(),
+            self.r#ref.clone(),
+        );
+        if let Some(input) = input {
+            action.inputs(input)
+        } else {
+            action
+        }
+        .send()
+        .await?;
+
+        Ok(())
+    }
+}
