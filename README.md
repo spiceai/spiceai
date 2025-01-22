@@ -19,6 +19,8 @@
 
 **Spice** is a SQL query and AI compute engine, written in Rust, for data-driven apps and agents.
 
+<img width="740" alt="Spice.ai Open Source accelerated data query and LLM-inference engine" src="https://github.com/user-attachments/assets/9db94f9c-10a1-47b0-ab45-05aa964590ff" />
+
 Spice provides three industry standard APIs in a lightweight, portable runtime (single ~140 MB binary):
 
 1. **SQL Query APIs**: Arrow Flight, Arrow Flight SQL, ODBC, JDBC, and ADBC.
