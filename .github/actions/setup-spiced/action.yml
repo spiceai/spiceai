@@ -5,14 +5,19 @@ description: 'composite action'
 #
 # Requires the MinIO CLI to be installed and configured to use this action
 # Requires the repository to have at least a fetch depth of 10 to collect the commit history
+inputs:
+  spiced_commit: # optionally override the commit find and set a specific commit
+    description: 'spiced build commit'
+    required: false
+    type: string
 outputs:
   spiced_commit:
-    value: ${{ steps.find-spiced.outputs.spiced_commit }}
+    value: ${{ steps.output_spiced_commit.outputs.spiced_commit }}
 runs:
   using: 'composite'
   steps:
     - name: Find the latest built spiced commit
-      id: find-spiced
+      if: ${{ !inputs.spiced_commit }}
       shell: bash
       run: |
         commit_hashes=($(git log --pretty=format:"%H" -n 10))
@@ -22,13 +27,23 @@ runs:
           if mc stat spice-minio/artifacts/spiced/linux-x86_64/$hash/spiced_models_linux_x86_64.tar.gz; then
             echo "Found $hash in MinIO"
             echo "SPICED_COMMIT=$hash" >> $GITHUB_ENV
-            echo "SPICED_COMMIT=$hash" >> $GITHUB_OUTPUT
             exit 0
           fi
         done
 
         echo "Could not find any recently built spiced commit in MinIO"
         exit 1
+    
+    - name: Set SPICED_COMMIT from workflow input
+      shell: bash
+      if: ${{ inputs.spiced_commit }}
+      run: |
+        echo "SPICED_COMMIT=${{ inputs.spiced_commit }}" >> $GITHUB_ENV
+    
+    - name: Output SPICED_COMMIT
+      id: output_spiced_commit
+      shell: bash
+      run: echo "SPICED_COMMIT=$SPICED_COMMIT" >> $GITHUB_OUTPUT
 
     - name: Download spiced from MinIO
       shell: bash
