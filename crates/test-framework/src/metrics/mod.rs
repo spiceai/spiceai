@@ -454,6 +454,7 @@ impl<T: ExtendedMetrics, R: ExtendedMetrics> QueryMetrics<T, R> {
         let test_type = vec![self.test_type.to_string()];
         let started_at = vec![self.started_at as u64];
         let finished_at = vec![self.finished_at as u64];
+        // the test can only pass if all queries pass, and the input status is a pass
         let status = [
             if self
                 .metrics
