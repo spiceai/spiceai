@@ -23,6 +23,8 @@ jobs:
     runs-on: spiceai-runners
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Install MinIO
         run: |
@@ -33,7 +35,6 @@ jobs:
 
       - name: Find the latest built spiced commit
         run: |
-          git fetch --all
           commit_hashes=($(git log --pretty=format:"%H" -n 10))
 
           for hash in "${commit_hashes[@]}"; do
