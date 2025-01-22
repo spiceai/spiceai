@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::borrow::Cow;
 use std::error::Error;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -39,8 +40,9 @@ use llms::chat::LlmRuntime;
 use prost::Message;
 use reqwest::Client;
 use rustyline::error::ReadlineError;
+use rustyline::highlight::Highlighter;
 use rustyline::history::FileHistory;
-use rustyline::{ConditionalEventHandler, KeyEvent};
+use rustyline::{Completer, ConditionalEventHandler, Helper, Hinter, KeyEvent, Validator};
 use rustyline::{Editor, EventHandler, Modifiers};
 use serde_json::json;
 use tonic::metadata::errors::InvalidMetadataValue;
@@ -109,6 +111,7 @@ async fn send_nsql_request(
 }
 
 const SPECIAL_COMMANDS: [&str; 6] = [".exit", "exit", "quit", "q", ".error", "help"];
+const PROMPT_COLOR: Colour = Colour::Fixed(8);
 
 #[derive(Clone)]
 struct KeyEventHandler;
@@ -132,6 +135,23 @@ impl ConditionalEventHandler for KeyEventHandler {
                 None
             }
         })
+    }
+}
+
+#[derive(Completer, Helper, Hinter, Validator)]
+struct EditorHelper;
+
+impl Highlighter for EditorHelper {
+    fn highlight_prompt<'b, 's: 'b, 'p: 'b>(
+        &'s self,
+        prompt: &'p str,
+        default: bool,
+    ) -> Cow<'b, str> {
+        if default {
+            PROMPT_COLOR.paint(prompt).to_string().into()
+        } else {
+            Cow::Borrowed(prompt)
+        }
     }
 }
 
@@ -178,7 +198,13 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
         .max_encoding_message_size(MAX_ENCODING_MESSAGE_SIZE)
         .max_decoding_message_size(MAX_DECODING_MESSAGE_SIZE);
 
-    let mut rl: Editor<(), FileHistory> = Editor::new()?;
+    #[cfg(target_os = "windows")]
+    // Ensure ANSI support on Windows is enabled for proper color display.
+    let _ = ansi_term::enable_ansi_support();
+
+    let mut rl = Editor::<EditorHelper, FileHistory>::new()?;
+    rl.set_helper(Some(EditorHelper));
+
     let key_handler = Box::new(KeyEventHandler {});
     rl.bind_sequence(KeyEvent::ctrl('C'), EventHandler::Conditional(key_handler));
     rl.bind_sequence(KeyEvent::ctrl('D'), rustyline::Cmd::EndOfFile);
@@ -190,11 +216,12 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
     println!("show tables; -- list available tables");
 
     let mut last_error: Option<Status> = None;
-    let prompt_color = Colour::Fixed(8);
 
     'outer: loop {
         let mut first_line = true;
-        let mut prompt = prompt_color.paint("sql> ").to_string();
+        // When using the Editor, prompt coloring is applied automatically by the Highlighter. Manual colorizing for
+        // the prompt should not be used, as it does not work on Windows: https://github.com/kkawakam/rustyline/issues/836
+        let mut prompt = "sql> ".to_string();
         let mut line = String::new();
         loop {
             let line_result = rl.readline(&prompt);
@@ -227,7 +254,7 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
             }
 
             if first_line {
-                prompt = prompt_color.paint("  -> ").to_string();
+                prompt = "  -> ".to_string();
                 first_line = false;
             }
         }
@@ -252,13 +279,13 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
                 println!("Available commands:\n");
                 println!(
                     "{} Exit the REPL",
-                    prompt_color.paint(".exit, exit, quit, q:")
+                    PROMPT_COLOR.paint(".exit, exit, quit, q:")
                 );
                 println!(
                     "{} Show details of the last error",
-                    prompt_color.paint(".error:")
+                    PROMPT_COLOR.paint(".error:")
                 );
-                println!("{} Show this help message", prompt_color.paint("help:"));
+                println!("{} Show this help message", PROMPT_COLOR.paint("help:"));
                 println!("\nOther lines will be interpreted as SQL");
                 continue;
             }
