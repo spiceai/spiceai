@@ -20,7 +20,7 @@ runs:
       shell: bash
       run: |
         git fetch --depth=10 origin
-        commit_hashes=($(git log trunk --pretty=format:"%H" -n 10))
+        commit_hashes=($(git log origin/trunk --pretty=format:"%H" -n 10))
 
         for hash in "${commit_hashes[@]}"; do
           echo "Checking $hash in MinIO"
