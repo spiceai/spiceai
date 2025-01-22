@@ -1,0 +1,37 @@
+name: Setup spiced
+description: 'composite action'
+
+# Downloads the most recent spiced build from MinIO, within the last 10 commits
+#
+# Requires the MinIO CLI to be installed and configured to use this action
+# Requires the repository to have at least a fetch depth of 10 to collect the commit history
+outputs:
+  SPICED_COMMIT: ${{ steps.find-spiced.outputs.spiced_commit }}
+runs:
+  using: 'composite'
+  steps:
+    - name: Find the latest built spiced commit
+      id: find-spiced
+      shell: bash
+      run: |
+        commit_hashes=($(git log --pretty=format:"%H" -n 10))
+
+        for hash in "${commit_hashes[@]}"; do
+          echo "Checking $hash in MinIO"
+          if mc stat spice-minio/artifacts/spiced/linux-x86_64/$hash/spiced_models_linux_x86_64.tar.gz; then
+            echo "Found $hash in MinIO"
+            echo "SPICED_COMMIT=$hash" >> $GITHUB_ENV
+            echo "SPICED_COMMIT=$hash" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+        done
+
+        echo "Could not find any recently built spiced commit in MinIO"
+        exit 1
+
+    - name: Download spiced from MinIO
+      shell: bash
+      run: |
+        mc cp spice-minio/artifacts/spiced/linux-x86_64/$SPICED_COMMIT/spiced_models_linux_x86_64.tar.gz spiced_models_linux_x86_64.tar.gz
+        tar -xzf spiced_models_linux_x86_64.tar.gz
+        sudo cp ./spiced /usr/local/bin/spiced
