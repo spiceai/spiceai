@@ -1,10 +1,10 @@
 ---
 source: crates/runtime/benches/bench.rs
-assertion_line: 386
 expression: records_pretty
+snapshot_kind: text
 ---
 +------------------+------------------+----------------+--------------+
-| call_center      | call_center_name | manager        | returns_loss |
+| Call_Center      | Call_Center_Name | Manager        | Returns_Loss |
 +------------------+------------------+----------------+--------------+
 | AAAAAAAACAAAAAAA | Mid Atlantic     | Mark Hightower | 4046.80      |
 | AAAAAAAABAAAAAAA | NY Metro         | Bob Belcher    | 615.62       |
