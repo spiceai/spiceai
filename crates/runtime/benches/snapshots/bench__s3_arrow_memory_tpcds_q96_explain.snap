@@ -26,7 +26,7 @@ snapshot_kind: text
 |               |                   TableScan: time_dim projection=[t_time_sk, t_hour, t_minute]                                                                                 |
 |               |         Projection: store.s_store_sk                                                                                                                           |
 |               |           BytesProcessedNode                                                                                                                                   |
-|               |             Filter: store.s_store_name = Utf8View("ese")                                                                                                       |
+|               |             Filter: store.s_store_name = LargeUtf8("ese")                                                                                                      |
 |               |               TableScan: store projection=[s_store_sk, s_store_name]                                                                                           |
 | physical_plan | SortExec: TopK(fetch=100), expr=[count(*)@0 ASC NULLS LAST], preserve_partitioning=[false]                                                                     |
 |               |   AggregateExec: mode=Final, gby=[], aggr=[count(*)]                                                                                                           |

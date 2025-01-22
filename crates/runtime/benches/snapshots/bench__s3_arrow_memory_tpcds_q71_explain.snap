@@ -46,7 +46,7 @@ snapshot_kind: text
 |               |                               TableScan: date_dim projection=[d_date_sk, d_year, d_moy]                                                                                                          |
 |               |             Projection: time_dim.t_time_sk, time_dim.t_hour, time_dim.t_minute                                                                                                                   |
 |               |               BytesProcessedNode                                                                                                                                                                 |
-|               |                 Filter: time_dim.t_meal_time = Utf8View("breakfast") OR time_dim.t_meal_time = Utf8View("dinner")                                                                                |
+|               |                 Filter: time_dim.t_meal_time = LargeUtf8("breakfast") OR time_dim.t_meal_time = LargeUtf8("dinner")                                                                              |
 |               |                   TableScan: time_dim projection=[t_time_sk, t_hour, t_minute, t_meal_time]                                                                                                      |
 | physical_plan | ProjectionExec: expr=[brand_id@0 as brand_id, brand@1 as brand, t_hour@2 as t_hour, t_minute@3 as t_minute, ext_price@4 as ext_price]                                                            |
 |               |   SortPreservingMergeExec: [ext_price@4 DESC, i_brand_id@5 ASC NULLS LAST]                                                                                                                       |
