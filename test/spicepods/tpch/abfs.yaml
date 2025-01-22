@@ -1,0 +1,31 @@
+version: v1
+kind: Spicepod
+name: abfs_tpch
+datasets:
+  - from: abfs://data/tpch/customer/
+    name: customer
+    params: &abfs_params
+      file_format: parquet
+      abfs_account: spiceaidemodatasets
+      abfs_skip_signature: true
+  - from: abfs://data/tpch/lineitem/
+    name: lineitem
+    params: *abfs_params
+  - from: abfs://data/tpch/nation/
+    name: nation
+    params: *abfs_params
+  - from: abfs://data/tpch/orders/
+    name: orders
+    params: *abfs_params
+  - from: abfs://data/tpch/part/
+    name: part
+    params: *abfs_params
+  - from: abfs://data/tpch/partsupp/
+    name: partsupp
+    params: *abfs_params
+  - from: abfs://data/tpch/region/
+    name: region
+    params: *abfs_params
+  - from: abfs://data/tpch/supplier/
+    name: supplier
+    params: *abfs_params

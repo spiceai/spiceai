@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: postgres
+name: postgres_clickbench
 datasets:
   - from: postgres:hits
     name: hits

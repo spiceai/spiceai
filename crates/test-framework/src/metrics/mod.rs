@@ -36,8 +36,9 @@ use crate::TestType;
 
 const FLOAT_ERROR_MARGIN: f64 = 0.0001;
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, PartialEq, Eq, Default)]
 pub enum QueryStatus {
+    #[default]
     Passed,
     Failed,
 }
@@ -207,7 +208,13 @@ impl StatisticsCollector<BTreeMap<String, Duration>, BTreeMap<String, Vec<Durati
     }
 }
 
-pub struct QueryMetrics<T: ExtendedMetrics> {
+/// A collection of metrics for a single test run
+/// A single instance of a ``QueryMetrics`` represents a single test run
+/// The generics T and R represent additional metric information that can exist, both for individual queries and the test run as a whole
+/// T and R may not always be equal, as the test run may have different metrics than the individual queries
+///
+/// For example, the throughput test uses ``NoExtendedMetrics`` for the individual queries, but ``ThroughputMetrics`` for the test run
+pub struct QueryMetrics<T: ExtendedMetrics, R: ExtendedMetrics> {
     pub run_id: Uuid,
     pub run_name: String,
     pub commit_sha: String,
@@ -216,12 +223,61 @@ pub struct QueryMetrics<T: ExtendedMetrics> {
     pub started_at: usize,
     pub finished_at: usize,
     pub metrics: Vec<QueryMetric<T>>,
+    pub run_metric: Option<R>,
+    pub memory_usage: Option<f64>,
 }
 
-impl<T: ExtendedMetrics> QueryMetrics<T> {
+// Macro to help extract values from metric vecs
+macro_rules! extract_metric_values {
+    // no clone or to_string, direct copy
+    ($metrics:expr, $field:ident) => {
+        $metrics
+            .iter()
+            .map(|metric| metric.$field)
+            .collect::<Vec<_>>()
+    };
+
+    // clone
+    ($metrics:expr, $field:ident, clone) => {
+        $metrics
+            .iter()
+            .map(|metric| metric.$field.clone())
+            .collect::<Vec<_>>()
+    };
+
+    // to_string
+    ($metrics:expr, $field:ident, to_string) => {
+        $metrics
+            .iter()
+            .map(|metric| metric.$field.to_string())
+            .collect::<Vec<_>>()
+    };
+
+    // as u64
+    ($metrics:expr, $field:ident, as_u64) => {
+        $metrics
+            .iter()
+            .map(|metric| metric.$field as u64)
+            .collect::<Vec<_>>()
+    };
+}
+
+impl<T: ExtendedMetrics, R: ExtendedMetrics> QueryMetrics<T, R> {
     #[must_use]
-    pub fn schema() -> SchemaRef {
-        let extended_fields = T::fields();
+    pub fn with_run_metric(mut self, run_metric: R) -> Self {
+        self.run_metric = Some(run_metric);
+        self
+    }
+
+    #[must_use]
+    pub fn with_memory_usage(mut self, memory_usage: f64) -> Self {
+        self.memory_usage = Some(memory_usage);
+        self
+    }
+
+    #[must_use]
+    pub fn run_schema() -> SchemaRef {
+        let extended_fields = R::fields();
 
         let mut base_fields = vec![
             Field::new("run_id", DataType::Utf8, false),
@@ -231,6 +287,24 @@ impl<T: ExtendedMetrics> QueryMetrics<T> {
             Field::new("test_type", DataType::Utf8, false),
             Field::new("started_at", DataType::UInt64, false),
             Field::new("finished_at", DataType::UInt64, false),
+            Field::new("status", DataType::Utf8, false),
+            Field::new("query_execution_count", DataType::UInt64, false),
+            Field::new("memory_usage", DataType::Float64, true),
+        ];
+
+        base_fields.extend(extended_fields);
+
+        Arc::new(Schema::new(base_fields))
+    }
+
+    /// Records do not need the values from the main run, because they contain a reference to the run ID to retrieve them
+    /// Runs are 1:N with records
+    #[must_use]
+    pub fn records_schema() -> SchemaRef {
+        let extended_fields = T::fields();
+
+        let mut base_fields = vec![
+            Field::new("run_id", DataType::Utf8, false),
             Field::new("query_name", DataType::Utf8, false),
             Field::new("query_status", DataType::Utf8, false),
             Field::new("median_duration", DataType::Float64, false),
@@ -245,9 +319,15 @@ impl<T: ExtendedMetrics> QueryMetrics<T> {
         Arc::new(Schema::new(base_fields))
     }
 
-    pub fn build_extended_metrics(&self) -> Result<BTreeMap<String, Builder>> {
-        let mut extended_metrics_builders = T::builders();
-        for e in self.metrics.iter().map(|m| m.extended_metrics.as_ref()) {
+    pub fn build_extended_metrics<'a, M>(
+        &self,
+        metrics_iter: impl Iterator<Item = Option<&'a M>>,
+    ) -> Result<BTreeMap<String, Builder>>
+    where
+        M: ExtendedMetrics + 'a,
+    {
+        let mut extended_metrics_builders = M::builders();
+        for e in metrics_iter {
             if let Some(extended_metrics) = e {
                 let extended_metrics = extended_metrics.build()?;
                 for target in extended_metrics {
@@ -313,50 +393,18 @@ impl<T: ExtendedMetrics> QueryMetrics<T> {
         Ok(extended_metrics_builders)
     }
 
-    pub fn build(&self) -> Result<Vec<RecordBatch>> {
+    /// Builds record batches for the individual metrics of this test run
+    /// For example, a record would be a single query execution
+    pub fn build_records(&self) -> Result<Vec<RecordBatch>> {
         let run_id = vec![self.run_id.to_string(); self.metrics.len()];
-        let run_name = vec![self.run_name.clone(); self.metrics.len()];
-        let commit_sha = vec![self.commit_sha.clone(); self.metrics.len()];
-        let branch_name = vec![self.branch_name.clone(); self.metrics.len()];
-        let test_type = vec![self.test_type.to_string(); self.metrics.len()];
-        let started_at = vec![self.started_at as u64; self.metrics.len()];
-        let finished_at = vec![self.finished_at as u64; self.metrics.len()];
 
-        let query_name = self
-            .metrics
-            .iter()
-            .map(|metric| metric.query_name.clone())
-            .collect::<Vec<_>>();
-        let query_status = self
-            .metrics
-            .iter()
-            .map(|metric| metric.query_status.to_string())
-            .collect::<Vec<_>>();
-        let median_duration = self
-            .metrics
-            .iter()
-            .map(|metric| metric.median_duration)
-            .collect::<Vec<_>>();
-        let percentile_99_duration = self
-            .metrics
-            .iter()
-            .map(|metric| metric.percentile_99_duration)
-            .collect::<Vec<_>>();
-        let percentile_95_duration = self
-            .metrics
-            .iter()
-            .map(|metric| metric.percentile_95_duration)
-            .collect::<Vec<_>>();
-        let percentile_90_duration = self
-            .metrics
-            .iter()
-            .map(|metric| metric.percentile_90_duration)
-            .collect::<Vec<_>>();
-        let run_count = self
-            .metrics
-            .iter()
-            .map(|metric| metric.run_count as u64)
-            .collect::<Vec<_>>();
+        let query_name = extract_metric_values!(self.metrics, query_name, clone);
+        let query_status = extract_metric_values!(self.metrics, query_status, to_string);
+        let median_duration = extract_metric_values!(self.metrics, median_duration);
+        let percentile_99_duration = extract_metric_values!(self.metrics, percentile_99_duration);
+        let percentile_95_duration = extract_metric_values!(self.metrics, percentile_95_duration);
+        let percentile_90_duration = extract_metric_values!(self.metrics, percentile_90_duration);
+        let run_count = extract_metric_values!(self.metrics, run_count, as_u64);
 
         let extended_metrics_fields = T::fields();
         let extended_metrics_field_names = extended_metrics_fields
@@ -366,12 +414,6 @@ impl<T: ExtendedMetrics> QueryMetrics<T> {
 
         let mut columns: Vec<ArrayRef> = vec![
             Arc::new(StringArray::from(run_id)),
-            Arc::new(StringArray::from(run_name)),
-            Arc::new(StringArray::from(commit_sha)),
-            Arc::new(StringArray::from(branch_name)),
-            Arc::new(StringArray::from(test_type)),
-            Arc::new(UInt64Array::from(started_at)),
-            Arc::new(UInt64Array::from(finished_at)),
             Arc::new(StringArray::from(query_name)),
             Arc::new(StringArray::from(query_status)),
             Arc::new(Float64Array::from(median_duration)),
@@ -382,7 +424,8 @@ impl<T: ExtendedMetrics> QueryMetrics<T> {
         ];
 
         if !extended_metrics_fields.is_empty() {
-            let mut extended_metrics_builders = self.build_extended_metrics()?;
+            let mut extended_metrics_builders = self
+                .build_extended_metrics(self.metrics.iter().map(|m| m.extended_metrics.as_ref()))?;
 
             for field in extended_metrics_field_names {
                 match extended_metrics_builders.get_mut(field) {
@@ -398,22 +441,102 @@ impl<T: ExtendedMetrics> QueryMetrics<T> {
             }
         }
 
-        Ok(vec![RecordBatch::try_new(Self::schema(), columns)?])
+        Ok(vec![RecordBatch::try_new(Self::records_schema(), columns)?])
     }
 
-    pub fn show(&self) -> Result<()> {
-        print_batches(&self.build()?)?;
+    /// Builds record batches for the test run
+    /// The record batch is a single row, representing the run as a whole - which can pass or fail separately from individual queries
+    pub fn build_run(&self, status: QueryStatus) -> Result<Vec<RecordBatch>> {
+        let run_id = vec![self.run_id.to_string()];
+        let run_name = vec![self.run_name.clone()];
+        let commit_sha = vec![self.commit_sha.clone()];
+        let branch_name = vec![self.branch_name.clone()];
+        let test_type = vec![self.test_type.to_string()];
+        let started_at = vec![self.started_at as u64];
+        let finished_at = vec![self.finished_at as u64];
+        // the test can only pass if all queries pass, and the input status is a pass
+        let status = [
+            if self
+                .metrics
+                .iter()
+                .all(|m| m.query_status == QueryStatus::Passed)
+                && status == QueryStatus::Passed
+            {
+                QueryStatus::Passed
+            } else {
+                QueryStatus::Failed
+            },
+        ];
+
+        let query_execution_count =
+            vec![self.metrics.iter().fold(0, |acc, m| acc + m.run_count) as u64];
+
+        let memory_usage = vec![self.memory_usage];
+
+        let extended_metrics_fields = R::fields();
+        let extended_metrics_field_names = extended_metrics_fields
+            .iter()
+            .map(arrow::datatypes::Field::name)
+            .collect::<Vec<_>>();
+
+        let mut columns: Vec<ArrayRef> = vec![
+            Arc::new(StringArray::from(run_id)),
+            Arc::new(StringArray::from(run_name)),
+            Arc::new(StringArray::from(commit_sha)),
+            Arc::new(StringArray::from(branch_name)),
+            Arc::new(StringArray::from(test_type)),
+            Arc::new(UInt64Array::from(started_at)),
+            Arc::new(UInt64Array::from(finished_at)),
+            Arc::new(StringArray::from(
+                status
+                    .iter()
+                    .map(std::string::ToString::to_string)
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(UInt64Array::from(query_execution_count)),
+            Arc::new(Float64Array::from(memory_usage)),
+        ];
+
+        if !extended_metrics_fields.is_empty() {
+            let mut extended_metrics_builders =
+                self.build_extended_metrics(vec![self.run_metric.as_ref()].into_iter())?;
+
+            for field in extended_metrics_field_names {
+                match extended_metrics_builders.get_mut(field) {
+                    Some(Builder::String(builder)) => columns.push(Arc::new(builder.finish())),
+                    Some(Builder::UInt64(builder)) => columns.push(Arc::new(builder.finish())),
+                    Some(Builder::Float64(builder)) => columns.push(Arc::new(builder.finish())),
+                    None => {
+                        return Err(anyhow::anyhow!(
+                            "No builder found for extended metric field: {field}"
+                        ))
+                    }
+                }
+            }
+        }
+
+        Ok(vec![RecordBatch::try_new(Self::run_schema(), columns)?])
+    }
+
+    pub fn show_records(&self) -> Result<()> {
+        print_batches(&self.build_records()?)?;
+
+        Ok(())
+    }
+
+    pub fn show_run(&self, status: Option<QueryStatus>) -> Result<()> {
+        print_batches(&self.build_run(status.unwrap_or_default())?)?;
 
         Ok(())
     }
 }
 
-pub trait MetricCollector<T: ExtendedMetrics> {
+pub trait MetricCollector<T: ExtendedMetrics, R: ExtendedMetrics> {
     fn start_time(&self) -> SystemTime;
     fn end_time(&self) -> SystemTime;
     fn name(&self) -> String;
     fn metrics(&self) -> Result<Vec<QueryMetric<T>>>;
-    fn collect(&self, test_type: TestType) -> Result<QueryMetrics<T>> {
+    fn collect(&self, test_type: TestType) -> Result<QueryMetrics<T, R>> {
         Ok(QueryMetrics {
             run_id: uuid::Uuid::new_v4(),
             run_name: self.name(),
@@ -431,6 +554,8 @@ pub trait MetricCollector<T: ExtendedMetrics> {
                     .as_secs(),
             )?,
             metrics: self.metrics()?,
+            memory_usage: None,
+            run_metric: None,
         })
     }
 }
@@ -480,25 +605,34 @@ impl ExtendedMetrics for NoExtendedMetrics {
     }
 }
 
-pub struct ExampleHelloWorldMetrics {
-    pub world: String,
+pub struct ThroughputMetrics {
+    pub throughput: f64,
 }
-impl ExtendedMetrics for ExampleHelloWorldMetrics {
+impl ExtendedMetrics for ThroughputMetrics {
     fn fields() -> Vec<Field> {
-        vec![Field::new("hello", DataType::Utf8, false)]
+        vec![Field::new("throughput", DataType::Float64, false)]
     }
 
     fn builders() -> BTreeMap<String, Builder> {
         let mut builders = BTreeMap::new();
-        builders.insert("hello".to_string(), Builder::String(StringBuilder::new()));
+        builders.insert(
+            "throughput".to_string(),
+            Builder::Float64(Float64Builder::new()),
+        );
         builders
     }
 
     fn build(&self) -> Result<Vec<BuilderTarget>> {
-        Ok(vec![BuilderTarget::String((
-            "hello".to_string(),
-            self.world.clone(),
+        Ok(vec![BuilderTarget::Float64((
+            "throughput".to_string(),
+            self.throughput,
         ))])
+    }
+}
+impl ThroughputMetrics {
+    #[must_use]
+    pub fn new(throughput: f64) -> Self {
+        Self { throughput }
     }
 }
 

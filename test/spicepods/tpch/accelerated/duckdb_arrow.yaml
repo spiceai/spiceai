@@ -1,0 +1,39 @@
+version: v1
+kind: Spicepod
+name: duckdb_tpch_arrow
+datasets:
+  - from: duckdb:customer
+    name: customer
+    params: &duckdb_params
+      duckdb_open: ./data/tpch.db
+    acceleration: &acceleration
+      enabled: true
+      engine: arrow
+  - from: duckdb:lineitem
+    name: lineitem
+    params: *duckdb_params
+    acceleration: *acceleration
+  - from: duckdb:nation
+    name: nation
+    params: *duckdb_params
+    acceleration: *acceleration
+  - from: duckdb:orders
+    name: orders
+    params: *duckdb_params
+    acceleration: *acceleration
+  - from: duckdb:part
+    name: part
+    params: *duckdb_params
+    acceleration: *acceleration
+  - from: duckdb:partsupp
+    name: partsupp
+    params: *duckdb_params
+    acceleration: *acceleration
+  - from: duckdb:region
+    name: region
+    params: *duckdb_params
+    acceleration: *acceleration
+  - from: duckdb:supplier
+    name: supplier
+    params: *duckdb_params
+    acceleration: *acceleration

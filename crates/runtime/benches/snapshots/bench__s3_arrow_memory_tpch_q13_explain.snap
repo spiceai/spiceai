@@ -18,7 +18,7 @@ snapshot_kind: text
 |               |                   TableScan: customer projection=[c_custkey]                                                                                |
 |               |                 Projection: orders.o_orderkey, orders.o_custkey                                                                             |
 |               |                   BytesProcessedNode                                                                                                        |
-|               |                     Filter: orders.o_comment NOT LIKE Utf8View("%special%requests%")                                                        |
+|               |                     Filter: orders.o_comment NOT LIKE LargeUtf8("%special%requests%")                                                       |
 |               |                       TableScan: orders projection=[o_orderkey, o_custkey, o_comment]                                                       |
 | physical_plan | SortPreservingMergeExec: [custdist@1 DESC, c_count@0 DESC]                                                                                  |
 |               |   SortExec: expr=[custdist@1 DESC, c_count@0 DESC], preserve_partitioning=[true]                                                            |

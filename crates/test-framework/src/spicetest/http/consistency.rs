@@ -191,7 +191,7 @@ impl SpiceTest<Completed> {
     }
 }
 
-impl MetricCollector<NoExtendedMetrics> for SpiceTest<Completed> {
+impl MetricCollector<NoExtendedMetrics, NoExtendedMetrics> for SpiceTest<Completed> {
     fn start_time(&self) -> SystemTime {
         self.start_time
     }

@@ -230,14 +230,16 @@ impl SpicedInstance {
         Ok(process.memory())
     }
 
-    pub fn show_memory_usage(&self) -> Result<()> {
+    /// Show the memory usage of the spiced instance in GB
+    /// Also returns the memory usage in GB as a float
+    pub fn show_memory_usage(&self) -> Result<f64> {
         let memory_usage = self.memory_usage()?;
         // drop memory usage to MB as a u32 before converting to GB as a float
         // we don't really care about the fractional memory usage of KB/MB
         let memory_usage_gb = f64::from(u32::try_from(memory_usage / 1024 / 1024)?) / 1024.0;
         println!("Memory usage: {memory_usage_gb:.2} GB");
 
-        Ok(())
+        Ok(memory_usage_gb)
     }
 }
 

@@ -65,23 +65,11 @@ jobs:
           sudo wget https://dl.min.io/client/mc/release/linux-amd64/mc -O /usr/local/bin/mc
           sudo chmod +x /usr/local/bin/mc
           mc alias set spice-minio ${{ secrets.MINIO_ENDPOINT }} ${{ secrets.MINIO_ACCESS_KEY }} ${{ secrets.MINIO_SECRET_KEY }}
-
-      - name: Get latest trunk commit
-        if: ${{ !github.event.inputs.spiced_commit }}
-        run: |
-          git fetch origin
-          echo "SPICED_COMMIT=$(git rev-parse origin/trunk)" >> $GITHUB_ENV
-
-      - name: Set SPICED_COMMIT from workflow input
-        if: ${{ github.event.inputs.spiced_commit }}
-        run: |
-          echo "SPICED_COMMIT=${{ github.event.inputs.spiced_commit }}" >> $GITHUB_ENV
-
-      - name: Download spiced from MinIO
-        run: |
-          mc cp spice-minio/artifacts/spiced/linux-x86_64/$SPICED_COMMIT/spiced_models_linux_x86_64.tar.gz spiced_models_linux_x86_64.tar.gz
-          tar -xzf spiced_models_linux_x86_64.tar.gz
-          sudo cp ./spiced /usr/local/bin/spiced
+      
+      - name: Setup spiced
+        uses: ./.github/actions/setup-spiced
+        with:
+          spiced_commit: ${{ github.event.inputs.spiced_commit }}
 
       - name: Build Testoperator
         uses: ./.github/actions/build-testoperator

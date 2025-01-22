@@ -1,0 +1,34 @@
+version: v1
+kind: Spicepod
+name: mssql_tpch
+datasets:
+  - from: mssql:customer
+    name: customer
+    params: &mssql_params
+      mssql_host: ${secrets:MSSQL_HOST}
+      mssql_username: ${secrets:MSSQL_USER}
+      mssql_password: ${secrets:MSSQL_PASSWORD}
+      mssql_database: ${secrets:MSSQL_DB}
+      mssql_encrypt: false
+      mssql_trust_server_certificate: true
+  - from: mssql:lineitem
+    name: lineitem
+    params: *mssql_params
+  - from: mssql:nation
+    name: nation
+    params: *mssql_params
+  - from: mssql:orders
+    name: orders
+    params: *mssql_params
+  - from: mssql:part
+    name: part
+    params: *mssql_params
+  - from: mssql:partsupp
+    name: partsupp
+    params: *mssql_params
+  - from: mssql:region
+    name: region
+    params: *mssql_params
+  - from: mssql:supplier
+    name: supplier
+    params: *mssql_params

@@ -1,0 +1,77 @@
+version: v1
+kind: Spicepod
+name: spicecloud_tpcds
+datasets:
+  - from: spice.ai:spiceai/benchmarks-tpcds/datasets/tpcds.catalog_sales
+    name: catalog_sales
+    params: &spicecloud_params
+      spiceai_api_key: ${secrets:SPICEAI_TPCDS_API_KEY}
+  - from: spice.ai:spiceai/benchmarks-tpcds/datasets/tpcds.catalog_returns
+    name: catalog_returns
+    params: *spicecloud_params
+  - from: spice.ai:spiceai/benchmarks-tpcds/datasets/tpcds.inventory
+    name: inventory
+    params: *spicecloud_params
+  - from: spice.ai:spiceai/benchmarks-tpcds/datasets/tpcds.store_sales
+    name: store_sales
+    params: *spicecloud_params
+  - from: spice.ai:spiceai/benchmarks-tpcds/datasets/tpcds.store_returns
+    name: store_returns
+    params: *spicecloud_params
+  - from: spice.ai:spiceai/benchmarks-tpcds/datasets/tpcds.web_sales
+    name: web_sales
+    params: *spicecloud_params
+  - from: spice.ai:spiceai/benchmarks-tpcds/datasets/tpcds.web_returns
+    name: web_returns
+    params: *spicecloud_params
+  - from: spice.ai:spiceai/benchmarks-tpcds/datasets/tpcds.customer
+    name: customer
+    params: *spicecloud_params
+  - from: spice.ai:spiceai/benchmarks-tpcds/datasets/tpcds.customer_address
+    name: customer_address
+    params: *spicecloud_params
+  - from: spice.ai:spiceai/benchmarks-tpcds/datasets/tpcds.customer_demographics
+    name: customer_demographics
+    params: *spicecloud_params
+  - from: spice.ai:spiceai/benchmarks-tpcds/datasets/tpcds.date_dim
+    name: date_dim
+    params: *spicecloud_params
+  - from: spice.ai:spiceai/benchmarks-tpcds/datasets/tpcds.household_demographics
+    name: household_demographics
+    params: *spicecloud_params
+  - from: spice.ai:spiceai/benchmarks-tpcds/datasets/tpcds.item
+    name: item
+    params: *spicecloud_params
+  - from: spice.ai:spiceai/benchmarks-tpcds/datasets/tpcds.promotion
+    name: promotion
+    params: *spicecloud_params
+  - from: spice.ai:spiceai/benchmarks-tpcds/datasets/tpcds.ship_mode
+    name: ship_mode
+    params: *spicecloud_params
+  - from: spice.ai:spiceai/benchmarks-tpcds/datasets/tpcds.store
+    name: store
+    params: *spicecloud_params
+  - from: spice.ai:spiceai/benchmarks-tpcds/datasets/tpcds.time_dim
+    name: time_dim
+    params: *spicecloud_params
+  - from: spice.ai:spiceai/benchmarks-tpcds/datasets/tpcds.warehouse
+    name: warehouse
+    params: *spicecloud_params
+  - from: spice.ai:spiceai/benchmarks-tpcds/datasets/tpcds.web_page
+    name: web_page
+    params: *spicecloud_params
+  - from: spice.ai:spiceai/benchmarks-tpcds/datasets/tpcds.web_site
+    name: web_site
+    params: *spicecloud_params
+  - from: spice.ai:spiceai/benchmarks-tpcds/datasets/tpcds.reason
+    name: reason
+    params: *spicecloud_params
+  - from: spice.ai:spiceai/benchmarks-tpcds/datasets/tpcds.call_center
+    name: call_center
+    params: *spicecloud_params
+  - from: spice.ai:spiceai/benchmarks-tpcds/datasets/tpcds.income_band
+    name: income_band
+    params: *spicecloud_params
+  - from: spice.ai:spiceai/benchmarks-tpcds/datasets/tpcds.catalog_page
+    name: catalog_page
+    params: *spicecloud_params

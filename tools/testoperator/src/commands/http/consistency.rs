@@ -70,7 +70,7 @@ pub async fn consistency_run(args: &HttpConsistencyTestArgs) -> anyhow::Result<(
 
     let mut spiced_instance = test.end();
 
-    results.show()?;
+    results.show_records()?;
 
     let (p50, p95): (Vec<f64>, Vec<f64>) = results
         .metrics

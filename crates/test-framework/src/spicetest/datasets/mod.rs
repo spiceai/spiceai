@@ -19,7 +19,7 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-use crate::metrics::{MetricCollector, NoExtendedMetrics, QueryMetric};
+use crate::metrics::{MetricCollector, NoExtendedMetrics, QueryMetric, ThroughputMetrics};
 use anyhow::Result;
 use futures::future::join_all;
 use indicatif::{MultiProgress, ProgressBar};
@@ -285,7 +285,28 @@ impl std::fmt::Display for SpiceTest<Completed> {
     }
 }
 
-impl MetricCollector<NoExtendedMetrics> for SpiceTest<Completed> {
+impl MetricCollector<NoExtendedMetrics, NoExtendedMetrics> for SpiceTest<Completed> {
+    fn start_time(&self) -> SystemTime {
+        self.start_time
+    }
+
+    fn end_time(&self) -> SystemTime {
+        self.state.end_time
+    }
+
+    fn name(&self) -> String {
+        self.name.clone()
+    }
+
+    fn metrics(&self) -> Result<Vec<QueryMetric<NoExtendedMetrics>>> {
+        self.get_query_durations()
+            .iter()
+            .map(|(query, durations)| QueryMetric::new_from_durations(query, durations))
+            .collect::<Result<Vec<_>>>()
+    }
+}
+
+impl MetricCollector<NoExtendedMetrics, ThroughputMetrics> for SpiceTest<Completed> {
     fn start_time(&self) -> SystemTime {
         self.start_time
     }
