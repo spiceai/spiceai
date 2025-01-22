@@ -5,7 +5,7 @@ description: 'composite action'
 #
 # Requires the MinIO CLI to be installed and configured to use this action
 inputs:
-  spiced_commit: # optionally override the commit find and set a specific commit
+  spiced_commit: # optionally override the commit to download
     description: 'spiced build commit'
     required: false
     type: string
