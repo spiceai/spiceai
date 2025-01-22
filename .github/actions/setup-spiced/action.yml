@@ -19,7 +19,7 @@ runs:
       if: ${{ !inputs.spiced_commit }}
       shell: bash
       run: |
-        git fetch --depth=10 origin/trunk
+        git fetch --depth=10 origin trunk
         commit_hashes=($(git log origin/trunk --pretty=format:"%H" -n 10))
 
         for hash in "${commit_hashes[@]}"; do
