@@ -55,6 +55,8 @@ jobs:
     runs-on: ${{ github.event.inputs.runner_type }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 10
 
       - name: Install MinIO
         run: |

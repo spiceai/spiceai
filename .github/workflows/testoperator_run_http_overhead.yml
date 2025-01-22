@@ -67,6 +67,8 @@ jobs:
           echo "  base_component=${{ github.event.inputs.base_component }}"
 
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 10
 
       - name: Install MinIO
         run: |
