@@ -33,6 +33,7 @@ jobs:
 
       - name: Find the latest built spiced commit
         run: |
+          git fetch --all
           commit_hashes=($(git log --pretty=format:"%H" -n 10))
 
           for hash in "${commit_hashes[@]}"; do
