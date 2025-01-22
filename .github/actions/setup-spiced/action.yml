@@ -6,7 +6,8 @@ description: 'composite action'
 # Requires the MinIO CLI to be installed and configured to use this action
 # Requires the repository to have at least a fetch depth of 10 to collect the commit history
 outputs:
-  SPICED_COMMIT: ${{ steps.find-spiced.outputs.spiced_commit }}
+  spiced_commit:
+    value: ${{ steps.find-spiced.outputs.spiced_commit }}
 runs:
   using: 'composite'
   steps:
