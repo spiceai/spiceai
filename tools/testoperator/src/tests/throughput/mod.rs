@@ -19,7 +19,7 @@ use crate::commands::DatasetTestArgs;
 use std::time::Duration;
 use test_framework::{
     anyhow,
-    metrics::{MetricCollector, QueryMetrics, QueryStatus, ThroughputMetrics},
+    metrics::{MetricCollector, QueryMetrics, ThroughputMetrics},
     queries::{QueryOverrides, QuerySet},
     spiced::SpicedInstance,
     spicetest::{
