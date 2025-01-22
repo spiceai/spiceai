@@ -4,7 +4,6 @@ description: 'composite action'
 # Downloads the most recent spiced build from MinIO, within the last 10 commits
 #
 # Requires the MinIO CLI to be installed and configured to use this action
-# Requires the repository to have at least a fetch depth of 10 to collect the commit history
 inputs:
   spiced_commit: # optionally override the commit find and set a specific commit
     description: 'spiced build commit'
@@ -20,7 +19,8 @@ runs:
       if: ${{ !inputs.spiced_commit }}
       shell: bash
       run: |
-        commit_hashes=($(git log --pretty=format:"%H" -n 10))
+        git fetch --depth=10 origin trunk
+        commit_hashes=($(git log trunk --pretty=format:"%H" -n 10))
 
         for hash in "${commit_hashes[@]}"; do
           echo "Checking $hash in MinIO"

@@ -56,8 +56,6 @@ jobs:
     timeout-minutes: 600
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 10
 
       - name: Install MinIO
         run: |

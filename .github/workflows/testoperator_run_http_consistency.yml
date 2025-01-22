@@ -58,8 +58,6 @@ jobs:
           echo "  buckets=${{ github.event.inputs.buckets }}"
 
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 10
 
       - name: Install MinIO
         run: |

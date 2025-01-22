@@ -23,8 +23,6 @@ jobs:
     runs-on: spiceai-runners
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 10
 
       - name: Install MinIO
         run: |
