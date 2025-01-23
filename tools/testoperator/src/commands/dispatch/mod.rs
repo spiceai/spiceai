@@ -14,32 +14,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::path::PathBuf;
 use test_framework::{
     anyhow::{self, Result},
     gh_utils::GitHubWorkflow,
-    octocrab, TestType,
+    octocrab,
+    utils::scan_directory_for_yamls,
+    TestType,
 };
 
 use crate::args::dispatch::{BenchWorkflowArgs, DispatchArgs, DispatchTestFile, LoadWorkflowArgs};
-
-/// Recursively scan a directory for YAML files
-fn scan_directory_for_yamls(path: &PathBuf) -> Result<Vec<PathBuf>> {
-    let mut files = vec![];
-
-    for entry in std::fs::read_dir(path)? {
-        let entry = entry?;
-        let path = entry.path();
-
-        if path.is_dir() {
-            files.append(&mut scan_directory_for_yamls(&path)?);
-        } else if path.is_file() && path.extension().map_or(false, |ext| ext == "yaml") {
-            files.push(path);
-        }
-    }
-
-    Ok(files)
-}
 
 pub async fn dispatch(args: DispatchArgs) -> Result<()> {
     if !args.path.is_dir() && !args.path.is_file() {
