@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"time"
@@ -31,6 +32,8 @@ import (
 	"github.com/spiceai/spiceai/bin/spice/pkg/util"
 	"github.com/spiceai/spiceai/bin/spice/pkg/version"
 )
+
+const reloadEnvVar = "SPICE_CLI_RELOADED"
 
 var upgradeCmd = &cobra.Command{
 	Use:   "upgrade",
@@ -45,93 +48,29 @@ spice upgrade
 			return
 		}
 
-		slog.Info("Checking for latest Spice CLI release...")
-		release, err := github.GetLatestCliRelease()
-		if err != nil {
-			slog.Error("checking for latest release", "error", err)
-			return
-		}
-
 		rtcontext := context.NewContext()
 		err = rtcontext.Init()
 		if err != nil {
 			slog.Error("initializing runtime context", "error", err)
 			os.Exit(1)
 		}
-		cliVersion := version.Version()
 
-		runtimeUpgradeRequired, err := rtcontext.IsRuntimeUpgradeAvailable()
-		if err != nil {
-			slog.Error("checking for runtime upgrade", "error", err)
-			return
+		// Run CLI upgrade
+		if os.Getenv(reloadEnvVar) != "true" {
+			upgradeCli(force, rtcontext)
 		}
 
-		if cliVersion == release.TagName && runtimeUpgradeRequired != "" && !force {
-			slog.Info(fmt.Sprintf("Using the latest version %s. No upgrade required.", release.TagName))
-			return
-		}
-
-		assetName := github.GetAssetName(constants.SpiceCliFilename)
-		spiceBinDir := filepath.Join(rtcontext.SpiceRuntimeDir(), "bin")
-
-		slog.Info("Upgrading the Spice.ai CLI ...")
-
-		stat, err := os.Stat(spiceBinDir)
-		if err != nil {
-			slog.Error("upgrading the spice binary", "error", err)
-			return
-		}
-
-		tmpDirName := strconv.FormatInt(time.Now().Unix(), 16)
-		tmpDir := filepath.Join(spiceBinDir, tmpDirName)
-
-		err = os.Mkdir(tmpDir, stat.Mode())
-		if err != nil {
-			slog.Error("upgrading the spice binary", "error", err)
-			return
-		}
-		defer os.RemoveAll(tmpDir)
-
-		err = github.DownloadAsset(release, tmpDir, assetName)
-		if err != nil {
-			slog.Error("downloading the spice binary", "error", err)
-			return
-		}
-
-		tempFilePath := filepath.Join(tmpDir, constants.SpiceCliFilename)
-
-		err = util.MakeFileExecutable(tempFilePath)
-		if err != nil {
-			slog.Error("upgrading the spice binary", "error", err)
-			return
-		}
-
-		releaseFilePath := filepath.Join(spiceBinDir, constants.SpiceCliFilename)
-
-		// On Windows, it is not possible to overwrite a binary while it's running.
-		// However, it can be moved/renamed making it possible to save new release with the original name.
-		if util.IsWindows() {
-			runningCliTempLocation := filepath.Join(spiceBinDir, constants.SpiceCliFilename+".bak")
-			err = os.Rename(releaseFilePath, runningCliTempLocation)
-			if err != nil {
-				slog.Error("upgrading the spice binary", "error", err)
-				return
-			}
-		}
-
-		err = os.Rename(tempFilePath, releaseFilePath)
-		if err != nil {
-			slog.Error("upgrading the spice binary", "error", err)
-			return
-		}
-
-		slog.Info(fmt.Sprintf("Spice.ai CLI upgraded to %s successfully.", release.TagName))
-
-		// For upgrades, default to the flavor that was installed previously.
+		// For runtime upgrades, default to the flavor that was installed previously.
 		flavor := constants.FlavorCore
 		models, accelerated := rtcontext.ModelsFlavorInstalled()
 		if models {
 			flavor = constants.FlavorAI
+		}
+
+		release, err := github.GetLatestRuntimeRelease()
+		if err != nil {
+			slog.Error("installing runtime", "error", err)
+			os.Exit(1)
 		}
 
 		err = rtcontext.InstallOrUpgradeRuntime(flavor, accelerated) // retain the current accelerator setting for upgrades
@@ -142,6 +81,110 @@ spice upgrade
 
 		slog.Info(fmt.Sprintf("Spice runtime upgraded to %s successfully.", release.TagName))
 	},
+}
+
+func upgradeCli(force bool, rtcontext *context.RuntimeContext) {
+	slog.Info("Checking for latest Spice CLI release...")
+	release, err := github.GetLatestCliRelease()
+	if err != nil {
+		slog.Error("checking for latest release", "error", err)
+		return
+	}
+
+	cliVersion := version.Version()
+
+	runtimeUpgradeRequired, err := rtcontext.IsRuntimeUpgradeAvailable()
+	if err != nil {
+		slog.Error("checking for runtime upgrade", "error", err)
+		return
+	}
+
+	if cliVersion == release.TagName && runtimeUpgradeRequired != "" && !force {
+		slog.Info(fmt.Sprintf("Using the latest version %s. No upgrade required.", release.TagName))
+		return
+	}
+
+	assetName := github.GetAssetName(constants.SpiceCliFilename)
+	spiceBinDir := filepath.Join(rtcontext.SpiceRuntimeDir(), "bin")
+
+	slog.Info("Upgrading the Spice.ai CLI ...")
+
+	stat, err := os.Stat(spiceBinDir)
+	if err != nil {
+		slog.Error("upgrading the spice binary", "error", err)
+		return
+	}
+
+	tmpDirName := strconv.FormatInt(time.Now().Unix(), 16)
+	tmpDir := filepath.Join(spiceBinDir, tmpDirName)
+
+	err = os.Mkdir(tmpDir, stat.Mode())
+	if err != nil {
+		slog.Error("upgrading the spice binary", "error", err)
+		return
+	}
+	defer os.RemoveAll(tmpDir)
+
+	err = github.DownloadAsset(release, tmpDir, assetName)
+	if err != nil {
+		slog.Error("downloading the spice binary", "error", err)
+		return
+	}
+
+	tempFilePath := filepath.Join(tmpDir, constants.SpiceCliFilename)
+
+	err = util.MakeFileExecutable(tempFilePath)
+	if err != nil {
+		slog.Error("upgrading the spice binary", "error", err)
+		return
+	}
+
+	releaseFilePath := filepath.Join(spiceBinDir, constants.SpiceCliFilename)
+
+	// On Windows, it is not possible to overwrite a binary while it's running.
+	// However, it can be moved/renamed making it possible to save new release with the original name.
+	if util.IsWindows() {
+		runningCliTempLocation := filepath.Join(spiceBinDir, constants.SpiceCliFilename+".bak")
+		err = os.Rename(releaseFilePath, runningCliTempLocation)
+		if err != nil {
+			slog.Error("upgrading the spice binary", "error", err)
+			return
+		}
+	}
+
+	err = os.Rename(tempFilePath, releaseFilePath)
+	if err != nil {
+		slog.Error("upgrading the spice binary", "error", err)
+		return
+	}
+
+	slog.Info(fmt.Sprintf("Spice.ai CLI upgraded to %s successfully.", release.TagName))
+
+	// Use the upgraded CLI for the rest of the code
+	err = runUpgradedCLI(releaseFilePath, os.Args)
+	if err != nil {
+		slog.Error("running the upgraded CLI", "error", err)
+		return
+	}
+}
+
+func runUpgradedCLI(newBinaryPath string, args []string) error {
+
+	// Execute the new binary with the same arguments
+	cmd := exec.Command(newBinaryPath, args[1:]...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Stdin = os.Stdin
+	cmd.Env = append(os.Environ(), fmt.Sprintf("%s=true", reloadEnvVar))
+
+	err := cmd.Run()
+	if err != nil {
+		return err
+	}
+
+	os.Exit(0)
+
+	return nil
 }
 
 func init() {
