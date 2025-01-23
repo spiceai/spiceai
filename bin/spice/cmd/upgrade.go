@@ -144,7 +144,17 @@ func upgradeCli(force bool, rtcontext *context.RuntimeContext) {
 	// On Windows, it is not possible to overwrite a binary while it's running.
 	// However, it can be moved/renamed making it possible to save new release with the original name.
 	if util.IsWindows() {
-		runningCliTempLocation := filepath.Join(spiceBinDir, constants.SpiceCliFilename+".bak")
+		// Create a temp directory under Windows temp folder
+		tmpCliDir := filepath.Join(os.TempDir(), fmt.Sprintf("spice-%d", time.Now().UnixNano()))
+		err = os.MkdirAll(tmpCliDir, stat.Mode())
+		if err != nil {
+			slog.Error("upgrading the spice binary", "error", err)
+			return
+		}
+		defer os.RemoveAll(tmpCliDir)
+
+		// Move running binary to temp location
+		runningCliTempLocation := filepath.Join(tmpCliDir, constants.SpiceCliFilename)
 		err = os.Rename(releaseFilePath, runningCliTempLocation)
 		if err != nil {
 			slog.Error("upgrading the spice binary", "error", err)
