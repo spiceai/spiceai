@@ -20,9 +20,11 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
+	"strings"
+	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -33,7 +35,10 @@ import (
 	"github.com/spiceai/spiceai/bin/spice/pkg/version"
 )
 
-const reloadEnvVar = "SPICE_CLI_RELOADED"
+const (
+	reloadEnvVar      = "SPICE_CLI_RESTARTED"
+	cleanupMarkerFile = "cleanup.marker"
+)
 
 var upgradeCmd = &cobra.Command{
 	Use:   "upgrade",
@@ -58,6 +63,8 @@ spice upgrade
 		// Run CLI upgrade
 		if os.Getenv(reloadEnvVar) != "true" {
 			upgradeCli(force, rtcontext)
+		} else {
+			cleanupOldBinaries()
 		}
 
 		// For runtime upgrades, default to the flavor that was installed previously.
@@ -83,7 +90,48 @@ spice upgrade
 	},
 }
 
+type cleanupInfo struct {
+	tmpDir     string
+	markerPath string
+	oldBinary  string
+}
+
+func createCleanupInfo() *cleanupInfo {
+	if !util.IsWindows() {
+		return nil
+	}
+	tmpDir := filepath.Join(os.TempDir(), fmt.Sprintf("spice-%d", time.Now().UnixNano()))
+	return &cleanupInfo{
+		tmpDir:     tmpDir,
+		markerPath: filepath.Join(tmpDir, cleanupMarkerFile),
+		oldBinary:  filepath.Join(tmpDir, constants.SpiceCliFilename),
+	}
+}
+
+func cleanupOldBinaries() {
+	if !util.IsWindows() {
+		return
+	}
+
+	entries, err := os.ReadDir(os.TempDir())
+	if err != nil {
+		return
+	}
+
+	for _, entry := range entries {
+		if entry.IsDir() && strings.HasPrefix(entry.Name(), "spice-") {
+			tmpDir := filepath.Join(os.TempDir(), entry.Name())
+			markerPath := filepath.Join(tmpDir, cleanupMarkerFile)
+			if _, err := os.Stat(markerPath); err == nil {
+				_ = os.RemoveAll(tmpDir)
+			}
+		}
+	}
+}
+
 func upgradeCli(force bool, rtcontext *context.RuntimeContext) {
+	slog.Info(fmt.Sprintf("Current version.", version.Version()))
+
 	slog.Info("Checking for latest Spice CLI release...")
 	release, err := github.GetLatestCliRelease()
 	if err != nil {
@@ -123,7 +171,6 @@ func upgradeCli(force bool, rtcontext *context.RuntimeContext) {
 		slog.Error("upgrading the spice binary", "error", err)
 		return
 	}
-	defer os.RemoveAll(tmpDir)
 
 	err = github.DownloadAsset(release, tmpDir, assetName)
 	if err != nil {
@@ -145,56 +192,65 @@ func upgradeCli(force bool, rtcontext *context.RuntimeContext) {
 	// However, it can be moved/renamed making it possible to save new release with the original name.
 	if util.IsWindows() {
 		// Create a temp directory under Windows temp folder
-		tmpCliDir := filepath.Join(os.TempDir(), fmt.Sprintf("spice-%d", time.Now().UnixNano()))
-		err = os.MkdirAll(tmpCliDir, stat.Mode())
-		if err != nil {
-			slog.Error("upgrading the spice binary", "error", err)
+		cleanup := createCleanupInfo()
+		if err := os.MkdirAll(cleanup.tmpDir, stat.Mode()); err != nil {
+			slog.Error("creating temp directory", "error", err)
 			return
 		}
-		defer os.RemoveAll(tmpCliDir)
-
-		// Move running binary to temp location
-		runningCliTempLocation := filepath.Join(tmpCliDir, constants.SpiceCliFilename)
-		err = os.Rename(releaseFilePath, runningCliTempLocation)
-		if err != nil {
-			slog.Error("upgrading the spice binary", "error", err)
+		// Move the old binary to the temp directory
+		if err := os.Rename(releaseFilePath, cleanup.oldBinary); err != nil {
+			slog.Error("moving old CLI", "error", err)
+			return
+		}
+		// Create a marker file to indicate that the old binary is moved
+		if err := os.WriteFile(cleanup.markerPath, []byte{}, 0644); err != nil {
+			slog.Error("creating cleanup marker", "error", err)
 			return
 		}
 	}
 
+	// Move new cli to the release file path, and remove the temp downloading directory
 	err = os.Rename(tempFilePath, releaseFilePath)
 	if err != nil {
 		slog.Error("upgrading the spice binary", "error", err)
 		return
 	}
+	os.RemoveAll(tmpDir)
 
 	slog.Info(fmt.Sprintf("Spice.ai CLI upgraded to %s successfully.", release.TagName))
 
-	// Use the upgraded CLI for the rest of the code
-	err = runUpgradedCLI(releaseFilePath, os.Args)
-	if err != nil {
-		slog.Error("running the upgraded CLI", "error", err)
+	execArgs := []string{releaseFilePath}
+	execArgs = append(execArgs, os.Args[1:]...)
+
+	if err := restartWithNewCli(releaseFilePath, execArgs); err != nil {
+		slog.Error("restarting CLI", "error", err)
 		return
 	}
 }
 
-func runUpgradedCLI(newBinaryPath string, args []string) error {
+func restartWithNewCli(cliPath string, args []string) error {
+	execEnv := append(os.Environ(), fmt.Sprintf("%s=true", reloadEnvVar))
 
-	// Execute the new binary with the same arguments
-	cmd := exec.Command(newBinaryPath, args[1:]...)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	cmd.Stdin = os.Stdin
-	cmd.Env = append(os.Environ(), fmt.Sprintf("%s=true", reloadEnvVar))
-
-	err := cmd.Run()
-	if err != nil {
-		return err
+	// windows: Start process with new cli, terminate the current process
+	if runtime.GOOS == "windows" {
+		proc, err := os.StartProcess(
+			cliPath,
+			args,
+			&os.ProcAttr{
+				Dir:   "",
+				Env:   execEnv,
+				Files: []*os.File{os.Stdin, os.Stdout, os.Stderr},
+			})
+		if err != nil {
+			return err
+		}
+		proc.Release()
+		os.Exit(0)
+		return nil
 	}
 
-	os.Exit(0)
-
-	return nil
+	// unix: Replace the current process with the new cli
+	return syscall.Exec(cliPath, args, execEnv)
 }
 
 func init() {
