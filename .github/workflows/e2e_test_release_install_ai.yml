@@ -241,7 +241,7 @@ jobs:
         run: |
           brew install expect
 
-      - name: Test vector search)
+      - name: Test vector search
         if: matrix.target.target_os != 'windows'
         run: |
           ./test/models/search_01.exp
