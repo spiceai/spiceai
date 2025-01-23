@@ -66,7 +66,7 @@ pub async fn consistency_run(args: &HttpConsistencyTestArgs) -> anyhow::Result<(
 
     println!("{}", with_color!(Color::Blue, "Starting consistency test"));
     let test = test.start()?.wait().await?;
-    let results = test.collect(TestType::HTTPConsistency)?;
+    let results = test.collect(TestType::HttpConsistency)?;
 
     let mut spiced_instance = test.end();
 

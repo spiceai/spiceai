@@ -43,8 +43,8 @@ pub enum TestType {
     Load,
     Benchmark,
     DataConsistency,
-    HTTPConsistency,
-    HTTPOverhead,
+    HttpConsistency,
+    HttpOverhead,
 }
 
 impl TestType {
@@ -55,8 +55,8 @@ impl TestType {
             TestType::Load => "testoperator_run_load.yml",
             TestType::Benchmark => "testoperator_run_bench.yml",
             TestType::DataConsistency => "testoperator_run_data_consistency.yml",
-            TestType::HTTPConsistency => "testoperator_run_http_consistency.yml",
-            TestType::HTTPOverhead => "testoperator_run_http_overhead.yml",
+            TestType::HttpConsistency => "testoperator_run_http_consistency.yml",
+            TestType::HttpOverhead => "testoperator_run_http_overhead.yml",
         }
     }
 }
@@ -68,8 +68,8 @@ impl Display for TestType {
             TestType::Load => write!(f, "load"),
             TestType::Benchmark => write!(f, "benchmark"),
             TestType::DataConsistency => write!(f, "data_consistency"),
-            TestType::HTTPConsistency => write!(f, "http_consistency"),
-            TestType::HTTPOverhead => write!(f, "http_overhead"),
+            TestType::HttpConsistency => write!(f, "http_consistency"),
+            TestType::HttpOverhead => write!(f, "http_overhead"),
         }
     }
 }

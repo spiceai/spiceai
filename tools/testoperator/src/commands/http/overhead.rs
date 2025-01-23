@@ -74,7 +74,7 @@ pub(crate) async fn overhead_run(args: &HttpOverheadTestArgs) -> anyhow::Result<
 
     println!("{}", with_color!(Color::Blue, "Starting overhead test"));
     let test = test.start()?.wait().await?;
-    let results = test.collect(TestType::HTTPOverhead)?;
+    let results = test.collect(TestType::HttpOverhead)?;
     results.show_records()?;
 
     let mut spiced_instance = test.end();
@@ -158,7 +158,7 @@ fn construct_baseline_cfg(
         .base_payload()?
         .map(|p| p.into_iter().map(Arc::from).collect());
 
-    // No payloads implies HTTP component is OpenAI compatible. Can use `HttpComponent`.
+    // No payloads implies Http component is OpenAI compatible. Can use `HttpComponent`.
     let base_component = if base_payloads.is_none() {
         spice_component
             .clone()

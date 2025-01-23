@@ -17,6 +17,7 @@ limitations under the License.
 use octocrab::actions::ActionsHandler;
 use serde_json::Value;
 
+/// Represents a GitHub workflow to be dispatched
 pub struct GitHubWorkflow {
     pub org: String,
     pub repo: String,
@@ -35,6 +36,8 @@ impl GitHubWorkflow {
         }
     }
 
+    /// Dispatches the GitHub workflow with the provided JSON input as workflow inputs
+    /// Uses an ``ActionsHandler`` from ``octocrab`` to send the request
     pub async fn send(
         &self,
         handler: ActionsHandler<'_>,

@@ -50,17 +50,21 @@ impl From<Workflow> for TestType {
             Workflow::Throughput => TestType::Throughput,
             Workflow::Load => TestType::Load,
             Workflow::DataConsistency => TestType::DataConsistency,
-            Workflow::HttpConsistency => TestType::HTTPConsistency,
-            Workflow::HttpOverhead => TestType::HTTPOverhead,
+            Workflow::HttpConsistency => TestType::HttpConsistency,
+            Workflow::HttpOverhead => TestType::HttpOverhead,
         }
     }
 }
 
+/// Represents a single test file payload
 #[derive(Debug, Clone, Deserialize)]
 pub struct DispatchTestFile {
     pub tests: DispatchTests,
 }
 
+/// Represents the tests that can be defined in a test file
+/// The tests correspond to the different workflows that can be dispatched
+/// If a test is not defined, it will be skipped for that workflow
 #[derive(Debug, Clone, Deserialize)]
 pub struct DispatchTests {
     pub bench: Option<BenchArgs>,
@@ -69,6 +73,7 @@ pub struct DispatchTests {
     // TODO: add data consistency, http consistency, http overhead
 }
 
+/// Benchmark and throughput workflow arguments, defined in the test files
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct BenchArgs {
     pub spicepod_path: PathBuf,
@@ -78,6 +83,7 @@ pub struct BenchArgs {
     pub runner_type: RunnerType,
 }
 
+/// Load workflow arguments, defined in the test files
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct LoadArgs {
     #[serde(flatten)]
@@ -85,6 +91,7 @@ pub struct LoadArgs {
     pub duration: Option<String>,
 }
 
+/// Represents the type of runner to use in the action
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub enum RunnerType {
     #[serde(rename = "spiceai-runners")]
@@ -93,6 +100,8 @@ pub enum RunnerType {
     LargeSelfHosted,
 }
 
+/// Payload sent to the GitHub Actions workflow request for Benchmark and Throughput tests
+/// `spiced_commit` is not an eligible argument in the test files, as it is controlled by the environment
 #[derive(Debug, Clone, Serialize)]
 pub struct BenchWorkflowArgs {
     #[serde(flatten)]
@@ -100,6 +109,8 @@ pub struct BenchWorkflowArgs {
     pub spiced_commit: String,
 }
 
+/// Payload sent to the GitHub Actions workflow request for Load tests
+/// `spiced_commit` is not an eligible argument in the test files, as it is controlled by the environment
 #[derive(Debug, Clone, Serialize)]
 pub struct LoadWorkflowArgs {
     #[serde(flatten)]
