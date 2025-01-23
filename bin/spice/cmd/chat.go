@@ -17,15 +17,10 @@ limitations under the License.
 package cmd
 
 import (
-	"bufio"
-	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"log/slog"
-	"net/http"
 	"os"
-	"strings"
 	"time"
 
 	"github.com/manifoldco/promptui"
@@ -127,7 +122,7 @@ spice chat --model <model> --cloud
 			model = selectedModel
 		}
 
-		httpEndpoint, err := cmd.Flags().GetString("http-endpoint")
+		httpEndpoint, err := cmd.Flags().GetString(httpEndpointKeyFlag)
 		if err != nil {
 			slog.Error("could not get http-endpoint flag", "error", err)
 			os.Exit(1)
@@ -136,10 +131,15 @@ spice chat --model <model> --cloud
 			rtcontext.SetHttpEndpoint(httpEndpoint)
 		}
 
+		headers := []option.RequestOption{option.WithAPIKey(apiKey), option.WithBaseURL(fmt.Sprintf("%s/v1/", rtcontext.HttpEndpoint()))}
+		for key, value := range rtcontext.GetHeaders() {
+			headers = append(
+				headers,
+				option.WithHeader(key, value),
+			)
+		}
 		client := openai.NewClient(
-			option.WithBaseURL(httpEndpoint),
-			option.WithAPIKey(apiKey),
-			option.WithHeader("User-Agent", userAgent),
+			headers...,
 		)
 
 		var messages []openai.ChatCompletionMessageParamUnion
@@ -147,6 +147,7 @@ spice chat --model <model> --cloud
 		line := liner.NewLiner()
 		line.SetCtrlCAborts(true)
 		defer line.Close()
+
 		for {
 			message, err := line.Prompt("chat> ")
 			if err == liner.ErrPromptAborted {
@@ -155,14 +156,13 @@ spice chat --model <model> --cloud
 				slog.Error("reading input line", "error", err)
 				continue
 			}
+			receivedFirstChunk := make(chan bool)
+			go func() {
+				util.ShowSpinner(receivedFirstChunk)
+			}()
 
 			line.AppendHistory(message)
 			messages = append(messages, openai.UserMessage(message))
-
-			done := make(chan bool)
-			go func() {
-				util.ShowSpinner(done)
-			}()
 
 			var timeAtCompletion time.Time
 			var timeAtFirstToken time.Time
@@ -178,47 +178,44 @@ spice chat --model <model> --cloud
 					}),
 				},
 			)
-			acc := openai.ChatCompletionAccumulator{}
-			var usage openai.CompletionUsage
-			doneLoading := false
 
+			acc := openai.ChatCompletionAccumulator{}
+
+			var usage *openai.CompletionUsage
 			for stream.Next() {
 				chunk := stream.Current()
 				if timeAtFirstToken.IsZero() {
 					timeAtFirstToken = time.Now()
-					if !doneLoading {
-						done <- true
-						doneLoading = true
-					}
+					receivedFirstChunk <- true
 				}
-				acc.AddChunk(chunk)
 
-				// When this fires, the current chunk value will not contain content data
+				if chunk.Usage.TotalTokens > 0 {
+					usage = &chunk.Usage
+				}
+
+				if !acc.AddChunk(chunk) {
+					slog.Error("Cannot accumulate stream of chat data")
+					break
+				}
+
 				if content, ok := acc.JustFinishedContent(); ok {
 					messages = append(messages, openai.SystemMessage(content))
 				}
 
-				if tool, ok := acc.JustFinishedToolCall(); ok {
-					println("Tool call stream finished:", tool.Index, tool.Name, tool.Arguments)
-					// TODO: add tool call completion into `messages`.
-					//
-					println()
-				}
-
 				if refusal, ok := acc.JustFinishedRefusal(); ok {
-					fmt.Printf("Refusal: %v\n\n", refusal)
-
+					slog.Error("Refused to answer", "refusal", refusal)
 				}
 
-				println(chunk.Choices[0].Delta.Content)
+				if len(chunk.Choices) > 0 {
+					fmt.Printf(chunk.Choices[0].Delta.Content)
+				}
 			}
 
-			usage = acc.Usage
 			timeAtCompletion = time.Now()
 
-			if usage.PromptTokens > 0 && usage.CompletionTokens > 0 {
+			if usage != nil {
 				cmd.Printf("\n\n%s\n\n", generateUsageMessage(
-					&usage,
+					usage,
 					timeAtFirstToken.Sub(startTime).Abs(),
 					timeAtCompletion.Sub(timeAtFirstToken).Abs(),
 				))
@@ -238,7 +235,7 @@ spice chat --model <model> --cloud
 // ```shell
 // Time: 3.36s (first token 0.45s).
 // ```
-func generateUsageMessage(u *Usage, timeToFirst time.Duration, streamDuration time.Duration) string {
+func generateUsageMessage(u *openai.CompletionUsage, timeToFirst time.Duration, streamDuration time.Duration) string {
 	totalTime := (streamDuration + timeToFirst)
 	times := fmt.Sprintf("Time: %.2fs (first token %.2fs).", totalTime.Seconds(), timeToFirst.Seconds())
 	if u == nil {
@@ -251,54 +248,10 @@ func generateUsageMessage(u *Usage, timeToFirst time.Duration, streamDuration ti
 	)
 }
 
-func sendChatRequest(rtcontext *context.RuntimeContext, body *ChatRequestBody) (*http.Response, error) {
-	jsonBody, err := json.Marshal(body)
-	if err != nil {
-		return nil, fmt.Errorf("error marshaling request body: %w", err)
-	}
-
-	url := fmt.Sprintf("%s/v1/chat/completions", rtcontext.HttpEndpoint())
-	request, err := http.NewRequest("POST", url, bytes.NewReader(jsonBody))
-	if err != nil {
-		return nil, fmt.Errorf("error creating request: %w", err)
-	}
-
-	headers := rtcontext.GetHeaders()
-	for key, value := range headers {
-		request.Header.Set(key, value)
-	}
-	request.Header.Set("Content-Type", "application/json")
-
-	response, err := rtcontext.Client().Do(request)
-	if err != nil {
-		return nil, fmt.Errorf("error sending request: %w", err)
-	}
-
-	return response, nil
-}
-
-func maybeErrorEvent(chunk string, scanner *bufio.Scanner) (*OpenAIError, error) {
-	if strings.HasPrefix(chunk, "event: error") {
-		scanner.Scan() // read line with error message
-		errorMessage := scanner.Text()
-		errorMessage = strings.TrimPrefix(errorMessage, "data: ")
-
-		var errorResponse OpenAIErrorResponse = OpenAIErrorResponse{}
-		err := json.Unmarshal([]byte(errorMessage), &errorResponse)
-		if err != nil {
-			return nil, fmt.Errorf("failed to unmarshal: %w", err)
-		}
-
-		return &errorResponse.Error, nil
-	}
-
-	return nil, nil
-}
-
 func init() {
 	chatCmd.Flags().Bool(cloudKeyFlag, false, "Use cloud instance for chat (default: false)")
 	chatCmd.Flags().String(modelKeyFlag, "", "Model to chat with")
-	chatCmd.Flags().String(httpEndpointKeyFlag, "", "HTTP endpoint for chat (default: http://localhost:8090)")
+	chatCmd.Flags().String(httpEndpointKeyFlag, "http://localhost:8090", "HTTP endpoint for chat (default: http://localhost:8090)")
 	chatCmd.Flags().String(userAgentKeyFlag, "", "User agent to use in all requests")
 	chatCmd.Flags().String("api-key", "", "The API key to use for authentication")
 
