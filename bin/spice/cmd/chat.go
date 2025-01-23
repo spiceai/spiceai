@@ -207,7 +207,7 @@ spice chat --model <model> --cloud
 				}
 
 				if len(chunk.Choices) > 0 {
-					fmt.Printf(chunk.Choices[0].Delta.Content)
+					fmt.Printf("%s", chunk.Choices[0].Delta.Content)
 				}
 			}
 
