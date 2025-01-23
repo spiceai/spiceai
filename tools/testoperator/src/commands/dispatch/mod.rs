@@ -120,6 +120,10 @@ pub async fn dispatch(args: DispatchArgs) -> Result<()> {
         GitHubWorkflow::new("spiceai", "spiceai", test_type.workflow(), "trunk")
             .send(octo_client.actions(), Some(payload))
             .await?;
+
+        // sleep to space out runs
+        println!("Waiting for next run...");
+        tokio::time::sleep(std::time::Duration::from_secs(45)).await;
     }
 
     Ok(())
