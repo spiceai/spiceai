@@ -5,23 +5,23 @@ on:
     tags:
       - v*
     paths-ignore:
-      - '**/*.md'
-      - 'docs/**'
-      - 'README.md'
-      - 'Makefile'
-      - 'CONTRIBUTING.md'
-      - 'SECURITY.md'
-      - 'LICENSE'
-      - '.github/**'
-      - 'version.txt'
-      - '.schema/**'
-      - '.vscode/**'
-      - 'deploy/**'
-      - 'install/**'
-      - 'media/**'
-      - 'monitoring/**'
-      - 'acknowledgements.md'
-      - 'Dockerfile*'
+      - "**/*.md"
+      - "docs/**"
+      - "README.md"
+      - "Makefile"
+      - "CONTRIBUTING.md"
+      - "SECURITY.md"
+      - "LICENSE"
+      - ".github/**"
+      - "version.txt"
+      - ".schema/**"
+      - ".vscode/**"
+      - "deploy/**"
+      - "install/**"
+      - "media/**"
+      - "monitoring/**"
+      - "acknowledgements.md"
+      - "Dockerfile*"
 
   workflow_dispatch:
     inputs:
@@ -43,6 +43,7 @@ on:
           - "75"
           - "80"
           - "86"
+          - "87"
           - "89"
           - "90"
         default: "all"
@@ -80,6 +81,12 @@ jobs:
                 target_arch: "x86_64"
               },
               {
+                compute_cap: "87",
+                runner: "ubuntu-gpu-t4-4-core",
+                target_os: "linux",
+                target_arch: "x86_64"
+              },
+              {
                 compute_cap: "89",
                 runner: "ubuntu-gpu-t4-4-core",
                 target_os: "linux",
@@ -105,6 +112,12 @@ jobs:
               },
               {
                 compute_cap: "86",
+                runner: "windows-gpu-t4-4-core",
+                target_os: "windows",
+                target_arch: "x86_64"
+              },
+              {
+                compute_cap: "87",
                 runner: "windows-gpu-t4-4-core",
                 target_os: "windows",
                 target_arch: "x86_64"
@@ -162,7 +175,7 @@ jobs:
         if: matrix.target.target_os == 'windows'
         uses: actions/setup-python@v4
         with:
-          python-version: '3.x'
+          python-version: "3.x"
 
       - name: Set REL_VERSION from version.txt
         run: python3 ./.github/scripts/get_release_version.py
@@ -276,13 +289,13 @@ jobs:
           OWNER_NAME="${GITHUB_REPOSITORY%%/*}"
           REPO_NAME="${GITHUB_REPOSITORY#*/}"
           export GITHUB_TOKEN=${{ secrets.GITHUB_TOKEN }}
-          
+
           # First check if we have any files to upload
           if [ -z "$(ls -A ${ARTIFACT_DIR})" ]; then
             echo "No artifacts found in ${ARTIFACT_DIR}"
             exit 1
           fi
-          
+
           # Create an array of actual files (no globs)
           RELEASE_ARTIFACTS=()
           for file in ${ARTIFACT_DIR}/*; do
@@ -290,19 +303,19 @@ jobs:
               RELEASE_ARTIFACTS+=("$file")
             fi
           done
-          
+
           # Delete existing release artifact
           python ./.github/scripts/github_release.py delete \
             --owner $OWNER_NAME --repo $REPO_NAME \
             --tag "v${{ env.REL_VERSION }}" \
             "${RELEASE_ARTIFACTS[@]}"
-            
+
           if [ "$LATEST_RELEASE" = "true" ]; then
             export RELEASE_BODY=`cat ./docs/release_notes/v${{ env.REL_VERSION }}.md`
           else
             export RELEASE_BODY="This is the release candidate ${{ env.REL_VERSION }}"
           fi
-          
+
           echo "Uploading Spice.ai CUDA Binaries to GitHub Release"
           python ./.github/scripts/github_release.py upload \
             --owner $OWNER_NAME --repo $REPO_NAME \
