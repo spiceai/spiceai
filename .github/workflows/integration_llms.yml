@@ -10,6 +10,16 @@ on:
       - "crates/llms/**"
 
   workflow_dispatch:
+    inputs:
+      run:
+        description: "Which groups of models to run"
+        required: true
+        default: "all"
+        type: choice
+        options:
+          - "all"
+          - "hosted"
+          - "networked"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref_name }}-${{ github.ref_name == 'trunk' && github.sha || 'any-sha' }}
@@ -18,7 +28,7 @@ concurrency:
 jobs:
   build:
     name: Build Test Binary
-    runs-on: spiceai-runners
+    runs-on: [self-hosted, macOS]
     steps:
       - uses: actions/checkout@v4
 
@@ -36,7 +46,7 @@ jobs:
       # Build the test binary without running tests
       - name: Build LLMs integration test binary
         run: |
-          TEST_BINARY_PATH=$(cargo test -p llms --test integration --no-run --message-format=json | jq -r 'select(.reason == "compiler-artifact" and (.target.kind | contains(["test"])) and .executable != null) | .executable')
+          TEST_BINARY_PATH=$(cargo test -p llms --test integration --features metal --no-run --message-format=json | jq -r 'select(.reason == "compiler-artifact" and (.target.kind | contains(["test"])) and .executable != null) | .executable')
           cp $TEST_BINARY_PATH ./llms_integration_test
 
       # Upload the test binary as an artifact
@@ -47,54 +57,30 @@ jobs:
           path: ./llms_integration_test
           retention-days: 1
 
-  test:
-    name: LLMs Integration Tests
+  test-hosted:
+    name: Self-hosted LLMs Integration Tests
     needs: build
     permissions: read-all
+    if: ${{ github.event_name == 'push' || github.event.inputs.run == 'all' || github.event.inputs.run == 'hosted' }}
+    runs-on: [self-hosted, macOS]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run hosted integration tests
+        uses: ./.github/actions/run-integration-tests
+        with:
+          model_allowlist: "local_phi3,hf_phi3"
+          networked: "false"
+
+  test-networked:
+    name: Networked LLMs Integration Tests
+    needs: build
+    permissions: read-all
+    if: ${{ github.event_name == 'push' || github.event.inputs.run == 'all' || github.event.inputs.run == 'networked' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Set up Rust
-        uses: ./.github/actions/setup-rust
+      - name: Run networked integration tests
+        uses: ./.github/actions/run-integration-tests
         with:
-          os: "linux"
-
-      # Download the test binary artifact
-      - name: Download test binary
-        uses: actions/download-artifact@v4
-        with:
-          name: llms-integration-test-binary
-          path: ./integration_test
-
-      - name: Mark test binary as executable
-        run: |
-          chmod +x ./integration_test/llms_integration_test
-
-      - name: Set up .env file
-        run: |
-          echo 'SPICE_OPENAI_API_KEY="${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}"' > .env
-          echo 'SPICE_ANTHROPIC_API_KEY="${{ secrets.SPICE_SECRET_ANTHROPIC_API_KEY }}"' >> .env
-          echo 'SPICE_XAI_API_KEY="${{ secrets.SPICE_SECRET_XAI_API_KEY }}"' >> .env
-
-        # Don't run local models in the integration test yet.
-      - name: Run integration test
-        env:
-          SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
-          SPICE_SECRET_ANTHROPIC_API_KEY: ${{ secrets.SPICE_SECRET_ANTHROPIC_API_KEY }}
-          SPICE_SECRET_XAI_API_KEY: ${{ secrets.SPICE_SECRET_XAI_API_KEY }}
-        run: |
-          if [ -z "$SPICE_SECRET_OPENAI_API_KEY" ] ; then
-            echo "Error: OpenAI API key is not defined."
-            exit 1
-          fi
-          if [ -z "$SPICE_SECRET_ANTHROPIC_API_KEY" ] ; then
-            echo "Error: Anthropic API key is not defined."
-            exit 1
-          fi
-          if [ -z "$SPICE_SECRET_XAI_API_KEY" ] ; then
-            echo "Error: xAI API key is not defined."
-            exit 1
-          fi
-          export MODEL_SKIPLIST="hf_phi3,local_phi3"
-          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" ./integration_test/llms_integration_test --nocapture
+          model_allowlist: "anthropic,openai,xai"
+          networked: "true"
