@@ -14,13 +14,11 @@ runs:
   steps:
     - name: Set up Rust
       uses: ./.github/actions/setup-rust
-      shell: bash
       with:
         os: "linux"
 
     - name: Download test binary
       uses: actions/download-artifact@v4
-      shell: bash
       with:
         name: llms-integration-test-binary
         path: ./integration_test
@@ -29,20 +27,8 @@ runs:
       shell: bash
       run: chmod +x ./integration_test/llms_integration_test
 
-    - name: Set up .env file (if networked)
-      if: ${{ inputs.networked == 'true' }}
-      shell: bash
-      run: |
-        echo 'SPICE_OPENAI_API_KEY="${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}"' > .env
-        echo 'SPICE_ANTHROPIC_API_KEY="${{ secrets.SPICE_SECRET_ANTHROPIC_API_KEY }}"' >> .env
-        echo 'SPICE_XAI_API_KEY="${{ secrets.SPICE_SECRET_XAI_API_KEY }}"' >> .env
-
     - name: Run integration test
       shell: bash
-      env:
-        SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
-        SPICE_SECRET_ANTHROPIC_API_KEY: ${{ secrets.SPICE_SECRET_ANTHROPIC_API_KEY }}
-        SPICE_SECRET_XAI_API_KEY: ${{ secrets.SPICE_SECRET_XAI_API_KEY }}
       run: |
         if [ "${{ inputs.networked }}" == "true" ]; then
           if [ -z "$SPICE_SECRET_OPENAI_API_KEY" ]; then
