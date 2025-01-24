@@ -1,0 +1,17 @@
+tests:
+  bench:
+    spicepod_path: ./test/spicepods/tpcds/snowflake_sf1.yaml
+    query_set: tpcds
+    query_overrides: snowflake
+    runner_type: spiceai-runners
+  throughput:
+    spicepod_path: ./test/spicepods/tpcds/snowflake_sf1.yaml
+    query_set: tpcds
+    query_overrides: snowflake
+    runner_type: spiceai-runners
+  load:
+    spicepod_path: ./test/spicepods/tpcds/snowflake_sf1.yaml
+    query_set: tpcds
+    query_overrides: snowflake
+    runner_type: spiceai-runners
+    duration: 28800
