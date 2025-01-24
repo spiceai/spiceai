@@ -131,8 +131,6 @@ func cleanupOldBinaries() {
 }
 
 func upgradeCli(force bool, rtcontext *context.RuntimeContext) bool {
-	slog.Info(fmt.Sprintf("Current version.", version.Version()))
-
 	slog.Info("Checking for latest Spice CLI release...")
 	release, err := github.GetLatestCliRelease()
 	if err != nil {
@@ -219,9 +217,6 @@ func upgradeCli(force bool, rtcontext *context.RuntimeContext) bool {
 	os.RemoveAll(tmpDir)
 
 	slog.Info(fmt.Sprintf("Spice.ai CLI upgraded to %s successfully.", release.TagName))
-
-	execArgs := []string{releaseFilePath}
-	execArgs = append(execArgs, os.Args[1:]...)
 
 	if err := restartWithNewCli(releaseFilePath, os.Args); err != nil {
 		slog.Error("restarting CLI", "error", err)
