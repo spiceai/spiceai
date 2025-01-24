@@ -63,6 +63,11 @@ spice upgrade
 			}
 		}
 
+		// Cleanup old binaries on windows
+		if runtime.GOOS == "windows" {
+			cleanupOldBinaries()
+		}
+
 		runtimeUpgradeRequired, err := rtcontext.IsRuntimeUpgradeAvailable()
 		if err != nil {
 			slog.Error("checking for runtime upgrade", "error", err)
@@ -72,11 +77,6 @@ spice upgrade
 		if runtimeUpgradeRequired == "" {
 			// Exit if no runtime upgrade is required
 			return
-		}
-
-		// Cleanup old binaries on windows
-		if runtime.GOOS == "windows" {
-			cleanupOldBinaries()
 		}
 
 		// For runtime upgrades, default to the flavor that was installed previously.
