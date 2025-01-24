@@ -40,25 +40,16 @@ impl QuerySet {
     }
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy)]
 pub enum QueryOverrides {
-    #[serde(rename = "sqlite")]
     SQLite,
-    #[serde(rename = "postgres")]
     PostgreSQL,
-    #[serde(rename = "mysql")]
     MySQL,
-    #[serde(rename = "dremio")]
     Dremio,
-    #[serde(rename = "spark")]
     Spark,
-    #[serde(rename = "odbc-athena")]
     ODBCAthena,
-    #[serde(rename = "duckdb")]
     DuckDB,
-    #[serde(rename = "snowflake")]
     Snowflake,
-    #[serde(rename = "iceberg-sf1")]
     IcebergSF1,
 }
 

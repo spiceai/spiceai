@@ -17,10 +17,9 @@ limitations under the License.
 use clap::{Parser, ValueEnum};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use test_framework::{
-    queries::{QueryOverrides, QuerySet},
-    TestType,
-};
+use test_framework::{queries::QuerySet, TestType};
+
+use super::dataset::QueryOverridesArg;
 
 #[derive(Parser, Debug, Clone)]
 pub struct DispatchArgs {
@@ -78,7 +77,7 @@ pub struct DispatchTests {
 pub struct BenchArgs {
     pub spicepod_path: PathBuf,
     pub query_set: QuerySet,
-    pub query_overrides: Option<QueryOverrides>,
+    pub query_overrides: Option<QueryOverridesArg>,
     pub ready_wait: Option<String>, // GH workflow inputs require strings, not numbers
     pub runner_type: RunnerType,
 }
