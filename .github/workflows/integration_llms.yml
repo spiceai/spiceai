@@ -35,13 +35,7 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
         with:
-          os: "linux"
-
-      - name: Set up make
-        uses: ./.github/actions/setup-make
-
-      - name: Set up cc
-        uses: ./.github/actions/setup-cc
+          os: "darwin"
 
       # Build the test binary without running tests
       - name: Build LLMs integration test binary
