@@ -22,8 +22,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -114,6 +116,25 @@ func cleanupOldBinaries() {
 		return
 	}
 
+	// Get parent PID
+	ppidStr := os.Getenv("SPICE_UPGRADE_PARENT_PID")
+	ppid, err := strconv.Atoi(ppidStr)
+	if err != nil {
+		return
+	}
+
+	// Wait for parent to exit
+	process, err := os.FindProcess(ppid)
+	if err == nil {
+		for {
+			if err := process.Signal(syscall.Signal(0)); err != nil {
+				break
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+	}
+
+	// Cleanup old binaries
 	entries, err := os.ReadDir(os.TempDir())
 	if err != nil {
 		return
@@ -218,7 +239,9 @@ func upgradeCli(force bool, rtcontext *context.RuntimeContext) bool {
 
 	slog.Info(fmt.Sprintf("Spice.ai CLI upgraded to %s successfully.", release.TagName))
 
-	if err := restartWithNewCli(releaseFilePath, os.Args); err != nil {
+	execArgs := []string{releaseFilePath}
+	execArgs = append(execArgs, os.Args[1:]...)
+	if err := restartWithNewCli(releaseFilePath, execArgs); err != nil {
 		slog.Error("restarting CLI", "error", err)
 	}
 
@@ -226,22 +249,44 @@ func upgradeCli(force bool, rtcontext *context.RuntimeContext) bool {
 }
 
 func restartWithNewCli(cliPath string, args []string) error {
-	// Execute the new binary with the same arguments
-	cmd := exec.Command(cliPath, args[1:]...)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	cmd.Stdin = os.Stdin
-	cmd.Env = append(os.Environ(), fmt.Sprintf("%s=true", reloadEnvVar))
+	// windows: Start process with new cli, terminate the current process
+	if runtime.GOOS == "windows" {
+		cmd := exec.Command(cliPath, args[1:]...)
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		cmd.Stdin = os.Stdin
+		cmd.Env = append(os.Environ(), fmt.Sprintf("%s=true", reloadEnvVar), fmt.Sprintf("SPICE_UPGRADE_PARENT_PID=%d", os.Getpid()))
 
-	err := cmd.Run()
-	if err != nil {
-		return err
+		if err := cmd.Start(); err != nil {
+			return err
+		}
+
+		os.Exit(0)
+		return nil
 	}
 
-	// Terminate old cli process
-	os.Exit(0)
-	return nil
+	// unix: Replace the current process with the new cli
+	execEnv := append(os.Environ(), fmt.Sprintf("%s=true", reloadEnvVar))
+	return syscall.Exec(cliPath, args, execEnv)
 }
+
+// func restartWithNewCli(cliPath string, args []string) error {
+// 	// Execute the new binary with the same arguments
+// 	cmd := exec.Command(cliPath, args[1:]...)
+// 	cmd.Stdout = os.Stdout
+// 	cmd.Stderr = os.Stderr
+// 	cmd.Stdin = os.Stdin
+// 	cmd.Env = append(os.Environ(), fmt.Sprintf("%s=true", reloadEnvVar))
+
+// 	err := cmd.Run()
+// 	if err != nil {
+// 		return err
+// 	}
+
+// 	// Terminate old cli process
+// 	os.Exit(0)
+// 	return nil
+// }
 
 func init() {
 	upgradeCmd.Flags().BoolP("force", "f", false, "Force upgrade to the latest released version")
