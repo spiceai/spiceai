@@ -1,6 +1,8 @@
 name: testoperator dispatch
 
 on:
+  schedule:
+    - cron: '10 20 * * *' # 10 mins after the hour to avoid GitHub high load delays 8:10pm UTC / 5:10am KST / 6:10am AEST
   workflow_dispatch:
     inputs:
       test_files_path:
@@ -41,11 +43,28 @@ jobs:
       - name: Build Testoperator
         uses: ./.github/actions/build-testoperator
       
-      - name: Dispatch Testoperator - ${{ github.event.inputs.workflow_type }}
+      - name: Dispatch Testoperator - Input
+        if: ${{ github.event_name == 'workflow_dispatch' }}
         run: |
           testoperator dispatch \
             ${{ github.event.inputs.test_files_path }} \
             --workflow ${{ github.event.inputs.workflow_type }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
+      
+      - name: Dispatch Testoperator - Scheduled Bench
+        if: ${{ github.event_name == 'schedule' }}
+        run: |
+          testoperator dispatch ./tools/testoperator/dispatch --workflow bench
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
+      
+      - name: Dispatch Testoperator - Scheduled Throughput
+        if: ${{ github.event_name == 'schedule' }}
+        run: |
+          testoperator dispatch ./tools/testoperator/dispatch --workflow throughput
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
