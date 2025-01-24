@@ -21,8 +21,10 @@ import (
 )
 
 const (
-	DotSpice               = ".spice"
-	SpicePodsDirectoryName = "spicepods"
+	DotSpice                  = ".spice"
+	SpicePodsDirectoryName    = "spicepods"
+	SpiceUpgradeReloadEnv     = "SPICE_CLI_RESTARTED"
+	SpiceCliCleanupMarkerFile = "cleanup.marker"
 )
 
 var (

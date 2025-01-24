@@ -20,7 +20,6 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -34,11 +33,6 @@ import (
 	"github.com/spiceai/spiceai/bin/spice/pkg/github"
 	"github.com/spiceai/spiceai/bin/spice/pkg/util"
 	"github.com/spiceai/spiceai/bin/spice/pkg/version"
-)
-
-const (
-	reloadEnvVar      = "SPICE_CLI_RESTARTED"
-	cleanupMarkerFile = "cleanup.marker"
 )
 
 var upgradeCmd = &cobra.Command{
@@ -61,12 +55,27 @@ spice upgrade
 			os.Exit(1)
 		}
 
-		if os.Getenv(reloadEnvVar) != "true" {
+		if os.Getenv(constants.SpiceUpgradeReloadEnv) != "true" {
 			// Run CLI upgrade
 			if !upgradeCli(force, rtcontext) {
+				// Exit if CLI upgrade fail
 				return
 			}
-		} else {
+		}
+
+		runtimeUpgradeRequired, err := rtcontext.IsRuntimeUpgradeAvailable()
+		if err != nil {
+			slog.Error("checking for runtime upgrade", "error", err)
+			return
+		}
+
+		if runtimeUpgradeRequired == "" {
+			// Exit if no runtime upgrade is required
+			return
+		}
+
+		// Cleanup old binaries on windows
+		if runtime.GOOS == "windows" {
 			cleanupOldBinaries()
 		}
 
@@ -106,7 +115,7 @@ func createCleanupInfo() *cleanupInfo {
 	tmpDir := filepath.Join(os.TempDir(), fmt.Sprintf("spice-%d", time.Now().UnixNano()))
 	return &cleanupInfo{
 		tmpDir:     tmpDir,
-		markerPath: filepath.Join(tmpDir, cleanupMarkerFile),
+		markerPath: filepath.Join(tmpDir, constants.SpiceCliCleanupMarkerFile),
 		oldBinary:  filepath.Join(tmpDir, constants.SpiceCliFilename),
 	}
 }
@@ -114,24 +123,6 @@ func createCleanupInfo() *cleanupInfo {
 func cleanupOldBinaries() {
 	if !util.IsWindows() {
 		return
-	}
-
-	// Get parent PID
-	ppidStr := os.Getenv("SPICE_UPGRADE_PARENT_PID")
-	ppid, err := strconv.Atoi(ppidStr)
-	if err != nil {
-		return
-	}
-
-	// Wait for parent to exit
-	process, err := os.FindProcess(ppid)
-	if err == nil {
-		for {
-			if err := process.Signal(syscall.Signal(0)); err != nil {
-				break
-			}
-			time.Sleep(100 * time.Millisecond)
-		}
 	}
 
 	// Cleanup old binaries
@@ -143,7 +134,7 @@ func cleanupOldBinaries() {
 	for _, entry := range entries {
 		if entry.IsDir() && strings.HasPrefix(entry.Name(), "spice-") {
 			tmpDir := filepath.Join(os.TempDir(), entry.Name())
-			markerPath := filepath.Join(tmpDir, cleanupMarkerFile)
+			markerPath := filepath.Join(tmpDir, constants.SpiceCliCleanupMarkerFile)
 			if _, err := os.Stat(markerPath); err == nil {
 				_ = os.RemoveAll(tmpDir)
 			}
@@ -151,6 +142,9 @@ func cleanupOldBinaries() {
 	}
 }
 
+// Upgrade CLI
+// Returns true if the CLI was upgraded successfully / no upgrade was required
+// Returns false if the upgrade failed
 func upgradeCli(force bool, rtcontext *context.RuntimeContext) bool {
 	slog.Info("Checking for latest Spice CLI release...")
 	release, err := github.GetLatestCliRelease()
@@ -160,16 +154,9 @@ func upgradeCli(force bool, rtcontext *context.RuntimeContext) bool {
 	}
 
 	cliVersion := version.Version()
-
-	runtimeUpgradeRequired, err := rtcontext.IsRuntimeUpgradeAvailable()
-	if err != nil {
-		slog.Error("checking for runtime upgrade", "error", err)
-		return false
-	}
-
-	if cliVersion == release.TagName && runtimeUpgradeRequired != "" && !force {
+	if cliVersion == release.TagName && !force {
 		slog.Info(fmt.Sprintf("Using the latest version %s. No upgrade required.", release.TagName))
-		return false
+		return true
 	}
 
 	assetName := github.GetAssetName(constants.SpiceCliFilename)
@@ -249,26 +236,14 @@ func upgradeCli(force bool, rtcontext *context.RuntimeContext) bool {
 }
 
 func restartWithNewCli(cliPath string, args []string) error {
-	// windows: Start process with new cli, terminate the current process
+	// windows: Prompt the user to restart the CLI
 	if runtime.GOOS == "windows" {
-		cmd := exec.Command(cliPath, args[1:]...)
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		cmd.Stdin = os.Stdin
-		cmd.Env = append(os.Environ(), fmt.Sprintf("%s=true", reloadEnvVar), fmt.Sprintf("SPICE_UPGRADE_PARENT_PID=%d", os.Getpid()))
-		// Set parent to terminal process
-		launchCmd(cmd)
-
-		if err := cmd.Start(); err != nil {
-			return err
-		}
-
-		os.Exit(0)
+		slog.Info("Please rerun the `spice upgrade` command to finish the runtime upgrade.")
 		return nil
 	}
 
 	// unix: Replace the current process with the new cli
-	execEnv := append(os.Environ(), fmt.Sprintf("%s=true", reloadEnvVar))
+	execEnv := append(os.Environ(), fmt.Sprintf("%s=true", constants.SpiceUpgradeReloadEnv))
 	return syscall.Exec(cliPath, args, execEnv)
 }
 
