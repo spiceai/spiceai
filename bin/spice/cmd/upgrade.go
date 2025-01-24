@@ -256,6 +256,8 @@ func restartWithNewCli(cliPath string, args []string) error {
 		cmd.Stderr = os.Stderr
 		cmd.Stdin = os.Stdin
 		cmd.Env = append(os.Environ(), fmt.Sprintf("%s=true", reloadEnvVar), fmt.Sprintf("SPICE_UPGRADE_PARENT_PID=%d", os.Getpid()))
+		// Set parent to terminal process
+		launchCmd(cmd)
 
 		if err := cmd.Start(); err != nil {
 			return err
@@ -269,24 +271,6 @@ func restartWithNewCli(cliPath string, args []string) error {
 	execEnv := append(os.Environ(), fmt.Sprintf("%s=true", reloadEnvVar))
 	return syscall.Exec(cliPath, args, execEnv)
 }
-
-// func restartWithNewCli(cliPath string, args []string) error {
-// 	// Execute the new binary with the same arguments
-// 	cmd := exec.Command(cliPath, args[1:]...)
-// 	cmd.Stdout = os.Stdout
-// 	cmd.Stderr = os.Stderr
-// 	cmd.Stdin = os.Stdin
-// 	cmd.Env = append(os.Environ(), fmt.Sprintf("%s=true", reloadEnvVar))
-
-// 	err := cmd.Run()
-// 	if err != nil {
-// 		return err
-// 	}
-
-// 	// Terminate old cli process
-// 	os.Exit(0)
-// 	return nil
-// }
 
 func init() {
 	upgradeCmd.Flags().BoolP("force", "f", false, "Force upgrade to the latest released version")
