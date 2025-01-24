@@ -60,7 +60,6 @@ runs:
 
     - name: Verify CUDA prerequisites
       run: |
-        nvidia-smi
         nvcc --version
       shell: ${{ env.SHELL }}
 
