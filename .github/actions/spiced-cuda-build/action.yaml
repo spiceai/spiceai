@@ -68,7 +68,7 @@ runs:
           "cp /usr/local/cuda-${{ env.CUDA_VERSION_MM }}/lib64/libcurand.so* ."
           "tar czf spiced_models_cuda_${{ inputs.cuda-compute-capability }}_${{ inputs.artifact-tag }}.tar.gz spiced lib*.so*"
         )
-        echo "PACKAGE_CMD=${commands[*]}" >> $GITHUB_ENV
+        echo "PACKAGE_CMD=$(IFS=" && "; echo "${commands[*]}")" >> $GITHUB_ENV
       shell: bash
 
     - name: Install CUDA Toolkit (Linux)
