@@ -64,73 +64,73 @@ jobs:
             const matrix = [
               {
                 compute_cap: "75",
-                runner: "ubuntu-gpu-t4-4-core",
+                runner: "spiceai-large-runners",
                 target_os: "linux",
                 target_arch: "x86_64"
               },
               {
                 compute_cap: "80",
-                runner: "ubuntu-gpu-t4-4-core",
+                runner: "spiceai-large-runners",
                 target_os: "linux",
                 target_arch: "x86_64"
               },
               {
                 compute_cap: "86",
-                runner: "ubuntu-gpu-t4-4-core",
+                runner: "spiceai-large-runners",
                 target_os: "linux",
                 target_arch: "x86_64"
               },
               {
                 compute_cap: "87",
-                runner: "ubuntu-gpu-t4-4-core",
+                runner: "spiceai-large-runners",
                 target_os: "linux",
                 target_arch: "x86_64"
               },
               {
                 compute_cap: "89",
-                runner: "ubuntu-gpu-t4-4-core",
+                runner: "spiceai-large-runners",
                 target_os: "linux",
                 target_arch: "x86_64"
               },
               {
                 compute_cap: "90",
-                runner: "ubuntu-gpu-t4-4-core",
+                runner: "spiceai-large-runners",
                 target_os: "linux",
                 target_arch: "x86_64"
               },
               {
                 compute_cap: "75",
-                runner: "windows-gpu-t4-4-core",
+                runner: "windows-latest",
                 target_os: "windows",
                 target_arch: "x86_64"
               },
               {
                 compute_cap: "80",
-                runner: "windows-gpu-t4-4-core",
+                runner: "windows-latest",
                 target_os: "windows",
                 target_arch: "x86_64"
               },
               {
                 compute_cap: "86",
-                runner: "windows-gpu-t4-4-core",
+                runner: "windows-latest",
                 target_os: "windows",
                 target_arch: "x86_64"
               },
               {
                 compute_cap: "87",
-                runner: "windows-gpu-t4-4-core",
+                runner: "windows-latest",
                 target_os: "windows",
                 target_arch: "x86_64"
               },
               {
                 compute_cap: "89",
-                runner: "windows-gpu-t4-4-core",
+                runner: "windows-latest",
                 target_os: "windows",
                 target_arch: "x86_64"
               },
               {
                 compute_cap: "90",
-                runner: "windows-gpu-t4-4-core",
+                runner: "windows-latest",
                 target_os: "windows",
                 target_arch: "x86_64"
               }
@@ -170,22 +170,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # The `windows-gpu-t4-4-core` does not have Python installed
-      - name: Set up Python3
-        if: matrix.target.target_os == 'windows'
-        uses: actions/setup-python@v4
-        with:
-          python-version: "3.x"
-
       - name: Set REL_VERSION from version.txt
         run: python3 ./.github/scripts/get_release_version.py
 
-      # The `windows-gpu-t4-4-core` does not have modern PowerShell installed
-      - name: Install PowerShell
-        if: matrix.target.target_os == 'windows'
-        uses: ./.github/actions/install-pwsh
-
-      # The `windows-gpu-t4-4-core` requires Visual Studio Build Tools
       - name: Install Visual Studio Build Tools
         if: matrix.target.target_os == 'windows'
         uses: ./.github/actions/install-vs-buildtools
@@ -194,6 +181,10 @@ jobs:
         uses: ./.github/actions/setup-rust
         with:
           os: ${{ matrix.target.target_os }}
+
+      - name: Set up wget
+        if: matrix.target.target_os == 'linux'
+        run: sudo apt-get update && sudo apt-get install wget -y
 
       - name: Set up make
         if: matrix.target.target_os == 'linux' || matrix.target.runner == 'windows-gpu-t4-4-core'
