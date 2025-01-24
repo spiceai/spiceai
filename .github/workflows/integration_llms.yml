@@ -70,7 +70,7 @@ jobs:
     needs: build
     permissions: read-all
     if: ${{ github.event_name == 'push' || github.event.inputs.run == 'all' || github.event.inputs.run == 'networked' }}
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, macOS]
     steps:
       - uses: actions/checkout@v4
       - name: Run networked integration tests
