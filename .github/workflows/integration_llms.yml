@@ -60,7 +60,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Run hosted integration tests
-        uses: ./.github/actions/run-integration-tests
+        uses: ./.github/actions/run-llm-integration-tests
         with:
           model_allowlist: "local_phi3,hf_phi3"
           networked: "false"
@@ -74,7 +74,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Run networked integration tests
-        uses: ./.github/actions/run-integration-tests
+        uses: ./.github/actions/run-llm-integration-tests
         with:
           model_allowlist: "anthropic,openai,xai"
           networked: "true"
