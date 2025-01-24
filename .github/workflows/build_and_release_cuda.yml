@@ -173,6 +173,10 @@ jobs:
       - name: Set REL_VERSION from version.txt
         run: python3 ./.github/scripts/get_release_version.py
 
+      - name: Install Visual Studio Build Tools
+        if: matrix.target.target_os == 'windows'
+        uses: ./.github/actions/install-vs-buildtools
+
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
         with:
