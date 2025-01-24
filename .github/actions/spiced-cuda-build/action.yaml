@@ -59,13 +59,18 @@ runs:
       run: |
         echo "SHELL=bash" >> $GITHUB_ENV
         echo "BUILD_CMD=make -C bin/spiced SPICED_NON_DEFAULT_FEATURES='models,cuda'" >> $GITHUB_ENV
-        echo 'PACKAGE_CMD=mv target/release/spiced spiced && \
-          chmod +x spiced && \
-          cp /usr/local/cuda-${{ env.CUDA_VERSION_MM }}/lib64/libcudart.so* . && \
-          cp /usr/local/cuda-${{ env.CUDA_VERSION_MM }}/lib64/libcublas.so* . && \
-          cp /usr/local/cuda-${{ env.CUDA_VERSION_MM }}/lib64/libcublasLt.so* . && \
-          cp /usr/local/cuda-${{ env.CUDA_VERSION_MM }}/lib64/libcurand.so* . && \
-          tar czf spiced_models_cuda_${{ inputs.cuda-compute-capability }}_${{ inputs.artifact-tag }}.tar.gz spiced lib*.so*' >> $GITHUB_ENV
+        {
+          echo "PACKAGE_CMD=$(cat <<'EOF'
+            mv target/release/spiced spiced &&
+            chmod +x spiced &&
+            cp /usr/local/cuda-${{ env.CUDA_VERSION_MM }}/lib64/libcudart.so* . &&
+            cp /usr/local/cuda-${{ env.CUDA_VERSION_MM }}/lib64/libcublas.so* . &&
+            cp /usr/local/cuda-${{ env.CUDA_VERSION_MM }}/lib64/libcublasLt.so* . &&
+            cp /usr/local/cuda-${{ env.CUDA_VERSION_MM }}/lib64/libcurand.so* . &&
+            tar czf spiced_models_cuda_${{ inputs.cuda-compute-capability }}_${{ inputs.artifact-tag }}.tar.gz spiced lib*.so*
+          EOF
+          )" | tr '\n' ' '
+        } >> $GITHUB_ENV
       shell: bash
 
     - name: Install CUDA Toolkit (Linux)
