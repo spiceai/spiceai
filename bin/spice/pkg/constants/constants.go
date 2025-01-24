@@ -23,7 +23,7 @@ import (
 const (
 	DotSpice                  = ".spice"
 	SpicePodsDirectoryName    = "spicepods"
-	SpiceUpgradeReloadEnv     = "SPICE_CLI_RESTARTED"
+	SpiceUpgradeReloadEnv     = "SPICE_CLI_RESTARTED_AFTER_UPGRADE"
 	SpiceCliCleanupMarkerFile = "cleanup.marker"
 )
 
