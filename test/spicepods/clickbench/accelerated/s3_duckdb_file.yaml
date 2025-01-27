@@ -1,0 +1,16 @@
+version: v1
+kind: Spicepod
+name: s3_clickbench_duckdb_file
+datasets:
+  - from: s3://benchmarks/clickbench/hits/
+    name: hits
+    params:
+      file_format: parquet
+      allow_http: true
+      s3_auth: key
+      s3_endpoint: ${secrets:S3_ENDPOINT}
+      s3_key: ${secrets:S3_KEY}
+      s3_secret: ${secrets:S3_SECRET}
+    acceleration:
+      engine: duckdb
+      mode: file

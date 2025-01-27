@@ -40,7 +40,6 @@ on:
         type: choice
         options:
           - "all"
-          - "75"
           - "80"
           - "86"
           - "87"
@@ -62,12 +61,6 @@ jobs:
         with:
           script: |
             const matrix = [
-              {
-                compute_cap: "75",
-                runner: "spiceai-large-runners",
-                target_os: "linux",
-                target_arch: "x86_64"
-              },
               {
                 compute_cap: "80",
                 runner: "spiceai-large-runners",
@@ -96,12 +89,6 @@ jobs:
                 compute_cap: "90",
                 runner: "spiceai-large-runners",
                 target_os: "linux",
-                target_arch: "x86_64"
-              },
-              {
-                compute_cap: "75",
-                runner: "windows-latest",
-                target_os: "windows",
                 target_arch: "x86_64"
               },
               {

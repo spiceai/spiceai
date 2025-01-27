@@ -60,3 +60,17 @@ impl GitHubWorkflow {
         Ok(())
     }
 }
+
+#[must_use]
+pub fn map_numbers_to_strings(mut payload: Value) -> Value {
+    // GitHub Actions cannot be called with number types in arguments, so they must be converted to strings
+    if let serde_json::Value::Object(ref mut map) = payload {
+        map.values_mut().for_each(|v| {
+            if let serde_json::Value::Number(n) = v {
+                *v = serde_json::Value::String(n.to_string());
+            }
+        });
+    }
+
+    payload
+}

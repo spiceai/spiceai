@@ -17,10 +17,9 @@ limitations under the License.
 use clap::{Parser, ValueEnum};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use test_framework::{
-    queries::{QueryOverrides, QuerySet},
-    TestType,
-};
+use test_framework::{queries::QuerySet, TestType};
+
+use super::dataset::QueryOverridesArg;
 
 #[derive(Parser, Debug, Clone)]
 pub struct DispatchArgs {
@@ -78,8 +77,8 @@ pub struct DispatchTests {
 pub struct BenchArgs {
     pub spicepod_path: PathBuf,
     pub query_set: QuerySet,
-    pub query_overrides: Option<QueryOverrides>,
-    pub ready_wait: Option<String>, // GH workflow inputs require strings, not numbers
+    pub query_overrides: Option<QueryOverridesArg>,
+    pub ready_wait: Option<u64>,
     pub runner_type: RunnerType,
 }
 
@@ -88,7 +87,7 @@ pub struct BenchArgs {
 pub struct LoadArgs {
     #[serde(flatten)]
     pub bench_args: BenchArgs,
-    pub duration: Option<String>,
+    pub duration: Option<u64>,
 }
 
 /// Represents the type of runner to use in the action
