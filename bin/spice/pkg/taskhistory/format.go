@@ -68,6 +68,7 @@ func printTree(w io.Writer, node *TreeNode, indent string, isLast bool, fn func(
 	if indent == "" {
 		connector = ""
 	}
+
 	fmt.Fprintf(w, "%s%s[%s] %s\n", indent, connector, node.TaskHistory.SpanID, fn(&node.TaskHistory))
 
 	// Recurse for children

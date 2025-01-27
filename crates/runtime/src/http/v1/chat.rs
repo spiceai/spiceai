@@ -22,7 +22,10 @@ use crate::{http::traceparent::override_task_history_with_traceparent, model::LL
 use async_openai::types::CreateChatCompletionResponse;
 use async_openai::{
     error::OpenAIError,
-    types::{ChatCompletionResponseStream, CreateChatCompletionRequest},
+    types::{
+        ChatChoice, ChatCompletionResponseMessage, ChatCompletionResponseStream,
+        CreateChatCompletionRequest,
+    },
 };
 use async_stream::stream;
 use axum::{
@@ -134,13 +137,15 @@ pub(crate) async fn post(
                 } else {
                     match model.chat_request(req).await {
                         Ok(response) => {
-                            let preview = response
+                            if let Some(ChatChoice{message: ChatCompletionResponseMessage{
+                                content: Some(content),..
+                            },..}) = response
                                 .choices
-                                .first()
-                                .map(|s| serde_json::to_string(s).unwrap_or_default())
-                                .unwrap_or_default();
+                                .first() {
+                                    tracing::info!(target: "task_history", parent: &span_clone, captured_output = %content);
+                                }
+                                tracing::info!(target: "task_history", parent: &span_clone,  id = %response.id, "labels");
 
-                            tracing::info!(target: "task_history", parent: &span_clone, captured_output = %preview);
                             Json(response).into_response()
                         }
                         Err(e) => {
@@ -167,9 +172,13 @@ fn create_sse_response(
 ) -> Response {
     Sse::new(Box::pin(stream! {
         let mut chat_output = String::new();
+        let mut id: Option<String> = None;
         while let Some(msg) = strm.next().instrument(span.clone()).await {
             match msg {
                 Ok(resp) => {
+                    if id.is_none() {
+                        id = Some(resp.id.clone());
+                    }
                     if let Some(choice) = resp.choices.first() {
                         if let Some(intermediate_chat_output) = &choice.delta.content {
                             chat_output.push_str(intermediate_chat_output);
@@ -189,6 +198,9 @@ fn create_sse_response(
             }
         };
         tracing::info!(target: "task_history", parent: &span, captured_output = %chat_output);
+        if let Some(id) = id {
+            tracing::info!(target: "task_history", parent: &span, id = %id, "labels");
+        }
         drop(span);
     }))
     .keep_alive(KeepAlive::new().interval(keep_alive_interval))
