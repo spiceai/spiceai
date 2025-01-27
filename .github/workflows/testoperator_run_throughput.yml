@@ -97,9 +97,9 @@ jobs:
             --disable-progress-bars \
             --concurrency 8
         env:
-          S3_ENDPOINT: ${{ secrets.CLICKBENCH_S3_ENDPOINT}}
-          S3_KEY: ${{ secrets.CLICKBENCH_S3_KEY}}
-          S3_SECRET: ${{ secrets.CLICKBENCH_S3_SECRET}}
+          S3_ENDPOINT: ${{ secrets.MINIO_ENDPOINT}}
+          S3_KEY: ${{ secrets.MINIO_ACCESS_KEY}}
+          S3_SECRET: ${{ secrets.MINIO_SECRET_KEY}}
           DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
           DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
           DATABRICKS_ENDPOINT: ${{ secrets.DATABRICKS_ENDPOINT }}
@@ -136,9 +136,9 @@ jobs:
             --query-overrides ${{ github.event.inputs.query_overrides }} \
             --concurrency 8
         env:
-          S3_ENDPOINT: ${{ secrets.CLICKBENCH_S3_ENDPOINT}}
-          S3_KEY: ${{ secrets.CLICKBENCH_S3_KEY}}
-          S3_SECRET: ${{ secrets.CLICKBENCH_S3_SECRET}}
+          S3_ENDPOINT: ${{ secrets.MINIO_ENDPOINT}}
+          S3_KEY: ${{ secrets.MINIO_ACCESS_KEY}}
+          S3_SECRET: ${{ secrets.MINIO_SECRET_KEY}}
           DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
           DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
           DATABRICKS_ENDPOINT: ${{ secrets.DATABRICKS_ENDPOINT }}
