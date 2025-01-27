@@ -1,9 +1,6 @@
 name: testoperator dispatch
 
 on:
-  schedule:
-    - cron: '10 18 * * *' # 10 mins after the hour to avoid GitHub high load delays 6:10pm UTC / 3:10am KST / 4:10am AEST
-    - cron: '10 20 */3 * *' # every third day, run a throughput test 8:10pm UTC / 5:10am KST / 6:10am AEST
   workflow_dispatch:
     inputs:
       test_files_path:
