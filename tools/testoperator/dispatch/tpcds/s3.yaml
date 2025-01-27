@@ -6,9 +6,9 @@ tests:
   throughput:
     spicepod_path: ./test/spicepods/tpcds/s3.yaml
     query_set: tpcds
-    runner_type: spiceai-runners
+    runner_type: spiceai-large-runners
   load:
     spicepod_path: ./test/spicepods/tpcds/s3.yaml
     query_set: tpcds
-    runner_type: spiceai-runners
+    runner_type: spiceai-large-runners
     duration: 28800

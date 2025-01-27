@@ -78,7 +78,7 @@ pub struct BenchArgs {
     pub spicepod_path: PathBuf,
     pub query_set: QuerySet,
     pub query_overrides: Option<QueryOverridesArg>,
-    pub ready_wait: Option<String>, // GH workflow inputs require strings, not numbers
+    pub ready_wait: Option<u64>,
     pub runner_type: RunnerType,
 }
 
@@ -87,7 +87,7 @@ pub struct BenchArgs {
 pub struct LoadArgs {
     #[serde(flatten)]
     pub bench_args: BenchArgs,
-    pub duration: Option<String>,
+    pub duration: Option<u64>,
 }
 
 /// Represents the type of runner to use in the action
