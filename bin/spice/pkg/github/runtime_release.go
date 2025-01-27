@@ -96,7 +96,7 @@ func getRustArch() string {
 }
 
 // GPU versions that are supported via dedicated CUDA builds
-var supportedCudaVersionsBinaries = []string{"75", "80", "86", "89", "90"}
+var supportedCudaVersionsBinaries = []string{"80", "86", "87", "89", "90"}
 
 func checkCudaVersionSupported(computeCap string) bool {
 	for _, version := range supportedCudaVersionsBinaries {

@@ -1,0 +1,119 @@
+version: v1
+kind: Spicepod
+name: file_tpcds_sqlite_file
+datasets:
+  - from: file:data/catalog_sales.parquet
+    name: catalog_sales
+    acceleration:
+      engine: sqlite
+      mode: file
+      enabled: true
+      indexes:
+        cs_ship_customer_sk: enabled
+        cs_sold_date_sk: enabled
+  - from: file:data/catalog_returns.parquet
+    name: catalog_returns
+    acceleration: &acceleration
+      engine: sqlite
+      mode: file
+      enabled: true
+  - from: file:data/inventory.parquet
+    name: inventory
+    acceleration: *acceleration
+  - from: file:data/store_sales.parquet
+    name: store_sales
+    acceleration:
+      engine: sqlite
+      mode: file
+      enabled: true
+      indexes:
+        ss_customer_sk: enabled
+        ss_sold_date_sk: enabled
+        (ss_store_sk, ss_sold_date_sk, ss_sales_price, ss_net_profit): enabled
+  - from: file:data/store_returns.parquet
+    name: store_returns
+    acceleration: *acceleration
+  - from: file:data/web_sales.parquet
+    name: web_sales
+    acceleration:
+      engine: sqlite
+      mode: file
+      enabled: true
+      indexes:
+        ws_bill_customer_sk: enabled
+        ws_sold_date_sk: enabled
+  - from: file:data/web_returns.parquet
+    name: web_returns
+    acceleration: *acceleration
+  - from: file:data/customer.parquet
+    name: customer
+    acceleration: *acceleration
+  - from: file:data/customer_address.parquet
+    name: customer_address
+    acceleration:
+      engine: sqlite
+      mode: file
+      enabled: true
+      indexes:
+        ca_county: enabled
+        (ca_address_sk, ca_country, ca_state): enabled
+  - from: file:data/customer_demographics.parquet
+    name: customer_demographics
+    acceleration:
+      engine: sqlite
+      mode: file
+      enabled: true
+      indexes:
+        (cd_demo_sk, cd_martial_status, cd_education_status): enabled
+  - from: file:data/date_dim.parquet
+    name: date_dim
+    acceleration:
+      engine: sqlite
+      mode: file
+      enabled: true
+      indexes:
+        (d_year, d_date_sk): enabled
+  - from: file:data/household_demographics.parquet
+    name: household_demographics
+    acceleration:
+      engine: sqlite
+      mode: file
+      enabled: true
+      indexes:
+        (hd_demo_sk, hd_dep_count): enabled
+  - from: file:data/item.parquet
+    name: item
+    acceleration: *acceleration
+  - from: file:data/promotion.parquet
+    name: promotion
+    acceleration: *acceleration
+  - from: file:data/ship_mode.parquet
+    name: ship_mode
+    acceleration: *acceleration
+  - from: file:data/store.parquet
+    name: store
+    acceleration: *acceleration
+  - from: file:data/time_dim.parquet
+    name: time_dim
+    acceleration: *acceleration
+  - from: file:data/warehouse.parquet
+    name: warehouse
+    acceleration: *acceleration
+  - from: file:data/web_page.parquet
+    name: web_page
+    acceleration: *acceleration
+  - from: file:data/web_site.parquet
+    name: web_site
+    acceleration: *acceleration
+  - from: file:data/reason.parquet
+    name: reason
+    acceleration: *acceleration
+  - from: file:data/call_center.parquet
+    name: call_center
+    acceleration: *acceleration
+  - from: file:data/income_band.parquet
+    name: income_band
+    acceleration: *acceleration
+  - from: file:data/catalog_page.parquet
+    name: catalog_page
+    acceleration: *acceleration

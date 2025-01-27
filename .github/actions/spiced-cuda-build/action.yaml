@@ -23,12 +23,27 @@ outputs:
 runs:
   using: 'composite'
   steps:
+    - name: Set CUDA version (Windows)
+      if: ${{ inputs.target_os == 'windows'}}
+      run: |
+        $version = "${{ inputs.cuda-version }}"
+        $majorMinor = $version.Split('.')[0..1] -join '.'
+        echo "CUDA_VERSION_MM=$majorMinor" >> $env:GITHUB_ENV
+      shell: pwsh
+
     - name: Define Shell and Commands (windows)
       if: ${{ inputs.target_os == 'windows'}}
       run: |
         echo "SHELL=pwsh" >> $env:GITHUB_ENV
         echo "BUILD_CMD=cd bin\\spiced && cargo build --release --features models,cuda --target-dir ../../target" >> $env:GITHUB_ENV
-        echo "PACKAGE_CMD=move target\\release\\spiced.exe spiced.exe -Force && tar -czf spiced.exe_models_cuda_${{ inputs.cuda-compute-capability }}_${{ inputs.artifact-tag }}.tar.gz spiced.exe" >> $env:GITHUB_ENV
+        @(
+            "PACKAGE_CMD=move target\release\spiced.exe spiced.exe -Force; ",
+            "copy 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v${{ env.CUDA_VERSION_MM }}\bin\cudart64_*.dll' .; ",
+            "copy 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v${{ env.CUDA_VERSION_MM }}\bin\cublas64_*.dll' .; ",
+            "copy 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v${{ env.CUDA_VERSION_MM }}\bin\cublasLt64_*.dll' .; ",
+            "copy 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v${{ env.CUDA_VERSION_MM }}\bin\curand64_*.dll' .; ",
+            "tar -czf spiced.exe_models_cuda_${{ inputs.cuda-compute-capability }}_${{ inputs.artifact-tag }}.tar.gz spiced.exe *.dll"
+        ) -join '' | echo >> $env:GITHUB_ENV
       shell: pwsh
 
     - name: Define Shell and Commands
