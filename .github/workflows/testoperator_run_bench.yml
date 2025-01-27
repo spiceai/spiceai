@@ -98,9 +98,9 @@ jobs:
             --ready-wait ${{ github.event.inputs.ready_wait }} \
             --disable-progress-bars
         env:
-          S3_ENDPOINT: ${{ secrets.CLICKBENCH_S3_ENDPOINT}}
-          S3_KEY: ${{ secrets.CLICKBENCH_S3_KEY}}
-          S3_SECRET: ${{ secrets.CLICKBENCH_S3_SECRET}}
+          S3_ENDPOINT: ${{ secrets.MINIO_ENDPOINT}}
+          S3_KEY: ${{ secrets.MINIO_ACCESS_KEY}}
+          S3_SECRET: ${{ secrets.MINIO_SECRET_KEY}}
           DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
           DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
           DATABRICKS_ENDPOINT: ${{ secrets.DATABRICKS_ENDPOINT }}
@@ -129,9 +129,9 @@ jobs:
           rm -rf .spice/data
           testoperator run bench -s /usr/local/bin/spiced -p ${{ github.event.inputs.spicepod_path }} -d /opt/spiced/data --query-set ${{ github.event.inputs.query_set }} --query-overrides ${{ github.event.inputs.query_overrides }} --ready-wait ${{ github.event.inputs.ready_wait }} --disable-progress-bars
         env:
-          S3_ENDPOINT: ${{ secrets.CLICKBENCH_S3_ENDPOINT}}
-          S3_KEY: ${{ secrets.CLICKBENCH_S3_KEY}}
-          S3_SECRET: ${{ secrets.CLICKBENCH_S3_SECRET}}
+          S3_ENDPOINT: ${{ secrets.MINIO_ENDPOINT}}
+          S3_KEY: ${{ secrets.MINIO_ACCESS_KEY}}
+          S3_SECRET: ${{ secrets.MINIO_SECRET_KEY}}
           DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
           DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
           DATABRICKS_ENDPOINT: ${{ secrets.DATABRICKS_ENDPOINT }}
