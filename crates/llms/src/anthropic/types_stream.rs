@@ -203,7 +203,7 @@ impl From<reqwest_eventsource::Error> for AnthropicStreamError {
             _,
         ) = &e
         {
-            "Anthropic API usage limit reached.\nCheck account limits and retry later: https://console.anthropic.com/settings/limits".to_string()
+            "Anthropic API limit exceeded. Check limits: https://console.anthropic.com/settings/limits.".to_string()
         } else {
             e.to_string()
         };
