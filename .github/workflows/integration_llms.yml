@@ -7,19 +7,19 @@ on:
       - trunk
       - release-*
     paths:
-      - "crates/llms/**"
+      - 'crates/llms/**"
 
   workflow_dispatch:
     inputs:
       run:
-        description: "Which groups of models to run"
+        description: 'Which groups of models to run'
         required: true
-        default: "all"
+        default: 'all'
         type: choice
         options:
-          - "all"
-          - "hosted"
-          - "self-hosted"
+          - 'all'
+          - 'hosted'
+          - 'self-hosted'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref_name }}-${{ github.ref_name == 'trunk' && github.sha || 'any-sha' }}
@@ -63,7 +63,7 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
         with:
-          os: "darwin"
+          os: 'darwin'
 
       - name: Build LLMs integration test binary
         run: |
