@@ -167,7 +167,8 @@ jobs:
       ## Default flavor
       - name: Build spiced
         if: contains(matrix.target.tags, 'default')
-        run: make -C bin/spiced
+        working-directory: bin/spiced
+        run: cargo build --release --features release  --target-dir ../../target
 
       - name: tar binary
         if: matrix.target.target_os != 'windows' && contains(matrix.target.tags, 'default')
@@ -205,7 +206,8 @@ jobs:
       ## Models flavor
       - name: Build spiced (models)
         if: contains(matrix.target.tags, 'models')
-        run: make -C bin/spiced SPICED_NON_DEFAULT_FEATURES="models"
+        working-directory: bin/spiced
+        run: cargo build --release --features release,models --target-dir ../../target
 
       - name: tar binary (models)
         if: matrix.target.target_os != 'windows' && contains(matrix.target.tags, 'models')
@@ -244,7 +246,8 @@ jobs:
       ## Models + metal flavor
       - name: Build spiced (models)
         if: matrix.target.target_os == 'darwin'
-        run: make -C bin/spiced SPICED_NON_DEFAULT_FEATURES="models,metal"
+        working-directory: bin/spiced
+        run: cargo build --release --features release,models,metal --target-dir ../../target
 
       - name: tar binary (models,metal)
         if: matrix.target.target_os == 'darwin'
