@@ -276,7 +276,7 @@ impl DisplayAs for SparkConnectExecutionPlan {
 }
 
 impl ExecutionPlan for SparkConnectExecutionPlan {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "SparkConnectExecutionPlan"
     }
 

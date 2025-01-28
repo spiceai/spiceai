@@ -144,13 +144,13 @@ impl PaginationArgument {
                 format!(r#"first: {z}, after: "{c}""#,)
             }
             (PaginationArgument::First(z), None) => {
-                format!(r#"first: {z}"#)
+                format!("first: {z}")
             }
             (PaginationArgument::Last(z), Some(c)) => {
-                format!(r#"last: {z}, before: "{c}""#)
+                format!("last: {z}, before: \"{c}\"")
             }
             (PaginationArgument::Last(z), None) => {
-                format!(r#"last: {z}"#)
+                format!("last: {z}")
             }
         }
     }
@@ -477,6 +477,7 @@ impl PaginationParameters {
     }
 
     fn apply(&self, query: &str, limit: Option<usize>, cursor: Option<String>) -> String {
+        #[allow(clippy::needless_raw_string_hashes)]
         let pattern = format!(r#"{}\s*\(.*\)"#, self.resource_name);
         let regex =
             Regex::new(&pattern).unwrap_or_else(|_| panic!("Invalid regex query resource pattern"));
@@ -486,7 +487,7 @@ impl PaginationParameters {
         let new_query = regex.replace(
             query,
             format!(
-                r#"{resource_name} ({arguments})"#,
+                "{resource_name} ({arguments})",
                 arguments = arguments.args,
                 resource_name = self.resource_name,
             ),

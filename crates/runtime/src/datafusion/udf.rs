@@ -81,7 +81,7 @@ impl ScalarUDFImpl for Greatest {
         self
     }
 
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "greatest"
     }
 
@@ -143,7 +143,7 @@ impl ScalarUDFImpl for Least {
         self
     }
 
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "least"
     }
 

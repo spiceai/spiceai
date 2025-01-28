@@ -110,7 +110,7 @@ fn yaml_files_from(dir: &Path) -> Result<Vec<PathBuf>> {
 
             if path
                 .extension()
-                .map_or(false, |ext| ext == "yaml" || ext == "yml")
+                .is_some_and(|ext| ext == "yaml" || ext == "yml")
             {
                 Some(path)
             } else {

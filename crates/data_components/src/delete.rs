@@ -90,7 +90,7 @@ impl DisplayAs for DeletionExec {
 }
 
 impl ExecutionPlan for DeletionExec {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "DeletionExec"
     }
 

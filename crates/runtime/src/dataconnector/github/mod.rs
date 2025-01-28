@@ -844,7 +844,7 @@ pub(crate) fn search_inject_parameters(
     let query_value = match &query_arg.1 {
         graphql_parser::query::Value::String(v) => {
             let v = v.replace('"', "");
-            Ok(format!(r#"{v} {arg_additions}"#))
+            Ok(format!("{v} {arg_additions}"))
         }
         _ => Err(DataFusionError::Execution(
             "GitHub GraphQL query 'query' argument was not a string".to_string(),
