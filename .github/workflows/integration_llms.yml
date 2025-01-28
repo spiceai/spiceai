@@ -52,6 +52,16 @@ jobs:
                 model_allowlist: 'local_phi3,hf_phi3'
               }
             ];
+
+            if (context.eventName === 'workflow_dispatch') {
+              const name = context.payload.inputs.name;
+
+              if (platform_option === 'all') {
+                return matrix;
+              }
+
+              return matrix.filter(m => m.name === name);
+            }
             return matrix;
 
   build:
