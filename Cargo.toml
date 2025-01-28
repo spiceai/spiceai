@@ -147,7 +147,7 @@ tracing = "0.1.41"
 tracing-futures = { version = "0.2.5", features = ["futures-03"] }
 tracing-opentelemetry = "0.28"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
-uuid = "1.9.1"
+uuid = "1"
 x509-certificate = "0.23.1"
 
 
@@ -172,8 +172,8 @@ rusqlite = { git = "https://github.com/spiceai/rusqlite.git", rev = "97054b6af72
 # Tracking Issue: https://github.com/allan2/dotenvy/issues/113
 dotenvy = { git = "https://github.com/spiceai/dotenvy.git", rev = "e5cef1871b08003198949dfe2da988633eaad78f" }
 
-iceberg = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "557c79ff2c443c089e09d3ad60d382eb7fdba7bf" }
-iceberg-catalog-rest = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "557c79ff2c443c089e09d3ad60d382eb7fdba7bf" }
-iceberg-datafusion = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "557c79ff2c443c089e09d3ad60d382eb7fdba7bf" }
+iceberg = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "07940c3fdaef24a5a4ddaf58f5c495d2fc4ce7d2" }
+iceberg-catalog-rest = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "07940c3fdaef24a5a4ddaf58f5c495d2fc4ce7d2" }
+iceberg-datafusion = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "07940c3fdaef24a5a4ddaf58f5c495d2fc4ce7d2" }
 
 cudarc = { git = "https://github.com/EricLBuehler/cudarc", rev = "f6e5bf51153d40e34eb1262b98895ac1235b6422" }

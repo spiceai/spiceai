@@ -1,0 +1,17 @@
+tests:
+  bench:
+    spicepod_path: ./test/spicepods/tpch/accelerated/file_sqlite_file.yaml
+    query_set: tpch
+    runner_type: spiceai-runners
+    ready_wait: 600
+  throughput:
+    spicepod_path: ./test/spicepods/tpch/accelerated/file_sqlite_file.yaml
+    query_set: tpch
+    runner_type: spiceai-runners
+    ready_wait: 600
+  load:
+    spicepod_path: ./test/spicepods/tpch/accelerated/file_sqlite_file.yaml
+    query_set: tpch
+    runner_type: spiceai-runners
+    duration: 28800
+    ready_wait: 600

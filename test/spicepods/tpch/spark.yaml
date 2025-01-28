@@ -5,13 +5,7 @@ datasets:
   - from: spark:spiceai_sandbox.tpch.customer
     name: customer
     params: &spark_params
-      spark_remote: |
-        sc://${ env:DATABRICKS_HOST }:443/;
-        use_ssl=true;
-        user_id=spice.ai;
-        session_id=spark_tpch_test;
-        token=${ env:DATABRICKS_TOKEN };
-        x-databricks-cluster-id=${ env:DATABRICKS_CLUSTER_ID };
+      spark_remote: sc://${ env:DATABRICKS_HOST }:443/;use_ssl=true;user_id=spice.ai;token=${ env:DATABRICKS_TOKEN };x-databricks-cluster-id=${ env:DATABRICKS_CLUSTER_ID };
   - from: spark:spiceai_sandbox.tpch.lineitem
     name: lineitem
     params: *spark_params
