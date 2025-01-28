@@ -131,7 +131,7 @@ tract-core = "0.21.0"
 url = "2.5.4"
 util = { path = "../util" }
 utoipa = { version = "5.2.0", features = ["axum_extras"], optional = true }
-utoipa-swagger-ui = { version = "8.1.1", features = ["axum"], optional = true }
+utoipa-swagger-ui = { version = "9", features = ["axum"], optional = true }
 
 uuid = { workspace = true, features = ["v7"] }
 x509-certificate.workspace = true
