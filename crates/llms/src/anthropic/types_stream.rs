@@ -198,11 +198,21 @@ impl fmt::Display for AnthropicStreamError {
 
 impl From<reqwest_eventsource::Error> for AnthropicStreamError {
     fn from(e: reqwest_eventsource::Error) -> Self {
+        let message = if let reqwest_eventsource::Error::InvalidStatusCode(
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            _,
+        ) = &e
+        {
+            "Anthropic API limit exceeded. Check limits: https://console.anthropic.com/settings/limits.".to_string()
+        } else {
+            e.to_string()
+        };
+
         AnthropicStreamError {
             event_type: "error".to_string(),
             error: ErrorPayload {
                 error_type: "reqwest_eventsource_error".to_string(),
-                message: e.to_string(),
+                message,
             },
         }
     }
