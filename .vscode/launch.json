@@ -27,7 +27,7 @@
       "type": "go",
       "request": "launch",
       "mode": "auto",
-      "program": "${workspaceFolder}/cmd/spice/main.go",
+      "program": "${workspaceFolder}/bin/spice/main.go",
       "args": ["version"]
     },
     {

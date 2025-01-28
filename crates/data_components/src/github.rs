@@ -331,19 +331,19 @@ impl GithubRestClient {
         match response_status {
             404 => {
                 let err_msg = format!(
-                    "The Github API ({endpoint}) failed with status code {response_status}; Please check that org `{owner}`, repo `{repo}` and git tree `{tree_sha}`are correct.",
+                    "The Github API ({endpoint}) failed with status code {response_status}.\nVerify that org `{owner}`, repo `{repo}` and git tree `{tree_sha}`are correct.",
                 );
                 Err(err_msg.into())
             }
             401 => {
                 let err_msg = format!(
-                    "The Github API ({endpoint}) failed with status code {response_status}; Please check if the token is correct.",
+                    "The Github API ({endpoint}) failed with status code {response_status}.\nVerify the token is correct.",
                 );
                 Err(err_msg.into())
             }
             403 => {
                 let err_msg = format!(
-                    "The Github API ({endpoint}) failed with status code {response_status}; Please check if the token has the necessary permissions.",
+                    "The Github API ({endpoint}) failed with status code {response_status}.\nVerify the token has the necessary permissions.",
                 );
                 Err(err_msg.into())
             }

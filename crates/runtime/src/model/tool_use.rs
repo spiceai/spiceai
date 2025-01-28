@@ -151,7 +151,10 @@ impl ToolUsingChat {
                     .await
                 {
                     Ok(v) => v,
-                    Err(e) => Value::String(format!("Error calling tool {}. Error: {e}", t.name())),
+                    Err(e) => Value::String(format!(
+                        "Failed to call the tool {}.\nAn error occurred: {e}",
+                        t.name()
+                    )),
                 }
             }
             None => Value::Null,
@@ -675,6 +678,15 @@ fn make_a_stream(
                         let mut resp2 = response.clone();
                         resp2.choices = finished_choices;
                         if let Err(e) = sender_clone.send(Ok(resp2)).await {
+                            if !sender_clone.is_closed() {
+                                tracing::error!("Error sending error: {}", e);
+                            }
+                        }
+                    }
+
+                    // When there are no [`ChatChoiceStream`]s, but the model has usage, send the response (with no choices).
+                    if response.choices.is_empty() && response.usage.is_some() {
+                        if let Err(e) = sender_clone.send(Ok(response)).await {
                             if !sender_clone.is_closed() {
                                 tracing::error!("Error sending error: {}", e);
                             }

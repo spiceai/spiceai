@@ -1,0 +1,29 @@
+version: v1
+kind: Spicepod
+name: spicecloud_tpch
+datasets:
+  - from: spice.ai:spiceai/tpch/datasets/tpch.customer
+    name: customer
+    params: &spicecloud_params
+      spiceai_api_key: ${secrets:SPICEAI_TPCH_API_KEY}
+  - from: spice.ai:spiceai/tpch/datasets/tpch.lineitem
+    name: lineitem
+    params: *spicecloud_params
+  - from: spice.ai:spiceai/tpch/datasets/tpch.nation
+    name: nation
+    params: *spicecloud_params
+  - from: spice.ai:spiceai/tpch/datasets/tpch.orders
+    name: orders
+    params: *spicecloud_params
+  - from: spice.ai:spiceai/tpch/datasets/tpch.part
+    name: part
+    params: *spicecloud_params
+  - from: spice.ai:spiceai/tpch/datasets/tpch.partsupp
+    name: partsupp
+    params: *spicecloud_params
+  - from: spice.ai:spiceai/tpch/datasets/tpch.region
+    name: region
+    params: *spicecloud_params
+  - from: spice.ai:spiceai/tpch/datasets/tpch.supplier
+    name: supplier
+    params: *spicecloud_params

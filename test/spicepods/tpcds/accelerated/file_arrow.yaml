@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: file_tpcds
+name: file_tpcds_arrow
 datasets:
   - from: file:data/catalog_sales.parquet
     name: catalog_sales

@@ -11,7 +11,7 @@ All criteria must be met for the Catalog to be considered Stable, with exception
 | Databricks    | ➖             |              |
 | Iceberg       | ➖             |              |
 | Spice.ai      | ➖             |              |
-| Unity Catalog | ➖             |              |
+| Unity Catalog | ✅             | @Sevenannn   |
 
 ## Stable Release Criteria
 

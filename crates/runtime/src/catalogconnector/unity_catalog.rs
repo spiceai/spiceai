@@ -31,6 +31,7 @@ use data_components::Read;
 use data_components::RefreshableCatalogProvider;
 use datafusion::sql::TableReference;
 use secrecy::SecretString;
+use snafu::ResultExt;
 use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -106,7 +107,7 @@ impl CatalogConnector for UnityCatalog {
             return Err(
                 super::Error::InvalidConfigurationNoSource {
                     connector: "unity_catalog".into(),
-                    message: "A Catalog Path is required for Unity Catalog.\nFor details, visit: https://docs.spiceai.org/components/catalogs/unity-catalog#from".into(),
+                    message: "A Catalog Path is required for Unity Catalog.\nFor details, visit: https://spiceai.org/docs/components/catalogs/unity-catalog#from".into(),
                     connector_component: ConnectorComponent::from(catalog),
                 },
             );
@@ -141,7 +142,21 @@ impl CatalogConnector for UnityCatalog {
             dataset_params.insert(key, value);
         }
 
-        let delta_table_creator = Arc::new(DeltaTableFactory::new(dataset_params)) as Arc<dyn Read>;
+        let params = Parameters::try_new(
+            "connector unity catalog",
+            dataset_params.into_iter().collect(),
+            "unity_catalog",
+            runtime.secrets(),
+            PARAMETERS,
+        )
+        .await
+        .context(super::InternalWithSourceSnafu {
+            connector: "unity_catalog".to_string(),
+            connector_component: ConnectorComponent::from(catalog),
+        })?;
+
+        let delta_table_creator =
+            Arc::new(DeltaTableFactory::new(params.to_secret_map())) as Arc<dyn Read>;
 
         let catalog_provider = match UnityCatalogProvider::try_new(
             client,

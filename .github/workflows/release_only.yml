@@ -1,0 +1,141 @@
+name: release_only
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "Build and Release workflow run ID to get artifacts from"
+        required: true
+        type: string
+      target_version:
+        description: "Target version to release"
+        required: true
+        type: string
+
+jobs:
+  publish:
+    name: Publish ${{ matrix.target_os }}-${{ matrix.target_arch }} binaries
+    strategy:
+      matrix:
+        include:
+          - target_os: linux
+            target_arch: x86_64
+          - target_os: linux
+            target_arch: aarch64
+          - target_os: darwin
+            target_arch: aarch64
+          - target_os: windows
+            target_arch: x86_64
+
+    runs-on: ubuntu-latest
+    env:
+      ARTIFACT_DIR: ./release
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set REL_VERSION to ${{ inputs.target_version }}
+        run: |
+          echo "REL_VERSION=${{ inputs.target_version }}" >> $GITHUB_ENV
+          echo "LATEST_RELEASE=true" >> $GITHUB_ENV
+
+      # Download spice artifacts
+      - name: Download spice artifact
+        if: matrix.target_os != 'windows'
+        uses: actions/download-artifact@v4
+        with:
+          name: spice_${{ matrix.target_os }}_${{ matrix.target_arch }}
+          path: ${{ env.ARTIFACT_DIR }}
+          github-token: ${{ secrets.DOWNLOAD_ARTIFACT_TOKEN }}
+          run-id: ${{ inputs.run_id }}
+
+      - name: Download spice.exe artifact
+        if: matrix.target_os == 'windows'
+        uses: actions/download-artifact@v4
+        with:
+          name: spice.exe_${{ matrix.target_os }}_${{ matrix.target_arch }}
+          path: ${{ env.ARTIFACT_DIR }}
+          github-token: ${{ secrets.DOWNLOAD_ARTIFACT_TOKEN }}
+          run-id: ${{ inputs.run_id }}
+
+      # Download spiced artifacts
+      - name: Download spiced artifact
+        if: matrix.target_os != 'windows'
+        uses: actions/download-artifact@v4
+        with:
+          name: spiced_${{ matrix.target_os }}_${{ matrix.target_arch }}
+          path: ${{ env.ARTIFACT_DIR }}
+          github-token: ${{ secrets.DOWNLOAD_ARTIFACT_TOKEN }}
+          run-id: ${{ inputs.run_id }}
+
+      - name: Download spiced.exe artifact
+        if: matrix.target_os == 'windows'
+        uses: actions/download-artifact@v4
+        with:
+          name: spiced.exe_${{ matrix.target_os }}_${{ matrix.target_arch }}
+          path: ${{ env.ARTIFACT_DIR }}
+          github-token: ${{ secrets.DOWNLOAD_ARTIFACT_TOKEN }}
+          run-id: ${{ inputs.run_id }}
+
+      # Download spiced models artifacts
+      - name: Download spiced models artifact
+        if: matrix.target_os != 'windows'
+        uses: actions/download-artifact@v4
+        with:
+          name: spiced_models_${{ matrix.target_os }}_${{ matrix.target_arch }}
+          path: ${{ env.ARTIFACT_DIR }}
+          github-token: ${{ secrets.DOWNLOAD_ARTIFACT_TOKEN }}
+          run-id: ${{ inputs.run_id }}
+
+      - name: Download spiced.exe models artifact
+        if: matrix.target_os == 'windows'
+        uses: actions/download-artifact@v4
+        with:
+          name: spiced.exe_models_${{ matrix.target_os }}_${{ matrix.target_arch }}
+          path: ${{ env.ARTIFACT_DIR }}
+          github-token: ${{ secrets.DOWNLOAD_ARTIFACT_TOKEN }}
+          run-id: ${{ inputs.run_id }}
+      
+      # Download macOS metal artifacts
+      - name: Download spiced models metal artifact
+        if: matrix.target_os == 'darwin'
+        uses: actions/download-artifact@v4
+        with:
+          name: spiced_models_metal_${{ matrix.target_os }}_${{ matrix.target_arch }}
+          path: ${{ env.ARTIFACT_DIR }}
+          github-token: ${{ secrets.DOWNLOAD_ARTIFACT_TOKEN }}
+          run-id: ${{ inputs.run_id }}
+
+      - name: List artifacts
+        run: ls -l ${{ env.ARTIFACT_DIR }}
+
+      - name: Publish ${{ matrix.target_os }}/${{ matrix.target_arch }} binaries to GitHub
+        run: |
+          # Parse repository to get owner and repo names
+          OWNER_NAME="${GITHUB_REPOSITORY%%/*}"
+          REPO_NAME="${GITHUB_REPOSITORY#*/}"
+          export GITHUB_TOKEN=${{ secrets.GITHUB_TOKEN }}
+          
+          # Get the list of files
+          RELEASE_ARTIFACT=(${ARTIFACT_DIR}/*)
+          
+          # Delete existing release artifact
+          python ./.github/scripts/github_release.py delete \
+            --owner $OWNER_NAME --repo $REPO_NAME \
+            --tag "v${{ env.REL_VERSION }}" \
+            ${RELEASE_ARTIFACT[*]}
+            
+          if [ "$LATEST_RELEASE" = "true" ]; then
+            export RELEASE_BODY=`cat ./docs/release_notes/v${{ env.REL_VERSION }}.md`
+          else
+            export RELEASE_BODY="This is the release candidate ${{ env.REL_VERSION }}"
+          fi
+          
+          echo "Uploading Spice.ai Binaries to GitHub Release"
+          python ./.github/scripts/github_release.py upload \
+            --owner $OWNER_NAME --repo $REPO_NAME \
+            --tag "v${{ env.REL_VERSION }}" \
+            --release-name "v${{ env.REL_VERSION }}" \
+            --body "${RELEASE_BODY}" \
+            --prerelease "$PRE_RELEASE" \
+            ${RELEASE_ARTIFACT[*]}

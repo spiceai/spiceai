@@ -1,0 +1,38 @@
+version: v1
+kind: Spicepod
+name: odbc_databricks_tpch
+datasets:
+  - from: odbc:spiceai_sandbox.tpch.customer
+    name: customer
+    params: &odbc_params
+      odbc_connection_string: |
+        Driver={Databricks ODBC Driver};
+        Host=${ env:DATABRICKS_HOST };
+        Port=443;
+        HTTPPath=${ env:DATABRICKS_ODBC_PATH };
+        SSL=1;
+        ThriftTransport=2;
+        AuthMech=3;
+        UID=token;
+        PWD=${ env:DATABRICKS_TOKEN }
+  - from: odbc:spiceai_sandbox.tpch.lineitem
+    name: lineitem
+    params: *odbc_params
+  - from: odbc:spiceai_sandbox.tpch.nation
+    name: nation
+    params: *odbc_params
+  - from: odbc:spiceai_sandbox.tpch.orders
+    name: orders
+    params: *odbc_params
+  - from: odbc:spiceai_sandbox.tpch.part
+    name: part
+    params: *odbc_params
+  - from: odbc:spiceai_sandbox.tpch.partsupp
+    name: partsupp
+    params: *odbc_params
+  - from: odbc:spiceai_sandbox.tpch.region
+    name: region
+    params: *odbc_params
+  - from: odbc:spiceai_sandbox.tpch.supplier
+    name: supplier
+    params: *odbc_params

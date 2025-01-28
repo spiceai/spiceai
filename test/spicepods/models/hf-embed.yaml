@@ -1,0 +1,7 @@
+version: v1
+kind: Spicepod
+name: huggingface-embed
+
+embeddings:
+  - from: huggingface:huggingface.co/sentence-transformers/all-MiniLM-L6-v2
+    name: all_minilm_l6_v2

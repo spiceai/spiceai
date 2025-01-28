@@ -1,0 +1,109 @@
+version: v1
+kind: Spicepod
+name: postgres_tpcds_duckdb_file
+datasets:
+  - from: postgres:catalog_sales
+    name: catalog_sales
+    params: &postgres_params
+      pg_host: ${secrets:POSTGRES_HOST}
+      pg_port: 5432
+      pg_user: postgres
+      pg_pass: ${secrets:POSTGRES_PASSWORD}
+      pg_db: tpcds
+      pg_sslmode: disable
+    acceleration: &acceleration
+      enabled: true
+      engine: duckdb
+      mode: file
+  - from: postgres:catalog_returns
+    name: catalog_returns
+    params: *postgres_params
+    acceleration: *acceleration
+  - from: postgres:inventory
+    name: inventory
+    params: *postgres_params
+    acceleration: *acceleration
+  - from: postgres:store_sales
+    name: store_sales
+    params: *postgres_params
+    acceleration: *acceleration
+  - from: postgres:store_returns
+    name: store_returns
+    params: *postgres_params
+    acceleration: *acceleration
+  - from: postgres:web_sales
+    name: web_sales
+    params: *postgres_params
+    acceleration: *acceleration
+  - from: postgres:web_returns
+    name: web_returns
+    params: *postgres_params
+    acceleration: *acceleration
+  - from: postgres:customer
+    name: customer
+    params: *postgres_params
+    acceleration: *acceleration
+  - from: postgres:customer_address
+    name: customer_address
+    params: *postgres_params
+    acceleration: *acceleration
+  - from: postgres:customer_demographics
+    name: customer_demographics
+    params: *postgres_params
+    acceleration: *acceleration
+  - from: postgres:date_dim
+    name: date_dim
+    params: *postgres_params
+    acceleration: *acceleration
+  - from: postgres:household_demographics
+    name: household_demographics
+    params: *postgres_params
+    acceleration: *acceleration
+  - from: postgres:item
+    name: item
+    params: *postgres_params
+    acceleration: *acceleration
+  - from: postgres:promotion
+    name: promotion
+    params: *postgres_params
+    acceleration: *acceleration
+  - from: postgres:ship_mode
+    name: ship_mode
+    params: *postgres_params
+    acceleration: *acceleration
+  - from: postgres:store
+    name: store
+    params: *postgres_params
+    acceleration: *acceleration
+  - from: postgres:time_dim
+    name: time_dim
+    params: *postgres_params
+    acceleration: *acceleration
+  - from: postgres:warehouse
+    name: warehouse
+    params: *postgres_params
+    acceleration: *acceleration
+  - from: postgres:web_page
+    name: web_page
+    params: *postgres_params
+    acceleration: *acceleration
+  - from: postgres:web_site
+    name: web_site
+    params: *postgres_params
+    acceleration: *acceleration
+  - from: postgres:reason
+    name: reason
+    params: *postgres_params
+    acceleration: *acceleration
+  - from: postgres:call_center
+    name: call_center
+    params: *postgres_params
+    acceleration: *acceleration
+  - from: postgres:income_band
+    name: income_band
+    params: *postgres_params
+    acceleration: *acceleration
+  - from: postgres:catalog_page
+    name: catalog_page
+    params: *postgres_params
+    acceleration: *acceleration

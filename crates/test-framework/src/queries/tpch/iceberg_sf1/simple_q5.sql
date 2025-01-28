@@ -1,0 +1,1 @@
+select SUM(o.o_totalprice) as total_price, l.l_linestatus from ice.tpch_sf1.orders o join ice.tpch_sf1.lineitem l on o.o_orderkey = l.l_orderkey group by l.l_linestatus order by total_price desc;

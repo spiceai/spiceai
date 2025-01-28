@@ -78,16 +78,25 @@ impl DataNumberBuilder {
         }
     }
 
-    fn finish(&mut self) -> StructArray {
+    fn finish(&mut self) -> Option<StructArray> {
         let arrays: Vec<ArrayRef> = vec![
             Arc::new(self.int_builder.finish()),
             Arc::new(self.double_builder.finish()),
         ];
-        StructArray::new(
+        match StructArray::try_new(
             number_fields().into(),
             arrays,
             self.null_buffer_builder.finish(),
-        )
+        ) {
+            Ok(array) => Some(array),
+            Err(e) => {
+                if cfg!(feature = "dev") {
+                    panic!("Could not convert number: {e}")
+                } else {
+                    None
+                }
+            }
+        }
     }
 }
 
@@ -133,7 +142,7 @@ impl DataHistogramBuilder {
         }
     }
 
-    fn finish(&mut self) -> StructArray {
+    fn finish(&mut self) -> Option<StructArray> {
         let arrays: Vec<ArrayRef> = vec![
             Arc::new(self.count_builder.finish()),
             Arc::new(self.sum_builder.finish()),
@@ -142,11 +151,20 @@ impl DataHistogramBuilder {
             Arc::new(self.min_builder.finish()),
             Arc::new(self.max_builder.finish()),
         ];
-        StructArray::new(
+        match StructArray::try_new(
             histogram_data_fields().into(),
             arrays,
             self.null_buffer_builder.finish(),
-        )
+        ) {
+            Ok(array) => Some(array),
+            Err(e) => {
+                if cfg!(feature = "dev") {
+                    panic!("Could not convert histogram data: {e}")
+                } else {
+                    None
+                }
+            }
+        }
     }
 }
 
@@ -171,17 +189,26 @@ impl ResourceBuilder {
         self.null_buffer_builder.append(is_valid);
     }
 
-    fn finish(&mut self) -> StructArray {
+    fn finish(&mut self) -> Option<StructArray> {
         let arrays: Vec<ArrayRef> = vec![
             Arc::new(self.schema_url_builder.finish()),
-            Arc::new(self.attributes_builder.finish()),
+            Arc::new(self.attributes_builder.finish()?),
             Arc::new(self.dropped_attributes_count_builder.finish()),
         ];
-        StructArray::new(
+        match StructArray::try_new(
             resource_fields().into(),
             arrays,
             self.null_buffer_builder.finish(),
-        )
+        ) {
+            Ok(array) => Some(array),
+            Err(e) => {
+                if cfg!(feature = "dev") {
+                    panic!("Could not convert resource: {e}")
+                } else {
+                    None
+                }
+            }
+        }
     }
 }
 
@@ -208,18 +235,27 @@ impl ScopeBuilder {
         self.null_buffer_builder.append(is_valid);
     }
 
-    fn finish(&mut self) -> StructArray {
+    fn finish(&mut self) -> Option<StructArray> {
         let arrays: Vec<ArrayRef> = vec![
             Arc::new(self.name_builder.finish()),
             Arc::new(self.version_builder.finish()),
-            Arc::new(self.attributes_builder.finish()),
+            Arc::new(self.attributes_builder.finish()?),
             Arc::new(self.dropped_attributes_count_builder.finish()),
         ];
-        StructArray::new(
+        match StructArray::try_new(
             scope_fields().into(),
             arrays,
             self.null_buffer_builder.finish(),
-        )
+        ) {
+            Ok(array) => Some(array),
+            Err(e) => {
+                if cfg!(feature = "dev") {
+                    panic!("Could not convert scope: {e}")
+                } else {
+                    None
+                }
+            }
+        }
     }
 }
 
@@ -269,7 +305,7 @@ impl AttributesBuilder {
         self.list_null_buffer_builder.append(is_valid);
     }
 
-    fn finish(&mut self) -> ListArray {
+    fn finish(&mut self) -> Option<ListArray> {
         let arrays: Vec<ArrayRef> = vec![
             Arc::new(self.key_builder.finish()),
             Arc::new(self.type_builder.finish()),
@@ -280,23 +316,41 @@ impl AttributesBuilder {
             Arc::new(self.bytes_builder.finish()),
             Arc::new(self.ser_builder.finish()),
         ];
-        let values = StructArray::new(
+        let values = match StructArray::try_new(
             attribute_struct_fields().into(),
             arrays,
             self.null_buffer_builder.finish(),
-        );
+        ) {
+            Ok(array) => array,
+            Err(e) => {
+                if cfg!(feature = "dev") {
+                    panic!("Could not convert attributes: {e}")
+                } else {
+                    return None;
+                }
+            }
+        };
 
         let offsets = self.list_offsets_builder.finish();
         // Safety: Safe by construction
         let offsets = unsafe { OffsetBuffer::new_unchecked(offsets.into()) };
         self.list_offsets_builder.append(0);
 
-        ListArray::new(
+        match ListArray::try_new(
             Arc::new(attribute_list_field()),
             offsets,
             Arc::new(values),
             self.list_null_buffer_builder.finish(),
-        )
+        ) {
+            Ok(array) => Some(array),
+            Err(e) => {
+                if cfg!(feature = "dev") {
+                    panic!("Could not convert attributes: {e}")
+                } else {
+                    None
+                }
+            }
+        }
     }
 }
 
@@ -345,11 +399,29 @@ impl OtelToArrowConverter {
             }
         }
 
+        let Some(resource) = self.resource_builder.finish() else {
+            return Err(MetricError::Other("Could not convert resource".into()));
+        };
+        let Some(scope) = self.scope_builder.finish() else {
+            return Err(MetricError::Other("Could not convert scope".into()));
+        };
+        let Some(attributes) = self.attributes_builder.finish() else {
+            return Err(MetricError::Other("Could not convert attributes".into()));
+        };
+        let Some(data_number) = self.data_number_builder.finish() else {
+            return Err(MetricError::Other("Could not convert data number".into()));
+        };
+        let Some(data_histogram) = self.data_histogram_builder.finish() else {
+            return Err(MetricError::Other(
+                "Could not convert data histogram".into(),
+            ));
+        };
+
         let arrays: Vec<Arc<dyn Array>> = vec![
             Arc::new(self.time_unix_nano_builder.finish()),
             Arc::new(self.start_time_unix_nano_builder.finish()),
-            Arc::new(self.resource_builder.finish()),
-            Arc::new(self.scope_builder.finish()),
+            Arc::new(resource),
+            Arc::new(scope),
             Arc::new(self.schema_url_builder.finish()),
             Arc::new(self.metric_type_builder.finish()),
             Arc::new(self.name_builder.finish()),
@@ -358,9 +430,9 @@ impl OtelToArrowConverter {
             Arc::new(self.aggregation_temporality_builder.finish()),
             Arc::new(self.is_monotonic_builder.finish()),
             Arc::new(self.flags_builder.finish()),
-            Arc::new(self.attributes_builder.finish()),
-            Arc::new(self.data_number_builder.finish()),
-            Arc::new(self.data_histogram_builder.finish()),
+            Arc::new(attributes),
+            Arc::new(data_number),
+            Arc::new(data_histogram),
         ];
 
         RecordBatch::try_new(crate::schema::schema(), arrays)

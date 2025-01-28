@@ -1,0 +1,6 @@
+version: v1
+kind: Spicepod
+name: file_clickbench_small
+datasets:
+  - from: file:data/hits_0.parquet
+    name: hits

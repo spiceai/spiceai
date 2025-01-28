@@ -1152,6 +1152,13 @@
           "default": true,
           "type": "boolean"
         },
+        "properties": {
+          "default": {},
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
         "user_agent_collection": {
           "default": "full",
           "allOf": [

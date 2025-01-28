@@ -24,31 +24,30 @@ pub mod provider;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Missing required parameter: {parameter}"))]
+    #[snafu(display("Missing required parameter: {parameter}. Specify a value.\nFor details, visit: https://spiceai.org/docs/components/catalogs/unity-catalog#configuration"))]
     MissingParameter { parameter: String },
 
-    #[snafu(display("Unity Catalog API request failed: {source}"))]
+    #[snafu(display("Failed to connect to the Unity Catalog API.\nCheck the Unity Catalog API endpoint is valid and accessible.\nThe following connection error occurred: {source}"))]
     ConnectionError { source: reqwest::Error },
 
-    #[snafu(display("Unity Catalog API request failed: {status}"))]
+    #[snafu(display("Failed to connect to the Unity Catalog API.\nCheck the Unity Catalog API endpoint is valid and accessible.\nThe following HTTP status code was received when connecting: {status}"))]
     UnexpectedStatusCode { status: reqwest::StatusCode },
 
-    #[snafu(display("Could not parse {url} into a URL: {source}"))]
+    #[snafu(display("Expected a valid URL, but '{url}' was provided.\nFor details, visit: https://spiceai.org/docs/components/catalogs/unity-catalog#configuration"))]
     URLParseError {
         url: String,
         source: url::ParseError,
     },
 
     #[snafu(display(
-        "Invalid catalog URL structure {}, expected format: https://<host>/api/2.1/unity-catalog/catalogs/<catalog_id>",
-        url,
+        "An invalid catalog URL was provided: '{url}'.\nExpected a catalog URL in the format of: 'https://<host>/api/2.1/unity-catalog/catalogs/<catalog_id>'",
     ))]
     InvalidCatalogURL { url: String },
 
-    #[snafu(display("The catalog {catalog_id} doesn't exist."))]
+    #[snafu(display("Failed to find the catalog with ID '{catalog_id}'.\nVerify the catalog exists, and try again."))]
     CatalogDoesntExist { catalog_id: String },
 
-    #[snafu(display("The schema {schema} doesn't exist in {catalog_id}."))]
+    #[snafu(display("Failed to find the schema '{schema}' in the catalog '{catalog_id}'.\nVerify the schema and catalog exist, and try again."))]
     SchemaDoesntExist { schema: String, catalog_id: String },
 }
 

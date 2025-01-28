@@ -75,6 +75,8 @@ jobs:
 
     - name: start Spice runtime
       if: matrix.target_os != 'windows'
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
         spice init app
         cd app
@@ -82,6 +84,8 @@ jobs:
   
     - name: start Spice runtime (Windows)
       if: matrix.target_os == 'windows'
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
         spice init app
         cd app
@@ -121,7 +125,7 @@ jobs:
         cli_version=$(echo "$version" | grep 'CLI version:' | cut -d':' -f2 | xargs)
         runtime_version=$(echo "$version" | grep 'Runtime version:' | cut -d':' -f2 | xargs)
 
-        release_version=$(curl -s "https://api.github.com/repos/spiceai/spiceai/releases/latest" -H "Authorization: token $GITHUB_TOKEN" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+        release_version="$(curl -s "https://api.github.com/repos/spiceai/spiceai/releases/latest" -H "Authorization: token $GITHUB_TOKEN" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')+models"
         
         echo "Release Version: $release_version"
         echo "CLI Version: $cli_version"

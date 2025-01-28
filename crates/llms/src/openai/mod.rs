@@ -23,10 +23,10 @@ pub mod embed;
 
 pub const MAX_COMPLETION_TOKENS: u16 = 1024_u16; // Avoid accidentally using infinite tokens. Should think about this more.
 
-pub(crate) const GPT3_5_TURBO_INSTRUCT: &str = "gpt-3.5-turbo";
+pub(crate) const GPT_4O_MINI: &str = "gpt-4o-mini";
 pub(crate) const TEXT_EMBED_3_SMALL: &str = "text-embedding-3-small";
 
-pub const DEFAULT_LLM_MODEL: &str = GPT3_5_TURBO_INSTRUCT;
+pub const DEFAULT_LLM_MODEL: &str = GPT_4O_MINI;
 pub const DEFAULT_EMBEDDING_MODEL: &str = TEXT_EMBED_3_SMALL;
 
 pub struct Openai<C: Config> {
@@ -75,7 +75,8 @@ pub fn new_openai_client(
     org_id: Option<&str>,
     project_id: Option<&str>,
 ) -> Openai<OpenAIConfig> {
-    let mut cfg = OpenAIConfig::new();
+    // Default to empty API key to avoid picking up ENV variable in downstream library.
+    let mut cfg = OpenAIConfig::new().with_api_key("");
 
     if let Some(org_id) = org_id {
         cfg = cfg.with_org_id(org_id);
@@ -85,7 +86,6 @@ pub fn new_openai_client(
         cfg = cfg.with_project_id(project_id);
     }
 
-    // If an API key is provided, use it. Otherwise use default from env variables.
     if let Some(api_key) = api_key {
         cfg = cfg.with_api_key(api_key);
     }

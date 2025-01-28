@@ -1,0 +1,82 @@
+version: v1
+kind: Spicepod
+name: s3_tpcds_sf5
+datasets:
+  - from: s3://benchmarks/tpcds_sf5/catalog_sales.parquet
+    name: catalog_sales
+    params: &s3_params
+      file_format: parquet
+      allow_http: true
+      s3_auth: key
+      s3_endpoint: ${secrets:S3_ENDPOINT}
+      s3_key: ${secrets:S3_KEY}
+      s3_secret: ${secrets:S3_SECRET}
+  - from: s3://benchmarks/tpcds_sf5/catalog_returns.parquet
+    name: catalog_returns
+    params: *s3_params
+  - from: s3://benchmarks/tpcds_sf5/inventory.parquet
+    name: inventory
+    params: *s3_params
+  - from: s3://benchmarks/tpcds_sf5/store_sales.parquet
+    name: store_sales
+    params: *s3_params
+  - from: s3://benchmarks/tpcds_sf5/store_returns.parquet
+    name: store_returns
+    params: *s3_params
+  - from: s3://benchmarks/tpcds_sf5/web_sales.parquet
+    name: web_sales
+    params: *s3_params
+  - from: s3://benchmarks/tpcds_sf5/web_returns.parquet
+    name: web_returns
+    params: *s3_params
+  - from: s3://benchmarks/tpcds_sf5/customer.parquet
+    name: customer
+    params: *s3_params
+  - from: s3://benchmarks/tpcds_sf5/customer_address.parquet
+    name: customer_address
+    params: *s3_params
+  - from: s3://benchmarks/tpcds_sf5/customer_demographics.parquet
+    name: customer_demographics
+    params: *s3_params
+  - from: s3://benchmarks/tpcds_sf5/date_dim.parquet
+    name: date_dim
+    params: *s3_params
+  - from: s3://benchmarks/tpcds_sf5/household_demographics.parquet
+    name: household_demographics
+    params: *s3_params
+  - from: s3://benchmarks/tpcds_sf5/item.parquet
+    name: item
+    params: *s3_params
+  - from: s3://benchmarks/tpcds_sf5/promotion.parquet
+    name: promotion
+    params: *s3_params
+  - from: s3://benchmarks/tpcds_sf5/store.parquet
+    name: store
+    params: *s3_params
+  - from: s3://benchmarks/tpcds_sf5/time_dim.parquet
+    name: time_dim
+    params: *s3_params
+  - from: s3://benchmarks/tpcds_sf5/warehouse.parquet
+    name: warehouse
+    params: *s3_params
+  - from: s3://benchmarks/tpcds_sf5/web_page.parquet
+    name: web_page
+    params: *s3_params
+  - from: s3://benchmarks/tpcds_sf5/web_site.parquet
+    name: web_site
+    params: *s3_params
+  - from: s3://benchmarks/tpcds_sf5/reason.parquet
+    name: reason
+    params: *s3_params
+  - from: s3://benchmarks/tpcds_sf5/call_center.parquet
+    name: call_center
+    params: *s3_params
+  - from: s3://benchmarks/tpcds_sf5/income_band.parquet
+    name: income_band
+    params: *s3_params
+  - from: s3://benchmarks/tpcds_sf5/catalog_page.parquet
+    name: catalog_page
+    params: *s3_params
+  - from: s3://benchmarks/tpcds_sf5/ship_mode.parquet
+    name: ship_mode
+    params: *s3_params

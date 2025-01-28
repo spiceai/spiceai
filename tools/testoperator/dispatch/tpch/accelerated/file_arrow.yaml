@@ -1,0 +1,14 @@
+tests:
+  bench:
+    spicepod_path: ./test/spicepods/tpch/accelerated/file_arrow.yaml
+    query_set: tpch
+    runner_type: spiceai-runners
+  throughput:
+    spicepod_path: ./test/spicepods/tpch/accelerated/file_arrow.yaml
+    query_set: tpch
+    runner_type: spiceai-large-runners
+  load:
+    spicepod_path: ./test/spicepods/tpch/accelerated/file_arrow.yaml
+    query_set: tpch
+    runner_type: spiceai-large-runners
+    duration: 28800

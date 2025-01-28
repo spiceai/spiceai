@@ -25,13 +25,20 @@ use crate::get_params_with_secrets;
 use crate::parameters::ParameterSpec;
 use crate::parameters::Parameters;
 use crate::secrets::Secrets;
+use arrow_schema::SchemaRef;
+use arrow_tools::schema::schema_meta_get_computed_columns;
 use async_trait::async_trait;
 use data_components::cdc::ChangesStream;
+use datafusion::common::tree_node::Transformed;
+use datafusion::common::tree_node::TreeNode;
+use datafusion::common::Column;
 use datafusion::dataframe::DataFrame;
 use datafusion::datasource::{DefaultTableSource, TableProvider};
 use datafusion::error::DataFusionError;
+use datafusion::error::Result as DataFusionResult;
 use datafusion::execution::context::SessionContext;
 use datafusion::execution::SendableRecordBatchStream;
+use datafusion::logical_expr::LogicalPlan;
 use datafusion::logical_expr::{Expr, LogicalPlanBuilder};
 use datafusion::sql::unparser::Unparser;
 use datafusion::sql::TableReference;
@@ -169,7 +176,7 @@ pub enum DataConnectorError {
         message: String,
     },
 
-    #[snafu(display("Cannot setup the {connector_component} ({dataconnector}).\nThe connector '{dataconnector}' is not a valid connector.\nFor details, visit: https://docs.spiceai.org/components/data-connectors"))]
+    #[snafu(display("Cannot setup the {connector_component} ({dataconnector}).\nThe connector '{dataconnector}' is not a valid connector.\nFor details, visit: https://spiceai.org/docs/components/data-connectors"))]
     InvalidConnectorType {
         dataconnector: String,
         connector_component: ConnectorComponent,
@@ -201,7 +208,7 @@ pub enum DataConnectorError {
         table_name: String,
     },
 
-    #[snafu(display("Failed to load the {connector_component} ({dataconnector}).\nAn unknown Data Connector Error occurred: {source}\nPlease report a bug on GitHub: https://github.com/spiceai/spiceai/issues"))]
+    #[snafu(display("Failed to load the {connector_component} ({dataconnector}).\nAn unknown Data Connector Error occurred: {source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"))]
     InternalWithSource {
         dataconnector: String,
         connector_component: ConnectorComponent,
@@ -226,7 +233,7 @@ pub enum DataConnectorError {
         connector_component: ConnectorComponent,
     },
 
-    #[snafu(display("Failed to load the {connector_component} ({dataconnector}).\nThe field '{field_name}' has an unsupported data type: {data_type}.\nSkip loading this field by setting the `invalid_type_action` parameter to `ignore` or `warn` in the dataset configuration.\nFor details, visit: https://docs.spiceai.org/reference/spicepod/datasets#invalid_type_action"))]
+    #[snafu(display("Failed to load the {connector_component} ({dataconnector}).\nThe field '{field_name}' has an unsupported data type: {data_type}.\nSkip loading this field by setting the `invalid_type_action` parameter to `ignore` or `warn` in the dataset configuration.\nFor details, visit: https://spiceai.org/docs/reference/spicepod/datasets#invalid_type_action"))]
     UnsupportedDataType {
         dataconnector: String,
         connector_component: ConnectorComponent,
@@ -234,7 +241,7 @@ pub enum DataConnectorError {
         field_name: String,
     },
 
-    #[snafu(display("Failed to initialize the {connector_component} (ODBC).\nThe runtime is built without ODBC support.\nBuild Spice.ai OSS with the `odbc` feature enabled or use the Docker image that includes ODBC support.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/odbc"))]
+    #[snafu(display("Failed to initialize the {connector_component} (ODBC).\nThe runtime is built without ODBC support.\nBuild Spice.ai OSS with the `odbc` feature enabled or use the Docker image that includes ODBC support.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/odbc"))]
     OdbcNotInstalled {
         connector_component: ConnectorComponent,
     },
@@ -444,7 +451,19 @@ pub async fn get_data(
 
             DataFrame::new(ctx.state(), logical_plan)
         }
-        Some(sql) => ctx.sql(&sql).await.map_err(find_datafusion_root)?,
+        Some(sql) => {
+            let session = ctx.state();
+            let mut plan = session
+                .create_logical_plan(&sql)
+                .await
+                .map_err(find_datafusion_root)?;
+
+            // If the refresh SQL defines a subset of columns to fetch, computed columns such as embeddings
+            // are not included automatically, so we verify their presence and add them manually if needed.
+            plan = include_computed_columns(plan, &table_provider.schema())?;
+
+            DataFrame::new(session, plan)
+        }
     };
 
     for filter in filters {
@@ -576,6 +595,46 @@ impl ConnectorParamsBuilder {
             component: self.component.clone(),
         })
     }
+}
+
+/// Ensures that the associated computed columns (e.g., embeddings) are included
+/// in the `LogicalPlan::Projection` node.
+/// If any required computed columns are missing, they are automatically added to the projection.
+fn include_computed_columns(
+    plan: LogicalPlan,
+    source_table_schema: &SchemaRef,
+) -> DataFusionResult<LogicalPlan> {
+    let plan = plan
+        .transform_down(|plan| {
+            match plan {
+                LogicalPlan::Projection(mut proj) => {
+                    for (idx, col) in proj.schema.columns().iter().enumerate() {
+                        if let Some(computed_columns) = schema_meta_get_computed_columns(
+                            source_table_schema.as_ref(),
+                            col.name(),
+                        ) {
+                            for computed_column in computed_columns {
+                                if !proj
+                                    .schema
+                                    .has_column_with_unqualified_name(computed_column.name())
+                                {
+                                    proj.expr.push(Expr::Column(Column::new(
+                                        proj.schema.qualified_field(idx).0.cloned(),
+                                        computed_column.name().to_string(),
+                                    )));
+                                }
+                            }
+                        }
+                    }
+                    // The Transformed flag is not used, so we always specify it as transformed for simplicity.
+                    Ok(Transformed::yes(LogicalPlan::Projection(proj)))
+                }
+                _ => Ok(Transformed::no(plan)),
+            }
+        })?
+        .data;
+
+    Ok(plan)
 }
 
 #[cfg(test)]

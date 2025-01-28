@@ -33,7 +33,7 @@ var runCmd = &cobra.Command{
 	Example: `
 spice run
 
-# See more at: https://docs.spiceai.org/
+# See more at: https://spiceai.org/docs/
 `,
 	Args: cobra.ArbitraryArgs,
 	Run: func(cmd *cobra.Command, args []string) {

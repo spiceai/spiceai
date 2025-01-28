@@ -1,11 +1,27 @@
 name: Installs the make tool
 description: 'composite action'
+inputs:
+  os:
+    description: 'Operating system to install make for'
+    default: 'linux' # 'linux', 'windows'
 
 runs:
   using: 'composite'
   steps:
-    - name: Install make
+    - name: Install make (Linux)
+      if: inputs.os == 'linux'
       shell: bash
       run: |
         sudo apt-get update
         sudo apt-get install -y make
+
+    - name: Install make (Windows)
+      if: inputs.os == 'windows'
+      shell: pwsh
+      run: |
+        # use choco to install make
+        if (-not (Get-Command choco -ErrorAction SilentlyContinue)) {
+          Set-ExecutionPolicy Bypass -Scope Process -Force; iex ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
+          echo "C:\ProgramData\Chocolatey\bin" >> $env:GITHUB_PATH
+        }
+        choco install make -y

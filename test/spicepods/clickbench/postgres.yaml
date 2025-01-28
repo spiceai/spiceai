@@ -1,0 +1,13 @@
+version: v1
+kind: Spicepod
+name: postgres_clickbench
+datasets:
+  - from: postgres:hits
+    name: hits
+    params:
+      pg_host: ${secrets:POSTGRES_HOST}
+      pg_port: 5432
+      pg_user: postgres
+      pg_pass: ${secrets:POSTGRES_PASSWORD}
+      pg_db: clickbench
+      pg_sslmode: disable

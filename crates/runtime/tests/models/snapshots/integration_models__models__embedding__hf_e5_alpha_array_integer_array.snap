@@ -1,0 +1,25 @@
+---
+source: crates/runtime/tests/models/embedding.rs
+expression: normalize_embeddings_response(response_raw)
+snapshot_kind: text
+---
+{
+  "data": [
+    {
+      "embedding": "array_384_items",
+      "index": 0,
+      "object": "embedding"
+    },
+    {
+      "embedding": "array_384_items",
+      "index": 1,
+      "object": "embedding"
+    }
+  ],
+  "model": "hf_e5",
+  "object": "list",
+  "usage": {
+    "prompt_tokens": 35,
+    "total_tokens": 35
+  }
+}

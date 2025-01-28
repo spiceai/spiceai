@@ -10,8 +10,8 @@ All criteria must be met for the connector to be considered Beta, with exception
 | -------------------------------- | ------------ | --------------- |
 | Clickhouse                       | ➖           |                 |
 | Databricks (mode: delta_lake)    | ✅           | @Sevenannn      |
-| Databricks (mode: spark_connect) | ➖           |                 |
-| Delta Lake                       | ➖           |                 |
+| Databricks (mode: spark_connect) | ✅           | @Sevenannn      |
+| Delta Lake                       | ✅           | @Sevenannn      |
 | Dremio                           | ✅           | @Sevenannn      |
 | DuckDB                           | ✅           | @peasee         |
 | File                             | ✅           | @peasee         |
@@ -21,6 +21,7 @@ All criteria must be met for the connector to be considered Beta, with exception
 | GitHub                           | ✅           | @peasee         |
 | HTTP/HTTPS                       | ➖           |                 |
 | Localpod                         | ➖           |                 |
+| Iceberg                          | ✅           | @phillipleblanc |
 | MS SQL                           | ✅           | @peasee         |
 | MySQL                            | ✅           | @peasee         |
 | ODBC                             | ➖           |                 |
@@ -45,7 +46,7 @@ This table defines the required features and/or tests for each connector:
 | -------------------------------- | --------------------- | -------------- | ----------------- | ------------------------ | ------------------- | -------------------------- |
 | Clickhouse                       | ✅ (100)              | ➖             | ☑️                | ➖                       | ✅                  | ➖                         |
 | Databricks (mode: delta_lake)    | ✅ (1)                | ➖             | ☑️                | ➖                       | ✅                  | ➖                         |
-| Databricks (mode: spark_connect) | ✅ (100)              | ➖             | ☑️                | ➖                       | ✅                  | ➖                         |
+| Databricks (mode: spark_connect) | ✅ (100)              | ➖             | ☑️                | ➖                       | ➖                  | ➖                         |
 | Delta Lake                       | ✅ (1)                | ➖             | ☑️                | ➖                       | ✅                  | ➖                         |
 | Dremio                           | ✅ (100)              | ➖             | ☑️                | ➖                       | ✅                  | ➖                         |
 | DuckDB                           | ✅ (100)              | ➖             | ☑️                | ➖                       | ✅                  | ➖                         |
@@ -54,6 +55,7 @@ This table defines the required features and/or tests for each connector:
 | GraphQL                          | ➖                    | ➖             | ➖                | ➖                       | ➖                  | ☑️                         |
 | GitHub                           | ➖                    | ➖             | ➖                | ➖                       | ➖                  | ☑️                         |
 | HTTP/HTTPS                       | ➖                    | ➖             | ➖                | ➖                       | ➖                  | ☑️                         |
+| Iceberg                          | ✅ (1)                | ➖             | ☑️                | ➖                       | ✅                  | ➖                         |
 | MS SQL                           | ✅ (100)              | ➖             | ☑️                | ➖                       | ✅                  | ➖                         |
 | MySQL                            | ✅ (100)              | ➖             | ☑️                | ➖                       | ✅                  | ➖                         |
 | ODBC                             | ✅ (100)              | ➖             | ☑️                | ➖                       | ✅                  | ➖                         |
@@ -63,7 +65,7 @@ This table defines the required features and/or tests for each connector:
 | Spice.ai Cloud Platform          | ✅ (100)              | ➖             | ☑️                | ➖                       | ✅                  | ➖                         |
 | S3                               | ✅ (1)                | ➖             | ➖                | ➖                       | ✅                  | ☑️                         |
 | Azure BlobFS                     | ✅ (1)                | ➖             | ➖                | ➖                       | ✅                  | ☑️                         |
-| Spark                            | ✅ (1)                | ➖             | ☑️                | ➖                       | ✅                  | ➖                         |
+| Spark                            | ✅ (1)                | ➖             | ☑️                | ➖                       | ➖                  | ➖                         |
 
 [tpch]: #tpc-h
 [fed]: #federation

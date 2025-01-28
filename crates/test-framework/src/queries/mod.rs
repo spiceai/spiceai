@@ -14,11 +14,16 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-#[derive(Clone)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub enum QuerySet {
+    #[serde(rename = "tpch")]
     Tpch,
+    #[serde(rename = "tpcds")]
     Tpcds,
-    ClickBench,
+    #[serde(rename = "clickbench")]
+    Clickbench,
 }
 
 impl QuerySet {
@@ -30,12 +35,12 @@ impl QuerySet {
         match self {
             QuerySet::Tpch => get_tpch_test_queries(overrides),
             QuerySet::Tpcds => get_tpcds_test_queries(overrides),
-            QuerySet::ClickBench => get_clickbench_test_queries(overrides),
+            QuerySet::Clickbench => get_clickbench_test_queries(overrides),
         }
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub enum QueryOverrides {
     SQLite,
     PostgreSQL,
@@ -45,6 +50,7 @@ pub enum QueryOverrides {
     ODBCAthena,
     DuckDB,
     Snowflake,
+    IcebergSF1,
 }
 
 impl QueryOverrides {
@@ -153,6 +159,37 @@ pub fn get_tpch_test_queries(
             simple_q6,
             simple_q7
         ),
+        Some(QueryOverrides::IcebergSF1) => generate_tpch_queries_override!(
+            "iceberg_sf1",
+            q1,
+            q2,
+            q3,
+            q4,
+            q5,
+            q6,
+            q7,
+            q8,
+            q9,
+            q10,
+            q11,
+            q12,
+            q13,
+            q14,
+            q16,
+            q17,
+            q18,
+            q19,
+            q20,
+            q21,
+            q22,
+            simple_q1,
+            simple_q2,
+            simple_q3,
+            simple_q4,
+            simple_q5,
+            simple_q6,
+            simple_q7
+        ),
         _ => queries,
     }
 }
@@ -230,6 +267,7 @@ pub fn get_tpcds_test_queries(
             // Issue: https://github.com/spiceai/spiceai/issues/2939
             let queries: Vec<(&'static str, &'static str)> = remove_tpcds_query!(
                 queries, 1, 8,  // EXCEPT and INTERSECT aren't supported
+                4, // slow postgresql performance: https://www.postgresql.org/message-id/9A28C8860F777E439AA12E8AEA7694F801133F57%40BPXM15GP.gisp.nec.co.jp
                 30, // https://github.com/spiceai/spiceai/issues/2939
                 36, // overridden below
                 38, // EXCEPT and INTERSECT aren't supported
@@ -297,6 +335,13 @@ pub fn get_clickbench_test_queries(
             // expressions can appear with other expressions, so re-write the query to fit
             Some(generate_clickbench_query_overrides!(
                 "dremio", 21, 22, 23, 24
+            ))
+        }
+        Some(QueryOverrides::DuckDB) => {
+            // specific to the DuckDB accelerator when used with on_zero_results: use_source
+            // the unparser does not support binary scalar literals, so cast the binary columns to text
+            Some(generate_clickbench_query_overrides!(
+                "duckdb", 11, 12, 13, 14, 15, 22, 23, 25, 26, 27, 28, 29, 31, 32, 37, 38
             ))
         }
         _ => None,

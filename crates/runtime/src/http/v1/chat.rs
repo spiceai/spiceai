@@ -20,7 +20,10 @@ use std::{convert::Infallible, sync::Arc, time::Duration};
 use crate::{http::traceparent::override_task_history_with_traceparent, model::LLMModelStore};
 #[cfg(feature = "openapi")]
 use async_openai::types::CreateChatCompletionResponse;
-use async_openai::types::{ChatCompletionResponseStream, CreateChatCompletionRequest};
+use async_openai::{
+    error::OpenAIError,
+    types::{ChatCompletionResponseStream, CreateChatCompletionRequest},
+};
 use async_stream::stream;
 use axum::{
     http::{HeaderMap, StatusCode},
@@ -124,7 +127,8 @@ pub(crate) async fn post(
                         Err(e) => {
                             tracing::error!(target: "task_history", parent: &span_clone, "{e}");
                             tracing::error!("Error from v1/chat: {e}");
-                            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+
+                            openai_error_to_response(e)
                         }
                     }
                 } else {
@@ -142,7 +146,8 @@ pub(crate) async fn post(
                         Err(e) => {
                             tracing::error!(target: "task_history", parent: &span_clone, "{e}");
                             tracing::error!("Error from v1/chat: {e}");
-                            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+
+                            openai_error_to_response(e)
                         }
                     }
                 }
@@ -219,5 +224,33 @@ impl OpenaiErrorEvent {
                 message: err.into(),
             },
         }
+    }
+}
+
+/// Converts `OpenAI` errors to HTTP responses
+/// Preserve the original `OpenAI` error structure to maintain compatibility with `OpenAI` documentation
+#[must_use]
+pub fn openai_error_to_response(e: OpenAIError) -> Response {
+    match e {
+        OpenAIError::InvalidArgument(_) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+        OpenAIError::ApiError(api_error) => {
+            let error_response = serde_json::json!({
+                "message": api_error.message,
+                "type": api_error.r#type,
+                "param": api_error.param,
+                "code": api_error.code
+            });
+
+            let status_code = match api_error.code.as_deref() {
+                Some("invalid_request_error") => StatusCode::BAD_REQUEST,
+                Some("invalid_api_key") => StatusCode::UNAUTHORIZED,
+                Some("insufficient_quota") => StatusCode::PAYMENT_REQUIRED,
+                Some("rate_limit_exceeded") => StatusCode::TOO_MANY_REQUESTS,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+
+            (status_code, Json(error_response)).into_response()
+        }
+        _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }

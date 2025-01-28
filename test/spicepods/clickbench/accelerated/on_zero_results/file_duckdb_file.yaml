@@ -1,0 +1,12 @@
+version: v1
+kind: Spicepod
+name: file_clickbench_duckdb_file_on_zero_results
+datasets:
+  - from: file:data/hits_0.parquet
+    name: hits
+    acceleration:
+      enabled: true
+      engine: duckdb
+      mode: file
+      refresh_sql: "SELECT * FROM hits LIMIT 0"
+      on_zero_results: use_source

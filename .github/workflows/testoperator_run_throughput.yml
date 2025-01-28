@@ -34,6 +34,7 @@ on:
           - 'odbc-athena'
           - 'duckdb'
           - 'snowflake'
+          - 'iceberg-sf1'
       ready_wait:
         description: 'How long (in seconds) to wait for spiced to start'
         required: true
@@ -61,88 +62,101 @@ jobs:
           sudo wget https://dl.min.io/client/mc/release/linux-amd64/mc -O /usr/local/bin/mc
           sudo chmod +x /usr/local/bin/mc
           mc alias set spice-minio ${{ secrets.MINIO_ENDPOINT }} ${{ secrets.MINIO_ACCESS_KEY }} ${{ secrets.MINIO_SECRET_KEY }}
-
-      - name: Set testoperator commit
-        run: |
-          echo "TESTOPERATOR_COMMIT=$(git rev-parse HEAD)" >> $GITHUB_ENV
-
-      - name: Download the testoperator from MinIO if it exists
-        run: |
-          sudo mkdir -p /usr/local/bin
-          if mc stat spice-minio/artifacts/testoperator/linux-x86_64/$TESTOPERATOR_COMMIT/testoperator; then
-            mc cp spice-minio/artifacts/testoperator/linux-x86_64/$TESTOPERATOR_COMMIT/testoperator ./testoperator
-            sudo cp ./testoperator /usr/local/bin/testoperator
-            sudo chmod +x /usr/local/bin/testoperator
-            echo "TESTOPERATOR_DOWNLOADED=true" >> $GITHUB_ENV
-          else
-            echo "TESTOPERATOR_DOWNLOADED=false" >> $GITHUB_ENV
-          fi
-
-      - name: Setup Rust
-        if: ${{ env.TESTOPERATOR_DOWNLOADED != 'true' }}
-        uses: ./.github/actions/setup-rust
+      
+      - name: Setup spiced
+        uses: ./.github/actions/setup-spiced
         with:
-          os: 'linux'
+          spiced_commit: ${{ github.event.inputs.spiced_commit }}
 
-      - name: Setup cc
-        if: ${{ env.TESTOPERATOR_DOWNLOADED != 'true' }}
-        uses: ./.github/actions/setup-cc
-
-      - name: Get latest trunk commit
-        if: ${{ !github.event.inputs.spiced_commit }}
-        run: |
-          git fetch origin
-          echo "SPICED_COMMIT=$(git rev-parse origin/trunk)" >> $GITHUB_ENV
-
-      - name: Set SPICED_COMMIT from workflow input
-        if: ${{ github.event.inputs.spiced_commit }}
-        run: |
-          echo "SPICED_COMMIT=${{ github.event.inputs.spiced_commit }}" >> $GITHUB_ENV
-
-      - name: Download spiced from MinIO
-        run: |
-          mc cp spice-minio/artifacts/spiced/linux-x86_64/$SPICED_COMMIT/spiced_models_linux_x86_64.tar.gz spiced_models_linux_x86_64.tar.gz
-          tar -xzf spiced_models_linux_x86_64.tar.gz
-          sudo cp ./spiced /usr/local/bin/spiced
+      - name: Build Testoperator
+        uses: ./.github/actions/build-testoperator
 
       - name: Setup Testoperator
-        uses: ./.github/actions/setup-testoperator
+        uses: ./.github/actions/setup-testoperator-data
         with:
-          build_testoperator: ${{ env.TESTOPERATOR_DOWNLOADED != 'true' }}
           query_set: ${{ github.event.inputs.query_set }}
+
+      - name: Setup MySQL
+        run: |
+          if [[ ${{ github.event.inputs.query_set }} == "tpcds" ]]; then
+            echo "MYSQL_DB=tpcds_sf1" >> $GITHUB_ENV
+          elif [[ ${{ github.event.inputs.query_set }} == "tpch" ]]; then
+            echo "MYSQL_DB=tpch_sf1" >> $GITHUB_ENV
+          fi
 
       - name: Run the throughput test
         if: ${{ github.event.inputs.query_overrides == '' }}
         run: |
           rm -rf .spice/data
-          testoperator run throughput -s /usr/local/bin/spiced -p ${{ github.event.inputs.spicepod_path }} -d /opt/spiced/data --query-set ${{ github.event.inputs.query_set }} --ready-wait ${{ github.event.inputs.ready_wait }}
+          testoperator run throughput \
+            -s /usr/local/bin/spiced \
+            -p ${{ github.event.inputs.spicepod_path }} \
+            -d /opt/spiced/data \
+            --query-set ${{ github.event.inputs.query_set }} \
+            --ready-wait ${{ github.event.inputs.ready_wait }} \
+            --disable-progress-bars \
+            --concurrency 8
         env:
-          S3_ENDPOINT: ${{ secrets.CLICKBENCH_S3_ENDPOINT}}
-          S3_KEY: ${{ secrets.CLICKBENCH_S3_KEY}}
-          S3_SECRET: ${{ secrets.CLICKBENCH_S3_SECRET}}
+          S3_ENDPOINT: ${{ secrets.MINIO_ENDPOINT}}
+          S3_KEY: ${{ secrets.MINIO_ACCESS_KEY}}
+          S3_SECRET: ${{ secrets.MINIO_SECRET_KEY}}
           DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
           DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+          DATABRICKS_ENDPOINT: ${{ secrets.DATABRICKS_ENDPOINT }}
+          DATABRICKS_CLUSTER_ID: ${{ secrets.DATABRICKS_CLUSTER_ID }}
           AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ secrets.AWS_DATABRICKS_DELTA_ACCESS_KEY_ID }}
           AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ secrets.AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY }}
+          SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+          SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
+          SNOWFLAKE_USERNAME: ${{ secrets.SNOWFLAKE_USERNAME }}
+          MYSQL_HOST: ${{ secrets.MYSQL_HOST }}
+          MYSQL_TCP_PORT: 3306
+          MYSQL_USER: root
+          MYSQL_PASSWORD: ${{ secrets.MYSQL_PASSWORD }}
+          POSTGRES_HOST: ${{ secrets.POSTGRES_HOST }}
+          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+          SPICEAI_TPCH_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TPCH_BENCHMARK_KEY }}
+          SPICEAI_TPCDS_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TPCDS_BENCHMARK_KEY }}
+          SPICEAI_CLICKBENCH_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_CLICKBENCH_BENCHMARK_KEY }}
+          DREMIO_ENDPOINT: ${{ secrets.SPICE_DREMIO_ENDPOINT}}
+          DREMIO_USERNAME: ${{ secrets.SPICE_DREMIO_USERNAME}}
+          DREMIO_PASSWORD: ${{ secrets.SPICE_DREMIO_PASSWORD}}
 
       - name: Run the throughput test (with overrides)
         if: ${{ github.event.inputs.query_overrides != '' }}
         run: |
           rm -rf .spice/data
-          testoperator run throughput -s /usr/local/bin/spiced -p ${{ github.event.inputs.spicepod_path }} -d /opt/spiced/data --query-set ${{ github.event.inputs.query_set }} --query-overrides ${{ github.event.inputs.query_overrides }} --ready-wait ${{ github.event.inputs.ready_wait }}
+          testoperator run throughput \
+            -s /usr/local/bin/spiced \
+            -p ${{ github.event.inputs.spicepod_path }} \
+            -d /opt/spiced/data \
+            --query-set ${{ github.event.inputs.query_set }} \
+            --ready-wait ${{ github.event.inputs.ready_wait }} \
+            --disable-progress-bars \
+            --query-overrides ${{ github.event.inputs.query_overrides }} \
+            --concurrency 8
         env:
-          S3_ENDPOINT: ${{ secrets.CLICKBENCH_S3_ENDPOINT}}
-          S3_KEY: ${{ secrets.CLICKBENCH_S3_KEY}}
-          S3_SECRET: ${{ secrets.CLICKBENCH_S3_SECRET}}
+          S3_ENDPOINT: ${{ secrets.MINIO_ENDPOINT}}
+          S3_KEY: ${{ secrets.MINIO_ACCESS_KEY}}
+          S3_SECRET: ${{ secrets.MINIO_SECRET_KEY}}
+          DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+          DATABRICKS_ENDPOINT: ${{ secrets.DATABRICKS_ENDPOINT }}
+          DATABRICKS_CLUSTER_ID: ${{ secrets.DATABRICKS_CLUSTER_ID }}
+          AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ secrets.AWS_DATABRICKS_DELTA_ACCESS_KEY_ID }}
+          AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ secrets.AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY }}
+          SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+          SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
+          SNOWFLAKE_USERNAME: ${{ secrets.SNOWFLAKE_USERNAME }}
+          MYSQL_HOST: ${{ secrets.MYSQL_HOST }}
+          MYSQL_TCP_PORT: 3306
+          MYSQL_USER: root
+          MYSQL_PASSWORD: ${{ secrets.MYSQL_PASSWORD }}
+          POSTGRES_HOST: ${{ secrets.POSTGRES_HOST }}
+          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+          SPICEAI_TPCH_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TPCH_BENCHMARK_KEY }}
+          SPICEAI_TPCDS_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TPCDS_BENCHMARK_KEY }}
+          SPICEAI_CLICKBENCH_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_CLICKBENCH_BENCHMARK_KEY }}
           DREMIO_ENDPOINT: ${{ secrets.SPICE_DREMIO_ENDPOINT}}
           DREMIO_USERNAME: ${{ secrets.SPICE_DREMIO_USERNAME}}
           DREMIO_PASSWORD: ${{ secrets.SPICE_DREMIO_PASSWORD}}
-          DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
-          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
-          AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ secrets.AWS_DATABRICKS_DELTA_ACCESS_KEY_ID }}
-          AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ secrets.AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY }}
-
-      - name: Upload the testoperator binary
-        if: ${{ env.TESTOPERATOR_DOWNLOADED != 'true' }}
-        run: |
-          mc cp /usr/local/bin/testoperator spice-minio/artifacts/testoperator/linux-x86_64/$TESTOPERATOR_COMMIT/testoperator

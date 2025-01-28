@@ -1,0 +1,80 @@
+name: Setup testoperator
+description: 'composite action'
+inputs:
+  query_set:
+    description: 'Query set'
+    required: true
+    default: 'tpch'
+    type: choice
+    options:
+      - 'tpch'
+      - 'tpcds'
+      - 'clickbench'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Prepare file-based data directory
+      shell: bash
+      run: |
+        sudo rm -rf /opt/spiced/data
+        sudo mkdir -p /opt/spiced/data
+        sudo chown runner:runner -R /opt/spiced/data
+
+    - name: Download DuckDB TPCH Data
+      shell: bash
+      if: inputs.query_set == 'tpch'
+      run: |
+        cd /opt/spiced/data
+        mc cp spice-minio/benchmarks/duckdb/tpch.db ./
+
+    - name: Download DuckDB TPCDS Data
+      shell: bash
+      if: inputs.query_set == 'tpcds'
+      run: |
+        cd /opt/spiced/data
+        mc cp spice-minio/benchmarks/duckdb/tpcds.db ./
+
+    - name: Download File Connector TPCH Data
+      shell: bash
+      if: inputs.query_set == 'tpch'
+      run: |
+        cd /opt/spiced/data
+        mc cp spice-minio/benchmarks/tpch_sf1/customer/ ./ --recursive
+        mc cp spice-minio/benchmarks/tpch_sf1/lineitem/ ./ --recursive
+        mc cp spice-minio/benchmarks/tpch_sf1/nation/ ./ --recursive
+        mc cp spice-minio/benchmarks/tpch_sf1/orders/ ./ --recursive
+        mc cp spice-minio/benchmarks/tpch_sf1/part/ ./ --recursive
+        mc cp spice-minio/benchmarks/tpch_sf1/partsupp/ ./ --recursive
+        mc cp spice-minio/benchmarks/tpch_sf1/region/ ./ --recursive
+        mc cp spice-minio/benchmarks/tpch_sf1/supplier/ ./ --recursive
+    
+    - name: Download File Connector TPCDS Data
+      shell: bash
+      if: inputs.query_set == 'tpcds'
+      run: |
+        cd /opt/spiced/data
+        mc cp spice-minio/benchmarks/tpcds_sf1/call_center/ ./ --recursive
+          mc cp spice-minio/benchmarks/tpcds_sf1/catalog_page/ ./ --recursive
+          mc cp spice-minio/benchmarks/tpcds_sf1/catalog_returns/ ./ --recursive
+          mc cp spice-minio/benchmarks/tpcds_sf1/catalog_sales/ ./ --recursive
+          mc cp spice-minio/benchmarks/tpcds_sf1/customer/ ./ --recursive
+          mc cp spice-minio/benchmarks/tpcds_sf1/customer_address/ ./ --recursive
+          mc cp spice-minio/benchmarks/tpcds_sf1/customer_demographics/ ./ --recursive
+          mc cp spice-minio/benchmarks/tpcds_sf1/date_dim/ ./ --recursive
+          mc cp spice-minio/benchmarks/tpcds_sf1/household_demographics/ ./ --recursive
+          mc cp spice-minio/benchmarks/tpcds_sf1/income_band/ ./ --recursive
+          mc cp spice-minio/benchmarks/tpcds_sf1/inventory/ ./ --recursive
+          mc cp spice-minio/benchmarks/tpcds_sf1/item/ ./ --recursive
+          mc cp spice-minio/benchmarks/tpcds_sf1/promotion/ ./ --recursive
+          mc cp spice-minio/benchmarks/tpcds_sf1/reason/ ./ --recursive
+          mc cp spice-minio/benchmarks/tpcds_sf1/ship_mode/ ./ --recursive
+          mc cp spice-minio/benchmarks/tpcds_sf1/store/ ./ --recursive
+          mc cp spice-minio/benchmarks/tpcds_sf1/store_returns/ ./ --recursive
+          mc cp spice-minio/benchmarks/tpcds_sf1/store_sales/ ./ --recursive
+          mc cp spice-minio/benchmarks/tpcds_sf1/time_dim/ ./ --recursive
+          mc cp spice-minio/benchmarks/tpcds_sf1/warehouse/ ./ --recursive
+          mc cp spice-minio/benchmarks/tpcds_sf1/web_page/ ./ --recursive
+          mc cp spice-minio/benchmarks/tpcds_sf1/web_returns/ ./ --recursive
+          mc cp spice-minio/benchmarks/tpcds_sf1/web_sales/ ./ --recursive
+          mc cp spice-minio/benchmarks/tpcds_sf1/web_site/ ./ --recursive

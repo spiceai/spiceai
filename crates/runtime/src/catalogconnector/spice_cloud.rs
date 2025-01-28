@@ -91,7 +91,7 @@ impl SpiceCloudPlatformCatalog {
             return Err(
                 super::Error::InvalidConfigurationNoSource {
                     connector: "spice.ai".into(),
-                    message: "A Catalog Path is required for Spice.ai in the format of: <org>/<app>[/<catalog>] where <catalog> is optional.\nFor details, visit: https://docs.spiceai.org/components/catalogs/spiceai#from".into(),
+                    message: "A Catalog Path is required for Spice.ai in the format of: <org>/<app>[/<catalog>] where <catalog> is optional.\nFor details, visit: https://spiceai.org/docs/components/catalogs/spiceai#from".into(),
                     connector_component: ConnectorComponent::from(catalog),
                 },
             );
@@ -102,7 +102,7 @@ impl SpiceCloudPlatformCatalog {
             Err(e) => {
                 Err(super::Error::InvalidConfiguration {
                     connector: "spice.ai".into(),
-                    message: "A Catalog Path is required for Spice.ai in the format of: <org>/<app>[/<catalog>] where <catalog> is optional.\nFor details, visit: https://docs.spiceai.org/components/catalogs/spiceai#from".into(),
+                    message: "A Catalog Path is required for Spice.ai in the format of: <org>/<app>[/<catalog>] where <catalog> is optional.\nFor details, visit: https://spiceai.org/docs/components/catalogs/spiceai#from".into(),
                     connector_component: ConnectorComponent::from(catalog),
                     source: Box::new(e),
                 })

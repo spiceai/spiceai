@@ -1,0 +1,52 @@
+name: Setup testoperator
+description: 'composite action'
+
+# Builds the testoperator if it doesn't exist in MinIO
+# Downloads it based on the commit from the HEAD of the current branch
+# Uploads the testoperator binary to MinIO if built
+#
+# Requires the MinIO CLI to be installed and configured to use this action
+runs:
+  using: 'composite'
+  steps:
+    - name: Set testoperator commit
+      shell: bash
+      run: |
+        echo "TESTOPERATOR_COMMIT=$(git rev-parse HEAD)" >> $GITHUB_ENV
+
+    - name: Download the testoperator from MinIO if it exists
+      shell: bash
+      run: |
+        sudo mkdir -p /usr/local/bin
+        if mc stat spice-minio/artifacts/testoperator/linux-x86_64/$TESTOPERATOR_COMMIT/testoperator; then
+          mc cp spice-minio/artifacts/testoperator/linux-x86_64/$TESTOPERATOR_COMMIT/testoperator ./testoperator
+          sudo cp ./testoperator /usr/local/bin/testoperator
+          sudo chmod +x /usr/local/bin/testoperator
+          echo "TESTOPERATOR_DOWNLOADED=true" >> $GITHUB_ENV
+        else
+          echo "TESTOPERATOR_DOWNLOADED=false" >> $GITHUB_ENV
+        fi
+    
+    - name: Setup Rust
+      if: ${{ env.TESTOPERATOR_DOWNLOADED != 'true' }}
+      uses: spiceai/spiceai/.github/actions/setup-rust@trunk
+      with:
+        os: 'linux'
+
+    - name: Setup cc
+      if: ${{ env.TESTOPERATOR_DOWNLOADED != 'true' }}
+      uses: spiceai/spiceai/.github/actions/setup-cc@trunk
+
+    - name: Build the testoperator if it wasn't downloaded
+      shell: bash
+      if: ${{ env.TESTOPERATOR_DOWNLOADED != 'true' }}
+      run: |
+        cargo build -p testoperator --release
+        sudo cp target/release/testoperator /usr/local/bin/testoperator
+        sudo chmod +x /usr/local/bin/testoperator
+      
+    - name: Upload the testoperator binary
+      shell: bash
+      if: ${{ env.TESTOPERATOR_DOWNLOADED != 'true' }}
+      run: |
+        mc cp /usr/local/bin/testoperator spice-minio/artifacts/testoperator/linux-x86_64/$TESTOPERATOR_COMMIT/testoperator

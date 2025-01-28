@@ -30,23 +30,23 @@ FROM debian:bookworm-slim
 
 ARG CARGO_FEATURES
 
-# Allow DuckDB to load extensions
-RUN mkdir /.duckdb/ && chmod 777 /.duckdb/
-
+# Install required packages
 RUN apt update \
-    && apt install --yes ca-certificates libssl3 --no-install-recommends \
+    && apt install --yes ca-certificates libssl3 findutils --no-install-recommends \
+    && if echo "$CARGO_FEATURES" | grep -q "odbc"; then \
+       apt install --yes unixodbc --no-install-recommends; \
+    fi \
     && rm -rf /var/lib/{apt,dpkg,cache,log}
 
-RUN if echo "$CARGO_FEATURES" | grep -q "odbc"; then \
-    apt update \
-    && apt install --yes unixodbc --no-install-recommends \
-    && rm -rf /var/lib/{apt,dpkg,cache,log}; \
-fi
-
+# Copy the spiced binary
 COPY --from=build /root/spiced /usr/local/bin/spiced
+
+# Copy and setup the sandbox script
+COPY scripts/setup_sandbox.sh /usr/local/bin/
+RUN chmod +x /usr/local/bin/setup_sandbox.sh
 
 EXPOSE 8090 50051
 
 WORKDIR /app
 
-ENTRYPOINT ["/usr/local/bin/spiced"]
+ENTRYPOINT ["/usr/local/bin/setup_sandbox.sh"]

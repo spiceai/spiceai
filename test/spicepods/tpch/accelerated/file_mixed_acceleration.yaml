@@ -1,0 +1,34 @@
+version: v1
+kind: Spicepod
+name: file_tpch_mixed_acceleration
+datasets:
+  - from: file:data/customer.parquet
+    name: customer
+    acceleration: &acceleration_duckdb
+      enabled: true
+      engine: duckdb
+      mode: file
+  - from: file:data/lineitem.parquet
+    name: lineitem
+    acceleration: &acceleration_sqlite
+      enabled: true
+      engine: sqlite
+      mode: file
+  - from: file:data/nation.parquet
+    name: nation
+    acceleration: *acceleration_duckdb
+  - from: file:data/orders.parquet
+    name: orders
+    acceleration: *acceleration_duckdb
+  - from: file:data/part.parquet
+    name: part
+    acceleration: *acceleration_duckdb
+  - from: file:data/partsupp.parquet
+    name: partsupp
+    acceleration: *acceleration_sqlite
+  - from: file:data/region.parquet
+    name: region
+    acceleration: *acceleration_sqlite
+  - from: file:data/supplier.parquet
+    name: supplier
+    acceleration: *acceleration_sqlite

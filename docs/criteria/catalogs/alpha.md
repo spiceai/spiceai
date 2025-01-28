@@ -6,13 +6,12 @@ All criteria must be met for the Catalog to be considered Alpha. As Alpha signif
 
 ## Alpha Quality Catalogs
 
-| Catalog                          | Alpha Quality | DRI Sign-off |
-| -------------------------------- | ------------- | ------------ |
-| Databricks (mode: delta_lake)    | ✅            | @Sevenannn   |
-| Databricks (mode: spark_connect) | ➖            |              |
-| Iceberg                          | ➖            |              |
-| Spice.ai                         | ➖            |              |
-| Unity Catalog                    | ➖            |              |
+| Catalog       | Alpha Quality | DRI Sign-off    |
+| ------------- | ------------- | --------------- |
+| Databricks    | ✅            | @Sevenannn      |
+| Iceberg       | ✅            | @phillipleblanc |
+| Spice.ai      | ➖            |                 |
+| Unity Catalog | ✅            | @Sevenannn      |
 
 ## Alpha Release Criteria
 

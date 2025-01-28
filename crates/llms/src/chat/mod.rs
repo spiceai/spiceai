@@ -49,6 +49,16 @@ use mistralrs::MessageContent;
 
 use crate::embeddings::candle::download_hf_file;
 
+static WEIGHTS_EXTENSIONS: [&str; 7] = [
+    ".safetensors",
+    ".pth",
+    ".pt",
+    ".bin",
+    ".onyx",
+    ".gguf",
+    ".ggml",
+];
+
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone, Copy)]
 #[serde(rename_all = "lowercase")]
 pub enum LlmRuntime {
@@ -59,56 +69,99 @@ pub enum LlmRuntime {
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Failed to run LLM health check: {source}"))]
+    #[snafu(display("Failed to check the status of the model.\nAn error occurred: {source}\nVerify the model configuration."))]
     HealthCheckError {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Failed to run the LLM chat model: {source}"))]
+    #[snafu(display("Failed to run the model.\nAn error occurred: {source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"))]
     FailedToRunModel {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Local model, expected at {expected_path}, not found"))]
+    #[snafu(display("Failed to find the Local model at '{expected_path}'.\nVerify the model exists, and try again."))]
     LocalModelNotFound { expected_path: String },
 
-    #[snafu(display("Local model config, expected at {expected_path}, not found"))]
+    #[snafu(display("Failed to find the Local model config at '{expected_path}'.\nVerify the model config exists, and try again."))]
     LocalModelConfigNotFound { expected_path: String },
 
-    #[snafu(display("Local tokenizer, expected at {expected_path}, not found"))]
+    #[snafu(display("Failed to find the Local tokenizer at '{expected_path}'.\nVerify the tokenizer exists, and try again."))]
     LocalTokenizerNotFound { expected_path: String },
 
-    #[snafu(display("Failed to load model: {source}"))]
+    #[snafu(display("Failed to load the model.\nAn error occurred: {source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"))]
     FailedToLoadModel {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Failed to load model tokenizer: {source}"))]
+    #[snafu(display("The specified model identifier '{model}' is not valid for the source '{model_source}'.\nVerify the model exists, and try again."))]
+    ModelNotFound { model: String, model_source: String },
+
+    #[snafu(display("Failed to load model tokenizer.\nAn error occurred: {source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"))]
     FailedToLoadTokenizer {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Failed to tokenize: {source}"))]
-    FailedToTokenize {
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
+    #[snafu(display("An unsupported model source was specified in the 'from' parameter: '{from}'.\nSpecify a valid source, like 'openai', and try again.\nFor details, visit: https://spiceai.org/docs/components/models"))]
+    UnknownModelSource { from: String },
 
-    #[snafu(display("Unsupported source of model: {source}"))]
-    UnknownModelSource {
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-
-    #[snafu(display("No model from {from} currently supports {task}"))]
+    #[snafu(display("The specified model, '{from}', does not support executing the task '{task}'.\nSelect a different model or task, and try again."))]
     UnsupportedTaskForModel { from: String, task: String },
 
-    #[snafu(display("Invalid value for 'params.tools'"))]
-    UnsupportedSpiceToolUseParameterError {},
+    #[snafu(display("Invalid value for parameter {param}. {message}"))]
+    InvalidParamError { param: String, message: String },
 
-    #[snafu(display("Runtime does not currently support the {modality} modality"))]
-    UnsupportedModalityType { modality: String },
+    #[snafu(display("Failed to find weights for the model.\nExpected tensors with a file extension of: {extensions}.\nVerify the model is correctly configured, and try again."))]
+    ModelMissingWeights { extensions: String },
+
+    #[snafu(display("Failed to load a file specified for the model.\nCould not find the file: {file_url}.\nVerify the `files` parameters for the model, and try again."))]
+    ModelFileMissing { file_url: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+/// Attempts to string match a model error to a known error type.
+/// Returns None if no match is found.
+#[must_use]
+pub fn try_map_boxed_error(e: &(dyn std::error::Error + Send + Sync)) -> Option<Error> {
+    let err_string = e.to_string().to_ascii_lowercase();
+    if err_string.contains("expected file with extension")
+        && WEIGHTS_EXTENSIONS
+            .iter()
+            .any(|ext| err_string.contains(ext))
+    {
+        Some(Error::ModelMissingWeights {
+            extensions: WEIGHTS_EXTENSIONS.join(", "),
+        })
+    } else if err_string.contains("hf api error") && err_string.contains("status: 404") {
+        let file_url = err_string
+            .split("url: ")
+            .last()
+            .map(|url| {
+                url.split(' ')
+                    .next()
+                    .unwrap_or_default()
+                    .replace([']', ')'], "")
+            })
+            .unwrap_or_default();
+
+        if file_url.is_empty() {
+            None
+        } else {
+            Some(Error::ModelFileMissing { file_url })
+        }
+    } else {
+        None
+    }
+}
+
+/// Re-writes a boxed error to a known error type, if possible.
+/// Always returns a boxed error. Returns the original error if no match is found.
+#[must_use]
+pub fn try_map_boxed_error_to_box(
+    e: Box<dyn std::error::Error + Send + Sync>,
+) -> Box<dyn std::error::Error + Send + Sync> {
+    try_map_boxed_error(&*e).map_or_else(|| e, std::convert::Into::into)
+}
 
 /// Convert a structured [`ChatCompletionRequestMessage`] to a basic string. Useful for basic
 /// [`Chat::run`] but reduces optional configuration provided by callers.

@@ -1,0 +1,29 @@
+version: v1
+kind: Spicepod
+name: spark_tpch
+datasets:
+  - from: spark:spiceai_sandbox.tpch.customer
+    name: customer
+    params: &spark_params
+      spark_remote: sc://${ env:DATABRICKS_HOST }:443/;use_ssl=true;user_id=spice.ai;token=${ env:DATABRICKS_TOKEN };x-databricks-cluster-id=${ env:DATABRICKS_CLUSTER_ID };
+  - from: spark:spiceai_sandbox.tpch.lineitem
+    name: lineitem
+    params: *spark_params
+  - from: spark:spiceai_sandbox.tpch.nation
+    name: nation
+    params: *spark_params
+  - from: spark:spiceai_sandbox.tpch.orders
+    name: orders
+    params: *spark_params
+  - from: spark:spiceai_sandbox.tpch.part
+    name: part
+    params: *spark_params
+  - from: spark:spiceai_sandbox.tpch.partsupp
+    name: partsupp
+    params: *spark_params
+  - from: spark:spiceai_sandbox.tpch.region
+    name: region
+    params: *spark_params
+  - from: spark:spiceai_sandbox.tpch.supplier
+    name: supplier
+    params: *spark_params

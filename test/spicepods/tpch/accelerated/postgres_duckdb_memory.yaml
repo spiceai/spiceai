@@ -1,0 +1,45 @@
+version: v1
+kind: Spicepod
+name: postgres_tpch_duckdb_memory
+datasets:
+  - from: postgres:customer
+    name: customer
+    params: &postgres_params
+      pg_host: ${secrets:POSTGRES_HOST}
+      pg_port: 5432
+      pg_user: postgres
+      pg_pass: ${secrets:POSTGRES_PASSWORD}
+      pg_db: tpch
+      pg_sslmode: disable
+    acceleration: &acceleration
+      enabled: true
+      engine: duckdb
+      mode: memory
+  - from: postgres:lineitem
+    name: lineitem
+    params: *postgres_params
+    acceleration: *acceleration
+  - from: postgres:nation
+    name: nation
+    params: *postgres_params
+    acceleration: *acceleration
+  - from: postgres:orders
+    name: orders
+    params: *postgres_params
+    acceleration: *acceleration
+  - from: postgres:part
+    name: part
+    params: *postgres_params
+    acceleration: *acceleration
+  - from: postgres:partsupp
+    name: partsupp
+    params: *postgres_params
+    acceleration: *acceleration
+  - from: postgres:region
+    name: region
+    params: *postgres_params
+    acceleration: *acceleration
+  - from: postgres:supplier
+    name: supplier
+    params: *postgres_params
+    acceleration: *acceleration

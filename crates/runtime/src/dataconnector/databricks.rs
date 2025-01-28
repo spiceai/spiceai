@@ -36,18 +36,18 @@ use super::{
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Missing required parameter: {parameter}. Specify a value.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/databricks#parameters"))]
+    #[snafu(display("Missing required parameter: {parameter}. Specify a value.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/databricks#parameters"))]
     MissingParameter { parameter: String },
 
-    #[snafu(display("Invalid `databricks_use_ssl` value: '{value}'. Use 'true' or 'false'.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/databricks#parameters"))]
+    #[snafu(display("Invalid `databricks_use_ssl` value: '{value}'. Use 'true' or 'false'.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/databricks#parameters"))]
     InvalidUsessl { value: String },
 
-    #[snafu(display("Failed to connect to Databricks Spark.\n{source}\nVerify the connector configuration, and try again.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/databricks#parameters"))]
+    #[snafu(display("Failed to connect to Databricks Spark.\n{source}\nVerify the connector configuration, and try again.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/databricks#parameters"))]
     UnableToConstructDatabricksSpark {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Invalid `mode` value: '{value}'. Use 'delta_lake' or 'spark_connect'.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/databricks#parameters"))]
+    #[snafu(display("Invalid `mode` value: '{value}'. Use 'delta_lake' or 'spark_connect'.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/databricks#parameters"))]
     InvalidMode { value: String },
 }
 

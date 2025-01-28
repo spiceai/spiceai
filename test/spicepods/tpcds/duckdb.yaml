@@ -1,0 +1,77 @@
+version: v1
+kind: Spicepod
+name: duckdb_tpcds
+datasets:
+  - from: duckdb:catalog_sales
+    name: catalog_sales
+    params: &duckdb_params
+      duckdb_open: ./data/tpcds.db
+  - from: duckdb:catalog_returns
+    name: catalog_returns
+    params: *duckdb_params
+  - from: duckdb:inventory
+    name: inventory
+    params: *duckdb_params
+  - from: duckdb:store_sales
+    name: store_sales
+    params: *duckdb_params
+  - from: duckdb:store_returns
+    name: store_returns
+    params: *duckdb_params
+  - from: duckdb:web_sales
+    name: web_sales
+    params: *duckdb_params
+  - from: duckdb:web_returns
+    name: web_returns
+    params: *duckdb_params
+  - from: duckdb:customer
+    name: customer
+    params: *duckdb_params
+  - from: duckdb:customer_address
+    name: customer_address
+    params: *duckdb_params
+  - from: duckdb:customer_demographics
+    name: customer_demographics
+    params: *duckdb_params
+  - from: duckdb:date_dim
+    name: date_dim
+    params: *duckdb_params
+  - from: duckdb:household_demographics
+    name: household_demographics
+    params: *duckdb_params
+  - from: duckdb:item
+    name: item
+    params: *duckdb_params
+  - from: duckdb:promotion
+    name: promotion
+    params: *duckdb_params
+  - from: duckdb:ship_mode
+    name: ship_mode
+    params: *duckdb_params
+  - from: duckdb:store
+    name: store
+    params: *duckdb_params
+  - from: duckdb:time_dim
+    name: time_dim
+    params: *duckdb_params
+  - from: duckdb:warehouse
+    name: warehouse
+    params: *duckdb_params
+  - from: duckdb:web_page
+    name: web_page
+    params: *duckdb_params
+  - from: duckdb:web_site
+    name: web_site
+    params: *duckdb_params
+  - from: duckdb:reason
+    name: reason
+    params: *duckdb_params
+  - from: duckdb:call_center
+    name: call_center
+    params: *duckdb_params
+  - from: duckdb:income_band
+    name: income_band
+    params: *duckdb_params
+  - from: duckdb:catalog_page
+    name: catalog_page
+    params: *duckdb_params

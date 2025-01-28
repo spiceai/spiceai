@@ -1,0 +1,1 @@
+SELECT * FROM (SELECT o_orderkey FROM ice.tpch_sf1.orders LIMIT 10) AS c(key) LIMIT 10;

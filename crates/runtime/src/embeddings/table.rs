@@ -19,6 +19,7 @@ use std::{any::Any, sync::Arc};
 
 use arrow::datatypes::{DataType, Schema, SchemaRef};
 use arrow_schema::Field;
+use arrow_tools::schema;
 use async_trait::async_trait;
 use datafusion::catalog::Session;
 use datafusion::common::{project_schema, Constraints, Statistics};
@@ -47,7 +48,12 @@ use crate::{embedding_col, offset_col};
 use super::common::{is_valid_embedding_type, is_valid_offset_type, vector_length};
 
 #[derive(Debug, Snafu)]
-pub enum Error {}
+pub enum Error {
+    #[snafu(display(
+        "Column '{column}' has an unsupported data type for embedding. Only string types are allowed.\nFor details, visit: https://spiceai.org/docs/components/embeddings",
+    ))]
+    InvalidColumnType { column: String, data_type: DataType },
+}
 
 /// An [`EmbeddingTable`] is a [`TableProvider`] where some columns are augmented with associated embedding columns
 #[derive(Clone)]
@@ -97,12 +103,12 @@ impl std::fmt::Debug for EmbeddingColumnConfig {
 impl EmbeddingTable {
     /// When creating a new [`EmbeddingTable`], the provided columns (in `embedded_column_to_model`) must be checked to see if they are already in the base table.
     /// Constructing the [`EmbeddingColumnConfig`] for each column is different depending on whether the column is in the base table or not.
-    pub async fn new(
+    pub async fn try_new(
         base_table: Arc<dyn TableProvider>,
         embedded_column_to_model: HashMap<String, String>,
         embedding_models: Arc<RwLock<EmbeddingModelStore>>,
         embed_chunker_config: HashMap<String, ChunkingConfig<'_>>,
-    ) -> Self {
+    ) -> Result<Self, Error> {
         let base_schema = base_table.schema();
         let mut embedded_columns: HashMap<String, EmbeddingColumnConfig> = HashMap::new();
 
@@ -137,6 +143,8 @@ impl EmbeddingTable {
             } else {
                 tracing::debug!("Column '{column}' does not have needed embeddings in base table. Will augment with model {model}.");
 
+                Self::verify_column_type_supported(&column, &base_schema)?;
+
                 let Some(vector_length) =
                     Self::embedding_size_from_models(&model, &embedding_models).await
                 else {
@@ -167,11 +175,11 @@ impl EmbeddingTable {
             }
         }
 
-        Self {
+        Ok(Self {
             base_table,
             embedded_columns,
             embedding_models,
-        }
+        })
     }
 
     /// Check if the base table has a column that is augmented with an embedding.
@@ -320,6 +328,23 @@ impl EmbeddingTable {
         vector_length(embedding_field.data_type())
     }
 
+    fn verify_column_type_supported(column: &str, base_schema: &SchemaRef) -> Result<(), Error> {
+        if let Some((_, field)) = base_schema.column_with_name(column) {
+            let data_type = field.data_type();
+            if !matches!(
+                data_type,
+                DataType::Utf8 | DataType::Utf8View | DataType::LargeUtf8
+            ) {
+                return InvalidColumnTypeSnafu {
+                    column: column.to_string(),
+                    data_type: data_type.clone(),
+                }
+                .fail();
+            }
+        }
+        Ok(())
+    }
+
     async fn embedding_size_from_models(
         model_name: &str,
         embedding_models: &Arc<RwLock<EmbeddingModelStore>>,
@@ -445,21 +470,37 @@ impl TableProvider for EmbeddingTable {
             .filter_map(|i| base_schema.fields.get(i).cloned())
             .collect();
 
+        let mut computed_columns_meta: HashMap<String, Vec<String>> = HashMap::new();
+
         // Important to be kept alphabetical for fast lookup in [`EmbeddingTable::columns_to_embed`]
         let mut embedding_fields: Vec<_> = self
             .get_additional_embedding_columns_sorted()
             .iter()
-            .filter_map(|k| {
+            .filter_map(|base_column_name| {
                 base_schema
-                    .column_with_name(k)
-                    .map(|(_, field)| self.embedding_fields(field))
+                    .column_with_name(base_column_name)
+                    .map(|(_, field)| {
+                        let embedding_fields = self.embedding_fields(field);
+                        computed_columns_meta.insert(
+                            base_column_name.clone(),
+                            embedding_fields
+                                .iter()
+                                .map(|f| f.name().to_string())
+                                .collect(),
+                        );
+                        embedding_fields
+                    })
             })
             .flatten()
             .collect();
 
         base_fields.append(&mut embedding_fields);
 
-        Arc::new(Schema::new(base_fields))
+        let mut schema = Schema::new(base_fields);
+
+        schema::set_computed_columns_meta(&mut schema, &computed_columns_meta);
+
+        Arc::new(schema)
     }
 
     async fn scan(

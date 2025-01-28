@@ -32,6 +32,14 @@ pub struct DatabricksDelta {
     storage_options: HashMap<String, SecretString>,
 }
 
+#[derive(Debug, Snafu)]
+pub enum Error {
+    #[snafu(display("A storage location for the Databricks table '{table_reference}' must be provided.\nSpecify a storage location, and try again."))]
+    TableDoesNotHaveStorageLocation { table_reference: TableReference },
+    #[snafu(display("Failed to find the Databricks table '{table_reference}'.\nVerify the table exists, and try again."))]
+    TableDoesNotExist { table_reference: TableReference },
+}
+
 impl DatabricksDelta {
     #[must_use]
     pub fn new(
@@ -85,13 +93,10 @@ impl DatabricksDelta {
             if let Some(storage_location) = table.storage_location {
                 Ok(storage_location)
             } else {
-                Err(
-                    format!("Databricks table {table_reference} does not have a storage location")
-                        .into(),
-                )
+                Err(Error::TableDoesNotHaveStorageLocation { table_reference }.into())
             }
         } else {
-            Err(format!("Databricks table {table_reference} does not exist").into())
+            Err(Error::TableDoesNotExist { table_reference }.into())
         }
     }
 }

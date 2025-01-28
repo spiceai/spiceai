@@ -42,13 +42,13 @@ pub enum Error {
     UnableToCreateODBCConnectionPool {
         source: db_connection_pool::odbcpool::Error,
     },
-    #[snafu(display("Missing required parameter: {param}. Specify a value.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/odbc"))]
+    #[snafu(display("Missing required parameter: {param}. Specify a value.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/odbc"))]
     MissingParameter { param: String },
-    #[snafu(display("An ODBC parameter is configured incorrectly: {param}.\n{msg}\nFor details, visit: https://docs.spiceai.org/components/data-connectors/odbc"))]
+    #[snafu(display("An ODBC parameter is configured incorrectly: {param}.\n{msg}\nFor details, visit: https://spiceai.org/docs/components/data-connectors/odbc"))]
     InvalidParameter { param: String, msg: String },
-    #[snafu(display("No ODBC driver was specified in the connection string.\nSpecify an installed driver in the connection string.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/odbc"))]
+    #[snafu(display("No ODBC driver was specified in the connection string.\nSpecify an installed driver in the connection string.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/odbc"))]
     NoDriverSpecified,
-    #[snafu(display("Accessing an ODBC driver with a file path is not permitted.\nInstall a driver using the system driver manager, and specify the driver name instead.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/odbc"))]
+    #[snafu(display("Accessing an ODBC driver with a file path is not permitted.\nInstall a driver using the system driver manager, and specify the driver name instead.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/odbc"))]
     DirectDriverNotPermitted,
 }
 

@@ -1,0 +1,86 @@
+name: release_only_cuda
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "Build and Release workflow run ID to get artifacts from"
+        required: true
+        type: string
+      target_version:
+        description: "Target version to release"
+        required: true
+        type: string
+
+jobs:
+  publish:
+    name: Publish CUDA binaries
+    env:
+      ARTIFACT_DIR: ./release
+
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set REL_VERSION to ${{ inputs.target_version }}
+        run: |
+          echo "REL_VERSION=${{ inputs.target_version }}" >> $GITHUB_ENV
+          echo "LATEST_RELEASE=true" >> $GITHUB_ENV
+
+      - name: Create artifact directory
+        run: mkdir -p ${{ env.ARTIFACT_DIR }}
+
+      # Download all CUDA artifacts for this platform from the specified run
+      - name: Download CUDA artifacts
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          path: ${{ env.ARTIFACT_DIR }}
+          github-token: ${{ secrets.DOWNLOAD_ARTIFACT_TOKEN }}
+          merge-multiple: true
+          run-id: ${{ inputs.run_id }}
+
+      - name: List artifacts
+        run: ls -l ${{ env.ARTIFACT_DIR }}
+
+      - name: Publish CUDA binaries to GitHub
+        run: |
+          # Parse repository to get owner and repo names
+          OWNER_NAME="${GITHUB_REPOSITORY%%/*}"
+          REPO_NAME="${GITHUB_REPOSITORY#*/}"
+          export GITHUB_TOKEN=${{ secrets.GITHUB_TOKEN }}
+          
+          # First check if we have any files to upload
+          if [ -z "$(ls -A ${ARTIFACT_DIR})" ]; then
+            echo "No artifacts found in ${ARTIFACT_DIR}"
+            exit 1
+          fi
+          
+          # Create an array of actual files (no globs)
+          RELEASE_ARTIFACTS=()
+          for file in ${ARTIFACT_DIR}/*; do
+            if [ -f "$file" ]; then
+              RELEASE_ARTIFACTS+=("$file")
+            fi
+          done
+          
+          # Delete existing release artifact
+          python ./.github/scripts/github_release.py delete \
+            --owner $OWNER_NAME --repo $REPO_NAME \
+            --tag "v${{ env.REL_VERSION }}" \
+            "${RELEASE_ARTIFACTS[@]}"
+            
+          if [ "$LATEST_RELEASE" = "true" ]; then
+            export RELEASE_BODY=`cat ./docs/release_notes/v${{ env.REL_VERSION }}.md`
+          else
+            export RELEASE_BODY="This is the release candidate ${{ env.REL_VERSION }}"
+          fi
+          
+          echo "Uploading Spice.ai CUDA Binaries to GitHub Release"
+          python ./.github/scripts/github_release.py upload \
+            --owner $OWNER_NAME --repo $REPO_NAME \
+            --tag "v${{ env.REL_VERSION }}" \
+            --release-name "v${{ env.REL_VERSION }}" \
+            --body "${RELEASE_BODY}" \
+            --prerelease "$PRE_RELEASE" \
+            "${RELEASE_ARTIFACTS[@]}"

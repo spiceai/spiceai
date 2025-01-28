@@ -11,7 +11,7 @@ All criteria must be met for the connector to be considered [RC](../definitions.
 | Clickhouse                       | ➖         |              |
 | Databricks (mode: delta_lake)    | ✅         | @Sevenannn   |
 | Databricks (mode: spark_connect) | ➖         |              |
-| Delta Lake                       | ➖         |              |
+| Delta Lake                       | ✅         | @Sevenannn   |
 | Dremio                           | ✅         | @Sevenannn   |
 | DuckDB                           | ✅         | @peasee      |
 | File                             | ✅         | @Sevenannn   |
@@ -54,6 +54,7 @@ This table defines the required features and/or tests for each connector:
 | GraphQL                          | ➖                    | ➖                      | ➖                | ➖                       | ➖                  | ☑️                         |
 | GitHub                           | ➖                    | ➖                      | ☑️                | ➖                       | ➖                  | ☑️                         |
 | HTTP/HTTPS                       | ✅ (1)                | ✅ (1)                  | ➖                | ➖                       | ➖                  | ☑️                         |
+| Iceberg                          | ✅ (1)                | ✅ (1)                  | ☑️                | ✅                       | ✅                  | ✅                         |
 | MS SQL                           | ✅ (100)              | ✅ (100)                | ✅                | ✅                       | ✅                  | ✅                         |
 | MySQL                            | ✅ (100)              | ✅ (100)                | ✅                | ✅                       | ✅                  | ✅                         |
 | ODBC                             | ✅ (100)              | ✅ (100)                | ✅                | ✅                       | ✅                  | ✅                         |

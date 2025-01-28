@@ -1,0 +1,68 @@
+name: testoperator dispatch
+
+on:
+  workflow_dispatch:
+    inputs:
+      test_files_path:
+        description: 'path to load test files to dispatch'
+        required: true
+        type: string
+      workflow_type:
+        description: 'the workflow to execute (bench, throughput, load, etc)'
+        required: true
+        default: 'bench'
+        type: choice
+        options:
+          - 'bench'
+          - 'load'
+          - 'throughput'
+
+jobs:
+  dispatch-tests:
+    name: Dispatch tests
+    runs-on: spiceai-runners
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install MinIO
+        run: |
+          sudo apt update && sudo apt install wget -y
+          sudo wget https://dl.min.io/client/mc/release/linux-amd64/mc -O /usr/local/bin/mc
+          sudo chmod +x /usr/local/bin/mc
+          mc alias set spice-minio ${{ secrets.MINIO_ENDPOINT }} ${{ secrets.MINIO_ACCESS_KEY }} ${{ secrets.MINIO_SECRET_KEY }}
+      
+      - name: Setup spiced
+        uses: ./.github/actions/setup-spiced
+        id: setup-spiced
+      
+      - name: Display spiced commit
+        run: echo "SPICED_COMMIT=${{ steps.setup-spiced.outputs.SPICED_COMMIT }}"
+
+      - name: Build Testoperator
+        uses: ./.github/actions/build-testoperator
+      
+      - name: Dispatch Testoperator - Input
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        run: |
+          testoperator dispatch \
+            ${{ github.event.inputs.test_files_path }} \
+            --workflow ${{ github.event.inputs.workflow_type }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
+      
+      - name: Dispatch Testoperator - Scheduled Bench
+        if: ${{ github.event_name == 'schedule' }}
+        run: |
+          testoperator dispatch ./tools/testoperator/dispatch --workflow bench
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
+      
+      - name: Dispatch Testoperator - Scheduled Throughput
+        if: ${{ github.event_name == 'schedule' && github.event.schedule == '10 22 */3 * *' }}
+        run: |
+          testoperator dispatch ./tools/testoperator/dispatch --workflow throughput
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}

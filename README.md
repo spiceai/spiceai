@@ -13,11 +13,13 @@
   <a href="https://github.com/spiceai/spiceai/actions/workflows/spiced_docker_nightly.yml"><img alt="GitHub Actions Workflow Status - docker build" src="https://img.shields.io/github/actions/workflow/status/spiceai/spiceai/spiced_docker_nightly.yml?label=docker%20build" /></a>
   <a href="https://github.com/spiceai/spiceai/actions/workflows/pr.yml"><img alt="GitHub Actions Workflow Status - unit tests" src="https://img.shields.io/github/actions/workflow/status/spiceai/spiceai/pr.yml?event=merge_group&label=unit%20tests" /></a>
   <a href="https://github.com/spiceai/spiceai/actions/workflows/integration.yml"><img alt="GitHub Actions Workflow Status - integration tests" src="https://img.shields.io/github/actions/workflow/status/spiceai/spiceai/integration.yml?event=pull_request&label=integration%20tests" /></a>
-  <a href="https://github.com/spiceai/spiceai/actions/workflows/integration_models.yml"><img alt="GitHub Actions Workflow Status - integration tests (models)" src="https://img.shields.io/github/actions/workflow/status/spiceai/spiceai/integration_models.yml?branch=trunk&label=integration%20tests%20(models)" /></a>
+  <a href="https://github.com/spiceai/spiceai/actions/workflows/integration_models.yml"><img alt="GitHub Actions Workflow Status - integration tests (models)" src="https://img.shields.io/github/actions/workflow/status/spiceai/spiceai/integration_models.yml?event=pull_request&label=integration%20tests%20(models)" /></a>
   <a href="https://github.com/spiceai/spiceai/actions/workflows/benchmarks.yml"><img alt="GitHub Actions Workflow Status - benchmark tests" src="https://img.shields.io/github/actions/workflow/status/spiceai/spiceai/benchmarks.yml?branch=trunk&label=benchmark%20tests" /></a>
 </p>
 
 **Spice** is a SQL query and AI compute engine, written in Rust, for data-driven apps and agents.
+
+<img width="740" alt="Spice.ai Open Source accelerated data query and LLM-inference engine" src="https://github.com/user-attachments/assets/9db94f9c-10a1-47b0-ab45-05aa964590ff" />
 
 Spice provides three industry standard APIs in a lightweight, portable runtime (single ~140 MB binary):
 
@@ -29,9 +31,9 @@ Spice provides three industry standard APIs in a lightweight, portable runtime (
 
 Spice is primarily used for:
 
-- **Data Federation**: SQL query across any database, data warehouse, or data lake. [Learn More](https://docs.spiceai.org/features/federated-queries).
+- **Data Federation**: SQL query across any database, data warehouse, or data lake. [Learn More](https://spiceai.org/docs/features/federated-queries).
 - **Data Materialization and Acceleration**: Materialize, accelerate, and cache database queries. [Read the MaterializedView interview - Building a CDN for Databases](https://materializedview.io/p/building-a-cdn-for-databases-spice-ai)
-- **AI apps and agents**: An AI-database powering retrieval-augmented generation (RAG) and intelligent agents. [Learn More](https://github.com/spiceai/cookbook/tree/trunk/rag#readme).
+- **AI apps and agents**: An AI-database powering retrieval-augmented generation (RAG) and intelligent agents. [Learn More](https://spiceai.org/docs/use-cases/rag).
 
 If you want to build with DataFusion or using DuckDB, Spice provides a simple, flexible, and production-ready engine you can just use.
 
@@ -112,7 +114,7 @@ Limited = Partial or restricted support
 - **OpenAI-compatible API**: Connect to hosted models (OpenAI, Anthropic, xAI) or deploy locally (Llama, NVIDIA NIM). [AI Gateway Recipe](https://github.com/spiceai/cookbook/blob/trunk/openai_sdk/README.md)
 - **Federated Data Access**: Query using SQL and NSQL (text-to-SQL) across databases, data warehouses, and data lakes with advanced query push-down for fast retrieval across disparate data sources. [Federated SQL Query Recipe](https://github.com/spiceai/cookbook/blob/trunk/federation/README.md)
 - **Search and RAG**: Search and retrieve context with accelerated embeddings for retrieval-augmented generation (RAG) workflows. [Vector Search over GitHub Files](https://github.com/spiceai/cookbook/blob/trunk/search_github_files/README.md)
-- **LLM Memory and Observability**: Store and retrieve history and context for AI agents while gaining deep visibility into data flows, model performance, and traces. [LLM Memory Recipe](https://github.com/spiceai/cookbook/blob/trunk/llm-memory/README.md) | [Monitoring Features Documentation](https://docs.spiceai.org/features/monitoring)
+- **LLM Memory and Observability**: Store and retrieve history and context for AI agents while gaining deep visibility into data flows, model performance, and traces. [LLM Memory Recipe](https://github.com/spiceai/cookbook/blob/trunk/llm-memory/README.md) | [Monitoring Features Documentation](https://spiceai.org/docs/features/monitoring)
 
 ### Database CDN and Query Mesh
 
@@ -124,13 +126,13 @@ Limited = Partial or restricted support
 ### Retrieval-Augmented Generation (RAG)
 
 - **Unified Search with Vector Similarity**: Perform efficient vector similarity search across structured and unstructured data sources. [Vector Search over GitHub Files](https://github.com/spiceai/cookbook/blob/trunk/search_github_files/README.md)
-- **Semantic Knowledge Layer**: Define a semantic context model to enrich data for AI. [Semantic Model Feature Documentation](https://docs.spiceai.org/features/semantic-model)
+- **Semantic Knowledge Layer**: Define a semantic context model to enrich data for AI. [Semantic Model Feature Documentation](https://spiceai.org/docs/features/semantic-model)
 - **Text-to-SQL**: Convert natural language queries into SQL using built-in NSQL and sampling tools for accurate query. [Text-to-SQL Recipe](https://github.com/spiceai/cookbook/blob/trunk/text-to-sql/README.md)
 - **Model and Data Evaluations**: Assess model performance and data quality with integrated evaluation tools. [Language Model Evaluations Recipe](https://github.com/spiceai/cookbook/blob/trunk/evals/README.md)
 
 ## FAQ
 
-- **Is Spice a cache?** No specifically; you can think of Spice data acceleration as an _active_ cache, materialization, or data prefetcher. A cache would fetch data on a cache-miss while Spice prefetches and materializes filtered data on an interval, trigger, or as data changes using CDC. In addition to acceleration Spice supports [results caching](https://docs.spiceai.org/features/caching).
+- **Is Spice a cache?** No specifically; you can think of Spice data acceleration as an _active_ cache, materialization, or data prefetcher. A cache would fetch data on a cache-miss while Spice prefetches and materializes filtered data on an interval, trigger, or as data changes using CDC. In addition to acceleration Spice supports [results caching](https://spiceai.org/docs/features/caching).
 
 - **Is Spice a CDN for databases?** Yes, a common use-case for Spice is as a CDN for different data sources. Using CDN concepts, Spice enables you to ship (load) a working set of your database (or data lake, or data warehouse) where it's most frequently accessed, like from a data-intensive application or for AI context.
 
@@ -144,32 +146,32 @@ See more demos on [YouTube](https://www.youtube.com/playlist?list=PLesJrUXEx3U9a
 
 | Name                               | Description                           | Status            | Protocol/Format              |
 | ---------------------------------- | ------------------------------------- | ----------------- | ---------------------------- |
-| `github`                           | GitHub                                | Stable            | GitHub API                   |
+| `databricks (mode: delta_lake)`    | [Databricks][databricks]              | Stable            | S3/Delta Lake                |
+| `delta_lake`                       | Delta Lake                            | Stable            | Delta Lake                   |
+| `dremio`                           | [Dremio][dremio]                      | Stable            | Arrow Flight                 |
+| `duckdb`                           | DuckDB                                | Stable            | Embedded                     |
 | `file`                             | File                                  | Stable            | Parquet, CSV                 |
-| `s3`                               | [S3][s3]                              | Release Candidate | Parquet, CSV                 |
-| `postgres`                         | PostgreSQL                            | Release Candidate |                              |
-| `mysql`                            | MySQL                                 | Release Candidate |                              |
-| `duckdb`                           | DuckDB                                | Release Candidate | Embedded                     |
+| `github`                           | GitHub                                | Stable            | GitHub API                   |
+| `postgres`                         | PostgreSQL                            | Stable            |                              |
+| `s3`                               | [S3][s3]                              | Stable            | Parquet, CSV                 |
+| `mysql`                            | MySQL                                 | Stable            |                              |
 | `graphql`                          | GraphQL                               | Release Candidate | JSON                         |
-| `databricks (mode: delta_lake)`    | [Databricks][databricks]              | Release Candidate | S3/Delta Lake                |
-| `dremio`                           | [Dremio][dremio]                      | Release Candidate | Arrow Flight                 |
-| `delta_lake`                       | Delta Lake                            | Beta              | Delta Lake                   |
-| `mssql`                            | Microsoft SQL Server                  | Beta              | Tabular Data Stream (TDS)    |
-| `flightsql`                        | FlightSQL                             | Beta              | Arrow Flight SQL             |
-| `spice.ai`                         | [Spice.ai][spiceai]                   | Beta              | Arrow Flight                 |
-| `odbc`                             | ODBC                                  | Beta              | ODBC                         |
 | `databricks (mode: spark_connect)` | [Databricks][databricks]              | Beta              | [Spark Connect][spark]       |
+| `flightsql`                        | FlightSQL                             | Beta              | Arrow Flight SQL             |
+| `iceberg`                          | [Apache Iceberg][iceberg]             | Beta              | Parquet                      |
+| `mssql`                            | Microsoft SQL Server                  | Beta              | Tabular Data Stream (TDS)    |
+| `odbc`                             | ODBC                                  | Beta              | ODBC                         |
 | `snowflake`                        | Snowflake                             | Beta              | Arrow                        |
 | `spark`                            | Spark                                 | Beta              | [Spark Connect][spark]       |
-| `iceberg`                          | [Apache Iceberg][iceberg]             | Alpha             | Parquet                      |
+| `spice.ai`                         | [Spice.ai][spiceai]                   | Beta              | Arrow Flight                 |
+| `abfs`                             | Azure BlobFS                          | Alpha             | Parquet, CSV                 |
 | `clickhouse`                       | Clickhouse                            | Alpha             |                              |
 | `debezium`                         | Debezium CDC                          | Alpha             | Kafka + JSON                 |
-| `abfs`                             | Azure BlobFS                          | Alpha             | Parquet, CSV                 |
+| `dynamodb`                         | Amazon DynamoDB                       | Alpha             |                              |
 | `ftp`, `sftp`                      | FTP/SFTP                              | Alpha             | Parquet, CSV                 |
 | `http`, `https`                    | HTTP(s)                               | Alpha             | Parquet, CSV                 |
 | `localpod`                         | [Local dataset replication][localpod] | Alpha             |                              |
 | `sharepoint`                       | Microsoft SharePoint                  | Alpha             | Unstructured UTF-8 documents |
-| `documentdb`                       | DocumentDB                            | Alpha             |                              |
 | `mongodb`                          | MongoDB                               | Coming Soon       |                              |
 | `elasticsearch`                    | ElasticSearch                         | Roadmap           |                              |
 
@@ -183,28 +185,38 @@ See more demos on [YouTube](https://www.youtube.com/playlist?list=PLesJrUXEx3U9a
 
 ## Supported Data Accelerators
 
-| Name       | Description                     | Status            | Engine Modes     |
-| ---------- | ------------------------------- | ----------------- | ---------------- |
-| `arrow`    | In-Memory Arrow Records         | Release Candidate | `memory`         |
-| `duckdb`   | Embedded [DuckDB][duckdb]       | Release Candidate | `memory`, `file` |
-| `postgres` | Attached [PostgreSQL][postgres] | Release Candidate | N/A              |
-| `sqlite`   | Embedded [SQLite][sqlite]       | Release Candidate | `memory`, `file` |
+| Name       | Description                      | Status            | Engine Modes     |
+| ---------- | -------------------------------- | ----------------- | ---------------- |
+| `arrow`    | [In-Memory Arrow Records][arrow] | Stable            | `memory`         |
+| `duckdb`   | Embedded [DuckDB][duckdb]        | Stable            | `memory`, `file` |
+| `postgres` | Attached [PostgreSQL][postgres]  | Release Candidate | N/A              |
+| `sqlite`   | Embedded [SQLite][sqlite]        | Release Candidate | `memory`, `file` |
 
-[duckdb]: https://docs.spiceai.org/data-accelerators/duckdb
-[postgres]: https://github.com/spiceai/cookbook/tree/trunk/postgres/accelerator#postgresql-data-accelerator
-[sqlite]: https://docs.spiceai.org/data-accelerators/sqlite
+[arrow]: https://spiceai.org/docs/components/data-accelerators/arrow
+[duckdb]: https://spiceai.org/docs/components/data-accelerators/duckdb
+[postgres]: https://spiceai.org/docs/components/data-accelerators/postgres
+[sqlite]: https://spiceai.org/docs/components/data-accelerators/sqlite
 
 ## Supported Model Providers
 
-| Name          | Description                                  | ML Format(s) | LLM Format(s)                   |
-| ------------- | -------------------------------------------- | ------------ | ------------------------------- |
-| `file`        | Local filesystem                             | ONNX         | GGUF, GGML, SafeTensor          |
-| `huggingface` | Models hosted on HuggingFace                 | ONNX         | GGUF, GGML, SafeTensor          |
-| `spice.ai`    | Models hosted on the Spice.ai Cloud Platform | ONNX         | OpenAI-compatible HTTP endpoint |
-| `openai`      | OpenAI (or compatible) LLM endpoint          | -            | OpenAI-compatible HTTP endpoint |
-| `azure`       | Azure OpenAI                                 | -            | OpenAI-compatible HTTP endpoint |
-| `anthropic`   | Models hosted on Anthropic                   | -            | OpenAI-compatible HTTP endpoint |
-| `xai`         | Models hosted on xAI                         | -            | OpenAI-compatible HTTP endpoint |
+| Name          | Description                                  | Status            | ML Format(s) | LLM Format(s)                   |
+| ------------- | -------------------------------------------- | ----------------- | ------------ | ------------------------------- |
+| `openai`      | OpenAI (or compatible) LLM endpoint          | Release Candidate | -            | OpenAI-compatible HTTP endpoint |
+| `file`        | Local filesystem                             | Beta              | ONNX         | GGUF, GGML, SafeTensor          |
+| `huggingface` | Models hosted on HuggingFace                 | Beta              | ONNX         | GGUF, GGML, SafeTensor          |
+| `spice.ai`    | Models hosted on the Spice.ai Cloud Platform |                   | ONNX         | OpenAI-compatible HTTP endpoint |
+| `azure`       | Azure OpenAI                                 |                   | -            | OpenAI-compatible HTTP endpoint |
+| `anthropic`   | Models hosted on Anthropic                   | Alpha             | -            | OpenAI-compatible HTTP endpoint |
+| `xai`         | Models hosted on xAI                         | Alpha             | -            | OpenAI-compatible HTTP endpoint |
+
+## Supported Embeddings Providers
+
+| Name          | Description                                  | Status            | ML Format(s) | LLM Format(s)\*                 |
+| --------------| -------------------------------------------- | ----------------- | ------------ | ------------------------------- |
+| `openai`      | OpenAI (or compatible) LLM endpoint          | Release Candidate | -            | OpenAI-compatible HTTP endpoint |
+| `file`        | Local filesystem                             | Release Candidate | ONNX         | GGUF, GGML, SafeTensor          |
+| `huggingface` | Models hosted on HuggingFace                 | Release Candidate | ONNX         | GGUF, GGML, SafeTensor          |
+| `azure`       | Azure OpenAI                                 | Alpha             | -            | OpenAI-compatible HTTP endpoint |
 
 ## Supported Catalogs
 
@@ -212,10 +224,10 @@ Catalog Connectors connect to external catalog providers and make their tables a
 
 | Name            | Description             | Status      | Protocol/Format              |
 | --------------- | ----------------------- | ----------- | ---------------------------- |
-| `databricks`    | Databricks              | Alpha       | Spark Connect, S3/Delta Lake |
-| `unity_catalog` | Unity Catalog           | Alpha       | Delta Lake                   |
+| `unity_catalog` | Unity Catalog           | Stable      | Delta Lake                   |
+| `databricks`    | Databricks              | Beta        | Spark Connect, S3/Delta Lake |
+| `iceberg`       | Apache Iceberg          | Beta        | Parquet                      |
 | `spice.ai`      | Spice.ai Cloud Platform | Alpha       | Arrow Flight                 |
-| `iceberg`       | Apache Iceberg          | Alpha       | Parquet                      |
 | `glue`          | AWS Glue                | Coming Soon | JSON, Parquet, Iceberg       |
 
 ## ⚡️ Quickstart (Local Machine)
@@ -263,12 +275,13 @@ spice run
 Example output will be shown as follows:
 
 ```bash
-Spice.ai runtime starting...
-2024-08-05T13:02:40.247484Z  INFO runtime::flight: Spice Runtime Flight listening on 127.0.0.1:50051
-2024-08-05T13:02:40.247490Z  INFO runtime::metrics_server: Spice Runtime Metrics listening on 127.0.0.1:9090
-2024-08-05T13:02:40.247949Z  INFO runtime: Initialized results cache; max size: 128.00 MiB, item ttl: 1s
-2024-08-05T13:02:40.248611Z  INFO runtime::http: Spice Runtime HTTP listening on 127.0.0.1:8090
-2024-08-05T13:02:40.252356Z  INFO runtime::opentelemetry: Spice Runtime OpenTelemetry listening on 127.0.0.1:50052
+2025/01/20 11:26:10 INFO Spice.ai runtime starting...
+2025-01-20T19:26:10.679068Z  INFO runtime::init::dataset: No datasets were configured. If this is unexpected, check the Spicepod configuration.
+2025-01-20T19:26:10.679716Z  INFO runtime::flight: Spice Runtime Flight listening on 127.0.0.1:50051
+2025-01-20T19:26:10.679786Z  INFO runtime::metrics_server: Spice Runtime Metrics listening on 127.0.0.1:9090
+2025-01-20T19:26:10.680140Z  INFO runtime::http: Spice Runtime HTTP listening on 127.0.0.1:8090
+2025-01-20T19:26:10.682080Z  INFO runtime::opentelemetry: Spice Runtime OpenTelemetry listening on 127.0.0.1:50052
+2025-01-20T19:26:10.879126Z  INFO runtime::init::results_cache: Initialized results cache; max size: 128.00 MiB, item ttl: 1s
 ```
 
 The runtime is now started and ready for queries.
@@ -292,9 +305,9 @@ dependencies:
 The `spiceai/quickstart` Spicepod will add a `taxi_trips` data table to the runtime which is now available to query by SQL.
 
 ```bash
-2024-08-05T13:04:56.742779Z  INFO runtime: Dataset taxi_trips registered (s3://spiceai-demo-datasets/taxi_trips/2024/), acceleration (arrow, 10s refresh), results cache enabled.
-2024-08-05T13:04:56.744062Z  INFO runtime::accelerated_table::refresh_task: Loading data for dataset taxi_trips
-2024-08-05T13:05:03.556169Z  INFO runtime::accelerated_table::refresh_task: Loaded 2,964,624 rows (421.71 MiB) for dataset taxi_trips in 6s 812ms.
+2025-01-20T19:26:30.011633Z  INFO runtime::init::dataset: Dataset taxi_trips registered (s3://spiceai-demo-datasets/taxi_trips/2024/), acceleration (arrow), results cache enabled.
+2025-01-20T19:26:30.013002Z  INFO runtime::accelerated_table::refresh_task: Loading data for dataset taxi_trips
+2025-01-20T19:26:40.312839Z  INFO runtime::accelerated_table::refresh_task: Loaded 2,964,624 rows (399.41 MiB) for dataset taxi_trips in 10s 299ms
 ```
 
 **Step 5.** Start the Spice SQL REPL:
@@ -493,13 +506,13 @@ You can experiment with the time it takes to generate queries when using non-acc
 
 ### 📄 Documentation
 
-Comprehensive documentation is available at [docs.spiceai.org](https://docs.spiceai.org/).
+Comprehensive documentation is available at [spiceai.org/docs](https://spiceai.org/docs/).
 
 Over 45 quickstarts and samples available in the [Spice Cookbook](https://github.com/spiceai/cookbook#spiceai-oss-cookbook).
 
 ### 🔌 Extensibility
 
-Spice.ai is designed to be extensible with extension points documented at [EXTENSIBILITY.md](./docs/EXTENSIBILITY.md). Build custom [Data Connectors](https://docs.spiceai.org/components/data-connectors), [Data Accelerators](https://docs.spiceai.org/components/data-accelerators), [Catalog Connectors](https://docs.spiceai.org/components/catalogs), [Secret Stores](https://docs.spiceai.org/components/secret-stores), [Models](https://docs.spiceai.org/components/models), or [Embeddings](https://docs.spiceai.org/components/embeddings).
+Spice.ai is designed to be extensible with extension points documented at [EXTENSIBILITY.md](./docs/EXTENSIBILITY.md). Build custom [Data Connectors](https://spiceai.org/docs/components/data-connectors), [Data Accelerators](https://spiceai.org/docs/components/data-accelerators), [Catalog Connectors](https://spiceai.org/docs/components/catalogs), [Secret Stores](https://spiceai.org/docs/components/secret-stores), [Models](https://spiceai.org/docs/components/models), or [Embeddings](https://spiceai.org/docs/components/embeddings).
 
 ### 🔨 Upcoming Features
 

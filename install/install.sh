@@ -193,7 +193,7 @@ fail_trap() {
     result=$?
     if [ "$result" != "0" ]; then
         echo "Failed to install Spice CLI"
-        echo "For support, see https://docs.spiceai.org"
+        echo "For support, see https://spiceai.org/docs"
     fi
     cleanup
     exit $result
@@ -233,7 +233,7 @@ addToProfile() {
 }
 
 installCompleted() {
-    echo -e "\nTo get started with Spice.ai, visit https://docs.spiceai.org"
+    echo -e "\nTo get started with Spice.ai, visit https://spiceai.org/docs"
 }
 
 # -----------------------------------------------------------------------------

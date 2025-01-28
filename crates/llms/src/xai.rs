@@ -25,9 +25,10 @@ use async_openai::{
     Client,
 };
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::chat::{nsql::SqlGeneration, Chat};
+use crate::chat::{nsql::SqlGeneration, Chat, Error};
 
 static DEFAULT_ENDPOINT: &str = "https://api.x.ai/v1";
 static DEFAULT_MODEL: &str = "grok-beta";
@@ -40,12 +41,10 @@ pub struct Xai {
 
 impl Xai {
     #[must_use]
-    pub fn new(model: Option<&str>, api_key: Option<&str>) -> Self {
-        let mut cfg = OpenAIConfig::default().with_api_base(DEFAULT_ENDPOINT);
-
-        if let Some(api_key) = api_key {
-            cfg = cfg.with_api_key(api_key);
-        }
+    pub fn new(model: Option<&str>, api_key: &str) -> Self {
+        let cfg = OpenAIConfig::default()
+            .with_api_base(DEFAULT_ENDPOINT)
+            .with_api_key(api_key);
 
         Self {
             model: model.unwrap_or(DEFAULT_MODEL).to_string(),
@@ -98,8 +97,34 @@ impl Xai {
     }
 }
 
+#[derive(Serialize, Deserialize, Debug)]
+struct Model {
+    id: String,
+    created: u64,
+    object: String,
+    owned_by: String,
+}
+
 #[async_trait]
 impl Chat for Xai {
+    async fn health(&self) -> Result<(), Error> {
+        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "health", input = "health");
+        match self
+            .client
+            .get::<Model>(format!("/models/{}", self.model).as_str())
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                tracing::error!(target: "task_history", parent: &span, "{e}");
+                Err(Error::ModelNotFound {
+                    model: self.model.clone(),
+                    model_source: "xai".to_string(),
+                })
+            }
+        }
+    }
+
     fn as_sql(&self) -> Option<&dyn SqlGeneration> {
         None
     }

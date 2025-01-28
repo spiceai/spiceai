@@ -14,103 +14,48 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use clap::{Parser, Subcommand, ValueEnum};
-use std::path::PathBuf;
-use test_framework::queries::{QueryOverrides, QuerySet};
+use std::collections::BTreeMap;
 
-#[derive(Subcommand)]
-pub enum Commands {
-    // Run a test
-    #[command(subcommand)]
-    Run(TestCommands),
-    // Export the spicepod environment that would run for a test
-    #[command(subcommand)]
-    Export(TestCommands),
+use crate::args::CommonArgs;
+use test_framework::{
+    anyhow, app::App, spiced::StartRequest, spicepod::Spicepod, spicepod_utils::from_app,
+};
+
+pub(crate) mod bench;
+pub(crate) mod data_consistency;
+pub(crate) mod dispatch;
+pub(crate) mod http;
+pub(crate) mod load;
+pub(crate) mod throughput;
+mod util;
+pub(crate) type RowCounts = BTreeMap<String, usize>;
+
+pub(crate) fn get_app_and_start_request(args: &CommonArgs) -> anyhow::Result<(App, StartRequest)> {
+    let spicepod = Spicepod::load_exact(args.spicepod_path.clone())?;
+    let app = test_framework::app::AppBuilder::new(spicepod.name.clone())
+        .with_spicepod(spicepod)
+        .build();
+
+    let start_request = StartRequest::new(args.spiced_path.clone(), from_app(app.clone()))?;
+    let start_request = if let Some(ref data_dir) = args.data_dir {
+        start_request.with_data_dir(data_dir.clone())
+    } else {
+        start_request
+    };
+
+    Ok((app, start_request))
 }
 
-#[derive(Subcommand)]
-pub enum TestCommands {
-    Throughput(TestArgs),
-    Load(TestArgs),
-    Bench(TestArgs),
-}
+pub(crate) fn env_export(args: &CommonArgs) -> anyhow::Result<()> {
+    let (_, mut start_request) = get_app_and_start_request(args)?;
 
-#[derive(Parser)]
-pub struct TestArgs {
-    /// Path to the spicepod.yaml file
-    #[arg(short('p'), long)]
-    pub(crate) spicepod_path: PathBuf,
+    start_request.prepare()?;
+    let tempdir_path = start_request.get_tempdir_path();
 
-    /// Path to the spiced binary
-    #[arg(short, long)]
-    pub(crate) spiced_path: PathBuf,
+    println!(
+        "Exported spicepod environment to: {}",
+        tempdir_path.to_string_lossy()
+    );
 
-    /// An optional data directory, to symlink into the spiced instance
-    #[arg(short, long)]
-    pub(crate) data_dir: Option<PathBuf>,
-
-    /// The expected scale factor for the test, used in metrics calculation
-    #[arg(long)]
-    pub(crate) scale_factor: Option<f64>,
-
-    /// The duration of the test in seconds
-    #[arg(long)]
-    pub(crate) duration: Option<usize>,
-
-    /// The query set to use for the test
-    #[arg(long)]
-    pub(crate) query_set: QuerySetArg,
-
-    #[arg(long)]
-    pub(crate) query_overrides: Option<QueryOverridesArg>,
-
-    #[arg(long)]
-    pub(crate) concurrency: Option<usize>,
-
-    #[arg(long)]
-    pub(crate) ready_wait: Option<usize>,
-}
-
-#[derive(Clone, ValueEnum)]
-pub enum QuerySetArg {
-    Tpch,
-    Tpcds,
-    ClickBench,
-}
-
-#[derive(Clone, ValueEnum)]
-pub enum QueryOverridesArg {
-    Sqlite,
-    Postgresql,
-    Mysql,
-    Dremio,
-    Spark,
-    ODBCAthena,
-    Duckdb,
-    Snowflake,
-}
-
-impl From<QuerySetArg> for QuerySet {
-    fn from(arg: QuerySetArg) -> Self {
-        match arg {
-            QuerySetArg::Tpch => QuerySet::Tpch,
-            QuerySetArg::Tpcds => QuerySet::Tpcds,
-            QuerySetArg::ClickBench => QuerySet::ClickBench,
-        }
-    }
-}
-
-impl From<QueryOverridesArg> for QueryOverrides {
-    fn from(arg: QueryOverridesArg) -> Self {
-        match arg {
-            QueryOverridesArg::Sqlite => QueryOverrides::SQLite,
-            QueryOverridesArg::Postgresql => QueryOverrides::PostgreSQL,
-            QueryOverridesArg::Mysql => QueryOverrides::MySQL,
-            QueryOverridesArg::Dremio => QueryOverrides::Dremio,
-            QueryOverridesArg::Spark => QueryOverrides::Spark,
-            QueryOverridesArg::ODBCAthena => QueryOverrides::ODBCAthena,
-            QueryOverridesArg::Duckdb => QueryOverrides::DuckDB,
-            QueryOverridesArg::Snowflake => QueryOverrides::Snowflake,
-        }
-    }
+    Ok(())
 }

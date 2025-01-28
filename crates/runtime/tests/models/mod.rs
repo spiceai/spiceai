@@ -33,7 +33,9 @@ use std::{
 };
 
 use serde_json::{json, Value};
+mod embedding;
 mod hf;
+mod local;
 mod openai;
 
 mod nsql {
@@ -188,7 +190,11 @@ fn get_taxi_trips_dataset() -> Dataset {
     dataset
 }
 
-fn get_tpcds_dataset(ds_name: &str, spice_name: Option<&str>) -> Dataset {
+fn get_tpcds_dataset(
+    ds_name: &str,
+    spice_name: Option<&str>,
+    refresh_sql: Option<&str>,
+) -> Dataset {
     let mut dataset = Dataset::new(
         format!("s3://spiceai-public-datasets/tpcds/{ds_name}/"),
         spice_name.unwrap_or(ds_name),
@@ -203,23 +209,26 @@ fn get_tpcds_dataset(ds_name: &str, spice_name: Option<&str>) -> Dataset {
     ));
     dataset.acceleration = Some(Acceleration {
         enabled: true,
-        refresh_sql: Some(format!(
-            "SELECT * FROM {} LIMIT 20",
-            spice_name.unwrap_or(ds_name)
-        )),
+        refresh_sql: Some(
+            refresh_sql
+                .unwrap_or(&format!(
+                    "SELECT * FROM {} LIMIT 20",
+                    spice_name.unwrap_or(ds_name)
+                ))
+                .to_string(),
+        ),
         ..Default::default()
     });
     dataset
 }
 
 /// Normalizes vector similarity search response for consistent snapshot testing by replacing dynamic
-/// values such as duration with placeholder and rounding scores to 4 decimal places.
+/// values such as duration with placeholder.
 fn normalize_search_response(mut json: Value) -> String {
     if let Some(matches) = json.get_mut("matches").and_then(|m| m.as_array_mut()) {
         for m in matches {
-            if let Some(score) = m.get_mut("score") {
-                // round score to 4 decimals for consistent snapshot testing
-                *score = json!(format!("{:.4}", score.as_f64().unwrap_or(0.0)));
+            if let Some(obj) = m.as_object_mut() {
+                obj.remove("score");
             }
         }
     }
@@ -351,7 +360,7 @@ async fn send_embeddings_request(
     }
 
     if let Some(u) = user {
-        request_body["user"] = json!(u);
+        request_body["user"] = Value::String(u.to_string());
     }
 
     if let Some(d) = dimensions {

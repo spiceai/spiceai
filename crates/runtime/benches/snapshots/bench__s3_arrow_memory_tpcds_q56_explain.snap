@@ -36,7 +36,7 @@ snapshot_kind: text
 |               |                   SubqueryAlias: __correlated_sq_1                                                                                                                                                 |
 |               |                     Projection: item.i_item_id                                                                                                                                                     |
 |               |                       BytesProcessedNode                                                                                                                                                           |
-|               |                         Filter: item.i_color = Utf8View("powder") OR item.i_color = Utf8View("goldenrod") OR item.i_color = Utf8View("bisque")                                                     |
+|               |                         Filter: item.i_color = LargeUtf8("powder") OR item.i_color = LargeUtf8("goldenrod") OR item.i_color = LargeUtf8("bisque")                                                  |
 |               |                           TableScan: item projection=[i_item_id, i_color]                                                                                                                          |
 |               |           SubqueryAlias: cs                                                                                                                                                                        |
 |               |             Projection: item.i_item_id, sum(catalog_sales.cs_ext_sales_price) AS total_sales                                                                                                       |
@@ -63,7 +63,7 @@ snapshot_kind: text
 |               |                   SubqueryAlias: __correlated_sq_2                                                                                                                                                 |
 |               |                     Projection: item.i_item_id                                                                                                                                                     |
 |               |                       BytesProcessedNode                                                                                                                                                           |
-|               |                         Filter: item.i_color = Utf8View("powder") OR item.i_color = Utf8View("goldenrod") OR item.i_color = Utf8View("bisque")                                                     |
+|               |                         Filter: item.i_color = LargeUtf8("powder") OR item.i_color = LargeUtf8("goldenrod") OR item.i_color = LargeUtf8("bisque")                                                  |
 |               |                           TableScan: item projection=[i_item_id, i_color]                                                                                                                          |
 |               |           SubqueryAlias: ws                                                                                                                                                                        |
 |               |             Projection: item.i_item_id, sum(web_sales.ws_ext_sales_price) AS total_sales                                                                                                           |
@@ -90,7 +90,7 @@ snapshot_kind: text
 |               |                   SubqueryAlias: __correlated_sq_3                                                                                                                                                 |
 |               |                     Projection: item.i_item_id                                                                                                                                                     |
 |               |                       BytesProcessedNode                                                                                                                                                           |
-|               |                         Filter: item.i_color = Utf8View("powder") OR item.i_color = Utf8View("goldenrod") OR item.i_color = Utf8View("bisque")                                                     |
+|               |                         Filter: item.i_color = LargeUtf8("powder") OR item.i_color = LargeUtf8("goldenrod") OR item.i_color = LargeUtf8("bisque")                                                  |
 |               |                           TableScan: item projection=[i_item_id, i_color]                                                                                                                          |
 | physical_plan | SortPreservingMergeExec: [total_sales@1 ASC NULLS LAST, i_item_id@0 ASC NULLS LAST], fetch=100                                                                                                     |
 |               |   SortExec: TopK(fetch=100), expr=[total_sales@1 ASC NULLS LAST, i_item_id@0 ASC NULLS LAST], preserve_partitioning=[true]                                                                         |

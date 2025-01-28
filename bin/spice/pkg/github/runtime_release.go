@@ -54,8 +54,8 @@ func GetLatestCliRelease() (*RepoRelease, error) {
 	return release, nil
 }
 
-func DownloadRuntimeAsset(flavor string, release *RepoRelease, downloadPath string) error {
-	assetName := GetRuntimeAssetName(flavor)
+func DownloadRuntimeAsset(flavor constants.Flavor, release *RepoRelease, downloadPath string, allowAccelerator bool) error {
+	assetName := GetRuntimeAssetName(flavor, allowAccelerator)
 	slog.Info(fmt.Sprintf("Downloading the Spice runtime..., %s", assetName))
 	return DownloadReleaseAsset(githubClient, release, assetName, downloadPath)
 }
@@ -64,19 +64,17 @@ func DownloadAsset(release *RepoRelease, downloadPath string, assetName string) 
 	return DownloadReleaseAsset(githubClient, release, assetName, downloadPath)
 }
 
-func GetRuntimeAssetName(flavor string) string {
-	switch {
-	case flavor == "ai":
-		if accelerator, exists := get_ai_accelerator(); exists {
-			flavor = fmt.Sprintf("_models_%s", accelerator)
+func GetRuntimeAssetName(flavor constants.Flavor, allowAccelerator bool) string {
+	var downloadFlavor string
+	if flavor == constants.FlavorAI || flavor == constants.FlavorDefault {
+		if accelerator, exists := get_ai_accelerator(); exists && allowAccelerator {
+			downloadFlavor = fmt.Sprintf("_models_%s", accelerator)
 		} else {
-			flavor = "_models"
+			downloadFlavor = "_models"
 		}
-	case flavor != "":
-		flavor = fmt.Sprintf("_%s", flavor)
 	}
 
-	assetName := fmt.Sprintf("%s%s_%s_%s.tar.gz", constants.SpiceRuntimeFilename, flavor, runtime.GOOS, getRustArch())
+	assetName := fmt.Sprintf("%s%s_%s_%s.tar.gz", constants.SpiceRuntimeFilename, downloadFlavor, runtime.GOOS, getRustArch())
 
 	return assetName
 }
@@ -97,6 +95,18 @@ func getRustArch() string {
 	return runtime.GOARCH
 }
 
+// GPU versions that are supported via dedicated CUDA builds
+var supportedCudaVersionsBinaries = []string{"80", "86", "87", "89", "90"}
+
+func checkCudaVersionSupported(computeCap string) bool {
+	for _, version := range supportedCudaVersionsBinaries {
+		if computeCap == version {
+			return true
+		}
+	}
+	return false
+}
+
 // get_ai_accelerator checks for accelerator devices, either GPU devices, or Apple silicon (metal).
 func get_ai_accelerator() (string, bool) {
 	if runtime.GOOS == "darwin" {
@@ -109,14 +119,22 @@ func get_ai_accelerator() (string, bool) {
 		}
 	}
 
-	if runtime.GOOS == "linux" {
-		hasCuda, err := has_cuda_device()
+	if runtime.GOOS == "linux" || runtime.GOOS == "windows" {
+		version, err := get_cuda_version()
 		if err != nil {
 			slog.Error("checking for CUDA device", "error", err)
 		}
-		if hasCuda {
-			return "cuda", true
+
+		if version == nil {
+			return "", false
 		}
+
+		if !checkCudaVersionSupported(*version) {
+			slog.Warn(fmt.Sprintf("Spice detected a GPU, but the GPU version (%s) is not supported for model acceleration. Spice will fallback to using the CPU to run local models, which may impact performance.", *version))
+			return "", false
+		}
+
+		return "cuda_" + *version, true
 	}
 
 	return "", false
@@ -138,24 +156,24 @@ func has_metal_device() (bool, error) {
 	return strings.Contains(string(output), "Metal Support: Metal"), nil
 }
 
-func has_cuda_device() (bool, error) {
-	if runtime.GOOS != "linux" {
-		return false, nil
+func get_cuda_version() (*string, error) {
+	if runtime.GOOS != "linux" && runtime.GOOS != "windows" {
+		return nil, nil
 	}
 
-	slog.Debug("On Linux, running `nvidia-smi --query-gpu=name --format=csv,noheader` to determine hardware")
-	cmd := exec.Command("nvidia-smi", "--query-gpu=name", "--format=csv,noheader")
+	slog.Debug("Running `nvidia-smi --query-gpu=compute_cap --format=csv,noheader` to determine hardware")
+	cmd := exec.Command("nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader")
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return false, fmt.Errorf("failed to get stdout pipe: %w", err)
+		return nil, fmt.Errorf("failed to get stdout pipe: %w", err)
 	}
 
 	if err := cmd.Start(); err != nil {
-		return false, fmt.Errorf("failed to start `nvidia-smi` command: %w", err)
+		return nil, fmt.Errorf("failed to start `nvidia-smi` command: %w", err)
 	}
 
 	// Read the output while the command is still running
-	cmd_output, readErr := io.ReadAll(stdout)
+	cmdOutput, readErr := io.ReadAll(stdout)
 
 	waitErr := cmd.Wait()
 
@@ -163,19 +181,22 @@ func has_cuda_device() (bool, error) {
 	if waitErr != nil {
 		if exitErr, ok := waitErr.(*exec.ExitError); ok {
 			slog.Warn("`nvidia-smi` command failed", "exit_code", exitErr.ExitCode(), "error", exitErr)
-			return false, nil
+			return nil, nil
 		}
-		return false, fmt.Errorf("unexpected error while waiting for `nvidia-smi`: %w", waitErr)
+		return nil, fmt.Errorf("unexpected error while waiting for `nvidia-smi`: %w", waitErr)
 	}
 
 	// Handle output reading errors separately
 	if readErr != nil {
-		return false, fmt.Errorf("failed to read output: %w", readErr)
+		return nil, fmt.Errorf("failed to read output: %w", readErr)
 	}
 
-	// Check if the output indicates available GPUs
-	if len(cmd_output) > 0 {
-		return true, nil
+	// Get CUDA version, if available: e.g., "8.6" will be returned as "86"
+	version := strings.ReplaceAll(strings.TrimSpace(string(cmdOutput)), ".", "")
+
+	if version == "" {
+		return nil, nil
 	}
-	return false, nil
+
+	return &version, nil
 }

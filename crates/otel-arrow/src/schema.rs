@@ -141,7 +141,7 @@ pub(crate) fn attribute_struct_fields() -> Vec<Field> {
         Field::new("key", DataType::Utf8, false),
         // AttributeValueType is the Rust enum corresponding to the UInt8 `type`.
         Field::new("type", DataType::UInt8, false),
-        Field::new("str", DataType::Utf8, false),
+        Field::new("str", DataType::Utf8, true),
         Field::new("int", DataType::Int64, true),
         Field::new("double", DataType::Float64, true),
         Field::new("bool", DataType::Boolean, true),

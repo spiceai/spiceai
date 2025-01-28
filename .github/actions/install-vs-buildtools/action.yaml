@@ -1,0 +1,36 @@
+name: 'Install MS Build Tools'
+description: 'Install Visual Studio Build Tools'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Install Visual Studio Build Tools
+      run: |
+        Invoke-WebRequest -Uri "https://aka.ms/vs/17/release/vs_buildtools.exe" -OutFile "vs_buildtools.exe"
+        Start-Process -FilePath "vs_buildtools.exe" -ArgumentList "--quiet", "--wait", "--norestart", "--nocache", `
+          "--installPath", "C:\BuildTools", `
+          "--add", "Microsoft.VisualStudio.Component.VC.Tools.x86.x64", `
+          "--add", "Microsoft.VisualStudio.Component.VC.CMake.Project", `
+          "--add", "Microsoft.VisualStudio.Component.Windows11SDK.22621" -Wait
+      shell: pwsh
+
+    - name: Add Visual Studio Build Tools to PATH
+      run: |
+        $vsPath = "C:\BuildTools\VC\Tools\MSVC"
+        $latestVersion = (Get-ChildItem $vsPath | Sort-Object {[version]$_.Name} -Descending)[0].Name
+        Add-Content $env:GITHUB_PATH "C:\BuildTools\VC\Tools\MSVC\$latestVersion\bin\Hostx64\x64"
+        Add-Content $env:GITHUB_PATH "C:\Program Files (x86)\Windows Kits\10\bin\10.0.22621.0\x64"
+        Add-Content $env:GITHUB_PATH "C:\BuildTools\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin"
+      shell: pwsh
+
+    - name: Install extra build tools (perl, protoc)
+      shell: pwsh
+      run: |
+        # use choco to install
+        if (-not (Get-Command choco -ErrorAction SilentlyContinue)) {
+          Set-ExecutionPolicy Bypass -Scope Process -Force; iex ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
+          echo "C:\ProgramData\Chocolatey\bin" >> $env:GITHUB_PATH
+        }
+        choco install strawberryperl -y
+        choco install protoc -y
+        echo "C:\Strawberry\perl\bin" >> $env:GITHUB_PATH

@@ -70,39 +70,42 @@ pub const AWS_REGIONS: [&str; 32] = [
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("S3 auth method 'key' requires an AWS access secret.\nSpecify an access secret with the `s3_secret` parameter.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/s3#auth"))]
+    #[snafu(display("S3 auth method 'key' requires an AWS access secret.\nSpecify an access secret with the `s3_secret` parameter.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/s3#auth"))]
     NoAccessSecret,
 
-    #[snafu(display("S3 auth method 'key' requires an AWS access key.\nSpecify an access key with the `s3_key` parameter.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/s3#auth"))]
+    #[snafu(display("S3 auth method 'key' requires an AWS access key.\nSpecify an access key with the `s3_key` parameter.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/s3#auth"))]
     NoAccessKey,
 
-    #[snafu(display("Unsupported S3 auth method '{method}'.\nUse 'public', 'iam_role', or 'key' for `s3_auth` parameter.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/s3#auth"))]
+    #[snafu(display("Unsupported S3 auth method '{method}'.\nUse 'public', 'iam_role', or 'key' for `s3_auth` parameter.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/s3#auth"))]
     UnsupportedAuthenticationMethod { method: String },
 
     #[snafu(display(
-        "The '{parameter}' parameter requires `s3_auth` set to '{auth}'.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/s3#auth"
+        "The '{parameter}' parameter requires `s3_auth` set to '{auth}'.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/s3#auth"
     ))]
     InvalidAuthParameterCombination { parameter: String, auth: String },
 
     #[snafu(display(
-        "The `s3_endpoint` parameter must be a HTTP/S URL, but '{endpoint}' was provided.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/s3#params"
+        "The `s3_endpoint` parameter must be a HTTP/S URL, but '{endpoint}' was provided.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/s3#params"
     ))]
     InvalidEndpoint { endpoint: String },
 
     #[snafu(display(
-        "The `s3_region` parameter must be a valid AWS region code, but '{region}' was provided.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/s3#params"
+        "The `s3_region` parameter must be a valid AWS region code, but '{region}' was provided.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/s3#params"
     ))]
     InvalidRegion { region: String },
 
     #[snafu(display(
-        "The `s3_region` parameter requires a lowercase AWS region code, but '{region}' was provided.\nSpice will automatically convert the region code to lowercase.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/s3#params"
+        "The `s3_region` parameter requires a lowercase AWS region code, but '{region}' was provided.\nSpice will automatically convert the region code to lowercase.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/s3#params"
     ))]
     InvalidRegionCorrected { region: String },
 
-    #[snafu(display("IAM role authentication failed.\nAre you sure you're running in an environment with an IAM role?\n{source}\nFor details, visit: https://docs.spiceai.org/components/data-connectors/s3#auth"))]
+    #[snafu(display("IAM role authentication failed.\nAre you sure you're running in an environment with an IAM role?\n{source}\nFor details, visit: https://spiceai.org/docs/components/data-connectors/s3#auth"))]
     InvalidIAMRoleAuthentication {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+
+    #[snafu(display("The '{endpoint}' is a HTTP URL, but `allow_http` is not enabled. Set the parameter `allow_http: true` and retry.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/abfs#params"))]
+    InsecureEndpointWithoutAllowHTTP { endpoint: String },
 }
 
 pub struct S3 {
@@ -165,6 +168,15 @@ impl DataConnectorFactory for S3Factory {
             if let Some(endpoint) = params.parameters.get("endpoint").expose().ok() {
                 if !(endpoint.starts_with("https://") || endpoint.starts_with("http://")) {
                     return Err(Box::new(Error::InvalidEndpoint {
+                        endpoint: endpoint.to_string(),
+                    })
+                        as Box<dyn std::error::Error + Send + Sync>);
+                }
+
+                if endpoint.starts_with("http://")
+                    && params.parameters.get("allow_http").expose().ok() != Some("true")
+                {
+                    return Err(Box::new(Error::InsecureEndpointWithoutAllowHTTP {
                         endpoint: endpoint.to_string(),
                     })
                         as Box<dyn std::error::Error + Send + Sync>);
@@ -268,7 +280,7 @@ impl ListingTableConnector for S3 {
                 .boxed()
                 .context(super::InvalidConfigurationSnafu {
                     dataconnector: format!("{self}"),
-                    message: format!("The specified URL is not valid: {}.\nEnsure the URL is valid and try again.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/s3#from", dataset.from),
+                    message: format!("The specified URL is not valid: {}.\nEnsure the URL is valid and try again.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/s3#from", dataset.from),
                     connector_component: ConnectorComponent::from(dataset)
                 })?;
 

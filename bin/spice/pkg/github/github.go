@@ -28,6 +28,7 @@ import (
 )
 
 type GitHubClient struct {
+	token string
 	Owner string
 	Repo  string
 }
@@ -46,7 +47,13 @@ func NewGitHubClientFromPath(path string) (*GitHubClient, error) {
 }
 
 func NewGitHubClient(owner string, repo string) *GitHubClient {
+	token := os.Getenv("GH_TOKEN")
+	if token == "" {
+		token = os.Getenv("GITHUB_TOKEN")
+	}
+
 	return &GitHubClient{
+		token: token,
 		Owner: owner,
 		Repo:  repo,
 	}
@@ -90,6 +97,11 @@ func (g *GitHubClient) call(method string, url string, payload []byte, accept st
 		req.Header.Add("Accept", accept)
 	}
 
+	// Add Authorization header if GITHUB_TOKEN is present
+	if g.token != "" {
+		req.Header.Add("Authorization", "Bearer "+g.token)
+	}
+
 	response, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return nil, err
@@ -100,6 +112,10 @@ func (g *GitHubClient) call(method string, url string, payload []byte, accept st
 	body, err := io.ReadAll(response.Body)
 	if err != nil {
 		return nil, err
+	}
+
+	if response.StatusCode == 401 {
+		return nil, NewGitHubCallError("Detected GitHub token from GH_TOKEN or GITHUB_TOKEN environment variable is invalid. Check the token and try again.", response.StatusCode)
 	}
 
 	if response.StatusCode != 200 {

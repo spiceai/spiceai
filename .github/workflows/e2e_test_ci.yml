@@ -5,15 +5,46 @@ on:
     branches:
       - trunk
       - release-*
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - 'README.md'
+      - 'Makefile'
+      - 'CONTRIBUTING.md'
+      - 'SECURITY.md'
+      - 'LICENSE'
+      - '.github/**'
+      - 'version.txt'
+      - '.schema/**'
+      - '.vscode/**'
+      - 'deploy/**'
+      - 'install/**'
+      - 'media/**'
+      - 'monitoring/**'
+      - 'acknowledgements.md'
+      - 'Dockerfile*'
 
   pull_request:
     branches:
       - trunk
     paths-ignore:
+      - '**/*.md'
       - 'docs/**'
       - 'README.md'
+      - 'Makefile'
+      - 'CONTRIBUTING.md'
+      - 'SECURITY.md'
+      - 'LICENSE'
+      - '.github/**'
       - 'version.txt'
+      - '.schema/**'
+      - '.vscode/**'
+      - 'deploy/**'
+      - 'install/**'
+      - 'media/**'
+      - 'monitoring/**'
       - 'acknowledgements.md'
+      - 'Dockerfile*'
 
   workflow_dispatch:
 
@@ -188,6 +219,8 @@ jobs:
 
       - name: Start spice runtime
         working-directory: test_app
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           spice run &> spice.log &
           # time to initialize added dataset
@@ -259,6 +292,7 @@ jobs:
 
       - name: Start spice runtime
         env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICE_SPICEAI_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_KEY }}
         working-directory: test_app
         run: |
@@ -352,6 +386,7 @@ jobs:
 
       - name: Start spice runtime
         env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICE_SPICEAI_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_KEY }}
         working-directory: test_app
         run: |
@@ -524,6 +559,7 @@ jobs:
 
       - name: Start spice runtime
         env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICE_PG_PASS: postgres
         working-directory: test_app
         run: |
@@ -542,7 +578,7 @@ jobs:
         with:
           name: test_postgresql_table
           expected-rows-count: ${{ matrix.acceleration.engine != '' && 2 || 3 }}
-      
+
       - name: Verify dataset2
         uses: ./.github/actions/verify-dataset
         with:
@@ -729,6 +765,7 @@ jobs:
 
       - name: Start spice runtime
         env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICE_MYSQL_PASS: password
         working-directory: test_app
         run: |
@@ -839,6 +876,7 @@ jobs:
 
       - name: Start spice runtime
         env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICE_CLICKHOUSE_PASS: password
         working-directory: test_app
         run: |
@@ -924,6 +962,8 @@ jobs:
 
       - name: Start Spice runtime
         working-directory: duckdb-app
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           spice run &> spice.log &
           # time to initialize added dataset
@@ -1034,6 +1074,7 @@ jobs:
 
       - name: Start spice runtime
         env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICE_PG_PASS: postgres
         working-directory: test_app
         run: |
@@ -1065,7 +1106,7 @@ jobs:
         with:
           name: eth.recent_blocks
           expected-rows-count: 1
-      
+
       - name: Manually refresh dataset (with params)
         working-directory: test_app
         run: |
@@ -1143,6 +1184,8 @@ jobs:
 
       - name: Start spice runtime
         working-directory: test_app
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           spice run &> spice.log &
           # time to initialize added dataset
@@ -1309,30 +1352,40 @@ jobs:
           while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
 
       - name: Run test query (issues)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         uses: ./.github/actions/run-query
         with:
           fail-on-error: true
           query: 'select number, title, state, labels, updated_at from spiceai.issues order by updated_at desc limit 10;'
 
       - name: Run test query (pulls)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         uses: ./.github/actions/run-query
         with:
           fail-on-error: true
           query: "select number, title, state, merged_at from spiceai.pulls where state = 'MERGED' order by merged_at desc limit 10;"
 
       - name: Run test query (commits)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         uses: ./.github/actions/run-query
         with:
           fail-on-error: true
           query: 'select message_head_line, author_name, sha from spiceai.commits order by committed_date desc limit 10;'
 
       - name: Run test query (files)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         uses: ./.github/actions/run-query
         with:
           fail-on-error: true
           query: 'select name, path, download_url, content from spiceai.files limit 1;'
 
       - name: Run test query (stargazers)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         uses: ./.github/actions/run-query
         with:
           fail-on-error: true
@@ -1375,14 +1428,16 @@ jobs:
 
       - name: Install mssql-tools
         run: |
+          curl https://packages.microsoft.com/keys/microsoft.asc | sudo tee /etc/apt/trusted.gpg.d/microsoft.asc
+          curl https://packages.microsoft.com/config/ubuntu/22.04/prod.list | sudo tee /etc/apt/sources.list.d/mssql-release.list
           sudo apt-get update
-          sudo apt-get install -y mssql-tools unixodbc-dev
-          # echo 'export PATH="$PATH:/opt/mssql-tools/bin"' >> ~/.bashrc
+          sudo apt-get install -y mssql-tools18 unixodbc-dev
+          # echo 'export PATH="$PATH:/opt/mssql-tools18/bin"' >> ~/.bashrc
           # source ~/.bashrc
 
       - name: Setup MS SQL test database
         run: |
-          /opt/mssql-tools/bin/sqlcmd -S localhost -U sa -P 1StrongPwd!! -i ./test/scripts/setup-data-mssql.sql
+          /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P 1StrongPwd!! -C -i ./test/scripts/setup-data-mssql.sql
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
         uses: actions/download-artifact@v4
@@ -1422,6 +1477,8 @@ jobs:
 
       - name: Start spice runtime
         working-directory: test_app
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           spice run &> spice.log &
           # time to accelerate added datasets
@@ -1439,6 +1496,8 @@ jobs:
           name: test_mssql_table
 
       - name: Run test query (issues)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         uses: ./.github/actions/run-query
         with:
           fail-on-error: true
@@ -1508,6 +1567,7 @@ jobs:
       - name: Start spice runtime
         working-directory: test_app
         env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ secrets.AWS_DATABRICKS_DELTA_ACCESS_KEY_ID }}
           AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ secrets.AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY }}
           DATABRICKS_ENDPOINT: ${{ secrets.DATABRICKS_ENDPOINT }}
@@ -1524,12 +1584,16 @@ jobs:
           while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
 
       - name: Run test query (tpch)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         uses: ./.github/actions/run-query
         with:
           fail-on-error: true
           query: 'select * from db_uc.tpch.lineitem limit 1;'
 
       - name: Run test query (tpcds)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         uses: ./.github/actions/run-query
         with:
           fail-on-error: true

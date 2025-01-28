@@ -26,6 +26,7 @@ use data_components::{
 };
 use iceberg::{Namespace, NamespaceIdent};
 use iceberg_catalog_rest::RestCatalogConfig;
+use ns_lookup::verify_ns_lookup_and_tcp_connect;
 use secrecy::ExposeSecret;
 use snafu::prelude::*;
 use std::{any::Any, collections::HashMap, sync::Arc};
@@ -53,6 +54,9 @@ pub enum Error {
 
     #[snafu(display("Failed to parse URL: {}", source))]
     UrlParse { source: url::ParseError },
+
+    #[snafu(display("Failed to connect to the S3 endpoint at '{url}'.\nVerify the S3 endpoint is accessible and try again."))]
+    FailedToConnectS3Endpoint { url: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -89,6 +93,13 @@ pub(crate) const PARAMETERS: &[ParameterSpec] = &[
         .default("catalog"),
     ParameterSpec::connector("oauth2_server_url")
         .description("URL of the OAuth2 server tokens endpoint."),
+    ParameterSpec::connector("sigv4_enabled")
+        .description("Enable SigV4 authentication for the catalog (for connecting to AWS Glue)."),
+    ParameterSpec::connector("signing_region")
+        .description("The region to use when signing the request for SigV4. Defaults to the region in the catalog URL if available."),
+    ParameterSpec::connector("signing_name")
+        .description("The name to use when signing the request for SigV4.")
+        .default("glue"),
     // S3 storage options
     ParameterSpec::connector("s3_endpoint")
         .description(
@@ -131,6 +142,9 @@ fn map_param_name_to_iceberg_prop(param_name: &str) -> Option<String> {
         "s3_region" => Some("s3.region".to_string()),
         "s3_role_session_name" => Some("client.assume-role.session-name".to_string()),
         "s3_role_arn" => Some("client.assume-role.arn".to_string()),
+        "sigv4_enabled" => Some("rest.sigv4-enabled".to_string()),
+        "signing_region" => Some("rest.signing-region".to_string()),
+        "signing_name" => Some("rest.signing-name".to_string()),
         _ => None,
     }
 }
@@ -150,7 +164,7 @@ impl CatalogConnector for IcebergCatalog {
             return Err(
                 super::Error::InvalidConfigurationNoSource {
                     connector: "iceberg".into(),
-                    message: "A Catalog Path is required for Iceberg in the format of: http://<host_and_port>/v1/namespaces/<namespace>.\nFor details, visit: https://docs.spiceai.org/components/catalogs/iceberg#from".into(),
+                    message: "A Catalog Path is required for Iceberg in the format of: http://<host_and_port>/v1/namespaces/<namespace>.\nFor details, visit: https://spiceai.org/docs/components/catalogs/iceberg#from".into(),
                     connector_component: ConnectorComponent::from(catalog),
                 },
             );
@@ -161,7 +175,7 @@ impl CatalogConnector for IcebergCatalog {
             Err(e) => {
                 return Err(super::Error::InvalidConfiguration {
                     connector: "iceberg".into(),
-                    message: format!("A Catalog Path is required for Iceberg in the format of: http://<host_and_port>/v1/namespaces/<namespace>.\nFor details, visit: https://docs.spiceai.org/components/catalogs/iceberg#from\n{e}"),
+                    message: format!("A Catalog Path is required for Iceberg in the format of: http://<host_and_port>/v1/namespaces/<namespace>.\nFor details, visit: https://spiceai.org/docs/components/catalogs/iceberg#from\n{e}"),
                     connector_component: ConnectorComponent::from(catalog),
                     source: Box::new(e),
                 });
@@ -172,6 +186,17 @@ impl CatalogConnector for IcebergCatalog {
             if let Some(prop) = map_param_name_to_iceberg_prop(key.as_str()) {
                 props.insert(prop, value.expose_secret().to_string());
             }
+        }
+
+        if let Some(endpoint) = props.get("s3.endpoint") {
+            verify_s3_endpoint(endpoint)
+                .await
+                .map_err(|e| super::Error::InvalidConfiguration {
+                    connector: "iceberg".into(),
+                    message: e.to_string(),
+                    connector_component: ConnectorComponent::from(catalog),
+                    source: Box::new(e),
+                })?;
         }
 
         let catalog_config = RestCatalogConfig::builder()
@@ -194,6 +219,27 @@ impl CatalogConnector for IcebergCatalog {
 
         Ok(Arc::new(catalog_provider) as Arc<dyn RefreshableCatalogProvider>)
     }
+}
+
+async fn verify_s3_endpoint(endpoint: &str) -> Result<()> {
+    let url = Url::parse(endpoint).context(UrlParseSnafu)?;
+    let host = url.host_str().context(MissingHostSnafu)?;
+    let port = url.port().unwrap_or_else(|| {
+        if url.scheme() == "http" {
+            80
+        } else if url.scheme() == "https" {
+            443
+        } else {
+            return 0;
+        }
+    });
+
+    verify_ns_lookup_and_tcp_connect(host, port)
+        .await
+        .map_err(|_| Error::FailedToConnectS3Endpoint {
+            url: endpoint.to_string(),
+        })?;
+    Ok(())
 }
 
 /// Parses a catalog URL into an Iceberg `RestCatalogConfig` (catalog URI + optional properties)
@@ -248,7 +294,7 @@ pub fn parse_catalog_url(
         Some(port) => format!(":{port}"),
         None => String::new(),
     };
-    let base_uri = format!("{}://{}{}", parsed.scheme(), host, port_part);
+    let mut base_uri = format!("{}://{}{}", parsed.scheme(), host, port_part);
 
     // Extract path segments
     let segments: Vec<_> = parsed
@@ -261,6 +307,12 @@ pub fn parse_catalog_url(
         .iter()
         .position(|seg| *seg == "v1")
         .context(MissingV1SegmentSnafu)?;
+
+    // Add any path segments before v1 to the base URI
+    if v1_idx > 0 {
+        let prefix_path = segments[..v1_idx].join("/");
+        base_uri.push_str(&format!("/{prefix_path}"));
+    }
 
     // Find the "namespaces" segment
     let namespaces_idx = segments
@@ -292,6 +344,20 @@ pub fn parse_catalog_url(
     let mut props = HashMap::new();
     if !prefix.is_empty() {
         props.insert("prefix".to_string(), prefix);
+    }
+
+    // Auto-detect AWS Glue URLs and set signing region, name, and SigV4 enabled
+    if let Some(host_str) = parsed.host_str() {
+        if host_str.starts_with("glue.") && host_str.ends_with(".amazonaws.com") {
+            if let Some(region) = host_str
+                .strip_prefix("glue.")
+                .and_then(|s| s.strip_suffix(".amazonaws.com"))
+            {
+                props.insert("rest.signing-region".to_string(), region.to_string());
+                props.insert("rest.signing-name".to_string(), "glue".to_string());
+                props.insert("rest.sigv4-enabled".to_string(), "true".to_string());
+            }
+        }
     }
 
     // Return the Base URI + Properties + Namespace
@@ -373,5 +439,67 @@ mod tests {
         let result = parse_catalog_url(url);
         assert!(result.is_ok());
         assert!(result.expect("Failed to parse catalog URL").2.is_none());
+    }
+
+    #[test]
+    fn test_path_before_v1() {
+        let url = "https://glue.ap-northeast-2.amazonaws.com/iceberg/v1/catalogs/123456789012/namespaces/default";
+        let (base_uri, props, namespace) =
+            parse_catalog_url(url).expect("Failed to parse catalog URL");
+        assert_eq!(
+            base_uri,
+            "https://glue.ap-northeast-2.amazonaws.com/iceberg"
+        );
+        assert_eq!(
+            props.get("prefix"),
+            Some(&"catalogs/123456789012".to_string())
+        );
+        assert_eq!(
+            namespace
+                .clone()
+                .expect("Namespace is None")
+                .name()
+                .to_url_string()
+                .as_str(),
+            "default"
+        );
+        assert!(namespace
+            .expect("Namespace is None")
+            .properties()
+            .is_empty());
+    }
+
+    #[test]
+    fn test_aws_glue_url_sets_signing_region() {
+        let url = "https://glue.ap-northeast-2.amazonaws.com/iceberg/v1/catalogs/123456789012/namespaces/default";
+        let (base_uri, props, namespace) =
+            parse_catalog_url(url).expect("Failed to parse catalog URL");
+        assert_eq!(
+            base_uri,
+            "https://glue.ap-northeast-2.amazonaws.com/iceberg"
+        );
+        assert_eq!(
+            props.get("prefix"),
+            Some(&"catalogs/123456789012".to_string())
+        );
+        assert_eq!(
+            props.get("rest.signing-region"),
+            Some(&"ap-northeast-2".to_string())
+        );
+        assert_eq!(
+            namespace
+                .expect("Namespace is None")
+                .name()
+                .to_url_string()
+                .as_str(),
+            "default"
+        );
+    }
+
+    #[test]
+    fn test_non_aws_url_no_signing_region() {
+        let url = "https://my.iceberg.com/v1/namespaces/spiceai_sandbox";
+        let (_, props, _) = parse_catalog_url(url).expect("Failed to parse catalog URL");
+        assert!(!props.contains_key("rest.signing-region"));
     }
 }

@@ -1,0 +1,86 @@
+version: v1
+kind: Spicepod
+name: odbc_databricks_tpcds
+datasets:
+  - from: odbc:spiceai_sandbox.tpcds.catalog_sales
+    name: catalog_sales
+    params: &odbc_params
+      odbc_connection_string: |
+        Driver={Databricks ODBC Driver};
+        Host=${ env:DATABRICKS_HOST };
+        Port=443;
+        HTTPPath=${ env:DATABRICKS_ODBC_PATH };
+        SSL=1;
+        ThriftTransport=2;
+        AuthMech=3;
+        UID=token;
+        PWD=${ env:DATABRICKS_TOKEN }
+  - from: odbc:spiceai_sandbox.tpcds.catalog_returns
+    name: catalog_returns
+    params: *odbc_params
+  - from: odbc:spiceai_sandbox.tpcds.inventory
+    name: inventory
+    params: *odbc_params
+  - from: odbc:spiceai_sandbox.tpcds.store_sales
+    name: store_sales
+    params: *odbc_params
+  - from: odbc:spiceai_sandbox.tpcds.store_returns
+    name: store_returns
+    params: *odbc_params
+  - from: odbc:spiceai_sandbox.tpcds.web_sales
+    name: web_sales
+    params: *odbc_params
+  - from: odbc:spiceai_sandbox.tpcds.web_returns
+    name: web_returns
+    params: *odbc_params
+  - from: odbc:spiceai_sandbox.tpcds.customer
+    name: customer
+    params: *odbc_params
+  - from: odbc:spiceai_sandbox.tpcds.customer_address
+    name: customer_address
+    params: *odbc_params
+  - from: odbc:spiceai_sandbox.tpcds.customer_demographics
+    name: customer_demographics
+    params: *odbc_params
+  - from: odbc:spiceai_sandbox.tpcds.date_dim
+    name: date_dim
+    params: *odbc_params
+  - from: odbc:spiceai_sandbox.tpcds.household_demographics
+    name: household_demographics
+    params: *odbc_params
+  - from: odbc:spiceai_sandbox.tpcds.item
+    name: item
+    params: *odbc_params
+  - from: odbc:spiceai_sandbox.tpcds.promotion
+    name: promotion
+    params: *odbc_params
+  - from: odbc:spiceai_sandbox.tpcds.ship_mode
+    name: ship_mode
+    params: *odbc_params
+  - from: odbc:spiceai_sandbox.tpcds.store
+    name: store
+    params: *odbc_params
+  - from: odbc:spiceai_sandbox.tpcds.time_dim
+    name: time_dim
+    params: *odbc_params
+  - from: odbc:spiceai_sandbox.tpcds.warehouse
+    name: warehouse
+    params: *odbc_params
+  - from: odbc:spiceai_sandbox.tpcds.web_page
+    name: web_page
+    params: *odbc_params
+  - from: odbc:spiceai_sandbox.tpcds.web_site
+    name: web_site
+    params: *odbc_params
+  - from: odbc:spiceai_sandbox.tpcds.reason
+    name: reason
+    params: *odbc_params
+  - from: odbc:spiceai_sandbox.tpcds.call_center
+    name: call_center
+    params: *odbc_params
+  - from: odbc:spiceai_sandbox.tpcds.income_band
+    name: income_band
+    params: *odbc_params
+  - from: odbc:spiceai_sandbox.tpcds.catalog_page
+    name: catalog_page
+    params: *odbc_params

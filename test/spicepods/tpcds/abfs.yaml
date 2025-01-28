@@ -1,0 +1,79 @@
+version: v1
+kind: Spicepod
+name: abfs_tpcds
+datasets:
+  - from: abfs://data/tpcds/catalog_sales/
+    name: catalog_sales
+    params: &abfs_params
+      file_format: parquet
+      abfs_account: spiceaidemodatasets
+      abfs_skip_signature: true
+  - from: abfs://data/tpcds/catalog_returns/
+    name: catalog_returns
+    params: *abfs_params
+  - from: abfs://data/tpcds/inventory/
+    name: inventory
+    params: *abfs_params
+  - from: abfs://data/tpcds/store_sales/
+    name: store_sales
+    params: *abfs_params
+  - from: abfs://data/tpcds/store_returns/
+    name: store_returns
+    params: *abfs_params
+  - from: abfs://data/tpcds/web_sales/
+    name: web_sales
+    params: *abfs_params
+  - from: abfs://data/tpcds/web_returns/
+    name: web_returns
+    params: *abfs_params
+  - from: abfs://data/tpcds/customer/
+    name: customer
+    params: *abfs_params
+  - from: abfs://data/tpcds/customer_address/
+    name: customer_address
+    params: *abfs_params
+  - from: abfs://data/tpcds/customer_demographics/
+    name: customer_demographics
+    params: *abfs_params
+  - from: abfs://data/tpcds/date_dim/
+    name: date_dim
+    params: *abfs_params
+  - from: abfs://data/tpcds/household_demographics/
+    name: household_demographics
+    params: *abfs_params
+  - from: abfs://data/tpcds/item/
+    name: item
+    params: *abfs_params
+  - from: abfs://data/tpcds/promotion/
+    name: promotion
+    params: *abfs_params
+  - from: abfs://data/tpcds/store/
+    name: store
+    params: *abfs_params
+  - from: abfs://data/tpcds/time_dim/
+    name: time_dim
+    params: *abfs_params
+  - from: abfs://data/tpcds/warehouse/
+    name: warehouse
+    params: *abfs_params
+  - from: abfs://data/tpcds/web_page/
+    name: web_page
+    params: *abfs_params
+  - from: abfs://data/tpcds/web_site/
+    name: web_site
+    params: *abfs_params
+  - from: abfs://data/tpcds/reason/
+    name: reason
+    params: *abfs_params
+  - from: abfs://data/tpcds/call_center/
+    name: call_center
+    params: *abfs_params
+  - from: abfs://data/tpcds/income_band/
+    name: income_band
+    params: *abfs_params
+  - from: abfs://data/tpcds/catalog_page/
+    name: catalog_page
+    params: *abfs_params
+  - from: abfs://data/tpcds/ship_mode/
+    name: ship_mode
+    params: *abfs_params

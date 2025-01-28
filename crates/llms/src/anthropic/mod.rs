@@ -155,7 +155,7 @@ impl Config for AnthropicConfig {
     }
 
     fn url(&self, path: &str) -> String {
-        format!("{}/{}", self.api_base(), path)
+        format!("{}{}", self.api_base(), path)
     }
 
     fn query(&self) -> Vec<(&str, &str)> {

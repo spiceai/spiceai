@@ -83,4 +83,4 @@ if (-not $envPath.Contains($spiceCliInstallDir)) {
     Write-Host "Spice CLI directory is already in PATH."
 }
 
-Write-Host "`nTo get started with Spice.ai, visit https://docs.spiceai.org"
+Write-Host "`nTo get started with Spice.ai, visit https://spiceai.org/docs"

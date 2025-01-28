@@ -33,11 +33,14 @@ use llms::{
 };
 use secrecy::{ExposeSecret, SecretString};
 use spicepod::component::model::{Model, ModelFileType, ModelSource};
-use std::pin::Pin;
 use std::{collections::HashMap, path::PathBuf, str::FromStr, sync::Arc};
+use std::{pin::Pin, time::Instant};
 use tracing_futures::Instrument;
 
-use super::tool_use::ToolUsingChat;
+use super::{
+    metrics::{handle_metrics, request_labels},
+    tool_use::ToolUsingChat,
+};
 use crate::{
     tools::{options::SpiceToolsOptions, utils::get_tools},
     Runtime,
@@ -65,7 +68,7 @@ pub async fn try_to_chat_model(
         .or(extract_secret!(params, "spice_tools"))
         .map(str::parse)
         .transpose()
-        .map_err(|_| LlmError::UnsupportedSpiceToolUseParameterError {})?;
+        .map_err(|_| unreachable!("SpiceToolsOptions::from_str has no error condition"))?;
 
     let spice_recursion_limit: Option<usize> = extract_secret!(params, "tool_recursion_limit")
         .map(|x| {
@@ -96,22 +99,16 @@ pub async fn construct_model(
 ) -> Result<Box<dyn Chat>, LlmError> {
     let model_id = component.get_model_id();
     let prefix = component.get_source().ok_or(LlmError::UnknownModelSource {
-        source: format!(
-            "Unknown model source for spicepod component from: {}",
-            component.from.clone()
-        )
-        .into(),
+        from: component.from.clone(),
     })?;
+
     let model = match prefix {
         ModelSource::HuggingFace => huggingface(model_id, component, params).await,
         ModelSource::File => file(component, params),
         ModelSource::Anthropic => anthropic(model_id.as_deref(), params),
         ModelSource::Azure => azure(model_id, component.name.as_str(), params),
-        ModelSource::Xai => Ok(Box::new(Xai::new(
-            model_id.as_deref(),
-            extract_secret!(params, "xai_api_key"),
-        )) as Box<dyn Chat>),
-        ModelSource::OpenAi => Ok(openai(model_id, params)),
+        ModelSource::Xai => xai(model_id.as_deref(), params),
+        ModelSource::OpenAi => openai(model_id, params),
         ModelSource::SpiceAI => Err(LlmError::UnsupportedTaskForModel {
             from: "spiceai".into(),
             task: "llm".into(),
@@ -131,6 +128,18 @@ pub async fn construct_model(
         component.get_openai_request_overrides(),
     );
     Ok(Box::new(wrapper))
+}
+
+fn xai(
+    model_id: Option<&str>,
+    params: &HashMap<String, SecretString>,
+) -> Result<Box<dyn Chat>, LlmError> {
+    let Some(api_key) = extract_secret!(params, "xai_api_key") else {
+        return Err(LlmError::FailedToLoadModel {
+            source: "No `xai_api_key` provided for xAI model.".into(),
+        });
+    };
+    Ok(Box::new(Xai::new(model_id, api_key)) as Box<dyn Chat>)
 }
 
 fn anthropic(
@@ -198,19 +207,41 @@ async fn huggingface(
     llms::chat::create_hf_model(&id, model_type, hf_token)
 }
 
-fn openai(model_id: Option<String>, params: &HashMap<String, SecretString>) -> Box<dyn Chat> {
+fn openai(
+    model_id: Option<String>,
+    params: &HashMap<String, SecretString>,
+) -> Result<Box<dyn Chat>, LlmError> {
     let api_base = extract_secret!(params, "endpoint");
     let api_key = extract_secret!(params, "openai_api_key");
     let org_id = extract_secret!(params, "openai_org_id");
     let project_id = extract_secret!(params, "openai_project_id");
 
-    Box::new(llms::openai::new_openai_client(
+    if let Some(temperature_str) = extract_secret!(params, "openai_temperature") {
+        match temperature_str.parse::<f64>() {
+            Ok(temperature) => {
+                if temperature < 0.0 {
+                    return Err(LlmError::InvalidParamError {
+                        param: "openai_temperature".to_string(),
+                        message: "Ensure it is a non-negative number.".to_string(),
+                    });
+                }
+            }
+            Err(_) => {
+                return Err(LlmError::InvalidParamError {
+                    param: "openai_temperature".to_string(),
+                    message: "Ensure it is a non-negative number.".to_string(),
+                })
+            }
+        }
+    }
+
+    Ok(Box::new(llms::openai::new_openai_client(
         model_id.unwrap_or(DEFAULT_LLM_MODEL.to_string()),
         api_base,
         api_key,
         org_id,
         project_id,
-    )) as Box<dyn Chat>
+    )) as Box<dyn Chat>)
 }
 
 fn azure(
@@ -221,7 +252,7 @@ fn azure(
     let Some(model_name) = model_id else {
         return Err(LlmError::FailedToLoadModel {
             source: format!(
-    "Azure model '{model_name}' requires a model ID in the format `from:azure:<model_id>`. See https://docs.spiceai.org/components/models/azure for details."
+    "Azure model '{model_name}' requires a model ID in the format `from:azure:<model_id>`. See https://spiceai.org/docs/components/models/azure for details."
 ).into(),
         });
     };
@@ -234,7 +265,7 @@ fn azure(
     if api_base.is_none() {
         return Err(LlmError::FailedToLoadModel {
             source: format!(
-    "Azure model '{model_name}' requires the 'endpoint' parameter. See https://docs.spiceai.org/components/models/azure for details."
+    "Azure model '{model_name}' requires the 'endpoint' parameter. See https://spiceai.org/docs/components/models/azure for details."
 ).into(),
         });
     }
@@ -242,7 +273,7 @@ fn azure(
     if api_key.is_some() && entra_token.is_some() {
         return Err(LlmError::FailedToLoadModel {
             source: format!(
-                "Azure model '{model_name}' allows only one of 'azure_api_key' or 'azure_entra_token'. See https://docs.spiceai.org/components/models/azure for details."
+                "Azure model '{model_name}' allows only one of 'azure_api_key' or 'azure_entra_token'. See https://spiceai.org/docs/components/models/azure for details."
             )
             .into(),
         });
@@ -251,7 +282,7 @@ fn azure(
     if api_key.is_none() && entra_token.is_none() {
         return Err(LlmError::FailedToLoadModel {
             source: format!(
-                "Azure model '{model_name}' requires either 'azure_api_key' or 'azure_entra_token'. See https://docs.spiceai.org/components/models/azure for details."
+                "Azure model '{model_name}' requires either 'azure_api_key' or 'azure_entra_token'. See https://spiceai.org/docs/components/models/azure for details."
             )
             .into(),
         });
@@ -451,6 +482,7 @@ impl Chat for ChatWrapper {
         &self,
         req: CreateChatCompletionRequest,
     ) -> Result<ChatCompletionResponseStream, OpenAIError> {
+        let start = Instant::now();
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "ai_completion", stream=true, model = %req.model, input = %serde_json::to_string(&req).unwrap_or_default());
         let req = self.prepare_req(req)?;
 
@@ -458,6 +490,7 @@ impl Chat for ChatWrapper {
             tracing::info!(target: "task_history", metadata = %metadata);
         }
 
+        let labels = request_labels(&req);
         match self.chat.chat_stream(req).instrument(span.clone()).await {
             Ok(resp) => {
                 let public_name = self.public_name.clone();
@@ -468,6 +501,7 @@ impl Chat for ChatWrapper {
                         // not incremental; provider only emits usage on last chunk.
                         if let Some(usage) = item.usage.clone() {
                             tracing::info!(target: "task_history", parent: &stream_span.clone(), completion_tokens = %usage.completion_tokens, total_tokens = %usage.total_tokens, prompt_tokens = %usage.prompt_tokens, "labels");
+                            handle_metrics(start.elapsed(), false, &labels);
                         }
                     }
                 }).instrument(span.clone());
@@ -475,6 +509,7 @@ impl Chat for ChatWrapper {
             }
             Err(e) => {
                 tracing::error!(target: "task_history", parent: &span, "Failed to run chat model: {}", e);
+                handle_metrics(start.elapsed(), true, &labels);
                 Err(e)
             }
         }
@@ -489,14 +524,17 @@ impl Chat for ChatWrapper {
         &self,
         req: CreateChatCompletionRequest,
     ) -> Result<CreateChatCompletionResponse, OpenAIError> {
+        let start = Instant::now();
+
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "ai_completion", stream=false, model = %req.model, input = %serde_json::to_string(&req).unwrap_or_default());
         let req = self.prepare_req(req)?;
 
+        let labels = request_labels(&req);
         if let Some(metadata) = &req.metadata {
             tracing::info!(target: "task_history", parent: &span, metadata = %metadata, "labels");
         }
 
-        match self.chat.chat_request(req).instrument(span.clone()).await {
+        let result = match self.chat.chat_request(req).instrument(span.clone()).await {
             Ok(mut resp) => {
                 if let Some(usage) = resp.usage.clone() {
                     tracing::info!(target: "task_history", parent: &span, completion_tokens = %usage.completion_tokens, total_tokens = %usage.total_tokens, prompt_tokens = %usage.prompt_tokens, "labels");
@@ -515,7 +553,9 @@ impl Chat for ChatWrapper {
                 tracing::error!(target: "task_history", parent: &span, "Failed to run chat model: {}", e);
                 Err(e)
             }
-        }
+        };
+        handle_metrics(start.elapsed(), result.is_err(), &labels);
+        result
     }
 
     async fn run(&self, prompt: String) -> ChatResult<Option<String>> {

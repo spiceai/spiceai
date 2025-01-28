@@ -1,0 +1,17 @@
+tests:
+  bench:
+    spicepod_path: ./test/spicepods/tpcds/postgres.yaml
+    query_set: tpcds
+    query_overrides: postgresql
+    runner_type: spiceai-runners
+  throughput:
+    spicepod_path: ./test/spicepods/tpcds/postgres.yaml
+    query_set: tpcds
+    query_overrides: postgresql
+    runner_type: spiceai-runners
+  load:
+    spicepod_path: ./test/spicepods/tpcds/postgres.yaml
+    query_set: tpcds
+    query_overrides: postgresql
+    runner_type: spiceai-runners
+    duration: 28800

@@ -1,0 +1,41 @@
+version: v1
+kind: Spicepod
+name: dremio_tpch_arrow
+datasets:
+  - from: dremio:tpch.customer
+    name: customer
+    params: &dremio_params
+      dremio_endpoint: ${secrets:DREMIO_ENDPOINT}
+      dremio_username: ${secrets:DREMIO_USERNAME}
+      dremio_password: ${secrets:DREMIO_PASSWORD}
+    acceleration: &acceleration
+      enabled: true
+      engine: arrow
+  - from: dremio:tpch.lineitem
+    name: lineitem
+    params: *dremio_params
+    acceleration: *acceleration
+  - from: dremio:tpch.nation
+    name: nation
+    params: *dremio_params
+    acceleration: *acceleration
+  - from: dremio:tpch.orders
+    name: orders
+    params: *dremio_params
+    acceleration: *acceleration
+  - from: dremio:tpch.part
+    name: part
+    params: *dremio_params
+    acceleration: *acceleration
+  - from: dremio:tpch.partsupp
+    name: partsupp
+    params: *dremio_params
+    acceleration: *acceleration
+  - from: dremio:tpch.region
+    name: region
+    params: *dremio_params
+    acceleration: *acceleration
+  - from: dremio:tpch.supplier
+    name: supplier
+    params: *dremio_params
+    acceleration: *acceleration

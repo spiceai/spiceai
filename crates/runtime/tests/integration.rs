@@ -34,8 +34,12 @@ mod catalog;
 mod cors;
 #[cfg(all(feature = "delta_lake", feature = "databricks"))]
 mod databricks_delta;
+#[cfg(all(feature = "delta_lake", feature = "databricks"))]
+mod databricks_delta_catalog;
 #[cfg(all(feature = "spark", feature = "databricks"))]
 mod databricks_spark;
+#[cfg(all(feature = "spark", feature = "databricks"))]
+mod databricks_spark_catalog;
 #[cfg(feature = "delta_lake")]
 mod delta_lake;
 mod docker;

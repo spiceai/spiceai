@@ -11,8 +11,8 @@ This document is an overview of all the interfaces and extension points in Spice
 | [Models]            | A machine-learning (ML) or language model (LLM) to load for inferencing.                                                                                                                     | [modelsource.rs](../crates/model_components/src/model.rs)  |
 | Embeddings          | Embeddings map high-dimensional data to a lower-dimensional vector space.                                                                                                                    | [embeddings.rs](../crates/llms/src/embeddings/mod.rs)      |
 
-[Data Connector]: https://docs.spiceai.org/components/data-connectors
-[Data Accelerator]: https://docs.spiceai.org/components/data-accelerators
-[Catalog Connector]: https://docs.spiceai.org/components/catalogs
-[Secret Stores]: https://docs.spiceai.org/components/secret-stores
-[Models]: https://docs.spiceai.org/components/models
+[Data Connector]: https://spiceai.org/docs/components/data-connectors
+[Data Accelerator]: https://spiceai.org/docs/components/data-accelerators
+[Catalog Connector]: https://spiceai.org/docs/components/catalogs
+[Secret Stores]: https://spiceai.org/docs/components/secret-stores
+[Models]: https://spiceai.org/docs/components/models

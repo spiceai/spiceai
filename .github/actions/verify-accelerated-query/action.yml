@@ -40,6 +40,8 @@ runs:
     
     - name: Run test query
       id: query
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       uses: ./.github/actions/run-query
       with:
         working-directory: app_${{ inputs.table-name }}
@@ -58,6 +60,8 @@ runs:
   
     - name: Run test query (accelerated)
       id: query-accelerated
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       uses: ./.github/actions/run-query
       with:
         working-directory: app_${{ inputs.table-name }}

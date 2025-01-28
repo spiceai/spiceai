@@ -1,0 +1,17 @@
+tests:
+  bench:
+    spicepod_path: ./test/spicepods/tpcds/accelerated/file_duckdb_file.yaml
+    query_set: tpcds
+    query_overrides: duckdb
+    runner_type: spiceai-runners
+  throughput:
+    spicepod_path: ./test/spicepods/tpcds/accelerated/file_duckdb_file.yaml
+    query_set: tpcds
+    query_overrides: duckdb
+    runner_type: spiceai-runners
+  load:
+    spicepod_path: ./test/spicepods/tpcds/accelerated/file_duckdb_file.yaml
+    query_set: tpcds
+    query_overrides: duckdb
+    runner_type: spiceai-runners
+    duration: 28800

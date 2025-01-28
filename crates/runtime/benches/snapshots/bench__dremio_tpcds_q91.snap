@@ -4,7 +4,7 @@ expression: records_pretty
 snapshot_kind: text
 ---
 +------------------+------------------+--------------+--------------+
-| call_center      | call_center_name | manager      | returns_loss |
+| Call_Center      | Call_Center_Name | Manager      | Returns_Loss |
 +------------------+------------------+--------------+--------------+
 | AAAAAAAAEAAAAAAA | North Midwest    | Larry Mccray | 3486.41      |
 | AAAAAAAAEAAAAAAA | North Midwest    | Larry Mccray | 490.38       |

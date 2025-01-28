@@ -37,16 +37,16 @@ pub enum GitHubAppError {
     InvalidSystemTime { source: std::num::TryFromIntError },
 
     #[snafu(display(
-        "Failed to generate JWT\nVerify the GitHub Connector configuration and try again. For details, visit: https://docs.spiceai.org/components/data-connectors/github#common-configuration"
+        "Failed to generate JWT\nVerify the GitHub Connector configuration and try again. For details, visit: https://spiceai.org/docs/components/data-connectors/github#common-configuration"
     ))]
     UnableToGenerateJWT { source: jsonwebtoken::errors::Error },
 
     #[snafu(display(
-        "Failed to get GitHub installation access token\nVerify the GitHub Connector configuration and try again. For details, visit: https://docs.spiceai.org/components/data-connectors/github#common-configuration"
+        "Failed to get GitHub installation access token\nVerify the GitHub Connector configuration and try again. For details, visit: https://spiceai.org/docs/components/data-connectors/github#common-configuration"
     ))]
     UnableToGetGitHubInstallationAccessToken { source: reqwest::Error },
 
-    #[snafu(display("Failed to get GitHub installation access token body.\nVerify the GitHub Connector configuration and try again. For details, visit: https://docs.spiceai.org/components/data-connectors/github#common-configuration"))]
+    #[snafu(display("Failed to get GitHub installation access token body.\nVerify the GitHub Connector configuration and try again. For details, visit: https://spiceai.org/docs/components/data-connectors/github#common-configuration"))]
     UnableToGetGitHubInstallationAccessTokenBody { source: reqwest::Error },
 }
 

@@ -9,11 +9,11 @@ All criteria must be met for the connector to be considered Stable, with excepti
 | Connector                        | Stable Quality | DRI Sign-off    |
 | -------------------------------- | -------------- | --------------- |
 | Clickhouse                       | ➖             |                 |
-| Databricks (mode: delta_lake)    | ➖             |                 |
+| Databricks (mode: delta_lake)    | ✅             | @Sevenannn      |
 | Databricks (mode: spark_connect) | ➖             |                 |
-| Delta Lake                       | ➖             |                 |
-| Dremio                           | ➖             |                 |
-| DuckDB                           | ➖             |                 |
+| Delta Lake                       | ✅             | @Sevenannn      |
+| Dremio                           | ✅             | @Sevenannn      |
+| DuckDB                           | ✅             | @peasee         |
 | File                             | ✅             | @ewgenius       |
 | FlightSQL                        | ➖             |                 |
 | FTP/SFTP                         | ➖             |                 |
@@ -22,13 +22,13 @@ All criteria must be met for the connector to be considered Stable, with excepti
 | HTTP/HTTPS                       | ➖             |                 |
 | Localpod                         | ➖             |                 |
 | MS SQL                           | ➖             |                 |
-| MySQL                            | ➖             |                 |
+| MySQL                            | ✅             | @phillipleblanc |
 | ODBC                             | ➖             |                 |
-| PostgreSQL                       | ➖             |                 |
+| PostgreSQL                       | ✅             | @peasee         |
 | Sharepoint                       | ➖             |                 |
 | Snowflake                        | ➖             |                 |
 | Spice.ai Cloud Platform          | ➖             |                 |
-| S3                               | ➖             |                 |
+| S3                               | ✅             | @ewgenius       |
 | Azure BlobFS                     | ➖             |                 |
 | Spark                            | ➖             |                 |
 
@@ -54,6 +54,7 @@ This table defines the required features and/or tests for each connector:
 | GraphQL                          | ➖                    | ➖                      | ➖                | ✅                       | ✅                  | ☑️                         |
 | GitHub                           | ➖                    | ➖                      | ☑️                | ✅                       | ✅                  | ☑️                         |
 | HTTP/HTTPS                       | ✅ (5)                | ✅ (5)                  | ➖                | ✅                       | ✅                  | ☑️                         |
+| Iceberg                          | ✅ (5)                | ✅ (5)                  | ☑️                | ✅                       | ✅                  | ✅                         |
 | MS SQL                           | ✅ (100)              | ✅ (100)                | ✅                | ✅                       | ✅                  | ✅                         |
 | MySQL                            | ✅ (100)              | ✅ (100)                | ✅                | ✅                       | ✅                  | ✅                         |
 | ODBC                             | ✅ (100)              | ✅ (100)                | ✅                | ✅                       | ✅                  | ✅                         |
@@ -88,7 +89,7 @@ Documentation criteria should be re-checked on every release, to ensure the docu
 - [ ] Documentation includes any mappings from [Core Connector Data Types](../definitions.md) to [Core Arrow Data Types](../definitions.md) types.
 - [ ] Documentation includes all known issues/limitations for the connector.
 - [ ] Documentation includes any exceptions made to allow this connector to reach RC quality (e.g. if a particular data type cannot be supported by the connector).
-- [ ] The connector has an easy to follow quickstart.
+- [ ] The connector has an easy to follow cookbook recipe.
 - [ ] The connector status is updated in the table of connectors in [spiceai/docs](https://github.com/spiceai/docs).
 
 ### Conditional Criteria
@@ -138,11 +139,9 @@ Indexes are not required for test coverage, but can be introduced if required fo
 
 ##### TPC-H
 
-- [ ] End-to-end tests should perform [Throughput Tests](../definitions.md) at the required [parallel query count](../definitions.md)
+- [ ] End-to-end tests should perform [Throughput Tests](../definitions.md) at the required [parallel query count](../definitions.md) at scale factor 1.
 - [ ] [Throughput Metric](../definitions.md) is calculated and reported as a metric with a parallel query count of 1 to serve as a baseline metric.
 - [ ] [Throughput Metric](../definitions.md) is calculated and reported as a metric at the required [parallel query count](../definitions.md).
-- [ ] A [Load Test](../definitions.md) runs for a minimum of 8 hours as part of the end-to-end test. The 99th percentile of load test query [timing measurements](../definitions.md) must be no more than 10% higher than the 99th percentile of the baseline throughput test timing measurements. The service must not become unavailable for the entire duration of the test.
-  - Queries that have a median execution time faster than 500ms are excluded from this check, as they complete so fast that this check is not meaningful.
 - [ ] Memory usage is collected at the end of the end-to-end test and reported as a metric on the overall connector.
 - [ ] At the scale factor required by the connector criteria:
   - [ ] A test script exists that can load TPC-H data at the [designated scale factor](#stable-release-criteria) into this connector.
@@ -152,16 +151,29 @@ Indexes are not required for test coverage, but can be introduced if required fo
 ##### TPC-DS
 
 - [ ] Connectors should run all queries with no [Major or Minor Bugs](../definitions.md).
-- [ ] End-to-end tests should perform [Throughput Tests](../definitions.md) at the required [parallel query count](../definitions.md)
+- [ ] End-to-end tests should perform [Throughput Tests](../definitions.md) at the required [parallel query count](../definitions.md) at scale factor 1.
 - [ ] [Throughput Metric](../definitions.md) is calculated and reported as a metric with a parallel query count of 1 to serve as a baseline metric.
 - [ ] [Throughput Metric](../definitions.md) is calculated and reported as a metric at the required [parallel query count](../definitions.md).
-- [ ] A [Load Test](../definitions.md) runs for a minimum of 8 hours as part of the end-to-end test. The 99th percentile of load test query [timing measurements](../definitions.md) must be no more than 10% higher than the 99th percentile of the baseline throughput test timing measurements. The service must not become unavailable for the entire duration of the test.
-  - Queries that have a median execution time faster than 500ms are excluded from this check, as they complete so fast that this check is not meaningful.
+- [ ] A [Load Test](../definitions.md) runs for a minimum of 8 hours at scale factor 1 as part of the end-to-end test. The 99th percentile of load test query [timing measurements](../definitions.md) must be compared against than the 99th percentile of the baseline throughput test timing measurements.
+  - Three or more [Yellow percentile measurements](../definitions.md#stop-light-percentile-measurements) are considered a test failure.
+  - One or more [Red percentile measurements](../definitions.md#stop-light-percentile-measurements) are considered a test failure.
+  - The service must not become unavailable for the entire duration of the test. A connection failure is considered a test failure.
+  - Queries that have a 99th percentile execution time faster than 1000ms are excluded from this check, as they complete so fast that this check is not meaningful.
+  - Note: If the load test fails due to inconsistencies in the underlying source's execution, the test is considered passed if documented evidence is provided (e.g., data source telemetry, logs, etc.).
 - [ ] Memory usage is collected at the end of the end-to-end test and reported as a metric on the overall connector.
 - [ ] At the scale factor required by the connector criteria:
   - [ ] A test script exists that can load TPC-DS data at the [designated scale factor](#stable-release-criteria) into this connector.
   - [ ] The connector can load TPC-DS at the [designated scale factor](#stable-release-criteria), and can run all queries with no [Major or Minor Bugs](../definitions.md).
   - [ ] TPC-DS queries that execute successfully on Datafusion, should execute successfully on the connector.
+
+> **[Load Test](../definitions.md) exceptions for Object Store based connectors**
+>
+> `S3`, `ABFS`, `File`, `FTP`/`SFTP` and `HTTPS` connectors loading data from Parquet, CSV, TSV and JSON files have reduced requirements for the load test.
+>
+> - [ ] Load test should run all queries with no [Major or Minor Bugs](../definitions.md) at scale factor 1.
+> - [ ] Connector documentation includes any performance limitations and exceptions noted from the load test run (e.g., high CPU and/or memory usage, high network bandwidth consumption, etc.).
+>
+> Percentile measurements and service availability requirements omitted.
 
 ##### ClickBench
 

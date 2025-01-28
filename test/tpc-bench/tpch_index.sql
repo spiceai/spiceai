@@ -30,3 +30,15 @@ CREATE INDEX idx_lineitem_orderkey ON lineitem(l_orderkey);
 
 CREATE INDEX idx_partsupp_supplier ON partsupp(ps_suppkey);
 CREATE INDEX idx_partsupp_part ON partsupp(ps_partkey);
+
+CREATE INDEX idx_part_brand_container ON part(p_brand, p_container);
+
+-- Foreign keys - based on PostgreSQL index creation syntax
+ALTER TABLE nation ADD CONSTRAINT nation_fk1 FOREIGN KEY (n_regionkey) REFERENCES region (r_regionkey);
+ALTER TABLE supplier ADD CONSTRAINT supplier_fk1 FOREIGN KEY (s_nationkey) REFERENCES nation (n_nationkey);
+ALTER TABLE customer ADD CONSTRAINT customer_fk1 FOREIGN KEY (c_nationkey) REFERENCES nation (n_nationkey);
+ALTER TABLE partsupp ADD CONSTRAINT partsupp_fk1 FOREIGN KEY (ps_suppkey) REFERENCES supplier (s_suppkey);
+ALTER TABLE partsupp ADD CONSTRAINT partsupp_fk2 FOREIGN KEY (ps_partkey) REFERENCES part (p_partkey);
+ALTER TABLE orders ADD CONSTRAINT orders_fk1 FOREIGN KEY (o_custkey) REFERENCES customer (c_custkey);
+ALTER TABLE lineitem ADD CONSTRAINT lineitem_fk1 FOREIGN KEY (l_orderkey) REFERENCES orders (o_orderkey);
+ALTER TABLE lineitem ADD CONSTRAINT lineitem_fk2 FOREIGN KEY (l_partkey, l_suppkey) REFERENCES partsupp (ps_partkey, ps_suppkey);

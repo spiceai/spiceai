@@ -124,7 +124,7 @@ impl CatalogConnector for Databricks {
         let Some(catalog_id) = catalog.catalog_id.clone() else {
             return Err(super::Error::InvalidConfigurationNoSource {
                 connector: "databricks".into(),
-                message: "A Catalog Name is required for the Databricks Unity Catalog.\nFor details, visit: https://docs.spiceai.org/components/catalogs/databricks#from".into(),
+                message: "A Catalog Name is required for the Databricks Unity Catalog.\nFor details, visit: https://spiceai.org/docs/components/catalogs/databricks#from".into(),
                 connector_component: ConnectorComponent::from(catalog)
             });
         };
@@ -132,14 +132,14 @@ impl CatalogConnector for Databricks {
         let endpoint = self.params.get("endpoint").expose().ok_or_else(|p| {
             super::Error::InvalidConfigurationNoSource {
                 connector: "databricks".into(),
-                message: format!("A required parameter was missing: {}.\nFor details, visit: https://docs.spiceai.org/components/catalogs/databricks#params", p.0),
+                message: format!("A required parameter was missing: {}.\nFor details, visit: https://spiceai.org/docs/components/catalogs/databricks#params", p.0),
                 connector_component: ConnectorComponent::from(catalog)
             }
         })?;
         let token = self.params.get("token").ok_or_else(|p| {
             super::Error::InvalidConfigurationNoSource {
                 connector: "databricks".into(),
-                message: format!("A required parameter was missing: {}.\nFor details, visit: https://docs.spiceai.org/components/catalogs/databricks#params", p.0),
+                message: format!("A required parameter was missing: {}.\nFor details, visit: https://spiceai.org/docs/components/catalogs/databricks#params", p.0),
                 connector_component: ConnectorComponent::from(catalog)
             }
         })?;

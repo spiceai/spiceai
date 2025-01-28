@@ -43,7 +43,7 @@ var configureCmd = &cobra.Command{
 	Example: `
 spice dataset configure
 
-# See more at: https://docs.spiceai.org/
+# See more at: https://spiceai.org/docs/
 `,
 	Run: func(cmd *cobra.Command, args []string) {
 		if fi, err := os.Stat("spicepod.yaml"); os.IsNotExist(err) || fi.IsDir() {
