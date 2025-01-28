@@ -56,7 +56,7 @@ jobs:
             if (context.eventName === 'workflow_dispatch') {
               const name = context.payload.inputs.name;
 
-              if (platform_option === 'all') {
+              if (name === 'all') {
                 return matrix;
               }
 
