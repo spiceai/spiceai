@@ -110,20 +110,20 @@ jobs:
       - name: Run integration test
         env:
           MODEL_ALLOWLIST: ${{ matrix.target.model_allowlist }}
-          SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
-          SPICE_SECRET_ANTHROPIC_API_KEY: ${{ secrets.SPICE_SECRET_ANTHROPIC_API_KEY }}
-          SPICE_SECRET_XAI_API_KEY: ${{ secrets.SPICE_SECRET_XAI_API_KEY }}
+          SPICE_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
+          SPICE_ANTHROPIC_API_KEY: ${{ secrets.SPICE_SECRET_ANTHROPIC_API_KEY }}
+          SPICE_XAI_API_KEY: ${{ secrets.SPICE_SECRET_XAI_API_KEY }}
         run: |
           if [ "${{ matrix.target.needs_env }}" == "true" ]; then
-            if [ -z "$SPICE_SECRET_OPENAI_API_KEY" ]; then
+            if [ -z "$SPICE_OPENAI_API_KEY" ]; then
               echo "Error: OpenAI API key is not defined."
               exit 1
             fi
-            if [ -z "$SPICE_SECRET_ANTHROPIC_API_KEY" ]; then
+            if [ -z "$SPICE_ANTHROPIC_API_KEY" ]; then
               echo "Error: Anthropic API key is not defined."
               exit 1
             fi
-            if [ -z "$SPICE_SECRET_XAI_API_KEY" ]; then
+            if [ -z "$SPICE_XAI_API_KEY" ]; then
               echo "Error: xAI API key is not defined."
               exit 1
             fi
