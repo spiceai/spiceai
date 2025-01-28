@@ -16,7 +16,7 @@ limitations under the License.
 
 use test_framework::{
     anyhow::{self, Result},
-    gh_utils::GitHubWorkflow,
+    gh_utils::{map_numbers_to_strings, GitHubWorkflow},
     octocrab,
     utils::scan_directory_for_yamls,
     TestType,
@@ -58,7 +58,7 @@ pub async fn dispatch(args: DispatchArgs) -> Result<()> {
     let spiced_commit = std::env::var("SPICED_COMMIT").ok().unwrap_or_default();
 
     for (path, test) in tests {
-        let payload = match test_type {
+        let mut payload = match test_type {
             TestType::Benchmark => {
                 if let Some(bench) = test.tests.bench {
                     serde_json::json!(BenchWorkflowArgs {
@@ -98,6 +98,8 @@ pub async fn dispatch(args: DispatchArgs) -> Result<()> {
                 ))
             }
         };
+
+        payload = map_numbers_to_strings(payload);
 
         println!("Dispatching {test_type} test from {path:#?}");
         GitHubWorkflow::new("spiceai", "spiceai", test_type.workflow(), "trunk")

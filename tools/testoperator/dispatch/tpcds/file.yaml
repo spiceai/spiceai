@@ -3,3 +3,12 @@ tests:
     spicepod_path: ./test/spicepods/tpcds/file.yaml
     query_set: tpcds
     runner_type: spiceai-runners
+  throughput:
+    spicepod_path: ./test/spicepods/tpcds/file.yaml
+    query_set: tpcds
+    runner_type: spiceai-large-runners
+  load:
+    spicepod_path: ./test/spicepods/tpcds/file.yaml
+    query_set: tpcds
+    runner_type: spiceai-large-runners
+    duration: 28800

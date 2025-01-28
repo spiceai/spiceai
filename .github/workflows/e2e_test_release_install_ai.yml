@@ -115,7 +115,7 @@ jobs:
       # nvidia-smi is not available on windows-gpu-t4-4-core, installing CUDA Toolkit
       - name: Install CUDA Toolkit (Windows)
         if: matrix.target.runner == 'windows-gpu-t4-4-core'
-        uses: Jimver/cuda-toolkit@v0.2.19
+        uses: Jimver/cuda-toolkit@v0.2.21
         id: cuda-toolkit
         with:
           method: network

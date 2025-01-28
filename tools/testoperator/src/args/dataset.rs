@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use clap::{Parser, ValueEnum};
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use test_framework::queries::{QueryOverrides, QuerySet};
 
@@ -44,16 +45,25 @@ pub enum QuerySetArg {
     Clickbench,
 }
 
-#[derive(Clone, ValueEnum, Debug)]
+#[derive(Clone, ValueEnum, Debug, Deserialize, Serialize)]
 pub enum QueryOverridesArg {
+    #[serde(rename = "sqlite")]
     Sqlite,
+    #[serde(rename = "postgresql")]
     Postgresql,
+    #[serde(rename = "mysql")]
     Mysql,
+    #[serde(rename = "dremio")]
     Dremio,
+    #[serde(rename = "spark")]
     Spark,
+    #[serde(rename = "odbc-athena")]
     ODBCAthena,
+    #[serde(rename = "duckdb")]
     Duckdb,
+    #[serde(rename = "snowflake")]
     Snowflake,
+    #[serde(rename = "iceberg_sf1")]
     IcebergSF1,
 }
 
