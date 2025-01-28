@@ -23,6 +23,7 @@ github.com/manifoldco/promptui, https://github.com/manifoldco/promptui/blob/v0.9
 github.com/mattn/go-runewidth, https://github.com/mattn/go-runewidth/blob/v0.0.15/LICENSE, MIT
 github.com/mitchellh/mapstructure, https://github.com/mitchellh/mapstructure/blob/v1.5.0/LICENSE, MIT
 github.com/olekukonko/tablewriter, https://github.com/olekukonko/tablewriter/blob/v0.0.5/LICENSE.md, MIT
+github.com/openai/openai-go, https://github.com/openai/openai-go/blob/v0.1.0-alpha.43/LICENSE, Apache-2.0
 github.com/pelletier/go-toml/v2, https://github.com/pelletier/go-toml/blob/v2.2.2/LICENSE, MIT
 github.com/peterh/liner, https://github.com/peterh/liner/blob/v1.2.2/COPYING, MIT
 github.com/pkg/browser, https://github.com/pkg/browser/blob/5ac0b6a4141c/LICENSE, BSD-2-Clause
@@ -34,6 +35,10 @@ github.com/spf13/cobra, https://github.com/spf13/cobra/blob/v1.8.1/LICENSE.txt, 
 github.com/spf13/pflag, https://github.com/spf13/pflag/blob/v1.0.5/LICENSE, BSD-3-Clause
 github.com/spf13/viper, https://github.com/spf13/viper/blob/v1.19.0/LICENSE, MIT
 github.com/subosito/gotenv, https://github.com/subosito/gotenv/blob/v1.6.0/LICENSE, MIT
+github.com/tidwall/gjson, https://github.com/tidwall/gjson/blob/v1.18.0/LICENSE, MIT
+github.com/tidwall/match, https://github.com/tidwall/match/blob/v1.1.1/LICENSE, MIT
+github.com/tidwall/pretty, https://github.com/tidwall/pretty/blob/v1.2.1/LICENSE, MIT
+github.com/tidwall/sjson, https://github.com/tidwall/sjson/blob/v1.2.5/LICENSE, MIT
 golang.org/x/mod/semver, https://cs.opensource.google/go/x/mod/+/v0.22.0:LICENSE, BSD-3-Clause
 golang.org/x/sys/unix, https://cs.opensource.google/go/x/sys/+/v0.24.0:LICENSE, BSD-3-Clause
 golang.org/x/text, https://cs.opensource.google/go/x/text/+/v0.17.0:LICENSE, BSD-3-Clause
@@ -321,7 +326,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - mistralrs-core 0.3.4, MIT 
   <br/>https://github.com/EricLBuehler/mistral.rs
 
-- moka 0.12.8, Apache-2.0 OR MIT 
+- moka 0.12.10, Apache-2.0 OR MIT 
   <br/>https://github.com/moka-rs/moka
 
 - mysql_async 0.34.2, Apache-2.0 OR MIT 
@@ -341,6 +346,9 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 
 - object_store 0.11.1, Apache-2.0 OR MIT 
   <br/>https://github.com/apache/arrow-rs/tree/master/object_store
+
+- octocrab 0.43.0, Apache-2.0 OR MIT 
+  <br/>https://github.com/XAMPPRocky/octocrab.git
 
 - odbc-api 8.1.2, MIT 
   <br/>https://github.com/pacman82/odbc-api
@@ -454,6 +462,9 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
   <br/>https://github.com/bluss/scopeguard
 
 - secrecy 0.8.0, Apache-2.0 OR MIT 
+  <br/>https://github.com/iqlusioninc/crates/tree/main/secrecy
+
+- secrecy 0.10.3, Apache-2.0 OR MIT 
   <br/>https://github.com/iqlusioninc/crates/tree/main/secrecy
 
 - serde 1.0.216, Apache-2.0 OR MIT 
@@ -591,7 +602,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - uuid 0.8.2, Apache-2.0 OR MIT 
   <br/>https://github.com/uuid-rs/uuid
 
-- uuid 1.11.0, Apache-2.0 OR MIT 
+- uuid 1.12.1, Apache-2.0 OR MIT 
   <br/>https://github.com/uuid-rs/uuid
 
 - winver 1.0.0, MIT 
