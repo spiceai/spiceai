@@ -97,8 +97,7 @@ pub(crate) async fn run(
                 | "s3_arrow_memory_use_source"
                 | "s3_duckdb_memory_use_source"
                 | "s3_duckdb_file_use_source"
-        ) && (query_name.starts_with("clickbench_q")
-            || query_name.starts_with("tpch_q")
+        ) && (query_name.starts_with("tpch_q")
             || query_name.starts_with("tpcds_q"));
 
         match super::run_query_and_return_result(
