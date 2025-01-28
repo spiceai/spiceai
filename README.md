@@ -17,6 +17,26 @@
   <a href="https://github.com/spiceai/spiceai/actions/workflows/benchmarks.yml"><img alt="GitHub Actions Workflow Status - benchmark tests" src="https://img.shields.io/github/actions/workflow/status/spiceai/spiceai/benchmarks.yml?branch=trunk&label=benchmark%20tests" /></a>
 </p>
 
+---
+
+- [Why Spice?](#why-spice)
+- [How does Spice compare?](#how-does-spice-compare)
+- [Example Use-Cases](#example-use-cases)
+- [FAQ](#faq)
+- [Supported Data Connectors](#supported-data-connectors)
+- [Supported Data Accelerators](#supported-data-accelerators)
+- [Supported Model Providers](#supported-model-providers)
+- [Supported Embeddings Providers](#supported-embeddings-providers)
+- [Supported Catalogs](#supported-catalogs)
+- [Quickstart (Local Machine)](#️-quickstart-local-machine)
+  - [Installation](#installation)
+- [Runtime Container Deployment](#️-runtime-container-deployment)
+- [Next Steps](#️-next-steps)
+- [Documentation](#-documentation)
+- [Connect with us](#-connect-with-us)
+
+---
+
 **Spice** is a SQL query and AI compute engine, written in Rust, for data-driven apps and agents.
 
 <img width="740" alt="Spice.ai Open Source accelerated data query and LLM-inference engine" src="https://github.com/user-attachments/assets/9db94f9c-10a1-47b0-ab45-05aa964590ff" />
@@ -234,7 +254,9 @@ Catalog Connectors connect to external catalog providers and make their tables a
 
 <https://github.com/spiceai/spiceai/assets/88671039/85cf9a69-46e7-412e-8b68-22617dcbd4e0>
 
-**Step 1.** Install the Spice CLI:
+### Installation
+
+Install the Spice CLI:
 
 On **macOS, Linux, and WSL**:
 
@@ -254,7 +276,9 @@ On **Windows**:
 curl -L "https://install.spiceai.org/Install.ps1" -o Install.ps1 && PowerShell -ExecutionPolicy Bypass -File ./Install.ps1
 ```
 
-**Step 2.** Initialize a new Spice app with the `spice init` command:
+### Usage
+
+**Step 1.** Initialize a new Spice app with the `spice init` command:
 
 ```bash
 spice init spice_qs
@@ -266,7 +290,7 @@ A `spicepod.yaml` file is created in the `spice_qs` directory. Change to that di
 cd spice_qs
 ```
 
-**Step 3.** Start the Spice runtime:
+**Step 2.** Start the Spice runtime:
 
 ```bash
 spice run
@@ -286,7 +310,7 @@ Example output will be shown as follows:
 
 The runtime is now started and ready for queries.
 
-**Step 4.** In a new terminal window, add the `spiceai/quickstart` Spicepod. A Spicepod is a package of configuration defining datasets and ML models.
+**Step 3.** In a new terminal window, add the `spiceai/quickstart` Spicepod. A Spicepod is a package of configuration defining datasets and ML models.
 
 ```bash
 spice add spiceai/quickstart
@@ -310,7 +334,7 @@ The `spiceai/quickstart` Spicepod will add a `taxi_trips` data table to the runt
 2025-01-20T19:26:40.312839Z  INFO runtime::accelerated_table::refresh_task: Loaded 2,964,624 rows (399.41 MiB) for dataset taxi_trips in 10s 299ms
 ```
 
-**Step 5.** Start the Spice SQL REPL:
+**Step 4.** Start the Spice SQL REPL:
 
 ```bash
 spice sql
