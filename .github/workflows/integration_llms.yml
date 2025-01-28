@@ -54,7 +54,7 @@ jobs:
             ];
 
             if (context.eventName === 'workflow_dispatch') {
-              const name = context.payload.inputs.name;
+              const name = context.payload.inputs.run;
 
               if (name === 'all') {
                 return matrix;
@@ -91,10 +91,10 @@ jobs:
     name: Self-hosted LLMs Integration Tests
     runs-on: [self-hosted, macOS]
     needs: [build, setup-matrix]
-    permissions: read-all
     strategy:
       matrix:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
+    permissions: read-all
 
     steps:
       - uses: actions/checkout@v4
