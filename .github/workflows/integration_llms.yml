@@ -48,7 +48,7 @@ jobs:
               {
                 name: 'hosted',
                 needs_env: true,
-                runner: 'macOS'
+                runner: 'macOS',
                 model_allowlist: 'local_phi3,hf_phi3'
               }
             ];
