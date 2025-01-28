@@ -67,7 +67,7 @@ impl ToolFactory for MemoryToolCatalog {
 
 #[async_trait]
 impl SpiceToolCatalog for MemoryToolCatalog {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "memory"
     }
 

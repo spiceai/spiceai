@@ -79,7 +79,7 @@ impl DeletionTableProvider for PolyTableProvider {
 }
 
 impl FederationProvider for PolyTableProvider {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "FederationProviderForPolyTableProvider"
     }
 

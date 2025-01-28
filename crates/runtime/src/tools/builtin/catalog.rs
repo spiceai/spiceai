@@ -113,7 +113,7 @@ impl SpiceToolCatalog for BuiltinToolCatalog {
         Self::construct_builtin(name, None, None, &HashMap::new())
     }
 
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "builtin"
     }
 }

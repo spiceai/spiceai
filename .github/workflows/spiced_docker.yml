@@ -324,7 +324,7 @@ jobs:
 
   publish-cuda:
     if: ${{ github.event_name == 'push' || inputs.target == 'cuda' || inputs.target == 'all' }}
-    needs: build-cuda
+    needs: [setup, build-cuda]
     runs-on: "ubuntu-gpu-t4-4-core"
     steps:
       - name: Download all artifacts

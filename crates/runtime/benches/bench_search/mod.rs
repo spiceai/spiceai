@@ -51,7 +51,7 @@ impl Display for SearchBenchmarkResultBuilder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            r#"configuration: {},
+            "configuration: {},
   status: {},
   run_id: {},
   commit_sha: {},
@@ -62,7 +62,7 @@ impl Display for SearchBenchmarkResultBuilder {
   rps: {:.2},
   mean_response_time: {:.2} ms,
   p95_response_time: {:.2} ms,
-  score: {:.2}"#,
+  score: {:.2}",
             self.config_name,
             self.status,
             self.run_id,

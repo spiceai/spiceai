@@ -49,9 +49,10 @@ pub enum AuthVerdict {
 }
 
 impl AuthPrincipal for ApiKey {
-    fn username(&self) -> &str {
+    fn username(&self) -> &'static str {
         "api_key_auth"
     }
+
     fn groups(&self) -> &[&str] {
         match self {
             ApiKey::ReadOnly { .. } => &["read"],

@@ -325,7 +325,7 @@ impl RefreshTask {
             || data_update
                 .data
                 .first()
-                .map_or(false, |x| x.columns().is_empty())
+                .is_some_and(|x| x.columns().is_empty())
         {
             if let Some(start_time) = start_time {
                 self.trace_dataset_loaded(start_time, 0, 0).await;

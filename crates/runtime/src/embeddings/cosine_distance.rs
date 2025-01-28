@@ -99,7 +99,7 @@ impl ScalarUDFImpl for CosineDistance {
         self
     }
 
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "cosine_distance"
     }
 
