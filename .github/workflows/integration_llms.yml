@@ -88,7 +88,6 @@ jobs:
           retention-days: 1
 
   test:
-    name: Self-hosted LLMs Integration Tests
     runs-on: [self-hosted, macOS]
     needs: [build, setup-matrix]
     strategy:
@@ -128,4 +127,5 @@ jobs:
               exit 1
             fi
           fi
-          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" ./integration_test/llms_integration_test --nocapture
+          # `--test-threads` to reduce possible rate limiting/ connection issues for hosted models.
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" ./integration_test/llms_integration_test --nocapture -- --test-threads=2
