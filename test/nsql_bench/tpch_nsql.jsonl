@@ -1,0 +1,2 @@
+{"category": "aggregation", "level": "basic", "input": "what is total number of orders", "ideal": "1500000"}
+{"category": "join", "level": "basic", "input": "What is customer Customer#000000001 nation", "ideal": "MOROCCO"}
