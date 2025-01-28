@@ -56,7 +56,7 @@ cudarc = { version = "0.12.2", optional = true, features = [
 ] }
 either = "1.13.0"
 indexmap.workspace = true
-tempfile = "3.13.0"
+tempfile.workspace = true
 
 
 [dev-dependencies]

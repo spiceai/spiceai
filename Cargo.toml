@@ -7,8 +7,8 @@ members = [
     "crates/arrow_tools",
     "crates/data_components",
     "crates/document_parse",
-    "crates/flightrepl",
     "crates/flight_client",
+    "crates/flightrepl",
     "crates/llms",
     "crates/model_components",
     "crates/ns_lookup",
@@ -16,16 +16,16 @@ members = [
     "crates/package",
     "crates/runtime",
     "crates/runtime-auth",
-    "crates/spicepod",
     "crates/spice_cloud",
+    "crates/spicepod",
     "crates/telemetry",
     "crates/test-framework",
     "crates/util",
+    "tools/evalconverter",
     "tools/flightpublisher/",
     "tools/flightsubscriber/",
     "tools/otelpublisher/",
     "tools/spicepodschema/",
-    "tools/evalconverter",
     "tools/spiceschema",
     "tools/testoperator",
 ]
@@ -126,6 +126,7 @@ snafu = "0.8.5"
 snowflake-api = { git = "https://github.com/spiceai/snowflake-rs.git", rev = "f95bd4715b9b9e3eaa425d7a775b49e1dcbb1212" }
 ssh2 = { version = "0.9.4" }
 suppaftp = { version = "5.3.1", features = ["async"] }
+tempfile = "3"
 tiberius = { version = "0.12.3", default-features = false, features = [
     "tds73",
     "rustls",
@@ -149,7 +150,6 @@ tracing-opentelemetry = "0.28"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 uuid = "1"
 x509-certificate = "0.23.1"
-
 
 [patch.crates-io]
 datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "4e1290a600233661e28952a42d39563c653c286e" }
