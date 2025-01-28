@@ -19,13 +19,41 @@ on:
         options:
           - "all"
           - "hosted"
-          - "networked"
+          - "self-hosted"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref_name }}-${{ github.ref_name == 'trunk' && github.sha || 'any-sha' }}
   cancel-in-progress: true
 
 jobs:
+  setup-matrix:
+    name: Setup strategy matrix
+    runs-on: spiceai-runners
+    outputs:
+      matrix: ${{ steps.setup-matrix.outputs.result }}
+
+    steps:
+      - name: Set up matrix
+        uses: actions/github-script@v7
+        id: setup-matrix
+        with:
+          script: |
+            const matrix = [
+              {
+                name: 'self-hosted',
+                needs_env: false,
+                runner: 'macOS',
+                model_allowlist: 'anthropic,openai,xai'
+              },
+              {
+                name: 'hosted',
+                needs_env: true,
+                runner: 'macOS'
+                model_allowlist: 'local_phi3,hf_phi3'
+              }
+            ];
+            return matrix;
+
   build:
     name: Build Test Binary
     runs-on: [self-hosted, macOS]
@@ -37,13 +65,11 @@ jobs:
         with:
           os: "darwin"
 
-      # Build the test binary without running tests
       - name: Build LLMs integration test binary
         run: |
           TEST_BINARY_PATH=$(cargo test -p llms --test integration --features metal --no-run --message-format=json | jq -r 'select(.reason == "compiler-artifact" and (.target.kind | contains(["test"])) and .executable != null) | .executable')
           cp $TEST_BINARY_PATH ./llms_integration_test
 
-      # Upload the test binary as an artifact
       - name: Upload test binary
         uses: actions/upload-artifact@v4
         with:
@@ -51,34 +77,47 @@ jobs:
           path: ./llms_integration_test
           retention-days: 1
 
-  test-hosted:
+  test:
     name: Self-hosted LLMs Integration Tests
-    needs: build
-    permissions: read-all
-    if: ${{ github.event_name == 'push' || github.event.inputs.run == 'all' || github.event.inputs.run == 'hosted' }}
     runs-on: [self-hosted, macOS]
-    steps:
-      - uses: actions/checkout@v4
-      - name: Run hosted integration tests
-        uses: ./.github/actions/run-llm-integration-tests
-        with:
-          model_allowlist: "local_phi3,hf_phi3"
-          networked: "false"
+    needs: [build, setup-matrix]
+    permissions: read-all
+    strategy:
+      matrix:
+        target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
-  test-networked:
-    name: Networked LLMs Integration Tests
-    needs: build
-    permissions: read-all
-    if: ${{ github.event_name == 'push' || github.event.inputs.run == 'all' || github.event.inputs.run == 'networked' }}
-    runs-on: [self-hosted, macOS]
     steps:
       - uses: actions/checkout@v4
-      - name: Run networked integration tests
-        uses: ./.github/actions/run-llm-integration-tests
+      - name: Download test binary
+        uses: actions/download-artifact@v4
         with:
-          model_allowlist: "anthropic,openai,xai"
-          networked: "true"
+          name: llms-integration-test-binary
+          path: ./integration_test
+
+      - name: Mark test binary as executable
+        shell: bash
+        run: chmod +x ./integration_test/llms_integration_test
+
+      - name: Run integration test
+        shell: bash
         env:
+          MODEL_ALLOWLIST: ${{ matrix.target.model_allowlist }}
           SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
           SPICE_SECRET_ANTHROPIC_API_KEY: ${{ secrets.SPICE_SECRET_ANTHROPIC_API_KEY }}
           SPICE_SECRET_XAI_API_KEY: ${{ secrets.SPICE_SECRET_XAI_API_KEY }}
+        run: |
+          if [ "${{ matrix.target.needs_env }}" == "true" ]; then
+            if [ -z "$SPICE_SECRET_OPENAI_API_KEY" ]; then
+              echo "Error: OpenAI API key is not defined."
+              exit 1
+            fi
+            if [ -z "$SPICE_SECRET_ANTHROPIC_API_KEY" ]; then
+              echo "Error: Anthropic API key is not defined."
+              exit 1
+            fi
+            if [ -z "$SPICE_SECRET_XAI_API_KEY" ]; then
+              echo "Error: xAI API key is not defined."
+              exit 1
+            fi
+          fi
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" ./integration_test/llms_integration_test --nocapture
