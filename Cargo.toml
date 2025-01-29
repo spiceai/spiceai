@@ -172,8 +172,8 @@ rusqlite = { git = "https://github.com/spiceai/rusqlite.git", rev = "97054b6af72
 # Tracking Issue: https://github.com/allan2/dotenvy/issues/113
 dotenvy = { git = "https://github.com/spiceai/dotenvy.git", rev = "e5cef1871b08003198949dfe2da988633eaad78f" }
 
-iceberg = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "07940c3fdaef24a5a4ddaf58f5c495d2fc4ce7d2" }
-iceberg-catalog-rest = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "07940c3fdaef24a5a4ddaf58f5c495d2fc4ce7d2" }
-iceberg-datafusion = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "07940c3fdaef24a5a4ddaf58f5c495d2fc4ce7d2" }
+iceberg = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "a80b3807a5082662fa608d85dedb1a5341ae395c" }
+iceberg-catalog-rest = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "a80b3807a5082662fa608d85dedb1a5341ae395c" }
+iceberg-datafusion = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "a80b3807a5082662fa608d85dedb1a5341ae395c" }
 
 cudarc = { git = "https://github.com/EricLBuehler/cudarc", rev = "f6e5bf51153d40e34eb1262b98895ac1235b6422" }

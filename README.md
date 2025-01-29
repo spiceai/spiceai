@@ -250,7 +250,7 @@ brew install spiceai/spiceai/spice
 
 On **Windows** using PowerShell:
 
-```bash
+```powershell
 iex ((New-Object System.Net.WebClient).DownloadString("https://install.spiceai.org/Install.ps1"))
 ```
 

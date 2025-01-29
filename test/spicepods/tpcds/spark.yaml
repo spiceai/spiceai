@@ -5,13 +5,7 @@ datasets:
   - from: spark:spiceai_sandbox.tpcds.catalog_sales
     name: catalog_sales
     params: &spark_params
-      spark_remote: |
-        sc://${ env:DATABRICKS_HOST }:443/;
-        use_ssl=true;
-        user_id=spice.ai;
-        session_id=spark_tpcds_test;
-        token=${ env:DATABRICKS_TOKEN };
-        x-databricks-cluster-id=${ env:DATABRICKS_CLUSTER_ID };
+      spark_remote: sc://${ env:DATABRICKS_HOST }:443/;use_ssl=true;user_id=spice.ai;token=${ env:DATABRICKS_TOKEN };x-databricks-cluster-id=${ env:DATABRICKS_CLUSTER_ID };
   - from: spark:spiceai_sandbox.tpcds.catalog_returns
     name: catalog_returns
     params: *spark_params
