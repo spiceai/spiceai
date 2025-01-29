@@ -25,11 +25,10 @@ Represents models with the lowest certification for use with the Spice Runtime, 
 
 - **Capabilities:**
   - The model supports chat completions.
-  - The model supports input tokens larger than X tokens.
-  - The model supports output tokens larger than X tokens.
-  - The model supports using tools, but cannot use tools via the Spice Runtime.
+  - The model supports input tokens larger than or equal to 8K tokens.
+  - The model supports output tokens larger than or equal to 4K tokens.
+  - The model does not support using tools via the Spice Runtime.
 - **Grading:**
-  - If the model can use tools via the Spice Runtime, more than 50% of the time the model calls a tool via the Spice Runtime when it should (e.g. list datasets, dataset schema, etc).
   - More than 50% of the time, the model produces valid SQL when using text-to-SQL (NSQL) queries.
   - More than 50% of the time, the model does not enter a recursion loop through any means (tool use, chat completions, etc).
 
@@ -41,8 +40,8 @@ Represents models certified for use with the Spice Runtime which support more ad
   - The model supports tools and tool use, and can call tools via the Spice Runtime.
   - The model successfully recursively calls tools via the Spice Runtime, when applicable.
   - The model supports chat completions.
-  - The model supports input tokens larger than X tokens.
-  - The model supports output tokens larger than X tokens.
+  - The model supports input tokens larger than or equal to 32K tokens.
+  - The model supports output tokens larger than or equal to 8K tokens.
   - The model supports structured outputs.
 - **Grading:**
   - More than 75% of the time correctly outputs structured output when it is requested.
@@ -59,8 +58,8 @@ Represents the most advanced model capabilities certified for use with the Spice
   - The model supports tools and tool use, and can call tools via the Spice Runtime.
   - The model successfully recursively calls tools via the Spice Runtime, when applicable.
   - The model supports chat completions.
-  - The model supports input tokens larger than X tokens.
-  - The model supports output tokens larger than X tokens.
+  - The model supports input tokens larger than or equal to 128K tokens.
+  - The model supports output tokens larger than or equal to 16K tokens.
   - The model supports reasoning capabilities.
   - The model supports structured outputs.
 - **Grading:**
