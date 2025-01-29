@@ -46,28 +46,39 @@ impl SpiceCatalog {
     }
 
     pub async fn get_table_schema(&self, table: &TableIdent) -> Result<ArrowSchemaRef, Error> {
-        let client = self
-            .inner
-            .http_client()
-            .map_err(|err| Error::LoadTable { source: err })?;
+        let client = self.inner.http_client().map_err(|err| Error::LoadTable {
+            table: table.name.clone(),
+            source: err,
+        })?;
 
         let request = client
             .request(Method::GET, self.inner.catalog_config.table_endpoint(table))
             .build()
-            .map_err(|err| Error::LoadTable { source: err.into() })?;
+            .map_err(|err| Error::LoadTable {
+                table: table.name.clone(),
+                source: err.into(),
+            })?;
 
         let resp = client
             .query::<LoadTableResponse, ErrorResponse, OK>(request)
             .await
-            .map_err(|err| Error::LoadTable { source: err })?;
+            .map_err(|err| Error::LoadTable {
+                table: table.name.clone(),
+                source: err,
+            })?;
 
         let schema = resp.metadata.schemas.first();
         if let Some(schema) = schema {
-            Ok(Arc::new(
-                schema_to_arrow_schema(schema).map_err(|err| Error::LoadTable { source: err })?,
-            ))
+            Ok(Arc::new(schema_to_arrow_schema(schema).map_err(|err| {
+                Error::LoadTable {
+                    table: table.name.clone(),
+                    source: err,
+                }
+            })?))
         } else {
-            Err(Error::NoSchemaFound {})
+            Err(Error::NoSchemaFound {
+                table: table.name.clone(),
+            })
         }
     }
 }

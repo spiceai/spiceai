@@ -25,6 +25,7 @@ use datafusion::catalog::{CatalogProvider, SchemaProvider, TableProvider};
 use datafusion::error::Result as DFResult;
 use datafusion::sql::TableReference;
 use futures::future::try_join_all;
+use futures::TryFutureExt;
 use globset::GlobSet;
 use iceberg::{Catalog, NamespaceIdent, TableIdent};
 use snafu::prelude::*;
@@ -37,22 +38,26 @@ use super::catalog::SpiceCatalog;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Failed to create Spice.ai table: {source}"))]
+    #[snafu(display("Failed to load the Spice.ai table '{table}'.\n{source}\nReport an issue on GitHub: https://github.com/spiceai/spiceai/issues"))]
     TableProviderCreation {
+        table: String,
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Failed to list namespaces: {source}"))]
+    #[snafu(display("Failed to list namespaces for the Spice Cloud Catalog.\n{source}\nReport an issue on GitHub: https://github.com/spiceai/spiceai/issues"))]
     ListNamespaces { source: iceberg::Error },
 
-    #[snafu(display("Failed to list tables: {source}"))]
+    #[snafu(display("Failed to list tables for the Spice Cloud Catalog.\n{source}\nReport an issue on GitHub: https://github.com/spiceai/spiceai/issues"))]
     ListTables { source: iceberg::Error },
 
-    #[snafu(display("Failed to load table: {source}"))]
-    LoadTable { source: iceberg::Error },
+    #[snafu(display("Failed to load the table '{table}'.\n{source}\nReport an issue on GitHub: https://github.com/spiceai/spiceai/issues"))]
+    LoadTable {
+        source: iceberg::Error,
+        table: String,
+    },
 
-    #[snafu(display("No schema found for table"))]
-    NoSchemaFound,
+    #[snafu(display("Failed to find a schema for the table '{table}'.\nVerify the table exists in Spice Cloud, and try again."))]
+    NoSchemaFound { table: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -243,11 +248,17 @@ impl SpiceCloudPlatformSchemaProvider {
             iceberg_schemas
                 .into_iter()
                 .zip(included_table_names.iter().cloned())
-                .map(|(schema, (name, _))| connector.table_provider(name, Some(schema)))
+                .map(|(schema, (name, _))| {
+                    connector
+                        .table_provider(name.clone(), Some(schema))
+                        .map_err(move |err| Error::TableProviderCreation {
+                            table: name.to_string(),
+                            source: err,
+                        })
+                })
                 .collect::<Vec<_>>(),
         )
-        .await
-        .map_err(|err| Error::TableProviderCreation { source: err })?;
+        .await?;
 
         let tables: HashMap<String, Arc<dyn TableProvider>> = included_table_names
             .into_iter()
