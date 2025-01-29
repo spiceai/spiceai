@@ -386,18 +386,15 @@ impl Refresher {
     ) -> Option<tokio::task::JoinHandle<()>> {
         let time_column = self.refresh.read().await.time_column.clone();
 
-        let mut on_start_refresh_external = match acceleration_refresh_mode {
-            AccelerationRefreshMode::Disabled => return None,
-            AccelerationRefreshMode::Append(receiver) => {
-                if let (Some(receiver), Some(_)) = (receiver, time_column) {
-                    receiver
-                } else {
-                    return Some(self.start_streaming_append(ready_sender));
-                }
+        let mut on_start_refresh_external = match (acceleration_refresh_mode, time_column) {
+            (AccelerationRefreshMode::Disabled, _) => return None,
+            (AccelerationRefreshMode::Append(Some(receiver)), Some(_))
+            | (AccelerationRefreshMode::Full(receiver), _) => receiver,
+            (AccelerationRefreshMode::Append(_), _) => {
+                return Some(self.start_streaming_append(ready_sender))
             }
-            AccelerationRefreshMode::Full(receiver) => receiver,
-            AccelerationRefreshMode::Changes(stream) => {
-                return Some(self.start_changes_stream(stream, ready_sender));
+            (AccelerationRefreshMode::Changes(stream), _) => {
+                return Some(self.start_changes_stream(stream, ready_sender))
             }
         };
 
