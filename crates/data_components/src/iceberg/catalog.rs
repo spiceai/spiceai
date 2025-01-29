@@ -23,11 +23,12 @@ use iceberg::{
     table::Table, Catalog, Error as IcebergError, ErrorKind, Namespace, NamespaceIdent,
     Result as IcebergResult, TableCommit, TableCreation, TableIdent,
 };
-use iceberg_catalog_rest::{RestCatalog as IcebergRestCatalog, RestCatalogConfig};
+use iceberg_catalog_rest::{HttpClient, RestCatalog as IcebergRestCatalog, RestCatalogConfig};
 
 #[derive(Debug)]
 pub struct RestCatalog {
     inner: IcebergRestCatalog,
+    pub(crate) catalog_config: RestCatalogConfig,
 }
 
 impl RestCatalog {
@@ -35,8 +36,13 @@ impl RestCatalog {
     #[allow(clippy::missing_panics_doc)]
     pub fn new(catalog_config: RestCatalogConfig) -> Self {
         Self {
-            inner: IcebergRestCatalog::new(catalog_config),
+            inner: IcebergRestCatalog::new(catalog_config.clone()),
+            catalog_config,
         }
+    }
+
+    pub fn http_client(&self) -> IcebergResult<HttpClient> {
+        HttpClient::new(&self.catalog_config)
     }
 }
 

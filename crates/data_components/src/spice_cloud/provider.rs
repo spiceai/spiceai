@@ -25,15 +25,15 @@ use datafusion::catalog::{CatalogProvider, SchemaProvider, TableProvider};
 use datafusion::error::Result as DFResult;
 use datafusion::sql::TableReference;
 use futures::future::try_join_all;
-use futures::TryFutureExt;
 use globset::GlobSet;
-use iceberg::arrow::schema_to_arrow_schema;
 use iceberg::{Catalog, NamespaceIdent, TableIdent};
 use snafu::prelude::*;
 
 use crate::{Read, RefreshableCatalogProvider};
 
 use crate::iceberg::catalog::RestCatalog;
+
+use super::catalog::SpiceCatalog;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -50,6 +50,9 @@ pub enum Error {
 
     #[snafu(display("Failed to load table: {source}"))]
     LoadTable { source: iceberg::Error },
+
+    #[snafu(display("No schema found for table"))]
+    NoSchemaFound,
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -227,29 +230,24 @@ impl SpiceCloudPlatformSchemaProvider {
             })
             .collect();
 
-        // let iceberg_tables = try_join_all(
-        //     included_table_names
-        //         .iter()
-        //         .map(|(_, name)| client.load_table(name))
-        //         .collect::<Vec<_>>(),
-        // )
-        // .await
-        // .map_err(|err| Error::LoadTable { source: err })?;
+        let client = SpiceCatalog::from(client);
+        let iceberg_schemas = try_join_all(
+            included_table_names
+                .iter()
+                .map(|(_, ident)| client.get_table_schema(ident))
+                .collect::<Vec<_>>(),
+        )
+        .await?;
 
-        // let table_providers: Vec<_> = try_join_all(
-        //     iceberg_tables
-        //         .into_iter()
-        //         .zip(included_table_names.iter().cloned())
-        //         .map(|(table, (name, _))| {
-        //             let schema = Arc::new(
-        //                 schema_to_arrow_schema(table.metadata().current_schema()).unwrap(),
-        //             );
-        //             connector.table_provider(name, Some(schema))
-        //         })
-        //         .collect::<Vec<_>>(),
-        // )
-        // .await
-        // .map_err(|err| Error::TableProviderCreation { source: err })?;
+        let table_providers: Vec<_> = try_join_all(
+            iceberg_schemas
+                .into_iter()
+                .zip(included_table_names.iter().cloned())
+                .map(|(schema, (name, _))| connector.table_provider(name, Some(schema)))
+                .collect::<Vec<_>>(),
+        )
+        .await
+        .map_err(|err| Error::TableProviderCreation { source: err })?;
 
         let tables: HashMap<String, Arc<dyn TableProvider>> = included_table_names
             .into_iter()
