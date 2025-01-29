@@ -44,7 +44,7 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Invalid value for `pooling` parameter: {value}.\nSupported pooling value include: `cls`, `mean`, `splade`, `last_token`. Verify `pooling` parameter and try again."))]
+    #[snafu(display("Invalid value for `pooling` parameter: {value}.\nSpecify a valid pooling value of `cls`, `mean`, `splade`, or `last_token`."))]
     InvalidPoolingMode { value: String },
 
     #[snafu(display("Failed to create chunker.\nAn error occurred: {source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"))]
