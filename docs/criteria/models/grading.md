@@ -27,7 +27,7 @@ Represents models with the lowest certification for use with the Spice Runtime, 
   - The model supports chat completions.
   - The model supports input tokens larger than or equal to 8K tokens.
   - The model supports output tokens larger than or equal to 4K tokens.
-  - The model does not support using tools via the Spice Runtime.
+  - The model is not required to support using tools via the Spice Runtime.
 - **Grading:**
   - More than 50% of the time, the model produces valid SQL when using text-to-SQL (NSQL) queries.
   - More than 50% of the time, the model does not enter a recursion loop through any means (tool use, chat completions, etc).
