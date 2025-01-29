@@ -117,12 +117,6 @@ impl FlightFactory {
         table_reference: impl Into<MultiPartTableReference>,
         schema: Option<SchemaRef>,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
-        if schema.is_some() {
-            println!("FlightSQL schema is some");
-        } else {
-            println!("FlightSQL schema is none");
-        }
-
         let table_provider = match schema {
             Some(schema) => Arc::new(FlightTable::create_with_schema(
                 self.name,
