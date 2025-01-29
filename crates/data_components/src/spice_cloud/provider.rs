@@ -25,7 +25,6 @@ use datafusion::catalog::{CatalogProvider, SchemaProvider, TableProvider};
 use datafusion::error::Result as DFResult;
 use datafusion::sql::TableReference;
 use futures::future::try_join_all;
-use futures::TryFutureExt;
 use globset::GlobSet;
 use iceberg::{Catalog, NamespaceIdent, TableIdent};
 use snafu::prelude::*;
@@ -244,17 +243,21 @@ impl SpiceCloudPlatformSchemaProvider {
         )
         .await?;
 
-        let table_providers: Vec<_> = try_join_all(
+        let table_providers = try_join_all(
             iceberg_schemas
                 .into_iter()
                 .zip(included_table_names.iter().cloned())
                 .map(|(schema, (name, _))| {
-                    connector
-                        .table_provider(name.clone(), Some(schema))
-                        .map_err(move |err| Error::TableProviderCreation {
-                            table: name.to_string(),
-                            source: err,
-                        })
+                    let connector = Arc::clone(&connector);
+                    async move {
+                        match connector.table_provider(name.clone(), Some(schema)).await {
+                            Ok(provider) => Ok(provider),
+                            Err(e) => Err(Error::TableProviderCreation {
+                                table: name.to_string(),
+                                source: e,
+                            }),
+                        }
+                    }
                 })
                 .collect::<Vec<_>>(),
         )
