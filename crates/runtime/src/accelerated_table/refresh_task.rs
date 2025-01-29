@@ -83,6 +83,7 @@ pub struct RefreshTask {
     runtime_status: Arc<status::RuntimeStatus>,
     dataset_name: TableReference,
     federated: Arc<FederatedTable>,
+    federated_source: Option<String>,
     accelerator: Arc<dyn TableProvider>,
     sink: Arc<RwLock<AccelerationSink>>,
 }
@@ -93,12 +94,14 @@ impl RefreshTask {
         runtime_status: Arc<status::RuntimeStatus>,
         dataset_name: TableReference,
         federated: Arc<FederatedTable>,
+        federated_source: Option<String>,
         accelerator: Arc<dyn TableProvider>,
     ) -> Self {
         Self {
             runtime_status,
             dataset_name,
             federated,
+            federated_source,
             accelerator: Arc::clone(&accelerator),
             sink: Arc::new(RwLock::new(AccelerationSink::new(accelerator))),
         }
@@ -122,8 +125,6 @@ impl RefreshTask {
         let retry_strategy = FibonacciBackoffBuilder::new()
             .max_retries(max_retries)
             .build();
-
-        let dataset_name = self.dataset_name.clone();
 
         let mut spans = vec![];
         let mut parent_span = Span::current();
@@ -150,7 +151,13 @@ impl RefreshTask {
         .instrument(span.clone())
         .await
         .inspect_err(|e| {
-            tracing::error!("Failed to refresh dataset {}: {e}", dataset_name);
+            tracing::error!(
+                "Failed to refresh dataset {}: {e}",
+                include_source_to_dataset_name(
+                    &self.dataset_name,
+                    self.federated_source.as_deref()
+                )
+            );
             for span in &spans {
                 tracing::error!(target: "task_history", parent: span, "{e}");
             }
@@ -748,10 +755,17 @@ impl RefreshTask {
 
         tracing::warn!(
             "Failed to load data for dataset {}: {error}",
-            self.dataset_name
+            include_source_to_dataset_name(&self.dataset_name, self.federated_source.as_deref()),
         );
         self.mark_dataset_status(refresh_sql, status::ComponentStatus::Error)
             .await;
+    }
+}
+
+fn include_source_to_dataset_name(dataset_name: &TableReference, source: Option<&str>) -> String {
+    match source {
+        Some(source) => format!("{dataset_name} ({source})"),
+        None => dataset_name.to_string(),
     }
 }
 

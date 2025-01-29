@@ -300,6 +300,7 @@ pub struct Refresher {
     runtime_status: Arc<status::RuntimeStatus>,
     dataset_name: TableReference,
     federated: Arc<FederatedTable>,
+    federated_source: Option<String>,
     refresh: Arc<RwLock<Refresh>>,
     accelerator: Arc<dyn TableProvider>,
     cache_provider: Option<Arc<QueryResultsCacheProvider>>,
@@ -315,6 +316,7 @@ impl Refresher {
         runtime_status: Arc<status::RuntimeStatus>,
         dataset_name: TableReference,
         federated: Arc<FederatedTable>,
+        federated_source: Option<String>,
         refresh: Arc<RwLock<Refresh>>,
         accelerator: Arc<dyn TableProvider>,
     ) -> Self {
@@ -322,6 +324,7 @@ impl Refresher {
             runtime_status,
             dataset_name,
             federated,
+            federated_source,
             refresh,
             accelerator,
             cache_provider: None,
@@ -402,6 +405,7 @@ impl Refresher {
             Arc::clone(&self.runtime_status),
             self.dataset_name.clone(),
             Arc::clone(&self.federated),
+            self.federated_source.clone(),
             Arc::clone(&self.refresh),
             Arc::clone(&self.accelerator),
         );
@@ -542,6 +546,7 @@ impl Refresher {
             Arc::clone(&self.runtime_status),
             self.dataset_name.clone(),
             Arc::clone(&self.federated),
+            self.federated_source.clone(),
             Arc::clone(&self.accelerator),
         ));
 
@@ -574,6 +579,7 @@ impl Refresher {
             Arc::clone(&self.runtime_status),
             self.dataset_name.clone(),
             Arc::clone(&self.federated),
+            self.federated_source.clone(),
             Arc::clone(&self.accelerator),
         ));
 
@@ -688,6 +694,7 @@ mod tests {
             status,
             TableReference::bare("test"),
             federated,
+            Some("mem_table".to_string()),
             Arc::new(RwLock::new(refresh)),
             Arc::clone(&accelerator),
         );
@@ -895,6 +902,7 @@ mod tests {
                 status::RuntimeStatus::new(),
                 TableReference::bare("test"),
                 federated,
+                Some("mem_table".to_string()),
                 Arc::new(RwLock::new(refresh)),
                 Arc::clone(&accelerator),
             );
@@ -1047,6 +1055,7 @@ mod tests {
                 status::RuntimeStatus::new(),
                 TableReference::bare("test"),
                 federated,
+                Some("mem_table".to_string()),
                 Arc::new(RwLock::new(refresh)),
                 Arc::clone(&accelerator),
             );
@@ -1249,6 +1258,7 @@ mod tests {
                 status::RuntimeStatus::new(),
                 TableReference::bare("test"),
                 federated,
+                Some("mem_table".to_string()),
                 Arc::new(RwLock::new(refresh)),
                 Arc::clone(&accelerator),
             );
