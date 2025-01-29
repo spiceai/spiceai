@@ -63,9 +63,9 @@ pub enum QueryOverridesArg {
     Duckdb,
     #[serde(rename = "snowflake")]
     Snowflake,
-    #[serde(rename = "iceberg_sf1")]
+    #[serde(rename = "iceberg-sf1")]
     IcebergSF1,
-    #[serde(rename = "spicecloud_catalog")]
+    #[serde(rename = "spicecloud-catalog")]
     SpicecloudCatalog,
 }
 
