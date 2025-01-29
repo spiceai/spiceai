@@ -7,12 +7,6 @@ This criteria defines a set of grades, from Ungraded to Grade A, to classify a m
 - **Grade B:** Represents models certified for use with the Spice Runtime which support more advanced use cases, like tool use (collecting data from connected sources) and text-to-SQL (NSQL).
 - **Grade A:** Represents the most advanced model capabilities certified for use with the Spice Runtime, suitable for any use case that requires reasoning, structured outputs, or a high success rate in tool use and text-to-SQL (NSQL).
 
-## Models
-
-| Model     | Spice Grade | Context Size | Structured Outputs | Reasoning | Embeddings |
-| --------- | ----------- | ------------ | ------------------ | --------- | ---------- |
-| None yet! |             |              |                    |           |            |
-
 ## Grading Definitions
 
 ### Ungraded
