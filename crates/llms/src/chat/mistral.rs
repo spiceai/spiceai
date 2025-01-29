@@ -299,9 +299,8 @@ impl MistralLlama {
         // If not provided, it will be inferred (generally from `.model_type` in a downloaded `config.json`)
         let loader_type = arch
             .map(|a| {
-                mistralrs::NormalLoaderType::from_str(a).map_err(|_| ChatError::FailedToLoadModel {
-                    source: format!("Unknown model type: {a}").into(),
-                })
+                mistralrs::NormalLoaderType::from_str(a)
+                    .map_err(|e| ChatError::UnsupportedModelType { source: e.into() })
             })
             .transpose()?;
 
