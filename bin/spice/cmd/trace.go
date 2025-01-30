@@ -17,8 +17,22 @@ limitations under the License.
 package cmd
 
 import (
+	"fmt"
+
 	"github.com/spf13/cobra"
 	"github.com/spiceai/spiceai/bin/spice/pkg/context"
+	"github.com/spiceai/spiceai/bin/spice/pkg/taskhistory"
+)
+
+var (
+	// If `--last` was requested
+	isLast bool
+
+	// The id of the trace to provide
+	id string
+
+	// The trace_id of the trace to provide
+	trace_id string
 )
 
 var traceCmd = &cobra.Command{
@@ -29,21 +43,56 @@ $ spice trace chat --id chatcmpl-At6ZmDE8iAYRPeuQLA0FLlWxGKNnM
 
 $ spice trace chat --last
 `,
-	Args: cobra.ArbitraryArgs,
+	Args: cobra.MinimumNArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
 		rtcontext := context.NewContext()
 		apiKey, _ := cmd.Flags().GetString("api-key")
 		if apiKey != "" {
 			rtcontext.SetApiKey(apiKey)
-			cmd.Print("API key set %s", apiKey)
 		}
-		cmd.Print(args)
+
+		var filter string
+		var err error
+		switch args[0] {
+		case "chat":
+			filter, err = getTraceFilterForChat(id, trace_id, &isLast)
+		default:
+			err = fmt.Errorf("invalid trace type %s", args[0])
+		}
+		if err != nil {
+			cmd.Println(err)
+			return
+		}
+
+		traces, err := taskhistory.SqlRequestToTraces(rtcontext, fmt.Sprintf("SELECT * FROM runtime.task_history WHERE %s ORDER BY start_time asc", filter))
+		if err != nil {
+			cmd.Println(err)
+			return
+		}
+		taskhistory.PrintTreeFromTraces(cmd.OutOrStdout(), traces, Display)
 	},
+}
+
+func Display(t *taskhistory.TaskHistory) string {
+	return fmt.Sprintf("(%8.2fms) %s ", t.ExecutionDurationMs, t.Task)
 }
 
 func init() {
 	RootCmd.AddCommand(traceCmd)
+	traceCmd.Flags().BoolVar(&isLast, "last", false, "Return the last trace")
+	traceCmd.Flags().StringVar(&id, "id", "", "Return the trace with the given id")
+	traceCmd.Flags().StringVar(&trace_id, "trace-id", "", "Return the trace with the given trace id")
 }
 
-//  select * from runtime.task_history where trace_id=(select trace_id from runtime.task_history where labels.id='chatcmpl-At6XgMxYOI7KB9oeJJCUu4UINbX9F')
-// select * from runtime.task_history where trace_id=(select trace_id from runtime.task_history where task='ai_chat' order by start_time desc limit 1);
+func getTraceFilterForChat(id string, trace_id string, last *bool) (string, error) {
+	if last != nil && *last {
+		return "trace_id=(SELECT trace_id from runtime.task_history where task='ai_chat' order by start_time desc limit 1)", nil
+	}
+	if id != "" {
+		return fmt.Sprintf("trace_id=(SELECT trace_id from runtime.task_history where labels.id='%s')", id), nil
+	}
+	if trace_id != "" {
+		return fmt.Sprintf("trace_id='%s'", trace_id), nil
+	}
+	return "", fmt.Errorf("One of --last, --trace-id or --id must be provided")
+}
