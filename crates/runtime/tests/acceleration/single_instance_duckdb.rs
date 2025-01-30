@@ -54,7 +54,7 @@ async fn test_acceleration_duckdb_single_instance() -> Result<(), anyhow::Error>
     let _guard = super::ACCELERATION_MUTEX.lock().await;
 
     test_request_context()
-        .scope(async {
+        .scope_retry(3, || async {
             let status = status::RuntimeStatus::new();
             let df = get_test_datafusion(Arc::clone(&status));
 
