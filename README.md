@@ -18,7 +18,7 @@
 </p>
 
 <p style="text-align:center;">
-[Documentation](https://spiceai.org/docs) | [Installation](#installation) | [Cookbook](https://github.com/spiceai/cookbook)
+  <a href="https://spiceai.org/docs">Documentation</a> | <a href="#installation">Installation</a> | <a href="https://github.com/spiceai/cookbook">Cookbook</a>
 </p>
 
 ---
