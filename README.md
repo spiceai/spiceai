@@ -17,24 +17,9 @@
   <a href="https://github.com/spiceai/spiceai/actions/workflows/benchmarks.yml"><img alt="GitHub Actions Workflow Status - benchmark tests" src="https://img.shields.io/github/actions/workflow/status/spiceai/spiceai/benchmarks.yml?branch=trunk&label=benchmark%20tests" /></a>
 </p>
 
----
-
-- [Why Spice?](#why-spice)
-- [How does Spice compare?](#how-does-spice-compare)
-- [Example Use-Cases](#example-use-cases)
-- [FAQ](#faq)
-- Components
-  - [Supported Data Connectors](#supported-data-connectors)
-  - [Supported Data Accelerators](#supported-data-accelerators)
-  - [Supported Model Providers](#supported-model-providers)
-  - [Supported Embeddings Providers](#supported-embeddings-providers)
-  - [Supported Catalogs](#supported-catalogs)
-- [Quickstart (Local Machine)](#️-quickstart-local-machine)
-  - [Installation](#installation)
-- [Runtime Container Deployment](#️-runtime-container-deployment)
-- [Next Steps](#️-next-steps)
-- [Documentation](#-documentation)
-- [Connect with us](#-connect-with-us)
+<p style="text-align:center;">
+[Documentation](https://spiceai.org/docs) | [Installation](#installation) | [Cookbook](https://github.com/spiceai/cookbook)
+</p>
 
 ---
 
