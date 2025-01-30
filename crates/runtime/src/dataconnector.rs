@@ -88,6 +88,7 @@ pub mod mysql;
 pub mod odbc;
 pub const ODBC_DATACONNECTOR: &str = "odbc"; // const needs to be accessible when ODBC isn't built
 
+pub mod imap;
 #[cfg(feature = "postgres")]
 pub mod postgres;
 pub mod s3;

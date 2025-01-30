@@ -49,8 +49,10 @@ http = { version = "1.1.0" }
 iceberg-catalog-rest.workspace = true
 iceberg.workspace = true
 iceberg-datafusion.workspace = true
+imap.workspace = true
 indexmap.workspace = true
 itertools.workspace = true
+mailparse.workspace = true
 object_store = { workspace = true }
 rdkafka = { version = "0.37.0", features = ["ssl-vendored"], optional = true }
 regex = "1.10.4"
