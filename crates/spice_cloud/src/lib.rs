@@ -332,6 +332,7 @@ pub async fn create_synced_internal_accelerated_table(
         runtime_status,
         table_reference.clone(),
         federated_table,
+        "spice.ai".to_string(),
         accelerated_table_provider,
         refresh,
     );

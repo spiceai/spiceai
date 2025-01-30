@@ -809,9 +809,11 @@ impl DataFusion {
             Arc::clone(&self.runtime_status),
             dataset.name.clone(),
             Arc::clone(&source_table_provider),
+            dataset.source().to_string(),
             accelerated_table_provider,
             refresh,
         );
+
         accelerated_table_builder.retention(Retention::new(
             dataset.time_column.clone(),
             dataset.time_format,

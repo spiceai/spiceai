@@ -27,7 +27,7 @@ serde_json.workspace = true
 serde_yaml.workspace = true
 spicepod = { path = "../spicepod" }
 sysinfo = "0.33.1"
-tempfile = "3"
+tempfile.workspace = true
 tokio.workspace = true
 tonic.workspace = true
 uuid = { workspace = true, features = ["v4"] }

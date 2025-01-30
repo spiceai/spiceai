@@ -248,7 +248,7 @@ Catalog Connectors connect to external catalog providers and make their tables a
 | `unity_catalog` | Unity Catalog           | Stable      | Delta Lake                   |
 | `databricks`    | Databricks              | Beta        | Spark Connect, S3/Delta Lake |
 | `iceberg`       | Apache Iceberg          | Beta        | Parquet                      |
-| `spice.ai`      | Spice.ai Cloud Platform | Alpha       | Arrow Flight                 |
+| `spice.ai`      | Spice.ai Cloud Platform | Beta        | Arrow Flight                 |
 | `glue`          | AWS Glue                | Coming Soon | JSON, Parquet, Iceberg       |
 
 ## ⚡️ Quickstart (Local Machine)
@@ -271,10 +271,10 @@ Or using `brew`:
 brew install spiceai/spiceai/spice
 ```
 
-On **Windows**:
+On **Windows** using PowerShell:
 
-```bash
-curl -L "https://install.spiceai.org/Install.ps1" -o Install.ps1 && PowerShell -ExecutionPolicy Bypass -File ./Install.ps1
+```powershell
+iex ((New-Object System.Net.WebClient).DownloadString("https://install.spiceai.org/Install.ps1"))
 ```
 
 ### Usage

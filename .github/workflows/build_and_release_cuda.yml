@@ -174,7 +174,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install wget -y
 
       - name: Set up make
-        if: matrix.target.target_os == 'linux' || matrix.target.runner == 'windows-gpu-t4-4-core'
+        if: matrix.target.target_os == 'linux'
         uses: ./.github/actions/setup-make
         with:
           os: ${{ matrix.target.target_os }}

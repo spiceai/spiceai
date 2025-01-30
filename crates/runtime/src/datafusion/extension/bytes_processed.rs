@@ -105,7 +105,7 @@ impl OptimizerRule for BytesProcessedOptimizerRule {
     }
 
     /// A human readable name for this optimizer rule
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "bytes_processed_optimizer_rule"
     }
 }
@@ -135,7 +135,7 @@ impl Debug for BytesProcessedNode {
 }
 
 impl UserDefinedLogicalNodeCore for BytesProcessedNode {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "BytesProcessedNode"
     }
 
@@ -233,7 +233,7 @@ impl DisplayAs for BytesProcessedExec {
 }
 
 impl ExecutionPlan for BytesProcessedExec {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "BytesProcessedExec"
     }
 

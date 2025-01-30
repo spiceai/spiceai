@@ -34,7 +34,7 @@ pub struct RunningContainer<'a> {
     docker: Docker,
 }
 
-impl<'a> RunningContainer<'a> {
+impl RunningContainer<'_> {
     pub async fn remove(&self) -> Result<(), anyhow::Error> {
         remove(&self.docker, self.name).await
     }

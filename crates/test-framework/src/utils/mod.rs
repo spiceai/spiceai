@@ -93,7 +93,7 @@ pub fn scan_directory_for_yamls(path: &PathBuf) -> anyhow::Result<Vec<PathBuf>> 
 
         if path.is_dir() {
             files.append(&mut scan_directory_for_yamls(&path)?);
-        } else if path.is_file() && path.extension().map_or(false, |ext| ext == "yaml") {
+        } else if path.is_file() && path.extension().is_some_and(|ext| ext == "yaml") {
             files.push(path);
         }
     }

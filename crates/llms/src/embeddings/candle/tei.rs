@@ -121,8 +121,8 @@ impl TeiEmbed {
             .map(|pp| {
                 let p = pool_from_str(pp);
                 if p.is_none() {
-                    return Err(Error::FailedToCreateEmbedding {
-                        source: format!("Invalid pooling mode: {pp}").into(),
+                    return Err(Error::InvalidPoolingMode {
+                        value: pp.to_string(),
                     });
                 }
                 Ok(p)
