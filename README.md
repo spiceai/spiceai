@@ -17,11 +17,9 @@
   <a href="https://github.com/spiceai/spiceai/actions/workflows/benchmarks.yml"><img alt="GitHub Actions Workflow Status - benchmark tests" src="https://img.shields.io/github/actions/workflow/status/spiceai/spiceai/benchmarks.yml?branch=trunk&label=benchmark%20tests" /></a>
 </p>
 
-<p style="text-align:center;">
+<p align="center">
   <a href="https://spiceai.org/docs">Documentation</a> | <a href="#installation">Installation</a> | <a href="https://github.com/spiceai/cookbook">Cookbook</a>
 </p>
-
----
 
 **Spice** is a SQL query and AI compute engine, written in Rust, for data-driven apps and agents.
 
