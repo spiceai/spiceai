@@ -17,38 +17,33 @@ limitations under the License.
 package cmd
 
 import (
-	"log/slog"
-
 	"github.com/spf13/cobra"
-	"github.com/spiceai/spiceai/bin/spice/pkg/api"
 	"github.com/spiceai/spiceai/bin/spice/pkg/context"
 )
 
-var statusCmd = &cobra.Command{
-	Use:   "status",
-	Short: "Spice runtime status",
+var traceCmd = &cobra.Command{
+	Use:   "trace",
+	Short: "Return a user friendly trace into an operation that occurred in Spice",
 	Example: `
-spice status
+$ spice trace chat --id chatcmpl-At6ZmDE8iAYRPeuQLA0FLlWxGKNnM
+
+$ spice trace chat --last
 `,
+	Args: cobra.ArbitraryArgs,
 	Run: func(cmd *cobra.Command, args []string) {
 		rtcontext := context.NewContext()
-		if rootCertPath, err := cmd.Flags().GetString("tls-root-certificate-file"); err == nil && rootCertPath != "" {
-			rtcontext = context.NewHttpsContext(rootCertPath)
-		}
-
 		apiKey, _ := cmd.Flags().GetString("api-key")
 		if apiKey != "" {
 			rtcontext.SetApiKey(apiKey)
+			cmd.Print("API key set %s", apiKey)
 		}
-
-		err := api.WriteDataTable(rtcontext, "/v1/status", api.Service{})
-		if err != nil {
-			slog.Error("getting spiced status", "error", err)
-		}
+		cmd.Print(args)
 	},
 }
 
 func init() {
-	statusCmd.Flags().String("tls-root-certificate-file", "", "The path to the root certificate file used to verify the Spice.ai runtime server certificate")
-	RootCmd.AddCommand(statusCmd)
+	RootCmd.AddCommand(traceCmd)
 }
+
+//  select * from runtime.task_history where trace_id=(select trace_id from runtime.task_history where labels.id='chatcmpl-At6XgMxYOI7KB9oeJJCUu4UINbX9F')
+// select * from runtime.task_history where trace_id=(select trace_id from runtime.task_history where task='ai_chat' order by start_time desc limit 1);
