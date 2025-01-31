@@ -16,6 +16,7 @@ on:
           - 'bench'
           - 'load'
           - 'throughput'
+          - 'http-consistency'
 
 jobs:
   dispatch-tests:
@@ -50,7 +51,8 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
-      
+          WORKFLOW_COMMIT: ${{ github.ref }}
+
       - name: Dispatch Testoperator - Scheduled Bench
         if: ${{ github.event_name == 'schedule' }}
         run: |

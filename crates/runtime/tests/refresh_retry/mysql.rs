@@ -116,6 +116,7 @@ async fn create_refresh_task(
             rt.status(),
             table_name.into(),
             Arc::clone(&accelerated_table.get_federated_table()),
+            None,
             accelerated_table.get_accelerator(),
         ),
         accelerated_table.refresh_params().read().await.clone(),

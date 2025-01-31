@@ -168,7 +168,8 @@ static TEST_CASES: LazyLock<Vec<TestCase>> = LazyLock::new(|| {
                         "role": "user",
                         "content": "pong"
                     }
-                ]
+                ],
+                "max_completion_tokens": 100,
             }),
             vec![
                 (

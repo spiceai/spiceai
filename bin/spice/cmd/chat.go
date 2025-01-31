@@ -17,19 +17,21 @@ limitations under the License.
 package cmd
 
 import (
-	"context"
+	"bufio"
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/manifoldco/promptui"
-	"github.com/openai/openai-go"
-	"github.com/openai/openai-go/option"
 	"github.com/peterh/liner"
 	"github.com/spf13/cobra"
 	"github.com/spiceai/spiceai/bin/spice/pkg/api"
-	spiceContext "github.com/spiceai/spiceai/bin/spice/pkg/context"
+	"github.com/spiceai/spiceai/bin/spice/pkg/context"
 	"github.com/spiceai/spiceai/bin/spice/pkg/util"
 )
 
@@ -39,6 +41,60 @@ const (
 	httpEndpointKeyFlag = "http-endpoint"
 	userAgentKeyFlag    = "user-agent"
 )
+
+type Message struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
+type ChatRequestBody struct {
+	Messages      []Message      `json:"messages"`
+	Model         string         `json:"model"`
+	Stream        bool           `json:"stream"`
+	StreamOptions *StreamOptions `json:"stream_options"`
+}
+
+type StreamOptions struct {
+	IncludeUsage bool `json:"include_usage"`
+}
+
+type Delta struct {
+	Content      string      `json:"content"`
+	FunctionCall interface{} `json:"function_call"`
+	ToolCalls    interface{} `json:"tool_calls"`
+	Role         interface{} `json:"role"`
+}
+
+type Choice struct {
+	Index        int         `json:"index"`
+	Delta        Delta       `json:"delta"`
+	FinishReason interface{} `json:"finish_reason"`
+	Logprobs     interface{} `json:"logprobs"`
+}
+
+type ChatCompletion struct {
+	ID                string   `json:"id"`
+	Choices           []Choice `json:"choices"`
+	Created           int64    `json:"created"`
+	Model             string   `json:"model"`
+	SystemFingerprint string   `json:"system_fingerprint"`
+	Object            string   `json:"object"`
+	Usage             *Usage   `json:"usage"`
+}
+
+type Usage struct {
+	CompletionTokens int `json:"completion_tokens"`
+	PromptTokens     int `json:"prompt_tokens"`
+	TotalTokens      int `json:"total_tokens"`
+}
+
+type OpenAIError struct {
+	Message string `json:"message"`
+}
+
+type OpenAIErrorResponse struct {
+	Error OpenAIError `json:"error"`
+}
 
 var chatCmd = &cobra.Command{
 	Use:   "chat",
@@ -52,7 +108,7 @@ spice chat --model <model> --cloud
 `,
 	Run: func(cmd *cobra.Command, args []string) {
 		cloud, _ := cmd.Flags().GetBool(cloudKeyFlag)
-		rtcontext := spiceContext.NewContext().WithCloud(cloud)
+		rtcontext := context.NewContext().WithCloud(cloud)
 		err := rtcontext.Init()
 		if err != nil {
 			slog.Error("could not initialize runtime context", "error", err)
@@ -122,7 +178,7 @@ spice chat --model <model> --cloud
 			model = selectedModel
 		}
 
-		httpEndpoint, err := cmd.Flags().GetString(httpEndpointKeyFlag)
+		httpEndpoint, err := cmd.Flags().GetString("http-endpoint")
 		if err != nil {
 			slog.Error("could not get http-endpoint flag", "error", err)
 			os.Exit(1)
@@ -131,23 +187,11 @@ spice chat --model <model> --cloud
 			rtcontext.SetHttpEndpoint(httpEndpoint)
 		}
 
-		headers := []option.RequestOption{option.WithAPIKey(apiKey), option.WithBaseURL(fmt.Sprintf("%s/v1/", rtcontext.HttpEndpoint()))}
-		for key, value := range rtcontext.GetHeaders() {
-			headers = append(
-				headers,
-				option.WithHeader(key, value),
-			)
-		}
-		client := openai.NewClient(
-			headers...,
-		)
-
-		var messages []openai.ChatCompletionMessageParamUnion
+		var messages []Message = []Message{}
 
 		line := liner.NewLiner()
 		line.SetCtrlCAborts(true)
 		defer line.Close()
-
 		for {
 			message, err := line.Prompt("chat> ")
 			if err == liner.ErrPromptAborted {
@@ -156,66 +200,101 @@ spice chat --model <model> --cloud
 				slog.Error("reading input line", "error", err)
 				continue
 			}
-			receivedFirstChunk := make(chan bool)
-			go func() {
-				util.ShowSpinner(receivedFirstChunk)
-			}()
 
 			line.AppendHistory(message)
-			messages = append(messages, openai.UserMessage(message))
+			messages = append(messages, Message{Role: "user", Content: message})
 
+			done := make(chan bool)
+			go func() {
+				util.ShowSpinner(done)
+			}()
+
+			body := &ChatRequestBody{
+				Messages:      messages,
+				Model:         model,
+				Stream:        true,
+				StreamOptions: &StreamOptions{IncludeUsage: true},
+			}
 			var timeAtCompletion time.Time
 			var timeAtFirstToken time.Time
 			startTime := time.Now()
+			response, err := sendChatRequest(rtcontext, body)
+			if err != nil {
+				slog.Error("failed to send chat request to spiced", "error", err)
+				continue
+			}
 
-			stream := client.Chat.Completions.NewStreaming(
-				context.Background(),
-				openai.ChatCompletionNewParams{
-					Messages: openai.F(messages),
-					Model:    openai.F(model),
-					StreamOptions: openai.F(openai.ChatCompletionStreamOptionsParam{
-						IncludeUsage: openai.F(true),
-					}),
-				},
-			)
+			scanner := bufio.NewScanner(response.Body)
+			var responseMessage = ""
 
-			acc := openai.ChatCompletionAccumulator{}
+			/// Usage for the entire stream, and related timing.
+			var usage Usage
+			doneLoading := false
 
-			var usage *openai.CompletionUsage
-			for stream.Next() {
-				chunk := stream.Current()
+			for scanner.Scan() {
+				chunk := scanner.Text()
 				if timeAtFirstToken.IsZero() {
 					timeAtFirstToken = time.Now()
-					receivedFirstChunk <- true
 				}
 
-				if chunk.Usage.TotalTokens > 0 {
-					usage = &chunk.Usage
+				errorEvent, err := maybeErrorEvent(chunk, scanner)
+
+				if err != nil {
+					slog.Error("failed to decode error event", "error", err)
+					continue
 				}
 
-				if !acc.AddChunk(chunk) {
-					slog.Error("Cannot accumulate stream of chat data")
+				if errorEvent != nil {
+					slog.Error("chat request failed", "error", errorEvent.Message)
 					break
 				}
 
-				if content, ok := acc.JustFinishedContent(); ok {
-					messages = append(messages, openai.SystemMessage(content))
+				if !strings.HasPrefix(chunk, "data: ") {
+					continue
+				}
+				chunk = strings.TrimPrefix(chunk, "data: ")
+
+				var chatResponse ChatCompletion = ChatCompletion{}
+				err = json.Unmarshal([]byte(chunk), &chatResponse)
+				if err != nil {
+					slog.Error("failed to unmarshal chat response", "error", err)
+					continue
 				}
 
-				if refusal, ok := acc.JustFinishedRefusal(); ok {
-					slog.Error("Refused to answer", "refusal", refusal)
+				if !doneLoading {
+					done <- true
+					doneLoading = true
 				}
 
-				if len(chunk.Choices) > 0 {
-					fmt.Printf("%s", chunk.Choices[0].Delta.Content)
+				if chatResponse.Usage != nil {
+					usage = *chatResponse.Usage
+					timeAtCompletion = time.Now()
 				}
+
+				if len(chatResponse.Choices) == 0 {
+					continue
+				}
+
+				token := chatResponse.Choices[0].Delta.Content
+				cmd.Printf("%s", token)
+				responseMessage = responseMessage + token
 			}
 
-			timeAtCompletion = time.Now()
+			if err := scanner.Err(); err != nil {
+				slog.Error("error occurred while processing the input stream", "error", err)
+			}
 
-			if usage != nil {
+			if !doneLoading {
+				done <- true
+				doneLoading = true
+			}
+
+			if responseMessage != "" {
+				messages = append(messages, Message{Role: "assistant", Content: responseMessage})
+			}
+			if usage != (Usage{}) {
 				cmd.Printf("\n\n%s\n\n", generateUsageMessage(
-					usage,
+					&usage,
 					timeAtFirstToken.Sub(startTime).Abs(),
 					timeAtCompletion.Sub(timeAtFirstToken).Abs(),
 				))
@@ -235,7 +314,7 @@ spice chat --model <model> --cloud
 // ```shell
 // Time: 3.36s (first token 0.45s).
 // ```
-func generateUsageMessage(u *openai.CompletionUsage, timeToFirst time.Duration, streamDuration time.Duration) string {
+func generateUsageMessage(u *Usage, timeToFirst time.Duration, streamDuration time.Duration) string {
 	totalTime := (streamDuration + timeToFirst)
 	times := fmt.Sprintf("Time: %.2fs (first token %.2fs).", totalTime.Seconds(), timeToFirst.Seconds())
 	if u == nil {
@@ -246,6 +325,50 @@ func generateUsageMessage(u *openai.CompletionUsage, timeToFirst time.Duration, 
 	return fmt.Sprintf(
 		"%s Tokens: %d. Prompt: %d. Completion: %d (%.2f/s).", times, u.TotalTokens, u.PromptTokens, u.CompletionTokens, tps,
 	)
+}
+
+func sendChatRequest(rtcontext *context.RuntimeContext, body *ChatRequestBody) (*http.Response, error) {
+	jsonBody, err := json.Marshal(body)
+	if err != nil {
+		return nil, fmt.Errorf("error marshaling request body: %w", err)
+	}
+
+	url := fmt.Sprintf("%s/v1/chat/completions", rtcontext.HttpEndpoint())
+	request, err := http.NewRequest("POST", url, bytes.NewReader(jsonBody))
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+
+	headers := rtcontext.GetHeaders()
+	for key, value := range headers {
+		request.Header.Set(key, value)
+	}
+	request.Header.Set("Content-Type", "application/json")
+
+	response, err := rtcontext.Client().Do(request)
+	if err != nil {
+		return nil, fmt.Errorf("error sending request: %w", err)
+	}
+
+	return response, nil
+}
+
+func maybeErrorEvent(chunk string, scanner *bufio.Scanner) (*OpenAIError, error) {
+	if strings.HasPrefix(chunk, "event: error") {
+		scanner.Scan() // read line with error message
+		errorMessage := scanner.Text()
+		errorMessage = strings.TrimPrefix(errorMessage, "data: ")
+
+		var errorResponse OpenAIErrorResponse = OpenAIErrorResponse{}
+		err := json.Unmarshal([]byte(errorMessage), &errorResponse)
+		if err != nil {
+			return nil, fmt.Errorf("failed to unmarshal: %w", err)
+		}
+
+		return &errorResponse.Error, nil
+	}
+
+	return nil, nil
 }
 
 func init() {

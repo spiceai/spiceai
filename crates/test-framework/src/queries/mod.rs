@@ -51,6 +51,7 @@ pub enum QueryOverrides {
     DuckDB,
     Snowflake,
     IcebergSF1,
+    SpicecloudCatalog,
 }
 
 impl QueryOverrides {
@@ -109,6 +110,7 @@ macro_rules! remove_tpch_query {
     };
 }
 
+#[allow(clippy::too_many_lines)]
 #[must_use]
 pub fn get_tpch_test_queries(
     overrides: Option<QueryOverrides>,
@@ -161,6 +163,37 @@ pub fn get_tpch_test_queries(
         ),
         Some(QueryOverrides::IcebergSF1) => generate_tpch_queries_override!(
             "iceberg_sf1",
+            q1,
+            q2,
+            q3,
+            q4,
+            q5,
+            q6,
+            q7,
+            q8,
+            q9,
+            q10,
+            q11,
+            q12,
+            q13,
+            q14,
+            q16,
+            q17,
+            q18,
+            q19,
+            q20,
+            q21,
+            q22,
+            simple_q1,
+            simple_q2,
+            simple_q3,
+            simple_q4,
+            simple_q5,
+            simple_q6,
+            simple_q7
+        ),
+        Some(QueryOverrides::SpicecloudCatalog) => generate_tpch_queries_override!(
+            "spicecloud_catalog",
             q1,
             q2,
             q3,

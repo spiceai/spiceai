@@ -34,7 +34,9 @@ on:
           - 'odbc-athena'
           - 'duckdb'
           - 'snowflake'
+          - 'spark'
           - 'iceberg-sf1'
+          - 'spicecloud-catalog'
       ready_wait:
         description: 'How long (in seconds) to wait for spiced to start'
         required: true

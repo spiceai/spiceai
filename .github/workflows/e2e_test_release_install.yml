@@ -53,10 +53,11 @@ jobs:
     
     - name: install Spice (Windows)
       if : matrix.target_os == 'windows'
+      shell: pwsh
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
-        curl -L "https://install.spiceai.org/Install.ps1" -o Install.ps1 && PowerShell -ExecutionPolicy Bypass -File ./Install.ps1
+        iex ((New-Object System.Net.WebClient).DownloadString("https://install.spiceai.org/Install.ps1")) 
 
     - name: add Spice bin to PATH
       if : matrix.target_os != 'windows'

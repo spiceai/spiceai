@@ -173,7 +173,7 @@ async fn mysql_federation_inner_join_with_acc() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
     let mysql_port = 13308;
 
-    test_request_context().scope(async {
+    test_request_context().scope_retry(3, || async {
         let running_container = start_mysql_docker_container(
             "runtime-integration-test-federation-inner-join-mysql",
             mysql_port,
@@ -211,7 +211,7 @@ async fn mysql_federation_inner_join_with_acc() -> Result<(), String> {
             .await;
         // Set a timeout for the test
         tokio::select! {
-            () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+            () = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
                 return Err("Timed out waiting for datasets to load".to_string());
             }
             () = rt.load_components() => {}

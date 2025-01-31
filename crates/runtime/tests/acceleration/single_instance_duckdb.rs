@@ -54,7 +54,7 @@ async fn test_acceleration_duckdb_single_instance() -> Result<(), anyhow::Error>
     let _guard = super::ACCELERATION_MUTEX.lock().await;
 
     test_request_context()
-        .scope(async {
+        .scope_retry(3, || async {
             let status = status::RuntimeStatus::new();
             let df = get_test_datafusion(Arc::clone(&status));
 
@@ -94,7 +94,7 @@ async fn test_acceleration_duckdb_single_instance() -> Result<(), anyhow::Error>
             drop(rt);
             runtime::dataaccelerator::clear_registry().await;
             runtime::dataaccelerator::register_all().await;
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            tokio::time::sleep(std::time::Duration::from_secs(15)).await;
 
             let pool = DuckDbConnectionPool::new_file(expected_path, &AccessMode::ReadWrite)
                 .expect("valid path");

@@ -32,12 +32,12 @@ use async_stream::stream;
 use async_trait::async_trait;
 use futures::{Stream, TryStreamExt};
 use mistralrs::{
-    ChatCompletionChunkResponse, ChatCompletionResponse, ChunkChoice, Constraint, Device,
-    DeviceMapMetadata, Function, GGMLLoaderBuilder, GGMLSpecificConfig, GGUFLoaderBuilder,
-    GGUFSpecificConfig, LocalModelPaths, MistralRs, MistralRsBuilder, ModelDType, ModelPaths,
-    NormalLoaderBuilder, NormalRequest, Pipeline, Request as MistralRequest, RequestMessage,
-    Response as MistralResponse, SamplingParams, TokenSource, Tool, ToolCallResponse, ToolChoice,
-    ToolType,
+    AutoDeviceMapParams, ChatCompletionChunkResponse, ChatCompletionResponse, ChunkChoice,
+    Constraint, Device, DeviceMapSetting, Function, GGMLLoaderBuilder, GGMLSpecificConfig,
+    GGUFLoaderBuilder, GGUFSpecificConfig, LocalModelPaths, MistralRs, MistralRsBuilder,
+    ModelDType, ModelPaths, NormalLoaderBuilder, NormalRequest, Pipeline,
+    Request as MistralRequest, RequestMessage, Response as MistralResponse, SamplingParams,
+    TokenSource, Tool, ToolCallResponse, ToolChoice, ToolType,
 };
 
 use secrecy::{ExposeSecret, Secret};
@@ -183,7 +183,7 @@ impl MistralLlama {
             &ModelDType::Auto,
             device,
             true,
-            DeviceMapMetadata::dummy(),
+            DeviceMapSetting::Auto(AutoDeviceMapParams::default_text()),
             None,
             None,
         )
@@ -236,7 +236,7 @@ impl MistralLlama {
             &ModelDType::Auto,
             device,
             true,
-            DeviceMapMetadata::dummy(),
+            DeviceMapSetting::Auto(AutoDeviceMapParams::default_text()),
             None,
             None,
         )
@@ -264,7 +264,7 @@ impl MistralLlama {
             &ModelDType::Auto,
             device,
             true,
-            DeviceMapMetadata::dummy(),
+            DeviceMapSetting::Auto(AutoDeviceMapParams::default_text()),
             None,
             None,
         )
@@ -299,9 +299,8 @@ impl MistralLlama {
         // If not provided, it will be inferred (generally from `.model_type` in a downloaded `config.json`)
         let loader_type = arch
             .map(|a| {
-                mistralrs::NormalLoaderType::from_str(a).map_err(|_| ChatError::FailedToLoadModel {
-                    source: format!("Unknown model type: {a}").into(),
-                })
+                mistralrs::NormalLoaderType::from_str(a)
+                    .map_err(|e| ChatError::UnsupportedModelType { source: e.into() })
             })
             .transpose()?;
 
@@ -325,7 +324,7 @@ impl MistralLlama {
                 &ModelDType::Auto,
                 &device,
                 false,
-                DeviceMapMetadata::dummy(),
+                DeviceMapSetting::Auto(AutoDeviceMapParams::default_text()),
                 None,
                 None,
             )

@@ -93,6 +93,11 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
+    #[snafu(display("Unsupported value for `model_type` parameter.\n{source}\n Verify the `model_type` parameter, and try again"))]
+    UnsupportedModelType {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
     #[snafu(display("The specified model identifier '{model}' is not valid for the source '{model_source}'.\nVerify the model exists, and try again."))]
     ModelNotFound { model: String, model_source: String },
 
