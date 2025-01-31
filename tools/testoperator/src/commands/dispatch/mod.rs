@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use serde_json::Value;
 use test_framework::{
     anyhow::{self, Result},
     gh_utils::{map_numbers_to_strings, GitHubWorkflow},
@@ -23,9 +22,7 @@ use test_framework::{
     TestType,
 };
 
-use crate::args::dispatch::{
-    BenchWorkflowArgs, DispatchArgs, DispatchTestFile, DispatchTests, LoadWorkflowArgs,
-};
+use crate::args::dispatch::{DispatchArgs, DispatchTestFile, DispatchTests, WorkflowArgs};
 
 #[allow(clippy::too_many_lines)]
 pub async fn dispatch(args: DispatchArgs) -> Result<()> {
@@ -61,8 +58,8 @@ pub async fn dispatch(args: DispatchArgs) -> Result<()> {
                     bench: Some(bench), ..
                 },
             ) => {
-                serde_json::json!(BenchWorkflowArgs {
-                    bench_args: bench.clone(),
+                serde_json::json!(WorkflowArgs {
+                    specific_args: bench.clone(),
                     spiced_commit: args.spiced_commit.clone(),
                 })
             }
@@ -73,8 +70,8 @@ pub async fn dispatch(args: DispatchArgs) -> Result<()> {
                     ..
                 },
             ) => {
-                serde_json::json!(BenchWorkflowArgs {
-                    bench_args: throughput.clone(),
+                serde_json::json!(WorkflowArgs {
+                    specific_args: throughput.clone(),
                     spiced_commit: args.spiced_commit.clone(),
                 })
             }
@@ -84,8 +81,8 @@ pub async fn dispatch(args: DispatchArgs) -> Result<()> {
                     load: Some(load), ..
                 },
             ) => {
-                serde_json::json!(LoadWorkflowArgs {
-                    load_args: load.clone(),
+                serde_json::json!(WorkflowArgs {
+                    specific_args: load.clone(),
                     spiced_commit: args.spiced_commit.clone(),
                 })
             }
@@ -96,9 +93,10 @@ pub async fn dispatch(args: DispatchArgs) -> Result<()> {
                     ..
                 },
             ) => {
-                let mut payload = serde_json::json!(consistency.clone());
-                payload["spiced_commit"] = Value::String(args.spiced_commit.clone());
-                payload
+                serde_json::json!(WorkflowArgs {
+                    specific_args: consistency,
+                    spiced_commit: args.spiced_commit.clone(),
+                })
             }
             (
                 TestType::HttpOverhead,
@@ -107,9 +105,10 @@ pub async fn dispatch(args: DispatchArgs) -> Result<()> {
                     ..
                 },
             ) => {
-                let mut payload = serde_json::json!(overhead.clone());
-                payload["spiced_commit"] = Value::String(args.spiced_commit.clone());
-                payload
+                serde_json::json!(WorkflowArgs {
+                    specific_args: overhead,
+                    spiced_commit: args.spiced_commit.clone(),
+                })
             }
             (TestType::Benchmark, _) => {
                 println!("Test file {path:#?} does not contain a benchmark test");

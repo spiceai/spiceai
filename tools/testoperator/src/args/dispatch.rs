@@ -111,24 +111,6 @@ pub enum RunnerType {
     LargeSelfHosted,
 }
 
-/// Payload sent to the GitHub Actions workflow request for Benchmark and Throughput tests
-/// `spiced_commit` is not an eligible argument in the test files, as it is controlled by the environment
-#[derive(Debug, Clone, Serialize)]
-pub struct BenchWorkflowArgs {
-    #[serde(flatten)]
-    pub bench_args: BenchArgs,
-    pub spiced_commit: String,
-}
-
-/// Payload sent to the GitHub Actions workflow request for Load tests
-/// `spiced_commit` is not an eligible argument in the test files, as it is controlled by the environment
-#[derive(Debug, Clone, Serialize)]
-pub struct LoadWorkflowArgs {
-    #[serde(flatten)]
-    pub load_args: LoadArgs,
-    pub spiced_commit: String,
-}
-
 /// Payload sent to the GitHub Actions workflow request for HTTP consistency tests
 /// `spiced_commit` is not an eligible argument in the test files, as it is controlled by the environment
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -172,4 +154,16 @@ pub enum OverheadBaseModel {
     OpenAI,
     Anthropic,
     Xai,
+}
+
+/// A wrapper around input arguments, from a test file, to use in a GitHub Actions workflow, that also expects
+/// a `spiced_commit` input.
+///
+/// `spiced_commit` is not an eligible argument in the test files, as it is controlled by the
+/// environment.
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkflowArgs<T: Serialize> {
+    #[serde(flatten)]
+    pub specific_args: T,
+    pub spiced_commit: String,
 }
