@@ -112,6 +112,10 @@ impl ImapFactory {
                         unreachable!("If there is a capture, capture group 0 will always exist");
                     };
 
+                    // With our new email capture, do a couple things:
+                    // 1. Set the username to the email, if no username is provided
+                    // 2. Figure out the domain portion of the email, and check if it has pre-set host information
+                    // 3. If it doesn't have pre-set host information, and there is no host parameter, error out
                     if params.parameters.get("username").expose().ok().is_none() {
                         params
                             .parameters
