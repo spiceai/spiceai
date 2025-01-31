@@ -14,26 +14,18 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{any::Any, sync::Arc};
+use std::sync::Arc;
 
 use arrow::{
-    array::{Date64Array, Date64Builder, RecordBatch, StringArray},
-    datatypes::{DataType, Field, Schema, SchemaRef},
+    array::{Date64Array, ListArray, ListBuilder, RecordBatch, StringArray, StringBuilder},
+    error::ArrowError,
 };
-use async_trait::async_trait;
-use datafusion::{
-    catalog::{Session, TableProvider},
-    datasource::TableType,
-    error::{DataFusionError, Result as DataFusionResult},
-    logical_expr::Expr,
-    physical_plan::ExecutionPlan,
-};
+use datafusion::{catalog::TableProvider, error::DataFusionError};
 use imap::{ImapConnection, Session as ImapSession};
-use mailparse::{dateparse, MailHeaderMap, ParsedContentType};
 use snafu::prelude::*;
 use tokio::sync::Mutex;
 
-use crate::arrow::write::MemTable;
+pub mod provider;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -53,16 +45,18 @@ pub enum Error {
     FailedToParseHeader { source: mailparse::MailParseError },
 }
 
-fn decode(value: &[u8]) -> String {
-    match String::from_utf8(value.to_vec()) {
-        Ok(s) => s,
-        Err(_) => charset::decode_latin1(value).to_string(),
-    }
-}
-
 #[derive(Debug)]
 pub struct ImapTableProvider {
     session: Mutex<ImapSession<Box<dyn ImapConnection>>>,
+}
+
+fn build_listarray_for_strings(values: Vec<Option<Vec<Option<String>>>>) -> ListArray {
+    let mut builder = ListBuilder::new(StringBuilder::new());
+    for value in values {
+        builder.append_option(value);
+    }
+
+    builder.finish()
 }
 
 impl ImapTableProvider {
@@ -72,6 +66,48 @@ impl ImapTableProvider {
             session: Mutex::new(session),
         }
     }
+
+    pub(crate) fn build_recordbatch(
+        &self,
+        messages: Vec<EmailMessage>,
+    ) -> Result<RecordBatch, ArrowError> {
+        let mut dates = vec![];
+        let mut subjects = vec![];
+        let mut froms = vec![];
+        let mut tos = vec![];
+        let mut ccs = vec![];
+        let mut bccs = vec![];
+        let mut reply_tos = vec![];
+        let mut message_ids = vec![];
+        let mut in_reply_tos = vec![];
+
+        for message in messages {
+            dates.push(message.date);
+            subjects.push(message.subject);
+            froms.push(message.from);
+            tos.push(message.to);
+            ccs.push(message.cc);
+            bccs.push(message.bcc);
+            reply_tos.push(message.reply_to);
+            message_ids.push(message.message_id);
+            in_reply_tos.push(message.in_reply_to);
+        }
+
+        RecordBatch::try_new(
+            self.schema(),
+            vec![
+                Arc::new(Date64Array::from(dates)),
+                Arc::new(StringArray::from(subjects)),
+                Arc::new(build_listarray_for_strings(froms)),
+                Arc::new(build_listarray_for_strings(tos)),
+                Arc::new(build_listarray_for_strings(ccs)),
+                Arc::new(build_listarray_for_strings(bccs)),
+                Arc::new(build_listarray_for_strings(reply_tos)),
+                Arc::new(StringArray::from(message_ids)),
+                Arc::new(StringArray::from(in_reply_tos)),
+            ],
+        )
+    }
 }
 
 impl From<Error> for DataFusionError {
@@ -80,128 +116,14 @@ impl From<Error> for DataFusionError {
     }
 }
 
-#[async_trait]
-impl TableProvider for ImapTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn schema(&self) -> SchemaRef {
-        Arc::new(Schema::new(vec![
-            Field::new("date", DataType::Date64, false),
-            Field::new("subject", DataType::Utf8, true),
-            // Field::new(
-            //     "from",
-            //     DataType::List(Arc::new(Field::new("email", DataType::Utf8, false))),
-            //     false,
-            // ),
-            // Field::new(
-            //     "to",
-            //     DataType::List(Arc::new(Field::new("email", DataType::Utf8, false))),
-            //     false,
-            // ),
-            // Field::new(
-            //     "cc",
-            //     DataType::List(Arc::new(Field::new("email", DataType::Utf8, false))),
-            //     false,
-            // ),
-            // Field::new(
-            //     "bcc",
-            //     DataType::List(Arc::new(Field::new("email", DataType::Utf8, false))),
-            //     false,
-            // ),
-            // Field::new(
-            //     "reply_to",
-            //     DataType::List(Arc::new(Field::new("email", DataType::Utf8, false))),
-            //     false,
-            // ),
-            Field::new("message_id", DataType::Utf8, true),
-            Field::new("in_reply_to", DataType::Utf8, true),
-        ]))
-    }
-
-    fn table_type(&self) -> TableType {
-        TableType::Base
-    }
-
-    async fn scan(
-        &self,
-        state: &dyn Session,
-        projection: Option<&Vec<usize>>,
-        filters: &[Expr],
-        limit: Option<usize>,
-    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        let mut session = self.session.lock().await;
-        session.examine("INBOX").context(ExamineMailboxSnafu)?;
-
-        let status = session
-            .status("INBOX", "(MESSAGES)")
-            .context(GetMailboxStatusSnafu)?;
-        let message_count = status.exists;
-
-        let messages = session
-            .fetch(
-                format!("1:{message_count}"),
-                "(ENVELOPE RFC822.HEADER RFC822)",
-            )
-            .context(FetchMessagesSnafu)?;
-        let mut subjects = vec![];
-        let mut dates = vec![];
-        let mut message_ids = vec![];
-        let mut in_reply_tos = vec![];
-
-        for i in 0..messages.len() {
-            let message = messages.get(i).ok_or(Error::MessageNotFound {})?;
-            // let header = message.header().ok_or(Error::HeaderNotFound {})?;
-            let envelope = message.envelope().ok_or(Error::EnvelopeNotFound {
-                segment: "envelope".to_string(),
-            })?;
-            let subject = envelope.subject.as_ref().map(|v| decode(v));
-            let date = dateparse(&decode(envelope.date.as_ref().ok_or(
-                Error::EnvelopeNotFound {
-                    segment: "date".to_string(),
-                },
-            )?))
-            .context(FailedToParseHeaderSnafu)?;
-
-            let message_id = envelope.message_id.as_ref().map(|v| decode(v));
-            let in_reply_to = envelope.in_reply_to.as_ref().map(|v| decode(v));
-            // let headers = mailparse::parse_headers(header).context(FailedToParseHeaderSnafu)?;
-            // let subject = headers
-            //     .0
-            //     .get_first_header("Subject")
-            //     .ok_or(Error::EnvelopeNotFound {})?
-            //     .get_value();
-            // let date = headers
-            //     .0
-            //     .get_first_header("Date")
-            //     .ok_or(Error::EnvelopeNotFound {})?
-            //     .get_value();
-            // let date = dateparse(&date).context(FailedToParseHeaderSnafu)?;
-
-            // for header in &headers.0 {
-            //     println!("{}", header.get_key());
-            // }
-
-            println!("{date} - {subject:?} - {i}/{message_count}");
-
-            dates.push(date);
-            subjects.push(subject);
-            message_ids.push(message_id);
-            in_reply_tos.push(in_reply_to);
-        }
-
-        let record_batch = RecordBatch::try_new(
-            self.schema(),
-            vec![
-                Arc::new(Date64Array::from(dates)),
-                Arc::new(StringArray::from(subjects)),
-                Arc::new(StringArray::from(message_ids)),
-                Arc::new(StringArray::from(in_reply_tos)),
-            ],
-        )?;
-
-        let table = MemTable::try_new(self.schema(), vec![vec![record_batch]])?;
-        table.scan(state, projection, filters, limit).await
-    }
+pub(crate) struct EmailMessage {
+    date: i64,
+    subject: Option<String>,
+    from: Option<Vec<Option<String>>>,
+    to: Option<Vec<Option<String>>>,
+    cc: Option<Vec<Option<String>>>,
+    bcc: Option<Vec<Option<String>>>,
+    reply_to: Option<Vec<Option<String>>>,
+    message_id: Option<String>,
+    in_reply_to: Option<String>,
 }
