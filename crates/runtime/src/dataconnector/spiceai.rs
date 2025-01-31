@@ -288,7 +288,7 @@ impl DataConnector for SpiceAI {
         })?;
 
         let schema = match (dataset.schema(), table_ident) {
-            (Some(schema), Some(_) | None) => Some(schema),
+            (Some(schema), _) => Some(schema),
             (None, Some(table_ident)) => Some(
                 self.catalog
                     .get_table_schema(&table_ident)
@@ -543,6 +543,7 @@ fn get_dataset_ident(dataset_path: &SpiceAIDatasetPath) -> Result<Option<TableId
 #[cfg(test)]
 mod tests {
     use super::*;
+    use datafusion::sql::TableReference;
 
     #[test]
     #[allow(clippy::too_many_lines)]
@@ -646,6 +647,59 @@ mod tests {
             let dataset = Dataset::try_new(input.clone(), "bar").expect("a valid dataset");
             let dataset_path = SpiceAI::spice_dataset_path(&dataset).expect("a valid dataset path");
             assert_eq!(dataset_path, expected, "Failed for input: {input}");
+        }
+    }
+
+    #[test]
+    fn test_get_dataset_ident() {
+        let tests = vec![
+            (
+                SpiceAIDatasetPath::OrgAppPath {
+                    org: MetadataValue::try_from("org1").expect("failed to parse org"),
+                    app: MetadataValue::try_from("app1").expect("failed to parse app"),
+                    path: TableReference::parse_str("schema.table"),
+                },
+                Some(TableIdent::new(
+                    NamespaceIdent::from_vec(vec![
+                        "org1".to_string(),
+                        "app1".to_string(),
+                        "spice".to_string(),
+                        "schema".to_string(),
+                    ])
+                    .expect("failed to create namespace"),
+                    "table".to_string(),
+                )),
+            ),
+            (
+                SpiceAIDatasetPath::OrgAppPath {
+                    org: MetadataValue::try_from("org2").expect("failed to parse org"),
+                    app: MetadataValue::try_from("app2").expect("failed to parse app"),
+                    path: TableReference::parse_str("table"),
+                },
+                Some(TableIdent::new(
+                    NamespaceIdent::from_vec(vec![
+                        "org2".to_string(),
+                        "app2".to_string(),
+                        "spice".to_string(),
+                        "public".to_string(),
+                    ])
+                    .expect("failed to create namespace"),
+                    "table".to_string(),
+                )),
+            ),
+            (
+                SpiceAIDatasetPath::Path(TableReference::parse_str("schema.table")),
+                None,
+            ),
+            (
+                SpiceAIDatasetPath::Path(TableReference::parse_str("table")),
+                None,
+            ),
+        ];
+
+        for (input, expected) in tests {
+            let result = get_dataset_ident(&input).expect("a valid result");
+            assert_eq!(result, expected, "Failed for input: {input:?}");
         }
     }
 }
