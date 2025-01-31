@@ -37,6 +37,7 @@ Represents models certified for use with the Spice Runtime which support more ad
   - The model supports input tokens larger than or equal to 32K tokens.
   - The model supports output tokens larger than or equal to 8K tokens.
   - The model supports structured outputs.
+  - The model supports streaming responses.
 - **Grading:**
   - More than 75% of the time correctly outputs structured output when it is requested.
   - More than 75% of the time, the model does not enter a recursion loop through any means (tool use, chat completions, etc).
@@ -56,6 +57,7 @@ Represents the most advanced model capabilities certified for use with the Spice
   - The model supports output tokens larger than or equal to 16K tokens.
   - The model supports reasoning capabilities.
   - The model supports structured outputs.
+  - The model supports streaming responses.
 - **Grading:**
   - More than 90% of the time correctly outputs structured output when it is requested.
   - More than 90% of the time, the model does not enter a recursion loop through any means (tool use, chat completions, etc).
