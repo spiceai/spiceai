@@ -31,7 +31,7 @@ use snafu::prelude::*;
 use crate::arrow::write::MemTable;
 
 use super::{
-    EmailMessage, Error, ExamineMailboxSnafu, FailedToParseHeaderSnafu, FetchMessagesSnafu,
+    EmailMessage, Error, FailedToLogoutSnafu, FailedToParseHeaderSnafu, FetchMessagesSnafu,
     GetMailboxStatusSnafu, ImapTableProvider,
 };
 
@@ -122,18 +122,17 @@ impl TableProvider for ImapTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        let mut session = self.session.lock().await;
-        session.examine("INBOX").context(ExamineMailboxSnafu)?;
+        let mut session = self.session.connect()?;
 
         let status = session
-            .status("INBOX", "(MESSAGES)")
+            .status(self.session.mailbox(), "(MESSAGES)")
             .context(GetMailboxStatusSnafu)?;
         let message_count = status.exists;
 
         let fetch_messages = session
             .fetch(
                 format!("1:{message_count}"),
-                "(ENVELOPE RFC822.HEADER RFC822)",
+                "(ENVELOPE BODY.PEEK[HEADER] BODY.PEEK[])",
             )
             .context(FetchMessagesSnafu)?;
         let mut messages = vec![];
@@ -170,6 +169,9 @@ impl TableProvider for ImapTableProvider {
                 in_reply_to,
             });
         }
+
+        session.logout().context(FailedToLogoutSnafu)?; // good IMAP etiquette to not leave the session open
+                                                        // logging out will drop the session, which also drops the client, which drops the stream/connection
 
         let record_batch = self.build_recordbatch(messages)?;
         let table = MemTable::try_new(self.schema(), vec![vec![record_batch]])?;

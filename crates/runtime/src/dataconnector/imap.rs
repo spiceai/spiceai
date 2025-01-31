@@ -16,11 +16,12 @@ limitations under the License.
 
 use crate::component::dataset::Dataset;
 use async_trait::async_trait;
-use data_components::imap::ImapTableProvider;
+use data_components::imap::{
+    session::{ImapAuthMode, ImapSession},
+    ImapTableProvider,
+};
 use datafusion::datasource::TableProvider;
-use imap::{Client, ImapConnection};
 use regex::Regex;
-use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
 use snafu::prelude::*;
 use std::{
     any::Any,
@@ -29,11 +30,10 @@ use std::{
     pin::Pin,
     sync::{Arc, LazyLock},
 };
-use url::Url;
 
 use super::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
-    InvalidConfigurationSnafu, ParameterSpec, Parameters,
+    ParameterSpec,
 };
 
 #[derive(Debug, Snafu)]
@@ -53,9 +53,7 @@ pub enum Error {
 }
 
 pub struct Imap {
-    params: Parameters,
-    host: Arc<str>,
-    port: u16,
+    session: ImapSession,
 }
 
 #[derive(Default, Copy, Clone)]
@@ -71,14 +69,92 @@ impl ImapFactory {
     pub fn new_arc() -> Arc<dyn DataConnectorFactory> {
         Arc::new(Self {}) as Arc<dyn DataConnectorFactory>
     }
+
+    /// Parse the email address and subsequently the host from the 'from' field of the dataset
+    fn parse_host(
+        params: &mut ConnectorParams,
+    ) -> Result<Arc<str>, Box<dyn std::error::Error + Send + Sync>> {
+        match &params.component {
+            ConnectorComponent::Dataset(dataset) => {
+                if let Some(captures) = EMAILISH_REGEX.captures(&dataset.from.replace("imap:", ""))
+                {
+                    let Some(email) = captures.get(0) else {
+                        unreachable!("If there is a capture, capture group 0 will always exist");
+                    };
+
+                    if params.parameters.get("username").expose().ok().is_none() {
+                        params
+                            .parameters
+                            .insert("username".to_string(), email.as_str().to_string().into());
+                    }
+
+                    let segments = email.as_str().split('@').collect::<Vec<&str>>();
+                    let Some(host) = segments.get(1) else {
+                        unreachable!("If there is a capture, there should be a split at @");
+                    };
+
+                    let host_param = params.parameters.get("host").expose().ok();
+
+                    if host_param.is_none()
+                        && (host.is_empty() || !PRESET_HOST_CONNECTIONS.contains_key(host))
+                    {
+                        return Err(DataConnectorError::InvalidConfigurationSourceOnly {
+                            dataconnector: "imap".to_string(),
+                            connector_component: params.component.clone(),
+                            source: Error::HostRequired.into(),
+                        }
+                        .into());
+                    }
+
+                    if let Some(host_param) = host_param {
+                        Ok(host_param.into())
+                    } else {
+                        let Some(preset_host) = PRESET_HOST_CONNECTIONS.get(host) else {
+                            return Err(DataConnectorError::InvalidConfigurationSourceOnly {
+                                dataconnector: "imap".to_string(),
+                                connector_component: params.component.clone(),
+                                source: Error::HostRequired.into(),
+                            }
+                            .into());
+                        };
+                        Ok((*preset_host).into())
+                    }
+                } else {
+                    Err(DataConnectorError::InvalidConfigurationSourceOnly {
+                        dataconnector: "imap".to_string(),
+                        connector_component: params.component.clone(),
+                        source: Error::InvalidFrom {
+                            from: dataset.from.to_string(),
+                        }
+                        .into(),
+                    }
+                    .into())
+                }
+            }
+            ConnectorComponent::Catalog(_) => Err(DataConnectorError::InvalidConnectorType {
+                dataconnector: "imap".to_string(),
+                connector_component: params.component.clone(),
+            }
+            .into()),
+        }
+    }
 }
 
 const PARAMETERS: &[ParameterSpec] = &[
-    ParameterSpec::connector("username").secret(),
-    ParameterSpec::connector("password").secret(),
-    ParameterSpec::connector("host"),
-    ParameterSpec::connector("mailbox"),
-    ParameterSpec::connector("port").default("993"),
+    ParameterSpec::connector("username")
+        .secret()
+        .description("The username to use for the IMAP connection"),
+    ParameterSpec::connector("password")
+        .required()
+        .secret()
+        .description("The password to use for the IMAP connection"),
+    ParameterSpec::connector("host").description("The IMAP server host to connect to"),
+    ParameterSpec::connector("mailbox")
+        .default("INBOX")
+        .description("The name of the IMAP mailbox to connect to"),
+    ParameterSpec::connector("port")
+        .default("993")
+        .description("The port to connect to on the IMAP server"),
 ];
 
 // Regex that matches an email address in a simple way
@@ -104,84 +180,25 @@ impl DataConnectorFactory for ImapFactory {
         mut params: ConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
-            let host = match &params.component {
-                ConnectorComponent::Dataset(dataset) => {
-                    // let email = dataset.from.matches(&EMAILISH_REGEX).collect::<Vec<&str>>();
-                    if let Some(captures) =
-                        EMAILISH_REGEX.captures(&dataset.from.replace("imap:", ""))
-                    {
-                        let Some(email) = captures.get(0) else {
-                            unreachable!(
-                                "If there is a capture, capture group 0 will always exist"
-                            );
-                        };
+            let host = Self::parse_host(&mut params)?;
 
-                        if params.parameters.get("username").expose().ok().is_none() {
-                            params
-                                .parameters
-                                .insert("username".to_string(), email.as_str().to_string().into());
-                        }
-
-                        let segments = email.as_str().split('@').collect::<Vec<&str>>();
-                        let Some(host) = segments.get(1) else {
-                            unreachable!("If there is a capture, there should be a split at @");
-                        };
-
-                        let host_param = params.parameters.get("host").expose().ok();
-
-                        if host_param.is_none()
-                            && (host.is_empty() || !PRESET_HOST_CONNECTIONS.contains_key(host))
-                        {
-                            return Err(DataConnectorError::InvalidConfigurationSourceOnly {
-                                dataconnector: "imap".to_string(),
-                                connector_component: params.component.clone(),
-                                source: Error::HostRequired.into(),
-                            }
-                            .into());
-                        }
-
-                        if let Some(host_param) = host_param {
-                            host_param
-                        } else {
-                            let Some(preset_host) = PRESET_HOST_CONNECTIONS.get(host) else {
-                                return Err(DataConnectorError::InvalidConfigurationSourceOnly {
-                                    dataconnector: "imap".to_string(),
-                                    connector_component: params.component.clone(),
-                                    source: Error::HostRequired.into(),
-                                }
-                                .into());
-                            };
-                            *preset_host
-                        }
-                    } else {
-                        return Err(DataConnectorError::InvalidConfigurationSourceOnly {
-                            dataconnector: "imap".to_string(),
-                            connector_component: params.component.clone(),
-                            source: Error::InvalidFrom {
-                                from: dataset.from.to_string(),
-                            }
-                            .into(),
-                        }
-                        .into());
-                    }
-                }
-                ConnectorComponent::Catalog(_) => {
-                    return Err(DataConnectorError::InvalidConnectorType {
-                        dataconnector: "imap".to_string(),
-                        connector_component: params.component.clone(),
-                    }
-                    .into());
-                }
-            };
-
-            if params.parameters.get("password").expose().ok().is_none() {
+            let Some(password) = params.parameters.get("password").ok() else {
                 return Err(DataConnectorError::InvalidConfigurationSourceOnly {
                     dataconnector: "imap".to_string(),
                     connector_component: params.component.clone(),
                     source: Error::PasswordRequired.into(),
                 }
                 .into());
-            }
+            };
+
+            let Some(username) = params.parameters.get("username").ok() else {
+                return Err(DataConnectorError::InvalidConfigurationSourceOnly {
+                    dataconnector: "imap".to_string(),
+                    connector_component: params.component.clone(),
+                    source: Error::PasswordRequired.into(),
+                }
+                .into());
+            };
 
             let port = if let Some(port) = params.parameters.get("port").expose().ok() {
                 match port.parse::<u16>() {
@@ -199,11 +216,24 @@ impl DataConnectorFactory for ImapFactory {
                 993
             };
 
-            let host = host.into();
+            let mailbox = params
+                .parameters
+                .get("mailbox")
+                .expose()
+                .ok()
+                .unwrap_or("INBOX");
+
+            let mailbox = mailbox.into();
+
+            let auth_mode =
+                if host == "imap.gmail.com".into() || host == "outlook.office365.com".into() {
+                    ImapAuthMode::new_oauth2(username.clone(), password.clone())
+                } else {
+                    ImapAuthMode::new_plain(username.clone(), password.clone())
+                };
+
             Ok(Arc::new(Imap {
-                params: params.parameters,
-                host,
-                port,
+                session: ImapSession::new(auth_mode, host, port, mailbox),
             }) as Arc<dyn DataConnector>)
         })
     }
@@ -225,40 +255,8 @@ impl DataConnector for Imap {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        _dataset: &Dataset,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
-        let client = imap::ClientBuilder::new(Arc::clone(&self.host), self.port)
-            .connect()
-            .map_err(|source| DataConnectorError::UnableToGetReadProvider {
-                dataconnector: "imap".to_string(),
-                connector_component: ConnectorComponent::Dataset(dataset.clone().into()),
-                source: Error::ImapError { source }.into(),
-            })?;
-
-        let Some(password) = self.params.get("password").expose().ok() else {
-            return Err(DataConnectorError::InvalidConfigurationSourceOnly {
-                dataconnector: "imap".to_string(),
-                connector_component: ConnectorComponent::Dataset(dataset.clone().into()),
-                source: Error::PasswordRequired.into(),
-            });
-        };
-
-        let Some(username) = self.params.get("username").expose().ok() else {
-            return Err(DataConnectorError::InvalidConfigurationSourceOnly {
-                dataconnector: "imap".to_string(),
-                connector_component: ConnectorComponent::Dataset(dataset.clone().into()),
-                source: Error::UsernameRequired.into(),
-            });
-        };
-
-        let session = client.login(username, password).map_err(|source| {
-            DataConnectorError::UnableToGetReadProvider {
-                dataconnector: "imap".to_string(),
-                connector_component: ConnectorComponent::Dataset(dataset.clone().into()),
-                source: Error::ImapError { source: source.0 }.into(),
-            }
-        })?;
-
-        Ok(Arc::new(ImapTableProvider::new(session)))
+        Ok(Arc::new(ImapTableProvider::new(self.session.clone())))
     }
 }

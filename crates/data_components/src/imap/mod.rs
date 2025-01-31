@@ -21,11 +21,11 @@ use arrow::{
     error::ArrowError,
 };
 use datafusion::{catalog::TableProvider, error::DataFusionError};
-use imap::{ImapConnection, Session as ImapSession};
+use session::ImapSession;
 use snafu::prelude::*;
-use tokio::sync::Mutex;
 
 pub mod provider;
+pub mod session;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -43,11 +43,19 @@ pub enum Error {
     HeaderNotFound,
     #[snafu(display("Failed to parse header: {source}"))]
     FailedToParseHeader { source: mailparse::MailParseError },
+    #[snafu(display(
+        "Failed to login.\nVerify the username and password, and try again.\n{source}"
+    ))]
+    FailedToLogin { source: imap::Error },
+    #[snafu(display("Failed to connect: {source}"))]
+    FailedToConnect { source: imap::Error },
+    #[snafu(display("Failed to logout: {source}"))]
+    FailedToLogout { source: imap::Error },
 }
 
 #[derive(Debug)]
 pub struct ImapTableProvider {
-    session: Mutex<ImapSession<Box<dyn ImapConnection>>>,
+    session: ImapSession,
 }
 
 fn build_listarray_for_strings(values: Vec<Option<Vec<Option<String>>>>) -> ListArray {
@@ -61,10 +69,8 @@ fn build_listarray_for_strings(values: Vec<Option<Vec<Option<String>>>>) -> List
 
 impl ImapTableProvider {
     #[must_use]
-    pub fn new(session: ImapSession<Box<dyn ImapConnection>>) -> Self {
-        Self {
-            session: Mutex::new(session),
-        }
+    pub fn new(session: ImapSession) -> Self {
+        Self { session }
     }
 
     pub(crate) fn build_recordbatch(
