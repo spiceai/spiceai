@@ -36,6 +36,36 @@ use super::{
     ParameterSpec,
 };
 
+const PARAMETERS: &[ParameterSpec] = &[
+    ParameterSpec::connector("username")
+        .secret()
+        .description("The username to use for the IMAP connection"),
+    ParameterSpec::connector("password")
+        .required()
+        .secret()
+        .description("The password to use for the IMAP connection"),
+    ParameterSpec::connector("host").description("The IMAP server host to connect to"),
+    ParameterSpec::connector("mailbox")
+        .default("INBOX")
+        .description("The name of the IMAP mailbox to connect to"),
+    ParameterSpec::connector("port")
+        .default("993")
+        .description("The port to connect to on the IMAP server"),
+];
+
+// Regex that matches an email address in a simple way
+// Email-ish - because it could match things that are not valid email addresses
+static EMAILISH_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^[\w._%+-]+@[\w-]+\.([\w-]+\.?){1,}$").expect("Should create emailish regex")
+});
+
+static PRESET_HOST_CONNECTIONS: LazyLock<HashMap<&str, &str>> = LazyLock::new(|| {
+    let mut map = HashMap::new();
+    map.insert("gmail.com", "imap.gmail.com");
+    map.insert("outlook.com", "outlook.office365.com");
+    map
+});
+
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("A password parameter is required, but was not provided"))]
@@ -139,36 +169,6 @@ impl ImapFactory {
         }
     }
 }
-
-const PARAMETERS: &[ParameterSpec] = &[
-    ParameterSpec::connector("username")
-        .secret()
-        .description("The username to use for the IMAP connection"),
-    ParameterSpec::connector("password")
-        .required()
-        .secret()
-        .description("The password to use for the IMAP connection"),
-    ParameterSpec::connector("host").description("The IMAP server host to connect to"),
-    ParameterSpec::connector("mailbox")
-        .default("INBOX")
-        .description("The name of the IMAP mailbox to connect to"),
-    ParameterSpec::connector("port")
-        .default("993")
-        .description("The port to connect to on the IMAP server"),
-];
-
-// Regex that matches an email address in a simple way
-// Email-ish - because it could match things that are not valid email addresses
-static EMAILISH_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^[\w._%+-]+@[\w-]+\.([\w-]+\.?){1,}$").expect("Should create emailish regex")
-});
-
-static PRESET_HOST_CONNECTIONS: LazyLock<HashMap<&str, &str>> = LazyLock::new(|| {
-    let mut map = HashMap::new();
-    map.insert("gmail.com", "imap.gmail.com");
-    map.insert("outlook.com", "outlook.office365.com");
-    map
-});
 
 impl DataConnectorFactory for ImapFactory {
     fn as_any(&self) -> &dyn Any {
