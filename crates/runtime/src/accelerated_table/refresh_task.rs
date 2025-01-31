@@ -208,6 +208,16 @@ impl RefreshTask {
             refresh.sql.as_deref(),
         )
         .await
+        .inspect_err(|e| {
+            tracing::warn!(
+                "Failed to load data for dataset {}: {}",
+                include_source_to_dataset_name(
+                    &self.dataset_name,
+                    self.federated_source.as_deref()
+                ),
+                inner_err_from_retry_ref(e)
+            );
+        })
     }
 
     async fn write_streaming_data_update(

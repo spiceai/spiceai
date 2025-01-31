@@ -2,6 +2,7 @@ name: http consistency tests
 
 on:
   workflow_dispatch:
+    # Only <=10 inputs allowed. Some parameters for `testoperator run http-consistency` are optional and less important..
     inputs:
       spiced_commit:
         description: "spiced build commit"
@@ -11,6 +12,11 @@ on:
         description: "The spicepod file to test with"
         required: true
         type: string
+      concurrency:
+        description: "The number of concurrent clients"
+        required: true
+        default: 1
+        type: number
       duration:
         description: "The test duration in seconds"
         required: true
@@ -28,11 +34,11 @@ on:
         description: "Embedding name"
         required: false
         type: string
-      ready_wait:
-        description: "How long (in seconds) to wait for spiced to start"
-        required: true
-        default: "30"
-        type: string
+      warmup:
+        description: "The duration of the warmup period in seconds"
+        required: false
+        default: 0
+        type: number
       buckets:
         description: "The number of buckets to divide the test duration into"
         required: true
@@ -51,10 +57,11 @@ jobs:
           echo "  spiced_commit=${{ github.event.inputs.spiced_commit || 'latest trunk' }}"
           echo "  spicepod_path=${{ github.event.inputs.spicepod_path }}"
           echo "  duration=${{ github.event.inputs.duration }}"
+          echo "  concurrency=${{ github.event.inputs.concurrency }}"
+          echo "  warmup=${{ github.event.inputs.warmup }}"
           echo "  payload_file=${{ github.event.inputs.payload_file }}"
           echo "  model=${{ github.event.inputs.model }}"
           echo "  embedding=${{ github.event.inputs.embedding }}"
-          echo "  ready_wait=${{ github.event.inputs.ready_wait }}"
           echo "  buckets=${{ github.event.inputs.buckets }}"
 
       - uses: actions/checkout@v4
@@ -65,7 +72,7 @@ jobs:
           sudo wget https://dl.min.io/client/mc/release/linux-amd64/mc -O /usr/local/bin/mc
           sudo chmod +x /usr/local/bin/mc
           mc alias set spice-minio ${{ secrets.MINIO_ENDPOINT }} ${{ secrets.MINIO_ACCESS_KEY }} ${{ secrets.MINIO_SECRET_KEY }}
-      
+
       - name: Setup spiced
         uses: ./.github/actions/setup-spiced
         with:
@@ -80,10 +87,11 @@ jobs:
           testoperator run http-consistency \
             -s /usr/local/bin/spiced \
             -p ${{ github.event.inputs.spicepod_path }} \
-            --ready-wait ${{ github.event.inputs.ready_wait }} \
             --model ${{ github.event.inputs.model }} \
             --disable-progress-bars \
             --duration ${{ github.event.inputs.duration }} \
+            --concurrency ${{ github.event.inputs.concurrency }} \
+            --warmup ${{ github.event.inputs.warmup }} \
             --payload-file ${{ github.event.inputs.payload_file }}
         env:
           SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
@@ -96,10 +104,11 @@ jobs:
           testoperator run http-consistency \
             -s /usr/local/bin/spiced \
             -p ${{ github.event.inputs.spicepod_path }} \
-            --ready-wait ${{ github.event.inputs.ready_wait }} \
             --embedding ${{ github.event.inputs.embedding }} \
             --disable-progress-bars \
+            --concurrency ${{ github.event.inputs.concurrency }} \
             --duration ${{ github.event.inputs.duration }} \
+            --warmup ${{ github.event.inputs.warmup }} \
             --payload-file ${{ github.event.inputs.payload_file }}
         env:
           SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}

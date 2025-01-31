@@ -28,10 +28,10 @@ on:
         description: "Embedding name"
         required: false
         type: string
-      ready_wait:
-        description: "How long (in seconds) to wait for spiced to start"
-        required: true
-        default: "30"
+      concurrency:
+        description: "The number of concurrent clients"
+        required: false
+        default: "1"
         type: string
       base:
         description: Underlying HTTP service to test against
@@ -45,6 +45,10 @@ on:
       base_component:
         description: "Base component"
         required: true
+        type: string
+      base_payload_file:
+        description: "The path to a file containing request body to use in testing the baseline component"
+        required: false
         type: string
 
 jobs:
@@ -62,7 +66,7 @@ jobs:
           echo "  payload_file=${{ github.event.inputs.payload_file }}"
           echo "  model=${{ github.event.inputs.model }}"
           echo "  embedding=${{ github.event.inputs.embedding }}"
-          echo "  ready_wait=${{ github.event.inputs.ready_wait }}"
+          echo "  concurrency=${{ github.event.inputs.concurrency }}"
           echo "  base=${{ github.event.inputs.base }}"
           echo "  base_component=${{ github.event.inputs.base_component }}"
 
@@ -74,7 +78,7 @@ jobs:
           sudo wget https://dl.min.io/client/mc/release/linux-amd64/mc -O /usr/local/bin/mc
           sudo chmod +x /usr/local/bin/mc
           mc alias set spice-minio ${{ secrets.MINIO_ENDPOINT }} ${{ secrets.MINIO_ACCESS_KEY }} ${{ secrets.MINIO_SECRET_KEY }}
-      
+
       - name: Setup spiced
         uses: ./.github/actions/setup-spiced
         with:
@@ -102,14 +106,15 @@ jobs:
           testoperator run http-overhead \
             -s /usr/local/bin/spiced \
             -p ${{ github.event.inputs.spicepod_path }} \
-            --ready-wait ${{ github.event.inputs.ready_wait }} \
             --model ${{ github.event.inputs.model }} \
             --disable-progress-bars \
+            --concurrency ${{ github.event.inputs.concurrency }} \
             --duration ${{ github.event.inputs.duration }} \
             --payload-file ${{ github.event.inputs.payload_file }} \
             --base-url ${{ env.BASE_URL }} \
             --base-header "${{ env.BASE_HEADER }}" \
-            --base-component ${{ github.event.inputs.base_component }}
+            --base-component ${{ github.event.inputs.base_component }} \
+            ${{ github.event.inputs.base_payload_file && '--base-payload-file ' || '' }}${{ github.event.inputs.base_payload_file }}
         env:
           SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
           SPICE_SECRET_ANTHROPIC_API_KEY: ${{ secrets.SPICE_SECRET_ANTHROPIC_API_KEY }}
@@ -121,14 +126,15 @@ jobs:
           testoperator run http-overhead \
             -s /usr/local/bin/spiced \
             -p ${{ github.event.inputs.spicepod_path }} \
-            --ready-wait ${{ github.event.inputs.ready_wait }} \
             --embedding ${{ github.event.inputs.embedding }} \
             --disable-progress-bars \
+            --concurrency ${{ github.event.inputs.concurrency }} \
             --duration ${{ github.event.inputs.duration }} \
             --payload-file ${{ github.event.inputs.payload_file }} \
             --base-url ${{ env.BASE_URL }} \
             --base-header "${{ env.BASE_HEADER }}" \
-            --base-component ${{ github.event.inputs.base_component }}
+            --base-component ${{ github.event.inputs.base_component }} \
+            ${{ github.event.inputs.base_payload_file && '--base-payload-file ' || '' }}${{github.event.inputs.base_payload_file }}
         env:
           SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
           SPICE_SECRET_ANTHROPIC_API_KEY: ${{ secrets.SPICE_SECRET_ANTHROPIC_API_KEY }}

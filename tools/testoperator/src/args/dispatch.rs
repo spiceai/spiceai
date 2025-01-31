@@ -21,6 +21,8 @@ use test_framework::{queries::QuerySet, TestType};
 
 use super::dataset::QueryOverridesArg;
 
+use super::HttpTestArgs;
+
 #[derive(Parser, Debug, Clone)]
 pub struct DispatchArgs {
     /// A positional argument for the directory to scan, or test file
@@ -30,6 +32,15 @@ pub struct DispatchArgs {
     /// The GitHub workflow to execute
     #[arg(long)]
     pub(crate) workflow: Workflow,
+
+    #[arg(long, env = "GH_TOKEN")]
+    pub(crate) github_token: String,
+
+    #[arg(long, env = "SPICED_COMMIT", default_value = "")]
+    pub(crate) spiced_commit: String,
+
+    #[arg(long, env = "WORKFLOW_COMMIT", default_value = "trunk")]
+    pub(crate) workflow_commit: String,
 }
 
 #[derive(Debug, Copy, Clone, ValueEnum)]
@@ -69,7 +80,8 @@ pub struct DispatchTests {
     pub bench: Option<BenchArgs>,
     pub throughput: Option<BenchArgs>,
     pub load: Option<LoadArgs>,
-    // TODO: add data consistency, http consistency, http overhead
+    pub http_consistency: Option<HttpConsistencyArgs>,
+    pub http_overhead: Option<HttpOverheadArgs>,
 }
 
 /// Benchmark and throughput workflow arguments, defined in the test files
@@ -99,20 +111,59 @@ pub enum RunnerType {
     LargeSelfHosted,
 }
 
-/// Payload sent to the GitHub Actions workflow request for Benchmark and Throughput tests
+/// Payload sent to the GitHub Actions workflow request for HTTP consistency tests
 /// `spiced_commit` is not an eligible argument in the test files, as it is controlled by the environment
-#[derive(Debug, Clone, Serialize)]
-pub struct BenchWorkflowArgs {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HttpConsistencyArgs {
     #[serde(flatten)]
-    pub bench_args: BenchArgs,
-    pub spiced_commit: String,
+    pub http_args: HttpTestArgs,
+
+    pub buckets: usize,
+    pub spicepod_path: PathBuf,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub concurrency: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration: Option<u64>,
 }
 
-/// Payload sent to the GitHub Actions workflow request for Load tests
+/// Payload sent to the GitHub Actions workflow request for HTTP overhead tests
 /// `spiced_commit` is not an eligible argument in the test files, as it is controlled by the environment
-#[derive(Debug, Clone, Serialize)]
-pub struct LoadWorkflowArgs {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HttpOverheadArgs {
     #[serde(flatten)]
-    pub load_args: LoadArgs,
+    pub http_args: HttpTestArgs,
+    pub spicepod_path: PathBuf,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub concurrency: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration: Option<u64>,
+
+    pub base: OverheadBaseModel,
+    pub base_component: String,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_payload_file: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OverheadBaseModel {
+    #[serde(rename = "openai")]
+    OpenAI,
+    Anthropic,
+    Xai,
+}
+
+/// A wrapper around input arguments, from a test file, to use in a GitHub Actions workflow, that also expects
+/// a `spiced_commit` input.
+///
+/// `spiced_commit` is not an eligible argument in the test files, as it is controlled by the
+/// environment.
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkflowArgs<T: Serialize> {
+    #[serde(flatten)]
+    pub specific_args: T,
     pub spiced_commit: String,
 }
