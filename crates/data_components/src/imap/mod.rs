@@ -45,12 +45,19 @@ pub enum Error {
     GetMailboxStatus { source: imap::Error },
     #[snafu(display("Could not find message at index"))]
     MessageNotFound,
-    #[snafu(display("Could not find envelope"))]
-    EnvelopeNotFound,
+    #[snafu(display("Could not find envelope segment: {segment}"))]
+    EnvelopeNotFound { segment: String },
     #[snafu(display("Could not find header"))]
     HeaderNotFound,
     #[snafu(display("Failed to parse header: {source}"))]
     FailedToParseHeader { source: mailparse::MailParseError },
+}
+
+fn decode(value: &[u8]) -> String {
+    match String::from_utf8(value.to_vec()) {
+        Ok(s) => s,
+        Err(_) => charset::decode_latin1(value).to_string(),
+    }
 }
 
 #[derive(Debug)]
@@ -82,34 +89,34 @@ impl TableProvider for ImapTableProvider {
     fn schema(&self) -> SchemaRef {
         Arc::new(Schema::new(vec![
             Field::new("date", DataType::Date64, false),
-            Field::new("subject", DataType::Utf8, false),
-            Field::new(
-                "from",
-                DataType::List(Arc::new(Field::new("email", DataType::Utf8, false))),
-                false,
-            ),
-            Field::new(
-                "to",
-                DataType::List(Arc::new(Field::new("email", DataType::Utf8, false))),
-                false,
-            ),
-            Field::new(
-                "cc",
-                DataType::List(Arc::new(Field::new("email", DataType::Utf8, false))),
-                false,
-            ),
-            Field::new(
-                "bcc",
-                DataType::List(Arc::new(Field::new("email", DataType::Utf8, false))),
-                false,
-            ),
-            Field::new(
-                "reply_to",
-                DataType::List(Arc::new(Field::new("email", DataType::Utf8, false))),
-                false,
-            ),
-            Field::new("message_id", DataType::Utf8, false),
-            Field::new("in_reply_to", DataType::Utf8, false),
+            Field::new("subject", DataType::Utf8, true),
+            // Field::new(
+            //     "from",
+            //     DataType::List(Arc::new(Field::new("email", DataType::Utf8, false))),
+            //     false,
+            // ),
+            // Field::new(
+            //     "to",
+            //     DataType::List(Arc::new(Field::new("email", DataType::Utf8, false))),
+            //     false,
+            // ),
+            // Field::new(
+            //     "cc",
+            //     DataType::List(Arc::new(Field::new("email", DataType::Utf8, false))),
+            //     false,
+            // ),
+            // Field::new(
+            //     "bcc",
+            //     DataType::List(Arc::new(Field::new("email", DataType::Utf8, false))),
+            //     false,
+            // ),
+            // Field::new(
+            //     "reply_to",
+            //     DataType::List(Arc::new(Field::new("email", DataType::Utf8, false))),
+            //     false,
+            // ),
+            Field::new("message_id", DataType::Utf8, true),
+            Field::new("in_reply_to", DataType::Utf8, true),
         ]))
     }
 
@@ -140,46 +147,57 @@ impl TableProvider for ImapTableProvider {
             .context(FetchMessagesSnafu)?;
         let mut subjects = vec![];
         let mut dates = vec![];
+        let mut message_ids = vec![];
+        let mut in_reply_tos = vec![];
 
         for i in 0..messages.len() {
             let message = messages.get(i).ok_or(Error::MessageNotFound {})?;
-            let header = message.header().ok_or(Error::HeaderNotFound {})?;
-            let headers = mailparse::parse_headers(header).context(FailedToParseHeaderSnafu)?;
-            let subject = headers
-                .0
-                .get_first_header("Subject")
-                .ok_or(Error::EnvelopeNotFound {})?
-                .get_value();
-            let date = headers
-                .0
-                .get_first_header("Date")
-                .ok_or(Error::EnvelopeNotFound {})?
-                .get_value();
-            let date = dateparse(&date).context(FailedToParseHeaderSnafu)?;
+            // let header = message.header().ok_or(Error::HeaderNotFound {})?;
+            let envelope = message.envelope().ok_or(Error::EnvelopeNotFound {
+                segment: "envelope".to_string(),
+            })?;
+            let subject = envelope.subject.as_ref().map(|v| decode(v));
+            let date = dateparse(&decode(envelope.date.as_ref().ok_or(
+                Error::EnvelopeNotFound {
+                    segment: "date".to_string(),
+                },
+            )?))
+            .context(FailedToParseHeaderSnafu)?;
 
-            for header in &headers.0 {
-                println!("{}", header.get_key());
-            }
+            let message_id = envelope.message_id.as_ref().map(|v| decode(v));
+            let in_reply_to = envelope.in_reply_to.as_ref().map(|v| decode(v));
+            // let headers = mailparse::parse_headers(header).context(FailedToParseHeaderSnafu)?;
+            // let subject = headers
+            //     .0
+            //     .get_first_header("Subject")
+            //     .ok_or(Error::EnvelopeNotFound {})?
+            //     .get_value();
+            // let date = headers
+            //     .0
+            //     .get_first_header("Date")
+            //     .ok_or(Error::EnvelopeNotFound {})?
+            //     .get_value();
+            // let date = dateparse(&date).context(FailedToParseHeaderSnafu)?;
 
-            println!("{date} - {subject} - {i}/{message_count}");
+            // for header in &headers.0 {
+            //     println!("{}", header.get_key());
+            // }
+
+            println!("{date} - {subject:?} - {i}/{message_count}");
 
             dates.push(date);
             subjects.push(subject);
+            message_ids.push(message_id);
+            in_reply_tos.push(in_reply_to);
         }
 
-        let subject_len = subjects.len();
         let record_batch = RecordBatch::try_new(
             self.schema(),
             vec![
                 Arc::new(Date64Array::from(dates)),
                 Arc::new(StringArray::from(subjects)),
-                Arc::new(StringArray::from(vec![""; subject_len])),
-                Arc::new(StringArray::from(vec![""; subject_len])),
-                Arc::new(StringArray::from(vec![""; subject_len])),
-                Arc::new(StringArray::from(vec![""; subject_len])),
-                Arc::new(StringArray::from(vec![""; subject_len])),
-                Arc::new(StringArray::from(vec![""; subject_len])),
-                Arc::new(StringArray::from(vec![""; subject_len])),
+                Arc::new(StringArray::from(message_ids)),
+                Arc::new(StringArray::from(in_reply_tos)),
             ],
         )?;
 

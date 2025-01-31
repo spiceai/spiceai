@@ -309,6 +309,7 @@ pub async fn register_all() {
     register_connector_factory("abfs", abfs::AzureBlobFSFactory::new_arc()).await;
     #[cfg(feature = "ftp")]
     register_connector_factory("ftp", ftp::FTPFactory::new_arc()).await;
+    register_connector_factory("imap", imap::ImapFactory::new_arc()).await;
     register_connector_factory("http", https::HttpsFactory::new_arc()).await;
     register_connector_factory("https", https::HttpsFactory::new_arc()).await;
     register_connector_factory("github", github::GithubFactory::new_arc()).await;

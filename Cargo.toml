@@ -60,6 +60,7 @@ base64 = "0.22.1"
 bb8 = "0.8"
 bb8-postgres = "0.8"
 bytes = "1.9.0"
+charset = "0.1.5"
 chrono = "0.4.38"
 clap = { version = "4.5.21", features = ["derive"] }
 clickhouse-rs = { git = "https://github.com/spiceai/clickhouse-rs.git", tag = "0.2.1", features = [
