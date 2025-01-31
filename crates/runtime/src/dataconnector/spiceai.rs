@@ -167,8 +167,14 @@ impl SpiceAIFactory {
             props.insert("token".to_string(), api_key.to_string());
         };
 
+        let endpoint = params
+            .get("http_endpoint")
+            .expose()
+            .ok()
+            .unwrap_or("https://data.spiceai.io");
+
         let catalog_config = RestCatalogConfig::builder()
-            .uri("https://data.spiceai.io".to_string())
+            .uri(endpoint.to_string())
             .props(props)
             .build();
 
@@ -179,7 +185,8 @@ impl SpiceAIFactory {
 const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::connector("api_key").secret(),
     ParameterSpec::connector("token").secret(),
-    ParameterSpec::connector("endpoint"),
+    ParameterSpec::connector("flight_endpoint"),
+    ParameterSpec::connector("http_endpoint"),
 ];
 
 const HEADER_ORG: &str = "spiceai-org";
@@ -202,7 +209,7 @@ impl DataConnectorFactory for SpiceAIFactory {
         Box::pin(async move {
             let url: Arc<str> = params
                 .parameters
-                .get("endpoint")
+                .get("flight_endpoint")
                 .expose()
                 .ok()
                 .map_or(default_flight_url, Into::into);
