@@ -58,7 +58,6 @@ jobs:
         run: python3 ./.github/scripts/get_release_version.py
 
       - name: Set up Go
-        if: matrix.target.target_os == 'linux'
         uses: actions/setup-go@v5
         with:
           go-version: ${{ env.GOVER }}

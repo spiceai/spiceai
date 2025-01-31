@@ -22,20 +22,15 @@ use test_framework::{
     TestType,
 };
 
-use crate::args::dispatch::{BenchWorkflowArgs, DispatchArgs, DispatchTestFile, LoadWorkflowArgs};
+use crate::args::dispatch::{DispatchArgs, DispatchTestFile, DispatchTests, WorkflowArgs};
 
+#[allow(clippy::too_many_lines)]
 pub async fn dispatch(args: DispatchArgs) -> Result<()> {
     if !args.path.is_dir() && !args.path.is_file() {
         return Err(anyhow::anyhow!("Path must be a directory or a file"));
     }
 
-    if std::env::var("GH_TOKEN").is_err() {
-        return Err(anyhow::anyhow!(
-            "A GitHub token must be set in the GH_TOKEN environment variable"
-        ));
-    }
-
-    let octo_client = octocrab::instance().user_access_token(std::env::var("GH_TOKEN")?)?;
+    let octo_client = octocrab::instance().user_access_token(args.github_token)?;
     let test_type: TestType = args.workflow.into();
     let yaml_files = if args.path.is_dir() {
         scan_directory_for_yamls(&args.path)?
@@ -55,42 +50,85 @@ pub async fn dispatch(args: DispatchArgs) -> Result<()> {
         })
         .collect::<Result<Vec<_>>>()?;
 
-    let spiced_commit = std::env::var("SPICED_COMMIT").ok().unwrap_or_default();
-
     for (path, test) in tests {
-        let mut payload = match test_type {
-            TestType::Benchmark => {
-                if let Some(bench) = test.tests.bench {
-                    serde_json::json!(BenchWorkflowArgs {
-                        bench_args: bench,
-                        spiced_commit: spiced_commit.clone(),
-                    })
-                } else {
-                    println!("Test file {path:#?} does not contain a benchmark test");
-                    continue;
-                }
+        let mut payload = match (test_type, &test.tests) {
+            (
+                TestType::Benchmark,
+                DispatchTests {
+                    bench: Some(bench), ..
+                },
+            ) => {
+                serde_json::json!(WorkflowArgs {
+                    specific_args: bench.clone(),
+                    spiced_commit: args.spiced_commit.clone(),
+                })
             }
-            TestType::Throughput => {
-                if let Some(throughput) = test.tests.throughput {
-                    serde_json::json!(BenchWorkflowArgs {
-                        bench_args: throughput,
-                        spiced_commit: spiced_commit.clone(),
-                    })
-                } else {
-                    println!("Test file {path:#?} does not contain a throughput test");
-                    continue;
-                }
+            (
+                TestType::Throughput,
+                DispatchTests {
+                    throughput: Some(throughput),
+                    ..
+                },
+            ) => {
+                serde_json::json!(WorkflowArgs {
+                    specific_args: throughput.clone(),
+                    spiced_commit: args.spiced_commit.clone(),
+                })
             }
-            TestType::Load => {
-                if let Some(load) = test.tests.load {
-                    serde_json::json!(LoadWorkflowArgs {
-                        load_args: load.clone(),
-                        spiced_commit: spiced_commit.clone(),
-                    })
-                } else {
-                    println!("Test file {path:#?} does not contain a load test");
-                    continue;
-                }
+            (
+                TestType::Load,
+                DispatchTests {
+                    load: Some(load), ..
+                },
+            ) => {
+                serde_json::json!(WorkflowArgs {
+                    specific_args: load.clone(),
+                    spiced_commit: args.spiced_commit.clone(),
+                })
+            }
+            (
+                TestType::HttpConsistency,
+                DispatchTests {
+                    http_consistency: Some(consistency),
+                    ..
+                },
+            ) => {
+                serde_json::json!(WorkflowArgs {
+                    specific_args: consistency,
+                    spiced_commit: args.spiced_commit.clone(),
+                })
+            }
+            (
+                TestType::HttpOverhead,
+                DispatchTests {
+                    http_overhead: Some(overhead),
+                    ..
+                },
+            ) => {
+                serde_json::json!(WorkflowArgs {
+                    specific_args: overhead,
+                    spiced_commit: args.spiced_commit.clone(),
+                })
+            }
+            (TestType::Benchmark, _) => {
+                println!("Test file {path:#?} does not contain a benchmark test");
+                continue;
+            }
+            (TestType::Throughput, _) => {
+                println!("Test file {path:#?} does not contain a throughput test");
+                continue;
+            }
+            (TestType::Load, _) => {
+                println!("Test file {path:#?} does not contain a load test");
+                continue;
+            }
+            (TestType::HttpConsistency, _) => {
+                println!("Test file {path:#?} does not contain an HTTP consistency test");
+                continue;
+            }
+            (TestType::HttpOverhead, _) => {
+                println!("Test file {path:#?} does not contain an HTTP overhead test");
+                continue;
             }
             _ => {
                 return Err(anyhow::anyhow!(
@@ -102,9 +140,14 @@ pub async fn dispatch(args: DispatchArgs) -> Result<()> {
         payload = map_numbers_to_strings(payload);
 
         println!("Dispatching {test_type} test from {path:#?}");
-        GitHubWorkflow::new("spiceai", "spiceai", test_type.workflow(), "trunk")
-            .send(octo_client.actions(), Some(payload))
-            .await?;
+        GitHubWorkflow::new(
+            "spiceai",
+            "spiceai",
+            test_type.workflow(),
+            &args.workflow_commit,
+        )
+        .send(octo_client.actions(), Some(payload))
+        .await?;
 
         // sleep to space out runs
         println!("Waiting for next run...");

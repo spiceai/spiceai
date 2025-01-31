@@ -1,0 +1,9 @@
+tests:
+  http_consistency:
+    spicepod_path: ./test/spicepods/models/hf-llm.yaml
+    concurrency: 8
+    duration: 300
+    payload_file: ./test/payloads/model-llm-lorem-100-completion-tokens.jsonl
+    embedding: model-llm
+    ready_wait: 0
+    buckets: 5
