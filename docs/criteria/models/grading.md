@@ -41,7 +41,6 @@ Represents models certified for use with the Spice Runtime which support more ad
 - **Grading:**
   - More than 75% of the time correctly outputs structured output when it is requested.
   - More than 75% of the time, the model does not enter a recursion loop through any means (tool use, chat completions, etc).
-  - More than 75% of the time, the model calls a tool via the Spice Runtime when it should (e.g. list datasets, dataset schema, etc).
   - More than 75% of the time, the model produces valid SQL when using text-to-SQL (NSQL) queries.
   - More than 75% of the time, the model accurately references documentation and information collected through tool use, including providing accurate citations to connected sources (including SQL tables).
 
@@ -61,6 +60,5 @@ Represents the most advanced model capabilities certified for use with the Spice
 - **Grading:**
   - More than 90% of the time correctly outputs structured output when it is requested.
   - More than 90% of the time, the model does not enter a recursion loop through any means (tool use, chat completions, etc).
-  - More than 90% of the time, the model calls a tool via the Spice Runtime when it should (e.g. list datasets, dataset schema, etc).
   - More than 90% of the time, the model produces valid SQL when using text-to-SQL (NSQL) queries.
   - More than 90% of the time, the model accurately references documentation and information collected through tool use, including providing accurate citations to connected sources (including SQL tables).
