@@ -7076,7 +7076,7 @@ dependencies = [
 [[package]]
 name = "mistralrs"
 version = "0.4.0"
-source = "git+https://github.com/spiceai/mistral.rs?rev=80a152b13219c638c7df5996fcae86effcafd565#80a152b13219c638c7df5996fcae86effcafd565"
+source = "git+https://github.com/spiceai/mistral.rs?rev=6339435d8a1a1b31d32e5a500ded56e2b4365b7b#6339435d8a1a1b31d32e5a500ded56e2b4365b7b"
 dependencies = [
  "anyhow",
  "candle-core 0.8.0",
@@ -7097,7 +7097,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-core"
 version = "0.4.0"
-source = "git+https://github.com/spiceai/mistral.rs?rev=80a152b13219c638c7df5996fcae86effcafd565#80a152b13219c638c7df5996fcae86effcafd565"
+source = "git+https://github.com/spiceai/mistral.rs?rev=6339435d8a1a1b31d32e5a500ded56e2b4365b7b#6339435d8a1a1b31d32e5a500ded56e2b4365b7b"
 dependencies = [
  "akin",
  "anyhow",
@@ -7173,7 +7173,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-paged-attn"
 version = "0.4.0"
-source = "git+https://github.com/spiceai/mistral.rs?rev=80a152b13219c638c7df5996fcae86effcafd565#80a152b13219c638c7df5996fcae86effcafd565"
+source = "git+https://github.com/spiceai/mistral.rs?rev=6339435d8a1a1b31d32e5a500ded56e2b4365b7b#6339435d8a1a1b31d32e5a500ded56e2b4365b7b"
 dependencies = [
  "anyhow",
  "bindgen_cuda 0.1.6",
@@ -7188,7 +7188,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-quant"
 version = "0.4.0"
-source = "git+https://github.com/spiceai/mistral.rs?rev=80a152b13219c638c7df5996fcae86effcafd565#80a152b13219c638c7df5996fcae86effcafd565"
+source = "git+https://github.com/spiceai/mistral.rs?rev=6339435d8a1a1b31d32e5a500ded56e2b4365b7b#6339435d8a1a1b31d32e5a500ded56e2b4365b7b"
 dependencies = [
  "bindgen_cuda 0.1.5",
  "byteorder",
@@ -7210,7 +7210,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-vision"
 version = "0.4.0"
-source = "git+https://github.com/spiceai/mistral.rs?rev=80a152b13219c638c7df5996fcae86effcafd565#80a152b13219c638c7df5996fcae86effcafd565"
+source = "git+https://github.com/spiceai/mistral.rs?rev=6339435d8a1a1b31d32e5a500ded56e2b4365b7b#6339435d8a1a1b31d32e5a500ded56e2b4365b7b"
 dependencies = [
  "candle-core 0.8.0",
  "image 0.25.5",
