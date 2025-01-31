@@ -22,6 +22,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/spiceai/spiceai/bin/spice/pkg/context"
 )
@@ -62,15 +63,36 @@ func SqlRequestToTraces(rtcontext *context.RuntimeContext, sql string) ([]TaskHi
 
 // TaskHistory represents a record in the `runtime.task_history` table.
 type TaskHistory struct {
-	TraceID        string  `json:"trace_id"`
-	SpanID         string  `json:"span_id"`
-	ParentSpanID   *string `json:"parent_span_id,omitempty"`
-	Task           string  `json:"task"`
-	Input          string  `json:"input"`
-	CapturedOutput *string `json:"captured_output,omitempty"`
-	// StartTime           time.Time         `json:"start_time"`
-	// EndTime             time.Time         `json:"end_time"`
-	ExecutionDurationMs float64           `json:"execution_duration_ms"`
-	ErrorMessage        *string           `json:"error_message,omitempty"`
-	Labels              map[string]string `json:"labels"`
+	TraceID             string               `json:"trace_id"`
+	SpanID              string               `json:"span_id"`
+	ParentSpanID        *string              `json:"parent_span_id,omitempty"`
+	Task                string               `json:"task"`
+	Input               string               `json:"input"`
+	CapturedOutput      *string              `json:"captured_output,omitempty"`
+	StartTime           TimeWithMilliSeconds `json:"start_time"`
+	EndTime             TimeWithMilliSeconds `json:"end_time"`
+	ExecutionDurationMs float64              `json:"execution_duration_ms"`
+	ErrorMessage        *string              `json:"error_message,omitempty"`
+	Labels              map[string]string    `json:"labels"`
+}
+
+type TimeWithMilliSeconds time.Time
+
+func (tMs *TimeWithMilliSeconds) UnmarshalJSON(b []byte) error {
+	s := string(b)
+	s = s[1 : len(s)-1]
+
+	layout := "2006-01-02T15:04:05.999999"
+
+	t, err := time.Parse(layout, s)
+	if err != nil {
+		return err
+	}
+
+	*tMs = TimeWithMilliSeconds(t)
+	return nil
+}
+
+func (tMs TimeWithMilliSeconds) asTime() time.Time {
+	return time.Time(tMs)
 }

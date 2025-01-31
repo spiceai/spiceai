@@ -61,7 +61,7 @@ func sortTree(node *TreeNode) {
 		return
 	}
 	sort.Slice(node.Children, func(i, j int) bool {
-		return node.Children[i].TaskHistory.SpanID < node.Children[j].TaskHistory.SpanID
+		return node.Children[i].TaskHistory.StartTime.asTime().Before(node.Children[j].TaskHistory.StartTime.asTime())
 	})
 	for _, child := range node.Children {
 		sortTree(child)
