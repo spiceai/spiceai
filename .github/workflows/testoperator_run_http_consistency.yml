@@ -98,7 +98,7 @@ jobs:
             --duration ${{ github.event.inputs.duration }} \
             --concurrency ${{ github.event.inputs.concurrency }} \
             --warmup ${{ github.event.inputs.warmup }} \
-            --payload-file ${{ github.event.inputs.payload_file }}
+            --payload-file ${{ github.event.inputs.payload_file }} \
             --ready-wait ${{ github.event.inputs.ready_wait }} \
         env:
           SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
@@ -116,8 +116,8 @@ jobs:
             --concurrency ${{ github.event.inputs.concurrency }} \
             --duration ${{ github.event.inputs.duration }} \
             --warmup ${{ github.event.inputs.warmup }} \
-            --payload-file ${{ github.event.inputs.payload_file }}
-            --ready-wait ${{ github.event.inputs.ready_wait }} \
+            --payload-file ${{ github.event.inputs.payload_file }} \
+            --ready-wait ${{ github.event.inputs.ready_wait }}
         env:
           SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
           SPICE_SECRET_ANTHROPIC_API_KEY: ${{ secrets.SPICE_SECRET_ANTHROPIC_API_KEY }}
