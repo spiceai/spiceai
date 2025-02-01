@@ -393,6 +393,7 @@ pub enum ModelFileType {
     Config,
     Tokenizer,
     TokenizerConfig,
+    GenerationConfig,
 }
 
 /// Attempts to determine the file type for the [`ModelFile`] based on the file path. If
@@ -417,6 +418,10 @@ pub(crate) fn determine_type_from_path(p: &str) -> Option<ModelFileType> {
 
     if filename == "tokenizer_config.json" {
         return Some(ModelFileType::TokenizerConfig);
+    }
+
+    if filename == "generation_config.json" {
+        return Some(ModelFileType::GenerationConfig);
     }
 
     None

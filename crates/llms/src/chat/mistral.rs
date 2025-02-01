@@ -73,6 +73,7 @@ impl MistralLlama {
         config: Option<&Path>,
         tokenizer: Option<&Path>,
         tokenizer_config: Option<&Path>,
+        generation_config: Option<&Path>,
         chat_template_literal: Option<&str>,
     ) -> Result<Self> {
         for weight in model_weights {
@@ -107,7 +108,13 @@ impl MistralLlama {
             }
         }
 
-        let paths = Self::create_paths(model_weights, config, tokenizer, tokenizer_config);
+        let paths = Self::create_paths(
+            model_weights,
+            config,
+            tokenizer,
+            tokenizer_config,
+            generation_config,
+        );
         let model_id = model_weights
             .first()
             .map(|w| w.to_string_lossy().to_string())
@@ -144,6 +151,7 @@ impl MistralLlama {
         config: Option<&Path>,
         tokenizer: Option<&Path>,
         tokenizer_config: Option<&Path>,
+        generation_config: Option<&Path>,
     ) -> Box<dyn ModelPaths> {
         Box::new(LocalModelPaths::new(
             tokenizer.map(Into::into).unwrap_or_default(),
@@ -155,7 +163,7 @@ impl MistralLlama {
             None,
             None,
             None,
-            None,
+            generation_config.map(Into::into),
             None,
             None,
             None,
