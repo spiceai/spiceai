@@ -127,7 +127,11 @@ impl TableProvider for ImapTableProvider {
         let status = session
             .status(self.session.mailbox(), "(MESSAGES)")
             .context(GetMailboxStatusSnafu)?;
-        let message_count = status.exists;
+        let message_count = if let Some(limit) = limit {
+            limit.min(status.exists as usize)
+        } else {
+            status.exists as usize
+        };
 
         let fetch_messages = session
             .fetch(

@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use base64::prelude::*;
 use imap::{ImapConnection, Session};
 use secrecy::{ExposeSecret, SecretString};
 use snafu::prelude::*;
@@ -50,11 +49,13 @@ impl imap::Authenticator for ImapAuthMode {
     type Response = String;
     fn process(&self, _data: &[u8]) -> Self::Response {
         match self {
-            Self::OAuth2 { user, access_token } => BASE64_STANDARD.encode(format!(
-                "user={}\x01auth=Bearer {}\x01\x01",
-                user.expose_secret(),
-                access_token.expose_secret()
-            )),
+            Self::OAuth2 { user, access_token } => {
+                format!(
+                    "user={}\x01auth=Bearer {}\x01\x01",
+                    user.expose_secret(),
+                    access_token.expose_secret()
+                )
+            }
             Self::Plain { .. } => {
                 unimplemented!("Use `session.login()` instead");
             }
