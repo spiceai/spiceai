@@ -12,7 +12,7 @@ on:
   workflow_dispatch:
     inputs:
       run:
-        description: "Which groups of models to run"
+        description: 'Which groups of models to run'
         required: true
         default: all
         type: choice
