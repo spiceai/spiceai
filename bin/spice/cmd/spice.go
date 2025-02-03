@@ -47,7 +47,7 @@ func init() {
 	RootCmd.PersistentFlags().CountVarP(&verbosity.VerbosityCount, "verbose", "v", "Verbose logging")
 	RootCmd.PersistentFlags().BoolVar(&verbosity.VeryVerbose, "very-verbose", false, "Very verbose logging")
 	RootCmd.PersistentFlags().BoolP("help", "h", false, "Print this help message")
-
+	RootCmd.PersistentFlags().String("api-key", "", "The API key to use for authentication")
 }
 
 func initConfig() {

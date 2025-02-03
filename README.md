@@ -206,7 +206,7 @@ See more demos on [YouTube](https://www.youtube.com/playlist?list=PLesJrUXEx3U9a
 | Name          | Description                                  | Status            | ML Format(s) | LLM Format(s)                   |
 | ------------- | -------------------------------------------- | ----------------- | ------------ | ------------------------------- |
 | `openai`      | OpenAI (or compatible) LLM endpoint          | Release Candidate | -            | OpenAI-compatible HTTP endpoint |
-| `file`        | Local filesystem                             | Beta              | ONNX         | GGUF, GGML, SafeTensor          |
+| `file`        | Local filesystem                             | Release Candidate | ONNX         | GGUF, GGML, SafeTensor          |
 | `huggingface` | Models hosted on HuggingFace                 | Beta              | ONNX         | GGUF, GGML, SafeTensor          |
 | `spice.ai`    | Models hosted on the Spice.ai Cloud Platform |                   | ONNX         | OpenAI-compatible HTTP endpoint |
 | `azure`       | Azure OpenAI                                 |                   | -            | OpenAI-compatible HTTP endpoint |

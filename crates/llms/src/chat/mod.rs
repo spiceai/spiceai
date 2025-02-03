@@ -663,7 +663,14 @@ pub async fn create_hf_w_gguf(
     .await
     .context(FailedToLoadModelSnafu)?;
 
-    create_local_model(&[gguf_file.display().to_string()], None, None, None, None)
+    create_local_model(
+        &[gguf_file.display().to_string()],
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
 }
 
 #[allow(unused_variables)]
@@ -672,6 +679,7 @@ pub fn create_local_model(
     config: Option<&str>,
     tokenizer: Option<&str>,
     tokenizer_config: Option<&str>,
+    generation_config: Option<&str>,
     chat_template_literal: Option<&str>,
 ) -> Result<Box<dyn Chat>> {
     mistral::MistralLlama::from(
@@ -685,6 +693,7 @@ pub fn create_local_model(
         config.map(Path::new),
         tokenizer.map(Path::new),
         tokenizer_config.map(Path::new),
+        generation_config.map(Path::new),
         chat_template_literal,
     )
     .map(|x| Box::new(x) as Box<dyn Chat>)

@@ -80,6 +80,7 @@ pub(crate) fn create_local(model_id: &str) -> Result<Arc<Box<dyn Chat>>, anyhow:
         temp_dir.join("tokenizer.json").to_str(),
         temp_dir.join("tokenizer_config.json").to_str(),
         None,
+        None,
     )
     .map_err(anyhow::Error::from)?;
     Ok(Arc::from(Box::new(model)))

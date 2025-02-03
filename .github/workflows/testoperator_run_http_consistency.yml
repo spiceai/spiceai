@@ -44,6 +44,11 @@ on:
         required: true
         default: 10
         type: number
+      ready_wait:
+         description: "How long (in seconds) to wait for spiced to start"
+         required: true
+         default: "30"
+         type: string
 
 jobs:
   run-http-consistency:
@@ -62,6 +67,7 @@ jobs:
           echo "  payload_file=${{ github.event.inputs.payload_file }}"
           echo "  model=${{ github.event.inputs.model }}"
           echo "  embedding=${{ github.event.inputs.embedding }}"
+          echo "  ready_wait=${{ github.event.inputs.ready_wait }}"
           echo "  buckets=${{ github.event.inputs.buckets }}"
 
       - uses: actions/checkout@v4
@@ -92,7 +98,8 @@ jobs:
             --duration ${{ github.event.inputs.duration }} \
             --concurrency ${{ github.event.inputs.concurrency }} \
             --warmup ${{ github.event.inputs.warmup }} \
-            --payload-file ${{ github.event.inputs.payload_file }}
+            --payload-file ${{ github.event.inputs.payload_file }} \
+            --ready-wait ${{ github.event.inputs.ready_wait }} \
         env:
           SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
           SPICE_SECRET_ANTHROPIC_API_KEY: ${{ secrets.SPICE_SECRET_ANTHROPIC_API_KEY }}
@@ -109,7 +116,8 @@ jobs:
             --concurrency ${{ github.event.inputs.concurrency }} \
             --duration ${{ github.event.inputs.duration }} \
             --warmup ${{ github.event.inputs.warmup }} \
-            --payload-file ${{ github.event.inputs.payload_file }}
+            --payload-file ${{ github.event.inputs.payload_file }} \
+            --ready-wait ${{ github.event.inputs.ready_wait }}
         env:
           SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
           SPICE_SECRET_ANTHROPIC_API_KEY: ${{ secrets.SPICE_SECRET_ANTHROPIC_API_KEY }}

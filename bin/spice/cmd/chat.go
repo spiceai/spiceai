@@ -376,7 +376,6 @@ func init() {
 	chatCmd.Flags().String(modelKeyFlag, "", "Model to chat with")
 	chatCmd.Flags().String(httpEndpointKeyFlag, "", "HTTP endpoint for chat (default: http://localhost:8090)")
 	chatCmd.Flags().String(userAgentKeyFlag, "", "User agent to use in all requests")
-	chatCmd.Flags().String("api-key", "", "The API key to use for authentication")
 
 	RootCmd.AddCommand(chatCmd)
 }
