@@ -33,7 +33,9 @@ var (
 	trace_id string
 )
 
-var supported_trace_tasks = []string{"ai_chat", "ai_completion", "sql_query", "nsql"}
+var supported_trace_tasks = []string{"ai_chat", "ai_completion", "sql_query", "nsql",
+	"tool_use::document_similarity", "tool_use::list_datasets", "tool_use::sql",
+	"tool_use::table_schema", "tool_use::sample_data", "tool_use::sql_query", "tool_use::memory"}
 
 func isValidTraceTask(task string) bool {
 	for _, supported_task := range supported_trace_tasks {
