@@ -54,7 +54,7 @@ arrow-odbc = "11.2.0"
 arrow-schema = "53"
 async-openai = { git = "https://github.com/spiceai/async-openai", rev = "75e6bf715760f63f3dd3e7a43222ec1e6fb9707f" }
 async-stream = "0.3.5"
-async-trait = "0.1.83"
+async-trait = "0.1.86"
 axum = { version = "0.7", features = ["macros"] }
 base64 = "0.22.1"
 bb8 = "0.8"
