@@ -40,9 +40,9 @@ var traceCmd = &cobra.Command{
 	Use:   "trace",
 	Short: "Return a user friendly trace into an operation that occurred in Spice",
 	Example: `
-$ spice trace chat --id chatcmpl-At6ZmDE8iAYRPeuQLA0FLlWxGKNnM
+$ spice trace ai_chat --id chatcmpl-At6ZmDE8iAYRPeuQLA0FLlWxGKNnM
 
-$ spice trace chat --last
+$ spice trace ai_chat --last
 `,
 	Args: cobra.MinimumNArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
@@ -55,7 +55,7 @@ $ spice trace chat --last
 		var filter string
 		var err error
 		switch args[0] {
-		case "chat":
+		case "ai_chat":
 			filter, err = getTraceFilterForChat(id, trace_id, &isLast)
 		default:
 			err = fmt.Errorf("invalid trace type %s", args[0])
@@ -100,5 +100,6 @@ func getTraceFilterForChat(id string, trace_id string, last *bool) (string, erro
 	if trace_id != "" {
 		return fmt.Sprintf("trace_id='%s'", trace_id), nil
 	}
-	return "", fmt.Errorf("One of --last, --trace-id or --id must be provided")
+	// use last by default
+	return "trace_id=(SELECT trace_id from runtime.task_history where task='ai_chat' order by start_time desc limit 1)", nil
 }
