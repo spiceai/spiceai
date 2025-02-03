@@ -69,6 +69,7 @@ pub mod rate_limit;
 pub mod cdc;
 pub mod delete;
 pub mod graphql;
+#[cfg(feature = "imap")]
 pub mod imap;
 pub mod object;
 pub mod poly;
