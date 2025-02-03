@@ -14,8 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::HashMap, fmt::Display, path::Path, sync::LazyLock};
 use regex::Regex;
+use std::{collections::HashMap, fmt::Display, path::Path, sync::LazyLock};
 
 use super::{Nameable, WithDependsOn};
 #[cfg(feature = "schemars")]
@@ -492,7 +492,6 @@ pub(crate) fn is_llm_file(p: &Path) -> bool {
         || extension == "safetensors"
         || filename == "pytorch_model.bin"
 }
-
 
 #[cfg(test)]
 mod tests {
