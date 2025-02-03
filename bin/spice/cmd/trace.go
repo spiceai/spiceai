@@ -33,6 +33,17 @@ var (
 	trace_id string
 )
 
+var supported_trace_tasks = []string{"ai_chat", "ai_completion", "sql_query", "nsql"}
+
+func isValidTraceTask(task string) bool {
+	for _, supported_task := range supported_trace_tasks {
+		if task == supported_task {
+			return true
+		}
+	}
+	return false
+}
+
 var traceCmd = &cobra.Command{
 	Use:   "trace",
 	Short: "Return a user friendly trace into an operation that occurred in Spice",
@@ -53,9 +64,9 @@ $ spice trace ai_chat --id chatcmpl-At6ZmDE8iAYRPeuQLA0FLlWxGKNnM
 
 		var filter string
 		var err error
-		switch args[0] {
-		case "ai_chat":
-			filter, err = getTraceFilterForChat(id, trace_id)
+		switch isValidTraceTask(args[0]) {
+		case true:
+			filter, err = getTraceFilter(args[0], id, trace_id)
 		default:
 			err = fmt.Errorf("invalid trace type %s", args[0])
 		}
@@ -88,7 +99,7 @@ func init() {
 	traceCmd.Flags().StringVar(&trace_id, "trace-id", "", "Return the trace with the given trace id")
 }
 
-func getTraceFilterForChat(id string, trace_id string) (string, error) {
+func getTraceFilter(task string, id string, trace_id string) (string, error) {
 	if id != "" {
 		return fmt.Sprintf("trace_id=(SELECT trace_id from runtime.task_history where labels.id='%s')", id), nil
 	}
@@ -96,5 +107,5 @@ func getTraceFilterForChat(id string, trace_id string) (string, error) {
 		return fmt.Sprintf("trace_id='%s'", trace_id), nil
 	}
 	// use last by default
-	return "trace_id=(SELECT trace_id from runtime.task_history where task='ai_chat' order by start_time desc limit 1)", nil
+	return fmt.Sprintf("trace_id=(SELECT trace_id from runtime.task_history where task='%s' order by start_time desc limit 1)", task), nil
 }
