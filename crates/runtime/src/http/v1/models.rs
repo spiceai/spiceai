@@ -44,19 +44,30 @@ pub struct ModelsQueryParams {
 
 #[derive(Debug, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[serde(rename_all = "lowercase")]
-pub(crate) struct ModelResponse {
+#[serde(rename_all = "snake_case")]
+pub(crate) struct OpenAIModelResponse {
+    object: String,
+    data: Vec<OpenAIModel>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub(crate) struct OpenAIModel {
     /// The name of the model
-    pub name: String,
+    id: String,
+
+    /// The type of the model (always `model`)
+    object: String,
 
     /// The source from which the model was loaded (e.g., `openai`, `spiceai`)
-    pub from: String,
+    owned_by: String,
 
     /// The datasets associated with this model, if any
-    pub datasets: Option<Vec<String>>,
+    datasets: Option<Vec<String>>,
 
     /// The status of the model (e.g., `ready`, `initializing`, `error`)
-    pub status: Option<ComponentStatus>,
+    status: Option<ComponentStatus>,
 }
 
 /// List Models
@@ -70,28 +81,33 @@ pub(crate) struct ModelResponse {
     params(ModelsQueryParams),
     responses(
         (status = 200, description = "List of models in JSON format", content((
-            ModelResponse = "application/json",
-            example = json!([
-                {
-                    "name": "example_model_1",
-                    "from": "openai",
-                    "datasets": ["dataset_a", "dataset_b"],
-                    "status": "ready"
-                },
-                {
-                    "name": "example_model_2",
-                    "from": "spiceai",
-                    "datasets": null,
-                    "status": "initializing"
-                }
-            ])
+            OpenAIModelResponse = "application/json",
+            example = json!({
+                "object": "list",
+                "data": [
+                    {
+                        "id": "gpt-4",
+                        "object": "model",
+                        "owned_by": "openai",
+                        "datasets": null,
+                        "status": "ready"
+                    },
+                    {
+                        "id": "text-embedding-ada-002",
+                        "object": "model",
+                        "owned_by": "openai-internal",
+                        "datasets": ["text-dataset-1", "text-dataset-2"],
+                        "status": "ready"
+                    }
+                ]
+            })
         ), (
             String = "text/csv",
-            example = r#"
-name,from,datasets,status
-example_model_1,openai,"[\"dataset_a\", \"dataset_b\"]",ready
-example_model_2,spiceai,,initializing
-"#
+            example = "
+id,object,owned_by,datasets,status
+gpt-4,model,openai,,ready
+text-embedding-ada-002,model,openai-internal,\"text-dataset-1,text-dataset-2\",ready
+"
         ))),
         (status = 500, description = "Internal server error occurred while processing models", content((
             serde_json::Value = "application/json",
@@ -111,7 +127,7 @@ pub(crate) async fn get(
     } else {
         HashMap::default()
     };
-    let resp = match app.read().await.as_ref() {
+    let models = match app.read().await.as_ref() {
         Some(a) => a
             .models
             .iter()
@@ -121,19 +137,15 @@ pub(crate) async fn get(
                 } else {
                     Some(m.datasets.clone())
                 };
-
-                ModelResponse {
-                    name: m.name.clone(),
-                    from: m.from.clone(),
+                OpenAIModel {
+                    id: m.name.clone(),
+                    object: "model".to_string(),
+                    owned_by: m.from.clone(),
                     datasets: d,
-                    status: if params.status {
-                        statuses.get(&m.name).copied()
-                    } else {
-                        None
-                    },
+                    status: statuses.get(&m.name).copied(),
                 }
             })
-            .collect::<Vec<ModelResponse>>(),
+            .collect::<Vec<OpenAIModel>>(),
         None => {
             return (
                 status::StatusCode::INTERNAL_SERVER_ERROR,
@@ -144,8 +156,15 @@ pub(crate) async fn get(
     };
 
     match params.format {
-        Format::Json => (status::StatusCode::OK, Json(resp)).into_response(),
-        Format::Csv => match convert_details_to_csv(&resp) {
+        Format::Json => (
+            status::StatusCode::OK,
+            Json(OpenAIModelResponse {
+                object: "list".to_string(),
+                data: models,
+            }),
+        )
+            .into_response(),
+        Format::Csv => match convert_details_to_csv(&models) {
             Ok(csv) => (status::StatusCode::OK, csv).into_response(),
             Err(e) => {
                 tracing::error!("Error converting to CSV: {e}");
@@ -155,7 +174,7 @@ pub(crate) async fn get(
     }
 }
 
-fn convert_details_to_csv(models: &[ModelResponse]) -> Result<String, Box<dyn std::error::Error>> {
+fn convert_details_to_csv(models: &[OpenAIModel]) -> Result<String, Box<dyn std::error::Error>> {
     let mut w = Writer::from_writer(vec![]);
     for d in models {
         let _ = w.serialize(d);

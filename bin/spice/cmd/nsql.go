@@ -93,21 +93,21 @@ nsql> How much money have I made in each country?
 			os.Exit(1)
 		}
 		if model == "" {
-			models, err := api.GetData[api.Model](rtcontext, "/v1/models?status=true")
+			models, err := api.GetDataSingle[api.ModelResponse](rtcontext, "/v1/models?status=true")
 			if err != nil {
 				slog.Error("listing spiced models", "error", err)
 				os.Exit(1)
 			}
-			if len(models) == 0 {
+			if len(models.Data) == 0 {
 				slog.Error("no models found")
 				os.Exit(1)
 			}
 
 			modelsSelection := []string{}
-			selectedModel := models[0].Name
-			if len(models) > 1 {
-				for _, model := range models {
-					modelsSelection = append(modelsSelection, model.Name)
+			selectedModel := models.Data[0].Id
+			if len(models.Data) > 1 {
+				for _, model := range models.Data {
+					modelsSelection = append(modelsSelection, model.Id)
 				}
 
 				prompt := promptui.Select{
