@@ -26,9 +26,6 @@ import (
 )
 
 var (
-	// If `--last` was requested
-	isLast bool
-
 	// The id of the trace to provide
 	id string
 
@@ -40,9 +37,11 @@ var traceCmd = &cobra.Command{
 	Use:   "trace",
 	Short: "Return a user friendly trace into an operation that occurred in Spice",
 	Example: `
-$ spice trace ai_chat --id chatcmpl-At6ZmDE8iAYRPeuQLA0FLlWxGKNnM
+# returns the last trace
+$ spice trace ai_chat
 
-$ spice trace ai_chat --last
+# returns the trace for the given id
+$ spice trace ai_chat --id chatcmpl-At6ZmDE8iAYRPeuQLA0FLlWxGKNnM
 `,
 	Args: cobra.MinimumNArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
@@ -56,7 +55,7 @@ $ spice trace ai_chat --last
 		var err error
 		switch args[0] {
 		case "ai_chat":
-			filter, err = getTraceFilterForChat(id, trace_id, &isLast)
+			filter, err = getTraceFilterForChat(id, trace_id)
 		default:
 			err = fmt.Errorf("invalid trace type %s", args[0])
 		}
@@ -85,15 +84,11 @@ func Display(t *taskhistory.TaskHistory) string {
 
 func init() {
 	RootCmd.AddCommand(traceCmd)
-	traceCmd.Flags().BoolVar(&isLast, "last", false, "Return the last trace")
 	traceCmd.Flags().StringVar(&id, "id", "", "Return the trace with the given id")
 	traceCmd.Flags().StringVar(&trace_id, "trace-id", "", "Return the trace with the given trace id")
 }
 
-func getTraceFilterForChat(id string, trace_id string, last *bool) (string, error) {
-	if last != nil && *last {
-		return "trace_id=(SELECT trace_id from runtime.task_history where task='ai_chat' order by start_time desc limit 1)", nil
-	}
+func getTraceFilterForChat(id string, trace_id string) (string, error) {
 	if id != "" {
 		return fmt.Sprintf("trace_id=(SELECT trace_id from runtime.task_history where labels.id='%s')", id), nil
 	}
