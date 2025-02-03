@@ -260,8 +260,11 @@ impl DataConnector for Imap {
 
     async fn read_provider(
         &self,
-        _dataset: &Dataset,
+        dataset: &Dataset,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
-        Ok(Arc::new(ImapTableProvider::new(self.session.clone())))
+        Ok(Arc::new(ImapTableProvider::new(
+            self.session.clone(),
+            dataset.is_accelerated(),
+        )))
     }
 }
