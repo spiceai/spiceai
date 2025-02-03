@@ -15,9 +15,8 @@ limitations under the License.
 */
 
 use bytes::Bytes;
-use lopdf::Document as LopdfDocument;
 use snafu::ResultExt;
-use std::{any::Any, collections::HashMap, io::Cursor, sync::Arc};
+use std::{any::Any, collections::HashMap, sync::Arc};
 
 use crate::{
     Document, DocumentParser, DocumentParserFactory, DocumentType, InternalParsingSnafu, Result,
@@ -49,28 +48,23 @@ impl PdfParser {
 
 impl DocumentParser for PdfParser {
     fn parse(&self, raw: &Bytes) -> Result<Arc<dyn Document>> {
-        let doc = LopdfDocument::load_from(Cursor::new(raw.to_vec()))
-            .boxed()
-            .context(InternalParsingSnafu {
-                format: DocumentType::Pdf,
-            })?;
+        let doc =
+            pdf_extract::extract_text_from_mem(raw)
+                .boxed()
+                .context(InternalParsingSnafu {
+                    format: DocumentType::Pdf,
+                })?;
         Ok(Arc::new(PdfDocument { doc }))
     }
 }
 
 struct PdfDocument {
-    pub doc: LopdfDocument,
+    pub doc: String,
 }
 
 impl Document for PdfDocument {
     fn as_flat_utf8(&self) -> Result<String> {
-        let pages = self.doc.get_pages().keys().copied().collect::<Vec<_>>();
-        self.doc
-            .extract_text(&pages)
-            .boxed()
-            .context(InternalParsingSnafu {
-                format: DocumentType::Pdf,
-            })
+        Ok(self.doc.clone())
     }
 
     fn type_(&self) -> DocumentType {
