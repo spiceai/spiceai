@@ -56,8 +56,8 @@ const PARAMETERS: &[ParameterSpec] = &[
 // Regex that matches an email address in a simple way
 // Email-ish - because it could match things that are not valid email addresses
 static EMAILISH_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    #[allow(clippy::expect_used)]
-    Regex::new(r"^[\w._%+-]+@[\w-]+\.([\w-]+\.?){1,}$").expect("Should create emailish regex")
+    Regex::new(r"^[\w._%+-]+@[\w-]+\.([\w-]+\.?){1,}$")
+        .unwrap_or_else(|_| unreachable!("The regex is a valid regex, so it should compile"))
 });
 
 static PRESET_HOST_CONNECTIONS: LazyLock<HashMap<&str, &str>> = LazyLock::new(|| {
