@@ -78,7 +78,7 @@ impl TableProvider for ImapTableProvider {
     }
 
     fn schema(&self) -> SchemaRef {
-        Arc::new(Schema::new(vec![
+        let mut fields = vec![
             Field::new("date", DataType::Date64, false),
             Field::new("subject", DataType::Utf8, true),
             Field::new(
@@ -108,7 +108,13 @@ impl TableProvider for ImapTableProvider {
             ),
             Field::new("message_id", DataType::Utf8, true),
             Field::new("in_reply_to", DataType::Utf8, true),
-        ]))
+        ];
+
+        if self.fetch_content {
+            fields.push(Field::new("content", DataType::Utf8, true));
+        }
+
+        Arc::new(Schema::new(fields))
     }
 
     fn table_type(&self) -> TableType {
@@ -160,6 +166,11 @@ impl TableProvider for ImapTableProvider {
             let message_ccs = parse_addreses_from_envelope!(envelope, cc);
             let message_blind_ccs = parse_addreses_from_envelope!(envelope, bcc);
             let message_reply_tos = parse_addreses_from_envelope!(envelope, reply_to);
+            let body = if self.fetch_content {
+                message.body().as_ref().map(|v| decode(v))
+            } else {
+                None
+            };
 
             messages.push(EmailMessage {
                 date,
@@ -171,6 +182,7 @@ impl TableProvider for ImapTableProvider {
                 reply_to: message_reply_tos,
                 message_id,
                 in_reply_to,
+                body,
             });
         }
 

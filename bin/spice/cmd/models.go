@@ -47,14 +47,14 @@ spice models
 			slog.Error("getting component statuses", "error", err)
 		}
 
-		models, err := api.GetData[api.Model](rtcontext, "/v1/models?status=true")
+		models, err := api.GetDataSingle[api.ModelResponse](rtcontext, "/v1/models?status=true")
 		if err != nil {
 			slog.Error("listing spiced models", "error", err)
 		}
 
-		table := make([]interface{}, len(models))
-		for i, model := range models {
-			statusEnum, exists := model_statuses[model.Name]
+		table := make([]interface{}, len(models.Data))
+		for i, model := range models.Data {
+			statusEnum, exists := model_statuses[model.Id]
 			if exists {
 				model.Status = statusEnum.String()
 			}

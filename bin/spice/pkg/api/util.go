@@ -97,6 +97,14 @@ func GetData[T interface{}](rtcontext *context.RuntimeContext, path string) ([]T
 	return result, nil
 }
 
+func GetDataSingle[T interface{}](rtcontext *context.RuntimeContext, path string) (T, error) {
+	result, err := doRuntimeApiRequest[T](rtcontext, GET, path, nil)
+	if err != nil {
+		return *new(T), err
+	}
+	return result, nil
+}
+
 func PostRuntime[T interface{}](rtcontext *context.RuntimeContext, path string, body *string) (T, error) {
 	return doRuntimeApiRequest[T](rtcontext, POST, path, body)
 }

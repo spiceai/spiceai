@@ -135,21 +135,21 @@ spice chat --model <model> --cloud
 			os.Exit(1)
 		}
 		if model == "" {
-			models, err := api.GetData[api.Model](rtcontext, "/v1/models?status=true")
+			models, err := api.GetDataSingle[api.ModelResponse](rtcontext, "/v1/models?status=true")
 			if err != nil {
 				slog.Error("could not list models", "error", err)
 				os.Exit(1)
 			}
 
-			if len(models) == 0 {
+			if len(models.Data) == 0 {
 				slog.Error("No models found")
 				os.Exit(1)
 			}
 
 			availableModels := []string{}
-			for _, model := range models {
+			for _, model := range models.Data {
 				if model.Status == "Ready" {
-					availableModels = append(availableModels, model.Name)
+					availableModels = append(availableModels, model.Id)
 				}
 			}
 
