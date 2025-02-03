@@ -338,7 +338,7 @@ impl MistralLlama {
 
         let device = Self::get_device();
         let token_source = hf_token_literal.map_or(TokenSource::CacheToken, |secret| {
-            tracing::info!("Explicitly given a Huggingface token. Using instead of any system defaults (if any).");
+            tracing::debug!("A HuggingFace token was specified in parameters. The specified token will be used instead of any system/environment defaults.");
             TokenSource::Literal(secret.expose_secret().clone())
         });
 
