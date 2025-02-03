@@ -181,7 +181,8 @@ impl Model {
     }
 
     /// Get all files for the model component, if a [`ModelFile`] is a directory, include all files in the directory too.
-    fn get_all_files(&self) -> Vec<ModelFile> {
+    #[must_use]
+    pub fn get_all_files(&self) -> Vec<ModelFile> {
         let mut component_files = self.files.clone();
 
         // If `from:file:...` then add the model_id as a possible source of files.
@@ -392,6 +393,7 @@ pub enum ModelFileType {
     Config,
     Tokenizer,
     TokenizerConfig,
+    GenerationConfig,
 }
 
 /// Attempts to determine the file type for the [`ModelFile`] based on the file path. If
@@ -416,6 +418,10 @@ pub(crate) fn determine_type_from_path(p: &str) -> Option<ModelFileType> {
 
     if filename == "tokenizer_config.json" {
         return Some(ModelFileType::TokenizerConfig);
+    }
+
+    if filename == "generation_config.json" {
+        return Some(ModelFileType::GenerationConfig);
     }
 
     None

@@ -22,6 +22,8 @@ use super::DataConnectorFactory;
 use super::ParameterSpec;
 use crate::component::dataset::Dataset;
 use crate::federated_table::FederatedTable;
+use crate::parameters::ExposedParamLookup;
+use crate::parameters::Parameters;
 use arrow_flight::decode::DecodedPayload;
 use async_stream::stream;
 use async_trait::async_trait;
@@ -30,6 +32,8 @@ use data_components::cdc::{
 };
 use data_components::flight::FlightFactory;
 use data_components::flight::FlightTable;
+use data_components::iceberg::catalog::RestCatalog;
+use data_components::spice_cloud::catalog::SpiceCatalog;
 use data_components::{Read, ReadWrite};
 use datafusion::datasource::TableProvider;
 use datafusion::sql::unparser::dialect::Dialect;
@@ -40,10 +44,14 @@ use datafusion_federation::FederatedTableProviderAdaptor;
 use flight_client::Credentials;
 use flight_client::FlightClient;
 use futures::{Stream, StreamExt};
+use iceberg::NamespaceIdent;
+use iceberg::TableIdent;
+use iceberg_catalog_rest::RestCatalogConfig;
 use ns_lookup::verify_endpoint_connection;
 use snafu::prelude::*;
 use std::any::Any;
 use std::borrow::Borrow;
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -74,6 +82,12 @@ pub enum Error {
         value: Arc<str>,
         source: InvalidMetadataValue,
     },
+
+    #[snafu(display("Failed to find a schema for the Spice.ai table '{table}'\n{source}\nVerify the table exists, and is accessible."))]
+    UnableToGetSchema {
+        table: String,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -81,6 +95,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 #[derive(Clone)]
 pub struct SpiceAI {
     flight_factory: FlightFactory,
+    catalog: SpiceCatalog,
 }
 
 impl SpiceAI {
@@ -144,12 +159,34 @@ impl SpiceAIFactory {
     pub fn new_arc() -> Arc<dyn DataConnectorFactory> {
         Arc::new(Self {}) as Arc<dyn DataConnectorFactory>
     }
+
+    #[must_use]
+    fn create_rest_catalog_client(params: &Parameters) -> RestCatalog {
+        let mut props = HashMap::new();
+        if let ExposedParamLookup::Present(api_key) = params.get("api_key").expose() {
+            props.insert("token".to_string(), api_key.to_string());
+        };
+
+        let endpoint = params
+            .get("http_endpoint")
+            .expose()
+            .ok()
+            .unwrap_or("https://data.spiceai.io");
+
+        let catalog_config = RestCatalogConfig::builder()
+            .uri(endpoint.to_string())
+            .props(props)
+            .build();
+
+        RestCatalog::new(catalog_config)
+    }
 }
 
 const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::connector("api_key").secret(),
     ParameterSpec::connector("token").secret(),
     ParameterSpec::connector("endpoint"),
+    ParameterSpec::connector("http_endpoint"),
 ];
 
 const HEADER_ORG: &str = "spiceai-org";
@@ -200,7 +237,14 @@ impl DataConnectorFactory for SpiceAIFactory {
                 Arc::new(SpiceCloudPlatformDialect {}),
                 false,
             );
-            let spiceai = SpiceAI { flight_factory };
+
+            let catalog = SpiceCatalog::from(Arc::new(Self::create_rest_catalog_client(
+                &params.parameters,
+            )));
+            let spiceai = SpiceAI {
+                flight_factory,
+                catalog,
+            };
             Ok(Arc::new(spiceai) as Arc<dyn DataConnector>)
         })
     }
@@ -224,8 +268,6 @@ impl DataConnector for SpiceAI {
         &self,
         dataset: &Dataset,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
-        let dataset_schema = dataset.schema();
-
         let dataset_path = match SpiceAI::spice_dataset_path(dataset) {
             Ok(dataset_path) => dataset_path,
             Err(e) => {
@@ -237,9 +279,39 @@ impl DataConnector for SpiceAI {
             }
         };
 
+        let table_ident = get_dataset_ident(&dataset_path).map_err(|err| {
+            DataConnectorError::UnableToGetReadProvider {
+                dataconnector: "spice.ai".to_string(),
+                connector_component: ConnectorComponent::from(dataset),
+                source: err.into(),
+            }
+        })?;
+
+        let schema = match (dataset.schema(), table_ident) {
+            (Some(schema), _) => Some(schema),
+            (None, Some(table_ident)) => Some(
+                self.catalog
+                    .get_table_schema(&table_ident)
+                    .await
+                    .map_err(|err| DataConnectorError::UnableToGetReadProvider {
+                        dataconnector: "spice.ai".to_string(),
+                        connector_component: ConnectorComponent::from(dataset),
+                        source: Error::UnableToGetSchema {
+                            table: table_ident.name.to_string(),
+                            source: err.into(),
+                        }
+                        .into(),
+                    })?,
+            ),
+            (None, None) => {
+                tracing::debug!("Could not retrieve schema in advance for Spice.ai dataset.\nSchema will be retrieved by querying the dataset.");
+                None
+            }
+        };
+
         let (flight_factory, table_reference) = self.flight_factory(dataset_path);
 
-        match Read::table_provider(&flight_factory, table_reference, dataset_schema).await {
+        match Read::table_provider(&flight_factory, table_reference, schema).await {
             Ok(provider) => Ok(provider),
             Err(e) => {
                 if let Some(data_components::flight::Error::UnableToGetSchema {
@@ -417,9 +489,61 @@ impl CommitChange for SpiceAIChangeCommiter {
     }
 }
 
+fn get_dataset_ident(dataset_path: &SpiceAIDatasetPath) -> Result<Option<TableIdent>, Error> {
+    match dataset_path {
+        SpiceAIDatasetPath::OrgAppPath { org, app, path } => {
+            let mut namespace_parts = vec![
+                org.to_str()
+                    .map_err(|err| Error::UnableToGetSchema {
+                        table: path.to_string(),
+                        source: err.into(),
+                    })?
+                    .to_string(),
+                app.to_str()
+                    .map_err(|err| Error::UnableToGetSchema {
+                        table: path.to_string(),
+                        source: err.into(),
+                    })?
+                    .to_string(),
+                "spice".to_string(),
+            ];
+
+            match path {
+                TableReference::Partial { schema, table } => {
+                    namespace_parts.push(schema.to_string());
+                    Ok(Some(TableIdent::new(
+                        NamespaceIdent::from_vec(namespace_parts).map_err(|err| {
+                            Error::UnableToGetSchema {
+                                table: path.to_string(),
+                                source: err.into(),
+                            }
+                        })?,
+                        table.to_string(),
+                    )))
+                }
+                TableReference::Bare { table } => {
+                    namespace_parts.push("public".to_string());
+                    Ok(Some(TableIdent::new(
+                        NamespaceIdent::from_vec(namespace_parts).map_err(|err| {
+                            Error::UnableToGetSchema {
+                                table: path.to_string(),
+                                source: err.into(),
+                            }
+                        })?,
+                        table.to_string(),
+                    )))
+                }
+                TableReference::Full { .. } => Ok(None),
+            }
+        }
+        SpiceAIDatasetPath::Path(_) => Ok(None),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use datafusion::sql::TableReference;
 
     #[test]
     #[allow(clippy::too_many_lines)]
@@ -523,6 +647,59 @@ mod tests {
             let dataset = Dataset::try_new(input.clone(), "bar").expect("a valid dataset");
             let dataset_path = SpiceAI::spice_dataset_path(&dataset).expect("a valid dataset path");
             assert_eq!(dataset_path, expected, "Failed for input: {input}");
+        }
+    }
+
+    #[test]
+    fn test_get_dataset_ident() {
+        let tests = vec![
+            (
+                SpiceAIDatasetPath::OrgAppPath {
+                    org: MetadataValue::try_from("org1").expect("failed to parse org"),
+                    app: MetadataValue::try_from("app1").expect("failed to parse app"),
+                    path: TableReference::parse_str("schema.table"),
+                },
+                Some(TableIdent::new(
+                    NamespaceIdent::from_vec(vec![
+                        "org1".to_string(),
+                        "app1".to_string(),
+                        "spice".to_string(),
+                        "schema".to_string(),
+                    ])
+                    .expect("failed to create namespace"),
+                    "table".to_string(),
+                )),
+            ),
+            (
+                SpiceAIDatasetPath::OrgAppPath {
+                    org: MetadataValue::try_from("org2").expect("failed to parse org"),
+                    app: MetadataValue::try_from("app2").expect("failed to parse app"),
+                    path: TableReference::parse_str("table"),
+                },
+                Some(TableIdent::new(
+                    NamespaceIdent::from_vec(vec![
+                        "org2".to_string(),
+                        "app2".to_string(),
+                        "spice".to_string(),
+                        "public".to_string(),
+                    ])
+                    .expect("failed to create namespace"),
+                    "table".to_string(),
+                )),
+            ),
+            (
+                SpiceAIDatasetPath::Path(TableReference::parse_str("schema.table")),
+                None,
+            ),
+            (
+                SpiceAIDatasetPath::Path(TableReference::parse_str("table")),
+                None,
+            ),
+        ];
+
+        for (input, expected) in tests {
+            let result = get_dataset_ident(&input).expect("a valid result");
+            assert_eq!(result, expected, "Failed for input: {input:?}");
         }
     }
 }

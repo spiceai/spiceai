@@ -164,9 +164,9 @@ pub trait DataAccelerator: Send + Sync {
             let path = std::path::Path::new(&path);
 
             !path.is_dir()
-                && path.extension().map_or(false, |ext| {
-                    self.valid_file_extensions().iter().any(|&e| e == ext)
-                })
+                && path
+                    .extension()
+                    .is_some_and(|ext| self.valid_file_extensions().iter().any(|&e| e == ext))
         } else {
             false
         }

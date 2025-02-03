@@ -312,6 +312,8 @@ fn file(
     let tokenizer_path = component.find_any_file_path(ModelFileType::Tokenizer);
     let tokenizer_config_path = component.find_any_file_path(ModelFileType::TokenizerConfig);
     let config_path = component.find_any_file_path(ModelFileType::Config);
+    let generation_config = component.find_any_file_path(ModelFileType::GenerationConfig);
+
     let chat_template_literal = params
         .get("chat_template")
         .map(|s| s.expose_secret().as_str());
@@ -321,6 +323,7 @@ fn file(
         config_path.as_deref(),
         tokenizer_path.as_deref(),
         tokenizer_config_path.as_deref(),
+        generation_config.as_deref(),
         chat_template_literal,
     )
 }

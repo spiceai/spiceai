@@ -292,7 +292,7 @@ impl FlightClient {
     /// # Errors
     ///
     /// Returns an error if the schema inference fails.
-    pub async fn get_query_schema<'a>(&self, sql: Cow<'a, str>) -> Result<Schema> {
+    pub async fn get_query_schema(&self, sql: Cow<'_, str>) -> Result<Schema> {
         let token = self.authenticate_basic_token().await?;
 
         let descriptor = FlightDescriptor::new_cmd(sql.into_owned());

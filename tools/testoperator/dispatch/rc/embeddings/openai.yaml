@@ -1,0 +1,18 @@
+tests:
+  http_consistency:
+    spicepod_path: ./test/spicepods/models/openai.yaml
+    concurrency: 8
+    duration: 3600
+    payload_file: ./test/payloads/model-generic-lorem.txt
+    embedding: text-embedding-3-small
+    ready_wait: 0
+    buckets: 60
+  http_overhead:
+    spicepod_path: ./test/spicepods/models/openai.yaml
+    concurrency: 8
+    duration: 3600
+    payload_file: ./test/payloads/model-generic-lorem.txt
+    embedding: text-embedding-3-small
+    warmup: 0
+    base: openai
+    base_component: text-embedding-3-small

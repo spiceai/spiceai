@@ -22,7 +22,7 @@ mod commands;
 
 use args::{
     Commands, DataConsistencyArgs, DatasetTestArgs, HttpConsistencyTestArgs, HttpOverheadTestArgs,
-    HttpTestArgs, TestCommands,
+    TestCommands,
 };
 
 #[derive(Parser)]
@@ -44,14 +44,8 @@ async fn main() -> anyhow::Result<()> {
             TestCommands::Throughput(DatasetTestArgs { common, .. })
             | TestCommands::Bench(DatasetTestArgs { common, .. })
             | TestCommands::Load(DatasetTestArgs { common, .. })
-            | TestCommands::HttpConsistency(HttpConsistencyTestArgs {
-                http: HttpTestArgs { common, .. },
-                ..
-            })
-            | TestCommands::HttpOverhead(HttpOverheadTestArgs {
-                http: HttpTestArgs { common, .. },
-                ..
-            })
+            | TestCommands::HttpConsistency(HttpConsistencyTestArgs { common, .. })
+            | TestCommands::HttpOverhead(HttpOverheadTestArgs { common, .. })
             | TestCommands::DataConsistency(DataConsistencyArgs {
                 test_args: DatasetTestArgs { common, .. },
                 ..

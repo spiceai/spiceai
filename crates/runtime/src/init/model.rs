@@ -44,6 +44,11 @@ pub enum Error {
         "Failed to load model {name} from spicepod.\nUnable to determine model type. Verify the model source and try again.\nFor details, visit https://spiceai.org/docs/components/models",
     ))]
     UnableToDetermineModelType { name: String },
+
+    #[snafu(display(
+        "Model {name} includes a non-existent path: {path}.\nVerify the model configuration and ensure all paths are correct.\nFor details, visit https://spiceai.org/docs/components/models",
+    ))]
+    ReferencedPathDoesNotExist { name: String, path: String },
 }
 
 impl Runtime {
@@ -97,6 +102,16 @@ impl Runtime {
             })
             .collect::<HashMap<_, _>>();
         let params = get_params_with_secrets(self.secrets(), &p).await;
+
+        // Verify all referenced local files exist before attempting to load the model and determine its type.
+        // Otherwise, we will fail to determine the model type and the error will be confusing.
+        if let Err(err) = verify_local_files_exist(m) {
+            metrics::models::LOAD_ERROR.add(1, &[]);
+            self.status
+                .update_model(&model.name, status::ComponentStatus::Error);
+            tracing::warn!("{err}");
+            return;
+        }
 
         let model_type = m.model_type();
         tracing::trace!("Model type for {} is {:#?}", m.name, model_type.clone());
@@ -202,4 +217,16 @@ impl Runtime {
             }
         }
     }
+}
+
+fn verify_local_files_exist(m: &SpicepodModel) -> Result<(), Error> {
+    for f in m.get_all_files() {
+        if !std::path::Path::new(&f.path).exists() {
+            return Err(Error::ReferencedPathDoesNotExist {
+                name: m.name.clone(),
+                path: f.path.clone(),
+            });
+        };
+    }
+    Ok(())
 }

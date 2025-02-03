@@ -63,7 +63,7 @@ pub enum Error {
     },
 
     #[snafu(display(
-        r#"GraphQL Query Error:
+        "GraphQL Query Error:
 Details:
 - Error: {message}
 - Location: Line {line}, Column {column}
@@ -71,7 +71,7 @@ Details:
 
 {query}
 
-Verify the syntax of your GraphQL query."#
+Verify the syntax of your GraphQL query."
     ))]
     InvalidGraphQLQuery {
         message: String,

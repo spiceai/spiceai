@@ -240,7 +240,6 @@ func init() {
 	nsqlCmd.Flags().String(modelKeyFlag, "", "Model to use for nsql")
 	nsqlCmd.Flags().String(httpEndpointKeyFlag, "", "HTTP endpoint for nsql (default: http://localhost:8090)")
 	nsqlCmd.Flags().String("user-agent", "", "User agent to use in all requests")
-	nsqlCmd.Flags().String("api-key", "", "The API key to use for authentication")
 
 	RootCmd.AddCommand(nsqlCmd)
 }

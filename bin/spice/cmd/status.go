@@ -50,6 +50,5 @@ spice status
 
 func init() {
 	statusCmd.Flags().String("tls-root-certificate-file", "", "The path to the root certificate file used to verify the Spice.ai runtime server certificate")
-	statusCmd.Flags().String("api-key", "", "The API key to use for authentication")
 	RootCmd.AddCommand(statusCmd)
 }

@@ -53,7 +53,7 @@ mod nsql {
     async fn openai_test_nsql() -> Result<(), anyhow::Error> {
         let _tracing = init_tracing(None);
 
-        test_request_context().scope(async {
+        test_request_context().scope_retry(3, || async {
             verify_env_secret_exists("SPICE_OPENAI_API_KEY")
                 .await
                 .map_err(anyhow::Error::msg)?;
@@ -388,7 +388,7 @@ async fn openai_test_chat_messages() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(None);
 
     test_request_context()
-        .scope(async {
+        .scope_retry(3, || async {
             verify_env_secret_exists("SPICE_OPENAI_API_KEY")
                 .await
                 .map_err(anyhow::Error::msg)?;
@@ -465,13 +465,12 @@ async fn verify_sql_query_chat_completion(
         sql_to_display(
             &rt,
             format!(
-                r#"SELECT task, count(1) > 0 as task_used
+                "SELECT task, count(1) > 0 as task_used
                 FROM runtime.task_history
                 WHERE start_time >= '{}'
                 AND task in ('tool_use::list_datasets', 'tool_use::sql', 'tool_use::sql_query')
                 GROUP BY task
-                ORDER BY task;
-            "#,
+                ORDER BY task;",
                 Into::<DateTime<Utc>>::into(task_start_time).to_rfc3339()
             )
             .as_str()
@@ -483,13 +482,13 @@ async fn verify_sql_query_chat_completion(
     let mut task_input = sql_to_single_json_value(
         &rt,
         format!(
-            r#"SELECT input
+            "SELECT input
         FROM runtime.task_history
         WHERE start_time >= '{}'
         AND task='ai_completion'
         ORDER BY start_time
         LIMIT 1;
-    "#,
+    ",
             Into::<DateTime<Utc>>::into(task_start_time).to_rfc3339()
         )
         .as_str(),
@@ -551,10 +550,9 @@ async fn verify_similarity_search_chat_completion(
         sql_to_display(
             &rt,
             format!(
-                r#"SELECT input
+                "SELECT input
                 FROM runtime.task_history
-                WHERE start_time >= '{}' and task='tool_use::document_similarity';
-            "#,
+                WHERE start_time >= '{}' and task='tool_use::document_similarity';",
                 Into::<DateTime<Utc>>::into(task_start_time).to_rfc3339()
             )
             .as_str()

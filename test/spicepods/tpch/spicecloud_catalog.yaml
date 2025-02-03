@@ -1,0 +1,10 @@
+version: v1
+kind: Spicepod
+name: spicecloud_catalog_tpch
+catalogs:
+  - from: spice.ai:spiceai/tpch
+    name: tpch
+    include:
+      - "tpch.*"
+    params:
+      spiceai_api_key: ${secrets:SPICEAI_TPCH_API_KEY}

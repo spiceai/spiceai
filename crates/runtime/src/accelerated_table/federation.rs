@@ -86,7 +86,7 @@ impl FederationAdaptor {
 }
 
 impl FederationProvider for FederationAdaptor {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "FederationProviderForAcceleratedDataset"
     }
 

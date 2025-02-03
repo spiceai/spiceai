@@ -54,7 +54,7 @@ impl PartialEq for ModelFormat {
 pub fn from_path(path: &str) -> Option<ModelFormat> {
     if std::path::Path::new(path)
         .extension()
-        .map_or(false, |ext| ext.eq_ignore_ascii_case("onnx"))
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("onnx"))
     {
         return Some(ModelFormat::Onnx(onnx::Onnx {}));
     }

@@ -16,7 +16,7 @@ limitations under the License.
 
 use arrow::datatypes::{Field, Schema, SchemaRef};
 use async_stream::stream;
-use axum::async_trait;
+use async_trait::async_trait;
 use datafusion::catalog::Session;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::{DataFusionError, Result};
@@ -73,7 +73,7 @@ impl fmt::Debug for SchemaCastScanExec {
 }
 
 impl ExecutionPlan for SchemaCastScanExec {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "SchemaCastScanExec"
     }
 

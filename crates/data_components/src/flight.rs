@@ -501,10 +501,7 @@ impl ExecutionPlan for FlightExec {
         _partition: usize,
         _context: Arc<TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
-        let sql = match self.sql().map_err(to_execution_error) {
-            Ok(sql) => sql,
-            Err(error) => return Err(error),
-        };
+        let sql = self.sql().map_err(to_execution_error)?;
 
         let stream_adapter = RecordBatchStreamAdapter::new(
             self.schema(),

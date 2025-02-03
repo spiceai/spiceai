@@ -65,7 +65,7 @@ impl SparkConnectTableProvider {
 
 #[async_trait]
 impl SQLExecutor for SparkConnectTableProvider {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "SparkConnect"
     }
 

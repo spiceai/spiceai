@@ -8,7 +8,7 @@ All criteria must be met for the model to be considered RC.
 
 |     Model Type          | RC Quality | DRI Sign-off |
 | ----------------------- | ---------- | ------------ |
-| File                    | ➖         |              |
+| File                    | ✅         | @sgrebnov    |
 | Hugging Face            | ➖         |              |
 | Spice.ai Cloud Platform | ➖         |              |
 | OpenAI                  | ✅         | @ewgenius    |

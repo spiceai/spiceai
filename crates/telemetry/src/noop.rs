@@ -6,10 +6,7 @@
 //!
 //! Copying this implementation since opentelemetry decided to make it private:
 //! <https://github.com/open-telemetry/opentelemetry-rust/pull/2191>
-use opentelemetry::{
-    metrics::{InstrumentProvider, Meter, MeterProvider},
-    otel_debug,
-};
+use opentelemetry::metrics::{InstrumentProvider, Meter, MeterProvider};
 use std::sync::Arc;
 
 /// A no-op instance of a `MetricProvider`
@@ -26,8 +23,7 @@ impl NoopMeterProvider {
 }
 
 impl MeterProvider for NoopMeterProvider {
-    fn meter_with_scope(&self, scope: opentelemetry::InstrumentationScope) -> Meter {
-        otel_debug!(name: "NoopMeterProvider.MeterCreation", meter_name = scope.name(), message = "Meter was obtained from a NoopMeterProvider. No metrics will be recorded. If global::meter_with_scope()/meter() was used, ensure that a valid MeterProvider is set globally before creating Meter.");
+    fn meter_with_scope(&self, _scope: opentelemetry::InstrumentationScope) -> Meter {
         Meter::new(Arc::new(NoopMeter::new()))
     }
 }

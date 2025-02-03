@@ -101,6 +101,27 @@ impl RequestContext {
         REQUEST_CONTEXT.scope(self, f).await
     }
 
+    /// Retries the provided future from the closure `r` times until it fails or succeeds.
+    pub async fn scope_retry<F, Fut, T, E>(self: Arc<Self>, r: u16, f: F) -> Fut::Output
+    where
+        F: Fn() -> Fut,
+        Fut: Future<Output = Result<T, E>>,
+    {
+        let mut try_count = 0;
+        loop {
+            let fut = f();
+            match REQUEST_CONTEXT.scope(Arc::clone(&self), fut).await {
+                Ok(result) => return Ok(result),
+                Err(e) => {
+                    try_count += 1;
+                    if try_count >= r {
+                        return Err(e);
+                    }
+                }
+            }
+        }
+    }
+
     #[must_use]
     pub fn to_dimensions(&self) -> Vec<KeyValue> {
         let mut dimensions = vec![KeyValue::new("protocol", self.protocol().as_str())];

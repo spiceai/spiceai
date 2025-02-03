@@ -77,7 +77,7 @@ jobs:
                 tags: ["default", "models", "metal"],
               }, {
                 name: "Windows x64",
-                runner: "rust-windows-x64",
+                runner: "windows-latest",
                 target_os: "windows",
                 target_arch: "x86_64",
                 target_arch_go: "amd64",
@@ -114,24 +114,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # The `windows-gpu-t4-4-core` runner does not have Python installed
-      - name: Set up Python3
-        if: matrix.target.runner == 'windows-gpu-t4-4-core'
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.x'
-
       - name: Set REL_VERSION from version.txt
         run: python3 ./.github/scripts/get_release_version.py
 
-      # The `windows-gpu-t4-4-core` does not have modern PowerShell installed
-      - name: Install PowerShell
-        if: matrix.target.runner == 'windows-gpu-t4-4-core'
-        uses: ./.github/actions/install-pwsh
-
-      # The `windows-gpu-t4-4-core` requires Visual Studio Build Tools
       - name: Install Visual Studio Build Tools
-        if: matrix.target.runner == 'windows-gpu-t4-4-core'
+        if: matrix.target.target_os == 'windows'
         uses: ./.github/actions/install-vs-buildtools
 
       - name: Set up Go
@@ -147,7 +134,7 @@ jobs:
           os: ${{ matrix.target.target_os }}
 
       - name: Set up make
-        if: matrix.target.target_os == 'linux' || matrix.target.runner == 'windows-gpu-t4-4-core'
+        if: matrix.target.target_os == 'linux'
         uses: ./.github/actions/setup-make
         with:
           os: ${{ matrix.target.target_os }}
@@ -155,22 +142,6 @@ jobs:
       - name: Set up cc
         if: matrix.target.target_os == 'linux'
         uses: ./.github/actions/setup-cc
-
-      - name: Restore build cache (macOS)
-        if: matrix.target.target_os == 'darwin'
-        run: |
-          mkdir -p target
-          if [ -d /Users/spiceai/build/target ]; then
-            rsync -av /Users/spiceai/build/target/ target/
-          fi
-
-      - name: Restore build cache (Linux)
-        if: matrix.target.target_os == 'linux'
-        run: |
-          mkdir -p target
-          if [ -d /home/spiceai/build/target ]; then
-            rsync -av /home/spiceai/build/target/ target/
-          fi
 
       # The aarch64 runner does not have any tools pre-installed
       - name: Install missing tools (Linux aarch64)
@@ -193,18 +164,11 @@ jobs:
           brew install unixodbc
           echo "RUSTFLAGS=-L /opt/homebrew/lib" >> $GITHUB_ENV
 
-      - name: Restore build cache (Windows)
-        if: matrix.target.target_os == 'windows'
-        run: |
-          mkdir -p target
-          if (Test-Path C:/spiceai/build/target) {
-            Copy-Item -Recurse -Force C:/spiceai/build/target/* target/
-          }
-
       ## Default flavor
       - name: Build spiced
         if: contains(matrix.target.tags, 'default')
-        run: make -C bin/spiced
+        working-directory: bin/spiced
+        run: cargo build --release --features release  --target-dir ../../target
 
       - name: tar binary
         if: matrix.target.target_os != 'windows' && contains(matrix.target.tags, 'default')
@@ -242,7 +206,8 @@ jobs:
       ## Models flavor
       - name: Build spiced (models)
         if: contains(matrix.target.tags, 'models')
-        run: make -C bin/spiced SPICED_NON_DEFAULT_FEATURES="models"
+        working-directory: bin/spiced
+        run: cargo build --release --features release,models --target-dir ../../target
 
       - name: tar binary (models)
         if: matrix.target.target_os != 'windows' && contains(matrix.target.tags, 'models')
@@ -281,7 +246,8 @@ jobs:
       ## Models + metal flavor
       - name: Build spiced (models)
         if: matrix.target.target_os == 'darwin'
-        run: make -C bin/spiced SPICED_NON_DEFAULT_FEATURES="models,metal"
+        working-directory: bin/spiced
+        run: cargo build --release --features release,models,metal --target-dir ../../target
 
       - name: tar binary (models,metal)
         if: matrix.target.target_os == 'darwin'
@@ -337,27 +303,6 @@ jobs:
         with:
           name: spice.exe_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: spice.exe_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz
-
-      - name: Update build cache (macOS)
-        if: matrix.target.target_os == 'darwin'
-        run: |
-          if [ -d /Users/spiceai/build/target ]; then
-            rsync -av target/ /Users/spiceai/build/target/
-          fi
-
-      - name: Update build cache (Linux)
-        if: matrix.target.target_os == 'linux'
-        run: |
-          if [ -d /home/spiceai/build/target ]; then
-            rsync -av target/ /home/spiceai/build/target/
-          fi
-
-      - name: Update build cache (Windows)
-        if: matrix.target.runner == 'rust-windows-x64'
-        run: |
-          if (Test-Path C:/spiceai/build/target) {
-            Copy-Item -Recurse -Force target/* C:/spiceai/build/target
-          }
 
   publish-minio:
     name: Publish linux-x86_64 binaries to Minio

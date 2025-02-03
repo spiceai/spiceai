@@ -27,6 +27,7 @@ pub struct AnonymousTelemetryExporter {
 }
 
 impl AnonymousTelemetryExporter {
+    #[allow(dead_code)]
     pub async fn new(url: Arc<str>) -> Self {
         let flight_client = match FlightClient::try_new(url, Credentials::anonymous(), None).await {
             Ok(client) => Some(client),

@@ -17,6 +17,10 @@
   <a href="https://github.com/spiceai/spiceai/actions/workflows/benchmarks.yml"><img alt="GitHub Actions Workflow Status - benchmark tests" src="https://img.shields.io/github/actions/workflow/status/spiceai/spiceai/benchmarks.yml?branch=trunk&label=benchmark%20tests" /></a>
 </p>
 
+<p align="center">
+  <a href="https://spiceai.org/docs">Documentation</a> | <a href="#installation">Installation</a> | <a href="https://github.com/spiceai/cookbook">Cookbook</a>
+</p>
+
 **Spice** is a SQL query and AI compute engine, written in Rust, for data-driven apps and agents.
 
 <img width="740" alt="Spice.ai Open Source accelerated data query and LLM-inference engine" src="https://github.com/user-attachments/assets/9db94f9c-10a1-47b0-ab45-05aa964590ff" />
@@ -202,7 +206,7 @@ See more demos on [YouTube](https://www.youtube.com/playlist?list=PLesJrUXEx3U9a
 | Name          | Description                                  | Status            | ML Format(s) | LLM Format(s)                   |
 | ------------- | -------------------------------------------- | ----------------- | ------------ | ------------------------------- |
 | `openai`      | OpenAI (or compatible) LLM endpoint          | Release Candidate | -            | OpenAI-compatible HTTP endpoint |
-| `file`        | Local filesystem                             | Beta              | ONNX         | GGUF, GGML, SafeTensor          |
+| `file`        | Local filesystem                             | Release Candidate | ONNX         | GGUF, GGML, SafeTensor          |
 | `huggingface` | Models hosted on HuggingFace                 | Beta              | ONNX         | GGUF, GGML, SafeTensor          |
 | `spice.ai`    | Models hosted on the Spice.ai Cloud Platform |                   | ONNX         | OpenAI-compatible HTTP endpoint |
 | `azure`       | Azure OpenAI                                 |                   | -            | OpenAI-compatible HTTP endpoint |
@@ -227,14 +231,16 @@ Catalog Connectors connect to external catalog providers and make their tables a
 | `unity_catalog` | Unity Catalog           | Stable      | Delta Lake                   |
 | `databricks`    | Databricks              | Beta        | Spark Connect, S3/Delta Lake |
 | `iceberg`       | Apache Iceberg          | Beta        | Parquet                      |
-| `spice.ai`      | Spice.ai Cloud Platform | Alpha       | Arrow Flight                 |
+| `spice.ai`      | Spice.ai Cloud Platform | Beta        | Arrow Flight                 |
 | `glue`          | AWS Glue                | Coming Soon | JSON, Parquet, Iceberg       |
 
 ## ⚡️ Quickstart (Local Machine)
 
 <https://github.com/spiceai/spiceai/assets/88671039/85cf9a69-46e7-412e-8b68-22617dcbd4e0>
 
-**Step 1.** Install the Spice CLI:
+### Installation
+
+Install the Spice CLI:
 
 On **macOS, Linux, and WSL**:
 
@@ -248,13 +254,15 @@ Or using `brew`:
 brew install spiceai/spiceai/spice
 ```
 
-On **Windows**:
+On **Windows** using PowerShell:
 
-```bash
-curl -L "https://install.spiceai.org/Install.ps1" -o Install.ps1 && PowerShell -ExecutionPolicy Bypass -File ./Install.ps1
+```powershell
+iex ((New-Object System.Net.WebClient).DownloadString("https://install.spiceai.org/Install.ps1"))
 ```
 
-**Step 2.** Initialize a new Spice app with the `spice init` command:
+### Usage
+
+**Step 1.** Initialize a new Spice app with the `spice init` command:
 
 ```bash
 spice init spice_qs
@@ -266,7 +274,7 @@ A `spicepod.yaml` file is created in the `spice_qs` directory. Change to that di
 cd spice_qs
 ```
 
-**Step 3.** Start the Spice runtime:
+**Step 2.** Start the Spice runtime:
 
 ```bash
 spice run
@@ -286,7 +294,7 @@ Example output will be shown as follows:
 
 The runtime is now started and ready for queries.
 
-**Step 4.** In a new terminal window, add the `spiceai/quickstart` Spicepod. A Spicepod is a package of configuration defining datasets and ML models.
+**Step 3.** In a new terminal window, add the `spiceai/quickstart` Spicepod. A Spicepod is a package of configuration defining datasets and ML models.
 
 ```bash
 spice add spiceai/quickstart
@@ -310,7 +318,7 @@ The `spiceai/quickstart` Spicepod will add a `taxi_trips` data table to the runt
 2025-01-20T19:26:40.312839Z  INFO runtime::accelerated_table::refresh_task: Loaded 2,964,624 rows (399.41 MiB) for dataset taxi_trips in 10s 299ms
 ```
 
-**Step 5.** Start the Spice SQL REPL:
+**Step 4.** Start the Spice SQL REPL:
 
 ```bash
 spice sql

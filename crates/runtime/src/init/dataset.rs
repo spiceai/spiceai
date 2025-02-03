@@ -525,7 +525,7 @@ impl Runtime {
             accelerated_table,
         } = register_dataset_ctx;
 
-        let replicate = ds.replication.as_ref().map_or(false, |r| r.enabled);
+        let replicate = ds.replication.as_ref().is_some_and(|r| r.enabled);
 
         // FEDERATED TABLE
         if !ds.is_accelerated() {

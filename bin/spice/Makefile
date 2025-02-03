@@ -21,7 +21,7 @@ LDFLAGS:="-X $(BASE_PACKAGE_NAME)/bin/spice/pkg/version.version=$(SPICE_VERSION)
 .PHONY: all
 all:
 ifeq ($(OS),Windows_NT)
-	go build -v -ldflags=$(LDFLAGS) -o ..\..\target\release\spice.exe
+	go build -v -ldflags=$(LDFLAGS) -o "..\..\target\release\spice.exe"
 else
 	mkdir -p ../../target/release 2> /dev/null || true
 	go build -v -ldflags=$(LDFLAGS) -o ../../target/release/spice $(TAGS)

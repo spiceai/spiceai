@@ -92,12 +92,11 @@ mod nsql {
         let response = http_post(
             format!("{base_url}/v1/sql").as_str(),
             format!(
-                r#"SELECT task, input
+                "SELECT task, input
                         FROM runtime.task_history
                         WHERE task NOT IN ('ai_completion', 'health', 'accelerated_refresh')
                         AND start_time > '{}'
-                        ORDER BY start_time, task;
-                    "#,
+                        ORDER BY start_time, task;",
                 Into::<DateTime<Utc>>::into(task_start_time).to_rfc3339()
             )
             .as_str(),
