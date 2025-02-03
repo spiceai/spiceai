@@ -185,7 +185,7 @@ impl SpiceAIFactory {
 const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::connector("api_key").secret(),
     ParameterSpec::connector("token").secret(),
-    ParameterSpec::connector("flight_endpoint"),
+    ParameterSpec::connector("endpoint"),
     ParameterSpec::connector("http_endpoint"),
 ];
 
@@ -209,7 +209,7 @@ impl DataConnectorFactory for SpiceAIFactory {
         Box::pin(async move {
             let url: Arc<str> = params
                 .parameters
-                .get("flight_endpoint")
+                .get("endpoint")
                 .expose()
                 .ok()
                 .map_or(default_flight_url, Into::into);
