@@ -11136,6 +11136,7 @@ name = "spicepod"
 version = "1.1.0"
 dependencies = [
  "fundu",
+ "regex",
  "schemars",
  "serde",
  "serde-value",
