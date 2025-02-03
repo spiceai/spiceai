@@ -88,10 +88,6 @@ pub enum Error {
     ImapError { source: imap::Error },
     #[snafu(display("The specified 'from' address is not a valid email address: {from}"))]
     InvalidFrom { from: String },
-    #[snafu(transparent)]
-    DataComponentError {
-        source: data_components::imap::Error,
-    },
 }
 
 pub struct Imap {
@@ -248,7 +244,12 @@ impl DataConnectorFactory for ImapFactory {
                     .expose()
                     .ok()
                     .unwrap_or("auto"),
-            )?;
+            )
+            .map_err(|e| DataConnectorError::InvalidConfigurationSourceOnly {
+                dataconnector: "imap".to_string(),
+                connector_component: params.component.clone(),
+                source: e.into(),
+            })?;
 
             let auth_mode = ImapAuthModeParameter::from_str(
                 params
@@ -257,7 +258,12 @@ impl DataConnectorFactory for ImapFactory {
                     .expose()
                     .ok()
                     .unwrap_or("plain"),
-            )?;
+            )
+            .map_err(|e| DataConnectorError::InvalidConfigurationSourceOnly {
+                dataconnector: "imap".to_string(),
+                connector_component: params.component.clone(),
+                source: e.into(),
+            })?;
 
             let auth_mode = auth_mode.build(username.clone(), password.clone());
 
