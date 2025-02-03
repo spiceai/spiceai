@@ -304,7 +304,7 @@ impl DataConnector for SpiceAI {
                     })?,
             ),
             (None, None) => {
-                tracing::warn!("Could not retrieve schema in advance for Spice.ai dataset.\nSchema will be retrieved by querying the dataset.");
+                tracing::debug!("Could not retrieve schema in advance for Spice.ai dataset.\nSchema will be retrieved by querying the dataset.");
                 None
             }
         };
