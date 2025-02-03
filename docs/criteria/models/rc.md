@@ -6,10 +6,10 @@ All criteria must be met for the model to be considered RC.
 
 ## RC Quality Models
 
-|     Model Type          | RC Quality | DRI Sign-off |
+| Model Type              | RC Quality | DRI Sign-off |
 | ----------------------- | ---------- | ------------ |
 | File                    | ✅         | @sgrebnov    |
-| Hugging Face            | ➖         |              |
+| Hugging Face            | ✅         | @Sevenannn   |
 | Spice.ai Cloud Platform | ➖         |              |
 | OpenAI                  | ✅         | @ewgenius    |
 | Azure Openai            | ➖         |              |
@@ -26,9 +26,10 @@ All criteria must be met for the model to be considered RC.
   - An increase in latency is defined as a 10% increase in both the 50th & 95th percentile between the first and last minute.
 
 ### Conditional Criteria
+
 - For hosted models in the Spice runtime:
- - [ ] Does not excessively increase the latency of the underlying hosted model.
-   - An increase in latency is defined as a 15% increase in either the 50th & 95th percentile above the underlying model.
+- [ ] Does not excessively increase the latency of the underlying hosted model.
+  - An increase in latency is defined as a 15% increase in either the 50th & 95th percentile above the underlying model.
 
 ### Documentation
 
