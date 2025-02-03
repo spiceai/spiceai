@@ -17,7 +17,7 @@ limitations under the License.
 use crate::component::dataset::Dataset;
 use async_trait::async_trait;
 use data_components::imap::{
-    session::{ImapAuthMode, ImapSession},
+    session::{ImapAuthModeParameter, ImapSSLMode, ImapSession},
     ImapTableProvider,
 };
 use datafusion::datasource::TableProvider;
@@ -28,6 +28,7 @@ use std::{
     collections::HashMap,
     future::Future,
     pin::Pin,
+    str::FromStr,
     sync::{Arc, LazyLock},
 };
 
@@ -51,6 +52,12 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::connector("port")
         .default("993")
         .description("The port to connect to on the IMAP server"),
+    ParameterSpec::connector("ssl_mode")
+        .default("auto")
+        .description("The IMAP SSL mode to use"),
+    ParameterSpec::connector("auth_mode")
+        .default("plain")
+        .description("The authentication method to use when connecting to the IMAP server"),
 ];
 
 // Regex that matches an email address in a simple way
@@ -81,6 +88,10 @@ pub enum Error {
     ImapError { source: imap::Error },
     #[snafu(display("The specified 'from' address is not a valid email address: {from}"))]
     InvalidFrom { from: String },
+    #[snafu(transparent)]
+    DataComponentError {
+        source: data_components::imap::Error,
+    },
 }
 
 pub struct Imap {
@@ -230,15 +241,28 @@ impl DataConnectorFactory for ImapFactory {
 
             let mailbox = mailbox.into();
 
-            let auth_mode =
-                if host == "imap.gmail.com".into() || host == "outlook.office365.com".into() {
-                    ImapAuthMode::new_oauth2(username.clone(), password.clone())
-                } else {
-                    ImapAuthMode::new_plain(username.clone(), password.clone())
-                };
+            let ssl_mode = ImapSSLMode::from_str(
+                params
+                    .parameters
+                    .get("ssl_mode")
+                    .expose()
+                    .ok()
+                    .unwrap_or("auto"),
+            )?;
+
+            let auth_mode = ImapAuthModeParameter::from_str(
+                params
+                    .parameters
+                    .get("auth_mode")
+                    .expose()
+                    .ok()
+                    .unwrap_or("plain"),
+            )?;
+
+            let auth_mode = auth_mode.build(username.clone(), password.clone());
 
             Ok(Arc::new(Imap {
-                session: ImapSession::new(auth_mode, host, port, mailbox),
+                session: ImapSession::new(auth_mode, host, port, mailbox).with_ssl_mode(ssl_mode),
             }) as Arc<dyn DataConnector>)
         })
     }
