@@ -17,9 +17,78 @@ limitations under the License.
 use imap::{ImapConnection, Session};
 use secrecy::{ExposeSecret, SecretString};
 use snafu::prelude::*;
-use std::sync::Arc;
+use std::{str::FromStr, sync::Arc};
 
 use super::{ExamineMailboxSnafu, FailedToConnectSnafu};
+
+#[derive(Debug, Copy, Clone, Default)]
+pub enum ImapSSLMode {
+    #[default]
+    Tls,
+    StartTls,
+    Disabled,
+    Auto,
+}
+
+impl FromStr for ImapSSLMode {
+    type Err = super::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "tls" => Ok(Self::Tls),
+            "starttls" => Ok(Self::StartTls),
+            "disabled" => Ok(Self::Disabled),
+            "auto" => Ok(Self::Auto),
+            _ => Err(super::Error::InvalidSSLMode {
+                ssl_mode: s.to_string(),
+            }),
+        }
+    }
+}
+
+impl From<ImapSSLMode> for imap::ConnectionMode {
+    fn from(mode: ImapSSLMode) -> Self {
+        match mode {
+            ImapSSLMode::Tls => imap::ConnectionMode::Tls,
+            ImapSSLMode::StartTls => imap::ConnectionMode::StartTls,
+            ImapSSLMode::Disabled => imap::ConnectionMode::Plaintext,
+            ImapSSLMode::Auto => imap::ConnectionMode::Auto,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum ImapAuthModeParameter {
+    OAuth,
+    Plain,
+}
+
+impl FromStr for ImapAuthModeParameter {
+    type Err = super::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "oauth" => Ok(Self::OAuth),
+            "plain" => Ok(Self::Plain),
+            _ => Err(super::Error::InvalidAuthMode {
+                auth_mode: s.to_string(),
+            }),
+        }
+    }
+}
+
+impl ImapAuthModeParameter {
+    #[must_use]
+    pub fn build(&self, username: SecretString, password: SecretString) -> ImapAuthMode {
+        match self {
+            Self::OAuth => ImapAuthMode::OAuth2 {
+                user: username,
+                access_token: password,
+            },
+            Self::Plain => ImapAuthMode::Plain { username, password },
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub enum ImapAuthMode {
@@ -31,18 +100,6 @@ pub enum ImapAuthMode {
         username: SecretString,
         password: SecretString,
     },
-}
-
-impl ImapAuthMode {
-    #[must_use]
-    pub fn new_oauth2(user: SecretString, access_token: SecretString) -> Self {
-        Self::OAuth2 { user, access_token }
-    }
-
-    #[must_use]
-    pub fn new_plain(username: SecretString, password: SecretString) -> Self {
-        Self::Plain { username, password }
-    }
 }
 
 impl imap::Authenticator for ImapAuthMode {
@@ -73,6 +130,7 @@ pub struct ImapSession {
     host: Arc<str>,
     port: u16,
     mailbox: Arc<str>,
+    ssl_mode: ImapSSLMode,
 }
 
 impl ImapSession {
@@ -88,11 +146,19 @@ impl ImapSession {
             host,
             port,
             mailbox,
+            ssl_mode: ImapSSLMode::default(),
         }
+    }
+
+    #[must_use]
+    pub fn with_ssl_mode(mut self, ssl_mode: ImapSSLMode) -> Self {
+        self.ssl_mode = ssl_mode;
+        self
     }
 
     pub fn connect(&self) -> Result<Session<Box<dyn ImapConnection>>, super::Error> {
         let client = imap::ClientBuilder::new(Arc::clone(&self.host), self.port)
+            .mode(self.ssl_mode.into())
             .connect()
             .context(FailedToConnectSnafu)?;
 

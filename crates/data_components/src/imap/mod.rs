@@ -51,6 +51,10 @@ pub enum Error {
     FailedToConnect { source: imap::Error },
     #[snafu(display("Failed to logout: {source}"))]
     FailedToLogout { source: imap::Error },
+    #[snafu(display("An invalid SSL mode was provided: {ssl_mode}"))]
+    InvalidSSLMode { ssl_mode: String },
+    #[snafu(display("An invalid authentication mode was provided: {auth_mode}"))]
+    InvalidAuthMode { auth_mode: String },
 }
 
 #[derive(Debug)]
