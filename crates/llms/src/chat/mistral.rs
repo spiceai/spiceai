@@ -300,11 +300,11 @@ impl MistralLlama {
         model_id: &str,
         arch: Option<&str>,
         hf_token_literal: Option<&Secret<String>>,
-        quantized_gguf_filename: Option<PathBuf>,
+        gguf_filename: Option<PathBuf>,
     ) -> Result<Self> {
         let model_parts: Vec<&str> = model_id.split(':').collect();
 
-        let loader: Result<Box<dyn Loader>> = match quantized_gguf_filename {
+        let loader: Result<Box<dyn Loader>> = match gguf_filename {
             // Loading the GGUF directly (as if it is a quantized model, although it need not be quantized).
             Some(gguf) => Ok(GGUFLoaderBuilder::new(
                 None,
