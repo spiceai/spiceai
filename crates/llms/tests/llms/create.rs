@@ -66,6 +66,7 @@ pub(crate) fn create_hf(model_id: &str) -> Result<Arc<Box<dyn Chat>>, ChatError>
     Ok(Arc::new(create_hf_model(
         model_id,
         None,
+        None,
         std::env::var("HF_TOKEN").ok().map(Secret::new).as_ref(),
     )?))
 }

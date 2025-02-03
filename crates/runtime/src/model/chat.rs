@@ -195,16 +195,14 @@ async fn huggingface(
             None
         });
 
-    if let Some(path) = gguf_path {
+    if let Some(ref path) = gguf_path {
         tracing::debug!(
             "For Huggingface model {}, the GGUF model {} will be downloaded and used.",
             component.name,
             path.display()
         );
-        return llms::chat::create_hf_w_gguf(id.as_str(), path.as_path(), hf_token).await;
-    }
-
-    llms::chat::create_hf_model(&id, model_type, hf_token)
+    };
+    llms::chat::create_hf_model(&id, model_type, gguf_path, hf_token)
 }
 
 fn openai(

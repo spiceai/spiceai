@@ -24,7 +24,7 @@ use app::App;
 use model_components::model::Model;
 use opentelemetry::KeyValue;
 use snafu::prelude::*;
-use spicepod::component::model::{Model as SpicepodModel, ModelType};
+use spicepod::component::model::{Model as SpicepodModel, ModelSource, ModelType};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -103,14 +103,16 @@ impl Runtime {
             .collect::<HashMap<_, _>>();
         let params = get_params_with_secrets(self.secrets(), &p).await;
 
-        // Verify all referenced local files exist before attempting to load the model and determine its type.
-        // Otherwise, we will fail to determine the model type and the error will be confusing.
-        if let Err(err) = verify_local_files_exist(m) {
-            metrics::models::LOAD_ERROR.add(1, &[]);
-            self.status
-                .update_model(&model.name, status::ComponentStatus::Error);
-            tracing::warn!("{err}");
-            return;
+        if matches!(source, Some(ModelSource::File)) {
+            // Verify all referenced local files exist before attempting to load the model and determine its type.
+            // Otherwise, we will fail to determine the model type and the error will be confusing.
+            if let Err(err) = verify_local_files_exist(m) {
+                metrics::models::LOAD_ERROR.add(1, &[]);
+                self.status
+                    .update_model(&model.name, status::ComponentStatus::Error);
+                tracing::warn!("{err}");
+                return;
+            }
         }
 
         let model_type = m.model_type();

@@ -34,7 +34,7 @@ use futures::{Stream, TryStreamExt};
 use mistralrs::{
     AutoDeviceMapParams, ChatCompletionChunkResponse, ChatCompletionResponse, ChunkChoice,
     Constraint, Device, DeviceMapSetting, Function, GGMLLoaderBuilder, GGMLSpecificConfig,
-    GGUFLoaderBuilder, GGUFSpecificConfig, LocalModelPaths, MistralRs, MistralRsBuilder,
+    GGUFLoaderBuilder, GGUFSpecificConfig, Loader, LocalModelPaths, MistralRs, MistralRsBuilder,
     ModelDType, ModelPaths, NormalLoaderBuilder, NormalRequest, Pipeline,
     Request as MistralRequest, RequestMessage, Response as MistralResponse, SamplingParams,
     TokenSource, Tool, ToolCallResponse, ToolChoice, ToolType,
@@ -300,32 +300,49 @@ impl MistralLlama {
         model_id: &str,
         arch: Option<&str>,
         hf_token_literal: Option<&Secret<String>>,
+        quantized_gguf_filename: Option<PathBuf>,
     ) -> Result<Self> {
         let model_parts: Vec<&str> = model_id.split(':').collect();
 
-        // Hardcoded model architecture can ensure correct loading type.
-        // If not provided, it will be inferred (generally from `.model_type` in a downloaded `config.json`)
-        let loader_type = arch
-            .map(|a| {
-                mistralrs::NormalLoaderType::from_str(a)
-                    .map_err(|e| ChatError::UnsupportedModelType { source: e.into() })
-            })
-            .transpose()?;
+        let loader: Result<Box<dyn Loader>> = match quantized_gguf_filename {
+            // Loading the GGUF directly (as if it is a quantized model, although it need not be quantized).
+            Some(gguf) => Ok(GGUFLoaderBuilder::new(
+                None,
+                None,
+                model_parts[0].to_string(),
+                vec![gguf.to_string_lossy().to_string()],
+                GGUFSpecificConfig::default(),
+            )
+            .build()),
+            None => {
+                // Hardcoded model architecture can ensure correct loading type.
+                // If not provided, it will be inferred (generally from `.model_type` in a downloaded `config.json`)
+                let loader_type = arch
+                    .map(|a| {
+                        mistralrs::NormalLoaderType::from_str(a)
+                            .map_err(|e| ChatError::UnsupportedModelType { source: e.into() })
+                    })
+                    .transpose()?;
 
-        let builder = NormalLoaderBuilder::new(
-            mistralrs::NormalSpecificConfig::default(),
-            None,
-            None,
-            Some(model_parts[0].to_string()),
-        );
+                let builder = NormalLoaderBuilder::new(
+                    mistralrs::NormalSpecificConfig::default(),
+                    None,
+                    None,
+                    Some(model_parts[0].to_string()),
+                );
+
+                builder
+                    .build(loader_type)
+                    .map_err(|e| ChatError::FailedToLoadModel { source: e.into() })
+            }
+        };
         let device = Self::get_device();
         let token_source = hf_token_literal.map_or(TokenSource::CacheToken, |secret| {
+            tracing::info!("Explicitly given a Huggingface token. Using instead of any system defaults (if any).");
             TokenSource::Literal(secret.expose_secret().clone())
         });
 
-        let pipeline = builder
-            .build(loader_type)
-            .map_err(|e| ChatError::FailedToLoadModel { source: e.into() })?
+        let pipeline = loader?
             .load_model_from_hf(
                 model_parts.get(1).map(|&x| x.to_string()),
                 token_source,
