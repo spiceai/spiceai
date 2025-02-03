@@ -53,7 +53,7 @@ mod nsql {
     async fn openai_test_nsql() -> Result<(), anyhow::Error> {
         let _tracing = init_tracing(None);
 
-        test_request_context().scope(async {
+        test_request_context().scope_retry(3, || async {
             verify_env_secret_exists("SPICE_OPENAI_API_KEY")
                 .await
                 .map_err(anyhow::Error::msg)?;
@@ -388,7 +388,7 @@ async fn openai_test_chat_messages() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(None);
 
     test_request_context()
-        .scope(async {
+        .scope_retry(3, || async {
             verify_env_secret_exists("SPICE_OPENAI_API_KEY")
                 .await
                 .map_err(anyhow::Error::msg)?;
