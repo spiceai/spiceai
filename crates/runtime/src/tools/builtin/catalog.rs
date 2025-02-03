@@ -114,6 +114,6 @@ impl SpiceToolCatalog for BuiltinToolCatalog {
     }
 
     fn name(&self) -> &'static str {
-        "builtin"
+        "auto"
     }
 }
