@@ -61,7 +61,7 @@ pub async fn try_to_chat_model(
     params: &HashMap<String, SecretString>,
     rt: Arc<Runtime>,
 ) -> Result<Box<dyn Chat>, LlmError> {
-    let model = construct_model(component, params).await?;
+    let model = construct_model(component, params)?;
 
     // Handle tool usage
     let spice_tool_opt: Option<SpiceToolsOptions> = extract_secret!(params, "tools")
@@ -93,7 +93,7 @@ pub async fn try_to_chat_model(
     Ok(tool_model)
 }
 
-pub async fn construct_model(
+pub fn construct_model(
     component: &spicepod::component::model::Model,
     params: &HashMap<String, SecretString>,
 ) -> Result<Box<dyn Chat>, LlmError> {
@@ -103,7 +103,7 @@ pub async fn construct_model(
     })?;
 
     let model = match prefix {
-        ModelSource::HuggingFace => huggingface(model_id, component, params).await,
+        ModelSource::HuggingFace => huggingface(model_id, component, params),
         ModelSource::File => file(component, params),
         ModelSource::Anthropic => anthropic(model_id.as_deref(), params),
         ModelSource::Azure => azure(model_id, component.name.as_str(), params),
@@ -168,7 +168,7 @@ fn anthropic(
     Ok(Box::new(anthropic) as Box<dyn Chat>)
 }
 
-async fn huggingface(
+fn huggingface(
     model_id: Option<String>,
     component: &spicepod::component::model::Model,
     params: &HashMap<String, SecretString>,
