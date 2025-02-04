@@ -25,12 +25,12 @@ use async_openai::{
 use async_trait::async_trait;
 use futures::Stream;
 use futures::{stream::StreamExt, TryStreamExt};
-use llms::openai::DEFAULT_LLM_MODEL;
 use llms::{
-    anthropic::{Anthropic, AnthropicConfig},
+    anthropic::Anthropic,
     chat::{nsql::SqlGeneration, Chat, Error as LlmError, Result as ChatResult},
     xai::Xai,
 };
+use llms::{config::GenericAuthMechanism, openai::DEFAULT_LLM_MODEL};
 use secrecy::{ExposeSecret, SecretString};
 use spicepod::component::model::{Model, ModelFileType, ModelSource};
 use std::{collections::HashMap, path::PathBuf, str::FromStr, sync::Arc};
@@ -150,19 +150,21 @@ fn anthropic(
     let api_key = extract_secret!(params, "anthropic_api_key");
     let auth_token = extract_secret!(params, "anthropic_auth_token");
 
-    if api_key.is_none() && auth_token.is_none() {
-        return Err(LlmError::FailedToLoadModel {
+    let auth = match (api_key, auth_token) {
+        (Some(s), None) => GenericAuthMechanism::from_api_key(s),
+        (None, Some(s)) => GenericAuthMechanism::from_bearer_token(s),
+        (None, None) => return Err(LlmError::FailedToLoadModel {
             source: "One of following `model.params` is required: `anthropic_api_key` or `anthropic_auth_token`.".into(),
-        });
-    }
+        }),
+        (Some(_), Some(_)) => return Err(LlmError::FailedToLoadModel {
+            source: "Only one of following `model.params` is allowed: `anthropic_api_key` or `anthropic_auth_token`.".into(),
+        }),
+    };
 
-    let cfg = AnthropicConfig::default()
-        .with_api_key(api_key)
-        .with_auth_token(auth_token)
-        .with_base_url(api_base);
-
-    let anthropic = Anthropic::new(cfg, model_id).map_err(|_| LlmError::FailedToLoadModel {
-        source: format!("Unknown anthropic model: {:?}", model_id.clone()).into(),
+    let anthropic = Anthropic::new(auth, model_id, api_base, None).map_err(|_| {
+        LlmError::FailedToLoadModel {
+            source: format!("Unknown anthropic model: {:?}", model_id.clone()).into(),
+        }
     })?;
 
     Ok(Box::new(anthropic) as Box<dyn Chat>)
