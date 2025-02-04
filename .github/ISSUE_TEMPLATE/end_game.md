@@ -147,7 +147,7 @@ assignees: ''
 
 - [ ] Prepare and finalize release notes:
 
-  - [ ] Acknowledge external contributors.
+  - [ ] Acknowledge external and new contributors.
   - [ ] List notable dependency updates (e.g. `datafusion`, `datafusion-table-providers`) under `## Dependencies`.
   - [ ] Summarize any cookbook changes under `## Cookbook`.
 
