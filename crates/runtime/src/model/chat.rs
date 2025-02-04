@@ -28,6 +28,7 @@ use futures::{stream::StreamExt, TryStreamExt};
 use llms::{
     anthropic::Anthropic,
     chat::{nsql::SqlGeneration, Chat, Error as LlmError, Result as ChatResult},
+    perplexity::PerplexitySonar,
     xai::Xai,
 };
 use llms::{config::GenericAuthMechanism, openai::DEFAULT_LLM_MODEL};
@@ -106,6 +107,7 @@ pub fn construct_model(
         ModelSource::HuggingFace => huggingface(model_id, component, params),
         ModelSource::File => file(component, params),
         ModelSource::Anthropic => anthropic(model_id.as_deref(), params),
+        ModelSource::Perplexity => perplexity(model_id.as_deref(), params),
         ModelSource::Azure => azure(model_id, component.name.as_str(), params),
         ModelSource::Xai => xai(model_id.as_deref(), params),
         ModelSource::OpenAi => openai(model_id, params),
@@ -140,6 +142,19 @@ fn xai(
         });
     };
     Ok(Box::new(Xai::new(model_id, api_key)) as Box<dyn Chat>)
+}
+
+fn perplexity(
+    model_id: Option<&str>,
+    params: &HashMap<String, SecretString>,
+) -> Result<Box<dyn Chat>, LlmError> {
+    let Some(auth_token) = params.get("perplexity_auth_token") else {
+        return Err(LlmError::FailedToLoadModel {
+            source: "No `perplexity_auth_token` provided for Perplexity model.".into(),
+        });
+    };
+
+    Ok(Box::new(PerplexitySonar::new(auth_token, model_id)) as Box<dyn Chat>)
 }
 
 fn anthropic(
