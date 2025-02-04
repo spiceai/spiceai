@@ -196,4 +196,4 @@ assignees: ''
 - [ ] Reddit: [reddit.com/r/spiceai](https://reddit.com/r/spiceai)
 - [ ] Discord: [#announcements](https://discord.gg/zv8ahzZVpf)
 - [ ] Telegram: [spiceai](https://t.me/spiceai)
-- [ ] Blog: [spiceai.org.blog](https://spiceai.org/blog)
+- [ ] Blog: [spiceai.org/blog](https://spiceai.org/blog)
