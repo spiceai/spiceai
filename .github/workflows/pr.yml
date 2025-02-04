@@ -82,6 +82,13 @@ jobs:
         if: needs.check_changes.outputs.relevant_changes == 'true'
         with:
           os: 'linux'
+        
+      - name: Set up sccache
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        uses: ./.github/actions/setup-sccache
+        with:
+          minio_endpoint: ${{ secrets.MINIO_ENDPOINT }}
+          os: 'linux'
       
       - name: Install Protoc
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -95,8 +102,13 @@ jobs:
       - name: Set up cc
         uses: ./.github/actions/setup-cc
 
-      - run: make lint
+      - run: make lint && sccache --show-stats
         if: needs.check_changes.outputs.relevant_changes == 'true'
+        env:
+          RUSTC_WRAPPER: sccache
+          AWS_ACCESS_KEY_ID: ${{ secrets.MINIO_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.MINIO_SECRET_KEY }}
+          CARGO_INCREMENTAL: 0
 
       - name: Check if Cargo.lock is updated
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -128,6 +140,12 @@ jobs:
         uses: ./.github/actions/setup-rust
         with:
           os: 'linux'
+        
+      - name: Set up sccache
+        uses: ./.github/actions/setup-sccache
+        with:
+          minio_endpoint: ${{ secrets.MINIO_ENDPOINT }}
+          os: 'linux'
 
       - name: Set up make
         uses: ./.github/actions/setup-make
@@ -135,8 +153,13 @@ jobs:
       - name: Set up cc
         uses: ./.github/actions/setup-cc
 
-      - run: make ci test
+      - run: make ci test && sccache --show-stats
         if: needs.check_changes.outputs.relevant_changes == 'true'
+        env:
+          RUSTC_WRAPPER: sccache
+          AWS_ACCESS_KEY_ID: ${{ secrets.MINIO_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.MINIO_SECRET_KEY }}
+          CARGO_INCREMENTAL: 0
 
   build-docker:
     name: Build Docker Image
