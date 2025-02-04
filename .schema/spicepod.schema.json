@@ -921,7 +921,8 @@
         "weights",
         "config",
         "tokenizer",
-        "tokenizerConfig"
+        "tokenizerConfig",
+        "generationConfig"
       ]
     },
     "OnConflictBehavior": {
