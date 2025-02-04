@@ -148,6 +148,11 @@ jobs:
               return filtered;
             }
 
+            // For `on.pull_request`, only build 90 compute capability on Linux.
+            if (context.eventName === 'pull_request') {
+              return matrix.filter(m => m.compute_cap === "90" && m.target_os === "linux");
+            }
+
             return matrix;
 
   build:
