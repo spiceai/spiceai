@@ -467,11 +467,6 @@ impl MistralLlama {
                     if c.finish_reason == "stop" && !c.message.tool_calls.is_empty() {
                         c.finish_reason = "tool_calls".to_string();
                     }
-
-                    if c.message.content.is_none() && !c.message.tool_calls.is_empty() {
-                        // Use Some(""), not None as it is more compatible with many open source `chat_template`s.
-                        c.message.content = Some("".to_string());
-                    }
                 });
 
                 Ok(resp)
@@ -712,8 +707,7 @@ fn chunk_choices_to_openai(choice: &ChunkChoice) -> Result<ChatChoiceStream, Ope
     Ok(ChatChoiceStream {
         index: *index as u32,
         delta: ChatCompletionStreamResponseDelta {
-            // Use Some(""), not None as it is more compatible with many open source `chat_template`s.
-            content: Some(delta.content.clone().unwrap_or_default()),
+            content: delta.content.clone(),
             function_call: None,
             tool_calls: delta.tool_calls.as_ref().map(|t| {
                 t.iter()
