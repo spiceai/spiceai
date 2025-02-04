@@ -713,7 +713,7 @@ fn chunk_choices_to_openai(choice: &ChunkChoice) -> Result<ChatChoiceStream, Ope
         index: *index as u32,
         delta: ChatCompletionStreamResponseDelta {
             // Use Some(""), not None as it is more compatible with many open source `chat_template`s.
-            content: Some(delta.content.unwrap_or_default()),
+            content: Some(delta.content.clone().unwrap_or_default()),
             function_call: None,
             tool_calls: delta.tool_calls.as_ref().map(|t| {
                 t.iter()
