@@ -49,6 +49,7 @@ impl RefreshTaskRunner {
         runtime_status: Arc<status::RuntimeStatus>,
         dataset_name: TableReference,
         federated: Arc<FederatedTable>,
+        federated_source: Option<String>,
         refresh: Arc<RwLock<Refresh>>,
         accelerator: Arc<dyn TableProvider>,
     ) -> Self {
@@ -56,6 +57,7 @@ impl RefreshTaskRunner {
             runtime_status,
             dataset_name.clone(),
             federated,
+            federated_source,
             accelerator,
         ));
 

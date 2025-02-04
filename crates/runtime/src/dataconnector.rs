@@ -88,6 +88,8 @@ pub mod mysql;
 pub mod odbc;
 pub const ODBC_DATACONNECTOR: &str = "odbc"; // const needs to be accessible when ODBC isn't built
 
+#[cfg(feature = "imap")]
+pub mod imap;
 #[cfg(feature = "postgres")]
 pub mod postgres;
 pub mod s3;
@@ -166,6 +168,13 @@ pub enum DataConnectorError {
         dataconnector: String,
         connector_component: ConnectorComponent,
         message: String,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display("Cannot setup the {connector_component} ({dataconnector}) with an invalid configuration.\n{source}"))]
+    InvalidConfigurationSourceOnly {
+        dataconnector: String,
+        connector_component: ConnectorComponent,
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
@@ -308,6 +317,8 @@ pub async fn register_all() {
     register_connector_factory("abfs", abfs::AzureBlobFSFactory::new_arc()).await;
     #[cfg(feature = "ftp")]
     register_connector_factory("ftp", ftp::FTPFactory::new_arc()).await;
+    #[cfg(feature = "imap")]
+    register_connector_factory("imap", imap::ImapFactory::new_arc()).await;
     register_connector_factory("http", https::HttpsFactory::new_arc()).await;
     register_connector_factory("https", https::HttpsFactory::new_arc()).await;
     register_connector_factory("github", github::GithubFactory::new_arc()).await;

@@ -21,6 +21,7 @@ aws-sdk-dynamodb = { version = "1.59.0", optional = true }
 base64.workspace = true
 bb8 = { workspace = true, optional = true }
 bytes.workspace = true
+charset = { workspace = true, optional = true }
 chrono.workspace = true
 clickhouse-rs = { workspace = true, optional = true }
 datafusion.workspace = true
@@ -49,8 +50,10 @@ http = { version = "1.1.0" }
 iceberg-catalog-rest.workspace = true
 iceberg.workspace = true
 iceberg-datafusion.workspace = true
+imap = { workspace = true, optional = true }
 indexmap.workspace = true
 itertools.workspace = true
+mailparse = { workspace = true, optional = true }
 object_store = { workspace = true }
 rdkafka = { version = "0.37.0", features = ["ssl-vendored"], optional = true }
 regex = "1.10.4"
@@ -91,6 +94,7 @@ duckdb = [
 ]
 dynamodb = ["dep:aws-sdk-dynamodb", "dep:aws-config"]
 flightsql = []
+imap = ["dep:charset", "dep:imap", "dep:mailparse"]
 mssql = ["dep:tiberius", "dep:tokio-util", "dep:bb8"]
 mysql = ["datafusion-table-providers/mysql"]
 odbc = []

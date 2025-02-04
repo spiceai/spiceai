@@ -60,8 +60,9 @@ base64 = "0.22.1"
 bb8 = "0.8"
 bb8-postgres = "0.8"
 bytes = "1.9.0"
+charset = "0.1.5"
 chrono = "0.4.38"
-clap = { version = "4.5.21", features = ["derive"] }
+clap = { version = "4.5.21", features = ["derive", "env"] }
 clickhouse-rs = { git = "https://github.com/spiceai/clickhouse-rs.git", tag = "0.2.1", features = [
     "tokio_io",
     "tls",
@@ -86,9 +87,11 @@ http = "1.1.0"
 iceberg = "0.4.0"
 iceberg-catalog-rest = "0.4.0"
 iceberg-datafusion = "0.4.0"
+imap = { git = "https://github.com/jonhoo/rust-imap", rev = "6fe22ed11a1ccffe1799a73f48e589366d8d100f" }
 indexmap = "2"
 insta = { version = "1.42.0", features = ["filters"] }
 itertools = "0.13"
+mailparse = "0.15.0"
 mysql_async = { version = "0.34.1", features = ["native-tls-tls", "chrono"] }
 object_store = { version = "0.11" }
 odbc-api = { version = "8.1.2" }
@@ -152,10 +155,10 @@ uuid = "1"
 x509-certificate = "0.23.1"
 
 [patch.crates-io]
-datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "4e1290a600233661e28952a42d39563c653c286e" }
-datafusion-common = { git = "https://github.com/spiceai/datafusion.git", rev = "4e1290a600233661e28952a42d39563c653c286e" }
-datafusion-execution = { git = "https://github.com/spiceai/datafusion.git", rev = "4e1290a600233661e28952a42d39563c653c286e" }
-datafusion-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "4e1290a600233661e28952a42d39563c653c286e" }
+datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "90409dee317a2accd63f9649807e52d51aa74097" }
+datafusion-common = { git = "https://github.com/spiceai/datafusion.git", rev = "90409dee317a2accd63f9649807e52d51aa74097" }
+datafusion-execution = { git = "https://github.com/spiceai/datafusion.git", rev = "90409dee317a2accd63f9649807e52d51aa74097" }
+datafusion-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "90409dee317a2accd63f9649807e52d51aa74097" }
 
 object_store = { git = "https://github.com/spiceai/arrow-rs.git", rev = "cee50b7d2ccf749eac89d0fe26fbd8a06c0bb3c4" }
 
@@ -172,8 +175,8 @@ rusqlite = { git = "https://github.com/spiceai/rusqlite.git", rev = "97054b6af72
 # Tracking Issue: https://github.com/allan2/dotenvy/issues/113
 dotenvy = { git = "https://github.com/spiceai/dotenvy.git", rev = "e5cef1871b08003198949dfe2da988633eaad78f" }
 
-iceberg = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "07940c3fdaef24a5a4ddaf58f5c495d2fc4ce7d2" }
-iceberg-catalog-rest = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "07940c3fdaef24a5a4ddaf58f5c495d2fc4ce7d2" }
-iceberg-datafusion = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "07940c3fdaef24a5a4ddaf58f5c495d2fc4ce7d2" }
+iceberg = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "a80b3807a5082662fa608d85dedb1a5341ae395c" }
+iceberg-catalog-rest = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "a80b3807a5082662fa608d85dedb1a5341ae395c" }
+iceberg-datafusion = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "a80b3807a5082662fa608d85dedb1a5341ae395c" }
 
 cudarc = { git = "https://github.com/EricLBuehler/cudarc", rev = "f6e5bf51153d40e34eb1262b98895ac1235b6422" }

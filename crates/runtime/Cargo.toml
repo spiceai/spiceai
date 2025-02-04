@@ -64,6 +64,7 @@ hyper = "1.5.1"
 hyper-util = { version = "0.1.6", features = ["service"] }
 iceberg.workspace = true
 iceberg-catalog-rest.workspace = true
+imap = { workspace = true, optional = true }
 indexmap.workspace = true
 itertools.workspace = true
 jsonwebtoken = "9.3.0"
@@ -183,6 +184,7 @@ dynamodb = ["dep:aws-sdk-dynamodb", "data_components/dynamodb"]
 flightsql = ["data_components/flightsql"]
 ftp = ["dep:suppaftp", "dep:ssh2"]
 keyring-secret-store = ["dep:keyring"]
+imap = ["data_components/imap", "dep:imap"]
 metal = ["llms/metal"]
 models = ["model_components/full"]
 mssql = ["dep:tiberius", "dep:tokio-util", "data_components/mssql"]

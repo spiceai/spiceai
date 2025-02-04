@@ -66,6 +66,7 @@ pub(crate) fn create_hf(model_id: &str) -> Result<Arc<Box<dyn Chat>>, ChatError>
     Ok(Arc::new(create_hf_model(
         model_id,
         None,
+        None,
         std::env::var("HF_TOKEN").ok().map(Secret::new).as_ref(),
     )?))
 }
@@ -79,6 +80,7 @@ pub(crate) fn create_local(model_id: &str) -> Result<Arc<Box<dyn Chat>>, anyhow:
         temp_dir.join("config.json").to_str(),
         temp_dir.join("tokenizer.json").to_str(),
         temp_dir.join("tokenizer_config.json").to_str(),
+        None,
         None,
     )
     .map_err(anyhow::Error::from)?;

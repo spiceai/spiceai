@@ -122,6 +122,7 @@ pub async fn create_internal_accelerated_table(
         runtime_status,
         name.clone(),
         federated_table,
+        "internal".to_string(),
         accelerated_table_provider,
         refresh,
     );

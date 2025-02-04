@@ -168,7 +168,8 @@ static TEST_CASES: LazyLock<Vec<TestCase>> = LazyLock::new(|| {
                         "role": "user",
                         "content": "pong"
                     }
-                ]
+                ],
+                "max_completion_tokens": 100,
             }),
             vec![
                 (
@@ -359,7 +360,7 @@ async fn run_single_test(
                 panic!("For test {test_name}/{model_name}, chat_request failed. Error: {e:#?}")
             })
     };
-    println!("Response for {test_name}/{model_name}: {actual_resp:?}");
+    tracing::debug!("Response for {test_name}/{model_name}: {actual_resp:?}");
 
     // Perform snapshot test from JSONPaths into the response.
     let resp_value =

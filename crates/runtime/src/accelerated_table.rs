@@ -205,6 +205,7 @@ pub struct Builder {
     runtime_status: Arc<status::RuntimeStatus>,
     dataset_name: TableReference,
     federated: Arc<FederatedTable>,
+    federated_source: String,
     accelerator: Arc<dyn TableProvider>,
     refresh: refresh::Refresh,
     retention: Option<Retention>,
@@ -224,6 +225,7 @@ impl Builder {
         runtime_status: Arc<status::RuntimeStatus>,
         dataset_name: TableReference,
         federated: Arc<FederatedTable>,
+        federated_source: String,
         accelerator: Arc<dyn TableProvider>,
         refresh: refresh::Refresh,
     ) -> Self {
@@ -231,6 +233,7 @@ impl Builder {
             runtime_status,
             dataset_name,
             federated,
+            federated_source,
             accelerator,
             refresh,
             retention: None,
@@ -398,6 +401,7 @@ impl Builder {
             Arc::clone(&self.runtime_status),
             self.dataset_name.clone(),
             Arc::clone(&self.federated),
+            Some(self.federated_source),
             Arc::clone(&refresh_params),
             Arc::clone(&self.accelerator),
         );
@@ -458,6 +462,7 @@ impl AcceleratedTable {
         runtime_status: Arc<status::RuntimeStatus>,
         dataset_name: TableReference,
         federated: Arc<FederatedTable>,
+        federated_source: String,
         accelerator: Arc<dyn TableProvider>,
         refresh: refresh::Refresh,
     ) -> Builder {
@@ -465,6 +470,7 @@ impl AcceleratedTable {
             runtime_status,
             dataset_name,
             federated,
+            federated_source,
             accelerator,
             refresh,
         )

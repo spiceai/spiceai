@@ -40,7 +40,7 @@ use test_framework::{
 /// Runs a test to ensure the P50 & p90 latencies do not increase by some threshold over the
 /// duration of the test when N clients are sending queries concurrently.
 pub(crate) async fn overhead_run(args: &HttpOverheadTestArgs) -> anyhow::Result<()> {
-    let (app, start_request) = get_app_and_start_request(&args.http.common)?;
+    let (app, start_request) = get_app_and_start_request(&args.common)?;
     let component = args.http.get_http_component()?;
     let payloads: Vec<_> = args
         .http
@@ -51,7 +51,7 @@ pub(crate) async fn overhead_run(args: &HttpOverheadTestArgs) -> anyhow::Result<
 
     let mut spiced_instance = SpicedInstance::start(start_request).await?;
     spiced_instance
-        .wait_for_ready(Duration::from_secs(args.http.common.ready_wait))
+        .wait_for_ready(Duration::from_secs(args.common.ready_wait))
         .await?;
 
     let baseline_cfg = construct_baseline_cfg(args, &component, &payloads)?;
@@ -61,12 +61,12 @@ pub(crate) async fn overhead_run(args: &HttpOverheadTestArgs) -> anyhow::Result<
         spiced_instance,
         overhead::NotStarted::new(
             HttpConfig {
-                duration: Duration::from_secs(args.http.common.duration),
-                concurrency: args.http.common.concurrency,
+                duration: Duration::from_secs(args.common.duration),
+                concurrency: args.common.concurrency,
                 payloads,
                 component,
-                warmup: Duration::from_secs(args.http.warmup),
-                disable_progress_bars: args.http.common.disable_progress_bars,
+                warmup: Duration::from_secs(0),
+                disable_progress_bars: args.common.disable_progress_bars,
             },
             baseline_cfg,
         ),

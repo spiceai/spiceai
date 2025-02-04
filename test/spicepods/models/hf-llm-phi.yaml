@@ -1,0 +1,9 @@
+version: v1
+kind: Spicepod
+name: huggingface-llm
+
+models:
+  - from: huggingface:huggingface.co/microsoft/Phi-3-mini-4k-instruct
+    name: model-llm
+    params:
+      model_type: phi3

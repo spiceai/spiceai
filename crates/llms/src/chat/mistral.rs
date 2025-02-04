@@ -32,12 +32,12 @@ use async_stream::stream;
 use async_trait::async_trait;
 use futures::{Stream, TryStreamExt};
 use mistralrs::{
-    ChatCompletionChunkResponse, ChatCompletionResponse, ChunkChoice, Constraint, Device,
-    DeviceMapMetadata, Function, GGMLLoaderBuilder, GGMLSpecificConfig, GGUFLoaderBuilder,
-    GGUFSpecificConfig, LocalModelPaths, MistralRs, MistralRsBuilder, ModelDType, ModelPaths,
-    NormalLoaderBuilder, NormalRequest, Pipeline, Request as MistralRequest, RequestMessage,
-    Response as MistralResponse, SamplingParams, TokenSource, Tool, ToolCallResponse, ToolChoice,
-    ToolType,
+    AutoDeviceMapParams, ChatCompletionChunkResponse, ChatCompletionResponse, ChunkChoice,
+    Constraint, Device, DeviceMapSetting, Function, GGMLLoaderBuilder, GGMLSpecificConfig,
+    GGUFLoaderBuilder, GGUFSpecificConfig, Loader, LocalModelPaths, MistralRs, MistralRsBuilder,
+    ModelDType, ModelPaths, NormalLoaderBuilder, NormalRequest, Pipeline,
+    Request as MistralRequest, RequestMessage, Response as MistralResponse, SamplingParams,
+    TokenSource, Tool, ToolCallResponse, ToolChoice, ToolType,
 };
 
 use secrecy::{ExposeSecret, Secret};
@@ -73,6 +73,7 @@ impl MistralLlama {
         config: Option<&Path>,
         tokenizer: Option<&Path>,
         tokenizer_config: Option<&Path>,
+        generation_config: Option<&Path>,
         chat_template_literal: Option<&str>,
     ) -> Result<Self> {
         for weight in model_weights {
@@ -107,7 +108,13 @@ impl MistralLlama {
             }
         }
 
-        let paths = Self::create_paths(model_weights, config, tokenizer, tokenizer_config);
+        let paths = Self::create_paths(
+            model_weights,
+            config,
+            tokenizer,
+            tokenizer_config,
+            generation_config,
+        );
         let model_id = model_weights
             .first()
             .map(|w| w.to_string_lossy().to_string())
@@ -144,6 +151,7 @@ impl MistralLlama {
         config: Option<&Path>,
         tokenizer: Option<&Path>,
         tokenizer_config: Option<&Path>,
+        generation_config: Option<&Path>,
     ) -> Box<dyn ModelPaths> {
         Box::new(LocalModelPaths::new(
             tokenizer.map(Into::into).unwrap_or_default(),
@@ -155,7 +163,7 @@ impl MistralLlama {
             None,
             None,
             None,
-            None,
+            generation_config.map(Into::into),
             None,
             None,
             None,
@@ -183,7 +191,7 @@ impl MistralLlama {
             &ModelDType::Auto,
             device,
             true,
-            DeviceMapMetadata::dummy(),
+            DeviceMapSetting::Auto(AutoDeviceMapParams::default_text()),
             None,
             None,
         )
@@ -236,7 +244,7 @@ impl MistralLlama {
             &ModelDType::Auto,
             device,
             true,
-            DeviceMapMetadata::dummy(),
+            DeviceMapSetting::Auto(AutoDeviceMapParams::default_text()),
             None,
             None,
         )
@@ -264,7 +272,7 @@ impl MistralLlama {
             &ModelDType::Auto,
             device,
             true,
-            DeviceMapMetadata::dummy(),
+            DeviceMapSetting::Auto(AutoDeviceMapParams::default_text()),
             None,
             None,
         )
@@ -292,40 +300,56 @@ impl MistralLlama {
         model_id: &str,
         arch: Option<&str>,
         hf_token_literal: Option<&Secret<String>>,
+        gguf_filename: Option<PathBuf>,
     ) -> Result<Self> {
         let model_parts: Vec<&str> = model_id.split(':').collect();
 
-        // Hardcoded model architecture can ensure correct loading type.
-        // If not provided, it will be inferred (generally from `.model_type` in a downloaded `config.json`)
-        let loader_type = arch
-            .map(|a| {
-                mistralrs::NormalLoaderType::from_str(a).map_err(|_| ChatError::FailedToLoadModel {
-                    source: format!("Unknown model type: {a}").into(),
+        // Loading the GGUF directly (as if it is a quantized model, although it need not be quantized).
+        let loader: Result<Box<dyn Loader>> = if let Some(gguf) = gguf_filename {
+            Ok(GGUFLoaderBuilder::new(
+                None,
+                None,
+                model_parts[0].to_string(),
+                vec![gguf.to_string_lossy().to_string()],
+                GGUFSpecificConfig::default(),
+            )
+            .build())
+        } else {
+            // Hardcoded model architecture can ensure correct loading type.
+            // If not provided, it will be inferred (generally from `.model_type` in a downloaded `config.json`)
+            let loader_type = arch
+                .map(|a| {
+                    mistralrs::NormalLoaderType::from_str(a)
+                        .map_err(|e| ChatError::UnsupportedModelType { source: e.into() })
                 })
-            })
-            .transpose()?;
+                .transpose()?;
 
-        let builder = NormalLoaderBuilder::new(
-            mistralrs::NormalSpecificConfig::default(),
-            None,
-            None,
-            Some(model_parts[0].to_string()),
-        );
+            let builder = NormalLoaderBuilder::new(
+                mistralrs::NormalSpecificConfig::default(),
+                None,
+                None,
+                Some(model_parts[0].to_string()),
+            );
+
+            builder
+                .build(loader_type)
+                .map_err(|e| ChatError::FailedToLoadModel { source: e.into() })
+        };
+
         let device = Self::get_device();
         let token_source = hf_token_literal.map_or(TokenSource::CacheToken, |secret| {
+            tracing::debug!("A HuggingFace token was specified in parameters. The specified token will be used instead of any system/environment defaults.");
             TokenSource::Literal(secret.expose_secret().clone())
         });
 
-        let pipeline = builder
-            .build(loader_type)
-            .map_err(|e| ChatError::FailedToLoadModel { source: e.into() })?
+        let pipeline = loader?
             .load_model_from_hf(
                 model_parts.get(1).map(|&x| x.to_string()),
                 token_source,
                 &ModelDType::Auto,
                 &device,
                 false,
-                DeviceMapMetadata::dummy(),
+                DeviceMapSetting::Auto(AutoDeviceMapParams::default_text()),
                 None,
                 None,
             )

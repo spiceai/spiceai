@@ -74,7 +74,6 @@ impl SpiceToolsOptions {
                 // Handle nested groupings. e.g: `spiced_tools: nsql, my_other_tool`.
                 .flat_map(|s| match s.parse() {
                     Ok(SpiceToolsOptions::Nsql) => SpiceToolsOptions::Nsql.tools_by_name(),
-                    Ok(SpiceToolsOptions::Auto) => SpiceToolsOptions::Auto.tools_by_name(),
                     _ => vec![s.as_str()],
                 })
                 .unique()

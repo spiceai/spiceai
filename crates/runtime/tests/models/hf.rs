@@ -360,7 +360,7 @@ async fn huggingface_test_chat_completion() -> Result<(), anyhow::Error> {
             .map_err(anyhow::Error::msg)?;
     }
 
-    test_request_context().scope(async {
+    test_request_context().scope_retry(3, || async {
         let mut model_with_tools = get_huggingface_model(HF_TEST_MODEL, HF_TEST_MODEL_TYPE, "hf_model");
         model_with_tools
             .params
@@ -425,6 +425,7 @@ async fn huggingface_test_chat_messages() -> Result<(), anyhow::Error> {
         let model = Arc::new(create_hf_model(
             HF_TEST_MODEL,
         Some(HF_TEST_MODEL_TYPE),
+        None,
             None,
         )?);
 
