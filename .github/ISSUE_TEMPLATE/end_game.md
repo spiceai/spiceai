@@ -36,7 +36,7 @@ assignees: ''
 
 ## Release Branch Creation
 
-- [ ] Create a release branch (`release-X.Y`) from `trunk` one day before the scheduled release (if not already created).
+- [ ] Create a release branch (`release/X.Y`) from `trunk` one day before the scheduled release (if not already created).
   - Refer to [docs/RELEASE.md](https://github.com/spiceai/spiceai/blob/trunk/docs/RELEASE.md) for more details.
 - [ ] If **patch release**: cherry-pick each commit to include.
 - [ ] If **minor release**: merge commit from `trunk`.
