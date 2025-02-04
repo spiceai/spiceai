@@ -20,15 +20,16 @@ models:
           3. The query requires joining or comparing data from multiple related tables
 
         Instructions for Responses:
-          1. When the answer is known, return a single value without any formatting.
-          2. If the answer is not known, respond with "I don't know" and do NOT guess.
+          1. When the answer is known, return information as plain json without additional formatting, example: { "column_name": 42 }
+          2. For JSON output use fields defined in question as 'Fields:'
+          2. If the answer is not known, respond with "{}" and do NOT guess.
           3. Ensure responses are concise and to the point.
 
 evals:
   - name: tpch_nsql
     dataset: tpch_nsql
     scorers:
-      - match
+      - json_match
 
 datasets:
 
