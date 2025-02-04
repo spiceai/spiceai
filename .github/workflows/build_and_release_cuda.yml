@@ -1,6 +1,11 @@
 name: build_and_release_cuda
 
 on:
+  pull_request:
+    branches:
+      - trunk
+    paths:
+      - "crates/llms/Cargo.toml"
   push:
     tags:
       - v*
