@@ -121,14 +121,28 @@ impl Config for HostedModelConfig {
         if let Some(auth) = &self.auth {
             match auth {
                 GenericAuthMechanism::ApiKey(key) => {
-                    let value =
-                        HeaderValue::from_str(key.expose_secret()).expect("Invalid API key");
-                    headers.insert("x-api-key", value);
+                    match HeaderValue::from_str(key.expose_secret()) {
+                        Ok(value) => {
+                            headers.insert("x-api-key", value);
+                        }
+                        Err(_) => {
+                            tracing::warn!(
+                                "Invalid API key given for 'x-api-key' header. Will not use"
+                            );
+                        }
+                    }
                 }
                 GenericAuthMechanism::BearerToken(token) => {
-                    let value = HeaderValue::from_str(&format!("Bearer {}", token.expose_secret()))
-                        .expect("Invalid bearer token");
-                    headers.insert(AUTHORIZATION, value);
+                    match HeaderValue::from_str(&format!("Bearer {}", token.expose_secret())) {
+                        Ok(value) => {
+                            headers.insert(AUTHORIZATION, value);
+                        }
+                        Err(_) => {
+                            tracing::warn!(
+                                "Invalid bearer token given for 'Authorization' header. Will not use"
+                            );
+                        }
+                    };
                 }
             }
         }
