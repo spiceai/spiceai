@@ -33,12 +33,14 @@ use async_openai::{
     error::{ApiError, OpenAIError},
     types::{
         ChatChoice, ChatChoiceStream, ChatCompletionRequestAssistantMessage,
+        ChatCompletionRequestDeveloperMessage, ChatCompletionRequestDeveloperMessageContent,
         ChatCompletionRequestFunctionMessage, ChatCompletionRequestMessage,
-        ChatCompletionRequestSystemMessage, ChatCompletionRequestToolMessage,
-        ChatCompletionRequestUserMessage, ChatCompletionRequestUserMessageContent,
-        ChatCompletionResponseMessage, ChatCompletionResponseStream,
-        ChatCompletionStreamResponseDelta, CreateChatCompletionRequest,
-        CreateChatCompletionResponse, CreateChatCompletionStreamResponse, Role,
+        ChatCompletionRequestMessageContentPartText, ChatCompletionRequestSystemMessage,
+        ChatCompletionRequestToolMessage, ChatCompletionRequestUserMessage,
+        ChatCompletionRequestUserMessageContent, ChatCompletionResponseMessage,
+        ChatCompletionResponseStream, ChatCompletionStreamResponseDelta,
+        CreateChatCompletionRequest, CreateChatCompletionResponse,
+        CreateChatCompletionStreamResponse, Role,
     },
 };
 
@@ -185,6 +187,9 @@ pub fn message_to_content(message: &ChatCompletionRequestMessage) -> String {
                         async_openai::types::ChatCompletionRequestUserMessageContentPart::ImageUrl(
                             i,
                         ) => i.image_url.url.clone(),
+                        async_openai::types::ChatCompletionRequestUserMessageContentPart::InputAudio(
+                            a
+                        ) => a.input_audio.data.clone(),
                     })
                     .collect();
                 x.join("\n")
@@ -249,6 +254,16 @@ pub fn message_to_content(message: &ChatCompletionRequestMessage) -> String {
             content,
             ..
         }) => content.clone().unwrap_or_default(),
+        ChatCompletionRequestMessage::Developer(ChatCompletionRequestDeveloperMessage {
+            content,
+            ..
+        }) => match content {
+            ChatCompletionRequestDeveloperMessageContent::Text(t) => t.clone(),
+            ChatCompletionRequestDeveloperMessageContent::Array(parts) => {
+                let x: Vec<_> = parts.iter().map(|p| p.text.clone()).collect();
+                x.join("\n")
+            }
+        },
     }
 }
 
@@ -281,6 +296,9 @@ pub fn message_to_mistral(
                             async_openai::types::ChatCompletionRequestUserMessageContentPart::ImageUrl(i) => {
                                 ("image_url".to_string(), Value::String(i.image_url.url.clone()))
                             }
+                            async_openai::types::ChatCompletionRequestUserMessageContentPart::InputAudio(a) => {
+                                ("input_audio".to_string(), Value::String(a.input_audio.data.clone()))
+                            }   
                         }
 
                     }).collect::<Vec<_>>();
@@ -291,6 +309,30 @@ pub fn message_to_mistral(
             IndexMap::from([
                 (String::from("role"), Either::Left(String::from("user"))),
                 (String::from("content"), body),
+            ])
+        }
+        ChatCompletionRequestMessage::Developer(ChatCompletionRequestDeveloperMessage {
+            content: ChatCompletionRequestDeveloperMessageContent::Text(text),
+            ..
+        }) => IndexMap::from([
+            (String::from("role"), Either::Left(String::from("developer"))),
+            (String::from("content"), Either::Left(text.clone())),
+        ]),
+        ChatCompletionRequestMessage::Developer(ChatCompletionRequestDeveloperMessage {
+            content: ChatCompletionRequestDeveloperMessageContent::Array(parts),
+            ..
+        }) => {
+            // TODO: This will cause issue for some chat_templates. Tracking: https://github.com/EricLBuehler/mistral.rs/issues/793
+            let content_json = parts
+                .iter()
+                .map(|p| p.text.clone())
+                .collect::<Vec<_>>();
+            IndexMap::from([
+                (String::from("role"), Either::Left(String::from("developer"))),
+                (
+                    String::from("content"),
+                    Either::Left(json!(content_json).to_string()),
+                ),
             ])
         }
         ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
@@ -591,6 +633,7 @@ pub trait Chat: Sync + Send {
                     content: Some(resp),
                     tool_calls: None,
                     role: Role::System,
+                    audio: None,
                     function_call: None,
                     refusal: None,
                 },

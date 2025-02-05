@@ -421,6 +421,11 @@ impl ChatWrapper {
                         .max_completion_tokens
                         .or_else(|| serde_json::from_value(value).ok());
                 }
+                "reasoning_effort" => {
+                    req.reasoning_effort = req
+                        .reasoning_effort
+                        .or_else(|| serde_json::from_value(value).ok());
+                }
                 "store" => {
                     req.store = req.store.or_else(|| serde_json::from_value(value).ok());
                 }
