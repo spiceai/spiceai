@@ -35,7 +35,6 @@ struct TableMetadata {
     schemas: Vec<SchemaRef>,
 }
 
-#[derive(Clone)]
 pub struct SpiceCatalog {
     inner: Arc<RestCatalog>,
 }
