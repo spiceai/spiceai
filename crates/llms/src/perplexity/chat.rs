@@ -21,15 +21,11 @@ use async_openai::{
     },
 };
 use async_trait::async_trait;
-use futures::{StreamExt, TryStreamExt};
-use reqwest_eventsource::Error as SseError;
+use futures::TryStreamExt;
 
 use crate::chat::{nsql::SqlGeneration, Chat};
 
-use super::{
-    types::{PerplexityRequest, PerplexityResponse, PerplexityResponseStream},
-    PerplexitySonar,
-};
+use super::{types::PerplexityRequest, PerplexitySonar};
 
 #[async_trait]
 impl Chat for PerplexitySonar {
@@ -41,43 +37,21 @@ impl Chat for PerplexitySonar {
         &self,
         req: CreateChatCompletionRequest,
     ) -> Result<ChatCompletionResponseStream, OpenAIError> {
-        let mut inner_req = PerplexityRequest::from(req);
-        inner_req.chat.model.clone_from(&self.model);
+        let resp = self.search_stream(PerplexityRequest::from(req)).await;
 
-        let inner_resp: PerplexityResponseStream = self
-            .client
-            .post_stream("/chat/completions", self.with_overrides(inner_req))
-            .await;
-
-        Ok(Box::pin(
-            inner_resp
-                .map_ok(|c| c.response)
-                // Perplexity does not send "Done" messages as per SSE protocol.
-                // Stop stream manually on `Stream ended` error.
-                .take_while(|item| {
-                    let stream_ended = matches!(item, Err(OpenAIError::StreamError(message))
-                            if SseError::StreamEnded{}.to_string().eq(message));
-
-                    futures::future::ready(!stream_ended)
-                }),
-        ))
+        Ok(Box::pin(resp.map_ok(|c| c.response)))
     }
 
     async fn chat_request(
         &self,
         req: CreateChatCompletionRequest,
     ) -> Result<CreateChatCompletionResponse, OpenAIError> {
-        let mut inner_req = PerplexityRequest::from(req);
-        inner_req.chat.model.clone_from(&self.model);
-        inner_req = self.with_overrides(inner_req);
+        let resp = self.search_request(PerplexityRequest::from(req)).await?;
 
-        let inner_resp: PerplexityResponse =
-            self.client.post("/chat/completions", inner_req).await?;
-
-        for (i, c) in inner_resp.citations.iter().enumerate() {
-            tracing::debug!("{i}th citation for id={}. {}", inner_resp.response.id, c);
+        for (i, c) in resp.citations.iter().enumerate() {
+            tracing::debug!("{i}th citation for id={}. {}", resp.response.id, c);
         }
 
-        Ok(inner_resp.response)
+        Ok(resp.response)
     }
 }

@@ -13,10 +13,16 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+#![allow(clippy::missing_errors_doc)]
 
-use async_openai::Client;
+use async_openai::{error::OpenAIError, Client};
+use futures::{StreamExt, TryStreamExt};
+use reqwest_eventsource::Error as SseError;
 use secrecy::Secret;
-use types::{PerplexityRequest, PerplexityRequestParameters};
+use types::{
+    PerplexityRequest, PerplexityRequestParameters, PerplexityResponse, PerplexityResponseStream,
+    PerplexityStreamResponse,
+};
 
 use crate::config::{GenericAuthMechanism, HostedModelConfig};
 
@@ -62,5 +68,55 @@ impl PerplexitySonar {
             req.extra_parameters = Some(p);
         }
         req
+    }
+
+    pub async fn search_request(
+        &self,
+        mut req: PerplexityRequest,
+    ) -> Result<PerplexityResponse, OpenAIError> {
+        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "citations", model = %req.chat.model);
+        if let Ok(m) = serde_json::to_string(&req.chat.messages) {
+            tracing::info!(target: "task_history", parent: &span, input = %m, "labels");
+        };
+
+        req.chat.model.clone_from(&self.model);
+        req = self.with_overrides(req);
+
+        let resp: Result<PerplexityResponse, OpenAIError> =
+            self.client.post("/chat/completions", req).await;
+
+        if let Ok(ref r) = resp {
+            tracing::info!(target: "task_history", parent: &span, captured_output = %format!("{:?}", r.citations), "labels");
+        }
+
+        resp
+    }
+
+    pub async fn search_stream(&self, mut req: PerplexityRequest) -> PerplexityResponseStream {
+        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "citations", model = %req.chat.model);
+        if let Ok(m) = serde_json::to_string(&req.chat.messages) {
+            tracing::info!(target: "task_history", parent: &span, input = %m, "labels");
+        };
+        req.chat.model.clone_from(&self.model);
+        req = self.with_overrides(req);
+        let span_stream = span.clone();
+
+        Box::pin(self
+            .client
+            .post_stream("/chat/completions", req)
+            .await
+            .inspect_ok(move |r: &PerplexityStreamResponse|  {
+                if !span_stream.has_field("captured_output") {
+                    tracing::info!(target: "task_history", parent: &span_stream, captured_output = %format!("{:?}", r.citations), "labels");
+                }
+            })
+            // Perplexity does not send "Done" messages as per SSE protocol.
+            // Stop stream manually on `Stream ended` error.
+            .take_while(|item| {
+                let stream_ended = matches!(item, Err(OpenAIError::StreamError(message))
+                            if SseError::StreamEnded{}.to_string().eq(message));
+
+                futures::future::ready(!stream_ended)
+            }))
     }
 }
