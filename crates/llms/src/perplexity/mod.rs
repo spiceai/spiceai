@@ -16,6 +16,7 @@ limitations under the License.
 
 use async_openai::Client;
 use secrecy::Secret;
+use types::{PerplexityRequest, PerplexityRequestParameters};
 
 use crate::config::{GenericAuthMechanism, GenericHandlerConfig};
 
@@ -25,6 +26,7 @@ pub mod types;
 pub struct PerplexitySonar {
     client: Client<GenericHandlerConfig>,
     model: String,
+    overrides: Vec<(String, String)>,
 }
 
 static PERPLEXITY_SONAR_API_BASE: &str = "https://api.perplexity.ai";
@@ -33,7 +35,11 @@ static PERPLEXITY_SONAR_DEFAULT_MODEL: &str = "sonar";
 // TODO: Add `PerplexityRequestParameters`
 impl PerplexitySonar {
     #[must_use]
-    pub fn new(auth_token: &Secret<String>, model: Option<&str>) -> Self {
+    pub fn new(
+        auth_token: &Secret<String>,
+        model: Option<&str>,
+        overrides: Vec<(String, String)>,
+    ) -> Self {
         let cfg = GenericHandlerConfig::default()
             .with_auth(GenericAuthMechanism::BearerToken(auth_token.clone()))
             .with_base_url(PERPLEXITY_SONAR_API_BASE);
@@ -41,6 +47,21 @@ impl PerplexitySonar {
         Self {
             client: Client::<GenericHandlerConfig>::with_config(cfg),
             model: model.unwrap_or(PERPLEXITY_SONAR_DEFAULT_MODEL).to_string(),
+            overrides,
         }
+    }
+
+    #[must_use]
+    pub fn with_overrides(&self, mut req: PerplexityRequest) -> PerplexityRequest {
+        if let Some(params) = req.extra_parameters.as_mut() {
+            params.update_overrides(&self.overrides);
+
+        // Still need to set overrides if user-request contains no perplexity parameters.
+        } else if !self.overrides.is_empty() {
+            let mut p = PerplexityRequestParameters::default();
+            p.update_overrides(&self.overrides);
+            req.extra_parameters = Some(p);
+        }
+        req
     }
 }

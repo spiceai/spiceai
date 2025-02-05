@@ -21,7 +21,8 @@ use async_openai::{
     },
 };
 use async_trait::async_trait;
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
+use reqwest_eventsource::Error as SseError;
 
 use crate::chat::{nsql::SqlGeneration, Chat};
 
@@ -40,31 +41,44 @@ impl Chat for PerplexitySonar {
         &self,
         req: CreateChatCompletionRequest,
     ) -> Result<ChatCompletionResponseStream, OpenAIError> {
-        // TODO: add `PerplexityRequestParameters`
         let mut inner_req = PerplexityRequest::from(req);
         inner_req.chat.model.clone_from(&self.model);
 
         let inner_resp: PerplexityResponseStream = self
             .client
-            .post_stream("/chat/completions", inner_req)
+            .post_stream("/chat/completions", self.with_overrides(inner_req))
             .await;
 
-        // TODO: log citations
-        Ok(Box::pin(inner_resp.map_ok(|c| c.response)))
+        Ok(Box::pin(
+            inner_resp
+                .map_ok(|c| c.response)
+                // Perplexity does not send "Done" messages as per SSE protocol.
+                // Stop stream manually on `Stream ended` error.
+                .take_while(|item| {
+                    let stream_ended = matches!(item, Err(OpenAIError::StreamError(message))
+                            if SseError::StreamEnded{}.to_string().eq(message));
+
+                    futures::future::ready(!stream_ended)
+                }),
+        ))
     }
 
     async fn chat_request(
         &self,
         req: CreateChatCompletionRequest,
     ) -> Result<CreateChatCompletionResponse, OpenAIError> {
-        // TODO: add `PerplexityRequestParameters`
         let mut inner_req = PerplexityRequest::from(req);
         inner_req.chat.model.clone_from(&self.model);
 
-        let inner_resp: PerplexityResponse =
-            self.client.post("/chat/completions", inner_req).await?;
+        let inner_resp: PerplexityResponse = self
+            .client
+            .post("/chat/completions", self.with_overrides(inner_req))
+            .await?;
 
-        // TODO: log citations
+        for (i, c) in inner_resp.citations.iter().enumerate() {
+            tracing::debug!("{i}th citation for id={}. {}", inner_resp.response.id, c);
+        }
+
         Ok(inner_resp.response)
     }
 }

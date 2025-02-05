@@ -46,7 +46,7 @@ impl From<CreateChatCompletionRequest> for PerplexityRequest {
 }
 
 /// Request parameters that only work for Perplexity endpoints (i.e. not `OpenAI` compatible parameters).
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Default, Serialize, Deserialize, Debug, Clone)]
 pub struct PerplexityRequestParameters {
     /// Determines whether to return images (default: false).
     #[serde(default)]
@@ -60,6 +60,28 @@ pub struct PerplexityRequestParameters {
     /// Returns search results within the specified time interval (e.g. "month", "week", etc.).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub search_recency_filter: Option<String>,
+}
+
+impl PerplexityRequestParameters {
+    pub(crate) fn update_overrides(&mut self, overrides: &[(String, String)]) {
+        for (key, value) in overrides {
+            match key.as_str() {
+                "return_images" => self.return_images = value.parse().unwrap_or(false),
+                "return_related_questions" => {
+                    self.return_related_questions = value.parse().unwrap_or(false);
+                }
+                "search_domain_filter" => match serde_json::from_str::<Vec<String>>(value.as_str())
+                {
+                    Ok(v) => self.search_domain_filter = Some(v),
+                    Err(e) => {
+                        tracing::warn!("Failed to parse search_domain_filter: {}", e);
+                    }
+                },
+                "search_recency_filter" => self.search_recency_filter = Some(value.clone()),
+                _ => (),
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
