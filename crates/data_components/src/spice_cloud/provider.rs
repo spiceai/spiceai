@@ -26,14 +26,12 @@ use datafusion::error::Result as DFResult;
 use datafusion::sql::TableReference;
 use futures::future::try_join_all;
 use globset::GlobSet;
-use iceberg::{Catalog, NamespaceIdent, TableIdent};
+use iceberg::{Catalog, NamespaceIdent};
 use snafu::prelude::*;
 
 use crate::{Read, RefreshableCatalogProvider};
 
 use crate::iceberg::catalog::RestCatalog;
-
-use super::catalog::SpiceCatalog;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -198,7 +196,7 @@ impl SpiceCloudPlatformSchemaProvider {
             .await
             .context(ListTablesSnafu)?;
 
-        let included_table_names: Vec<(TableReference, TableIdent)> = table_names
+        let included_table_names = table_names
             .clone()
             .into_iter()
             .filter_map(|ref table_name| {
@@ -230,27 +228,17 @@ impl SpiceCloudPlatformSchemaProvider {
                         return None;
                     }
                 }
-                Some((table_reference, table_name.clone()))
+                Some(table_reference)
             })
-            .collect();
-
-        let client = SpiceCatalog::from(client);
-        let iceberg_schemas = try_join_all(
-            included_table_names
-                .iter()
-                .map(|(_, ident)| client.get_table_schema(ident))
-                .collect::<Vec<_>>(),
-        )
-        .await?;
+            .collect::<Vec<_>>();
 
         let table_providers = try_join_all(
-            iceberg_schemas
-                .into_iter()
-                .zip(included_table_names.iter().cloned())
-                .map(|(schema, (name, _))| {
+            included_table_names
+                .iter()
+                .map(|name| {
                     let connector = Arc::clone(&connector);
                     async move {
-                        match connector.table_provider(name.clone(), Some(schema)).await {
+                        match connector.table_provider(name.clone(), None).await {
                             Ok(provider) => Ok(provider),
                             Err(e) => Err(Error::TableProviderCreation {
                                 table: name.to_string(),
@@ -266,7 +254,7 @@ impl SpiceCloudPlatformSchemaProvider {
         let tables: HashMap<String, Arc<dyn TableProvider>> = included_table_names
             .into_iter()
             .zip(table_providers.into_iter())
-            .map(|((name, _), provider)| (name.table().to_string(), provider))
+            .map(|(name, provider)| (name.table().to_string(), provider))
             .collect();
 
         Ok(SpiceCloudPlatformSchemaProvider { tables })
