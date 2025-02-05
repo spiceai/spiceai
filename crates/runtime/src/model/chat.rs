@@ -154,7 +154,23 @@ fn perplexity(
         });
     };
 
-    Ok(Box::new(PerplexitySonar::new(auth_token, model_id)) as Box<dyn Chat>)
+    let perplexity_overrides: Vec<(String, String)> = params
+        .iter()
+        .filter_map(|(k, v)| {
+            if k != "perplexity_auth_token" {
+                if let Some(p) = k.strip_prefix("perplexity_") {
+                    return Some((p.to_string(), v.expose_secret().clone()));
+                }
+            };
+            None
+        })
+        .collect();
+
+    Ok(Box::new(PerplexitySonar::new(
+        auth_token,
+        model_id,
+        perplexity_overrides,
+    )) as Box<dyn Chat>)
 }
 
 fn anthropic(
