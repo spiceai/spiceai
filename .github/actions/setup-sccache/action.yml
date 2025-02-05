@@ -1,0 +1,31 @@
+name: Setup sccache
+description: 'composite action'
+
+inputs:
+  minio_endpoint:
+    description: 'MinIO endpoint'
+    required: true
+    type: string
+  os:
+    description: 'Operating system to set up the toolchain for'
+    default: 'linux' # 'linux', 'darwin', 'windows'
+runs:
+  using: 'composite'
+  steps:
+    - name: Set up sccache
+      if: inputs.os == 'linux'
+      shell: bash
+      run: |
+        sudo apt-get update && sudo apt-get install wget -y
+        wget -q https://github.com/mozilla/sccache/releases/download/v0.9.1/sccache-v0.9.1-x86_64-unknown-linux-musl.tar.gz
+        tar -xzf sccache-v0.9.1-x86_64-unknown-linux-musl.tar.gz
+        sudo mv sccache-v0.9.1-x86_64-unknown-linux-musl/sccache /usr/local/bin
+        rm -rf ~/.config/sccache/config
+        mkdir -p ~/.config/sccache
+        cat <<EOF > ~/.config/sccache/config
+        [cache.s3]
+        bucket = "sccache"
+        endpoint = "${{ inputs.minio_endpoint }}"
+        server_side_encryption = false
+        no_credentials = false
+        region = "auto"

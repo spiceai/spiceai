@@ -58,3 +58,4 @@ venv
 data/
 ./testoperator
 !test/spicepods/
+!test/nsql_bench/spicepod.yaml

@@ -326,8 +326,7 @@ checksum = "7c02d123df017efcdfbd739ef81735b36c5ba83ec3c59c80a9d7ecc718f92e50"
 [[package]]
 name = "arrow"
 version = "53.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eaf3437355979f1e93ba84ba108c38be5767713051f3c8ffbf07c094e2e61f9f"
+source = "git+https://github.com/spiceai/arrow-rs.git?rev=5feaa5f724d32c09e30394cedb7799de670e43e1#5feaa5f724d32c09e30394cedb7799de670e43e1"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -336,7 +335,7 @@ dependencies = [
  "arrow-csv",
  "arrow-data",
  "arrow-ipc",
- "arrow-json 53.4.0",
+ "arrow-json",
  "arrow-ord",
  "arrow-row",
  "arrow-schema",
@@ -390,8 +389,7 @@ dependencies = [
 [[package]]
 name = "arrow-cast"
 version = "53.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c73c6233c5b5d635a56f6010e6eb1ab9e30e94707db21cea03da317f67d84cf3"
+source = "git+https://github.com/spiceai/arrow-rs.git?rev=5feaa5f724d32c09e30394cedb7799de670e43e1#5feaa5f724d32c09e30394cedb7799de670e43e1"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -484,28 +482,8 @@ dependencies = [
 
 [[package]]
 name = "arrow-json"
-version = "53.1.0"
-source = "git+https://github.com/spiceai/arrow-rs.git?rev=63d05723107d6dc5f08acc5461417ee42937adcc#63d05723107d6dc5f08acc5461417ee42937adcc"
-dependencies = [
- "arrow-array",
- "arrow-buffer",
- "arrow-cast",
- "arrow-data",
- "arrow-schema",
- "chrono",
- "half",
- "indexmap 2.7.1",
- "lexical-core",
- "num",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "arrow-json"
 version = "53.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0eff38eeb8a971ad3a4caf62c5d57f0cff8a48b64a55e3207c4fd696a9234aad"
+source = "git+https://github.com/spiceai/arrow-rs.git?rev=5feaa5f724d32c09e30394cedb7799de670e43e1#5feaa5f724d32c09e30394cedb7799de670e43e1"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -622,6 +600,7 @@ name = "arrow_tools"
 version = "1.1.0"
 dependencies = [
  "arrow",
+ "arrow-cast",
  "arrow-schema",
  "datafusion",
  "snafu",
@@ -3275,7 +3254,7 @@ name = "datafusion-federation"
 version = "0.1.6"
 source = "git+https://github.com/spiceai/datafusion-federation.git?rev=a889f4bd47cba6b96d24a63a03891c64dadb6e15#a889f4bd47cba6b96d24a63a03891c64dadb6e15"
 dependencies = [
- "arrow-json 53.4.0",
+ "arrow-json",
  "async-stream",
  "async-trait",
  "datafusion",
@@ -3539,10 +3518,10 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=47f096b1551ccd4a21adf51084fa03b0bc518288#47f096b1551ccd4a21adf51084fa03b0bc518288"
+source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=dd8853f3282417edf2e56619d4fa9fa5bed0dcb6#dd8853f3282417edf2e56619d4fa9fa5bed0dcb6"
 dependencies = [
  "arrow",
- "arrow-json 53.4.0",
+ "arrow-json",
  "arrow-schema",
  "async-stream",
  "async-trait",
@@ -3633,7 +3612,7 @@ dependencies = [
  "arrow-array",
  "arrow-buffer",
  "arrow-cast",
- "arrow-json 53.4.0",
+ "arrow-json",
  "arrow-ord",
  "arrow-schema",
  "arrow-select",
@@ -4343,7 +4322,7 @@ version = "1.1.0"
 dependencies = [
  "ansi_term",
  "arrow-flight",
- "arrow-json 53.1.0",
+ "arrow-json",
  "clap",
  "datafusion",
  "flight_client",
@@ -7154,7 +7133,7 @@ dependencies = [
 [[package]]
 name = "mistralrs"
 version = "0.4.0"
-source = "git+https://github.com/spiceai/mistral.rs?rev=dc0807771716d7d9aeb65c9b2e2abced8a4a18b5#dc0807771716d7d9aeb65c9b2e2abced8a4a18b5"
+source = "git+https://github.com/spiceai/mistral.rs?rev=a6a96b815a4f359882bc62268ddea5acd53185ed#a6a96b815a4f359882bc62268ddea5acd53185ed"
 dependencies = [
  "anyhow",
  "candle-core 0.8.0",
@@ -7175,7 +7154,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-core"
 version = "0.4.0"
-source = "git+https://github.com/spiceai/mistral.rs?rev=dc0807771716d7d9aeb65c9b2e2abced8a4a18b5#dc0807771716d7d9aeb65c9b2e2abced8a4a18b5"
+source = "git+https://github.com/spiceai/mistral.rs?rev=a6a96b815a4f359882bc62268ddea5acd53185ed#a6a96b815a4f359882bc62268ddea5acd53185ed"
 dependencies = [
  "akin",
  "anyhow",
@@ -7251,7 +7230,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-paged-attn"
 version = "0.4.0"
-source = "git+https://github.com/spiceai/mistral.rs?rev=dc0807771716d7d9aeb65c9b2e2abced8a4a18b5#dc0807771716d7d9aeb65c9b2e2abced8a4a18b5"
+source = "git+https://github.com/spiceai/mistral.rs?rev=a6a96b815a4f359882bc62268ddea5acd53185ed#a6a96b815a4f359882bc62268ddea5acd53185ed"
 dependencies = [
  "anyhow",
  "bindgen_cuda 0.1.6",
@@ -7266,7 +7245,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-quant"
 version = "0.4.0"
-source = "git+https://github.com/spiceai/mistral.rs?rev=dc0807771716d7d9aeb65c9b2e2abced8a4a18b5#dc0807771716d7d9aeb65c9b2e2abced8a4a18b5"
+source = "git+https://github.com/spiceai/mistral.rs?rev=a6a96b815a4f359882bc62268ddea5acd53185ed#a6a96b815a4f359882bc62268ddea5acd53185ed"
 dependencies = [
  "bindgen_cuda 0.1.5",
  "byteorder",
@@ -7288,7 +7267,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-vision"
 version = "0.4.0"
-source = "git+https://github.com/spiceai/mistral.rs?rev=dc0807771716d7d9aeb65c9b2e2abced8a4a18b5#dc0807771716d7d9aeb65c9b2e2abced8a4a18b5"
+source = "git+https://github.com/spiceai/mistral.rs?rev=a6a96b815a4f359882bc62268ddea5acd53185ed#a6a96b815a4f359882bc62268ddea5acd53185ed"
 dependencies = [
  "candle-core 0.8.0",
  "image 0.25.5",
@@ -8046,7 +8025,7 @@ dependencies = [
 [[package]]
 name = "object_store"
 version = "0.11.1"
-source = "git+https://github.com/spiceai/arrow-rs.git?rev=cee50b7d2ccf749eac89d0fe26fbd8a06c0bb3c4#cee50b7d2ccf749eac89d0fe26fbd8a06c0bb3c4"
+source = "git+https://github.com/spiceai/arrow-rs.git?rev=5feaa5f724d32c09e30394cedb7799de670e43e1#5feaa5f724d32c09e30394cedb7799de670e43e1"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -10020,7 +9999,7 @@ dependencies = [
  "arrow-csv",
  "arrow-flight",
  "arrow-ipc",
- "arrow-json 53.1.0",
+ "arrow-json",
  "arrow-schema",
  "arrow_sql_gen",
  "arrow_tools",
