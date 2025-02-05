@@ -69,11 +69,10 @@ impl Chat for PerplexitySonar {
     ) -> Result<CreateChatCompletionResponse, OpenAIError> {
         let mut inner_req = PerplexityRequest::from(req);
         inner_req.chat.model.clone_from(&self.model);
+        inner_req = self.with_overrides(inner_req);
 
-        let inner_resp: PerplexityResponse = self
-            .client
-            .post("/chat/completions", self.with_overrides(inner_req))
-            .await?;
+        let inner_resp: PerplexityResponse =
+            self.client.post("/chat/completions", inner_req).await?;
 
         for (i, c) in inner_resp.citations.iter().enumerate() {
             tracing::debug!("{i}th citation for id={}. {}", inner_resp.response.id, c);

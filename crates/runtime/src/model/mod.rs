@@ -25,6 +25,7 @@ mod embed;
 mod eval;
 mod metrics;
 mod tool_use;
+mod wrapper;
 
 pub use chat::{try_to_chat_model, LLMModelStore};
 pub use embed::{try_to_embedding, EmbeddingModelStore};
