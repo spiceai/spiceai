@@ -43,7 +43,8 @@ pub struct ChatWrapper {
     pub defaults: Vec<(String, serde_json::Value)>,
 }
 
-// For fields that should always log a warning on parse failure.
+/// Sets a certain field in a [`CreateChatCompletionRequest`] to a given value.
+/// Emit a warning if the value cannot be parsed, from a string to the respective field's type.
 macro_rules! set_default_w_warning {
     ($req:expr, $field:ident, $value:expr, $model:expr) => {
         $req.$field = $req
@@ -77,7 +78,8 @@ impl ChatWrapper {
             defaults,
         };
 
-        // Check defaults provided are valid. `with_model_defaults` will emit appropriate warnings.
+        // Check defaults provided are valid at startup.
+        // `with_model_defaults` will emit appropriate warnings to user.
         s.with_model_defaults(CreateChatCompletionRequest::default());
 
         s

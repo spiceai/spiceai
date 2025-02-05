@@ -29,13 +29,13 @@ static DUMMY_API_KEY: LazyLock<Secret<String>> = LazyLock::new(|| Secret::new(St
 /// This configuration supports two authentication mechanisms (API key or Bearer token)
 /// and allows you to set the base URL and add arbitrary default headers.
 #[derive(Clone, Debug)]
-pub struct GenericHandlerConfig {
+pub struct HostedModelConfig {
     pub auth: Option<GenericAuthMechanism>,
     pub base_url: String,
     pub default_headers: HeaderMap,
 }
 
-impl Default for GenericHandlerConfig {
+impl Default for HostedModelConfig {
     fn default() -> Self {
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
@@ -47,7 +47,7 @@ impl Default for GenericHandlerConfig {
     }
 }
 
-impl GenericHandlerConfig {
+impl HostedModelConfig {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -113,7 +113,7 @@ impl GenericAuthMechanism {
     }
 }
 
-impl Config for GenericHandlerConfig {
+impl Config for HostedModelConfig {
     fn headers(&self) -> HeaderMap {
         let mut headers = self.default_headers.clone();
 

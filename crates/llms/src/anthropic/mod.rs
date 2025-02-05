@@ -23,10 +23,10 @@ mod types_stream;
 
 pub use types::AnthropicModelVariant;
 
-use crate::config::{GenericAuthMechanism, GenericHandlerConfig};
+use crate::config::{GenericAuthMechanism, HostedModelConfig};
 
 pub struct Anthropic {
-    client: Client<GenericHandlerConfig>,
+    client: Client<HostedModelConfig>,
     model: AnthropicModelVariant,
 }
 
@@ -42,7 +42,7 @@ impl Anthropic {
         version: Option<&str>,
     ) -> Result<Self, OpenAIError> {
         let variant = validate_model_variant(model.unwrap_or(DEFAULT_ANTHROPIC_MODEL))?;
-        let cfg = GenericHandlerConfig::default()
+        let cfg = HostedModelConfig::default()
             .with_auth(auth)
             .with_base_url(api_base.unwrap_or(ANTHROPIC_API_BASE))
             .with_header(
@@ -52,7 +52,7 @@ impl Anthropic {
             .map_err(|e| OpenAIError::InvalidArgument(e.to_string()))?;
 
         Ok(Self {
-            client: Client::<GenericHandlerConfig>::with_config(cfg),
+            client: Client::<HostedModelConfig>::with_config(cfg),
             model: variant,
         })
     }

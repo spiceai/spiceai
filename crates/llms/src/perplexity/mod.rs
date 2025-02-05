@@ -18,13 +18,13 @@ use async_openai::Client;
 use secrecy::Secret;
 use types::{PerplexityRequest, PerplexityRequestParameters};
 
-use crate::config::{GenericAuthMechanism, GenericHandlerConfig};
+use crate::config::{GenericAuthMechanism, HostedModelConfig};
 
 pub mod chat;
 pub mod types;
 
 pub struct PerplexitySonar {
-    client: Client<GenericHandlerConfig>,
+    client: Client<HostedModelConfig>,
     model: String,
     overrides: Vec<(String, String)>,
 }
@@ -32,7 +32,6 @@ pub struct PerplexitySonar {
 static PERPLEXITY_SONAR_API_BASE: &str = "https://api.perplexity.ai";
 static PERPLEXITY_SONAR_DEFAULT_MODEL: &str = "sonar";
 
-// TODO: Add `PerplexityRequestParameters`
 impl PerplexitySonar {
     #[must_use]
     pub fn new(
@@ -40,12 +39,12 @@ impl PerplexitySonar {
         model: Option<&str>,
         overrides: Vec<(String, String)>,
     ) -> Self {
-        let cfg = GenericHandlerConfig::default()
+        let cfg = HostedModelConfig::default()
             .with_auth(GenericAuthMechanism::BearerToken(auth_token.clone()))
             .with_base_url(PERPLEXITY_SONAR_API_BASE);
 
         Self {
-            client: Client::<GenericHandlerConfig>::with_config(cfg),
+            client: Client::<HostedModelConfig>::with_config(cfg),
             model: model.unwrap_or(PERPLEXITY_SONAR_DEFAULT_MODEL).to_string(),
             overrides,
         }
