@@ -126,6 +126,7 @@ impl SpiceTest<NotStarted> {
             start_time: self.start_time,
             spiced_instance: self.spiced_instance,
             use_progress_bars: self.use_progress_bars,
+            api_key: self.api_key,
             state: Running {
                 baseline_handles,
                 spice_handles,
@@ -163,6 +164,7 @@ impl SpiceTest<Running> {
             start_time: self.start_time,
             spiced_instance: self.spiced_instance,
             use_progress_bars: self.use_progress_bars,
+            api_key: self.api_key,
             state: Completed {
                 baseline_results,
                 spice_results,

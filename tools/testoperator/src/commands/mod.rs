@@ -22,7 +22,7 @@ use test_framework::{
     app::App,
     spiced::StartRequest,
     spicepod::Spicepod,
-    spicepod_utils::{from_app, make_spiceai_rw_dataset},
+    spicepod_utils::{from_app, make_spiceai_rw_dataset, set_read_write_api_key},
 };
 
 pub(crate) mod bench;
@@ -35,6 +35,7 @@ mod util;
 pub(crate) type RowCounts = BTreeMap<String, usize>;
 
 const TEST_RESULTS_DATASET: &str = "test_results";
+const TEST_RESULTS_API_KEY: &str = "test_results_api_key";
 
 pub(crate) fn get_app_and_start_request(args: &CommonArgs) -> anyhow::Result<(App, StartRequest)> {
     let spicepod = Spicepod::load_exact(args.spicepod_path.clone())?;
@@ -49,6 +50,7 @@ pub(crate) fn get_app_and_start_request(args: &CommonArgs) -> anyhow::Result<(Ap
             TEST_RESULTS_DATASET,
             None,
         ));
+        set_read_write_api_key(&mut app.runtime, TEST_RESULTS_API_KEY.to_string());
     }
 
     let start_request = StartRequest::new(args.spiced_path.clone(), from_app(app.clone()))?;

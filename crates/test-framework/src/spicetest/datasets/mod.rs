@@ -143,7 +143,10 @@ impl SpiceTest<NotStarted> {
             None
         };
 
-        let flight_client = self.spiced_instance.flight_client().await?;
+        let flight_client = self
+            .spiced_instance
+            .flight_client(self.api_key.clone())
+            .await?;
         let query_workers = (0..self.state.parallel_count)
             .map(|id| {
                 let worker = SpiceTestQueryWorker::new(
@@ -167,6 +170,7 @@ impl SpiceTest<NotStarted> {
             spiced_instance: self.spiced_instance,
             start_time: self.start_time,
             use_progress_bars: self.use_progress_bars,
+            api_key: self.api_key,
             state: Running {
                 start_time: Instant::now(),
                 query_workers,
@@ -214,6 +218,7 @@ impl SpiceTest<Running> {
             spiced_instance: self.spiced_instance,
             start_time: self.start_time,
             use_progress_bars: self.use_progress_bars,
+            api_key: self.api_key,
             state: Completed {
                 query_durations,
                 row_counts,

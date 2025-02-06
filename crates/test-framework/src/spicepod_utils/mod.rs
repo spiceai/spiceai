@@ -21,6 +21,7 @@ use spicepod::{
     component::{
         dataset::{replication::Replication, Dataset, Mode},
         params::Params,
+        runtime::{ApiKey, ApiKeyAuth, Auth, Runtime},
         ComponentOrReference,
     },
     spec::{SpicepodDefinition, SpicepodKind, SpicepodVersion},
@@ -100,4 +101,13 @@ pub fn make_spiceai_rw_dataset(path: &str, name: &str, api_key: Option<String>) 
         ));
     }
     ds
+}
+
+pub fn set_read_write_api_key(runtime: &mut Runtime, api_key: String) {
+    runtime.auth = Some(Auth {
+        api_key: Some(ApiKeyAuth {
+            enabled: true,
+            keys: vec![ApiKey::ReadWrite { key: api_key }],
+        }),
+    });
 }

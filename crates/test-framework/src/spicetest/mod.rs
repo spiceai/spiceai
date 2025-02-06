@@ -34,6 +34,7 @@ pub struct SpiceTest<S: TestState> {
     spiced_instance: SpicedInstance,
     start_time: SystemTime,
     use_progress_bars: bool,
+    api_key: Option<String>,
 
     state: S,
 }
@@ -54,8 +55,15 @@ impl<S: TestNotStarted> SpiceTest<S> {
             spiced_instance: spice_instance,
             start_time: SystemTime::now(),
             use_progress_bars: true,
+            api_key: None,
             state,
         }
+    }
+
+    #[must_use]
+    pub fn with_api_key(mut self, api_key: Option<String>) -> Self {
+        self.api_key = api_key;
+        self
     }
 
     #[must_use]

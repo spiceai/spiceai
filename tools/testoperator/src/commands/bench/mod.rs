@@ -15,7 +15,10 @@ limitations under the License.
 */
 
 use super::{get_app_and_start_request, RowCounts};
-use crate::{args::DatasetTestArgs, commands::TEST_RESULTS_DATASET};
+use crate::{
+    args::DatasetTestArgs,
+    commands::{TEST_RESULTS_API_KEY, TEST_RESULTS_DATASET},
+};
 use std::time::Duration;
 use test_framework::{
     anyhow,
@@ -55,6 +58,11 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
             .with_end_condition(EndCondition::QuerySetCompleted(5)),
     )
     .with_progress_bars(!args.common.disable_progress_bars)
+    .with_api_key(if args.common.upload_results_dataset.is_some() {
+        Some(TEST_RESULTS_API_KEY.to_string())
+    } else {
+        None
+    })
     .start()
     .await?;
 
@@ -68,7 +76,9 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
 
     if args.common.upload_results_dataset.is_some() {
         println!("Uploading test results...");
-        let mut flight_client = spiced_instance.flight_client().await?;
+        let mut flight_client = spiced_instance
+            .flight_client(Some(TEST_RESULTS_API_KEY.to_string()))
+            .await?;
         put_batches(&mut flight_client, TEST_RESULTS_DATASET, records).await?;
     }
 
