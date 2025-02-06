@@ -67,14 +67,8 @@ pub async fn forge(
     let from_source = component
         .from
         .split_once(':')
-        .map_or("builtin", |(a, _b)| a);
-    // else {
-    //     return Err(format!(
-    //         "Invalid tool component `from` field. Expected: `<tool_source>:<tool_id>`. Recieved: {}",
-    //         component.from
-    //     )
-    //     .into());
-    // };
+        .map(|(a, _b)| a)
+        .unwrap_or("builtin");
 
     let registry = TOOL_SHED_FACTORY.lock().await;
 

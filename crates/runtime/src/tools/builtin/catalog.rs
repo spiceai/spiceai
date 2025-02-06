@@ -101,7 +101,7 @@ impl ToolFactory for BuiltinToolCatalog {
         let id = component
             .from
             .split_once(':')
-            .map_or("builtin", |(_, id)| id);
+            .map_or(component.from.as_str(), |(_, id)| id);
 
         Self::construct_builtin(
             id,
