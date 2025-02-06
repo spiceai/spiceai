@@ -57,9 +57,9 @@ impl LogVerbosity {
 impl From<LogVerbosity> for EnvFilter {
     fn from(v: LogVerbosity) -> Self {
         match v {
-            LogVerbosity::Default => EnvFilter::new("task_history=INFO,spiced=INFO,runtime=INFO,secrets=INFO,data_components=INFO,cache=INFO,extensions=INFO,spice_cloud=INFO,llms=INFO,reqwest_retry::middleware=off,opentelemetry_sdk=off,WARN"),
-            LogVerbosity::Verbose => EnvFilter::new("task_history=DEBUG,spiced=DEBUG,runtime=DEBUG,secrets=DEBUG,data_components=DEBUG,cache=DEBUG,extensions=DEBUG,spice_cloud=DEBUG,llms=DEBUG,INFO"),
-            LogVerbosity::VeryVerbose => EnvFilter::new("task_history=TRACE,spiced=TRACE,runtime=TRACE,secrets=TRACE,data_components=TRACE,cache=TRACE,extensions=TRACE,spice_cloud=TRACE,llms=TRACE,DEBUG"),
+            LogVerbosity::Default => EnvFilter::new("task_history=INFO,spiced=INFO,runtime=INFO,secrets=INFO,data_components=INFO,cache=INFO,extensions=INFO,spice_cloud=INFO,llms=INFO,tpc_extension=INFO,reqwest_retry::middleware=off,opentelemetry_sdk=off,WARN"),
+            LogVerbosity::Verbose => EnvFilter::new("task_history=DEBUG,spiced=DEBUG,runtime=DEBUG,secrets=DEBUG,data_components=DEBUG,cache=DEBUG,extensions=DEBUG,spice_cloud=DEBUG,llms=DEBUG,tpc_extension=DEBUG,INFO"),
+            LogVerbosity::VeryVerbose => EnvFilter::new("task_history=TRACE,spiced=TRACE,runtime=TRACE,secrets=TRACE,data_components=TRACE,cache=TRACE,extensions=TRACE,spice_cloud=TRACE,llms=TRACE,tpc_extension=TRACE,DEBUG"),
             LogVerbosity::Specific(filter) => EnvFilter::new(filter),
         }
     }

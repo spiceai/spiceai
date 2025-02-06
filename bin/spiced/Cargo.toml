@@ -30,6 +30,7 @@ serde_yaml.workspace = true
 snafu.workspace = true
 snmalloc-rs = "0.3.6"
 spice-cloud = { path = "../../crates/spice_cloud" }
+tpc-extension = { path = "../../crates/tpc_extension", optional = true }
 tokio.workspace = true
 telemetry = { path = "../../crates/telemetry" }
 tracing.workspace = true
@@ -84,3 +85,4 @@ spark = ["runtime/spark"]
 sqlite = ["runtime/sqlite"]
 sharepoint = ["runtime/sharepoint"]
 postgres-write = ["runtime/postgres-write"]
+tpc-extension = ["dep:tpc-extension"]
