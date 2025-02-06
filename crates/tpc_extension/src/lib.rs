@@ -72,7 +72,7 @@ impl Extension for TpcExtension {
             .manifest
             .params
             .get("benchmark")
-            .map_or(String::from("tpch"), |v| v.to_string());
+            .map_or(String::from("tpch"), std::string::ToString::to_string);
 
         if benchmark != "tpch" && benchmark != "tpcds" {
             return Err(ExtensionError::UnableToInitializeExtension {
@@ -82,13 +82,10 @@ impl Extension for TpcExtension {
             });
         }
 
-        let path = self
-            .manifest
-            .params
-            .get("path")
-            .map_or(String::from(format!(".spice/data/{benchmark}.db")), |v| {
-                v.to_string()
-            });
+        let path = self.manifest.params.get("path").map_or(
+            format!(".spice/data/{benchmark}.db"),
+            std::string::ToString::to_string,
+        );
 
         if let Some(parent) = PathBuf::from(&path).parent() {
             fs::create_dir_all(parent).map_err(|e| {
@@ -133,7 +130,7 @@ impl Extension for TpcExtension {
         );
 
         connection
-            .execute_batch(&query.as_str())
+            .execute_batch(query.as_str())
             .boxed()
             .map_err(|source| ExtensionError::UnableToInitializeExtension { source })?;
 
