@@ -74,10 +74,10 @@ impl PerplexitySonar {
         &self,
         mut req: PerplexityRequest,
     ) -> Result<PerplexityResponse, OpenAIError> {
-        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "citations", model = %req.chat.model);
-        if let Ok(m) = serde_json::to_string(&req.chat.messages) {
-            tracing::info!(target: "task_history", parent: &span, input = %m, "labels");
-        };
+        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "citations",
+            model = %req.chat.model,
+            input = %serde_json::to_string(&req.chat.messages).unwrap_or_default()
+        );
 
         req.chat.model.clone_from(&self.model);
         req = self.with_overrides(req);
@@ -86,17 +86,18 @@ impl PerplexitySonar {
             self.client.post("/chat/completions", req).await;
 
         if let Ok(ref r) = resp {
-            tracing::info!(target: "task_history", parent: &span, captured_output = %format!("{:?}", r.citations), "labels");
+            tracing::info!(target: "task_history", parent: &span, captured_output = %format!("{:?}", r.citations));
         }
 
         resp
     }
 
     pub async fn search_stream(&self, mut req: PerplexityRequest) -> PerplexityResponseStream {
-        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "citations", model = %req.chat.model);
-        if let Ok(m) = serde_json::to_string(&req.chat.messages) {
-            tracing::info!(target: "task_history", parent: &span, input = %m, "labels");
-        };
+        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "citations",
+            model = %req.chat.model,
+            input = %serde_json::to_string(&req.chat.messages).unwrap_or_default()
+        );
+
         req.chat.model.clone_from(&self.model);
         req = self.with_overrides(req);
         let span_stream = span.clone();
@@ -107,7 +108,7 @@ impl PerplexitySonar {
             .await
             .inspect_ok(move |r: &PerplexityStreamResponse|  {
                 if !span_stream.has_field("captured_output") {
-                    tracing::info!(target: "task_history", parent: &span_stream, captured_output = %format!("{:?}", r.citations), "labels");
+                    tracing::info!(target: "task_history", parent: &span_stream, captured_output = %format!("{:?}", r.citations));
                 }
             })
             // Perplexity does not send "Done" messages as per SSE protocol.
