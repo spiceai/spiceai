@@ -9,6 +9,7 @@ expression: "normalize_chat_completion_response(response, true)"
       "index": 0,
       "logprobs": null,
       "message": {
+        "audio": null,
         "content": "content_val",
         "function_call": null,
         "refusal": null,
