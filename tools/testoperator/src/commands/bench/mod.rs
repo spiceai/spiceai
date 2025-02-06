@@ -15,10 +15,12 @@ limitations under the License.
 */
 
 use super::{get_app_and_start_request, RowCounts};
-use crate::args::DatasetTestArgs;
+use crate::{args::DatasetTestArgs, commands::TEST_RESULTS_DATASET};
 use std::time::Duration;
 use test_framework::{
     anyhow,
+    arrow::util::pretty::print_batches,
+    flight::put_batches,
     metrics::{MetricCollector, NoExtendedMetrics, QueryMetrics},
     queries::{QueryOverrides, QuerySet},
     spiced::SpicedInstance,
@@ -61,7 +63,14 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
     let metrics: QueryMetrics<_, NoExtendedMetrics> = test.collect(TestType::Benchmark)?;
     let mut spiced_instance = test.end();
 
-    metrics.show_records()?;
+    let records = metrics.build_records()?;
+    print_batches(&records)?;
+
+    if args.common.upload_results_dataset.is_some() {
+        println!("Uploading test results...");
+        let mut flight_client = spiced_instance.flight_client().await?;
+        put_batches(&mut flight_client, TEST_RESULTS_DATASET, records).await?;
+    }
 
     spiced_instance.show_memory_usage()?;
     spiced_instance.stop()?;

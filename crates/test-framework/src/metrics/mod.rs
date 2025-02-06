@@ -518,12 +518,6 @@ impl<T: ExtendedMetrics, R: ExtendedMetrics> QueryMetrics<T, R> {
         Ok(vec![RecordBatch::try_new(Self::run_schema(), columns)?])
     }
 
-    pub fn show_records(&self) -> Result<()> {
-        print_batches(&self.build_records()?)?;
-
-        Ok(())
-    }
-
     pub fn show_run(&self, status: Option<QueryStatus>) -> Result<()> {
         print_batches(&self.build_run(status.unwrap_or_default())?)?;
 

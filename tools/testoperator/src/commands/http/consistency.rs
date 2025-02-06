@@ -22,7 +22,7 @@ use crate::{
 use std::{sync::Arc, time::Duration};
 use test_framework::{
     anyhow::{self, anyhow},
-    arrow::array::ArrowNativeTypeOp,
+    arrow::{array::ArrowNativeTypeOp, util::pretty::print_batches},
     metrics::MetricCollector,
     spiced::SpicedInstance,
     spicetest::{
@@ -70,7 +70,8 @@ pub async fn consistency_run(args: &HttpConsistencyTestArgs) -> anyhow::Result<(
 
     let mut spiced_instance = test.end();
 
-    results.show_records()?;
+    let records = results.build_records()?;
+    print_batches(&records)?;
 
     let (p50, p95): (Vec<f64>, Vec<f64>) = results
         .metrics

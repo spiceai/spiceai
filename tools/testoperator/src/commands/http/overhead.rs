@@ -23,7 +23,7 @@ use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use std::{sync::Arc, time::Duration};
 use test_framework::{
     anyhow::{self, anyhow},
-    arrow::array::ArrowNativeTypeOp,
+    arrow::{array::ArrowNativeTypeOp, util::pretty::print_batches},
     metrics::MetricCollector,
     spiced::SpicedInstance,
     spicetest::{
@@ -75,7 +75,8 @@ pub(crate) async fn overhead_run(args: &HttpOverheadTestArgs) -> anyhow::Result<
     println!("{}", with_color!(Color::Blue, "Starting overhead test"));
     let test = test.start()?.wait().await?;
     let results = test.collect(TestType::HttpOverhead)?;
-    results.show_records()?;
+    let records = results.build_records()?;
+    print_batches(&records)?;
 
     let mut spiced_instance = test.end();
     spiced_instance.stop()?;
