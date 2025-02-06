@@ -17,7 +17,7 @@ limitations under the License.
 use std::{collections::HashMap, fmt::Display};
 
 use super::{
-    model::{ModelFile, ModelFileType},
+    model::{ModelFile, ModelFileType, HUGGINGFACE_PATH_REGEX},
     Nameable, WithDependsOn,
 };
 #[cfg(feature = "schemars")]
@@ -116,9 +116,14 @@ impl Embeddings {
     pub fn get_model_id(&self) -> Option<String> {
         match self.get_prefix() {
             Some(EmbeddingPrefix::HuggingFace) => {
-                let from = &self.from;
-                from.strip_prefix("huggingface:huggingface.co/")
-                    .map(ToString::to_string)
+                HUGGINGFACE_PATH_REGEX.captures(&self.from).map(|caps| {
+                    let model = format!("{}/{}", &caps["org"], &caps["model"]);
+                    if let Some(revision) = caps.name("revision") {
+                        format!("{}:{}", model, revision.as_str())
+                    } else {
+                        model
+                    }
+                })
             }
             Some(EmbeddingPrefix::OpenAi) => {
                 let from = &self.from;
@@ -148,7 +153,7 @@ impl TryFrom<&str> for EmbeddingPrefix {
     type Error = &'static str;
 
     fn try_from(value: &str) -> Result<Self, Self::Error> {
-        if value.starts_with("huggingface:huggingface.co") {
+        if value.starts_with("huggingface") || value.starts_with("hf") {
             Ok(EmbeddingPrefix::HuggingFace)
         } else if value.starts_with("file") {
             Ok(EmbeddingPrefix::File)
@@ -167,7 +172,7 @@ impl Display for EmbeddingPrefix {
         match self {
             EmbeddingPrefix::OpenAi => write!(f, "openai"),
             EmbeddingPrefix::Azure => write!(f, "azure"),
-            EmbeddingPrefix::HuggingFace => write!(f, "huggingface:huggingface.co"),
+            EmbeddingPrefix::HuggingFace => write!(f, "huggingface"),
             EmbeddingPrefix::File => write!(f, "file"),
         }
     }

@@ -17,10 +17,10 @@ limitations under the License.
 use arrow::{
     array::{new_null_array, Array, ArrayRef, ListArray, RecordBatch, StructArray},
     buffer::{Buffer, OffsetBuffer},
-    compute::cast,
     datatypes::{DataType, Field, SchemaRef},
     error::ArrowError,
 };
+use arrow_cast::cast;
 use snafu::prelude::*;
 use std::sync::Arc;
 

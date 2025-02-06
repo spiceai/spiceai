@@ -130,6 +130,12 @@ jobs:
           nvidia-smi
           nvidia-smi --query-gpu=compute_cap --format=csv
 
+      # on self-hosted runners, there is a newer dev version installed, so we need to remove it first
+      - name: remove existing release
+        if: matrix.target.runner == 'spiceai-macos'
+        run: |
+          rm -rf ~/.spice/bin/
+
       - name: install Spice (https://install.spiceai.org)
         if: matrix.target.target_os != 'windows'
         env:

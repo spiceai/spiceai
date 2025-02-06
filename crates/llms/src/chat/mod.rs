@@ -387,7 +387,10 @@ pub fn message_to_mistral(
                         Either::Left(json!(content_json).to_string()),
                     );
                 }
-                None => {}
+                None => {
+                    // Use Some(""), not None as it is more compatible with many open source `chat_template`s.
+                    map.insert("content".to_string(), Either::Left(String::new()));
+                }
             };
             if let Some(name) = name {
                 map.insert("name".to_string(), Either::Left(name.clone()));

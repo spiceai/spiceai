@@ -778,31 +778,36 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ModelResponse"
+                  "$ref": "#/components/schemas/OpenAIModelResponse"
                 },
-                "example": [
-                  {
-                    "name": "example_model_1",
-                    "from": "openai",
-                    "datasets": [
-                      "dataset_a",
-                      "dataset_b"
-                    ],
-                    "status": "ready"
-                  },
-                  {
-                    "name": "example_model_2",
-                    "from": "spiceai",
-                    "datasets": null,
-                    "status": "initializing"
-                  }
-                ]
+                "example": {
+                  "object": "list",
+                  "data": [
+                    {
+                      "id": "gpt-4",
+                      "object": "model",
+                      "owned_by": "openai",
+                      "datasets": null,
+                      "status": "ready"
+                    },
+                    {
+                      "id": "text-embedding-ada-002",
+                      "object": "model",
+                      "owned_by": "openai-internal",
+                      "datasets": [
+                        "text-dataset-1",
+                        "text-dataset-2"
+                      ],
+                      "status": "ready"
+                    }
+                  ]
+                }
               },
               "text/csv": {
                 "schema": {
                   "type": "string"
                 },
-                "example": "\nname,from,datasets,status\nexample_model_1,openai,\"[\\\"dataset_a\\\", \\\"dataset_b\\\"]\",ready\nexample_model_2,spiceai,,initializing\n"
+                "example": "\nid,object,owned_by,datasets,status\ngpt-4,model,openai,,ready\ntext-embedding-ada-002,model,openai-internal,\"text-dataset-1,text-dataset-2\",ready\n"
               }
             }
           },
@@ -3475,44 +3480,6 @@
           }
         }
       },
-      "ModelResponse": {
-        "type": "object",
-        "required": [
-          "name",
-          "from"
-        ],
-        "properties": {
-          "datasets": {
-            "type": [
-              "array",
-              "null"
-            ],
-            "items": {
-              "type": "string"
-            },
-            "description": "The datasets associated with this model, if any"
-          },
-          "from": {
-            "type": "string",
-            "description": "The source from which the model was loaded (e.g., `openai`, `spiceai`)"
-          },
-          "name": {
-            "type": "string",
-            "description": "The name of the model"
-          },
-          "status": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/ComponentStatus",
-                "description": "The status of the model (e.g., `ready`, `initializing`, `error`)"
-              }
-            ]
-          }
-        }
-      },
       "Namespace": {
         "type": "object",
         "required": [
@@ -3538,6 +3505,67 @@
             "items": {
               "$ref": "#/components/schemas/Namespace"
             }
+          }
+        }
+      },
+      "OpenAIModel": {
+        "type": "object",
+        "required": [
+          "id",
+          "object",
+          "owned_by"
+        ],
+        "properties": {
+          "datasets": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "The datasets associated with this model, if any"
+          },
+          "id": {
+            "type": "string",
+            "description": "The name of the model"
+          },
+          "object": {
+            "type": "string",
+            "description": "The type of the model (always `model`)"
+          },
+          "owned_by": {
+            "type": "string",
+            "description": "The source from which the model was loaded (e.g., `openai`, `spiceai`)"
+          },
+          "status": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ComponentStatus",
+                "description": "The status of the model (e.g., `ready`, `initializing`, `error`)"
+              }
+            ]
+          }
+        }
+      },
+      "OpenAIModelResponse": {
+        "type": "object",
+        "required": [
+          "object",
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/OpenAIModel"
+            }
+          },
+          "object": {
+            "type": "string"
           }
         }
       },
