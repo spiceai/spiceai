@@ -15,7 +15,7 @@ limitations under the License.
 */
 use arrow::array::RecordBatch;
 use async_trait::async_trait;
-use std::sync::Arc;
+use std::{borrow::Cow, sync::Arc};
 
 use crate::{
     tools::{utils::parameters, SpiceModelTool},
@@ -60,12 +60,12 @@ impl Default for SqlTool {
 
 #[async_trait]
 impl SpiceModelTool for SqlTool {
-    fn name(&self) -> &str {
-        self.name.as_str()
+    fn name(&self) -> Cow<'_, str> {
+        Cow::Borrowed(&self.name)
     }
 
-    fn description(&self) -> Option<&str> {
-        self.description.as_deref()
+    fn description(&self) -> Option<Cow<'_, str>> {
+        self.description.as_deref().map(Cow::Borrowed)
     }
 
     fn parameters(&self) -> Option<Value> {
@@ -77,7 +77,7 @@ impl SpiceModelTool for SqlTool {
         arg: &str,
         rt: Arc<Runtime>,
     ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
-        let span: Span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::sql", tool = self.name(), input = arg);
+        let span: Span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::sql", tool = self.name().to_string(), input = arg);
         let tool_use_result: Result<Value, Box<dyn std::error::Error + Send + Sync>> = async {
             let req: SqlToolParams = serde_json::from_str(arg)?;
 

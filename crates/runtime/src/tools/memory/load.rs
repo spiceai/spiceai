@@ -21,7 +21,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use snafu::ResultExt;
-use std::sync::Arc;
+use std::{borrow::Cow, sync::Arc};
 use tracing_futures::Instrument;
 
 use crate::{
@@ -63,12 +63,12 @@ impl Default for LoadMemoryTool {
 
 #[async_trait]
 impl SpiceModelTool for LoadMemoryTool {
-    fn name(&self) -> &str {
-        self.name.as_str()
+    fn name(&self) -> Cow<'_, str> {
+        Cow::Borrowed(&self.name)
     }
 
-    fn description(&self) -> Option<&str> {
-        self.description.as_deref()
+    fn description(&self) -> Option<Cow<'_, str>> {
+        self.description.as_deref().map(Cow::Borrowed)
     }
 
     fn parameters(&self) -> Option<Value> {
@@ -80,7 +80,7 @@ impl SpiceModelTool for LoadMemoryTool {
         arg: &str,
         rt: Arc<Runtime>,
     ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
-        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::load_memory", tool = self.name(), input = arg);
+        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::load_memory", tool = self.name().to_string(), input = arg);
 
         let table_name = memory_table_name(&rt).await?;
         let result: Result<Value, Box<dyn std::error::Error + Send + Sync>> = async {

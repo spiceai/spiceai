@@ -78,7 +78,7 @@ impl ToolUsingChat {
                 function: FunctionObject {
                     strict: t.strict(),
                     name: t.name().to_string(),
-                    description: t.description().map(ToString::to_string),
+                    description: t.description().map(|d| d.to_string()),
                     parameters: t.parameters(),
                 },
             })
