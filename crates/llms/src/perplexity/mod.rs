@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use async_openai::{error::OpenAIError, Client};
 use futures::{StreamExt, TryStreamExt};
 use reqwest_eventsource::Error as SseError;
-use secrecy::{ExposeSecret, Secret, SecretString};
+use secrecy::{ExposeSecret, SecretString};
 use types::{
     PerplexityRequest, PerplexityRequestParameters, PerplexityResponse, PerplexityResponseStream,
     PerplexityStreamResponse,
@@ -51,7 +51,7 @@ impl PerplexitySonar {
             ));
         };
 
-        let perplexity_overrides: Vec<(String, String)> = params
+        let overrides: Vec<(String, String)> = params
             .iter()
             .filter_map(|(k, v)| {
                 if k != "perplexity_auth_token" {
@@ -63,24 +63,15 @@ impl PerplexitySonar {
             })
             .collect();
 
-        Ok(Self::new(auth_token, model, perplexity_overrides))
-    }
-
-    #[must_use]
-    pub fn new(
-        auth_token: &Secret<String>,
-        model: Option<&str>,
-        overrides: Vec<(String, String)>,
-    ) -> Self {
         let cfg = HostedModelConfig::default()
             .with_auth(GenericAuthMechanism::BearerToken(auth_token.clone()))
             .with_base_url(PERPLEXITY_SONAR_API_BASE);
 
-        Self {
+        Ok(Self {
             client: Client::<HostedModelConfig>::with_config(cfg),
             model: model.unwrap_or(PERPLEXITY_SONAR_DEFAULT_MODEL).to_string(),
             overrides,
-        }
+        })
     }
 
     #[must_use]

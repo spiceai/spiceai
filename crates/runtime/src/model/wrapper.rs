@@ -148,7 +148,7 @@ impl ChatWrapper {
                 }
                 "reasoning_effort" => {
                     set_default_w_warning!(req, reasoning_effort, value, self.public_name);
-                },
+                }
                 "store" => set_default_w_warning!(req, store, value, self.public_name),
                 "metadata" => set_default_w_warning!(req, metadata, value, self.public_name),
                 "n" => set_default_w_warning!(req, n, value, self.public_name),

@@ -67,8 +67,7 @@ pub async fn forge(
     let from_source = component
         .from
         .split_once(':')
-        .map(|(a, _b)| a)
-        .unwrap_or("builtin");
+        .map_or("builtin", |(a, _b)| a);
 
     let registry = TOOL_SHED_FACTORY.lock().await;
 
