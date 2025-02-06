@@ -16,6 +16,8 @@ limitations under the License.
 pub mod anthropic;
 pub mod chat;
 pub mod chunking;
+pub mod config;
 pub mod embeddings;
 pub mod openai;
+pub mod perplexity;
 pub mod xai;

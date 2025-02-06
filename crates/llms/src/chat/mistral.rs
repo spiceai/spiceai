@@ -468,6 +468,7 @@ impl MistralLlama {
                         c.finish_reason = "tool_calls".to_string();
                     }
                 });
+
                 Ok(resp)
             }
             MistralResponse::ModelError(e, _) => Err(OpenAIError::ApiError(ApiError {
