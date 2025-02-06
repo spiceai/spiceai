@@ -35,12 +35,11 @@ use async_openai::{
         ChatChoice, ChatChoiceStream, ChatCompletionRequestAssistantMessage,
         ChatCompletionRequestDeveloperMessage, ChatCompletionRequestDeveloperMessageContent,
         ChatCompletionRequestFunctionMessage, ChatCompletionRequestMessage,
-        ChatCompletionRequestMessageContentPartText, ChatCompletionRequestSystemMessage,
-        ChatCompletionRequestToolMessage, ChatCompletionRequestUserMessage,
-        ChatCompletionRequestUserMessageContent, ChatCompletionResponseMessage,
-        ChatCompletionResponseStream, ChatCompletionStreamResponseDelta,
-        CreateChatCompletionRequest, CreateChatCompletionResponse,
-        CreateChatCompletionStreamResponse, Role,
+        ChatCompletionRequestSystemMessage, ChatCompletionRequestToolMessage,
+        ChatCompletionRequestUserMessage, ChatCompletionRequestUserMessageContent,
+        ChatCompletionResponseMessage, ChatCompletionResponseStream,
+        ChatCompletionStreamResponseDelta, CreateChatCompletionRequest,
+        CreateChatCompletionResponse, CreateChatCompletionStreamResponse, Role,
     },
 };
 
@@ -298,7 +297,7 @@ pub fn message_to_mistral(
                             }
                             async_openai::types::ChatCompletionRequestUserMessageContentPart::InputAudio(a) => {
                                 ("input_audio".to_string(), Value::String(a.input_audio.data.clone()))
-                            }   
+                            }
                         }
 
                     }).collect::<Vec<_>>();
@@ -315,7 +314,10 @@ pub fn message_to_mistral(
             content: ChatCompletionRequestDeveloperMessageContent::Text(text),
             ..
         }) => IndexMap::from([
-            (String::from("role"), Either::Left(String::from("developer"))),
+            (
+                String::from("role"),
+                Either::Left(String::from("developer")),
+            ),
             (String::from("content"), Either::Left(text.clone())),
         ]),
         ChatCompletionRequestMessage::Developer(ChatCompletionRequestDeveloperMessage {
@@ -323,12 +325,12 @@ pub fn message_to_mistral(
             ..
         }) => {
             // TODO: This will cause issue for some chat_templates. Tracking: https://github.com/EricLBuehler/mistral.rs/issues/793
-            let content_json = parts
-                .iter()
-                .map(|p| p.text.clone())
-                .collect::<Vec<_>>();
+            let content_json = parts.iter().map(|p| p.text.clone()).collect::<Vec<_>>();
             IndexMap::from([
-                (String::from("role"), Either::Left(String::from("developer"))),
+                (
+                    String::from("role"),
+                    Either::Left(String::from("developer")),
+                ),
                 (
                     String::from("content"),
                     Either::Left(json!(content_json).to_string()),
