@@ -146,6 +146,11 @@ impl ChatWrapper {
                 "max_completion_tokens" => {
                     set_default_w_warning!(req, max_completion_tokens, value, self.public_name);
                 }
+                "reasoning_effort" => {
+                    req.reasoning_effort = req
+                        .reasoning_effort
+                        .or_else(|| serde_json::from_value(value).ok());
+                }
                 "store" => set_default_w_warning!(req, store, value, self.public_name),
                 "metadata" => set_default_w_warning!(req, metadata, value, self.public_name),
                 "n" => set_default_w_warning!(req, n, value, self.public_name),
