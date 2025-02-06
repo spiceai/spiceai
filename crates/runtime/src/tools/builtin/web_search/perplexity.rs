@@ -31,7 +31,7 @@ impl TryFrom<WebSearchParams> for PerplexityRequest {
     fn try_from(params: WebSearchParams) -> Result<PerplexityRequest, Self::Error> {
         let WebSearchParams { query, limit: None } = params else {
             return Err(OpenAIError::InvalidArgument(
-                "Perplexity web search does not support limit. Ignoring".to_string(),
+                "Perplexity web search does not support 'limit'".to_string(),
             ));
         };
 
