@@ -1,6 +1,6 @@
 version: v1beta1
 kind: Spicepod
-name: structured-output-sample
+name: recursion-test-sample
 
 default_acceleration: &default_acceleration
   enabled: true

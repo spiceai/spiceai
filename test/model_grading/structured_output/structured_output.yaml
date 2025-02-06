@@ -15,7 +15,7 @@ evals:
 
 models:
   - from: openai:o3-mini
-    name: openai_model
+    name: test_model
     params:
       openai_api_key: ${ secrets:OPENAI_API_KEY }
       openai_response_format:
