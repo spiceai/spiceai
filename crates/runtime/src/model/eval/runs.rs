@@ -74,6 +74,7 @@ pub static EVAL_RUNS_TABLE_REFERENCE: LazyLock<TableReference> =
     });
 
 pub static EVAL_RUNS_TABLE_TIME_COLUMN: &str = "created_at";
+pub static EVAL_RUNS_TABLE_TIME_COMPLETED_COLUMN: &str = "completed_at";
 pub static EVAL_RUNS_TABLE_PRIMARY_KEY: &str = "id";
 
 /// Represents the response for an evaluation run
@@ -112,6 +113,11 @@ pub static EVAL_RUNS_TABLE_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
             EVAL_RUNS_TABLE_TIME_COLUMN,
             DataType::Timestamp(TimeUnit::Second, None),
             false,
+        ),
+        Field::new(
+            EVAL_RUNS_TABLE_TIME_COMPLETED_COLUMN,
+            DataType::Timestamp(TimeUnit::Second, None),
+            true,
         ),
         Field::new("dataset", DataType::Utf8, false),
         Field::new("model", DataType::Utf8, false),
@@ -178,6 +184,16 @@ pub async fn update_eval_run_status(
         "status",
         Arc::new(StringArray::from(vec![status.to_string()])),
     );
+
+    if matches!(status, EvalRunStatus::Completed) {
+        updates.insert(
+            EVAL_RUNS_TABLE_TIME_COMPLETED_COLUMN,
+            Arc::new(TimestampSecondArray::from(vec![Some(
+                chrono::Utc::now().timestamp(),
+            )])),
+        );
+    }
+
     if let Some(err) = err_msg {
         updates.insert("error_message", Arc::new(StringArray::from(vec![err])));
     };
@@ -317,6 +333,7 @@ fn eval_runs_record(id: &str, model: &str, eval: &Eval) -> Result<RecordBatch, A
         Arc::new(TimestampSecondArray::from(vec![
             chrono::Utc::now().timestamp()
         ])),
+        Arc::new(TimestampSecondArray::from(vec![None])),
         Arc::new(StringArray::from(vec![eval.dataset.clone()])),
         Arc::new(StringArray::from(vec![model.to_string()])),
         Arc::new(StringArray::from(vec![EvalRunStatus::Waiting.to_string()])),
