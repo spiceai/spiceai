@@ -14,17 +14,104 @@ curl -XPOST "http://localhost:8090/v1/evals/tpch_nsql" \
 [{"id":"d846dcc0a0dd9df94b8d4f72c874aa90","created_at":"2025-02-04T23:10:29","dataset":"tpch_nsql","model":"gpt-4o-mini","status":"Completed","scorers":["json_match"],"metrics":{"json_match/mean":0.6363636}}]
 ```
 
-To review benchmark detailed result:
+To review model answers and score details:
 
 ```bash
-curl -XPOST http://localhost:8090/v1/sql \
-  --data "SELECT
-    input,
-    output,
-    actual,
-    value
-  FROM eval.results
-  WHERE run_id='74d3c352a21966af0f1a5a56fc85f4b8'" | jq
+curl -XPOST http://localhost:8090/v1/sql --data "
+WITH latest_run AS (
+  SELECT id FROM spice.eval.runs ORDER BY created_at DESC LIMIT 1
+)
+SELECT run_id, input, output, actual, value
+FROM eval.results
+WHERE run_id = (SELECT id FROM latest_run)
+" | jq
+```
+
+## Performance metrics
+
+### Main Metrics
+
+```sql
+WITH latest_run AS (
+    SELECT id, created_at, EXTRACT(EPOCH FROM (completed_at - created_at)) AS duration_seconds
+    FROM spice.eval.runs
+    ORDER BY created_at DESC LIMIT 1
+),
+mean_score AS (
+    SELECT run_id, AVG(value) AS mean_score, COUNT(*) AS evals_count
+    FROM spice.eval.results
+    WHERE run_id = (SELECT id FROM latest_run)
+    GROUP BY run_id
+),
+tool_stats AS (
+    SELECT 
+        COUNT(*) AS task_calls,
+        COUNT(CASE WHEN error_message IS NOT NULL THEN 1 END) AS task_errors
+    FROM runtime.task_history
+    WHERE 
+        task != 'test_connectivity'
+        AND start_time BETWEEN (SELECT created_at FROM latest_run)
+        AND COALESCE(end_time, NOW())
+)
+SELECT 
+    r.id AS run_id, r.model, r.status, ms.evals_count AS tests, lr.duration_seconds, ROUND(ms.mean_score, 4) as score, ts.task_calls,
+    COALESCE(ts.task_calls::FLOAT / ms.evals_count, 0) AS mean_task_calls,
+    ts.task_errors
+FROM spice.eval.runs r
+JOIN latest_run lr ON r.id = lr.id
+LEFT JOIN mean_score ms ON r.id = ms.run_id
+LEFT JOIN tool_stats ts ON 1=1;
+```
+
+### Tools Call Summary
+
+```sql
+WITH latest_run AS (
+  SELECT id 
+  FROM spice.eval.runs 
+  ORDER BY created_at DESC 
+  LIMIT 1
+)
+
+SELECT 
+  task, 
+  COUNT(*) AS num_task_calls,
+  COUNT(CASE WHEN error_message IS NOT NULL THEN 1 END) AS num_errors,
+  SUM(CAST((end_time - start_time) AS Float) /  1000000) AS duration_ms
+FROM runtime.task_history
+WHERE 
+  task != 'test_connectivity'
+  AND start_time BETWEEN (SELECT created_at FROM spice.eval.runs WHERE id = (SELECT id FROM latest_run)) AND 
+  COALESCE(end_time, NOW())
+GROUP BY task
+ORDER BY duration_ms DESC;
+```
+
+### Aggregated Errors Information
+
+```sql
+WITH latest_run AS (
+  SELECT id 
+  FROM spice.eval.runs 
+  ORDER BY created_at DESC 
+  LIMIT 1
+)
+
+SELECT 
+    task,
+    COUNT(*) AS failure_count,
+    error_message,
+    input
+FROM 
+    runtime.task_history
+WHERE 
+    error_message IS NOT NULL
+    AND start_time BETWEEN (SELECT created_at FROM spice.eval.runs WHERE id = (SELECT id FROM latest_run)) AND 
+  	COALESCE(end_time, NOW())
+GROUP BY 
+    task, input, error_message
+ORDER BY 
+    failure_count DESC;
 ```
 
 ## Prompt to generate sample questions

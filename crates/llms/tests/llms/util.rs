@@ -69,6 +69,7 @@ pub(crate) async fn accumulate(
                                     tool_calls: None,
                                     function_call: None,
                                     role: async_openai::types::Role::User,
+                                    audio: None,
                                 },
                             })
                             .collect();

@@ -540,12 +540,11 @@ fn make_a_stream(
                         // TODO: only concatenate, spiced tools
                         if let Some(ref tool_calls) = chat_choice.delta.tool_calls {
                             for tool_call_chunk in tool_calls {
-                                let key = if let Ok(index) = chat_choice.index.try_into() {
-                                    (index, tool_call_chunk.index)
-                                } else {
+                                let key: (i32, i32) = if let (Ok(index), Ok(tool_call_index)) = (chat_choice.index.try_into(), tool_call_chunk.index.try_into()) { (index, tool_call_index) } else {
                                     tracing::error!(
-                                        "chat_choice.index value {} is too large to fit in an i32",
-                                        chat_choice.index
+                                        "chat_choice.index value {} or tool_call_chunk.index value {} is too large to fit in an i32",
+                                        chat_choice.index,
+                                        tool_call_chunk.index
                                     );
                                     return;
                                 };

@@ -53,7 +53,7 @@ arrow-json = "53"
 arrow-cast = "53"
 arrow-odbc = "11.2.0"
 arrow-schema = "53"
-async-openai = { git = "https://github.com/spiceai/async-openai", rev = "75e6bf715760f63f3dd3e7a43222ec1e6fb9707f" }
+async-openai = { git = "https://github.com/spiceai/async-openai", rev = "9debf2001eaf8f1b6407fdf4b8cf9aa28fb3465e" }
 async-stream = "0.3.5"
 async-trait = "0.1.83"
 axum = { version = "0.7", features = ["macros"] }
