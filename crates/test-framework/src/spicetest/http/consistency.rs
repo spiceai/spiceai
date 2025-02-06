@@ -15,7 +15,9 @@ limitations under the License.
 */
 
 use super::HttpConfig;
-use crate::metrics::{MetricCollector, NoExtendedMetrics, QueryMetric};
+use crate::metrics::{
+    system_time_to_unix_epoch_ms, MetricCollector, NoExtendedMetrics, QueryMetric,
+};
 use crate::spicetest::{SpiceTest, TestCompleted, TestNotStarted, TestState};
 use crate::utils::get_random_element;
 use anyhow::Result;
@@ -137,6 +139,7 @@ impl SpiceTest<NotStarted> {
 
         Ok(SpiceTest {
             name: self.name,
+            connector_name: self.connector_name,
             start_time: self.start_time,
             spiced_instance: self.spiced_instance,
             use_progress_bars: self.use_progress_bars,
@@ -171,6 +174,7 @@ impl SpiceTest<Running> {
 
         Ok(SpiceTest {
             name: self.name,
+            connector_name: self.connector_name,
             start_time: self.start_time,
             spiced_instance: self.spiced_instance,
             use_progress_bars: self.use_progress_bars,
@@ -206,6 +210,10 @@ impl MetricCollector<NoExtendedMetrics, NoExtendedMetrics> for SpiceTest<Complet
         self.name.clone()
     }
 
+    fn connector_name(&self) -> String {
+        self.connector_name.clone()
+    }
+
     fn metrics(&self) -> Result<Vec<QueryMetric<NoExtendedMetrics>>> {
         self.state
             .result
@@ -213,7 +221,13 @@ impl MetricCollector<NoExtendedMetrics, NoExtendedMetrics> for SpiceTest<Complet
             .iter()
             .enumerate()
             .map(|(i, durations)| {
-                QueryMetric::new_from_durations(format!("{i}").as_str(), durations)
+                QueryMetric::new_from_durations(
+                    format!("{i}").as_str(),
+                    durations,
+                    &self.connector_name,
+                    system_time_to_unix_epoch_ms(self.start_time),
+                    system_time_to_unix_epoch_ms(self.state.end_time),
+                )
             })
             .collect()
     }

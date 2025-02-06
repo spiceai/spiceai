@@ -52,6 +52,7 @@ pub async fn consistency_run(args: &HttpConsistencyTestArgs) -> anyhow::Result<(
 
     let test = SpiceTest::new(
         app.name.clone(),
+        args.common.connector_name.clone(),
         spiced_instance,
         consistency::NotStarted::new(ConsistencyConfig::new(
             Duration::from_secs(args.common.duration),

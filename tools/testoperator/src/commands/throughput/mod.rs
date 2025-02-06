@@ -52,6 +52,7 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
     println!("Running baseline test");
     let baseline_test = SpiceTest::new(
         app.name.clone(),
+        args.common.connector_name.clone(),
         spiced_instance,
         NotStarted::new()
             .with_parallel_count(1)
@@ -69,6 +70,7 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
     println!("Running throughput test");
     let throughput_test = SpiceTest::new(
         app.name.clone(),
+        args.common.connector_name.clone(),
         spiced_instance,
         NotStarted::new()
             .with_parallel_count(args.common.concurrency)

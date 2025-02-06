@@ -51,6 +51,7 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
 
     let benchmark_test = SpiceTest::new(
         app.name.clone(),
+        args.common.connector_name.clone(),
         spiced_instance,
         NotStarted::new()
             .with_query_set(queries.clone())

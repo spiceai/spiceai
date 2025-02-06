@@ -18,14 +18,14 @@ use std::{
     collections::BTreeMap,
     fmt::Display,
     sync::Arc,
-    time::{Duration, SystemTime},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::Result;
 use arrow::{
     array::{
-        ArrayRef, Float64Array, Float64Builder, RecordBatch, StringArray, StringBuilder,
-        UInt64Array, UInt64Builder,
+        ArrayRef, Float64Array, Float64Builder, Int32Array, Int64Array, RecordBatch, StringArray,
+        StringBuilder, UInt64Array, UInt64Builder,
     },
     datatypes::{DataType, Field, Schema, SchemaRef},
     util::pretty::print_batches,
@@ -35,6 +35,15 @@ use uuid::Uuid;
 use crate::TestType;
 
 const FLOAT_ERROR_MARGIN: f64 = 0.0001;
+
+#[allow(
+    clippy::must_use_candidate,
+    clippy::cast_possible_wrap,
+    clippy::cast_possible_truncation
+)]
+pub fn to_i32(value: usize) -> i32 {
+    value as i32
+}
 
 #[derive(Copy, Clone, PartialEq, Eq, Default)]
 pub enum QueryStatus {
@@ -55,29 +64,46 @@ impl Display for QueryStatus {
 pub struct QueryMetric<T: ExtendedMetrics> {
     pub query_name: String,
     pub query_status: QueryStatus,
+    pub started_at: usize,
+    pub finished_at: usize,
+    pub min_duration_ms: i64,
+    pub max_duration_ms: i64,
+    pub iterations: usize,
     pub median_duration: f64,
     pub percentile_99_duration: f64,
     pub percentile_95_duration: f64,
     pub percentile_90_duration: f64,
-    pub run_count: usize,
+    pub connector_name: String,
     pub extended_metrics: Option<T>,
 }
 
 impl<T: ExtendedMetrics> QueryMetric<T> {
-    pub fn new_from_durations(name: &str, durations: &Vec<Duration>) -> Result<Self> {
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn new_from_durations(
+        name: &str,
+        durations: &Vec<Duration>,
+        connector_name: &str,
+        started_at: usize,
+        finished_at: usize,
+    ) -> Result<Self> {
         if durations.is_empty() {
-            return Ok(Self::new(name).failed());
+            return Ok(Self::new(name, connector_name).failed());
         }
 
         let durations = durations.statistical_set()?;
         Ok(Self {
             query_name: name.to_string(),
             query_status: QueryStatus::Passed,
+            started_at,
+            finished_at,
+            min_duration_ms: durations.min_duration()?.as_millis() as i64,
+            max_duration_ms: durations.max_duration()?.as_millis() as i64,
+            iterations: durations.len(),
             median_duration: durations.median()?.as_secs_f64(),
             percentile_99_duration: durations.percentile(99.0)?.as_secs_f64(),
             percentile_95_duration: durations.percentile(95.0)?.as_secs_f64(),
             percentile_90_duration: durations.percentile(90.0)?.as_secs_f64(),
-            run_count: durations.len(),
+            connector_name: connector_name.to_string(),
             extended_metrics: None,
         })
     }
@@ -89,15 +115,20 @@ impl<T: ExtendedMetrics> QueryMetric<T> {
     }
 
     #[must_use]
-    pub fn new(name: &str) -> Self {
+    pub fn new(name: &str, connector_name: &str) -> Self {
         Self {
             query_name: name.to_string(),
             query_status: QueryStatus::Passed,
+            started_at: 0,
+            finished_at: 0,
+            min_duration_ms: 0,
+            max_duration_ms: 0,
+            iterations: 0,
             median_duration: 0.0,
             percentile_99_duration: 0.0,
             percentile_95_duration: 0.0,
             percentile_90_duration: 0.0,
-            run_count: 0,
+            connector_name: connector_name.to_string(),
             extended_metrics: None,
         }
     }
@@ -107,6 +138,8 @@ pub trait StatisticsCollector<T, C> {
     fn percentile(&self, percentile: f64) -> Result<T>;
     fn median(&self) -> Result<T>;
     fn statistical_set(&self) -> Result<C>;
+    fn min_duration(&self) -> Result<T>;
+    fn max_duration(&self) -> Result<T>;
 }
 
 impl StatisticsCollector<Duration, Vec<Duration>> for Vec<Duration> {
@@ -136,6 +169,20 @@ impl StatisticsCollector<Duration, Vec<Duration>> for Vec<Duration> {
         } else {
             Ok(self[half])
         }
+    }
+
+    fn min_duration(&self) -> Result<Duration> {
+        self.iter()
+            .min()
+            .ok_or_else(|| anyhow::anyhow!("Cannot get min of empty duration list"))
+            .copied()
+    }
+
+    fn max_duration(&self) -> Result<Duration> {
+        self.iter()
+            .max()
+            .ok_or_else(|| anyhow::anyhow!("Cannot get max of empty duration list"))
+            .copied()
     }
 
     fn statistical_set(&self) -> Result<Vec<Duration>> {
@@ -194,6 +241,28 @@ impl StatisticsCollector<BTreeMap<String, Duration>, BTreeMap<String, Vec<Durati
             medians.insert(query.clone(), durations.median()?);
         }
         Ok(medians)
+    }
+
+    fn min_duration(&self) -> Result<BTreeMap<String, Duration>> {
+        let mut mins = BTreeMap::new();
+        for (query, durations) in self {
+            if durations.is_empty() {
+                continue;
+            }
+            mins.insert(query.clone(), durations.min_duration()?);
+        }
+        Ok(mins)
+    }
+
+    fn max_duration(&self) -> Result<BTreeMap<String, Duration>> {
+        let mut maxes = BTreeMap::new();
+        for (query, durations) in self {
+            if durations.is_empty() {
+                continue;
+            }
+            maxes.insert(query.clone(), durations.max_duration()?);
+        }
+        Ok(maxes)
     }
 
     fn statistical_set(&self) -> Result<BTreeMap<String, Vec<Duration>>> {
@@ -260,6 +329,22 @@ macro_rules! extract_metric_values {
             .map(|metric| metric.$field as u64)
             .collect::<Vec<_>>()
     };
+
+    // as i64
+    ($metrics:expr, $field:ident, as_i64) => {
+        $metrics
+            .iter()
+            .map(|metric| metric.$field as i64)
+            .collect::<Vec<_>>()
+    };
+
+    // as i32
+    ($metrics:expr, $field:ident, as_i32) => {
+        $metrics
+            .iter()
+            .map(|metric| to_i32(metric.$field))
+            .collect::<Vec<_>>()
+    };
 }
 
 impl<T: ExtendedMetrics, R: ExtendedMetrics> QueryMetrics<T, R> {
@@ -305,13 +390,20 @@ impl<T: ExtendedMetrics, R: ExtendedMetrics> QueryMetrics<T, R> {
 
         let mut base_fields = vec![
             Field::new("run_id", DataType::Utf8, false),
+            Field::new("started_at", DataType::Int64, false),
+            Field::new("finished_at", DataType::Int64, false),
             Field::new("query_name", DataType::Utf8, false),
-            Field::new("query_status", DataType::Utf8, false),
+            Field::new("status", DataType::Utf8, false),
+            Field::new("min_duration_ms", DataType::Int64, false),
+            Field::new("max_duration_ms", DataType::Int64, false),
+            Field::new("iterations", DataType::Int32, false),
+            Field::new("commit_sha", DataType::Utf8, false),
+            Field::new("branch_name", DataType::Utf8, false),
+            Field::new("connector_name", DataType::Utf8, false),
             Field::new("median_duration", DataType::Float64, false),
             Field::new("percentile_99_duration", DataType::Float64, false),
             Field::new("percentile_95_duration", DataType::Float64, false),
             Field::new("percentile_90_duration", DataType::Float64, false),
-            Field::new("run_count", DataType::UInt64, false),
         ];
 
         base_fields.extend(extended_fields);
@@ -395,33 +487,53 @@ impl<T: ExtendedMetrics, R: ExtendedMetrics> QueryMetrics<T, R> {
 
     /// Builds record batches for the individual metrics of this test run
     /// For example, a record would be a single query execution
+    #[allow(clippy::cast_possible_wrap)]
     pub fn build_records(&self) -> Result<Vec<RecordBatch>> {
         let run_id = vec![self.run_id.to_string(); self.metrics.len()];
 
+        let started_at = extract_metric_values!(self.metrics, started_at, as_i64);
+        let finished_at = extract_metric_values!(self.metrics, finished_at, as_i64);
         let query_name = extract_metric_values!(self.metrics, query_name, clone);
         let query_status = extract_metric_values!(self.metrics, query_status, to_string);
+        let min_duration_ms = extract_metric_values!(self.metrics, min_duration_ms);
+        let max_duration_ms = extract_metric_values!(self.metrics, max_duration_ms);
+        let iterations = extract_metric_values!(self.metrics, iterations, as_i32);
         let median_duration = extract_metric_values!(self.metrics, median_duration);
         let percentile_99_duration = extract_metric_values!(self.metrics, percentile_99_duration);
         let percentile_95_duration = extract_metric_values!(self.metrics, percentile_95_duration);
         let percentile_90_duration = extract_metric_values!(self.metrics, percentile_90_duration);
-        let run_count = extract_metric_values!(self.metrics, run_count, as_u64);
+
+        let commit_sha = vec![self.commit_sha.clone(); self.metrics.len()];
+        let branch_name = vec![self.branch_name.clone(); self.metrics.len()];
+        let connector_name = self
+            .metrics
+            .iter()
+            .map(|m| m.connector_name.clone())
+            .collect::<Vec<_>>();
+
+        let mut columns: Vec<ArrayRef> = vec![
+            Arc::new(StringArray::from(run_id)),
+            Arc::new(Int64Array::from(started_at)),
+            Arc::new(Int64Array::from(finished_at)),
+            Arc::new(StringArray::from(query_name)),
+            Arc::new(StringArray::from(query_status)),
+            Arc::new(Int64Array::from(min_duration_ms)),
+            Arc::new(Int64Array::from(max_duration_ms)),
+            Arc::new(Int32Array::from(iterations)),
+            Arc::new(StringArray::from(commit_sha)),
+            Arc::new(StringArray::from(branch_name)),
+            Arc::new(StringArray::from(connector_name)),
+            Arc::new(Float64Array::from(median_duration)),
+            Arc::new(Float64Array::from(percentile_99_duration)),
+            Arc::new(Float64Array::from(percentile_95_duration)),
+            Arc::new(Float64Array::from(percentile_90_duration)),
+        ];
 
         let extended_metrics_fields = T::fields();
         let extended_metrics_field_names = extended_metrics_fields
             .iter()
             .map(arrow::datatypes::Field::name)
             .collect::<Vec<_>>();
-
-        let mut columns: Vec<ArrayRef> = vec![
-            Arc::new(StringArray::from(run_id)),
-            Arc::new(StringArray::from(query_name)),
-            Arc::new(StringArray::from(query_status)),
-            Arc::new(Float64Array::from(median_duration)),
-            Arc::new(Float64Array::from(percentile_99_duration)),
-            Arc::new(Float64Array::from(percentile_95_duration)),
-            Arc::new(Float64Array::from(percentile_90_duration)),
-            Arc::new(UInt64Array::from(run_count)),
-        ];
 
         if !extended_metrics_fields.is_empty() {
             let mut extended_metrics_builders = self
@@ -469,7 +581,7 @@ impl<T: ExtendedMetrics, R: ExtendedMetrics> QueryMetrics<T, R> {
         ];
 
         let query_execution_count =
-            vec![self.metrics.iter().fold(0, |acc, m| acc + m.run_count) as u64];
+            vec![self.metrics.iter().fold(0, |acc, m| acc + m.iterations) as u64];
 
         let memory_usage = vec![self.memory_usage];
 
@@ -529,6 +641,7 @@ pub trait MetricCollector<T: ExtendedMetrics, R: ExtendedMetrics> {
     fn start_time(&self) -> SystemTime;
     fn end_time(&self) -> SystemTime;
     fn name(&self) -> String;
+    fn connector_name(&self) -> String;
     fn metrics(&self) -> Result<Vec<QueryMetric<T>>>;
     fn collect(&self, test_type: TestType) -> Result<QueryMetrics<T, R>> {
         Ok(QueryMetrics {
@@ -628,6 +741,14 @@ impl ThroughputMetrics {
     pub fn new(throughput: f64) -> Self {
         Self { throughput }
     }
+}
+
+#[must_use]
+#[allow(clippy::missing_panics_doc)]
+pub fn system_time_to_unix_epoch_ms(time: SystemTime) -> usize {
+    time.duration_since(UNIX_EPOCH)
+        .expect("Time went backwards")
+        .as_millis() as usize
 }
 
 #[cfg(test)]

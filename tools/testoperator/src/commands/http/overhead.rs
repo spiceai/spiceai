@@ -58,6 +58,7 @@ pub(crate) async fn overhead_run(args: &HttpOverheadTestArgs) -> anyhow::Result<
 
     let test = SpiceTest::new(
         app.name.clone(),
+        args.common.connector_name.clone(),
         spiced_instance,
         overhead::NotStarted::new(
             HttpConfig {

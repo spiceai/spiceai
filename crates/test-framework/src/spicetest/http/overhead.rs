@@ -16,7 +16,9 @@ limitations under the License.
 
 use super::component::HttpComponent;
 use super::HttpConfig;
-use crate::metrics::{MetricCollector, NoExtendedMetrics, QueryMetric};
+use crate::metrics::{
+    system_time_to_unix_epoch_ms, MetricCollector, NoExtendedMetrics, QueryMetric,
+};
 use crate::spicetest::{SpiceTest, TestCompleted, TestNotStarted, TestState};
 use crate::utils::get_random_element;
 use anyhow::Result;
@@ -123,6 +125,7 @@ impl SpiceTest<NotStarted> {
 
         Ok(SpiceTest {
             name: self.name,
+            connector_name: self.connector_name,
             start_time: self.start_time,
             spiced_instance: self.spiced_instance,
             use_progress_bars: self.use_progress_bars,
@@ -161,6 +164,7 @@ impl SpiceTest<Running> {
 
         Ok(SpiceTest {
             name: self.name,
+            connector_name: self.connector_name,
             start_time: self.start_time,
             spiced_instance: self.spiced_instance,
             use_progress_bars: self.use_progress_bars,
@@ -187,10 +191,25 @@ impl MetricCollector<NoExtendedMetrics, NoExtendedMetrics> for SpiceTest<Complet
         self.name.clone()
     }
 
+    fn connector_name(&self) -> String {
+        self.connector_name.clone()
+    }
+
     fn metrics(&self) -> Result<Vec<QueryMetric<NoExtendedMetrics>>> {
-        let baseline =
-            QueryMetric::new_from_durations("baseline", &self.state.baseline_results.durations)?;
-        let spice = QueryMetric::new_from_durations("spice", &self.state.spice_results.durations)?;
+        let baseline = QueryMetric::new_from_durations(
+            "baseline",
+            &self.state.baseline_results.durations,
+            &self.connector_name,
+            system_time_to_unix_epoch_ms(self.start_time),
+            system_time_to_unix_epoch_ms(self.state.end_time),
+        )?;
+        let spice = QueryMetric::new_from_durations(
+            "spice",
+            &self.state.spice_results.durations,
+            &self.connector_name,
+            system_time_to_unix_epoch_ms(self.start_time),
+            system_time_to_unix_epoch_ms(self.state.end_time),
+        )?;
         Ok(vec![baseline, spice])
     }
 }

@@ -56,6 +56,10 @@ pub struct CommonArgs {
     #[arg(short('p'), long, default_value = "spicepod.yaml")]
     pub(crate) spicepod_path: PathBuf,
 
+    /// The connector being tested
+    #[arg(long)]
+    pub(crate) connector_name: String,
+
     /// The number of clients to run simultaneously. Each client will send a query, wait for a response, then send another query.
     #[arg(long, default_value = "1")]
     pub(crate) concurrency: usize,
