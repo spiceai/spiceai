@@ -14,33 +14,18 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 #![allow(clippy::implicit_hasher)]
-use async_openai::{
-    error::OpenAIError,
-    types::{
-        ChatCompletionRequestMessage, ChatCompletionRequestSystemMessageArgs,
-        ChatCompletionResponseStream, ChatCompletionStreamOptions, CreateChatCompletionRequest,
-        CreateChatCompletionResponse,
-    },
-};
-use async_trait::async_trait;
-use futures::Stream;
-use futures::{stream::StreamExt, TryStreamExt};
-use llms::openai::DEFAULT_LLM_MODEL;
 use llms::{
-    anthropic::{Anthropic, AnthropicConfig},
-    chat::{nsql::SqlGeneration, Chat, Error as LlmError, Result as ChatResult},
+    anthropic::Anthropic,
+    chat::{Chat, Error as LlmError},
+    perplexity::PerplexitySonar,
     xai::Xai,
 };
+use llms::{config::GenericAuthMechanism, openai::DEFAULT_LLM_MODEL};
 use secrecy::{ExposeSecret, SecretString};
 use spicepod::component::model::{Model, ModelFileType, ModelSource};
 use std::{collections::HashMap, path::PathBuf, str::FromStr, sync::Arc};
-use std::{pin::Pin, time::Instant};
-use tracing_futures::Instrument;
 
-use super::{
-    metrics::{handle_metrics, request_labels},
-    tool_use::ToolUsingChat,
-};
+use super::{tool_use::ToolUsingChat, wrapper::ChatWrapper};
 use crate::{
     tools::{options::SpiceToolsOptions, utils::get_tools},
     Runtime,
@@ -106,6 +91,7 @@ pub fn construct_model(
         ModelSource::HuggingFace => huggingface(model_id, component, params),
         ModelSource::File => file(component, params),
         ModelSource::Anthropic => anthropic(model_id.as_deref(), params),
+        ModelSource::Perplexity => perplexity(model_id.as_deref(), params),
         ModelSource::Azure => azure(model_id, component.name.as_str(), params),
         ModelSource::Xai => xai(model_id.as_deref(), params),
         ModelSource::OpenAi => openai(model_id, params),
@@ -142,6 +128,35 @@ fn xai(
     Ok(Box::new(Xai::new(model_id, api_key)) as Box<dyn Chat>)
 }
 
+fn perplexity(
+    model_id: Option<&str>,
+    params: &HashMap<String, SecretString>,
+) -> Result<Box<dyn Chat>, LlmError> {
+    let Some(auth_token) = params.get("perplexity_auth_token") else {
+        return Err(LlmError::FailedToLoadModel {
+            source: "No `perplexity_auth_token` provided for Perplexity model.".into(),
+        });
+    };
+
+    let perplexity_overrides: Vec<(String, String)> = params
+        .iter()
+        .filter_map(|(k, v)| {
+            if k != "perplexity_auth_token" {
+                if let Some(p) = k.strip_prefix("perplexity_") {
+                    return Some((p.to_string(), v.expose_secret().clone()));
+                }
+            };
+            None
+        })
+        .collect();
+
+    Ok(Box::new(PerplexitySonar::new(
+        auth_token,
+        model_id,
+        perplexity_overrides,
+    )) as Box<dyn Chat>)
+}
+
 fn anthropic(
     model_id: Option<&str>,
     params: &HashMap<String, SecretString>,
@@ -150,19 +165,21 @@ fn anthropic(
     let api_key = extract_secret!(params, "anthropic_api_key");
     let auth_token = extract_secret!(params, "anthropic_auth_token");
 
-    if api_key.is_none() && auth_token.is_none() {
-        return Err(LlmError::FailedToLoadModel {
+    let auth = match (api_key, auth_token) {
+        (Some(s), None) => GenericAuthMechanism::from_api_key(s),
+        (None, Some(s)) => GenericAuthMechanism::from_bearer_token(s),
+        (None, None) => return Err(LlmError::FailedToLoadModel {
             source: "One of following `model.params` is required: `anthropic_api_key` or `anthropic_auth_token`.".into(),
-        });
-    }
+        }),
+        (Some(_), Some(_)) => return Err(LlmError::FailedToLoadModel {
+            source: "Only one of following `model.params` is allowed: `anthropic_api_key` or `anthropic_auth_token`.".into(),
+        }),
+    };
 
-    let cfg = AnthropicConfig::default()
-        .with_api_key(api_key)
-        .with_auth_token(auth_token)
-        .with_base_url(api_base);
-
-    let anthropic = Anthropic::new(cfg, model_id).map_err(|_| LlmError::FailedToLoadModel {
-        source: format!("Unknown anthropic model: {:?}", model_id.clone()).into(),
+    let anthropic = Anthropic::new(auth, model_id, api_base, None).map_err(|_| {
+        LlmError::FailedToLoadModel {
+            source: format!("Unknown anthropic model: {:?}", model_id.clone()).into(),
+        }
     })?;
 
     Ok(Box::new(anthropic) as Box<dyn Chat>)
@@ -324,253 +341,4 @@ fn file(
         generation_config.as_deref(),
         chat_template_literal,
     )
-}
-
-/// Wraps [`Chat`] models with additional handling specifically for the spice runtime (e.g. telemetry, injecting system prompts).
-pub struct ChatWrapper {
-    pub public_name: String,
-    pub chat: Box<dyn Chat>,
-    pub system_prompt: Option<String>,
-    pub defaults: Vec<(String, serde_json::Value)>,
-}
-impl ChatWrapper {
-    pub fn new(
-        chat: Box<dyn Chat>,
-        public_name: &str,
-        system_prompt: Option<String>,
-        defaults: Vec<(String, serde_json::Value)>,
-    ) -> Self {
-        Self {
-            public_name: public_name.to_string(),
-            chat,
-            system_prompt,
-            defaults,
-        }
-    }
-
-    fn prepare_req(
-        &self,
-        req: CreateChatCompletionRequest,
-    ) -> Result<CreateChatCompletionRequest, OpenAIError> {
-        let mut prepared_req = self.with_system_prompt(req)?;
-
-        prepared_req = self.with_model_defaults(prepared_req);
-        prepared_req = Self::with_stream_usage(prepared_req);
-        Ok(prepared_req)
-    }
-
-    /// Injects a system prompt as the first message in the request, if it exists.
-    fn with_system_prompt(
-        &self,
-        mut req: CreateChatCompletionRequest,
-    ) -> Result<CreateChatCompletionRequest, OpenAIError> {
-        if let Some(prompt) = self.system_prompt.clone() {
-            let system_message = ChatCompletionRequestSystemMessageArgs::default()
-                .content(prompt)
-                .build()?;
-            req.messages
-                .insert(0, ChatCompletionRequestMessage::System(system_message));
-        }
-        Ok(req)
-    }
-
-    /// Ensure that streaming requests have `stream_options: {"include_usage": true}` internally.
-    fn with_stream_usage(mut req: CreateChatCompletionRequest) -> CreateChatCompletionRequest {
-        if req.stream.is_some_and(|s| s) {
-            req.stream_options = match req.stream_options {
-                Some(mut opts) => {
-                    opts.include_usage = true;
-                    Some(opts)
-                }
-                None => Some(ChatCompletionStreamOptions {
-                    include_usage: true,
-                }),
-            };
-        }
-        req
-    }
-
-    /// For [`None`] valued fields in a [`CreateChatCompletionRequest`], if the chat model has non-`None` defaults, use those instead.
-    fn with_model_defaults(
-        &self,
-        mut req: CreateChatCompletionRequest,
-    ) -> CreateChatCompletionRequest {
-        for (key, v) in &self.defaults {
-            let value = v.clone();
-            match key.as_str() {
-                "frequency_penalty" => {
-                    req.frequency_penalty = req
-                        .frequency_penalty
-                        .or_else(|| serde_json::from_value(value).ok());
-                }
-                "logit_bias" => {
-                    req.logit_bias = req
-                        .logit_bias
-                        .or_else(|| serde_json::from_value(value).ok());
-                }
-                "logprobs" => {
-                    req.logprobs = req.logprobs.or_else(|| serde_json::from_value(value).ok());
-                }
-                "top_logprobs" => {
-                    req.top_logprobs = req
-                        .top_logprobs
-                        .or_else(|| serde_json::from_value(value).ok());
-                }
-                "max_completion_tokens" => {
-                    req.max_completion_tokens = req
-                        .max_completion_tokens
-                        .or_else(|| serde_json::from_value(value).ok());
-                }
-                "store" => {
-                    req.store = req.store.or_else(|| serde_json::from_value(value).ok());
-                }
-                "metadata" => {
-                    req.metadata = req.metadata.or_else(|| serde_json::from_value(value).ok());
-                }
-                "n" => req.n = req.n.or_else(|| serde_json::from_value(value).ok()),
-                "presence_penalty" => {
-                    req.presence_penalty = req
-                        .presence_penalty
-                        .or_else(|| serde_json::from_value(value).ok());
-                }
-                "response_format" => {
-                    req.response_format = req
-                        .response_format
-                        .or_else(|| serde_json::from_value(value).ok());
-                }
-                "seed" => req.seed = req.seed.or_else(|| serde_json::from_value(value).ok()),
-                "stop" => req.stop = req.stop.or_else(|| serde_json::from_value(value).ok()),
-                "stream" => req.stream = req.stream.or_else(|| serde_json::from_value(value).ok()),
-                "stream_options" => {
-                    req.stream_options = req
-                        .stream_options
-                        .or_else(|| serde_json::from_value(value).ok());
-                }
-                "temperature" => {
-                    req.temperature = req
-                        .temperature
-                        .or_else(|| serde_json::from_value(value).ok());
-                }
-                "top_p" => req.top_p = req.top_p.or_else(|| serde_json::from_value(value).ok()),
-                "tools" => req.tools = req.tools.or_else(|| serde_json::from_value(value).ok()),
-                "tool_choice" => {
-                    req.tool_choice = req
-                        .tool_choice
-                        .or_else(|| serde_json::from_value(value).ok());
-                }
-                "parallel_tool_calls" => {
-                    req.parallel_tool_calls = req
-                        .parallel_tool_calls
-                        .or_else(|| serde_json::from_value(value).ok());
-                }
-                "user" => req.user = req.user.or_else(|| serde_json::from_value(value).ok()),
-                _ => {
-                    tracing::debug!("Ignoring unknown default key: {}", key);
-                }
-            };
-        }
-        req
-    }
-}
-
-#[async_trait]
-impl Chat for ChatWrapper {
-    /// Expect `captured_output` to be instrumented by the underlying chat model (to not reopen/parse streams). i.e.
-    /// ```rust
-    /// tracing::info!(target: "task_history", captured_output = %chat_output)
-    /// ```
-    async fn chat_stream(
-        &self,
-        req: CreateChatCompletionRequest,
-    ) -> Result<ChatCompletionResponseStream, OpenAIError> {
-        let start = Instant::now();
-        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "ai_completion", stream=true, model = %req.model, input = %serde_json::to_string(&req).unwrap_or_default());
-        let req = self.prepare_req(req)?;
-
-        if let Some(metadata) = &req.metadata {
-            tracing::info!(target: "task_history", metadata = %metadata);
-        }
-
-        let labels = request_labels(&req);
-        match self.chat.chat_stream(req).instrument(span.clone()).await {
-            Ok(resp) => {
-                let public_name = self.public_name.clone();
-                let stream_span = span.clone();
-                let logged_stream = resp.map_ok(move |mut r| {r.model.clone_from(&public_name); r}).inspect(move |item| {
-                    if let Ok(item) = item {
-
-                        // not incremental; provider only emits usage on last chunk.
-                        if let Some(usage) = item.usage.clone() {
-                            tracing::info!(target: "task_history", parent: &stream_span.clone(), completion_tokens = %usage.completion_tokens, total_tokens = %usage.total_tokens, prompt_tokens = %usage.prompt_tokens, "labels");
-                            handle_metrics(start.elapsed(), false, &labels);
-                        }
-                    }
-                }).instrument(span.clone());
-                Ok(Box::pin(logged_stream))
-            }
-            Err(e) => {
-                tracing::error!(target: "task_history", parent: &span, "Failed to run chat model: {}", e);
-                handle_metrics(start.elapsed(), true, &labels);
-                Err(e)
-            }
-        }
-    }
-
-    async fn health(&self) -> ChatResult<()> {
-        self.chat.health().await
-    }
-
-    /// Unlike [`ChatWrapper::chat_stream`], this method will instrument the `captured_output` for the model output.
-    async fn chat_request(
-        &self,
-        req: CreateChatCompletionRequest,
-    ) -> Result<CreateChatCompletionResponse, OpenAIError> {
-        let start = Instant::now();
-
-        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "ai_completion", stream=false, model = %req.model, input = %serde_json::to_string(&req).unwrap_or_default());
-        let req = self.prepare_req(req)?;
-
-        let labels = request_labels(&req);
-        if let Some(metadata) = &req.metadata {
-            tracing::info!(target: "task_history", parent: &span, metadata = %metadata, "labels");
-        }
-
-        let result = match self.chat.chat_request(req).instrument(span.clone()).await {
-            Ok(mut resp) => {
-                if let Some(usage) = resp.usage.clone() {
-                    tracing::info!(target: "task_history", parent: &span, completion_tokens = %usage.completion_tokens, total_tokens = %usage.total_tokens, prompt_tokens = %usage.prompt_tokens, "labels");
-                };
-                let captured_output: Vec<_> = resp.choices.iter().map(|c| &c.message).collect();
-                match serde_json::to_string(&captured_output) {
-                    Ok(output) => {
-                        tracing::info!(target: "task_history", parent: &span, captured_output = %output);
-                    }
-                    Err(e) => tracing::error!("Failed to serialize truncated output: {e}"),
-                }
-                resp.model.clone_from(&self.public_name);
-                Ok(resp)
-            }
-            Err(e) => {
-                tracing::error!(target: "task_history", parent: &span, "Failed to run chat model: {}", e);
-                Err(e)
-            }
-        };
-        handle_metrics(start.elapsed(), result.is_err(), &labels);
-        result
-    }
-
-    async fn run(&self, prompt: String) -> ChatResult<Option<String>> {
-        self.chat.run(prompt).await
-    }
-
-    async fn stream<'a>(
-        &self,
-        prompt: String,
-    ) -> ChatResult<Pin<Box<dyn Stream<Item = ChatResult<Option<String>>> + Send>>> {
-        self.chat.stream(prompt).await
-    }
-
-    fn as_sql(&self) -> Option<&dyn SqlGeneration> {
-        self.chat.as_sql()
-    }
 }
