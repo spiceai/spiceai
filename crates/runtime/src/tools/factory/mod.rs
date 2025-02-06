@@ -64,14 +64,17 @@ pub async fn forge(
     component: &Tool,
     secrets: HashMap<String, SecretString>,
 ) -> Result<Arc<dyn SpiceModelTool>, Box<dyn std::error::Error + Send + Sync>> {
-    // TODO (jeadie), need to default to builtin if no source is provided.
-    let Some(from_source) = component.from.split_once(':').map(|(a, _b)| a) else {
-        return Err(format!(
-            "Invalid tool component `from` field. Expected: `<tool_source>:<tool_id>`. Recieved: {}",
-            component.from
-        )
-        .into());
-    };
+    let from_source = component
+        .from
+        .split_once(':')
+        .map_or("builtin", |(a, _b)| a);
+    // else {
+    //     return Err(format!(
+    //         "Invalid tool component `from` field. Expected: `<tool_source>:<tool_id>`. Recieved: {}",
+    //         component.from
+    //     )
+    //     .into());
+    // };
 
     let registry = TOOL_SHED_FACTORY.lock().await;
 

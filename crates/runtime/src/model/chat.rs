@@ -132,29 +132,10 @@ fn perplexity(
     model_id: Option<&str>,
     params: &HashMap<String, SecretString>,
 ) -> Result<Box<dyn Chat>, LlmError> {
-    let Some(auth_token) = params.get("perplexity_auth_token") else {
-        return Err(LlmError::FailedToLoadModel {
-            source: "No `perplexity_auth_token` provided for Perplexity model.".into(),
-        });
-    };
+    let model = PerplexitySonar::from_params(model_id, params)
+        .map_err(|source| LlmError::FailedToLoadModel { source })?;
 
-    let perplexity_overrides: Vec<(String, String)> = params
-        .iter()
-        .filter_map(|(k, v)| {
-            if k != "perplexity_auth_token" {
-                if let Some(p) = k.strip_prefix("perplexity_") {
-                    return Some((p.to_string(), v.expose_secret().clone()));
-                }
-            };
-            None
-        })
-        .collect();
-
-    Ok(Box::new(PerplexitySonar::new(
-        auth_token,
-        model_id,
-        perplexity_overrides,
-    )) as Box<dyn Chat>)
+    Ok(Box::new(model) as Box<dyn Chat>)
 }
 
 fn anthropic(

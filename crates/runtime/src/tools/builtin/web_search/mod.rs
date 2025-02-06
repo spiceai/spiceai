@@ -14,15 +14,21 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::fmt::{self, Display, Formatter};
+use std::{
+    collections::HashMap,
+    fmt::{self, Display, Formatter},
+};
 
 use llms::perplexity::PerplexitySonar;
 use schemars::JsonSchema;
+use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use snafu::ResultExt;
 
 mod perplexity;
 mod tool;
+
+pub use tool::WebSearchTool;
 
 pub enum SearchEngineType {
     Perplexity,
@@ -37,7 +43,8 @@ impl Display for SearchEngineType {
 }
 
 impl SearchEngineType {
-    #[must_use] pub fn description(&self) -> String {
+    #[must_use]
+    pub fn description(&self) -> String {
         match self {
             SearchEngineType::Perplexity => {
                 "Search the web with Perplexity's Sonar API.".to_string()
@@ -50,8 +57,30 @@ pub enum SearchEngine {
     Perplexity(PerplexitySonar),
 }
 
+impl TryFrom<&HashMap<String, SecretString>> for SearchEngine {
+    type Error = Box<dyn std::error::Error + Send + Sync>;
+
+    fn try_from(params: &HashMap<String, SecretString>) -> Result<Self, Self::Error> {
+        let Some(engine) = params.get("engine").map(SecretString::expose_secret) else {
+            return Err("Missing 'engine' parameter".into());
+        };
+
+        match engine.as_str() {
+            "perplexity" => {
+                let model_id = params
+                    .get("perplexity_model")
+                    .map(|s| s.expose_secret().as_str());
+                let sonar = PerplexitySonar::from_params(model_id, params)?;
+                Ok(SearchEngine::Perplexity(sonar))
+            }
+            _ => Err("Unknown search engine '{engine}'".into()),
+        }
+    }
+}
+
 impl SearchEngine {
-    #[must_use] pub fn engine_type(&self) -> SearchEngineType {
+    #[must_use]
+    pub fn engine_type(&self) -> SearchEngineType {
         match self {
             SearchEngine::Perplexity(_) => SearchEngineType::Perplexity,
         }
@@ -96,7 +125,8 @@ pub struct WebSearchResult {
 }
 
 impl WebSearchResult {
-    #[must_use] pub fn image_url(url: String) -> Self {
+    #[must_use]
+    pub fn image_url(url: String) -> Self {
         Self {
             url,
             title: None,
@@ -104,7 +134,8 @@ impl WebSearchResult {
             content: None,
         }
     }
-    #[must_use] pub fn webpage(url: String) -> Self {
+    #[must_use]
+    pub fn webpage(url: String) -> Self {
         Self {
             url,
             title: None,

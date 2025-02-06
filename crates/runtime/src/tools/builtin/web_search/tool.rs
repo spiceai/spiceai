@@ -14,13 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{borrow::Cow, sync::Arc};
+use std::{borrow::Cow, collections::HashMap, sync::Arc};
 
 use crate::{
     tools::{utils::parameters, SpiceModelTool},
     Runtime,
 };
 use async_trait::async_trait;
+use secrecy::SecretString;
 use serde_json::Value;
 use snafu::ResultExt;
 use tracing::Span;
@@ -35,17 +36,16 @@ pub struct WebSearchTool {
 }
 
 impl WebSearchTool {
-    #[must_use]
-    pub fn new(
-        engine: impl Into<SearchEngine>,
-        name: Option<&str>,
-        description: Option<&str>,
-    ) -> Self {
-        Self {
-            name: name.map(ToString::to_string),
-            description: description.map(ToString::to_string),
-            engine: engine.into(),
-        }
+    pub fn try_new(
+        name: &str,
+        description: Option<String>,
+        params: &HashMap<String, SecretString>,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(Self {
+            name: Some(name.to_string()),
+            description,
+            engine: SearchEngine::try_from(params)?,
+        })
     }
 }
 
