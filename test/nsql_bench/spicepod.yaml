@@ -46,7 +46,7 @@ evals:
 
 datasets:
 
-  - from: file:./tpch_nsql.jsonl
+  - from: file:./data/tpch_nsql.jsonl
     name: tpch_nsql
 
   - from: s3://spiceai-demo-datasets/tpch/customer/

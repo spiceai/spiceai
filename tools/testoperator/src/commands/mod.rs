@@ -24,6 +24,7 @@ use test_framework::{
 pub(crate) mod bench;
 pub(crate) mod data_consistency;
 pub(crate) mod dispatch;
+pub(crate) mod evals;
 pub(crate) mod http;
 pub(crate) mod load;
 pub(crate) mod throughput;

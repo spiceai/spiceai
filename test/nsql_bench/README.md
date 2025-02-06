@@ -37,8 +37,8 @@ WITH latest_run AS (
     FROM spice.eval.runs
     ORDER BY created_at DESC LIMIT 1
 ),
-mean_score AS (
-    SELECT run_id, AVG(value) AS mean_score, COUNT(*) AS evals_count
+score AS (
+    SELECT run_id, AVG(value) AS overall_score, COUNT(*) AS evals_count
     FROM spice.eval.results
     WHERE run_id = (SELECT id FROM latest_run)
     GROUP BY run_id
@@ -53,14 +53,11 @@ tool_stats AS (
         AND start_time BETWEEN (SELECT created_at FROM latest_run)
         AND COALESCE(end_time, NOW())
 )
-SELECT 
-    r.id AS run_id, r.model, r.status, ms.evals_count AS tests, lr.duration_seconds, ROUND(ms.mean_score, 4) as score, ts.task_calls,
-    COALESCE(ts.task_calls::FLOAT / ms.evals_count, 0) AS mean_task_calls,
-    ts.task_errors
+SELECT r.id AS run_id, r.model, r.status, s.evals_count AS tests, lr.duration_seconds, ROUND(s.overall_score, 4) as score, ts.task_calls, ts.task_errors
 FROM spice.eval.runs r
 JOIN latest_run lr ON r.id = lr.id
-LEFT JOIN mean_score ms ON r.id = ms.run_id
-LEFT JOIN tool_stats ts ON 1=1;
+LEFT JOIN score s ON r.id = s.run_id
+LEFT JOIN tool_stats ts ON 1 = 1;
 ```
 
 ### Tools Call Summary
@@ -72,11 +69,10 @@ WITH latest_run AS (
   ORDER BY created_at DESC 
   LIMIT 1
 )
-
 SELECT 
   task, 
-  COUNT(*) AS num_task_calls,
-  COUNT(CASE WHEN error_message IS NOT NULL THEN 1 END) AS num_errors,
+  COUNT(*) AS calls,
+  COUNT(CASE WHEN error_message IS NOT NULL THEN 1 END) AS failures,
   SUM(CAST((end_time - start_time) AS Float) /  1000000) AS duration_ms
 FROM runtime.task_history
 WHERE 
@@ -96,11 +92,10 @@ WITH latest_run AS (
   ORDER BY created_at DESC 
   LIMIT 1
 )
-
 SELECT 
     task,
-    COUNT(*) AS failure_count,
-    error_message,
+    COUNT(*) AS count,
+    error_message as message,
     input
 FROM 
     runtime.task_history
@@ -109,9 +104,10 @@ WHERE
     AND start_time BETWEEN (SELECT created_at FROM spice.eval.runs WHERE id = (SELECT id FROM latest_run)) AND 
   	COALESCE(end_time, NOW())
 GROUP BY 
-    task, input, error_message
+    task, input, message
 ORDER BY 
-    failure_count DESC;
+    count DESC
+LIMIT 20;
 ```
 
 ## Prompt to generate sample questions

@@ -7,7 +7,7 @@
     {
       "type": "lldb",
       "request": "launch",
-      "name": "[Rust] Debug spiced",
+      "name": "Debug spiced",
       "program": "${workspaceFolder}/target/debug/spiced",
       "args": [],
       "cwd": "${workspaceFolder}",
@@ -16,11 +16,22 @@
     {
       "type": "lldb",
       "request": "launch",
-      "name": "[Rust] Debug spice sql",
+      "name": "Debug spice sql",
       "program": "${workspaceFolder}/target/debug/spiced",
       "args": ["--repl"],
       "cwd": "${workspaceFolder}",
       "preLaunchTask": "rust: cargo build"
+    },
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug testoperator",
+      "program": "${workspaceFolder}/target/debug/testoperator",
+      "args": ["run", "evals", "--ready-wait", "180", "--eval", "tpch_nsql", "--model", "gpt-4o-mini", "-p", "./test/nsql_bench/spicepod.yaml", "-d", "./test/nsql_bench/data" ],
+      "env": {
+      },
+      "cwd": "${workspaceFolder}",
+      "preLaunchTask": "rust: cargo build testoperator"
     },
     {
       "name": "spice version",
