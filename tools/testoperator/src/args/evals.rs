@@ -27,7 +27,7 @@ pub struct EvalsTestArgs {
     #[arg(long)]
     pub(crate) model: Option<String>,
 
-    /// The eval name (as named in Spicepod) to test against. 
+    /// The eval name (as named in Spicepod) to test against.
     /// If not specified, the first eval from the Spicepod definition will be used.
     #[arg(long)]
     pub(crate) eval: Option<String>,

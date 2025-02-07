@@ -35,12 +35,14 @@ pub(crate) async fn run(args: &EvalsTestArgs) -> anyhow::Result<()> {
     let eval = args
         .eval
         .as_ref()
-        .unwrap_or_else(|| &app.evals.get(0).expect("No evals defined").name);
+        .or_else(|| app.evals.first().map(|eval| &eval.name))
+        .ok_or_else(|| anyhow::anyhow!("No evals defined"))?;
 
     let model = args
         .model
         .as_ref()
-        .unwrap_or_else(|| &app.models.get(0).expect("No models defined").name);
+        .or_else(|| app.models.first().map(|model| &model.name))
+        .ok_or_else(|| anyhow::anyhow!("No models defined"))?;
 
     spiced_instance
         .wait_for_ready(Duration::from_secs(args.common.ready_wait))
@@ -50,7 +52,7 @@ pub(crate) async fn run(args: &EvalsTestArgs) -> anyhow::Result<()> {
 
     let http_client = spiced_instance.http_client()?;
 
-    let url = format!("http://localhost:8090/v1/evals/{}", eval);
+    let url = format!("http://localhost:8090/v1/evals/{eval}");
     let body = json!({"model": model}).to_string();
 
     let response = http_client
