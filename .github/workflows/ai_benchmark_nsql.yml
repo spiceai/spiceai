@@ -95,10 +95,12 @@ jobs:
               {
                 name: "gpt-4o-mini",
                 spicepod: "./test/nsql_bench/spicepod.yaml",
+                data: "./test/nsql_bench/data"
               },
               {
                 name: "llama3-3B-Instruct",
                 spicepod: "./test/nsql_bench/spicepod_hf.yaml",
+                data: "./test/nsql_bench/data"
               },
             ];
 
@@ -147,8 +149,6 @@ jobs:
         run: |
           ./testoperator run evals \
             -s $GITHUB_WORKSPACE/spiced \
-            --eval tpch_nsql \
-            --model ${{ matrix.target.name }} \
             -p ${{ matrix.target.spicepod }} \
-            -d $GITHUB_WORKSPACE/test/nsql_bench/data \
+            -d $GITHUB_WORKSPACE/${{ matrix.target.data }} \
             --ready-wait 180
