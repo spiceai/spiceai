@@ -55,8 +55,8 @@ pub enum QueryStatus {
 impl Display for QueryStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            QueryStatus::Passed => write!(f, "Passed"),
-            QueryStatus::Failed => write!(f, "Failed"),
+            QueryStatus::Passed => write!(f, "passed"),
+            QueryStatus::Failed => write!(f, "failed"),
         }
     }
 }
@@ -73,7 +73,6 @@ pub struct QueryMetric<T: ExtendedMetrics> {
     pub percentile_99_duration: f64,
     pub percentile_95_duration: f64,
     pub percentile_90_duration: f64,
-    pub connector_name: String,
     pub extended_metrics: Option<T>,
 }
 
@@ -82,12 +81,11 @@ impl<T: ExtendedMetrics> QueryMetric<T> {
     pub fn new_from_durations(
         name: &str,
         durations: &Vec<Duration>,
-        connector_name: &str,
         started_at: usize,
         finished_at: usize,
     ) -> Result<Self> {
         if durations.is_empty() {
-            return Ok(Self::new(name, connector_name).failed());
+            return Ok(Self::new(name).failed());
         }
 
         let durations = durations.statistical_set()?;
@@ -103,7 +101,6 @@ impl<T: ExtendedMetrics> QueryMetric<T> {
             percentile_99_duration: durations.percentile(99.0)?.as_secs_f64(),
             percentile_95_duration: durations.percentile(95.0)?.as_secs_f64(),
             percentile_90_duration: durations.percentile(90.0)?.as_secs_f64(),
-            connector_name: connector_name.to_string(),
             extended_metrics: None,
         })
     }
@@ -115,7 +112,7 @@ impl<T: ExtendedMetrics> QueryMetric<T> {
     }
 
     #[must_use]
-    pub fn new(name: &str, connector_name: &str) -> Self {
+    pub fn new(name: &str) -> Self {
         Self {
             query_name: name.to_string(),
             query_status: QueryStatus::Passed,
@@ -128,9 +125,14 @@ impl<T: ExtendedMetrics> QueryMetric<T> {
             percentile_99_duration: 0.0,
             percentile_95_duration: 0.0,
             percentile_90_duration: 0.0,
-            connector_name: connector_name.to_string(),
             extended_metrics: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_extended_metrics(mut self, extended_metrics: T) -> Self {
+        self.extended_metrics = Some(extended_metrics);
+        self
     }
 }
 
@@ -399,14 +401,20 @@ impl<T: ExtendedMetrics, R: ExtendedMetrics> QueryMetrics<T, R> {
             Field::new("iterations", DataType::Int32, false),
             Field::new("commit_sha", DataType::Utf8, false),
             Field::new("branch_name", DataType::Utf8, false),
-            Field::new("connector_name", DataType::Utf8, false),
+            // Field::new("median_duration", DataType::Float64, false),
+            // Field::new("percentile_99_duration", DataType::Float64, false),
+            // Field::new("percentile_95_duration", DataType::Float64, false),
+            // Field::new("percentile_90_duration", DataType::Float64, false),
+        ];
+
+        base_fields.extend(extended_fields);
+
+        base_fields.extend(vec![
             Field::new("median_duration", DataType::Float64, false),
             Field::new("percentile_99_duration", DataType::Float64, false),
             Field::new("percentile_95_duration", DataType::Float64, false),
             Field::new("percentile_90_duration", DataType::Float64, false),
-        ];
-
-        base_fields.extend(extended_fields);
+        ]);
 
         Arc::new(Schema::new(base_fields))
     }
@@ -505,11 +513,6 @@ impl<T: ExtendedMetrics, R: ExtendedMetrics> QueryMetrics<T, R> {
 
         let commit_sha = vec![self.commit_sha.clone(); self.metrics.len()];
         let branch_name = vec![self.branch_name.clone(); self.metrics.len()];
-        let connector_name = self
-            .metrics
-            .iter()
-            .map(|m| m.connector_name.clone())
-            .collect::<Vec<_>>();
 
         let mut columns: Vec<ArrayRef> = vec![
             Arc::new(StringArray::from(run_id)),
@@ -522,11 +525,6 @@ impl<T: ExtendedMetrics, R: ExtendedMetrics> QueryMetrics<T, R> {
             Arc::new(Int32Array::from(iterations)),
             Arc::new(StringArray::from(commit_sha)),
             Arc::new(StringArray::from(branch_name)),
-            Arc::new(StringArray::from(connector_name)),
-            Arc::new(Float64Array::from(median_duration)),
-            Arc::new(Float64Array::from(percentile_99_duration)),
-            Arc::new(Float64Array::from(percentile_95_duration)),
-            Arc::new(Float64Array::from(percentile_90_duration)),
         ];
 
         let extended_metrics_fields = T::fields();
@@ -552,6 +550,13 @@ impl<T: ExtendedMetrics, R: ExtendedMetrics> QueryMetrics<T, R> {
                 }
             }
         }
+
+        columns.extend(vec![
+            Arc::new(Float64Array::from(median_duration)) as ArrayRef,
+            Arc::new(Float64Array::from(percentile_99_duration)) as ArrayRef,
+            Arc::new(Float64Array::from(percentile_95_duration)) as ArrayRef,
+            Arc::new(Float64Array::from(percentile_90_duration)) as ArrayRef,
+        ]);
 
         Ok(vec![RecordBatch::try_new(Self::records_schema(), columns)?])
     }
@@ -641,7 +646,6 @@ pub trait MetricCollector<T: ExtendedMetrics, R: ExtendedMetrics> {
     fn start_time(&self) -> SystemTime;
     fn end_time(&self) -> SystemTime;
     fn name(&self) -> String;
-    fn connector_name(&self) -> String;
     fn metrics(&self) -> Result<Vec<QueryMetric<T>>>;
     fn collect(&self, test_type: TestType) -> Result<QueryMetrics<T, R>> {
         Ok(QueryMetrics {
@@ -709,6 +713,39 @@ impl ExtendedMetrics for NoExtendedMetrics {
 
     fn build(&self) -> Result<Vec<BuilderTarget>> {
         Ok(vec![])
+    }
+}
+
+pub struct DatasetMetrics {
+    pub connector_name: String,
+}
+
+impl ExtendedMetrics for DatasetMetrics {
+    fn fields() -> Vec<Field> {
+        vec![Field::new("connector_name", DataType::Utf8, false)]
+    }
+
+    fn builders() -> BTreeMap<String, Builder> {
+        let mut builders = BTreeMap::new();
+        builders.insert(
+            "connector_name".to_string(),
+            Builder::String(StringBuilder::new()),
+        );
+        builders
+    }
+
+    fn build(&self) -> Result<Vec<BuilderTarget>> {
+        Ok(vec![BuilderTarget::String((
+            "connector_name".to_string(),
+            self.connector_name.clone(),
+        ))])
+    }
+}
+
+impl DatasetMetrics {
+    #[must_use]
+    pub fn new(connector_name: String) -> Self {
+        Self { connector_name }
     }
 }
 

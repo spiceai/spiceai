@@ -26,6 +26,10 @@ pub struct DatasetTestArgs {
     #[command(flatten)]
     pub(crate) common: CommonArgs,
 
+    /// The connector being tested
+    #[arg(long)]
+    pub(crate) connector_name: String,
+
     /// The expected scale factor for the test, used in metrics calculation
     #[arg(long)]
     pub(crate) scale_factor: Option<f64>,

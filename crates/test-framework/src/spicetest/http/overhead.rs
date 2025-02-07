@@ -191,22 +191,16 @@ impl MetricCollector<NoExtendedMetrics, NoExtendedMetrics> for SpiceTest<Complet
         self.name.clone()
     }
 
-    fn connector_name(&self) -> String {
-        self.connector_name.clone()
-    }
-
     fn metrics(&self) -> Result<Vec<QueryMetric<NoExtendedMetrics>>> {
         let baseline = QueryMetric::new_from_durations(
             "baseline",
             &self.state.baseline_results.durations,
-            &self.connector_name,
             system_time_to_unix_epoch_ms(self.start_time),
             system_time_to_unix_epoch_ms(self.state.end_time),
         )?;
         let spice = QueryMetric::new_from_durations(
             "spice",
             &self.state.spice_results.durations,
-            &self.connector_name,
             system_time_to_unix_epoch_ms(self.start_time),
             system_time_to_unix_epoch_ms(self.state.end_time),
         )?;

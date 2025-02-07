@@ -32,10 +32,10 @@ pub trait TestCompleted: TestState {
 pub struct SpiceTest<S: TestState> {
     name: String,
     spiced_instance: SpicedInstance,
-    connector_name: String,
     start_time: SystemTime,
     use_progress_bars: bool,
     api_key: Option<String>,
+    connector_name: Option<String>,
 
     state: S,
 }
@@ -50,21 +50,22 @@ impl<S: TestCompleted> SpiceTest<S> {
 
 impl<S: TestNotStarted> SpiceTest<S> {
     #[must_use]
-    pub fn new(
-        name: String,
-        connector_name: String,
-        spice_instance: SpicedInstance,
-        state: S,
-    ) -> Self {
+    pub fn new(name: String, spice_instance: SpicedInstance, state: S) -> Self {
         Self {
             name,
             spiced_instance: spice_instance,
-            connector_name,
             start_time: SystemTime::now(),
             use_progress_bars: true,
             api_key: None,
+            connector_name: None,
             state,
         }
+    }
+
+    #[must_use]
+    pub fn with_connector_name(mut self, connector_name: String) -> Self {
+        self.connector_name = Some(connector_name);
+        self
     }
 
     #[must_use]

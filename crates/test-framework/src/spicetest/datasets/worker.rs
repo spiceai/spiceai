@@ -16,7 +16,7 @@ limitations under the License.
 
 use std::{
     collections::BTreeMap,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use anyhow::Result;
@@ -37,6 +37,7 @@ pub(crate) struct SpiceTestQueryWorker {
 
 pub struct SpiceTestQueryWorkerResult {
     pub query_durations: BTreeMap<String, Vec<Duration>>,
+    pub query_iteration_durations: BTreeMap<String, (SystemTime, SystemTime)>,
     pub connection_failed: bool,
     pub row_counts: BTreeMap<String, Vec<usize>>,
 }
@@ -44,11 +45,13 @@ pub struct SpiceTestQueryWorkerResult {
 impl SpiceTestQueryWorkerResult {
     pub fn new(
         query_durations: BTreeMap<String, Vec<Duration>>,
+        query_iteration_durations: BTreeMap<String, (SystemTime, SystemTime)>,
         connection_failed: bool,
         row_counts: BTreeMap<String, Vec<usize>>,
     ) -> Self {
         Self {
             query_durations,
+            query_iteration_durations,
             connection_failed,
             row_counts,
         }
@@ -79,86 +82,177 @@ impl SpiceTestQueryWorker {
     pub fn start(self) -> JoinHandle<Result<SpiceTestQueryWorkerResult>> {
         tokio::spawn(async move {
             let mut query_durations: BTreeMap<String, Vec<Duration>> = BTreeMap::new();
+
+            // Keeps track of the start and end time of each query iteration
+            let mut query_iteration_durations: BTreeMap<String, (SystemTime, SystemTime)> =
+                BTreeMap::new();
             let mut row_counts: BTreeMap<String, Vec<usize>> = BTreeMap::new();
             let mut query_set_count = 0;
             let start = Instant::now();
 
-            while !self.end_condition.is_met(&start, query_set_count) {
-                if self.progress_bar.is_none() && self.id == 0 {
-                    println!(
-                        "Worker {} - Query set count: {} - Elapsed time: {:?}",
-                        self.id,
-                        query_set_count,
-                        start.elapsed()
-                    );
-                }
-
-                'query_set: for query in &self.query_set {
-                    let mut row_count = 0;
-                    let query_start = Instant::now();
-                    match self.flight_client.query(query.1).await {
-                        Ok(mut result_stream) => {
-                            while let Some(batch) = result_stream.next().await {
-                                match batch {
-                                    Ok(batch) => {
-                                        row_count += batch.num_rows();
-                                    }
-                                    Err(e) => {
-                                        eprintln!(
-                                            "FAIL - Worker {} - Query '{}' failed: {}",
-                                            self.id, query.0, e
-                                        );
-                                        query_durations.entry(query.0.to_string()).or_default();
-                                        continue 'query_set;
-                                    }
-                                }
-                            }
-
-                            let duration = query_start.elapsed();
-                            query_durations
-                                .entry(query.0.to_string())
-                                .or_default()
-                                .push(duration);
-
-                            row_counts
-                                .entry(query.0.to_string())
-                                .or_default()
-                                .push(row_count);
-
-                            if let Some(pb) = self.progress_bar.as_ref() {
-                                pb.inc(1);
-                            }
+            match self.end_condition {
+                EndCondition::Duration(_) => {
+                    // For Duration-based end condition, keep running queries in sequence
+                    while !self.end_condition.is_met(&start, query_set_count) {
+                        if self.progress_bar.is_none() && self.id == 0 {
+                            println!(
+                                "Worker {} - Query set count: {} - Elapsed time: {:?}",
+                                self.id,
+                                query_set_count,
+                                start.elapsed()
+                            );
                         }
-                        Err(e) => match e {
-                            flight_client::Error::UnableToConnectToServer { .. }
-                            | flight_client::Error::UnableToPerformHandshake { .. } => {
-                                eprintln!(
-                                    "FAIL - EARLY EXIT - Worker {} - Query '{}' failed: {}",
-                                    self.id, query.0, e
+
+                        if !self
+                            .run_query_set(&mut query_durations, &mut row_counts)
+                            .await?
+                        {
+                            return Ok(SpiceTestQueryWorkerResult::new(
+                                query_durations,
+                                query_iteration_durations,
+                                true,
+                                row_counts,
+                            ));
+                        }
+                        query_set_count += 1;
+                    }
+                }
+                EndCondition::QuerySetCompleted(target_count) => {
+                    // For QuerySetCompleted, run each query target_count times before moving to next
+                    for query in &self.query_set {
+                        let mut current_query_count = 0;
+                        let start = SystemTime::now();
+                        while current_query_count < target_count {
+                            if self.progress_bar.is_none() && self.id == 0 {
+                                println!(
+                                    "Worker {} - Query '{}' count: {}/{} - Elapsed time: {:?}",
+                                    self.id,
+                                    query.0,
+                                    current_query_count + 1,
+                                    target_count,
+                                    start.elapsed().unwrap_or_default()
                                 );
+                            }
+
+                            if !self
+                                .run_single_query(query, &mut query_durations, &mut row_counts)
+                                .await?
+                            {
                                 return Ok(SpiceTestQueryWorkerResult::new(
                                     query_durations,
+                                    query_iteration_durations,
                                     true,
                                     row_counts,
                                 ));
                             }
-                            _ => {
-                                eprintln!(
-                                    "FAIL - Worker {} - Query '{}' failed: {}",
-                                    self.id, query.0, e
-                                );
-                                query_durations.entry(query.0.to_string()).or_default();
-                            }
-                        },
-                    };
+                            current_query_count += 1;
+                        }
+                        let end = SystemTime::now();
+                        query_iteration_durations.insert(query.0.to_string(), (start, end));
+                        query_set_count += 1;
+                    }
                 }
-                query_set_count += 1;
             }
+
             Ok(SpiceTestQueryWorkerResult::new(
                 query_durations,
+                query_iteration_durations,
                 false,
                 row_counts,
             ))
         })
+    }
+
+    async fn run_query_set(
+        &self,
+        query_durations: &mut BTreeMap<String, Vec<Duration>>,
+        row_counts: &mut BTreeMap<String, Vec<usize>>,
+    ) -> Result<bool> {
+        for query in &self.query_set {
+            if !self
+                .run_single_query(query, query_durations, row_counts)
+                .await?
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    async fn run_single_query(
+        &self,
+        query: &(&'static str, &'static str),
+        query_durations: &mut BTreeMap<String, Vec<Duration>>,
+        row_counts: &mut BTreeMap<String, Vec<usize>>,
+    ) -> Result<bool> {
+        match self.execute_query(query, query_durations, row_counts).await {
+            Ok(()) => Ok(true),
+            Err(e) => {
+                let flight_error = e.downcast_ref::<flight_client::Error>();
+
+                if let Some(
+                    flight_client::Error::UnableToConnectToServer { .. }
+                    | flight_client::Error::UnableToPerformHandshake { .. },
+                ) = flight_error
+                {
+                    eprintln!(
+                        "FAIL - EARLY EXIT - Worker {} - Query '{}' failed: {}",
+                        self.id, query.0, e
+                    );
+                    Ok(false)
+                } else {
+                    eprintln!(
+                        "FAIL - Worker {} - Query '{}' failed: {}",
+                        self.id, query.0, e
+                    );
+                    query_durations.entry(query.0.to_string()).or_default();
+                    Ok(true)
+                }
+            }
+        }
+    }
+
+    async fn execute_query(
+        &self,
+        query: &(&'static str, &'static str),
+        query_durations: &mut BTreeMap<String, Vec<Duration>>,
+        row_counts: &mut BTreeMap<String, Vec<usize>>,
+    ) -> Result<()> {
+        let mut row_count = 0;
+        let query_start = Instant::now();
+        let mut result_stream = self.flight_client.query(query.1).await?;
+
+        while let Some(batch) = result_stream.next().await {
+            match batch {
+                Ok(batch) => {
+                    row_count += batch.num_rows();
+                }
+                Err(e) => {
+                    eprintln!(
+                        "FAIL - Worker {} - Query '{}' failed: {}",
+                        self.id, query.0, e
+                    );
+                    query_durations.entry(query.0.to_string()).or_default();
+                    return Err(e.into());
+                }
+            }
+        }
+
+        let duration = query_start.elapsed();
+        query_durations
+            .entry(query.0.to_string())
+            .or_default()
+            .push(duration);
+
+        row_counts
+            .entry(query.0.to_string())
+            .or_default()
+            .push(row_count);
+
+        if let Some(pb) = self.progress_bar.as_ref() {
+            pb.inc(1);
+        }
+
+        Ok(())
     }
 }
