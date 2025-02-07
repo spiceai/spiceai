@@ -95,6 +95,26 @@ async fn execute_sql(
     Ok(res)
 }
 
+/**
+ * Fetches key metrics for the latest evaluation run, including duration, evaluation score, task call counts, and errors.
+ *
+ * Output:
+ * - `run_id`: Evaluation run ID  
+ * - `model`: Model name  
+ * - `status`: Run status  
+ * - `tests`: Number of tests performed
+ * - `duration_seconds`: Eval duration (seconds)  
+ * - `score`: Rounded average score
+ * - `task_calls`: Total task invocations  
+ * - `task_errors`: Task task errors  
+ *
+ * Example:
+ * +----------------------------------+-------------+-----------+-------+------------------+--------+------------+-------------+
+ * | `run_id`                         | `model`     | `status`  |`tests`|`duration_seconds`|`score` |`task_calls`|`task_errors`|
+ * +----------------------------------+-------------+-----------+-------+------------------+--------+------------+-------------+
+ * | c74a65614ea314bc7036489bbc6f7ba3 | gpt-4o-mini | Completed | 11    | 83.0             | 0.8182 | 209        | 100         |
+ * +----------------------------------+-------------+-----------+-------+------------------+--------+------------+-------------+
+ */
 static QUERY_EVAL_BENCHMARK_MAIN_METRICS: &str = "
 WITH latest_run AS (
     SELECT id, created_at, EXTRACT(EPOCH FROM (completed_at - created_at)) AS duration_seconds
@@ -124,6 +144,25 @@ LEFT JOIN score s ON r.id = s.run_id
 LEFT JOIN tool_stats ts ON 1 = 1;
 ";
 
+/**
+ * Retrieves statistis on executed tasks/tools during the latest evaluation run.
+ *
+ * Output:
+ * - `task`: Task name  
+ * - `calls`: Total number of task calls  
+ * - `failures`: Total number of task failures  
+ * - `duration_ms`: Aggregated task duration in milliseconds  
+ *
+ * Example:
+ * +-------------------------+-------+----------+--------------------+
+ * | `task`                  |`calls`|`failures`| `duration_ms`      |
+ * +-------------------------+-------+----------+--------------------+
+ * |`ai_completion`          | 72    | 0        | 77136.66854858398  |
+ * |`sql_query`              | 64    | 50       | 140.39500185847282 |
+ * |`tool_use::sql`          | 62    | 50       | 135.9049990773201  |
+ * |`tool_use::list_datasets`| 11    | 0        | 0.9290000051259995 |
+ * +-------------------------+-------+----------+--------------------+
+ */
 static QUERY_EVAL_BENCHMARK_TASKS: &str = "
 WITH latest_run AS (
   SELECT id 
@@ -145,6 +184,22 @@ GROUP BY task
 ORDER BY duration_ms DESC;
 ";
 
+/**
+ * Fetches the top task errors for the latest evaluation run aggregated by associated task name, error message, and input
+ *
+ * Output:
+ * - `task`: Task name  
+ * - `count`: Number of error occurrences  
+ * - `message`: Error message  
+ * - `input`: Input causing the error  
+ *
+ * Example:
+ * +---------------+-------+---------------------------------------------------------------------------------------+-----------------------------------------------------------------------------------+
+ * | `task`        |`count`| `message`                                                                             | `input`                                                                           |
+ * +---------------+-------+---------------------------------------------------------------------------------------+-----------------------------------------------------------------------------------+
+ * |`tool_use::sql`| 17    | Failed to execute query: SQL error: ParserError("Expected: an expression:, found: '") | {"query":"SELECT `nation` FROM `spice`.`public`.`customer` WHERE `c_custkey` = 1"}|
+ * +---------------+-------+---------------------------------------------------------------------------------------+-----------------------------------------------------------------------------------+
+ */
 static QUERY_EVAL_BENCHMARK_TOP_ERRORS: &str = "
 WITH latest_run AS (
   SELECT id 
