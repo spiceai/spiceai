@@ -22,11 +22,13 @@ pub struct EvalsTestArgs {
     #[clap(flatten)]
     pub(crate) common: CommonArgs,
 
-    /// The language model (as named in spicepod) to test against.
+    /// The language model (as named in Spicepod) to test against.
+    /// If not specified, the first model from the Spicepod definition will be used.
     #[arg(long)]
-    pub(crate) model: String,
+    pub(crate) model: Option<String>,
 
-    /// The eval name (as named in spicepod) to test against.
+    /// The eval name (as named in Spicepod) to test against.
+    /// If not specified, the first eval from the Spicepod definition will be used.
     #[arg(long)]
-    pub(crate) eval: String,
+    pub(crate) eval: Option<String>,
 }

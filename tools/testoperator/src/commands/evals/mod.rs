@@ -29,22 +29,31 @@ use test_framework::{
 
 #[allow(clippy::too_many_lines)]
 pub(crate) async fn run(args: &EvalsTestArgs) -> anyhow::Result<()> {
-    let (_, start_request) = get_app_and_start_request(&args.common)?;
+    let (app, start_request) = get_app_and_start_request(&args.common)?;
     let mut spiced_instance = SpicedInstance::start(start_request).await?;
+
+    let eval = args
+        .eval
+        .as_ref()
+        .or_else(|| app.evals.first().map(|eval| &eval.name))
+        .ok_or_else(|| anyhow::anyhow!("No evals defined"))?;
+
+    let model = args
+        .model
+        .as_ref()
+        .or_else(|| app.models.first().map(|model| &model.name))
+        .ok_or_else(|| anyhow::anyhow!("No models defined"))?;
 
     spiced_instance
         .wait_for_ready(Duration::from_secs(args.common.ready_wait))
         .await?;
 
-    println!(
-        "Executing {} eval benchmark. It might take several minutes...",
-        args.eval
-    );
+    println!("Executing {eval} eval benchmark for model {model}. It might take several minutes...");
 
     let http_client = spiced_instance.http_client()?;
 
-    let url = format!("http://localhost:8090/v1/evals/{}", args.eval);
-    let body = json!({"model": args.model}).to_string();
+    let url = format!("http://localhost:8090/v1/evals/{eval}");
+    let body = json!({"model": model}).to_string();
 
     let response = http_client
         .post(&url)
