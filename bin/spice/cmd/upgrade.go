@@ -232,7 +232,9 @@ func upgradeCli(force bool, rtcontext *context.RuntimeContext) bool {
 		slog.Error("restarting CLI", "error", err)
 	}
 
-	return true
+	// For unix, this is unreachable
+	// For windows, the CLI will be restarted with the new binary, return false to terminate old CLI
+	return false
 }
 
 func restartWithNewCli(cliPath string, args []string) error {
