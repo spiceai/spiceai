@@ -68,6 +68,14 @@ impl Extension for TpcExtension {
             return Ok(());
         }
 
+        Ok(())
+    }
+
+    async fn on_start(&self, _runtime: &Runtime) -> Result<()> {
+        if !self.manifest.enabled {
+            return Ok(());
+        }
+
         let benchmark = self
             .manifest
             .params
@@ -75,7 +83,7 @@ impl Extension for TpcExtension {
             .map_or(String::from("tpch"), std::string::ToString::to_string);
 
         if benchmark != "tpch" && benchmark != "tpcds" {
-            return Err(ExtensionError::UnableToInitializeExtension {
+            return Err(ExtensionError::UnableToStartExtension {
                 source: Box::new(Error::InvalidBenchmark {
                     benchmark: benchmark.clone(),
                 }),
@@ -88,10 +96,8 @@ impl Extension for TpcExtension {
         );
 
         if let Some(parent) = PathBuf::from(&path).parent() {
-            fs::create_dir_all(parent).map_err(|e| {
-                ExtensionError::UnableToInitializeExtension {
-                    source: Box::new(e),
-                }
+            fs::create_dir_all(parent).map_err(|e| ExtensionError::UnableToStartExtension {
+                source: Box::new(e),
             })?;
         }
 
@@ -106,15 +112,15 @@ impl Extension for TpcExtension {
 
         let connection = Connection::open(path.clone())
             .boxed()
-            .map_err(|source| ExtensionError::UnableToInitializeExtension { source })?;
+            .map_err(|source| ExtensionError::UnableToStartExtension { source })?;
 
-        tracing::info!("Setting up {benchmark} benchamrk datasets.");
+        tracing::info!("Setting up {benchmark} benchamrk datasets with scale factor {scale_factor}, using file {path}");
 
         let gen_func = match benchmark.as_str() {
             "tpch" => String::from("dbgen"),
             "tpcds" => String::from("dsdgen"),
             _ => {
-                return Err(ExtensionError::UnableToInitializeExtension {
+                return Err(ExtensionError::UnableToStartExtension {
                     source: Box::new(Error::InvalidBenchmark {
                         benchmark: benchmark.clone(),
                     }),
@@ -132,20 +138,16 @@ impl Extension for TpcExtension {
         connection
             .execute_batch(query.as_str())
             .boxed()
-            .map_err(|source| ExtensionError::UnableToInitializeExtension { source })?;
+            .map_err(|source| ExtensionError::UnableToStartExtension { source })?;
 
         connection
             .close()
-            .map_err(|(_, err)| ExtensionError::UnableToInitializeExtension {
+            .map_err(|(_, err)| ExtensionError::UnableToStartExtension {
                 source: Box::new(err),
             })?;
 
         tracing::info!("{benchmark} data loaded");
 
-        Ok(())
-    }
-
-    async fn on_start(&self, _runtime: &Runtime) -> Result<()> {
         Ok(())
     }
 }
