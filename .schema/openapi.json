@@ -1762,6 +1762,46 @@
           }
         }
       },
+      "ChatCompletionAudio": {
+        "type": "object",
+        "required": [
+          "voice",
+          "format"
+        ],
+        "properties": {
+          "format": {
+            "$ref": "#/components/schemas/ChatCompletionAudioFormat",
+            "description": "Specifies the output audio format. Must be one of `wav`, `mp3`, `flac`, `opus`, or `pcm16`."
+          },
+          "voice": {
+            "$ref": "#/components/schemas/ChatCompletionAudioVoice",
+            "description": "The voice the model uses to respond. Supported voices are `ash`, `ballad`, `coral`, `sage`, and `verse` (also supported but not recommended are `alloy`, `echo`, and `shimmer`; these voices are less expressive)."
+          }
+        }
+      },
+      "ChatCompletionAudioFormat": {
+        "type": "string",
+        "enum": [
+          "wav",
+          "mp3",
+          "flac",
+          "opus",
+          "pcm16"
+        ]
+      },
+      "ChatCompletionAudioVoice": {
+        "type": "string",
+        "enum": [
+          "alloy",
+          "ash",
+          "ballad",
+          "coral",
+          "echo",
+          "sage",
+          "shimmer",
+          "verse"
+        ]
+      },
       "ChatCompletionFunctionCall": {
         "oneOf": [
           {
@@ -1847,6 +1887,14 @@
           }
         }
       },
+      "ChatCompletionModalities": {
+        "type": "string",
+        "description": "Output types that you would like the model to generate for this request.\n\nMost models are capable of generating text, which is the default: `[\"text\"]`\n\nThe `gpt-4o-audio-preview` model can also be used to [generate\naudio](https://platform.openai.com/docs/guides/audio). To request that this model generate both text and audio responses, you can use: `[\"text\", \"audio\"]`",
+        "enum": [
+          "text",
+          "audio"
+        ]
+      },
       "ChatCompletionNamedToolChoice": {
         "type": "object",
         "description": "Specifies a tool the model should use. Use to force the model to call a specific function.",
@@ -1867,6 +1915,17 @@
       "ChatCompletionRequestAssistantMessage": {
         "type": "object",
         "properties": {
+          "audio": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ChatCompletionRequestAssistantMessageAudio",
+                "description": "Data about a previous audio response from the model.\n[Learn more](https://platform.openai.com/docs/guides/audio)."
+              }
+            ]
+          },
           "content": {
             "oneOf": [
               {
@@ -1911,6 +1970,18 @@
             "items": {
               "$ref": "#/components/schemas/ChatCompletionMessageToolCall"
             }
+          }
+        }
+      },
+      "ChatCompletionRequestAssistantMessageAudio": {
+        "type": "object",
+        "required": [
+          "id"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Unique identifier for a previous audio response from the model."
           }
         }
       },
@@ -1975,6 +2046,38 @@
           }
         ]
       },
+      "ChatCompletionRequestDeveloperMessage": {
+        "type": "object",
+        "required": [
+          "content"
+        ],
+        "properties": {
+          "content": {
+            "$ref": "#/components/schemas/ChatCompletionRequestDeveloperMessageContent",
+            "description": "The contents of the developer message."
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "An optional name for the participant. Provides the model information to differentiate between participants of the same role."
+          }
+        }
+      },
+      "ChatCompletionRequestDeveloperMessageContent": {
+        "oneOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ChatCompletionRequestMessageContentPartText"
+            }
+          }
+        ]
+      },
       "ChatCompletionRequestFunctionMessage": {
         "type": "object",
         "required": [
@@ -1996,6 +2099,27 @@
       },
       "ChatCompletionRequestMessage": {
         "oneOf": [
+          {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ChatCompletionRequestDeveloperMessage"
+              },
+              {
+                "type": "object",
+                "required": [
+                  "role"
+                ],
+                "properties": {
+                  "role": {
+                    "type": "string",
+                    "enum": [
+                      "developer"
+                    ]
+                  }
+                }
+              }
+            ]
+          },
           {
             "allOf": [
               {
@@ -2102,6 +2226,18 @@
             ]
           }
         ]
+      },
+      "ChatCompletionRequestMessageContentPartAudio": {
+        "type": "object",
+        "description": "Learn about [audio inputs](https://platform.openai.com/docs/guides/audio).",
+        "required": [
+          "input_audio"
+        ],
+        "properties": {
+          "input_audio": {
+            "$ref": "#/components/schemas/InputAudio"
+          }
+        }
       },
       "ChatCompletionRequestMessageContentPartImage": {
         "type": "object",
@@ -2283,7 +2419,7 @@
             "items": {
               "$ref": "#/components/schemas/ChatCompletionRequestUserMessageContentPart"
             },
-            "description": "An array of content parts with a defined type, each can be of type `text` or `image_url` when passing in images. You can pass multiple images by adding multiple `image_url` content parts. Image input is only supported when using the `gpt-4o` model."
+            "description": "An array of content parts with a defined type. Supported options differ based on the [model](https://platform.openai.com/docs/models) being used to generate the response. Can contain text, image, or audio inputs."
           }
         ]
       },
@@ -2330,6 +2466,27 @@
                 }
               }
             ]
+          },
+          {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ChatCompletionRequestMessageContentPartAudio"
+              },
+              {
+                "type": "object",
+                "required": [
+                  "type"
+                ],
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "input_audio"
+                    ]
+                  }
+                }
+              }
+            ]
           }
         ]
       },
@@ -2340,6 +2497,17 @@
           "role"
         ],
         "properties": {
+          "audio": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ChatCompletionResponseMessageAudio",
+                "description": "If the audio output modality is requested, this object contains data about the audio response from the model. [Learn more](https://platform.openai.com/docs/guides/audio)."
+              }
+            ]
+          },
           "content": {
             "type": [
               "string",
@@ -2378,6 +2546,35 @@
               "$ref": "#/components/schemas/ChatCompletionMessageToolCall"
             },
             "description": "The tool calls generated by the model, such as function calls."
+          }
+        }
+      },
+      "ChatCompletionResponseMessageAudio": {
+        "type": "object",
+        "required": [
+          "id",
+          "expires_at",
+          "data",
+          "transcript"
+        ],
+        "properties": {
+          "data": {
+            "type": "string",
+            "description": "Base64 encoded audio bytes generated by the model, in the format specified in the request."
+          },
+          "expires_at": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The Unix timestamp (in seconds) for when this audio response will no longer be accessible on the server for use in multi-turn conversations.",
+            "minimum": 0
+          },
+          "id": {
+            "type": "string",
+            "description": "Unique identifier for this audio response."
+          },
+          "transcript": {
+            "type": "string",
+            "description": "Transcript of the audio generated by the model."
           }
         }
       },
@@ -2620,13 +2817,24 @@
           "model"
         ],
         "properties": {
+          "audio": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ChatCompletionAudio",
+                "description": "Parameters for audio output. Required when audio output is requested with `modalities: [\"audio\"]`. [Learn more](https://platform.openai.com/docs/guides/audio)."
+              }
+            ]
+          },
           "frequency_penalty": {
             "type": [
               "number",
               "null"
             ],
             "format": "float",
-            "description": "Number between -2.0 and 2.0. Positive values penalize new tokens based on their existing frequency in the text so far, decreasing the model's likelihood to repeat the same line verbatim.\n\n[See more information about frequency and presence penalties.](https://platform.openai.com/docs/api-reference/parameter-details)"
+            "description": "Number between -2.0 and 2.0. Positive values penalize new tokens based on their existing frequency in the text so far, decreasing the model's likelihood to repeat the same line verbatim."
           },
           "function_call": {
             "oneOf": [
@@ -2674,7 +2882,7 @@
               "null"
             ],
             "format": "int32",
-            "description": "An upper bound for the number of tokens that can be generated for a completion, including visible output tokens and reasoning tokens.",
+            "description": "An upper bound for the number of tokens that can be generated for a completion, including visible output tokens and [reasoning tokens](https://platform.openai.com/docs/guides/reasoning).",
             "minimum": 0
           },
           "max_tokens": {
@@ -2683,7 +2891,7 @@
               "null"
             ],
             "format": "int32",
-            "description": "The maximum number of tokens that can be generated in the chat completion. This value can be used to control costs for text generated via API.\nThis value is now **deprecated** in favor of max_completion_tokens, and is not compatible with o1 series models.",
+            "description": "The maximum number of [tokens](https://platform.openai.com/tokenizer) that can be generated in the chat completion.\n\nThis value can be used to control [costs](https://openai.com/api/pricing/) for text generated via API.\nThis value is now deprecated in favor of `max_completion_tokens`, and is\nnot compatible with [o1 series models](https://platform.openai.com/docs/guides/reasoning).",
             "deprecated": true,
             "minimum": 0
           },
@@ -2692,14 +2900,23 @@
             "items": {
               "$ref": "#/components/schemas/ChatCompletionRequestMessage"
             },
-            "description": "A list of messages comprising the conversation so far. [Example Python code](https://cookbook.openai.com/examples/how_to_format_inputs_to_chatgpt_models)."
+            "description": "A list of messages comprising the conversation so far. Depending on the [model](https://platform.openai.com/docs/models) you use, different message types (modalities) are supported, like [text](https://platform.openai.com/docs/guides/text-generation), [images](https://platform.openai.com/docs/guides/vision), and [audio](https://platform.openai.com/docs/guides/audio)."
           },
           "metadata": {
             "description": "Developer-defined tags and values used for filtering completions."
           },
+          "modalities": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/ChatCompletionModalities"
+            }
+          },
           "model": {
             "type": "string",
-            "description": "ID of the model to use.\nSee the [model endpoint compatibility](https://platform.openai.com/docs/models/model-endpoint-compatibility) table for details on which models work with the Chat API."
+            "description": "ID of the model to use.\nSee the [model endpoint compatibility](https://platform.openai.com/docs/models#model-endpoint-compatibility) table for details on which models work with the Chat API."
           },
           "n": {
             "type": [
@@ -2717,13 +2934,35 @@
             ],
             "description": "Whether to enable [parallel function calling](https://platform.openai.com/docs/guides/function-calling/parallel-function-calling) during tool use."
           },
+          "prediction": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PredictionContent",
+                "description": "Configuration for a [Predicted Output](https://platform.openai.com/docs/guides/predicted-outputs),which can greatly improve response times when large parts of the model response are known ahead of time. This is most common when you are regenerating a file with only minor changes to most of the content."
+              }
+            ]
+          },
           "presence_penalty": {
             "type": [
               "number",
               "null"
             ],
             "format": "float",
-            "description": "Number between -2.0 and 2.0. Positive values penalize new tokens based on whether they appear in the text so far, increasing the model's likelihood to talk about new topics.\n\n[See more information about frequency and presence penalties.](https://platform.openai.com/docs/api-reference/parameter-details)"
+            "description": "Number between -2.0 and 2.0. Positive values penalize new tokens based on whether they appear in the text so far, increasing the model's likelihood to talk about new topics."
+          },
+          "reasoning_effort": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ReasoningEffort",
+                "description": "**o1 models only**\n\nConstrains effort on reasoning for\n[reasoning models](https://platform.openai.com/docs/guides/reasoning).\n\nCurrently supported values are `low`, `medium`, and `high`. Reducing\n\nreasoning effort can result in faster responses and fewer tokens\nused on reasoning in a response."
+              }
+            ]
           },
           "response_format": {
             "oneOf": [
@@ -2840,7 +3079,7 @@
               "string",
               "null"
             ],
-            "description": "A unique identifier representing your end-user, which can help OpenAI to monitor and detect abuse. [Learn more](https://platform.openai.com/docs/guides/safety-best-practices/end-user-ids)."
+            "description": "A unique identifier representing your end-user, which can help OpenAI to monitor and detect abuse. [Learn more](https://platform.openai.com/docs/guides/safety-best-practices#end-user-ids)."
           }
         }
       },
@@ -3382,6 +3621,30 @@
           }
         }
       },
+      "InputAudio": {
+        "type": "object",
+        "required": [
+          "data",
+          "format"
+        ],
+        "properties": {
+          "data": {
+            "type": "string",
+            "description": "Base64 encoded audio data."
+          },
+          "format": {
+            "$ref": "#/components/schemas/InputAudioFormat",
+            "description": "The format of the encoded audio data. Currently supports \"wav\" and \"mp3\"."
+          }
+        }
+      },
+      "InputAudioFormat": {
+        "type": "string",
+        "enum": [
+          "wav",
+          "mp3"
+        ]
+      },
       "ListEvalElement": {
         "type": "object",
         "required": [
@@ -3636,6 +3899,47 @@
           "InternalError"
         ]
       },
+      "PredictionContent": {
+        "oneOf": [
+          {
+            "type": "object",
+            "description": "The type of the predicted content you want to provide. This type is\ncurrently always `content`.",
+            "required": [
+              "content",
+              "type"
+            ],
+            "properties": {
+              "content": {
+                "$ref": "#/components/schemas/PredictionContentContent",
+                "description": "The type of the predicted content you want to provide. This type is\ncurrently always `content`."
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "content"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "Static predicted output content, such as the content of a text file that is being regenerated."
+      },
+      "PredictionContentContent": {
+        "oneOf": [
+          {
+            "type": "string",
+            "description": "The content used for a Predicted Output. This is often the text of a file you are regenerating with minor changes."
+          },
+          {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ChatCompletionRequestMessageContentPartText"
+            },
+            "description": "An array of content parts with a defined type. Supported options differ based on the [model](https://platform.openai.com/docs/models) being used to generate the response. Can contain text inputs."
+          }
+        ],
+        "description": "The content that should be matched when generating a model response. If generated tokens would match this content, the entire model response can be returned much more quickly."
+      },
       "PromptTokensDetails": {
         "type": "object",
         "description": "Breakdown of tokens used in a prompt.",
@@ -3659,6 +3963,14 @@
             "minimum": 0
           }
         }
+      },
+      "ReasoningEffort": {
+        "type": "string",
+        "enum": [
+          "low",
+          "medium",
+          "high"
+        ]
       },
       "Request": {
         "type": "object",
@@ -3758,7 +4070,7 @@
           },
           "name": {
             "type": "string",
-            "description": "The name of the response format. Must be a-z, A-Z, 0-9, or contain underscores and dashes, with a maximum length"
+            "description": "The name of the response format. Must be a-z, A-Z, 0-9, or contain underscores and dashes, with a maximum length of 64."
           },
           "schema": {
             "description": "The schema for the response format, described as a JSON Schema object."
