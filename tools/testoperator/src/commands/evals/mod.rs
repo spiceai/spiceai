@@ -82,6 +82,9 @@ pub(crate) async fn run(args: &EvalsTestArgs) -> anyhow::Result<()> {
         pretty_format_batches(&tasks_calls)?
     );
 
+    let failed_tests = execute_sql(&mut flight_client, QUERY_EVAL_BENCHMARK_FAILED_TESTS).await?;
+    println!("Failed tests:\n{}\n", pretty_format_batches(&failed_tests)?);
+
     let top_errors = execute_sql(&mut flight_client, QUERY_EVAL_BENCHMARK_TOP_ERRORS).await?;
     println!("Top errors:\n{}\n", pretty_format_batches(&top_errors)?);
 
@@ -232,4 +235,30 @@ GROUP BY
 ORDER BY 
     count DESC
 LIMIT 20;
+";
+
+/**
+ * Fetches the failed tests for the latest evaluation run.
+ *
+ * Output:
+ * - `run_id`: Evaluation run ID  
+ * - `input`: Test input query  
+ * - `output`: Model response  
+ * - `expected`: Expected response  
+ * - `score`: Test score  
+ *
+ * Example:
+ * +----------------------------------+----------------------------------+----------------------------------+----------------------------------+-------+
+ * | `run_id`                         | `input`                          | `output`                         | `expected`                       |`score`|
+ * +----------------------------------+----------------------------------+----------------------------------+----------------------------------+-------+
+ * | c74a65614ea314bc7036489bbc6f7ba3 | get part brand for part key 3    | Information is not available     | {"part_brand": "Brand#42"}       | 0.0   |
+ * +----------------------------------+----------------------------------+----------------------------------+----------------------------------+-------+
+ */
+static QUERY_EVAL_BENCHMARK_FAILED_TESTS: &str = "
+WITH latest_run AS (
+    SELECT id FROM spice.eval.runs ORDER BY created_at DESC LIMIT 1
+)
+SELECT run_id, input, output, actual as expected, value as score
+FROM eval.results
+WHERE run_id = (SELECT id FROM latest_run) and value < 1;
 ";
