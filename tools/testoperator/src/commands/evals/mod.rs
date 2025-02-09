@@ -273,6 +273,9 @@ fn arrow_to_json(data: &[RecordBatch]) -> Result<String, anyhow::Error> {
     writer.write_batches(&data.iter().collect::<Vec<_>>())?;
     writer.finish()?;
 
-    // Convert buffer to UTF-8 string and map any error to anyhow::Error.
-    String::from_utf8(writer.into_inner()).map_err(anyhow::Error::from)
+    let json_str = String::from_utf8(writer.into_inner()).map_err(anyhow::Error::from)?;
+
+    // Pretty-print the JSON output
+    let json_value: serde_json::Value = serde_json::from_str(&json_str)?;
+    serde_json::to_string_pretty(&json_value).map_err(anyhow::Error::from)
 }

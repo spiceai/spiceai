@@ -11645,6 +11645,7 @@ dependencies = [
 name = "testoperator"
 version = "1.1.0"
 dependencies = [
+ "arrow-json",
  "clap",
  "reqwest 0.12.12",
  "serde",
