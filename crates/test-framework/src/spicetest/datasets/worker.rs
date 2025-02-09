@@ -16,12 +16,14 @@ limitations under the License.
 
 use std::{
     collections::BTreeMap,
+    panic,
     time::{Duration, Instant, SystemTime},
 };
 
 use anyhow::Result;
+use arrow::array::RecordBatch;
 use flight_client::FlightClient;
-use futures::StreamExt;
+use futures::TryStreamExt;
 use indicatif::ProgressBar;
 use tokio::task::JoinHandle;
 
@@ -35,6 +37,7 @@ pub(crate) struct SpiceTestQueryWorker {
     end_condition: EndCondition,
     flight_client: FlightClient,
     explain_plan_snapshot: bool,
+    results_snapshot_predicate: Option<fn(&str) -> bool>,
     connector_name: Option<String>,
     pub progress_bar: Option<ProgressBar>,
 }
@@ -75,6 +78,7 @@ impl SpiceTestQueryWorker {
             end_condition,
             flight_client,
             explain_plan_snapshot: false,
+            results_snapshot_predicate: None,
             connector_name: None,
             progress_bar: None,
         }
@@ -90,11 +94,20 @@ impl SpiceTestQueryWorker {
         self
     }
 
+    pub fn with_results_snapshot(
+        mut self,
+        results_snapshot_predicate: Option<fn(&str) -> bool>,
+    ) -> Self {
+        self.results_snapshot_predicate = results_snapshot_predicate;
+        self
+    }
+
     pub fn with_progress_bar(mut self, progress_bar: ProgressBar) -> Self {
         self.progress_bar = Some(progress_bar);
         self
     }
 
+    #[allow(clippy::too_many_lines)]
     pub fn start(self) -> JoinHandle<Result<SpiceTestQueryWorkerResult>> {
         tokio::spawn(async move {
             let mut query_durations: BTreeMap<String, Vec<Duration>> = BTreeMap::new();
@@ -139,10 +152,19 @@ impl SpiceTestQueryWorker {
                         let mut current_query_count = 0;
                         let start = SystemTime::now();
 
+                        let snapshot_results = self
+                            .results_snapshot_predicate
+                            .is_some_and(|predicate| predicate(query.0));
+
                         // Additional round of query run before recording results.
                         // To discard the abnormal results caused by: establishing initial connection / spark cluster startup time
                         if !self
-                            .run_single_query(query, &mut BTreeMap::new(), &mut BTreeMap::new())
+                            .run_single_query(
+                                query,
+                                &mut BTreeMap::new(),
+                                &mut BTreeMap::new(),
+                                snapshot_results,
+                            )
                             .await?
                         {
                             return Ok(SpiceTestQueryWorkerResult::new(
@@ -181,7 +203,12 @@ impl SpiceTestQueryWorker {
                             }
 
                             if !self
-                                .run_single_query(query, &mut query_durations, &mut row_counts)
+                                .run_single_query(
+                                    query,
+                                    &mut query_durations,
+                                    &mut row_counts,
+                                    false,
+                                )
                                 .await?
                             {
                                 return Ok(SpiceTestQueryWorkerResult::new(
@@ -215,7 +242,7 @@ impl SpiceTestQueryWorker {
     ) -> Result<bool> {
         for query in &self.query_set {
             if !self
-                .run_single_query(query, query_durations, row_counts)
+                .run_single_query(query, query_durations, row_counts, false)
                 .await?
             {
                 return Ok(false);
@@ -229,8 +256,12 @@ impl SpiceTestQueryWorker {
         query: &(&'static str, &'static str),
         query_durations: &mut BTreeMap<String, Vec<Duration>>,
         row_counts: &mut BTreeMap<String, Vec<usize>>,
+        results_snapshot: bool,
     ) -> Result<bool> {
-        match self.execute_query(query, query_durations, row_counts).await {
+        match self
+            .execute_query(query, query_durations, row_counts, results_snapshot)
+            .await
+        {
             Ok(()) => Ok(true),
             Err(e) => {
                 let flight_error = e.downcast_ref::<flight_client::Error>();
@@ -262,24 +293,62 @@ impl SpiceTestQueryWorker {
         query: &(&'static str, &'static str),
         query_durations: &mut BTreeMap<String, Vec<Duration>>,
         row_counts: &mut BTreeMap<String, Vec<usize>>,
+        results_snapshot: bool,
     ) -> Result<()> {
-        let mut row_count = 0;
         let query_start = Instant::now();
-        let mut result_stream = self.flight_client.query(query.1).await?;
+        let result_stream = self.flight_client.query(query.1).await?;
 
-        while let Some(batch) = result_stream.next().await {
-            match batch {
-                Ok(batch) => {
-                    row_count += batch.num_rows();
-                }
-                Err(e) => {
-                    eprintln!(
-                        "FAIL - Worker {} - Query '{}' failed: {}",
-                        self.id, query.0, e
-                    );
-                    query_durations.entry(query.0.to_string()).or_default();
-                    return Err(e.into());
-                }
+        let records = match result_stream.try_collect::<Vec<_>>().await {
+            Ok(records) => records,
+            Err(e) => {
+                eprintln!(
+                    "FAIL - Worker {} - Query '{}' failed: {}",
+                    self.id, query.0, e
+                );
+                query_durations.entry(query.0.to_string()).or_default();
+                return Err(e.into());
+            }
+        };
+
+        let row_count = records
+            .iter()
+            .map(arrow::array::RecordBatch::num_rows)
+            .sum::<usize>();
+
+        if results_snapshot {
+            let query_name = query.0;
+            let connector = self
+                .connector_name
+                .clone()
+                .expect("Connector name is required for results snapshot");
+
+            let num_rows = records
+                .iter()
+                .map(arrow::array::RecordBatch::num_rows)
+                .sum::<usize>();
+            let limited_records: Vec<_> = records
+                .iter()
+                .flat_map(|batch: &RecordBatch| {
+                    // We only take up to 10 records anyway, so avoid iterating over large row results
+                    let end = if batch.num_rows() > 10 {
+                        10
+                    } else {
+                        batch.num_rows()
+                    };
+
+                    (0..end).map(move |i| batch.slice(i, 1))
+                })
+                .take(10)
+                .collect();
+            let records_pretty = arrow::util::pretty::pretty_format_batches(&limited_records)?;
+            let result = panic::catch_unwind(|| {
+                insta::assert_snapshot!(format!("{connector}_{query_name}"), records_pretty);
+            });
+            if result.is_err() {
+                let error_str =
+                    format!("Query `{connector}` `{query_name}` snapshot assertion failed",);
+                eprintln!("{error_str}");
+                return Err(anyhow::anyhow!(error_str));
             }
         }
 

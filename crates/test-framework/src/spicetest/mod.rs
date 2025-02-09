@@ -37,6 +37,7 @@ pub struct SpiceTest<S: TestState> {
     api_key: Option<String>,
     connector_name: Option<String>,
     explain_plan_snapshot: bool,
+    results_snapshot_predicate: Option<fn(&str) -> bool>,
 
     state: S,
 }
@@ -60,8 +61,15 @@ impl<S: TestNotStarted> SpiceTest<S> {
             api_key: None,
             connector_name: None,
             explain_plan_snapshot: false,
+            results_snapshot_predicate: None,
             state,
         }
+    }
+
+    #[must_use]
+    pub fn with_results_snapshot(mut self, predicate: fn(&str) -> bool) -> Self {
+        self.results_snapshot_predicate = Some(predicate);
+        self
     }
 
     #[must_use]

@@ -131,6 +131,7 @@ impl SpiceTest<NotStarted> {
             use_progress_bars: self.use_progress_bars,
             api_key: self.api_key,
             explain_plan_snapshot: self.explain_plan_snapshot,
+            results_snapshot_predicate: self.results_snapshot_predicate,
             state: Running {
                 baseline_handles,
                 spice_handles,
@@ -171,6 +172,7 @@ impl SpiceTest<Running> {
             use_progress_bars: self.use_progress_bars,
             api_key: self.api_key,
             explain_plan_snapshot: self.explain_plan_snapshot,
+            results_snapshot_predicate: self.results_snapshot_predicate,
             state: Completed {
                 baseline_results,
                 spice_results,

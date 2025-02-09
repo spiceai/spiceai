@@ -59,6 +59,7 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
     )
     .with_connector_name(args.connector_name.clone())
     .with_explain_plan_snapshot()
+    .with_results_snapshot(snapshot_predicate)
     .with_progress_bars(!args.common.disable_progress_bars)
     .with_api_key(if args.common.upload_results_dataset.is_some() {
         Some(TEST_RESULTS_API_KEY.to_string())
@@ -87,4 +88,9 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
     spiced_instance.show_memory_usage()?;
     spiced_instance.stop()?;
     Ok(row_counts)
+}
+
+/// Only snapshot the official TPCH and TPCDS queries, not the "simple" extensions as they don't return consistent results
+fn snapshot_predicate(query_name: &str) -> bool {
+    query_name.starts_with("tpch_q") || query_name.starts_with("tpcds_q")
 }

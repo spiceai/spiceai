@@ -160,7 +160,8 @@ impl SpiceTest<NotStarted> {
                     flight_client.clone(),
                 )
                 .with_connector_name(self.connector_name.clone())
-                .with_explain_plan_snapshot(self.explain_plan_snapshot);
+                .with_explain_plan_snapshot(self.explain_plan_snapshot)
+                .with_results_snapshot(self.results_snapshot_predicate);
 
                 if let Some(multi) = &multi {
                     worker.with_progress_bar(multi.add(self.get_new_progress_bar()))
@@ -179,6 +180,7 @@ impl SpiceTest<NotStarted> {
             use_progress_bars: self.use_progress_bars,
             api_key: self.api_key,
             explain_plan_snapshot: self.explain_plan_snapshot,
+            results_snapshot_predicate: self.results_snapshot_predicate,
             state: Running {
                 start_time: Instant::now(),
                 query_workers,
@@ -236,6 +238,7 @@ impl SpiceTest<Running> {
             use_progress_bars: self.use_progress_bars,
             api_key: self.api_key,
             explain_plan_snapshot: self.explain_plan_snapshot,
+            results_snapshot_predicate: self.results_snapshot_predicate,
             state: Completed {
                 query_durations,
                 query_iteration_durations,
