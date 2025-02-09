@@ -1,0 +1,9 @@
+---
+source: crates/test-framework/src/spicetest/datasets/worker.rs
+expression: records_pretty
+---
++----------+
+| count(*) |
++----------+
+| 950      |
++----------+
