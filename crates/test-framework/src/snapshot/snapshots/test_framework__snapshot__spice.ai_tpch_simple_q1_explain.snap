@@ -1,7 +1,6 @@
 ---
-source: crates/runtime/benches/bench.rs
+source: crates/test-framework/src/snapshot/mod.rs
 description: "Query: SELECT MAX(l_orderkey) FROM lineitem;"
-snapshot_kind: text
 ---
 +---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
 | plan_type     | plan                                                                                                                                                                                                                                                  |
