@@ -18,6 +18,7 @@ limitations under the License.
 
 pub mod flight;
 pub mod gh_utils;
+pub mod git;
 pub mod metrics;
 pub mod queries;
 pub mod spiced;

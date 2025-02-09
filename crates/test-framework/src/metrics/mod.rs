@@ -32,7 +32,7 @@ use arrow::{
 };
 use uuid::Uuid;
 
-use crate::TestType;
+use crate::{git, TestType};
 
 const FLOAT_ERROR_MARGIN: f64 = 0.0001;
 
@@ -88,6 +88,7 @@ impl<T: ExtendedMetrics> QueryMetric<T> {
             return Ok(Self::new(name).failed());
         }
 
+        let iterations = durations.len();
         let durations = durations.statistical_set()?;
         Ok(Self {
             query_name: name.to_string(),
@@ -96,7 +97,7 @@ impl<T: ExtendedMetrics> QueryMetric<T> {
             finished_at,
             min_duration_ms: durations.min_duration()?.as_millis() as i64,
             max_duration_ms: durations.max_duration()?.as_millis() as i64,
-            iterations: durations.len(),
+            iterations,
             median_duration_ms: durations.median()?.as_millis() as i64,
             percentile_99_duration_ms: durations.percentile(99.0)?.as_millis() as i64,
             percentile_95_duration_ms: durations.percentile(95.0)?.as_millis() as i64,
@@ -401,19 +402,15 @@ impl<T: ExtendedMetrics, R: ExtendedMetrics> QueryMetrics<T, R> {
             Field::new("iterations", DataType::Int32, false),
             Field::new("commit_sha", DataType::Utf8, false),
             Field::new("branch_name", DataType::Utf8, false),
-            // Field::new("median_duration", DataType::Float64, false),
-            // Field::new("percentile_99_duration", DataType::Float64, false),
-            // Field::new("percentile_95_duration", DataType::Float64, false),
-            // Field::new("percentile_90_duration", DataType::Float64, false),
         ];
 
         base_fields.extend(extended_fields);
 
         base_fields.extend(vec![
-            Field::new("median_duration", DataType::Float64, false),
-            Field::new("percentile_99_duration", DataType::Float64, false),
-            Field::new("percentile_95_duration", DataType::Float64, false),
-            Field::new("percentile_90_duration", DataType::Float64, false),
+            Field::new("median_duration_ms", DataType::Int64, false),
+            Field::new("percentile_99_duration_ms", DataType::Int64, false),
+            Field::new("percentile_95_duration_ms", DataType::Int64, false),
+            Field::new("percentile_90_duration_ms", DataType::Int64, false),
         ]);
 
         Arc::new(Schema::new(base_fields))
@@ -654,8 +651,8 @@ pub trait MetricCollector<T: ExtendedMetrics, R: ExtendedMetrics> {
         Ok(QueryMetrics {
             run_id: uuid::Uuid::new_v4(),
             run_name: self.name(),
-            commit_sha: "TODO".to_string(),
-            branch_name: "TODO".to_string(),
+            commit_sha: git::get_commit_sha(),
+            branch_name: git::get_branch_name(),
             test_type,
             started_at: usize::try_from(
                 self.start_time()

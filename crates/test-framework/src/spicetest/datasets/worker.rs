@@ -164,7 +164,6 @@ impl SpiceTestQueryWorker {
                         }
                         let end = SystemTime::now();
                         query_iteration_durations.insert(query.0.to_string(), (start, end));
-                        query_set_count += 1;
                     }
                 }
             }
