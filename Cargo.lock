@@ -11623,6 +11623,7 @@ dependencies = [
  "flight_client",
  "futures",
  "indicatif",
+ "insta",
  "nix",
  "octocrab",
  "rand 0.8.5",
