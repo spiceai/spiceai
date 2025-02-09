@@ -25,6 +25,8 @@ use futures::StreamExt;
 use indicatif::ProgressBar;
 use tokio::task::JoinHandle;
 
+use crate::snapshot::record_explain_plan;
+
 use super::EndCondition;
 
 pub(crate) struct SpiceTestQueryWorker {
@@ -32,6 +34,8 @@ pub(crate) struct SpiceTestQueryWorker {
     query_set: Vec<(&'static str, &'static str)>,
     end_condition: EndCondition,
     flight_client: FlightClient,
+    explain_plan_snapshot: bool,
+    connector_name: Option<String>,
     pub progress_bar: Option<ProgressBar>,
 }
 
@@ -70,8 +74,20 @@ impl SpiceTestQueryWorker {
             query_set,
             end_condition,
             flight_client,
+            explain_plan_snapshot: false,
+            connector_name: None,
             progress_bar: None,
         }
+    }
+
+    pub fn with_connector_name(mut self, connector_name: Option<String>) -> Self {
+        self.connector_name = connector_name;
+        self
+    }
+
+    pub fn with_explain_plan_snapshot(mut self, explain_plan_snapshot: bool) -> Self {
+        self.explain_plan_snapshot = explain_plan_snapshot;
+        self
     }
 
     pub fn with_progress_bar(mut self, progress_bar: ProgressBar) -> Self {
@@ -135,6 +151,21 @@ impl SpiceTestQueryWorker {
                                 true,
                                 row_counts,
                             ));
+                        }
+
+                        if let Some(connector_name) = &self.connector_name {
+                            if self.explain_plan_snapshot {
+                                record_explain_plan(
+                                    &self.flight_client,
+                                    connector_name,
+                                    query.0,
+                                    query.1,
+                                )
+                                .await
+                                .map_err(|e| {
+                                    anyhow::anyhow!("Failed to record explain plan: {}", e)
+                                })?;
+                            }
                         }
 
                         while current_query_count < target_count {

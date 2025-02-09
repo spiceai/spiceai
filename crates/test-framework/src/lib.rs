@@ -21,6 +21,7 @@ pub mod gh_utils;
 pub mod git;
 pub mod metrics;
 pub mod queries;
+pub mod snapshot;
 pub mod spiced;
 pub mod spicepod_utils;
 pub mod spicetest;

@@ -36,6 +36,7 @@ pub struct SpiceTest<S: TestState> {
     use_progress_bars: bool,
     api_key: Option<String>,
     connector_name: Option<String>,
+    explain_plan_snapshot: bool,
 
     state: S,
 }
@@ -58,8 +59,15 @@ impl<S: TestNotStarted> SpiceTest<S> {
             use_progress_bars: true,
             api_key: None,
             connector_name: None,
+            explain_plan_snapshot: false,
             state,
         }
+    }
+
+    #[must_use]
+    pub fn with_explain_plan_snapshot(mut self) -> Self {
+        self.explain_plan_snapshot = true;
+        self
     }
 
     #[must_use]

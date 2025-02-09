@@ -144,6 +144,7 @@ impl SpiceTest<NotStarted> {
             spiced_instance: self.spiced_instance,
             use_progress_bars: self.use_progress_bars,
             api_key: self.api_key,
+            explain_plan_snapshot: self.explain_plan_snapshot,
             state: Running {
                 worker_handles,
                 config: self.state.config,
@@ -179,6 +180,7 @@ impl SpiceTest<Running> {
             spiced_instance: self.spiced_instance,
             use_progress_bars: self.use_progress_bars,
             api_key: self.api_key,
+            explain_plan_snapshot: self.explain_plan_snapshot,
             state: Completed {
                 result: ConsistencyResult {
                     durations,
