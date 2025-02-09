@@ -83,10 +83,12 @@ pub(crate) async fn run(args: &EvalsTestArgs) -> anyhow::Result<()> {
     );
 
     let failed_tests = execute_sql(&mut flight_client, QUERY_EVAL_BENCHMARK_FAILED_TESTS).await?;
-    println!("Failed tests:\n{}\n", pretty_format_batches(&failed_tests)?);
+    // json format is easier to read as table could be too wide
+    println!("Failed tests:\n{}\n", arrow_to_json(&failed_tests)?);
 
     let top_errors = execute_sql(&mut flight_client, QUERY_EVAL_BENCHMARK_TOP_ERRORS).await?;
-    println!("Top errors:\n{}\n", pretty_format_batches(&top_errors)?);
+    // json format is easier to read as table could be too wide
+    println!("Top errors:\n{}\n", arrow_to_json(&top_errors)?);
 
     spiced_instance.stop()?;
 
@@ -251,7 +253,7 @@ LIMIT 20;
  * +----------------------------------+----------------------------------+----------------------------------+----------------------------------+-------+
  * | `run_id`                         | `input`                          | `output`                         | `expected`                       |`score`|
  * +----------------------------------+----------------------------------+----------------------------------+----------------------------------+-------+
- * | c74a65614ea314bc7036489bbc6f7ba3 | get part brand for part key 3    | Information is not available     | {"part_brand": "Brand#42"}       | 0.0   |
+ * | c74a65614ea314bc7036489bbc6f7ba3 | get part brand for part key 3    | Information is not available     | {`part_brand`: `Brand#42`}       | 0.0   |
  * +----------------------------------+----------------------------------+----------------------------------+----------------------------------+-------+
  */
 static QUERY_EVAL_BENCHMARK_FAILED_TESTS: &str = "
@@ -262,3 +264,15 @@ SELECT run_id, input, output, actual as expected, value as score
 FROM eval.results
 WHERE run_id = (SELECT id FROM latest_run) and value < 1;
 ";
+
+/// Converts a vector of `RecordBatch` to a JSON string.
+fn arrow_to_json(data: &[RecordBatch]) -> Result<String, anyhow::Error> {
+    let buf = Vec::new();
+    let mut writer = arrow_json::ArrayWriter::new(buf);
+
+    writer.write_batches(&data.iter().collect::<Vec<_>>())?;
+    writer.finish()?;
+
+    // Convert buffer to UTF-8 string and map any error to anyhow::Error.
+    String::from_utf8(writer.into_inner()).map_err(anyhow::Error::from)
+}
