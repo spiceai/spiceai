@@ -1,7 +1,6 @@
 ---
-source: crates/runtime/benches/bench.rs
+source: crates/test-framework/src/spicetest/datasets/worker.rs
 expression: records_pretty
-snapshot_kind: text
 ---
 +--------+------------+
 | o_year | mkt_share  |
