@@ -322,10 +322,6 @@ impl SpiceTestQueryWorker {
                 .clone()
                 .expect("Connector name is required for results snapshot");
 
-            let num_rows = records
-                .iter()
-                .map(arrow::array::RecordBatch::num_rows)
-                .sum::<usize>();
             let limited_records: Vec<_> = records
                 .iter()
                 .flat_map(|batch: &RecordBatch| {
