@@ -1,6 +1,13 @@
 version: v1
 kind: Spicepod
 name: spicecloud_tpch
+
+runtime:
+  results_cache:
+    enabled: false
+    cache_max_size: 0MiB
+    item_ttl: 0s
+
 datasets:
   - from: spice.ai:spiceai/tpch/datasets/tpch.customer
     name: customer

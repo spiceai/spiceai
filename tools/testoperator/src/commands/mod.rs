@@ -74,5 +74,9 @@ pub(crate) fn env_export(args: &CommonArgs) -> anyhow::Result<()> {
         tempdir_path.to_string_lossy()
     );
 
+    // Wait for input before exiting
+    println!("Press Enter to exit...");
+    std::io::stdin().read_line(&mut String::new())?;
+
     Ok(())
 }

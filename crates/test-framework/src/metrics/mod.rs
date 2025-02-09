@@ -69,10 +69,10 @@ pub struct QueryMetric<T: ExtendedMetrics> {
     pub min_duration_ms: i64,
     pub max_duration_ms: i64,
     pub iterations: usize,
-    pub median_duration: f64,
-    pub percentile_99_duration: f64,
-    pub percentile_95_duration: f64,
-    pub percentile_90_duration: f64,
+    pub median_duration_ms: i64,
+    pub percentile_99_duration_ms: i64,
+    pub percentile_95_duration_ms: i64,
+    pub percentile_90_duration_ms: i64,
     pub extended_metrics: Option<T>,
 }
 
@@ -97,10 +97,10 @@ impl<T: ExtendedMetrics> QueryMetric<T> {
             min_duration_ms: durations.min_duration()?.as_millis() as i64,
             max_duration_ms: durations.max_duration()?.as_millis() as i64,
             iterations: durations.len(),
-            median_duration: durations.median()?.as_secs_f64(),
-            percentile_99_duration: durations.percentile(99.0)?.as_secs_f64(),
-            percentile_95_duration: durations.percentile(95.0)?.as_secs_f64(),
-            percentile_90_duration: durations.percentile(90.0)?.as_secs_f64(),
+            median_duration_ms: durations.median()?.as_millis() as i64,
+            percentile_99_duration_ms: durations.percentile(99.0)?.as_millis() as i64,
+            percentile_95_duration_ms: durations.percentile(95.0)?.as_millis() as i64,
+            percentile_90_duration_ms: durations.percentile(90.0)?.as_millis() as i64,
             extended_metrics: None,
         })
     }
@@ -121,10 +121,10 @@ impl<T: ExtendedMetrics> QueryMetric<T> {
             min_duration_ms: 0,
             max_duration_ms: 0,
             iterations: 0,
-            median_duration: 0.0,
-            percentile_99_duration: 0.0,
-            percentile_95_duration: 0.0,
-            percentile_90_duration: 0.0,
+            median_duration_ms: 0,
+            percentile_99_duration_ms: 0,
+            percentile_95_duration_ms: 0,
+            percentile_90_duration_ms: 0,
             extended_metrics: None,
         }
     }
@@ -506,10 +506,13 @@ impl<T: ExtendedMetrics, R: ExtendedMetrics> QueryMetrics<T, R> {
         let min_duration_ms = extract_metric_values!(self.metrics, min_duration_ms);
         let max_duration_ms = extract_metric_values!(self.metrics, max_duration_ms);
         let iterations = extract_metric_values!(self.metrics, iterations, as_i32);
-        let median_duration = extract_metric_values!(self.metrics, median_duration);
-        let percentile_99_duration = extract_metric_values!(self.metrics, percentile_99_duration);
-        let percentile_95_duration = extract_metric_values!(self.metrics, percentile_95_duration);
-        let percentile_90_duration = extract_metric_values!(self.metrics, percentile_90_duration);
+        let median_duration_ms = extract_metric_values!(self.metrics, median_duration_ms);
+        let percentile_99_duration_ms =
+            extract_metric_values!(self.metrics, percentile_99_duration_ms);
+        let percentile_95_duration_ms =
+            extract_metric_values!(self.metrics, percentile_95_duration_ms);
+        let percentile_90_duration_ms =
+            extract_metric_values!(self.metrics, percentile_90_duration_ms);
 
         let commit_sha = vec![self.commit_sha.clone(); self.metrics.len()];
         let branch_name = vec![self.branch_name.clone(); self.metrics.len()];
@@ -552,10 +555,10 @@ impl<T: ExtendedMetrics, R: ExtendedMetrics> QueryMetrics<T, R> {
         }
 
         columns.extend(vec![
-            Arc::new(Float64Array::from(median_duration)) as ArrayRef,
-            Arc::new(Float64Array::from(percentile_99_duration)) as ArrayRef,
-            Arc::new(Float64Array::from(percentile_95_duration)) as ArrayRef,
-            Arc::new(Float64Array::from(percentile_90_duration)) as ArrayRef,
+            Arc::new(Int64Array::from(median_duration_ms)) as ArrayRef,
+            Arc::new(Int64Array::from(percentile_99_duration_ms)) as ArrayRef,
+            Arc::new(Int64Array::from(percentile_95_duration_ms)) as ArrayRef,
+            Arc::new(Int64Array::from(percentile_90_duration_ms)) as ArrayRef,
         ]);
 
         Ok(vec![RecordBatch::try_new(Self::records_schema(), columns)?])

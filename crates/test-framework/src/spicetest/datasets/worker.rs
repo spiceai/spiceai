@@ -122,6 +122,21 @@ impl SpiceTestQueryWorker {
                     for query in &self.query_set {
                         let mut current_query_count = 0;
                         let start = SystemTime::now();
+
+                        // Additional round of query run before recording results.
+                        // To discard the abnormal results caused by: establishing initial connection / spark cluster startup time
+                        if !self
+                            .run_single_query(query, &mut BTreeMap::new(), &mut BTreeMap::new())
+                            .await?
+                        {
+                            return Ok(SpiceTestQueryWorkerResult::new(
+                                query_durations,
+                                query_iteration_durations,
+                                true,
+                                row_counts,
+                            ));
+                        }
+
                         while current_query_count < target_count {
                             if self.progress_bar.is_none() && self.id == 0 {
                                 println!(
