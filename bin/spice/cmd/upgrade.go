@@ -58,7 +58,7 @@ spice upgrade
 		if os.Getenv(constants.SpiceUpgradeReloadEnv) != "true" {
 			// Run CLI upgrade
 			if !upgradeCli(force, rtcontext) {
-				// Exit if CLI upgrade fail
+				// Exit if CLI upgrade fail / completes
 				return
 			}
 		}
@@ -150,8 +150,8 @@ func cleanupOldBinaries() {
 }
 
 // Upgrade CLI
-// Returns true if the CLI was upgraded successfully / no upgrade was required
-// Returns false if the upgrade failed
+// Returns true if the CLI no upgrade was required
+// Returns false if the upgrade failed or the CLI upgrade completes
 func upgradeCli(force bool, rtcontext *context.RuntimeContext) bool {
 	slog.Info("Checking for latest Spice CLI release...")
 	release, err := github.GetLatestCliRelease()
