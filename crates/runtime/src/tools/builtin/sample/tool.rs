@@ -18,7 +18,7 @@ use crate::{
     Runtime,
 };
 use arrow::util::pretty::pretty_format_batches;
-use arrow_tools::record_batch::truncate_string_columns;
+use arrow_tools::record_batch::{truncate_numeric_column_length, truncate_string_columns};
 use async_trait::async_trait;
 use serde_json::Value;
 use snafu::ResultExt;
@@ -96,6 +96,7 @@ impl SpiceModelTool for SampleDataTool {
 
             // truncate large text fields
             batch = truncate_string_columns(&batch, 512)?;
+            batch = truncate_numeric_column_length(&batch, 8)?;
 
             let serial = pretty_format_batches(&[batch]).boxed()?;
 
