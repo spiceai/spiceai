@@ -184,17 +184,17 @@ pub fn truncate_numeric_column_length(
         .zip(schema.fields())
         .map(|(column, field)| {
             if is_numeric_list(field) {
-                let c = format_column_data(
+                let new_column = format_column_data(
                     Arc::clone(column),
                     field,
                     FormatOperation::TruncateListLength(max_elements),
                 )?;
                 let new_field = Arc::new(Field::new(
                     field.name(),
-                    c.data_type().clone(),
+                    new_column.data_type().clone(),
                     field.is_nullable(),
                 ));
-                Ok((c, new_field))
+                Ok((new_column, new_field))
             } else {
                 Ok((Arc::clone(column), Arc::clone(field)))
             }

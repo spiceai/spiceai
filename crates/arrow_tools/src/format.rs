@@ -14,13 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use arrow::array::{
-    Array, ArrayRef, FixedSizeListArray, GenericListArrayIter, ListArray, StructArray,
-};
+use arrow::array::{Array, ArrayRef, FixedSizeListArray, ListArray, StructArray};
 use arrow::buffer::OffsetBuffer;
 use arrow::compute::concat;
 use arrow_schema::{ArrowError, DataType, Field};
-use std::f32::MAX_EXP;
 use std::sync::Arc;
 
 /// Operations to apply to [`ArrayRef`] or [`RecordBatch`] data so as to prepare it for display.
@@ -81,8 +78,6 @@ pub(crate) fn format_column_data(
                 Some(_),
             ),
         ) => {
-            println!("Dasta type: {:?}", column.data_type());
-
             let array_ref = if let DataType::FixedSizeList(_, _) = column.data_type() {
                 let fixed_list_array = column
                     .as_any()
@@ -93,7 +88,7 @@ pub(crate) fn format_column_data(
                 Arc::new(truncate_fixed_size_list_array(
                     fixed_list_array,
                     num_elements,
-                )) as ArrayRef
+                )?) as ArrayRef
             } else {
                 let list_array = column
                     .as_any()
@@ -101,7 +96,7 @@ pub(crate) fn format_column_data(
                     .ok_or_else(|| {
                         ArrowError::CastError("Failed to downcast to ListArray".into())
                     })?;
-                Arc::new(truncate_list_array(list_array, num_elements)) as ArrayRef
+                Arc::new(truncate_list_array(list_array, num_elements)?) as ArrayRef
             };
             Ok(array_ref)
         }
@@ -184,36 +179,24 @@ fn trancate_str(str: Option<&str>, max_characters: usize) -> Option<&str> {
     }
 }
 
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    clippy::cast_possible_wrap
-)]
 fn truncate_fixed_size_list_array(
     list_array: &FixedSizeListArray,
     max_len: usize,
-) -> FixedSizeListArray {
+) -> Result<FixedSizeListArray, ArrowError> {
     let child_array = list_array.values();
     let original_size = list_array.value_length() as usize;
     let truncated_size = max_len.min(original_size);
-    let num_lists = list_array.len();
 
-    let mut sliced_arrays = Vec::new(); // Store Arc<Array> slices to extend lifetime
-    let mut new_values = Vec::new(); // Store &dyn Array references separately
+    let sliced_arrays: Vec<Arc<dyn Array>> = (0..list_array.len())
+        .map(|i| child_array.slice(i * original_size, truncated_size))
+        .collect();
 
-    for i in 0..num_lists {
-        let start = i * original_size;
-        let slice = child_array.slice(start, truncated_size);
-        sliced_arrays.push(slice);
-    }
-
-    // Borrow references only after all slices are created
-    new_values.extend(sliced_arrays.iter().map(AsRef::as_ref));
-
-    let new_child_array = Arc::new(concat(&new_values).expect("Failed to concatenate arrays"));
+    let new_child_array = Arc::new(concat(
+        &sliced_arrays.iter().map(AsRef::as_ref).collect::<Vec<_>>(),
+    )?);
     let nulls = new_child_array.nulls().cloned();
 
-    FixedSizeListArray::new(
+    FixedSizeListArray::try_new(
         Arc::new(Field::new(
             "item",
             child_array.data_type().clone(),
@@ -225,12 +208,7 @@ fn truncate_fixed_size_list_array(
     )
 }
 
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    clippy::cast_possible_wrap
-)]
-fn truncate_list_array(list_array: &ListArray, max_len: usize) -> ListArray {
+fn truncate_list_array(list_array: &ListArray, max_len: usize) -> Result<ListArray, ArrowError> {
     let child_array = list_array.values();
     let offsets = list_array.value_offsets();
 
@@ -249,13 +227,10 @@ fn truncate_list_array(list_array: &ListArray, max_len: usize) -> ListArray {
     // Now borrow only after all pushes are done
     new_values.extend(sliced_arrays.iter().map(AsRef::as_ref));
 
-    let Ok(child) = concat(&new_values) else {
-        panic!("Failed to concatenate arrays");
-    };
-    let new_child_array = Arc::new(child);
+    let new_child_array = Arc::new(concat(&new_values)?);
     let nulls = new_child_array.nulls().cloned();
 
-    ListArray::new(
+    ListArray::try_new(
         Arc::new(Field::new_list(
             "item",
             Field::new(
