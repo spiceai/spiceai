@@ -799,7 +799,7 @@ impl DataFusion {
             refresh = refresh.append_overlap(append_overlap);
         }
 
-        // we must not fetch data longer than explicitly set refresh data window or retention period
+        // we must not fetch data older than the explicitly set refresh data window or retention period
         let refresh_data_window = dataset.refresh_data_window().or(dataset.retention_period());
 
         if let Some(refresh_data_window) = refresh_data_window {
