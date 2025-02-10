@@ -128,7 +128,7 @@ serde_json = "1"
 serde_yaml = "0.9.30"
 snafu = "0.8.5"
 snowflake-api = { git = "https://github.com/spiceai/snowflake-rs.git", rev = "f95bd4715b9b9e3eaa425d7a775b49e1dcbb1212" }
-ssh2 = { version = "0.9.4" }
+ssh2 = { version = "0.9.5" }
 suppaftp = { version = "5.3.1", features = ["async"] }
 tempfile = "3"
 tiberius = { version = "0.12.3", default-features = false, features = [
