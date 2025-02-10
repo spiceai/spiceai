@@ -160,7 +160,7 @@ pub fn truncate_string_columns(
             format_column_data(
                 Arc::clone(column),
                 field,
-                FormatOperation::TruncateUtf8Length(max_characters, true),
+                FormatOperation::TruncateUtf8Length(max_characters),
             )
         })
         .collect::<Result<Vec<_>, _>>()?;

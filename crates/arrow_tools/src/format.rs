@@ -24,8 +24,9 @@ use std::sync::Arc;
 ///
 /// Note: Operations do not preserve all original data, and as such, should be used for human display purposes only.
 pub enum FormatOperation {
-    /// Truncate strings to be no larger than a given length. If `bool=true`, then Utf8 elements within lists and structs will be truncated.
-    TruncateUtf8Length(usize, bool),
+    /// Truncate strings to be no larger than a given length. This includesnested strings (i.e.
+    /// UTF8 elements within lists and structs).
+    TruncateUtf8Length(usize),
 
     /// Truncate lists to contain no more than a given number of elements.
     TruncateListLength(usize),
@@ -38,7 +39,7 @@ pub(crate) fn format_column_data(
     operation: FormatOperation,
 ) -> Result<ArrayRef, ArrowError> {
     match (operation, get_possible_nested_list_datatype(field)) {
-        (FormatOperation::TruncateUtf8Length(max_characters, _), (DataType::Utf8View, _)) => {
+        (FormatOperation::TruncateUtf8Length(max_characters), (DataType::Utf8View, _)) => {
             let string_array = column
                 .as_any()
                 .downcast_ref::<arrow::array::StringViewArray>()
@@ -53,7 +54,7 @@ pub(crate) fn format_column_data(
 
             Ok(Arc::new(truncated) as ArrayRef)
         }
-        (FormatOperation::TruncateUtf8Length(max_characters, _), (DataType::Utf8, _)) => {
+        (FormatOperation::TruncateUtf8Length(max_characters), (DataType::Utf8, _)) => {
             let string_array = column
                 .as_any()
                 .downcast_ref::<arrow::array::StringArray>()
@@ -100,7 +101,7 @@ pub(crate) fn format_column_data(
             };
             Ok(array_ref)
         }
-        (FormatOperation::TruncateUtf8Length(max_characters, true), (DataType::List(field), _)) => {
+        (FormatOperation::TruncateUtf8Length(max_characters), (DataType::List(field), _)) => {
             let list_array = column
                 .as_any()
                 .downcast_ref::<arrow::array::ListArray>()
@@ -109,7 +110,7 @@ pub(crate) fn format_column_data(
             let truncated_values = format_column_data(
                 Arc::clone(list_array.values()),
                 &field,
-                FormatOperation::TruncateUtf8Length(max_characters, true),
+                FormatOperation::TruncateUtf8Length(max_characters),
             )?;
 
             let list = ListArray::new(
@@ -123,10 +124,7 @@ pub(crate) fn format_column_data(
 
             Ok(Arc::new(list) as ArrayRef)
         }
-        (
-            FormatOperation::TruncateUtf8Length(max_characters, true),
-            (DataType::Struct(fields), _),
-        ) => {
+        (FormatOperation::TruncateUtf8Length(max_characters), (DataType::Struct(fields), _)) => {
             let struct_array = column
                 .as_any()
                 .downcast_ref::<StructArray>()
@@ -140,7 +138,7 @@ pub(crate) fn format_column_data(
                     format_column_data(
                         Arc::clone(field_data),
                         field,
-                        FormatOperation::TruncateUtf8Length(max_characters, true),
+                        FormatOperation::TruncateUtf8Length(max_characters),
                     )
                 })
                 .collect::<Result<Vec<_>, _>>()?;
