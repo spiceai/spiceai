@@ -10,8 +10,13 @@ on:
           type: choice
           options:
             - "all"
+            - "gpt-4o"
             - "gpt-4o-mini"
+            - "o1"
+            - "o3_mini"
             - "llama3-3B-Instruct"
+            - "claude-3-5-sonnet"
+            - "grok2"
           default: "all"
 
 concurrency:
@@ -93,13 +98,38 @@ jobs:
           script: |
             const matrix = [
               {
+                name: "gpt-4o",
+                spicepod: "./test/nsql_bench/spicepod_gpt-4o.yaml",
+                data: "./test/nsql_bench/data"
+              },
+              {
                 name: "gpt-4o-mini",
-                spicepod: "./test/nsql_bench/spicepod.yaml",
+                spicepod: "./test/nsql_bench/spicepod_gpt-4o-mini.yaml",
+                data: "./test/nsql_bench/data"
+              },
+              {
+                name: "o1",
+                spicepod: "./test/nsql_bench/spicepod_o1.yaml",
+                data: "./test/nsql_bench/data"
+              },
+              {
+                name: "o3_mini",
+                spicepod: "./test/nsql_bench/spicepod_o3_mini.yaml",
                 data: "./test/nsql_bench/data"
               },
               {
                 name: "llama3-3B-Instruct",
-                spicepod: "./test/nsql_bench/spicepod_hf.yaml",
+                spicepod: "./test/nsql_bench/spicepod_llama3-3b.yaml",
+                data: "./test/nsql_bench/data"
+              },
+              {
+                name: "claude-3-5-sonnet",
+                spicepod: "./test/nsql_bench/spicepod_claude-3-5-sonnet.yaml",
+                data: "./test/nsql_bench/data"
+              },
+              {
+                name: "grok2",
+                spicepod: "./test/nsql_bench/spicepod_grok2.yaml",
                 data: "./test/nsql_bench/data"
               },
             ];
@@ -146,6 +176,8 @@ jobs:
         env:
           SPICE_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
           SPICE_HF_TOKEN: ${{ secrets.SPICE_SECRET_HF_TOKEN }}
+          SPICE_ANTHROPIC_API_KEY: ${{ secrets.SPICE_SECRET_ANTHROPIC_API_KEY }}
+          SPICE_XAI_API_KEY: ${{ secrets.SPICE_SECRET_XAI_API_KEY }}
         run: |
           ./testoperator run evals \
             -s $GITHUB_WORKSPACE/spiced \
