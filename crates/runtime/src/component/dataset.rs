@@ -122,28 +122,37 @@ impl std::fmt::Display for TimeFormat {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub enum InvalidTypeAction {
+pub enum UnsupportedTypeAction {
     Error,
     Warn,
     Ignore,
+    String,
 }
 
-impl From<spicepod_dataset::InvalidTypeAction> for InvalidTypeAction {
-    fn from(action: spicepod_dataset::InvalidTypeAction) -> Self {
+impl From<spicepod_dataset::UnsupportedTypeAction> for UnsupportedTypeAction {
+    fn from(action: spicepod_dataset::UnsupportedTypeAction) -> Self {
         match action {
-            spicepod_dataset::InvalidTypeAction::Error => InvalidTypeAction::Error,
-            spicepod_dataset::InvalidTypeAction::Warn => InvalidTypeAction::Warn,
-            spicepod_dataset::InvalidTypeAction::Ignore => InvalidTypeAction::Ignore,
+            spicepod_dataset::UnsupportedTypeAction::Error => UnsupportedTypeAction::Error,
+            spicepod_dataset::UnsupportedTypeAction::Warn => UnsupportedTypeAction::Warn,
+            spicepod_dataset::UnsupportedTypeAction::Ignore => UnsupportedTypeAction::Ignore,
+            spicepod_dataset::UnsupportedTypeAction::String => UnsupportedTypeAction::String,
         }
     }
 }
 
-impl From<InvalidTypeAction> for datafusion_table_providers::InvalidTypeAction {
-    fn from(action: InvalidTypeAction) -> Self {
+impl From<UnsupportedTypeAction> for datafusion_table_providers::UnsupportedTypeAction {
+    fn from(action: UnsupportedTypeAction) -> Self {
         match action {
-            InvalidTypeAction::Error => datafusion_table_providers::InvalidTypeAction::Error,
-            InvalidTypeAction::Warn => datafusion_table_providers::InvalidTypeAction::Warn,
-            InvalidTypeAction::Ignore => datafusion_table_providers::InvalidTypeAction::Ignore,
+            UnsupportedTypeAction::Error => {
+                datafusion_table_providers::UnsupportedTypeAction::Error
+            }
+            UnsupportedTypeAction::Warn => datafusion_table_providers::UnsupportedTypeAction::Warn,
+            UnsupportedTypeAction::Ignore => {
+                datafusion_table_providers::UnsupportedTypeAction::Ignore
+            }
+            UnsupportedTypeAction::String => {
+                datafusion_table_providers::UnsupportedTypeAction::String
+            }
         }
     }
 }
@@ -192,7 +201,7 @@ pub struct Dataset {
     pub embeddings: Vec<ColumnEmbeddingConfig>,
     pub app: Option<Arc<App>>,
     schema: Option<SchemaRef>,
-    pub invalid_type_action: Option<InvalidTypeAction>,
+    pub unsupported_type_action: Option<UnsupportedTypeAction>,
     pub ready_state: ReadyState,
 }
 
@@ -266,7 +275,9 @@ impl TryFrom<spicepod_dataset::Dataset> for Dataset {
             acceleration,
             schema: None,
             app: None,
-            invalid_type_action: dataset.invalid_type_action.map(InvalidTypeAction::from),
+            unsupported_type_action: dataset
+                .unsupported_type_action
+                .map(UnsupportedTypeAction::from),
             ready_state,
         })
     }
@@ -289,7 +300,7 @@ impl Dataset {
             embeddings: Vec::default(),
             schema: None,
             app: None,
-            invalid_type_action: None,
+            unsupported_type_action: None,
             ready_state: ReadyState::default(),
         })
     }
