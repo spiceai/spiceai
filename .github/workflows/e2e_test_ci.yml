@@ -287,7 +287,7 @@ jobs:
       - name: Spice dataset configure
         working-directory: test_app
         run: |
-          echo -e "eth_recent_blocks\neth recent logs\nspice.ai/eth.recent_blocks\ny" | spice dataset configure
+          echo -e "taxi_trips\nnew york taxi trips\nspice.ai/spiceai/quickstart/datasets/taxi_trips\ny" | spice dataset configure
           cat spicepod.yaml
 
       - name: Start spice runtime
@@ -309,7 +309,7 @@ jobs:
       - name: Verify dataset
         uses: ./.github/actions/verify-dataset
         with:
-          name: eth_recent_blocks
+          name: taxi_trips
 
       - name: Stop spice and check logs
         working-directory: test_app

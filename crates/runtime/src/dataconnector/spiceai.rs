@@ -123,7 +123,7 @@ impl Dialect for SpiceCloudPlatformDialect {
     }
 
     fn interval_style(&self) -> IntervalStyle {
-        IntervalStyle::SQLStandard
+        IntervalStyle::PostgresVerbose
     }
 
     fn identifier_quote_style(&self, identifier: &str) -> Option<char> {

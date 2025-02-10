@@ -22,7 +22,7 @@ use datafusion::sql::TableReference;
 use datafusion_table_providers::duckdb::DuckDBTableFactory;
 use datafusion_table_providers::sql::db_connection_pool::dbconnection::duckdbconn::is_table_function;
 use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
-use datafusion_table_providers::InvalidTypeAction;
+use datafusion_table_providers::UnsupportedTypeAction;
 use duckdb::AccessMode;
 use snafu::prelude::*;
 use std::any::Any;
@@ -58,10 +58,10 @@ impl DuckDB {
                     connector_component: params.component.clone(),
                     source,
                 })?
-                .with_invalid_type_action(
+                .with_unsupported_type_action(
                     params
-                        .invalid_type_action
-                        .unwrap_or(InvalidTypeAction::Error),
+                        .unsupported_type_action
+                        .unwrap_or(UnsupportedTypeAction::Error),
                 ),
         );
 
@@ -79,10 +79,10 @@ impl DuckDB {
                     connector_component: params.component.clone(),
                     source,
                 })?
-                .with_invalid_type_action(
+                .with_unsupported_type_action(
                     params
-                        .invalid_type_action
-                        .unwrap_or(InvalidTypeAction::Error),
+                        .unsupported_type_action
+                        .unwrap_or(UnsupportedTypeAction::Error),
                 ),
         );
 
@@ -128,7 +128,7 @@ impl DataConnectorFactory for DuckDBFactory {
         })
     }
 
-    fn supports_invalid_type_action(&self) -> bool {
+    fn supports_unsupported_type_action(&self) -> bool {
         true
     }
 

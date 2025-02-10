@@ -58,7 +58,7 @@ spice upgrade
 		if os.Getenv(constants.SpiceUpgradeReloadEnv) != "true" {
 			// Run CLI upgrade
 			if !upgradeCli(force, rtcontext) {
-				// Exit if CLI upgrade fail
+				// Exit if CLI upgrade fail / completes
 				return
 			}
 		}
@@ -68,6 +68,13 @@ spice upgrade
 			cleanupOldBinaries()
 		}
 
+		slog.Info("Checking for the latest Spice Runtime release...")
+		currentVersion, err := rtcontext.Version()
+		if err != nil {
+			slog.Info("Spice runtime is not installed and won't be upgraded. Run `spice install` to install the runtime.")
+			return
+		}
+
 		runtimeUpgradeRequired, err := rtcontext.IsRuntimeUpgradeAvailable()
 		if err != nil {
 			slog.Error("checking for runtime upgrade", "error", err)
@@ -75,7 +82,7 @@ spice upgrade
 		}
 
 		if runtimeUpgradeRequired == "" {
-			// Exit if no runtime upgrade is required
+			slog.Info(fmt.Sprintf("Using version %s. No upgrade required.", currentVersion))
 			return
 		}
 
@@ -143,8 +150,8 @@ func cleanupOldBinaries() {
 }
 
 // Upgrade CLI
-// Returns true if the CLI was upgraded successfully / no upgrade was required
-// Returns false if the upgrade failed
+// Returns true if the CLI no upgrade was required
+// Returns false if the upgrade failed or the CLI upgrade completes
 func upgradeCli(force bool, rtcontext *context.RuntimeContext) bool {
 	slog.Info("Checking for latest Spice CLI release...")
 	release, err := github.GetLatestCliRelease()
@@ -232,7 +239,9 @@ func upgradeCli(force bool, rtcontext *context.RuntimeContext) bool {
 		slog.Error("restarting CLI", "error", err)
 	}
 
-	return true
+	// For unix, this is unreachable
+	// For windows, the CLI will be restarted with the new binary, return false to terminate old CLI
+	return false
 }
 
 func restartWithNewCli(cliPath string, args []string) error {

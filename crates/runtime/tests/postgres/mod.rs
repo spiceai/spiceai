@@ -22,7 +22,8 @@ use arrow::{
 };
 use datafusion::execution::context::SessionContext;
 use datafusion_table_providers::{
-    postgres::DynPostgresConnectionPool, sql::sql_provider_datafusion::SqlTable, InvalidTypeAction,
+    postgres::DynPostgresConnectionPool, sql::sql_provider_datafusion::SqlTable,
+    UnsupportedTypeAction,
 };
 
 use crate::{init_tracing, utils::test_request_context};
@@ -187,7 +188,7 @@ CREATE TABLE test (
 }
 
 #[tokio::test]
-async fn test_postgres_invalid_type_action() -> Result<(), anyhow::Error> {
+async fn test_postgres_unsupported_type_action() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
     test_request_context()
@@ -197,7 +198,8 @@ async fn test_postgres_invalid_type_action() -> Result<(), anyhow::Error> {
 
             let ctx = SessionContext::new();
             let pool =
-                common::get_postgres_connection_pool(port, Some(InvalidTypeAction::Warn)).await?;
+                common::get_postgres_connection_pool(port, Some(UnsupportedTypeAction::Warn))
+                    .await?;
             let db_conn = pool
                 .connect_direct()
                 .await

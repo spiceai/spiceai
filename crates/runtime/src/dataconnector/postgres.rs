@@ -88,8 +88,8 @@ impl DataConnectorFactory for PostgresFactory {
         Box::pin(async move {
             match PostgresConnectionPool::new(params.parameters.to_secret_map()).await {
                 Ok(mut pool) => {
-                    if let Some(invalid_type_action) = params.invalid_type_action {
-                        pool = pool.with_invalid_type_action(invalid_type_action);
+                    if let Some(unsupported_type_action) = params.unsupported_type_action {
+                        pool = pool.with_unsupported_type_action(unsupported_type_action);
                     }
 
                     let postgres_factory = PostgresTableFactory::new(Arc::new(pool));
@@ -127,7 +127,7 @@ impl DataConnectorFactory for PostgresFactory {
         })
     }
 
-    fn supports_invalid_type_action(&self) -> bool {
+    fn supports_unsupported_type_action(&self) -> bool {
         true
     }
 
