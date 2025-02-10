@@ -179,6 +179,11 @@ fn trancate_str(str: Option<&str>, max_characters: usize) -> Option<&str> {
     }
 }
 
+#[allow(
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap
+)]
 fn truncate_fixed_size_list_array(
     list_array: &FixedSizeListArray,
     max_len: usize,
@@ -208,26 +213,33 @@ fn truncate_fixed_size_list_array(
     )
 }
 
+#[allow(
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap
+)]
 fn truncate_list_array(list_array: &ListArray, max_len: usize) -> Result<ListArray, ArrowError> {
     let child_array = list_array.values();
     let offsets = list_array.value_offsets();
 
-    let mut new_lengths = Vec::new();
-    let mut sliced_arrays = Vec::new(); // Store Arc<Array> so slices live long enough
-    let mut new_values = Vec::new(); // Store &dyn Array references separately
+    let new_lengths: Vec<usize> = (0..list_array.len())
+        .map(|i| {
+            let start = offsets[i] as usize;
+            let end = offsets[i + 1] as usize;
+            max_len.min(end - start)
+        })
+        .collect();
 
-    for i in 0..list_array.len() {
-        let start = offsets[i] as usize;
-        let end = offsets[i + 1] as usize;
-        let truncated_len = max_len.min(end - start);
-        new_lengths[i] = truncated_len;
-        sliced_arrays.push(child_array.slice(start, truncated_len)); // Push first
-    }
+    let sliced_arrays: Vec<Arc<dyn Array>> = new_lengths
+        .iter()
+        .enumerate()
+        .map(|(i, &len)| child_array.slice(offsets[i] as usize, len))
+        .collect();
 
-    // Now borrow only after all pushes are done
-    new_values.extend(sliced_arrays.iter().map(AsRef::as_ref));
+    let new_child_array = Arc::new(concat(
+        &sliced_arrays.iter().map(AsRef::as_ref).collect::<Vec<_>>(),
+    )?);
 
-    let new_child_array = Arc::new(concat(&new_values)?);
     let nulls = new_child_array.nulls().cloned();
 
     ListArray::try_new(
