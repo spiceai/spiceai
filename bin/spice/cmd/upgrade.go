@@ -68,7 +68,7 @@ spice upgrade
 			cleanupOldBinaries()
 		}
 
-		slog.Info("Checking for latest Spice Runtime release...")
+		slog.Info("Checking for the latest Spice Runtime release...")
 		currentVersion, err := rtcontext.Version()
 		if err != nil {
 			slog.Info("Spice runtime is not installed and won't be upgraded. Run `spice install` to install the runtime.")
