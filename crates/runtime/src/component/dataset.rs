@@ -39,10 +39,18 @@ use super::{find_first_delimiter, validate_identifier};
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "Column for index {index} not found in schema. Valid columns: {valid_columns}"
+        "Column for index '{index}' was not found in the schema.\nValid columns: {valid_columns}.\nVerify configuration and try again.\nFor details, visit https://spiceai.org/docs/features/data-acceleration/indexes"
     ))]
     IndexColumnNotFound {
         index: String,
+        valid_columns: String,
+    },
+
+    #[snafu(display(
+        "Primary key column '{invalid_column}' was not found in the schema.\nValid columns: {valid_columns}.\nVerify configuration and try again.\nFor details, visit https://spiceai.org/docs/features/data-acceleration/constraints"
+    ))]
+    PrimaryKeyColumnNotFound {
+        invalid_column: String,
         valid_columns: String,
     },
 

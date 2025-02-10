@@ -339,6 +339,13 @@ pub async fn create_accelerator_table(
         .fail()?;
     };
 
+    if let Err(e) = acceleration_settings.validate_primary_key(&schema) {
+        InvalidConfigurationSnafu {
+            msg: format!("{e}"),
+        }
+        .fail()?;
+    };
+
     let cloned_secrets = Arc::clone(&secrets);
     let secret_guard = cloned_secrets.read().await;
     let mut params_with_secrets: HashMap<String, SecretString> = HashMap::new();
