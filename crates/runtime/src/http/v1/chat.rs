@@ -157,7 +157,7 @@ pub(crate) async fn post(
                     }
                 }
             }
-            None => StatusCode::NOT_FOUND.into_response(),
+            None => (StatusCode::NOT_FOUND, format!("model '{model_id}' not found")).into_response(),
         }
     }
     .instrument(span)
