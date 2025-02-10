@@ -12,7 +12,7 @@ on:
   workflow_dispatch:
     inputs:
       run:
-        description: 'Which groups of models to run'
+        description: "Which groups of models to run"
         required: true
         default: all
         type: choice
@@ -43,7 +43,7 @@ jobs:
                 name: 'self-hosted',
                 needs_env: false,
                 runner: 'macOS',
-                model_allowlist: 'anthropic,openai,xai'
+                model_allowlist: 'anthropic,openai,xai,perplexity'
               },
               {
                 name: 'hosted',
@@ -112,6 +112,7 @@ jobs:
           SPICE_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
           SPICE_ANTHROPIC_API_KEY: ${{ secrets.SPICE_SECRET_ANTHROPIC_API_KEY }}
           SPICE_XAI_API_KEY: ${{ secrets.SPICE_SECRET_XAI_API_KEY }}
+          SPICE_PERPLEXITY_AUTH_TOKEN: ${{ secrets.SPICE_SECRET_PERPLEXITY_AUTH_TOKEN }}
         run: |
           if [ "${{ matrix.target.needs_env }}" == "true" ]; then
             if [ -z "$SPICE_OPENAI_API_KEY" ]; then

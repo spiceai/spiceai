@@ -82,7 +82,7 @@ pub(crate) fn create_hf(model_id: &str) -> Result<Arc<Box<dyn Chat>>, ChatError>
 
 pub(crate) fn create_perplexity() -> Result<Arc<Box<dyn Chat>>, ChatError> {
     let mut params: HashMap<String, SecretString> = HashMap::new();
-    if let Ok(api_key) = std::env::var("HF_TOKEN") {
+    if let Ok(api_key) = std::env::var("SPICE_PERPLEXITY_AUTH_TOKEN") {
         params.insert(
             "perplexity_auth_token".to_string(),
             SecretString::new(api_key),
