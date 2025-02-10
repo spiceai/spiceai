@@ -17,7 +17,7 @@ datasets:
       reference_url_template: https://github.com/spiceai/spiceai/issues/<issue_id>
     params:
       github_token: ${secrets:GITHUB_TOKEN}
-      github_query_mode: "search"
+      github_query_mode: 'search'
     acceleration:
       enabled: true
       refresh_retry_max_attempts: 3
