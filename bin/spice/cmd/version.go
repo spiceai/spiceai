@@ -110,7 +110,11 @@ func checkLatestCliReleaseVersion() error {
 	cliIsPreRelease := strings.HasPrefix(cliVersion, "local") || strings.Contains(cliVersion, "build")
 
 	if !cliIsPreRelease && semver.Compare(cliVersion, latestReleaseVersion) < 0 {
-		slog.Info(fmt.Sprintf("\nCLI version %s is now available!\nTo upgrade, run \"spice upgrade\".\n", aurora.BrightGreen(latestReleaseVersion)))
+		if rtcontext.IsDownloadedFromHomebrew() {
+			slog.Info(fmt.Sprintf("\nCLI version %s is now available!\nTo upgrade, run \"brew upgrade spiceai/spiceai/spice\".\n", aurora.BrightGreen(latestReleaseVersion)))
+		} else {
+			slog.Info(fmt.Sprintf("\nCLI version %s is now available!\nTo upgrade, run \"spice upgrade\".\n", aurora.BrightGreen(latestReleaseVersion)))
+		}
 	}
 
 	return nil

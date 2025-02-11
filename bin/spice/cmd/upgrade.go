@@ -55,6 +55,11 @@ spice upgrade
 			os.Exit(1)
 		}
 
+		if rtcontext.IsDownloadedFromHomebrew() {
+			slog.Info("Spice is downloaded from Homebrew. Run `brew upgrade spiceai/spiceai/spice` to upgrade the CLI.")
+			return
+		}
+
 		if os.Getenv(constants.SpiceUpgradeReloadEnv) != "true" {
 			// Run CLI upgrade
 			if !upgradeCli(force, rtcontext) {

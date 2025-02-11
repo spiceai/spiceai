@@ -394,6 +394,19 @@ func (c *RuntimeContext) SetHttpEndpoint(endpoint string) {
 	c.httpEndpoint = endpoint
 }
 
+func (c *RuntimeContext) IsDownloadedFromHomebrew() bool {
+	executableDir, err := os.Executable()
+	if err != nil {
+		slog.Error("getting path", "error", err)
+		return false
+	}
+
+	spiceBinDir := filepath.Join(c.SpiceRuntimeDir(), "bin")
+	releaseFilePath := filepath.Join(spiceBinDir, constants.SpiceCliFilename)
+
+	return executableDir != releaseFilePath
+}
+
 func loadDotEnvValues() (map[string]string, error) {
 	env_file := ".env"
 	if _, err := os.Stat(".env.local"); err == nil {
