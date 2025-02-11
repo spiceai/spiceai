@@ -76,6 +76,7 @@ type TaskHistory struct {
 	Labels              map[string]string    `json:"labels"`
 }
 
+// TimeWithMilliSeconds is a custom time type that can be unmarshalled from a JSON string with millisecond precision.
 type TimeWithMilliSeconds time.Time
 
 func (tMs *TimeWithMilliSeconds) UnmarshalJSON(b []byte) error {

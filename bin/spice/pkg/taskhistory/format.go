@@ -18,23 +18,24 @@ package taskhistory
 
 import (
 	"fmt"
-	"strconv"
-	"strings"
 )
 
+// Represents a table row to display a `TaskHistory` with an additional column to display the
+// tree structure of the trace.
 type TaskHistoryRow struct {
-	/// The tree structure (i.e. with indentations, etc) for the `TaskHistory` row.
+	// The tree structure (i.e. with indentations, etc) for the `TaskHistory` row.
 	Tree string
 	Task TaskHistory
 }
 
+// Constructs an ordered list of `TaskHistoryRow` from a trace of `TaskHistory`s.
 // Expects all `traces` to be from the same trace (i.e. same `TraceId`).
 func TreeRowsFromTraces(traces []TaskHistory) []TaskHistoryRow {
 	tree := buildTraceTree(traces)
 	c := make(chan TaskHistoryRow)
 	go func() {
 		defer close(c)
-		printTree(c, tree, "", true)
+		recurseThroughTree(c, tree, "", true)
 	}()
 
 	rows := make([]TaskHistoryRow, 0)
@@ -45,33 +46,8 @@ func TreeRowsFromTraces(traces []TaskHistory) []TaskHistoryRow {
 	return rows
 }
 
-func ConvertLabelsToString(labels map[string]string) string {
-	var sb strings.Builder
-	sb.WriteString("{")
-
-	i := 0
-	for key, value := range labels {
-		if i > 0 {
-			sb.WriteString(", ")
-		}
-
-		switch {
-		case isBool(value):
-			sb.WriteString(fmt.Sprintf("%s: %t", key, mustParseBool(value)))
-		case isInt(value):
-			sb.WriteString(fmt.Sprintf("%s: %d", key, mustParseInt(value)))
-		default:
-			sb.WriteString(fmt.Sprintf("%s: %s", key, value))
-		}
-		i++
-	}
-
-	sb.WriteString("}")
-	return sb.String()
-}
-
-// printTree prints the tree in ASCII format.
-func printTree(c chan TaskHistoryRow, node *TreeNode, indent string, isLast bool) {
+// Recurse through the tree and construct the formatted tree column. Push each row to the channel.
+func recurseThroughTree(c chan TaskHistoryRow, node *TreeNode, indent string, isLast bool) {
 	if node == nil {
 		return
 	}
@@ -92,26 +68,6 @@ func printTree(c chan TaskHistoryRow, node *TreeNode, indent string, isLast bool
 	}
 
 	for i, child := range node.Children {
-		printTree(c, child, newIndent, i == len(node.Children)-1)
+		recurseThroughTree(c, child, newIndent, i == len(node.Children)-1)
 	}
-}
-
-func isBool(s string) bool {
-	_, err := strconv.ParseBool(s)
-	return err == nil
-}
-
-func mustParseBool(s string) bool {
-	b, _ := strconv.ParseBool(s)
-	return b
-}
-
-func isInt(s string) bool {
-	_, err := strconv.Atoi(s)
-	return err == nil
-}
-
-func mustParseInt(s string) int {
-	n, _ := strconv.Atoi(s)
-	return n
 }

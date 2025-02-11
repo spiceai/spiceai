@@ -106,15 +106,19 @@ $ spice trace ai_chat --id chatcmpl-At6ZmDE8iAYRPeuQLA0FLlWxGKNnM
 	},
 }
 
+// Reduce the `taskhistory.TaskHistory` to only the columns that are needed for the table. This includes the
+// `treePrefix` as the first column.
+//
+// Must use a struct because `util.WriteTable` uses `reflect` functions that require a struct.
+// Must use separate structs for each combination of input/output. Otherwise table will have columns with all `nil`s. A
+// `json:"fieldName,omitempty"` tag does not work.
 func ToRowInterface(treePrefix string, t *taskhistory.TaskHistory, includeInput bool, includeOutput bool) interface{} {
-
 	type TaskRowBase struct {
 		Tree     string `json:"tree"`
 		Status   string `json:"status"`
 		Duration string `json:"duration"`
 		Task     string `json:"task"`
 	}
-	// Need additional struct for each combination of input/output. Otherwise table will have empty columns.
 	type TaskRowFull struct {
 		TaskRowBase
 		Input  interface{} `json:"input"`
@@ -138,7 +142,7 @@ func ToRowInterface(treePrefix string, t *taskhistory.TaskHistory, includeInput 
 	if t.ErrorMessage == nil || *t.ErrorMessage == "" {
 		base.Status = "✅"
 	} else {
-		base.Status = "❌"
+		base.Status = "🚫"
 	}
 
 	if includeInput && includeOutput {
