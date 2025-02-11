@@ -328,19 +328,37 @@ name = "arrow"
 version = "53.4.0"
 source = "git+https://github.com/spiceai/arrow-rs.git?rev=5feaa5f724d32c09e30394cedb7799de670e43e1#5feaa5f724d32c09e30394cedb7799de670e43e1"
 dependencies = [
- "arrow-arith",
- "arrow-array",
- "arrow-buffer",
- "arrow-cast",
+ "arrow-arith 53.4.0",
+ "arrow-array 53.4.0",
+ "arrow-buffer 53.4.0",
+ "arrow-cast 53.4.0",
  "arrow-csv",
- "arrow-data",
+ "arrow-data 53.4.0",
  "arrow-ipc",
  "arrow-json",
- "arrow-ord",
- "arrow-row",
- "arrow-schema",
- "arrow-select",
- "arrow-string",
+ "arrow-ord 53.4.0",
+ "arrow-row 53.4.0",
+ "arrow-schema 53.4.0",
+ "arrow-select 53.4.0",
+ "arrow-string 53.4.0",
+]
+
+[[package]]
+name = "arrow"
+version = "54.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6422e12ac345a0678d7a17e316238e3a40547ae7f92052b77bd86d5e0239f3fc"
+dependencies = [
+ "arrow-arith 54.1.0",
+ "arrow-array 54.1.0",
+ "arrow-buffer 54.1.0",
+ "arrow-cast 54.1.0",
+ "arrow-data 54.1.0",
+ "arrow-ord 54.1.0",
+ "arrow-row 54.1.0",
+ "arrow-schema 54.1.0",
+ "arrow-select 54.1.0",
+ "arrow-string 54.1.0",
 ]
 
 [[package]]
@@ -349,12 +367,26 @@ version = "53.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "31dce77d2985522288edae7206bffd5fc4996491841dda01a13a58415867e681"
 dependencies = [
- "arrow-array",
- "arrow-buffer",
- "arrow-data",
- "arrow-schema",
+ "arrow-array 53.4.0",
+ "arrow-buffer 53.4.0",
+ "arrow-data 53.4.0",
+ "arrow-schema 53.4.0",
  "chrono",
  "half",
+ "num",
+]
+
+[[package]]
+name = "arrow-arith"
+version = "54.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "23cf34bb1f48c41d3475927bcc7be498665b8e80b379b88f62a840337f8b8248"
+dependencies = [
+ "arrow-array 54.1.0",
+ "arrow-buffer 54.1.0",
+ "arrow-data 54.1.0",
+ "arrow-schema 54.1.0",
+ "chrono",
  "num",
 ]
 
@@ -365,11 +397,27 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2d45fe6d3faed0435b7313e59a02583b14c6c6339fa7729e94c32a20af319a79"
 dependencies = [
  "ahash 0.8.11",
- "arrow-buffer",
- "arrow-data",
- "arrow-schema",
+ "arrow-buffer 53.4.0",
+ "arrow-data 53.4.0",
+ "arrow-schema 53.4.0",
  "chrono",
  "chrono-tz 0.10.1",
+ "half",
+ "hashbrown 0.15.2",
+ "num",
+]
+
+[[package]]
+name = "arrow-array"
+version = "54.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fb4a06d507f54b70a277be22a127c8ffe0cec6cd98c0ad8a48e77779bbda8223"
+dependencies = [
+ "ahash 0.8.11",
+ "arrow-buffer 54.1.0",
+ "arrow-data 54.1.0",
+ "arrow-schema 54.1.0",
+ "chrono",
  "half",
  "hashbrown 0.15.2",
  "num",
@@ -387,15 +435,47 @@ dependencies = [
 ]
 
 [[package]]
+name = "arrow-buffer"
+version = "54.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d69d326d5ad1cb82dcefa9ede3fee8fdca98f9982756b16f9cb142f4aa6edc89"
+dependencies = [
+ "bytes",
+ "half",
+ "num",
+]
+
+[[package]]
 name = "arrow-cast"
 version = "53.4.0"
 source = "git+https://github.com/spiceai/arrow-rs.git?rev=5feaa5f724d32c09e30394cedb7799de670e43e1#5feaa5f724d32c09e30394cedb7799de670e43e1"
 dependencies = [
- "arrow-array",
- "arrow-buffer",
- "arrow-data",
- "arrow-schema",
- "arrow-select",
+ "arrow-array 53.4.0",
+ "arrow-buffer 53.4.0",
+ "arrow-data 53.4.0",
+ "arrow-schema 53.4.0",
+ "arrow-select 53.4.0",
+ "atoi",
+ "base64 0.22.1",
+ "chrono",
+ "comfy-table",
+ "half",
+ "lexical-core",
+ "num",
+ "ryu",
+]
+
+[[package]]
+name = "arrow-cast"
+version = "54.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "626e65bd42636a84a238bed49d09c8777e3d825bf81f5087a70111c2831d9870"
+dependencies = [
+ "arrow-array 54.1.0",
+ "arrow-buffer 54.1.0",
+ "arrow-data 54.1.0",
+ "arrow-schema 54.1.0",
+ "arrow-select 54.1.0",
  "atoi",
  "base64 0.22.1",
  "chrono",
@@ -412,11 +492,11 @@ version = "53.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ec222848d70fea5a32af9c3602b08f5d740d5e2d33fbd76bf6fd88759b5b13a7"
 dependencies = [
- "arrow-array",
- "arrow-buffer",
- "arrow-cast",
- "arrow-data",
- "arrow-schema",
+ "arrow-array 53.4.0",
+ "arrow-buffer 53.4.0",
+ "arrow-cast 53.4.0",
+ "arrow-data 53.4.0",
+ "arrow-schema 53.4.0",
  "chrono",
  "csv",
  "csv-core",
@@ -431,8 +511,20 @@ version = "53.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b7f2861ffa86f107b8ab577d86cff7c7a490243eabe961ba1e1af4f27542bb79"
 dependencies = [
- "arrow-buffer",
- "arrow-schema",
+ "arrow-buffer 53.4.0",
+ "arrow-schema 53.4.0",
+ "half",
+ "num",
+]
+
+[[package]]
+name = "arrow-data"
+version = "54.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1858e7c7d01c44cf71c21a85534fd1a54501e8d60d1195d0d6fbcc00f4b10754"
+dependencies = [
+ "arrow-buffer 54.1.0",
+ "arrow-schema 54.1.0",
  "half",
  "num",
 ]
@@ -443,17 +535,17 @@ version = "53.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3ab7635558f3f803b492eae56c03cde97ea5f85a1c768f94181cb7db69cd81be"
 dependencies = [
- "arrow-arith",
- "arrow-array",
- "arrow-buffer",
- "arrow-cast",
- "arrow-data",
+ "arrow-arith 53.4.0",
+ "arrow-array 53.4.0",
+ "arrow-buffer 53.4.0",
+ "arrow-cast 53.4.0",
+ "arrow-data 53.4.0",
  "arrow-ipc",
- "arrow-ord",
- "arrow-row",
- "arrow-schema",
- "arrow-select",
- "arrow-string",
+ "arrow-ord 53.4.0",
+ "arrow-row 53.4.0",
+ "arrow-schema 53.4.0",
+ "arrow-select 53.4.0",
+ "arrow-string 53.4.0",
  "base64 0.22.1",
  "bytes",
  "futures",
@@ -471,11 +563,11 @@ version = "53.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0270dc511f11bb5fa98a25020ad51a99ca5b08d8a8dfbd17503bb9dba0388f0b"
 dependencies = [
- "arrow-array",
- "arrow-buffer",
- "arrow-cast",
- "arrow-data",
- "arrow-schema",
+ "arrow-array 53.4.0",
+ "arrow-buffer 53.4.0",
+ "arrow-cast 53.4.0",
+ "arrow-data 53.4.0",
+ "arrow-schema 53.4.0",
  "flatbuffers",
  "lz4_flex",
 ]
@@ -485,11 +577,11 @@ name = "arrow-json"
 version = "53.4.0"
 source = "git+https://github.com/spiceai/arrow-rs.git?rev=5feaa5f724d32c09e30394cedb7799de670e43e1#5feaa5f724d32c09e30394cedb7799de670e43e1"
 dependencies = [
- "arrow-array",
- "arrow-buffer",
- "arrow-cast",
- "arrow-data",
- "arrow-schema",
+ "arrow-array 53.4.0",
+ "arrow-buffer 53.4.0",
+ "arrow-cast 53.4.0",
+ "arrow-data 53.4.0",
+ "arrow-schema 53.4.0",
  "chrono",
  "half",
  "indexmap 2.7.1",
@@ -504,7 +596,7 @@ name = "arrow-odbc"
 version = "11.2.0"
 source = "git+https://github.com/spiceai/arrow-odbc.git?rev=dfb1e03a5f0702c1a318db5abf40e762d6b2bcc2#dfb1e03a5f0702c1a318db5abf40e762d6b2bcc2"
 dependencies = [
- "arrow",
+ "arrow 53.4.0",
  "chrono",
  "log",
  "odbc-api",
@@ -517,13 +609,26 @@ version = "53.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c6f202a879d287099139ff0d121e7f55ae5e0efe634b8cf2106ebc27a8715dee"
 dependencies = [
- "arrow-array",
- "arrow-buffer",
- "arrow-data",
- "arrow-schema",
- "arrow-select",
+ "arrow-array 53.4.0",
+ "arrow-buffer 53.4.0",
+ "arrow-data 53.4.0",
+ "arrow-schema 53.4.0",
+ "arrow-select 53.4.0",
  "half",
  "num",
+]
+
+[[package]]
+name = "arrow-ord"
+version = "54.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8aa06e5f267dc53efbacb933485c79b6fc1685d3ffbe870a16ce4e696fb429da"
+dependencies = [
+ "arrow-array 54.1.0",
+ "arrow-buffer 54.1.0",
+ "arrow-data 54.1.0",
+ "arrow-schema 54.1.0",
+ "arrow-select 54.1.0",
 ]
 
 [[package]]
@@ -533,10 +638,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a8f936954991c360ba762dff23f5dda16300774fafd722353d9683abd97630ae"
 dependencies = [
  "ahash 0.8.11",
- "arrow-array",
- "arrow-buffer",
- "arrow-data",
- "arrow-schema",
+ "arrow-array 53.4.0",
+ "arrow-buffer 53.4.0",
+ "arrow-data 53.4.0",
+ "arrow-schema 53.4.0",
+ "half",
+]
+
+[[package]]
+name = "arrow-row"
+version = "54.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "66f1144bb456a2f9d82677bd3abcea019217e572fc8f07de5a7bac4b2c56eb2c"
+dependencies = [
+ "arrow-array 54.1.0",
+ "arrow-buffer 54.1.0",
+ "arrow-data 54.1.0",
+ "arrow-schema 54.1.0",
  "half",
 ]
 
@@ -546,8 +664,16 @@ version = "53.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9579b9d8bce47aa41389fe344f2c6758279983b7c0ebb4013e283e3e91bb450e"
 dependencies = [
- "bitflags 2.8.0",
  "serde",
+]
+
+[[package]]
+name = "arrow-schema"
+version = "54.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "105f01ec0090259e9a33a9263ec18ff223ab91a0ea9fbc18042f7e38005142f6"
+dependencies = [
+ "bitflags 2.8.0",
 ]
 
 [[package]]
@@ -557,10 +683,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7471ba126d0b0aaa24b50a36bc6c25e4e74869a1fd1a5553357027a0b1c8d1f1"
 dependencies = [
  "ahash 0.8.11",
- "arrow-array",
- "arrow-buffer",
- "arrow-data",
- "arrow-schema",
+ "arrow-array 53.4.0",
+ "arrow-buffer 53.4.0",
+ "arrow-data 53.4.0",
+ "arrow-schema 53.4.0",
+ "num",
+]
+
+[[package]]
+name = "arrow-select"
+version = "54.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f690752fdbd2dee278b5f1636fefad8f2f7134c85e20fd59c4199e15a39a6807"
+dependencies = [
+ "ahash 0.8.11",
+ "arrow-array 54.1.0",
+ "arrow-buffer 54.1.0",
+ "arrow-data 54.1.0",
+ "arrow-schema 54.1.0",
  "num",
 ]
 
@@ -570,11 +710,28 @@ version = "53.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72993b01cb62507b06f1fb49648d7286c8989ecfabdb7b77a750fcb54410731b"
 dependencies = [
- "arrow-array",
- "arrow-buffer",
- "arrow-data",
- "arrow-schema",
- "arrow-select",
+ "arrow-array 53.4.0",
+ "arrow-buffer 53.4.0",
+ "arrow-data 53.4.0",
+ "arrow-schema 53.4.0",
+ "arrow-select 53.4.0",
+ "memchr",
+ "num",
+ "regex",
+ "regex-syntax 0.8.5",
+]
+
+[[package]]
+name = "arrow-string"
+version = "54.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d0fff9cd745a7039b66c47ecaf5954460f9fa12eed628f65170117ea93e64ee0"
+dependencies = [
+ "arrow-array 54.1.0",
+ "arrow-buffer 54.1.0",
+ "arrow-data 54.1.0",
+ "arrow-schema 54.1.0",
+ "arrow-select 54.1.0",
  "memchr",
  "num",
  "regex",
@@ -585,7 +742,7 @@ dependencies = [
 name = "arrow_sql_gen"
 version = "1.1.0"
 dependencies = [
- "arrow",
+ "arrow 53.4.0",
  "bigdecimal",
  "chrono",
  "chrono-tz 0.8.6",
@@ -599,9 +756,9 @@ dependencies = [
 name = "arrow_tools"
 version = "1.1.0"
 dependencies = [
- "arrow",
- "arrow-cast",
- "arrow-schema",
+ "arrow 53.4.0",
+ "arrow-cast 53.4.0",
+ "arrow-schema 53.4.0",
  "datafusion",
  "snafu",
 ]
@@ -2089,7 +2246,7 @@ dependencies = [
 name = "cache"
 version = "1.1.0"
 dependencies = [
- "arrow",
+ "arrow 53.4.0",
  "async-stream",
  "async-trait",
  "byte-unit",
@@ -3036,8 +3193,8 @@ checksum = "0e60eed09d8c01d3cee5b7d30acb059b76614c918fa0f992e0dd6eeb10daad6f"
 name = "data_components"
 version = "1.1.0"
 dependencies = [
- "arrow",
- "arrow-buffer",
+ "arrow 53.4.0",
+ "arrow-buffer 53.4.0",
  "arrow-flight",
  "async-stream",
  "async-trait",
@@ -3098,10 +3255,10 @@ version = "43.0.0"
 source = "git+https://github.com/spiceai/datafusion.git?rev=90409dee317a2accd63f9649807e52d51aa74097#90409dee317a2accd63f9649807e52d51aa74097"
 dependencies = [
  "ahash 0.8.11",
- "arrow",
- "arrow-array",
+ "arrow 53.4.0",
+ "arrow-array 53.4.0",
  "arrow-ipc",
- "arrow-schema",
+ "arrow-schema 53.4.0",
  "async-compression",
  "async-trait",
  "bytes",
@@ -3153,7 +3310,7 @@ name = "datafusion-catalog"
 version = "43.0.0"
 source = "git+https://github.com/spiceai/datafusion.git?rev=90409dee317a2accd63f9649807e52d51aa74097#90409dee317a2accd63f9649807e52d51aa74097"
 dependencies = [
- "arrow-schema",
+ "arrow-schema 53.4.0",
  "async-trait",
  "datafusion-common",
  "datafusion-execution",
@@ -3168,10 +3325,10 @@ version = "43.0.0"
 source = "git+https://github.com/spiceai/datafusion.git?rev=90409dee317a2accd63f9649807e52d51aa74097#90409dee317a2accd63f9649807e52d51aa74097"
 dependencies = [
  "ahash 0.8.11",
- "arrow",
- "arrow-array",
- "arrow-buffer",
- "arrow-schema",
+ "arrow 53.4.0",
+ "arrow-array 53.4.0",
+ "arrow-buffer 53.4.0",
+ "arrow-schema 53.4.0",
  "chrono",
  "half",
  "hashbrown 0.14.5",
@@ -3200,7 +3357,7 @@ name = "datafusion-execution"
 version = "43.0.0"
 source = "git+https://github.com/spiceai/datafusion.git?rev=90409dee317a2accd63f9649807e52d51aa74097#90409dee317a2accd63f9649807e52d51aa74097"
 dependencies = [
- "arrow",
+ "arrow 53.4.0",
  "chrono",
  "dashmap",
  "datafusion-common",
@@ -3221,9 +3378,9 @@ version = "43.0.0"
 source = "git+https://github.com/spiceai/datafusion.git?rev=90409dee317a2accd63f9649807e52d51aa74097#90409dee317a2accd63f9649807e52d51aa74097"
 dependencies = [
  "ahash 0.8.11",
- "arrow",
- "arrow-array",
- "arrow-buffer",
+ "arrow 53.4.0",
+ "arrow-array 53.4.0",
+ "arrow-buffer 53.4.0",
  "chrono",
  "datafusion-common",
  "datafusion-expr-common",
@@ -3243,7 +3400,7 @@ name = "datafusion-expr-common"
 version = "43.0.0"
 source = "git+https://github.com/spiceai/datafusion.git?rev=90409dee317a2accd63f9649807e52d51aa74097#90409dee317a2accd63f9649807e52d51aa74097"
 dependencies = [
- "arrow",
+ "arrow 53.4.0",
  "datafusion-common",
  "itertools 0.13.0",
  "paste",
@@ -3279,8 +3436,8 @@ name = "datafusion-functions"
 version = "43.0.0"
 source = "git+https://github.com/spiceai/datafusion.git?rev=90409dee317a2accd63f9649807e52d51aa74097#90409dee317a2accd63f9649807e52d51aa74097"
 dependencies = [
- "arrow",
- "arrow-buffer",
+ "arrow 53.4.0",
+ "arrow-buffer 53.4.0",
  "base64 0.22.1",
  "blake2",
  "blake3",
@@ -3306,8 +3463,8 @@ version = "43.0.0"
 source = "git+https://github.com/spiceai/datafusion.git?rev=90409dee317a2accd63f9649807e52d51aa74097#90409dee317a2accd63f9649807e52d51aa74097"
 dependencies = [
  "ahash 0.8.11",
- "arrow",
- "arrow-schema",
+ "arrow 53.4.0",
+ "arrow-schema 53.4.0",
  "datafusion-common",
  "datafusion-execution",
  "datafusion-expr",
@@ -3326,7 +3483,7 @@ version = "43.0.0"
 source = "git+https://github.com/spiceai/datafusion.git?rev=90409dee317a2accd63f9649807e52d51aa74097#90409dee317a2accd63f9649807e52d51aa74097"
 dependencies = [
  "ahash 0.8.11",
- "arrow",
+ "arrow 53.4.0",
  "datafusion-common",
  "datafusion-expr-common",
  "datafusion-physical-expr-common",
@@ -3350,11 +3507,11 @@ name = "datafusion-functions-nested"
 version = "43.0.0"
 source = "git+https://github.com/spiceai/datafusion.git?rev=90409dee317a2accd63f9649807e52d51aa74097#90409dee317a2accd63f9649807e52d51aa74097"
 dependencies = [
- "arrow",
- "arrow-array",
- "arrow-buffer",
- "arrow-ord",
- "arrow-schema",
+ "arrow 53.4.0",
+ "arrow-array 53.4.0",
+ "arrow-buffer 53.4.0",
+ "arrow-ord 53.4.0",
+ "arrow-schema 53.4.0",
  "datafusion-common",
  "datafusion-execution",
  "datafusion-expr",
@@ -3395,7 +3552,7 @@ name = "datafusion-optimizer"
 version = "43.0.0"
 source = "git+https://github.com/spiceai/datafusion.git?rev=90409dee317a2accd63f9649807e52d51aa74097#90409dee317a2accd63f9649807e52d51aa74097"
 dependencies = [
- "arrow",
+ "arrow 53.4.0",
  "async-trait",
  "chrono",
  "datafusion-common",
@@ -3415,12 +3572,12 @@ version = "43.0.0"
 source = "git+https://github.com/spiceai/datafusion.git?rev=90409dee317a2accd63f9649807e52d51aa74097#90409dee317a2accd63f9649807e52d51aa74097"
 dependencies = [
  "ahash 0.8.11",
- "arrow",
- "arrow-array",
- "arrow-buffer",
- "arrow-ord",
- "arrow-schema",
- "arrow-string",
+ "arrow 53.4.0",
+ "arrow-array 53.4.0",
+ "arrow-buffer 53.4.0",
+ "arrow-ord 53.4.0",
+ "arrow-schema 53.4.0",
+ "arrow-string 53.4.0",
  "chrono",
  "datafusion-common",
  "datafusion-expr",
@@ -3442,7 +3599,7 @@ version = "43.0.0"
 source = "git+https://github.com/spiceai/datafusion.git?rev=90409dee317a2accd63f9649807e52d51aa74097#90409dee317a2accd63f9649807e52d51aa74097"
 dependencies = [
  "ahash 0.8.11",
- "arrow",
+ "arrow 53.4.0",
  "datafusion-common",
  "datafusion-expr-common",
  "hashbrown 0.14.5",
@@ -3454,8 +3611,8 @@ name = "datafusion-physical-optimizer"
 version = "43.0.0"
 source = "git+https://github.com/spiceai/datafusion.git?rev=90409dee317a2accd63f9649807e52d51aa74097#90409dee317a2accd63f9649807e52d51aa74097"
 dependencies = [
- "arrow",
- "arrow-schema",
+ "arrow 53.4.0",
+ "arrow-schema 53.4.0",
  "datafusion-common",
  "datafusion-execution",
  "datafusion-expr-common",
@@ -3470,11 +3627,11 @@ version = "43.0.0"
 source = "git+https://github.com/spiceai/datafusion.git?rev=90409dee317a2accd63f9649807e52d51aa74097#90409dee317a2accd63f9649807e52d51aa74097"
 dependencies = [
  "ahash 0.8.11",
- "arrow",
- "arrow-array",
- "arrow-buffer",
- "arrow-ord",
- "arrow-schema",
+ "arrow 53.4.0",
+ "arrow-array 53.4.0",
+ "arrow-buffer 53.4.0",
+ "arrow-ord 53.4.0",
+ "arrow-schema 53.4.0",
  "async-trait",
  "chrono",
  "datafusion-common",
@@ -3503,9 +3660,9 @@ name = "datafusion-sql"
 version = "43.0.0"
 source = "git+https://github.com/spiceai/datafusion.git?rev=90409dee317a2accd63f9649807e52d51aa74097#90409dee317a2accd63f9649807e52d51aa74097"
 dependencies = [
- "arrow",
- "arrow-array",
- "arrow-schema",
+ "arrow 53.4.0",
+ "arrow-array 53.4.0",
+ "arrow-schema 53.4.0",
  "datafusion-common",
  "datafusion-expr",
  "indexmap 2.7.1",
@@ -3520,9 +3677,9 @@ name = "datafusion-table-providers"
 version = "0.1.0"
 source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=54bed07357fb1f201d812b45cf7d1d1bb32726f1#54bed07357fb1f201d812b45cf7d1d1bb32726f1"
 dependencies = [
- "arrow",
+ "arrow 53.4.0",
  "arrow-json",
- "arrow-schema",
+ "arrow-schema 53.4.0",
  "async-stream",
  "async-trait",
  "bb8",
@@ -3567,7 +3724,7 @@ dependencies = [
 name = "db_connection_pool"
 version = "1.1.0"
 dependencies = [
- "arrow",
+ "arrow 53.4.0",
  "arrow-odbc",
  "arrow_sql_gen",
  "async-stream",
@@ -3608,14 +3765,14 @@ name = "delta_kernel"
 version = "0.6.0"
 source = "git+https://github.com/spiceai/delta-kernel-rs.git?rev=69e11a29a6dc67ec1d969e3a652f00924b995b3a#69e11a29a6dc67ec1d969e3a652f00924b995b3a"
 dependencies = [
- "arrow-arith",
- "arrow-array",
- "arrow-buffer",
- "arrow-cast",
+ "arrow-arith 53.4.0",
+ "arrow-array 53.4.0",
+ "arrow-buffer 53.4.0",
+ "arrow-cast 53.4.0",
  "arrow-json",
- "arrow-ord",
- "arrow-schema",
- "arrow-select",
+ "arrow-ord 53.4.0",
+ "arrow-schema 53.4.0",
+ "arrow-select 53.4.0",
  "bytes",
  "chrono",
  "delta_kernel_derive",
@@ -3918,10 +4075,10 @@ checksum = "f25c0e292a7ca6d6498557ff1df68f32c99850012b6ea401cf8daf771f22ff53"
 
 [[package]]
 name = "duckdb"
-version = "1.1.3"
-source = "git+https://github.com/spiceai/duckdb-rs.git?rev=c7421f30d8ff2d39ed6df01a9ec51bc8781cfaae#c7421f30d8ff2d39ed6df01a9ec51bc8781cfaae"
+version = "1.2.0"
+source = "git+https://github.com/spiceai/duckdb-rs.git?rev=43137110dd1d682db8f2dad588093936630c2427#43137110dd1d682db8f2dad588093936630c2427"
 dependencies = [
- "arrow",
+ "arrow 54.1.0",
  "cast",
  "fallible-iterator 0.3.0",
  "fallible-streaming-iterator",
@@ -4292,7 +4449,7 @@ dependencies = [
 name = "flight_client"
 version = "1.1.0"
 dependencies = [
- "arrow",
+ "arrow 53.4.0",
  "arrow-flight",
  "base64 0.22.1",
  "bytes",
@@ -4307,7 +4464,7 @@ dependencies = [
 name = "flightpublisher"
 version = "1.1.0"
 dependencies = [
- "arrow",
+ "arrow 53.4.0",
  "arrow-flight",
  "clap",
  "futures",
@@ -5690,13 +5847,13 @@ dependencies = [
  "anyhow",
  "apache-avro",
  "array-init",
- "arrow-arith",
- "arrow-array",
- "arrow-cast",
- "arrow-ord",
- "arrow-schema",
- "arrow-select",
- "arrow-string",
+ "arrow-arith 53.4.0",
+ "arrow-array 53.4.0",
+ "arrow-cast 53.4.0",
+ "arrow-ord 53.4.0",
+ "arrow-schema 53.4.0",
+ "arrow-select 53.4.0",
+ "arrow-string 53.4.0",
  "async-trait",
  "bimap",
  "bitvec",
@@ -6492,8 +6649,8 @@ checksum = "b5aba8db14291edd000dfcc4d620c7ebfb122c613afb886ca8803fa4e128a20a"
 
 [[package]]
 name = "libduckdb-sys"
-version = "1.1.3"
-source = "git+https://github.com/spiceai/duckdb-rs.git?rev=c7421f30d8ff2d39ed6df01a9ec51bc8781cfaae#c7421f30d8ff2d39ed6df01a9ec51bc8781cfaae"
+version = "1.2.0"
+source = "git+https://github.com/spiceai/duckdb-rs.git?rev=43137110dd1d682db8f2dad588093936630c2427#43137110dd1d682db8f2dad588093936630c2427"
 dependencies = [
  "autocfg",
  "cc",
@@ -7288,7 +7445,7 @@ name = "model_components"
 version = "1.1.0"
 dependencies = [
  "anyhow",
- "arrow",
+ "arrow 53.4.0",
  "async-trait",
  "dirs",
  "ndarray 0.15.6",
@@ -8381,8 +8538,8 @@ dependencies = [
 name = "otel-arrow"
 version = "1.1.0"
 dependencies = [
- "arrow",
- "arrow-buffer",
+ "arrow 53.4.0",
+ "arrow-buffer 53.4.0",
  "async-trait",
  "opentelemetry",
  "opentelemetry_sdk",
@@ -8518,13 +8675,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8957c0c95a6a1804f3e51a18f69df29be53856a8c5768cc9b6d00fcafcd2917c"
 dependencies = [
  "ahash 0.8.11",
- "arrow-array",
- "arrow-buffer",
- "arrow-cast",
- "arrow-data",
+ "arrow-array 53.4.0",
+ "arrow-buffer 53.4.0",
+ "arrow-cast 53.4.0",
+ "arrow-data 53.4.0",
  "arrow-ipc",
- "arrow-schema",
- "arrow-select",
+ "arrow-schema 53.4.0",
+ "arrow-select 53.4.0",
  "base64 0.22.1",
  "brotli",
  "bytes",
@@ -9995,12 +10152,12 @@ version = "1.1.0"
 dependencies = [
  "anyhow",
  "app",
- "arrow",
+ "arrow 53.4.0",
  "arrow-csv",
  "arrow-flight",
  "arrow-ipc",
  "arrow-json",
- "arrow-schema",
+ "arrow-schema 53.4.0",
  "arrow_sql_gen",
  "arrow_tools",
  "async-graphql",
@@ -11007,7 +11164,7 @@ name = "snowflake-api"
 version = "0.9.0"
 source = "git+https://github.com/spiceai/snowflake-rs.git?rev=f95bd4715b9b9e3eaa425d7a775b49e1dcbb1212#f95bd4715b9b9e3eaa425d7a775b49e1dcbb1212"
 dependencies = [
- "arrow",
+ "arrow 53.4.0",
  "async-stream",
  "async-trait",
  "base64 0.22.1",
@@ -11070,7 +11227,7 @@ name = "spark-connect-core"
 version = "0.0.1-beta.4"
 source = "git+https://github.com/spiceai/spark-connect-rs.git?rev=81b159ccd10f806fcb2d30f86715f77350ba24a2#81b159ccd10f806fcb2d30f86715f77350ba24a2"
 dependencies = [
- "arrow",
+ "arrow 53.4.0",
  "arrow-ipc",
  "chrono",
  "parking_lot 0.12.3",
@@ -11567,7 +11724,7 @@ dependencies = [
 name = "telemetry"
 version = "1.1.0"
 dependencies = [
- "arrow",
+ "arrow 53.4.0",
  "async-trait",
  "flight_client",
  "hostname 0.4.0",
@@ -11618,7 +11775,7 @@ version = "1.1.0"
 dependencies = [
  "anyhow",
  "app",
- "arrow",
+ "arrow 53.4.0",
  "async-openai",
  "clap",
  "flight_client",
