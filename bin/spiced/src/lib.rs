@@ -41,6 +41,8 @@ use serde_yaml::Value;
 use snafu::prelude::*;
 use spice_cloud::SpiceExtensionFactory;
 use spiced_tracing::LogVerbosity;
+#[cfg(feature = "tpc-extension")]
+use tpc_extension::TpcExtensionFactory;
 use tracing::subscriber;
 
 #[path = "tracing.rs"]
@@ -169,28 +171,29 @@ pub async fn run(args: Args) -> Result<()> {
     let prometheus_registry = args.metrics.map(|_| prometheus::Registry::new());
 
     let current_dir = env::current_dir().unwrap_or(PathBuf::from("."));
-    let app: Option<Arc<App>> = if let Ok(mut app) =
-        AppBuilder::build_from_filesystem_path(current_dir.clone())
-            .context(UnableToConstructSpiceAppSnafu)
-    {
-        app.runtime = apply_overrides(app.runtime, &args.set_runtime)?;
-        Some(Arc::new(app))
-    } else {
-        in_tracing_context(|| {
-            tracing::warn!(
-    "No spicepod.yaml detected in the current directory: {}\nRun `spice init <name>` to initialize spicepod.yaml and restart the runtime.",
-    current_dir.display()
-    );
-        });
-        None
+    let app: Option<Arc<App>> = match AppBuilder::build_from_filesystem_path(current_dir.clone()) {
+        Ok(mut app) => {
+            app.runtime = apply_overrides(app.runtime, &args.set_runtime)?;
+            Some(Arc::new(app))
+        }
+        Err(e) => {
+            in_tracing_context(|| {
+                tracing::warn!("{e}");
+            });
+            None
+        }
     };
-
     let mut extension_factories: Vec<Box<dyn ExtensionFactory>> = vec![];
 
     if let Some(app) = &app {
         if let Some(manifest) = app.extensions.get("spice_cloud") {
             let spice_extension_factory = SpiceExtensionFactory::new(manifest.clone());
             extension_factories.push(Box::new(spice_extension_factory));
+        }
+        #[cfg(feature = "tpc-extension")]
+        if let Some(manifest) = app.extensions.get("tpc") {
+            let tpc_extension_factory = TpcExtensionFactory::new(manifest.clone());
+            extension_factories.push(Box::new(tpc_extension_factory));
         }
     }
 

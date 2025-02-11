@@ -61,7 +61,7 @@ pub(crate) async fn list(Extension(rt): Extension<Arc<Runtime>>) -> Response {
         .filter_map(|(name, tool)| match tool {
             Tooling::Tool(tool) => Some(ListToolElement {
                 name: name.clone(),
-                description: tool.description().map(ToString::to_string),
+                description: tool.description().map(|d| d.to_string()),
                 parameters: tool.parameters(),
             }),
             Tooling::Catalog(_) => None,

@@ -1,0 +1,186 @@
+---
+name: ai benchmark (nsql)
+
+on:
+  workflow_dispatch:
+    inputs:
+        model_option:
+          description: "Which model do you want to test? (Default is ALL)"
+          required: false
+          type: choice
+          options:
+            - "all"
+            - "gpt-4o"
+            - "gpt-4o-mini"
+            - "o1"
+            - "o3_mini"
+            - "llama3-3B-Instruct"
+            - "claude-3-5-sonnet"
+            - "grok2"
+          default: "all"
+
+concurrency:
+  # Allow only one workflow per any non-trunk branch.
+  group: ${{ github.workflow }}-${{ github.ref_name }}-${{ github.ref_name == 'trunk' && github.sha || 'any-sha' }}
+  cancel-in-progress: true
+
+jobs:
+  build-testoperator:
+    name: Build testoperator
+    runs-on: 'spiceai-macos'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+        with:
+          os: 'darwin'
+
+      - name: Build the testoperator
+        run: |
+          cargo build -p testoperator --release
+
+      - name: make testoperator executable
+        run: |
+          mv target/release/testoperator testoperator
+          chmod +x testoperator
+          
+      - name: Save spice artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: testoperator
+          path: testoperator
+
+  build-spiced:
+    name: Build spiced
+    runs-on: 'spiceai-macos'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+        with:
+          os: darwin
+
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build spiced
+        if: matrix.target.target_os != 'darwin'
+        run: |
+          make -C bin/spiced SPICED_NON_DEFAULT_FEATURES="models"
+
+      - name: make spiced executable
+        if: matrix.target.target_os != 'windows'
+        run: |
+          mv target/release/spiced spiced
+          chmod +x spiced
+
+      - name: Save spice artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: spiced
+          path: spiced
+
+  setup-matrix:
+    name: Setup matrix
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.setup-matrix.outputs.result }}
+
+    steps:
+      - name: Set up matrix
+        uses: actions/github-script@v7
+        id: setup-matrix
+        with:
+          script: |
+            const matrix = [
+              {
+                name: "gpt-4o",
+                spicepod: "./test/nsql_bench/spicepod_gpt-4o.yaml",
+                data: "./test/nsql_bench/data"
+              },
+              {
+                name: "gpt-4o-mini",
+                spicepod: "./test/nsql_bench/spicepod_gpt-4o-mini.yaml",
+                data: "./test/nsql_bench/data"
+              },
+              {
+                name: "o1",
+                spicepod: "./test/nsql_bench/spicepod_o1.yaml",
+                data: "./test/nsql_bench/data"
+              },
+              {
+                name: "o3_mini",
+                spicepod: "./test/nsql_bench/spicepod_o3_mini.yaml",
+                data: "./test/nsql_bench/data"
+              },
+              {
+                name: "llama3-3B-Instruct",
+                spicepod: "./test/nsql_bench/spicepod_llama3-3b.yaml",
+                data: "./test/nsql_bench/data"
+              },
+              {
+                name: "claude-3-5-sonnet",
+                spicepod: "./test/nsql_bench/spicepod_claude-3-5-sonnet.yaml",
+                data: "./test/nsql_bench/data"
+              },
+              {
+                name: "grok2",
+                spicepod: "./test/nsql_bench/spicepod_grok2.yaml",
+                data: "./test/nsql_bench/data"
+              },
+            ];
+
+            const model_option = context.payload.inputs.model_option;
+            let filtered = matrix;
+
+            if (model_option !== 'all') {
+              filtered = filtered.filter(m => m.name === model_option);
+            }
+
+            return filtered;
+
+  run-testoperator:
+    name: tpch_nsql benchmark
+    needs:
+      - build-testoperator
+      - build-spiced
+      - setup-matrix
+    runs-on: 'spiceai-macos'
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download testoperator
+        uses: actions/download-artifact@v4
+        with:
+          name: testoperator
+  
+      - name: Download spiced
+        uses: actions/download-artifact@v4
+        with:
+          name: spiced
+
+      - name: Mark binaries executable
+        run: |
+          chmod +x ./testoperator
+          chmod +x ./spiced
+
+      - name: Run tpch_nsql evals
+        env:
+          SPICE_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
+          SPICE_HF_TOKEN: ${{ secrets.SPICE_SECRET_HF_TOKEN }}
+          SPICE_ANTHROPIC_API_KEY: ${{ secrets.SPICE_SECRET_ANTHROPIC_API_KEY }}
+          SPICE_XAI_API_KEY: ${{ secrets.SPICE_SECRET_XAI_API_KEY }}
+        run: |
+          ./testoperator run evals \
+            -s $GITHUB_WORKSPACE/spiced \
+            -p ${{ matrix.target.spicepod }} \
+            -d $GITHUB_WORKSPACE/${{ matrix.target.data }} \
+            --ready-wait 180

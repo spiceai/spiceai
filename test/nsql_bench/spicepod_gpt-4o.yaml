@@ -1,0 +1,98 @@
+version: v1
+kind: Spicepod
+name: "nsql_benchmark"
+
+default_acceleration: &default_acceleration
+  enabled: true
+  mode: file
+  engine: duckdb
+
+models:
+  - name: gpt-4o
+    from: openai:gpt-4o-2024-08-06
+    params:
+      spice_tools: auto
+      openai_api_key: ${ secrets:SPICE_OPENAI_API_KEY }
+      system_prompt: |
+        Use the SQL tool when:
+          1. The query involves precise numerical data, statistics, or aggregations
+          2. The user asks for specific counts, sums, averages, or other calculations
+          3. The query requires joining or comparing data from multiple related tables
+
+        
+        When writing SQL queries, do not put double quotes around schema-qualified table names. For example:
+          Correct: SELECT * FROM schema.table
+          Correct: SELECT * FROM database.schema.table
+          Incorrect: SELECT * FROM "schema.table"
+          Incorrect: SELECT * FROM "database.schema.table"
+
+          Only use double quotes when you need to preserve case sensitivity or when identifiers contain special characters.
+
+          Prefer quoting column names. For example:
+          Correct: `SELECT COUNT(*) AS "total_records" FROM "spice"."public"."taxi_trips"`
+          Incorrect: `SELECT COUNT(*) AS total_records FROM "spice"."public"."taxi_trips"`
+
+        Instructions for Responses:
+          1. When the answer is known, return information as plain json without additional formatting, example: { "column_name": 42 }
+          2. For JSON output use fields defined in question as 'Fields:'
+          2. If the answer is not known, respond with "{}" and do NOT guess.
+          3. Ensure responses are concise and to the point.
+
+evals:
+  - name: tpch_nsql
+    dataset: tpch_nsql
+    scorers:
+      - json_match
+
+datasets:
+
+  - from: file:./data/tpch_nsql.jsonl
+    name: tpch_nsql
+
+  - from: s3://spiceai-demo-datasets/tpch/customer/
+    name: customer
+    params:
+      file_format: parquet
+    acceleration: *default_acceleration
+
+  - from: s3://spiceai-demo-datasets/tpch/lineitem/
+    name: lineitem
+    params:
+      file_format: parquet
+    acceleration: *default_acceleration
+
+  - from: s3://spiceai-demo-datasets/tpch/nation/
+    name: nation
+    params:
+      file_format: parquet
+    acceleration: *default_acceleration
+
+  - from: s3://spiceai-demo-datasets/tpch/orders/
+    name: orders
+    params:
+      file_format: parquet
+    acceleration: *default_acceleration
+
+  - from: s3://spiceai-demo-datasets/tpch/part/
+    name: part
+    params:
+      file_format: parquet
+    acceleration: *default_acceleration
+
+  - from: s3://spiceai-demo-datasets/tpch/partsupp/
+    name: partsupp
+    params:
+      file_format: parquet
+    acceleration: *default_acceleration
+
+  - from: s3://spiceai-demo-datasets/tpch/region/
+    name: region
+    params:
+      file_format: parquet
+    acceleration: *default_acceleration
+
+  - from: s3://spiceai-demo-datasets/tpch/supplier/
+    name: supplier
+    params:
+      file_format: parquet
+    acceleration: *default_acceleration

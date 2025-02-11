@@ -31,7 +31,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use spicepod::component::dataset::{column::Column, Dataset};
-use std::{collections::HashMap, sync::Arc};
+use std::{borrow::Cow, collections::HashMap, sync::Arc};
 
 use crate::{
     tools::{utils::parameters, SpiceModelTool},
@@ -87,7 +87,7 @@ impl TableSchemaTool {
         rt: Arc<Runtime>,
         req: &TableSchemaToolParams,
     ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
-        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::table_schema", tool = self.name(), input = serde_json::to_string(&req).boxed()?);
+        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::table_schema", tool = self.name().to_string(), input = serde_json::to_string(&req).boxed()?);
         let TableSchemaToolParams { tables, output } = req;
 
         // Precompute extra column details only if needed (for `full` output).
@@ -231,14 +231,13 @@ impl Default for TableSchemaTool {
 
 #[async_trait]
 impl SpiceModelTool for TableSchemaTool {
-    fn name(&self) -> &str {
-        self.name.as_str()
+    fn name(&self) -> Cow<'_, str> {
+        Cow::Borrowed(&self.name)
     }
 
-    fn description(&self) -> Option<&str> {
-        self.description.as_deref()
+    fn description(&self) -> Option<Cow<'_, str>> {
+        self.description.as_deref().map(Cow::Borrowed)
     }
-
     fn parameters(&self) -> Option<Value> {
         parameters::<TableSchemaToolParams>()
     }

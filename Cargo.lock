@@ -40,6 +40,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "aae1277d39aeec15cb388266ecc24b11c80469deae6067e17a1a7aa9e5c1f234"
 
 [[package]]
+name = "adobe-cmap-parser"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ae8abfa9a4688de8fc9f42b3f013b6fffec18ed8a554f5f113577e0b9b3212a3"
+dependencies = [
+ "pom",
+]
+
+[[package]]
 name = "aes"
 version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -317,8 +326,7 @@ checksum = "7c02d123df017efcdfbd739ef81735b36c5ba83ec3c59c80a9d7ecc718f92e50"
 [[package]]
 name = "arrow"
 version = "53.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eaf3437355979f1e93ba84ba108c38be5767713051f3c8ffbf07c094e2e61f9f"
+source = "git+https://github.com/spiceai/arrow-rs.git?rev=5feaa5f724d32c09e30394cedb7799de670e43e1#5feaa5f724d32c09e30394cedb7799de670e43e1"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -327,7 +335,7 @@ dependencies = [
  "arrow-csv",
  "arrow-data",
  "arrow-ipc",
- "arrow-json 53.4.0",
+ "arrow-json",
  "arrow-ord",
  "arrow-row",
  "arrow-schema",
@@ -381,8 +389,7 @@ dependencies = [
 [[package]]
 name = "arrow-cast"
 version = "53.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c73c6233c5b5d635a56f6010e6eb1ab9e30e94707db21cea03da317f67d84cf3"
+source = "git+https://github.com/spiceai/arrow-rs.git?rev=5feaa5f724d32c09e30394cedb7799de670e43e1#5feaa5f724d32c09e30394cedb7799de670e43e1"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -475,28 +482,8 @@ dependencies = [
 
 [[package]]
 name = "arrow-json"
-version = "53.1.0"
-source = "git+https://github.com/spiceai/arrow-rs.git?rev=63d05723107d6dc5f08acc5461417ee42937adcc#63d05723107d6dc5f08acc5461417ee42937adcc"
-dependencies = [
- "arrow-array",
- "arrow-buffer",
- "arrow-cast",
- "arrow-data",
- "arrow-schema",
- "chrono",
- "half",
- "indexmap 2.7.1",
- "lexical-core",
- "num",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "arrow-json"
 version = "53.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0eff38eeb8a971ad3a4caf62c5d57f0cff8a48b64a55e3207c4fd696a9234aad"
+source = "git+https://github.com/spiceai/arrow-rs.git?rev=5feaa5f724d32c09e30394cedb7799de670e43e1#5feaa5f724d32c09e30394cedb7799de670e43e1"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -613,6 +600,7 @@ name = "arrow_tools"
 version = "1.1.0"
 dependencies = [
  "arrow",
+ "arrow-cast",
  "arrow-schema",
  "datafusion",
  "snafu",
@@ -872,7 +860,7 @@ dependencies = [
 [[package]]
 name = "async-openai"
 version = "0.26.0"
-source = "git+https://github.com/spiceai/async-openai?rev=75e6bf715760f63f3dd3e7a43222ec1e6fb9707f#75e6bf715760f63f3dd3e7a43222ec1e6fb9707f"
+source = "git+https://github.com/spiceai/async-openai?rev=9debf2001eaf8f1b6407fdf4b8cf9aa28fb3465e#9debf2001eaf8f1b6407fdf4b8cf9aa28fb3465e"
 dependencies = [
  "async-convert",
  "backoff",
@@ -3266,7 +3254,7 @@ name = "datafusion-federation"
 version = "0.1.6"
 source = "git+https://github.com/spiceai/datafusion-federation.git?rev=a889f4bd47cba6b96d24a63a03891c64dadb6e15#a889f4bd47cba6b96d24a63a03891c64dadb6e15"
 dependencies = [
- "arrow-json 53.4.0",
+ "arrow-json",
  "async-stream",
  "async-trait",
  "datafusion",
@@ -3530,10 +3518,10 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=47f096b1551ccd4a21adf51084fa03b0bc518288#47f096b1551ccd4a21adf51084fa03b0bc518288"
+source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=54bed07357fb1f201d812b45cf7d1d1bb32726f1#54bed07357fb1f201d812b45cf7d1d1bb32726f1"
 dependencies = [
  "arrow",
- "arrow-json 53.4.0",
+ "arrow-json",
  "arrow-schema",
  "async-stream",
  "async-trait",
@@ -3624,7 +3612,7 @@ dependencies = [
  "arrow-array",
  "arrow-buffer",
  "arrow-cast",
- "arrow-json 53.4.0",
+ "arrow-json",
  "arrow-ord",
  "arrow-schema",
  "arrow-select",
@@ -3892,7 +3880,7 @@ version = "1.1.0"
 dependencies = [
  "bytes",
  "docx-rs",
- "lopdf",
+ "pdf-extract",
  "snafu",
  "tokio",
 ]
@@ -4090,6 +4078,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d817e038c30374a4bcb22f94d0a8a0e216958d4c3dcde369b1439fec4bdda6e6"
 dependencies = [
  "cc",
+]
+
+[[package]]
+name = "euclid"
+version = "0.20.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2bb7ef65b3777a325d1eeefefab5b6d4959da54747e33bd6258e789640f307ad"
+dependencies = [
+ "num-traits",
 ]
 
 [[package]]
@@ -4325,7 +4322,7 @@ version = "1.1.0"
 dependencies = [
  "ansi_term",
  "arrow-flight",
- "arrow-json 53.1.0",
+ "arrow-json",
  "clap",
  "datafusion",
  "flight_client",
@@ -6829,9 +6826,9 @@ dependencies = [
 [[package]]
 name = "lopdf"
 version = "0.34.0"
-source = "git+https://github.com/J-F-Liu/lopdf?rev=38b8c25f3e92c578baf18928a8ce75d447a6009a#38b8c25f3e92c578baf18928a8ce75d447a6009a"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c5c8ecfc6c72051981c0459f75ccc585e7ff67c70829560cda8e647882a9abff"
 dependencies = [
- "chrono",
  "encoding_rs",
  "flate2",
  "indexmap 2.7.1",
@@ -6840,7 +6837,6 @@ dependencies = [
  "md-5",
  "nom",
  "rangemap",
- "rayon",
  "time",
  "weezl",
 ]
@@ -7149,7 +7145,7 @@ dependencies = [
 [[package]]
 name = "mistralrs"
 version = "0.4.0"
-source = "git+https://github.com/spiceai/mistral.rs?rev=6339435d8a1a1b31d32e5a500ded56e2b4365b7b#6339435d8a1a1b31d32e5a500ded56e2b4365b7b"
+source = "git+https://github.com/spiceai/mistral.rs?rev=b8f7eab30b7ef54ec30d24b8de14b1583a277039#b8f7eab30b7ef54ec30d24b8de14b1583a277039"
 dependencies = [
  "anyhow",
  "candle-core 0.8.0",
@@ -7170,7 +7166,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-core"
 version = "0.4.0"
-source = "git+https://github.com/spiceai/mistral.rs?rev=6339435d8a1a1b31d32e5a500ded56e2b4365b7b#6339435d8a1a1b31d32e5a500ded56e2b4365b7b"
+source = "git+https://github.com/spiceai/mistral.rs?rev=b8f7eab30b7ef54ec30d24b8de14b1583a277039#b8f7eab30b7ef54ec30d24b8de14b1583a277039"
 dependencies = [
  "akin",
  "anyhow",
@@ -7246,7 +7242,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-paged-attn"
 version = "0.4.0"
-source = "git+https://github.com/spiceai/mistral.rs?rev=6339435d8a1a1b31d32e5a500ded56e2b4365b7b#6339435d8a1a1b31d32e5a500ded56e2b4365b7b"
+source = "git+https://github.com/spiceai/mistral.rs?rev=b8f7eab30b7ef54ec30d24b8de14b1583a277039#b8f7eab30b7ef54ec30d24b8de14b1583a277039"
 dependencies = [
  "anyhow",
  "bindgen_cuda 0.1.6",
@@ -7261,7 +7257,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-quant"
 version = "0.4.0"
-source = "git+https://github.com/spiceai/mistral.rs?rev=6339435d8a1a1b31d32e5a500ded56e2b4365b7b#6339435d8a1a1b31d32e5a500ded56e2b4365b7b"
+source = "git+https://github.com/spiceai/mistral.rs?rev=b8f7eab30b7ef54ec30d24b8de14b1583a277039#b8f7eab30b7ef54ec30d24b8de14b1583a277039"
 dependencies = [
  "bindgen_cuda 0.1.5",
  "byteorder",
@@ -7283,7 +7279,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-vision"
 version = "0.4.0"
-source = "git+https://github.com/spiceai/mistral.rs?rev=6339435d8a1a1b31d32e5a500ded56e2b4365b7b#6339435d8a1a1b31d32e5a500ded56e2b4365b7b"
+source = "git+https://github.com/spiceai/mistral.rs?rev=b8f7eab30b7ef54ec30d24b8de14b1583a277039#b8f7eab30b7ef54ec30d24b8de14b1583a277039"
 dependencies = [
  "candle-core 0.8.0",
  "image 0.25.5",
@@ -8041,7 +8037,7 @@ dependencies = [
 [[package]]
 name = "object_store"
 version = "0.11.1"
-source = "git+https://github.com/spiceai/arrow-rs.git?rev=cee50b7d2ccf749eac89d0fe26fbd8a06c0bb3c4#cee50b7d2ccf749eac89d0fe26fbd8a06c0bb3c4"
+source = "git+https://github.com/spiceai/arrow-rs.git?rev=5feaa5f724d32c09e30394cedb7799de670e43e1#5feaa5f724d32c09e30394cedb7799de670e43e1"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -8595,6 +8591,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "pdf-extract"
+version = "0.8.0"
+source = "git+https://github.com/spiceai/pdf-extract?rev=3ca5e2c904cdf5897f3d671e3b2c4b62b1612b0c#3ca5e2c904cdf5897f3d671e3b2c4b62b1612b0c"
+dependencies = [
+ "adobe-cmap-parser",
+ "encoding_rs",
+ "euclid",
+ "lopdf",
+ "postscript",
+ "tracing",
+ "type1-encoding-parser",
+ "unicode-normalization",
+]
+
+[[package]]
 name = "pem"
 version = "3.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8829,6 +8840,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "pom"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "60f6ce597ecdcc9a098e7fddacb1065093a3d66446fa16c675e7e71d1b5c28e6"
+
+[[package]]
 name = "portable-atomic"
 version = "1.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8889,6 +8906,12 @@ dependencies = [
  "serde_json",
  "uuid 1.12.1",
 ]
+
+[[package]]
+name = "postscript"
+version = "0.14.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "78451badbdaebaf17f053fd9152b3ffb33b516104eacb45e7864aaa9c712f306"
 
 [[package]]
 name = "powerfmt"
@@ -10019,7 +10042,7 @@ dependencies = [
  "arrow-csv",
  "arrow-flight",
  "arrow-ipc",
- "arrow-json 53.1.0",
+ "arrow-json",
  "arrow-schema",
  "arrow_sql_gen",
  "arrow_tools",
@@ -11169,6 +11192,7 @@ dependencies = [
  "spice-cloud",
  "telemetry",
  "tokio",
+ "tpc-extension",
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
@@ -11179,6 +11203,7 @@ name = "spicepod"
 version = "1.1.0"
 dependencies = [
  "fundu",
+ "regex",
  "schemars",
  "serde",
  "serde-value",
@@ -11663,6 +11688,7 @@ dependencies = [
 name = "testoperator"
 version = "1.1.0"
 dependencies = [
+ "arrow-json",
  "clap",
  "reqwest 0.12.12",
  "serde",
@@ -12307,6 +12333,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8df9b6e13f2d32c91b9bd719c00d1958837bc7dec474d94952798cc8e69eeec3"
 
 [[package]]
+name = "tpc-extension"
+version = "1.1.0"
+dependencies = [
+ "async-trait",
+ "datafusion",
+ "duckdb",
+ "runtime",
+ "snafu",
+ "tracing",
+]
+
+[[package]]
 name = "tqdm"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -12640,6 +12678,15 @@ dependencies = [
  "cfg-if",
  "rand 0.8.5",
  "static_assertions",
+]
+
+[[package]]
+name = "type1-encoding-parser"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d3d6cc09e1a99c7e01f2afe4953789311a1c50baebbdac5b477ecf78e2e92a5b"
+dependencies = [
+ "pom",
 ]
 
 [[package]]

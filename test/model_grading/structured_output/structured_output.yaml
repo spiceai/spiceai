@@ -1,0 +1,36 @@
+version: v1beta1
+kind: Spicepod
+name: structured-output-sample
+
+datasets:
+  - from: file:structured_output.jsonl
+    name: structured_output
+
+evals:
+  - name: structured_output
+    description: Measure the quality of structured output
+    dataset: structured_output
+    scorers:
+      - json_match
+
+models:
+  - from: openai:o3-mini
+    name: test_model
+    params:
+      openai_api_key: ${ secrets:OPENAI_API_KEY }
+      openai_response_format:
+        type: json_schema
+        json_schema:
+          name: math_reasoning
+          schema:
+            type: object
+            properties:
+              student:
+                type: string
+              final_answer:
+                type: integer
+            required:
+              - student
+              - final_answer
+            additionalProperties: false
+          strict: true

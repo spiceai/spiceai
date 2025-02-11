@@ -132,7 +132,8 @@ jobs:
         echo "CLI Version: $cli_version"
         echo "Runtime Version: $runtime_version"
 
-        if [ "$cli_version" != "$release_version" ]; then
+        # Release version contains '+models' suffix, so we need to add it to the cli_version for comparison
+        if [ "$cli_version+models" != "$release_version" ]; then
           echo "CLI version $cli_version does not match the latest release version $release_version."
           exit 1
         fi
@@ -163,9 +164,12 @@ jobs:
 
         $response = Invoke-WebRequest -Uri "https://api.github.com/repos/spiceai/spiceai/releases/latest" -UseBasicParsing -Headers $headers
         $releaseVersion = ($response.Content | ConvertFrom-Json).tag_name
+        # Append "+models" to the release version to match default runtime
+        $releaseVersion = "$releaseVersion+models"
         Write-Host "Release Version: $releaseVersion"
 
-        if ($cliVersion -ne $releaseVersion) {
+        # Release version contains '+models' suffix, so we need to add it to the cliVersion for comparison
+        if ("$cliVersion+models" -ne $releaseVersion) {
           Write-Host "CLI version $cliVersion does not match the latest release version $releaseVersion."
           exit 1
         }

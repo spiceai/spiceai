@@ -14,6 +14,7 @@ snapshot_kind: text
             tool_calls: None,
             role: Assistant,
             function_call: None,
+            audio: None,
         },
         finish_reason: Some(
             Stop,

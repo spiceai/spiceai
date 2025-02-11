@@ -21,8 +21,8 @@ mod args;
 mod commands;
 
 use args::{
-    Commands, DataConsistencyArgs, DatasetTestArgs, HttpConsistencyTestArgs, HttpOverheadTestArgs,
-    TestCommands,
+    Commands, DataConsistencyArgs, DatasetTestArgs, EvalsTestArgs, HttpConsistencyTestArgs,
+    HttpOverheadTestArgs, TestCommands,
 };
 
 #[derive(Parser)]
@@ -46,6 +46,7 @@ async fn main() -> anyhow::Result<()> {
             | TestCommands::Load(DatasetTestArgs { common, .. })
             | TestCommands::HttpConsistency(HttpConsistencyTestArgs { common, .. })
             | TestCommands::HttpOverhead(HttpOverheadTestArgs { common, .. })
+            | TestCommands::Evals(EvalsTestArgs { common, .. })
             | TestCommands::DataConsistency(DataConsistencyArgs {
                 test_args: DatasetTestArgs { common, .. },
                 ..
@@ -69,6 +70,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Dispatch(args) => {
             commands::dispatch::dispatch(args).await?;
+        }
+        Commands::Run(TestCommands::Evals(args)) => {
+            commands::evals::run(&args).await?;
         }
     }
 

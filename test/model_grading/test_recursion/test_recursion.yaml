@@ -1,0 +1,63 @@
+version: v1beta1
+kind: Spicepod
+name: recursion-test-sample
+
+default_acceleration: &default_acceleration
+  enabled: true
+  mode: memory
+
+datasets:
+  - from: s3://spiceai-demo-datasets/tpch/customer/
+    name: customer
+    params:
+      file_format: parquet
+    acceleration: *default_acceleration
+
+  - from: s3://spiceai-demo-datasets/tpch/lineitem/
+    name: lineitem
+    params:
+      file_format: parquet
+    acceleration: *default_acceleration
+
+  - from: s3://spiceai-demo-datasets/tpch/nation/
+    name: nation
+    params:
+      file_format: parquet
+    acceleration: *default_acceleration
+
+  - from: s3://spiceai-demo-datasets/tpch/orders/
+    name: orders
+    params:
+      file_format: parquet
+    acceleration: *default_acceleration
+
+  - from: s3://spiceai-demo-datasets/tpch/part/
+    name: part
+    params:
+      file_format: parquet
+    acceleration: *default_acceleration
+
+  - from: s3://spiceai-demo-datasets/tpch/partsupp/
+    name: partsupp
+    params:
+      file_format: parquet
+    acceleration: *default_acceleration
+
+  - from: s3://spiceai-demo-datasets/tpch/region/
+    name: region
+    params:
+      file_format: parquet
+    acceleration: *default_acceleration
+
+  - from: s3://spiceai-demo-datasets/tpch/supplier/
+    name: supplier
+    params:
+      file_format: parquet
+    acceleration: *default_acceleration
+
+models:
+  - from: openai:o3-mini
+    name: openai_model
+    params:
+      tools: auto
+      openai_api_key: ${ secrets:OPENAI_API_KEY }

@@ -42,7 +42,7 @@ use datafusion::logical_expr::LogicalPlan;
 use datafusion::logical_expr::{Expr, LogicalPlanBuilder};
 use datafusion::sql::unparser::Unparser;
 use datafusion::sql::TableReference;
-use datafusion_table_providers::InvalidTypeAction;
+use datafusion_table_providers::UnsupportedTypeAction;
 use snafu::prelude::*;
 use std::any::Any;
 use std::collections::HashMap;
@@ -235,14 +235,14 @@ pub enum DataConnectorError {
     },
 
     #[snafu(display(
-        "Failed to load the {connector_component} ({dataconnector}).\nInvalid type action is not supported for the {dataconnector} Data Connector.\nRemove the parameter from your dataset configuration."
+        "Failed to load the {connector_component} ({dataconnector}).\nUnsupported type action is not enabled for the {dataconnector} Data Connector.\nRemove the parameter from your dataset configuration."
     ))]
-    UnsupportedInvalidTypeAction {
+    UnsupportedTypeAction {
         dataconnector: String,
         connector_component: ConnectorComponent,
     },
 
-    #[snafu(display("Failed to load the {connector_component} ({dataconnector}).\nThe field '{field_name}' has an unsupported data type: {data_type}.\nSkip loading this field by setting the `invalid_type_action` parameter to `ignore` or `warn` in the dataset configuration.\nFor details, visit: https://spiceai.org/docs/reference/spicepod/datasets#invalid_type_action"))]
+    #[snafu(display("Failed to load the {connector_component} ({dataconnector}).\nThe field '{field_name}' has an unsupported data type: {data_type}.\nSkip loading this field by setting the `unsupported_type_action` parameter to `ignore` or `warn` in the dataset configuration.\nFor details, visit: https://spiceai.org/docs/reference/spicepod/datasets#unsupported_type_action"))]
     UnsupportedDataType {
         dataconnector: String,
         connector_component: ConnectorComponent,
@@ -290,8 +290,8 @@ pub async fn create_new_connector(
 
     let factory = connector_factory?;
 
-    if params.invalid_type_action.is_some() && !factory.supports_invalid_type_action() {
-        return Some(Err(DataConnectorError::UnsupportedInvalidTypeAction {
+    if params.unsupported_type_action.is_some() && !factory.supports_unsupported_type_action() {
+        return Some(Err(DataConnectorError::UnsupportedTypeAction {
             dataconnector: name.to_string(),
             connector_component: params.component.clone(),
         }
@@ -360,7 +360,7 @@ pub trait DataConnectorFactory: Send + Sync {
         params: ConnectorParams,
     ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>>;
 
-    fn supports_invalid_type_action(&self) -> bool {
+    fn supports_unsupported_type_action(&self) -> bool {
         false
     }
 
@@ -525,7 +525,7 @@ impl std::fmt::Display for ConnectorComponent {
 
 pub struct ConnectorParams {
     pub(crate) parameters: Parameters,
-    pub(crate) invalid_type_action: Option<InvalidTypeAction>,
+    pub(crate) unsupported_type_action: Option<UnsupportedTypeAction>,
     pub(crate) component: ConnectorComponent,
 }
 
@@ -548,7 +548,7 @@ impl ConnectorParamsBuilder {
         secrets: Arc<RwLock<Secrets>>,
     ) -> Result<ConnectorParams, Box<dyn std::error::Error + Send + Sync>> {
         let name = self.connector.to_string();
-        let mut invalid_type_action = None;
+        let mut unsupported_type_action = None;
         let (params, prefix, parameters) = match &self.component {
             ConnectorComponent::Catalog(catalog) => {
                 let guard = CATALOG_CONNECTOR_FACTORY_REGISTRY.lock().await;
@@ -570,7 +570,7 @@ impl ConnectorParamsBuilder {
                 let guard = DATA_CONNECTOR_FACTORY_REGISTRY.lock().await;
                 let connector_factory = guard.get(&name);
 
-                invalid_type_action = dataset.invalid_type_action;
+                unsupported_type_action = dataset.unsupported_type_action;
 
                 let factory = connector_factory.ok_or_else(|| {
                     if name == ODBC_DATACONNECTOR {
@@ -602,7 +602,7 @@ impl ConnectorParamsBuilder {
 
         Ok(ConnectorParams {
             parameters,
-            invalid_type_action: invalid_type_action.map(InvalidTypeAction::from),
+            unsupported_type_action: unsupported_type_action.map(UnsupportedTypeAction::from),
             component: self.component.clone(),
         })
     }
@@ -651,10 +651,10 @@ fn include_computed_columns(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::component::dataset::InvalidTypeAction as DatasetInvalidTypeAction;
+    use crate::component::dataset::UnsupportedTypeAction as DatasetUnsupportedTypeAction;
 
     #[tokio::test]
-    async fn test_connector_params_builder_invalid_type_action() {
+    async fn test_connector_params_builder_unsupported_type_action() {
         // Register a test connector factory
         struct TestConnectorFactory;
         impl DataConnectorFactory for TestConnectorFactory {
@@ -677,7 +677,7 @@ mod tests {
                 &[]
             }
 
-            fn supports_invalid_type_action(&self) -> bool {
+            fn supports_unsupported_type_action(&self) -> bool {
                 true
             }
         }
@@ -699,10 +699,10 @@ mod tests {
 
         register_connector_factory("test", Arc::new(TestConnectorFactory)).await;
 
-        // Create a test dataset with invalid_type_action
+        // Create a test dataset with unsupported_type_action
         let mut dataset = Dataset::try_new("test:test_dataset".to_string(), "test_dataset")
             .expect("failed to create dataset");
-        dataset.invalid_type_action = Some(DatasetInvalidTypeAction::Ignore);
+        dataset.unsupported_type_action = Some(DatasetUnsupportedTypeAction::Ignore);
 
         let secrets = Arc::new(RwLock::new(Secrets::default()));
         let builder = ConnectorParamsBuilder::new(
@@ -715,9 +715,9 @@ mod tests {
 
         let params = result.expect("failed to build connector params");
         assert_eq!(
-            params.invalid_type_action,
-            Some(InvalidTypeAction::Ignore),
-            "Invalid type action should be properly set in connector params"
+            params.unsupported_type_action,
+            Some(UnsupportedTypeAction::Ignore),
+            "Unsupported type action should be properly set in connector params"
         );
     }
 }

@@ -44,15 +44,16 @@ rust-version = "1.84"
 version = "1.1.0"
 
 [workspace.dependencies]
-arrow = "53"
+arrow = { version = "53", features = ["prettyprint"] }
 arrow-buffer = "53"
 arrow-flight = "53"
 # Use published version once https://github.com/apache/arrow-rs/pull/6606 is released
 arrow-ipc = "53"
-arrow-json = { git = "https://github.com/spiceai/arrow-rs.git", rev = "63d05723107d6dc5f08acc5461417ee42937adcc" }
+arrow-json = "53"
+arrow-cast = "53"
 arrow-odbc = "11.2.0"
 arrow-schema = "53"
-async-openai = { git = "https://github.com/spiceai/async-openai", rev = "75e6bf715760f63f3dd3e7a43222ec1e6fb9707f" }
+async-openai = { git = "https://github.com/spiceai/async-openai", rev = "9debf2001eaf8f1b6407fdf4b8cf9aa28fb3465e" }
 async-stream = "0.3.5"
 async-trait = "0.1.86"
 axum = { version = "0.7", features = ["macros"] }
@@ -160,10 +161,13 @@ datafusion-common = { git = "https://github.com/spiceai/datafusion.git", rev = "
 datafusion-execution = { git = "https://github.com/spiceai/datafusion.git", rev = "90409dee317a2accd63f9649807e52d51aa74097" }
 datafusion-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "90409dee317a2accd63f9649807e52d51aa74097" }
 
-object_store = { git = "https://github.com/spiceai/arrow-rs.git", rev = "cee50b7d2ccf749eac89d0fe26fbd8a06c0bb3c4" }
+arrow = { git = "https://github.com/spiceai/arrow-rs.git", rev = "5feaa5f724d32c09e30394cedb7799de670e43e1" }
+arrow-json = { git = "https://github.com/spiceai/arrow-rs.git", rev = "5feaa5f724d32c09e30394cedb7799de670e43e1" }
+arrow-cast = { git = "https://github.com/spiceai/arrow-rs.git", rev = "5feaa5f724d32c09e30394cedb7799de670e43e1" }
+object_store = { git = "https://github.com/spiceai/arrow-rs.git", rev = "5feaa5f724d32c09e30394cedb7799de670e43e1" }
 
 datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "a889f4bd47cba6b96d24a63a03891c64dadb6e15" }
-datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "47f096b1551ccd4a21adf51084fa03b0bc518288" }
+datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "54bed07357fb1f201d812b45cf7d1d1bb32726f1" }
 
 duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "c7421f30d8ff2d39ed6df01a9ec51bc8781cfaae" }
 

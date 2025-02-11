@@ -16,6 +16,7 @@ limitations under the License.
 
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use async_trait::async_trait;
+use chrono::TimeZone;
 use datafusion::catalog::Session;
 use datafusion::common::DFSchema;
 use datafusion::datasource::listing::PartitionedFile;
@@ -43,6 +44,7 @@ use delta_kernel::scan::ScanBuilder;
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::Table;
 use indexmap::IndexMap;
+use object_store::ObjectMeta;
 use secrecy::{ExposeSecret, SecretString};
 use snafu::prelude::*;
 use std::{collections::HashMap, sync::Arc};
@@ -495,6 +497,7 @@ struct PartitionFileContext {
 
 #[allow(clippy::needless_pass_by_value)]
 #[allow(clippy::cast_sign_loss)]
+#[allow(clippy::cast_possible_truncation)]
 fn handle_scan_file(
     scan_context: &mut ScanContext,
     path: &str,
@@ -514,9 +517,36 @@ fn handle_scan_file(
             return;
         }
     };
-    let path = format!("{}/{path}", root_url.path());
 
-    let partitioned_file = PartitionedFile::new(path.clone(), size as u64);
+    let path = if root_url.path().ends_with('/') {
+        format!("{}{}", root_url.path(), path)
+    } else {
+        format!("{}/{}", root_url.path(), path)
+    };
+
+    let partitioned_file_path = match object_store::path::Path::from_url_path(&path) {
+        Ok(path) => path,
+        Err(e) => {
+            scan_context
+                .errs
+                .push(datafusion::error::DataFusionError::Execution(format!(
+                    "Error parsing file path: {e}",
+                )));
+            return;
+        }
+    };
+
+    tracing::trace!("partitioned_file_path: {partitioned_file_path:?}");
+
+    let partitioned_file_object_meta = ObjectMeta {
+        location: partitioned_file_path,
+        last_modified: chrono::Utc.timestamp_nanos(0),
+        size: size as usize,
+        e_tag: None,
+        version: None,
+    };
+
+    let partitioned_file = PartitionedFile::from(partitioned_file_object_meta);
 
     // Get the selection vector (i.e. inverse deletion vector)
     let selection_vector =

@@ -54,11 +54,10 @@ datasets:
 
 models:
   - name: hf_local_model
-    from: huggingface:huggingface.co/microsoft/Phi-3-mini-4k-instruct
+    from: huggingface:huggingface.co/Qwen/Qwen2.5-3B-Instruct
     params:
-      model_type: phi3
       system_prompt: |
-        Instructions for Responses: 
+        Instructions for Responses:
           - Do not include any private metadata provided to the model as context such as \"reference_url_template\" or \"instructions\" in your responses.
 
 embeddings:

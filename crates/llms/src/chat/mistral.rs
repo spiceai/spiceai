@@ -468,6 +468,7 @@ impl MistralLlama {
                         c.finish_reason = "tool_calls".to_string();
                     }
                 });
+
                 Ok(resp)
             }
             MistralResponse::ModelError(e, _) => Err(OpenAIError::ApiError(ApiError {
@@ -710,7 +711,7 @@ fn chunk_choices_to_openai(choice: &ChunkChoice) -> Result<ChatChoiceStream, Ope
             function_call: None,
             tool_calls: delta.tool_calls.as_ref().map(|t| {
                 t.iter()
-                    .map(|x| parse_tool_call_response(*index as i32, x))
+                    .map(|x| parse_tool_call_response(*index as u32, x))
                     .collect()
             }),
             role: Some(role),
@@ -761,7 +762,7 @@ fn convert_tool(x: &ChatCompletionTool) -> Tool {
 }
 
 fn parse_tool_call_response(
-    index: i32,
+    index: u32,
     r: &ToolCallResponse,
 ) -> ChatCompletionMessageToolCallChunk {
     ChatCompletionMessageToolCallChunk {

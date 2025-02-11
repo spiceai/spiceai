@@ -58,6 +58,22 @@ impl Acceleration {
         Ok(())
     }
 
+    pub fn validate_primary_key(&self, schema: &SchemaRef) -> dataset::Result<()> {
+        if let Some(columns) = &self.primary_key {
+            for column in columns.iter() {
+                if schema.field_with_name(column).is_err() {
+                    return dataset::PrimaryKeyColumnNotFoundSnafu {
+                        invalid_column: column.to_string(),
+                        valid_columns: Self::valid_columns(schema),
+                    }
+                    .fail();
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     #[allow(clippy::needless_pass_by_value)]
     pub fn table_constraints(&self, schema: SchemaRef) -> dataset::Result<Option<Constraints>> {
         if self.indexes.is_empty() && self.primary_key.is_none() {

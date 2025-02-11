@@ -30,6 +30,7 @@ serde_yaml.workspace = true
 snafu.workspace = true
 snmalloc-rs = "0.3.6"
 spice-cloud = { path = "../../crates/spice_cloud" }
+tpc-extension = { path = "../../crates/tpc_extension", optional = true }
 tokio.workspace = true
 telemetry = { path = "../../crates/telemetry" }
 tracing.workspace = true
@@ -71,6 +72,7 @@ dynamodb = ["runtime/dynamodb"]
 flightsql = ["runtime/flightsql"]
 ftp = ["runtime/ftp"]
 keyring-secret-store = ["runtime/keyring-secret-store"]
+imap = ["runtime/imap"]
 metal =  ["runtime/metal"]
 models = ["runtime/models"]
 mssql = ["runtime/mssql"]
@@ -83,3 +85,4 @@ spark = ["runtime/spark"]
 sqlite = ["runtime/sqlite"]
 sharepoint = ["runtime/sharepoint"]
 postgres-write = ["runtime/postgres-write"]
+tpc-extension = ["dep:tpc-extension"]

@@ -217,3 +217,38 @@ async fn query_delta_lake_with_null_partitions() -> Result<(), String> {
         })
         .await
 }
+
+#[tokio::test]
+async fn query_delta_lake_with_percent_encoded_path() -> Result<(), String> {
+    test_request_context()
+        .scope(async {
+            let path = setup_test_data(
+                "https://public-data.spiceai.org/delta_table_partition.zip",
+                "delta_table_partition",
+            )
+            .await?;
+            let _hook = FileCleanup { path: path.clone() };
+
+            let query = "SELECT * FROM test ORDER BY date_col, name, value";
+            let expected_results = [
+                "+--------------+---------+-------+",
+                "| date_col     | name    | value |",
+                "+--------------+---------+-------+",
+                "| 2024-02-04   | Alice   | 100   |",
+                "| 2025-01-01   | Charlie | 300   |",
+                "| 2030-06-15   | David   | 400   |",
+                "| +10999-12-31 | Bob     | 200   |",
+                "+--------------+---------+-------+",
+            ];
+
+            run_delta_lake_test(
+                "delta_lake_percent_encoded_path_test",
+                &format!("{path}/delta_table_partition"),
+                "test",
+                query,
+                &expected_results,
+            )
+            .await
+        })
+        .await
+}

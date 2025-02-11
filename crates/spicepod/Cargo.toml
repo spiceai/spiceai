@@ -9,6 +9,7 @@ version.workspace = true
 
 [dependencies]
 fundu.workspace = true
+regex.workspace = true
 schemars = { version = "0.8.19", optional = true }
 serde = { workspace = true, features = ["derive", "rc"] }
 serde-value = "0.7.0"
