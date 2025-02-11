@@ -60,7 +60,7 @@ graphql-parser.workspace = true
 headers-accept = "0.1.3"
 http.workspace = true
 http-body-util = "0.1.2"
-hyper = "1.5.1"
+hyper = "1.6.0"
 hyper-util = { version = "0.1.6", features = ["service"] }
 iceberg.workspace = true
 iceberg-catalog-rest.workspace = true
