@@ -57,21 +57,28 @@ impl Xai {
         // Use name of xAI model, not spicepod model.
         req.model.clone_from(&self.model);
 
-        // xAI requires content to be set, even if tool calls are present.
         req.messages.iter_mut().for_each(|m| {
             if let ChatCompletionRequestMessage::Assistant(
                 ChatCompletionRequestAssistantMessage {
                     content,
-                    tool_calls: Some(ref _tool_calls),
+                    tool_calls: Some(ref mut tool_calls),
                     ..
                 },
             ) = m
             {
+                // xAI requires content to be set, even if tool calls are present.
                 if content.is_none() {
                     content.replace(ChatCompletionRequestAssistantMessageContent::Text(
                         String::new(),
                     ));
                 };
+
+                // xAI requires tool calls with empty parameters used to be `{}` not ``.
+                for t in tool_calls.iter_mut() {
+                    if t.function.arguments.is_empty() {
+                        t.function.arguments = "{}".to_string();
+                    }
+                }
             }
         });
 
