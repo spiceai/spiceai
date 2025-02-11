@@ -18,16 +18,31 @@ package taskhistory
 
 import (
 	"fmt"
-	"io"
 	"strconv"
 	"strings"
 )
 
-// PrintTreeFromTraces prints a hierarchical tree of TaskHistory entries to the provided writer.
+type TaskHistoryRow struct {
+	/// The tree structure (i.e. with indentations, etc) for the `TaskHistory` row.
+	Tree string
+	Task TaskHistory
+}
+
 // Expects all `traces` to be from the same trace (i.e. same `TraceId`).
-// The `fn` function is used to format details to display on each task history line.
-func PrintTreeFromTraces(w io.Writer, traces []TaskHistory, fn func(t *TaskHistory) string) {
-	printTree(w, buildTraceTree(traces), "", true, fn)
+func TreeRowsFromTraces(traces []TaskHistory) []TaskHistoryRow {
+	tree := buildTraceTree(traces)
+	c := make(chan TaskHistoryRow)
+	go func() {
+		defer close(c)
+		printTree(c, tree, "", true)
+	}()
+
+	rows := make([]TaskHistoryRow, 0)
+	for cc := range c {
+		rows = append(rows, cc)
+	}
+
+	return rows
 }
 
 func ConvertLabelsToString(labels map[string]string) string {
@@ -56,7 +71,7 @@ func ConvertLabelsToString(labels map[string]string) string {
 }
 
 // printTree prints the tree in ASCII format.
-func printTree(w io.Writer, node *TreeNode, indent string, isLast bool, fn func(t *TaskHistory) string) {
+func printTree(c chan TaskHistoryRow, node *TreeNode, indent string, isLast bool) {
 	if node == nil {
 		return
 	}
@@ -68,8 +83,7 @@ func printTree(w io.Writer, node *TreeNode, indent string, isLast bool, fn func(
 	if indent == "" {
 		connector = ""
 	}
-
-	fmt.Fprintf(w, "%s%s[%s] %s\n", indent, connector, node.TaskHistory.SpanID, fn(&node.TaskHistory))
+	c <- TaskHistoryRow{fmt.Sprintf("%s%s%s", indent, connector, node.TaskHistory.SpanID), node.TaskHistory}
 
 	// Recurse for children
 	newIndent := indent + "│ "
@@ -78,7 +92,7 @@ func printTree(w io.Writer, node *TreeNode, indent string, isLast bool, fn func(
 	}
 
 	for i, child := range node.Children {
-		printTree(w, child, newIndent, i == len(node.Children)-1, fn)
+		printTree(c, child, newIndent, i == len(node.Children)-1)
 	}
 }
 
