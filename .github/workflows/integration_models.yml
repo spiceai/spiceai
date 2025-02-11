@@ -25,6 +25,7 @@ on:
       - 'monitoring/**'
       - 'acknowledgements.md'
       - 'Dockerfile*'
+      - 'bin/spice/**'
 
   workflow_dispatch:
 
