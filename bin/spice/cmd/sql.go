@@ -50,7 +50,7 @@ sql> show tables
 
 		_, err := rtcontext.Version()
 		if err != nil {
-			slog.Error("Failed to run `spice sql`: Spice runtime is not installed. Run `spice install` to install the runtime.")
+			slog.Error("Failed to run `spice sql`: The Spice runtime is not installed. Run `spice install` and retry.")
 			return
 		}
 
