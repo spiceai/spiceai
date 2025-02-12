@@ -23,6 +23,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/spiceai/spiceai/bin/spice/pkg/context"
 	"github.com/spiceai/spiceai/bin/spice/pkg/taskhistory"
+	"github.com/spiceai/spiceai/bin/spice/pkg/util"
 )
 
 var (
@@ -31,6 +32,12 @@ var (
 
 	// The trace_id of the trace to provide
 	trace_id string
+
+	// The include input flag
+	include_input bool
+
+	// The include output flag
+	include_output bool
 )
 
 var supported_trace_tasks = []string{"ai_chat", "accelerated_refresh", "ai_completion", "sql_query", "nsql",
@@ -87,18 +94,79 @@ $ spice trace ai_chat --id chatcmpl-At6ZmDE8iAYRPeuQLA0FLlWxGKNnM
 			cmd.PrintErrln("Error: No events found")
 			return
 		}
-		taskhistory.PrintTreeFromTraces(cmd.OutOrStdout(), traces, Display)
+
+		rows := taskhistory.TreeRowsFromTraces(traces)
+
+		table := make([]interface{}, len(rows))
+		for i, dataset := range rows {
+			table[i] = ToRowInterface(dataset.Tree, &dataset.Task, include_input, include_output)
+		}
+
+		util.WriteTable(table)
 	},
 }
 
-func Display(t *taskhistory.TaskHistory) string {
-	return fmt.Sprintf("(%8.2fms) %s ", t.ExecutionDurationMs, t.Task)
+// Reduce the `taskhistory.TaskHistory` to only the columns that are needed for the table. This includes the
+// `treePrefix` as the first column.
+//
+// Must use a struct because `util.WriteTable` uses `reflect` functions that require a struct.
+// Must use separate structs for each combination of input/output. Otherwise table will have columns with all `nil`s. A
+// `json:"fieldName,omitempty"` tag does not work.
+func ToRowInterface(treePrefix string, t *taskhistory.TaskHistory, includeInput bool, includeOutput bool) interface{} {
+	type TaskRowBase struct {
+		Tree     string `json:"tree"`
+		Status   string `json:"status"`
+		Duration string `json:"duration"`
+		Task     string `json:"task"`
+	}
+	type TaskRowFull struct {
+		TaskRowBase
+		Input  interface{} `json:"input"`
+		Output interface{} `json:"output"`
+	}
+	type TaskRowWithInput struct {
+		TaskRowBase
+		Input interface{} `json:"input"`
+	}
+	type TaskRowWithOutput struct {
+		TaskRowBase
+		Output interface{} `json:"output"`
+	}
+
+	base := TaskRowBase{
+		Tree:     treePrefix,
+		Duration: fmt.Sprintf("%8.2fms", t.ExecutionDurationMs),
+		Task:     t.Task,
+	}
+
+	if t.ErrorMessage == nil || *t.ErrorMessage == "" {
+		base.Status = "✅"
+	} else {
+		base.Status = "🚫"
+	}
+
+	if includeInput && includeOutput {
+		return TaskRowFull{TaskRowBase: base, Input: t.Input, Output: t.CapturedOutput}
+	} else if includeInput {
+		return TaskRowWithInput{TaskRowBase: base, Input: t.Input}
+	} else if includeOutput {
+		var output string
+		if t.CapturedOutput != nil {
+			output = *t.CapturedOutput
+		} else {
+			output = ""
+		}
+		return TaskRowWithOutput{TaskRowBase: base, Output: output}
+	}
+	return base
 }
 
 func init() {
 	RootCmd.AddCommand(traceCmd)
 	traceCmd.Flags().StringVar(&id, "id", "", "Return the trace with the given id")
 	traceCmd.Flags().StringVar(&trace_id, "trace-id", "", "Return the trace with the given trace id")
+	traceCmd.Flags().BoolVar(&include_input, "include-input", false, "Include input data in the trace")
+	traceCmd.Flags().BoolVar(&include_output, "include-output", false, "Include output data in the trace")
 }
 
 func getTraceFilter(task string, id string, trace_id string) (string, error) {

@@ -23,9 +23,10 @@ use llms::{
     config::GenericAuthMechanism,
     embeddings::candle::link_files_into_tmp_dir,
     openai::new_openai_client,
+    perplexity::PerplexitySonar,
     xai::Xai,
 };
-use secrecy::Secret;
+use secrecy::{Secret, SecretString};
 use std::{
     collections::HashMap,
     fs,
@@ -77,6 +78,20 @@ pub(crate) fn create_hf(model_id: &str) -> Result<Arc<Box<dyn Chat>>, ChatError>
         None,
         std::env::var("HF_TOKEN").ok().map(Secret::new).as_ref(),
     )?))
+}
+
+pub(crate) fn create_perplexity() -> Result<Arc<Box<dyn Chat>>, ChatError> {
+    let mut params: HashMap<String, SecretString> = HashMap::new();
+    if let Ok(api_key) = std::env::var("SPICE_PERPLEXITY_AUTH_TOKEN") {
+        params.insert(
+            "perplexity_auth_token".to_string(),
+            SecretString::new(api_key),
+        );
+    }
+    let sonar = PerplexitySonar::from_params(None, &params)
+        .map_err(|e| ChatError::FailedToLoadModel { source: e })?;
+
+    Ok(Arc::new(Box::new(sonar)))
 }
 
 pub(crate) fn create_local(model_id: &str) -> Result<Arc<Box<dyn Chat>>, anyhow::Error> {

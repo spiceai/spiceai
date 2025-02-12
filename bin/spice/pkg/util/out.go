@@ -50,12 +50,8 @@ func WriteTable(items []interface{}) {
 		return
 	}
 
-	t := reflect.TypeOf(items[0])
-
-	headers := make([]string, t.NumField())
-	for i := 0; i < t.NumField(); i++ {
-		headers[i] = strings.TrimSuffix(t.Field(i).Name, "Enabled")
-	}
+	// Get all headers dynamically, flattening embedded fields
+	headers := getFlattenedHeaders(reflect.TypeOf(items[0]))
 
 	table := tablewriter.NewWriter(os.Stdout)
 	table.SetHeader(headers)
@@ -70,16 +66,41 @@ func WriteTable(items []interface{}) {
 	table.SetTablePadding(" ")
 	table.SetNoWhiteSpace(true)
 
+	// Process each item
 	for _, item := range items {
-		v := reflect.ValueOf(item)
-		row := make([]string, v.NumField())
-		for i := 0; i < v.NumField(); i++ {
-			row[i] = fmt.Sprintf("%v", v.Field(i))
-		}
+		row := getFlattenedValues(reflect.ValueOf(item))
 		table.Append(row)
 	}
 
 	table.Render()
+}
+
+// Recursively extracts flattened headers
+func getFlattenedHeaders(t reflect.Type) []string {
+	var headers []string
+	for i := 0; i < t.NumField(); i++ {
+		field := t.Field(i)
+		if field.Anonymous { // Embedded struct
+			headers = append(headers, getFlattenedHeaders(field.Type)...) // Recursively extract
+		} else {
+			headers = append(headers, strings.TrimSuffix(field.Name, "Enabled"))
+		}
+	}
+	return headers
+}
+
+// Recursively extracts flattened values
+func getFlattenedValues(v reflect.Value) []string {
+	var row []string
+	for i := 0; i < v.NumField(); i++ {
+		field := v.Field(i)
+		if field.Kind() == reflect.Struct { // Handle embedded structs
+			row = append(row, getFlattenedValues(field)...) // Recursively extract
+		} else {
+			row = append(row, fmt.Sprintf("%v", field.Interface()))
+		}
+	}
+	return row
 }
 
 func MarshalAndPrintTable(writer io.Writer, in interface{}) error {
