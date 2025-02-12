@@ -50,7 +50,7 @@ use tonic::metadata::{Ascii, AsciiMetadataKey, MetadataValue};
 use tonic::transport::{Channel, ClientTlsConfig};
 use tonic::{Code, IntoRequest, Status};
 
-mod cache_control;
+pub mod cache_control;
 mod config;
 
 #[derive(Parser, Debug)]
