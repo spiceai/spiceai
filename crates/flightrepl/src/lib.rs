@@ -87,7 +87,7 @@ pub struct ReplConfig {
     #[arg(long, value_name = "USER_AGENT", help_heading = "SQL REPL")]
     pub user_agent: Option<String>,
 
-    /// Control whether the cache is used for queries.
+    /// Control whether the results cache is used for queries.
     #[arg(
         long,
         value_enum,
