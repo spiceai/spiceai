@@ -234,6 +234,39 @@ func (c *RuntimeContext) IsRuntimeInstallRequired() bool {
 	return errors.Is(err, os.ErrNotExist)
 }
 
+func (c *RuntimeContext) InstallMatchingRuntime(cliVersion string, flavor constants.Flavor, allowAccelerator bool) error {
+	err := c.prepareInstallDir()
+	if err != nil {
+		return err
+	}
+
+	release, err := github.GetRuntimeRelease(cliVersion)
+	if err != nil {
+		return err
+	}
+
+	slog.Info(fmt.Sprintf("Downloading and installing Spice.ai Runtime %s ...\n", cliVersion))
+
+	err = github.DownloadRuntimeAsset(flavor, release, c.spiceBinDir, allowAccelerator)
+	if err != nil {
+		slog.Error("downloading Spice.ai runtime binaries", "error", err)
+		return err
+	}
+
+	releaseFilePath := filepath.Join(c.spiceBinDir, constants.SpiceRuntimeFilename)
+
+	err = util.MakeFileExecutable(releaseFilePath)
+	if err != nil {
+		slog.Error("downloading Spice runtime binaries.", "error", err)
+		return err
+	}
+
+	slog.Info(fmt.Sprintf("Spice runtime installed into %s successfully.\n", c.spiceBinDir))
+
+	return nil
+
+}
+
 func (c *RuntimeContext) InstallOrUpgradeRuntime(flavor constants.Flavor, allowAccelerator bool) error {
 	err := c.prepareInstallDir()
 	if err != nil {

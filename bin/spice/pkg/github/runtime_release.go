@@ -36,6 +36,15 @@ const (
 	runtimeRepo  = "spiceai"
 )
 
+func GetRuntimeRelease(cliVersion string) (*RepoRelease, error) {
+	release, err := GetRelease(githubClient, cliVersion)
+	if err != nil {
+		return nil, err
+	}
+
+	return release, nil
+}
+
 func GetLatestRuntimeRelease() (*RepoRelease, error) {
 	release, err := GetLatestRelease(githubClient, GetAssetName(constants.SpiceRuntimeFilename))
 	if err != nil {
