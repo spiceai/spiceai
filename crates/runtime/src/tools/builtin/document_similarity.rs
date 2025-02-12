@@ -73,6 +73,7 @@ impl SpiceModelTool for DocumentSimilarityTool {
 
         let tool_use_result = async {
             let req: SearchRequestAIJson = serde_json::from_str(arg)?;
+            tracing::trace!("document_similarity tool use function call request: {req:?}");
 
             let vs = VectorSearch::new(
                 rt.datafusion(),
