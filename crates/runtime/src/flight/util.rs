@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use arrow_flight::flight_service_server::FlightService;
+use cache::QueryCacheStatus;
 use tonic::{
     metadata::{Ascii, MetadataValue},
     Response,
@@ -27,21 +28,19 @@ use crate::{
 
 pub fn attach_cache_metadata(
     response: &mut Response<<Service as FlightService>::DoGetStream>,
-    from_cache: Option<bool>,
+    cache_status: QueryCacheStatus,
 ) {
-    if let Some(from_cache) = from_cache {
-        let val: Result<MetadataValue<Ascii>, _> = if from_cache {
-            "Hit from spiceai".parse()
-        } else {
-            "Miss from spiceai".parse()
-        };
-        match val {
-            Ok(val) => {
-                response.metadata_mut().insert("x-cache", val);
-            }
-            Err(e) => {
-                tracing::error!("Failed to parse metadata value: {}", e);
-            }
+    let val: Result<MetadataValue<Ascii>, _> = match cache_status {
+        QueryCacheStatus::CacheHit => "Hit from spiceai".parse(),
+        QueryCacheStatus::CacheMiss => "Miss from spiceai".parse(),
+        QueryCacheStatus::CacheNotChecked => return,
+    };
+    match val {
+        Ok(val) => {
+            response.metadata_mut().insert("x-cache", val);
+        }
+        Err(e) => {
+            tracing::error!("Failed to parse metadata value: {}", e);
         }
     }
 }

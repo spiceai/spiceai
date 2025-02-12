@@ -99,7 +99,7 @@ async fn execute_query_and_check_cache_status(
         .await
         .map_err(|e| format!("Failed to collect query results: {e}"))?;
 
-    assert_eq!(query_result.from_cache, expected_cache_status);
+    assert_eq!(query_result.cache_status, expected_cache_status);
 
     Ok(records)
 }
