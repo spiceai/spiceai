@@ -148,9 +148,15 @@ impl Query {
         ))
     }
 
-    fn should_cache_results(df: &DataFusion, plan: &LogicalPlan) -> bool {
-        df.cache_provider()
-            .is_some_and(|provider| provider.cache_is_enabled_for_plan(plan))
+    fn should_cache_results(
+        df: &DataFusion,
+        plan: &LogicalPlan,
+        cache_status: QueryCacheStatus,
+    ) -> (bool, QueryCacheStatus) {
+        match df.cache_provider() {
+            Some(provider) if provider.cache_is_enabled_for_plan(plan) => (true, cache_status),
+            _ => (false, QueryCacheStatus::CacheNotChecked),
+        }
     }
 
     fn wrap_stream_with_cache(
@@ -214,7 +220,8 @@ impl Query {
                 CacheResult::Error(e) => return Err(e),
             };
 
-            let plan_is_cache_enabled = Self::should_cache_results(&ctx.df, &plan);
+            let (plan_is_cache_enabled, cache_status) =
+                Self::should_cache_results(&ctx.df, &plan, cache_status);
             let plan_cache_key = cache::key_for_logical_plan(&plan);
             tracker = tracker.results_cache_hit(false);
 
