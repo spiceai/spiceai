@@ -32,7 +32,6 @@ use datafusion::{common::Constraint, datasource::TableProvider, sql::TableRefere
 use datafusion_federation::FederatedTableProviderAdaptor;
 use futures::TryStreamExt;
 use itertools::Itertools;
-use schemars::schema::{Metadata, SchemaObject};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
@@ -157,9 +156,6 @@ pub struct SearchRequestHTTPJson {
     #[serde(flatten)]
     pub base: SearchRequestBaseJson,
 
-    /// At least one keyword should be supplied for a vector search. Keywords should be individual words.
-    /// Keywords are used to pre-filter the embedding column, applied as a `WHERE col LIKE '%keyword%'` condition.
-    /// Keywords should not contain column names, special characters, or other operators.
     #[serde(default)]
     pub keywords: Option<Vec<String>>,
 }
@@ -615,7 +611,7 @@ impl VectorSearch {
 
         let keywords_filter = keywords
             .iter()
-            .map(|k| format!("LOWER({embedding_column}) LIKE '%{}%'", k.to_lowercase()))
+            .map(|k| format!("{embedding_column} ILIKE '%{k}%'"))
             .join(" OR ");
 
         let where_str = match (where_cond, keywords.is_empty()) {
