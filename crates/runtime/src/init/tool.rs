@@ -18,8 +18,8 @@ use std::{collections::HashMap, sync::Arc};
 
 use crate::{
     get_params_with_secrets, metrics, status,
-    tools::{self, factory::default_available_catalogs},
-    Runtime, SpiceModelTool, SpiceToolCatalog, UnableToInitializeLlmToolSnafu,
+    tools::{self, factory::default_available_catalogs, Tooling},
+    Runtime, SpiceToolCatalog, UnableToInitializeLlmToolSnafu,
 };
 use opentelemetry::KeyValue;
 use secrecy::SecretString;
@@ -43,7 +43,7 @@ impl Runtime {
         for ctlg in default_available_catalogs() {
             self.insert_tool_catalog(&ctlg).await;
             for tool in ctlg.all().await {
-                self.insert_tool(&tool).await;
+                self.insert_tool(tool.into()).await;
             }
         }
     }
@@ -59,11 +59,11 @@ impl Runtime {
             .update_tool_catalog(&name, status::ComponentStatus::Ready);
     }
 
-    async fn insert_tool(&self, t: &Arc<dyn SpiceModelTool>) {
+    async fn insert_tool(&self, t: Tooling) {
         let name = t.name().to_string();
         let mut tools_map = self.tools.write().await;
 
-        tools_map.insert(name.clone(), Arc::clone(t).into());
+        tools_map.insert(name.clone(), t);
         tracing::debug!("Tool {} ready to use", name.clone());
         metrics::tools::COUNT.add(1, &[KeyValue::new("tool", name.clone())]);
         self.status
@@ -80,7 +80,7 @@ impl Runtime {
             .await
             .context(UnableToInitializeLlmToolSnafu)
         {
-            Ok(t) => self.insert_tool(&t).await,
+            Ok(t) => self.insert_tool(t).await,
             Err(e) => {
                 metrics::tools::LOAD_ERROR.add(1, &[]);
                 self.status

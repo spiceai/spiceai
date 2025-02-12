@@ -1,4 +1,3 @@
-use secrecy::SecretString;
 /*
 Copyright 2024-2025 The Spice.ai OSS Authors
 
@@ -14,8 +13,8 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+use secrecy::SecretString;
 use spicepod::component::tool::Tool;
-
 use std::{
     collections::HashMap,
     sync::{Arc, LazyLock},
@@ -24,10 +23,41 @@ use tokio::sync::Mutex;
 
 use super::{
     builtin::catalog::BuiltinToolCatalog, catalog::SpiceToolCatalog,
-    memory::catalog::MemoryToolCatalog, SpiceModelTool,
+    memory::catalog::MemoryToolCatalog, SpiceModelTool, Tooling,
 };
 
-pub trait ToolFactory: Send + Sync {
+pub enum ToolFactory {
+    Catalog(Arc<dyn ToolCatalogFactory>),
+    Tool(Arc<dyn IndividualToolFactory>),
+}
+
+impl ToolFactory {
+    fn construct(
+        &self,
+        component: &Tool,
+        params_with_secrets: HashMap<String, SecretString>,
+    ) -> Result<Tooling, Box<dyn std::error::Error + Send + Sync>> {
+        match self {
+            ToolFactory::Catalog(c) => c.construct(component, params_with_secrets).map(Into::into),
+            ToolFactory::Tool(t) => t.construct(component, params_with_secrets).map(Into::into),
+        }
+    }
+}
+
+impl From<Arc<dyn ToolCatalogFactory>> for ToolFactory {
+    fn from(catalog: Arc<dyn ToolCatalogFactory>) -> Self {
+        ToolFactory::Catalog(catalog)
+    }
+}
+
+impl From<Arc<dyn IndividualToolFactory>> for ToolFactory {
+    fn from(tool: Arc<dyn IndividualToolFactory>) -> Self {
+        ToolFactory::Tool(tool)
+    }
+}
+
+/// A factory that can create individual [`SpiceModelTool`]s from a [`Tool`] component.
+pub trait IndividualToolFactory: Send + Sync {
     fn construct(
         &self,
         component: &Tool,
@@ -35,19 +65,27 @@ pub trait ToolFactory: Send + Sync {
     ) -> Result<Arc<dyn SpiceModelTool>, Box<dyn std::error::Error + Send + Sync>>;
 }
 
-static TOOL_SHED_FACTORY: LazyLock<Mutex<HashMap<String, Arc<dyn ToolFactory>>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-
-/// Register a tool factory. The `from_source` is defined in the [`Tool`]'s `from`.
-pub async fn register_tool_factory(from_source: &str, tool: Arc<dyn ToolFactory>) {
-    let mut registry = TOOL_SHED_FACTORY.lock().await;
-
-    registry.insert(from_source.to_string(), tool);
+pub trait ToolCatalogFactory: Send + Sync {
+    fn construct(
+        &self,
+        component: &Tool,
+        params_with_secrets: HashMap<String, SecretString>,
+    ) -> Result<Arc<dyn SpiceToolCatalog>, Box<dyn std::error::Error + Send + Sync>>;
 }
 
+static TOOL_SHED_FACTORY: LazyLock<Mutex<HashMap<String, ToolFactory>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
 pub async fn register_all_factories() {
-    register_tool_factory("builtin", Arc::new(BuiltinToolCatalog {})).await;
-    register_tool_factory("memory", Arc::new(MemoryToolCatalog {})).await;
+    let mut registry = TOOL_SHED_FACTORY.lock().await;
+    registry.insert(
+        "builtin".to_string(),
+        ToolFactory::Tool(Arc::new(BuiltinToolCatalog {})),
+    );
+    registry.insert(
+        "memory".to_string(),
+        ToolFactory::Tool(Arc::new(MemoryToolCatalog {})),
+    );
 }
 
 /// Get all catalogs available by default in the spice runtime.
@@ -59,11 +97,12 @@ pub fn default_available_catalogs() -> Vec<Arc<dyn SpiceToolCatalog>> {
     ]
 }
 
+/// Forge creates `Tooling` from a `Tool` component. It uses the `from` field to determine if it should create a [`SpiceToolCatalog`] or a [`SpiceModelTool`].
 #[allow(clippy::implicit_hasher)]
 pub async fn forge(
     component: &Tool,
     secrets: HashMap<String, SecretString>,
-) -> Result<Arc<dyn SpiceModelTool>, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<Tooling, Box<dyn std::error::Error + Send + Sync>> {
     let from_source = component
         .from
         .split_once(':')

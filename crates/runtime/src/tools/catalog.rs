@@ -1,3 +1,4 @@
+use async_openai::types::{ChatCompletionTool, ChatCompletionToolType, FunctionObject};
 /*
 Copyright 2024-2025 The Spice.ai OSS Authors
 
@@ -24,6 +25,25 @@ pub trait SpiceToolCatalog: Send + Sync {
 
     /// Retrieve all available tools from a tool catalog.
     async fn all(&self) -> Vec<Arc<dyn SpiceModelTool>>;
+
+    /// Return all available tool definitions for a given catalog.
+    ///
+    /// Overriding this method if it can be implemented more efficiently than by using [`Self::all`].
+    async fn all_definitons(&self) -> Vec<ChatCompletionTool> {
+        self.all()
+            .await
+            .into_iter()
+            .map(|t| ChatCompletionTool {
+                r#type: ChatCompletionToolType::Function,
+                function: FunctionObject {
+                    strict: t.strict(),
+                    name: t.name().to_string(),
+                    description: t.description().map(|d| d.to_string()),
+                    parameters: t.parameters(),
+                },
+            })
+            .collect()
+    }
 
     /// Retrieve a tool by name from a tool catalog.
     ///

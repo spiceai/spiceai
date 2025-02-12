@@ -20,7 +20,9 @@ use snafu::{ResultExt, Snafu};
 use spicepod::component::tool::Tool;
 use std::{collections::HashMap, sync::Arc};
 
-use crate::tools::{catalog::SpiceToolCatalog, factory::ToolFactory, options::SpiceToolsOptions};
+use crate::tools::{
+    catalog::SpiceToolCatalog, factory::IndividualToolFactory, options::SpiceToolsOptions,
+};
 
 use super::{
     document_similarity::DocumentSimilarityTool,
@@ -92,7 +94,7 @@ impl BuiltinToolCatalog {
     }
 }
 
-impl ToolFactory for BuiltinToolCatalog {
+impl IndividualToolFactory for BuiltinToolCatalog {
     fn construct(
         &self,
         component: &Tool,
