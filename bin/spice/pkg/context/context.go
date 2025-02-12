@@ -394,17 +394,36 @@ func (c *RuntimeContext) SetHttpEndpoint(endpoint string) {
 	c.httpEndpoint = endpoint
 }
 
-func (c *RuntimeContext) IsDownloadedFromHomebrew() bool {
+func (c *RuntimeContext) SpicePath() (constants.SpiceInstallPath, string, error) {
 	executableDir, err := os.Executable()
 	if err != nil {
-		slog.Error("getting path", "error", err)
-		return false
+		return constants.OtherInstall, "", err
 	}
 
 	spiceBinDir := filepath.Join(c.SpiceRuntimeDir(), "bin")
 	releaseFilePath := filepath.Join(spiceBinDir, constants.SpiceCliFilename)
 
-	return executableDir != releaseFilePath
+	if executableDir == releaseFilePath {
+		return constants.StandardInstall, executableDir, nil
+	}
+
+	brewPath := getBrewPrefix()
+	if brewPath != "" && strings.Contains(executableDir, brewPath) {
+		return constants.BrewInstall, executableDir, nil
+	}
+
+	return constants.OtherInstall, executableDir, nil
+}
+
+func getBrewPrefix() string {
+	cmd := exec.Command("brew", "--prefix")
+	out, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+
+	brewPrefix := strings.TrimSpace(string(out))
+	return brewPrefix
 }
 
 func loadDotEnvValues() (map[string]string, error) {
