@@ -294,6 +294,7 @@ async fn run_search_queries(
                         search_limit,
                         None,
                         vec!["_id".to_string()],
+                        vec![],
                     );
 
                     let start = Instant::now();
