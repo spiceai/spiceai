@@ -18,6 +18,7 @@ use std::sync::Arc;
 
 use app::AppBuilder;
 use arrow::array::RecordBatch;
+use cache::QueryCacheStatus;
 use futures::TryStreamExt;
 use runtime::{datafusion::query::QueryBuilder, status, Runtime};
 use spicepod::component::{dataset::Dataset, params::Params, runtime::ResultsCache};
