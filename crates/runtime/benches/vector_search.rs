@@ -180,11 +180,19 @@ async fn vector_search_benchmarks(upload_results_dataset: Option<&String>) -> Re
         return Err("No benchmarks to run: the configuration list is empty.".to_string());
     }
 
+    let mut is_successful = true;
+
     for config in benchmark_configurations {
-        let _ = run_benchmark(&config, upload_results_dataset).await;
+        if let Err(err) = run_benchmark(&config, upload_results_dataset).await {
+            tracing::error!("Benchmark configuration '{}' failed: {err}", config.name);
+            is_successful = false;
+        }
     }
 
-    Ok(())
+    match is_successful {
+        true => Ok(()),
+        false => Err("Some benchmarks failed".to_string()),
+    }
 }
 
 macro_rules! handle_error {
@@ -219,7 +227,7 @@ async fn run_benchmark(
         parse_explicit_primary_keys(rt.app()).await,
     ));
 
-    let test_queries = load_search_queries(&rt).await?;
+    let test_queries = handle_error!(load_search_queries(&rt).await, benchmark_result)?;
 
     tracing::info!("Running search queries");
 
