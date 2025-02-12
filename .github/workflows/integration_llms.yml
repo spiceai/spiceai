@@ -43,13 +43,13 @@ jobs:
                 name: 'self-hosted',
                 needs_env: false,
                 runner: 'macOS',
-                model_allowlist: 'anthropic,openai,xai'
+                model_allowlist: 'local_phi3,hf_phi3'
               },
               {
                 name: 'hosted',
                 needs_env: true,
                 runner: 'macOS',
-                model_allowlist: 'local_phi3,hf_phi3'
+                model_allowlist: 'anthropic,openai,xai,perplexity'
               }
             ];
 
@@ -112,6 +112,7 @@ jobs:
           SPICE_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
           SPICE_ANTHROPIC_API_KEY: ${{ secrets.SPICE_SECRET_ANTHROPIC_API_KEY }}
           SPICE_XAI_API_KEY: ${{ secrets.SPICE_SECRET_XAI_API_KEY }}
+          SPICE_PERPLEXITY_AUTH_TOKEN: ${{ secrets.SPICE_SECRET_PERPLEXITY_AUTH_TOKEN }}
         run: |
           if [ "${{ matrix.target.needs_env }}" == "true" ]; then
             if [ -z "$SPICE_OPENAI_API_KEY" ]; then
@@ -126,6 +127,10 @@ jobs:
               echo "Error: xAI API key is not defined."
               exit 1
             fi
+            if [ -z "$SPICE_PERPLEXITY_AUTH_TOKEN" ]; then
+              echo "Error: Perplexity API key is not defined."
+              exit 1
+            fi
           fi
           # `--test-threads` to reduce possible rate limiting/ connection issues for hosted models.
-          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" ./integration_test/llms_integration_test --nocapture -- --test-threads=2
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" ./integration_test/llms_integration_test --nocapture -- llms::tests --test-threads=2
