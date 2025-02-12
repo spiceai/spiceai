@@ -528,13 +528,15 @@ async fn verify_similarity_search_chat_completion(
     let response = model.chat_request(req).await?;
 
     // Verify Response
-    let resp_value =
+    let mut resp_value =
         serde_json::to_value(&response).expect("Failed to serialize response.choices: {}");
+
+    resp_value = sort_json_keys(&mut resp_value);
+
     let selector = JsonPath::from_str(
         "$.choices[*].message[?(@.content~='.*there just big vehicles. Journalists.*')].length()",
     )
     .expect("Failed to create JSONPath selector");
-
     insta::assert_snapshot!(
         "chat_2_response",
         serde_json::to_string_pretty(&selector.find(&resp_value))
