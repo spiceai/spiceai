@@ -58,6 +58,13 @@ expression: "serde_json::to_string_pretty(&task_input).expect(\"Failed to serial
                 "null"
               ]
             },
+            "keywords": {
+              "description": "At least one keyword should be supplied for a vector search. Keywords should be individual words. Keywords are used to pre-filter the embedding column, applied as a `WHERE col LIKE '%keyword%'` condition. Keywords should not contain column names, special characters, or other operators.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
             "limit": {
               "default": null,
               "description": "Number of documents to return for each dataset",
@@ -82,9 +89,10 @@ expression: "serde_json::to_string_pretty(&task_input).expect(\"Failed to serial
             }
           },
           "required": [
+            "keywords",
             "text"
           ],
-          "title": "SearchRequestJson",
+          "title": "SearchRequestAIJson",
           "type": "object"
         }
       },
