@@ -162,7 +162,9 @@ fn extract_queries_from_batches(records: &[RecordBatch]) -> Result<Vec<Query>, S
                 .ok_or_else(|| "Missing 'text' column".to_string())?
                 .as_any()
                 .downcast_ref::<arrow::array::LargeStringArray>()
-                .ok_or_else(|| "Failed to downcast 'text' column to LargeStringArray".to_string())?;
+                .ok_or_else(|| {
+                    "Failed to downcast 'text' column to LargeStringArray".to_string()
+                })?;
 
             let queries = (0..batch.num_rows())
                 .map(|i| {
@@ -191,7 +193,9 @@ fn extract_query_relevance_from_batches(records: &[RecordBatch]) -> Result<Query
             .ok_or_else(|| "Missing 'query-id' column".to_string())?
             .as_any()
             .downcast_ref::<arrow::array::LargeStringArray>()
-            .ok_or_else(|| "Failed to downcast 'query-id' column to LargeStringArray".to_string())?;
+            .ok_or_else(|| {
+                "Failed to downcast 'query-id' column to LargeStringArray".to_string()
+            })?;
 
         let corpus_id_column = batch
             .column_by_name("corpus-id")

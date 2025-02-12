@@ -189,9 +189,10 @@ async fn vector_search_benchmarks(upload_results_dataset: Option<&String>) -> Re
         }
     }
 
-    match is_successful {
-        true => Ok(()),
-        false => Err("Some benchmarks failed".to_string()),
+    if is_successful {
+        Ok(())
+    } else {
+        Err("Some benchmarks failed".to_string())
     }
 }
 
