@@ -6,9 +6,6 @@ on:
           description: 'A dummy release version used for building the binaries'
           required: true
           default: '1.0.2'
-  push:
-    branches:
-      - qianqian/cli-e2e
 
 jobs:
   setup-matrix:
