@@ -425,6 +425,11 @@ impl TableProvider for DeltaTable {
             partitioned_files.push(partitioned_file);
         }
 
+        // TODO: Prune files based on partition filters.
+        // 1) Find the filters that can be used for partition pruning. i.e. can_be_evaluted_for_partition_pruning
+        // 2) Parse each partitioned_file path to extract the partition values, assemble into a RecordBatch. See `prune_partitions` in DF code.
+        // 3) Evaluate the filters on the RecordBatch, only keep the partition files that match the filters.
+
         let partition_cols = &all_partition_columns
             .into_iter()
             .map(|(field, ())| field)
