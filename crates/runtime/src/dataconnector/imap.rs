@@ -43,11 +43,9 @@ const PARAMETERS: &[ParameterSpec] = &[
         .secret()
         .description("The username to use for the IMAP connection"),
     ParameterSpec::connector("password")
-        .required()
         .secret()
         .description("The password to use for the IMAP connection"),
     ParameterSpec::connector("access_token")
-        .required()
         .secret()
         .description("The OAuth access token to use for the IMAP connection"),
     ParameterSpec::connector("host").description("The IMAP server host to connect to"),
