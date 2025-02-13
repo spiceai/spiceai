@@ -1320,7 +1320,7 @@ pub(crate) mod tests {
         assert!(result.is_err());
 
         // Test escaping column name
-        let additional_columns = vec!["1; DROP TABLE testing; SELECT *".to_string()];
+        let additional_columns = vec!["1; DROP TABLE testing; --".to_string()]; // would result in SELECT 1; DROP TABLE testing; -- FROM testing;
         let result = SearchRequest::parse_additional_columns(&additional_columns);
         assert!(result.is_err());
     }
