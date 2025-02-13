@@ -156,6 +156,7 @@ pub struct SearchRequestHTTPJson {
     #[serde(flatten)]
     pub base: SearchRequestBaseJson,
 
+    // A list of optional keywords, to pre-filter on the embedding column in SQL before performing the vector search.
     #[serde(default)]
     pub keywords: Option<Vec<String>>,
 }
