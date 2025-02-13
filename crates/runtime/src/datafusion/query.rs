@@ -14,19 +14,23 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{cell::LazyCell, sync::Arc};
+use std::{cell::LazyCell, collections::HashSet, sync::Arc};
 
 use arrow::{
     array::RecordBatch,
     datatypes::{Schema, SchemaRef},
 };
 use arrow_tools::schema::verify_schema;
-use cache::{get_logical_plan_input_tables, to_cached_record_batch_stream, QueryResult};
+use cache::{
+    get_logical_plan_input_tables, to_cached_record_batch_stream, QueryCacheStatus, QueryResult,
+};
 use datafusion::{
     error::DataFusionError,
     execution::{context::SQLOptions, SendableRecordBatchStream},
+    logical_expr::LogicalPlan,
     physical_plan::{memory::MemoryStream, stream::RecordBatchStreamAdapter},
     prelude::DataFrame,
+    sql::TableReference,
 };
 use error_code::ErrorCode;
 use snafu::{ResultExt, Snafu};
@@ -44,9 +48,9 @@ mod tracker;
 use async_stream::stream;
 use futures::StreamExt;
 
-use crate::request::{AsyncMarker, RequestContext};
+use crate::request::{AsyncMarker, CacheControl, RequestContext};
 
-use super::{error::find_datafusion_root, SPICE_RUNTIME_SCHEMA};
+use super::{error::find_datafusion_root, DataFusion, SPICE_RUNTIME_SCHEMA};
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -92,7 +96,82 @@ macro_rules! handle_error {
     }};
 }
 
+enum CacheResult {
+    Hit(QueryResult),
+    MissOrSkipped(QueryTracker, QueryCacheStatus),
+    Error(Error),
+}
+
 impl Query {
+    async fn try_get_cached_result(
+        df: &DataFusion,
+        ctx: Arc<RequestContext>,
+        mut tracker: QueryTracker,
+        plan: &LogicalPlan,
+    ) -> CacheResult {
+        let Some(cache_provider) = df.cache_provider() else {
+            return CacheResult::MissOrSkipped(tracker, QueryCacheStatus::CacheNotChecked);
+        };
+
+        // If the user requested no caching, skip the cache lookup
+        if matches!(ctx.cache_control(), CacheControl::NoCache) {
+            return CacheResult::MissOrSkipped(tracker, QueryCacheStatus::CacheNotChecked);
+        }
+
+        let cached_result = match cache_provider.get(plan).await {
+            Ok(Some(result)) => result,
+            Ok(None) => return CacheResult::MissOrSkipped(tracker, QueryCacheStatus::CacheMiss),
+            Err(e) => return CacheResult::Error(Error::FailedToAccessCache { source: e }),
+        };
+
+        tracker = tracker
+            .datasets(cached_result.input_tables)
+            .results_cache_hit(true);
+
+        let record_batch_stream =
+            match MemoryStream::try_new(cached_result.records.to_vec(), cached_result.schema, None)
+            {
+                Ok(stream) => stream,
+                Err(e) => {
+                    return CacheResult::Error(Error::UnableToCreateMemoryStream { source: e })
+                }
+            };
+
+        CacheResult::Hit(QueryResult::new(
+            attach_query_tracker_to_stream(
+                Span::current(),
+                ctx,
+                tracker,
+                Box::pin(record_batch_stream),
+            ),
+            QueryCacheStatus::CacheHit,
+        ))
+    }
+
+    fn should_cache_results(
+        df: &DataFusion,
+        plan: &LogicalPlan,
+        cache_status: QueryCacheStatus,
+    ) -> (bool, QueryCacheStatus) {
+        match df.cache_provider() {
+            Some(provider) if provider.cache_is_enabled_for_plan(plan) => (true, cache_status),
+            _ => (false, QueryCacheStatus::CacheNotChecked),
+        }
+    }
+
+    fn wrap_stream_with_cache(
+        df: &DataFusion,
+        stream: SendableRecordBatchStream,
+        plan_cache_key: u64,
+        datasets: Arc<HashSet<TableReference>>,
+    ) -> SendableRecordBatchStream {
+        if let Some(cache_provider) = df.cache_provider() {
+            to_cached_record_batch_stream(cache_provider, stream, plan_cache_key, datasets)
+        } else {
+            stream
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     pub async fn run(self) -> Result<QueryResult> {
         let request_context = RequestContext::current(AsyncMarker::new().await);
@@ -105,7 +184,7 @@ impl Query {
             let mut session = self.df.ctx.state();
 
             let ctx = self;
-            let mut tracker = ctx.tracker;
+            let tracker = ctx.tracker;
 
             // Sets the request context as an extension on DataFusion, to allow recovering it to track telemetry
             session
@@ -127,59 +206,24 @@ impl Query {
                 }
             };
 
-            let mut plan_is_cache_enabled = false;
+            // Try to get cached results first
+            let (mut tracker, cache_status) = match Self::try_get_cached_result(
+                &ctx.df,
+                Arc::clone(&request_context),
+                tracker,
+                &plan,
+            )
+            .await
+            {
+                CacheResult::Hit(result) => return Ok(result),
+                CacheResult::MissOrSkipped(tracker, status) => (tracker, status),
+                CacheResult::Error(e) => return Err(e),
+            };
+
+            let (plan_is_cache_enabled, cache_status) =
+                Self::should_cache_results(&ctx.df, &plan, cache_status);
             let plan_cache_key = cache::key_for_logical_plan(&plan);
-
-            if let Some(cache_provider) = &ctx.df.cache_provider() {
-                if let Some(cached_result) = match cache_provider.get(&plan).await {
-                    Ok(Some(v)) => Some(v),
-                    Ok(None) => None,
-                    Err(e) => {
-                        handle_error!(
-                            tracker,
-                            &request_context,
-                            ErrorCode::InternalError,
-                            e,
-                            FailedToAccessCache
-                        )
-                    }
-                } {
-                    tracker = tracker
-                        .datasets(cached_result.input_tables)
-                        .results_cache_hit(true);
-
-                    let record_batch_stream = match MemoryStream::try_new(
-                        cached_result.records.to_vec(),
-                        cached_result.schema,
-                        None,
-                    ) {
-                        Ok(stream) => stream,
-                        Err(e) => {
-                            let e = find_datafusion_root(e);
-                            handle_error!(
-                                tracker,
-                                &request_context,
-                                ErrorCode::InternalError,
-                                e,
-                                UnableToCreateMemoryStream
-                            )
-                        }
-                    };
-
-                    return Ok(QueryResult::new(
-                        attach_query_tracker_to_stream(
-                            inner_span,
-                            Arc::clone(&request_context),
-                            tracker,
-                            Box::pin(record_batch_stream),
-                        ),
-                        Some(true),
-                    ));
-                }
-
-                plan_is_cache_enabled = cache_provider.cache_is_enabled_for_plan(&plan);
-                tracker = tracker.results_cache_hit(false);
-            }
+            tracker = tracker.results_cache_hit(false);
 
             if let Err(e) =
                 RESTRICTED_SQL_OPTIONS.with(|sql_options| sql_options.verify_plan(&plan))
@@ -250,35 +294,25 @@ impl Query {
                 )
             };
 
-            if plan_is_cache_enabled {
-                if let Some(cache_provider) = &ctx.df.cache_provider() {
-                    let record_batch_stream = to_cached_record_batch_stream(
-                        Arc::clone(cache_provider),
-                        res_stream,
-                        plan_cache_key,
-                        Arc::clone(&tracker.datasets),
-                    );
-
-                    return Ok(QueryResult::new(
-                        attach_query_tracker_to_stream(
-                            inner_span,
-                            Arc::clone(&request_context),
-                            tracker,
-                            record_batch_stream,
-                        ),
-                        Some(false),
-                    ));
-                }
-            }
+            let final_stream = if plan_is_cache_enabled {
+                Self::wrap_stream_with_cache(
+                    &ctx.df,
+                    res_stream,
+                    plan_cache_key,
+                    Arc::clone(&tracker.datasets),
+                )
+            } else {
+                res_stream
+            };
 
             Ok(QueryResult::new(
                 attach_query_tracker_to_stream(
                     inner_span,
                     Arc::clone(&request_context),
                     tracker,
-                    res_stream,
+                    final_stream,
                 ),
-                None,
+                cache_status,
             ))
         }
         .instrument(span.clone())

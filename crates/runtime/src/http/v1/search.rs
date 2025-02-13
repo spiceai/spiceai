@@ -14,7 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 use crate::embeddings::vector_search::{
-    to_matches_sorted, Match, SearchRequest, SearchRequestJson, VectorSearch,
+    to_matches_sorted, Match, SearchRequest, SearchRequestAIJson, SearchRequestHTTPJson,
+    VectorSearch,
 };
 use axum::{
     http::StatusCode,
@@ -48,7 +49,7 @@ struct SearchResponse {
     request_body(
         description = "Search request parameters",
         content((
-            SearchRequestJson = "application/json",
+            SearchRequestHTTPJson = "application/json",
                 example = json!({
                     "datasets": ["app_messages"],
                     "text": "Tokyo plane tickets",
@@ -103,12 +104,13 @@ struct SearchResponse {
 ))]
 pub(crate) async fn post(
     Extension(vs): Extension<Arc<VectorSearch>>,
-    Json(payload): Json<SearchRequestJson>,
+    Json(payload): Json<SearchRequestHTTPJson>,
 ) -> Response {
     let start_time = Instant::now();
 
     // For now, force the user to specify which data.
     if payload
+        .base
         .datasets
         .as_ref()
         .is_some_and(std::vec::Vec::is_empty)
@@ -116,13 +118,13 @@ pub(crate) async fn post(
         return (StatusCode::BAD_REQUEST, "No data sources provided").into_response();
     }
 
-    if payload.limit.is_some_and(|limit| limit == 0) {
+    if payload.base.limit.is_some_and(|limit| limit == 0) {
         return (StatusCode::BAD_REQUEST, "Limit must be greater than 0").into_response();
     }
 
-    let span = tracing::span!(target: "task_history", tracing::Level::INFO, "vector_search", input = %payload.text);
+    let span = tracing::span!(target: "task_history", tracing::Level::INFO, "vector_search", input = %payload.base.text);
 
-    let search_request = match SearchRequest::try_from(payload) {
+    let search_request = match SearchRequest::try_from(SearchRequestAIJson::from(payload)) {
         Ok(r) => r,
         Err(e) => {
             tracing::error!(target: "task_history", parent: &span, "{e}");

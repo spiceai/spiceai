@@ -26,11 +26,12 @@ use opentelemetry::KeyValue;
 use runtime_auth::{AuthPrincipalRef, AuthRequestContext};
 use spicepod::component::runtime::UserAgentCollection;
 
-use super::{baggage, Protocol, UserAgent};
+use super::{baggage, CacheControl, Protocol, UserAgent};
 
 pub struct RequestContext {
     // Use an AtomicU8 to allow updating the protocol without locking
     protocol: AtomicU8,
+    cache_control: CacheControl,
     dimensions: Vec<KeyValue>,
     auth_principal: OnceLock<AuthPrincipalRef>,
 }
@@ -138,6 +139,11 @@ impl RequestContext {
         self.protocol
             .store(protocol as u8, std::sync::atomic::Ordering::Relaxed);
     }
+
+    #[must_use]
+    pub fn cache_control(&self) -> CacheControl {
+        self.cache_control
+    }
 }
 
 impl AuthRequestContext for RequestContext {
@@ -158,6 +164,7 @@ impl AuthRequestContext for RequestContext {
 
 pub struct RequestContextBuilder {
     protocol: Protocol,
+    cache_control: CacheControl,
     app: Option<Arc<App>>,
     user_agent: UserAgent,
     baggage: Vec<KeyValue>,
@@ -168,6 +175,7 @@ impl RequestContextBuilder {
     pub fn new(protocol: Protocol) -> Self {
         Self {
             protocol,
+            cache_control: CacheControl::Cache,
             app: None,
             user_agent: UserAgent::Absent,
             baggage: vec![],
@@ -192,6 +200,7 @@ impl RequestContextBuilder {
             UserAgentCollection::Full => UserAgent::from_headers(headers),
             UserAgentCollection::Disabled => UserAgent::Absent,
         };
+        self.cache_control = CacheControl::from_headers(headers);
         self.baggage.extend(baggage::from_headers(headers));
         self
     }
@@ -199,6 +208,12 @@ impl RequestContextBuilder {
     #[must_use]
     pub fn with_user_agent(mut self, user_agent: UserAgent) -> Self {
         self.user_agent = user_agent;
+        self
+    }
+
+    #[must_use]
+    pub fn with_cache_control(mut self, cache_control: CacheControl) -> Self {
+        self.cache_control = cache_control;
         self
     }
 
@@ -252,6 +267,7 @@ impl RequestContextBuilder {
 
         RequestContext {
             protocol: AtomicU8::new(self.protocol as u8),
+            cache_control: self.cache_control,
             dimensions,
             auth_principal: OnceLock::new(),
         }

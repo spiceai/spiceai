@@ -44,6 +44,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use axum_extra::TypedHeader;
+use cache::QueryCacheStatus;
 use csv::Writer;
 use headers_accept::Accept;
 use serde::{Deserialize, Serialize};
@@ -137,9 +138,9 @@ fn dataset_status(df: &DataFusion, ds: &Dataset) -> ComponentStatus {
 pub async fn sql_to_http_response(df: Arc<DataFusion>, sql: &str, format: ArrowFormat) -> Response {
     let query = QueryBuilder::new(sql, Arc::clone(&df)).build();
 
-    let (data, is_data_from_cache) = match query.run().await {
+    let (data, cache_status) = match query.run().await {
         Ok(query_result) => match query_result.data.try_collect::<Vec<RecordBatch>>().await {
-            Ok(batches) => (batches, query_result.from_cache),
+            Ok(batches) => (batches, query_result.cache_status),
             Err(e) => {
                 tracing::debug!("Error executing query: {e}");
                 return (
@@ -170,18 +171,18 @@ pub async fn sql_to_http_response(df: Arc<DataFusion>, sql: &str, format: ArrowF
 
     let mut headers = HeaderMap::new();
 
-    match is_data_from_cache {
-        Some(true) => {
+    match cache_status {
+        QueryCacheStatus::CacheHit => {
             if let Ok(value) = "Hit from spiceai".parse() {
                 headers.insert("X-Cache", value);
             }
         }
-        Some(false) => {
+        QueryCacheStatus::CacheMiss => {
             if let Ok(value) = "Miss from spiceai".parse() {
                 headers.insert("X-Cache", value);
             }
         }
-        None => {}
+        QueryCacheStatus::CacheNotChecked => {}
     };
     (StatusCode::OK, headers, body).into_response()
 }

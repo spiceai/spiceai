@@ -22,7 +22,7 @@ use tracing_futures::Instrument;
 
 use crate::{
     embeddings::vector_search::{
-        parse_explicit_primary_keys, SearchRequest, SearchRequestJson, VectorSearch,
+        parse_explicit_primary_keys, SearchRequest, SearchRequestAIJson, VectorSearch,
     },
     tools::{utils::parameters, SpiceModelTool},
     Runtime,
@@ -61,7 +61,7 @@ impl SpiceModelTool for DocumentSimilarityTool {
     }
 
     fn parameters(&self) -> Option<Value> {
-        parameters::<SearchRequestJson>()
+        parameters::<SearchRequestAIJson>()
     }
 
     async fn call(
@@ -72,7 +72,8 @@ impl SpiceModelTool for DocumentSimilarityTool {
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::document_similarity", tool = self.name().to_string(), input = arg);
 
         let tool_use_result = async {
-            let req: SearchRequestJson = serde_json::from_str(arg)?;
+            let req: SearchRequestAIJson = serde_json::from_str(arg)?;
+            tracing::trace!("document_similarity tool use function call request: {req:?}");
 
             let vs = VectorSearch::new(
                 rt.datafusion(),

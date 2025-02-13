@@ -1181,7 +1181,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/SearchRequestJson"
+                "$ref": "#/components/schemas/SearchRequestHTTPJson"
               },
               "example": {
                 "datasets": [
@@ -4106,7 +4106,7 @@
           }
         }
       },
-      "SearchRequestJson": {
+      "SearchRequestBaseJson": {
         "type": "object",
         "required": [
           "text"
@@ -4149,6 +4149,28 @@
             "description": "An SQL filter predicate to apply. Format: 'WHERE `where_cond`'."
           }
         }
+      },
+      "SearchRequestHTTPJson": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/SearchRequestBaseJson"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "keywords": {
+                "type": [
+                  "array",
+                  "null"
+                ],
+                "items": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        ],
+        "description": "HTTP request schema is separate from AI requests, so that keywords can be supplied as an optional field for HTTP calls.\n`schemars` doesn't allow setting `#[serde(default)]` as well as `#[schemars(required)]` - the field does not become required.\nWhen the field is not required, the model ignores it."
       },
       "SearchResponse": {
         "type": "object",
