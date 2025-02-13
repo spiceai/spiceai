@@ -29,6 +29,7 @@ use arrow_flight::encode::FlightDataEncoderBuilder;
 use arrow_flight::{Action, ActionType, Criteria, IpcMessage, PollInfo, SchemaResult};
 use arrow_ipc::writer::IpcWriteOptions;
 use bytes::Bytes;
+use cache::QueryCacheStatus;
 use datafusion::error::DataFusionError;
 use datafusion::sql::sqlparser::parser::ParserError;
 use datafusion::sql::TableReference;
@@ -176,7 +177,13 @@ impl Service {
     async fn sql_to_flight_stream(
         datafusion: Arc<DataFusion>,
         sql: &str,
-    ) -> Result<(BoxStream<'static, Result<FlightData, Status>>, Option<bool>), Status> {
+    ) -> Result<
+        (
+            BoxStream<'static, Result<FlightData, Status>>,
+            QueryCacheStatus,
+        ),
+        Status,
+    > {
         let query = QueryBuilder::new(sql, Arc::clone(&datafusion)).build();
 
         let query_result = query.run().await.map_err(handle_query_error)?;
@@ -223,7 +230,7 @@ impl Service {
 
         let flights_stream = stream::once(async { Ok(schema_flight_data) }).chain(batches_stream);
 
-        Ok((flights_stream.boxed(), query_result.from_cache))
+        Ok((flights_stream.boxed(), query_result.cache_status))
     }
 }
 

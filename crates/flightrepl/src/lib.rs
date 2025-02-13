@@ -50,6 +50,7 @@ use tonic::metadata::{Ascii, AsciiMetadataKey, MetadataValue};
 use tonic::transport::{Channel, ClientTlsConfig};
 use tonic::{Code, IntoRequest, Status};
 
+pub mod cache_control;
 mod config;
 
 #[derive(Parser, Debug)]
@@ -85,6 +86,16 @@ pub struct ReplConfig {
 
     #[arg(long, value_name = "USER_AGENT", help_heading = "SQL REPL")]
     pub user_agent: Option<String>,
+
+    /// Control whether the results cache is used for queries.
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = cache_control::CacheControl::Cache,
+        value_name = "CACHE_CONTROL",
+        help_heading = "SQL REPL"
+    )]
+    pub cache_control: cache_control::CacheControl,
 }
 
 const NQL_LINE_PREFIX: &str = "nql ";
@@ -312,6 +323,7 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
             line,
             repl_config.api_key.as_ref(),
             &user_agent,
+            repl_config.cache_control,
         )
         .await
         {
@@ -348,6 +360,7 @@ pub async fn get_records(
     line: &str,
     api_key: Option<&String>,
     user_agent: &str,
+    cache_control: cache_control::CacheControl,
 ) -> Result<(Vec<RecordBatch>, usize, bool), FlightError> {
     let sql_command = CommandStatementQuery {
         query: line.to_string(),
@@ -368,6 +381,13 @@ pub async fn get_records(
         return Err(FlightError::Tonic(Status::internal("No ticket")));
     };
     let mut request = add_api_key(ticket.into_request(), api_key);
+
+    if cache_control == cache_control::CacheControl::NoCache {
+        request
+            .metadata_mut()
+            .insert("cache-control", MetadataValue::from_static("no-cache"));
+    }
+
     let user_agent_key = AsciiMetadataKey::from_str("User-Agent")
         .map_err(|e| FlightError::ExternalError(e.into()))?;
     let user_agent_value = user_agent

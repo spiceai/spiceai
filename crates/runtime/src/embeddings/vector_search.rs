@@ -125,7 +125,7 @@ static VECTOR_DISTANCE_COLUMN_NAME: &str = "dist";
 #[derive(Debug, Clone, JsonSchema, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "lowercase")]
-pub struct SearchRequestJson {
+pub struct SearchRequestBaseJson {
     /// The text to search documents for similarity
     pub text: String,
 
@@ -146,18 +146,55 @@ pub struct SearchRequestJson {
     pub additional_columns: Vec<String>,
 }
 
-impl TryFrom<SearchRequestJson> for SearchRequest {
+/// HTTP request schema is separate from AI requests, so that keywords can be supplied as an optional field for HTTP calls.
+/// `schemars` doesn't allow setting `#[serde(default)]` as well as `#[schemars(required)]` - the field does not become required.
+/// When the field is not required, the model ignores it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "lowercase")]
+pub struct SearchRequestHTTPJson {
+    #[serde(flatten)]
+    pub base: SearchRequestBaseJson,
+
+    #[serde(default)]
+    pub keywords: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, JsonSchema, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub struct SearchRequestAIJson {
+    #[serde(flatten)]
+    pub base: SearchRequestBaseJson,
+
+    /// At least one keyword should be supplied for a vector search. Keywords should be individual words.
+    /// Keywords are used to pre-filter the embedding column, applied as a `WHERE col LIKE '%keyword%'` condition.
+    /// Keywords should not contain column names, special characters, or other operators.
+    pub keywords: Vec<String>,
+}
+
+impl From<SearchRequestHTTPJson> for SearchRequestAIJson {
+    fn from(req: SearchRequestHTTPJson) -> Self {
+        SearchRequestAIJson {
+            base: req.base,
+            keywords: req.keywords.unwrap_or_default(),
+        }
+    }
+}
+
+impl TryFrom<SearchRequestAIJson> for SearchRequest {
     type Error = String;
 
-    fn try_from(req: SearchRequestJson) -> Result<Self, Self::Error> {
+    fn try_from(req: SearchRequestAIJson) -> Result<Self, Self::Error> {
         Ok(SearchRequest::new(
-            req.text,
-            req.datasets,
-            req.limit.unwrap_or(default_limit()),
-            req.where_cond
+            req.base.text,
+            req.base.datasets,
+            req.base.limit.unwrap_or(default_limit()),
+            req.base
+                .where_cond
                 .map(|r| SearchRequest::parse_where_cond(r).map_err(|e| e.to_string()))
                 .transpose()?,
-            req.additional_columns,
+            req.base.additional_columns,
+            req.keywords,
         ))
     }
 }
@@ -178,6 +215,9 @@ pub struct SearchRequest {
 
     /// Additional columns to return from the dataset.
     pub additional_columns: Vec<String>,
+
+    /// Keywords to perform a lexical search and pre-filter the embedding column.
+    pub keywords: Vec<String>,
 }
 
 #[must_use]
@@ -197,6 +237,7 @@ impl SearchRequest {
         limit: usize,
         where_cond: Option<Expr>,
         additional_columns: Vec<String>,
+        keywords: Vec<String>,
     ) -> Self {
         SearchRequest {
             text,
@@ -204,6 +245,7 @@ impl SearchRequest {
             limit,
             where_cond,
             additional_columns,
+            keywords,
         }
     }
 
@@ -555,6 +597,7 @@ impl VectorSearch {
         is_chunked: bool,
         additional_columns: &[String],
         where_cond: Option<&Expr>,
+        keywords: &[&str],
         n: usize,
     ) -> Result<VectorSearchTableResult> {
         let projection: Vec<String> = primary_keys
@@ -566,7 +609,19 @@ impl VectorSearch {
             .map(|s| quote_identifier(&s).to_string())
             .collect();
 
-        let where_str = where_cond.map_or_else(String::new, |cond| format!("WHERE ({cond})"));
+        let keywords_filter = keywords
+            .iter()
+            .map(|k| format!("{embedding_column} ILIKE '%{k}%'"))
+            .join(" OR ");
+
+        let where_str = match (where_cond, keywords.is_empty()) {
+            (Some(cond), false) => {
+                format!("WHERE ({cond}) AND ({keywords_filter})")
+            }
+            (Some(cond), true) => format!("WHERE ({cond})"),
+            (None, false) => format!("WHERE ({keywords_filter})"),
+            (None, true) => String::new(),
+        };
 
         let query = if is_chunked {
             Self::construct_chunk_query_sql(
@@ -632,6 +687,7 @@ impl VectorSearch {
             limit,
             where_cond,
             additional_columns,
+            keywords,
         } = req;
 
         let tables = match data_source_opt {
@@ -664,6 +720,7 @@ impl VectorSearch {
                 .await?;
 
             let mut response: VectorSearchResult = HashMap::new();
+            let keywords = keywords.iter().map(std::string::String::as_str).collect::<Vec<&str>>();
 
             for (tbl, search_vectors) in per_table_embeddings {
                 tracing::debug!("Running vector search for table {:#?}", tbl);
@@ -709,6 +766,7 @@ impl VectorSearch {
                                 embedding_table.is_chunked(embedding_column),
                                 additional_columns,
                                 where_cond.as_ref(),
+                                &keywords,
                                 *limit,
                             )
                             .await?;
@@ -967,7 +1025,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn test_search_request_schema() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        serde_json::to_value(schema_for!(SearchRequestJson)).boxed()?;
+        serde_json::to_value(schema_for!(SearchRequestAIJson)).boxed()?;
         Ok(())
     }
 

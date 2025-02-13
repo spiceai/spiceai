@@ -63,13 +63,20 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct QueryResult {
     pub data: SendableRecordBatchStream,
-    pub from_cache: Option<bool>,
+    pub cache_status: QueryCacheStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryCacheStatus {
+    CacheNotChecked,
+    CacheHit,
+    CacheMiss,
 }
 
 impl QueryResult {
     #[must_use]
-    pub fn new(data: SendableRecordBatchStream, from_cache: Option<bool>) -> Self {
-        QueryResult { data, from_cache }
+    pub fn new(data: SendableRecordBatchStream, cache_status: QueryCacheStatus) -> Self {
+        QueryResult { data, cache_status }
     }
 }
 
