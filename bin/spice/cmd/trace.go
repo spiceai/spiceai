@@ -155,7 +155,8 @@ func ToRowInterface(treePrefix string, t *taskhistory.TaskHistory, includeInput 
 		if len(t.Input) == 0 {
 			t.Input = "<empty>"
 		} else if truncateLength > 0 && len(t.Input) > truncateLength {
-			t.Input = t.Input[:truncateLength] + "..."
+			originalLength := len(t.Input)
+			t.Input = t.Input[:truncateLength] + "... " + fmt.Sprintf("(%d characters omitted)", originalLength-truncateLength)
 		}
 	}
 
@@ -164,7 +165,8 @@ func ToRowInterface(treePrefix string, t *taskhistory.TaskHistory, includeInput 
 		if len(*t.CapturedOutput) == 0 {
 			output = "<empty>"
 		} else if truncateLength > 0 && len(*t.CapturedOutput) > truncateLength {
-			output = (*t.CapturedOutput)[:truncateLength] + "..."
+			originalLength := len(*t.CapturedOutput)
+			output = (*t.CapturedOutput)[:truncateLength] + "... " + fmt.Sprintf("(%d characters omitted)", originalLength-truncateLength)
 		} else {
 			output = *t.CapturedOutput
 		}
