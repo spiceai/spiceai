@@ -51,35 +51,43 @@ pub struct DataFusionBuilder {
     cache_provider: Option<Arc<QueryResultsCacheProvider>>,
 }
 
+pub(crate) fn get_df_default_config() -> SessionConfig {
+    let mut df_config = SessionConfig::new();
+
+    // Prevents DataFusion from lowercasing identifiers, i.e. "SELECT MyColumn FROM my_table" would be "SELECT mycolumn FROM mytable" without this.
+    // This improves the UX for data sources where column names are case-sensitive, since they no longer need to be quoted.
+    df_config
+        .options_mut()
+        .sql_parser
+        .enable_ident_normalization = false;
+
+    df_config.options_mut().optimizer.expand_views_at_output = true;
+    df_config.options_mut().sql_parser.dialect = "PostgreSQL".to_string();
+    df_config
+        .options_mut()
+        .execution
+        .listing_table_ignore_subdirectory = false;
+
+    // There are some unidentified bugs in DataFusion that cause schema checks to fail for aggregate functions.
+    // Spice is affected by this - skip the check until all bugs are fixed.
+    // Tracking issue: https://github.com/apache/datafusion/issues/12733
+    df_config
+        .options_mut()
+        .execution
+        .skip_physical_aggregate_schema_check = true;
+
+    df_config
+}
+
 impl DataFusionBuilder {
     #[must_use]
     pub fn new(status: Arc<status::RuntimeStatus>) -> Self {
-        let mut df_config = SessionConfig::new()
+        let mut df_config = get_df_default_config()
             .with_information_schema(true)
             .with_create_default_catalog_and_schema(false);
 
-        // Prevents DataFusion from lowercasing identifiers, i.e. "SELECT MyColumn FROM my_table" would be "SELECT mycolumn FROM mytable" without this.
-        // This improves the UX for data sources where column names are case-sensitive, since they no longer need to be quoted.
-        df_config
-            .options_mut()
-            .sql_parser
-            .enable_ident_normalization = false;
-        df_config.options_mut().optimizer.expand_views_at_output = true;
-        df_config.options_mut().sql_parser.dialect = "PostgreSQL".to_string();
         df_config.options_mut().catalog.default_catalog = SPICE_DEFAULT_CATALOG.to_string();
         df_config.options_mut().catalog.default_schema = SPICE_DEFAULT_SCHEMA.to_string();
-        df_config
-            .options_mut()
-            .execution
-            .listing_table_ignore_subdirectory = false;
-
-        // There are some unidentified bugs in DataFusion that cause schema checks to fail for aggregate functions.
-        // Spice is affected by this - skip the check until all bugs are fixed.
-        // Tracking issue: https://github.com/apache/datafusion/issues/12733
-        df_config
-            .options_mut()
-            .execution
-            .skip_physical_aggregate_schema_check = true;
 
         Self {
             config: df_config,

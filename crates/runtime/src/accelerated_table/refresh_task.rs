@@ -32,6 +32,7 @@ use tracing::{Instrument, Span};
 use util::fibonacci_backoff::FibonacciBackoffBuilder;
 use util::{retry, RetryError};
 
+use crate::datafusion::builder::get_df_default_config;
 use crate::datafusion::error::{find_datafusion_root, get_spice_df_error, SpiceExternalError};
 use crate::datafusion::is_spice_internal_dataset;
 use crate::datafusion::schema::BaseSchema;
@@ -64,7 +65,6 @@ use datafusion::{
     error::DataFusionError,
     logical_expr::{cast, col, Expr, Operator},
     physical_plan::stream::RecordBatchStreamAdapter,
-    prelude::SessionConfig,
     sql::TableReference,
 };
 
@@ -477,13 +477,8 @@ impl RefreshTask {
     }
 
     fn refresh_df_context(&self, federated_provider: Arc<dyn TableProvider>) -> SessionContext {
-        let ctx = SessionContext::new_with_config_rt(
-            SessionConfig::new().set_bool(
-                "datafusion.execution.listing_table_ignore_subdirectory",
-                false,
-            ),
-            default_runtime_env(),
-        );
+        let ctx =
+            SessionContext::new_with_config_rt(get_df_default_config(), default_runtime_env());
 
         let ctx_state = ctx.state();
         let default_catalog = &ctx_state.config_options().catalog.default_catalog;

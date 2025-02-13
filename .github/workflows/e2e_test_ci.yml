@@ -708,7 +708,7 @@ jobs:
           if [[ -n "$ENGINE" ]]; then
             echo "    acceleration:" >> spicepod.yaml
             echo "      enabled: true" >> spicepod.yaml
-            echo "      refresh_sql: SELECT * FROM test_mysql_table WHERE \"col_Bit\" is NULL or \"col_Bit\" !=0" >> spicepod.yaml
+            echo "      refresh_sql: SELECT * FROM test_mysql_table WHERE col_Bit is NULL or col_Bit !=0" >> spicepod.yaml
             echo "      engine: $ENGINE" >> spicepod.yaml
             if [[ -n "$MODE" ]]; then
               echo "      mode: $MODE" >> spicepod.yaml
@@ -751,7 +751,7 @@ jobs:
             echo "      engine: $ENGINE" >> spicepod.yaml
             echo "      refresh_mode: append" >> spicepod.yaml
             echo "      refresh_check_interval: 2s" >> spicepod.yaml
-            echo "      refresh_sql: SELECT * FROM test_mysql_table2 WHERE \"col_Bit\" is NULL or \"col_Bit\" !=0" >> spicepod.yaml
+            echo "      refresh_sql: SELECT * FROM test_mysql_table2 WHERE col_Bit is NULL or col_Bit !=0" >> spicepod.yaml
             if [[ -n "$MODE" ]]; then
               echo "      mode: $MODE" >> spicepod.yaml
            fi
