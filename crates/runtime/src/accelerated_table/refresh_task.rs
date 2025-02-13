@@ -472,8 +472,20 @@ impl RefreshTask {
         let schema = self.federated.schema();
         let column = refresh.time_column.as_deref().unwrap_or_default();
         let field = schema.column_with_name(column).map(|(_, f)| f).cloned();
+        let time_partition_column = refresh.time_partition_column.as_deref();
+        let partition_field = schema
+            .column_with_name(time_partition_column.unwrap_or_default())
+            .map(|(_, f)| f)
+            .cloned();
 
-        TimestampFilterConvert::create(field, refresh.time_column.clone(), refresh.time_format)
+        TimestampFilterConvert::create(
+            field,
+            refresh.time_column.clone(),
+            refresh.time_format,
+            partition_field,
+            refresh.time_partition_column.clone(),
+            refresh.time_partition_format,
+        )
     }
 
     fn refresh_df_context(&self, federated_provider: Arc<dyn TableProvider>) -> SessionContext {
@@ -657,7 +669,12 @@ impl RefreshTask {
                 Some(TimeFormat::UnixSeconds) => {
                     value *= 1_000_000_000;
                 }
-                Some(TimeFormat::ISO8601 | TimeFormat::Timestamp | TimeFormat::Timestamptz)
+                Some(
+                    TimeFormat::ISO8601
+                    | TimeFormat::Timestamp
+                    | TimeFormat::Timestamptz
+                    | TimeFormat::Date,
+                )
                 | None => unreachable!("refresh.validate_time_format should've returned error"),
             }
         };
