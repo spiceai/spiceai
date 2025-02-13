@@ -708,11 +708,17 @@ jobs:
           if [[ -n "$ENGINE" ]]; then
             echo "    acceleration:" >> spicepod.yaml
             echo "      enabled: true" >> spicepod.yaml
-            echo "      refresh_sql: SELECT * FROM test_mysql_table WHERE col_bit is NULL or col_bit !=0" >> spicepod.yaml
+            echo "      refresh_sql: SELECT * FROM test_mysql_table WHERE \"col_Bit\" is NULL or \"col_Bit\" !=0" >> spicepod.yaml
             echo "      engine: $ENGINE" >> spicepod.yaml
             if [[ -n "$MODE" ]]; then
               echo "      mode: $MODE" >> spicepod.yaml
-           fi
+            fi
+            if [[ "$ENGINE" != 'arrow' ]]; then
+              echo "      primary_key: ID" >> spicepod.yaml
+              echo "      indexes:" >> spicepod.yaml
+              echo "        col_Timestamp: enabled" >> spicepod.yaml
+              echo "        '(col_Timestamp, col_String)': unique" >> spicepod.yaml
+            fi
           fi
 
           # add params if present
@@ -739,13 +745,13 @@ jobs:
           MODE=$(echo '${{ matrix.acceleration.mode }}')
 
           if [[ -n "$ENGINE" ]]; then
-            echo "    time_column: col_timestamp" >> spicepod.yaml
+            echo "    time_column: col_Timestamp" >> spicepod.yaml
             echo "    acceleration:" >> spicepod.yaml
             echo "      enabled: true" >> spicepod.yaml
             echo "      engine: $ENGINE" >> spicepod.yaml
             echo "      refresh_mode: append" >> spicepod.yaml
             echo "      refresh_check_interval: 2s" >> spicepod.yaml
-            echo "      refresh_sql: SELECT * FROM test_mysql_table2 WHERE col_bit is NULL or col_bit !=0" >> spicepod.yaml
+            echo "      refresh_sql: SELECT * FROM test_mysql_table2 WHERE \"col_Bit\" is NULL or \"col_Bit\" !=0" >> spicepod.yaml
             if [[ -n "$MODE" ]]; then
               echo "      mode: $MODE" >> spicepod.yaml
            fi
