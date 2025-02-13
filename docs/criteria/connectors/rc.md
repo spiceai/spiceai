@@ -27,7 +27,7 @@ All criteria must be met for the connector to be considered [RC](../definitions.
 | PostgreSQL                       | ✅         | @Sevenannn   |
 | Sharepoint                       | ➖         |              |
 | Snowflake                        | ➖         |              |
-| Spice.ai Cloud Platform          | ➖         |              |
+| Spice.ai Cloud Platform          | ✅         | @peasee      |
 | S3                               | ✅         | @Sevenannn   |
 | Azure BlobFS                     | ➖         |              |
 | Spark                            | ➖         |              |
