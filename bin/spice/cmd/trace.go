@@ -184,7 +184,7 @@ func init() {
 	traceCmd.Flags().StringVar(&trace_id, "trace-id", "", "Return the trace with the given trace id")
 	traceCmd.Flags().BoolVar(&include_input, "include-input", false, "Include input data in the trace")
 	traceCmd.Flags().BoolVar(&include_output, "include-output", false, "Include output data in the trace")
-	traceCmd.Flags().IntVar(&truncateLength, "truncate", 0, "Truncate output to 80 characters if no value is specified")
+	traceCmd.Flags().IntVar(&truncateLength, "truncate", 0, "Truncates the input/output data to 80 when set, or to the given length")
 	traceCmd.Flags().Lookup("truncate").NoOptDefVal = "80"
 }
 
