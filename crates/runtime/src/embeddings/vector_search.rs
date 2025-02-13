@@ -771,7 +771,7 @@ impl VectorSearch {
                 format!("WHERE ({cond}) AND ({keywords_filter})")
             }
             (Some(cond), true) => format!("WHERE ({cond})"),
-            (None, false) => format!("WHERE ({keywords_filter})"), // LIKE ""; DROP TABLE testing;)
+            (None, false) => format!("WHERE ({keywords_filter})"),
             (None, true) => String::new(),
         };
 
