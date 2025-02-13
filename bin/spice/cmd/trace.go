@@ -151,8 +151,12 @@ func ToRowInterface(treePrefix string, t *taskhistory.TaskHistory, includeInput 
 		base.Status = "🚫"
 	}
 
-	if truncateLength > 0 && includeInput && len(t.Input) > truncateLength {
-		t.Input = t.Input[:truncateLength] + "..."
+	if includeInput {
+		if len(t.Input) == 0 {
+			t.Input = "<empty>"
+		} else if truncateLength > 0 && len(t.Input) > truncateLength {
+			t.Input = t.Input[:truncateLength] + "..."
+		}
 	}
 
 	var output string
