@@ -338,6 +338,30 @@ fn sort_json_keys(value: &mut Value) {
     }
 }
 
+// Checks that the response from a chat completion call against the relevant snapshot and jsonpath filter.
+//
+// # Error
+// Returns error if it fails to check the snapshot, not if snapshot assertion is failed.
+fn check_snapshot_for_chat_completion(
+    response: &CreateChatCompletionResponse,
+    json_path: &str,
+    snapshot_name: &str,
+) -> Result<(), String> {
+    let mut resp_value = serde_json::to_value(&response)
+        .map_err(|e| format!("Failed to serialize response.choices: {e}").to_string())?;
+
+    resp_value = sort_json_keys(&mut resp_value);
+
+    let selector = JsonPath::from_str(json_path)
+        .map_err(|e| format!("Failed to create JSONPath selector {e}".to_string()))?;
+
+    let filtered_response = serde_json::to_string_pretty(&selector.find(&resp_value))
+        .map_err(|e| format!("Failed to serialize response.choices {e}".to_string()))?;
+
+    insta::assert_snapshot!(snapshot_name, filtered_response);
+    Ok(())
+}
+
 async fn send_embeddings_request(
     base_url: &str,
     model: &str,

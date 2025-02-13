@@ -527,21 +527,12 @@ async fn verify_similarity_search_chat_completion(
     let task_start_time = std::time::SystemTime::now();
     let response = model.chat_request(req).await?;
 
-    // Verify Response
-    let mut resp_value =
-        serde_json::to_value(&response).expect("Failed to serialize response.choices: {}");
-
-    resp_value = sort_json_keys(&mut resp_value);
-
-    let selector = JsonPath::from_str(
+    check_snapshot_for_chat_completion(
+        &response,
         "$.choices[*].message[?(@.content~='.*there just big vehicles. Journalists.*')].length()",
-    )
-    .expect("Failed to create JSONPath selector");
-    insta::assert_snapshot!(
         "chat_2_response",
-        serde_json::to_string_pretty(&selector.find(&resp_value))
-            .expect("Failed to serialize response.choices")
-    );
+    )
+    .expect("Failed to check snapshot for chat completion");
 
     // ensure all spans are exported into task_history
     let _ = trace_provider.force_flush();
