@@ -1327,15 +1327,17 @@ pub(crate) mod tests {
 
     #[test]
     fn test_performance_of_column_parsing() {
-        let mut additional_columns = vec!["column1".to_string()];
         let mut timings = vec![];
 
-        for i in 0..100 {
-            let start = std::time::Instant::now();
-            let result = SearchRequest::parse_additional_columns(&additional_columns);
-            timings.push(start.elapsed());
-            assert!(result.is_ok());
-            additional_columns.push(format!("column{}", i + 2));
+        for _ in 0..3 {
+            let mut additional_columns = vec!["column1".to_string()];
+            for i in 0..100 {
+                let start = std::time::Instant::now();
+                let result = SearchRequest::parse_additional_columns(&additional_columns);
+                timings.push(start.elapsed());
+                assert!(result.is_ok());
+                additional_columns.push(format!("column{}", i + 2));
+            }
         }
 
         let total_time: std::time::Duration = timings.iter().sum();
@@ -1372,15 +1374,17 @@ pub(crate) mod tests {
 
     #[test]
     fn test_performance_of_keyword_parsing() {
-        let mut keywords = vec!["column1".to_string()];
         let mut timings = vec![];
 
-        for i in 0..100 {
-            let start = std::time::Instant::now();
-            let result = SearchRequest::parse_keywords(&keywords);
-            timings.push(start.elapsed());
-            assert!(result.is_ok());
-            keywords.push(format!("column{}", i + 2));
+        for _ in 0..3 {
+            let mut keywords = vec!["column1".to_string()];
+            for i in 0..100 {
+                let start = std::time::Instant::now();
+                let result = SearchRequest::parse_keywords(&keywords);
+                timings.push(start.elapsed());
+                assert!(result.is_ok());
+                keywords.push(format!("column{}", i + 2));
+            }
         }
 
         let total_time: std::time::Duration = timings.iter().sum();
