@@ -1,5 +1,5 @@
 name: 'Install Spice'
-description: 'Installs Spice locally from build artifacts directory'
+description: 'Installs the Spice CLI locally from build artifacts directory'
 inputs:
   build-path:
     description: 'Directory containing Spice CLI'
