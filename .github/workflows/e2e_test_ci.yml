@@ -1208,7 +1208,7 @@ jobs:
         run: |
           response=$(curl -i -XPOST "127.0.0.1:8090/v1/sql" --data "SELECT c_name FROM (SELECT * FROM customer)")
           echo "$response"
-          if echo "$response" | grep -q "x-cache: Miss from spiceai"; then
+          if echo "$response" | grep -q "results-cache-status: MISS"; then
             echo "Cache miss detected as expected"
           else
             echo "Cache miss not detected" >&2
@@ -1220,7 +1220,7 @@ jobs:
         run: |
           response=$(curl -i -XPOST "127.0.0.1:8090/v1/sql" --data "select c_name from (select * from customer)")
           echo "$response"
-          if echo "$response" | grep -q "x-cache: Hit from spiceai"; then
+          if echo "$response" | grep -q "results-cache-status: HIT"; then
             echo "Cache hit detected as expected"
           else
             echo "Cache hit not detected" >&2
@@ -1245,7 +1245,7 @@ jobs:
         run: |
           response=$(curl -i -XPOST "127.0.0.1:8090/v1/sql" --data "SELECT c_name FROM (SELECT * FROM customer)")
           echo "$response"
-          if echo "$response" | grep -q "x-cache: Miss from spiceai"; then
+          if echo "$response" | grep -q "results-cache-status: MISS"; then
             echo "Cache miss detected as expected"
           else
             echo "Cache miss not detected" >&2
