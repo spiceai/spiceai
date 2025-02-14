@@ -113,6 +113,7 @@ jobs:
     runs-on: ${{ matrix.target.runner }}
     env:
       REL_VERSION: ${{ github.event.inputs.rel_version || '1.0.2' }}
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     needs:
       - build
       - setup-matrix
@@ -215,6 +216,7 @@ jobs:
     runs-on: ${{ matrix.target.runner }}
     env:
       REL_VERSION: ${{ github.event.inputs.rel_version || '1.0.2' }}
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     needs:
       - build
       - setup-matrix
