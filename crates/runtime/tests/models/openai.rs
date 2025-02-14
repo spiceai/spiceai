@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 #![allow(clippy::expect_used)]
+use crate::models::check_snapshot_for_chat_completion;
 use crate::models::{sort_json_keys, sql_to_display, sql_to_single_json_value};
 use crate::{
     init_tracing, init_tracing_with_task_history,
