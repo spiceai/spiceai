@@ -24,7 +24,6 @@ import (
 	"github.com/spiceai/spiceai/bin/spice/pkg/constants"
 	"github.com/spiceai/spiceai/bin/spice/pkg/context"
 	"github.com/spiceai/spiceai/bin/spice/pkg/util"
-	"github.com/spiceai/spiceai/bin/spice/pkg/version"
 )
 
 // Ensures the runtime is installed. Returns true if the runtime was installed or upgraded, false if it was already installed.
@@ -59,8 +58,7 @@ func EnsureInstalled(flavor constants.Flavor, autoUpgrade bool, allowAccelerator
 	}
 
 	if shouldInstall {
-		cliVersion := version.Version()
-		err = rtcontext.InstallMatchingRuntime(cliVersion, flavor, allowAccelerator)
+		err = rtcontext.InstallMatchingRuntime(flavor, allowAccelerator)
 		if err != nil {
 			return shouldInstall, err
 		}

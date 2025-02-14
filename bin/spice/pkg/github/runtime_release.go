@@ -45,15 +45,6 @@ func GetRuntimeRelease(cliVersion string) (*RepoRelease, error) {
 	return release, nil
 }
 
-func GetLatestRuntimeRelease() (*RepoRelease, error) {
-	release, err := GetLatestRelease(githubClient, GetAssetName(constants.SpiceRuntimeFilename))
-	if err != nil {
-		return nil, err
-	}
-
-	return release, nil
-}
-
 func GetLatestCliRelease() (*RepoRelease, error) {
 	release, err := GetLatestRelease(githubClient, GetAssetName(constants.SpiceCliFilename))
 	if err != nil {
