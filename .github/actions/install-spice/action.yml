@@ -6,10 +6,11 @@ inputs:
     required: true
 
 runs:
-  using: "composite"
+  using: 'composite'
   steps:
     - name: Install Spice binaries
       shell: bash
+      if: runner.os != 'Windows'
       run: |
         echo "Installing Spice from local folder: ${{ inputs.build-path }}"
 
@@ -26,7 +27,40 @@ runs:
         echo "Spice binaries installed successfully into $HOME/.spice/bin."
         ls -la "$HOME/.spice/bin"
 
+    - name: Install Spice binaries (Windows)
+      shell: pwsh
+      if: runner.os == 'Windows'
+      run: |
+        echo "Installing Spice from local folder: ${{ inputs.build-path }}"
+
+        $spiceBin = ".spice\bin"
+        $spiceInstallDir = Join-Path $HOME $spiceBin
+        $spiceCliFileName = "spice.exe"
+        $spiceRuntimeFileName = "spiced.exe"
+        $spiceCliFullPath= Join-Path $spiceInstallDir $spiceCliFileName
+        $spiceRuntimeFullPath= Join-Path $spiceInstallDir $spiceRuntimeFileName
+
+        Write-Host "Spice Binaries directory created"
+        New-Item -Path $spiceInstallDir -ItemType Directory -Force > $null
+
+        Write-Host "Moving spice CLI"
+        Move-Item -Force "${{ inputs.build-path }}\spice.exe" -Destination $spiceCliFullPath
+
+        Write-Host "Moving spice Runtime"
+        Move-Item -Force "${{ inputs.build-path }}\spiced.exe" -Destination $spiceRuntimeFullPath
+
+        echo "$spiceInstallDir" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+        Write-Host "Spice binaries installed successfully into $spiceInstallDir"
+        Get-ChildItem -Path "$spiceInstallDir" -Force
+
     - name: Verify Spice installation
       shell: bash
+      run: |
+        spice version
+
+    - name: Verify Spice installation (Windows)
+      if: runner.os == 'Windows'
+      shell: pwsh
       run: |
         spice version
