@@ -16,16 +16,37 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
+      - name: Check for existing PR
+        id: check_pr
+        run: |
+          existing_pr=$(gh pr list \
+            --base trunk \
+            --json title,headRefName \
+            --jq '.[] | select(.title=="Update openapi.json")')
+
+          if [ ! -z "$existing_pr" ]; then
+            echo "An existing PR for updating openapi.json was found. Skipping updates."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Install Rust stable
+        if: steps.check_pr.outputs.skip != 'true'
         run: rustup toolchain install stable --profile minimal
 
       - name: Build Cargo project
+        if: steps.check_pr.outputs.skip != 'true'
         run: cargo build --manifest-path tools/spiceschema/Cargo.toml
 
       - name: Run Cargo project to generate OpenAPI
+        if: steps.check_pr.outputs.skip != 'true'
         run: cargo run --manifest-path tools/spiceschema/Cargo.toml -- http --json > .schema/openapi.json
 
       - name: Verify OpenAPI file
+        if: steps.check_pr.outputs.skip != 'true'
         run: |
           if [ -f ".schema/openapi.json" ]; then
             echo ".schema/openapi.json file was successfully created."
@@ -36,15 +57,18 @@ jobs:
           fi
 
       - name: Upload OpenAPI artifact
+        if: steps.check_pr.outputs.skip != 'true'
         uses: actions/upload-artifact@v4
         with:
           name: openapi.json
           path: .schema/openapi.json
 
-      - name: Create PR
+      - name: Create PR if needed
+        if: steps.check_pr.outputs.skip != 'true'
         run: |
           git config --global user.name 'Spice Schema Bot'
           git config --global user.email 'schema-bot@spice.ai'
+
           git checkout -b openapi/${GITHUB_RUN_ID}
           if git diff --exit-code -- .schema/openapi.json; then
             echo "No changes detected"

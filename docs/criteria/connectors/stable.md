@@ -20,6 +20,7 @@ All criteria must be met for the connector to be considered Stable, with excepti
 | GraphQL                          | ➖             |                 |
 | GitHub                           | ✅             | @phillipleblanc |
 | HTTP/HTTPS                       | ➖             |                 |
+| IMAP                             | ➖             |                 |
 | Localpod                         | ➖             |                 |
 | MS SQL                           | ➖             |                 |
 | MySQL                            | ✅             | @phillipleblanc |
@@ -54,6 +55,7 @@ This table defines the required features and/or tests for each connector:
 | GraphQL                          | ➖                    | ➖                      | ➖                | ✅                       | ✅                  | ☑️                         |
 | GitHub                           | ➖                    | ➖                      | ☑️                | ✅                       | ✅                  | ☑️                         |
 | HTTP/HTTPS                       | ✅ (5)                | ✅ (5)                  | ➖                | ✅                       | ✅                  | ☑️                         |
+| IMAP                             | ➖                    | ➖                      | ☑️                | ✅                       | ✅                  | ☑️                         |
 | Iceberg                          | ✅ (5)                | ✅ (5)                  | ☑️                | ✅                       | ✅                  | ✅                         |
 | MS SQL                           | ✅ (100)              | ✅ (100)                | ✅                | ✅                       | ✅                  | ✅                         |
 | MySQL                            | ✅ (100)              | ✅ (100)                | ✅                | ✅                       | ✅                  | ✅                         |

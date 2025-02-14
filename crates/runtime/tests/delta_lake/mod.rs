@@ -17,6 +17,7 @@ limitations under the License.
 use crate::utils::test_request_context;
 use crate::RecordBatch;
 use app::AppBuilder;
+use arrow::util::pretty::pretty_format_batches;
 use datafusion::assert_batches_eq;
 use futures::TryStreamExt;
 use runtime::Runtime;
@@ -71,7 +72,7 @@ async fn run_delta_lake_test(
     dataset_name: &str,
     query: &str,
     expected_results: &[&str],
-) -> Result<(), String> {
+) -> Result<Runtime, String> {
     let app = AppBuilder::new(app_name)
         .with_dataset(make_delta_lake_dataset(dataset_path, dataset_name, false))
         .build();
@@ -107,7 +108,7 @@ async fn run_delta_lake_test(
         .map_err(|e| format!("query `{query}` to results: {e}"))?;
 
     assert_batches_eq!(expected_results, &data);
-    Ok(())
+    Ok(rt)
 }
 
 #[tokio::test]
@@ -153,14 +154,16 @@ async fn query_delta_lake_with_partitions() -> Result<(), String> {
         "+-------------+----------------+-------------+--------------------------------------------------------------------------------------------------------------------+",
         ];
 
-        run_delta_lake_test(
+        let _ = run_delta_lake_test(
             "delta_lake_partition_test",
             &format!("{path}/nation"),
             "test",
             query,
             &expected_results,
         )
-        .await
+        .await?;
+
+        Ok(())
     })
     .await
 }
@@ -241,14 +244,73 @@ async fn query_delta_lake_with_percent_encoded_path() -> Result<(), String> {
                 "+--------------+---------+-------+",
             ];
 
-            run_delta_lake_test(
+            let _ = run_delta_lake_test(
                 "delta_lake_percent_encoded_path_test",
                 &format!("{path}/delta_table_partition"),
                 "test",
                 query,
                 &expected_results,
             )
-            .await
+            .await?;
+            Ok(())
+        })
+        .await
+}
+
+#[tokio::test]
+async fn query_delta_lake_with_partition_pruning() -> Result<(), String> {
+    test_request_context()
+        .scope(async {
+            let path = setup_test_data(
+                "https://public-data.spiceai.org/delta_table_partition.zip",
+                "delta_table_partition",
+            )
+            .await?;
+            let _hook = FileCleanup { path: path.clone() };
+
+            let query =
+                "SELECT * FROM test WHERE date_col > '2025-01-01' ORDER BY date_col, name, value";
+            let expected_results = [
+                "+--------------+-------+-------+",
+                "| date_col     | name  | value |",
+                "+--------------+-------+-------+",
+                "| 2030-06-15   | David | 400   |",
+                "| +10999-12-31 | Bob   | 200   |",
+                "+--------------+-------+-------+",
+            ];
+
+            let rt = run_delta_lake_test(
+                "query_delta_lake_with_partition_pruning",
+                &format!("{path}/delta_table_partition"),
+                "test",
+                query,
+                &expected_results,
+            )
+            .await?;
+
+            let explain_plan = rt
+                .datafusion()
+                .query_builder(&format!("EXPLAIN {query}"))
+                .build()
+                .run()
+                .await
+                .map_err(|e| format!("query `{query}` to plan: {e}"))?
+                .data
+                .try_collect::<Vec<RecordBatch>>()
+                .await
+                .map_err(|e| format!("query `{query}` to results: {e}"))?;
+
+            let pretty_explain_plan = pretty_format_batches(&explain_plan)
+                .expect("failed to format explain plan")
+                .to_string();
+
+            // The explain plan should contain only the partitions greater than 2025-01-01
+            assert!(pretty_explain_plan.contains("date_col=%2B10999-12-31"));
+            assert!(pretty_explain_plan.contains("date_col=2030-06-15"));
+            assert!(!pretty_explain_plan.contains("date_col=2025-01-01"));
+            assert!(!pretty_explain_plan.contains("date_col=2024-02-04"));
+
+            Ok(())
         })
         .await
 }
