@@ -146,17 +146,14 @@ pub(crate) async fn post(
             Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
         },
         Err(e) => {
-            match e {
+            let error_type = match e {
                 vector_search::Error::NoTablesWithEmbeddingsFound {}
-                | vector_search::Error::CannotVectorSearchDataset { .. }
-                | vector_search::Error::CannotVectorSearchDatasets { .. } => {
-                    return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
-                }
-                _ => {}
+                | vector_search::Error::CannotVectorSearchDataset { .. } => StatusCode::BAD_REQUEST,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
             };
 
             tracing::error!(target: "task_history", parent: &span, "{e}");
-            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+            (error_type, e.to_string()).into_response()
         }
     }
 }
