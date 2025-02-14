@@ -326,10 +326,9 @@ jobs:
 
       - name: download spice cli from homebrew
         run: |
-          brewSpicePath=$(which spice)
-          brewSpiceDir=$(dirname "$spicePath")
-          sudo mv ./build/spice "$spiceDir/spice"
-          chmod +x "$brewSpicePath"
+          sudo mv ./build/spice /opt/homebrew/bin
+          sudo chmod +x /opt/homebrew/bin/spice
+          which spice
           spice version
 
       - name: Mimic the homebrew spice upgrade
