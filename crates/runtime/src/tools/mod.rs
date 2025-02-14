@@ -24,6 +24,7 @@ use crate::Runtime;
 pub mod builtin;
 pub mod catalog;
 pub mod factory;
+#[cfg(feature = "mcp")]
 pub mod mcp;
 pub mod memory;
 pub mod options;

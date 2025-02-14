@@ -22,9 +22,12 @@ use std::{
 };
 use tokio::sync::Mutex;
 
+#[cfg(feature = "mcp")]
+use super::mcp::factory::McpCatalogFactory;
+
 use super::{
     builtin::catalog::BuiltinToolCatalog, catalog::SpiceToolCatalog,
-    mcp::factory::McpCatalogFactory, memory::catalog::MemoryToolCatalog, SpiceModelTool, Tooling,
+    memory::catalog::MemoryToolCatalog, SpiceModelTool, Tooling,
 };
 
 pub enum ToolFactory {
@@ -92,6 +95,7 @@ pub async fn register_all_factories() {
         "memory".to_string(),
         ToolFactory::Tool(Arc::new(MemoryToolCatalog {})),
     );
+    #[cfg(feature = "mcp")]
     registry.insert(
         "mcp".to_string(),
         ToolFactory::Catalog(Arc::new(McpCatalogFactory {})),
