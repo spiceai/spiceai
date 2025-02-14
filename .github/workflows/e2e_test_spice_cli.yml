@@ -289,7 +289,7 @@ jobs:
               Format-Table -AutoSize
 
   test_spice_install_without_runtime:
-    name: 'Test spice upgrade without runtime (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
+    name: 'Test spice install without runtime (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
     continue-on-error: true
     runs-on: ${{ matrix.target.runner }}
     env:
@@ -351,7 +351,7 @@ jobs:
           spice version
 
   test_spice_run_without_runtime:
-    name: 'Test spice upgrade without runtime (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
+    name: 'Test spice run without runtime (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
     continue-on-error: true
     runs-on: ${{ matrix.target.runner }}
     env:
@@ -411,12 +411,32 @@ jobs:
           sleep 60
           killall spice || true
 
+      - name: Start spice runtime
+        working-directory: test_app
+        run: |
+          spice run &> spice.log &
+          # time to download runtime
+          sleep 60
+
       - name: Run spice run
         if: matrix.target.target_os == 'windows'
         run: |
-          spice run &
+          Start-Process spice -ArgumentList "run" -NoNewWindow -RedirectStandardOutput "spice.log" -RedirectStandardError "spice.log"
+          # time to download runtime
           Start-Sleep -Seconds 60
+
+      - name: Stop spice and check logs
+        if: always()
+        run: |
+          killall spice || true
+          cat spice.log
+
+      - name: Stop spice and check logs
+        if: always()
+        shell: pwsh
+        run: |
           Get-Process -Name spice -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          Get-Content spice.log
 
       - name: Run spice version
         run: |
