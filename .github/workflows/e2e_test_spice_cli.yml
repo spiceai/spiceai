@@ -2,9 +2,13 @@ name: E2E Test CLI behavior
 on:
   workflow_dispatch:
     inputs:
+        build_cli:
+          description: 'Build the CLI instead of using the specified release version'
+          required: false
+          default: 'true'
         rel_version:
-          description: 'A dummy release version used for building the binaries'
-          required: true
+          description: 'The version to build CLI / download released CLI'
+          required: false
           default: '1.0.2'
 
 jobs:
@@ -45,6 +49,7 @@ jobs:
             
   build:
     name: Build ${{ matrix.target.name }} CLI
+    if: ${{ github.event.inputs.build_cli == 'true' || github.event.inputs.build_cli == null }}
     runs-on: ${{ matrix.target.runner }}
     needs: setup-matrix
     env:
@@ -118,10 +123,33 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
+        if: github.event.inputs.build_cli != 'false'
         uses: actions/download-artifact@v4
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
+      
+      - name: download spice cli released version
+        if: ${{ github.event.inputs.build_cli == 'false' }} && ${{ matrix.target.target_os != 'windows' }}
+        run: |
+          mkdir -p ./build
+          cd ./build
+          url="https://github.com/spiceai/spiceai/releases/download/v${{ env.REL_VERSION }}/spice_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz"
+          output="spice.tar.gz"
+          curl -L -o "$output" "$url"
+          tar -xzf "$output"
+          rm "$output"
+          chmod +x spice
+      
+      - name: download spice cli released version
+        if: ${{ github.event.inputs.build_cli == 'false' }} && ${{ matrix.target.target_os == 'windows' }}
+        run: |
+          Set-Location "./build"
+          $url = "https://github.com/spiceai/spiceai/releases/download/v${{ env.REL_VERSION }}/spice.exe_windows_x86_64.tar.gz"
+          $output = "spice.exe_windows_x86_64.tar.gz"
+          Invoke-WebRequest -Uri $url -OutFile $output
+          tar -xzf $output
+          Remove-Item $output
       
       - name: Download a older spiced
         shell: pwsh
@@ -133,23 +161,12 @@ jobs:
           Invoke-WebRequest -Uri $url -OutFile $output
           tar -xzf $output
           Remove-Item $output
-      
-      - name: Download a older spiced
-        if: matrix.target.target_os == 'linux'
+
+      - name: Download older spiced
+        if: matrix.target.target_os != 'windows'
         run: |
           cd ./build
-          url="https://github.com/spiceai/spiceai/releases/download/v${{ env.REL_VERSION }}/spiced_linux_x86_64.tar.gz"
-          output="spiced.tar.gz"
-          curl -L -o "$output" "$url"
-          tar -xzf "$output"
-          rm "$output"
-          chmod +x spiced
-      
-      - name: Download a older spiced
-        if: matrix.target.target_os == 'darwin'
-        run: |
-          cd ./build
-          url="https://github.com/spiceai/spiceai/releases/download/v${{ env.REL_VERSION }}/spiced_darwin_aarch64.tar.gz"
+          url="https://github.com/spiceai/spiceai/releases/download/v${{ env.REL_VERSION }}/spiced_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz"
           output="spiced.tar.gz"
           curl -L -o "$output" "$url"
           tar -xzf "$output"
@@ -193,6 +210,8 @@ jobs:
     name: 'Test spice upgrade without runtime (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
     continue-on-error: true
     runs-on: ${{ matrix.target.runner }}
+    env:
+      REL_VERSION: ${{ github.event.inputs.rel_version || '1.0.2' }}
     needs:
       - build
       - setup-matrix
@@ -206,10 +225,33 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
+        if: github.event.inputs.build_cli != 'false'
         uses: actions/download-artifact@v4
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
+
+      - name: download spice cli released version
+        if: ${{ github.event.inputs.build_cli == 'false' }} && ${{ matrix.target.target_os != 'windows' }}
+        run: |
+          mkdir -p ./build
+          cd ./build
+          url="https://github.com/spiceai/spiceai/releases/download/v${{ env.REL_VERSION }}/spice_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz"
+          output="spice.tar.gz"
+          curl -L -o "$output" "$url"
+          tar -xzf "$output"
+          rm "$output"
+          chmod +x spice
+      
+      - name: download spice cli released version
+        if: ${{ github.event.inputs.build_cli == 'false' }} && ${{ matrix.target.target_os == 'windows' }}
+        run: |
+          Set-Location "./build"
+          $url = "https://github.com/spiceai/spiceai/releases/download/v${{ env.REL_VERSION }}/spice.exe_windows_x86_64.tar.gz"
+          $output = "spice.exe_windows_x86_64.tar.gz"
+          Invoke-WebRequest -Uri $url -OutFile $output
+          tar -xzf $output
+          Remove-Item $output
 
       - name: Install Spice CLI
         uses: ./.github/actions/install-spice-cli
