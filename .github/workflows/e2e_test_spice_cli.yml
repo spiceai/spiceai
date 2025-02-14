@@ -190,7 +190,7 @@ jobs:
               Format-Table -AutoSize
 
 
-  test_spice_uprgade_without_runtime:
+  test_spice_upgrade_without_runtime:
     name: 'Test spice upgrade without runtime (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
     continue-on-error: true
     runs-on: ${{ matrix.target.runner }}
