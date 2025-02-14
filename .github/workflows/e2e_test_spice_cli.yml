@@ -127,7 +127,6 @@ jobs:
         shell: pwsh
         if: matrix.target.target_os == 'windows'
         run: |
-          # New-Item -ItemType Directory -Force -Path "./build"
           Set-Location "./build"
           $url = "https://github.com/spiceai/spiceai/releases/download/v${{ env.REL_VERSION }}/spiced.exe_windows_x86_64.tar.gz"
           $output = "spiced.exe_windows_x86_64.tar.gz"
