@@ -86,7 +86,6 @@ pub async fn get_tools(rt: Arc<Runtime>, opts: &SpiceToolsOptions) -> Vec<Arc<dy
     let all_tools = rt.tools.read().await;
 
     let mut tools = vec![];
-
     let mut missing_tools = vec![];
 
     for tt in opts.tools_by_name() {

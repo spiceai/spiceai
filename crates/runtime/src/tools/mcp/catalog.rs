@@ -89,17 +89,9 @@ impl McpToolCatalog {
         let mut cursor: Option<String> = None;
         let mut tools: Vec<McpTool> = vec![];
         loop {
-            println!("Listing tools... cursor={cursor:?}");
-            let response = match self.client.read().await.list_tools(cursor.clone()).await {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::error!("Error listing tools: {:?}", e);
-                    return Err(e);
-                }
-            };
+            let response = self.client.read().await.list_tools(cursor.clone()).await?;
             tools.extend(response.tools);
             cursor = response.next_cursor;
-            println!("Got {} tools. cursor={:?}", tools.len(), cursor);
             if cursor.is_none() {
                 break;
             }
@@ -110,13 +102,7 @@ impl McpToolCatalog {
     async fn get_tool(&self, name: &str) -> std::result::Result<Option<McpTool>, McpError> {
         let mut cursor: Option<String> = None;
         loop {
-            let response = match self.client.read().await.list_tools(cursor.clone()).await {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::error!("");
-                    return Err(e);
-                }
-            };
+            let response = self.client.read().await.list_tools(cursor.clone()).await?;
             if let Some(t) = response.tools.iter().find(|t| t.name.as_str() == name) {
                 return Ok(Some(t.clone()));
             }

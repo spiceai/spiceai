@@ -60,7 +60,7 @@ impl From<Arc<dyn IndividualToolFactory>> for ToolFactory {
     }
 }
 
-/// A factory that can create individual [`SpiceModelTool`]s from a [`Tool`] component.
+/// A factory that can create individual [`SpiceModelTool`]s from a spicepod [`Tool`] component.
 pub trait IndividualToolFactory: Send + Sync {
     fn construct(
         &self,
@@ -69,6 +69,7 @@ pub trait IndividualToolFactory: Send + Sync {
     ) -> Result<Arc<dyn SpiceModelTool>, Box<dyn std::error::Error + Send + Sync>>;
 }
 
+/// A factory that can creates [`SpiceToolCatalog`]s from a spicepod [`Tool`] component.
 #[async_trait]
 pub trait ToolCatalogFactory: Send + Sync {
     async fn construct(

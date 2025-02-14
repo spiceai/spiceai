@@ -1,4 +1,3 @@
-use async_openai::types::{ChatCompletionTool, ChatCompletionToolType, FunctionObject};
 /*
 Copyright 2024-2025 The Spice.ai OSS Authors
 
@@ -14,6 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+use async_openai::types::{ChatCompletionTool, ChatCompletionToolType, FunctionObject};
 use async_trait::async_trait;
 
 use super::SpiceModelTool;
