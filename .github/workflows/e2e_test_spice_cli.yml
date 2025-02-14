@@ -404,21 +404,14 @@ jobs:
         with:
           build-path: ./build
 
-      - name: Run spice run
-        if: matrix.target.target_os != 'windows'
-        run: |
-          spice run
-          sleep 60
-          killall spice || true
-
       - name: Start spice runtime
-        working-directory: test_app
+        if: matrix.target.target_os != 'windows'
         run: |
           spice run &> spice.log &
           # time to download runtime
           sleep 60
 
-      - name: Run spice run
+      - name: Start spice runtime
         if: matrix.target.target_os == 'windows'
         run: |
           Start-Process spice -ArgumentList "run" -NoNewWindow -RedirectStandardOutput "spice.log" -RedirectStandardError "spice.log"
@@ -426,13 +419,13 @@ jobs:
           Start-Sleep -Seconds 60
 
       - name: Stop spice and check logs
-        if: always()
+        if: always() && matrix.target.target_os != 'windows'
         run: |
           killall spice || true
           cat spice.log
 
       - name: Stop spice and check logs
-        if: always()
+        if: always() && matrix.target.target_os == 'windows'
         shell: pwsh
         run: |
           Get-Process -Name spice -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
