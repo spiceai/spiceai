@@ -44,7 +44,7 @@ jobs:
             return matrix;
             
   build:
-    name: Build ${{ matrix.target.name }} binaries
+    name: Build ${{ matrix.target.name }} CLI
     runs-on: ${{ matrix.target.runner }}
     needs: setup-matrix
     env:
