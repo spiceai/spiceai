@@ -99,7 +99,7 @@ jobs:
           path: |
             spice.exe
 
-  test_spice_uprgade_with_runtime:
+  test_spice_upgrade_with_runtime:
     name: 'Test spice upgrade (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
     continue-on-error: true
     runs-on: ${{ matrix.target.runner }}
