@@ -83,6 +83,8 @@ pub async fn register_metrics_table(datafusion: &Arc<DataFusion>) -> Result<(), 
     let retention = Retention::new(
         Some("time_unix_nano".to_string()),
         Some(TimeFormat::Timestamptz),
+        None,
+        None,
         Some(Duration::from_secs(1800)), // delete metrics older then 30 minutes
         Some(Duration::from_secs(300)),  // run retention every 5 minutes
         true,

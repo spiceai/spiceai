@@ -63,13 +63,31 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct QueryResult {
     pub data: SendableRecordBatchStream,
-    pub from_cache: Option<bool>,
+    pub results_cache_status: QueryResultsCacheStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryResultsCacheStatus {
+    // The request was not eligible for caching, and thus the results cache was not checked.
+    CacheDisabled,
+    // The request asked to bypass the cache, i.e. via `Cache-Control: no-cache`.
+    CacheBypass,
+    // The request was a cache hit.
+    CacheHit,
+    // The request was a cache miss.
+    CacheMiss,
 }
 
 impl QueryResult {
     #[must_use]
-    pub fn new(data: SendableRecordBatchStream, from_cache: Option<bool>) -> Self {
-        QueryResult { data, from_cache }
+    pub fn new(
+        data: SendableRecordBatchStream,
+        results_cache_status: QueryResultsCacheStatus,
+    ) -> Self {
+        QueryResult {
+            data,
+            results_cache_status,
+        }
     }
 }
 

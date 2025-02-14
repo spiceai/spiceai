@@ -41,7 +41,7 @@ homepage = "https://spice.ai"
 license = "Apache-2.0"
 repository = "https://github.com/spiceai/spiceai"
 rust-version = "1.84"
-version = "1.1.0"
+version = "1.1.0-unstable"
 
 [workspace.dependencies]
 arrow = { version = "53", features = ["prettyprint"] }
@@ -167,7 +167,7 @@ arrow-cast = { git = "https://github.com/spiceai/arrow-rs.git", rev = "5feaa5f72
 object_store = { git = "https://github.com/spiceai/arrow-rs.git", rev = "5feaa5f724d32c09e30394cedb7799de670e43e1" }
 
 datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "a889f4bd47cba6b96d24a63a03891c64dadb6e15" }
-datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "54bed07357fb1f201d812b45cf7d1d1bb32726f1" }
+datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "465faf02bb6a2e6c11237368efbd9da91348bdd0" }
 
 duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "c7421f30d8ff2d39ed6df01a9ec51bc8781cfaae" }
 
@@ -179,8 +179,8 @@ rusqlite = { git = "https://github.com/spiceai/rusqlite.git", rev = "97054b6af72
 # Tracking Issue: https://github.com/allan2/dotenvy/issues/113
 dotenvy = { git = "https://github.com/spiceai/dotenvy.git", rev = "e5cef1871b08003198949dfe2da988633eaad78f" }
 
-iceberg = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "a80b3807a5082662fa608d85dedb1a5341ae395c" }
-iceberg-catalog-rest = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "a80b3807a5082662fa608d85dedb1a5341ae395c" }
-iceberg-datafusion = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "a80b3807a5082662fa608d85dedb1a5341ae395c" }
+iceberg = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "3597335f0238cc9bb8fbf5a5287a080020549f48" }
+iceberg-catalog-rest = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "3597335f0238cc9bb8fbf5a5287a080020549f48" }
+iceberg-datafusion = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "3597335f0238cc9bb8fbf5a5287a080020549f48" }
 
 cudarc = { git = "https://github.com/EricLBuehler/cudarc", rev = "f6e5bf51153d40e34eb1262b98895ac1235b6422" }

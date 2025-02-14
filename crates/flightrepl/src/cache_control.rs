@@ -14,13 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-mod baggage;
-mod cache_control;
-mod context;
-mod protocol;
-mod user_agent;
+use clap::ValueEnum;
 
-pub use cache_control::*;
-pub use context::*;
-pub use protocol::*;
-pub use user_agent::*;
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum CacheControl {
+    #[default]
+    Cache,
+    NoCache,
+}

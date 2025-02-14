@@ -38,6 +38,9 @@ var (
 
 	// The include output flag
 	include_output bool
+
+	// The truncation length
+	truncateLength int
 )
 
 var supported_trace_tasks = []string{
@@ -102,7 +105,7 @@ $ spice trace ai_chat --id chatcmpl-At6ZmDE8iAYRPeuQLA0FLlWxGKNnM
 
 		table := make([]interface{}, len(rows))
 		for i, dataset := range rows {
-			table[i] = ToRowInterface(dataset.Tree, &dataset.Task, include_input, include_output)
+			table[i] = ToRowInterface(dataset.Tree, &dataset.Task, include_input, include_output, truncateLength)
 		}
 
 		util.WriteTable(table)
@@ -115,7 +118,7 @@ $ spice trace ai_chat --id chatcmpl-At6ZmDE8iAYRPeuQLA0FLlWxGKNnM
 // Must use a struct because `util.WriteTable` uses `reflect` functions that require a struct.
 // Must use separate structs for each combination of input/output. Otherwise table will have columns with all `nil`s. A
 // `json:"fieldName,omitempty"` tag does not work.
-func ToRowInterface(treePrefix string, t *taskhistory.TaskHistory, includeInput bool, includeOutput bool) interface{} {
+func ToRowInterface(treePrefix string, t *taskhistory.TaskHistory, includeInput bool, includeOutput bool, truncateLength int) interface{} {
 	type TaskRowBase struct {
 		Tree     string `json:"tree"`
 		Status   string `json:"status"`
@@ -148,17 +151,34 @@ func ToRowInterface(treePrefix string, t *taskhistory.TaskHistory, includeInput 
 		base.Status = "🚫"
 	}
 
+	if includeInput {
+		if len(t.Input) == 0 {
+			t.Input = "<empty>"
+		} else if truncateLength > 0 && len(t.Input) > truncateLength {
+			originalLength := len(t.Input)
+			t.Input = t.Input[:truncateLength] + "... " + fmt.Sprintf("(%d characters omitted)", originalLength-truncateLength)
+		}
+	}
+
+	var output string
+	if t.CapturedOutput != nil {
+		if len(*t.CapturedOutput) == 0 {
+			output = "<empty>"
+		} else if truncateLength > 0 && len(*t.CapturedOutput) > truncateLength {
+			originalLength := len(*t.CapturedOutput)
+			output = (*t.CapturedOutput)[:truncateLength] + "... " + fmt.Sprintf("(%d characters omitted)", originalLength-truncateLength)
+		} else {
+			output = *t.CapturedOutput
+		}
+	} else {
+		output = "<empty>"
+	}
+
 	if includeInput && includeOutput {
-		return TaskRowFull{TaskRowBase: base, Input: t.Input, Output: t.CapturedOutput}
+		return TaskRowFull{TaskRowBase: base, Input: t.Input, Output: output}
 	} else if includeInput {
 		return TaskRowWithInput{TaskRowBase: base, Input: t.Input}
 	} else if includeOutput {
-		var output string
-		if t.CapturedOutput != nil {
-			output = *t.CapturedOutput
-		} else {
-			output = ""
-		}
 		return TaskRowWithOutput{TaskRowBase: base, Output: output}
 	}
 	return base
@@ -170,6 +190,8 @@ func init() {
 	traceCmd.Flags().StringVar(&trace_id, "trace-id", "", "Return the trace with the given trace id")
 	traceCmd.Flags().BoolVar(&include_input, "include-input", false, "Include input data in the trace")
 	traceCmd.Flags().BoolVar(&include_output, "include-output", false, "Include output data in the trace")
+	traceCmd.Flags().IntVar(&truncateLength, "truncate", 0, "Truncates the input/output data to 80 when set, or to the given length")
+	traceCmd.Flags().Lookup("truncate").NoOptDefVal = "80"
 }
 
 func getTraceFilter(task string, id string, trace_id string) (string, error) {

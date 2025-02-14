@@ -32,6 +32,14 @@ var (
 	SpiceCliFilename     string
 )
 
+type SpiceInstallPath int
+
+const (
+	StandardInstall SpiceInstallPath = iota
+	BrewInstall
+	OtherInstall
+)
+
 func init() {
 	if util.IsWindows() {
 		SpiceRuntimeFilename = "spiced.exe"

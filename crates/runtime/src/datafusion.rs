@@ -789,6 +789,12 @@ impl DataFusion {
         if let Some(time_col) = &dataset.time_column {
             refresh = refresh.time_column(time_col.clone());
         }
+        if let Some(time_partition_column) = &dataset.time_partition_column {
+            refresh = refresh.time_partition_column(time_partition_column.clone());
+        }
+        if let Some(time_partition_format) = dataset.time_partition_format {
+            refresh = refresh.time_partition_format(time_partition_format);
+        }
         if let Some(check_interval) = dataset.refresh_check_interval() {
             refresh = refresh.check_interval(check_interval);
         }
@@ -821,6 +827,8 @@ impl DataFusion {
         accelerated_table_builder.retention(Retention::new(
             dataset.time_column.clone(),
             dataset.time_format,
+            dataset.time_partition_column.clone(),
+            dataset.time_partition_format,
             dataset.retention_period(),
             dataset.retention_check_interval(),
             acceleration_settings.retention_check_enabled,
