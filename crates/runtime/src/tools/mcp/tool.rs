@@ -65,11 +65,7 @@ impl SpiceModelTool for McpToolWrapper {
         let span: Span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::mcp", tool = self.name().to_string(), input = arg);
         let tool_use_result: Result<Value, Box<dyn std::error::Error + Send + Sync>> = async {
             let client = self.client.read().await;
-            println!(
-                "In call {} {:#?}",
-                self.internal_name(),
-                serde_json::json!(arg)
-            );
+
             let response = client
                 .call_tool(self.internal_name(), serde_json::from_str(arg).unwrap())
                 .await
