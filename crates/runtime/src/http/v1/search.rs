@@ -55,7 +55,8 @@ struct SearchResponse {
                     "text": "Tokyo plane tickets",
                     "where": "user=1234321",
                     "additional_columns": ["timestamp"],
-                    "limit": 3
+                    "limit": 3,
+                    "keywords": ["plane", "tickets"]
                 })
             )
         )

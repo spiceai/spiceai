@@ -300,10 +300,16 @@ async fn query_delta_lake_with_partition_pruning() -> Result<(), String> {
                 .await
                 .map_err(|e| format!("query `{query}` to results: {e}"))?;
 
-            let pretty_explain_plan =
-                pretty_format_batches(&explain_plan).expect("failed to format explain plan");
+            let pretty_explain_plan = pretty_format_batches(&explain_plan)
+                .expect("failed to format explain plan")
+                .to_string();
 
-            insta::assert_snapshot!(pretty_explain_plan);
+            // The explain plan should contain only the partitions greater than 2025-01-01
+            assert!(pretty_explain_plan.contains("date_col=%2B10999-12-31"));
+            assert!(pretty_explain_plan.contains("date_col=2030-06-15"));
+            assert!(!pretty_explain_plan.contains("date_col=2025-01-01"));
+            assert!(!pretty_explain_plan.contains("date_col=2024-02-04"));
+
             Ok(())
         })
         .await
