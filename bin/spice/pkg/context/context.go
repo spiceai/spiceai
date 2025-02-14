@@ -247,7 +247,7 @@ func (c *RuntimeContext) InstallMatchingRuntime(flavor constants.Flavor, allowAc
 		return err
 	}
 
-	slog.Info(fmt.Sprintf("Downloading and installing Spice.ai Runtime %s ...\n", cliVersion))
+	slog.Info(fmt.Sprintf("Downloading and installing Spice.ai Runtime %s ...\n", release.TagName))
 
 	err = github.DownloadRuntimeAsset(flavor, release, c.spiceBinDir, allowAccelerator)
 	if err != nil {

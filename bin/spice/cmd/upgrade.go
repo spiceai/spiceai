@@ -101,7 +101,7 @@ spice upgrade
 		}
 
 		if runtimeUpgradeRequired == "" {
-			slog.Info(fmt.Sprintf("Using version %s. No upgrade required.", currentVersion))
+			slog.Info(fmt.Sprintf("Using version %s matching with CLI version %s. No upgrade required.", currentVersion, version.Version()))
 			return
 		}
 
@@ -188,7 +188,7 @@ func upgradeCli(force bool, rtcontext *context.RuntimeContext) bool {
 	assetName := github.GetAssetName(constants.SpiceCliFilename)
 	spiceBinDir := filepath.Join(rtcontext.SpiceRuntimeDir(), "bin")
 
-	slog.Info("Upgrading the Spice.ai CLI ...")
+	slog.Info(fmt.Sprintf("Found latest CLI version %s, upgrading the Spice.ai CLI ...", release.TagName))
 
 	stat, err := os.Stat(spiceBinDir)
 	if err != nil {
