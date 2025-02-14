@@ -215,6 +215,87 @@ mod test {
         );
     }
 
+    #[test]
+    fn test_timestamp_filter_convert_with_partition() {
+        // Test case with both time and partition columns as Int64
+        let time_field = Field::new("timestamp", DataType::Int64, false);
+        let partition_field = Field::new("partition_ts", DataType::Int64, false);
+
+        let converter = TimestampFilterConvert::create(
+            Some(time_field),
+            Some("timestamp".to_string()),
+            Some(TimeFormat::UnixMillis),
+            Some(partition_field),
+            Some("partition_ts".to_string()),
+            Some(TimeFormat::UnixMillis),
+        );
+
+        let result = match converter {
+            Some(c) => c.convert(1_620_000_000_000_000_000, Operator::Gt),
+            None => panic!("Failed to create converter"),
+        };
+
+        assert_eq!(
+            result.to_string(),
+            "timestamp > UInt64(1620000000000) AND partition_ts > UInt64(1620000000000)"
+        );
+
+        // Test case with timestamp and partition columns having different formats
+        let time_field = Field::new("timestamp", DataType::Int64, false);
+        let partition_field = Field::new(
+            "partition_ts",
+            DataType::Timestamp(TimeUnit::Second, None),
+            false,
+        );
+
+        let converter = TimestampFilterConvert::create(
+            Some(time_field),
+            Some("timestamp".to_string()),
+            Some(TimeFormat::UnixMillis),
+            Some(partition_field),
+            Some("partition_ts".to_string()),
+            Some(TimeFormat::UnixSeconds),
+        );
+
+        let result = match converter {
+            Some(c) => c.convert(1_620_000_000_000_000_000, Operator::Gt),
+            None => panic!("Failed to create converter"),
+        };
+
+        assert_eq!(
+            result.to_string(),
+            "timestamp > UInt64(1620000000000) AND CAST(partition_ts AS Timestamp(Nanosecond, None)) > TimestampNanosecond(1620000000000000000, None)"
+        );
+    }
+
+    #[test]
+    fn test_timestamp_filter_convert_with_timezone() {
+        let time_field = Field::new(
+            "timestamp",
+            DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+            false,
+        );
+
+        let converter = TimestampFilterConvert::create(
+            Some(time_field),
+            Some("timestamp".to_string()),
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let result = match converter {
+            Some(c) => c.convert(1_620_000_000_000_000_000, Operator::Gt),
+            None => panic!("Failed to create converter"),
+        };
+
+        assert_eq!(
+            result.to_string(),
+            r#"CAST(timestamp AS Timestamp(Nanosecond, None)) > TimestampNanosecond(1620000000000000000, Some("UTC"))"#
+        );
+    }
+
     fn test(field: Field, time_format: TimeFormat, timestamp: u128, expected: &str) {
         let time_column = "timestamp".to_string();
         let timestamp_filter_convert = TimestampFilterConvert::create(
