@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::{
-    tools::{SpiceModelTool, Tooling},
+    tools::{factory::default_available_catalogs, SpiceModelTool, Tooling},
     Runtime,
 };
 
@@ -62,26 +62,39 @@ struct ListToolElement {
 pub(crate) async fn list(Extension(rt): Extension<Arc<Runtime>>) -> Response {
     let tools = &*rt.tools.read().await;
 
+    let default_catalogs = default_available_catalogs();
+
     let tools = stream::iter(tools.iter())
-        .then(|(name, t)| async move {
-            match t {
-                Tooling::Tool(tool) => vec![ListToolElement {
-                    name: name.to_string(),
-                    description: tool.description().map(|d| d.to_string()),
-                    parameters: tool.parameters(),
-                    is_catalog: false,
-                }],
-                Tooling::Catalog(c) => c
-                    .all()
-                    .await
-                    .into_iter()
-                    .map(|tool| ListToolElement {
-                        name: format!("{name}/{}", tool.name()),
+        .then(|(name, t)| {
+            let default_catalog_names = default_catalogs
+                .iter()
+                .map(|c| c.name())
+                .collect::<Vec<_>>();
+            async move {
+                match t {
+                    Tooling::Tool(tool) => vec![ListToolElement {
+                        name: name.to_string(),
                         description: tool.description().map(|d| d.to_string()),
                         parameters: tool.parameters(),
-                        is_catalog: true,
-                    })
-                    .collect(),
+                        is_catalog: false,
+                    }],
+                    Tooling::Catalog(c) => {
+                        // Do not list tools from default catalogs. They are already listed individually as tools.
+                        if default_catalog_names.contains(&name.as_str()) {
+                            return vec![];
+                        };
+                        c.all()
+                            .await
+                            .into_iter()
+                            .map(|tool| ListToolElement {
+                                name: format!("{name}/{}", tool.name()),
+                                description: tool.description().map(|d| d.to_string()),
+                                parameters: tool.parameters(),
+                                is_catalog: true,
+                            })
+                            .collect()
+                    }
+                }
             }
         })
         .collect::<Vec<_>>()
