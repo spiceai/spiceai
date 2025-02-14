@@ -61,6 +61,9 @@ pub enum Error {
     #[snafu(display("Vector search cannot be run on {}.", data_source.to_quoted_string()))]
     CannotVectorSearchDataset { data_source: TableReference },
 
+    #[snafu(display("Vector search cannot be run.\nEmbeddings are not configured for the following datasets: [{}].", data_source.iter().map(TableReference::to_quoted_string).join(", ")))]
+    CannotVectorSearchDatasets { data_source: Vec<TableReference> },
+
     #[snafu(display("Error occurred interacting with datafusion: {source}"))]
     DataFusionError {
         source: Box<dyn std::error::Error + Send + Sync>,
@@ -833,6 +836,7 @@ impl VectorSearch {
         })
     }
 
+    #[allow(clippy::too_many_lines)]
     pub async fn search(&self, req: &SearchRequest) -> Result<VectorSearchResult> {
         let SearchRequest {
             text: query,
@@ -843,13 +847,25 @@ impl VectorSearch {
             keywords,
         } = req;
 
+        let tables_with_embeddings = self.user_tables_with_embeddings().await?;
         let tables = match data_source_opt {
             Some(ts) => ts.iter().map(TableReference::from).collect(),
-            None => self.user_tables_with_embeddings().await?,
+            None => tables_with_embeddings.clone(),
         };
 
         if tables.is_empty() {
             return Err(Error::NoTablesWithEmbeddingsFound {});
+        }
+
+        // reference the tables to the tables with embeddings
+        if tables.iter().any(|t| !tables_with_embeddings.contains(t)) {
+            return Err(Error::CannotVectorSearchDatasets {
+                data_source: tables
+                    .iter()
+                    .filter(|t| !tables_with_embeddings.contains(t))
+                    .cloned()
+                    .collect(),
+            });
         }
 
         let span = match Span::current() {
