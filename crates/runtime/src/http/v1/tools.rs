@@ -25,7 +25,10 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::{tools::Tooling, Runtime};
+use crate::{
+    tools::{SpiceModelTool, Tooling},
+    Runtime,
+};
 
 /// Summary of a tool available to run, and the schema of its input parameters.
 #[derive(Serialize, Debug, Clone, PartialEq, Eq, Hash, Default, Deserialize)]
@@ -34,6 +37,7 @@ struct ListToolElement {
     name: String,
     description: Option<String>,
     parameters: Option<serde_json::Value>,
+    is_catalog: bool,
 }
 
 /// List Tools
@@ -56,15 +60,26 @@ struct ListToolElement {
 ))]
 pub(crate) async fn list(Extension(rt): Extension<Arc<Runtime>>) -> Response {
     let tools = &*rt.tools.read().await;
-    let tools = tools
+
+    // For catalogs, get all tools.
+    let mut all_tools = vec![];
+    for t in tools.values() {
+        match t {
+            Tooling::Tool(tool) => all_tools.push(Arc::clone(&tool)),
+            Tooling::Catalog(c) => {
+                let tools = c.all().await;
+                all_tools.extend(tools.into_iter());
+            }
+        }
+    }
+
+    let tools = all_tools
         .iter()
-        .filter_map(|(name, tool)| match tool {
-            Tooling::Tool(tool) => Some(ListToolElement {
-                name: name.clone(),
-                description: tool.description().map(|d| d.to_string()),
-                parameters: tool.parameters(),
-            }),
-            Tooling::Catalog(_) => None,
+        .map(|tool| ListToolElement {
+            name: tool.name().to_string(),
+            description: tool.description().map(|d| d.to_string()),
+            parameters: tool.parameters(),
+            is_catalog: false,
         })
         .collect::<Vec<_>>();
 
@@ -123,13 +138,39 @@ pub(crate) async fn post(
 ) -> Response {
     let tools = &*rt.tools.read().await;
 
-    let Some(Tooling::Tool(tool)) = tools.get(&tool_name) else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({"message": format!("Tool {tool_name} not found")})),
-        )
-            .into_response();
+    println!("Inside");
+    // Find tool by first checking if it is a tool catalog (i.e. has a '/'), if not find it as regular tool.
+    let tool: Arc<dyn SpiceModelTool> = if let Some((catalog_name, _)) = tool_name.split_once('/') {
+        let Some(Tooling::Catalog(catalog)) = tools.get(catalog_name) else {
+            println!("Catalog {catalog_name} not found");
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"message": format!("T ool {tool_name} not found")})),
+            )
+                .into_response();
+        };
+        match catalog.get(tool_name.as_str()).await {
+            Some(tool) => tool,
+            None => {
+                println!("tool_name {tool_name} not found");
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({"message": format!("Tool {tool_name} not found")})),
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        let Some(Tooling::Tool(tool)) = tools.get(&tool_name) else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"message": format!("Tool {tool_name} not found")})),
+            )
+                .into_response();
+        };
+        Arc::clone(tool)
     };
+    println!("Have a tol? {:#?}", tool.name());
 
     match tool.call(body.as_str(), Arc::clone(&rt)).await {
         Ok(result) => (StatusCode::OK, Json(result)).into_response(),

@@ -14,38 +14,40 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use async_openai::types::{ChatCompletionTool, ChatCompletionToolType, FunctionObject};
 use async_trait::async_trait;
-use mcp_client::{
-    transport::Error as TransportError, Error as McpError, McpClient, McpClientTrait, McpService,
-    SseTransport, StdioTransport, Transport,
-};
+use mcp_client::McpClientTrait;
 use mcp_core::Tool as McpTool;
 use serde_json::Value;
 use snafu::ResultExt;
-use std::{borrow::Cow, collections::HashMap, sync::Arc, time::Duration};
+use std::{borrow::Cow, sync::Arc};
 use tokio::sync::RwLock;
 use tracing::Span;
 use tracing_futures::Instrument;
 
-use crate::{
-    tools::{catalog::SpiceToolCatalog, SpiceModelTool},
-    Runtime,
-};
+use crate::{tools::SpiceModelTool, Runtime};
 
-use super::{Error, MCPConfig, Result};
+use super::Result;
 
 pub struct McpToolWrapper {
-    client: Arc<RwLock<dyn McpClientTrait>>,
+    client: Arc<RwLock<Box<dyn McpClientTrait>>>,
     name: String,
-    description: String,
     spec: McpTool,
+}
+
+impl McpToolWrapper {
+    pub fn new(client: Arc<RwLock<Box<dyn McpClientTrait>>>, name: String, spec: McpTool) -> Self {
+        Self { client, name, spec }
+    }
+
+    pub fn internal_name(&self) -> &str {
+        self.spec.name.as_str()
+    }
 }
 
 #[async_trait]
 impl SpiceModelTool for McpToolWrapper {
     fn name(&self) -> Cow<'_, str> {
-        Cow::Owned(self.spec.name.clone())
+        Cow::Owned(self.name.clone())
     }
 
     fn description(&self) -> Option<Cow<'_, str>> {
@@ -59,13 +61,18 @@ impl SpiceModelTool for McpToolWrapper {
     async fn call(
         &self,
         arg: &str,
-        rt: Arc<Runtime>,
+        _rt: Arc<Runtime>,
     ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
         let span: Span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::mcp", tool = self.name().to_string(), input = arg);
         let tool_use_result: Result<Value, Box<dyn std::error::Error + Send + Sync>> = async {
             let client = self.client.read().await;
+            println!(
+                "In call {} {:#?}",
+                self.internal_name(),
+                serde_json::json!(arg)
+            );
             let response = client
-                .call_tool(self.name.as_str(), arg.into())
+                .call_tool(self.internal_name(), serde_json::from_str(arg).unwrap())
                 .await
                 .boxed()?;
 

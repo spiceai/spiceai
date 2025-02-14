@@ -32,6 +32,7 @@ impl Runtime {
         let app_lock = self.app.read().await;
         if let Some(app) = app_lock.as_ref() {
             for tool in &app.tools {
+                tracing::debug!("Loading tool [{}] from {}...", tool.name, tool.from);
                 self.load_tool(tool).await;
             }
         }

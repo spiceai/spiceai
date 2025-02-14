@@ -18,16 +18,16 @@ pub mod catalog;
 pub mod factory;
 pub mod tool;
 
-use std::collections::HashMap;
+use std::{collections::HashMap, str::FromStr};
 
-use mcp_client::transport::Error as TransportError;
+use mcp_client::{transport::Error as TransportError, Error as McpError};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use snafu::Snafu;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Invalid MCP directive 'from:mcp:{}'", id))]
+    #[snafu(display("Invalid MCP directive 'from: mcp:{}'", id))]
     InvalidMCPDirective { id: String },
 
     #[snafu(display("Could not construct tool `{}`. Error: {}", name, e))]
@@ -41,6 +41,12 @@ pub enum Error {
         source
     ))]
     UnderlyingTransportError { source: TransportError },
+
+    #[snafu(display(
+        "Error occured in initialization client connection with underlying MCP server. Error: {}",
+        source
+    ))]
+    UnderlyingInitilizationError { source: McpError },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -55,6 +61,17 @@ pub enum MCPType {
     Https(url::Url),
 }
 
+impl FromStr for MCPType {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match serde_json::from_str(format!("\"{s}\"").as_str()) {
+            Ok(mcp_type) => Ok(mcp_type),
+            Err(_) => Err(Error::InvalidMCPDirective { id: s.to_string() }),
+        }
+    }
+}
+
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) enum MCPConfig {
     Stdio {
@@ -66,26 +83,22 @@ pub(crate) enum MCPConfig {
     },
 }
 impl MCPConfig {
-    fn try_from_type(mcp_type: &MCPType, params: &HashMap<String, SecretString>) -> Result<Self> {
+    fn from_type(mcp_type: &MCPType, params: &HashMap<String, SecretString>) -> Self {
         match mcp_type {
             MCPType::Stdio(command) => match params.get("mcp_args") {
                 Some(args) => {
                     let args = args.expose_secret();
-                    let args: Vec<String> =
-                        serde_json::from_str(&args).map_err(|_| Error::InvalidMcpArgs {
-                            args_str: args.clone(),
-                        })?;
-                    Ok(Self::Stdio {
+                    Self::Stdio {
                         command: command.clone(),
-                        args: Some(args),
-                    })
+                        args: Some(args.split_whitespace().map(|s| s.to_string()).collect()),
+                    }
                 }
-                None => Ok(Self::Stdio {
+                None => Self::Stdio {
                     command: command.clone(),
                     args: None,
-                }),
+                },
             },
-            MCPType::Https(url) => Ok(Self::Https { url: url.clone() }),
+            MCPType::Https(url) => Self::Https { url: url.clone() },
         }
     }
 }

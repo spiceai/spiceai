@@ -46,6 +46,7 @@ impl Tooling {
         }
     }
 
+    #[must_use]
     pub fn name(&self) -> Cow<'_, str> {
         match self {
             Tooling::Tool(t) => t.name(),

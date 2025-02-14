@@ -13,6 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+use async_trait::async_trait;
 use secrecy::SecretString;
 use spicepod::component::tool::Tool;
 use std::{
@@ -23,7 +24,7 @@ use tokio::sync::Mutex;
 
 use super::{
     builtin::catalog::BuiltinToolCatalog, catalog::SpiceToolCatalog,
-    memory::catalog::MemoryToolCatalog, SpiceModelTool, Tooling,
+    mcp::factory::McpCatalogFactory, memory::catalog::MemoryToolCatalog, SpiceModelTool, Tooling,
 };
 
 pub enum ToolFactory {
@@ -32,13 +33,16 @@ pub enum ToolFactory {
 }
 
 impl ToolFactory {
-    fn construct(
+    async fn construct(
         &self,
         component: &Tool,
         params_with_secrets: HashMap<String, SecretString>,
     ) -> Result<Tooling, Box<dyn std::error::Error + Send + Sync>> {
         match self {
-            ToolFactory::Catalog(c) => c.construct(component, params_with_secrets).map(Into::into),
+            ToolFactory::Catalog(c) => c
+                .construct(component, params_with_secrets)
+                .await
+                .map(Into::into),
             ToolFactory::Tool(t) => t.construct(component, params_with_secrets).map(Into::into),
         }
     }
@@ -65,8 +69,9 @@ pub trait IndividualToolFactory: Send + Sync {
     ) -> Result<Arc<dyn SpiceModelTool>, Box<dyn std::error::Error + Send + Sync>>;
 }
 
+#[async_trait]
 pub trait ToolCatalogFactory: Send + Sync {
-    fn construct(
+    async fn construct(
         &self,
         component: &Tool,
         params_with_secrets: HashMap<String, SecretString>,
@@ -85,6 +90,10 @@ pub async fn register_all_factories() {
     registry.insert(
         "memory".to_string(),
         ToolFactory::Tool(Arc::new(MemoryToolCatalog {})),
+    );
+    registry.insert(
+        "mcp".to_string(),
+        ToolFactory::Catalog(Arc::new(McpCatalogFactory {})),
     );
 }
 
@@ -111,7 +120,7 @@ pub async fn forge(
     let registry = TOOL_SHED_FACTORY.lock().await;
 
     match registry.get(from_source) {
-        Some(factory) => factory.construct(component, secrets),
+        Some(factory) => factory.construct(component, secrets).await,
         None => Err(format!("Tool factory not found for source: {from_source}").into()),
     }
 }
