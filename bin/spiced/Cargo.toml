@@ -63,6 +63,7 @@ default = [
   "anonymous_telemetry",
   "mssql",
   "dynamodb",
+  "imap",
 ]
 delta_lake = ["runtime/delta_lake"]
 dev = ["runtime/dev"]

@@ -1,10 +1,35 @@
 name: E2E Test CI (models)
 
 on:
+  pull_request:
+    branches:
+      - trunk
+      - release-*
+      - release/*
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - 'README.md'
+      - 'Makefile'
+      - 'CONTRIBUTING.md'
+      - 'SECURITY.md'
+      - 'LICENSE'
+      - '.github/**'
+      - 'version.txt'
+      - '.schema/**'
+      - '.vscode/**'
+      - 'deploy/**'
+      - 'install/**'
+      - 'media/**'
+      - 'monitoring/**'
+      - 'acknowledgements.md'
+      - 'Dockerfile*'
+      - 'bin/spice/**'
   push:
     branches:
       - trunk
       - release-*
+      - release/*
     paths-ignore:
       - '**/*.md'
       - 'docs/**'

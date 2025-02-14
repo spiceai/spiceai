@@ -127,7 +127,9 @@ spice chat --model <model> --cloud
 			rtcontext.SetUserAgentClient("chat")
 		}
 
-		rtcontext.RequireModelsFlavor(cmd)
+		if !cloud {
+			rtcontext.RequireModelsFlavor(cmd)
+		}
 
 		model, err := cmd.Flags().GetString(modelKeyFlag)
 		if err != nil {

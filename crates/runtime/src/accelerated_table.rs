@@ -554,6 +554,15 @@ impl AcceleratedTable {
         let field = schema
             .column_with_name(time_column.as_str())
             .map(|(_, f)| f);
+        let partition_field =
+            retention
+                .time_partition_column
+                .as_ref()
+                .and_then(|time_partition_column| {
+                    schema
+                        .column_with_name(time_partition_column.as_str())
+                        .map(|(_, f)| f)
+                });
 
         let mut interval_timer = tokio::time::interval(retention.check_interval);
 
@@ -561,6 +570,9 @@ impl AcceleratedTable {
             field.cloned(),
             Some(time_column.clone()),
             retention.time_format,
+            partition_field.cloned(),
+            retention.time_partition_column.clone(),
+            retention.time_partition_format,
         ) else {
             tracing::error!("[retention] Failed to get the expression time format for {time_column}, check schema and time format");
             return;
@@ -766,6 +778,8 @@ impl TableProvider for AcceleratedTable {
 pub struct Retention {
     pub(crate) time_column: String,
     pub(crate) time_format: Option<TimeFormat>,
+    pub(crate) time_partition_column: Option<String>,
+    pub(crate) time_partition_format: Option<TimeFormat>,
     pub(crate) period: Duration,
     pub(crate) check_interval: Duration,
 }
@@ -775,6 +789,8 @@ impl Retention {
     pub fn new(
         time_column: Option<String>,
         time_format: Option<TimeFormat>,
+        time_partition_column: Option<String>,
+        time_partition_format: Option<TimeFormat>,
         retention_period: Option<Duration>,
         retention_check_interval: Option<Duration>,
         retention_check_enabled: bool,
@@ -788,6 +804,8 @@ impl Retention {
             Some(Self {
                 time_column,
                 time_format,
+                time_partition_column,
+                time_partition_format,
                 period,
                 check_interval,
             })
