@@ -29,7 +29,7 @@ use arrow_flight::encode::FlightDataEncoderBuilder;
 use arrow_flight::{Action, ActionType, Criteria, IpcMessage, PollInfo, SchemaResult};
 use arrow_ipc::writer::IpcWriteOptions;
 use bytes::Bytes;
-use cache::QueryCacheStatus;
+use cache::QueryResultsCacheStatus;
 use datafusion::error::DataFusionError;
 use datafusion::sql::sqlparser::parser::ParserError;
 use datafusion::sql::TableReference;
@@ -180,7 +180,7 @@ impl Service {
     ) -> Result<
         (
             BoxStream<'static, Result<FlightData, Status>>,
-            QueryCacheStatus,
+            QueryResultsCacheStatus,
         ),
         Status,
     > {
@@ -230,7 +230,7 @@ impl Service {
 
         let flights_stream = stream::once(async { Ok(schema_flight_data) }).chain(batches_stream);
 
-        Ok((flights_stream.boxed(), query_result.cache_status))
+        Ok((flights_stream.boxed(), query_result.results_cache_status))
     }
 }
 
