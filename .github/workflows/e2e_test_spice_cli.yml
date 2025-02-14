@@ -301,13 +301,13 @@ jobs:
 
     strategy:
       matrix:
-        target: 
+        target:
           - name: "macOS aarch64 (Apple Silicon)"
-          - runner: "macos-14"
-          - target_os: "darwin"
-          - target_arch: "aarch64"
-          - target_arch_go: "arm64"
-
+            runner: "macos-14"
+            target_os: "darwin"
+            target_arch: "aarch64"
+            target_arch_go: "arm64"
+            
     steps:
       - uses: actions/checkout@v4
 
