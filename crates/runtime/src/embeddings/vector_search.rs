@@ -833,7 +833,6 @@ impl VectorSearch {
         })
     }
 
-    #[allow(clippy::too_many_lines)]
     pub async fn search(&self, req: &SearchRequest) -> Result<VectorSearchResult> {
         let SearchRequest {
             text: query,
