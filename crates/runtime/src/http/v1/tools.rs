@@ -22,6 +22,7 @@ use axum::{
     response::{IntoResponse, Response},
     Extension, Json,
 };
+use futures::{stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -61,26 +62,32 @@ struct ListToolElement {
 pub(crate) async fn list(Extension(rt): Extension<Arc<Runtime>>) -> Response {
     let tools = &*rt.tools.read().await;
 
-    // For catalogs, get all tools.
-    let mut all_tools = vec![];
-    for t in tools.values() {
-        match t {
-            Tooling::Tool(tool) => all_tools.push(Arc::clone(&tool)),
-            Tooling::Catalog(c) => {
-                let tools = c.all().await;
-                all_tools.extend(tools.into_iter());
+    let tools = stream::iter(tools.iter())
+        .then(|(name, t)| async move {
+            match t {
+                Tooling::Tool(tool) => vec![ListToolElement {
+                    name: name.to_string(),
+                    description: tool.description().map(|d| d.to_string()),
+                    parameters: tool.parameters(),
+                    is_catalog: false,
+                }],
+                Tooling::Catalog(c) => c
+                    .all()
+                    .await
+                    .into_iter()
+                    .map(|tool| ListToolElement {
+                        name: format!("{name}/{}", tool.name()),
+                        description: tool.description().map(|d| d.to_string()),
+                        parameters: tool.parameters(),
+                        is_catalog: true,
+                    })
+                    .collect(),
             }
-        }
-    }
-
-    let tools = all_tools
-        .iter()
-        .map(|tool| ListToolElement {
-            name: tool.name().to_string(),
-            description: tool.description().map(|d| d.to_string()),
-            parameters: tool.parameters(),
-            is_catalog: false,
         })
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .flatten()
         .collect::<Vec<_>>();
 
     (StatusCode::OK, Json(tools)).into_response()
@@ -138,39 +145,24 @@ pub(crate) async fn post(
 ) -> Response {
     let tools = &*rt.tools.read().await;
 
-    println!("Inside");
     // Find tool by first checking if it is a tool catalog (i.e. has a '/'), if not find it as regular tool.
-    let tool: Arc<dyn SpiceModelTool> = if let Some((catalog_name, _)) = tool_name.split_once('/') {
-        let Some(Tooling::Catalog(catalog)) = tools.get(catalog_name) else {
-            println!("Catalog {catalog_name} not found");
-            return (
-                StatusCode::NOT_FOUND,
-                Json(json!({"message": format!("T ool {tool_name} not found")})),
-            )
-                .into_response();
-        };
-        match catalog.get(tool_name.as_str()).await {
-            Some(tool) => tool,
-            None => {
-                println!("tool_name {tool_name} not found");
-                return (
-                    StatusCode::NOT_FOUND,
-                    Json(json!({"message": format!("Tool {tool_name} not found")})),
-                )
-                    .into_response();
+    let tool: Arc<dyn SpiceModelTool> =
+        if let Some((catalog_name, name)) = tool_name.split_once('/') {
+            let Some(Tooling::Catalog(catalog)) = tools.get(catalog_name) else {
+                return not_found(format!("Tool '{tool_name}' not found"));
+            };
+            match catalog.get(name).await {
+                Some(tool) => tool,
+                None => {
+                    return not_found(format!("Tool '{name}' not found in '{catalog_name}'"));
+                }
             }
-        }
-    } else {
-        let Some(Tooling::Tool(tool)) = tools.get(&tool_name) else {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(json!({"message": format!("Tool {tool_name} not found")})),
-            )
-                .into_response();
+        } else {
+            let Some(Tooling::Tool(tool)) = tools.get(&tool_name) else {
+                return not_found(format!("Tool {tool_name} not found"));
+            };
+            Arc::clone(tool)
         };
-        Arc::clone(tool)
-    };
-    println!("Have a tol? {:#?}", tool.name());
 
     match tool.call(body.as_str(), Arc::clone(&rt)).await {
         Ok(result) => (StatusCode::OK, Json(result)).into_response(),
@@ -180,4 +172,8 @@ pub(crate) async fn post(
         )
             .into_response(),
     }
+}
+
+fn not_found(message: String) -> Response {
+    (StatusCode::NOT_FOUND, Json(json!({"message": message}))).into_response()
 }

@@ -30,13 +30,12 @@ use super::Result;
 
 pub struct McpToolWrapper {
     client: Arc<RwLock<Box<dyn McpClientTrait>>>,
-    name: String,
     spec: McpTool,
 }
 
 impl McpToolWrapper {
-    pub fn new(client: Arc<RwLock<Box<dyn McpClientTrait>>>, name: String, spec: McpTool) -> Self {
-        Self { client, name, spec }
+    pub fn new(client: Arc<RwLock<Box<dyn McpClientTrait>>>, spec: McpTool) -> Self {
+        Self { client, spec }
     }
 
     pub fn internal_name(&self) -> &str {
@@ -47,7 +46,7 @@ impl McpToolWrapper {
 #[async_trait]
 impl SpiceModelTool for McpToolWrapper {
     fn name(&self) -> Cow<'_, str> {
-        Cow::Owned(self.name.clone())
+        Cow::Borrowed(self.internal_name())
     }
 
     fn description(&self) -> Option<Cow<'_, str>> {

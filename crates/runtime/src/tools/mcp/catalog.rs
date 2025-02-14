@@ -21,7 +21,6 @@ use mcp_client::{
     McpClient, McpClientTrait, McpService, SseTransport, StdioTransport, Transport,
 };
 use mcp_core::Tool as McpTool;
-use opentelemetry::trace::FutureExt;
 use snafu::ResultExt;
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
@@ -33,7 +32,7 @@ use super::{
     tool::McpToolWrapper, MCPConfig, Result, UnderlyingInitilizationSnafu, UnderlyingTransportSnafu,
 };
 
-pub struct McpToolCatalog {
+pub(crate) struct McpToolCatalog {
     client: Arc<RwLock<Box<dyn McpClientTrait>>>,
 
     /// User defined name & description, not from underlying MCP.
@@ -128,13 +127,6 @@ impl McpToolCatalog {
         }
         Ok(None)
     }
-
-    /// Returns the full name of a tool available in the MCP service.
-    ///
-    /// This is defined as the user-defined name of the MCP catalog, and the tool name from the underlying service.
-    fn subtool_name(&self, name: &str) -> String {
-        format!("{}/{}", self.name, name)
-    }
 }
 
 #[async_trait]
@@ -147,11 +139,8 @@ impl SpiceToolCatalog for McpToolCatalog {
         tools
             .into_iter()
             .map(|t| {
-                Arc::new(McpToolWrapper::new(
-                    Arc::clone(&self.client),
-                    self.subtool_name(t.name.as_str()),
-                    t,
-                )) as Arc<dyn SpiceModelTool>
+                Arc::new(McpToolWrapper::new(Arc::clone(&self.client), t))
+                    as Arc<dyn SpiceModelTool>
             })
             .collect()
     }
@@ -172,16 +161,14 @@ impl SpiceToolCatalog for McpToolCatalog {
             .collect()
     }
 
-    /// `name` is user-defined so will be in the form `catalog/tool`.
+    /// `name` is the name from the underlying MCP server.
     async fn get(&self, name: &str) -> Option<Arc<dyn SpiceModelTool>> {
-        let (catalog, tool_name) = name.split_once("/")?;
-        let Ok(Some(tool)) = self.get_tool(tool_name).await else {
+        let Ok(Some(tool)) = self.get_tool(name).await else {
             return None;
         };
 
         Some(Arc::new(McpToolWrapper::new(
             Arc::clone(&self.client),
-            self.subtool_name(tool_name),
             tool,
         )))
     }

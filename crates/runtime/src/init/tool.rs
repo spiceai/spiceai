@@ -87,7 +87,7 @@ impl Runtime {
                 self.status
                     .update_tool(&tool.name, status::ComponentStatus::Error);
                 tracing::warn!(
-                    "Unable to load tool from spicepod {}, error: {}",
+                    "Unable to load tool '{}' from spicepod. Error: {}",
                     tool.name,
                     e,
                 );
