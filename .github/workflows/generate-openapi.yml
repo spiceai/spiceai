@@ -41,10 +41,22 @@ jobs:
           name: openapi.json
           path: .schema/openapi.json
 
-      - name: Create PR
+      - name: Create PR if needed
         run: |
           git config --global user.name 'Spice Schema Bot'
           git config --global user.email 'schema-bot@spice.ai'
+
+          # Check for existing PRs from our bot
+          existing_pr=$(gh pr list \
+            --base trunk \
+            --json title,headRefName \
+            --jq '.[] | select(.title=="Update openapi.json")')
+
+          if [ ! -z "$existing_pr" ]; then
+            echo "An existing PR for updating openapi.json was found. Skipping PR creation."
+            exit 0
+          fi
+
           git checkout -b openapi/${GITHUB_RUN_ID}
           if git diff --exit-code -- .schema/openapi.json; then
             echo "No changes detected"
