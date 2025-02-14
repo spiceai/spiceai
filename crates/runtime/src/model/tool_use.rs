@@ -256,16 +256,6 @@ impl ToolUsingChat {
             let inner_req = self.add_runtime_tools(&req);
 
             let resp = self.inner_chat.chat_request(inner_req.clone()).await?;
-            let proceed_with_tools = resp.choices.first().is_some_and(|c| {
-                c.finish_reason
-                    .is_some_and(|f| matches!(f, FinishReason::ToolCalls))
-            });
-
-            // Return reason was not to call tools, so return early.
-            if !proceed_with_tools {
-                return Ok(resp);
-            }
-
             let usage = resp.usage.clone();
 
             let tools_used = resp
