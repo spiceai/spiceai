@@ -10,9 +10,6 @@ on:
           description: 'The version to build CLI / download released CLI'
           required: false
           default: '1.0.2'
-  push:
-    branches:
-      - qianqian/cli-e2e
 
 jobs:
   setup-matrix:
@@ -219,7 +216,7 @@ jobs:
       REL_VERSION: ${{ github.event.inputs.rel_version || '1.0.2' }}
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     needs:
-      # - build
+      - build
       - setup-matrix
     timeout-minutes: 5
 
