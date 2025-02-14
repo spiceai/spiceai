@@ -414,7 +414,7 @@ jobs:
       - name: Start spice runtime
         if: matrix.target.target_os == 'windows'
         run: |
-          Start-Process spice -ArgumentList "run" -NoNewWindow -RedirectStandardOutput "spice.log" -RedirectStandardError "spice.log"
+          Start-Process spice -ArgumentList "run" -NoNewWindow -RedirectStandardOutput "spice.stdout.log" -RedirectStandardError "spice.stderr.log"
           # time to download runtime
           Start-Sleep -Seconds 60
 
@@ -429,7 +429,7 @@ jobs:
         shell: pwsh
         run: |
           Get-Process -Name spice -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-          Get-Content spice.log
+          Get-Content spice.stdout.log, spice.stderr.log
 
       - name: Run spice version
         run: |
