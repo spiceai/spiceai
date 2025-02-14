@@ -109,6 +109,7 @@ pub enum TimeFormat {
     UnixSeconds,
     UnixMillis,
     ISO8601,
+    Date,
 }
 
 impl From<spicepod_dataset::TimeFormat> for TimeFormat {
@@ -119,6 +120,7 @@ impl From<spicepod_dataset::TimeFormat> for TimeFormat {
             spicepod_dataset::TimeFormat::ISO8601 => TimeFormat::ISO8601,
             spicepod_dataset::TimeFormat::Timestamp => TimeFormat::Timestamp,
             spicepod_dataset::TimeFormat::Timestamptz => TimeFormat::Timestamptz,
+            spicepod_dataset::TimeFormat::Date => TimeFormat::Date,
         }
     }
 }
@@ -205,6 +207,8 @@ pub struct Dataset {
     pub replication: Option<replication::Replication>,
     pub time_column: Option<String>,
     pub time_format: Option<TimeFormat>,
+    pub time_partition_column: Option<String>,
+    pub time_partition_format: Option<TimeFormat>,
     pub acceleration: Option<acceleration::Acceleration>,
     pub embeddings: Vec<ColumnEmbeddingConfig>,
     pub app: Option<Arc<App>>,
@@ -226,6 +230,8 @@ impl PartialEq for Dataset {
             && self.replication == other.replication
             && self.time_column == other.time_column
             && self.time_format == other.time_format
+            && self.time_partition_column == other.time_partition_column
+            && self.time_partition_format == other.time_partition_format
             && self.acceleration == other.acceleration
             && self.embeddings == other.embeddings
             && self.schema == other.schema
@@ -279,6 +285,8 @@ impl TryFrom<spicepod_dataset::Dataset> for Dataset {
             replication: dataset.replication.map(replication::Replication::from),
             time_column: dataset.time_column,
             time_format: dataset.time_format.map(TimeFormat::from),
+            time_partition_column: dataset.time_partition_column,
+            time_partition_format: dataset.time_partition_format.map(TimeFormat::from),
             embeddings: dataset.embeddings,
             acceleration,
             schema: None,
@@ -304,6 +312,8 @@ impl Dataset {
             replication: None,
             time_column: None,
             time_format: None,
+            time_partition_column: None,
+            time_partition_format: None,
             acceleration: None,
             embeddings: Vec::default(),
             schema: None,

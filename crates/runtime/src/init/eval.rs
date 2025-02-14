@@ -54,6 +54,8 @@ impl Runtime {
         let retention = Retention::new(
             Some(EVAL_RESULTS_TABLE_TIME_COLUMN.to_string()),
             Some(TimeFormat::Timestamptz),
+            None,
+            None,
             Some(Duration::from_secs(24 * 3600)), // Keep data for last 24 hours
             Some(Duration::from_secs(1800)),      // Check every 30 minutes
             true,
@@ -83,6 +85,8 @@ impl Runtime {
         let retention = Retention::new(
             Some(EVAL_RUNS_TABLE_TIME_COLUMN.to_string()),
             Some(TimeFormat::Timestamptz),
+            None,
+            None,
             Some(Duration::from_secs(24 * 3600)), // Keep data for last 24 hours
             Some(Duration::from_secs(1800)),      // Check every 30 minutes
             true,
