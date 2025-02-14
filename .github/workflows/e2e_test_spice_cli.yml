@@ -133,7 +133,7 @@ jobs:
           path: ./build
       
       - name: download spice cli released version
-        if: ${{ github.event.inputs.build_cli == 'false' }} && ${{ matrix.target.target_os != 'windows' }}
+        if: github.event.inputs.build_cli == 'false' && matrix.target.target_os != 'windows'
         run: |
           mkdir -p ./build
           cd ./build
@@ -145,7 +145,7 @@ jobs:
           chmod +x spice
       
       - name: download spice cli released version
-        if: ${{ github.event.inputs.build_cli == 'false' }} && ${{ matrix.target.target_os == 'windows' }}
+        if: github.event.inputs.build_cli == 'false' && matrix.target.target_os == 'windows'
         run: |
           Set-Location "./build"
           $url = "https://github.com/spiceai/spiceai/releases/download/v${{ env.REL_VERSION }}/spice.exe_windows_x86_64.tar.gz"
@@ -235,7 +235,7 @@ jobs:
           path: ./build
 
       - name: download spice cli released version
-        if: ${{ github.event.inputs.build_cli == 'false' }} && ${{ matrix.target.target_os != 'windows' }}
+        if: github.event.inputs.build_cli == 'false' && matrix.target.target_os != 'windows'
         run: |
           mkdir -p ./build
           cd ./build
@@ -247,7 +247,7 @@ jobs:
           chmod +x spice
       
       - name: download spice cli released version
-        if: ${{ github.event.inputs.build_cli == 'false' }} && ${{ matrix.target.target_os == 'windows' }}
+        if: github.event.inputs.build_cli == 'false' && matrix.target.target_os == 'windows'
         run: |
           Set-Location "./build"
           $url = "https://github.com/spiceai/spiceai/releases/download/v${{ env.REL_VERSION }}/spice.exe_windows_x86_64.tar.gz"
