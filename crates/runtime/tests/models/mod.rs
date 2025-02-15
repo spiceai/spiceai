@@ -15,10 +15,8 @@ limitations under the License.
 */
 
 use arrow::{array::StringArray, util::pretty::pretty_format_batches};
-use async_openai::types::CreateChatCompletionResponse;
 use async_openai::types::EmbeddingInput;
 use futures::TryStreamExt;
-use jsonpath_rust::JsonPath;
 use rand::Rng;
 use reqwest::{header::HeaderMap, Client};
 use runtime::{config::Config, get_params_with_secrets, Runtime};
@@ -28,7 +26,6 @@ use spicepod::component::{
     dataset::{acceleration::Acceleration, Dataset},
     params::Params,
 };
-use std::str::FromStr;
 use std::sync::Arc;
 use std::{
     collections::HashMap,
@@ -339,30 +336,6 @@ fn sort_json_keys(value: &mut Value) {
         }
         _ => {}
     }
-}
-
-// Checks that the response from a chat completion call against the relevant snapshot and jsonpath filter.
-//
-// # Error
-// Returns error if it fails to check the snapshot, not if snapshot assertion is failed.
-fn check_snapshot_for_chat_completion(
-    response: &CreateChatCompletionResponse,
-    json_path: &str,
-    snapshot_name: &str,
-) -> Result<(), anyhow::Error> {
-    let mut resp_value = serde_json::to_value(&response)
-        .map_err(|e| anyhow::anyhow!("Failed to serialize response.choices: {e}"))?;
-
-    sort_json_keys(&mut resp_value);
-
-    let selector = JsonPath::from_str(json_path)
-        .map_err(|e| anyhow::anyhow!("Failed to create JSONPath selector {e}"))?;
-
-    let filtered_response = serde_json::to_string_pretty(&selector.find(&resp_value))
-        .map_err(|e| anyhow::anyhow!("Failed to serialize response.choices {e}"))?;
-
-    insta::assert_snapshot!(snapshot_name, filtered_response);
-    Ok(())
 }
 
 async fn send_embeddings_request(
