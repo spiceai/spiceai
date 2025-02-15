@@ -159,23 +159,24 @@ pub(crate) async fn post(
     let tools = &*rt.tools.read().await;
 
     // Find tool by first checking if it is a tool catalog (i.e. has a '/'), if not find it as regular tool.
-    let tool: Arc<dyn SpiceModelTool> =
-        if let Some((catalog_name, name)) = tool_name.split_once('/') {
-            let Some(Tooling::Catalog(catalog)) = tools.get(catalog_name) else {
-                return not_found(format!("Tool '{tool_name}' not found"));
-            };
-            match catalog.get(name).await {
-                Some(tool) => tool,
-                None => {
-                    return not_found(format!("Tool '{name}' not found in '{catalog_name}'"));
-                }
-            }
-        } else {
-            let Some(Tooling::Tool(tool)) = tools.get(&tool_name) else {
-                return not_found(format!("Tool {tool_name} not found"));
-            };
-            Arc::clone(tool)
+    let tool: Arc<dyn SpiceModelTool> = if let Some((catalog_name, name)) =
+        tool_name.split_once('/')
+    {
+        let Some(Tooling::Catalog(catalog)) = tools.get(catalog_name) else {
+            return not_found(format!("Tool '{tool_name}' not found").as_str());
         };
+        match catalog.get(name).await {
+            Some(tool) => tool,
+            None => {
+                return not_found(format!("Tool '{name}' not found in '{catalog_name}'").as_str());
+            }
+        }
+    } else {
+        let Some(Tooling::Tool(tool)) = tools.get(&tool_name) else {
+            return not_found(format!("Tool {tool_name} not found").as_str());
+        };
+        Arc::clone(tool)
+    };
 
     match tool.call(body.as_str(), Arc::clone(&rt)).await {
         Ok(result) => (StatusCode::OK, Json(result)).into_response(),
@@ -187,6 +188,6 @@ pub(crate) async fn post(
     }
 }
 
-fn not_found(message: String) -> Response {
+fn not_found(message: &str) -> Response {
     (StatusCode::NOT_FOUND, Json(json!({"message": message}))).into_response()
 }
