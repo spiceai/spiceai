@@ -45,12 +45,15 @@ use delta_kernel::snapshot::Snapshot;
 use delta_kernel::Table;
 use indexmap::IndexMap;
 use object_store::ObjectMeta;
+use pruning::{can_be_evaluted_for_partition_pruning, prune_partitions};
 use secrecy::{ExposeSecret, SecretString};
 use snafu::prelude::*;
 use std::{collections::HashMap, sync::Arc};
 use url::Url;
 
 use crate::Read;
+
+mod pruning;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -312,8 +315,6 @@ impl TableProvider for DeltaTable {
             .map_err(map_delta_error_to_datafusion_err)?;
 
         let df_schema = DFSchema::try_from(Arc::clone(&self.arrow_schema))?;
-        let filter = conjunction(filters.to_vec()).unwrap_or_else(|| lit(true));
-        let physical_expr = state.create_physical_expr(filter, &df_schema)?;
 
         let store = self
             .engine
@@ -425,10 +426,36 @@ impl TableProvider for DeltaTable {
             partitioned_files.push(partitioned_file);
         }
 
-        let partition_cols = &all_partition_columns
+        let partition_cols = all_partition_columns
             .into_iter()
             .map(|(field, ())| field)
             .collect::<Vec<_>>();
+
+        let table_partition_col_names = partition_cols
+            .iter()
+            .map(|field| field.name().as_str())
+            .collect::<Vec<_>>();
+
+        // Split the filters into partition filters and the rest
+        let (partition_filters, filters): (Vec<_>, Vec<_>) =
+            filters.iter().cloned().partition(|filter| {
+                can_be_evaluted_for_partition_pruning(&table_partition_col_names, filter)
+            });
+        tracing::trace!("partition_filters: {partition_filters:?}");
+        tracing::trace!("filters: {filters:?}");
+
+        let num_partition_files = partitioned_files.len();
+        let filtered_partitioned_files =
+            prune_partitions(partitioned_files, &partition_filters, &partition_cols)?;
+
+        tracing::debug!(
+            "Partition pruning yielded {} files (out of {num_partition_files})",
+            filtered_partitioned_files.len(),
+        );
+
+        let filter = conjunction(filters).unwrap_or_else(|| lit(true));
+        let physical_expr = state.create_physical_expr(filter, &df_schema)?;
+
         let schema = self.arrow_schema.project(
             &self
                 .arrow_schema
@@ -443,9 +470,9 @@ impl TableProvider for DeltaTable {
             projection,
             limit,
             &Arc::new(schema),
-            partition_cols,
+            &partition_cols,
             &parquet_file_reader_factory,
-            &partitioned_files,
+            &filtered_partitioned_files,
             &physical_expr,
         ))
     }

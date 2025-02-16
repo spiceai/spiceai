@@ -73,7 +73,9 @@ spice search --cloud
 		cloud, _ := cmd.Flags().GetBool(cloudKeyFlag)
 		rtcontext := context.NewContext().WithCloud(cloud)
 
-		rtcontext.RequireModelsFlavor(cmd)
+		if !cloud {
+			rtcontext.RequireModelsFlavor(cmd)
+		}
 
 		datasets, err := api.GetDatasetsWithStatus(rtcontext)
 		if err != nil {

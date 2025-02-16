@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use arrow_flight::flight_service_server::FlightService;
-use cache::QueryCacheStatus;
+use cache::QueryResultsCacheStatus;
 use tonic::{
     metadata::{Ascii, MetadataValue},
     Response,
@@ -28,20 +28,36 @@ use crate::{
 
 pub fn attach_cache_metadata(
     response: &mut Response<<Service as FlightService>::DoGetStream>,
-    cache_status: QueryCacheStatus,
+    results_cache_status: QueryResultsCacheStatus,
 ) {
-    let val: Result<MetadataValue<Ascii>, _> = match cache_status {
-        QueryCacheStatus::CacheHit => "Hit from spiceai".parse(),
-        QueryCacheStatus::CacheMiss => "Miss from spiceai".parse(),
-        QueryCacheStatus::CacheNotChecked => return,
-    };
-    match val {
-        Ok(val) => {
-            response.metadata_mut().insert("x-cache", val);
-        }
-        Err(e) => {
-            tracing::error!("Failed to parse metadata value: {}", e);
-        }
+    if let Some(val) = status_to_x_cache_value(results_cache_status) {
+        response.metadata_mut().insert("x-cache", val);
+    }
+
+    if let Some(val) = status_to_results_cache_value(results_cache_status) {
+        response.metadata_mut().insert("results-cache-status", val);
+    }
+}
+
+/// This is the legacy cache header, preserved for backwards compatibility.
+fn status_to_x_cache_value(
+    results_cache_status: QueryResultsCacheStatus,
+) -> Option<MetadataValue<Ascii>> {
+    match results_cache_status {
+        QueryResultsCacheStatus::CacheHit => "Hit from spiceai".parse().ok(),
+        QueryResultsCacheStatus::CacheMiss => "Miss from spiceai".parse().ok(),
+        QueryResultsCacheStatus::CacheDisabled | QueryResultsCacheStatus::CacheBypass => None,
+    }
+}
+
+fn status_to_results_cache_value(
+    results_cache_status: QueryResultsCacheStatus,
+) -> Option<MetadataValue<Ascii>> {
+    match results_cache_status {
+        QueryResultsCacheStatus::CacheHit => "HIT".parse().ok(),
+        QueryResultsCacheStatus::CacheMiss => "MISS".parse().ok(),
+        QueryResultsCacheStatus::CacheBypass => "BYPASS".parse().ok(),
+        QueryResultsCacheStatus::CacheDisabled => None,
     }
 }
 

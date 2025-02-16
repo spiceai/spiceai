@@ -17,11 +17,12 @@ limitations under the License.
 use crate::component::dataset::Dataset;
 use async_trait::async_trait;
 use data_components::imap::{
-    session::{ImapAuthModeParameter, ImapSSLMode, ImapSession},
+    session::{ImapAuthMode, ImapAuthModeParameter, ImapSSLMode, ImapSession},
     ImapTableProvider,
 };
 use datafusion::datasource::TableProvider;
 use regex::Regex;
+use secrecy::SecretString;
 use snafu::prelude::*;
 use std::{
     any::Any,
@@ -42,9 +43,11 @@ const PARAMETERS: &[ParameterSpec] = &[
         .secret()
         .description("The username to use for the IMAP connection"),
     ParameterSpec::connector("password")
-        .required()
         .secret()
         .description("The password to use for the IMAP connection"),
+    ParameterSpec::connector("access_token")
+        .secret()
+        .description("The OAuth access token to use for the IMAP connection"),
     ParameterSpec::connector("host").description("The IMAP server host to connect to"),
     ParameterSpec::connector("mailbox")
         .default("INBOX")
@@ -55,9 +58,6 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::connector("ssl_mode")
         .default("auto")
         .description("The IMAP SSL mode to use"),
-    ParameterSpec::connector("auth_mode")
-        .default("plain")
-        .description("The authentication method to use when connecting to the IMAP server"),
 ];
 
 // Regex that matches an email address in a simple way
@@ -78,6 +78,8 @@ static PRESET_HOST_CONNECTIONS: LazyLock<HashMap<&str, &str>> = LazyLock::new(||
 pub enum Error {
     #[snafu(display("A password parameter is required, but was not provided"))]
     PasswordRequired,
+    #[snafu(display("An access token parameter is required, but was not provided"))]
+    PasswordOrAccessTokenRequired,
     #[snafu(display("A username parameter is required, but was not provided"))]
     UsernameRequired,
     #[snafu(display("A host parameter is required, but was not provided"))]
@@ -88,6 +90,8 @@ pub enum Error {
     ImapError { source: imap::Error },
     #[snafu(display("The specified 'from' address is not a valid email address: {from}"))]
     InvalidFrom { from: String },
+    #[snafu(display("A password and access token were provided. Only one can be specified."))]
+    PasswordAndAccessTokenError,
 }
 
 pub struct Imap {
@@ -180,6 +184,34 @@ impl ImapFactory {
             .into()),
         }
     }
+
+    fn parse_authentication(
+        connector_component: &ConnectorComponent,
+        username: &SecretString,
+        password: Option<&SecretString>,
+        access_token: Option<&SecretString>,
+    ) -> Result<ImapAuthMode, Box<dyn std::error::Error + Send + Sync>> {
+        match (password, access_token) {
+            (Some(_), Some(_)) => Err(DataConnectorError::InvalidConfigurationSourceOnly {
+                dataconnector: "imap".to_string(),
+                connector_component: connector_component.clone(),
+                source: Error::PasswordAndAccessTokenError.into(),
+            }
+            .into()),
+            (Some(password), None) => {
+                Ok(ImapAuthModeParameter::Plain.build(username.clone(), password.clone()))
+            }
+            (None, Some(access_token)) => {
+                Ok(ImapAuthModeParameter::OAuth.build(username.clone(), access_token.clone()))
+            }
+            (None, None) => Err(DataConnectorError::InvalidConfigurationSourceOnly {
+                dataconnector: "imap".to_string(),
+                connector_component: connector_component.clone(),
+                source: Error::PasswordOrAccessTokenRequired.into(),
+            }
+            .into()),
+        }
+    }
 }
 
 impl DataConnectorFactory for ImapFactory {
@@ -194,15 +226,6 @@ impl DataConnectorFactory for ImapFactory {
         Box::pin(async move {
             let host = Self::parse_host(&mut params)?;
 
-            let Some(password) = params.parameters.get("password").ok() else {
-                return Err(DataConnectorError::InvalidConfigurationSourceOnly {
-                    dataconnector: "imap".to_string(),
-                    connector_component: params.component.clone(),
-                    source: Error::PasswordRequired.into(),
-                }
-                .into());
-            };
-
             let Some(username) = params.parameters.get("username").ok() else {
                 return Err(DataConnectorError::InvalidConfigurationSourceOnly {
                     dataconnector: "imap".to_string(),
@@ -211,6 +234,16 @@ impl DataConnectorFactory for ImapFactory {
                 }
                 .into());
             };
+
+            let password_parameter = params.parameters.get("password").ok();
+            let access_token_parameter = params.parameters.get("access_token").ok();
+
+            let authentication = Self::parse_authentication(
+                &params.component,
+                username,
+                password_parameter,
+                access_token_parameter,
+            )?;
 
             let port = if let Some(port) = params.parameters.get("port").expose().ok() {
                 match port.parse::<u16>() {
@@ -251,24 +284,9 @@ impl DataConnectorFactory for ImapFactory {
                 source: e.into(),
             })?;
 
-            let auth_mode = ImapAuthModeParameter::from_str(
-                params
-                    .parameters
-                    .get("auth_mode")
-                    .expose()
-                    .ok()
-                    .unwrap_or("plain"),
-            )
-            .map_err(|e| DataConnectorError::InvalidConfigurationSourceOnly {
-                dataconnector: "imap".to_string(),
-                connector_component: params.component.clone(),
-                source: e.into(),
-            })?;
-
-            let auth_mode = auth_mode.build(username.clone(), password.clone());
-
             Ok(Arc::new(Imap {
-                session: ImapSession::new(auth_mode, host, port, mailbox).with_ssl_mode(ssl_mode),
+                session: ImapSession::new(authentication, host, port, mailbox)
+                    .with_ssl_mode(ssl_mode),
             }) as Arc<dyn DataConnector>)
         })
     }

@@ -46,6 +46,7 @@ pub enum TimeFormat {
     UnixMillis,
     #[serde(rename = "ISO8601")]
     ISO8601,
+    Date,
 }
 
 impl std::fmt::Display for TimeFormat {
@@ -115,6 +116,12 @@ pub struct Dataset {
     pub time_format: Option<TimeFormat>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_partition_column: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_partition_format: Option<TimeFormat>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub acceleration: Option<acceleration::Acceleration>,
 
     #[serde(rename = "embeddings", default, skip_serializing_if = "Vec::is_empty")]
@@ -151,6 +158,8 @@ impl Dataset {
             replication: None,
             time_column: None,
             time_format: None,
+            time_partition_column: None,
+            time_partition_format: None,
             acceleration: None,
             embeddings: Vec::default(),
             depends_on: Vec::default(),
@@ -179,6 +188,8 @@ impl WithDependsOn<Dataset> for Dataset {
             replication: self.replication.clone(),
             time_column: self.time_column.clone(),
             time_format: self.time_format.clone(),
+            time_partition_column: self.time_partition_column.clone(),
+            time_partition_format: self.time_partition_format.clone(),
             acceleration: self.acceleration.clone(),
             embeddings: self.embeddings.clone(),
             depends_on: depends_on.to_vec(),
@@ -623,6 +634,10 @@ struct DatasetDeserializer {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     time_format: Option<TimeFormat>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    time_partition_column: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    time_partition_format: Option<TimeFormat>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     acceleration: Option<acceleration::Acceleration>,
     #[serde(rename = "embeddings", default, skip_serializing_if = "Vec::is_empty")]
     embeddings: Vec<ColumnEmbeddingConfig>,
@@ -676,6 +691,8 @@ impl TryFrom<DatasetDeserializer> for Dataset {
             replication: deserializer.replication,
             time_column: deserializer.time_column,
             time_format: deserializer.time_format,
+            time_partition_column: deserializer.time_partition_column,
+            time_partition_format: deserializer.time_partition_format,
             acceleration: deserializer.acceleration,
             embeddings: deserializer.embeddings,
             depends_on: deserializer.depends_on,

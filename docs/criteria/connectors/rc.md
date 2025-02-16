@@ -20,6 +20,7 @@ All criteria must be met for the connector to be considered [RC](../definitions.
 | GraphQL                          | ✅         | @peasee      |
 | GitHub                           | ✅         | @peasee      |
 | HTTP/HTTPS                       | ➖         |              |
+| IMAP                             | ➖         |              |
 | Localpod                         | ➖         |              |
 | MS SQL                           | ➖         |              |
 | MySQL                            | ✅         | @peasee      |
@@ -27,7 +28,7 @@ All criteria must be met for the connector to be considered [RC](../definitions.
 | PostgreSQL                       | ✅         | @Sevenannn   |
 | Sharepoint                       | ➖         |              |
 | Snowflake                        | ➖         |              |
-| Spice.ai Cloud Platform          | ➖         |              |
+| Spice.ai Cloud Platform          | ✅         | @peasee      |
 | S3                               | ✅         | @Sevenannn   |
 | Azure BlobFS                     | ➖         |              |
 | Spark                            | ➖         |              |
@@ -54,6 +55,7 @@ This table defines the required features and/or tests for each connector:
 | GraphQL                          | ➖                    | ➖                      | ➖                | ➖                       | ➖                  | ☑️                         |
 | GitHub                           | ➖                    | ➖                      | ☑️                | ➖                       | ➖                  | ☑️                         |
 | HTTP/HTTPS                       | ✅ (1)                | ✅ (1)                  | ➖                | ➖                       | ➖                  | ☑️                         |
+| IMAP                             | ➖                    | ➖                      | ☑️                | ✅                       | ✅                  | ☑️                         |
 | Iceberg                          | ✅ (1)                | ✅ (1)                  | ☑️                | ✅                       | ✅                  | ✅                         |
 | MS SQL                           | ✅ (100)              | ✅ (100)                | ✅                | ✅                       | ✅                  | ✅                         |
 | MySQL                            | ✅ (100)              | ✅ (100)                | ✅                | ✅                       | ✅                  | ✅                         |

@@ -401,7 +401,7 @@ pub async fn get_records(
     let response = client.do_get(request).await?;
     let from_cache = response
         .metadata()
-        .get("x-cache")
+        .get("results-cache-status")
         .and_then(|value| value.to_str().ok())
         .is_some_and(|s| s.to_lowercase().starts_with("hit"));
 

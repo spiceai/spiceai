@@ -55,6 +55,25 @@ spice upgrade
 			os.Exit(1)
 		}
 
+		spicePathVar, spicePath, err := rtcontext.SpicePath()
+		if err != nil {
+			slog.Error("finding spice binary location", "error", err)
+			os.Exit(1)
+		}
+
+		switch spicePathVar {
+		case constants.BrewInstall:
+			slog.Info("Spice is downloaded from Homebrew. Run `brew upgrade spiceai/spiceai/spice` to upgrade the CLI.")
+			return
+		case constants.OtherInstall:
+			msg := fmt.Sprintf("Spice upgrade failed: Spice CLI found at non-standard location '%s'. To upgrade:\n"+
+				"1. Remove current installation\n"+
+				"2. Refer to https://spiceai.org/docs/installation to reinstall spice\n"+
+				"3. Try upgrade again", spicePath)
+			slog.Info(msg)
+			return
+		}
+
 		if os.Getenv(constants.SpiceUpgradeReloadEnv) != "true" {
 			// Run CLI upgrade
 			if !upgradeCli(force, rtcontext) {
