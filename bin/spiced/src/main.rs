@@ -59,7 +59,7 @@ fn main() {
 
 async fn start_runtime(args: spiced::Args) -> Result<(), Box<dyn std::error::Error>> {
     spiced::in_tracing_context(|| {
-        tracing::info!("Starting Spice Runtime {version}", version = get_version_string());
+        tracing::info!("Starting runtime {version}", version = get_version_string());
     });
     spiced::run(args).await?;
     Ok(())
