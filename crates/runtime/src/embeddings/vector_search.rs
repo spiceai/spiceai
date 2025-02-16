@@ -695,6 +695,16 @@ impl VectorSearch {
                 .collect_vec()
         };
 
+        let final_projection_str = if projection.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "{},",
+                // `t.` refers to the table name alias in SQL below.
+                projection.iter().map(|s| format!("t.{s}")).join(", ")
+            )
+        };
+
         format!(
             "WITH distances as (
                 SELECT
@@ -721,7 +731,7 @@ impl VectorSearch {
             )
             SELECT
                 substring(t.{embed_col}, rd.offset[1], rd.offset[2] - rd.offset[1]) AS {embed_col}_chunk,
-                {projection_str},
+                {projection_str}
                 rd.{VECTOR_DISTANCE_COLUMN_NAME}
             FROM ranked_docs rd
             JOIN {table_name} t ON {join_on_conditions}",
@@ -729,9 +739,7 @@ impl VectorSearch {
                 embed_col_offset=offset_col!(quote_identifier(embedding_column).to_string()),
                 embed_col_embedding=embedding_col!(quote_identifier(embedding_column).to_string()),
                 pks = pks.iter().join(", "),
-                projection_str = projection.iter()
-                    .map(|s| format!("t.{s}"))
-                    .join(", "),
+                projection_str = final_projection_str,
                 join_on_conditions = pks
                     .iter()
                     .map(|pk| format!("rd.{p} = t.{p}", p = quote_identifier(pk)))
@@ -777,9 +785,25 @@ impl VectorSearch {
         };
 
         let query = if is_chunked {
+            // Remove the embedding column from the projection if it is not in the additional columns.
+            // The chunk from the embedding column is added back separately.
+            let mut chunked_projection = projection.clone();
+            let c = quote_identifier(embedding_column);
+            if !additional_columns.contains(&c.to_string()) {
+                if let Some(index) = chunked_projection.iter().enumerate().find_map(|(i, col)| {
+                    if col == &c {
+                        Some(i)
+                    } else {
+                        None
+                    }
+                }) {
+                    chunked_projection.remove(index);
+                }
+            }
+
             Self::construct_chunk_query_sql(
                 primary_keys,
-                &projection,
+                &chunked_projection,
                 embedding_column,
                 tbl,
                 &embedding,
