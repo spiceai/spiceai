@@ -69,7 +69,11 @@ fn get_version_string() -> String {
     if cfg!(feature = "release") {
         format!("v{}{}", env!("CARGO_PKG_VERSION"), build_metadata())
     } else {
-        let mut version = format!("v{}-build.{}", env!("CARGO_PKG_VERSION"), env!("GIT_COMMIT_HASH"));
+        let mut version = format!(
+            "v{}-build.{}",
+            env!("CARGO_PKG_VERSION"),
+            env!("GIT_COMMIT_HASH")
+        );
         if cfg!(feature = "dev") {
             version.push_str("-dev");
         }
