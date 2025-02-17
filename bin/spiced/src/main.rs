@@ -77,7 +77,7 @@ fn get_version_string() -> String {
         if cfg!(feature = "dev") {
             version.push_str("-dev");
         }
-        version.push_str(&build_metadata());
+        version.push_str(build_metadata());
         version
     }
 }
