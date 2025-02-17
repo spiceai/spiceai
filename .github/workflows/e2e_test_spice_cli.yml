@@ -290,6 +290,7 @@ jobs:
 
   test_spice_upgrade_from_brew:
     name: 'Test spice upgrade from a homebrew spice cli'
+    if: github.event.inputs.build_cli == 'true'
     continue-on-error: true
     runs-on: ${{ matrix.target.runner }}
     env:
@@ -324,7 +325,7 @@ jobs:
           spice version
           which spice
 
-      - name: download spice cli from homebrew
+      - name: move the built spice cli to brew directory
         run: |
           sudo mv ./build/spice /opt/homebrew/bin
           sudo chmod +x /opt/homebrew/bin/spice
