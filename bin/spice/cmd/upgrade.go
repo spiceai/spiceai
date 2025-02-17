@@ -101,7 +101,7 @@ spice upgrade
 		}
 
 		if runtimeUpgradeRequired == "" {
-			slog.Info(fmt.Sprintf("Using version %s matching with CLI version %s. No upgrade required.", currentVersion, version.Version()))
+			slog.Info(fmt.Sprintf("Using version %s. No upgrade required.", currentVersion))
 			return
 		}
 
