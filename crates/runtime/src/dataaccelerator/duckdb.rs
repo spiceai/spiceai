@@ -80,6 +80,12 @@ pub struct DuckDBAccelerator {
     duckdb_factory: DuckDBTableProviderFactory,
 }
 
+impl Drop for DuckDBAccelerator {
+    fn drop(&mut self) {
+        tracing::debug!("Dropping DuckDBAccelerator");
+    }
+}
+
 impl DuckDBAccelerator {
     #[must_use]
     pub fn new() -> Self {

@@ -262,12 +262,16 @@ pub async fn run(args: Args) -> Result<()> {
         },
     }
 
-    match server_thread.await {
+    let result = match server_thread.await {
         Ok(ok) => ok.context(UnableToStartServersSnafu),
         Err(_) => Err(Error::GenericError {
             reason: "Unable to start spiced".into(),
         }),
-    }
+    };
+
+    rt.close().await;
+
+    result
 }
 
 fn init_metrics(
