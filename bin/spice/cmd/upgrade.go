@@ -188,7 +188,7 @@ func upgradeCli(force bool, rtcontext *context.RuntimeContext) bool {
 	assetName := github.GetAssetName(constants.SpiceCliFilename)
 	spiceBinDir := filepath.Join(rtcontext.SpiceRuntimeDir(), "bin")
 
-	slog.Info(fmt.Sprintf("Found latest CLI version %s, upgrading the Spice.ai CLI ...", release.TagName))
+	slog.Info(fmt.Sprintf("Found version %s, upgrading the Spice.ai CLI ...", release.TagName))
 
 	stat, err := os.Stat(spiceBinDir)
 	if err != nil {
