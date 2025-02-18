@@ -24,6 +24,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 	"github.com/spiceai/spiceai/bin/spice/pkg/util"
+	"github.com/spiceai/spiceai/bin/spice/pkg/version"
 )
 
 var verbosity = util.NewVerbosity()
@@ -31,6 +32,15 @@ var verbosity = util.NewVerbosity()
 var RootCmd = &cobra.Command{
 	Use:   "spice",
 	Short: "Spice.ai CLI",
+
+	PersistentPreRun: func(cmd *cobra.Command, args []string) {
+
+		if cmd.Name() == "version" {
+			// don't duplicate version information in version command
+			return
+		}
+		cmd.Printf("Spice.ai OSS CLI %s (https://spiceai.org/docs/cli)\n", version.Version())
+	},
 }
 
 // Execute adds all child commands to the root command.
