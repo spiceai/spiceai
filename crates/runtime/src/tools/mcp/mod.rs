@@ -54,11 +54,11 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum MCPType {
-    /// Uses stdio to communicate with an MCP server. The string is the command to run.
-    Stdio(String),
-
     /// Connect to an MCP server over HTTP(s) SSE protocol.
     Https(url::Url),
+
+    /// Uses stdio to communicate with an MCP server. The string is the command to run.
+    Stdio(String),
 }
 
 impl FromStr for MCPType {
