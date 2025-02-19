@@ -87,7 +87,7 @@ pub(super) struct ResultBuilder {
     run_id: StringBuilder,
     created_at: TimestampSecondBuilder,
     input: StringBuilder,
-    output: StringBuilder,
+    output: StringBuilder, // expected output given the `input`.
     actual: StringBuilder,
     scorer: StringBuilder,
     value: Float32Builder,
@@ -112,15 +112,15 @@ impl ResultBuilder {
         id: &EvalRunId,
         created_at: DateTime<Utc>,
         input: &DatasetInput,
-        output: &DatasetOutput,
         actual: &DatasetOutput,
+        expected: &DatasetOutput,
         scorer: &str,
         value: f32,
     ) -> Result<()> {
         self.run_id.append_value(id);
         self.created_at.append_value(created_at.timestamp());
         self.input.append_value(input.try_serialize()?);
-        self.output.append_value(output.try_serialize()?);
+        self.output.append_value(expected.try_serialize()?);
         self.actual.append_value(actual.try_serialize()?);
         self.scorer.append_value(scorer);
         self.value.append_value(value);
