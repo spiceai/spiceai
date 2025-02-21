@@ -50,7 +50,7 @@ verifySupported() {
         fi
     done
 
-    echo "Unfortunately, ${current_osarch} is not supported. If you want to check the supported OS architectures, please visit spiceai.org/docs/installation#supported-os-architectures"
+    echo "Unfortunately, ${current_osarch} is not supported. For supported architectures, please visit spiceai.org/docs/installation#supported-os-architectures"
     exit 1
 }
 
