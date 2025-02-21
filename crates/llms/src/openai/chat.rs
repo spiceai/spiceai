@@ -66,7 +66,9 @@ impl<C: Config + Send + Sync> Chat for Openai<C> {
             messages: vec![ChatCompletionRequestMessage::User(
                 ChatCompletionRequestUserMessage {
                     name: None,
-                    content: ChatCompletionRequestUserMessageContent::Text("ping.".to_string()),
+                    content: ChatCompletionRequestUserMessageContent::Text(
+                        "Respond with the single letter 'A'. This is a healthcheck.".to_string(),
+                    ),
                 },
             )],
             ..Default::default()
