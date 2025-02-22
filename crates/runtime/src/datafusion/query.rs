@@ -22,7 +22,8 @@ use arrow::{
 };
 use arrow_tools::schema::verify_schema;
 use cache::{
-    get_logical_plan_input_tables, to_cached_record_batch_stream, QueryCacheStatus, QueryResult,
+    get_logical_plan_input_tables, to_cached_record_batch_stream, QueryResult,
+    QueryResultsCacheStatus,
 };
 use datafusion::{
     error::DataFusionError,
@@ -98,7 +99,7 @@ macro_rules! handle_error {
 
 enum CacheResult {
     Hit(QueryResult),
-    MissOrSkipped(QueryTracker, QueryCacheStatus),
+    MissOrSkipped(QueryTracker, QueryResultsCacheStatus),
     Error(Error),
 }
 
@@ -110,17 +111,19 @@ impl Query {
         plan: &LogicalPlan,
     ) -> CacheResult {
         let Some(cache_provider) = df.cache_provider() else {
-            return CacheResult::MissOrSkipped(tracker, QueryCacheStatus::CacheNotChecked);
+            return CacheResult::MissOrSkipped(tracker, QueryResultsCacheStatus::CacheDisabled);
         };
 
         // If the user requested no caching, skip the cache lookup
         if matches!(ctx.cache_control(), CacheControl::NoCache) {
-            return CacheResult::MissOrSkipped(tracker, QueryCacheStatus::CacheNotChecked);
+            return CacheResult::MissOrSkipped(tracker, QueryResultsCacheStatus::CacheBypass);
         }
 
         let cached_result = match cache_provider.get(plan).await {
             Ok(Some(result)) => result,
-            Ok(None) => return CacheResult::MissOrSkipped(tracker, QueryCacheStatus::CacheMiss),
+            Ok(None) => {
+                return CacheResult::MissOrSkipped(tracker, QueryResultsCacheStatus::CacheMiss)
+            }
             Err(e) => return CacheResult::Error(Error::FailedToAccessCache { source: e }),
         };
 
@@ -144,18 +147,18 @@ impl Query {
                 tracker,
                 Box::pin(record_batch_stream),
             ),
-            QueryCacheStatus::CacheHit,
+            QueryResultsCacheStatus::CacheHit,
         ))
     }
 
     fn should_cache_results(
         df: &DataFusion,
         plan: &LogicalPlan,
-        cache_status: QueryCacheStatus,
-    ) -> (bool, QueryCacheStatus) {
+        cache_status: QueryResultsCacheStatus,
+    ) -> (bool, QueryResultsCacheStatus) {
         match df.cache_provider() {
             Some(provider) if provider.cache_is_enabled_for_plan(plan) => (true, cache_status),
-            _ => (false, QueryCacheStatus::CacheNotChecked),
+            _ => (false, QueryResultsCacheStatus::CacheDisabled),
         }
     }
 
