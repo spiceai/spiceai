@@ -46,7 +46,7 @@ var (
 var supported_trace_tasks = []string{
 	"ai_chat", "accelerated_refresh", "ai_completion", "sql_query", "nsql",
 	"tool_use::document_similarity", "tool_use::list_datasets", "tool_use::sql",
-	"tool_use::table_schema", "tool_use::sample_data", "tool_use::sql_query", "tool_use::memory",
+	"tool_use::table_schema", "tool_use::sample_data", "tool_use::sql_query", "tool_use::memory", "eval_run",
 	"vector_search",
 }
 
@@ -68,6 +68,9 @@ $ spice trace ai_chat
 
 # returns the trace for the given id
 $ spice trace ai_chat --id chatcmpl-At6ZmDE8iAYRPeuQLA0FLlWxGKNnM
+
+Include the input and truncate to 120 characters (default is 80).
+$ spice trace ai_chat --include-input --truncate=120
 `,
 	Args: cobra.MinimumNArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
