@@ -20,6 +20,7 @@ use model_components::model::{Error as ModelError, Model};
 use std::result::Result;
 use std::sync::Arc;
 
+mod accumulate;
 mod chat;
 mod embed;
 mod eval;
