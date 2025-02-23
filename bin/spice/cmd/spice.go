@@ -39,7 +39,7 @@ var RootCmd = &cobra.Command{
 			// don't duplicate version information in version command
 			return
 		}
-		cmd.Printf("Spice.ai OSS CLI %s (https://spiceai.org/docs/cli)\n", version.Version())
+		cmd.Printf("Spice.ai OSS CLI %s\n", version.Version())
 	},
 }
 
