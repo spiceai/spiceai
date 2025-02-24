@@ -332,6 +332,6 @@ jobs:
           which spice
           spice version
 
-      - name: Mimic the homebrew spice upgrade
+      - name: run spice upgrade
         run: |
           spice upgrade
