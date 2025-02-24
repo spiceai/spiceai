@@ -110,13 +110,17 @@ jobs:
       - name: Set up cc
         uses: ./.github/actions/setup-cc
 
-      - run: make lint && sccache --show-stats
+      - run: make lint
         if: needs.check_changes.outputs.relevant_changes == 'true'
         env:
           RUSTC_WRAPPER: ${{ env.SCCACHE_SETUP && 'sccache' || '' }}
           AWS_ACCESS_KEY_ID: ${{ secrets.MINIO_ACCESS_KEY }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.MINIO_SECRET_KEY }}
           CARGO_INCREMENTAL: 0
+      
+      - run: Show sccache stats
+        if: ${{ needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true' }}
+        run: sccache --show-stats
 
       - name: Check if Cargo.lock is updated
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -170,13 +174,17 @@ jobs:
       - name: Set up cc
         uses: ./.github/actions/setup-cc
 
-      - run: make ci test && sccache --show-stats
+      - run: make ci test
         if: needs.check_changes.outputs.relevant_changes == 'true'
         env:
           RUSTC_WRAPPER: ${{ env.SCCACHE_SETUP && 'sccache' || '' }}
           AWS_ACCESS_KEY_ID: ${{ secrets.MINIO_ACCESS_KEY }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.MINIO_SECRET_KEY }}
           CARGO_INCREMENTAL: 0
+      
+      - run: Show sccache stats
+        if: ${{ env.SCCACHE_SETUP == 'true' }}
+        run: sccache --show-stats
 
   build-docker:
     name: Build Docker Image
