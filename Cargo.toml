@@ -91,7 +91,7 @@ iceberg-datafusion = "0.4.0"
 imap = { git = "https://github.com/jonhoo/rust-imap", rev = "6fe22ed11a1ccffe1799a73f48e589366d8d100f" }
 indexmap = "2"
 insta = { version = "1.42.0", features = ["filters"] }
-itertools = "0.13"
+itertools = "0.14"
 mailparse = "0.15.0"
 mysql_async = { version = "0.34.1", features = ["native-tls-tls", "chrono"] }
 object_store = { version = "0.11" }
