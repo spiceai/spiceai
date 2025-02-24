@@ -676,6 +676,22 @@
             }
           ]
         },
+        "time_partition_column": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "time_partition_format": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/TimeFormat"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "unsupported_type_action": {
           "anyOf": [
             {
@@ -1170,7 +1186,8 @@
         "timestamptz",
         "unix_seconds",
         "unix_millis",
-        "ISO8601"
+        "ISO8601",
+        "date"
       ]
     },
     "TlsConfig": {
