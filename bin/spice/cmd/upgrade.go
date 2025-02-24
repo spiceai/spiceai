@@ -162,7 +162,7 @@ func upgradeCli(force bool, rtcontext *context.RuntimeContext) bool {
 
 	cliVersion := version.Version()
 	if cliVersion == release.TagName && !force {
-		slog.Info(fmt.Sprintf("Using the latest version %s. No CLI upgrade required.", release.TagName))
+		slog.Info(fmt.Sprintf("Using the latest version %s. CLI upgrade not required.", release.TagName))
 		return true
 	}
 
