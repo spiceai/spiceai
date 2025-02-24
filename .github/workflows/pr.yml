@@ -82,9 +82,17 @@ jobs:
         if: needs.check_changes.outputs.relevant_changes == 'true'
         with:
           os: 'linux'
+      
+      - name: Check if sccache can be set up
+        run: |
+          if [ -z "${{ secrets.MINIO_ENDPOINT }}" ]; then
+            echo "SCCACHE_SETUP=false" >> $GITHUB_ENV
+          else
+            echo "SCCACHE_SETUP=true" >> $GITHUB_ENV
+          fi
         
       - name: Set up sccache
-        if: needs.check_changes.outputs.relevant_changes == 'true'
+        if: ${{ needs.check_changes.outputs.relevant_changes == 'true' &&  env.SCCACHE_SETUP == 'true' }}
         uses: ./.github/actions/setup-sccache
         with:
           minio_endpoint: ${{ secrets.MINIO_ENDPOINT }}
@@ -102,13 +110,17 @@ jobs:
       - name: Set up cc
         uses: ./.github/actions/setup-cc
 
-      - run: make lint && sccache --show-stats
+      - run: make lint
         if: needs.check_changes.outputs.relevant_changes == 'true'
         env:
-          RUSTC_WRAPPER: sccache
+          RUSTC_WRAPPER: ${{ env.SCCACHE_SETUP && 'sccache' || '' }}
           AWS_ACCESS_KEY_ID: ${{ secrets.MINIO_ACCESS_KEY }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.MINIO_SECRET_KEY }}
           CARGO_INCREMENTAL: 0
+      
+      - name: Show sccache stats
+        if: ${{ needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true' }}
+        run: sccache --show-stats
 
       - name: Check if Cargo.lock is updated
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -140,8 +152,17 @@ jobs:
         uses: ./.github/actions/setup-rust
         with:
           os: 'linux'
-        
+      
+      - name: Check if sccache can be set up
+        run: |
+          if [ -z "${{ secrets.MINIO_ENDPOINT }}" ]; then
+            echo "SCCACHE_SETUP=false" >> $GITHUB_ENV
+          else
+            echo "SCCACHE_SETUP=true" >> $GITHUB_ENV
+          fi
+      
       - name: Set up sccache
+        if: ${{ needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true' }}
         uses: ./.github/actions/setup-sccache
         with:
           minio_endpoint: ${{ secrets.MINIO_ENDPOINT }}
@@ -153,13 +174,17 @@ jobs:
       - name: Set up cc
         uses: ./.github/actions/setup-cc
 
-      - run: make ci test && sccache --show-stats
+      - run: make ci test
         if: needs.check_changes.outputs.relevant_changes == 'true'
         env:
-          RUSTC_WRAPPER: sccache
+          RUSTC_WRAPPER: ${{ env.SCCACHE_SETUP && 'sccache' || '' }}
           AWS_ACCESS_KEY_ID: ${{ secrets.MINIO_ACCESS_KEY }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.MINIO_SECRET_KEY }}
           CARGO_INCREMENTAL: 0
+      
+      - name: Show sccache stats
+        if: ${{ env.SCCACHE_SETUP == 'true' }}
+        run: sccache --show-stats
 
   build-docker:
     name: Build Docker Image
