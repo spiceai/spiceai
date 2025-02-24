@@ -207,7 +207,6 @@ jobs:
               Select-Object FullName, Length, LastWriteTime | 
               Format-Table -AutoSize
 
-
   test_spice_upgrade_without_runtime:
     name: 'Test spice upgrade without runtime (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
     continue-on-error: true
@@ -288,3 +287,51 @@ jobs:
               Where-Object { $_.Name -like "spice*" } | 
               Select-Object FullName, Length, LastWriteTime | 
               Format-Table -AutoSize
+
+  test_spice_upgrade_from_brew:
+    name: 'Test spice upgrade from a homebrew spice cli'
+    if: github.event.inputs.build_cli == 'true'
+    continue-on-error: true
+    runs-on: ${{ matrix.target.runner }}
+    env:
+      REL_VERSION: ${{ github.event.inputs.rel_version || '1.0.2' }}
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    needs:
+      - build
+    timeout-minutes: 5
+
+    strategy:
+      matrix:
+        target:
+          - name: "macOS aarch64 (Apple Silicon)"
+            runner: "macos-14"
+            target_os: "darwin"
+            target_arch: "aarch64"
+            target_arch_go: "arm64"
+            
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
+        if: github.event.inputs.build_cli != 'false'
+        uses: actions/download-artifact@v4
+        with:
+          name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
+          path: ./build
+
+      - name: download spice cli from homebrew
+        run: |
+          brew install spiceai/spiceai/spice
+          spice version
+          which spice
+
+      - name: move the built spice cli to brew directory
+        run: |
+          sudo mv ./build/spice /opt/homebrew/bin
+          sudo chmod +x /opt/homebrew/bin/spice
+          which spice
+          spice version
+
+      - name: run spice upgrade
+        run: |
+          spice upgrade

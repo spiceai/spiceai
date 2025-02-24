@@ -256,16 +256,6 @@ impl ToolUsingChat {
             let inner_req = self.add_runtime_tools(&req);
 
             let resp = self.inner_chat.chat_request(inner_req.clone()).await?;
-            let proceed_with_tools = resp.choices.first().is_some_and(|c| {
-                c.finish_reason
-                    .is_some_and(|f| matches!(f, FinishReason::ToolCalls))
-            });
-
-            // Return reason was not to call tools, so return early.
-            if !proceed_with_tools {
-                return Ok(resp);
-            }
-
             let usage = resp.usage.clone();
 
             let tools_used = resp
@@ -404,7 +394,7 @@ fn create_new_recursive_req(
     new_req.messages = new_msg;
 
     // Remove tool_choice if it is named (since it was just used), and set it to `Auto`.
-    // This also includes when a tool_choice is not set. It could be set as a default (in spicepod.yaml via openai_tool_choice), but will appear as None here. We want to set it to Auto here to ensure named tool is used once and does cause infinite tool use.
+    // This also includes when a tool_choice is not set. It could be set as a default (in spicepod.yaml via openai_tool_choice), but will appear as None here. We want to set it to Auto here to ensure named tool is used once and does not cause infinite tool use.
     if matches!(
         new_req.tool_choice,
         Some(ChatCompletionToolChoiceOption::Named(_)) | None
