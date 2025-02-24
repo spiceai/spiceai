@@ -74,9 +74,9 @@ impl<C: Config + Send + Sync> Chat for Openai<C> {
             ..Default::default()
         };
         if self.supports_max_completion_tokens() {
-            req.max_completion_tokens = Some(100);
+            req.max_completion_tokens = Some(150);
         } else {
-            req.max_tokens = Some(100);
+            req.max_tokens = Some(150);
         }
 
         if let Err(e) = self.chat_request(req).instrument(span.clone()).await {
