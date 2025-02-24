@@ -107,7 +107,7 @@ pub fn construct_model(
         Some(v) => {
             return Err(LlmError::InvalidParamError {
                 param: "system_prompt".to_string(),
-                message: format!("Expected a string, got: {:?}", v),
+                message: format!("Expected a string, got: {v:?}"),
             });
         }
         None => None,
