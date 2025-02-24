@@ -28,7 +28,7 @@ use async_trait::async_trait;
 use futures::Stream;
 use futures::TryStreamExt;
 use llms::{
-    accumulate::{default_completion_response, fold_completion_stream},
+    accumulate::{empty_completion_response, fold_completion_stream},
     chat::{nsql::SqlGeneration, Chat, Result as ChatResult},
 };
 use opentelemetry::KeyValue;
@@ -290,7 +290,7 @@ impl Chat for ChatWrapper {
     }
 }
 
-/// [`TracedChatCompletionStream`] wraps a [`ChatCompletionResponseStream`]-like stream and provides metrics and task_history tracing. Importantly, when aggregrating the output, it does not need to block until the full stream is consumed.
+/// [`TracedChatCompletionStream`] wraps a [`ChatCompletionResponseStream`]-like stream and provides metrics and `task_history` tracing. Importantly, when aggregrating the output, it does not need to block until the full stream is consumed.
 struct TracedChatCompletionStream<S> {
     inner: S,
     accumulated_response: Arc<Mutex<CreateChatCompletionResponse>>,
@@ -312,7 +312,7 @@ where
     ) -> Self {
         Self {
             inner,
-            accumulated_response: Arc::new(Mutex::new(default_completion_response())),
+            accumulated_response: Arc::new(Mutex::new(empty_completion_response())),
             span,
             model_public_name,
             started: Instant::now(),

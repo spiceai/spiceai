@@ -22,7 +22,7 @@ use async_openai::types::{
 use futures::StreamExt;
 
 #[must_use]
-pub fn default_completion_response() -> CreateChatCompletionResponse {
+pub fn empty_completion_response() -> CreateChatCompletionResponse {
     CreateChatCompletionResponse {
         id: String::new(),
         choices: vec![],
@@ -38,10 +38,9 @@ pub fn default_completion_response() -> CreateChatCompletionResponse {
 /// Accumulate a [`ChatCompletionResponseStream`] into a single [`CreateChatCompletionResponse`].
 ///
 /// This enables comparing the output from [`super::Chat::chat_stream`] as if it was a [`super::Chat::chat_request`].
-#[allow(deprecated, clippy::cast_possible_truncation)]
 pub async fn accumulate(stream: ChatCompletionResponseStream) -> CreateChatCompletionResponse {
     stream
-        .fold(default_completion_response(), |mut acc, item| async move {
+        .fold(empty_completion_response(), |mut acc, item| async move {
             if let Ok(stream) = item {
                 fold_completion_stream(&mut acc, &stream);
             }
@@ -50,28 +49,27 @@ pub async fn accumulate(stream: ChatCompletionResponseStream) -> CreateChatCompl
         .await
 }
 
-#[allow(clippy::cast_possible_truncation, deprecated)]
+#[allow(deprecated, clippy::cast_possible_truncation)]
 pub fn fold_completion_stream(
     acc: &mut CreateChatCompletionResponse,
-    item: &CreateChatCompletionStreamResponse,
+    stream: &CreateChatCompletionStreamResponse,
 ) {
-    let stream = item.clone();
     // Update these fields on first iteration only.
     if acc.model.is_empty() {
-        acc.id = stream.id;
-        acc.created = stream.created;
-        acc.model = stream.model;
-        acc.service_tier = stream.service_tier;
-        acc.system_fingerprint = stream.system_fingerprint;
-        acc.object = stream.object;
+        acc.id.clone_from(&stream.id);
+        acc.created.clone_from(&stream.created);
+        acc.model.clone_from(&stream.model);
+        acc.service_tier.clone_from(&stream.service_tier);
+        acc.system_fingerprint
+            .clone_from(&stream.system_fingerprint);
+        acc.object.clone_from(&stream.object);
     }
     // Usage will be non-null on last iteration.
-    if let Some(usage) = stream.usage {
-        acc.usage = Some(usage);
+    if let Some(usage) = &stream.usage {
+        acc.usage = Some(usage.clone());
     }
 
-    // Update stat of [`ChatChoice`].
-    // On first, need to infer `n` choices, initialise "default" [`ChatChoice`].
+    // On the first call, infer `n` choices and initialise default [`ChatChoice`]s.
     if acc.choices.is_empty() && !stream.choices.is_empty() {
         acc.choices = (0..stream.choices.len())
             .map(|i| ChatChoice {
@@ -89,13 +87,16 @@ pub fn fold_completion_stream(
             })
             .collect();
     }
+
+    // Zip over the choices and update each one.
     acc.choices
         .iter_mut()
-        .zip(stream.choices)
+        .zip(&stream.choices)
         .for_each(|(c, s)| update_chat_choice(c, s));
 }
 
-fn update_chat_choice(acc: &mut ChatChoice, update: ChatChoiceStream) {
+fn update_chat_choice(acc: &mut ChatChoice, update: &ChatChoiceStream) {
+    // Destructure the update, borrowing fields from `update`.
     let ChatChoiceStream {
         index,
         finish_reason,
@@ -109,26 +110,30 @@ fn update_chat_choice(acc: &mut ChatChoice, update: ChatChoiceStream) {
                 ..
             },
     } = update;
-    acc.index = index;
-    acc.finish_reason = finish_reason;
-    acc.logprobs = logprobs;
+
+    acc.index = *index;
+    acc.finish_reason.clone_from(finish_reason);
+    acc.logprobs.clone_from(logprobs);
     if let Some(role) = role {
-        acc.message.role = role;
+        acc.message.role.clone_from(role);
     }
 
+    // Update `content`.
     match (&mut acc.message.content, content) {
-        (Some(ref mut a), Some(b)) => *a += &b,
-        (None, Some(b)) => acc.message.content = Some(b),
+        (Some(ref mut a), Some(b)) => *a += b,
+        (None, Some(b)) => acc.message.content = Some(b.clone()),
         _ => (),
     }
+    // Update `refusal`.
     match (&mut acc.message.refusal, refusal) {
-        (Some(ref mut a), Some(b)) => *a += &b,
-        (None, Some(b)) => acc.message.refusal = Some(b),
+        (Some(ref mut a), Some(b)) => *a += b,
+        (None, Some(b)) => acc.message.refusal = Some(b.clone()),
         _ => (),
     }
 
+    // Update tool calls if any.
     if let Some(tool_calls) = tool_calls {
-        tool_calls.into_iter().enumerate().for_each(|(i, tool)| {
+        tool_calls.iter().enumerate().for_each(|(i, tool)| {
             if acc.message.tool_calls.is_none() {
                 acc.message.tool_calls = Some(vec![]);
             }
@@ -150,16 +155,16 @@ fn update_chat_choice(acc: &mut ChatChoice, update: ChatChoiceStream) {
                 if let Some(id) = &tool.id {
                     acc_tools[i].id.clone_from(id);
                 }
-                if let Some(r#type) = tool.r#type {
-                    acc_tools[i].r#type = r#type;
+                if let Some(r#type) = &tool.r#type {
+                    acc_tools[i].r#type = r#type.clone();
                 }
 
-                if let Some(fun) = tool.function {
-                    if let Some(args) = fun.arguments {
-                        acc_tools[i].function.arguments += &args;
+                if let Some(fun) = &tool.function {
+                    if let Some(args) = &fun.arguments {
+                        acc_tools[i].function.arguments += args;
                     }
-                    if let Some(name) = fun.name {
-                        acc_tools[i].function.name += &name;
+                    if let Some(name) = &fun.name {
+                        acc_tools[i].function.name += name;
                     }
                 }
             }
