@@ -18,7 +18,7 @@ flight_client = { path = "../flight_client" }
 futures.workspace = true
 indicatif = "0.17.9"
 octocrab = "0.43.0"
-rand = "0.8.4"
+rand = "0.9.0"
 regex.workspace = true
 reqwest.workspace = true
 rustls.workspace = true
