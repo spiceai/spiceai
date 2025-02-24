@@ -48,7 +48,7 @@ pub static EVAL_RESULTS_TABLE_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
             false,
         ),
         Field::new("input", DataType::Utf8, false),
-        Field::new("output", DataType::Utf8, false),
+        Field::new("expected", DataType::Utf8, false),
         Field::new("actual", DataType::Utf8, false),
         Field::new("scorer", DataType::Utf8, false),
         Field::new("value", DataType::Float32, false),
@@ -87,7 +87,7 @@ pub(super) struct ResultBuilder {
     run_id: StringBuilder,
     created_at: TimestampSecondBuilder,
     input: StringBuilder,
-    output: StringBuilder, // expected output given the `input`.
+    expected: StringBuilder,
     actual: StringBuilder,
     scorer: StringBuilder,
     value: Float32Builder,
@@ -99,7 +99,7 @@ impl ResultBuilder {
             run_id: StringBuilder::new(),
             created_at: TimestampSecondBuilder::new(),
             input: StringBuilder::new(),
-            output: StringBuilder::new(),
+            expected: StringBuilder::new(),
             actual: StringBuilder::new(),
             scorer: StringBuilder::new(),
             value: Float32Builder::new(),
@@ -120,7 +120,7 @@ impl ResultBuilder {
         self.run_id.append_value(id);
         self.created_at.append_value(created_at.timestamp());
         self.input.append_value(input.try_serialize()?);
-        self.output.append_value(expected.try_serialize()?);
+        self.expected.append_value(expected.try_serialize()?);
         self.actual.append_value(actual.try_serialize()?);
         self.scorer.append_value(scorer);
         self.value.append_value(value);
@@ -134,7 +134,7 @@ impl ResultBuilder {
                 Arc::new(self.run_id.finish()),
                 Arc::new(self.created_at.finish()),
                 Arc::new(self.input.finish()),
-                Arc::new(self.output.finish()),
+                Arc::new(self.expected.finish()),
                 Arc::new(self.actual.finish()),
                 Arc::new(self.scorer.finish()),
                 Arc::new(self.value.finish()),
