@@ -84,7 +84,7 @@ jobs:
           os: 'linux'
         
       - name: Set up sccache
-        if: needs.check_changes.outputs.relevant_changes == 'true' && secrets.MINIO_ENDPOINT != ''
+        if: ${{ needs.check_changes.outputs.relevant_changes == 'true' && secrets.MINIO_ENDPOINT != '' }}
         uses: ./.github/actions/setup-sccache
         with:
           minio_endpoint: ${{ secrets.MINIO_ENDPOINT }}
@@ -142,7 +142,7 @@ jobs:
           os: 'linux'
         
       - name: Set up sccache
-        if: secrets.MINIO_ENDPOINT != ''
+        if: ${{ secrets.MINIO_ENDPOINT != '' }}
         uses: ./.github/actions/setup-sccache
         with:
           minio_endpoint: ${{ secrets.MINIO_ENDPOINT }}
