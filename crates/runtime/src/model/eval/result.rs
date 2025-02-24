@@ -48,8 +48,8 @@ pub static EVAL_RESULTS_TABLE_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
             false,
         ),
         Field::new("input", DataType::Utf8, false),
-        Field::new("output", DataType::Utf8, false),
         Field::new("actual", DataType::Utf8, false),
+        Field::new("expected", DataType::Utf8, false),
         Field::new("scorer", DataType::Utf8, false),
         Field::new("value", DataType::Float32, false),
     ]))
@@ -87,8 +87,8 @@ pub(super) struct ResultBuilder {
     run_id: StringBuilder,
     created_at: TimestampSecondBuilder,
     input: StringBuilder,
-    output: StringBuilder,
     actual: StringBuilder,
+    expected: StringBuilder,
     scorer: StringBuilder,
     value: Float32Builder,
 }
@@ -99,8 +99,8 @@ impl ResultBuilder {
             run_id: StringBuilder::new(),
             created_at: TimestampSecondBuilder::new(),
             input: StringBuilder::new(),
-            output: StringBuilder::new(),
             actual: StringBuilder::new(),
+            expected: StringBuilder::new(),
             scorer: StringBuilder::new(),
             value: Float32Builder::new(),
         }
@@ -112,16 +112,16 @@ impl ResultBuilder {
         id: &EvalRunId,
         created_at: DateTime<Utc>,
         input: &DatasetInput,
-        output: &DatasetOutput,
         actual: &DatasetOutput,
+        expected: &DatasetOutput,
         scorer: &str,
         value: f32,
     ) -> Result<()> {
         self.run_id.append_value(id);
         self.created_at.append_value(created_at.timestamp());
         self.input.append_value(input.try_serialize()?);
-        self.output.append_value(output.try_serialize()?);
         self.actual.append_value(actual.try_serialize()?);
+        self.expected.append_value(expected.try_serialize()?);
         self.scorer.append_value(scorer);
         self.value.append_value(value);
         Ok(())
@@ -134,11 +134,74 @@ impl ResultBuilder {
                 Arc::new(self.run_id.finish()),
                 Arc::new(self.created_at.finish()),
                 Arc::new(self.input.finish()),
-                Arc::new(self.output.finish()),
                 Arc::new(self.actual.finish()),
+                Arc::new(self.expected.finish()),
                 Arc::new(self.scorer.finish()),
                 Arc::new(self.value.finish()),
             ],
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::StringArray;
+    use chrono::Utc;
+
+    #[test]
+    fn test_builder_column_order() {
+        let mut builder = ResultBuilder::new();
+
+        let test_run_id: EvalRunId = "run_123".into();
+        let test_created_at = Utc::now();
+        let test_input = DatasetInput::from_raw("input_test");
+        let test_actual = DatasetOutput::from_raw("actual_test");
+        let test_expected = DatasetOutput::from_raw("expected_test");
+        let test_scorer = "scorer_test";
+        let test_value = 42.0_f32;
+
+        builder
+            .append(
+                &test_run_id,
+                test_created_at,
+                &test_input,
+                &test_actual,
+                &test_expected,
+                test_scorer,
+                test_value,
+            )
+            .expect("append should succeed");
+
+        let record_batch = builder.finish().expect("finish should succeed");
+
+        // Verify the schema order.
+        let schema = record_batch.schema();
+        let fields = schema.fields();
+
+        // Expected order (by index):
+        assert_eq!(fields[2].name(), "input");
+        assert_eq!(fields[3].name(), "actual");
+        assert_eq!(fields[4].name(), "expected");
+
+        let input_array = record_batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("Column input should be a StringArray");
+        let actual_array = record_batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("Column expected should be a StringArray");
+        let expected_array = record_batch
+            .column(4)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("Column actual should be a StringArray");
+
+        assert_eq!(input_array.value(0), "input_test");
+        assert_eq!(actual_array.value(0), "actual_test");
+        assert_eq!(expected_array.value(0), "expected_test");
     }
 }

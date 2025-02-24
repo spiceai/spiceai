@@ -68,13 +68,13 @@ impl ChatWrapper {
     pub fn new(
         chat: Box<dyn Chat>,
         public_name: &str,
-        system_prompt: Option<String>,
+        system_prompt: Option<&str>,
         defaults: Vec<(String, serde_json::Value)>,
     ) -> Self {
         let s = Self {
             public_name: public_name.to_string(),
             chat,
-            system_prompt,
+            system_prompt: system_prompt.map(ToString::to_string),
             defaults,
         };
 

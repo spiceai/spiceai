@@ -15,7 +15,7 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 - Model Providers: HuggingFace, File (Release Candidate)
 - Spice Cloud Catalog Connector (Beta)
 
-## v1.2 (Feb 2025)
+## v1.2 (Mar 2025)
 
 - Enterprise Search and Retrieval improvements
   - [#3006](https://github.com/spiceai/spiceai/issues/3006) Search with keyword filtering
@@ -25,7 +25,7 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 - [#3018](https://github.com/spiceai/spiceai/issues/3018) Results caching for embeddings and search
 - Spice Cloud Data Connector (Stable)
 
-## v1.3 (Mar 2025)
+## v1.3 (Apr 2025)
 
 - Data Accelerators: PostgreSQL (Stable)
 - Ingestion
