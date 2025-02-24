@@ -174,13 +174,15 @@ func upgradeCli(force bool, rtcontext *context.RuntimeContext) bool {
 
 	switch spicePathVar {
 	case constants.BrewInstall:
-		slog.Info("Spice is installed via Homebrew. To upgrade the CLI and Runtime, run: `brew upgrade spiceai/spiceai/spice`.")
+		slog.Info("Spice is installed via Homebrew. Upgrade the CLI and Runtime by running:\n\n  brew upgrade spiceai/spiceai/spice\n")
 		return false
 	case constants.OtherInstall:
-		msg := fmt.Sprintf("Spice upgrade failed: Spice CLI installed in non-standard location '%s'\n"+
+		msg := fmt.Sprintf("Spice upgrade failed: The Spice CLI is installed in a non-standard location: '%s'.\n\n"+
 			"To upgrade:\n"+
-			"1. Remove existing installation\n"+
-			"2. Follow https://spiceai.org/docs/installation to reinstall spice", spicePath)
+			"1. Remove the existing installation. Example:\n"+
+			"   rm -rf %s\n\n"+
+			"2. Reinstall Spice by following the instructions at:\n"+
+			"   https://spiceai.org/docs/installation", spicePath, spicePath)
 		slog.Info(msg)
 		return false
 	}
