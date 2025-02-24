@@ -283,8 +283,8 @@ async fn write_results(
                 run_id,
                 chrono::Utc::now(),
                 input,
-                actual,
                 expected,
+                actual,
                 name,
                 score[i],
             )?;
