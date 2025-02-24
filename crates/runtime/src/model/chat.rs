@@ -22,6 +22,7 @@ use llms::{
 };
 use llms::{config::GenericAuthMechanism, openai::DEFAULT_LLM_MODEL};
 use secrecy::{ExposeSecret, SecretString};
+use serde_json::Value;
 use spicepod::component::model::{Model, ModelFileType, ModelSource};
 use std::{collections::HashMap, path::PathBuf, str::FromStr, sync::Arc};
 
@@ -102,11 +103,11 @@ pub fn construct_model(
     }?;
 
     // Handle runtime wrapping
-    let system_prompt = component
-        .params
-        .get("system_prompt")
-        .cloned()
-        .map(|s| s.to_string());
+    let system_prompt = if let Some(Value::String(s)) = component.params.get("system_prompt") {
+        Some(s.as_str())
+    } else {
+        None
+    };
     let wrapper = ChatWrapper::new(
         model,
         component.name.as_str(),
