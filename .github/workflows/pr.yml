@@ -118,7 +118,7 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.MINIO_SECRET_KEY }}
           CARGO_INCREMENTAL: 0
       
-      - run: Show sccache stats
+      - name: Show sccache stats
         if: ${{ needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true' }}
         run: sccache --show-stats
 
@@ -182,7 +182,7 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.MINIO_SECRET_KEY }}
           CARGO_INCREMENTAL: 0
       
-      - run: Show sccache stats
+      - name: Show sccache stats
         if: ${{ env.SCCACHE_SETUP == 'true' }}
         run: sccache --show-stats
 
