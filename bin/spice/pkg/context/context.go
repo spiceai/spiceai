@@ -266,7 +266,6 @@ func (c *RuntimeContext) InstallMatchingRuntime(flavor constants.Flavor, allowAc
 	slog.Info(fmt.Sprintf("Spice runtime installed into %s successfully.\n", c.spiceBinDir))
 
 	return nil
-
 }
 
 func (c *RuntimeContext) IsRuntimeUpgradeAvailable() (string, error) {
