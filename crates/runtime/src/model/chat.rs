@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 #![allow(clippy::implicit_hasher)]
+use async_graphql::OutputType;
 use llms::{
     anthropic::Anthropic,
     chat::{Chat, Error as LlmError},
@@ -102,11 +103,15 @@ pub fn construct_model(
         }),
     }?;
 
-    // Handle runtime wrapping
-    let system_prompt = if let Some(Value::String(s)) = component.params.get("system_prompt") {
-        Some(s.as_str())
-    } else {
-        None
+    let system_prompt = match component.params.get("system_prompt") {
+        Some(Value::String(s)) => Some(s.as_str()),
+        Some(v) => {
+            return Err(LlmError::InvalidParamError {
+                param: "system_prompt".to_string(),
+                message: format!("Expected a string, got: {:?}", v),
+            });
+        }
+        None => None,
     };
     let wrapper = ChatWrapper::new(
         model,
