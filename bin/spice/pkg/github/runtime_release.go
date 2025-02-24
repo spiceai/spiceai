@@ -126,7 +126,7 @@ func get_ai_accelerator() (string, bool) {
 		}
 
 		if version == nil {
-			slog.Info("No CUDA device detected, spice will use the CPU to run local models")
+			slog.Info("No CUDA device detected. The Spice runtime will use the CPU to run local models")
 			return "", false
 		}
 
