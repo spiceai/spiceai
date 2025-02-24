@@ -404,7 +404,7 @@ fn create_new_recursive_req(
     new_req.messages = new_msg;
 
     // Remove tool_choice if it is named (since it was just used), and set it to `Auto`.
-    // This also includes when a tool_choice is not set. It could be set as a default (in spicepod.yaml via openai_tool_choice), but will appear as None here. We want to set it to Auto here to ensure named tool is used once and does cause infinite tool use.
+    // This also includes when a tool_choice is not set. It could be set as a default (in spicepod.yaml via openai_tool_choice), but will appear as None here. We want to set it to Auto here to ensure named tool is used once and does not cause infinite tool use.
     if matches!(
         new_req.tool_choice,
         Some(ChatCompletionToolChoiceOption::Named(_)) | None
