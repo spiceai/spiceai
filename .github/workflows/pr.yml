@@ -82,9 +82,17 @@ jobs:
         if: needs.check_changes.outputs.relevant_changes == 'true'
         with:
           os: 'linux'
+      
+      - name: Check if sccache can be set up
+        run: |
+          if [ -z "${{ secrets.MINIO_ENDPOINT }}" ]; then
+            echo "SCCACHE_SETUP=false" >> $GITHUB_ENV
+          else
+            echo "SCCACHE_SETUP=true" >> $GITHUB_ENV
+          fi
         
       - name: Set up sccache
-        if: ${{ needs.check_changes.outputs.relevant_changes == 'true' && secrets.MINIO_ENDPOINT != '' }}
+        if: ${{ needs.check_changes.outputs.relevant_changes == 'true' &&  env.SCCACHE_SETUP == 'true' }}
         uses: ./.github/actions/setup-sccache
         with:
           minio_endpoint: ${{ secrets.MINIO_ENDPOINT }}
@@ -105,7 +113,7 @@ jobs:
       - run: make lint && sccache --show-stats
         if: needs.check_changes.outputs.relevant_changes == 'true'
         env:
-          RUSTC_WRAPPER: ${{ secrets.MINIO_ENDPOINT && 'sccache' || '' }}
+          RUSTC_WRAPPER: ${{ env.SCCACHE_SETUP && 'sccache' || '' }}
           AWS_ACCESS_KEY_ID: ${{ secrets.MINIO_ACCESS_KEY }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.MINIO_SECRET_KEY }}
           CARGO_INCREMENTAL: 0
@@ -140,9 +148,17 @@ jobs:
         uses: ./.github/actions/setup-rust
         with:
           os: 'linux'
-        
+      
+      - name: Check if sccache can be set up
+        run: |
+          if [ -z "${{ secrets.MINIO_ENDPOINT }}" ]; then
+            echo "SCCACHE_SETUP=false" >> $GITHUB_ENV
+          else
+            echo "SCCACHE_SETUP=true" >> $GITHUB_ENV
+          fi
+      
       - name: Set up sccache
-        if: ${{ secrets.MINIO_ENDPOINT != '' }}
+        if: ${{ needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true' }}
         uses: ./.github/actions/setup-sccache
         with:
           minio_endpoint: ${{ secrets.MINIO_ENDPOINT }}
@@ -157,7 +173,7 @@ jobs:
       - run: make ci test && sccache --show-stats
         if: needs.check_changes.outputs.relevant_changes == 'true'
         env:
-          RUSTC_WRAPPER: ${{ secrets.MINIO_ENDPOINT && 'sccache' || '' }}
+          RUSTC_WRAPPER: ${{ env.SCCACHE_SETUP && 'sccache' || '' }}
           AWS_ACCESS_KEY_ID: ${{ secrets.MINIO_ACCESS_KEY }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.MINIO_SECRET_KEY }}
           CARGO_INCREMENTAL: 0
