@@ -316,7 +316,7 @@ impl Chat for ChatWrapper {
     }
 }
 
-/// [`AggregatingStream`] wraps a stream
+/// [`AggregatingStream`] wraps a [`ChatCompletionResponseStream`]-like stream and traces the accumulated output to task_history's captured_output. Importantly it processes the output separately so that the stream does not block until the full stream is consumed.
 struct AggregatingStream<S> {
     inner: S,
     accumulated_response: Arc<Mutex<CreateChatCompletionResponse>>,
