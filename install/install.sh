@@ -52,7 +52,7 @@ verifySupported() {
         fi
     done
 
-    echo echo "${current_osarch} does not have a pre-built binary. For supported architectures, visit https://spiceai.org/docs/installation#supported-os-architectures"
+    echo "${current_osarch} does not have a pre-built binary. For supported architectures, visit https://spiceai.org/docs/installation#supported-os-architectures"
     exit 1
 }
 
