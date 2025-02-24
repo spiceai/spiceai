@@ -82,7 +82,7 @@ spice upgrade
 		}
 
 		if runtimeUpgradeRequired == "" {
-			slog.Info(fmt.Sprintf("Using version %s. No runtime upgrade required.", currentVersion))
+			slog.Info(fmt.Sprintf("Using version %s. Runtime upgrade not required.", currentVersion))
 			return
 		}
 
