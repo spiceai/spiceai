@@ -27,7 +27,10 @@ use async_openai::{
 use async_trait::async_trait;
 use futures::Stream;
 use futures::{stream::StreamExt, TryStreamExt};
-use llms::chat::{nsql::SqlGeneration, Chat, Result as ChatResult};
+use llms::{
+    accumulate::{default_completion_response, fold_completion_stream},
+    chat::{nsql::SqlGeneration, Chat, Result as ChatResult},
+};
 use tokio::time::Instant;
 use tracing_futures::Instrument;
 
@@ -206,9 +209,8 @@ impl Chat for ChatWrapper {
         match self.chat.chat_stream(req).instrument(span.clone()).await {
             Ok(resp) => {
                 let public_name = self.public_name.clone();
-                let stream_span = span.clone();
-                let accumulator = Arc::new(Mutex::new(CreateChatCompletionResponse::default()));
-                let acc_clone = accumulator.clone();
+                let accumulator = Arc::new(Mutex::new(default_completion_response()));
+                let stream_accumulator = Arc::clone(&accumulator);
 
                 let logged_stream = resp
                     .map_ok(move |mut r| {
@@ -218,13 +220,10 @@ impl Chat for ChatWrapper {
                     .inspect(move |item| {
                         if let Ok(item) = item {
                             // Aggregate output in preparation to log `captured_output`.
-                            if let Some(choice) = item.choices.first() {
-                                if let Some(content) = &choice.delta.content {
-                                    // Append the new content to our accumulator.
-                                    let mut agg = acc_clone.lock().unwrap();
-                                    agg.push_str(content);
-                                }
+                            if let Ok(mut acc) = accumulator.lock() {
+                                fold_completion_stream(&mut acc, item);
                             }
+
                             // Log usage if available
                             if let Some(usage) = item.usage.clone() {
                                 tracing::info!(
@@ -243,7 +242,7 @@ impl Chat for ChatWrapper {
                 // Wrap the stream with our custom aggregator that logs when dropped.
                 let final_stream = AggregatingStream {
                     inner: logged_stream,
-                    accumulated_response: accumulator,
+                    accumulated_response: stream_accumulator,
                     span: span.clone(),
                     model_public_name: self.public_name.clone(),
                 };

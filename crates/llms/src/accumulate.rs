@@ -17,72 +17,82 @@ limitations under the License.
 use async_openai::types::{
     ChatChoice, ChatChoiceStream, ChatCompletionMessageToolCall, ChatCompletionResponseMessage,
     ChatCompletionResponseStream, ChatCompletionStreamResponseDelta, ChatCompletionToolType,
-    CreateChatCompletionResponse, FunctionCall,
+    CreateChatCompletionResponse, CreateChatCompletionStreamResponse, FunctionCall,
 };
 use futures::StreamExt;
+
+#[must_use]
+pub fn default_completion_response() -> CreateChatCompletionResponse {
+    CreateChatCompletionResponse {
+        id: String::new(),
+        choices: vec![],
+        created: 0,
+        model: String::new(),
+        service_tier: None,
+        system_fingerprint: None,
+        object: String::new(),
+        usage: None,
+    }
+}
+
 /// Accumulate a [`ChatCompletionResponseStream`] into a single [`CreateChatCompletionResponse`].
 ///
 /// This enables comparing the output from [`super::Chat::chat_stream`] as if it was a [`super::Chat::chat_request`].
 #[allow(deprecated, clippy::cast_possible_truncation)]
-pub(crate) async fn accumulate(
-    stream: ChatCompletionResponseStream,
-) -> CreateChatCompletionResponse {
+pub async fn accumulate(stream: ChatCompletionResponseStream) -> CreateChatCompletionResponse {
     stream
-        .fold(
-            CreateChatCompletionResponse {
-                id: String::new(),
-                choices: vec![],
-                created: 0,
-                model: String::new(),
-                service_tier: None,
-                system_fingerprint: None,
-                object: String::new(),
-                usage: None,
-            },
-            |mut acc, item| async move {
-                if let Ok(stream) = item {
-                    // Update these fields on first iteration only.
-                    if acc.model.is_empty() {
-                        acc.id = stream.id;
-                        acc.created = stream.created;
-                        acc.model = stream.model;
-                        acc.service_tier = stream.service_tier;
-                        acc.system_fingerprint = stream.system_fingerprint;
-                        acc.object = stream.object;
-                    }
-                    // Usage will be non-null on last iteration.
-                    if let Some(usage) = stream.usage {
-                        acc.usage = Some(usage);
-                    }
-
-                    // Update stat of [`ChatChoice`].
-                    // On first, need to infer `n` choices, initialise "default" [`ChatChoice`].
-                    if acc.choices.is_empty() && !stream.choices.is_empty() {
-                        acc.choices = (0..stream.choices.len())
-                            .map(|i| ChatChoice {
-                                index: i as u32,
-                                finish_reason: None,
-                                logprobs: None,
-                                message: ChatCompletionResponseMessage {
-                                    content: None,
-                                    refusal: None,
-                                    tool_calls: None,
-                                    function_call: None,
-                                    role: async_openai::types::Role::User,
-                                    audio: None,
-                                },
-                            })
-                            .collect();
-                    }
-                    acc.choices
-                        .iter_mut()
-                        .zip(stream.choices.into_iter())
-                        .for_each(|(c, s)| update_chat_choice(c, s));
-                }
-                acc
-            },
-        )
+        .fold(default_completion_response(), |mut acc, item| async move {
+            if let Ok(stream) = item {
+                fold_completion_stream(&mut acc, &stream);
+            }
+            acc
+        })
         .await
+}
+
+#[allow(clippy::cast_possible_truncation, deprecated)]
+pub fn fold_completion_stream(
+    acc: &mut CreateChatCompletionResponse,
+    item: &CreateChatCompletionStreamResponse,
+) {
+    let stream = item.clone();
+    // Update these fields on first iteration only.
+    if acc.model.is_empty() {
+        acc.id = stream.id;
+        acc.created = stream.created;
+        acc.model = stream.model;
+        acc.service_tier = stream.service_tier;
+        acc.system_fingerprint = stream.system_fingerprint;
+        acc.object = stream.object;
+    }
+    // Usage will be non-null on last iteration.
+    if let Some(usage) = stream.usage {
+        acc.usage = Some(usage);
+    }
+
+    // Update stat of [`ChatChoice`].
+    // On first, need to infer `n` choices, initialise "default" [`ChatChoice`].
+    if acc.choices.is_empty() && !stream.choices.is_empty() {
+        acc.choices = (0..stream.choices.len())
+            .map(|i| ChatChoice {
+                index: i as u32,
+                finish_reason: None,
+                logprobs: None,
+                message: ChatCompletionResponseMessage {
+                    content: None,
+                    refusal: None,
+                    tool_calls: None,
+                    function_call: None,
+                    role: async_openai::types::Role::User,
+                    audio: None,
+                },
+            })
+            .collect();
+    }
+    acc.choices
+        .iter_mut()
+        .zip(stream.choices)
+        .for_each(|(c, s)| update_chat_choice(c, s));
 }
 
 fn update_chat_choice(acc: &mut ChatChoice, update: ChatChoiceStream) {
@@ -157,13 +167,15 @@ fn update_chat_choice(acc: &mut ChatChoice, update: ChatChoiceStream) {
     }
 }
 
+#[cfg(test)]
 pub mod tests {
 
-    use async_openai::{error::OpenAIError, types::CreateChatCompletionStreamResponse};
+    use async_openai::error::OpenAIError;
     use serde_json::json;
 
     use super::*;
 
+    #[allow(clippy::missing_panics_doc)]
     #[tokio::test]
     pub async fn test_accumulate() {
         let parts = vec![
