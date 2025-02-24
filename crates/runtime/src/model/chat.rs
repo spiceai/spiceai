@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 #![allow(clippy::implicit_hasher)]
-use async_graphql::OutputType;
 use llms::{
     anthropic::Anthropic,
     chat::{Chat, Error as LlmError},
