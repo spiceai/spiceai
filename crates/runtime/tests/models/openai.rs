@@ -384,6 +384,7 @@ async fn openai_test_chat_completion() -> Result<(), anyhow::Error> {
 }
 
 #[tokio::test]
+#[ignore] // https://github.com/spiceai/spiceai/issues/4870
 async fn openai_test_chat_messages() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(None);
 
