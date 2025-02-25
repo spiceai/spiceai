@@ -229,10 +229,10 @@ pub mod tests {
                                 }
                             ],
                             "role":"assistant",
-                            "function_call":null
+                            "function_call":null,
+                            "audio": null,
                         },
                         "finish_reason":"stop",
-                        "audio": null,
                         "logprobs":null
                     }
                 ],
