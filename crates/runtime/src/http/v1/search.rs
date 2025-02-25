@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 use crate::embeddings::vector_search::{
-    to_matches_sorted, Match, SearchRequest, SearchRequestAIJson, SearchRequestHTTPJson,
+    self, to_matches_sorted, Match, SearchRequest, SearchRequestAIJson, SearchRequestHTTPJson,
     VectorSearch,
 };
 use axum::{
@@ -146,8 +146,14 @@ pub(crate) async fn post(
             Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
         },
         Err(e) => {
+            let error_type = match e {
+                vector_search::Error::NoTablesWithEmbeddingsFound {}
+                | vector_search::Error::CannotVectorSearchDataset { .. } => StatusCode::BAD_REQUEST,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+
             tracing::error!(target: "task_history", parent: &span, "{e}");
-            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+            (error_type, e.to_string()).into_response()
         }
     }
 }

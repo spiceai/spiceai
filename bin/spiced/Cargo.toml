@@ -14,10 +14,10 @@ clap = { workspace = true, features = ["derive"] }
 flightrepl = { path = "../../crates/flightrepl" }
 futures.workspace = true
 opentelemetry.workspace = true
-opentelemetry_sdk.workspace = true
+opentelemetry-http.workspace = true
 opentelemetry-prometheus.workspace = true
 opentelemetry-zipkin.workspace = true
-opentelemetry-http.workspace = true
+opentelemetry_sdk.workspace = true
 otel-arrow = { path = "../../crates/otel-arrow" }
 prometheus.workspace = true
 reqwest.workspace = true
@@ -30,19 +30,19 @@ serde_yaml.workspace = true
 snafu.workspace = true
 snmalloc-rs = "0.3.6"
 spice-cloud = { path = "../../crates/spice_cloud" }
-tpc-extension = { path = "../../crates/tpc_extension", optional = true }
-tokio.workspace = true
 telemetry = { path = "../../crates/telemetry" }
+tokio.workspace = true
+tpc-extension = { path = "../../crates/tpc_extension", optional = true }
 tracing.workspace = true
-tracing-subscriber.workspace = true
 tracing-opentelemetry.workspace = true
+tracing-subscriber.workspace = true
 
 # Non-default features should be added to `lint-rust` make target.
 [features]
 anonymous_telemetry = ["telemetry/anonymous_telemetry"]
 aws-secrets-manager = ["runtime/aws-secrets-manager"]
 clickhouse = ["runtime/clickhouse"]
-cuda =  ["runtime/cuda"]
+cuda = ["runtime/cuda"]
 databricks = ["runtime/databricks"]
 debezium = ["runtime/debezium"]
 default = [
@@ -72,18 +72,19 @@ duckdb = ["runtime/duckdb"]
 dynamodb = ["runtime/dynamodb"]
 flightsql = ["runtime/flightsql"]
 ftp = ["runtime/ftp"]
-keyring-secret-store = ["runtime/keyring-secret-store"]
 imap = ["runtime/imap"]
-metal =  ["runtime/metal"]
+keyring-secret-store = ["runtime/keyring-secret-store"]
+mcp = ["runtime/mcp"]
+metal = ["runtime/metal"]
 models = ["runtime/models"]
 mssql = ["runtime/mssql"]
 mysql = ["runtime/mysql"]
 odbc = ["runtime/odbc"]
 postgres = ["runtime/postgres"]
+postgres-write = ["runtime/postgres-write"]
 release = []
+sharepoint = ["runtime/sharepoint"]
 snowflake = ["runtime/snowflake"]
 spark = ["runtime/spark"]
 sqlite = ["runtime/sqlite"]
-sharepoint = ["runtime/sharepoint"]
-postgres-write = ["runtime/postgres-write"]
 tpc-extension = ["dep:tpc-extension"]

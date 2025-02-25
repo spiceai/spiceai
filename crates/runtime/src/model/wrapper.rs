@@ -49,14 +49,14 @@ macro_rules! set_default_w_warning {
     ($req:expr, $field:ident, $value:expr, $model:expr) => {
         $req.$field = $req
             .$field
-            .or_else(|| match serde_json::from_value($value) {
+            .or_else(|| match serde_json::from_value($value.clone()) {
                 Ok(val) => Some(val),
-                Err(e) => {
+                Err(_) => {
                     tracing::warn!(
-                        "Failed to parse `openai_{}` override for model='{}': {}",
+                        "Failed to parse `openai_{}` override for model='{}'. Ensure {:?} is of the correct format.",
                         stringify!($field),
                         $model,
-                        e
+                        $value
                     );
                     None
                 }
@@ -68,13 +68,13 @@ impl ChatWrapper {
     pub fn new(
         chat: Box<dyn Chat>,
         public_name: &str,
-        system_prompt: Option<String>,
+        system_prompt: Option<&str>,
         defaults: Vec<(String, serde_json::Value)>,
     ) -> Self {
         let s = Self {
             public_name: public_name.to_string(),
             chat,
-            system_prompt,
+            system_prompt: system_prompt.map(ToString::to_string),
             defaults,
         };
 
@@ -192,8 +192,8 @@ impl Chat for ChatWrapper {
         req: CreateChatCompletionRequest,
     ) -> Result<ChatCompletionResponseStream, OpenAIError> {
         let start = Instant::now();
-        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "ai_completion", stream=true, model = %req.model, input = %serde_json::to_string(&req).unwrap_or_default());
         let req = self.prepare_req(req)?;
+        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "ai_completion", stream=true, model = %req.model, input = %serde_json::to_string(&req).unwrap_or_default());
 
         if let Some(metadata) = &req.metadata {
             tracing::info!(target: "task_history", metadata = %metadata);
@@ -235,8 +235,8 @@ impl Chat for ChatWrapper {
     ) -> Result<CreateChatCompletionResponse, OpenAIError> {
         let start = Instant::now();
 
-        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "ai_completion", stream=false, model = %req.model, input = %serde_json::to_string(&req).unwrap_or_default());
         let req = self.prepare_req(req)?;
+        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "ai_completion", stream=false, model = %req.model, input = %serde_json::to_string(&req).unwrap_or_default());
 
         let labels = request_labels(&req);
         if let Some(metadata) = &req.metadata {
