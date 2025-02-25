@@ -6774,7 +6774,7 @@ dependencies = [
  "mistralrs-core",
  "paste",
  "pulldown-cmark",
- "rand 0.8.5",
+ "rand 0.9.0",
  "regex",
  "reqwest 0.12.12",
  "reqwest-eventsource",
@@ -10252,7 +10252,7 @@ dependencies = [
  "prometheus",
  "prometheus-parse",
  "prost 0.13.4",
- "rand 0.8.5",
+ "rand 0.9.0",
  "regex",
  "reqwest 0.12.12",
  "runtime-auth",
@@ -11798,7 +11798,7 @@ dependencies = [
  "indicatif",
  "nix",
  "octocrab",
- "rand 0.8.5",
+ "rand 0.9.0",
  "regex",
  "reqwest 0.12.12",
  "rustls 0.23.22",
@@ -12816,7 +12816,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "97fee6b57c6a41524a810daee9286c02d7752c4253064d0b05472833a438f675"
 dependencies = [
  "cfg-if",
- "rand 0.8.5",
+ "rand 0.7.3",
  "static_assertions",
 ]
 
@@ -13144,7 +13144,7 @@ version = "1.1.0-unstable"
 dependencies = [
  "backoff",
  "humantime",
- "rand 0.8.5",
+ "rand 0.9.0",
  "tokio",
  "tracing",
 ]
