@@ -22,10 +22,14 @@ use axum::{
     response::{IntoResponse, Response},
     Extension, Json,
 };
+use futures::{stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::{tools::Tooling, Runtime};
+use crate::{
+    tools::{factory::default_available_catalogs, SpiceModelTool, Tooling},
+    Runtime,
+};
 
 /// Summary of a tool available to run, and the schema of its input parameters.
 #[derive(Serialize, Debug, Clone, PartialEq, Eq, Hash, Default, Deserialize)]
@@ -34,6 +38,7 @@ struct ListToolElement {
     name: String,
     description: Option<String>,
     parameters: Option<serde_json::Value>,
+    is_catalog: bool,
 }
 
 /// List Tools
@@ -56,16 +61,46 @@ struct ListToolElement {
 ))]
 pub(crate) async fn list(Extension(rt): Extension<Arc<Runtime>>) -> Response {
     let tools = &*rt.tools.read().await;
-    let tools = tools
-        .iter()
-        .filter_map(|(name, tool)| match tool {
-            Tooling::Tool(tool) => Some(ListToolElement {
-                name: name.clone(),
-                description: tool.description().map(|d| d.to_string()),
-                parameters: tool.parameters(),
-            }),
-            Tooling::Catalog(_) => None,
+
+    let default_catalogs = default_available_catalogs();
+
+    let tools = stream::iter(tools.iter())
+        .then(|(name, t)| {
+            let default_catalog_names = default_catalogs
+                .iter()
+                .map(|c| c.name())
+                .collect::<Vec<_>>();
+            async move {
+                match t {
+                    Tooling::Tool(tool) => vec![ListToolElement {
+                        name: name.to_string(),
+                        description: tool.description().map(|d| d.to_string()),
+                        parameters: tool.parameters(),
+                        is_catalog: false,
+                    }],
+                    Tooling::Catalog(c) => {
+                        // Do not list tools from default catalogs. They are already listed individually as tools.
+                        if default_catalog_names.contains(&name.as_str()) {
+                            return vec![];
+                        };
+                        c.all()
+                            .await
+                            .into_iter()
+                            .map(|tool| ListToolElement {
+                                name: format!("{name}/{}", tool.name()),
+                                description: tool.description().map(|d| d.to_string()),
+                                parameters: tool.parameters(),
+                                is_catalog: true,
+                            })
+                            .collect()
+                    }
+                }
+            }
         })
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .flatten()
         .collect::<Vec<_>>();
 
     (StatusCode::OK, Json(tools)).into_response()
@@ -123,12 +158,24 @@ pub(crate) async fn post(
 ) -> Response {
     let tools = &*rt.tools.read().await;
 
-    let Some(Tooling::Tool(tool)) = tools.get(&tool_name) else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({"message": format!("Tool {tool_name} not found")})),
-        )
-            .into_response();
+    // Find tool by first checking if it is a tool catalog (i.e. has a '/'), if not find it as regular tool.
+    let tool: Arc<dyn SpiceModelTool> = if let Some((catalog_name, name)) =
+        tool_name.split_once('/')
+    {
+        let Some(Tooling::Catalog(catalog)) = tools.get(catalog_name) else {
+            return not_found(format!("Tool '{tool_name}' not found").as_str());
+        };
+        match catalog.get(name).await {
+            Some(tool) => tool,
+            None => {
+                return not_found(format!("Tool '{name}' not found in '{catalog_name}'").as_str());
+            }
+        }
+    } else {
+        let Some(Tooling::Tool(tool)) = tools.get(&tool_name) else {
+            return not_found(format!("Tool {tool_name} not found").as_str());
+        };
+        Arc::clone(tool)
     };
 
     match tool.call(body.as_str(), Arc::clone(&rt)).await {
@@ -139,4 +186,8 @@ pub(crate) async fn post(
         )
             .into_response(),
     }
+}
+
+fn not_found(message: &str) -> Response {
+    (StatusCode::NOT_FOUND, Json(json!({"message": message}))).into_response()
 }

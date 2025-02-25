@@ -55,25 +55,6 @@ spice upgrade
 			os.Exit(1)
 		}
 
-		spicePathVar, spicePath, err := rtcontext.SpicePath()
-		if err != nil {
-			slog.Error("finding spice binary location", "error", err)
-			os.Exit(1)
-		}
-
-		switch spicePathVar {
-		case constants.BrewInstall:
-			slog.Info("Spice is downloaded from Homebrew. Run `brew upgrade spiceai/spiceai/spice` to upgrade the CLI.")
-			return
-		case constants.OtherInstall:
-			msg := fmt.Sprintf("Spice upgrade failed: Spice CLI found at non-standard location '%s'. To upgrade:\n"+
-				"1. Remove current installation\n"+
-				"2. Refer to https://spiceai.org/docs/installation to reinstall spice\n"+
-				"3. Try upgrade again", spicePath)
-			slog.Info(msg)
-			return
-		}
-
 		if os.Getenv(constants.SpiceUpgradeReloadEnv) != "true" {
 			// Run CLI upgrade
 			if !upgradeCli(force, rtcontext) {
@@ -101,7 +82,7 @@ spice upgrade
 		}
 
 		if runtimeUpgradeRequired == "" {
-			slog.Info(fmt.Sprintf("Using version %s. No upgrade required.", currentVersion))
+			slog.Info(fmt.Sprintf("Using version %s. Runtime upgrade not required.", currentVersion))
 			return
 		}
 
@@ -181,8 +162,29 @@ func upgradeCli(force bool, rtcontext *context.RuntimeContext) bool {
 
 	cliVersion := version.Version()
 	if cliVersion == release.TagName && !force {
-		slog.Info(fmt.Sprintf("Using the latest version %s. No upgrade required.", release.TagName))
+		slog.Info(fmt.Sprintf("Using the latest version %s. CLI upgrade not required.", release.TagName))
 		return true
+	}
+
+	spicePathVar, spicePath, err := rtcontext.SpicePath()
+	if err != nil {
+		slog.Error("finding spice binary location", "error", err)
+		os.Exit(1)
+	}
+
+	switch spicePathVar {
+	case constants.BrewInstall:
+		slog.Info("Spice is installed via Homebrew. Upgrade the CLI and Runtime by running:\n\n  brew upgrade spiceai/spiceai/spice\n")
+		return false
+	case constants.OtherInstall:
+		msg := fmt.Sprintf("Spice upgrade failed: The Spice CLI is installed in a non-standard location: '%s'.\n\n"+
+			"To upgrade:\n"+
+			"1. Remove the existing installation. Example:\n"+
+			"   rm -rf %s\n\n"+
+			"2. Reinstall Spice by following the instructions at:\n"+
+			"   https://spiceai.org/docs/installation", spicePath, spicePath)
+		slog.Info(msg)
+		return false
 	}
 
 	assetName := github.GetAssetName(constants.SpiceCliFilename)
