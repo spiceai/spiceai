@@ -114,7 +114,6 @@ export PATH="$PATH:$HOME/.spice/bin"
 
 # Initialize and run a test app to ensure everything is working
 cd ../
-mkdir test-app
 spice init test-app
 cd test-app
 spice run
@@ -164,7 +163,6 @@ export PATH="$PATH:$HOME/.spice/bin"
 
 # Initialize and run a test app to ensure everything is working
 cd ../
-mkdir test-app
 spice init test-app
 cd test-app
 spice run
