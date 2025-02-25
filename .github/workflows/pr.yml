@@ -187,7 +187,7 @@ jobs:
           CARGO_INCREMENTAL: 0
       
       - name: Show sccache stats
-        if: ${{ env.SCCACHE_SETUP == 'true' }}
+        if: ${{ needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true' }}
         run: sccache --show-stats
 
   build-docker:
