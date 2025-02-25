@@ -122,7 +122,7 @@ func get_ai_accelerator() (string, bool) {
 	if runtime.GOOS == "linux" || runtime.GOOS == "windows" {
 		version, err := get_cuda_version()
 		if err != nil {
-			slog.Error("checking for CUDA device", "error", err)
+			slog.Debug("Failed to check for CUDA device", "error", err)
 		}
 
 		if version == nil {
@@ -169,7 +169,7 @@ func get_cuda_version() (*string, error) {
 	}
 
 	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("failed to start `nvidia-smi` command: %w", err)
+		return nil, fmt.Errorf("failed to execute `nvidia-smi` command: %w", err)
 	}
 
 	// Read the output while the command is still running

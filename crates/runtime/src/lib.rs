@@ -45,7 +45,7 @@ use status::ComponentStatus;
 use tls::TlsConfig;
 use tokio::sync::{oneshot::error::RecvError, RwLock};
 use tools::factory::default_available_catalogs;
-use tools::{catalog::SpiceToolCatalog, SpiceModelTool, Tooling};
+use tools::{catalog::SpiceToolCatalog, Tooling};
 pub use util::shutdown_signal;
 
 use crate::extension::Extension;
