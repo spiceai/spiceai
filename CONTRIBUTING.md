@@ -126,11 +126,9 @@ spice run
 sudo apt update
 sudo apt install build-essential curl openssl libssl-dev pkg-config protobuf-compiler cmake
 
-# Detect the machine's architecture
-ARCH=$(uname -m)
-
-# Map uname output to Go's naming convention
-case "$ARCH" in
+# Install Go
+ARCH=$(uname -m) # Detect the machine's architecture
+case "$ARCH" in # Map uname output to Go's naming convention
   x86_64)
     ARCH="amd64"
     ;;
@@ -142,7 +140,7 @@ case "$ARCH" in
     exit 1
     ;;
 esac
-
+export GO_VERSION="1.24.0"
 rm -rf /tmp/spice
 mkdir -p /tmp/spice
 cd /tmp/spice
