@@ -93,13 +93,13 @@ spice upgrade
 			flavor = constants.FlavorAI
 		}
 
-		release, err := github.GetLatestRuntimeRelease()
+		release, err := github.GetRuntimeRelease(version.Version())
 		if err != nil {
 			slog.Error("installing runtime", "error", err)
 			os.Exit(1)
 		}
 
-		err = rtcontext.InstallOrUpgradeRuntime(flavor, accelerated) // retain the current accelerator setting for upgrades
+		err = rtcontext.InstallMatchingRuntime(flavor, accelerated) // retain the current accelerator setting for upgrades
 		if err != nil {
 			slog.Error("installing runtime", "error", err)
 			os.Exit(1)
@@ -190,7 +190,7 @@ func upgradeCli(force bool, rtcontext *context.RuntimeContext) bool {
 	assetName := github.GetAssetName(constants.SpiceCliFilename)
 	spiceBinDir := filepath.Join(rtcontext.SpiceRuntimeDir(), "bin")
 
-	slog.Info("Upgrading the Spice.ai CLI ...")
+	slog.Info(fmt.Sprintf("Found version %s, upgrading the Spice.ai CLI ...", release.TagName))
 
 	stat, err := os.Stat(spiceBinDir)
 	if err != nil {

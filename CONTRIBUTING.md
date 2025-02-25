@@ -114,9 +114,8 @@ export PATH="$PATH:$HOME/.spice/bin"
 
 # Initialize and run a test app to ensure everything is working
 cd ../
-mkdir test-app
-cd test-app
 spice init test-app
+cd test-app
 spice run
 ```
 
@@ -128,12 +127,25 @@ sudo apt update
 sudo apt install build-essential curl openssl libssl-dev pkg-config protobuf-compiler cmake
 
 # Install Go
-export GO_VERSION="1.23.4"
+ARCH=$(uname -m) # Detect the machine's architecture
+case "$ARCH" in # Map uname output to Go's naming convention
+  x86_64)
+    ARCH="amd64"
+    ;;
+  aarch64)
+    ARCH="arm64"
+    ;;
+  *)
+    echo "Unsupported architecture: $ARCH"
+    exit 1
+    ;;
+esac
+export GO_VERSION="1.24.0"
 rm -rf /tmp/spice
 mkdir -p /tmp/spice
 cd /tmp/spice
-wget https://go.dev/dl/go$GO_VERSION.linux-amd64.tar.gz
-tar xvfz go$GO_VERSION.linux-amd64.tar.gz
+wget https://go.dev/dl/go$GO_VERSION.linux-$ARCH.tar.gz
+tar xvfz go$GO_VERSION.linux-$ARCH.tar.gz
 sudo mv ./go /usr/local/go
 echo 'export PATH=$PATH:/usr/local/go/bin' >> $HOME/.profile
 source $HOME/.profile
@@ -163,9 +175,8 @@ export PATH="$PATH:$HOME/.spice/bin"
 
 # Initialize and run a test app to ensure everything is working
 cd ../
-mkdir test-app
-cd test-app
 spice init test-app
+cd test-app
 spice run
 ```
 
