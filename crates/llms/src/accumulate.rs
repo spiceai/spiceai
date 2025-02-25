@@ -232,6 +232,7 @@ pub mod tests {
                             "function_call":null
                         },
                         "finish_reason":"stop",
+                        "audio": null,
                         "logprobs":null
                     }
                 ],
