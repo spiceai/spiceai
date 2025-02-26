@@ -18,10 +18,10 @@ use futures_util::TryStreamExt;
 use llms::chat::{nsql::SqlGeneration, Chat};
 use logical::{logical_plan_complete_summary, plan::LogicalPlan};
 use physical::{executor::PhysicalJobExecutor, plan::PhysicalPlan};
-use pipeline::{with_ending, with_starting};
+use pipeline::{create_working_stream_payload, with_ending, with_starting};
 use research::{
     model::{parse_response, research_complete_msg},
-    Research,
+    Artifact, Research,
 };
 use serde::{de::DeserializeOwned, Serialize};
 use snafu::ResultExt;
@@ -144,7 +144,8 @@ impl AgentChat {
                 Err(e) => {
                     if should_retry_on_error(&e) {
                         tracing::warn!("Error: {e}. Retrying operation.");
-                        tx.send(Err(OpenAIError::InvalidArgument(format!("RETRY ERROR"))))
+                        let _ = tx
+                            .send(create_working_stream_payload(retry_message.clone()))
                             .await;
                         return Err(RetryError::transient(e));
                     }
@@ -246,7 +247,7 @@ impl AgentChat {
 
         Ok(Research {
             prompt: prompt.clone(),
-            artifacts: artifacts,
+            artifacts: vec![Artifact::TextSnippet("blah".to_string())],
         })
     }
 
