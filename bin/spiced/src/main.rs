@@ -18,7 +18,6 @@ use clap::Parser;
 use opentelemetry::global;
 use rustls::crypto::{self, CryptoProvider};
 use tokio::runtime::Runtime;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 #[global_allocator]
