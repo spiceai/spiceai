@@ -81,7 +81,7 @@ spice install ai
 				slog.Error("initializing runtime context", "error", err)
 				os.Exit(1)
 			}
-			err = rtcontext.InstallOrUpgradeRuntime(flavor, !cpu)
+			err = rtcontext.InstallMatchingRuntime(flavor, !cpu)
 			if err != nil {
 				slog.Error("installing runtime", "error", err)
 				os.Exit(1)

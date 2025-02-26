@@ -24,6 +24,8 @@ use crate::Runtime;
 pub mod builtin;
 pub mod catalog;
 pub mod factory;
+#[cfg(feature = "mcp")]
+pub mod mcp;
 pub mod memory;
 pub mod options;
 pub mod utils;
@@ -42,6 +44,14 @@ impl Tooling {
         match self {
             Tooling::Tool(t) => vec![Arc::clone(t)],
             Tooling::Catalog(c) => c.all().await,
+        }
+    }
+
+    #[must_use]
+    pub fn name(&self) -> Cow<'_, str> {
+        match self {
+            Tooling::Tool(t) => t.name(),
+            Tooling::Catalog(c) => Cow::Borrowed(c.name()),
         }
     }
 }
