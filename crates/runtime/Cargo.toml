@@ -75,6 +75,8 @@ keyring = { version = "3.6.1", features = [
 ], optional = true }
 llms = { path = "../llms" }
 logos = "0.15.0"
+mcp-client = { git = "https://github.com/block/goose", package = "mcp-client", optional = true }
+mcp-core = { git = "https://github.com/block/goose", package = "mcp-core", optional = true }
 mediatype = "0.19.18"
 model_components = { path = "../model_components" }
 mysql_async = { workspace = true, optional = true }
@@ -177,14 +179,15 @@ databricks = ["data_components/databricks"]
 debezium = ["data_components/debezium"]
 default = ["keyring-secret-store", "aws-secrets-manager", "sharepoint"]
 delta_lake = ["data_components/delta_lake"]
-dev = ["openapi", "otel-arrow/dev"]
+dev = ["openapi", "otel-arrow/dev", "mcp"]
 dremio = []
 duckdb = ["dep:duckdb", "db_connection_pool/duckdb", "data_components/duckdb"]
 dynamodb = ["dep:aws-sdk-dynamodb", "data_components/dynamodb"]
 flightsql = ["data_components/flightsql"]
 ftp = ["dep:suppaftp", "dep:ssh2"]
-keyring-secret-store = ["dep:keyring"]
 imap = ["data_components/imap", "dep:imap"]
+keyring-secret-store = ["dep:keyring"]
+mcp = ["dep:mcp-client", "dep:mcp-core"]
 metal = ["llms/metal"]
 models = ["model_components/full"]
 mssql = ["dep:tiberius", "dep:tokio-util", "data_components/mssql"]

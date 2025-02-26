@@ -409,7 +409,7 @@ jobs:
         run: INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" INSTA_UPDATE=${{ github.event.inputs.update_snapshots}} ./spice_bench --bench ${{ matrix.cmd }}
         continue-on-error: true
         env:
-          UPLOAD_RESULTS_DATASET: 'spiceai.tests.oss_benchmarks'
+          # UPLOAD_RESULTS_DATASET: 'spiceai.tests.oss_benchmarks'
           PG_BENCHMARK_PG_HOST: localhost
           PG_BENCHMARK_PG_USER: postgres
           PG_BENCHMARK_PG_PASS: postgres
@@ -575,7 +575,7 @@ jobs:
         run: INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" ./spice_bench --bench ${{ matrix.cmd }}
         continue-on-error: true
         env:
-          UPLOAD_RESULTS_DATASET: 'spiceai.tests.oss_benchmarks'
+          # UPLOAD_RESULTS_DATASET: 'spiceai.tests.oss_benchmarks'
           S3_ENDPOINT: ${{ secrets.CLICKBENCH_S3_ENDPOINT}}
           S3_KEY: ${{ secrets.CLICKBENCH_S3_KEY}}
           S3_SECRET: ${{ secrets.CLICKBENCH_S3_SECRET}}

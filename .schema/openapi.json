@@ -7,7 +7,7 @@
       "name": "Apache-2.0",
       "identifier": "Apache-2.0"
     },
-    "version": "1.1.0"
+    "version": "1.1.0-unstable"
   },
   "servers": [
     {
@@ -1192,7 +1192,11 @@
                 "additional_columns": [
                   "timestamp"
                 ],
-                "limit": 3
+                "limit": 3,
+                "keywords": [
+                  "plane",
+                  "tickets"
+                ]
               }
             }
           },
@@ -3677,7 +3681,8 @@
         "type": "object",
         "description": "Summary of a tool available to run, and the schema of its input parameters.",
         "required": [
-          "name"
+          "name",
+          "is_catalog"
         ],
         "properties": {
           "description": {
@@ -3685,6 +3690,9 @@
               "string",
               "null"
             ]
+          },
+          "is_catalog": {
+            "type": "boolean"
           },
           "name": {
             "type": "string"
