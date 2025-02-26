@@ -365,13 +365,13 @@ func (c *RuntimeContext) AddHeaders(headers map[string]string) {
 func (c *RuntimeContext) GetHeaders() map[string]string {
 	headers := make(map[string]string)
 
-	if c.isCloud {
-		apiKey := os.Getenv("SPICE_API_KEY")
-		if apiKey != "" {
-			headers["X-API-Key"] = apiKey
-		}
+	apiKey := os.Getenv("SPICE_API_KEY")
+	if apiKey == "" {
+		apiKey = os.Getenv("SPICE_SPICEAI_API_KEY")
 	}
-
+	if apiKey != "" {
+		headers["X-API-Key"] = apiKey
+	}
 	if c.apiKey != "" {
 		headers["X-API-Key"] = c.apiKey
 	}
