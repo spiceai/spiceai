@@ -616,6 +616,7 @@ impl Runtime {
         dataaccelerator::unregister_all().await;
         tools::factory::unregister_all_factories().await;
         document_parse::unregister_all().await;
+        self.df.shutdown().await;
     }
 }
 
