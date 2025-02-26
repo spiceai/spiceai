@@ -372,6 +372,8 @@ func (c *RuntimeContext) GetHeaders() map[string]string {
 	if apiKey != "" {
 		headers["X-API-Key"] = apiKey
 	}
+
+	// api_key from context takes precedence
 	if c.apiKey != "" {
 		headers["X-API-Key"] = c.apiKey
 	}
