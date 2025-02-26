@@ -18,9 +18,15 @@ use clap::Parser;
 use opentelemetry::global;
 use rustls::crypto::{self, CryptoProvider};
 use tokio::runtime::Runtime;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 #[global_allocator]
 static ALLOC: snmalloc_rs::SnMalloc = snmalloc_rs::SnMalloc;
+
+// Counter for tracking Ctrl+C presses
+static CTRL_C_COUNT: AtomicUsize = AtomicUsize::new(0);
+static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 fn main() {
     let args = spiced::Args::parse();
@@ -48,10 +54,45 @@ fn main() {
         return;
     }
 
-    if let Err(err) = tokio_runtime.block_on(start_runtime(args)) {
-        spiced::in_tracing_context(|| {
-            tracing::error!("{err}");
-        });
+    // Register a global Ctrl+C handler that forcibly exits after repeated presses
+    ctrlc::set_handler(move || {
+        let count = CTRL_C_COUNT.fetch_add(1, Ordering::SeqCst) + 1;
+        
+        // First press: request graceful shutdown
+        if count == 1 {
+            SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
+            spiced::in_tracing_context(|| {
+                tracing::info!("Received Ctrl+C, shutting down gracefully...");
+            });
+        }
+        // Second press: warn user
+        else if count == 2 {
+            spiced::in_tracing_context(|| {
+                tracing::warn!("Received Ctrl+C again, waiting for graceful shutdown to complete...");
+                tracing::warn!("Press Ctrl+C once more to force exit");
+            });
+        }
+        // Third press or more: force exit
+        else {
+            spiced::in_tracing_context(|| {
+                tracing::error!("Received Ctrl+C multiple times, forcing immediate exit");
+            });
+            std::process::exit(130); // Standard exit code for Ctrl+C termination
+        }
+    }).expect("Error setting Ctrl+C handler");
+
+    match tokio_runtime.block_on(start_runtime(args)) {
+        Ok(_) => {
+            // Successful clean shutdown
+            spiced::in_tracing_context(|| {
+                tracing::info!("Runtime shut down successfully");
+            });
+        }
+        Err(err) => {
+            spiced::in_tracing_context(|| {
+                tracing::error!("{err}");
+            });
+        }
     }
 
     global::shutdown_tracer_provider();
@@ -61,7 +102,42 @@ async fn start_runtime(args: spiced::Args) -> Result<(), Box<dyn std::error::Err
     spiced::in_tracing_context(|| {
         tracing::info!("Starting runtime {version}", version = get_version_string());
     });
-    spiced::run(args).await?;
+    
+    // Create a future that completes when Ctrl+C is pressed
+    let shutdown_signal = async {
+        let mut grace_period = tokio::time::interval(tokio::time::Duration::from_secs(5));
+        
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep(tokio::time::Duration::from_millis(50)) => {
+                    if SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
+                        // Exit the loop if shutdown was requested
+                        break;
+                    }
+                }
+                _ = grace_period.tick() => {
+                    // Add a long grace period timer that will force exit if shutdown takes too long
+                    if SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
+                        spiced::in_tracing_context(|| {
+                            tracing::warn!("Shutdown taking too long, forcing exit...");
+                        });
+                        std::process::exit(1);
+                    }
+                }
+            }
+        }
+    };
+    
+    // Race between normal runtime execution and the Ctrl+C signal
+    tokio::select! {
+        result = spiced::run(args) => result?,
+        _ = shutdown_signal => {
+            spiced::in_tracing_context(|| {
+                tracing::info!("Shutdown signal received, stopping runtime");
+            });
+        }
+    }
+    
     Ok(())
 }
 
