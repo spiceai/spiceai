@@ -1280,6 +1280,21 @@ impl DataFusion {
     pub fn query_builder<'a>(self: &Arc<Self>, sql: &'a str) -> QueryBuilder<'a> {
         QueryBuilder::new(sql, Arc::clone(self))
     }
+
+    /// Performs `DataFusion` cleanup during shutdown.
+    /// Currently performs cleanup of accelerated tables only.
+    pub async fn shutdown(&self) {
+        // Don't block self.accelerated_tables as it needs to be modified during table removal
+        // and will be cleaned up authomatically by removing accelerated tables.
+
+        let accelerated_tables = self.accelerated_tables.read().await.clone();
+
+        for table in &accelerated_tables {
+            if let Err(err) = self.remove_table(table).await {
+                tracing::error!("Failed to clean up '{table}' during shutdown: {err}");
+            }
+        }
+    }
 }
 
 #[must_use]

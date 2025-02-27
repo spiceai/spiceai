@@ -1,0 +1,106 @@
+version: v1
+kind: Spicepod
+name: tpch-indexes
+
+extensions:
+  tpc:
+    enabled: true
+    params:
+      benchmark: tpch
+      scale_factor: "1"
+      path: .spice/tpch.db
+
+runtime:
+  task_history:
+    enabled: true
+    captured_output: truncated
+  results_cache:
+    enabled: false
+
+defaults: &default_params
+  duckdb_open: .spice/tpch.db
+
+datasets:
+  - from: duckdb:customer
+    name: customer
+    params: *default_params
+    acceleration:
+      enabled: true
+      engine: duckdb
+      mode: file
+      refresh_check_interval: &default_refresh_check_interval 10s
+      primary_key: c_custkey
+      indexes:
+        c_mktsegment: enabled
+
+  - from: duckdb:lineitem
+    name: lineitem
+    params: *default_params
+    acceleration:
+      enabled: true
+      engine: duckdb
+      mode: file
+      refresh_check_interval: *default_refresh_check_interval
+      primary_key: '(l_orderkey, l_linenumber)'
+      indexes:
+        l_orderkey: enabled
+        l_shipdate: enabled
+
+  - from: duckdb:nation
+    params: *default_params
+    name: nation
+    acceleration:
+      enabled: true
+      engine: duckdb
+      mode: file
+      refresh_check_interval: *default_refresh_check_interval
+      primary_key: n_nationkey
+    
+  - from: duckdb:orders
+    name: orders
+    params: *default_params
+    acceleration:
+      enabled: true
+      engine: duckdb
+      mode: file
+      refresh_check_interval: *default_refresh_check_interval
+      primary_key: o_orderkey
+
+  - from: duckdb:part
+    name: part
+    params: *default_params
+    acceleration:
+      enabled: true
+      engine: duckdb
+      mode: file
+      refresh_check_interval: *default_refresh_check_interval
+      primary_key: p_partkey
+
+  - from: duckdb:partsupp
+    name: partsupp
+    params: *default_params
+    acceleration:
+      enabled: true
+      engine: duckdb
+      mode: file
+      refresh_check_interval: *default_refresh_check_interval
+      primary_key: '(ps_partkey, ps_suppkey)'
+
+  - from: duckdb:region
+    name: region
+    params: *default_params
+    acceleration:
+      enabled: true
+      engine: duckdb
+      mode: file
+      refresh_check_interval: *default_refresh_check_interval
+  
+  - from: duckdb:supplier
+    name: supplier
+    params: *default_params
+    acceleration:
+      enabled: true
+      engine: duckdb
+      mode: file
+      refresh_check_interval: *default_refresh_check_interval
+      primary_key: s_suppkey

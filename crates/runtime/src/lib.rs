@@ -608,6 +608,16 @@ impl Runtime {
             tracing::error!("Could not start the Spice runtime: {err}");
         }
     }
+
+    // Closes and deallocates all resources (including the static registries)
+    pub async fn close(self) {
+        dataconnector::unregister_all().await;
+        catalogconnector::unregister_all().await;
+        dataaccelerator::unregister_all().await;
+        tools::factory::unregister_all_factories().await;
+        document_parse::unregister_all().await;
+        self.df.shutdown().await;
+    }
 }
 
 #[allow(clippy::implicit_hasher)]

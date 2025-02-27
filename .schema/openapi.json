@@ -3681,7 +3681,8 @@
         "type": "object",
         "description": "Summary of a tool available to run, and the schema of its input parameters.",
         "required": [
-          "name"
+          "name",
+          "is_catalog"
         ],
         "properties": {
           "description": {
@@ -3689,6 +3690,9 @@
               "string",
               "null"
             ]
+          },
+          "is_catalog": {
+            "type": "boolean"
           },
           "name": {
             "type": "string"
