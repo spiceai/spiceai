@@ -49,6 +49,11 @@ pub async fn register_all() {
     register_parser_factory("pdf", Arc::new(pdf::PdfParserFactory {})).await;
 }
 
+pub async fn unregister_all() {
+    let mut registry = DOCUMENT_PARSER_FACTORY_REGISTRY.lock().await;
+    registry.clear();
+}
+
 pub async fn get_parser_factory(ext: &str) -> Option<Arc<dyn DocumentParserFactory>> {
     let registry = DOCUMENT_PARSER_FACTORY_REGISTRY.lock().await;
     registry.get(ext.strip_prefix('.').unwrap_or(ext)).cloned()

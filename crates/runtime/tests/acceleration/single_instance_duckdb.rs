@@ -92,7 +92,7 @@ async fn test_acceleration_duckdb_single_instance() -> Result<(), anyhow::Error>
 
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             drop(rt);
-            runtime::dataaccelerator::clear_registry().await;
+            runtime::dataaccelerator::unregister_all().await;
             runtime::dataaccelerator::register_all().await;
             tokio::time::sleep(std::time::Duration::from_secs(15)).await;
 

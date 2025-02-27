@@ -352,6 +352,10 @@ pub async fn register_all() {
     register_connector_factory("dynamodb", dynamodb::DynamoDBFactory::new_arc()).await;
 }
 
+pub async fn unregister_all() {
+    let mut registry = DATA_CONNECTOR_FACTORY_REGISTRY.lock().await;
+    registry.clear();
+}
 pub trait DataConnectorFactory: Send + Sync {
     fn as_any(&self) -> &dyn Any;
 
