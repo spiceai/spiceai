@@ -17,7 +17,6 @@ limitations under the License.
 use clap::Parser;
 use opentelemetry::global;
 use rustls::crypto::{self, CryptoProvider};
-use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::runtime::Runtime;
 
 #[global_allocator]
@@ -52,9 +51,16 @@ fn main() {
     // Register a global Ctrl+C handler that initiates a shutdown
     ctrlc::set_handler(move || {
         tracing::debug!("Shutdown signal received, stopping runtime.");
+        //
         std::process::exit(130);
     })
     .expect("Error setting Ctrl+C handler");
+
+    if let Err(err) = tokio_runtime.block_on(start_runtime(args)) {
+        spiced::in_tracing_context(|| {
+            tracing::error!("{err}");
+        });
+    }
 
     global::shutdown_tracer_provider();
 }
@@ -63,42 +69,7 @@ async fn start_runtime(args: spiced::Args) -> Result<(), Box<dyn std::error::Err
     spiced::in_tracing_context(|| {
         tracing::info!("Starting runtime {version}", version = get_version_string());
     });
-
-    // Create a future that completes when Ctrl+C is pressed
-    let shutdown_signal = async {
-        let mut grace_period = tokio::time::interval(tokio::time::Duration::from_secs(5));
-
-        loop {
-            tokio::select! {
-                _ = tokio::time::sleep(tokio::time::Duration::from_millis(50)) => {
-                    if SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
-                        // Exit the loop if shutdown was requested
-                        break;
-                    }
-                }
-                _ = grace_period.tick() => {
-                    // Add a long grace period timer that will force exit if shutdown takes too long
-                    if SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
-                        spiced::in_tracing_context(|| {
-                            tracing::warn!("Shutdown taking too long, forcing exit...");
-                        });
-                        std::process::exit(1);
-                    }
-                }
-            }
-        }
-    };
-
-    // Race between normal runtime execution and the Ctrl+C signal
-    tokio::select! {
-        result = spiced::run(args) => result?,
-        _ = shutdown_signal => {
-            spiced::in_tracing_context(|| {
-                tracing::info!("Shutdown signal received, stopping runtime");
-            });
-        }
-    }
-
+    spiced::run(args).await?;
     Ok(())
 }
 
