@@ -147,9 +147,9 @@ impl SpiceAIFactory {
 }
 
 const PARAMETERS: &[ParameterSpec] = &[
-    ParameterSpec::connector("api_key").secret(),
-    ParameterSpec::connector("token").secret(),
-    ParameterSpec::connector("endpoint"),
+    ParameterSpec::component("api_key").secret(),
+    ParameterSpec::component("token").secret(),
+    ParameterSpec::component("endpoint"),
 ];
 
 const HEADER_ORG: &str = "spiceai-org";

@@ -315,13 +315,13 @@ pub struct ParameterSpec {
     pub description: &'static str,
     pub help_link: &'static str,
     pub examples: &'static [&'static str],
-    pub r#type: ParameterType,
     pub deprecation_message: Option<&'static str>,
+    pub r#type: ParameterType,
 }
 
 impl ParameterSpec {
     #[must_use]
-    pub const fn connector(name: &'static str) -> Self {
+    pub const fn component(name: &'static str) -> Self {
         Self {
             name,
             required: false,
@@ -330,8 +330,8 @@ impl ParameterSpec {
             description: "",
             help_link: "",
             examples: &[],
-            r#type: ParameterType::Connector,
             deprecation_message: None,
+            r#type: ParameterType::Component,
         }
     }
 
@@ -345,23 +345,8 @@ impl ParameterSpec {
             description: "",
             help_link: "",
             examples: &[],
+            deprecation_message: None,
             r#type: ParameterType::Runtime,
-            deprecation_message: None,
-        }
-    }
-
-    #[must_use]
-    pub const fn accelerator(name: &'static str) -> Self {
-        Self {
-            name,
-            required: false,
-            default: None,
-            secret: false,
-            description: "",
-            help_link: "",
-            examples: &[],
-            r#type: ParameterType::Accelerator,
-            deprecation_message: None,
         }
     }
 
@@ -410,54 +395,40 @@ impl ParameterSpec {
 
 #[derive(Default, Debug, Clone, Copy, PartialEq)]
 pub enum ParameterType {
-    /// A parameter which tells Spice how to connect to the underlying data source.
+    /// A parameter which tells Spice how to configure the underlying component, and is usually passed directly to the underlying component configuration.
     ///
-    /// These parameters are automatically prefixed with the data connector's prefix (from
-    /// [`crate::dataconnector::DataConnectorFactory::prefix`]).
+    /// These parameters are automatically prefixed with the component's prefix.
     ///
     /// # Examples
     ///
-    /// In Postgres, the `host` is a Connector parameter and would be auto-prefixed with `pg_`.
+    /// In Postgres, `host` is a Component parameter and would be auto-prefixed with `pg_`.
     #[default]
-    Connector,
+    Component,
 
-    /// A parameter which tells Spice how to connect to the underlying data accelerator.
+    /// Other parameters which control how the runtime interacts with the component, but does
+    /// not affect the actual component configuration.
     ///
-    /// These parameters are automatically prefixed with the data accelerator's prefix (from
-    /// [`crate::dataaccelerator::DataAccelerator::prefix`]).
-    ///
-    /// # Examples
-    ///
-    /// In Postgres, the `host` is an Accelerator parameter and would be auto-prefixed with `pg_`.
-    Accelerator,
-
-    /// Other parameters which control how the runtime interacts with the data source, but does
-    /// not affect the actual connection.
-    ///
-    /// These parameters are not prefixed with the data connector's prefix.
+    /// These parameters are not prefixed with the component's prefix.
     ///
     /// # Examples
     ///
     /// In Databricks, the `mode` parameter is used to select which connection to use, and thus is
-    /// not a Connector parameter.
+    /// not a component parameter.
     Runtime,
 }
 
-// Display implementation for ParameterType
 impl Display for ParameterType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ParameterType::Connector => write!(f, "Connector"),
-            ParameterType::Accelerator => write!(f, "Accelerator"),
-            ParameterType::Runtime => write!(f, "Runtime"),
+            Self::Component => write!(f, "Component"),
+            Self::Runtime => write!(f, "Runtime"),
         }
     }
 }
 
 impl ParameterType {
-    #[must_use]
     pub const fn is_prefixed(self) -> bool {
-        matches!(self, Self::Connector | Self::Accelerator)
+        matches!(self, Self::Component)
     }
 }
 
@@ -470,7 +441,7 @@ mod test {
         // key with prefix, parameter expects prefix.
         assert_eq!(
             Parameters::validate_and_format_key(
-                &[ParameterSpec::connector("endpoint")],
+                &[ParameterSpec::component("endpoint")],
                 "databricks",
                 "databricks_endpoint",
                 "connector databricks"
@@ -481,7 +452,7 @@ mod test {
         // key with wrong prefix, parameter expects prefix.
         assert_eq!(
             Parameters::validate_and_format_key(
-                &[ParameterSpec::connector("endpoint")],
+                &[ParameterSpec::component("endpoint")],
                 "not_databricks",
                 "databricks_endpoint",
                 "connector databricks"
@@ -492,7 +463,7 @@ mod test {
         // key with prefix, parameter does not expect prefix.
         assert_eq!(
             Parameters::validate_and_format_key(
-                &[ParameterSpec::runtime("endpoint")], // deliberately `runtime` not `connector`.
+                &[ParameterSpec::runtime("endpoint")], // deliberately `runtime` not `component`.
                 "databricks",
                 "databricks_endpoint",
                 "connector databricks"
@@ -514,7 +485,7 @@ mod test {
         // key with prefix, parameter expects prefix. Prefix not stripped from key
         assert_eq!(
             Parameters::validate_and_format_key(
-                &[ParameterSpec::connector("file_format")],
+                &[ParameterSpec::component("file_format")],
                 "file",
                 "file_format",
                 "connector file"
@@ -525,7 +496,7 @@ mod test {
         // key with prefix, parameter expects prefix. Prefix stripped from key
         assert_eq!(
             Parameters::validate_and_format_key(
-                &[ParameterSpec::connector("format")],
+                &[ParameterSpec::component("format")],
                 "file",
                 "file_format",
                 "connector file"

@@ -112,22 +112,22 @@ impl ClickhouseFactory {
 
 const PARAMETERS: &[ParameterSpec] = &[
     // clickhouse_connection_string
-    ParameterSpec::connector("connection_string").secret()
+    ParameterSpec::component("connection_string").secret()
         .description("The connection string to use to connect to the Clickhouse server. This can be used instead of providing individual connection parameters."),
     // clickhouse_pass
-    ParameterSpec::connector("pass").secret().description("The password to use to connect to the Clickhouse server."),
+    ParameterSpec::component("pass").secret().description("The password to use to connect to the Clickhouse server."),
     // clickhouse_user
-    ParameterSpec::connector("user").description("The username to use to connect to the Clickhouse server."),
+    ParameterSpec::component("user").description("The username to use to connect to the Clickhouse server."),
     // clickhouse_host
-    ParameterSpec::connector("host").description("The hostname of the Clickhouse server."),
+    ParameterSpec::component("host").description("The hostname of the Clickhouse server."),
     // clickhouse_tcp_port
-    ParameterSpec::connector("tcp_port").description("The port of the Clickhouse server."),
+    ParameterSpec::component("tcp_port").description("The port of the Clickhouse server."),
     // clickhouse_db
-    ParameterSpec::connector("db").description("The database to use on the Clickhouse server."),
+    ParameterSpec::component("db").description("The database to use on the Clickhouse server."),
     // clickhouse_secure
-    ParameterSpec::connector("secure").description("Whether to use a secure connection to the Clickhouse server."),
+    ParameterSpec::component("secure").description("Whether to use a secure connection to the Clickhouse server."),
     // connection_timeout
-    ParameterSpec::runtime("connection_timeout").description("The connection timeout in milliseconds."),
+    ParameterSpec::runtime("connection_timeout").description("The connection timeout in milliseconds.")
 ];
 
 impl DataConnectorFactory for ClickhouseFactory {

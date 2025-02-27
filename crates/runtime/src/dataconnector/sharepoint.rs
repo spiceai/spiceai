@@ -120,10 +120,10 @@ impl SharepointFactory {
 }
 
 const PARAMETERS: &[ParameterSpec] = &[
-    ParameterSpec::connector("client_id").secret().required(),
-    ParameterSpec::connector("bearer_token").secret(),
-    ParameterSpec::connector("tenant_id").secret().required(),
-    ParameterSpec::connector("client_secret").secret(),
+    ParameterSpec::component("client_id").secret().required(),
+    ParameterSpec::component("bearer_token").secret(),
+    ParameterSpec::component("tenant_id").secret().required(),
+    ParameterSpec::component("client_secret").secret(),
     ParameterSpec::runtime("file_format"),
 ];
 

@@ -105,7 +105,7 @@ impl DuckDBFactory {
     }
 }
 
-const PARAMETERS: &[ParameterSpec] = &[ParameterSpec::connector("open")];
+const PARAMETERS: &[ParameterSpec] = &[ParameterSpec::component("open")];
 
 impl DataConnectorFactory for DuckDBFactory {
     fn as_any(&self) -> &dyn Any {
