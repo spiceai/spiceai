@@ -17,14 +17,12 @@ limitations under the License.
 use clap::Parser;
 use opentelemetry::global;
 use rustls::crypto::{self, CryptoProvider};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::runtime::Runtime;
 
 #[global_allocator]
 static ALLOC: snmalloc_rs::SnMalloc = snmalloc_rs::SnMalloc;
 
-// Counter for tracking Ctrl+C presses
-static CTRL_C_COUNT: AtomicUsize = AtomicUsize::new(0);
 static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 fn main() {
@@ -53,56 +51,13 @@ fn main() {
         return;
     }
 
-    // Register a global Ctrl+C handler that forcibly exits after repeated presses
+    // Register a global Ctrl+C handler that initiates a shutdown
     ctrlc::set_handler(move || {
-        let count = CTRL_C_COUNT.fetch_add(1, Ordering::SeqCst) + 1;
-
-        // First press: request graceful shutdown
-        // use std::future::Future::block_on;
-        if count == 1 {
-            SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
-            spiced::in_tracing_context(|| {
-                tracing::info!("Received Ctrl+C, shutting down gracefully...");
-
-                tokio::spawn(async {
-                    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-                    tracing::info!("Shutdown complete, exiting now.");
-                    std::process::exit(0);
-                });
-            });
-        }
-        // Second press: warn user
-        else if count == 2 {
-            spiced::in_tracing_context(|| {
-                tracing::warn!(
-                    "Received Ctrl+C again, waiting for graceful shutdown to complete..."
-                );
-                tracing::warn!("Press Ctrl+C once more to force exit");
-            });
-        }
-        // Third press or more: force exit
-        else {
-            spiced::in_tracing_context(|| {
-                tracing::error!("Received Ctrl+C multiple times, forcing immediate exit");
-            });
-            std::process::exit(130); // Standard exit code for Ctrl+C termination
-        }
-    })
-    .expect("Error setting Ctrl+C handler");
-
-    match tokio_runtime.block_on(start_runtime(args)) {
-        Ok(_) => {
-            // Successful clean shutdown
-            spiced::in_tracing_context(|| {
-                tracing::info!("Runtime shut down successfully");
-            });
-        }
-        Err(err) => {
-            spiced::in_tracing_context(|| {
-                tracing::error!("{err}");
-            });
-        }
-    }
+        
+            tracing::debug!("Shutdown signal received, stopping runtime.");
+            std::process::exit(130);
+    
+    }).expect("Error setting Ctrl+C handler");
 
     global::shutdown_tracer_provider();
 }
