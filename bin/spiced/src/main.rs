@@ -49,12 +49,18 @@ fn main() {
     }
 
     // Register a global Ctrl+C handler that initiates a shutdown
-    ctrlc::set_handler(move || {
-        tracing::debug!("Shutdown signal received, stopping runtime.");
-        //
+    if let Err(err) = ctrlc::set_handler(move || {
+        spiced::in_tracing_context(|| {
+            tracing::debug!("Ctrl+C received, shutting down");
+        });
         std::process::exit(130);
-    })
-    .expect("Error setting Ctrl+C handler");
+    }) {
+        eprintln!("Error setting Ctrl+C handler: {err}");
+        spiced::in_tracing_context(|| {
+            tracing::error!("{err}");
+        });
+        std::process::exit(1);
+    }
 
     if let Err(err) = tokio_runtime.block_on(start_runtime(args)) {
         spiced::in_tracing_context(|| {
