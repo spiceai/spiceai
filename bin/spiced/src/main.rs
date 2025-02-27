@@ -23,8 +23,6 @@ use tokio::runtime::Runtime;
 #[global_allocator]
 static ALLOC: snmalloc_rs::SnMalloc = snmalloc_rs::SnMalloc;
 
-static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
-
 fn main() {
     let args = spiced::Args::parse();
 
