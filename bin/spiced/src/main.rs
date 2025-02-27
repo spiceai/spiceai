@@ -53,11 +53,10 @@ fn main() {
 
     // Register a global Ctrl+C handler that initiates a shutdown
     ctrlc::set_handler(move || {
-        
-            tracing::debug!("Shutdown signal received, stopping runtime.");
-            std::process::exit(130);
-    
-    }).expect("Error setting Ctrl+C handler");
+        tracing::debug!("Shutdown signal received, stopping runtime.");
+        std::process::exit(130);
+    })
+    .expect("Error setting Ctrl+C handler");
 
     global::shutdown_tracer_provider();
 }
