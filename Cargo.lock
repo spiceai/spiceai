@@ -3517,7 +3517,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=465faf02bb6a2e6c11237368efbd9da91348bdd0#465faf02bb6a2e6c11237368efbd9da91348bdd0"
+source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=5efd341539735a2f8fa89e1be4948f2e288852af#5efd341539735a2f8fa89e1be4948f2e288852af"
 dependencies = [
  "arrow",
  "arrow-json",
