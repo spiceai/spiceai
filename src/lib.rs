@@ -174,8 +174,18 @@ impl EventStreamStore {
     }
 }
 
-#[derive(Debug, Default)]
-pub struct EventStreamLayer {}
+#[derive(Debug)]
+pub struct EventStreamLayer {
+    // The field to include in the event message.
+    field: &'static str,
+}
+
+impl EventStreamLayer {
+    #[must_use]
+    pub fn new(field: &'static str) -> Self {
+        Self { field }
+    }
+}
 
 impl<S: Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>> Layer<S>
     for EventStreamLayer
@@ -196,9 +206,12 @@ impl<S: Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>> Layer
             let mut message = String::new();
             let mut visitor = EventMessageVisitor {
                 message: &mut message,
+                field_name: self.field,
             };
             event.record(&mut visitor);
-            let _ = EVENT_STREAM_STORE.send_event(span_id, message);
+            if !message.is_empty() {
+                let _ = EVENT_STREAM_STORE.send_event(span_id, message);
+            }
         }
     }
 
@@ -209,14 +222,20 @@ impl<S: Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>> Layer
 
 struct EventMessageVisitor<'a> {
     message: &'a mut String,
+    field_name: &'static str,
 }
 
 impl Visit for EventMessageVisitor<'_> {
-    fn record_debug(&mut self, _field: &tracing::field::Field, _value: &dyn std::fmt::Debug) {}
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        use std::fmt::Write;
+        if field.name() == self.field_name {
+            let _ = write!(self.message, "{value:?}");
+        }
+    }
 
     fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
         use std::fmt::Write;
-        if field.name() == "message" {
+        if field.name() == self.field_name {
             let _ = write!(self.message, "{value}");
         }
     }
