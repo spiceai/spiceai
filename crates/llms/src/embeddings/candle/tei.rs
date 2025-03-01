@@ -315,8 +315,8 @@ impl Drop for TeiEmbed {
             tracing::debug!("Cleaning up model directory: {}", dir_str);
 
             // Use a separate scope to handle cleanup to ensure proper error handling
-            let cleanup_result = std::panic::catch_unwind(|| {
-                match super::util::cleanup_model_dir(dir) {
+            let cleanup_result =
+                std::panic::catch_unwind(|| match super::util::cleanup_model_dir(dir) {
                     Ok(_) => {
                         tracing::debug!(
                             "CLEANUP CONFIRMATION: Model resources successfully cleaned up for: {}",
@@ -330,11 +330,13 @@ impl Drop for TeiEmbed {
                             e
                         );
                     }
-                }
-            });
+                });
 
             if cleanup_result.is_err() {
-                tracing::error!("Panic occurred during model directory cleanup for: {}", dir_str);
+                tracing::error!(
+                    "Panic occurred during model directory cleanup for: {}",
+                    dir_str
+                );
             }
         }
     }
