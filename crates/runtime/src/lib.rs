@@ -540,7 +540,7 @@ impl Runtime {
     ///
     /// The future returned by this function will not resolve until all components have been loaded and marked as ready.
     /// This includes waiting for the first refresh of any accelerated tables to complete.
-    pub async fn load_components(&self) -> bool {
+    pub async fn load_components(&self) {
         self.set_components_initializing().await;
 
         self.start_extensions().await;
@@ -622,9 +622,7 @@ impl Runtime {
 
         if let Err(err) = load_result {
             tracing::error!("Could not start the Spice runtime: {err}");
-            return false;
         }
-        true
     }
 
     // Closes and deallocates all resources (including the static registries)
