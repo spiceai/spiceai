@@ -15,8 +15,11 @@ limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
 
-use std::{net::SocketAddr, sync::atomic::{AtomicBool, Ordering}};
 use std::{collections::HashMap, sync::Arc};
+use std::{
+    net::SocketAddr,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 use crate::{
     auth::EndpointAuth, dataconnector::DataConnector, datafusion::DataFusion,

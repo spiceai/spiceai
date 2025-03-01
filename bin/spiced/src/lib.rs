@@ -37,11 +37,11 @@ use runtime::datafusion::DataFusion;
 use runtime::podswatcher::PodsWatcher;
 use runtime::spice_metrics;
 use runtime::{auth::EndpointAuth, extension::ExtensionFactory, Runtime};
-use tokio::sync::broadcast;
 use serde_yaml::Value;
 use snafu::prelude::*;
 use spice_cloud::SpiceExtensionFactory;
 use spiced_tracing::LogVerbosity;
+use tokio::sync::broadcast;
 #[cfg(feature = "tpc-extension")]
 use tpc_extension::TpcExtensionFactory;
 use tracing::subscriber;
@@ -264,7 +264,7 @@ pub async fn run(args: Args, shutdown_rx: broadcast::Receiver<()>) -> Result<()>
 
     let server_thread = tokio::spawn(async move {
         // Pass shutdown signal to servers
-        
+
         Box::pin(Arc::new(cloned_rt).start_servers(args.runtime, tls_config, endpoint_auth)).await
     });
 
@@ -289,27 +289,26 @@ pub async fn run(args: Args, shutdown_rx: broadcast::Receiver<()>) -> Result<()>
             }
         }
     };
-    
+
     components_task.await;
 
     // Use a timeout to ensure we don't wait forever for the server thread
-    let result = match tokio::time::timeout(tokio::time::Duration::from_secs(5), server_thread).await {
-        Ok(thread_result) => {
-            match thread_result {
+    let result =
+        match tokio::time::timeout(tokio::time::Duration::from_secs(5), server_thread).await {
+            Ok(thread_result) => match thread_result {
                 Ok(ok) => ok.context(UnableToStartServersSnafu),
                 Err(_) => Err(Error::GenericError {
                     reason: "Unable to start spiced".into(),
                 }),
+            },
+            Err(_) => {
+                // Timeout occurred, the server thread didn't complete in time
+                tracing::debug!("Server thread did not complete in time, proceeding with cleanup");
+                Err(Error::GenericError {
+                    reason: "Server shutdown timeout".into(),
+                })
             }
-        },
-        Err(_) => {
-            // Timeout occurred, the server thread didn't complete in time
-            tracing::debug!("Server thread did not complete in time, proceeding with cleanup");
-            Err(Error::GenericError {
-                reason: "Server shutdown timeout".into(),
-            })
-        }
-    };
+        };
 
     // Ensure cleanup happens even if there was an error
     tracing::debug!("Closing runtime and cleaning up resources");

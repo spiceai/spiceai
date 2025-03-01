@@ -17,16 +17,16 @@ limitations under the License.
 use std::{collections::HashMap, sync::Arc};
 
 use crate::{
-    get_params_with_secrets, metrics, model::ENABLE_MODEL_SUPPORT_MESSAGE, status, SHUTDOWN_IN_PROGRESS,
-    timing::TimeMeasurement, Runtime,
+    get_params_with_secrets, metrics, model::ENABLE_MODEL_SUPPORT_MESSAGE, status,
+    timing::TimeMeasurement, Runtime, SHUTDOWN_IN_PROGRESS,
 };
 use app::App;
+use futures::future;
 use model_components::model::Model;
 use opentelemetry::KeyValue;
 use snafu::prelude::*;
-use tokio::{task, time};
-use futures::future;
 use spicepod::component::model::{Model as SpicepodModel, ModelSource, ModelType};
+use tokio::{task, time};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -70,22 +70,30 @@ impl Runtime {
             for model in app.models.iter() {
                 models.push(model);
             }
-            
+
             for model in models {
                 // Check for cancellation signal between models
                 // Add a small yield point to be responsive to shutdown signals
                 task::yield_now().await;
-                
+
                 // Check global shutdown flag
                 if SHUTDOWN_IN_PROGRESS.load(std::sync::atomic::Ordering::SeqCst) {
                     tracing::debug!("Shutdown in progress, canceling further model loading");
                     break;
-
                 }
-                if tokio::time::timeout(tokio::time::Duration::from_millis(0), future::pending::<()>()).await.is_ok() { break; }
-                
-                self.status.update_model(&model.name, status::ComponentStatus::Initializing);
-                
+                if tokio::time::timeout(
+                    tokio::time::Duration::from_millis(0),
+                    future::pending::<()>(),
+                )
+                .await
+                .is_ok()
+                {
+                    break;
+                }
+
+                self.status
+                    .update_model(&model.name, status::ComponentStatus::Initializing);
+
                 // Create a separate task for each model load that can be canceled
                 // This is necessary because model downloading can be time-consuming
                 let model_task = task::spawn({
@@ -95,15 +103,16 @@ impl Runtime {
                         self_clone.load_model(&model_clone).await;
                     }
                 });
-                
+
                 // Wait for completion but be cancelable
                 if let Err(err) = model_task.await {
                     if err.is_cancelled() {
                         tracing::debug!("Model [{}] loading canceled due to shutdown", model.name);
-                        
+
                         // Mark model as disabled rather than error when canceled due to shutdown
-                        self.status.update_model(&model.name, status::ComponentStatus::Disabled);
-                        
+                        self.status
+                            .update_model(&model.name, status::ComponentStatus::Disabled);
+
                         // We received a cancellation, so stop loading further models
                         tracing::debug!("Canceling loading of remaining models due to shutdown");
                         break;

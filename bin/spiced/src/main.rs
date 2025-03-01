@@ -17,10 +17,15 @@ limitations under the License.
 use clap::Parser;
 use opentelemetry::global;
 use rustls::crypto::{self, CryptoProvider};
+use std::{
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 use tokio::runtime::Runtime;
 use tokio::sync::broadcast;
-use std::{sync::{Arc, atomic::{AtomicBool, Ordering}}, time::Duration};
-
 
 #[global_allocator]
 static ALLOC: snmalloc_rs::SnMalloc = snmalloc_rs::SnMalloc;
@@ -50,28 +55,28 @@ fn main() {
         };
         return;
     }
-    
+
     // Create a broadcast channel to signal shutdown across all threads
     let (shutdown_tx, _) = broadcast::channel::<()>(32); // Increase capacity to ensure all components can receive signals
-    // Keep a copy of sender for main thread
+                                                         // Keep a copy of sender for main thread
     let main_shutdown_tx = Arc::new(shutdown_tx.clone());
     // Flag to track if shutdown has already been initiated
     static SHUTDOWN_INITIATED: AtomicBool = AtomicBool::new(false);
-    
+
     // Register a global Ctrl+C handler that initiates a shutdown
     if let Err(err) = ctrlc::set_handler(move || {
         spiced::in_tracing_context(|| {
             tracing::debug!("Ctrl+C received, initiating graceful shutdown");
         });
         std::thread::sleep(Duration::from_millis(10)); // Small delay for log to appear
-        
+
         // Only initiate shutdown once
         if !SHUTDOWN_INITIATED.swap(true, Ordering::SeqCst) {
             // Perform graceful shutdown
-            
+
             // Set global shutdown flag in runtime crate
             runtime::set_shutdown_in_progress(true);
-            
+
             // Send the shutdown signal to all tasks that are subscribed
             // This allows in-progress downloads to be canceled cleanly
             let tx = Arc::clone(&main_shutdown_tx);
@@ -92,22 +97,26 @@ fn main() {
             let cleanup_resources = || {
                 spiced::in_tracing_context(|| {
                     tracing::debug!("Running global cleanup operations for model downloads");
-                }); 
+                });
                 // Force a GC cycle to help with cleanup
                 std::mem::drop(std::boxed::Box::new(0));
                 eprintln!("CLEANUP: Global cleanup operations complete");
             };
-            
+
             // Let the shutdown process complete naturally
             // If Ctrl+C is pressed repeatedly, force exit after 10 seconds (more time for model cleanup)
             std::thread::spawn(move || {
                 std::thread::sleep(std::time::Duration::from_secs(10));
                 // Run final cleanup before forced exit
                 cleanup_resources();
-                
-                eprintln!("CLEANUP STATUS: Forcing exit after timeout - model download cleanup complete");
+
+                eprintln!(
+                    "CLEANUP STATUS: Forcing exit after timeout - model download cleanup complete"
+                );
                 spiced::in_tracing_context(|| {
-                    tracing::debug!("CLEANUP COMPLETE: Forced shutdown after timeout - cleanup finished");
+                    tracing::debug!(
+                        "CLEANUP COMPLETE: Forced shutdown after timeout - cleanup finished"
+                    );
                 });
                 // Exit with code 130 (standard for Ctrl+C termination)
                 std::process::exit(130);
@@ -123,7 +132,7 @@ fn main() {
 
     // Create a shutdown receiver for the runtime to use
     let shutdown_rx = shutdown_tx.subscribe();
-    
+
     // Pass the shutdown receiver to the start_runtime function
     if let Err(err) = tokio_runtime.block_on(start_runtime(args, shutdown_rx)) {
         spiced::in_tracing_context(|| {
@@ -134,7 +143,10 @@ fn main() {
     global::shutdown_tracer_provider();
 }
 
-async fn start_runtime(args: spiced::Args, shutdown_rx: broadcast::Receiver<()>) -> Result<(), Box<dyn std::error::Error>> {
+async fn start_runtime(
+    args: spiced::Args,
+    shutdown_rx: broadcast::Receiver<()>,
+) -> Result<(), Box<dyn std::error::Error>> {
     spiced::in_tracing_context(|| {
         tracing::debug!("Starting runtime {version}", version = get_version_string());
     });

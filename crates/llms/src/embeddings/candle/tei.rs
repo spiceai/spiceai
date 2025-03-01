@@ -53,8 +53,8 @@ use super::util::{
 
 pub struct TeiEmbed {
     pub infer: Infer,
-    pub model_size: i32,     // Used for `size` method.
-    pub tok: Arc<Tokenizer>, // Used for `chunker` method.
+    pub model_size: i32,            // Used for `size` method.
+    pub tok: Arc<Tokenizer>,        // Used for `chunker` method.
     pub model_dir: Option<PathBuf>, // Path to the model directory for cleanup
 }
 
@@ -313,17 +313,27 @@ impl Drop for TeiEmbed {
         if let Some(dir) = &self.model_dir {
             let dir_str = dir.to_string_lossy().to_string();
             tracing::debug!("Cleaning up model directory: {}", dir_str);
-            
+
             match super::util::cleanup_model_dir(&dir) {
                 Ok(_) => {
-                    tracing::debug!("CLEANUP CONFIRMATION: Model resources successfully cleaned up for: {}", dir_str);
+                    tracing::debug!(
+                        "CLEANUP CONFIRMATION: Model resources successfully cleaned up for: {}",
+                        dir_str
+                    );
                     // Print this to stderr as well to ensure it's always visible during shutdown
                     eprintln!("SUCCESS: Model resources cleaned up for: {}", dir_str);
                 }
                 Err(e) => {
                     // Print direct output to ensure it's visible
-                    eprintln!("CLEANUP FAILED: Unable to clean up model directory {}: {}", dir_str, e);
-                    tracing::debug!("CLEANUP FAILED: Unable to clean up model directory {}: {}", dir_str, e);
+                    eprintln!(
+                        "CLEANUP FAILED: Unable to clean up model directory {}: {}",
+                        dir_str, e
+                    );
+                    tracing::debug!(
+                        "CLEANUP FAILED: Unable to clean up model directory {}: {}",
+                        dir_str,
+                        e
+                    );
                 }
             }
         }
