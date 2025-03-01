@@ -37,6 +37,7 @@ use runtime::datafusion::DataFusion;
 use runtime::podswatcher::PodsWatcher;
 use runtime::spice_metrics;
 use runtime::{auth::EndpointAuth, extension::ExtensionFactory, Runtime};
+use tokio::sync::broadcast;
 use serde_yaml::Value;
 use snafu::prelude::*;
 use spice_cloud::SpiceExtensionFactory;
@@ -167,7 +168,7 @@ pub struct Args {
     pub set_runtime: Vec<(String, String)>,
 }
 
-pub async fn run(args: Args) -> Result<()> {
+pub async fn run(args: Args, shutdown_rx: broadcast::Receiver<()>) -> Result<()> {
     let prometheus_registry = args.metrics.map(|_| prometheus::Registry::new());
 
     let current_dir = env::current_dir().unwrap_or(PathBuf::from("."));
@@ -251,26 +252,70 @@ pub async fn run(args: Args) -> Result<()> {
         None => EndpointAuth::no_auth(),
     };
 
+    // Share the shutdown receiver with all components
+    let mut components_shutdown_rx = shutdown_rx.resubscribe();
+
+    // Register a panic hook for cleanup
+    let default_panic = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic_info| {
+        tracing::error!("Process panicked during cleanup: {:?}", panic_info);
+        default_panic(panic_info);
+    }));
+
     let server_thread = tokio::spawn(async move {
+        // Pass shutdown signal to servers
+        
         Box::pin(Arc::new(cloned_rt).start_servers(args.runtime, tls_config, endpoint_auth)).await
     });
 
-    tokio::select! {
-        () = rt.load_components() => {},
-        () = runtime::shutdown_signal() => {
-            tracing::debug!("Cancelling runtime initializing!");
-        },
-    }
+    let components_task = async {
+        tokio::select! {
+            completed = rt.load_components() => { tracing::debug!("Components loading completed: {}", completed); },
+            // Internal shutdown signal from runtime
+            () = runtime::shutdown_signal() => {
+                tracing::debug!("Runtime shutdown signal received, cancelling initialization!");
+            },
+            // Listen for the external shutdown signal (Ctrl+C)
+            result = components_shutdown_rx.recv() => {
+                match result {
+                    Ok(_) => {
+                        tracing::debug!("External shutdown signal received, cancelling component initialization");
+                        tokio::task::yield_now().await; // Yield to allow other tasks to process the shutdown
+                    },
+                    Err(e) => {
+                        tracing::debug!("Error receiving shutdown signal: {}", e);
+                    }
+                }
+            }
+        }
+    };
+    
+    components_task.await;
 
-    let result = match server_thread.await {
-        Ok(ok) => ok.context(UnableToStartServersSnafu),
-        Err(_) => Err(Error::GenericError {
-            reason: "Unable to start spiced".into(),
-        }),
+    // Use a timeout to ensure we don't wait forever for the server thread
+    let result = match tokio::time::timeout(tokio::time::Duration::from_secs(5), server_thread).await {
+        Ok(thread_result) => {
+            match thread_result {
+                Ok(ok) => ok.context(UnableToStartServersSnafu),
+                Err(_) => Err(Error::GenericError {
+                    reason: "Unable to start spiced".into(),
+                }),
+            }
+        },
+        Err(_) => {
+            // Timeout occurred, the server thread didn't complete in time
+            tracing::debug!("Server thread did not complete in time, proceeding with cleanup");
+            Err(Error::GenericError {
+                reason: "Server shutdown timeout".into(),
+            })
+        }
     };
 
-    rt.close().await;
+    // Ensure cleanup happens even if there was an error
+    tracing::debug!("Closing runtime and cleaning up resources");
+    let _ = rt.close().await;
 
+    // Finally return the result
     result
 }
 

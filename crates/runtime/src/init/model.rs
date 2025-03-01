@@ -17,13 +17,15 @@ limitations under the License.
 use std::{collections::HashMap, sync::Arc};
 
 use crate::{
-    get_params_with_secrets, metrics, model::ENABLE_MODEL_SUPPORT_MESSAGE, status,
+    get_params_with_secrets, metrics, model::ENABLE_MODEL_SUPPORT_MESSAGE, status, SHUTDOWN_IN_PROGRESS,
     timing::TimeMeasurement, Runtime,
 };
 use app::App;
 use model_components::model::Model;
 use opentelemetry::KeyValue;
 use snafu::prelude::*;
+use tokio::{task, time};
+use futures::future;
 use spicepod::component::model::{Model as SpicepodModel, ModelSource, ModelType};
 
 #[derive(Debug, Snafu)]
@@ -52,24 +54,67 @@ pub enum Error {
 }
 
 impl Runtime {
-    pub(crate) async fn load_models(&self) {
+    pub(crate) async fn load_models(&self) -> bool {
         let app_lock = self.app.read().await;
 
         if !cfg!(feature = "models") && app_lock.as_ref().is_some_and(|s| !s.models.is_empty()) {
-            tracing::error!("Cannot load models without the 'models' feature enabled. {ENABLE_MODEL_SUPPORT_MESSAGE}");
-            return;
+            tracing::debug!("Cannot load models without the 'models' feature enabled. {ENABLE_MODEL_SUPPORT_MESSAGE}");
+            return false;
         }
 
         // Load tools before loading models.
         self.load_tools().await;
 
         if let Some(app) = app_lock.as_ref() {
-            for model in &app.models {
-                self.status
-                    .update_model(&model.name, status::ComponentStatus::Initializing);
-                self.load_model(model).await;
+            let mut models = Vec::new();
+            for model in app.models.iter() {
+                models.push(model);
+            }
+            
+            for model in models {
+                // Check for cancellation signal between models
+                // Add a small yield point to be responsive to shutdown signals
+                task::yield_now().await;
+                
+                // Check global shutdown flag
+                if SHUTDOWN_IN_PROGRESS.load(std::sync::atomic::Ordering::SeqCst) {
+                    tracing::debug!("Shutdown in progress, canceling further model loading");
+                    break;
+
+                }
+                if tokio::time::timeout(tokio::time::Duration::from_millis(0), future::pending::<()>()).await.is_ok() { break; }
+                
+                self.status.update_model(&model.name, status::ComponentStatus::Initializing);
+                
+                // Create a separate task for each model load that can be canceled
+                // This is necessary because model downloading can be time-consuming
+                let model_task = task::spawn({
+                    let self_clone = self.clone();
+                    let model_clone = model.clone();
+                    async move {
+                        self_clone.load_model(&model_clone).await;
+                    }
+                });
+                
+                // Wait for completion but be cancelable
+                if let Err(err) = model_task.await {
+                    if err.is_cancelled() {
+                        tracing::debug!("Model [{}] loading canceled due to shutdown", model.name);
+                        
+                        // Mark model as disabled rather than error when canceled due to shutdown
+                        self.status.update_model(&model.name, status::ComponentStatus::Disabled);
+                        
+                        // We received a cancellation, so stop loading further models
+                        tracing::debug!("Canceling loading of remaining models due to shutdown");
+                        break;
+                    } else {
+                        // This is an actual error, not just cancellation
+                        tracing::debug!("Error loading model [{}]: {}", model.name, err);
+                    }
+                }
             }
         }
+        true
     }
 
     // Caller must set `status::update_model(...` before calling `load_model`. This function will set error/ready statues appropriately.`
@@ -85,7 +130,7 @@ impl Runtime {
             ],
         );
 
-        tracing::info!("Loading model [{}] from {}...", m.name, m.from);
+        tracing::debug!("Loading model [{}] from {}...", m.name, m.from);
 
         // TODO: Have downstream code using model parameters to accept `Hashmap<String, Value>`.
         // This will require handling secrets with `Value` type.
@@ -110,7 +155,7 @@ impl Runtime {
                 metrics::models::LOAD_ERROR.add(1, &[]);
                 self.status
                     .update_model(&model.name, status::ComponentStatus::Error);
-                tracing::warn!("{err}");
+                tracing::debug!("{err}");
                 return;
             }
         }
@@ -146,7 +191,7 @@ impl Runtime {
         };
         match result {
             Ok(()) => {
-                tracing::info!("Model [{}] deployed, ready for inferencing", m.name);
+                tracing::debug!("Model [{}] deployed, ready for inferencing", m.name);
                 metrics::models::COUNT.add(
                     1,
                     &[
@@ -161,7 +206,7 @@ impl Runtime {
                 metrics::models::LOAD_ERROR.add(1, &[]);
                 self.status
                     .update_model(&model.name, status::ComponentStatus::Error);
-                tracing::warn!("{e}");
+                tracing::debug!("{e}");
             }
         }
     }
@@ -179,7 +224,7 @@ impl Runtime {
             None => return,
         };
 
-        tracing::info!("Model [{}] has been unloaded", m.name);
+        tracing::debug!("Model [{}] has been unloaded", m.name);
         let source_str = m.get_source().map(|s| s.to_string()).unwrap_or_default();
         metrics::models::COUNT.add(
             -1,

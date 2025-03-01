@@ -15,7 +15,7 @@ limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
 
-use std::net::SocketAddr;
+use std::{net::SocketAddr, sync::atomic::{AtomicBool, Ordering}};
 use std::{collections::HashMap, sync::Arc};
 
 use crate::{
@@ -46,6 +46,19 @@ use tls::TlsConfig;
 use tokio::sync::{oneshot::error::RecvError, RwLock};
 use tools::factory::default_available_catalogs;
 use tools::{catalog::SpiceToolCatalog, Tooling};
+
+// Global shutdown flag that can be set from other crates
+pub static SHUTDOWN_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+
+/// Sets the global shutdown flag to indicate shutdown is in progress.
+/// This allows components across the application to check if they should stop processing.
+pub fn set_shutdown_in_progress(value: bool) {
+    SHUTDOWN_IN_PROGRESS.store(value, Ordering::SeqCst);
+    if value {
+        tracing::debug!("Global shutdown flag set");
+    }
+}
+
 pub use util::shutdown_signal;
 
 use crate::extension::Extension;
@@ -524,7 +537,7 @@ impl Runtime {
     ///
     /// The future returned by this function will not resolve until all components have been loaded and marked as ready.
     /// This includes waiting for the first refresh of any accelerated tables to complete.
-    pub async fn load_components(&self) {
+    pub async fn load_components(&self) -> bool {
         self.set_components_initializing().await;
 
         self.start_extensions().await;
@@ -606,7 +619,9 @@ impl Runtime {
 
         if let Err(err) = load_result {
             tracing::error!("Could not start the Spice runtime: {err}");
+            return false;
         }
+        true
     }
 
     // Closes and deallocates all resources (including the static registries)
