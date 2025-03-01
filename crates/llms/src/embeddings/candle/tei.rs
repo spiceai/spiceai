@@ -314,27 +314,27 @@ impl Drop for TeiEmbed {
             let dir_str = dir.to_string_lossy().to_string();
             tracing::debug!("Cleaning up model directory: {}", dir_str);
 
-            match super::util::cleanup_model_dir(dir) {
-                Ok(_) => {
-                    tracing::debug!(
-                        "CLEANUP CONFIRMATION: Model resources successfully cleaned up for: {}",
-                        dir_str
-                    );
-                    // Print this to stderr as well to ensure it's always visible during shutdown
-                    eprintln!("SUCCESS: Model resources cleaned up for: {}", dir_str);
+            // Use a separate scope to handle cleanup to ensure proper error handling
+            let cleanup_result = std::panic::catch_unwind(|| {
+                match super::util::cleanup_model_dir(dir) {
+                    Ok(_) => {
+                        tracing::debug!(
+                            "CLEANUP CONFIRMATION: Model resources successfully cleaned up for: {}",
+                            dir_str
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "CLEANUP FAILED: Unable to clean up model directory {}: {}",
+                            dir_str,
+                            e
+                        );
+                    }
                 }
-                Err(e) => {
-                    // Print direct output to ensure it's visible
-                    eprintln!(
-                        "CLEANUP FAILED: Unable to clean up model directory {}: {}",
-                        dir_str, e
-                    );
-                    tracing::debug!(
-                        "CLEANUP FAILED: Unable to clean up model directory {}: {}",
-                        dir_str,
-                        e
-                    );
-                }
+            });
+
+            if cleanup_result.is_err() {
+                tracing::error!("Panic occurred during model directory cleanup for: {}", dir_str);
             }
         }
     }
