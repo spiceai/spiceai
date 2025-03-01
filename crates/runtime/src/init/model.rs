@@ -26,7 +26,7 @@ use model_components::model::Model;
 use opentelemetry::KeyValue;
 use snafu::prelude::*;
 use spicepod::component::model::{Model as SpicepodModel, ModelSource, ModelType};
-use tokio::{task, time};
+use tokio::task;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
