@@ -266,17 +266,15 @@ pub fn cleanup_model_dir(dir_path: &Path) -> io::Result<()> {
             let mut file_list = Vec::new();
 
             if let Ok(entries) = fs::read_dir(dir_path) {
-                for entry_result in entries {
-                    if let Ok(entry) = entry_result {
-                        let path = entry.path();
-                        if path.is_file() {
-                            let file_str = path.to_string_lossy().to_string();
-                            file_list.push(file_str.clone());
-                            if let Err(e) = fs::remove_file(&path) {
-                                tracing::debug!("Failed to remove model file {}: {}", file_str, e);
-                            } else {
-                                cleaned_files += 1;
-                            }
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_file() {
+                        let file_str = path.to_string_lossy().to_string();
+                        file_list.push(file_str.clone());
+                        if let Err(e) = fs::remove_file(&path) {
+                            tracing::debug!("Failed to remove model file {}: {}", file_str, e);
+                        } else {
+                            cleaned_files += 1;
                         }
                     }
                 }

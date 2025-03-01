@@ -314,7 +314,7 @@ impl Drop for TeiEmbed {
             let dir_str = dir.to_string_lossy().to_string();
             tracing::debug!("Cleaning up model directory: {}", dir_str);
 
-            match super::util::cleanup_model_dir(&dir) {
+            match super::util::cleanup_model_dir(dir) {
                 Ok(_) => {
                     tracing::debug!(
                         "CLEANUP CONFIRMATION: Model resources successfully cleaned up for: {}",

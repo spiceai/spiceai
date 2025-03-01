@@ -270,7 +270,7 @@ pub async fn run(args: Args, shutdown_rx: broadcast::Receiver<()>) -> Result<()>
 
     let components_task = async {
         tokio::select! {
-            completed = rt.load_components() => { tracing::debug!("Components loading completed: {}", completed); },
+            completed = rt.load_components() => { tracing::debug!("Components loading completed: {:?}", completed); },
             // Internal shutdown signal from runtime
             () = runtime::shutdown_signal() => {
                 tracing::debug!("Runtime shutdown signal received, cancelling initialization!");
