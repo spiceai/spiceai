@@ -350,7 +350,7 @@ async fn launch_server_components(
     shutdown_rx: broadcast::Receiver<()>,
     tls_config: Option<Arc<runtime::tls::TlsConfig>>,
 ) -> Result<()> {
-    let cloned_rt = rt.clone();
+    let cloned_rt = Arc::clone(rt);
 
     // Set up endpoint auth
     let endpoint_auth = match app {
@@ -373,12 +373,8 @@ async fn launch_server_components(
 
     // Start servers in a background task
     let server_thread = tokio::spawn(async move {
-        Box::pin(
-            cloned_rt
-                .clone()
-                .start_servers(runtime_config, tls_config, endpoint_auth),
-        )
-        .await
+        Box::pin(Arc::clone(&cloned_rt).start_servers(runtime_config, tls_config, endpoint_auth))
+            .await
     });
 
     // Wait for component loading or shutdown signal
