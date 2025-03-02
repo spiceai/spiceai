@@ -231,23 +231,21 @@ pub async fn run(args: Args, shutdown_rx: broadcast::Receiver<()>) -> Result<()>
 type AppSetupResult = (Option<Arc<App>>, Vec<Box<dyn ExtensionFactory>>, AppConfigs);
 
 /// Initialize app from filesystem and setup extension factories
-fn setup_app_and_extensions(
-    args: &Args,
-    current_dir: &Path,
-) -> Result<AppSetupResult> {
+fn setup_app_and_extensions(args: &Args, current_dir: &Path) -> Result<AppSetupResult> {
     // Build app from filesystem
-    let app: Option<Arc<App>> = match AppBuilder::build_from_filesystem_path(current_dir.to_path_buf()) {
-        Ok(mut app) => {
-            app.runtime = apply_overrides(app.runtime, &args.set_runtime)?;
-            Some(Arc::new(app))
-        }
-        Err(e) => {
-            in_tracing_context(|| {
-                tracing::warn!("{e}");
-            });
-            None
-        }
-    };
+    let app: Option<Arc<App>> =
+        match AppBuilder::build_from_filesystem_path(current_dir.to_path_buf()) {
+            Ok(mut app) => {
+                app.runtime = apply_overrides(app.runtime, &args.set_runtime)?;
+                Some(Arc::new(app))
+            }
+            Err(e) => {
+                in_tracing_context(|| {
+                    tracing::warn!("{e}");
+                });
+                None
+            }
+        };
 
     // Set up extension factories
     let mut extension_factories: Vec<Box<dyn ExtensionFactory>> = vec![];
@@ -375,7 +373,12 @@ async fn launch_server_components(
 
     // Start servers in a background task
     let server_thread = tokio::spawn(async move {
-        Box::pin(cloned_rt.clone().start_servers(runtime_config, tls_config, endpoint_auth)).await
+        Box::pin(
+            cloned_rt
+                .clone()
+                .start_servers(runtime_config, tls_config, endpoint_auth),
+        )
+        .await
     });
 
     // Wait for component loading or shutdown signal

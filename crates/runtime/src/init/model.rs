@@ -117,7 +117,7 @@ impl Runtime {
                         tracing::debug!("Canceling loading of remaining models due to shutdown");
                         break;
                     }
-                    
+
                     // This is an actual error, not just cancellation
                     tracing::debug!("Error loading model [{}]: {}", model.name, err);
                 }
