@@ -77,6 +77,11 @@ pub enum Error {
 
     #[snafu(display("The specified model, '{from}', does not support executing the task '{task}'.\nSelect a different model or task, and try again."))]
     UnsupportedTaskForModel { from: String, task: String },
+
+    #[snafu(display("Failed to clean up model resources.\nAn error occurred: {source}\nThis is not critical but may leave temporary files."))]
+    CleanupFailed {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

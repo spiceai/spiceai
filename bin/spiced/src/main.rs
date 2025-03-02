@@ -30,6 +30,9 @@ use tokio::sync::broadcast;
 #[global_allocator]
 static ALLOC: snmalloc_rs::SnMalloc = snmalloc_rs::SnMalloc;
 
+// Flag to track if shutdown has already been initiated
+static SHUTDOWN_INITIATED: AtomicBool = AtomicBool::new(false);
+
 fn main() {
     let args = spiced::Args::parse();
 
@@ -60,8 +63,6 @@ fn main() {
     let (shutdown_tx, _) = broadcast::channel::<()>(32); // Increase capacity to ensure all components can receive signals
                                                          // Keep a copy of sender for main thread
     let main_shutdown_tx = Arc::new(shutdown_tx.clone());
-    // Flag to track if shutdown has already been initiated
-    static SHUTDOWN_INITIATED: AtomicBool = AtomicBool::new(false);
 
     // Register a global Ctrl+C handler that initiates a shutdown
     if let Err(err) = ctrlc::set_handler(move || {

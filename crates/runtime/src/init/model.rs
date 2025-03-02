@@ -67,7 +67,7 @@ impl Runtime {
 
         if let Some(app) = app_lock.as_ref() {
             let mut models = Vec::new();
-            for model in app.models.iter() {
+            for model in &app.models {
                 models.push(model);
             }
 
@@ -116,10 +116,10 @@ impl Runtime {
                         // We received a cancellation, so stop loading further models
                         tracing::debug!("Canceling loading of remaining models due to shutdown");
                         break;
-                    } else {
-                        // This is an actual error, not just cancellation
-                        tracing::debug!("Error loading model [{}]: {}", model.name, err);
                     }
+                    
+                    // This is an actual error, not just cancellation
+                    tracing::debug!("Error loading model [{}]: {}", model.name, err);
                 }
             }
         }

@@ -317,7 +317,7 @@ impl Drop for TeiEmbed {
             // Use a separate scope to handle cleanup to ensure proper error handling
             let cleanup_result =
                 std::panic::catch_unwind(|| match super::util::cleanup_model_dir(dir) {
-                    Ok(_) => {
+                    Ok(()) => {
                         tracing::debug!(
                             "CLEANUP CONFIRMATION: Model resources successfully cleaned up for: {}",
                             dir_str

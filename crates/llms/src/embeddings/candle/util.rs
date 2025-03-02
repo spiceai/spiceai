@@ -27,7 +27,7 @@ use serde::Deserialize;
 use snafu::ResultExt;
 use std::{
     collections::HashMap,
-    fs, io,
+    fs,
     path::{self, Path, PathBuf},
 };
 use tei_backend::Pool;
@@ -240,87 +240,28 @@ pub fn link_files_into_tmp_dir(files: HashMap<String, PathBuf>) -> Result<PathBu
 
 /// Clean up a model directory by removing all files and the directory itself.
 /// This is used during graceful shutdown to ensure no temporary files are left behind.
-pub fn cleanup_model_dir(dir_path: &Path) -> io::Result<()> {
-    // We need to use tracing in a way that works across crates
-    let path_str = dir_path.to_string_lossy().to_string();
-    tracing::debug!("Starting model cleanup for: {}", path_str);
+pub fn cleanup_model_dir(dir: &Path) -> Result<()> {
+    tracing::debug!("Cleaning up model directory: {}", dir.display());
 
-    // Use a more robust process to ensure cleanup happens even during forced shutdown
-    let result = std::panic::catch_unwind(|| {
-        if !dir_path.exists() {
-            // Directory doesn't exist, nothing to do
-            let path_str = dir_path.to_string_lossy().to_string();
-            tracing::debug!(
-                "Model directory doesn't exist, no cleanup needed: {}",
-                path_str
-            );
-            return Ok(());
+    // Use catch_unwind to avoid panic during cleanup
+    let cleanup_result = std::panic::catch_unwind(|| {
+        match std::fs::remove_dir_all(dir) {
+            Ok(()) => tracing::debug!("Successfully removed model directory: {}", dir.display()),
+            Err(e) => {
+                tracing::warn!("Failed to remove model directory: {}: {}", dir.display(), e);
+                return Err(e);
+            }
         }
-
-        if dir_path.is_dir() {
-            let path_str = dir_path.to_string_lossy().to_string();
-            tracing::debug!("Starting cleanup of model directory: {}", path_str);
-
-            // First attempt to remove each file individually (for better error reporting and counting)
-            let mut cleaned_files = 0;
-            let mut file_list = Vec::new();
-
-            if let Ok(entries) = fs::read_dir(dir_path) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path.is_file() {
-                        let file_str = path.to_string_lossy().to_string();
-                        file_list.push(file_str.clone());
-                        if let Err(e) = fs::remove_file(&path) {
-                            tracing::debug!("Failed to remove model file {}: {}", file_str, e);
-                        } else {
-                            cleaned_files += 1;
-                        }
-                    }
-                }
-            }
-
-            if !file_list.is_empty() {
-                tracing::debug!("Cleaned up {} model files", cleaned_files);
-                // Only log details at trace level to avoid too much output
-                tracing::trace!("Removed files: {:?}", file_list);
-            }
-
-            // Then remove the directory itself (which should also clean up any remaining files)
-            let path_str = dir_path.to_string_lossy().to_string();
-            match fs::remove_dir_all(dir_path) {
-                Ok(_) => tracing::debug!(
-                    "SUCCESS: Successfully removed model directory: {}",
-                    path_str
-                ),
-                Err(e) => tracing::debug!("Failed to remove model directory {}: {}", path_str, e),
-            }
-            Ok(())
-        } else {
-            let path_str = dir_path.to_string_lossy().to_string();
-            tracing::debug!("Not a model directory: {}", path_str);
-            Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Not a directory",
-            ))
-        }
+        Ok(())
     });
 
-    // Handle any panics during cleanup
-    let path_str = dir_path.to_string_lossy().to_string();
-    match result {
-        Ok(io_result) => io_result,
-        Err(e) => {
-            tracing::debug!(
-                "Panic during model directory cleanup of {}: {:?}",
-                path_str,
-                e
-            );
-            Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!("Panic during cleanup: {:?}", e),
-            ))
-        }
+    match cleanup_result {
+        Ok(result) => result.map_err(|e| Error::CleanupFailed {
+            source: Box::new(e),
+        }),
+        Err(e) => Err(Error::CleanupFailed {
+            source: format!("Panic during cleanup: {e:?}").into(),
+        }),
     }
 }
 
