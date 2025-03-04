@@ -60,13 +60,13 @@ impl Default for PostgresAccelerator {
 }
 
 const PARAMETERS: &[ParameterSpec] = &[
-    ParameterSpec::accelerator("host"),
-    ParameterSpec::accelerator("port"),
-    ParameterSpec::accelerator("db"),
-    ParameterSpec::accelerator("user").secret(),
-    ParameterSpec::accelerator("pass").secret(),
-    ParameterSpec::accelerator("sslmode"),
-    ParameterSpec::accelerator("sslrootcert"),
+    ParameterSpec::component("host"),
+    ParameterSpec::component("port"),
+    ParameterSpec::component("db"),
+    ParameterSpec::component("user").secret(),
+    ParameterSpec::component("pass").secret(),
+    ParameterSpec::component("sslmode"),
+    ParameterSpec::component("sslrootcert"),
     ParameterSpec::runtime("file_watcher"),
     ParameterSpec::runtime("connection_pool_size")
         .description("The maximum number of connections created in the connection pool")

@@ -21,17 +21,24 @@ use async_openai::{
     types::{
         ChatCompletionRequestMessage, ChatCompletionRequestSystemMessageArgs,
         ChatCompletionResponseStream, ChatCompletionStreamOptions, CreateChatCompletionRequest,
-        CreateChatCompletionResponse,
+        CreateChatCompletionResponse, CreateChatCompletionStreamResponse,
     },
 };
 use async_trait::async_trait;
 use futures::Stream;
-use futures::{stream::StreamExt, TryStreamExt};
-use llms::chat::{nsql::SqlGeneration, Chat, Result as ChatResult};
+use futures::TryStreamExt;
+use llms::{
+    accumulate::{empty_completion_response, fold_completion_stream},
+    chat::{nsql::SqlGeneration, Chat, Result as ChatResult},
+};
+use opentelemetry::KeyValue;
 use tokio::time::Instant;
 use tracing_futures::Instrument;
 
 use crate::model::metrics::handle_metrics;
+
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 
 use super::metrics::request_labels;
 
@@ -203,18 +210,18 @@ impl Chat for ChatWrapper {
         match self.chat.chat_stream(req).instrument(span.clone()).await {
             Ok(resp) => {
                 let public_name = self.public_name.clone();
-                let stream_span = span.clone();
-                let logged_stream = resp.map_ok(move |mut r| {r.model.clone_from(&public_name); r}).inspect(move |item| {
-                    if let Ok(item) = item {
+                let logged_stream = resp.map_ok(move |mut r| {
+                    r.model.clone_from(&public_name);
+                    r
+                });
 
-                        // not incremental; provider only emits usage on last chunk.
-                        if let Some(usage) = item.usage.clone() {
-                            tracing::info!(target: "task_history", parent: &stream_span.clone(), completion_tokens = %usage.completion_tokens, total_tokens = %usage.total_tokens, prompt_tokens = %usage.prompt_tokens, "labels");
-                            handle_metrics(start.elapsed(), false, &labels);
-                        }
-                    }
-                }).instrument(span.clone());
-                Ok(Box::pin(logged_stream))
+                // Wrap the stream with our custom aggregator that logs when dropped.
+                Ok(Box::pin(TracedChatCompletionStream::new(
+                    logged_stream,
+                    span.clone(),
+                    self.public_name.clone(),
+                    labels,
+                )))
             }
             Err(e) => {
                 tracing::error!(target: "task_history", parent: &span, "Failed to run chat model: {}", e);
@@ -280,5 +287,90 @@ impl Chat for ChatWrapper {
 
     fn as_sql(&self) -> Option<&dyn SqlGeneration> {
         self.chat.as_sql()
+    }
+}
+
+/// [`TracedChatCompletionStream`] wraps a [`ChatCompletionResponseStream`]-like stream and provides metrics and `task_history` tracing. Importantly, when aggregrating the output, it does not need to block until the full stream is consumed.
+struct TracedChatCompletionStream<S> {
+    inner: S,
+    accumulated_response: Arc<Mutex<CreateChatCompletionResponse>>,
+    span: tracing::Span,
+    model_public_name: String,
+    started: Instant,
+    labels: Vec<KeyValue>,
+}
+
+impl<S> TracedChatCompletionStream<S>
+where
+    S: Stream<Item = Result<CreateChatCompletionStreamResponse, OpenAIError>> + Unpin,
+{
+    pub fn new(
+        inner: S,
+        span: tracing::Span,
+        model_public_name: String,
+        labels: Vec<KeyValue>,
+    ) -> Self {
+        Self {
+            inner,
+            accumulated_response: Arc::new(Mutex::new(empty_completion_response())),
+            span,
+            model_public_name,
+            started: Instant::now(),
+            labels,
+        }
+    }
+}
+
+impl<S> Stream for TracedChatCompletionStream<S>
+where
+    S: Stream<Item = Result<CreateChatCompletionStreamResponse, OpenAIError>> + Unpin,
+{
+    type Item = Result<CreateChatCompletionStreamResponse, OpenAIError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        match Pin::new(&mut self.inner).poll_next(cx) {
+            Poll::Ready(Some(Ok(item))) => {
+                // Aggregate the response.
+                if let Ok(mut acc) = self.accumulated_response.lock() {
+                    fold_completion_stream(&mut acc, &item);
+                }
+
+                // Log usage info if available.
+                if let Some(usage) = item.usage.clone() {
+                    tracing::info!(
+                        target: "task_history",
+                        completion_tokens = %usage.completion_tokens,
+                        total_tokens = %usage.total_tokens,
+                        prompt_tokens = %usage.prompt_tokens,
+                        "Usage info"
+                    );
+
+                    // Usage should be on last message, so we can add latency metrics here.
+                    handle_metrics(self.started.elapsed(), false, &self.labels);
+                }
+                Poll::Ready(Some(Ok(item)))
+            }
+            Poll::Ready(Some(Err(e))) => {
+                handle_metrics(self.started.elapsed(), true, &self.labels);
+                Poll::Ready(Some(Err(e)))
+            }
+            other => other,
+        }
+    }
+}
+
+impl<S> Drop for TracedChatCompletionStream<S> {
+    fn drop(&mut self) {
+        if let Ok(output) = self.accumulated_response.lock() {
+            let _guard = self.span.enter();
+            if let Ok(resp_str) = serde_json::to_string(&*output) {
+                tracing::info!(target: "task_history", captured_output = %*resp_str);
+            }
+        } else {
+            tracing::warn!(
+                "Failed to write output of ai_completion for '{}' model",
+                self.model_public_name
+            );
+        }
     }
 }

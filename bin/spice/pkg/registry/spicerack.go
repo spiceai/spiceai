@@ -36,6 +36,11 @@ import (
 type SpiceRackRegistry struct{}
 
 func getSpiceRackBaseUrl() string {
+	spiceRackBaseUrl := os.Getenv("SPICERACK_BASE_URL")
+	if spiceRackBaseUrl != "" {
+		return spiceRackBaseUrl
+	}
+
 	if strings.HasSuffix(version.Version(), "-dev") {
 		return "https://dev-data.spiceai.io/v1"
 	} else {

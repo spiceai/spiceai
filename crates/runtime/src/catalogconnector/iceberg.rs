@@ -76,55 +76,55 @@ impl IcebergCatalog {
 }
 
 pub(crate) const PARAMETERS: &[ParameterSpec] = &[
-    ParameterSpec::connector("token")
+    ParameterSpec::component("token")
         .secret()
         .description("Bearer token value to use for Authorization header."),
-    ParameterSpec::connector("oauth2_credential")
+    ParameterSpec::component("oauth2_credential")
         .secret()
         .description(
             "Credential to use for OAuth2 client credential flow when initializing the catalog. Separated by a colon as <client_id>:<client_secret>.",
         ),
-    ParameterSpec::connector("oauth2_token_url")
+    ParameterSpec::component("oauth2_token_url")
         .description("The URL to use for OAuth2 token endpoint."),
-    ParameterSpec::connector("oauth2_scope")
+    ParameterSpec::component("oauth2_scope")
         .description(
             "The scope to use for OAuth2 token endpoint (default: catalog).",
         )
         .default("catalog"),
-    ParameterSpec::connector("oauth2_server_url")
+    ParameterSpec::component("oauth2_server_url")
         .description("URL of the OAuth2 server tokens endpoint."),
-    ParameterSpec::connector("sigv4_enabled")
+    ParameterSpec::component("sigv4_enabled")
         .description("Enable SigV4 authentication for the catalog (for connecting to AWS Glue)."),
-    ParameterSpec::connector("signing_region")
+    ParameterSpec::component("signing_region")
         .description("The region to use when signing the request for SigV4. Defaults to the region in the catalog URL if available."),
-    ParameterSpec::connector("signing_name")
+    ParameterSpec::component("signing_name")
         .description("The name to use when signing the request for SigV4.")
         .default("glue"),
     // S3 storage options
-    ParameterSpec::connector("s3_endpoint")
+    ParameterSpec::component("s3_endpoint")
         .description(
             "Configure an alternative endpoint for the S3 service. This can be any s3-compatible object storage service. i.e. Minio, Cloudflare R2, etc.",
         )
         .secret(),
-    ParameterSpec::connector("s3_access_key_id")
+    ParameterSpec::component("s3_access_key_id")
         .description("The AWS access key ID to use for S3 storage.")
         .secret(),
-    ParameterSpec::connector("s3_secret_access_key")
+    ParameterSpec::component("s3_secret_access_key")
         .description("The AWS secret access key to use for S3 storage.")
         .secret(),
-    ParameterSpec::connector("s3_session_token")
+    ParameterSpec::component("s3_session_token")
         .description("Configure the static session token used for S3 storage.")
         .secret(),
-    ParameterSpec::connector("s3_region")
+    ParameterSpec::component("s3_region")
         .description("The AWS S3 region to use.")
         .secret(),
-    ParameterSpec::connector("s3_role_session_name")
+    ParameterSpec::component("s3_role_session_name")
         .description("An optional identifier for the assumed role session for auditing purposes.")
         .secret(),
-    ParameterSpec::connector("s3_role_arn")
+    ParameterSpec::component("s3_role_arn")
         .description("The Amazon Resource Name (ARN) of the role to assume. If provided instead of s3_access_key_id and s3_secret_access_key, temporary credentials will be fetched by assuming this role")
         .secret(),
-    ParameterSpec::connector("s3_connect_timeout")
+    ParameterSpec::component("s3_connect_timeout")
         .description("Configure socket connection timeout, in seconds (default: 60).")
 ];
 

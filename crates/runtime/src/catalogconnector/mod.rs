@@ -138,6 +138,11 @@ pub async fn register_all() {
     );
 }
 
+pub async fn unregister_all() {
+    let mut registry = CATALOG_CONNECTOR_FACTORY_REGISTRY.lock().await;
+    registry.clear();
+}
+
 pub(crate) struct CatalogConnectorFactory {
     connector_factory: fn(ConnectorParams) -> Arc<dyn CatalogConnector>,
     prefix: &'static str,

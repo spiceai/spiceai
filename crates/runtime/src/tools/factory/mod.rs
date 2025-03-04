@@ -102,6 +102,11 @@ pub async fn register_all_factories() {
     );
 }
 
+pub async fn unregister_all_factories() {
+    let mut registry = TOOL_SHED_FACTORY.lock().await;
+    registry.clear();
+}
+
 /// Get all catalogs available by default in the spice runtime.
 #[must_use]
 pub fn default_available_catalogs() -> Vec<Arc<dyn SpiceToolCatalog>> {

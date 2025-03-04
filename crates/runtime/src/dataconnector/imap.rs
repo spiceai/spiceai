@@ -39,23 +39,23 @@ use super::{
 };
 
 const PARAMETERS: &[ParameterSpec] = &[
-    ParameterSpec::connector("username")
+    ParameterSpec::component("username")
         .secret()
         .description("The username to use for the IMAP connection"),
-    ParameterSpec::connector("password")
+    ParameterSpec::component("password")
         .secret()
         .description("The password to use for the IMAP connection"),
-    ParameterSpec::connector("access_token")
+    ParameterSpec::component("access_token")
         .secret()
         .description("The OAuth access token to use for the IMAP connection"),
-    ParameterSpec::connector("host").description("The IMAP server host to connect to"),
-    ParameterSpec::connector("mailbox")
+    ParameterSpec::component("host").description("The IMAP server host to connect to"),
+    ParameterSpec::component("mailbox")
         .default("INBOX")
         .description("The name of the IMAP mailbox to connect to"),
-    ParameterSpec::connector("port")
+    ParameterSpec::component("port")
         .default("993")
         .description("The port to connect to on the IMAP server"),
-    ParameterSpec::connector("ssl_mode")
+    ParameterSpec::component("ssl_mode")
         .default("auto")
         .description("The IMAP SSL mode to use"),
 ];
