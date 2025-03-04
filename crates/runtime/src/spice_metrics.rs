@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use arrow::array::RecordBatch;
@@ -44,12 +44,14 @@ pub enum Error {
 }
 
 pub struct SpiceMetricsExporter {
-    datafusion: Arc<DataFusion>,
+    datafusion: Weak<DataFusion>,
 }
 
 impl SpiceMetricsExporter {
-    pub fn new(datafusion: Arc<DataFusion>) -> Self {
-        SpiceMetricsExporter { datafusion }
+    pub fn new(datafusion: &Arc<DataFusion>) -> Self {
+        SpiceMetricsExporter {
+            datafusion: Arc::downgrade(datafusion),
+        }
     }
 }
 
@@ -62,8 +64,13 @@ impl otel_arrow::ArrowExporter for SpiceMetricsExporter {
             update_type: UpdateType::Append,
         };
 
-        self.datafusion
-            .write_data(&get_metrics_table_reference(), data_update)
+        let Some(df) = self.datafusion.upgrade() else {
+            return Err(MetricError::Other(
+                "DataFusion is not available".to_string(),
+            ));
+        };
+
+        df.write_data(&get_metrics_table_reference(), data_update)
             .await
             .map_err(|e| MetricError::Other(e.to_string()))
     }
