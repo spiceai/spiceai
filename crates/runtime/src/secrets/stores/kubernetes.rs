@@ -199,9 +199,9 @@ impl SecretStore for KubernetesSecretStore {
         match self.kubernetes_client.get_secret(&self.secret_name).await {
             Ok(secret) => {
                 if let Some(value) = secret.get(&prefixed_key) {
-                    return Ok(Some(SecretString::new(value.clone())));
+                    return Ok(Some(SecretString::from(value.clone())));
                 }
-                Ok(secret.get(key).cloned().map(SecretString::new))
+                Ok(secret.get(key).cloned().map(SecretString::from))
             }
             Err(err) => Err(Box::new(StoreError::UnableToGetSecret { source: err })),
         }

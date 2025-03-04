@@ -19,10 +19,10 @@ use async_openai::config::Config;
 use reqwest::header::{
     HeaderMap, HeaderName, HeaderValue, InvalidHeaderValue, AUTHORIZATION, CONTENT_TYPE,
 };
-use secrecy::{ExposeSecret, Secret};
+use secrecy::{ExposeSecret, SecretBox, SecretString};
 use std::sync::LazyLock;
 
-static DUMMY_API_KEY: LazyLock<Secret<String>> = LazyLock::new(|| Secret::new(String::new()));
+static DUMMY_API_KEY: LazyLock<SecretString> = LazyLock::new(|| SecretString::from(String::new()));
 
 /// A generic configuration for any hosted `OpenAI` API client.
 ///
@@ -57,7 +57,7 @@ impl HostedModelConfig {
     #[must_use]
     pub fn with_api_key<S: Into<String>>(mut self, api_key: Option<S>) -> Self {
         if let Some(key) = api_key {
-            self.auth = Some(GenericAuthMechanism::ApiKey(Secret::new(key.into())));
+            self.auth = Some(GenericAuthMechanism::ApiKey(SecretString::from(key.into())));
         }
         self
     }
@@ -66,7 +66,9 @@ impl HostedModelConfig {
     #[must_use]
     pub fn with_bearer_token<S: Into<String>>(mut self, token: Option<S>) -> Self {
         if let Some(token) = token {
-            self.auth = Some(GenericAuthMechanism::BearerToken(Secret::new(token.into())));
+            self.auth = Some(GenericAuthMechanism::BearerToken(SecretBox::from(
+                token.into(),
+            )));
         }
         self
     }
@@ -100,16 +102,16 @@ impl HostedModelConfig {
 /// A generic authentication mechanism that supports either an API key or a Bearer token.
 #[derive(Clone, Debug)]
 pub enum GenericAuthMechanism {
-    ApiKey(Secret<String>),
-    BearerToken(Secret<String>),
+    ApiKey(SecretString),
+    BearerToken(SecretString),
 }
 
 impl GenericAuthMechanism {
     pub fn from_api_key<S: Into<String>>(api_key: S) -> Self {
-        Self::ApiKey(Secret::new(api_key.into()))
+        Self::ApiKey(SecretBox::from(api_key.into()))
     }
     pub fn from_bearer_token<S: Into<String>>(bearer_token: S) -> Self {
-        Self::BearerToken(Secret::new(bearer_token.into()))
+        Self::BearerToken(SecretBox::from(bearer_token.into()))
     }
 }
 
@@ -162,7 +164,7 @@ impl Config for HostedModelConfig {
         &self.base_url
     }
 
-    fn api_key(&self) -> &Secret<String> {
+    fn api_key(&self) -> &SecretString {
         // This is a bit of a hack, will result in valid, understandable auth errors.
         match &self.auth {
             Some(GenericAuthMechanism::ApiKey(key)) => key,

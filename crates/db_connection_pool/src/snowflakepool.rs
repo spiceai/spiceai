@@ -19,7 +19,7 @@ use datafusion_table_providers::sql::db_connection_pool::{
     dbconnection::DbConnection, DbConnectionPool, JoinPushDown,
 };
 use pkcs8::{LineEnding, SecretDocument};
-use secrecy::{ExposeSecret, Secret, SecretString};
+use secrecy::{ExposeSecret, SecretBox, SecretString};
 use snafu::prelude::*;
 use snowflake_api::{SnowflakeApi, SnowflakeApiError};
 use std::{collections::HashMap, fs, sync::Arc};
@@ -84,28 +84,28 @@ impl SnowflakeConnectionPool {
     pub async fn new(params: &HashMap<String, SecretString>) -> Result<Self, Error> {
         let username = params
             .get("username")
-            .map(Secret::expose_secret)
+            .map(SecretBox::expose_secret)
             .context(MissingRequiredSecretSnafu { name: "username" })?;
 
         let account = params
             .get("account")
-            .map(Secret::expose_secret)
+            .map(SecretBox::expose_secret)
             .context(MissingRequiredSecretSnafu { name: "account" })?;
         // account identifier can be in <orgname.account_name> format but API requires it as <orgname-account_name>
         let account = account.replace('.', "-");
 
         let warehouse = params
             .get("warehouse")
-            .map(Secret::expose_secret)
+            .map(SecretBox::expose_secret)
             .map(ToString::to_string);
         let role = params
             .get("role")
-            .map(Secret::expose_secret)
+            .map(SecretBox::expose_secret)
             .map(ToString::to_string);
 
         let auth_type = params
             .get("auth_type")
-            .map(Secret::expose_secret)
+            .map(SecretBox::expose_secret)
             .map_or_else(|| "snowflake".to_string(), ToString::to_string)
             .to_lowercase();
 
@@ -177,7 +177,7 @@ fn init_snowflake_api_with_password_auth(
 ) -> Result<SnowflakeApi, Error> {
     let password = params
         .get("password")
-        .map(Secret::expose_secret)
+        .map(SecretBox::expose_secret)
         .context(MissingRequiredSecretSnafu { name: "password" })?;
     let api = SnowflakeApi::with_password_auth(
         account,
@@ -202,7 +202,7 @@ fn init_snowflake_api_with_keypair_auth(
 ) -> Result<SnowflakeApi, Error> {
     let private_key_path = params
         .get("private_key_path")
-        .map(Secret::expose_secret)
+        .map(SecretBox::expose_secret)
         .context(MissingRequiredSecretSnafu {
             name: "snowflake_private_key_path",
         })?;
@@ -218,7 +218,7 @@ fn init_snowflake_api_with_keypair_auth(
     if label.to_uppercase() == "ENCRYPTED PRIVATE KEY" {
         let passphrase = params
             .get("private_key_passphrase")
-            .map(Secret::expose_secret)
+            .map(SecretBox::expose_secret)
             .context(MissingRequiredSecretSnafu {
                 name: "snowflake_private_key_passphrase",
             })?;

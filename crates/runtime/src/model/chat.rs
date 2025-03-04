@@ -37,7 +37,7 @@ pub type LLMModelStore = HashMap<String, Box<dyn Chat>>;
 /// Extract a secret from a hashmap of secrets, if it exists.
 macro_rules! extract_secret {
     ($params:expr, $key:expr) => {
-        $params.get($key).map(|s| s.expose_secret().as_str())
+        $params.get($key).map(|s| s.expose_secret())
     };
 }
 
@@ -317,7 +317,7 @@ fn file(
 
     let chat_template_literal = params
         .get("chat_template")
-        .map(|s| s.expose_secret().as_str());
+        .map(|s| s.expose_secret());
 
     llms::chat::create_local_model(
         model_weights.as_slice(),
