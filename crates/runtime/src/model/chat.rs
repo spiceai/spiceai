@@ -315,9 +315,7 @@ fn file(
     let config_path = component.find_any_file_path(ModelFileType::Config);
     let generation_config = component.find_any_file_path(ModelFileType::GenerationConfig);
 
-    let chat_template_literal = params
-        .get("chat_template")
-        .map(|s| s.expose_secret());
+    let chat_template_literal = params.get("chat_template").map(|s| s.expose_secret());
 
     llms::chat::create_local_model(
         model_weights.as_slice(),
