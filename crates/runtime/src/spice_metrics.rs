@@ -43,6 +43,8 @@ pub enum Error {
     UnableToRegisterToMetricsTable { source: DataFusionError },
 }
 
+/// Uses a `Weak` reference to `DataFusion` to prevent blocking its cleanup after runtime termination.
+/// This ensures `DataFusion` can gracefully shut down, even when metrics persist.
 pub struct SpiceMetricsExporter {
     datafusion: Weak<DataFusion>,
 }
@@ -65,8 +67,9 @@ impl otel_arrow::ArrowExporter for SpiceMetricsExporter {
         };
 
         let Some(df) = self.datafusion.upgrade() else {
+            // this should never happen as the exporter must be shutdown before the DataFusion instance is dropped
             return Err(MetricError::Other(
-                "DataFusion is not available".to_string(),
+                "Failed to export metrics as the DataFusion instance has already been dropped.\nReport an issue on GitHub: https://github.com/spiceai/spiceai/issues".to_string(),
             ));
         };
 
