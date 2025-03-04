@@ -41,7 +41,7 @@ pub type EmbeddingModelStore = HashMap<String, Box<dyn Embed>>;
 /// Extract a secret from a hashmap of secrets, if it exists.
 macro_rules! extract_secret {
     ($params:expr, $key:expr) => {
-        $params.get($key).map(|s| s.expose_secret())
+        $params.get($key).map(secrecy::ExposeSecret::expose_secret)
     };
 }
 
@@ -178,15 +178,15 @@ async fn openai(
         params
             .get("api_key")
             .or(params.get("openai_api_key"))
-            .map(|s| s.expose_secret()),
+            .map(secrecy::ExposeSecret::expose_secret),
         params
             .get("org_id")
             .or(params.get("openai_org_id"))
-            .map(|s| s.expose_secret()),
+            .map(secrecy::ExposeSecret::expose_secret),
         params
             .get("project_id")
             .or(params.get("openai_project_id"))
-            .map(|s| s.expose_secret()),
+            .map(secrecy::ExposeSecret::expose_secret),
     ));
 
     // For OpenAI compatible embedding models, we allow users to
@@ -230,7 +230,9 @@ async fn get_bytes_for_file(
                 model_id,
                 Some(branch),
                 file.join("/").as_str(),
-                params.get("hf_token").map(|s| s.expose_secret()),
+                params
+                    .get("hf_token")
+                    .map(secrecy::ExposeSecret::expose_secret),
             )
             .await
         }
@@ -243,7 +245,9 @@ async fn get_bytes_for_file(
                 model_id,
                 branch,
                 file.join("/").as_str(),
-                params.get("hf_token").map(|s| s.expose_secret()),
+                params
+                    .get("hf_token")
+                    .map(secrecy::ExposeSecret::expose_secret),
             )
             .await
         }
@@ -255,11 +259,14 @@ async fn get_bytes_for_file(
                 model_id,
                 branch,
                 file.join("/").as_str(),
-                params.get("hf_token").map(|s| s.expose_secret()),
+                params
+                    .get("hf_token")
+                    .map(secrecy::ExposeSecret::expose_secret),
             )
             .await
         }
-        ["hf:", "", "models", org_id, model_id_revision, file @ ..] => {
+        ["hf:", "", "models", org_id, model_id_revision, file @ ..]
+        | ["hf:", "", org_id, model_id_revision, file @ ..] => {
             let (model_id, branch) = parse_model_id_w_revision(model_id_revision);
             get_file_from_hf(
                 Some("models"),
@@ -267,19 +274,9 @@ async fn get_bytes_for_file(
                 model_id,
                 branch,
                 file.join("/").as_str(),
-                params.get("hf_token").map(|s| s.expose_secret()),
-            )
-            .await
-        }
-        ["hf:", "", org_id, model_id_revision, file @ ..] => {
-            let (model_id, branch) = parse_model_id_w_revision(model_id_revision);
-            get_file_from_hf(
-                Some("models"),
-                org_id,
-                model_id,
-                branch,
-                file.join("/").as_str(),
-                params.get("hf_token").map(|s| s.expose_secret()),
+                params
+                    .get("hf_token")
+                    .map(secrecy::ExposeSecret::expose_secret),
             )
             .await
         }
@@ -342,11 +339,12 @@ fn max_seq_length_from_params(
     params
         .get("max_seq_length")
         .map(|s| {
-            s.expose_secret().parse().boxed().map_err(|e| {
-                EmbedError::FailedToInstantiateEmbeddingModel {
+            secrecy::ExposeSecret::expose_secret(s)
+                .parse()
+                .boxed()
+                .map_err(|e| EmbedError::FailedToInstantiateEmbeddingModel {
                     source: format!("Failed to parse 'max_seq_length' parameter: {e}").into(),
-                }
-            })
+                })
         })
         .transpose()
 }

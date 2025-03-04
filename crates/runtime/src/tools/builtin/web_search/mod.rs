@@ -67,7 +67,9 @@ impl TryFrom<&HashMap<String, SecretString>> for SearchEngine {
 
         match engine {
             "perplexity" => {
-                let model_id = params.get("perplexity_model").map(|s| s.expose_secret());
+                let model_id = params
+                    .get("perplexity_model")
+                    .map(secrecy::ExposeSecret::expose_secret);
                 let sonar = PerplexitySonar::from_params(model_id, params)?;
                 Ok(SearchEngine::Perplexity(sonar))
             }
