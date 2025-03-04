@@ -59,7 +59,7 @@ pub fn get_pg_params(port: usize) -> HashMap<String, SecretString> {
 }
 
 pub fn get_random_port() -> usize {
-    rand::thread_rng().gen_range(15432..65535)
+    rand::rng().random_range(15432..65535)
 }
 
 #[instrument]
