@@ -43,7 +43,7 @@ use futures::Stream;
 pub use http::ApiDoc;
 use model::{EmbeddingModelStore, EvalScorerRegistry, LLMModelStore};
 
-use ::tools::{with_name, SpiceModelTool};
+use crate::tools::{with_name, SpiceModelTool};
 use model_components::model::Model;
 pub use notify::Error as NotifyError;
 use secrecy::SecretString;
@@ -743,7 +743,7 @@ impl Runtime {
     ///
     /// For tools from catalog, the name is prefixed with the catalog name. e.g. `catalog_name/tool_name`.
     fn list_all_tools(self: &Arc<Self>) -> impl Stream<Item = Arc<dyn SpiceModelTool>> {
-        let default_catalogs = default_available_catalogs(Arc::clone(self));
+        let default_catalogs = default_available_catalogs();
         let stream_self = Arc::clone(self);
         stream! {
             let tool_lock = stream_self.tools.read().await;
@@ -782,7 +782,7 @@ impl Runtime {
                 let Some(Tooling::Tool(tool)) = tools.get(tool_name) else {
                     return None;
                 };
-                Arc::clone(tool)
+                tool
             };
         Some(tool)
     }

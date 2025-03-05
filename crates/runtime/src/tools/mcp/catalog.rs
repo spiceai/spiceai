@@ -23,8 +23,10 @@ use mcp_client::{
 use mcp_core::Tool as McpTool;
 use snafu::ResultExt;
 use std::{collections::HashMap, sync::Arc, time::Duration};
-
-use tokio::sync::RwLock;
+use tokio::{
+    sync::RwLock,
+    time::{interval, MissedTickBehavior},
+};
 
 use crate::tools::{catalog::SpiceToolCatalog, SpiceModelTool};
 
@@ -32,20 +34,27 @@ use super::{
     tool::McpToolWrapper, MCPConfig, Result, UnderlyingInitilizationSnafu, UnderlyingTransportSnafu,
 };
 
+const HEARTBEAT_INTERVAL_SECONDS: u64 = 30; // 30 seconds
+
 pub(crate) struct McpToolCatalog {
     client: Arc<RwLock<Box<dyn McpClientTrait>>>,
 
     /// User defined name & description, not from underlying MCP.
     name: String,
+    heartbeat_task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for McpToolCatalog {
+    fn drop(&mut self) {
+        self.heartbeat_task.abort();
+    }
 }
 
 impl McpToolCatalog {
     pub async fn try_new(cfg: MCPConfig, name: &str) -> Result<Self> {
-        let client = match cfg {
-            MCPConfig::Stdio { command, args } => Self::stdio_client(command.as_str(), args).await,
-            MCPConfig::Https { url } => Self::https_client(url).await,
-        }
-        .context(UnderlyingTransportSnafu)?;
+        let client = Self::create_client(&cfg)
+            .await
+            .context(UnderlyingTransportSnafu)?;
 
         client
             .write()
@@ -65,7 +74,7 @@ impl McpToolCatalog {
         let cfg_clone = cfg.clone();
         let name_clone = name.to_string();
 
-        let (future, heartbeat_task) = spawn_cancellable_task(None, async move {
+        let heartbeat_task = tokio::spawn(async move {
             let mut interval = interval(Duration::from_secs(HEARTBEAT_INTERVAL_SECONDS));
             interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
@@ -77,7 +86,6 @@ impl McpToolCatalog {
                 if let Err(ref e) = heartbeat_result {
                     tracing::warn!("MCP client heartbeat failed, attempting reconnection");
                     tracing::debug!("MCP client heartbeat failed with error: {e}");
-
                     if let Ok(new_client_rwlock) = Self::create_client(&cfg_clone).await {
                         if new_client_rwlock
                             .write()
@@ -104,11 +112,22 @@ impl McpToolCatalog {
             }
         });
 
-        tokio::spawn(future);
         Ok(Self {
-            client: Arc::new(client),
+            client,
             name: name.to_string(),
+            heartbeat_task,
         })
+    }
+
+    async fn create_client(
+        cfg: &MCPConfig,
+    ) -> std::result::Result<RwLock<Box<dyn McpClientTrait>>, TransportError> {
+        match cfg {
+            MCPConfig::Stdio { command, args } => {
+                Self::stdio_client(command.as_str(), args.clone()).await
+            }
+            MCPConfig::Https { url } => Self::https_client(url.clone()).await,
+        }
     }
 
     async fn stdio_client(
