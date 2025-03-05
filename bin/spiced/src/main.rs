@@ -17,6 +17,7 @@ limitations under the License.
 use clap::Parser;
 use opentelemetry::global;
 use rustls::crypto::{self, CryptoProvider};
+use telemetry::noop::NoopMeterProvider;
 use std::{
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -142,6 +143,8 @@ fn main() {
     }
 
     global::shutdown_tracer_provider();
+    // There is no global::shutdown_meter_provider, so we replace currently used meter provider with a noop one to clean up resources
+    global::set_meter_provider(NoopMeterProvider::new());
 }
 
 async fn start_runtime(

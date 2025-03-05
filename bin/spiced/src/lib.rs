@@ -237,7 +237,7 @@ pub async fn run(args: Args, shutdown_rx: broadcast::Receiver<()>) -> Result<()>
     .context(UnableToInitializeTracingSnafu)?;
 
     if let Some(metrics_registry) = prometheus_registry {
-        init_metrics(rt.datafusion(), metrics_registry).context(UnableToInitializeMetricsSnafu)?;
+        init_metrics(&rt.datafusion(), metrics_registry).context(UnableToInitializeMetricsSnafu)?;
     }
 
     let tls_config = tls::load_tls_config(&args, spicepod_tls_config.as_ref(), rt.secrets())
@@ -284,7 +284,7 @@ pub async fn run(args: Args, shutdown_rx: broadcast::Receiver<()>) -> Result<()>
 }
 
 fn init_metrics(
-    df: Arc<DataFusion>,
+    df: &Arc<DataFusion>,
     registry: prometheus::Registry,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let resource = Resource::default();
