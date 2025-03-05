@@ -269,7 +269,7 @@ pub async fn run(args: Args) -> Result<()> {
         }),
     };
 
-    rt.close().await;
+    rt.shutdown().await;
 
     result
 }
