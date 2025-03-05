@@ -19,7 +19,7 @@ limitations under the License.
 use std::collections::HashMap;
 use std::env;
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -168,132 +168,44 @@ pub struct Args {
     pub set_runtime: Vec<(String, String)>,
 }
 
-// Split the run function into smaller parts to address the "too many lines" warning
 pub async fn run(args: Args, shutdown_rx: broadcast::Receiver<()>) -> Result<()> {
     let prometheus_registry = args.metrics.map(|_| prometheus::Registry::new());
-    let current_dir = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
-    // Initialize app and extension factories
-    let (app, extension_factories, configs) = setup_app_and_extensions(&args, &current_dir)?;
-
-    // Initialize runtime with configuration
-    let rt = setup_runtime(
-        &args,
-        app.clone(),
-        extension_factories,
-        prometheus_registry.clone(),
-        &current_dir,
-    )
-    .await;
-
-    // Setup tracing and metrics
-    setup_tracing_and_metrics(
-        &args,
-        app.as_deref(),
-        configs.tracing_config.as_ref(),
-        &rt,
-        prometheus_registry,
-    )
-    .await?;
-
-    // Setup TLS and telemetry
-    let tls_config =
-        tls::load_tls_config(&args, configs.spicepod_tls_config.as_ref(), rt.secrets())
-            .await
-            .context(UnableToInitializeTlsSnafu)?;
-
-    start_anonymous_telemetry(
-        &args,
-        configs.telemetry_config.as_ref(),
-        configs.app_name.as_ref(),
-    )
-    .await;
-
-    // Launch server components
-    let result = launch_server_components(
-        &args,
-        &rt,
-        app.as_deref(),
-        shutdown_rx,
-        tls_config.as_ref().map(Arc::clone),
-    )
-    .await;
-
-    // Since the close method consumes self and we're dealing with an Arc,
-    // just log the cleanup message and return the result.
-    // The runtime will be dropped automatically when it goes out of scope.
-    tracing::debug!("Closing runtime and cleaning up resources");
-
-    result
-}
-
-/// Type alias for the App setup result to simplify function signature
-type AppSetupResult = (Option<Arc<App>>, Vec<Box<dyn ExtensionFactory>>, AppConfigs);
-
-/// Initialize app from filesystem and setup extension factories
-fn setup_app_and_extensions(args: &Args, current_dir: &Path) -> Result<AppSetupResult> {
-    // Build app from filesystem
-    let app: Option<Arc<App>> =
-        match AppBuilder::build_from_filesystem_path(current_dir.to_path_buf()) {
-            Ok(mut app) => {
-                app.runtime = apply_overrides(app.runtime, &args.set_runtime)?;
-                Some(Arc::new(app))
-            }
-            Err(e) => {
-                in_tracing_context(|| {
-                    tracing::warn!("{e}");
-                });
-                None
-            }
-        };
-
-    // Set up extension factories
+    let current_dir = env::current_dir().unwrap_or(PathBuf::from("."));
+    let app: Option<Arc<App>> = match AppBuilder::build_from_filesystem_path(current_dir.clone()) {
+        Ok(mut app) => {
+            app.runtime = apply_overrides(app.runtime, &args.set_runtime)?;
+            Some(Arc::new(app))
+        }
+        Err(e) => {
+            in_tracing_context(|| {
+                tracing::warn!("{e}");
+            });
+            None
+        }
+    };
     let mut extension_factories: Vec<Box<dyn ExtensionFactory>> = vec![];
+
     if let Some(app) = &app {
         if let Some(manifest) = app.extensions.get("spice_cloud") {
-            extension_factories.push(Box::new(SpiceExtensionFactory::new(manifest.clone())));
+            let spice_extension_factory = SpiceExtensionFactory::new(manifest.clone());
+            extension_factories.push(Box::new(spice_extension_factory));
         }
         #[cfg(feature = "tpc-extension")]
         if let Some(manifest) = app.extensions.get("tpc") {
-            extension_factories.push(Box::new(TpcExtensionFactory::new(manifest.clone())));
+            let tpc_extension_factory = TpcExtensionFactory::new(manifest.clone());
+            extension_factories.push(Box::new(tpc_extension_factory));
         }
     }
 
-    // Extract various configs from app
     let runtime_config = app.as_ref().map(|app| &app.runtime);
     let app_name = app.as_ref().map(|app| app.name.clone());
     let spicepod_tls_config = runtime_config.and_then(|rt| rt.tls.clone());
     let tracing_config = runtime_config.and_then(|rt| rt.tracing.clone());
     let telemetry_config = runtime_config.map(|rt| rt.telemetry.clone());
 
-    let configs = AppConfigs {
-        app_name,
-        spicepod_tls_config,
-        tracing_config,
-        telemetry_config,
-    };
-
-    Ok((app, extension_factories, configs))
-}
-
-/// Configuration extracted from the app
-struct AppConfigs {
-    app_name: Option<String>,
-    spicepod_tls_config: Option<app::spicepod::component::runtime::TlsConfig>,
-    tracing_config: Option<app::spicepod::component::runtime::TracingConfig>,
-    telemetry_config: Option<TelemetryConfig>,
-}
-
-/// Initialize runtime with the given configuration
-async fn setup_runtime(
-    args: &Args,
-    app: Option<Arc<App>>,
-    extension_factories: Vec<Box<dyn ExtensionFactory>>,
-    prometheus_registry: Option<prometheus::Registry>,
-    current_dir: &Path,
-) -> Arc<Runtime> {
     let mut builder = Runtime::builder()
-        .with_app_opt(app)
+        .with_app_opt(app.clone())
         // User configured extensions
         .with_extensions(extension_factories)
         // Extensions that will be auto-loaded if not explicitly loaded and requested by a component
@@ -302,28 +214,18 @@ async fn setup_runtime(
             Box::new(SpiceExtensionFactory::default()) as Box<dyn ExtensionFactory>,
         )]))
         .with_datasets_health_monitor()
-        .with_metrics_server_opt(args.metrics, prometheus_registry);
+        .with_metrics_server_opt(args.metrics, prometheus_registry.clone());
 
     if args.pods_watcher_enabled {
-        let pods_watcher = PodsWatcher::new(current_dir.to_path_buf());
+        let pods_watcher = PodsWatcher::new(current_dir.clone());
         builder = builder.with_pods_watcher(pods_watcher);
     }
 
-    builder.build().await.into()
-}
+    let rt = builder.build().await;
 
-/// Initialize tracing and metrics
-async fn setup_tracing_and_metrics(
-    args: &Args,
-    app: Option<&App>,
-    tracing_config: Option<&app::spicepod::component::runtime::TracingConfig>,
-    rt: &Arc<Runtime>,
-    prometheus_registry: Option<prometheus::Registry>,
-) -> Result<()> {
-    // Initialize tracing
     spiced_tracing::init_tracing(
-        app.map(|app| Arc::new(app.clone())).as_ref(),
-        tracing_config,
+        app.as_ref(),
+        tracing_config.as_ref(),
         rt.datafusion(),
         LogVerbosity::from_flags_and_env(
             args.verbose == 1,                      // -v or --verbose
@@ -334,104 +236,51 @@ async fn setup_tracing_and_metrics(
     .await
     .context(UnableToInitializeTracingSnafu)?;
 
-    // Initialize metrics if enabled
     if let Some(metrics_registry) = prometheus_registry {
         init_metrics(rt.datafusion(), metrics_registry).context(UnableToInitializeMetricsSnafu)?;
     }
 
-    Ok(())
-}
+    let tls_config = tls::load_tls_config(&args, spicepod_tls_config.as_ref(), rt.secrets())
+        .await
+        .context(UnableToInitializeTlsSnafu)?;
 
-/// Launch server and components, handle shutdown
-async fn launch_server_components(
-    args: &Args,
-    rt: &Arc<Runtime>,
-    app: Option<&App>,
-    shutdown_rx: broadcast::Receiver<()>,
-    tls_config: Option<Arc<runtime::tls::TlsConfig>>,
-) -> Result<()> {
-    let cloned_rt = Arc::clone(rt);
+    start_anonymous_telemetry(&args, telemetry_config.as_ref(), app_name.as_ref()).await;
 
-    // Set up endpoint auth
-    let endpoint_auth = match app {
+    let cloned_rt = rt.clone();
+    let endpoint_auth = match app.as_ref() {
         Some(app) => EndpointAuth::new(rt.secrets(), app).await,
         None => EndpointAuth::no_auth(),
     };
 
-    // Share the shutdown receiver with all components
-    let components_shutdown_rx = shutdown_rx.resubscribe();
-
-    // Register a panic hook for cleanup
-    let default_panic = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |panic_info| {
-        tracing::error!("Process panicked during cleanup: {:?}", panic_info);
-        default_panic(panic_info);
-    }));
-
-    // Clone runtime config to avoid reference issues
-    let runtime_config = args.runtime.clone();
-
-    // Start servers in a background task
     let server_thread = tokio::spawn(async move {
-        Box::pin(Arc::clone(&cloned_rt).start_servers(runtime_config, tls_config, endpoint_auth))
-            .await
+        Box::pin(Arc::new(cloned_rt).start_servers(args.runtime, tls_config, endpoint_auth)).await
     });
 
-    // Wait for component loading or shutdown signal
-    await_components_or_shutdown(rt, components_shutdown_rx).await;
-
-    // Wait for server thread with timeout
-    handle_server_thread_completion(server_thread).await
-}
-
-/// Wait for component loading or shutdown signal
-async fn await_components_or_shutdown(
-    rt: &Arc<Runtime>,
-    mut components_shutdown_rx: broadcast::Receiver<()>,
-) {
+    let mut shutdown_rx = shutdown_rx;
     tokio::select! {
-        completed = rt.load_components() => {
-            tracing::debug!("Components loading completed: {:?}", completed);
-        },
-        // Internal shutdown signal from runtime
+        () = rt.load_components() => {},
         () = runtime::shutdown_signal() => {
-            tracing::debug!("Runtime shutdown signal received, cancelling initialization!");
+            tracing::debug!("Cancelling runtime initializing due to system shutdown signal!");
+            // Set global shutdown flag to signal model loading to abort
+            runtime::set_shutdown_in_progress(true);
         },
-        // Listen for the external shutdown signal (Ctrl+C)
-        result = components_shutdown_rx.recv() => {
-            match result {
-                Ok(()) => {
-                    tracing::debug!("External shutdown signal received, cancelling component initialization");
-                    tokio::task::yield_now().await; // Yield to allow other tasks to process the shutdown
-                },
-                Err(e) => {
-                    tracing::debug!("Error receiving shutdown signal: {}", e);
-                }
-            }
-        }
+        _ = shutdown_rx.recv() => {
+            tracing::debug!("Cancelling runtime initializing due to application shutdown signal!");
+            // Set global shutdown flag to signal model loading to abort
+            runtime::set_shutdown_in_progress(true);
+        },
     }
-}
 
-/// Handle server thread completion with timeout
-async fn handle_server_thread_completion(
-    server_thread: tokio::task::JoinHandle<Result<(), runtime::Error>>,
-) -> Result<()> {
-    if let Ok(thread_result) =
-        tokio::time::timeout(tokio::time::Duration::from_secs(5), server_thread).await
-    {
-        match thread_result {
-            Ok(ok) => ok.context(UnableToStartServersSnafu),
-            Err(_) => Err(Error::GenericError {
-                reason: "Unable to start spiced".into(),
-            }),
-        }
-    } else {
-        // Timeout occurred, the server thread didn't complete in time
-        tracing::debug!("Server thread did not complete in time, proceeding with cleanup");
-        Err(Error::GenericError {
-            reason: "Server shutdown timeout".into(),
-        })
-    }
+    let result = match server_thread.await {
+        Ok(ok) => ok.context(UnableToStartServersSnafu),
+        Err(_) => Err(Error::GenericError {
+            reason: "Unable to start spiced".into(),
+        }),
+    };
+
+    rt.close().await;
+
+    result
 }
 
 fn init_metrics(
