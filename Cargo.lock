@@ -699,15 +699,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "async-convert"
-version = "1.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6d416feee97712e43152cd42874de162b8f9b77295b1c85e5d92725cc8310bae"
-dependencies = [
- "async-trait",
-]
-
-[[package]]
 name = "async-executor"
 version = "1.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -859,10 +850,10 @@ dependencies = [
 
 [[package]]
 name = "async-openai"
-version = "0.26.0"
-source = "git+https://github.com/spiceai/async-openai?rev=9debf2001eaf8f1b6407fdf4b8cf9aa28fb3465e#9debf2001eaf8f1b6407fdf4b8cf9aa28fb3465e"
+version = "0.28.0"
+source = "git+https://github.com/spiceai/async-openai?rev=08f8c9df21275f0b59a99233994eac62153afb94#08f8c9df21275f0b59a99233994eac62153afb94"
 dependencies = [
- "async-convert",
+ "async-openai-macros",
  "backoff",
  "base64 0.22.1",
  "bytes",
@@ -872,15 +863,25 @@ dependencies = [
  "rand 0.8.5",
  "reqwest 0.12.12",
  "reqwest-eventsource",
- "secrecy 0.8.0",
+ "secrecy",
  "serde",
  "serde_json",
- "thiserror 1.0.69",
+ "thiserror 2.0.11",
  "tokio",
  "tokio-stream",
  "tokio-util",
  "tracing",
  "utoipa",
+]
+
+[[package]]
+name = "async-openai-macros"
+version = "0.1.0"
+source = "git+https://github.com/spiceai/async-openai?rev=08f8c9df21275f0b59a99233994eac62153afb94#08f8c9df21275f0b59a99233994eac62153afb94"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.98",
 ]
 
 [[package]]
@@ -3074,7 +3075,7 @@ dependencies = [
  "regex",
  "reqwest 0.12.12",
  "rusqlite",
- "secrecy 0.8.0",
+ "secrecy",
  "serde",
  "serde_json",
  "snafu",
@@ -3517,7 +3518,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=5efd341539735a2f8fa89e1be4948f2e288852af#5efd341539735a2f8fa89e1be4948f2e288852af"
+source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=a1f7173691675238607867e6ae5c6a881700de5b#a1f7173691675238607867e6ae5c6a881700de5b"
 dependencies = [
  "arrow",
  "arrow-json",
@@ -3548,7 +3549,7 @@ dependencies = [
  "rand 0.8.5",
  "rusqlite",
  "sea-query",
- "secrecy 0.8.0",
+ "secrecy",
  "serde",
  "serde_json",
  "snafu",
@@ -3578,7 +3579,7 @@ dependencies = [
  "futures",
  "odbc-api",
  "pkcs8",
- "secrecy 0.8.0",
+ "secrecy",
  "serde_json",
  "sha2",
  "snafu",
@@ -6758,7 +6759,7 @@ dependencies = [
  "reqwest 0.12.12",
  "reqwest-eventsource",
  "schemars",
- "secrecy 0.8.0",
+ "secrecy",
  "serde",
  "serde_json",
  "snafu",
@@ -7372,7 +7373,7 @@ dependencies = [
  "ndarray 0.15.6",
  "regex",
  "reqwest 0.12.12",
- "secrecy 0.8.0",
+ "secrecy",
  "serde",
  "serde_json",
  "snafu",
@@ -8156,7 +8157,7 @@ dependencies = [
  "once_cell",
  "percent-encoding",
  "pin-project",
- "secrecy 0.10.3",
+ "secrecy",
  "serde",
  "serde_json",
  "serde_path_to_error",
@@ -10206,7 +10207,7 @@ dependencies = [
  "rustls-pemfile 2.2.0",
  "schemars",
  "scopeguard",
- "secrecy 0.8.0",
+ "secrecy",
  "serde",
  "serde_json",
  "snafu",
@@ -10692,20 +10693,11 @@ checksum = "1c107b6f4780854c8b126e228ea8869f4d7b71260f962fefb57b996b8959ba6b"
 
 [[package]]
 name = "secrecy"
-version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9bd1c54ea06cfd2f6b63219704de0b9b4f72dcc2b8fdef820be6cd799780e91e"
-dependencies = [
- "serde",
- "zeroize",
-]
-
-[[package]]
-name = "secrecy"
 version = "0.10.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e891af845473308773346dc847b2c23ee78fe442e0472ac50e22a18a93d3ae5a"
 dependencies = [
+ "serde",
  "zeroize",
 ]
 

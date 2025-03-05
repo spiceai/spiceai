@@ -436,7 +436,7 @@ fn parse_schema_from_json(resp: &serde_json::Value) -> Result<SchemaRef, Error> 
 
         let is_nullable = column[4]
             .as_str()
-            .map_or(true, |s| s.to_uppercase() == "TRUE");
+            .is_none_or(|s| s.to_uppercase() == "TRUE");
 
         fields.push(Field::new(column_name, data_type, is_nullable));
     }

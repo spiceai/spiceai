@@ -235,7 +235,7 @@ pub trait ListingTableConnector: DataConnector {
             .get(&format!("{delimiter}_has_header"))
             .expose()
             .ok()
-            .map_or(true, |f| f.eq_ignore_ascii_case("true"));
+            .is_none_or(|f| f.eq_ignore_ascii_case("true"));
         let quote = params
             .get(&format!("{delimiter}_quote"))
             .expose()
@@ -346,10 +346,7 @@ impl<T: ListingTableConnector + Display> DataConnector for T {
             return None;
         }
 
-        Some(
-            self.construct_metadata_provider(dataset)
-                .map_err(Into::into),
-        )
+        Some(self.construct_metadata_provider(dataset))
     }
 
     async fn read_provider(
