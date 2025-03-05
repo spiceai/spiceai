@@ -104,8 +104,8 @@ func init() {
 	sqlCmd.Flags().String("tls-root-certificate-file", "", "The path to the root certificate file used to verify the Spice.ai runtime server certificate")
 	sqlCmd.Flags().String("user-agent", "", "The user agent to use for all requests")
 	sqlCmd.Flags().String("cache-control", "cache", "Control whether the results cache is used for queries. [possible values: cache, no-cache]")
-	sqlCmd.Flags().String("flight-endpoint", "", "Specifies the runtime Flight address. Defaults to http://localhost:50051")
-	sqlCmd.Flags().String("http-endpoint", "", "Specifies the runtime HTTP address. Defaults to http://localhost:8090")
+	sqlCmd.Flags().String("flight-endpoint", "", "Specifies the runtime Flight endpoint. Defaults to http://localhost:50051")
+	sqlCmd.Flags().String("http-endpoint", "", "Specifies the runtime HTTP endpoint. Defaults to http://localhost:8090")
 
 	RootCmd.AddCommand(sqlCmd)
 }

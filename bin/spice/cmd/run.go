@@ -66,6 +66,6 @@ spice run
 
 func init() {
 	RootCmd.AddCommand(runCmd)
-	runCmd.Flags().String("flight-endpoint", "", "Specifies the runtime Flight address. Defaults to http://localhost:50051.")
-	runCmd.Flags().String("http-endpoint", "", "Specifies the runtime HTTP address. Defaults to http://127.0.0.1:8090")
+	runCmd.Flags().String("flight-endpoint", "", "Specifies the runtime Flight endpoint. Defaults to http://localhost:50051.")
+	runCmd.Flags().String("http-endpoint", "", "Specifies the runtime HTTP endpoint. Defaults to http://127.0.0.1:8090")
 }
