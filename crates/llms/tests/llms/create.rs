@@ -26,7 +26,7 @@ use llms::{
     perplexity::PerplexitySonar,
     xai::Xai,
 };
-use secrecy::{Secret, SecretString};
+use secrecy::SecretString;
 use std::{
     collections::HashMap,
     fs,
@@ -76,7 +76,10 @@ pub(crate) fn create_hf(model_id: &str) -> Result<Arc<Box<dyn Chat>>, ChatError>
         model_id,
         None,
         None,
-        std::env::var("HF_TOKEN").ok().map(Secret::new).as_ref(),
+        std::env::var("HF_TOKEN")
+            .ok()
+            .map(SecretString::from)
+            .as_ref(),
     )?))
 }
 
@@ -85,7 +88,7 @@ pub(crate) fn create_perplexity() -> Result<Arc<Box<dyn Chat>>, ChatError> {
     if let Ok(api_key) = std::env::var("SPICE_PERPLEXITY_AUTH_TOKEN") {
         params.insert(
             "perplexity_auth_token".to_string(),
-            SecretString::new(api_key),
+            SecretString::from(api_key),
         );
     }
     let sonar = PerplexitySonar::from_params(None, &params)

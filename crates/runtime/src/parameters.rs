@@ -16,7 +16,7 @@ limitations under the License.
 
 use std::{collections::HashMap, fmt::Display, sync::Arc};
 
-use secrecy::{ExposeSecret, SecretString};
+use secrecy::SecretString;
 use snafu::prelude::*;
 use tokio::sync::RwLock;
 
@@ -264,7 +264,9 @@ impl<'a> ParamLookup<'a> {
     #[must_use]
     pub fn expose(self) -> ExposedParamLookup<'a> {
         match self {
-            ParamLookup::Present(s) => ExposedParamLookup::Present(s.expose_secret()),
+            ParamLookup::Present(s) => {
+                ExposedParamLookup::Present(secrecy::ExposeSecret::expose_secret(s))
+            }
             ParamLookup::Absent(s) => ExposedParamLookup::Absent(s),
         }
     }
