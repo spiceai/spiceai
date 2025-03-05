@@ -17,7 +17,6 @@ limitations under the License.
 use clap::Parser;
 use opentelemetry::global;
 use rustls::crypto::{self, CryptoProvider};
-use telemetry::noop::NoopMeterProvider;
 use std::{
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -25,6 +24,7 @@ use std::{
     },
     time::Duration,
 };
+use telemetry::noop::NoopMeterProvider;
 use tokio::runtime::Runtime;
 use tokio::sync::broadcast;
 
