@@ -87,7 +87,7 @@ impl MCPConfig {
         match mcp_type {
             MCPType::Stdio(command) => match params.get("mcp_args") {
                 Some(args) => {
-                    let args = argsecrecy::ExposeSecret::expose_secret(s);
+                    let args = ExposeSecret::expose_secret(args);
                     Self::Stdio {
                         command: command.clone(),
                         args: Some(args.split_whitespace().map(|s| s.to_string()).collect()),
