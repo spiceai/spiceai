@@ -851,7 +851,7 @@ dependencies = [
 [[package]]
 name = "async-openai"
 version = "0.28.0"
-source = "git+https://github.com/spiceai/async-openai?rev=506340b655b017e7235743e7d7bcc037b381ff43#506340b655b017e7235743e7d7bcc037b381ff43"
+source = "git+https://github.com/spiceai/async-openai?rev=08f8c9df21275f0b59a99233994eac62153afb94#08f8c9df21275f0b59a99233994eac62153afb94"
 dependencies = [
  "async-openai-macros",
  "backoff",
@@ -877,7 +877,7 @@ dependencies = [
 [[package]]
 name = "async-openai-macros"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/async-openai?rev=506340b655b017e7235743e7d7bcc037b381ff43#506340b655b017e7235743e7d7bcc037b381ff43"
+source = "git+https://github.com/spiceai/async-openai?rev=08f8c9df21275f0b59a99233994eac62153afb94#08f8c9df21275f0b59a99233994eac62153afb94"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -3518,7 +3518,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=44d4b86adb615b0b5f87ba9a5b437b3307e6fa46#44d4b86adb615b0b5f87ba9a5b437b3307e6fa46"
+source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=a1f7173691675238607867e6ae5c6a881700de5b#a1f7173691675238607867e6ae5c6a881700de5b"
 dependencies = [
  "arrow",
  "arrow-json",
