@@ -62,11 +62,11 @@ impl SecretStore for KeyringSecretStore {
             (Ok(prefixed_entry), Ok(fallback_entry)) => {
                 // Try getting password with prefixed key first
                 match prefixed_entry.get_password() {
-                    Ok(secret) => return Ok(Some(SecretString::new(secret))),
+                    Ok(secret) => return Ok(Some(SecretString::from(secret))),
                     Err(keyring::Error::NoEntry) => {
                         // Prefixed key failed, try fallback
                         match fallback_entry.get_password() {
-                            Ok(secret) => Ok(Some(SecretString::new(secret))),
+                            Ok(secret) => Ok(Some(SecretString::from(secret))),
                             Err(keyring::Error::NoEntry) => Ok(None),
                             Err(err) => {
                                 Err(Box::new(Error::UnableToGetSecretValue { source: err }))
@@ -79,7 +79,7 @@ impl SecretStore for KeyringSecretStore {
             (Err(keyring::Error::NoEntry), Ok(fallback_entry)) => {
                 // Prefixed entry creation failed, try fallback
                 match fallback_entry.get_password() {
-                    Ok(secret) => Ok(Some(SecretString::new(secret))),
+                    Ok(secret) => Ok(Some(SecretString::from(secret))),
                     Err(keyring::Error::NoEntry) => Ok(None),
                     Err(err) => Err(Box::new(Error::UnableToGetSecretValue { source: err })),
                 }

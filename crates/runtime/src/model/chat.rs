@@ -21,7 +21,7 @@ use llms::{
     xai::Xai,
 };
 use llms::{config::GenericAuthMechanism, openai::DEFAULT_LLM_MODEL};
-use secrecy::{ExposeSecret, SecretString};
+use secrecy::SecretString;
 use serde_json::Value;
 use spicepod::component::model::{Model, ModelFileType, ModelSource};
 use std::{collections::HashMap, path::PathBuf, str::FromStr, sync::Arc};
@@ -37,7 +37,7 @@ pub type LLMModelStore = HashMap<String, Box<dyn Chat>>;
 /// Extract a secret from a hashmap of secrets, if it exists.
 macro_rules! extract_secret {
     ($params:expr, $key:expr) => {
-        $params.get($key).map(|s| s.expose_secret().as_str())
+        $params.get($key).map(secrecy::ExposeSecret::expose_secret)
     };
 }
 
@@ -317,7 +317,7 @@ fn file(
 
     let chat_template_literal = params
         .get("chat_template")
-        .map(|s| s.expose_secret().as_str());
+        .map(secrecy::ExposeSecret::expose_secret);
 
     llms::chat::create_local_model(
         model_weights.as_slice(),

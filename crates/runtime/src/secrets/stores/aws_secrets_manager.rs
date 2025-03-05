@@ -128,9 +128,9 @@ impl SecretStore for AwsSecretsManager {
         if let Some(secret_str) = secret_value.secret_string() {
             let data = parse_json_to_hashmap(secret_str)?;
             if let Some(value) = data.get(&prefixed_key) {
-                return Ok(Some(SecretString::new(value.clone())));
+                return Ok(Some(SecretString::from(value.clone())));
             }
-            return Ok(data.get(key).cloned().map(SecretString::new));
+            return Ok(data.get(key).cloned().map(SecretString::from));
         }
 
         Ok(None)
