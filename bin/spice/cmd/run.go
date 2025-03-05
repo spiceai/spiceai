@@ -48,6 +48,14 @@ spice run
 			args = append(args, fmt.Sprintf("-%s", strings.Repeat("v", level)))
 		}
 
+		if flight, err := cmd.Flags().GetString("flight"); err == nil && flight != "" {
+			args = append(args, "--flight", flight)
+		}
+
+		if http, err := cmd.Flags().GetString("http"); err == nil && http != "" {
+			args = append(args, "--http", http)
+		}
+
 		err = runtime.Run(args)
 		if err != nil {
 			slog.Error("error running Spice.ai", "error", err)
@@ -58,4 +66,6 @@ spice run
 
 func init() {
 	RootCmd.AddCommand(runCmd)
+	runCmd.Flags().String("flight", "", "Spice.ai runtime Flight address to use (default: http://127.0.0.1:50051)")
+	runCmd.Flags().String("http", "", "Spice.ai runtime HTTP address to use (default: http://127.0.0.1:8090)")
 }
