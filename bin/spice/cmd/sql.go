@@ -72,11 +72,11 @@ sql> show tables
 			args = append(args, "--cache-control", cacheControl)
 		}
 
-		if flight, err := cmd.Flags().GetString("flight"); err == nil && flight != "" {
+		if flight, err := cmd.Flags().GetString("flight-endpoint"); err == nil && flight != "" {
 			args = append(args, "--repl-flight-endpoint", flight)
 		}
 
-		if http, err := cmd.Flags().GetString("http"); err == nil && http != "" {
+		if http, err := cmd.Flags().GetString("http-endpoint"); err == nil && http != "" {
 			args = append(args, "--http-endpoint", http)
 		}
 
@@ -104,8 +104,8 @@ func init() {
 	sqlCmd.Flags().String("tls-root-certificate-file", "", "The path to the root certificate file used to verify the Spice.ai runtime server certificate")
 	sqlCmd.Flags().String("user-agent", "", "The user agent to use for all requests")
 	sqlCmd.Flags().String("cache-control", "cache", "Control whether the results cache is used for queries. [possible values: cache, no-cache]")
-	sqlCmd.Flags().String("flight", "", "Spice.ai runtime Flight address to use (default: http://localhost:50051)")
-	sqlCmd.Flags().String("http", "", "Spice.ai runtime HTTP address to use (default: http://localhost:8090)")
+	sqlCmd.Flags().String("flight-endpoint", "", "Specifies the runtime Flight address. Defaults to http://localhost:50051")
+	sqlCmd.Flags().String("http-endpoint", "", "Specifies the runtime HTTP address. Defaults to http://localhost:8090")
 
 	RootCmd.AddCommand(sqlCmd)
 }
