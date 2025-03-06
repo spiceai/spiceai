@@ -38,8 +38,9 @@ pub async fn record_explain_plan(
     let mut assertion_err: Option<String> = None;
 
     insta::with_settings!({
-        description => format!("Query: {query}"),
+        description => format!("Query: {query_name}"),
         omit_expression => true,
+        snapshot_path => "snapshots/explain",
         filters => vec![
             (r"required_guarantees=\[[^\]]*\]", "required_guarantees=[N]"),
         ],

@@ -1,0 +1,10 @@
+---
+source: crates/test-framework/src/spicetest/datasets/worker.rs
+assertion_line: 351
+description: "Query: tpcds_q61"
+---
++------------+-------+-------------------------------------------------------------+
+| promotions | total | promotional_sales.promotions / all_sales.total * Int64(100) |
++------------+-------+-------------------------------------------------------------+
+|            |       |                                                             |
++------------+-------+-------------------------------------------------------------+

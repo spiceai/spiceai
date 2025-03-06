@@ -1,9 +1,0 @@
----
-source: crates/test-framework/src/spicetest/datasets/worker.rs
-expression: records_pretty
----
-+-------------------+
-| avg_yearly        |
-+-------------------+
-| 348406.0542857143 |
-+-------------------+

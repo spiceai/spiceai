@@ -343,8 +343,15 @@ impl SpiceTestQueryWorker {
                 .collect();
             let records_pretty = arrow::util::pretty::pretty_format_batches(&limited_records)?;
             let result = panic::catch_unwind(|| {
-                insta::assert_snapshot!(format!("{connector}_{query_name}"), records_pretty);
+                insta::with_settings!({
+                    description => format!("Query: {query_name}"),
+                    omit_expression => true,
+                    snapshot_path => "../../snapshot/snapshots/results"
+                }, {
+                    insta::assert_snapshot!(format!("{connector}_{query_name}"), records_pretty);
+                });
             });
+
             if result.is_err() {
                 let error_str =
                     format!("Query `{connector}` `{query_name}` snapshot assertion failed",);

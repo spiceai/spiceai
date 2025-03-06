@@ -1,0 +1,7 @@
+---
+source: crates/test-framework/src/spicetest/datasets/worker.rs
+assertion_line: 351
+description: "Query: tpcds_q54"
+---
+++
+++

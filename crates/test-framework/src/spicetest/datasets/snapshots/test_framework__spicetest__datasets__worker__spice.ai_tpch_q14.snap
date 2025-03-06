@@ -1,9 +1,0 @@
----
-source: crates/test-framework/src/spicetest/datasets/worker.rs
-expression: records_pretty
----
-+--------------------+
-| promo_revenue      |
-+--------------------+
-| 16.380778626395543 |
-+--------------------+

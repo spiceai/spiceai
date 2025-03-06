@@ -1,0 +1,10 @@
+---
+source: crates/test-framework/src/spicetest/datasets/worker.rs
+assertion_line: 351
+description: "Query: tpcds_q95"
+---
++-------------+---------------------+------------------+
+| order count | total shipping cost | total net profit |
++-------------+---------------------+------------------+
+| 3           | 17845.49            | 4454.26          |
++-------------+---------------------+------------------+
