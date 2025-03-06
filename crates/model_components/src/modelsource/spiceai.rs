@@ -18,7 +18,7 @@ pub struct SpiceAI {}
 
 use super::ModelSource;
 use async_trait::async_trait;
-use secrecy::{ExposeSecret, Secret, SecretString};
+use secrecy::{ExposeSecret, SecretBox, SecretString};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use snafu::prelude::*;
@@ -34,7 +34,7 @@ impl ModelSource for SpiceAI {
     async fn pull(&self, params: Arc<HashMap<String, SecretString>>) -> super::Result<String> {
         let name = params
             .get("name")
-            .map(Secret::expose_secret)
+            .map(SecretBox::expose_secret)
             .map(ToString::to_string);
 
         let Some(name) = name else {
@@ -49,7 +49,7 @@ impl ModelSource for SpiceAI {
 
         let remote_path = params
             .get("path")
-            .map(Secret::expose_secret)
+            .map(SecretBox::expose_secret)
             .map(ToString::to_string);
 
         let Some(remote_path) = remote_path else {
@@ -106,7 +106,7 @@ impl ModelSource for SpiceAI {
             .bearer_auth(
                 params
                     .get("token")
-                    .map(Secret::expose_secret)
+                    .map(SecretBox::expose_secret)
                     .map(ToString::to_string)
                     .unwrap_or_default(),
             )

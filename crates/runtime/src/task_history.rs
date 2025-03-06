@@ -92,6 +92,8 @@ impl TaskSpan {
         let retention = Retention::new(
             time_column.clone(),
             time_format,
+            None,
+            None,
             Some(Duration::from_secs(retention_period_secs)), // 1 day
             Some(Duration::from_secs(retention_check_interval_secs)),
             true,

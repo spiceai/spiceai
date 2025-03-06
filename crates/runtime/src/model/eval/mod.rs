@@ -269,21 +269,21 @@ async fn write_results(
     run_id: &EvalRunId,
     df: Arc<DataFusion>,
     input: &[DatasetInput],
-    output: &[DatasetOutput],
+    actual: &[DatasetOutput],
     expected: &[DatasetOutput],
     scores: &HashMap<String, Vec<f32>>,
 ) -> Result<()> {
     let mut bldr = ResultBuilder::new();
     for i in 0..input.len() {
         let input = &input[i];
-        let output = &output[i];
+        let actual = &actual[i];
         let expected = &expected[i];
         for (name, score) in scores {
             bldr.append(
                 run_id,
                 chrono::Utc::now(),
                 input,
-                output,
+                actual,
                 expected,
                 name,
                 score[i],

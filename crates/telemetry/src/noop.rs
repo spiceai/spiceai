@@ -11,13 +11,14 @@ use std::sync::Arc;
 
 /// A no-op instance of a `MetricProvider`
 #[derive(Debug, Default)]
-pub(crate) struct NoopMeterProvider {
+pub struct NoopMeterProvider {
     _private: (),
 }
 
 impl NoopMeterProvider {
     /// Create a new no-op meter provider.
-    pub(crate) fn new() -> Self {
+    #[must_use]
+    pub fn new() -> Self {
         NoopMeterProvider { _private: () }
     }
 }

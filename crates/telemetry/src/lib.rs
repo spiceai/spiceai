@@ -25,7 +25,7 @@ use std::{sync::LazyLock, time::Duration};
 pub mod anonymous;
 mod exporter;
 mod meter;
-mod noop;
+pub mod noop;
 
 static QUERY_COUNT: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER

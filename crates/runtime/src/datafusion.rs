@@ -789,6 +789,12 @@ impl DataFusion {
         if let Some(time_col) = &dataset.time_column {
             refresh = refresh.time_column(time_col.clone());
         }
+        if let Some(time_partition_column) = &dataset.time_partition_column {
+            refresh = refresh.time_partition_column(time_partition_column.clone());
+        }
+        if let Some(time_partition_format) = dataset.time_partition_format {
+            refresh = refresh.time_partition_format(time_partition_format);
+        }
         if let Some(check_interval) = dataset.refresh_check_interval() {
             refresh = refresh.check_interval(check_interval);
         }
@@ -798,7 +804,11 @@ impl DataFusion {
         if let Some(append_overlap) = acceleration_settings.refresh_append_overlap {
             refresh = refresh.append_overlap(append_overlap);
         }
-        if let Some(refresh_data_window) = dataset.refresh_data_window() {
+
+        // we must not fetch data older than the explicitly set refresh data window or retention period
+        let refresh_data_window = dataset.refresh_data_window().or(dataset.retention_period());
+
+        if let Some(refresh_data_window) = refresh_data_window {
             refresh = refresh.period(refresh_data_window);
         }
         refresh
@@ -817,6 +827,8 @@ impl DataFusion {
         accelerated_table_builder.retention(Retention::new(
             dataset.time_column.clone(),
             dataset.time_format,
+            dataset.time_partition_column.clone(),
+            dataset.time_partition_format,
             dataset.retention_period(),
             dataset.retention_check_interval(),
             acceleration_settings.retention_check_enabled,
@@ -1267,6 +1279,21 @@ impl DataFusion {
 
     pub fn query_builder<'a>(self: &Arc<Self>, sql: &'a str) -> QueryBuilder<'a> {
         QueryBuilder::new(sql, Arc::clone(self))
+    }
+
+    /// Performs `DataFusion` cleanup during shutdown.
+    /// Currently performs cleanup of accelerated tables only.
+    pub async fn shutdown(&self) {
+        // Don't block self.accelerated_tables as it needs to be modified during table removal
+        // and will be cleaned up authomatically by removing accelerated tables.
+
+        let accelerated_tables = self.accelerated_tables.read().await.clone();
+
+        for table in &accelerated_tables {
+            if let Err(err) = self.remove_table(table).await {
+                tracing::error!("Failed to clean up '{table}' during shutdown: {err}");
+            }
+        }
     }
 }
 

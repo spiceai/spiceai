@@ -17,13 +17,15 @@ limitations under the License.
 use async_trait::async_trait;
 use catalog::SpiceToolCatalog;
 use serde_json::Value;
-use std::sync::Arc;
+use std::{borrow::Cow, sync::Arc};
 
 use crate::Runtime;
 
 pub mod builtin;
 pub mod catalog;
 pub mod factory;
+#[cfg(feature = "mcp")]
+pub mod mcp;
 pub mod memory;
 pub mod options;
 pub mod utils;
@@ -44,6 +46,14 @@ impl Tooling {
             Tooling::Catalog(c) => c.all().await,
         }
     }
+
+    #[must_use]
+    pub fn name(&self) -> Cow<'_, str> {
+        match self {
+            Tooling::Tool(t) => t.name(),
+            Tooling::Catalog(c) => Cow::Borrowed(c.name()),
+        }
+    }
 }
 
 impl From<Arc<dyn SpiceModelTool>> for Tooling {
@@ -61,8 +71,8 @@ impl From<Arc<dyn SpiceToolCatalog>> for Tooling {
 /// Tools that implement the [`SpiceModelTool`] trait can automatically be used by LLMs in the runtime.
 #[async_trait]
 pub trait SpiceModelTool: Sync + Send {
-    fn name(&self) -> &str;
-    fn description(&self) -> Option<&str>;
+    fn name(&self) -> Cow<'_, str>;
+    fn description(&self) -> Option<Cow<'_, str>>;
     fn strict(&self) -> Option<bool> {
         None
     }

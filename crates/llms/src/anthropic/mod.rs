@@ -14,10 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
-use async_openai::{config::Config, error::OpenAIError, Client};
-use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
-use secrecy::{ExposeSecret, Secret};
-use std::sync::LazyLock;
+use async_openai::{error::OpenAIError, Client};
 use types::validate_model_variant;
 
 mod chat;
@@ -26,152 +23,37 @@ mod types_stream;
 
 pub use types::AnthropicModelVariant;
 
+use crate::config::{GenericAuthMechanism, HostedModelConfig};
+
 pub struct Anthropic {
-    client: Client<AnthropicConfig>,
+    client: Client<HostedModelConfig>,
     model: AnthropicModelVariant,
 }
 
 static ANTHROPIC_API_BASE: &str = "https://api.anthropic.com/v1";
 pub static DEFAULT_ANTHROPIC_MODEL: &str = "claude-3-5-sonnet-latest";
 static ANTHROPIC_API_VERSION: &str = "2023-06-01";
-static DUMMY_API_KEY: LazyLock<Secret<String>> = LazyLock::new(|| Secret::new(String::new()));
 
 impl Anthropic {
-    pub fn new(config: AnthropicConfig, model: Option<&str>) -> Result<Self, OpenAIError> {
+    pub fn new(
+        auth: GenericAuthMechanism,
+        model: Option<&str>,
+        api_base: Option<&str>,
+        version: Option<&str>,
+    ) -> Result<Self, OpenAIError> {
         let variant = validate_model_variant(model.unwrap_or(DEFAULT_ANTHROPIC_MODEL))?;
+        let cfg = HostedModelConfig::default()
+            .with_auth(auth)
+            .with_base_url(api_base.unwrap_or(ANTHROPIC_API_BASE))
+            .with_header(
+                "anthropic-version",
+                version.unwrap_or(ANTHROPIC_API_VERSION),
+            )
+            .map_err(|e| OpenAIError::InvalidArgument(e.to_string()))?;
+
         Ok(Self {
-            client: Client::<AnthropicConfig>::with_config(config),
+            client: Client::<HostedModelConfig>::with_config(cfg),
             model: variant,
         })
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct AnthropicConfig {
-    pub auth: Option<AnthropicAuthMechanism>,
-    pub base_url: String,
-    pub version: String,
-    pub beta: Option<Vec<String>>,
-}
-
-impl Default for AnthropicConfig {
-    fn default() -> Self {
-        Self {
-            auth: None,
-            base_url: ANTHROPIC_API_BASE.to_string(),
-            version: ANTHROPIC_API_VERSION.to_string(),
-            beta: None,
-        }
-    }
-}
-
-impl AnthropicConfig {
-    #[must_use]
-    pub fn new() -> Self {
-        AnthropicConfig::default()
-    }
-
-    #[must_use]
-    pub fn with_api_key<S: Into<String>>(mut self, api_key: Option<S>) -> Self {
-        if let Some(api_key) = api_key {
-            self.auth = Some(AnthropicAuthMechanism::ApiKey(Secret::new(api_key.into())));
-        }
-        self
-    }
-
-    #[must_use]
-    pub fn with_auth_token<S: Into<String>>(mut self, auth_token: Option<S>) -> Self {
-        if let Some(auth_token) = auth_token {
-            self.auth = Some(AnthropicAuthMechanism::AuthToken(Secret::new(
-                auth_token.into(),
-            )));
-        }
-        self
-    }
-
-    #[must_use]
-    pub fn with_base_url<S: Into<String>>(mut self, base_url: Option<S>) -> Self {
-        if let Some(base_url) = base_url {
-            self.base_url = base_url.into();
-        }
-        self
-    }
-
-    #[must_use]
-    pub fn with_version<S: Into<String>>(mut self, version: Option<S>) -> Self {
-        if let Some(version) = version {
-            self.version = version.into();
-        }
-        self
-    }
-
-    #[must_use]
-    pub fn with_beta(mut self, beta: Vec<String>) -> Self {
-        self.beta = Some(beta);
-        self
-    }
-}
-
-#[derive(Clone, Debug)]
-pub enum AnthropicAuthMechanism {
-    ApiKey(Secret<String>),
-    AuthToken(Secret<String>),
-}
-
-impl Config for AnthropicConfig {
-    fn headers(&self) -> HeaderMap {
-        let mut headers = HeaderMap::new();
-        match &self.auth {
-            Some(AnthropicAuthMechanism::ApiKey(api_key)) => {
-                let Ok(value) = HeaderValue::from_str(api_key.expose_secret()) else {
-                    panic!("Invalid Anthropic API key");
-                };
-                headers.insert("x-api-key", value);
-            }
-            Some(AnthropicAuthMechanism::AuthToken(auth_token)) => {
-                let Ok(value) = HeaderValue::from_str(
-                    format!("Bearer {}", auth_token.expose_secret()).as_str(),
-                ) else {
-                    panic!("Invalid Anthropic auth token");
-                };
-                headers.insert(AUTHORIZATION, value);
-            }
-            None => {}
-        }
-
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        let Ok(version) = HeaderValue::from_str(self.version.as_str()) else {
-            panic!("Invalid `anthropic-version` header");
-        };
-        headers.insert("anthropic-version", version);
-
-        if let Some(beta) = &self.beta {
-            let Ok(value) = HeaderValue::from_str(beta.join(",").as_str()) else {
-                panic!("Invalid `anthropic-beta` header");
-            };
-            headers.insert("anthropic-beta", value);
-        }
-        headers
-    }
-
-    fn url(&self, path: &str) -> String {
-        format!("{}{}", self.api_base(), path)
-    }
-
-    fn query(&self) -> Vec<(&str, &str)> {
-        vec![]
-    }
-
-    fn api_base(&self) -> &str {
-        &self.base_url
-    }
-
-    fn api_key(&self) -> &Secret<String> {
-        // This is a bit of a hack, but this method is not used anywhere.
-        match &self.auth {
-            Some(AnthropicAuthMechanism::ApiKey(api_key)) => api_key,
-            Some(AnthropicAuthMechanism::AuthToken(auth_token)) => auth_token,
-            None => &DUMMY_API_KEY,
-        }
     }
 }

@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 /*
 Copyright 2024-2025 The Spice.ai OSS Authors
 
@@ -46,11 +47,11 @@ impl Default for GetReadinessTool {
 
 #[async_trait]
 impl SpiceModelTool for GetReadinessTool {
-    fn name(&self) -> &str {
-        &self.name
+    fn name(&self) -> Cow<'_, str> {
+        Cow::Borrowed(&self.name)
     }
-    fn description(&self) -> Option<&str> {
-        self.description.as_deref()
+    fn description(&self) -> Option<Cow<'_, str>> {
+        self.description.as_deref().map(Cow::Borrowed)
     }
     fn parameters(&self) -> Option<Value> {
         None
@@ -61,7 +62,7 @@ impl SpiceModelTool for GetReadinessTool {
         _arg: &str,
         rt: Arc<Runtime>,
     ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
-        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::get_readiness", tool = self.name());
+        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::get_readiness", tool = self.name().to_string());
 
         let statuses = rt.status().get_all_statuses();
         let statuses_map: serde_json::Map<String, Value> = statuses

@@ -27,6 +27,9 @@ pub use dataset::{DataConsistencyArgs, DatasetTestArgs};
 pub mod dispatch;
 use dispatch::DispatchArgs;
 
+mod evals;
+pub use evals::EvalsTestArgs;
+
 #[derive(Subcommand)]
 pub enum Commands {
     // Run a test
@@ -47,6 +50,7 @@ pub enum TestCommands {
     DataConsistency(DataConsistencyArgs),
     HttpConsistency(HttpConsistencyTestArgs),
     HttpOverhead(HttpOverheadTestArgs),
+    Evals(EvalsTestArgs),
 }
 
 /// Arguments Common to all [`TestCommands`].

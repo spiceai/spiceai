@@ -41,6 +41,8 @@ use serde_yaml::Value;
 use snafu::prelude::*;
 use spice_cloud::SpiceExtensionFactory;
 use spiced_tracing::LogVerbosity;
+#[cfg(feature = "tpc-extension")]
+use tpc_extension::TpcExtensionFactory;
 use tracing::subscriber;
 
 #[path = "tracing.rs"]
@@ -188,6 +190,11 @@ pub async fn run(args: Args) -> Result<()> {
             let spice_extension_factory = SpiceExtensionFactory::new(manifest.clone());
             extension_factories.push(Box::new(spice_extension_factory));
         }
+        #[cfg(feature = "tpc-extension")]
+        if let Some(manifest) = app.extensions.get("tpc") {
+            let tpc_extension_factory = TpcExtensionFactory::new(manifest.clone());
+            extension_factories.push(Box::new(tpc_extension_factory));
+        }
     }
 
     let runtime_config = app.as_ref().map(|app| &app.runtime);
@@ -229,7 +236,7 @@ pub async fn run(args: Args) -> Result<()> {
     .context(UnableToInitializeTracingSnafu)?;
 
     if let Some(metrics_registry) = prometheus_registry {
-        init_metrics(rt.datafusion(), metrics_registry).context(UnableToInitializeMetricsSnafu)?;
+        init_metrics(&rt.datafusion(), metrics_registry).context(UnableToInitializeMetricsSnafu)?;
     }
 
     let tls_config = tls::load_tls_config(&args, spicepod_tls_config.as_ref(), rt.secrets())
@@ -255,16 +262,20 @@ pub async fn run(args: Args) -> Result<()> {
         },
     }
 
-    match server_thread.await {
+    let result = match server_thread.await {
         Ok(ok) => ok.context(UnableToStartServersSnafu),
         Err(_) => Err(Error::GenericError {
             reason: "Unable to start spiced".into(),
         }),
-    }
+    };
+
+    rt.close().await;
+
+    result
 }
 
 fn init_metrics(
-    df: Arc<DataFusion>,
+    df: &Arc<DataFusion>,
     registry: prometheus::Registry,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let resource = Resource::default();

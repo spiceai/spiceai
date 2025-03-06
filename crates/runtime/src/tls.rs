@@ -19,7 +19,7 @@ use rustls::{
     ServerConfig,
 };
 use rustls_pemfile::{certs, private_key};
-use secrecy::{ExposeSecret, Secret};
+use secrecy::{ExposeSecret, SecretBox};
 use std::{
     io::{self, Cursor},
     sync::Arc,
@@ -27,8 +27,8 @@ use std::{
 use x509_certificate::X509Certificate;
 
 pub struct TlsConfig {
-    pub cert: Secret<Vec<u8>>,
-    pub key: Secret<Vec<u8>>,
+    pub cert: SecretBox<Vec<u8>>,
+    pub key: SecretBox<Vec<u8>>,
     pub server_config: Arc<ServerConfig>,
 }
 
@@ -45,8 +45,8 @@ impl TlsConfig {
             .with_single_cert(certs, key)?;
 
         Ok(Self {
-            cert: Secret::new(cert_bytes),
-            key: Secret::new(key_bytes),
+            cert: SecretBox::new(Box::new(cert_bytes)),
+            key: SecretBox::new(Box::new(key_bytes)),
             server_config: Arc::new(config),
         })
     }

@@ -117,7 +117,7 @@ impl Dialect for SpiceCloudPlatformDialect {
     }
 
     fn interval_style(&self) -> IntervalStyle {
-        IntervalStyle::SQLStandard
+        IntervalStyle::PostgresVerbose
     }
 
     fn identifier_quote_style(&self, identifier: &str) -> Option<char> {
@@ -141,9 +141,9 @@ impl SpiceAIFactory {
 }
 
 const PARAMETERS: &[ParameterSpec] = &[
-    ParameterSpec::connector("api_key").secret(),
-    ParameterSpec::connector("token").secret(),
-    ParameterSpec::connector("endpoint"),
+    ParameterSpec::component("api_key").secret(),
+    ParameterSpec::component("token").secret(),
+    ParameterSpec::component("endpoint"),
 ];
 
 const HEADER_ORG: &str = "spiceai-org";

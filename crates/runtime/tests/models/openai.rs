@@ -384,6 +384,7 @@ async fn openai_test_chat_completion() -> Result<(), anyhow::Error> {
 }
 
 #[tokio::test]
+#[ignore] // https://github.com/spiceai/spiceai/issues/4870
 async fn openai_test_chat_messages() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(None);
 
@@ -528,8 +529,10 @@ async fn verify_similarity_search_chat_completion(
     let response = model.chat_request(req).await?;
 
     // Verify Response
-    let resp_value =
+    let mut resp_value =
         serde_json::to_value(&response).expect("Failed to serialize response.choices: {}");
+    sort_json_keys(&mut resp_value);
+
     let selector = JsonPath::from_str(
         "$.choices[*].message[?(@.content~='.*there just big vehicles. Journalists.*')].length()",
     )

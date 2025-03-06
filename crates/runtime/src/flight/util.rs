@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use arrow_flight::flight_service_server::FlightService;
+use cache::QueryResultsCacheStatus;
 use tonic::{
     metadata::{Ascii, MetadataValue},
     Response,
@@ -27,22 +28,36 @@ use crate::{
 
 pub fn attach_cache_metadata(
     response: &mut Response<<Service as FlightService>::DoGetStream>,
-    from_cache: Option<bool>,
+    results_cache_status: QueryResultsCacheStatus,
 ) {
-    if let Some(from_cache) = from_cache {
-        let val: Result<MetadataValue<Ascii>, _> = if from_cache {
-            "Hit from spiceai".parse()
-        } else {
-            "Miss from spiceai".parse()
-        };
-        match val {
-            Ok(val) => {
-                response.metadata_mut().insert("x-cache", val);
-            }
-            Err(e) => {
-                tracing::error!("Failed to parse metadata value: {}", e);
-            }
-        }
+    if let Some(val) = status_to_x_cache_value(results_cache_status) {
+        response.metadata_mut().insert("x-cache", val);
+    }
+
+    if let Some(val) = status_to_results_cache_value(results_cache_status) {
+        response.metadata_mut().insert("results-cache-status", val);
+    }
+}
+
+/// This is the legacy cache header, preserved for backwards compatibility.
+fn status_to_x_cache_value(
+    results_cache_status: QueryResultsCacheStatus,
+) -> Option<MetadataValue<Ascii>> {
+    match results_cache_status {
+        QueryResultsCacheStatus::CacheHit => "Hit from spiceai".parse().ok(),
+        QueryResultsCacheStatus::CacheMiss => "Miss from spiceai".parse().ok(),
+        QueryResultsCacheStatus::CacheDisabled | QueryResultsCacheStatus::CacheBypass => None,
+    }
+}
+
+fn status_to_results_cache_value(
+    results_cache_status: QueryResultsCacheStatus,
+) -> Option<MetadataValue<Ascii>> {
+    match results_cache_status {
+        QueryResultsCacheStatus::CacheHit => "HIT".parse().ok(),
+        QueryResultsCacheStatus::CacheMiss => "MISS".parse().ok(),
+        QueryResultsCacheStatus::CacheBypass => "BYPASS".parse().ok(),
+        QueryResultsCacheStatus::CacheDisabled => None,
     }
 }
 

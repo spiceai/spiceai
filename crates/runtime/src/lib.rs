@@ -45,7 +45,7 @@ use status::ComponentStatus;
 use tls::TlsConfig;
 use tokio::sync::{oneshot::error::RecvError, RwLock};
 use tools::factory::default_available_catalogs;
-use tools::{catalog::SpiceToolCatalog, SpiceModelTool, Tooling};
+use tools::{catalog::SpiceToolCatalog, Tooling};
 pub use util::shutdown_signal;
 
 use crate::extension::Extension;
@@ -607,6 +607,16 @@ impl Runtime {
         if let Err(err) = load_result {
             tracing::error!("Could not start the Spice runtime: {err}");
         }
+    }
+
+    // Closes and deallocates all resources (including the static registries)
+    pub async fn close(self) {
+        dataconnector::unregister_all().await;
+        catalogconnector::unregister_all().await;
+        dataaccelerator::unregister_all().await;
+        tools::factory::unregister_all_factories().await;
+        document_parse::unregister_all().await;
+        self.df.shutdown().await;
     }
 }
 

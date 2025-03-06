@@ -17,6 +17,7 @@ limitations under the License.
 use clap::Parser;
 use opentelemetry::global;
 use rustls::crypto::{self, CryptoProvider};
+use telemetry::noop::NoopMeterProvider;
 use tokio::runtime::Runtime;
 
 #[global_allocator]
@@ -26,24 +27,7 @@ fn main() {
     let args = spiced::Args::parse();
 
     if args.version {
-        if cfg!(feature = "release") {
-            println!("v{}{}", env!("CARGO_PKG_VERSION"), build_metadata());
-        } else {
-            print!(
-                "v{}-build.{}",
-                env!("CARGO_PKG_VERSION"),
-                env!("GIT_COMMIT_HASH")
-            );
-
-            if cfg!(feature = "dev") {
-                print!("-dev");
-            }
-
-            print!("{}", build_metadata());
-
-            println!();
-        };
-
+        println!("{}", get_version_string());
         return;
     }
 
@@ -72,11 +56,33 @@ fn main() {
     }
 
     global::shutdown_tracer_provider();
+    // There is no global::shutdown_meter_provider, so we replace currently used meter provider with a noop one to clean up resources
+    global::set_meter_provider(NoopMeterProvider::new());
 }
 
 async fn start_runtime(args: spiced::Args) -> Result<(), Box<dyn std::error::Error>> {
+    spiced::in_tracing_context(|| {
+        tracing::info!("Starting runtime {version}", version = get_version_string());
+    });
     spiced::run(args).await?;
     Ok(())
+}
+
+fn get_version_string() -> String {
+    if cfg!(feature = "release") {
+        format!("v{}{}", env!("CARGO_PKG_VERSION"), build_metadata())
+    } else {
+        let mut version = format!(
+            "v{}-build.{}",
+            env!("CARGO_PKG_VERSION"),
+            env!("GIT_COMMIT_HASH")
+        );
+        if cfg!(feature = "dev") {
+            version.push_str("-dev");
+        }
+        version.push_str(build_metadata());
+        version
+    }
 }
 
 /// Build metadata conforming to <https://semver.org/#spec-item-10>

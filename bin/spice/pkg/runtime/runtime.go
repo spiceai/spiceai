@@ -58,7 +58,7 @@ func EnsureInstalled(flavor constants.Flavor, autoUpgrade bool, allowAccelerator
 	}
 
 	if shouldInstall {
-		err = rtcontext.InstallOrUpgradeRuntime(flavor, allowAccelerator)
+		err = rtcontext.InstallMatchingRuntime(flavor, allowAccelerator)
 		if err != nil {
 			return shouldInstall, err
 		}

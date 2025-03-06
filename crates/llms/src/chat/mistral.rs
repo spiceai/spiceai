@@ -40,7 +40,7 @@ use mistralrs::{
     TokenSource, Tool, ToolCallResponse, ToolChoice, ToolType,
 };
 
-use secrecy::{ExposeSecret, Secret};
+use secrecy::{ExposeSecret, SecretString};
 use snafu::ResultExt;
 use std::{
     collections::HashMap,
@@ -299,7 +299,7 @@ impl MistralLlama {
     pub fn from_hf(
         model_id: &str,
         arch: Option<&str>,
-        hf_token_literal: Option<&Secret<String>>,
+        hf_token_literal: Option<&SecretString>,
         gguf_filename: Option<PathBuf>,
     ) -> Result<Self> {
         let model_parts: Vec<&str> = model_id.split(':').collect();
@@ -339,7 +339,7 @@ impl MistralLlama {
         let device = Self::get_device();
         let token_source = hf_token_literal.map_or(TokenSource::CacheToken, |secret| {
             tracing::debug!("A HuggingFace token was specified in parameters. The specified token will be used instead of any system/environment defaults.");
-            TokenSource::Literal(secret.expose_secret().clone())
+            TokenSource::Literal(secret.expose_secret().to_string())
         });
 
         let pipeline = loader?
@@ -468,6 +468,7 @@ impl MistralLlama {
                         c.finish_reason = "tool_calls".to_string();
                     }
                 });
+
                 Ok(resp)
             }
             MistralResponse::ModelError(e, _) => Err(OpenAIError::ApiError(ApiError {
@@ -710,7 +711,7 @@ fn chunk_choices_to_openai(choice: &ChunkChoice) -> Result<ChatChoiceStream, Ope
             function_call: None,
             tool_calls: delta.tool_calls.as_ref().map(|t| {
                 t.iter()
-                    .map(|x| parse_tool_call_response(*index as i32, x))
+                    .map(|x| parse_tool_call_response(*index as u32, x))
                     .collect()
             }),
             role: Some(role),
@@ -761,7 +762,7 @@ fn convert_tool(x: &ChatCompletionTool) -> Tool {
 }
 
 fn parse_tool_call_response(
-    index: i32,
+    index: u32,
     r: &ToolCallResponse,
 ) -> ChatCompletionMessageToolCallChunk {
     ChatCompletionMessageToolCallChunk {

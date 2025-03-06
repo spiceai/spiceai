@@ -21,8 +21,11 @@ use arrow::{
     error::ArrowError,
 };
 use arrow_cast::cast;
+use arrow_schema::Schema;
 use snafu::prelude::*;
 use std::sync::Arc;
+
+use crate::format::{format_column_data, FormatOperation};
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -138,8 +141,8 @@ pub fn to_primitive_type_list(
     Err(ArrowError::CastError("Invalid column type".into()))
 }
 
-/// Recursively truncates the data in a record batch to the specified maximum number of characters.
-/// The truncation is applied to `Utf8` and `Utf8View` data.
+/// Recursively truncates the data in a [`RecordBatch`] to the specified maximum number of characters.
+/// The truncation is applies to [`DataType::Utf8`] and [`DataType::Utf8View`] data.
 ///
 /// # Errors
 ///
@@ -153,101 +156,66 @@ pub fn truncate_string_columns(
         .columns()
         .iter()
         .zip(schema.fields())
-        .map(|(column, field)| truncate_column_data(Arc::clone(column), field, max_characters))
+        .map(|(column, field)| {
+            format_column_data(
+                Arc::clone(column),
+                field,
+                FormatOperation::TruncateUtf8Length(max_characters),
+            )
+        })
         .collect::<Result<Vec<_>, _>>()?;
 
     RecordBatch::try_new(schema, columns)
 }
 
-fn truncate_column_data(
-    column: ArrayRef,
-    field: &Arc<Field>,
-    max_characters: usize,
-) -> Result<ArrayRef, ArrowError> {
-    match field.data_type() {
-        DataType::Utf8View => {
-            let string_array = column
-                .as_any()
-                .downcast_ref::<arrow::array::StringViewArray>()
-                .ok_or(ArrowError::CastError(
-                    "Failed to downcast to StringViewArray".into(),
-                ))?;
+/// Truncates any column in the [`RecordBatch`] that is a list of numerical values to the first `max_elements` elements.
+///
+/// # Errors
+///
+/// This function will return an error if arrow conversion fails.
+pub fn truncate_numeric_column_length(
+    record_batch: &RecordBatch,
+    max_elements: usize,
+) -> Result<RecordBatch, ArrowError> {
+    let schema = record_batch.schema();
+    let column_and_fields = record_batch
+        .columns()
+        .iter()
+        .zip(schema.fields())
+        .map(|(column, field)| {
+            if is_numeric_list(field) {
+                let new_column = format_column_data(
+                    Arc::clone(column),
+                    field,
+                    FormatOperation::TruncateListLength(max_elements),
+                )?;
+                let new_field = Arc::new(Field::new(
+                    field.name(),
+                    new_column.data_type().clone(),
+                    field.is_nullable(),
+                ));
+                Ok((new_column, new_field))
+            } else {
+                Ok((Arc::clone(column), Arc::clone(field)))
+            }
+        })
+        .collect::<Result<Vec<_>, ArrowError>>()?;
 
-            let truncated = string_array
-                .iter()
-                .map(|x| trancate_str(x, max_characters))
-                .collect::<arrow::array::StringViewArray>();
+    let (columns, fields) = column_and_fields
+        .into_iter()
+        .unzip::<_, _, Vec<_>, Vec<_>>();
 
-            Ok(Arc::new(truncated) as ArrayRef)
-        }
-        DataType::Utf8 => {
-            let string_array = column
-                .as_any()
-                .downcast_ref::<arrow::array::StringArray>()
-                .ok_or(ArrowError::CastError(
-                    "Failed to downcast to ListArray".into(),
-                ))?;
-
-            let truncated = string_array
-                .iter()
-                .map(|x| trancate_str(x, max_characters))
-                .collect::<arrow::array::StringArray>();
-
-            Ok(Arc::new(truncated) as ArrayRef)
-        }
-        DataType::List(field) => {
-            let list_array = column
-                .as_any()
-                .downcast_ref::<arrow::array::ListArray>()
-                .ok_or_else(|| ArrowError::CastError("Failed to downcast to ListArray".into()))?;
-
-            let truncated_values =
-                truncate_column_data(Arc::clone(list_array.values()), field, max_characters)?;
-
-            let list = ListArray::new(
-                Arc::clone(field),
-                arrow::buffer::OffsetBuffer::new(
-                    arrow::buffer::Buffer::from_slice_ref(list_array.value_offsets()).into(),
-                ),
-                truncated_values,
-                list_array.logical_nulls(),
-            );
-
-            Ok(Arc::new(list) as ArrayRef)
-        }
-        DataType::Struct(fields) => {
-            let struct_array = column
-                .as_any()
-                .downcast_ref::<StructArray>()
-                .ok_or_else(|| ArrowError::CastError("Failed to downcast to StructArray".into()))?;
-
-            let columns = fields
-                .iter()
-                .enumerate()
-                .map(|(i, field)| {
-                    let field_data = struct_array.column(i);
-                    truncate_column_data(Arc::clone(field_data), field, max_characters)
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-
-            let truncated_struct =
-                StructArray::from(fields.iter().cloned().zip(columns).collect::<Vec<_>>());
-            Ok(Arc::new(truncated_struct) as ArrayRef)
-        }
-        _ => Ok(column),
-    }
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
 }
 
-fn trancate_str(str: Option<&str>, max_characters: usize) -> Option<&str> {
-    match str {
-        Some(value) => {
-            if value.len() > max_characters {
-                Some(&value[..max_characters])
-            } else {
-                Some(value)
-            }
-        }
-        None => None,
+fn is_numeric_list(field: &Arc<Field>) -> bool {
+    match field.data_type() {
+        DataType::LargeListView(inner)
+        | DataType::FixedSizeList(inner, _)
+        | DataType::LargeList(inner)
+        | DataType::ListView(inner)
+        | DataType::List(inner) => inner.data_type().is_numeric(),
+        _ => false,
     }
 }
 

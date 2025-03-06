@@ -19,7 +19,6 @@ package github
 import (
 	"encoding/json"
 	"fmt"
-	"sort"
 	"strings"
 
 	"golang.org/x/mod/semver"
@@ -77,7 +76,7 @@ func (r *RepoRelease) HasAsset(assetName string) bool {
 	return false
 }
 
-func GetReleases(gh *GitHubClient) (RepoReleases, error) {
+func GetRelease(gh *GitHubClient, version string) (*RepoRelease, error) {
 	releasesURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/releases", gh.Owner, gh.Repo)
 	body, err := gh.Get(releasesURL, nil)
 	if err != nil {
@@ -90,35 +89,34 @@ func GetReleases(gh *GitHubClient) (RepoReleases, error) {
 		return nil, err
 	}
 
-	return githubRepoReleases, nil
+	for _, release := range githubRepoReleases {
+		if release.TagName == version {
+			return &release, nil
+		}
+	}
+
+	return nil, fmt.Errorf("No matching release is found for version %s", version)
 }
 
 func GetLatestRelease(gh *GitHubClient, assetName string) (*RepoRelease, error) {
-	releases, err := GetReleases(gh)
+	latestReleasesURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/releases/latest", gh.Owner, gh.Repo)
+
+	body, err := gh.Get(latestReleasesURL, nil)
 	if err != nil {
 		return nil, err
 	}
 
-	if len(releases) == 0 {
+	var release RepoRelease
+	err = json.Unmarshal(body, &release)
+	if err != nil {
+		return nil, err
+	}
+
+	if assetName != "" && !release.HasAsset(assetName) {
 		return nil, fmt.Errorf("no releases")
 	}
 
-	// Sort by semver in descending order
-	sort.Sort(releases)
-
-	for _, release := range releases {
-
-		if release.Draft || release.Prerelease {
-			continue
-		}
-
-		if assetName != "" && !release.HasAsset(assetName) {
-			continue
-		}
-		return &release, nil
-	}
-
-	return nil, fmt.Errorf("no releases")
+	return &release, nil
 }
 
 func DownloadReleaseByTagName(gh *GitHubClient, tagName string, downloadDir string, filename string) error {

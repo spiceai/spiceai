@@ -97,7 +97,7 @@ pub async fn register_all() {
     register_accelerator_engine(Engine::Sqlite, Arc::new(SqliteAccelerator::new())).await;
 }
 
-pub async fn clear_registry() {
+pub async fn unregister_all() {
     let mut registry = DATA_ACCELERATOR_ENGINES.lock().await;
     registry.clear();
 }
@@ -333,6 +333,13 @@ pub async fn create_accelerator_table(
             })?;
 
     if let Err(e) = acceleration_settings.validate_indexes(&schema) {
+        InvalidConfigurationSnafu {
+            msg: format!("{e}"),
+        }
+        .fail()?;
+    };
+
+    if let Err(e) = acceleration_settings.validate_primary_key(&schema) {
         InvalidConfigurationSnafu {
             msg: format!("{e}"),
         }

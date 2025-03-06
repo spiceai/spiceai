@@ -58,7 +58,7 @@ spice upgrade
 		if os.Getenv(constants.SpiceUpgradeReloadEnv) != "true" {
 			// Run CLI upgrade
 			if !upgradeCli(force, rtcontext) {
-				// Exit if CLI upgrade fail
+				// Exit if CLI upgrade fail / completes
 				return
 			}
 		}
@@ -68,6 +68,13 @@ spice upgrade
 			cleanupOldBinaries()
 		}
 
+		slog.Info("Checking for the latest Spice Runtime release...")
+		currentVersion, err := rtcontext.Version()
+		if err != nil {
+			slog.Info("Spice runtime is not installed and won't be upgraded. Run `spice install` to install the runtime.")
+			return
+		}
+
 		runtimeUpgradeRequired, err := rtcontext.IsRuntimeUpgradeAvailable()
 		if err != nil {
 			slog.Error("checking for runtime upgrade", "error", err)
@@ -75,7 +82,7 @@ spice upgrade
 		}
 
 		if runtimeUpgradeRequired == "" {
-			// Exit if no runtime upgrade is required
+			slog.Info(fmt.Sprintf("Using version %s. Runtime upgrade not required.", currentVersion))
 			return
 		}
 
@@ -86,13 +93,13 @@ spice upgrade
 			flavor = constants.FlavorAI
 		}
 
-		release, err := github.GetLatestRuntimeRelease()
+		release, err := github.GetRuntimeRelease(version.Version())
 		if err != nil {
 			slog.Error("installing runtime", "error", err)
 			os.Exit(1)
 		}
 
-		err = rtcontext.InstallOrUpgradeRuntime(flavor, accelerated) // retain the current accelerator setting for upgrades
+		err = rtcontext.InstallMatchingRuntime(flavor, accelerated) // retain the current accelerator setting for upgrades
 		if err != nil {
 			slog.Error("installing runtime", "error", err)
 			os.Exit(1)
@@ -143,8 +150,8 @@ func cleanupOldBinaries() {
 }
 
 // Upgrade CLI
-// Returns true if the CLI was upgraded successfully / no upgrade was required
-// Returns false if the upgrade failed
+// Returns true if the CLI no upgrade was required
+// Returns false if the upgrade failed or the CLI upgrade completes
 func upgradeCli(force bool, rtcontext *context.RuntimeContext) bool {
 	slog.Info("Checking for latest Spice CLI release...")
 	release, err := github.GetLatestCliRelease()
@@ -155,14 +162,35 @@ func upgradeCli(force bool, rtcontext *context.RuntimeContext) bool {
 
 	cliVersion := version.Version()
 	if cliVersion == release.TagName && !force {
-		slog.Info(fmt.Sprintf("Using the latest version %s. No upgrade required.", release.TagName))
+		slog.Info(fmt.Sprintf("Using the latest version %s. CLI upgrade not required.", release.TagName))
 		return true
+	}
+
+	spicePathVar, spicePath, err := rtcontext.SpicePath()
+	if err != nil {
+		slog.Error("finding spice binary location", "error", err)
+		os.Exit(1)
+	}
+
+	switch spicePathVar {
+	case constants.BrewInstall:
+		slog.Info("Spice is installed via Homebrew. Upgrade the CLI and Runtime by running:\n\n  brew upgrade spiceai/spiceai/spice\n")
+		return false
+	case constants.OtherInstall:
+		msg := fmt.Sprintf("Spice upgrade failed: The Spice CLI is installed in a non-standard location: '%s'.\n\n"+
+			"To upgrade:\n"+
+			"1. Remove the existing installation. Example:\n"+
+			"   rm -rf %s\n\n"+
+			"2. Reinstall Spice by following the instructions at:\n"+
+			"   https://spiceai.org/docs/installation", spicePath, spicePath)
+		slog.Info(msg)
+		return false
 	}
 
 	assetName := github.GetAssetName(constants.SpiceCliFilename)
 	spiceBinDir := filepath.Join(rtcontext.SpiceRuntimeDir(), "bin")
 
-	slog.Info("Upgrading the Spice.ai CLI ...")
+	slog.Info(fmt.Sprintf("Found version %s, upgrading the Spice.ai CLI ...", release.TagName))
 
 	stat, err := os.Stat(spiceBinDir)
 	if err != nil {
@@ -232,7 +260,9 @@ func upgradeCli(force bool, rtcontext *context.RuntimeContext) bool {
 		slog.Error("restarting CLI", "error", err)
 	}
 
-	return true
+	// For unix, this is unreachable
+	// For windows, the CLI will be restarted with the new binary, return false to terminate old CLI
+	return false
 }
 
 func restartWithNewCli(cliPath string, args []string) error {

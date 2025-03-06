@@ -10,6 +10,17 @@
 			],
 			"group": "build",
 			"label": "rust: cargo build"
-		}
+		},
+		{
+			"type": "cargo",
+			"command": "build",
+			"args": ["-p", "testoperator", "--features", "models"],
+			"problemMatcher": ["$rustc"],
+			"group": {
+			  "kind": "build",
+			  "isDefault": false
+			},
+			"label": "rust: cargo build testoperator"
+		  }
 	]
 }

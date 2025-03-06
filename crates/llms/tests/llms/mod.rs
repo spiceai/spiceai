@@ -16,18 +16,16 @@ limitations under the License.
 
 use async_openai::types::{ChatCompletionStreamOptions, CreateChatCompletionRequest};
 use jsonpath_rust::JsonPath;
-use llms::chat::Chat;
+use llms::{accumulate::accumulate, chat::Chat};
 use serde_json::{json, Value};
 use std::{
     str::FromStr,
     sync::{Arc, LazyLock},
 };
-use util::accumulate;
 
 use crate::{init_tracing, TEST_ARGS};
 
 mod create;
-mod util;
 
 #[derive(Clone)]
 pub struct TestCase {
@@ -62,7 +60,7 @@ type ModelFn<'a> = (&'a str, Box<dyn Fn() -> Arc<Box<dyn Chat>>>);
 type ModelDef<'a> = (&'a str, Arc<Box<dyn Chat>>);
 #[allow(clippy::expect_used)]
 static TEST_MODELS: LazyLock<Vec<ModelDef>> = LazyLock::new(|| {
-    let model_creators: [ModelFn; 5] = [
+    let model_creators: [ModelFn; 6] = [
         (
             "anthropic",
             Box::new(|| create::create_anthropic(None).expect("failed to create anthropic model")),
@@ -88,6 +86,10 @@ static TEST_MODELS: LazyLock<Vec<ModelDef>> = LazyLock::new(|| {
                     .expect("failed to create 'microsoft/Phi-3-mini-4k-instruct' from local system")
             }),
         ),
+        (
+            "perplexity",
+            Box::new(|| create::create_perplexity().expect("failed to create perplexity model")),
+        ),
     ];
 
     model_creators
@@ -103,8 +105,17 @@ static TEST_MODELS: LazyLock<Vec<ModelDef>> = LazyLock::new(|| {
 });
 
 /// A mapping of model names (in [`TEST_MODELS`]) and test names (in [`TEST_CASES`]) to skip.
-static TEST_DENY_LIST: LazyLock<Vec<(&'static str, &'static str)>> =
-    LazyLock::new(|| vec![("hf_phi3", "tool_use"), ("local_phi3", "tool_use")]);
+static TEST_DENY_LIST: LazyLock<Vec<(&'static str, &'static str)>> = LazyLock::new(|| {
+    vec![
+        ("hf_phi3", "tool_use"),
+        ("local_phi3", "tool_use"),
+        ("perplexity", "tool_use"),
+        ("perplexity", "system_prompt"),
+        ("perplexity", "supports_basic_message_roles"),
+        ("perplexity", "supports_all_message_roles"),
+        ("perplexity", "tool_use"),
+    ]
+});
 
 static TEST_CASES: LazyLock<Vec<TestCase>> = LazyLock::new(|| {
     vec![
@@ -407,6 +418,10 @@ macro_rules! generate_model_tests {
                 }
             };
         }
+
+        // Non-Criteria test
+        test_model_case!(perplexity, basic);
+        test_model_case!(perplexity, usage);
 
         // Alpha Criteria
         test_model_case!(anthropic, basic);

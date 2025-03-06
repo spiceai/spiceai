@@ -1,0 +1,17 @@
+[package]
+edition.workspace = true
+exclude.workspace = true
+homepage.workspace = true
+license.workspace = true
+name = "tpc-extension"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+datafusion.workspace = true
+runtime = { path = "../runtime" }
+snafu.workspace = true
+tracing.workspace = true
+duckdb.workspace = true

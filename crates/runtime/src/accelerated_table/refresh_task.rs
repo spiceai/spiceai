@@ -32,6 +32,7 @@ use tracing::{Instrument, Span};
 use util::fibonacci_backoff::FibonacciBackoffBuilder;
 use util::{retry, RetryError};
 
+use crate::datafusion::builder::get_df_default_config;
 use crate::datafusion::error::{find_datafusion_root, get_spice_df_error, SpiceExternalError};
 use crate::datafusion::is_spice_internal_dataset;
 use crate::datafusion::schema::BaseSchema;
@@ -64,7 +65,6 @@ use datafusion::{
     error::DataFusionError,
     logical_expr::{cast, col, Expr, Operator},
     physical_plan::stream::RecordBatchStreamAdapter,
-    prelude::SessionConfig,
     sql::TableReference,
 };
 
@@ -472,18 +472,25 @@ impl RefreshTask {
         let schema = self.federated.schema();
         let column = refresh.time_column.as_deref().unwrap_or_default();
         let field = schema.column_with_name(column).map(|(_, f)| f).cloned();
+        let time_partition_column = refresh.time_partition_column.as_deref();
+        let partition_field = schema
+            .column_with_name(time_partition_column.unwrap_or_default())
+            .map(|(_, f)| f)
+            .cloned();
 
-        TimestampFilterConvert::create(field, refresh.time_column.clone(), refresh.time_format)
+        TimestampFilterConvert::create(
+            field,
+            refresh.time_column.clone(),
+            refresh.time_format,
+            partition_field,
+            refresh.time_partition_column.clone(),
+            refresh.time_partition_format,
+        )
     }
 
     fn refresh_df_context(&self, federated_provider: Arc<dyn TableProvider>) -> SessionContext {
-        let ctx = SessionContext::new_with_config_rt(
-            SessionConfig::new().set_bool(
-                "datafusion.execution.listing_table_ignore_subdirectory",
-                false,
-            ),
-            default_runtime_env(),
-        );
+        let ctx =
+            SessionContext::new_with_config_rt(get_df_default_config(), default_runtime_env());
 
         let ctx_state = ctx.state();
         let default_catalog = &ctx_state.config_options().catalog.default_catalog;
@@ -657,7 +664,12 @@ impl RefreshTask {
                 Some(TimeFormat::UnixSeconds) => {
                     value *= 1_000_000_000;
                 }
-                Some(TimeFormat::ISO8601 | TimeFormat::Timestamp | TimeFormat::Timestamptz)
+                Some(
+                    TimeFormat::ISO8601
+                    | TimeFormat::Timestamp
+                    | TimeFormat::Timestamptz
+                    | TimeFormat::Date,
+                )
                 | None => unreachable!("refresh.validate_time_format should've returned error"),
             }
         };

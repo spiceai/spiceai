@@ -627,16 +627,6 @@
             "null"
           ]
         },
-        "invalid_type_action": {
-          "anyOf": [
-            {
-              "$ref": "#/definitions/InvalidTypeAction"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
         "metadata": {
           "type": "object",
           "additionalProperties": true
@@ -680,6 +670,32 @@
           "anyOf": [
             {
               "$ref": "#/definitions/TimeFormat"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "time_partition_column": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "time_partition_format": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/TimeFormat"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "unsupported_type_action": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/UnsupportedTypeAction"
             },
             {
               "type": "null"
@@ -807,14 +823,6 @@
       "enum": [
         "enabled",
         "unique"
-      ]
-    },
-    "InvalidTypeAction": {
-      "type": "string",
-      "enum": [
-        "error",
-        "warn",
-        "ignore"
       ]
     },
     "Mode": {
@@ -1178,7 +1186,8 @@
         "timestamptz",
         "unix_seconds",
         "unix_millis",
-        "ISO8601"
+        "ISO8601",
+        "date"
       ]
     },
     "TlsConfig": {
@@ -1272,6 +1281,15 @@
         }
       },
       "additionalProperties": false
+    },
+    "UnsupportedTypeAction": {
+      "type": "string",
+      "enum": [
+        "error",
+        "warn",
+        "ignore",
+        "string"
+      ]
     },
     "UserAgentCollection": {
       "type": "string",

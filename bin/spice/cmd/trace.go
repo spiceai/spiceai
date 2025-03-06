@@ -23,6 +23,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/spiceai/spiceai/bin/spice/pkg/context"
 	"github.com/spiceai/spiceai/bin/spice/pkg/taskhistory"
+	"github.com/spiceai/spiceai/bin/spice/pkg/util"
 )
 
 var (
@@ -31,11 +32,23 @@ var (
 
 	// The trace_id of the trace to provide
 	trace_id string
+
+	// The include input flag
+	include_input bool
+
+	// The include output flag
+	include_output bool
+
+	// The truncation length
+	truncateLength int
 )
 
-var supported_trace_tasks = []string{"ai_chat", "ai_completion", "sql_query", "nsql",
+var supported_trace_tasks = []string{
+	"ai_chat", "accelerated_refresh", "ai_completion", "sql_query", "nsql",
 	"tool_use::document_similarity", "tool_use::list_datasets", "tool_use::sql",
-	"tool_use::table_schema", "tool_use::sample_data", "tool_use::sql_query", "tool_use::memory"}
+	"tool_use::table_schema", "tool_use::sample_data", "tool_use::sql_query", "tool_use::memory", "eval_run",
+	"vector_search",
+}
 
 func isValidTraceTask(task string) bool {
 	for _, supported_task := range supported_trace_tasks {
@@ -55,6 +68,9 @@ $ spice trace ai_chat
 
 # returns the trace for the given id
 $ spice trace ai_chat --id chatcmpl-At6ZmDE8iAYRPeuQLA0FLlWxGKNnM
+
+Include the input and truncate to 120 characters (default is 80).
+$ spice trace ai_chat --include-input --truncate=120
 `,
 	Args: cobra.MinimumNArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
@@ -87,18 +103,98 @@ $ spice trace ai_chat --id chatcmpl-At6ZmDE8iAYRPeuQLA0FLlWxGKNnM
 			cmd.PrintErrln("Error: No events found")
 			return
 		}
-		taskhistory.PrintTreeFromTraces(cmd.OutOrStdout(), traces, Display)
+
+		rows := taskhistory.TreeRowsFromTraces(traces)
+
+		table := make([]interface{}, len(rows))
+		for i, dataset := range rows {
+			table[i] = ToRowInterface(dataset.Tree, &dataset.Task, include_input, include_output, truncateLength)
+		}
+
+		util.WriteTable(table)
 	},
 }
 
-func Display(t *taskhistory.TaskHistory) string {
-	return fmt.Sprintf("(%8.2fms) %s ", t.ExecutionDurationMs, t.Task)
+// Reduce the `taskhistory.TaskHistory` to only the columns that are needed for the table. This includes the
+// `treePrefix` as the first column.
+//
+// Must use a struct because `util.WriteTable` uses `reflect` functions that require a struct.
+// Must use separate structs for each combination of input/output. Otherwise table will have columns with all `nil`s. A
+// `json:"fieldName,omitempty"` tag does not work.
+func ToRowInterface(treePrefix string, t *taskhistory.TaskHistory, includeInput bool, includeOutput bool, truncateLength int) interface{} {
+	type TaskRowBase struct {
+		Tree     string `json:"tree"`
+		Status   string `json:"status"`
+		Duration string `json:"duration"`
+		Task     string `json:"task"`
+	}
+	type TaskRowFull struct {
+		TaskRowBase
+		Input  interface{} `json:"input"`
+		Output interface{} `json:"output"`
+	}
+	type TaskRowWithInput struct {
+		TaskRowBase
+		Input interface{} `json:"input"`
+	}
+	type TaskRowWithOutput struct {
+		TaskRowBase
+		Output interface{} `json:"output"`
+	}
+
+	base := TaskRowBase{
+		Tree:     treePrefix,
+		Duration: fmt.Sprintf("%8.2fms", t.ExecutionDurationMs),
+		Task:     t.Task,
+	}
+
+	if t.ErrorMessage == nil || *t.ErrorMessage == "" {
+		base.Status = "✅"
+	} else {
+		base.Status = "🚫"
+	}
+
+	if includeInput {
+		if len(t.Input) == 0 {
+			t.Input = "<empty>"
+		} else if truncateLength > 0 && len(t.Input) > truncateLength {
+			originalLength := len(t.Input)
+			t.Input = t.Input[:truncateLength] + "... " + fmt.Sprintf("(%d characters omitted)", originalLength-truncateLength)
+		}
+	}
+
+	var output string
+	if t.CapturedOutput != nil {
+		if len(*t.CapturedOutput) == 0 {
+			output = "<empty>"
+		} else if truncateLength > 0 && len(*t.CapturedOutput) > truncateLength {
+			originalLength := len(*t.CapturedOutput)
+			output = (*t.CapturedOutput)[:truncateLength] + "... " + fmt.Sprintf("(%d characters omitted)", originalLength-truncateLength)
+		} else {
+			output = *t.CapturedOutput
+		}
+	} else {
+		output = "<empty>"
+	}
+
+	if includeInput && includeOutput {
+		return TaskRowFull{TaskRowBase: base, Input: t.Input, Output: output}
+	} else if includeInput {
+		return TaskRowWithInput{TaskRowBase: base, Input: t.Input}
+	} else if includeOutput {
+		return TaskRowWithOutput{TaskRowBase: base, Output: output}
+	}
+	return base
 }
 
 func init() {
 	RootCmd.AddCommand(traceCmd)
 	traceCmd.Flags().StringVar(&id, "id", "", "Return the trace with the given id")
 	traceCmd.Flags().StringVar(&trace_id, "trace-id", "", "Return the trace with the given trace id")
+	traceCmd.Flags().BoolVar(&include_input, "include-input", false, "Include input data in the trace")
+	traceCmd.Flags().BoolVar(&include_output, "include-output", false, "Include output data in the trace")
+	traceCmd.Flags().IntVar(&truncateLength, "truncate", 0, "Truncates the input/output data to 80 when set, or to the given length")
+	traceCmd.Flags().Lookup("truncate").NoOptDefVal = "80"
 }
 
 func getTraceFilter(task string, id string, trace_id string) (string, error) {
