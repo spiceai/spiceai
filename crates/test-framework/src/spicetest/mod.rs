@@ -35,7 +35,7 @@ pub struct SpiceTest<S: TestState> {
     start_time: SystemTime,
     use_progress_bars: bool,
     api_key: Option<String>,
-    connector_name: Option<String>,
+    component_name: Option<String>,
     explain_plan_snapshot: bool,
     results_snapshot_predicate: Option<fn(&str) -> bool>,
 
@@ -59,7 +59,7 @@ impl<S: TestNotStarted> SpiceTest<S> {
             start_time: SystemTime::now(),
             use_progress_bars: true,
             api_key: None,
-            connector_name: None,
+            component_name: None,
             explain_plan_snapshot: false,
             results_snapshot_predicate: None,
             state,
@@ -79,8 +79,8 @@ impl<S: TestNotStarted> SpiceTest<S> {
     }
 
     #[must_use]
-    pub fn with_connector_name(mut self, connector_name: String) -> Self {
-        self.connector_name = Some(connector_name);
+    pub fn with_component_name(mut self, component_name: String) -> Self {
+        self.component_name = Some(component_name);
         self
     }
 

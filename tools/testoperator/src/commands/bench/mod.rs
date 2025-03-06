@@ -57,7 +57,7 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
             .with_parallel_count(1)
             .with_end_condition(EndCondition::QuerySetCompleted(5)),
     )
-    .with_connector_name(args.connector_name.clone())
+    .with_component_name(app.name.clone())
     .with_explain_plan_snapshot()
     .with_results_snapshot(snapshot_predicate)
     .with_progress_bars(!args.common.disable_progress_bars)

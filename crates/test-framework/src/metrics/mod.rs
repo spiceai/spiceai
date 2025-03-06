@@ -717,18 +717,18 @@ impl ExtendedMetrics for NoExtendedMetrics {
 }
 
 pub struct DatasetMetrics {
-    pub connector_name: String,
+    pub component_name: String,
 }
 
 impl ExtendedMetrics for DatasetMetrics {
     fn fields() -> Vec<Field> {
-        vec![Field::new("connector_name", DataType::Utf8, false)]
+        vec![Field::new("component_name", DataType::Utf8, false)]
     }
 
     fn builders() -> BTreeMap<String, Builder> {
         let mut builders = BTreeMap::new();
         builders.insert(
-            "connector_name".to_string(),
+            "component_name".to_string(),
             Builder::String(StringBuilder::new()),
         );
         builders
@@ -736,16 +736,16 @@ impl ExtendedMetrics for DatasetMetrics {
 
     fn build(&self) -> Result<Vec<BuilderTarget>> {
         Ok(vec![BuilderTarget::String((
-            "connector_name".to_string(),
-            self.connector_name.clone(),
+            "component_name".to_string(),
+            self.component_name.clone(),
         ))])
     }
 }
 
 impl DatasetMetrics {
     #[must_use]
-    pub fn new(connector_name: String) -> Self {
-        Self { connector_name }
+    pub fn new(component_name: String) -> Self {
+        Self { component_name }
     }
 }
 

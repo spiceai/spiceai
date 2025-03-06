@@ -28,7 +28,7 @@ pub struct DatasetTestArgs {
 
     /// The connector being tested
     #[arg(long)]
-    pub(crate) connector_name: String,
+    pub(crate) component_name: String,
 
     /// The expected scale factor for the test, used in metrics calculation
     #[arg(long)]

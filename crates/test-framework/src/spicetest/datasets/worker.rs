@@ -38,7 +38,7 @@ pub(crate) struct SpiceTestQueryWorker {
     flight_client: FlightClient,
     explain_plan_snapshot: bool,
     results_snapshot_predicate: Option<fn(&str) -> bool>,
-    connector_name: Option<String>,
+    component_name: Option<String>,
     pub progress_bar: Option<ProgressBar>,
 }
 
@@ -79,13 +79,13 @@ impl SpiceTestQueryWorker {
             flight_client,
             explain_plan_snapshot: false,
             results_snapshot_predicate: None,
-            connector_name: None,
+            component_name: None,
             progress_bar: None,
         }
     }
 
-    pub fn with_connector_name(mut self, connector_name: Option<String>) -> Self {
-        self.connector_name = connector_name;
+    pub fn with_component_name(mut self, component_name: Option<String>) -> Self {
+        self.component_name = component_name;
         self
     }
 
@@ -175,11 +175,11 @@ impl SpiceTestQueryWorker {
                             ));
                         }
 
-                        if let Some(connector_name) = &self.connector_name {
+                        if let Some(component_name) = &self.component_name {
                             if self.explain_plan_snapshot {
                                 record_explain_plan(
                                     &self.flight_client,
-                                    connector_name,
+                                    component_name,
                                     query.0,
                                     query.1,
                                 )
@@ -318,7 +318,7 @@ impl SpiceTestQueryWorker {
         if results_snapshot {
             let query_name = query.0;
 
-            let connector = match &self.connector_name {
+            let connector = match &self.component_name {
                 Some(name) => name.clone(),
                 None => {
                     return Err(anyhow::anyhow!(
