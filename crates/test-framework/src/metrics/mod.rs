@@ -780,12 +780,13 @@ impl ThroughputMetrics {
     }
 }
 
-#[must_use]
 #[allow(clippy::missing_panics_doc)]
-pub fn system_time_to_unix_epoch_ms(time: SystemTime) -> usize {
-    time.duration_since(UNIX_EPOCH)
-        .expect("Time went backwards")
-        .as_millis() as usize
+pub fn system_time_to_unix_epoch_ms(time: SystemTime) -> Result<usize> {
+    let duration = time
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| anyhow::anyhow!("Time went backwards"))?;
+
+    Ok(duration.as_millis() as usize)
 }
 
 #[cfg(test)]

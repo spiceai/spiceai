@@ -317,10 +317,15 @@ impl SpiceTestQueryWorker {
 
         if results_snapshot {
             let query_name = query.0;
-            let connector = self
-                .connector_name
-                .clone()
-                .expect("Connector name is required for results snapshot");
+
+            let connector = match &self.connector_name {
+                Some(name) => name.clone(),
+                None => {
+                    return Err(anyhow::anyhow!(
+                        "Connector name is required for results snapshot but was not provided"
+                    ))
+                }
+            };
 
             let limited_records: Vec<_> = records
                 .iter()

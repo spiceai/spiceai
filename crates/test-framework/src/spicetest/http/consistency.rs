@@ -224,8 +224,8 @@ impl MetricCollector<NoExtendedMetrics, NoExtendedMetrics> for SpiceTest<Complet
                 QueryMetric::new_from_durations(
                     format!("{i}").as_str(),
                     durations,
-                    system_time_to_unix_epoch_ms(self.start_time),
-                    system_time_to_unix_epoch_ms(self.state.end_time),
+                    system_time_to_unix_epoch_ms(self.start_time)?,
+                    system_time_to_unix_epoch_ms(self.state.end_time)?,
                 )
             })
             .collect()

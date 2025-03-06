@@ -345,8 +345,8 @@ impl MetricCollector<DatasetMetrics, NoExtendedMetrics> for SpiceTest<Completed>
                 let metric = QueryMetric::new_from_durations(
                     query,
                     durations,
-                    system_time_to_unix_epoch_ms(query_start_time),
-                    system_time_to_unix_epoch_ms(query_end_time),
+                    system_time_to_unix_epoch_ms(query_start_time)?,
+                    system_time_to_unix_epoch_ms(query_end_time)?,
                 );
 
                 if let Some(connector_name) = &self.connector_name {
@@ -388,8 +388,8 @@ impl MetricCollector<NoExtendedMetrics, ThroughputMetrics> for SpiceTest<Complet
                 QueryMetric::new_from_durations(
                     query,
                     durations,
-                    system_time_to_unix_epoch_ms(query_start_time),
-                    system_time_to_unix_epoch_ms(query_end_time),
+                    system_time_to_unix_epoch_ms(query_start_time)?,
+                    system_time_to_unix_epoch_ms(query_end_time)?,
                 )
             })
             .collect::<Result<Vec<_>>>()
