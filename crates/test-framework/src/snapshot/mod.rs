@@ -22,7 +22,7 @@ use crate::flight::query_to_batches;
 
 pub async fn record_explain_plan(
     client: &FlightClient,
-    connector: &str,
+    name: &str,
     query_name: &str,
     query: &str,
 ) -> Result<(), String> {
@@ -46,10 +46,10 @@ pub async fn record_explain_plan(
         ],
     }, {
         let result = panic::catch_unwind(|| {
-            insta::assert_snapshot!(format!("{connector}_{query_name}_explain"), explain_plan);
+            insta::assert_snapshot!(format!("{name}_{query_name}_explain"), explain_plan);
         });
         if result.is_err() {
-            assertion_err = Some(format!("Snapshot assertion failed for {connector}, {query_name}"));
+            assertion_err = Some(format!("Snapshot assertion failed for {name}, {query_name}"));
         }
     });
 

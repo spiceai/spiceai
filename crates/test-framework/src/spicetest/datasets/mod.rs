@@ -158,8 +158,8 @@ impl SpiceTest<NotStarted> {
                     self.state.query_set.clone(),
                     self.state.end_condition,
                     flight_client.clone(),
+                    self.name.clone(),
                 )
-                .with_component_name(self.component_name.clone())
                 .with_explain_plan_snapshot(self.explain_plan_snapshot)
                 .with_results_snapshot(self.results_snapshot_predicate);
 
@@ -174,7 +174,6 @@ impl SpiceTest<NotStarted> {
 
         Ok(SpiceTest {
             name: self.name,
-            component_name: self.component_name,
             spiced_instance: self.spiced_instance,
             start_time: self.start_time,
             use_progress_bars: self.use_progress_bars,
@@ -232,7 +231,6 @@ impl SpiceTest<Running> {
 
         Ok(SpiceTest {
             name: self.name,
-            component_name: self.component_name,
             spiced_instance: self.spiced_instance,
             start_time: self.start_time,
             use_progress_bars: self.use_progress_bars,
@@ -349,14 +347,9 @@ impl MetricCollector<DatasetMetrics, NoExtendedMetrics> for SpiceTest<Completed>
                     system_time_to_unix_epoch_ms(query_end_time)?,
                 );
 
-                if let Some(component_name) = &self.component_name {
-                    metric.map(|metric| {
-                        metric
-                            .with_extended_metrics(DatasetMetrics::new(component_name.to_string()))
-                    })
-                } else {
-                    metric
-                }
+                metric.map(|metric| {
+                    metric.with_extended_metrics(DatasetMetrics::new(self.name.clone()))
+                })
             })
             .collect::<Result<Vec<_>>>()
     }

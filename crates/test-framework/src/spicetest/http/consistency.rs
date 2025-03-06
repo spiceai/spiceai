@@ -139,7 +139,6 @@ impl SpiceTest<NotStarted> {
 
         Ok(SpiceTest {
             name: self.name,
-            component_name: self.component_name,
             start_time: self.start_time,
             spiced_instance: self.spiced_instance,
             use_progress_bars: self.use_progress_bars,
@@ -176,7 +175,6 @@ impl SpiceTest<Running> {
 
         Ok(SpiceTest {
             name: self.name,
-            component_name: self.component_name,
             start_time: self.start_time,
             spiced_instance: self.spiced_instance,
             use_progress_bars: self.use_progress_bars,

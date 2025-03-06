@@ -38,7 +38,7 @@ pub(crate) struct SpiceTestQueryWorker {
     flight_client: FlightClient,
     explain_plan_snapshot: bool,
     results_snapshot_predicate: Option<fn(&str) -> bool>,
-    component_name: Option<String>,
+    name: String,
     pub progress_bar: Option<ProgressBar>,
 }
 
@@ -71,6 +71,7 @@ impl SpiceTestQueryWorker {
         query_set: Vec<(&'static str, &'static str)>,
         end_condition: EndCondition,
         flight_client: FlightClient,
+        name: String,
     ) -> Self {
         Self {
             id,
@@ -79,14 +80,9 @@ impl SpiceTestQueryWorker {
             flight_client,
             explain_plan_snapshot: false,
             results_snapshot_predicate: None,
-            component_name: None,
+            name,
             progress_bar: None,
         }
-    }
-
-    pub fn with_component_name(mut self, component_name: Option<String>) -> Self {
-        self.component_name = component_name;
-        self
     }
 
     pub fn with_explain_plan_snapshot(mut self, explain_plan_snapshot: bool) -> Self {
@@ -175,19 +171,15 @@ impl SpiceTestQueryWorker {
                             ));
                         }
 
-                        if let Some(component_name) = &self.component_name {
-                            if self.explain_plan_snapshot {
-                                record_explain_plan(
-                                    &self.flight_client,
-                                    component_name,
-                                    query.0,
-                                    query.1,
-                                )
-                                .await
-                                .map_err(|e| {
-                                    anyhow::anyhow!("Failed to record explain plan: {}", e)
-                                })?;
-                            }
+                        if self.explain_plan_snapshot {
+                            record_explain_plan(
+                                &self.flight_client,
+                                self.name.as_str(),
+                                query.0,
+                                query.1,
+                            )
+                            .await
+                            .map_err(|e| anyhow::anyhow!("Failed to record explain plan: {}", e))?;
                         }
 
                         while current_query_count < target_count {
@@ -317,15 +309,7 @@ impl SpiceTestQueryWorker {
 
         if results_snapshot {
             let query_name = query.0;
-
-            let connector = match &self.component_name {
-                Some(name) => name.clone(),
-                None => {
-                    return Err(anyhow::anyhow!(
-                        "Connector name is required for results snapshot but was not provided"
-                    ))
-                }
-            };
+            let name = self.name.clone();
 
             let limited_records: Vec<_> = records
                 .iter()
@@ -348,13 +332,12 @@ impl SpiceTestQueryWorker {
                     omit_expression => true,
                     snapshot_path => "../../snapshot/snapshots/results"
                 }, {
-                    insta::assert_snapshot!(format!("{connector}_{query_name}"), records_pretty);
+                    insta::assert_snapshot!(format!("{name}_{query_name}"), records_pretty);
                 });
             });
 
             if result.is_err() {
-                let error_str =
-                    format!("Query `{connector}` `{query_name}` snapshot assertion failed",);
+                let error_str = format!("Query `{name}` `{query_name}` snapshot assertion failed",);
                 eprintln!("{error_str}");
                 return Err(anyhow::anyhow!(error_str));
             }

@@ -1,6 +1,6 @@
 ---
 source: crates/test-framework/src/spicetest/datasets/worker.rs
-assertion_line: 351
+assertion_line: 335
 description: "Query: tpcds_q16"
 ---
 +-------------+---------------------+------------------+
