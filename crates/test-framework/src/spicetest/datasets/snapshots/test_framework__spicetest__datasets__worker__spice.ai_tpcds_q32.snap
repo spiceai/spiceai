@@ -1,0 +1,9 @@
+---
+source: crates/test-framework/src/spicetest/datasets/worker.rs
+expression: records_pretty
+---
++------------------------+
+| excess discount amount |
++------------------------+
+| 122275.56              |
++------------------------+
