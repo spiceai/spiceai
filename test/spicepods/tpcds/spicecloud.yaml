@@ -1,11 +1,6 @@
 version: v1
 kind: Spicepod
 name: spicecloud_tpcds
-
-runtime:
-  results_cache:
-    enabled: false
-
 datasets:
   - from: spice.ai:spiceai/benchmarks-tpcds/datasets/tpcds.catalog_sales
     name: catalog_sales
