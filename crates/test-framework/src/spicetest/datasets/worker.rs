@@ -21,7 +21,6 @@ use std::{
 };
 
 use anyhow::Result;
-use arrow::array::RecordBatch;
 use flight_client::FlightClient;
 use futures::TryStreamExt;
 use indicatif::ProgressBar;
@@ -315,12 +314,7 @@ impl SpiceTestQueryWorker {
                 Ok(Some(batch)) => {
                     row_count += batch.num_rows();
 
-                    if limited_records
-                        .iter()
-                        .map(|b: &RecordBatch| b.num_rows())
-                        .sum::<usize>()
-                        < 10
-                    {
+                    if limited_records.len() < 10 {
                         let required_rows = 10 - limited_records.len();
                         let end = if batch.num_rows() > required_rows {
                             required_rows
@@ -328,7 +322,9 @@ impl SpiceTestQueryWorker {
                             batch.num_rows()
                         };
 
-                        limited_records.push(batch.slice(0, end));
+                        for i in 0..end {
+                            limited_records.push(batch.slice(i, 1));
+                        }
                     }
                 }
             }
