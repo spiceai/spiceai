@@ -322,7 +322,9 @@ impl SpiceTestQueryWorker {
                             batch.num_rows()
                         };
 
-                        limited_records.push(batch.slice(0, end));
+                        for i in 0..end {
+                            limited_records.push(batch.slice(i, 1));
+                        }
                     }
                 }
             }
