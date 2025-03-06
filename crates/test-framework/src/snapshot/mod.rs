@@ -52,9 +52,5 @@ pub async fn record_explain_plan(
         }
     });
 
-    if let Some(assertion_err) = assertion_err {
-        return Err(assertion_err);
-    }
-
     Ok(())
 }

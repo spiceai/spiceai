@@ -71,7 +71,7 @@ pub(crate) async fn run(args: &EvalsTestArgs) -> anyhow::Result<()> {
 
     println!("Execution completed, retrieving results...");
 
-    let mut flight_client = spiced_instance.flight_client().await?;
+    let mut flight_client = spiced_instance.flight_client(None).await?;
 
     let eval_result = execute_sql(&mut flight_client, QUERY_EVAL_BENCHMARK_MAIN_METRICS).await?;
     println!("Result:\n{}\n", pretty_format_batches(&eval_result)?);
