@@ -603,6 +603,7 @@ dependencies = [
  "arrow-cast",
  "arrow-schema",
  "datafusion",
+ "insta",
  "snafu",
 ]
 

@@ -19,8 +19,8 @@ use std::{collections::HashMap, fmt::Display, sync::Arc};
 use app::App;
 use arrow::array::{LargeStringArray, RecordBatch, StringArray, StringViewArray};
 use arrow::error::ArrowError;
-use arrow::util::pretty::pretty_format_batches;
 use arrow_schema::{Schema, SchemaRef};
+use arrow_tools::format::pretty_format_batches_markdown;
 use async_openai::types::EmbeddingInput;
 use datafusion::common::utils::quote_identifier;
 use datafusion::sql::sqlparser;
@@ -447,7 +447,7 @@ pub struct VectorSearchTableResult {
 impl VectorSearchTableResult {
     /// Return the underlying [`RecordBatch`]s as a pretty formatted table.
     pub fn to_pretty(&self) -> Result<impl Display, ArrowError> {
-        pretty_format_batches(&self.data)
+        pretty_format_batches_markdown(&self.data)
     }
 
     /// Return the primary keys of the [`VectorSearch::individual_search`] as an array of JSON objects.

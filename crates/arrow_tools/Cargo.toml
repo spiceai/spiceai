@@ -14,3 +14,6 @@ arrow-cast.workspace = true
 arrow-schema.workspace = true
 snafu.workspace = true
 datafusion.workspace = true
+
+[dev-dependencies]
+insta.workspace = true
