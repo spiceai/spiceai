@@ -166,11 +166,14 @@ impl StatisticsCollector<Duration, Vec<Duration>> for Vec<Duration> {
     }
 
     fn median(&self) -> Result<Duration> {
-        let half = self.len() / 2;
-        if self.len() % 2 == 0 {
-            Ok((self[half - 1] + self[half]) / 2)
+        let mut sorted_durations = self.clone();
+        sorted_durations.sort();
+
+        let half = sorted_durations.len() / 2;
+        if sorted_durations.len() % 2 == 0 {
+            Ok((sorted_durations[half - 1] + sorted_durations[half]) / 2)
         } else {
-            Ok(self[half])
+            Ok(sorted_durations[half])
         }
     }
 
