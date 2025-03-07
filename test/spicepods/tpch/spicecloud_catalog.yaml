@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: spicecloud
+name: spicecloud_catalog
 catalogs:
   - from: spice.ai:spiceai/tpch
     name: tpch

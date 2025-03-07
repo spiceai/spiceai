@@ -1,0 +1,5 @@
+tests:
+  bench:
+    spicepod_path: ./test/spicepods/tpch/mssql.yaml
+    query_set: tpch
+    runner_type: spiceai-runners
