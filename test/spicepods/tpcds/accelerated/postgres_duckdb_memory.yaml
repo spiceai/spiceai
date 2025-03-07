@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: postgres_tpcds_duckdb_memory
+name: postgres_duckdb_memory
 datasets:
   - from: postgres:catalog_sales
     name: catalog_sales

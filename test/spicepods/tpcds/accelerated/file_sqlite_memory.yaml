@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: file_tpcds_sqlite_memory
+name: file_sqlite_memory
 datasets:
   - from: file:data/catalog_sales.parquet
     name: catalog_sales

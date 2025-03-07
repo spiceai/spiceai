@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: odbc_databricks_tpcds
+name: odbc_databricks
 datasets:
   - from: odbc:spiceai_sandbox.tpcds.catalog_sales
     name: catalog_sales

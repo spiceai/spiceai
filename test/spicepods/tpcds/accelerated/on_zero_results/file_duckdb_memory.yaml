@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: file_tpcds_duckdb_file_on_zero_results
+name: file_duckdb_file_on_zero_results
 datasets:
   - from: file:data/catalog_sales.parquet
     name: catalog_sales
@@ -8,7 +8,7 @@ datasets:
       engine: duckdb
       mode: memory
       enabled: true
-      refresh_sql: "SELECT * FROM catalog_sales LIMIT 0"
+      refresh_sql: 'SELECT * FROM catalog_sales LIMIT 0'
       on_zero_results: use_source
   - from: file:data/catalog_returns.parquet
     name: catalog_returns
@@ -16,7 +16,7 @@ datasets:
       engine: duckdb
       mode: memory
       enabled: true
-      refresh_sql: "SELECT * FROM catalog_returns LIMIT 0"
+      refresh_sql: 'SELECT * FROM catalog_returns LIMIT 0'
       on_zero_results: use_source
   - from: file:data/inventory.parquet
     name: inventory
@@ -24,7 +24,7 @@ datasets:
       engine: duckdb
       mode: memory
       enabled: true
-      refresh_sql: "SELECT * FROM inventory LIMIT 0"
+      refresh_sql: 'SELECT * FROM inventory LIMIT 0'
       on_zero_results: use_source
   - from: file:data/store_sales.parquet
     name: store_sales
@@ -32,7 +32,7 @@ datasets:
       engine: duckdb
       mode: memory
       enabled: true
-      refresh_sql: "SELECT * FROM store_sales LIMIT 0"
+      refresh_sql: 'SELECT * FROM store_sales LIMIT 0'
       on_zero_results: use_source
   - from: file:data/store_returns.parquet
     name: store_returns
@@ -40,7 +40,7 @@ datasets:
       engine: duckdb
       mode: memory
       enabled: true
-      refresh_sql: "SELECT * FROM store_returns LIMIT 0"
+      refresh_sql: 'SELECT * FROM store_returns LIMIT 0'
       on_zero_results: use_source
   - from: file:data/web_sales.parquet
     name: web_sales
@@ -48,7 +48,7 @@ datasets:
       engine: duckdb
       mode: memory
       enabled: true
-      refresh_sql: "SELECT * FROM web_sales LIMIT 0"
+      refresh_sql: 'SELECT * FROM web_sales LIMIT 0'
       on_zero_results: use_source
   - from: file:data/web_returns.parquet
     name: web_returns
@@ -56,7 +56,7 @@ datasets:
       engine: duckdb
       mode: memory
       enabled: true
-      refresh_sql: "SELECT * FROM web_returns LIMIT 0"
+      refresh_sql: 'SELECT * FROM web_returns LIMIT 0'
       on_zero_results: use_source
   - from: file:data/customer.parquet
     name: customer
@@ -64,7 +64,7 @@ datasets:
       engine: duckdb
       mode: memory
       enabled: true
-      refresh_sql: "SELECT * FROM customer LIMIT 0"
+      refresh_sql: 'SELECT * FROM customer LIMIT 0'
       on_zero_results: use_source
   - from: file:data/customer_address.parquet
     name: customer_address
@@ -72,7 +72,7 @@ datasets:
       engine: duckdb
       mode: memory
       enabled: true
-      refresh_sql: "SELECT * FROM customer_address LIMIT 0"
+      refresh_sql: 'SELECT * FROM customer_address LIMIT 0'
       on_zero_results: use_source
   - from: file:data/customer_demographics.parquet
     name: customer_demographics
@@ -80,7 +80,7 @@ datasets:
       engine: duckdb
       mode: memory
       enabled: true
-      refresh_sql: "SELECT * FROM customer_demographics LIMIT 0"
+      refresh_sql: 'SELECT * FROM customer_demographics LIMIT 0'
       on_zero_results: use_source
   - from: file:data/date_dim.parquet
     name: date_dim
@@ -88,7 +88,7 @@ datasets:
       engine: duckdb
       mode: memory
       enabled: true
-      refresh_sql: "SELECT * FROM date_dim LIMIT 0"
+      refresh_sql: 'SELECT * FROM date_dim LIMIT 0'
       on_zero_results: use_source
   - from: file:data/household_demographics.parquet
     name: household_demographics
@@ -96,7 +96,7 @@ datasets:
       engine: duckdb
       mode: memory
       enabled: true
-      refresh_sql: "SELECT * FROM household_demographics LIMIT 0"
+      refresh_sql: 'SELECT * FROM household_demographics LIMIT 0'
       on_zero_results: use_source
   - from: file:data/item.parquet
     name: item
@@ -104,7 +104,7 @@ datasets:
       engine: duckdb
       mode: memory
       enabled: true
-      refresh_sql: "SELECT * FROM item LIMIT 0"
+      refresh_sql: 'SELECT * FROM item LIMIT 0'
       on_zero_results: use_source
   - from: file:data/promotion.parquet
     name: promotion
@@ -112,7 +112,7 @@ datasets:
       engine: duckdb
       mode: memory
       enabled: true
-      refresh_sql: "SELECT * FROM promotion LIMIT 0"
+      refresh_sql: 'SELECT * FROM promotion LIMIT 0'
       on_zero_results: use_source
   - from: file:data/ship_mode.parquet
     name: ship_mode
@@ -120,7 +120,7 @@ datasets:
       engine: duckdb
       mode: memory
       enabled: true
-      refresh_sql: "SELECT * FROM ship_mode LIMIT 0"
+      refresh_sql: 'SELECT * FROM ship_mode LIMIT 0'
       on_zero_results: use_source
   - from: file:data/store.parquet
     name: store
@@ -128,7 +128,7 @@ datasets:
       engine: duckdb
       mode: memory
       enabled: true
-      refresh_sql: "SELECT * FROM store LIMIT 0"
+      refresh_sql: 'SELECT * FROM store LIMIT 0'
       on_zero_results: use_source
   - from: file:data/time_dim.parquet
     name: time_dim
@@ -136,7 +136,7 @@ datasets:
       engine: duckdb
       mode: memory
       enabled: true
-      refresh_sql: "SELECT * FROM time_dim LIMIT 0"
+      refresh_sql: 'SELECT * FROM time_dim LIMIT 0'
       on_zero_results: use_source
   - from: file:data/warehouse.parquet
     name: warehouse
@@ -144,7 +144,7 @@ datasets:
       engine: duckdb
       mode: memory
       enabled: true
-      refresh_sql: "SELECT * FROM warehouse LIMIT 0"
+      refresh_sql: 'SELECT * FROM warehouse LIMIT 0'
       on_zero_results: use_source
   - from: file:data/web_page.parquet
     name: web_page
@@ -152,7 +152,7 @@ datasets:
       engine: duckdb
       mode: memory
       enabled: true
-      refresh_sql: "SELECT * FROM web_page LIMIT 0"
+      refresh_sql: 'SELECT * FROM web_page LIMIT 0'
       on_zero_results: use_source
   - from: file:data/web_site.parquet
     name: web_site
@@ -160,7 +160,7 @@ datasets:
       engine: duckdb
       mode: memory
       enabled: true
-      refresh_sql: "SELECT * FROM web_site LIMIT 0"
+      refresh_sql: 'SELECT * FROM web_site LIMIT 0'
       on_zero_results: use_source
   - from: file:data/reason.parquet
     name: reason
@@ -168,7 +168,7 @@ datasets:
       engine: duckdb
       mode: memory
       enabled: true
-      refresh_sql: "SELECT * FROM reason LIMIT 0"
+      refresh_sql: 'SELECT * FROM reason LIMIT 0'
       on_zero_results: use_source
   - from: file:data/call_center.parquet
     name: call_center
@@ -176,7 +176,7 @@ datasets:
       engine: duckdb
       mode: memory
       enabled: true
-      refresh_sql: "SELECT * FROM call_center LIMIT 0"
+      refresh_sql: 'SELECT * FROM call_center LIMIT 0'
       on_zero_results: use_source
   - from: file:data/income_band.parquet
     name: income_band
@@ -184,7 +184,7 @@ datasets:
       engine: duckdb
       mode: memory
       enabled: true
-      refresh_sql: "SELECT * FROM income_band LIMIT 0"
+      refresh_sql: 'SELECT * FROM income_band LIMIT 0'
       on_zero_results: use_source
   - from: file:data/catalog_page.parquet
     name: catalog_page
@@ -192,5 +192,5 @@ datasets:
       engine: duckdb
       mode: memory
       enabled: true
-      refresh_sql: "SELECT * FROM catalog_page LIMIT 0"
+      refresh_sql: 'SELECT * FROM catalog_page LIMIT 0'
       on_zero_results: use_source

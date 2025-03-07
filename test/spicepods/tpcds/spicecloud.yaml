@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: spicecloud_tpcds
+name: spicecloud
 datasets:
   - from: spice.ai:spiceai/benchmarks-tpcds/datasets/tpcds.catalog_sales
     name: catalog_sales
