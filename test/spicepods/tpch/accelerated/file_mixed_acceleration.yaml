@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: file_tpch_mixed_acceleration
+name: file_mixed_acceleration
 datasets:
   - from: file:data/customer.parquet
     name: customer
