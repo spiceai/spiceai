@@ -17,7 +17,10 @@ limitations under the License.
 use std::{
     collections::{HashMap, HashSet},
     fmt::Display,
-    sync::{Arc, RwLock},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, RwLock,
+    },
 };
 
 use datafusion::sql::TableReference;
@@ -44,6 +47,9 @@ pub enum ComponentStatus {
 
     /// The component is in the process of refreshing its state
     Refreshing,
+
+    /// The component is in the process of shutting down
+    ShuttingDown,
 }
 
 impl Display for ComponentStatus {
@@ -54,6 +60,7 @@ impl Display for ComponentStatus {
             ComponentStatus::Disabled => write!(f, "Disabled"),
             ComponentStatus::Error => write!(f, "Error"),
             ComponentStatus::Refreshing => write!(f, "Refreshing"),
+            ComponentStatus::ShuttingDown => write!(f, "ShuttingDown"),
         }
     }
 }
@@ -64,6 +71,8 @@ pub struct RuntimeStatus {
     statuses: Arc<RwLock<HashMap<String, ComponentStatus>>>,
     /// Tracks components that have been in the Ready state at least once.
     ever_ready_components: Arc<RwLock<HashSet<String>>>,
+    /// Tracks if the runtime is in the process of shutting down.
+    is_shutdown: Arc<AtomicBool>,
 }
 
 impl RuntimeStatus {
@@ -72,7 +81,13 @@ impl RuntimeStatus {
         Arc::new(Self {
             statuses: Arc::new(RwLock::new(HashMap::new())),
             ever_ready_components: Arc::new(RwLock::new(HashSet::new())),
+            is_shutdown: Arc::new(AtomicBool::new(false)),
         })
+    }
+
+    #[must_use]
+    pub fn is_shutdown(&self) -> bool {
+        self.is_shutdown.load(Ordering::Relaxed)
     }
 
     /// Updates the status of a component and tracks if it has ever been ready.
@@ -139,7 +154,7 @@ impl RuntimeStatus {
         metrics::views::STATUS.record(status as u64, &[KeyValue::new("view", view_name)]);
     }
 
-    /// Checks if all registered components have been ready at least once.
+    /// Checks if all registered components have been ready at least once and the runtime is not shutting down.
     ///
     /// This function returns `true` if all components that have ever been registered
     /// have reached the `Ready` state at least once.
@@ -153,8 +168,13 @@ impl RuntimeStatus {
     /// Returns `false` if:
     /// - No components have been registered yet.
     /// - There are one or more registered components that have never been in the `Ready` state.
+    /// - The runtime is in the process of shutting down.
     #[must_use]
     pub fn is_ready(&self) -> bool {
+        if self.is_shutdown() {
+            return false;
+        }
+
         let statuses = match self.statuses.read() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
@@ -201,5 +221,10 @@ impl RuntimeStatus {
                     .map(|model_name| (model_name.to_string(), *v))
             })
             .collect()
+    }
+
+    /// Sets the runtime to the shutting down state.
+    pub fn mark_shutdown(&self) {
+        self.is_shutdown.store(true, Ordering::Relaxed);
     }
 }

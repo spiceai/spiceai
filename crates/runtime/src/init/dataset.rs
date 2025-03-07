@@ -215,6 +215,11 @@ impl Runtime {
             let connector = match self.load_dataset_connector(Arc::clone(&ds)).await {
                 Ok(connector) => connector,
                 Err(err) => {
+                    if self.status.is_shutdown() {
+                        // should not retry or trace error if runtime is shutting down
+                        return Err(RetryError::permanent(err));
+                    }
+
                     let ds_name = &ds.name;
                     self.status
                         .update_dataset(ds_name, status::ComponentStatus::Error);
@@ -228,6 +233,10 @@ impl Runtime {
                 .register_loaded_dataset(Arc::clone(&ds), connector, None)
                 .await
             {
+                if self.status.is_shutdown() {
+                    // should not retry if runtime is shutting down
+                    return Err(RetryError::permanent(err));
+                }
                 return Err(RetryError::transient(err));
             };
 

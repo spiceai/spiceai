@@ -610,13 +610,15 @@ impl Runtime {
     }
 
     // Closes and deallocates all resources (including the static registries)
-    pub async fn close(self) {
+    pub async fn shutdown(self) {
+        self.status.mark_shutdown();
+        // Clean up DataFusion first as there could be datasets loading and accessing registries below.
+        self.df.shutdown().await;
         dataconnector::unregister_all().await;
         catalogconnector::unregister_all().await;
         dataaccelerator::unregister_all().await;
         tools::factory::unregister_all_factories().await;
         document_parse::unregister_all().await;
-        self.df.shutdown().await;
     }
 }
 
