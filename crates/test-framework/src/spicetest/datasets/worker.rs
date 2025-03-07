@@ -21,7 +21,6 @@ use std::{
 };
 
 use anyhow::Result;
-use arrow::array::RecordBatch;
 use flight_client::FlightClient;
 use futures::TryStreamExt;
 use indicatif::ProgressBar;
@@ -288,43 +287,45 @@ impl SpiceTestQueryWorker {
         results_snapshot: bool,
     ) -> Result<()> {
         let query_start = Instant::now();
-        let result_stream = self.flight_client.query(query.1).await?;
+        let mut result_stream = self.flight_client.query(query.1).await?;
 
-        let records = match result_stream.try_collect::<Vec<_>>().await {
-            Ok(records) => records,
-            Err(e) => {
-                eprintln!(
-                    "FAIL - Worker {} - Query '{}' failed: {}",
-                    self.id, query.0, e
-                );
-                query_durations.entry(query.0.to_string()).or_default();
-                return Err(e.into());
+        let mut row_count: usize = 0;
+        let mut limited_records = vec![];
+        loop {
+            let batch = result_stream.try_next().await;
+            match batch {
+                Ok(None) => break,
+                Err(e) => {
+                    eprintln!(
+                        "FAIL - Worker {} - Query '{}' failed: {}",
+                        self.id, query.0, e
+                    );
+                    query_durations.entry(query.0.to_string()).or_default();
+                    return Err(e.into());
+                }
+                Ok(Some(batch)) => {
+                    row_count += batch.num_rows();
+
+                    if limited_records.len() < 10 {
+                        let required_rows = 10 - limited_records.len();
+                        let end = if batch.num_rows() > required_rows {
+                            required_rows
+                        } else {
+                            batch.num_rows()
+                        };
+
+                        for i in 0..end {
+                            limited_records.push(batch.slice(i, 1));
+                        }
+                    }
+                }
             }
-        };
-
-        let row_count = records
-            .iter()
-            .map(arrow::array::RecordBatch::num_rows)
-            .sum::<usize>();
+        }
 
         if results_snapshot {
             let query_name = query.0;
             let name = self.name.clone();
 
-            let limited_records: Vec<_> = records
-                .iter()
-                .flat_map(|batch: &RecordBatch| {
-                    // We only take up to 10 records anyway, so avoid iterating over large row results
-                    let end = if batch.num_rows() > 10 {
-                        10
-                    } else {
-                        batch.num_rows()
-                    };
-
-                    (0..end).map(move |i| batch.slice(i, 1))
-                })
-                .take(10)
-                .collect();
             let records_pretty = arrow::util::pretty::pretty_format_batches(&limited_records)?;
             let result = panic::catch_unwind(|| {
                 insta::with_settings!({
