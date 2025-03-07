@@ -213,7 +213,7 @@ impl SpiceTestQueryWorker {
                                     query,
                                     &mut query_durations,
                                     &mut row_counts,
-                                    false,
+                                    true,
                                 )
                                 .await?;
 
