@@ -17,7 +17,7 @@ limitations under the License.
 use super::component::HttpComponent;
 use super::HttpConfig;
 use crate::metrics::{
-    system_time_to_unix_epoch_ms, MetricCollector, NoExtendedMetrics, QueryMetric,
+    system_time_to_unix_epoch_ms, MetricCollector, NoExtendedMetrics, QueryMetric, QueryStatus,
 };
 use crate::spicetest::{SpiceTest, TestCompleted, TestNotStarted, TestState};
 use crate::utils::get_random_element;
@@ -197,12 +197,14 @@ impl MetricCollector<NoExtendedMetrics, NoExtendedMetrics> for SpiceTest<Complet
         let baseline = QueryMetric::new_from_durations(
             "baseline",
             &self.state.baseline_results.durations,
+            QueryStatus::Passed,
             system_time_to_unix_epoch_ms(self.start_time)?,
             system_time_to_unix_epoch_ms(self.state.end_time)?,
         )?;
         let spice = QueryMetric::new_from_durations(
             "spice",
             &self.state.spice_results.durations,
+            QueryStatus::Passed,
             system_time_to_unix_epoch_ms(self.start_time)?,
             system_time_to_unix_epoch_ms(self.state.end_time)?,
         )?;

@@ -81,6 +81,7 @@ impl<T: ExtendedMetrics> QueryMetric<T> {
     pub fn new_from_durations(
         name: &str,
         durations: &Vec<Duration>,
+        query_status: QueryStatus,
         started_at: usize,
         finished_at: usize,
     ) -> Result<Self> {
@@ -92,7 +93,7 @@ impl<T: ExtendedMetrics> QueryMetric<T> {
         let durations = durations.statistical_set()?;
         Ok(Self {
             query_name: name.to_string(),
-            query_status: QueryStatus::Passed,
+            query_status,
             started_at,
             finished_at,
             min_duration_ms: durations.min_duration()?.as_millis() as i64,

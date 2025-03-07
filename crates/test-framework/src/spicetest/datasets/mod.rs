@@ -21,7 +21,7 @@ use std::{
 
 use crate::metrics::{
     system_time_to_unix_epoch_ms, DatasetMetrics, MetricCollector, NoExtendedMetrics, QueryMetric,
-    ThroughputMetrics,
+    QueryStatus, ThroughputMetrics,
 };
 use anyhow::Result;
 use futures::future::join_all;
@@ -101,6 +101,7 @@ pub struct Completed {
     query_durations: BTreeMap<String, Vec<Duration>>,
     query_iteration_durations: BTreeMap<String, (SystemTime, SystemTime)>,
     row_counts: BTreeMap<String, Vec<usize>>,
+    query_statuses: BTreeMap<String, QueryStatus>,
     test_duration: Duration,
     end_time: SystemTime,
     query_count: usize,
@@ -196,6 +197,7 @@ impl SpiceTest<Running> {
         let mut query_durations = BTreeMap::new();
         let mut query_iteration_durations = BTreeMap::new();
         let mut row_counts = BTreeMap::new();
+        let mut query_statuses = BTreeMap::new();
         for worker_result in join_all(self.state.query_workers).await {
             let worker_result = worker_result??;
             if worker_result.connection_failed {
@@ -223,6 +225,18 @@ impl SpiceTest<Running> {
                     .or_insert_with(Vec::new)
                     .extend(query_row_counts);
             }
+
+            for (query, worker_status) in worker_result.query_statuses {
+                query_statuses
+                    .entry(query)
+                    .and_modify(|existing_status| {
+                        // If the worker reports failure, update the status to Failed
+                        if worker_status == QueryStatus::Failed {
+                            *existing_status = QueryStatus::Failed;
+                        }
+                    })
+                    .or_insert(worker_status);
+            }
         }
 
         if let Some(multi) = self.state.progress_bar {
@@ -241,6 +255,7 @@ impl SpiceTest<Running> {
                 query_durations,
                 query_iteration_durations,
                 row_counts,
+                query_statuses,
                 test_duration: self.state.start_time.elapsed(),
                 end_time: SystemTime::now(),
                 query_count: self.state.query_count,
@@ -339,10 +354,17 @@ impl MetricCollector<DatasetMetrics, NoExtendedMetrics> for SpiceTest<Completed>
                     query_iteration_durations.map_or(self.start_time, |(start, _)| *start);
                 let query_end_time =
                     query_iteration_durations.map_or(self.state.end_time, |(_, end)| *end);
+                let query_status = self
+                    .state
+                    .query_statuses
+                    .get(query)
+                    .unwrap_or(&QueryStatus::Failed)
+                    .to_owned();
 
                 let metric = QueryMetric::new_from_durations(
                     query,
                     durations,
+                    query_status,
                     system_time_to_unix_epoch_ms(query_start_time)?,
                     system_time_to_unix_epoch_ms(query_end_time)?,
                 );
@@ -377,10 +399,17 @@ impl MetricCollector<NoExtendedMetrics, ThroughputMetrics> for SpiceTest<Complet
                     query_iteration_durations.map_or(self.start_time, |(start, _)| *start);
                 let query_end_time =
                     query_iteration_durations.map_or(self.state.end_time, |(_, end)| *end);
+                let query_status = self
+                    .state
+                    .query_statuses
+                    .get(query)
+                    .unwrap_or(&QueryStatus::Failed)
+                    .to_owned();
 
                 QueryMetric::new_from_durations(
                     query,
                     durations,
+                    query_status,
                     system_time_to_unix_epoch_ms(query_start_time)?,
                     system_time_to_unix_epoch_ms(query_end_time)?,
                 )

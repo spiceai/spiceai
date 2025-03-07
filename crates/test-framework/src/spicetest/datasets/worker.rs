@@ -26,7 +26,7 @@ use futures::TryStreamExt;
 use indicatif::ProgressBar;
 use tokio::task::JoinHandle;
 
-use crate::snapshot::record_explain_plan;
+use crate::{metrics::QueryStatus, snapshot::record_explain_plan};
 
 use super::EndCondition;
 
@@ -44,6 +44,7 @@ pub(crate) struct SpiceTestQueryWorker {
 pub struct SpiceTestQueryWorkerResult {
     pub query_durations: BTreeMap<String, Vec<Duration>>,
     pub query_iteration_durations: BTreeMap<String, (SystemTime, SystemTime)>,
+    pub query_statuses: BTreeMap<String, QueryStatus>,
     pub connection_failed: bool,
     pub row_counts: BTreeMap<String, Vec<usize>>,
 }
@@ -52,12 +53,14 @@ impl SpiceTestQueryWorkerResult {
     pub fn new(
         query_durations: BTreeMap<String, Vec<Duration>>,
         query_iteration_durations: BTreeMap<String, (SystemTime, SystemTime)>,
+        query_statuses: BTreeMap<String, QueryStatus>,
         connection_failed: bool,
         row_counts: BTreeMap<String, Vec<usize>>,
     ) -> Self {
         Self {
             query_durations,
             query_iteration_durations,
+            query_statuses,
             connection_failed,
             row_counts,
         }
@@ -110,6 +113,8 @@ impl SpiceTestQueryWorker {
             // Keeps track of the start and end time of each query iteration
             let mut query_iteration_durations: BTreeMap<String, (SystemTime, SystemTime)> =
                 BTreeMap::new();
+
+            let mut query_statuses: BTreeMap<String, QueryStatus> = BTreeMap::new();
             let mut row_counts: BTreeMap<String, Vec<usize>> = BTreeMap::new();
             let mut query_set_count = 0;
             let start = Instant::now();
@@ -134,6 +139,7 @@ impl SpiceTestQueryWorker {
                             return Ok(SpiceTestQueryWorkerResult::new(
                                 query_durations,
                                 query_iteration_durations,
+                                query_statuses,
                                 true,
                                 row_counts,
                             ));
@@ -146,6 +152,7 @@ impl SpiceTestQueryWorker {
                     for query in &self.query_set {
                         let mut current_query_count = 0;
                         let start = SystemTime::now();
+                        let mut query_status = QueryStatus::Passed;
 
                         let snapshot_results = self
                             .results_snapshot_predicate
@@ -153,32 +160,36 @@ impl SpiceTestQueryWorker {
 
                         // Additional round of query run before recording results.
                         // To discard the abnormal results caused by: establishing initial connection / spark cluster startup time
-                        if !self
+
+                        let (connection_succeed, _) = self
                             .run_single_query(
                                 query,
                                 &mut BTreeMap::new(),
                                 &mut BTreeMap::new(),
                                 snapshot_results,
                             )
-                            .await?
-                        {
+                            .await?;
+                        if !connection_succeed {
                             return Ok(SpiceTestQueryWorkerResult::new(
                                 query_durations,
                                 query_iteration_durations,
+                                query_statuses,
                                 true,
                                 row_counts,
                             ));
                         }
 
-                        if self.explain_plan_snapshot {
-                            record_explain_plan(
+                        if self.explain_plan_snapshot
+                            && record_explain_plan(
                                 &self.flight_client,
                                 self.name.as_str(),
                                 query.0,
                                 query.1,
                             )
                             .await
-                            .map_err(|e| anyhow::anyhow!("Failed to record explain plan: {}", e))?;
+                            .is_err()
+                        {
+                            query_status = QueryStatus::Failed;
                         }
 
                         while current_query_count < target_count {
@@ -193,26 +204,34 @@ impl SpiceTestQueryWorker {
                                 );
                             }
 
-                            if !self
+                            let (connection_succeed, query_succeed) = self
                                 .run_single_query(
                                     query,
                                     &mut query_durations,
                                     &mut row_counts,
                                     false,
                                 )
-                                .await?
-                            {
+                                .await?;
+
+                            if !connection_succeed {
                                 return Ok(SpiceTestQueryWorkerResult::new(
                                     query_durations,
                                     query_iteration_durations,
+                                    query_statuses,
                                     true,
                                     row_counts,
                                 ));
                             }
+
+                            if !query_succeed {
+                                query_status = QueryStatus::Failed;
+                            }
+
                             current_query_count += 1;
                         }
                         let end = SystemTime::now();
                         query_iteration_durations.insert(query.0.to_string(), (start, end));
+                        query_statuses.insert(query.0.to_string(), query_status);
                     }
                 }
             }
@@ -220,6 +239,7 @@ impl SpiceTestQueryWorker {
             Ok(SpiceTestQueryWorkerResult::new(
                 query_durations,
                 query_iteration_durations,
+                query_statuses,
                 false,
                 row_counts,
             ))
@@ -232,10 +252,10 @@ impl SpiceTestQueryWorker {
         row_counts: &mut BTreeMap<String, Vec<usize>>,
     ) -> Result<bool> {
         for query in &self.query_set {
-            if !self
+            let (connection_succeed, _) = self
                 .run_single_query(query, query_durations, row_counts, false)
-                .await?
-            {
+                .await?;
+            if !connection_succeed {
                 return Ok(false);
             }
         }
@@ -248,12 +268,12 @@ impl SpiceTestQueryWorker {
         query_durations: &mut BTreeMap<String, Vec<Duration>>,
         row_counts: &mut BTreeMap<String, Vec<usize>>,
         results_snapshot: bool,
-    ) -> Result<bool> {
+    ) -> Result<(bool, bool)> {
         match self
             .execute_query(query, query_durations, row_counts, results_snapshot)
             .await
         {
-            Ok(()) => Ok(true),
+            Ok(()) => Ok((true, true)),
             Err(e) => {
                 let flight_error = e.downcast_ref::<flight_client::Error>();
 
@@ -266,14 +286,14 @@ impl SpiceTestQueryWorker {
                         "FAIL - EARLY EXIT - Worker {} - Query '{}' failed: {}",
                         self.id, query.0, e
                     );
-                    Ok(false)
+                    Ok((false, false))
                 } else {
                     eprintln!(
                         "FAIL - Worker {} - Query '{}' failed: {}",
                         self.id, query.0, e
                     );
                     query_durations.entry(query.0.to_string()).or_default();
-                    Ok(true)
+                    Ok((true, false))
                 }
             }
         }
