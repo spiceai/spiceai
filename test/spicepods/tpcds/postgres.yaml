@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: postgres_tpcds
+name: postgres
 datasets:
   - from: postgres:catalog_sales
     name: catalog_sales

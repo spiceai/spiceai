@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: mssql_tpch
+name: mssql
 datasets:
   - from: mssql:customer
     name: customer

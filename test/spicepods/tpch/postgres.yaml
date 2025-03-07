@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: postgres_tpch
+name: postgres
 datasets:
   - from: postgres:customer
     name: customer

@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: spicecloud_tpch
+name: spicecloud
 datasets:
   - from: spice.ai:spiceai/tpch/datasets/tpch.customer
     name: customer
