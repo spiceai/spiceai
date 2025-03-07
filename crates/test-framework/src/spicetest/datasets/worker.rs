@@ -183,17 +183,22 @@ impl SpiceTestQueryWorker {
                             ));
                         }
 
-                        if self.explain_plan_snapshot
-                            && record_explain_plan(
+                        if self.explain_plan_snapshot {
+                            if let Err(e) = record_explain_plan(
                                 &self.flight_client,
                                 self.name.as_str(),
                                 query.0,
                                 query.1,
                             )
                             .await
-                            .is_err()
-                        {
-                            query_status = QueryStatus::Failed;
+                            {
+                                println!(
+                                    "Worker {} - Query '{}' explain plan failed: {}",
+                                    self.id, query.0, e
+                                );
+
+                                query_status = QueryStatus::Failed;
+                            }
                         }
 
                         while current_query_count < target_count {
@@ -250,6 +255,7 @@ impl SpiceTestQueryWorker {
         })
     }
 
+    // run queries as a duration-based test
     async fn run_query_set(
         &self,
         query_durations: &mut BTreeMap<String, Vec<Duration>>,
@@ -283,6 +289,7 @@ impl SpiceTestQueryWorker {
         Ok(true)
     }
 
+    // run queries as a set-completion based test
     async fn run_single_query(
         &self,
         query: &(&'static str, &'static str),
