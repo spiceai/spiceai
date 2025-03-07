@@ -81,6 +81,7 @@ impl<T: ExtendedMetrics> QueryMetric<T> {
     pub fn new_from_durations(
         name: &str,
         durations: &Vec<Duration>,
+        query_status: QueryStatus,
         started_at: usize,
         finished_at: usize,
     ) -> Result<Self> {
@@ -92,7 +93,7 @@ impl<T: ExtendedMetrics> QueryMetric<T> {
         let durations = durations.statistical_set()?;
         Ok(Self {
             query_name: name.to_string(),
-            query_status: QueryStatus::Passed,
+            query_status,
             started_at,
             finished_at,
             min_duration_ms: durations.min_duration()?.as_millis() as i64,
@@ -166,11 +167,14 @@ impl StatisticsCollector<Duration, Vec<Duration>> for Vec<Duration> {
     }
 
     fn median(&self) -> Result<Duration> {
-        let half = self.len() / 2;
-        if self.len() % 2 == 0 {
-            Ok((self[half - 1] + self[half]) / 2)
+        let mut sorted_durations = self.clone();
+        sorted_durations.sort();
+
+        let half = sorted_durations.len() / 2;
+        if sorted_durations.len() % 2 == 0 {
+            Ok((sorted_durations[half - 1] + sorted_durations[half]) / 2)
         } else {
-            Ok(self[half])
+            Ok(sorted_durations[half])
         }
     }
 
