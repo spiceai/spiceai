@@ -133,7 +133,11 @@ impl SpiceTestQueryWorker {
                         }
 
                         if !self
-                            .run_query_set(&mut query_durations, &mut row_counts)
+                            .run_query_set(
+                                &mut query_durations,
+                                &mut query_statuses,
+                                &mut row_counts,
+                            )
                             .await?
                         {
                             return Ok(SpiceTestQueryWorkerResult::new(
@@ -249,15 +253,32 @@ impl SpiceTestQueryWorker {
     async fn run_query_set(
         &self,
         query_durations: &mut BTreeMap<String, Vec<Duration>>,
+        query_statuses: &mut BTreeMap<String, QueryStatus>,
         row_counts: &mut BTreeMap<String, Vec<usize>>,
     ) -> Result<bool> {
         for query in &self.query_set {
-            let (connection_succeed, _) = self
+            let (connection_succeed, query_succeed) = self
                 .run_single_query(query, query_durations, row_counts, false)
                 .await?;
             if !connection_succeed {
                 return Ok(false);
             }
+
+            let worker_status = if query_succeed {
+                QueryStatus::Passed
+            } else {
+                QueryStatus::Failed
+            };
+
+            query_statuses
+                .entry(query.0.to_string())
+                .and_modify(|existing_status| {
+                    // If the worker reports failure, update the status to Failed
+                    if worker_status == QueryStatus::Failed {
+                        *existing_status = QueryStatus::Failed;
+                    }
+                })
+                .or_insert(worker_status);
         }
         Ok(true)
     }
@@ -276,7 +297,6 @@ impl SpiceTestQueryWorker {
             Ok(()) => Ok((true, true)),
             Err(e) => {
                 let flight_error = e.downcast_ref::<flight_client::Error>();
-
                 if let Some(
                     flight_client::Error::UnableToConnectToServer { .. }
                     | flight_client::Error::UnableToPerformHandshake { .. },
