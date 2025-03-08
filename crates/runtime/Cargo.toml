@@ -64,6 +64,7 @@ hyper = "1.6.0"
 hyper-util = { version = "0.1.6", features = ["service"] }
 iceberg.workspace = true
 iceberg-catalog-rest.workspace = true
+iceberg-datafusion.workspace = true
 imap = { workspace = true, optional = true }
 indexmap.workspace = true
 itertools.workspace = true

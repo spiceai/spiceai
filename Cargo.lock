@@ -10168,6 +10168,7 @@ dependencies = [
  "hyper-util",
  "iceberg",
  "iceberg-catalog-rest",
+ "iceberg-datafusion",
  "imap",
  "indexmap 2.7.1",
  "insta",
