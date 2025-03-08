@@ -311,7 +311,7 @@ impl SpiceTest<Completed> {
             EndCondition::QuerySetCompleted(count) => f64::from(u32::try_from(count)?),
         };
 
-        Ok(lhs / self.state.test_duration.as_secs_f64() * scale * end_condition_modifier)
+        Ok((lhs / self.state.test_duration.as_secs_f64()) * scale * end_condition_modifier)
     }
 
     /// Validates that row counts are consistent across queries
