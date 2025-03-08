@@ -2195,39 +2195,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "candle-core"
-version = "0.8.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bef79e00300acaaa6b0b33168e2ed5050f06125d1add87e7103c40a119083581"
-dependencies = [
- "byteorder",
- "candle-kernels 0.8.3",
- "candle-metal-kernels 0.8.3",
- "cudarc 0.13.9",
- "gemm 0.17.1",
- "half",
- "memmap2",
- "metal 0.27.0",
- "num-traits",
- "num_cpus",
- "rand 0.8.5",
- "rand_distr",
- "rayon",
- "safetensors",
- "thiserror 1.0.69",
- "ug",
- "ug-cuda",
- "ug-metal",
- "yoke",
- "zip 1.1.4",
-]
-
-[[package]]
 name = "candle-cublaslt"
 version = "0.2.2"
 source = "git+https://github.com/spiceai/candle-cublaslt?rev=147f4424b0567131c41cf1ee667645120682170b#147f4424b0567131c41cf1ee667645120682170b"
 dependencies = [
- "candle-core 0.8.3",
+ "candle-core",
  "cudarc 0.12.2",
  "half",
 ]
@@ -2239,7 +2211,7 @@ source = "git+https://github.com/spiceai/candle.git?rev=296f14fefc8166574d3270c5
 dependencies = [
  "anyhow",
  "bindgen_cuda 0.1.5",
- "candle-core 0.8.0",
+ "candle-core",
  "half",
 ]
 
@@ -2287,7 +2259,7 @@ version = "0.0.1"
 source = "git+https://github.com/spiceai/candle-layer-norm?rev=88b9ffdd7077fce11d3f6cb77bbe7093269631fe#88b9ffdd7077fce11d3f6cb77bbe7093269631fe"
 dependencies = [
  "anyhow",
- "candle-core 0.8.3",
+ "candle-core",
  "half",
  "num_cpus",
  "rayon",
@@ -2321,7 +2293,7 @@ name = "candle-nn"
 version = "0.8.0"
 source = "git+https://github.com/spiceai/candle.git?rev=296f14fefc8166574d3270c524494c49d8f2c893#296f14fefc8166574d3270c524494c49d8f2c893"
 dependencies = [
- "candle-core 0.8.0",
+ "candle-core",
  "candle-metal-kernels 0.8.0",
  "half",
  "metal 0.27.0",
@@ -2338,7 +2310,7 @@ version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e56763529af17e3483297e40fddeb2992117485498ec56a7c410c8a7825b7fee"
 dependencies = [
- "candle-core 0.8.3",
+ "candle-core",
  "candle-metal-kernels 0.8.3",
  "half",
  "metal 0.27.0",
@@ -2356,7 +2328,7 @@ source = "git+https://github.com/spiceai/candle-rotary?rev=8a437f99881bd4803f61c
 dependencies = [
  "anyhow",
  "bindgen_cuda 0.1.5",
- "candle-core 0.8.3",
+ "candle-core",
  "half",
 ]
 
@@ -2367,7 +2339,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bf2ddc361689defc282e870f18b138940b2548276d075801052eee5d11293029"
 dependencies = [
  "byteorder",
- "candle-core 0.8.3",
+ "candle-core",
  "candle-nn 0.8.3",
  "fancy-regex",
  "num-traits",
@@ -7422,7 +7394,7 @@ version = "0.4.0"
 source = "git+https://github.com/spiceai/mistral.rs?rev=b8f7eab30b7ef54ec30d24b8de14b1583a277039#b8f7eab30b7ef54ec30d24b8de14b1583a277039"
 dependencies = [
  "anyhow",
- "candle-core 0.8.0",
+ "candle-core",
  "candle-nn 0.8.0",
  "clap",
  "either",
@@ -7450,7 +7422,7 @@ dependencies = [
  "bindgen_cuda 0.1.5",
  "bytemuck",
  "bytemuck_derive",
- "candle-core 0.8.0",
+ "candle-core",
  "candle-flash-attn",
  "candle-hf-hub",
  "candle-nn 0.8.0",
@@ -7520,7 +7492,7 @@ source = "git+https://github.com/spiceai/mistral.rs?rev=b8f7eab30b7ef54ec30d24b8
 dependencies = [
  "anyhow",
  "bindgen_cuda 0.1.6",
- "candle-core 0.8.0",
+ "candle-core",
  "float8",
  "half",
  "metal 0.27.0",
@@ -7535,7 +7507,7 @@ source = "git+https://github.com/spiceai/mistral.rs?rev=b8f7eab30b7ef54ec30d24b8
 dependencies = [
  "bindgen_cuda 0.1.5",
  "byteorder",
- "candle-core 0.8.0",
+ "candle-core",
  "candle-nn 0.8.0",
  "float8",
  "half",
@@ -7555,7 +7527,7 @@ name = "mistralrs-vision"
 version = "0.4.0"
 source = "git+https://github.com/spiceai/mistral.rs?rev=b8f7eab30b7ef54ec30d24b8de14b1583a277039#b8f7eab30b7ef54ec30d24b8de14b1583a277039"
 dependencies = [
- "candle-core 0.8.0",
+ "candle-core",
  "image 0.25.5",
 ]
 
@@ -12061,7 +12033,7 @@ version = "1.5.0"
 source = "git+https://github.com/spiceai/text-embeddings-inference.git?rev=a23f1aec8d53008a642cb632199d58d26fe88ae4#a23f1aec8d53008a642cb632199d58d26fe88ae4"
 dependencies = [
  "anyhow",
- "candle-core 0.8.3",
+ "candle-core",
  "candle-cublaslt",
  "candle-layer-norm",
  "candle-nn 0.8.3",
