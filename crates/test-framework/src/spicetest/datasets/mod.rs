@@ -317,7 +317,7 @@ impl SpiceTest<Completed> {
         let end_condition_modifier = match self.state.end_condition {
             EndCondition::Duration(_) => {
                 let query_count = self.get_average_total_queries_executed()?;
-                let query_sets_completed = u32::try_from(self.state.query_count)? / query_count;
+                let query_sets_completed = query_count / u32::try_from(self.state.query_count)?;
                 f64::from(query_sets_completed)
             }
             EndCondition::QuerySetCompleted(count) => f64::from(u32::try_from(count)?),
