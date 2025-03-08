@@ -325,8 +325,8 @@ checksum = "7c02d123df017efcdfbd739ef81735b36c5ba83ec3c59c80a9d7ecc718f92e50"
 
 [[package]]
 name = "arrow"
-version = "53.4.0"
-source = "git+https://github.com/spiceai/arrow-rs.git?rev=5feaa5f724d32c09e30394cedb7799de670e43e1#5feaa5f724d32c09e30394cedb7799de670e43e1"
+version = "53.4.1"
+source = "git+https://github.com/spiceai/arrow-rs.git?rev=b7925192b38cfcaca04e0af42f5aa9a3b5dc9ce0#b7925192b38cfcaca04e0af42f5aa9a3b5dc9ce0"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -389,8 +389,7 @@ dependencies = [
 [[package]]
 name = "arrow-cast"
 version = "53.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6365f8527d4f87b133eeb862f9b8093c009d41a210b8f101f91aa2392f61daac"
+source = "git+https://github.com/spiceai/arrow-rs.git?rev=b7925192b38cfcaca04e0af42f5aa9a3b5dc9ce0#b7925192b38cfcaca04e0af42f5aa9a3b5dc9ce0"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -483,8 +482,8 @@ dependencies = [
 
 [[package]]
 name = "arrow-json"
-version = "53.4.0"
-source = "git+https://github.com/spiceai/arrow-rs.git?rev=5feaa5f724d32c09e30394cedb7799de670e43e1#5feaa5f724d32c09e30394cedb7799de670e43e1"
+version = "53.4.1"
+source = "git+https://github.com/spiceai/arrow-rs.git?rev=b7925192b38cfcaca04e0af42f5aa9a3b5dc9ce0#b7925192b38cfcaca04e0af42f5aa9a3b5dc9ce0"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -8170,7 +8169,7 @@ dependencies = [
 [[package]]
 name = "object_store"
 version = "0.11.1"
-source = "git+https://github.com/spiceai/arrow-rs.git?rev=5feaa5f724d32c09e30394cedb7799de670e43e1#5feaa5f724d32c09e30394cedb7799de670e43e1"
+source = "git+https://github.com/spiceai/arrow-rs.git?rev=b7925192b38cfcaca04e0af42f5aa9a3b5dc9ce0#b7925192b38cfcaca04e0af42f5aa9a3b5dc9ce0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -14394,8 +14393,3 @@ checksum = "99a5bab8d7dedf81405c4bb1f2b83ea057643d9cb28778cea9eecddeedd2e028"
 dependencies = [
  "zune-core",
 ]
-
-[[patch.unused]]
-name = "arrow-cast"
-version = "53.4.0"
-source = "git+https://github.com/spiceai/arrow-rs.git?rev=5feaa5f724d32c09e30394cedb7799de670e43e1#5feaa5f724d32c09e30394cedb7799de670e43e1"
