@@ -307,7 +307,7 @@ enum IcebergPathInfo {
 /// For example:
 /// - `https://my.iceberg.com/v1/namespaces/spiceai_sandbox` (namespace path)
 /// - `https://my.iceberg.com/v1/namespaces/spiceai_sandbox/tables/my_table` (table path)
-pub fn parse_iceberg_url(url: &str) -> Result<(String, HashMap<String, String>, IcebergPathInfo)> {
+fn parse_iceberg_url(url: &str) -> Result<(String, HashMap<String, String>, IcebergPathInfo)> {
     // Parse the URL
     let parsed = Url::parse(url).context(UrlParseSnafu)?;
 
