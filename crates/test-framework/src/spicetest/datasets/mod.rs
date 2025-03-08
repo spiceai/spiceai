@@ -96,6 +96,7 @@ pub struct Running {
     progress_bar: Option<MultiProgress>,
     query_count: usize,
     parallel_count: usize,
+    end_condition: EndCondition,
 }
 pub struct Completed {
     query_durations: BTreeMap<String, Vec<Duration>>,
@@ -106,6 +107,7 @@ pub struct Completed {
     end_time: SystemTime,
     query_count: usize,
     parallel_count: usize,
+    end_condition: EndCondition,
 }
 
 impl TestState for NotStarted {}
@@ -187,6 +189,7 @@ impl SpiceTest<NotStarted> {
                 progress_bar: multi,
                 query_count: self.state.query_count,
                 parallel_count: self.state.parallel_count,
+                end_condition: self.state.end_condition,
             },
         })
     }
@@ -260,6 +263,7 @@ impl SpiceTest<Running> {
                 end_time: SystemTime::now(),
                 query_count: self.state.query_count,
                 parallel_count: self.state.parallel_count,
+                end_condition: self.state.end_condition,
             },
         })
     }
@@ -292,9 +296,22 @@ impl SpiceTest<Completed> {
     pub fn get_throughput_metric(&self, scale: f64) -> Result<f64> {
         // metric = (Parallel Query Count * Test Suite Query Count * 3600) / Cs * Scale
         let lhs = self.state.parallel_count * self.state.query_count * 3600;
-        let rhs = self.get_cumulative_query_duration().as_secs_f64() * scale;
+
         // u32 is safe because lhs is unlikely to be greater than u32::MAX unless some extreme parameters are used (more than 1000 parallel and query count)
-        Ok(f64::from(u32::try_from(lhs)?) / rhs)
+        let lhs = f64::from(u32::try_from(lhs)?);
+
+        // because we perform query sets one after the other, we're not 100% like the original TPCH QpH metric because it expects to only run once
+        // apply a modifier based on the query set count
+        // e.g. query set count of 5, means our calculated QpH needs to be times 5 because we ran 5 query sets
+        // this adjusts for a longer test duration as a result of running multiple query sets, which would otherwise reduce the QpH
+        let end_condition_modifier = match self.state.end_condition {
+            EndCondition::Duration(_) => {
+                return Err(anyhow::anyhow!("Throughput metric calculation for duration-based tests is not supported. Use a QuerySetCompleted test instead."))
+            }
+            EndCondition::QuerySetCompleted(count) => f64::from(u32::try_from(count)?),
+        };
+
+        Ok((lhs / self.state.test_duration.as_secs_f64()) * scale * end_condition_modifier)
     }
 
     /// Validates that row counts are consistent across queries
