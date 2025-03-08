@@ -96,6 +96,7 @@ pub struct Running {
     progress_bar: Option<MultiProgress>,
     query_count: usize,
     parallel_count: usize,
+    end_condition: EndCondition,
 }
 pub struct Completed {
     query_durations: BTreeMap<String, Vec<Duration>>,
@@ -106,6 +107,7 @@ pub struct Completed {
     end_time: SystemTime,
     query_count: usize,
     parallel_count: usize,
+    end_condition: EndCondition,
 }
 
 impl TestState for NotStarted {}
@@ -187,6 +189,7 @@ impl SpiceTest<NotStarted> {
                 progress_bar: multi,
                 query_count: self.state.query_count,
                 parallel_count: self.state.parallel_count,
+                end_condition: self.state.end_condition,
             },
         })
     }
@@ -260,6 +263,7 @@ impl SpiceTest<Running> {
                 end_time: SystemTime::now(),
                 query_count: self.state.query_count,
                 parallel_count: self.state.parallel_count,
+                end_condition: self.state.end_condition,
             },
         })
     }
@@ -284,6 +288,16 @@ impl SpiceTest<Completed> {
         self.state.query_durations.values().flatten().copied().sum()
     }
 
+    pub fn get_average_total_queries_executed(&self) -> Result<u32> {
+        // total query count across all workers
+        let total_query_count = self.state.query_durations.values().flatten().count();
+
+        // average query count per worker
+        Ok(u32::try_from(
+            total_query_count / self.state.parallel_count,
+        )?)
+    }
+
     #[must_use]
     pub fn get_test_duration(&self) -> Duration {
         self.state.test_duration
@@ -292,9 +306,24 @@ impl SpiceTest<Completed> {
     pub fn get_throughput_metric(&self, scale: f64) -> Result<f64> {
         // metric = (Parallel Query Count * Test Suite Query Count * 3600) / Cs * Scale
         let lhs = self.state.parallel_count * self.state.query_count * 3600;
-        let rhs = self.get_cumulative_query_duration().as_secs_f64() * scale;
+
         // u32 is safe because lhs is unlikely to be greater than u32::MAX unless some extreme parameters are used (more than 1000 parallel and query count)
-        Ok(f64::from(u32::try_from(lhs)?) / rhs)
+        let lhs = f64::from(u32::try_from(lhs)?);
+
+        // because we perform query sets one after the other, we're not 100% like the original TPCH QpH metric because it expects to only run once
+        // apply a modifier based on the query set count, making an assumption for query set count for duration based tests
+        // e.g. query set count of 5, means our calculated QpH needs to be times 5 because we ran 5 query sets
+        // this adjusts for a longer test duration as a result of running multiple query sets, which would otherwise reduce the QpH
+        let end_condition_modifier = match self.state.end_condition {
+            EndCondition::Duration(_) => {
+                let query_count = self.get_average_total_queries_executed()?;
+                let query_sets_completed = u32::try_from(self.state.query_count)? / query_count;
+                f64::from(query_sets_completed)
+            }
+            EndCondition::QuerySetCompleted(count) => f64::from(u32::try_from(count)?),
+        };
+
+        Ok(lhs / self.state.test_duration.as_secs_f64() * scale * end_condition_modifier)
     }
 
     /// Validates that row counts are consistent across queries
