@@ -288,16 +288,6 @@ impl SpiceTest<Completed> {
         self.state.query_durations.values().flatten().copied().sum()
     }
 
-    pub fn get_average_total_queries_executed(&self) -> Result<u32> {
-        // total query count across all workers
-        let total_query_count = self.state.query_durations.values().flatten().count();
-
-        // average query count per worker
-        Ok(u32::try_from(
-            total_query_count / self.state.parallel_count,
-        )?)
-    }
-
     #[must_use]
     pub fn get_test_duration(&self) -> Duration {
         self.state.test_duration
@@ -311,14 +301,12 @@ impl SpiceTest<Completed> {
         let lhs = f64::from(u32::try_from(lhs)?);
 
         // because we perform query sets one after the other, we're not 100% like the original TPCH QpH metric because it expects to only run once
-        // apply a modifier based on the query set count, making an assumption for query set count for duration based tests
+        // apply a modifier based on the query set count
         // e.g. query set count of 5, means our calculated QpH needs to be times 5 because we ran 5 query sets
         // this adjusts for a longer test duration as a result of running multiple query sets, which would otherwise reduce the QpH
         let end_condition_modifier = match self.state.end_condition {
             EndCondition::Duration(_) => {
-                let query_count = self.get_average_total_queries_executed()?;
-                let query_sets_completed = query_count / u32::try_from(self.state.query_count)?;
-                f64::from(query_sets_completed)
+                return Err(anyhow::anyhow!("Throughput metric calculation for duration-based tests is not supported. Use a QuerySetCompleted test instead."))
             }
             EndCondition::QuerySetCompleted(count) => f64::from(u32::try_from(count)?),
         };
