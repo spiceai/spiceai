@@ -934,7 +934,7 @@ impl VectorSearch {
                         });
                     }
                     match search_vectors.first() {
-                        None => unreachable!(),
+                        None => unreachable!("Vector search can only be performed on one embedding column, and the column exists"),
                         Some(embedding) => {
                             let result = self
                                 .individual_search(
@@ -955,17 +955,8 @@ impl VectorSearch {
                 }
             }).collect::<Vec<_>>();
 
-            let results = futures::future::join_all(search_futures).await;
-
-            let mut response: VectorSearchResult = HashMap::new();
-            for result in results {
-                match result {
-                    Ok((tbl, result)) => {
-                        response.insert(tbl, result);
-                    },
-                    Err(e) => return Err(e),
-                }
-            }
+            let results = futures::future::try_join_all(search_futures).await?;
+            let response: VectorSearchResult = results.into_iter().collect();
             tracing::info!(target: "task_history", captured_output = ?response);
             Ok(response)
         }.instrument(span.clone()).await;
