@@ -19,6 +19,7 @@ use crate::args::DatasetTestArgs;
 use std::time::Duration;
 use test_framework::{
     anyhow,
+    arrow::util::pretty::print_batches,
     metrics::{MetricCollector, NoExtendedMetrics, QueryMetrics, StatisticsCollector},
     queries::{QueryOverrides, QuerySet},
     spiced::SpicedInstance,
@@ -73,7 +74,8 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
 
     let baseline_metrics: QueryMetrics<_, NoExtendedMetrics> = test.collect(TestType::Load)?;
     println!("Baseline metrics:");
-    baseline_metrics.show_records()?;
+    let records = baseline_metrics.build_records()?;
+    print_batches(&records)?;
     let spiced_instance = test.end();
 
     // load test
@@ -98,10 +100,12 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
     let mut spiced_instance = test.end();
 
     println!("Baseline metrics:");
-    baseline_metrics.show_records()?;
+    let baseline_records = baseline_metrics.build_records()?;
+    print_batches(&baseline_records)?;
     println!("{}", vec!["-"; 30].join(""));
     println!("Load test metrics:");
-    metrics.show_records()?;
+    let records = metrics.build_records()?;
+    print_batches(&records)?;
 
     spiced_instance.show_memory_usage()?;
     spiced_instance.stop()?;

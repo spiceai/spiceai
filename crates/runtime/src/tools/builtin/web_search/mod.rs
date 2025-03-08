@@ -65,11 +65,11 @@ impl TryFrom<&HashMap<String, SecretString>> for SearchEngine {
             return Err("Missing 'engine' parameter".into());
         };
 
-        match engine.as_str() {
+        match engine {
             "perplexity" => {
                 let model_id = params
                     .get("perplexity_model")
-                    .map(|s| s.expose_secret().as_str());
+                    .map(secrecy::ExposeSecret::expose_secret);
                 let sonar = PerplexitySonar::from_params(model_id, params)?;
                 Ok(SearchEngine::Perplexity(sonar))
             }

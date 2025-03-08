@@ -18,7 +18,12 @@ use std::{collections::HashMap, path::PathBuf};
 
 use app::App;
 use spicepod::{
-    component::ComponentOrReference,
+    component::{
+        dataset::{replication::Replication, Dataset, Mode},
+        params::Params,
+        runtime::{ApiKey, ApiKeyAuth, Auth, Runtime},
+        ComponentOrReference,
+    },
     spec::{SpicepodDefinition, SpicepodKind, SpicepodVersion},
 };
 
@@ -81,4 +86,28 @@ pub fn from_app(app: App) -> SpicepodDefinition {
         metadata: HashMap::default(),
         dependencies: Vec::default(),
     }
+}
+
+#[must_use]
+pub fn make_spiceai_rw_dataset(path: &str, name: &str, api_key: Option<String>) -> Dataset {
+    let mut ds = Dataset::new(format!("spice.ai:{path}"), name.to_string());
+    ds.mode = Mode::ReadWrite;
+    ds.replication = Some(Replication { enabled: true });
+    if let Some(api_key) = api_key {
+        ds.params = Some(Params::from_string_map(
+            vec![("spiceai_api_key".to_string(), api_key)]
+                .into_iter()
+                .collect(),
+        ));
+    }
+    ds
+}
+
+pub fn set_read_write_api_key(runtime: &mut Runtime, api_key: String) {
+    runtime.auth = Some(Auth {
+        api_key: Some(ApiKeyAuth {
+            enabled: true,
+            keys: vec![ApiKey::ReadWrite { key: api_key }],
+        }),
+    });
 }

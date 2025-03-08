@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: odbc_athena_tpch_arrow
+name: odbc_athena_arrow
 datasets:
   - from: odbc:tpch.customer
     name: customer

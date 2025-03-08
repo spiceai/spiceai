@@ -148,7 +148,7 @@ impl Secrets {
         // Append the remaining text after the last match
         result.push_str(&param_str.0[last_end..]);
 
-        SecretString::new(result)
+        SecretString::from(result)
     }
 
     /// Gets a secret key from the connected secret stores in precedence order.
@@ -376,10 +376,7 @@ mod tests {
                 super::ParamStr(&format!("This is a secret: ${{ env:{key} }}! 🫡")),
             )
             .await;
-        assert_eq!(
-            "This is a secret: super_secret! 🫡",
-            result.expose_secret().as_str()
-        );
+        assert_eq!("This is a secret: super_secret! 🫡", result.expose_secret());
     }
 
     #[tokio::test]
@@ -398,6 +395,6 @@ mod tests {
                 super::ParamStr(&format!("This is a secret: ${{ env:{key} }}! 🫡")),
             )
             .await;
-        assert_eq!("This is a secret: ! 🫡", result.expose_secret().as_str());
+        assert_eq!("This is a secret: ! 🫡", result.expose_secret());
     }
 }

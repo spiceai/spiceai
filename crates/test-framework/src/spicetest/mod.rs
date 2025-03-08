@@ -34,6 +34,9 @@ pub struct SpiceTest<S: TestState> {
     spiced_instance: SpicedInstance,
     start_time: SystemTime,
     use_progress_bars: bool,
+    api_key: Option<String>,
+    explain_plan_snapshot: bool,
+    results_snapshot_predicate: Option<fn(&str) -> bool>,
 
     state: S,
 }
@@ -54,8 +57,29 @@ impl<S: TestNotStarted> SpiceTest<S> {
             spiced_instance: spice_instance,
             start_time: SystemTime::now(),
             use_progress_bars: true,
+            api_key: None,
+            explain_plan_snapshot: false,
+            results_snapshot_predicate: None,
             state,
         }
+    }
+
+    #[must_use]
+    pub fn with_results_snapshot(mut self, predicate: fn(&str) -> bool) -> Self {
+        self.results_snapshot_predicate = Some(predicate);
+        self
+    }
+
+    #[must_use]
+    pub fn with_explain_plan_snapshot(mut self) -> Self {
+        self.explain_plan_snapshot = true;
+        self
+    }
+
+    #[must_use]
+    pub fn with_api_key(mut self, api_key: Option<String>) -> Self {
+        self.api_key = api_key;
+        self
     }
 
     #[must_use]

@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: dremio_tpch_arrow
+name: dremio_arrow
 datasets:
   - from: dremio:tpch.customer
     name: customer

@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: snowflake_tpch_sf100
+name: snowflake
 datasets:
   - from: snowflake:SNOWFLAKE_SAMPLE_DATA.TPCH_SF100.CUSTOMER
     name: customer

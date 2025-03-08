@@ -83,4 +83,8 @@ pub struct CommonArgs {
     /// An optional data directory, to symlink into the spiced instance
     #[arg(short, long)]
     pub(crate) data_dir: Option<PathBuf>,
+
+    /// The Spice.ai dataset to upload the test results to after the test has completed
+    #[arg(long)]
+    pub(crate) upload_results_dataset: Option<String>,
 }

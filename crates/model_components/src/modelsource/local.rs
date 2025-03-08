@@ -17,7 +17,7 @@ limitations under the License.
 use async_trait::async_trait;
 
 use super::ModelSource;
-use secrecy::{ExposeSecret, Secret, SecretString};
+use secrecy::{ExposeSecret, SecretBox, SecretString};
 use std::collections::HashMap;
 use std::string::ToString;
 use std::sync::Arc;
@@ -28,7 +28,7 @@ impl ModelSource for Local {
     async fn pull(&self, params: Arc<HashMap<String, SecretString>>) -> super::Result<String> {
         let name = params
             .get("name")
-            .map(Secret::expose_secret)
+            .map(SecretBox::expose_secret)
             .map(ToString::to_string);
 
         let Some(name) = name else {
@@ -43,7 +43,7 @@ impl ModelSource for Local {
 
         let path = params
             .get("from")
-            .map(Secret::expose_secret)
+            .map(SecretBox::expose_secret)
             .map(ToString::to_string);
 
         let Some(path) = path else {

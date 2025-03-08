@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: dremio_tpcds
+name: dremio
 datasets:
   - from: dremio:tpcds.call_center
     name: call_center

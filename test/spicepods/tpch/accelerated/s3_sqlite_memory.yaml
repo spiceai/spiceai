@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: s3_tpch_sqlite_memory
+name: s3_sqlite_memory
 datasets:
   - from: s3://benchmarks/tpch_sf1/customer/
     name: customer
