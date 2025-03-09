@@ -605,6 +605,9 @@ mod tests {
         let url = "https://my.iceberg.com/v1/namespaces/spiceai_sandbox";
         let result = parse_table_url(url);
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), Error::MissingTableSegment));
+        assert!(matches!(
+            result.expect_err("Failed to parse table URL"),
+            Error::MissingTableSegment
+        ));
     }
 }
