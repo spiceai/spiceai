@@ -24,6 +24,13 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{Error, FailedToExecuteTaskSnafu};
 
+/// A handle for managing the lifecycle of a spawned task.
+///
+/// Allows external control over a task's execution, supporting
+/// both graceful cancellation via provided [`CancellationToken`] and forced termination.
+///
+/// - If a [`CancellationToken`] is provided, it enables graceful shutdown.
+/// - If the task does not exit within the allowed time after termination request, it is forcefully aborted.
 pub(crate) struct ManagedTaskHandle {
     notify_abort_task: oneshot::Sender<()>,
     cancellation_token: Option<CancellationToken>,
@@ -53,7 +60,10 @@ impl ManagedTaskHandle {
     }
 }
 
-/// Spawns a task with optional external `CancellationToken`.
+/// Spawns a managed task with termination support.
+///
+/// Returns a future that resolves when the task completes or is canceled,
+/// along with a [`ManagedTaskHandle`] for external task control.
 pub(crate) fn spawn_managed_task<F>(
     task_fn: F,
     task_cancellation: Option<CancellationToken>,

@@ -15,6 +15,7 @@ limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
 
+use std::future::Future;
 use std::net::SocketAddr;
 use std::time::Duration;
 use std::{collections::HashMap, sync::Arc};
@@ -278,6 +279,12 @@ pub enum Error {
     ComponentError { source: component::Error },
 }
 
+const HTTP_SERVER: &str = "http_server";
+const METRICS_SERVER: &str = "metrics_server";
+const FLIGHT_SERVER: &str = "flight_server";
+const OPENTELEMETRY_SERVER: &str = "opentelemetry_server";
+const PODS_WATCHER: &str = "pods_watcher";
+
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Clone, Copy)]
@@ -306,7 +313,7 @@ pub struct Runtime {
 
     status: Arc<status::RuntimeStatus>,
 
-    running_components: Arc<RwLock<HashMap<String, ManagedTaskHandle>>>,
+    server_components: Arc<RwLock<HashMap<String, ManagedTaskHandle>>>,
 }
 
 impl Runtime {
@@ -385,106 +392,84 @@ impl Runtime {
         self.register_metrics_table(self.prometheus_registry.is_some())
             .await?;
 
-        let cloned_self = Arc::clone(&self);
-        let cloned_config = config.clone();
+        // Start Http server
         let cloned_tls_config = tls_config.clone();
-
-        // Start HTTP server
+        let cloned_config = config.clone();
         let http_auth = endpoint_auth.http_auth.clone();
-        let (http_future, http_handle) = spawn_managed_task(
-            async move {
+        let self_ref = Arc::clone(&self);
+
+        let http_future = self
+            .start_server_component(HTTP_SERVER, None, async move {
                 http::start(
                     cloned_config.http_bind_address,
-                    cloned_self,
+                    self_ref,
                     cloned_config.into(),
                     cloned_tls_config,
                     http_auth,
                 )
                 .await
                 .context(UnableToStartHttpServerSnafu)
-            },
-            None,
-        );
-
-        self.running_components
-            .write()
-            .await
-            .insert("http_server".to_string(), http_handle);
+            })
+            .await;
 
         // Start Metrics server
         let metrics_endpoint = self.metrics_endpoint;
         let prometheus_registry = self.prometheus_registry.clone();
         let cloned_tls_config = tls_config.clone();
 
-        let (metrics_future, metrics_handle) = spawn_managed_task(
-            async move {
+        let metrics_future = self
+            .start_server_component(METRICS_SERVER, None, async move {
                 metrics_server::start(metrics_endpoint, prometheus_registry, cloned_tls_config)
                     .await
                     .context(UnableToStartMetricsServerSnafu)
-            },
-            None,
-        );
+            })
+            .await;
 
-        self.running_components
-            .write()
-            .await
-            .insert("metrics_server".to_string(), metrics_handle);
-
-        let flight_graceful_shutdown = CancellationToken::new();
-        let flight_graceful_shutdown_clone = flight_graceful_shutdown.clone();
-
-        let cloned_self = Arc::clone(&self);
+        // Start Flight server
+        let flight_shutdown = CancellationToken::new();
+        let self_ref = Arc::clone(&self);
         let cloned_tls_config = tls_config.clone();
         let cloned_endpoint_auth = endpoint_auth.clone();
 
-        // Start Flight server
-        let (flight_future, flight_handle) = spawn_managed_task(
-            async move {
+        let flight_future = self
+            .start_server_component(FLIGHT_SERVER, Some(flight_shutdown.clone()), async move {
                 flight::start(
                     config.flight_bind_address,
-                    cloned_self.app.read().await.as_ref().map(Arc::clone),
-                    Arc::clone(&cloned_self.df),
+                    self_ref.app.read().await.as_ref().map(Arc::clone),
+                    Arc::clone(&self_ref.df),
                     cloned_tls_config,
                     cloned_endpoint_auth,
-                    Arc::clone(&cloned_self.rate_limits),
-                    Some(flight_graceful_shutdown_clone),
+                    Arc::clone(&self_ref.rate_limits),
+                    Some(flight_shutdown),
                 )
                 .await
                 .context(UnableToStartFlightServerSnafu)
-            },
-            Some(flight_graceful_shutdown),
-        );
-
-        self.running_components
-            .write()
-            .await
-            .insert("flight_server".to_string(), flight_handle);
+            })
+            .await;
 
         // Start OpenTelemetry server
         let opentelemetry_graceful_shutdown = CancellationToken::new();
-        let opentelemetry_graceful_shutdown_clone = opentelemetry_graceful_shutdown.clone();
-        let cloned_self = Arc::clone(&self);
+        let df_ref = Arc::clone(&self.df);
         let cloned_tls_config = tls_config.clone();
         let grpc_auth = endpoint_auth.grpc_auth.clone();
 
-        let (opentelemetry_future, opentelemetry_handle) = spawn_managed_task(
-            async move {
-                opentelemetry::start(
-                    config.open_telemetry_bind_address,
-                    Arc::clone(&cloned_self.df),
-                    cloned_tls_config,
-                    grpc_auth,
-                    Some(opentelemetry_graceful_shutdown_clone),
-                )
-                .await
-                .context(UnableToStartOpenTelemetryServerSnafu)
-            },
-            Some(opentelemetry_graceful_shutdown),
-        );
-        self.running_components
-            .write()
-            .await
-            .insert("opentelemetry_server".to_string(), opentelemetry_handle);
+        let opentelemetry_future = self
+            .start_server_component(
+                OPENTELEMETRY_SERVER,
+                Some(opentelemetry_graceful_shutdown.clone()),
+                async move {
+                    opentelemetry::start(
+                        config.open_telemetry_bind_address,
+                        df_ref,
+                        cloned_tls_config,
+                        grpc_auth,
+                        Some(opentelemetry_graceful_shutdown),
+                    )
+                    .await
+                    .context(UnableToStartOpenTelemetryServerSnafu)
+                },
+            )
+            .await;
 
         if let Some(tls_config) = tls_config {
             match tls_config.subject_name() {
@@ -497,26 +482,19 @@ impl Runtime {
             }
         }
 
-        // Pods watcher
-        let cloned_self = Arc::clone(&self);
-        let (pods_watcher_future, posd_watcher_handle) = spawn_managed_task(
-            async move {
-                cloned_self
+        // Start Spicepod watcher
+        let self_ref = Arc::clone(&self);
+        let pods_watcher_future = self
+            .start_server_component(PODS_WATCHER, None, async move {
+                self_ref
                     .start_pods_watcher()
                     .await
                     .context(UnableToInitializePodsWatcherSnafu)
-            },
-            None,
-        );
+            })
+            .await;
 
-        self.running_components
-            .write()
-            .await
-            .insert("pods_watcher".to_string(), posd_watcher_handle);
-
-        // Start Spicepod watcher
-
-        let shutdown_signnal_future = async {
+        // Shutdown signal
+        let shutdown_signal_future = async {
             shutdown_signal().await;
             tracing::debug!("Shutdown signal received.");
             self.shutdown().await;
@@ -530,7 +508,7 @@ impl Runtime {
             metrics_future,
             opentelemetry_future,
             pods_watcher_future,
-            shutdown_signnal_future
+            shutdown_signal_future
         ) {
             Err(err) => Err(err),
             _ => Ok(()),
@@ -684,7 +662,7 @@ impl Runtime {
         self.status.mark_shutdown();
 
         // shutdown all running components except the HTTP and Metrics servers
-        let mut running_components = self.running_components.write().await;
+        let mut running_components = self.server_components.write().await;
         for (name, handle) in running_components.drain() {
             // if name == "http_server" || name == "metrics_server" {
             //     continue;
@@ -700,6 +678,26 @@ impl Runtime {
         dataaccelerator::unregister_all().await;
         tools::factory::unregister_all_factories().await;
         document_parse::unregister_all().await;
+    }
+
+    /// Spawns and registers a server component with optional cancellation support.
+    async fn start_server_component<F>(
+        self: &Arc<Self>,
+        component_name: &str,
+        cancellation_token: Option<CancellationToken>,
+        task_fn: F,
+    ) -> impl Future<Output = Result<(), Error>>
+    where
+        F: Future<Output = Result<(), Error>> + Send + 'static,
+    {
+        let (future, handle) = spawn_managed_task(task_fn, cancellation_token);
+
+        self.server_components
+            .write()
+            .await
+            .insert(component_name.to_string(), handle);
+
+        future
     }
 }
 
