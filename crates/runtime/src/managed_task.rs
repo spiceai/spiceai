@@ -98,7 +98,7 @@ where
     let task_future = async move {
         match handle.await {
             Ok(result) => result,
-            // If the task was canceled (for example during termination), we return Ok(()) so that other tasks can continue.
+            // If task was cancelled (for example during runtime termination), we return Ok (expected behavior).
             Err(err) if err.is_cancelled() => Ok(()),
             Err(err) => Err(err).context(FailedToExecuteTaskSnafu),
         }

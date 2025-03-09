@@ -34,6 +34,7 @@ use dataconnector::ConnectorComponent;
 use datasets_health_monitor::DatasetsHealthMonitor;
 use extension::ExtensionFactory;
 use flight::RateLimits;
+use futures::future::join_all;
 #[cfg(feature = "openapi")]
 pub use http::ApiDoc;
 use managed_task::{spawn_managed_task, ManagedTaskHandle};
@@ -285,6 +286,9 @@ const FLIGHT_SERVER: &str = "flight_server";
 const OPENTELEMETRY_SERVER: &str = "opentelemetry_server";
 const PODS_WATCHER: &str = "pods_watcher";
 
+// Allow 30 seconds for server components to shutdown
+const SERVER_COMPONENT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Clone, Copy)]
@@ -502,6 +506,7 @@ impl Runtime {
             Ok(())
         };
 
+        // wait for all servers to shut down or if any of the servers fail to start
         match tokio::try_join!(
             http_future,
             flight_future,
@@ -658,18 +663,26 @@ impl Runtime {
             return;
         }
 
-        tracing::info!("Shutting down...");
+        tracing::info!("Shutting down runtime...");
         self.status.mark_shutdown();
 
         // shutdown all running components except the HTTP and Metrics servers
         let mut running_components = self.server_components.write().await;
-        for (name, handle) in running_components.drain() {
-            // if name == "http_server" || name == "metrics_server" {
-            //     continue;
-            // }
-            handle.shutdown(Duration::from_secs(10)).await;
-            tracing::debug!("Shutdown component: {name}");
-        }
+
+        // HTTP and METRICS servers must be shutdown last
+        let (to_shutdown, to_shutdown_last) = running_components
+            .drain()
+            .partition::<Vec<_>, _>(|(name, _)| *name != HTTP_SERVER && *name != METRICS_SERVER);
+
+        let shutdown_futures: Vec<_> = to_shutdown
+            .into_iter()
+            .map(|(name, handle)| {
+                tracing::debug!("Shutting down {name}");
+                handle.shutdown(SERVER_COMPONENT_SHUTDOWN_TIMEOUT)
+            })
+            .collect();
+
+        join_all(shutdown_futures).await;
 
         // Clean up DataFusion first as there could be datasets loading and accessing registries below.
         self.df.shutdown().await;
@@ -678,6 +691,19 @@ impl Runtime {
         dataaccelerator::unregister_all().await;
         tools::factory::unregister_all_factories().await;
         document_parse::unregister_all().await;
+
+        // Shutdown HTTP & Metrics servers last
+        let shutdown_futures: Vec<_> = to_shutdown_last
+            .into_iter()
+            .map(|(name, handle)| {
+                tracing::debug!("Shutting down {name}");
+                handle.shutdown(SERVER_COMPONENT_SHUTDOWN_TIMEOUT)
+            })
+            .collect();
+
+        join_all(shutdown_futures).await;
+
+        tracing::debug!("Shutdown complete.");
     }
 
     /// Spawns and registers a server component with optional cancellation support.
