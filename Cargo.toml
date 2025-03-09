@@ -63,7 +63,7 @@ bb8-postgres = "0.8"
 bytes = "1.10.0"
 charset = "0.1.5"
 chrono = "0.4.38"
-clap = { version = "4.5.28", features = ["derive", "env"] }
+clap = { version = "4.5.29", features = ["derive", "env"] }
 clickhouse-rs = { git = "https://github.com/spiceai/clickhouse-rs.git", tag = "0.2.1", features = [
     "tokio_io",
     "tls",
@@ -91,7 +91,7 @@ iceberg-datafusion = "0.4.0"
 imap = { git = "https://github.com/jonhoo/rust-imap", rev = "6fe22ed11a1ccffe1799a73f48e589366d8d100f" }
 indexmap = "2"
 insta = { version = "1.42.0", features = ["filters"] }
-itertools = "0.13"
+itertools = "0.14"
 mailparse = "0.15.0"
 mysql_async = { version = "0.34.1", features = ["native-tls-tls", "chrono"] }
 object_store = { version = "0.11" }
@@ -161,10 +161,10 @@ datafusion-common = { git = "https://github.com/spiceai/datafusion.git", rev = "
 datafusion-execution = { git = "https://github.com/spiceai/datafusion.git", rev = "90409dee317a2accd63f9649807e52d51aa74097" }
 datafusion-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "90409dee317a2accd63f9649807e52d51aa74097" }
 
-arrow = { git = "https://github.com/spiceai/arrow-rs.git", rev = "5feaa5f724d32c09e30394cedb7799de670e43e1" }
-arrow-json = { git = "https://github.com/spiceai/arrow-rs.git", rev = "5feaa5f724d32c09e30394cedb7799de670e43e1" }
-arrow-cast = { git = "https://github.com/spiceai/arrow-rs.git", rev = "5feaa5f724d32c09e30394cedb7799de670e43e1" }
-object_store = { git = "https://github.com/spiceai/arrow-rs.git", rev = "5feaa5f724d32c09e30394cedb7799de670e43e1" }
+arrow = { git = "https://github.com/spiceai/arrow-rs.git", rev = "b7925192b38cfcaca04e0af42f5aa9a3b5dc9ce0" }
+arrow-json = { git = "https://github.com/spiceai/arrow-rs.git", rev = "b7925192b38cfcaca04e0af42f5aa9a3b5dc9ce0" }
+arrow-cast = { git = "https://github.com/spiceai/arrow-rs.git", rev = "b7925192b38cfcaca04e0af42f5aa9a3b5dc9ce0" }
+object_store = { git = "https://github.com/spiceai/arrow-rs.git", rev = "b7925192b38cfcaca04e0af42f5aa9a3b5dc9ce0" }
 
 datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "a889f4bd47cba6b96d24a63a03891c64dadb6e15" }
 datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "a1f7173691675238607867e6ae5c6a881700de5b" }
