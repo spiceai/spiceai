@@ -50,6 +50,7 @@ mod file;
 mod flight;
 mod github;
 mod graphql;
+mod iceberg;
 #[cfg(feature = "mssql")]
 mod mssql;
 #[cfg(feature = "mysql")]
