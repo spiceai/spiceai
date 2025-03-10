@@ -18,12 +18,9 @@ use crate::{get_test_datafusion, init_tracing, utils::test_request_context};
 use anyhow::Context;
 use app::AppBuilder;
 use arrow::array::RecordBatch;
-use datafusion::assert_batches_eq;
 use futures::StreamExt;
-use runtime::extension::ExtensionFactory;
 use runtime::{status, Runtime};
-use spice_cloud::SpiceExtensionFactory;
-use spicepod::component::{catalog::Catalog, dataset::Dataset, params::Params as DatasetParams};
+use spicepod::component::{dataset::Dataset, params::Params as DatasetParams};
 use std::collections::HashMap;
 use std::sync::Arc;
 
