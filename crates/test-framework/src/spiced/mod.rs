@@ -30,7 +30,7 @@ use crate::utils::wait_until_true;
 
 pub struct SpicedInstance {
     child: Child,
-    _tempdir: TempDir,
+    tempdir: TempDir,
 }
 
 pub struct StartRequest {
@@ -119,10 +119,12 @@ impl SpicedInstance {
         cmd.arg("--telemetry-enabled=false");
         let child = cmd.spawn()?;
 
-        Ok(Self {
-            child,
-            _tempdir: tempdir,
-        })
+        Ok(Self { child, tempdir })
+    }
+
+    #[must_use]
+    pub fn get_tempdir_path(&self) -> PathBuf {
+        self.tempdir.path().to_path_buf()
     }
 
     /// Get a flight client for the spiced instance

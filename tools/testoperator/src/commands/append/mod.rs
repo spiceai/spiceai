@@ -22,11 +22,13 @@ use crate::{
 use std::time::Duration;
 use test_framework::{
     anyhow,
+    app::App,
     arrow::util::pretty::print_batches,
     flight::put_batches,
     metrics::{MetricCollector, NoExtendedMetrics, QueryMetrics},
     queries::{QueryOverrides, QuerySet},
     spiced::SpicedInstance,
+    spicepod::component::dataset::acceleration::RefreshMode,
     spicetest::{append::NotStarted, SpiceTest},
     TestType,
 };
@@ -34,18 +36,20 @@ use test_framework::{
 pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
     let query_set = QuerySet::from(args.query_set.clone());
     let query_overrides = args.query_overrides.clone().map(QueryOverrides::from);
-    let queries = query_set.get_queries(query_overrides);
 
     let (app, start_request) = get_app_and_start_request(&args.common)?;
+
+    check_app_is_appendable(&app)?;
 
     println!("Running append test");
 
     let append_test = SpiceTest::new(
         app.name.clone(),
         NotStarted::new()
-            .with_query_set(queries.clone())
+            .with_query_set(query_set, query_overrides)
             .with_parallel_count(1)
-            .with_end_duration(Duration::from_secs(60 * 60)),
+            .with_end_duration(Duration::from_secs(60 * 60))
+            .with_tempdir_path(start_request.get_tempdir_path()),
     )
     .with_explain_plan_snapshot()
     .with_results_snapshot(snapshot_predicate)
@@ -55,7 +59,8 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
     } else {
         None
     })
-    .start_appending()?;
+    .start_appending()
+    .await?;
 
     let mut spiced_instance = SpicedInstance::start(start_request).await?;
 
@@ -90,4 +95,30 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
 /// Only snapshot the official TPCH and TPCDS queries, not the "simple" extensions as they don't return consistent results
 fn snapshot_predicate(query_name: &str) -> bool {
     query_name.starts_with("tpch_q") || query_name.starts_with("tpcds_q")
+}
+
+fn check_app_is_appendable(app: &App) -> anyhow::Result<()> {
+    for dataset in &app.datasets {
+        // check that each dataset has an append-mode accelerator
+        if dataset
+            .acceleration
+            .as_ref()
+            .map_or(true, |a| a.refresh_mode != Some(RefreshMode::Append))
+        {
+            return Err(anyhow::anyhow!(
+                "Dataset {} does not have an append-mode accelerator",
+                dataset.name
+            ));
+        }
+
+        // check that each dataset uses a supported append-mode source
+        if dataset.from.split(':').next() != Some("file") {
+            return Err(anyhow::anyhow!(
+                "Dataset {} does not use a supported append-mode source",
+                dataset.name
+            ));
+        }
+    }
+
+    Ok(())
 }

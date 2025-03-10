@@ -16,6 +16,7 @@ limitations under the License.
 
 use std::{
     collections::BTreeMap,
+    path::PathBuf,
     time::{Duration, Instant, SystemTime},
 };
 
@@ -24,9 +25,9 @@ use crate::{
         system_time_to_unix_epoch_ms, DatasetMetrics, MetricCollector, NoExtendedMetrics,
         QueryMetric, QueryStatus, ThroughputMetrics,
     },
-    queries::QuerySet,
+    queries::{QueryOverrides, QuerySet},
 };
-use anyhow::Result;
+use anyhow::{Context, Result};
 use futures::future::join_all;
 use indicatif::{MultiProgress, ProgressBar};
 use tokio::task::JoinHandle;
@@ -37,14 +38,19 @@ use super::{
 };
 
 mod worker;
-use worker::AppendWorker;
+use worker::{AppendConfig, AppendWorker};
+
+mod sources;
+use sources::FileAppendableSource;
 
 #[derive(Default)]
 pub struct NotStarted {
-    query_set: Vec<(&'static str, &'static str)>,
+    query_set: QuerySet,
+    queries: Vec<(&'static str, &'static str)>,
     query_count: usize,
     parallel_count: usize,
     end_duration: Duration,
+    tempdir_path: Option<PathBuf>,
 }
 
 impl NotStarted {
@@ -60,8 +66,13 @@ impl NotStarted {
     }
 
     #[must_use]
-    pub fn with_query_set(mut self, query_set: Vec<(&'static str, &'static str)>) -> Self {
-        self.query_count = query_set.len();
+    pub fn with_query_set(
+        mut self,
+        query_set: QuerySet,
+        overrides: Option<QueryOverrides>,
+    ) -> Self {
+        self.queries = query_set.get_queries(overrides);
+        self.query_count = self.queries.len();
         self.query_set = query_set;
         self
     }
@@ -71,10 +82,23 @@ impl NotStarted {
         self.end_duration = end_duration;
         self
     }
+
+    #[must_use]
+    pub fn with_tempdir_path(mut self, tempdir_path: PathBuf) -> Self {
+        self.tempdir_path = Some(tempdir_path);
+        self
+    }
+
+    pub fn get_tempdir_path(&self) -> Result<&PathBuf> {
+        self.tempdir_path
+            .as_ref()
+            .context("Start request should be present")
+    }
 }
 
 pub struct AppendStarted {
-    query_set: Vec<(&'static str, &'static str)>,
+    query_set: QuerySet,
+    queries: Vec<(&'static str, &'static str)>,
     append_worker: JoinHandle<Result<()>>,
     query_count: usize,
     parallel_count: usize,
@@ -89,6 +113,7 @@ pub struct Running {
     progress_bar: Option<MultiProgress>,
     query_count: usize,
     parallel_count: usize,
+    query_set: QuerySet,
 }
 pub struct Completed {
     query_durations: BTreeMap<String, Vec<Duration>>,
@@ -99,6 +124,7 @@ pub struct Completed {
     end_time: SystemTime,
     _query_count: usize,
     _parallel_count: usize,
+    _query_set: QuerySet,
 }
 
 impl TestState for NotStarted {}
@@ -114,8 +140,8 @@ impl TestCompleted for Completed {
 }
 
 impl SpiceTest<NotStarted> {
-    pub fn start_appending(self) -> Result<SpiceTest<AppendStarted>> {
-        if self.state.query_set.is_empty() {
+    pub async fn start_appending(self) -> Result<SpiceTest<AppendStarted>> {
+        if self.state.queries.is_empty() {
             return Err(anyhow::anyhow!("Query set is empty"));
         }
 
@@ -123,9 +149,16 @@ impl SpiceTest<NotStarted> {
             return Err(anyhow::anyhow!("Parallel count must be greater than 0"));
         }
 
-        // TODO: Update QuerySet to use an input parameter instead
-        let append_worker =
-            AppendWorker::new(0, self.state.end_duration, QuerySet::Tpch).start()?;
+        let append_config = AppendConfig::new(
+            self.state.end_duration,
+            self.state.query_set,
+            self.state.get_tempdir_path()?.clone(),
+        );
+        let append_source = FileAppendableSource::new(&append_config);
+
+        let append_worker = AppendWorker::new(append_config, Box::new(append_source))
+            .start()
+            .await?;
 
         Ok(SpiceTest {
             name: self.name,
@@ -136,7 +169,8 @@ impl SpiceTest<NotStarted> {
             explain_plan_snapshot: self.explain_plan_snapshot,
             results_snapshot_predicate: self.results_snapshot_predicate,
             state: AppendStarted {
-                query_set: self.state.query_set.clone(),
+                query_set: self.state.query_set,
+                queries: self.state.queries.clone(),
                 append_worker,
                 query_count: self.state.query_count,
                 parallel_count: self.state.parallel_count,
@@ -167,7 +201,7 @@ impl SpiceTest<AppendStarted> {
             .map(|id| {
                 let worker = SpiceTestQueryWorker::new(
                     id,
-                    self.state.query_set.clone(),
+                    self.state.queries.clone(),
                     EndCondition::Duration(self.state.end_duration),
                     flight_client.clone(),
                     self.name.clone(),
@@ -200,6 +234,7 @@ impl SpiceTest<AppendStarted> {
                 parallel_count: self.state.parallel_count,
                 _end_duration: self.state.end_duration,
                 append_worker: self.state.append_worker,
+                query_set: self.state.query_set,
             },
         })
     }
@@ -291,6 +326,7 @@ impl SpiceTest<Running> {
                 end_time: SystemTime::now(),
                 _query_count: self.state.query_count,
                 _parallel_count: self.state.parallel_count,
+                _query_set: self.state.query_set,
             },
         })
     }
