@@ -19,6 +19,7 @@ package cmd
 import (
 	"fmt"
 	"log/slog"
+	"strings"
 
 	"github.com/spf13/cobra"
 	"github.com/spiceai/spiceai/bin/spice/pkg/context"
@@ -62,6 +63,10 @@ func isValidTraceTask(task string) bool {
 var traceCmd = &cobra.Command{
 	Use:   "trace",
 	Short: "Return a user friendly trace into an operation that occurred in Spice",
+	Long: fmt.Sprintf(`
+	Available operations:
+	  %s
+	`, strings.Join(supported_trace_tasks, ", ")),
 	Example: `
 # returns the last trace
 $ spice trace ai_chat
