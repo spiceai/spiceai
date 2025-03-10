@@ -40,9 +40,10 @@ use crate::{
 use snafu::ResultExt;
 use tracing_futures::Instrument;
 
+/// A tool to retrieve the schema of one or more available SQL tables.
 #[derive(Debug, Clone, JsonSchema, Serialize, Deserialize)]
 pub struct TableSchemaToolParams {
-    /// Which subset of tables to return results for. Default to all tables.
+    /// Which tables to return the schema of.
     tables: Vec<String>,
 
     /// If `full` return metadata and semantic details about the columns.
