@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::fmt::Display;
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -36,6 +38,16 @@ impl QuerySet {
             QuerySet::Tpch => get_tpch_test_queries(overrides),
             QuerySet::Tpcds => get_tpcds_test_queries(overrides),
             QuerySet::Clickbench => get_clickbench_test_queries(overrides),
+        }
+    }
+}
+
+impl Display for QuerySet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            QuerySet::Tpch => write!(f, "tpch"),
+            QuerySet::Tpcds => write!(f, "tpcds"),
+            QuerySet::Clickbench => write!(f, "clickbench"),
         }
     }
 }

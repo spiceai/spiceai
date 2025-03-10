@@ -19,47 +19,32 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-use crate::metrics::{
-    system_time_to_unix_epoch_ms, DatasetMetrics, MetricCollector, NoExtendedMetrics, QueryMetric,
-    QueryStatus, ThroughputMetrics,
+use crate::{
+    metrics::{
+        system_time_to_unix_epoch_ms, DatasetMetrics, MetricCollector, NoExtendedMetrics,
+        QueryMetric, QueryStatus, ThroughputMetrics,
+    },
+    queries::QuerySet,
 };
 use anyhow::Result;
 use futures::future::join_all;
 use indicatif::{MultiProgress, ProgressBar};
 use tokio::task::JoinHandle;
 
-use super::{SpiceTest, TestCompleted, TestNotStarted, TestState};
+use super::{
+    datasets::{EndCondition, SpiceTestQueryWorker, SpiceTestQueryWorkers},
+    SpiceTest, TestCompleted, TestNotStarted, TestState,
+};
+
 mod worker;
-pub(crate) use worker::{SpiceTestQueryWorker, SpiceTestQueryWorkerResult};
-
-#[derive(Debug, Clone, Copy)]
-pub enum EndCondition {
-    Duration(Duration),
-    QuerySetCompleted(usize),
-}
-
-impl Default for EndCondition {
-    fn default() -> Self {
-        EndCondition::QuerySetCompleted(1)
-    }
-}
-
-impl EndCondition {
-    #[must_use]
-    pub fn is_met(&self, start: &Instant, query_set_count: usize) -> bool {
-        match self {
-            EndCondition::Duration(duration) => start.elapsed() >= *duration,
-            EndCondition::QuerySetCompleted(count) => query_set_count >= *count,
-        }
-    }
-}
+use worker::AppendWorker;
 
 #[derive(Default)]
 pub struct NotStarted {
     query_set: Vec<(&'static str, &'static str)>,
-    end_condition: EndCondition,
     query_count: usize,
     parallel_count: usize,
+    end_duration: Duration,
 }
 
 impl NotStarted {
@@ -82,21 +67,28 @@ impl NotStarted {
     }
 
     #[must_use]
-    pub fn with_end_condition(mut self, end_condition: EndCondition) -> Self {
-        self.end_condition = end_condition;
+    pub fn with_end_duration(mut self, end_duration: Duration) -> Self {
+        self.end_duration = end_duration;
         self
     }
 }
 
-pub type SpiceTestQueryWorkers = Vec<JoinHandle<Result<SpiceTestQueryWorkerResult>>>;
+pub struct AppendStarted {
+    query_set: Vec<(&'static str, &'static str)>,
+    append_worker: JoinHandle<Result<()>>,
+    query_count: usize,
+    parallel_count: usize,
+    end_duration: Duration,
+}
 
 pub struct Running {
     start_time: Instant,
+    _end_duration: Duration,
     query_workers: SpiceTestQueryWorkers,
+    append_worker: JoinHandle<Result<()>>,
     progress_bar: Option<MultiProgress>,
     query_count: usize,
     parallel_count: usize,
-    end_condition: EndCondition,
 }
 pub struct Completed {
     query_durations: BTreeMap<String, Vec<Duration>>,
@@ -105,15 +97,16 @@ pub struct Completed {
     query_statuses: BTreeMap<String, QueryStatus>,
     test_duration: Duration,
     end_time: SystemTime,
-    query_count: usize,
-    parallel_count: usize,
-    end_condition: EndCondition,
+    _query_count: usize,
+    _parallel_count: usize,
 }
 
 impl TestState for NotStarted {}
+impl TestState for AppendStarted {}
 impl TestState for Running {}
 impl TestState for Completed {}
 impl TestNotStarted for NotStarted {}
+impl TestNotStarted for AppendStarted {}
 impl TestCompleted for Completed {
     fn end_time(&self) -> SystemTime {
         self.end_time
@@ -121,21 +114,7 @@ impl TestCompleted for Completed {
 }
 
 impl SpiceTest<NotStarted> {
-    fn get_new_progress_bar(&self) -> ProgressBar {
-        match self.state.end_condition {
-            EndCondition::Duration(duration) => {
-                // refresh the progress bar every 10 seconds, or every 1/1000th of the duration
-                // for an 8 hour test, this would be every ~28 seconds
-                ProgressBar::new((duration.as_secs() / self.state.query_set.len() as u64) * 2)
-                // this isn't 100% representative of the progress bar count, but it's close enough (2s per query)
-            }
-            EndCondition::QuerySetCompleted(count) => {
-                ProgressBar::new((self.state.query_set.len() * count) as u64)
-            }
-        }
-    }
-
-    pub async fn start(self) -> Result<SpiceTest<Running>> {
+    pub fn start_appending(self) -> Result<SpiceTest<AppendStarted>> {
         if self.state.query_set.is_empty() {
             return Err(anyhow::anyhow!("Query set is empty"));
         }
@@ -144,6 +123,35 @@ impl SpiceTest<NotStarted> {
             return Err(anyhow::anyhow!("Parallel count must be greater than 0"));
         }
 
+        // TODO: Update QuerySet to use an input parameter instead
+        let append_worker =
+            AppendWorker::new(0, self.state.end_duration, QuerySet::Tpch).start()?;
+
+        Ok(SpiceTest {
+            name: self.name,
+            spiced_instance: self.spiced_instance,
+            start_time: self.start_time,
+            use_progress_bars: self.use_progress_bars,
+            api_key: self.api_key,
+            explain_plan_snapshot: self.explain_plan_snapshot,
+            results_snapshot_predicate: self.results_snapshot_predicate,
+            state: AppendStarted {
+                query_set: self.state.query_set.clone(),
+                append_worker,
+                query_count: self.state.query_count,
+                parallel_count: self.state.parallel_count,
+                end_duration: self.state.end_duration,
+            },
+        })
+    }
+}
+
+impl SpiceTest<AppendStarted> {
+    fn get_new_progress_bar(&self) -> ProgressBar {
+        ProgressBar::new(self.state.end_duration.as_secs())
+    }
+
+    pub async fn start_test(self) -> Result<SpiceTest<Running>> {
         let multi = if self.use_progress_bars {
             Some(MultiProgress::new())
         } else {
@@ -154,12 +162,13 @@ impl SpiceTest<NotStarted> {
             .get_spiced()?
             .flight_client(self.api_key.clone())
             .await?;
+
         let query_workers = (0..self.state.parallel_count)
             .map(|id| {
                 let worker = SpiceTestQueryWorker::new(
                     id,
                     self.state.query_set.clone(),
-                    self.state.end_condition,
+                    EndCondition::Duration(self.state.end_duration),
                     flight_client.clone(),
                     self.name.clone(),
                 )
@@ -189,7 +198,8 @@ impl SpiceTest<NotStarted> {
                 progress_bar: multi,
                 query_count: self.state.query_count,
                 parallel_count: self.state.parallel_count,
-                end_condition: self.state.end_condition,
+                _end_duration: self.state.end_duration,
+                append_worker: self.state.append_worker,
             },
         })
     }
@@ -201,6 +211,24 @@ impl SpiceTest<Running> {
         let mut query_iteration_durations = BTreeMap::new();
         let mut row_counts = BTreeMap::new();
         let mut query_statuses = BTreeMap::new();
+        match self.state.append_worker.await {
+            Err(e) => {
+                self.state.query_workers.iter().for_each(|worker| {
+                    worker.abort();
+                });
+
+                return Err(anyhow::anyhow!("Append worker failed: {}", e));
+            }
+            Ok(Err(e)) => {
+                self.state.query_workers.iter().for_each(|worker| {
+                    worker.abort();
+                });
+
+                return Err(anyhow::anyhow!("Append worker failed: {}", e));
+            }
+            _ => {}
+        }
+
         for worker_result in join_all(self.state.query_workers).await {
             let worker_result = worker_result??;
             if worker_result.connection_failed {
@@ -261,9 +289,8 @@ impl SpiceTest<Running> {
                 query_statuses,
                 test_duration: self.state.start_time.elapsed(),
                 end_time: SystemTime::now(),
-                query_count: self.state.query_count,
-                parallel_count: self.state.parallel_count,
-                end_condition: self.state.end_condition,
+                _query_count: self.state.query_count,
+                _parallel_count: self.state.parallel_count,
             },
         })
     }
@@ -291,27 +318,6 @@ impl SpiceTest<Completed> {
     #[must_use]
     pub fn get_test_duration(&self) -> Duration {
         self.state.test_duration
-    }
-
-    pub fn get_throughput_metric(&self, scale: f64) -> Result<f64> {
-        // metric = (Parallel Query Count * Test Suite Query Count * 3600) / Cs * Scale
-        let lhs = self.state.parallel_count * self.state.query_count * 3600;
-
-        // u32 is safe because lhs is unlikely to be greater than u32::MAX unless some extreme parameters are used (more than 1000 parallel and query count)
-        let lhs = f64::from(u32::try_from(lhs)?);
-
-        // because we perform query sets one after the other, we're not 100% like the original TPCH QpH metric because it expects to only run once
-        // apply a modifier based on the query set count
-        // e.g. query set count of 5, means our calculated QpH needs to be times 5 because we ran 5 query sets
-        // this adjusts for a longer test duration as a result of running multiple query sets, which would otherwise reduce the QpH
-        let end_condition_modifier = match self.state.end_condition {
-            EndCondition::Duration(_) => {
-                return Err(anyhow::anyhow!("Throughput metric calculation for duration-based tests is not supported. Use a QuerySetCompleted test instead."))
-            }
-            EndCondition::QuerySetCompleted(count) => f64::from(u32::try_from(count)?),
-        };
-
-        Ok((lhs / self.state.test_duration.as_secs_f64()) * scale * end_condition_modifier)
     }
 
     /// Validates that row counts are consistent across queries
