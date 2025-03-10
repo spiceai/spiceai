@@ -46,6 +46,7 @@ use runtime_auth::layer::grpc::make_interceptor;
 use runtime_auth::GrpcAuth;
 use secrecy::ExposeSecret;
 use snafu::prelude::*;
+use tokio_util::sync::CancellationToken;
 use tonic::async_trait;
 use tonic::codec::CompressionEncoding;
 use tonic::service::interceptor;
@@ -589,6 +590,7 @@ pub async fn start(
     datafusion: Arc<DataFusion>,
     tls_config: Option<Arc<TlsConfig>>,
     grpc_auth: Option<Arc<dyn GrpcAuth + Send + Sync>>,
+    shutdown_signal: Option<CancellationToken>,
 ) -> Result<()> {
     let service = Service {
         datafusion,
@@ -610,13 +612,21 @@ pub async fn start(
             .context(UnableToConfigureTlsSnafu)?;
     }
 
-    server
+    let server = server
         .layer(interceptor(make_interceptor(grpc_auth)))
         .add_service(create_health_service().await)
-        .add_service(svc)
-        .serve(bind_address)
-        .await
-        .context(UnableToServeSnafu)?;
+        .add_service(svc);
+
+    if let Some(token) = shutdown_signal {
+        server
+            .serve_with_shutdown(bind_address, token.cancelled())
+            .await
+    } else {
+        server.serve(bind_address).await
+    }
+    .context(UnableToServeSnafu)?;
+
+    tracing::debug!("Spice Runtime OpenTelemetry stopped");
 
     Ok(())
 }

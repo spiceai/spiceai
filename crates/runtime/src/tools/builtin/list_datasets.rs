@@ -98,6 +98,17 @@ pub async fn get_dataset_elements(
     rt: Arc<Runtime>,
     opt_include: Option<&[String]>,
 ) -> Vec<ListDatasetElement> {
+    let mut tables = get_table_elements(Arc::clone(&rt), opt_include).await;
+    let views = get_view_elements(Arc::clone(&rt), opt_include).await;
+    tables.extend(views.into_iter());
+
+    tables
+}
+
+pub async fn get_table_elements(
+    rt: Arc<Runtime>,
+    opt_include: Option<&[String]>,
+) -> Vec<ListDatasetElement> {
     let Some(app) = &*rt.app.read().await else {
         return vec![];
     };
@@ -112,6 +123,28 @@ pub async fn get_dataset_elements(
             can_search_documents: d.has_embeddings(),
             description: d.description.clone(),
             metadata: d.metadata.clone(),
+        })
+        .collect_vec()
+}
+
+pub async fn get_view_elements(
+    rt: Arc<Runtime>,
+    opt_include: Option<&[String]>,
+) -> Vec<ListDatasetElement> {
+    let Some(app) = &*rt.app.read().await else {
+        return vec![];
+    };
+
+    app.views
+        .iter()
+        .filter(|v| opt_include.is_none_or(|ts| ts.contains(&v.name)))
+        .map(|v| ListDatasetElement {
+            table: TableReference::parse_str(&v.name)
+                .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
+                .to_string(),
+            can_search_documents: false,
+            description: v.description.clone(),
+            metadata: v.metadata.clone(),
         })
         .collect_vec()
 }

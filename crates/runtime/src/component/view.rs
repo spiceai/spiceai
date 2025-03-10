@@ -15,16 +15,21 @@ limitations under the License.
 */
 
 use datafusion::sql::TableReference;
+use serde_json::Value;
 use snafu::prelude::*;
 use spicepod::component::view as spicepod_view;
-use std::fs;
+use std::{collections::HashMap, fs};
 
 use super::{dataset::Dataset, validate_identifier};
+use spicepod::semantic::Column;
 
+/// [`View`] is the internal representation of the [`spicepod_view::View`] spicepod component.
 #[derive(Debug, Clone, PartialEq)]
 pub struct View {
     pub name: TableReference,
     pub sql: String,
+    pub metadata: HashMap<String, Value>,
+    pub columns: Vec<Column>,
 }
 
 impl TryFrom<spicepod_view::View> for View {
@@ -48,18 +53,13 @@ impl TryFrom<spicepod_view::View> for View {
         Ok(View {
             name: table_reference,
             sql,
+            metadata: view.metadata,
+            columns: view.columns,
         })
     }
 }
 
 impl View {
-    pub fn try_new(name: &str, sql: String) -> Result<Self, crate::Error> {
-        Ok(Self {
-            name: Dataset::parse_table_reference(name)?,
-            sql,
-        })
-    }
-
     fn load_sql_ref(sql_ref: &str) -> crate::Result<String> {
         let sql = fs::read_to_string(sql_ref)
             .context(crate::UnableToLoadSqlFileSnafu { file: sql_ref })?;

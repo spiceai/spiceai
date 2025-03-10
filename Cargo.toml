@@ -48,12 +48,14 @@ arrow = { version = "53", features = ["prettyprint"] }
 arrow-buffer = "53"
 arrow-flight = "53"
 # Use published version once https://github.com/apache/arrow-rs/pull/6606 is released
+arrow-cast = "53"
 arrow-ipc = "53"
 arrow-json = "53"
-arrow-cast = "53"
 arrow-odbc = "11.2.0"
 arrow-schema = "53"
-async-openai = { git = "https://github.com/spiceai/async-openai", rev = "08f8c9df21275f0b59a99233994eac62153afb94", features = ["byot"] }
+async-openai = { git = "https://github.com/spiceai/async-openai", rev = "c3db38ec439b55d5e1e7c515d1159632575fb091", features = [
+    "byot",
+] }
 async-stream = "0.3.5"
 async-trait = "0.1.86"
 axum = { version = "0.7", features = ["macros"] }
@@ -162,8 +164,8 @@ datafusion-execution = { git = "https://github.com/spiceai/datafusion.git", rev 
 datafusion-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "90409dee317a2accd63f9649807e52d51aa74097" }
 
 arrow = { git = "https://github.com/spiceai/arrow-rs.git", rev = "b7925192b38cfcaca04e0af42f5aa9a3b5dc9ce0" }
-arrow-json = { git = "https://github.com/spiceai/arrow-rs.git", rev = "b7925192b38cfcaca04e0af42f5aa9a3b5dc9ce0" }
 arrow-cast = { git = "https://github.com/spiceai/arrow-rs.git", rev = "b7925192b38cfcaca04e0af42f5aa9a3b5dc9ce0" }
+arrow-json = { git = "https://github.com/spiceai/arrow-rs.git", rev = "b7925192b38cfcaca04e0af42f5aa9a3b5dc9ce0" }
 object_store = { git = "https://github.com/spiceai/arrow-rs.git", rev = "b7925192b38cfcaca04e0af42f5aa9a3b5dc9ce0" }
 
 datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "a889f4bd47cba6b96d24a63a03891c64dadb6e15" }

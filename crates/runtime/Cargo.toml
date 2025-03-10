@@ -124,7 +124,7 @@ tokio.workspace = true
 tokio-rusqlite = { workspace = true, optional = true }
 tokio-rustls = "0.26.0"
 tokio-stream.workspace = true
-tokio-util = { workspace = true, optional = true }
+tokio-util.workspace = true
 tonic.workspace = true
 tonic-health.workspace = true
 tower.workspace = true
@@ -191,7 +191,7 @@ keyring-secret-store = ["dep:keyring"]
 mcp = ["dep:mcp-client", "dep:mcp-core"]
 metal = ["llms/metal"]
 models = ["model_components/full"]
-mssql = ["dep:tiberius", "dep:tokio-util", "data_components/mssql"]
+mssql = ["dep:tiberius", "data_components/mssql"]
 mysql = ["dep:mysql_async", "db_connection_pool/mysql", "data_components/mysql"]
 odbc = ["db_connection_pool/odbc", "data_components/odbc"]
 openapi = ["dep:utoipa-swagger-ui", "dep:utoipa"]

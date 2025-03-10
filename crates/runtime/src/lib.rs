@@ -15,22 +15,27 @@ limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
 
+use std::future::Future;
 use std::net::SocketAddr;
+use std::time::Duration;
 use std::{collections::HashMap, sync::Arc};
 
 use crate::{
     auth::EndpointAuth, dataconnector::DataConnector, datafusion::DataFusion,
     internal_table::Error as InternalTableError, model::ENABLE_MODEL_SUPPORT_MESSAGE,
 };
+
 use ::datafusion::error::DataFusionError;
 use ::datafusion::sql::{sqlparser, TableReference};
 use app::App;
 use builder::RuntimeBuilder;
+use cancellable_task::{spawn_cancellable_task, CancellableTaskHandle};
 use config::Config;
 use dataconnector::ConnectorComponent;
 use datasets_health_monitor::DatasetsHealthMonitor;
 use extension::ExtensionFactory;
 use flight::RateLimits;
+use futures::future::join_all;
 #[cfg(feature = "openapi")]
 pub use http::ApiDoc;
 use model::{EmbeddingModelStore, EvalScorerRegistry, LLMModelStore};
@@ -44,6 +49,7 @@ use spicepod::component::eval::Eval;
 use status::ComponentStatus;
 use tls::TlsConfig;
 use tokio::sync::{oneshot::error::RecvError, RwLock};
+use tokio_util::sync::CancellationToken;
 use tools::factory::default_available_catalogs;
 use tools::{catalog::SpiceToolCatalog, Tooling};
 pub use util::shutdown_signal;
@@ -52,6 +58,7 @@ use crate::extension::Extension;
 pub mod accelerated_table;
 pub mod auth;
 mod builder;
+mod cancellable_task;
 pub mod catalogconnector;
 pub mod component;
 pub mod config;
@@ -94,8 +101,8 @@ pub enum Error {
     #[snafu(display("Unable to start HTTP server: {source}"))]
     UnableToStartHttpServer { source: http::Error },
 
-    #[snafu(display("{source}"))]
-    UnableToJoinTask { source: tokio::task::JoinError },
+    #[snafu(display("Task execution failed: {source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"))]
+    FailedToExecuteTask { source: tokio::task::JoinError },
 
     #[snafu(display("Unable to start Prometheus metrics server: {source}"))]
     UnableToStartMetricsServer { source: metrics_server::Error },
@@ -273,6 +280,15 @@ pub enum Error {
     ComponentError { source: component::Error },
 }
 
+const HTTP_SERVER: &str = "http_server";
+const METRICS_SERVER: &str = "metrics_server";
+const FLIGHT_SERVER: &str = "flight_server";
+const OPENTELEMETRY_SERVER: &str = "opentelemetry_server";
+const PODS_WATCHER: &str = "pods_watcher";
+
+// Allow 30 seconds for server components to shutdown
+const SERVER_COMPONENT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Clone, Copy)]
@@ -300,6 +316,8 @@ pub struct Runtime {
     spaced_tracer: Arc<tracers::SpacedTracer>,
 
     status: Arc<status::RuntimeStatus>,
+
+    server_components: Arc<RwLock<HashMap<String, CancellableTaskHandle>>>,
 }
 
 impl Runtime {
@@ -368,6 +386,7 @@ impl Runtime {
     /// The future returned by this function drives the individual server futures and will only return once the servers are shutdown.
     ///
     /// It is recommended to start the servers in parallel to loading the Runtime components to speed up startup.
+    #[allow(clippy::too_many_lines)]
     pub async fn start_servers(
         self: Arc<Self>,
         config: Config,
@@ -377,48 +396,84 @@ impl Runtime {
         self.register_metrics_table(self.prometheus_registry.is_some())
             .await?;
 
+        // Start Http server
+        let cloned_tls_config = tls_config.clone();
+        let cloned_config = config.clone();
         let http_auth = endpoint_auth.http_auth.clone();
-        let http_server_future = tokio::spawn(http::start(
-            config.http_bind_address,
-            Arc::clone(&self),
-            config.clone().into(),
-            tls_config.clone(),
-            http_auth,
-        ));
+        let self_ref = Arc::clone(&self);
 
-        // Spawn the metrics server in the background
+        let http_future = self
+            .start_server_component(HTTP_SERVER, None, async move {
+                http::start(
+                    cloned_config.http_bind_address,
+                    self_ref,
+                    cloned_config.into(),
+                    cloned_tls_config,
+                    http_auth,
+                )
+                .await
+                .context(UnableToStartHttpServerSnafu)
+            })
+            .await;
+
+        // Start Metrics server
         let metrics_endpoint = self.metrics_endpoint;
         let prometheus_registry = self.prometheus_registry.clone();
         let cloned_tls_config = tls_config.clone();
-        tokio::spawn(async move {
-            if let Err(e) =
+
+        let metrics_future = self
+            .start_server_component(METRICS_SERVER, None, async move {
                 metrics_server::start(metrics_endpoint, prometheus_registry, cloned_tls_config)
                     .await
-            {
-                tracing::error!("Prometheus metrics server error: {e}");
-            }
-        });
+                    .context(UnableToStartMetricsServerSnafu)
+            })
+            .await;
 
-        let flight_server_future = tokio::spawn(flight::start(
-            config.flight_bind_address,
-            self.app.read().await.as_ref().map(Arc::clone),
-            Arc::clone(&self.df),
-            tls_config.clone(),
-            endpoint_auth.clone(),
-            Arc::clone(&self.rate_limits),
-        ));
-        let open_telemetry_server_future = tokio::spawn(opentelemetry::start(
-            config.open_telemetry_bind_address,
-            Arc::clone(&self.df),
-            tls_config.clone(),
-            endpoint_auth.grpc_auth.clone(),
-        ));
+        // Start Flight server
+        let flight_shutdown = CancellationToken::new();
+        let self_ref = Arc::clone(&self);
+        let cloned_tls_config = tls_config.clone();
+        let cloned_endpoint_auth = endpoint_auth.clone();
 
-        let pods_watcher_future = if self.pods_watcher.read().await.is_some() {
-            Some(self.start_pods_watcher())
-        } else {
-            None
-        };
+        let flight_future = self
+            .start_server_component(FLIGHT_SERVER, Some(flight_shutdown.clone()), async move {
+                flight::start(
+                    config.flight_bind_address,
+                    self_ref.app.read().await.as_ref().map(Arc::clone),
+                    Arc::clone(&self_ref.df),
+                    cloned_tls_config,
+                    cloned_endpoint_auth,
+                    Arc::clone(&self_ref.rate_limits),
+                    Some(flight_shutdown),
+                )
+                .await
+                .context(UnableToStartFlightServerSnafu)
+            })
+            .await;
+
+        // Start OpenTelemetry server
+        let opentelemetry_graceful_shutdown = CancellationToken::new();
+        let df_ref = Arc::clone(&self.df);
+        let cloned_tls_config = tls_config.clone();
+        let grpc_auth = endpoint_auth.grpc_auth.clone();
+
+        let opentelemetry_future = self
+            .start_server_component(
+                OPENTELEMETRY_SERVER,
+                Some(opentelemetry_graceful_shutdown.clone()),
+                async move {
+                    opentelemetry::start(
+                        config.open_telemetry_bind_address,
+                        df_ref,
+                        cloned_tls_config,
+                        grpc_auth,
+                        Some(opentelemetry_graceful_shutdown),
+                    )
+                    .await
+                    .context(UnableToStartOpenTelemetryServerSnafu)
+                },
+            )
+            .await;
 
         if let Some(tls_config) = tls_config {
             match tls_config.subject_name() {
@@ -431,44 +486,37 @@ impl Runtime {
             }
         }
 
-        tokio::select! {
-            http_res = http_server_future => {
-                match http_res {
-                    Ok(http_res) => http_res.context(UnableToStartHttpServerSnafu),
-                    Err(source) => {
-                        Err(Error::UnableToJoinTask { source })
-                    }
-                }
-             },
-            flight_res = flight_server_future => {
-                match flight_res {
-                    Ok(flight_res) => flight_res.context(UnableToStartFlightServerSnafu),
-                    Err(source) => {
-                        Err(Error::UnableToJoinTask { source })
-                    }
-                }
-            },
-            open_telemetry_res = open_telemetry_server_future => {
-                match open_telemetry_res {
-                    Ok(open_telemetry_res) => open_telemetry_res.context(UnableToStartOpenTelemetryServerSnafu),
-                    Err(source) => {
-                        Err(Error::UnableToJoinTask { source })
-                    }
-                }
-            },
-            pods_watcher_res = async {
-                if let Some(fut) = pods_watcher_future {
-                    fut.await
-                } else {
-                    futures::future::pending().await
-                }
-            } => {
-                pods_watcher_res.context(UnableToInitializePodsWatcherSnafu)
-            },
-            () = shutdown_signal() => {
-                tracing::info!("Goodbye!");
-                Ok(())
-            },
+        // Start Spicepod watcher
+        let self_ref = Arc::clone(&self);
+        let pods_watcher_future = self
+            .start_server_component(PODS_WATCHER, None, async move {
+                self_ref
+                    .start_pods_watcher()
+                    .await
+                    .context(UnableToInitializePodsWatcherSnafu)
+            })
+            .await;
+
+        // Shutdown signal
+        let shutdown_signal_future = async {
+            shutdown_signal().await;
+            tracing::debug!("Shutdown signal received.");
+            self.shutdown().await;
+            tracing::info!("Goodbye!");
+            Ok(())
+        };
+
+        // wait for all servers to shut down or if any of the servers fail to start
+        match tokio::try_join!(
+            http_future,
+            flight_future,
+            metrics_future,
+            opentelemetry_future,
+            pods_watcher_future,
+            shutdown_signal_future
+        ) {
+            Err(err) => Err(err),
+            _ => Ok(()),
         }
     }
 
@@ -610,8 +658,38 @@ impl Runtime {
     }
 
     // Closes and deallocates all resources (including the static registries)
-    pub async fn shutdown(self) {
+    pub async fn shutdown(&self) {
+        if self.status.is_shutdown() {
+            return;
+        }
+
+        tracing::info!("Shutting down runtime...");
         self.status.mark_shutdown();
+
+        // shutdown all running components except the HTTP and Metrics servers
+        let mut running_components = self.server_components.write().await;
+
+        // HTTP and METRICS servers must be shutdown last
+        let mut first_shutdown_group = Vec::new();
+        let mut last_shutdown_group = Vec::new();
+
+        for (name, handle) in running_components.drain() {
+            match name.as_str() {
+                HTTP_SERVER | METRICS_SERVER => last_shutdown_group.push((name, handle)),
+                _ => first_shutdown_group.push((name, handle)),
+            }
+        }
+
+        let shutdown_futures: Vec<_> = first_shutdown_group
+            .into_iter()
+            .map(|(name, handle)| {
+                tracing::debug!("Shutting down {name}");
+                handle.cancel(SERVER_COMPONENT_SHUTDOWN_TIMEOUT)
+            })
+            .collect();
+
+        join_all(shutdown_futures).await;
+
         // Clean up DataFusion first as there could be datasets loading and accessing registries below.
         self.df.shutdown().await;
         dataconnector::unregister_all().await;
@@ -619,6 +697,39 @@ impl Runtime {
         dataaccelerator::unregister_all().await;
         tools::factory::unregister_all_factories().await;
         document_parse::unregister_all().await;
+
+        // Shutdown HTTP & Metrics servers last
+        let shutdown_futures: Vec<_> = last_shutdown_group
+            .into_iter()
+            .map(|(name, handle)| {
+                tracing::debug!("Shutting down {name}");
+                handle.cancel(SERVER_COMPONENT_SHUTDOWN_TIMEOUT)
+            })
+            .collect();
+
+        join_all(shutdown_futures).await;
+
+        tracing::debug!("Shutdown complete.");
+    }
+
+    /// Spawns and registers a server component with optional cancellation support.
+    async fn start_server_component<F>(
+        self: &Arc<Self>,
+        component_name: &str,
+        cancellation_token: Option<CancellationToken>,
+        task_fn: F,
+    ) -> impl Future<Output = Result<(), Error>>
+    where
+        F: Future<Output = Result<(), Error>> + Send + 'static,
+    {
+        let (future, handle) = spawn_cancellable_task(cancellation_token, task_fn);
+
+        self.server_components
+            .write()
+            .await
+            .insert(component_name.to_string(), handle);
+
+        future
     }
 }
 
