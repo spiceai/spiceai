@@ -29,6 +29,7 @@ use ::datafusion::error::DataFusionError;
 use ::datafusion::sql::{sqlparser, TableReference};
 use app::App;
 use builder::RuntimeBuilder;
+use cancellable_task::{spawn_cancellable_task, CancellableTaskHandle};
 use config::Config;
 use dataconnector::ConnectorComponent;
 use datasets_health_monitor::DatasetsHealthMonitor;
@@ -37,7 +38,6 @@ use flight::RateLimits;
 use futures::future::join_all;
 #[cfg(feature = "openapi")]
 pub use http::ApiDoc;
-use cancellable_task::{spawn_cancellable_task, CancellableTaskHandle};
 use model::{EmbeddingModelStore, EvalScorerRegistry, LLMModelStore};
 
 use model_components::model::Model;
@@ -58,6 +58,7 @@ use crate::extension::Extension;
 pub mod accelerated_table;
 pub mod auth;
 mod builder;
+mod cancellable_task;
 pub mod catalogconnector;
 pub mod component;
 pub mod config;
@@ -74,7 +75,6 @@ pub mod flight;
 mod http;
 mod init;
 pub mod internal_table;
-mod cancellable_task;
 mod metrics;
 mod metrics_server;
 pub mod model;
@@ -670,11 +670,17 @@ impl Runtime {
         let mut running_components = self.server_components.write().await;
 
         // HTTP and METRICS servers must be shutdown last
-        let (to_shutdown, to_shutdown_last) = running_components
-            .drain()
-            .partition::<Vec<_>, _>(|(name, _)| *name != HTTP_SERVER && *name != METRICS_SERVER);
+        let mut first_shutdown_group = Vec::new();
+        let mut last_shutdown_group = Vec::new();
 
-        let shutdown_futures: Vec<_> = to_shutdown
+        for (name, handle) in running_components.drain() {
+            match name.as_str() {
+                HTTP_SERVER | METRICS_SERVER => last_shutdown_group.push((name, handle)),
+                _ => first_shutdown_group.push((name, handle)),
+            }
+        }
+
+        let shutdown_futures: Vec<_> = first_shutdown_group
             .into_iter()
             .map(|(name, handle)| {
                 tracing::debug!("Shutting down {name}");
@@ -693,7 +699,7 @@ impl Runtime {
         document_parse::unregister_all().await;
 
         // Shutdown HTTP & Metrics servers last
-        let shutdown_futures: Vec<_> = to_shutdown_last
+        let shutdown_futures: Vec<_> = last_shutdown_group
             .into_iter()
             .map(|(name, handle)| {
                 tracing::debug!("Shutting down {name}");

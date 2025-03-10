@@ -25,7 +25,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{Error, FailedToExecuteTaskSnafu};
 
 /// A handle for a spawned task that allows external cancellation.
-/// 
+///
 /// This handle supports both graceful cancellation and forced termination:
 /// - If a [`CancellationToken`] is provided, it enables graceful shutdown.
 /// - If the task does not exit within the specified timeout after a termination request, it is forcibly aborted.
@@ -65,7 +65,10 @@ impl CancellableTaskHandle {
 pub(crate) fn spawn_cancellable_task<F>(
     task_fn: F,
     task_cancellation: Option<CancellationToken>,
-) -> (impl Future<Output = Result<(), Error>>, CancellableTaskHandle)
+) -> (
+    impl Future<Output = Result<(), Error>>,
+    CancellableTaskHandle,
+)
 where
     F: Future<Output = Result<(), Error>> + Send + 'static,
 {
