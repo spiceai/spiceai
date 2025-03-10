@@ -158,14 +158,10 @@ uuid = "1"
 x509-certificate = "0.23.1"
 
 [patch.crates-io]
-#datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "90409dee317a2accd63f9649807e52d51aa74097" }
-datafusion = { path = "/Users/phillip/code/apache/datafusion/datafusion/core" }
-#datafusion-common = { git = "https://github.com/spiceai/datafusion.git", rev = "90409dee317a2accd63f9649807e52d51aa74097" }
-datafusion-common = { path = "/Users/phillip/code/apache/datafusion/datafusion/common" }
-#datafusion-execution = { git = "https://github.com/spiceai/datafusion.git", rev = "90409dee317a2accd63f9649807e52d51aa74097" }
-datafusion-execution = { path = "/Users/phillip/code/apache/datafusion/datafusion/execution" }
-#datafusion-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "90409dee317a2accd63f9649807e52d51aa74097" }
-datafusion-expr = { path = "/Users/phillip/code/apache/datafusion/datafusion/expr" }
+datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "8066f4aaba4f09c0312f760f8d8b881a4035f75d" }
+datafusion-common = { git = "https://github.com/spiceai/datafusion.git", rev = "8066f4aaba4f09c0312f760f8d8b881a4035f75d" }
+datafusion-execution = { git = "https://github.com/spiceai/datafusion.git", rev = "8066f4aaba4f09c0312f760f8d8b881a4035f75d" }
+datafusion-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "8066f4aaba4f09c0312f760f8d8b881a4035f75d" }
 
 arrow = { git = "https://github.com/spiceai/arrow-rs.git", rev = "b7925192b38cfcaca04e0af42f5aa9a3b5dc9ce0" }
 arrow-cast = { git = "https://github.com/spiceai/arrow-rs.git", rev = "b7925192b38cfcaca04e0af42f5aa9a3b5dc9ce0" }
