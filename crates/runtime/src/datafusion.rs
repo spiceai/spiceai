@@ -1286,6 +1286,7 @@ impl DataFusion {
     pub async fn shutdown(&self) {
         // Don't block self.accelerated_tables as it needs to be modified during table removal
         // and will be cleaned up authomatically by removing accelerated tables.
+        tracing::debug!("Datafusion shutdown started");
 
         let accelerated_tables = self.accelerated_tables.read().await.clone();
 
@@ -1312,4 +1313,10 @@ pub fn is_spice_internal_schema(catalog: &str, schema: &str) -> bool {
         && (schema == SPICE_RUNTIME_SCHEMA
             || schema == SPICE_METADATA_SCHEMA
             || schema == SPICE_EVAL_SCHEMA)
+}
+
+impl Drop for DataFusion {
+    fn drop(&mut self) {
+        tracing::debug!("DataFusion resources cleanup");
+    }
 }

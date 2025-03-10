@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::embeddings::vector_search;
+use crate::{embeddings::vector_search, status::RuntimeStatus};
 
 #[cfg(feature = "openapi")]
 use crate::http::v1::{
@@ -26,7 +26,7 @@ use crate::Runtime;
 use crate::{config, request::RequestContext};
 
 use app::App;
-use axum::routing::patch;
+use axum::{extract::State, routing::patch};
 use opentelemetry::KeyValue;
 use spicepod::component::runtime::CorsConfig;
 use std::sync::Arc;
@@ -181,6 +181,7 @@ pub(crate) fn routes(
 
     unauthenticated_router
         .merge(authenticated_router)
+        .route_layer(middleware::from_fn_with_state(rt.status(), check_shutdown))
         .route_layer(middleware::from_fn(track_metrics))
         .layer(Extension(Arc::clone(&rt.app)))
         .layer(cors_layer(cors_config))
@@ -259,4 +260,25 @@ fn cors_layer(cors_config: &CorsConfig) -> CorsLayer {
 
     cors.allow_methods([Method::GET, Method::POST, Method::PATCH])
         .allow_origin(allowed_origins)
+}
+
+async fn check_shutdown(
+    State(status): State<Arc<RuntimeStatus>>,
+    req: axum::http::Request<Body>,
+    next: Next,
+) -> impl IntoResponse {
+    // Allow /health to bypass shutdown check
+    if req.uri().path() == "/health" {
+        return next.run(req).await;
+    }
+
+    if status.is_shutdown() {
+        return (
+            http::StatusCode::SERVICE_UNAVAILABLE,
+            "Runtime is shutting down",
+        )
+            .into_response();
+    }
+
+    next.run(req).await
 }

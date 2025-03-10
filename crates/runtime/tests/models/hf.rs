@@ -351,6 +351,7 @@ async fn huggingface_test_embeddings() -> Result<(), anyhow::Error> {
 }
 
 #[tokio::test]
+#[ignore] // https://github.com/spiceai/spiceai/issues/4943
 async fn huggingface_test_chat_completion() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(None);
 
@@ -414,6 +415,7 @@ async fn huggingface_test_chat_completion() -> Result<(), anyhow::Error> {
 }
 
 #[tokio::test]
+#[ignore] // https://github.com/spiceai/spiceai/issues/4943
 async fn huggingface_test_chat_messages() -> Result<(), anyhow::Error> {
     if HF_TEST_MODEL_REQUIRES_HF_API_KEY {
         verify_env_secret_exists("SPICE_HF_TOKEN")

@@ -187,6 +187,7 @@ impl RuntimeBuilder {
             prometheus_registry: self.prometheus_registry,
             rate_limits: self.rate_limits.unwrap_or_default(),
             status,
+            server_components: Arc::new(RwLock::new(HashMap::new())),
         };
 
         let mut extensions: HashMap<String, Arc<dyn Extension>> = HashMap::new();
