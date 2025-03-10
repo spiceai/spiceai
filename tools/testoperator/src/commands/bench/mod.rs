@@ -15,10 +15,15 @@ limitations under the License.
 */
 
 use super::{get_app_and_start_request, RowCounts};
-use crate::args::DatasetTestArgs;
+use crate::{
+    args::DatasetTestArgs,
+    commands::{TEST_RESULTS_API_KEY, TEST_RESULTS_DATASET},
+};
 use std::time::Duration;
 use test_framework::{
     anyhow,
+    arrow::util::pretty::print_batches,
+    flight::put_batches,
     metrics::{MetricCollector, NoExtendedMetrics, QueryMetrics},
     queries::{QueryOverrides, QuerySet},
     spiced::SpicedInstance,
@@ -52,7 +57,14 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
             .with_parallel_count(1)
             .with_end_condition(EndCondition::QuerySetCompleted(5)),
     )
+    .with_explain_plan_snapshot()
+    .with_results_snapshot(snapshot_predicate)
     .with_progress_bars(!args.common.disable_progress_bars)
+    .with_api_key(if args.common.upload_results_dataset.is_some() {
+        Some(TEST_RESULTS_API_KEY.to_string())
+    } else {
+        None
+    })
     .start()
     .await?;
 
@@ -61,9 +73,23 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
     let metrics: QueryMetrics<_, NoExtendedMetrics> = test.collect(TestType::Benchmark)?;
     let mut spiced_instance = test.end();
 
-    metrics.show_records()?;
+    let records = metrics.build_records()?;
+    print_batches(&records)?;
+
+    if args.common.upload_results_dataset.is_some() {
+        println!("Uploading test results...");
+        let mut flight_client = spiced_instance
+            .flight_client(Some(TEST_RESULTS_API_KEY.to_string()))
+            .await?;
+        put_batches(&mut flight_client, TEST_RESULTS_DATASET, records).await?;
+    }
 
     spiced_instance.show_memory_usage()?;
     spiced_instance.stop()?;
     Ok(row_counts)
+}
+
+/// Only snapshot the official TPCH and TPCDS queries, not the "simple" extensions as they don't return consistent results
+fn snapshot_predicate(query_name: &str) -> bool {
+    query_name.starts_with("tpch_q") || query_name.starts_with("tpcds_q")
 }

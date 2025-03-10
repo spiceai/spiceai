@@ -49,17 +49,17 @@ impl DynamoDBFactory {
 
 const PARAMETERS: &[ParameterSpec] = &[
     // Connector parameters
-    ParameterSpec::connector("aws_region")
+    ParameterSpec::component("aws_region")
         .description("The AWS region to use for DynamoDB.")
         .required()
         .secret(),
-    ParameterSpec::connector("aws_access_key_id")
+    ParameterSpec::component("aws_access_key_id")
         .description("The AWS access key ID to use for DynamoDB.")
         .secret(),
-    ParameterSpec::connector("aws_secret_access_key")
+    ParameterSpec::component("aws_secret_access_key")
         .description("The AWS secret access key to use for DynamoDB.")
         .secret(),
-    ParameterSpec::connector("aws_session_token")
+    ParameterSpec::component("aws_session_token")
         .description("The AWS session token to use for DynamoDB.")
         .secret(),
 ];

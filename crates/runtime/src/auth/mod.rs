@@ -97,15 +97,16 @@ impl Default for EndpointAuth {
 async fn api_key_auth(secrets: &Secrets, api_key_auth: &SpicepodApiKeyAuth) -> Arc<ApiKeyAuth> {
     let mut keys = Vec::with_capacity(api_key_auth.keys.len());
     for key in &api_key_auth.keys {
-        let secret_key = secrets
-            .inject_secrets("keys", ParamStr(key.as_ref()))
-            .await
-            .expose_secret()
-            .clone();
+        let secret_key_box = secrets.inject_secrets("keys", ParamStr(key.as_ref())).await;
+        let secret_key = secret_key_box.expose_secret();
 
         let key = match key {
-            ApiKey::ReadOnly { key: _ } => ApiKey::ReadOnly { key: secret_key },
-            ApiKey::ReadWrite { key: _ } => ApiKey::ReadWrite { key: secret_key },
+            ApiKey::ReadOnly { key: _ } => ApiKey::ReadOnly {
+                key: secret_key.to_string(),
+            },
+            ApiKey::ReadWrite { key: _ } => ApiKey::ReadWrite {
+                key: secret_key.to_string(),
+            },
         };
 
         keys.push(key);

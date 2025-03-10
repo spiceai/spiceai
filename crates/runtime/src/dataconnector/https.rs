@@ -59,9 +59,9 @@ impl HttpsFactory {
 static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
     let mut all_parameters = Vec::new();
     all_parameters.extend_from_slice(&[
-        ParameterSpec::connector("username").secret(),
-        ParameterSpec::connector("password").secret(),
-        ParameterSpec::connector("port").description("The port to connect to."),
+        ParameterSpec::component("username").secret(),
+        ParameterSpec::component("password").secret(),
+        ParameterSpec::component("port").description("The port to connect to."),
         ParameterSpec::runtime("client_timeout")
             .description("The timeout setting for HTTP(S) client."),
     ]);

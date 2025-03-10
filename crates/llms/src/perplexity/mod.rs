@@ -56,7 +56,7 @@ impl PerplexitySonar {
             .filter_map(|(k, v)| {
                 if k != "perplexity_auth_token" {
                     if let Some(p) = k.strip_prefix("perplexity_") {
-                        return Some((p.to_string(), v.expose_secret().clone()));
+                        return Some((p.to_string(), v.expose_secret().to_string()));
                     }
                 };
                 None

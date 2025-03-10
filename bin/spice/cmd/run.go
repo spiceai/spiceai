@@ -48,6 +48,20 @@ spice run
 			args = append(args, fmt.Sprintf("-%s", strings.Repeat("v", level)))
 		}
 
+		if flight, err := cmd.Flags().GetString("flight-endpoint"); err == nil && flight != "" {
+			args = append(args, "--flight", flight)
+		}
+
+		if http, err := cmd.Flags().GetString("http-endpoint"); err == nil && http != "" {
+			args = append(args, "--http", http)
+		}
+
+		if metrics, err := cmd.Flags().GetString("metrics-endpoint"); err == nil && metrics != "" {
+			args = append(args, "--metrics", metrics)
+		} else {
+			args = append(args, "--metrics", "127.0.0.1:9090")
+		}
+
 		err = runtime.Run(args)
 		if err != nil {
 			slog.Error("error running Spice.ai", "error", err)
@@ -58,4 +72,7 @@ spice run
 
 func init() {
 	RootCmd.AddCommand(runCmd)
+	runCmd.Flags().String("flight-endpoint", "", "Specifies the runtime Flight endpoint. Defaults to http://127.0.0.1:50051")
+	runCmd.Flags().String("http-endpoint", "", "Specifies the runtime HTTP endpoint. Defaults to http://127.0.0.1:8090")
+	runCmd.Flags().String("metrics-endpoint", "", "Specifies the runtime Prometheus metrics endpoint. Defaults to http://127.0.0.1:9090")
 }

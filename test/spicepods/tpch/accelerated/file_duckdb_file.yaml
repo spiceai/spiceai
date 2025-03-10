@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: file_tpch_duckdb_file
+name: file_duckdb_file
 datasets:
   - from: file:data/customer.parquet
     name: customer

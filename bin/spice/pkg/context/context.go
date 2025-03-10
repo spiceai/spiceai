@@ -33,6 +33,7 @@ import (
 	"github.com/spiceai/spiceai/bin/spice/pkg/constants"
 	"github.com/spiceai/spiceai/bin/spice/pkg/github"
 	"github.com/spiceai/spiceai/bin/spice/pkg/util"
+	"github.com/spiceai/spiceai/bin/spice/pkg/version"
 	"golang.org/x/mod/semver"
 )
 
@@ -181,7 +182,7 @@ func (c *RuntimeContext) RequireModelsFlavor(cmd *cobra.Command) {
 		os.Exit(0)
 	}
 	slog.Info("Installing AI-enabled runtime...")
-	err := c.InstallOrUpgradeRuntime(constants.FlavorAI, true) // default to using an accelerator for prompted installs
+	err := c.InstallMatchingRuntime(constants.FlavorAI, true) // default to using an accelerator for prompted installs
 	if err != nil {
 		slog.Error("installing models runtime", "error", err)
 		os.Exit(1)
@@ -234,20 +235,19 @@ func (c *RuntimeContext) IsRuntimeInstallRequired() bool {
 	return errors.Is(err, os.ErrNotExist)
 }
 
-func (c *RuntimeContext) InstallOrUpgradeRuntime(flavor constants.Flavor, allowAccelerator bool) error {
+func (c *RuntimeContext) InstallMatchingRuntime(flavor constants.Flavor, allowAccelerator bool) error {
+	cliVersion := version.Version()
 	err := c.prepareInstallDir()
 	if err != nil {
 		return err
 	}
 
-	release, err := github.GetLatestRuntimeRelease()
+	release, err := github.GetRuntimeRelease(cliVersion)
 	if err != nil {
 		return err
 	}
 
-	runtimeVersion := release.TagName
-
-	slog.Info(fmt.Sprintf("Downloading and installing Spice.ai Runtime %s ...\n", runtimeVersion))
+	slog.Info(fmt.Sprintf("Downloading and installing Spice.ai Runtime %s ...\n", release.TagName))
 
 	err = github.DownloadRuntimeAsset(flavor, release, c.spiceBinDir, allowAccelerator)
 	if err != nil {
@@ -278,16 +278,13 @@ func (c *RuntimeContext) IsRuntimeUpgradeAvailable() (string, error) {
 		return "", nil
 	}
 
-	release, err := github.GetLatestRuntimeRelease()
-	if err != nil {
-		return "", err
-	}
+	cliVersion := version.Version()
 
-	if semver.Compare(currentVersion, release.TagName) >= 0 {
+	if semver.Compare(currentVersion, cliVersion) >= 0 {
 		return "", nil
 	}
 
-	return release.TagName, nil
+	return cliVersion, nil
 }
 
 func (c *RuntimeContext) GetSpiceAppRelativePath(absolutePath string) string {
@@ -301,7 +298,6 @@ func (c *RuntimeContext) GetRunCmd(args []string) (*exec.Cmd, error) {
 	spiceCMD := c.binaryFilePath("spiced")
 
 	spiceArgs := []string{
-		"--metrics", "127.0.0.1:9090",
 		"--pods-watcher-enabled",
 	}
 	args = append(spiceArgs, args...)
@@ -368,13 +364,15 @@ func (c *RuntimeContext) AddHeaders(headers map[string]string) {
 func (c *RuntimeContext) GetHeaders() map[string]string {
 	headers := make(map[string]string)
 
-	if c.isCloud {
-		apiKey := os.Getenv("SPICE_API_KEY")
-		if apiKey != "" {
-			headers["X-API-Key"] = apiKey
-		}
+	apiKey := os.Getenv("SPICE_API_KEY")
+	if apiKey == "" {
+		apiKey = os.Getenv("SPICE_SPICEAI_API_KEY")
+	}
+	if apiKey != "" {
+		headers["X-API-Key"] = apiKey
 	}
 
+	// api_key from context takes precedence
 	if c.apiKey != "" {
 		headers["X-API-Key"] = c.apiKey
 	}

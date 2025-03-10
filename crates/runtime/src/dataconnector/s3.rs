@@ -129,17 +129,17 @@ impl S3Factory {
 static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
     let mut all_parameters = Vec::new();
     all_parameters.extend_from_slice(&[
-            ParameterSpec::connector("region").secret(),
-            ParameterSpec::connector("endpoint").secret(),
-            ParameterSpec::connector("key").secret(),
-            ParameterSpec::connector("secret").secret(),
-            ParameterSpec::connector("auth")
+            ParameterSpec::component("region").secret(),
+            ParameterSpec::component("endpoint").secret(),
+            ParameterSpec::component("key").secret(),
+            ParameterSpec::component("secret").secret(),
+            ParameterSpec::component("auth")
                 .description("Configures the authentication method for S3. Supported methods are: public (i.e. no auth), iam_role, key.")
                 .secret(),
             ParameterSpec::runtime("client_timeout")
                 .description("The timeout setting for S3 client."),
             ParameterSpec::runtime("allow_http")
-                .description("Allow HTTP protocol for S3 endpoint."),
+                .description("Allow HTTP protocol for S3 endpoint.")
         ]);
     all_parameters.extend_from_slice(LISTING_TABLE_PARAMETERS);
     all_parameters

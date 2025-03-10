@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: abfs_tpcds
+name: abfs
 datasets:
   - from: abfs://data/tpcds/catalog_sales/
     name: catalog_sales

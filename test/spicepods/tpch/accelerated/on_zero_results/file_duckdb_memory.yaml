@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: file_tpch_duckdb_memory_on_zero_results
+name: file_duckdb_memory_on_zero_results
 datasets:
   - from: file:data/customer.parquet
     name: customer
@@ -8,7 +8,7 @@ datasets:
       enabled: true
       engine: duckdb
       mode: memory
-      refresh_sql: "SELECT * FROM customer LIMIT 0"
+      refresh_sql: 'SELECT * FROM customer LIMIT 0'
       on_zero_results: use_source
   - from: file:data/lineitem.parquet
     name: lineitem
@@ -16,7 +16,7 @@ datasets:
       enabled: true
       engine: duckdb
       mode: memory
-      refresh_sql: "SELECT * FROM lineitem LIMIT 0"
+      refresh_sql: 'SELECT * FROM lineitem LIMIT 0'
       on_zero_results: use_source
   - from: file:data/nation.parquet
     name: nation
@@ -24,7 +24,7 @@ datasets:
       enabled: true
       engine: duckdb
       mode: memory
-      refresh_sql: "SELECT * FROM nation LIMIT 0"
+      refresh_sql: 'SELECT * FROM nation LIMIT 0'
       on_zero_results: use_source
   - from: file:data/orders.parquet
     name: orders
@@ -32,7 +32,7 @@ datasets:
       enabled: true
       engine: duckdb
       mode: memory
-      refresh_sql: "SELECT * FROM orders LIMIT 0"
+      refresh_sql: 'SELECT * FROM orders LIMIT 0'
       on_zero_results: use_source
   - from: file:data/part.parquet
     name: part
@@ -40,7 +40,7 @@ datasets:
       enabled: true
       engine: duckdb
       mode: memory
-      refresh_sql: "SELECT * FROM part LIMIT 0"
+      refresh_sql: 'SELECT * FROM part LIMIT 0'
       on_zero_results: use_source
   - from: file:data/partsupp.parquet
     name: partsupp
@@ -48,7 +48,7 @@ datasets:
       enabled: true
       engine: duckdb
       mode: memory
-      refresh_sql: "SELECT * FROM partsupp LIMIT 0"
+      refresh_sql: 'SELECT * FROM partsupp LIMIT 0'
       on_zero_results: use_source
   - from: file:data/region.parquet
     name: region
@@ -56,7 +56,7 @@ datasets:
       enabled: true
       engine: duckdb
       mode: memory
-      refresh_sql: "SELECT * FROM region LIMIT 0"
+      refresh_sql: 'SELECT * FROM region LIMIT 0'
       on_zero_results: use_source
   - from: file:data/supplier.parquet
     name: supplier
@@ -64,5 +64,5 @@ datasets:
       enabled: true
       engine: duckdb
       mode: memory
-      refresh_sql: "SELECT * FROM supplier LIMIT 0"
+      refresh_sql: 'SELECT * FROM supplier LIMIT 0'
       on_zero_results: use_source

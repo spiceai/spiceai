@@ -83,7 +83,7 @@ async fn test_acceleration_duckdb_checkpoint() -> Result<(), anyhow::Error> {
             // Wait for the checkpoint to be created
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             drop(rt);
-            runtime::dataaccelerator::clear_registry().await;
+            runtime::dataaccelerator::unregister_all().await;
             runtime::dataaccelerator::register_all().await;
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 

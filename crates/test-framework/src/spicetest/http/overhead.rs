@@ -16,7 +16,9 @@ limitations under the License.
 
 use super::component::HttpComponent;
 use super::HttpConfig;
-use crate::metrics::{MetricCollector, NoExtendedMetrics, QueryMetric};
+use crate::metrics::{
+    system_time_to_unix_epoch_ms, MetricCollector, NoExtendedMetrics, QueryMetric, QueryStatus,
+};
 use crate::spicetest::{SpiceTest, TestCompleted, TestNotStarted, TestState};
 use crate::utils::get_random_element;
 use anyhow::Result;
@@ -126,6 +128,9 @@ impl SpiceTest<NotStarted> {
             start_time: self.start_time,
             spiced_instance: self.spiced_instance,
             use_progress_bars: self.use_progress_bars,
+            api_key: self.api_key,
+            explain_plan_snapshot: self.explain_plan_snapshot,
+            results_snapshot_predicate: self.results_snapshot_predicate,
             state: Running {
                 baseline_handles,
                 spice_handles,
@@ -163,6 +168,9 @@ impl SpiceTest<Running> {
             start_time: self.start_time,
             spiced_instance: self.spiced_instance,
             use_progress_bars: self.use_progress_bars,
+            api_key: self.api_key,
+            explain_plan_snapshot: self.explain_plan_snapshot,
+            results_snapshot_predicate: self.results_snapshot_predicate,
             state: Completed {
                 baseline_results,
                 spice_results,
@@ -186,9 +194,20 @@ impl MetricCollector<NoExtendedMetrics, NoExtendedMetrics> for SpiceTest<Complet
     }
 
     fn metrics(&self) -> Result<Vec<QueryMetric<NoExtendedMetrics>>> {
-        let baseline =
-            QueryMetric::new_from_durations("baseline", &self.state.baseline_results.durations)?;
-        let spice = QueryMetric::new_from_durations("spice", &self.state.spice_results.durations)?;
+        let baseline = QueryMetric::new_from_durations(
+            "baseline",
+            &self.state.baseline_results.durations,
+            QueryStatus::Passed,
+            system_time_to_unix_epoch_ms(self.start_time)?,
+            system_time_to_unix_epoch_ms(self.state.end_time)?,
+        )?;
+        let spice = QueryMetric::new_from_durations(
+            "spice",
+            &self.state.spice_results.durations,
+            QueryStatus::Passed,
+            system_time_to_unix_epoch_ms(self.start_time)?,
+            system_time_to_unix_epoch_ms(self.state.end_time)?,
+        )?;
         Ok(vec![baseline, spice])
     }
 }

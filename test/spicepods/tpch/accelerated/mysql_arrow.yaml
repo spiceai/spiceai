@@ -1,10 +1,9 @@
 version: v1
 kind: Spicepod
-name: mysql_tpch_arrow
+name: mysql_arrow
 
 # Define common anchors
 definitions:
-  
   # Common mysql parameters
   - &mysql_params
     mysql_host: ${env:MYSQL_HOST}
@@ -52,7 +51,7 @@ datasets:
     name: region
     params: *mysql_params
     acceleration: *acceleration
-  
+
   - from: mysql:supplier
     name: supplier
     params: *mysql_params

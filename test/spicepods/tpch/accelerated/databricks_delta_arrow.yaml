@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: databricks_delta_tpch_arrow
+name: databricks_delta_arrow
 datasets:
   - from: databricks:spiceai_sandbox.tpch.partsupp
     name: partsupp

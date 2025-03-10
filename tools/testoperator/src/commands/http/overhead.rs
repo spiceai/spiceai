@@ -23,7 +23,7 @@ use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use std::{sync::Arc, time::Duration};
 use test_framework::{
     anyhow::{self, anyhow},
-    arrow::array::ArrowNativeTypeOp,
+    arrow::util::pretty::print_batches,
     metrics::MetricCollector,
     spiced::SpicedInstance,
     spicetest::{
@@ -75,7 +75,8 @@ pub(crate) async fn overhead_run(args: &HttpOverheadTestArgs) -> anyhow::Result<
     println!("{}", with_color!(Color::Blue, "Starting overhead test"));
     let test = test.start()?.wait().await?;
     let results = test.collect(TestType::HttpOverhead)?;
-    results.show_records()?;
+    let records = results.build_records()?;
+    print_batches(&records)?;
 
     let mut spiced_instance = test.end();
     spiced_instance.stop()?;
@@ -88,20 +89,20 @@ pub(crate) async fn overhead_run(args: &HttpOverheadTestArgs) -> anyhow::Result<
     };
 
     check_threshold(
-        spice.median_duration,
-        baseline.median_duration,
+        spice.median_duration_ms,
+        baseline.median_duration_ms,
         args.increase_threshold,
         "median",
     )?;
     check_threshold(
-        spice.percentile_90_duration,
-        baseline.percentile_90_duration,
+        spice.percentile_90_duration_ms,
+        baseline.percentile_90_duration_ms,
         args.increase_threshold,
         "p90",
     )?;
     check_threshold(
-        spice.percentile_95_duration,
-        baseline.percentile_95_duration,
+        spice.percentile_95_duration_ms,
+        baseline.percentile_95_duration_ms,
         args.increase_threshold,
         "p95",
     )?;
@@ -115,32 +116,33 @@ pub(crate) async fn overhead_run(args: &HttpOverheadTestArgs) -> anyhow::Result<
 /// check_threshold(10.0, 5.0, 1.1, "p50") // Ok
 /// check_threshold(12.0, 5.0, 1.1, "p50") // Err
 /// ```
+#[allow(clippy::cast_precision_loss)]
 fn check_threshold(
-    spice_duration: f64,
-    baseline_duration: f64,
+    spice_duration: i64,
+    baseline_duration: i64,
     increase_threshold: f64,
     label: &str,
 ) -> Result<(), anyhow::Error> {
-    if let Ok(multiple) = spice_duration.div_checked(baseline_duration) {
-        if multiple > increase_threshold {
-            return Err(anyhow::anyhow!(with_color!(Color::RedBold,
-                "Spice {} duration ({}) increased beyond baseline ({}) by more than the threshold ({} > {})",
-                label,
-                spice_duration,
-                baseline_duration,
+    let multiple = spice_duration as f64 / baseline_duration as f64;
+    if multiple > increase_threshold {
+        return Err(anyhow::anyhow!(with_color!(Color::RedBold,
+            "Spice {} duration ({}) increased beyond baseline ({}) by more than the threshold ({} > {})",
+            label,
+            spice_duration,
+            baseline_duration,
                 multiple,
                 increase_threshold
             )));
-        }
-        println!("{}", with_color!(Color::Green,
+    }
+    println!("{}", with_color!(Color::Green,
                 "Spice {} duration ({}) increased beyond baseline ({}) by less than the threshold ({} <= {})",
                 label,
                 spice_duration,
                 baseline_duration,
                 multiple,
-                increase_threshold)
-            );
-    }
+            increase_threshold
+        )
+    );
     Ok(())
 }
 

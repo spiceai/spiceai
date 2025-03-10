@@ -87,7 +87,7 @@ pub mod mysql;
 #[cfg(feature = "odbc")]
 pub mod odbc;
 pub const ODBC_DATACONNECTOR: &str = "odbc"; // const needs to be accessible when ODBC isn't built
-
+pub mod iceberg;
 #[cfg(feature = "imap")]
 pub mod imap;
 #[cfg(feature = "postgres")]
@@ -350,8 +350,13 @@ pub async fn register_all() {
     register_connector_factory("localpod", localpod::LocalPodFactory::new_arc()).await;
     #[cfg(feature = "dynamodb")]
     register_connector_factory("dynamodb", dynamodb::DynamoDBFactory::new_arc()).await;
+    register_connector_factory("iceberg", iceberg::IcebergDataConnectorFactory::new_arc()).await;
 }
 
+pub async fn unregister_all() {
+    let mut registry = DATA_CONNECTOR_FACTORY_REGISTRY.lock().await;
+    registry.clear();
+}
 pub trait DataConnectorFactory: Send + Sync {
     fn as_any(&self) -> &dyn Any;
 

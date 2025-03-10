@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use arrow::array::RecordBatch;
@@ -43,13 +43,17 @@ pub enum Error {
     UnableToRegisterToMetricsTable { source: DataFusionError },
 }
 
+/// Uses a `Weak` reference to `DataFusion` to prevent blocking its cleanup after runtime termination.
+/// This ensures `DataFusion` can gracefully shut down, even when metrics persist.
 pub struct SpiceMetricsExporter {
-    datafusion: Arc<DataFusion>,
+    datafusion: Weak<DataFusion>,
 }
 
 impl SpiceMetricsExporter {
-    pub fn new(datafusion: Arc<DataFusion>) -> Self {
-        SpiceMetricsExporter { datafusion }
+    pub fn new(datafusion: &Arc<DataFusion>) -> Self {
+        SpiceMetricsExporter {
+            datafusion: Arc::downgrade(datafusion),
+        }
     }
 }
 
@@ -62,8 +66,14 @@ impl otel_arrow::ArrowExporter for SpiceMetricsExporter {
             update_type: UpdateType::Append,
         };
 
-        self.datafusion
-            .write_data(&get_metrics_table_reference(), data_update)
+        let Some(df) = self.datafusion.upgrade() else {
+            // this should never happen as the exporter must be shutdown before the DataFusion instance is dropped
+            return Err(MetricError::Other(
+                "Failed to export metrics as the DataFusion instance has already been dropped.\nReport an issue on GitHub: https://github.com/spiceai/spiceai/issues".to_string(),
+            ));
+        };
+
+        df.write_data(&get_metrics_table_reference(), data_update)
             .await
             .map_err(|e| MetricError::Other(e.to_string()))
     }

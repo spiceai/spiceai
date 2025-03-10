@@ -399,8 +399,8 @@ async fn start_spice_test_app(
     flight_auth: Option<Arc<dyn FlightBasicAuth + Send + Sync>>,
     rate_limits: Option<RateLimits>,
 ) -> Result<(Channel, Arc<DataFusion>), anyhow::Error> {
-    let mut rng = rand::thread_rng();
-    let http_port: u16 = rng.gen_range(50000..60000);
+    let mut rng = rand::rng();
+    let http_port: u16 = rng.random_range(50000..60000);
     let flight_port: u16 = http_port + 1;
     let otel_port: u16 = http_port + 2;
     let metrics_port: u16 = http_port + 3;

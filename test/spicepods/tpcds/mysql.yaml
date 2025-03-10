@@ -1,10 +1,9 @@
 version: v1
 kind: Spicepod
-name: mysql_tpcds
+name: mysql
 
 # Define common anchors
 definitions:
-  
   # Common mysql parameters
   - &mysql_params
     mysql_host: ${env:MYSQL_HOST}

@@ -14,27 +14,17 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::ConnectorComponent;
-use super::ConnectorParams;
-use super::DataConnector;
-use super::DataConnectorError;
-use super::DataConnectorFactory;
-use super::ParameterSpec;
-use crate::component::dataset::Dataset;
-use crate::federated_table::FederatedTable;
+use std::any::Any;
+use std::borrow::Borrow;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+
 use arrow_flight::decode::DecodedPayload;
 use async_stream::stream;
 use async_trait::async_trait;
-use data_components::cdc::{
-    self, ChangeBatch, ChangeEnvelope, ChangesStream, CommitChange, CommitError,
-};
-use data_components::flight::FlightFactory;
-use data_components::flight::FlightTable;
-use data_components::{Read, ReadWrite};
 use datafusion::datasource::TableProvider;
-use datafusion::sql::unparser::dialect::Dialect;
-use datafusion::sql::unparser::dialect::IntervalStyle;
-use datafusion::sql::unparser::dialect::PostgreSqlDialect;
+use datafusion::sql::unparser::dialect::{Dialect, IntervalStyle, PostgreSqlDialect};
 use datafusion::sql::TableReference;
 use datafusion_federation::FederatedTableProviderAdaptor;
 use flight_client::Credentials;
@@ -42,15 +32,19 @@ use flight_client::FlightClient;
 use futures::{Stream, StreamExt};
 use ns_lookup::verify_endpoint_connection;
 use snafu::prelude::*;
-use std::any::Any;
-use std::borrow::Borrow;
-use std::future::Future;
-use std::pin::Pin;
-use std::sync::Arc;
-use tonic::metadata::errors::InvalidMetadataValue;
-use tonic::metadata::Ascii;
-use tonic::metadata::MetadataMap;
-use tonic::metadata::MetadataValue;
+use tonic::metadata::{errors::InvalidMetadataValue, Ascii, MetadataMap, MetadataValue};
+
+use super::{
+    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
+    ParameterSpec,
+};
+use crate::component::dataset::Dataset;
+use crate::federated_table::FederatedTable;
+use data_components::cdc::{
+    self, ChangeBatch, ChangeEnvelope, ChangesStream, CommitChange, CommitError,
+};
+use data_components::flight::{FlightFactory, FlightTable};
+use data_components::{Read, ReadWrite};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -147,9 +141,9 @@ impl SpiceAIFactory {
 }
 
 const PARAMETERS: &[ParameterSpec] = &[
-    ParameterSpec::connector("api_key").secret(),
-    ParameterSpec::connector("token").secret(),
-    ParameterSpec::connector("endpoint"),
+    ParameterSpec::component("api_key").secret(),
+    ParameterSpec::component("token").secret(),
+    ParameterSpec::component("endpoint"),
 ];
 
 const HEADER_ORG: &str = "spiceai-org";

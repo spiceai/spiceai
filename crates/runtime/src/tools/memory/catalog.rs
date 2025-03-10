@@ -20,7 +20,8 @@ use spicepod::component::tool::Tool;
 use std::{collections::HashMap, sync::Arc};
 
 use crate::tools::{
-    catalog::SpiceToolCatalog, factory::ToolFactory, memory::store::StoreMemoryTool, SpiceModelTool,
+    catalog::SpiceToolCatalog, factory::IndividualToolFactory, memory::store::StoreMemoryTool,
+    SpiceModelTool,
 };
 
 use super::load::LoadMemoryTool;
@@ -42,7 +43,7 @@ impl MemoryToolCatalog {
     }
 }
 
-impl ToolFactory for MemoryToolCatalog {
+impl IndividualToolFactory for MemoryToolCatalog {
     fn construct(
         &self,
         component: &Tool,
