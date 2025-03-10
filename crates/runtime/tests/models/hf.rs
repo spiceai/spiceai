@@ -351,6 +351,7 @@ async fn huggingface_test_embeddings() -> Result<(), anyhow::Error> {
 }
 
 #[tokio::test]
+#[ignore] // https://github.com/spiceai/spiceai/issues/4943
 async fn huggingface_test_chat_completion() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(None);
 
