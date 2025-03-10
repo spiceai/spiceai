@@ -160,7 +160,8 @@ impl SpiceTestQueryWorker {
 
                         let snapshot_results = self
                             .results_snapshot_predicate
-                            .is_some_and(|predicate| predicate(query.0));
+                            .is_some_and(|predicate| predicate(query.0))
+                            && self.id == 0; // only one worker should snapshot results
 
                         // Additional round of query run before recording results.
                         // To discard the abnormal results caused by: establishing initial connection / spark cluster startup time
@@ -183,7 +184,7 @@ impl SpiceTestQueryWorker {
                             ));
                         }
 
-                        if self.explain_plan_snapshot {
+                        if self.explain_plan_snapshot && self.id == 0 {
                             if let Err(e) = record_explain_plan(
                                 &self.flight_client,
                                 self.name.as_str(),
