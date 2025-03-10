@@ -153,9 +153,11 @@ impl SpiceTestQueryWorker {
                 }
                 EndCondition::QuerySetCompleted(target_count) => {
                     // For QuerySetCompleted, run each query target_count times before moving to next
+                    // let start = SystemTime::now();
+                    let start = SystemTime::now();
                     for query in &self.query_set {
                         let mut current_query_count = 0;
-                        let start = SystemTime::now();
+                        let query_start = SystemTime::now();
                         let mut query_status = QueryStatus::Passed;
 
                         let snapshot_results = self
@@ -203,9 +205,12 @@ impl SpiceTestQueryWorker {
                         }
 
                         while current_query_count < target_count {
-                            if self.progress_bar.is_none() && self.id == 0 {
+                            if self.progress_bar.is_none()
+                                && self.id == 0
+                                && current_query_count % 10 == 0
+                            {
                                 println!(
-                                    "Worker {} - Query '{}' count: {}/{} - Elapsed time: {:?}",
+                                    "Worker {} - Query '{}' - {}/{} - Elapsed time: {:?}",
                                     self.id,
                                     query.0,
                                     current_query_count + 1,
@@ -240,7 +245,7 @@ impl SpiceTestQueryWorker {
                             current_query_count += 1;
                         }
                         let end = SystemTime::now();
-                        query_iteration_durations.insert(query.0.to_string(), (start, end));
+                        query_iteration_durations.insert(query.0.to_string(), (query_start, end));
                         query_statuses.insert(query.0.to_string(), query_status);
                     }
                 }
