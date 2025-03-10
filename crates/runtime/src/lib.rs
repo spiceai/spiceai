@@ -722,7 +722,7 @@ impl Runtime {
     where
         F: Future<Output = Result<(), Error>> + Send + 'static,
     {
-        let (future, handle) = spawn_cancellable_task(task_fn, cancellation_token);
+        let (future, handle) = spawn_cancellable_task(cancellation_token, task_fn);
 
         self.server_components
             .write()

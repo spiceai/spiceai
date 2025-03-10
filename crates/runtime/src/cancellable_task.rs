@@ -63,8 +63,8 @@ impl CancellableTaskHandle {
 /// Returns a future that resolves when the task completes or is canceled,
 /// along with a [`CancellableTaskHandle`] for external task control.
 pub(crate) fn spawn_cancellable_task<F>(
-    task_fn: F,
     task_cancellation: Option<CancellationToken>,
+    task_fn: F,
 ) -> (
     impl Future<Output = Result<(), Error>>,
     CancellableTaskHandle,
@@ -106,4 +106,135 @@ where
     };
 
     (task_future, task_handle)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_task_completes_successfully() {
+        let task_fn = async { Ok::<(), Error>(()) };
+        let (task_future, _handle) = spawn_cancellable_task(None, task_fn);
+        let result = task_future.await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_task_fails() {
+        // test that correct error is returned
+        let task_fn =
+            async { Err::<(), Error>(Error::AcceleratedReadWriteTableWithoutReplication {}) };
+        let (task_future, _handle) = spawn_cancellable_task(None, task_fn);
+        let result = task_future.await;
+        assert!(matches!(
+            result,
+            Err(Error::AcceleratedReadWriteTableWithoutReplication { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_task_is_cancelled_gracefully() {
+        let cancellation_token = CancellationToken::new();
+        let (task_future, handle) =
+            spawn_cancellable_task(Some(cancellation_token.clone()), async move {
+                // Simulate some work
+                cancellation_token.cancelled().await;
+                Ok::<(), Error>(())
+            });
+
+        // cancel the task async after 100 ms
+        let cancel_future = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            tokio::select! {
+                // We expect the task to be cancelled immediately (before timeout)
+                () = handle.cancel(Duration::from_secs(5)) => {}
+                () = tokio::time::sleep(Duration::from_secs(1)) => {
+                    panic!("Timed out waiting for task to complete");
+                }
+            }
+        });
+
+        let (task_result, cancel_result) = tokio::join!(task_future, cancel_future);
+        assert!(task_result.is_ok());
+        assert!(cancel_result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_task_is_aborted() {
+        let (task_future, handle) = spawn_cancellable_task(None, async move {
+            // Simulate some work
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            Ok::<(), Error>(())
+        });
+
+        // cancel the task async after 100 ms
+        let cancel_future = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            tokio::select! {
+                // We expect the task to be cancelled immediately (before timeout)
+                () = handle.cancel(Duration::from_secs(5)) => {}
+                () = tokio::time::sleep(Duration::from_secs(1)) => {
+                    panic!("Timed out waiting for task to complete");
+                }
+            }
+        });
+
+        let (task_result, cancel_result) = tokio::join!(task_future, cancel_future);
+        assert!(task_result.is_ok());
+        assert!(cancel_result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_task_can_be_force_aborted() {
+        // test that the task can be aborted after timeout when cancellation token is provided
+        let (task_future, handle) =
+            spawn_cancellable_task(Some(CancellationToken::new()), async move {
+                // Simulate some work
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                Ok::<(), Error>(())
+            });
+
+        // cancel the task async after 100 ms
+        let cancel_future = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            tokio::select! {
+                // the task must be force aborted after timeout
+                () = handle.cancel(Duration::from_millis(200)) => {}
+                () = tokio::time::sleep(Duration::from_secs(1)) => {
+                    panic!("Timed out waiting for task to complete");
+                }
+            }
+        });
+
+        let (task_result, cancel_result) = tokio::join!(task_future, cancel_future);
+        assert!(task_result.is_ok());
+        assert!(cancel_result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_cancel_already_completed_task() {
+        let cancellation_token = CancellationToken::new();
+        let (task_future, handle) = spawn_cancellable_task(Some(cancellation_token), async move {
+            // complete the task immediatly
+            Ok::<(), Error>(())
+        });
+
+        assert!(task_future.await.is_ok());
+
+        // attempt to cancel already completed task after 100 ms
+        let cancel_result = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            tokio::select! {
+                // We expect the task to be cancelled immediately (before timeout)
+                () = handle.cancel(Duration::from_secs(5)) => {}
+                () = tokio::time::sleep(Duration::from_secs(1)) => {
+                    panic!("Timed out waiting for task to complete");
+                }
+            }
+        })
+        .await;
+
+        assert!(cancel_result.is_ok());
+    }
 }
