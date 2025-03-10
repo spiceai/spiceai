@@ -82,7 +82,7 @@ dotenvy = "0.15"
 duckdb = "1.2.0"
 fundu = "2.0.1"
 futures = "0.3.30"
-globset = "0.4.15"
+globset = "0.4.16"
 graph-rs-sdk = { git = "https://github.com/spiceai/graph-rs-sdk", rev = "f8703df260146b313461029d41c4a021306832b8" }
 graphql-parser = "0.4.0"
 hf-hub = { version = "0.3.0", features = ["tokio"] }
