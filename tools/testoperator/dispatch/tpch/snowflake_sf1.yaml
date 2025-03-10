@@ -1,0 +1,6 @@
+tests:
+  bench:
+    spicepod_path: ./test/spicepods/tpch/snowflake_sf1.yaml
+    query_set: tpch
+    query_overrides: snowflake
+    runner_type: spiceai-runners

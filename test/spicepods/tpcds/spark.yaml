@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: spark_tpcds
+name: spark
 datasets:
   - from: spark:spiceai_sandbox.tpcds.catalog_sales
     name: catalog_sales

@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: abfs_tpch
+name: abfs
 datasets:
   - from: abfs://data/tpch/customer/
     name: customer

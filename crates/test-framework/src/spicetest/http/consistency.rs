@@ -15,7 +15,9 @@ limitations under the License.
 */
 
 use super::HttpConfig;
-use crate::metrics::{MetricCollector, NoExtendedMetrics, QueryMetric};
+use crate::metrics::{
+    system_time_to_unix_epoch_ms, MetricCollector, NoExtendedMetrics, QueryMetric, QueryStatus,
+};
 use crate::spicetest::{SpiceTest, TestCompleted, TestNotStarted, TestState};
 use crate::utils::get_random_element;
 use anyhow::Result;
@@ -140,6 +142,9 @@ impl SpiceTest<NotStarted> {
             start_time: self.start_time,
             spiced_instance: self.spiced_instance,
             use_progress_bars: self.use_progress_bars,
+            api_key: self.api_key,
+            explain_plan_snapshot: self.explain_plan_snapshot,
+            results_snapshot_predicate: self.results_snapshot_predicate,
             state: Running {
                 worker_handles,
                 config: self.state.config,
@@ -173,6 +178,9 @@ impl SpiceTest<Running> {
             start_time: self.start_time,
             spiced_instance: self.spiced_instance,
             use_progress_bars: self.use_progress_bars,
+            api_key: self.api_key,
+            explain_plan_snapshot: self.explain_plan_snapshot,
+            results_snapshot_predicate: self.results_snapshot_predicate,
             state: Completed {
                 result: ConsistencyResult {
                     durations,
@@ -211,7 +219,13 @@ impl MetricCollector<NoExtendedMetrics, NoExtendedMetrics> for SpiceTest<Complet
             .iter()
             .enumerate()
             .map(|(i, durations)| {
-                QueryMetric::new_from_durations(format!("{i}").as_str(), durations)
+                QueryMetric::new_from_durations(
+                    format!("{i}").as_str(),
+                    durations,
+                    QueryStatus::Passed,
+                    system_time_to_unix_epoch_ms(self.start_time)?,
+                    system_time_to_unix_epoch_ms(self.state.end_time)?,
+                )
             })
             .collect()
     }

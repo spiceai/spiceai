@@ -19,6 +19,7 @@ use crate::args::DatasetTestArgs;
 use std::time::Duration;
 use test_framework::{
     anyhow,
+    arrow::util::pretty::print_batches,
     metrics::{MetricCollector, QueryMetrics, ThroughputMetrics},
     queries::{QueryOverrides, QuerySet},
     spiced::SpicedInstance,
@@ -86,7 +87,8 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
     let mut spiced_instance = test.end();
     let memory_usage = spiced_instance.show_memory_usage()?;
 
-    metrics.show_records()?;
+    let records = metrics.build_records()?;
+    print_batches(&records)?;
     metrics.with_memory_usage(memory_usage).show_run(None)?; // no additional test pass logic applies
     spiced_instance.stop()?;
 
