@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: s3_tpch_arrow
+name: s3_sf5_duckdb_file_cache_ttl
 runtime:
   results_cache:
     enabled: true

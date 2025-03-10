@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: mysql_tpch
+name: mysql_cache_ttl
 
 runtime:
   results_cache:
