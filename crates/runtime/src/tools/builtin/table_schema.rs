@@ -30,7 +30,7 @@ use itertools::Itertools;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use spicepod::component::semantic::Column;
+use spicepod::semantic::Column;
 use std::{borrow::Cow, sync::Arc};
 
 use crate::{

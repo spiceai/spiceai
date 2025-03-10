@@ -21,7 +21,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::{semantic::Column, Nameable, WithDependsOn};
+use super::{Nameable, WithDependsOn};
+use crate::semantic::Column;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]

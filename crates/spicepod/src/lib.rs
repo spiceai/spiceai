@@ -31,6 +31,7 @@ use spec::{SpicepodDefinition, SpicepodVersion};
 
 pub mod component;
 pub mod reader;
+pub mod semantic;
 pub mod spec;
 
 #[derive(Debug, Snafu)]

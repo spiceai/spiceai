@@ -22,9 +22,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::{
-    embeddings::ColumnEmbeddingConfig, is_default, params::Params, semantic::Column, Nameable,
-    WithDependsOn,
+    embeddings::ColumnEmbeddingConfig, is_default, params::Params, Nameable, WithDependsOn,
 };
+use crate::semantic::Column;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]

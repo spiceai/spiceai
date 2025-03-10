@@ -21,7 +21,7 @@ use spicepod::component::view as spicepod_view;
 use std::{collections::HashMap, fs};
 
 use super::{dataset::Dataset, validate_identifier};
-use spicepod::component::semantic::Column;
+use spicepod::semantic::Column;
 
 /// [`View`] is the internal representation of the [`spicepod_view::View`] spicepod component.
 #[derive(Debug, Clone, PartialEq)]

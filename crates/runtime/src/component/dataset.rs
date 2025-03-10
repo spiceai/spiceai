@@ -26,8 +26,8 @@ use datafusion::sql::{
 };
 use datafusion_table_providers::util::column_reference;
 use snafu::prelude::*;
-use spicepod::component::{
-    dataset as spicepod_dataset, embeddings::ColumnEmbeddingConfig, params::Params,
+use spicepod::{
+    component::{dataset as spicepod_dataset, embeddings::ColumnEmbeddingConfig, params::Params},
     semantic::Column,
 };
 use std::{collections::HashMap, fmt::Display, str::FromStr, sync::Arc, time::Duration};

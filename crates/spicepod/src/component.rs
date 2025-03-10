@@ -35,7 +35,6 @@ pub mod model;
 pub mod params;
 pub mod runtime;
 pub mod secret;
-pub mod semantic;
 pub mod tool;
 pub mod view;
 
