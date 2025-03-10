@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: s3_sf5_duckdb_file
+name: s3_sf5_arrow
 datasets:
   - from: s3://benchmarks/tpch_sf5/customer/
     name: customer
@@ -13,8 +13,7 @@ datasets:
       s3_secret: ${secrets:S3_SECRET}
     acceleration: &acceleration
       enabled: true
-      engine: duckdb
-      mode: file
+      engine: arrow
   - from: s3://benchmarks/tpch_sf5/lineitem/
     name: lineitem
     params: *s3_params
