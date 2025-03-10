@@ -151,15 +151,19 @@ impl RefreshTask {
         .instrument(span.clone())
         .await
         .inspect_err(|e| {
-            tracing::error!(
-                "Failed to refresh dataset {}: {e}",
-                include_source_to_dataset_name(
-                    &self.dataset_name,
-                    self.federated_source.as_deref()
-                )
-            );
-            for span in &spans {
-                tracing::error!(target: "task_history", parent: span, "{e}");
+            // During runtime shutdown, refresh tasks are canceled resulting in acceleration error.
+            // This is expected and should not be logged as an error.
+            if !self.runtime_status.is_shutdown() {
+                tracing::error!(
+                    "Failed to refresh dataset {}: {e}",
+                    include_source_to_dataset_name(
+                        &self.dataset_name,
+                        self.federated_source.as_deref()
+                    )
+                );
+                for span in &spans {
+                    tracing::error!(target: "task_history", parent: span, "{e}");
+                }
             }
         })
     }
@@ -209,14 +213,18 @@ impl RefreshTask {
         )
         .await
         .inspect_err(|e| {
-            tracing::warn!(
-                "Failed to load data for dataset {}: {}",
-                include_source_to_dataset_name(
-                    &self.dataset_name,
-                    self.federated_source.as_deref()
-                ),
-                inner_err_from_retry_ref(e)
-            );
+            // During runtime shutdown, refresh tasks are canceled resulting in acceleration error.
+            // This is expected and should not be logged as an error.
+            if !self.runtime_status.is_shutdown() {
+                tracing::warn!(
+                    "Failed to load data for dataset {}: {}",
+                    include_source_to_dataset_name(
+                        &self.dataset_name,
+                        self.federated_source.as_deref()
+                    ),
+                    inner_err_from_retry_ref(e)
+                );
+            }
         })
     }
 
