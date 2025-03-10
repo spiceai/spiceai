@@ -21,7 +21,7 @@ use duckdb::Connection;
 use tonic::async_trait;
 
 use crate::{
-    queries::{QuerySet, TableWithColumn},
+    queries::{QuerySet, TableWithTimeColumn},
     spicetest::append::worker::AppendConfig,
 };
 
@@ -29,7 +29,7 @@ use super::AppendableSource;
 
 pub(crate) struct FileAppendableSource {
     dest_db_file: PathBuf,
-    tables: Vec<TableWithColumn>,
+    tables: Vec<TableWithTimeColumn>,
 }
 
 impl FileAppendableSource {
@@ -53,7 +53,7 @@ impl AppendableSource for FileAppendableSource {
             std::fs::remove_file(&self.dest_db_file)?;
         }
 
-        for TableWithColumn { name, .. } in &self.tables {
+        for TableWithTimeColumn { name, .. } in &self.tables {
             let parquet_path = config.temp_directory.join(format!("{name}.parquet"));
             if std::fs::exists(&parquet_path)? {
                 std::fs::remove_file(&parquet_path)?;
@@ -75,7 +75,7 @@ impl AppendableSource for FileAppendableSource {
                     load_steps = config.load_steps
                 );
 
-                for TableWithColumn { name, column } in &self.tables {
+                for TableWithTimeColumn { name, column } in &self.tables {
                     let parquet_path = config.temp_directory.join(format!("{name}.parquet"));
                     sql += &format!(
                         "ALTER TABLE {name} ADD COLUMN {column} TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
@@ -114,7 +114,7 @@ impl AppendableSource for FileAppendableSource {
                         load_steps = config.load_steps
                 );
 
-                for TableWithColumn { name, column } in &self.tables {
+                for TableWithTimeColumn { name, column } in &self.tables {
                     let parquet_path = config.temp_directory.join(format!("{name}.parquet"));
                     sql += &format!("ALTER TABLE {name}_new ADD COLUMN {column} TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
                                         INSERT INTO {name} SELECT * FROM {name}_new;

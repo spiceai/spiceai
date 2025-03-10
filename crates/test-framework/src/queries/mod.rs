@@ -30,12 +30,12 @@ pub enum QuerySet {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct TableWithColumn {
+pub struct TableWithTimeColumn {
     pub name: &'static str,
     pub column: &'static str,
 }
 
-impl From<&(&'static str, &'static str)> for TableWithColumn {
+impl From<&(&'static str, &'static str)> for TableWithTimeColumn {
     fn from((name, column): &(&'static str, &'static str)) -> Self {
         Self { name, column }
     }
@@ -55,7 +55,7 @@ impl QuerySet {
     }
 
     #[must_use]
-    pub fn append_time_columns(&self) -> Vec<TableWithColumn> {
+    pub fn append_time_columns(&self) -> Vec<TableWithTimeColumn> {
         match self {
             QuerySet::Tpch => [
                 ("customer", "c_created_at"),
@@ -68,7 +68,7 @@ impl QuerySet {
                 ("supplier", "s_created_at"),
             ]
             .iter()
-            .map(TableWithColumn::from)
+            .map(TableWithTimeColumn::from)
             .collect(),
             QuerySet::Tpcds => [
                 ("call_center", "cc_created_at"),
@@ -97,11 +97,11 @@ impl QuerySet {
                 ("web_site", "ws_created_at"),
             ]
             .iter()
-            .map(TableWithColumn::from)
+            .map(TableWithTimeColumn::from)
             .collect(),
             QuerySet::Clickbench => [("hits_delayed", "created_at")]
                 .iter()
-                .map(TableWithColumn::from)
+                .map(TableWithTimeColumn::from)
                 .collect(),
         }
     }
