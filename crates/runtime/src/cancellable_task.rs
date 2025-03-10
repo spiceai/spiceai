@@ -24,21 +24,19 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{Error, FailedToExecuteTaskSnafu};
 
-/// A handle for managing the lifecycle of a spawned task.
-///
-/// Allows external control over a task's execution, supporting
-/// both graceful cancellation via provided [`CancellationToken`] and forced termination.
-///
+/// A handle for a spawned task that allows external cancellation.
+/// 
+/// This handle supports both graceful cancellation and forced termination:
 /// - If a [`CancellationToken`] is provided, it enables graceful shutdown.
-/// - If the task does not exit within the allowed time after termination request, it is forcefully aborted.
-pub(crate) struct ManagedTaskHandle {
+/// - If the task does not exit within the specified timeout after a termination request, it is forcibly aborted.
+pub(crate) struct CancellableTaskHandle {
     notify_abort_task: oneshot::Sender<()>,
     cancellation_token: Option<CancellationToken>,
     on_task_completed: oneshot::Receiver<()>,
 }
 
-impl ManagedTaskHandle {
-    pub async fn shutdown(mut self, timeout: Duration) {
+impl CancellableTaskHandle {
+    pub async fn cancel(mut self, timeout: Duration) {
         let Some(token) = self.cancellation_token.take() else {
             // The task does not support graceful cancellation, so we abort it.
             // The error is expected if the receiver has already been deallocated, indicating the task has completed or aborted.
@@ -60,21 +58,21 @@ impl ManagedTaskHandle {
     }
 }
 
-/// Spawns a managed task with termination support.
+/// Spawns a task that allows external cancellation.
 ///
 /// Returns a future that resolves when the task completes or is canceled,
-/// along with a [`ManagedTaskHandle`] for external task control.
-pub(crate) fn spawn_managed_task<F>(
+/// along with a [`CancellableTaskHandle`] for external task control.
+pub(crate) fn spawn_cancellable_task<F>(
     task_fn: F,
     task_cancellation: Option<CancellationToken>,
-) -> (impl Future<Output = Result<(), Error>>, ManagedTaskHandle)
+) -> (impl Future<Output = Result<(), Error>>, CancellableTaskHandle)
 where
     F: Future<Output = Result<(), Error>> + Send + 'static,
 {
     let (notify_abort_task, on_abort_task) = oneshot::channel();
     let (notify_task_completed, on_task_completed) = oneshot::channel();
 
-    let task_handle = ManagedTaskHandle {
+    let task_handle = CancellableTaskHandle {
         notify_abort_task,
         cancellation_token: task_cancellation,
         on_task_completed,

@@ -37,7 +37,7 @@ use flight::RateLimits;
 use futures::future::join_all;
 #[cfg(feature = "openapi")]
 pub use http::ApiDoc;
-use managed_task::{spawn_managed_task, ManagedTaskHandle};
+use cancellable_task::{spawn_cancellable_task, CancellableTaskHandle};
 use model::{EmbeddingModelStore, EvalScorerRegistry, LLMModelStore};
 
 use model_components::model::Model;
@@ -74,7 +74,7 @@ pub mod flight;
 mod http;
 mod init;
 pub mod internal_table;
-mod managed_task;
+mod cancellable_task;
 mod metrics;
 mod metrics_server;
 pub mod model;
@@ -317,7 +317,7 @@ pub struct Runtime {
 
     status: Arc<status::RuntimeStatus>,
 
-    server_components: Arc<RwLock<HashMap<String, ManagedTaskHandle>>>,
+    server_components: Arc<RwLock<HashMap<String, CancellableTaskHandle>>>,
 }
 
 impl Runtime {
@@ -678,7 +678,7 @@ impl Runtime {
             .into_iter()
             .map(|(name, handle)| {
                 tracing::debug!("Shutting down {name}");
-                handle.shutdown(SERVER_COMPONENT_SHUTDOWN_TIMEOUT)
+                handle.cancel(SERVER_COMPONENT_SHUTDOWN_TIMEOUT)
             })
             .collect();
 
@@ -697,7 +697,7 @@ impl Runtime {
             .into_iter()
             .map(|(name, handle)| {
                 tracing::debug!("Shutting down {name}");
-                handle.shutdown(SERVER_COMPONENT_SHUTDOWN_TIMEOUT)
+                handle.cancel(SERVER_COMPONENT_SHUTDOWN_TIMEOUT)
             })
             .collect();
 
@@ -716,7 +716,7 @@ impl Runtime {
     where
         F: Future<Output = Result<(), Error>> + Send + 'static,
     {
-        let (future, handle) = spawn_managed_task(task_fn, cancellation_token);
+        let (future, handle) = spawn_cancellable_task(task_fn, cancellation_token);
 
         self.server_components
             .write()
