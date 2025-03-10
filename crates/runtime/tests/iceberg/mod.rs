@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use crate::{get_test_datafusion, init_tracing, utils::test_request_context};
+use anyhow::Context;
 use app::AppBuilder;
 use arrow::array::RecordBatch;
 use datafusion::assert_batches_eq;
@@ -33,14 +34,11 @@ async fn iceberg_integration_test_dataset() -> Result<(), anyhow::Error> {
     );
     let _tracing = init_tracing(None);
 
-    let account_id = std::env::var("AWS_ICEBERG_ACCOUNT_ID")
-        .map_err(|_| anyhow::anyhow!("AWS_ICEBERG_ACCOUNT_ID is not set"))?;
-    let region = std::env::var("AWS_ICEBERG_REGION")
-        .map_err(|_| anyhow::anyhow!("AWS_ICEBERG_REGION is not set"))?;
-    let access_key_id = std::env::var("AWS_ACCESS_KEY_ID")
-        .map_err(|_| anyhow::anyhow!("AWS_ACCESS_KEY_ID is not set"))?;
-    let secret_access_key = std::env::var("AWS_SECRET_ACCESS_KEY")
-        .map_err(|_| anyhow::anyhow!("AWS_SECRET_ACCESS_KEY is not set"))?;
+    let account_id =
+        std::env::var("AWS_ICEBERG_ACCOUNT_ID").context("AWS_ICEBERG_ACCOUNT_ID is not set")?;
+    let region = std::env::var("AWS_ICEBERG_REGION").context("AWS_ICEBERG_REGION is not set")?;
+    let _ = std::env::var("AWS_ACCESS_KEY_ID").context("AWS_ACCESS_KEY_ID is not set")?;
+    let _ = std::env::var("AWS_SECRET_ACCESS_KEY").context("AWS_SECRET_ACCESS_KEY is not set")?;
 
     let from = format!("iceberg:https://glue.ap-northeast-2.amazonaws.com/iceberg/v1/catalogs/{account_id}/namespaces/tpch_sf1/tables/customer");
     let mut dataset = Dataset::new(from, "customer");
