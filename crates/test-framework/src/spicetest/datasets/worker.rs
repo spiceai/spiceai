@@ -218,7 +218,7 @@ impl SpiceTestQueryWorker {
                                     query,
                                     &mut query_durations,
                                     &mut row_counts,
-                                    true,
+                                    false, // don't attempt to snapshot results more than once
                                 )
                                 .await?;
 
@@ -370,6 +370,7 @@ impl SpiceTestQueryWorker {
         }
 
         if results_snapshot {
+            println!("snapshotting results");
             let query_name = query.0;
             let name = self.name.clone();
 
