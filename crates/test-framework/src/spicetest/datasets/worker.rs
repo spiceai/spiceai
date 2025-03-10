@@ -153,7 +153,6 @@ impl SpiceTestQueryWorker {
                 }
                 EndCondition::QuerySetCompleted(target_count) => {
                     // For QuerySetCompleted, run each query target_count times before moving to next
-                    // let start = SystemTime::now();
                     let start = SystemTime::now();
                     for query in &self.query_set {
                         let mut current_query_count = 0;
