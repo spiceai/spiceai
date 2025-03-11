@@ -19,8 +19,8 @@ use async_stream::stream;
 use async_trait::async_trait;
 use futures::{Stream, StreamExt, TryStreamExt};
 use nsql::SqlGeneration;
-use rand::distributions::Alphanumeric;
-use rand::{thread_rng, Rng};
+use rand::distr::Alphanumeric;
+use rand::{rng, Rng};
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 use snafu::{ResultExt, Snafu};
@@ -567,7 +567,7 @@ pub trait Chat: Sync + Send {
             })
         })?;
 
-        let strm_id: String = thread_rng()
+        let strm_id: String = rng()
             .sample_iter(&Alphanumeric)
             .take(10)
             .map(char::from)
@@ -653,7 +653,7 @@ pub trait Chat: Sync + Send {
             id: format!(
                 "{}-{}",
                 model_id.clone(),
-                thread_rng()
+                rng()
                     .sample_iter(&Alphanumeric)
                     .take(10)
                     .map(char::from)

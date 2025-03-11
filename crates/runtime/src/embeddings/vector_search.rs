@@ -896,61 +896,67 @@ impl VectorSearch {
                 .get_primary_keys_with_overrides(&self.explicit_primary_keys, &tables)
                 .await?;
 
-            let mut response: VectorSearchResult = HashMap::new();
-            let keywords = keywords.iter().map(std::string::String::as_str).collect::<Vec<&str>>();
+            let keywords = keywords.iter().map(String::as_str).collect::<Vec<&str>>();
 
-            for (tbl, search_vectors) in per_table_embeddings {
-                tracing::debug!("Running vector search for table {:#?}", tbl);
+            let search_futures = per_table_embeddings.into_iter().map(|(tbl, search_vectors)| {
+                let keywords = keywords.clone();
                 let primary_keys = table_primary_keys.get(&tbl).map_or(&[] as &[String], |v| v.as_slice());
 
-                // Only support one embedding column per table.
-                let table_provider = self
-                    .df
-                    .get_table(&tbl)
-                    .await
-                    .ok_or(Error::DataSourcesNotFound {
-                        data_source: vec![tbl.clone()],
-                    })?;
+                async move {
+                    tracing::debug!("Running vector search for table {:#?}", tbl);
 
-                let Some(embedding_table) = get_embedding_table(&table_provider).await else {
-                    return Err(Error::CannotVectorSearchDataset {
-                        data_source: tbl.clone()
-                    });
-                };
+                    // Only support one embedding column per table.
+                    let table_provider = self
+                        .df
+                        .get_table(&tbl)
+                        .await
+                        .ok_or(Error::DataSourcesNotFound {
+                            data_source: vec![tbl.clone()],
+                        })?;
 
-                let embedding_columns = embedding_table.get_embedding_columns();
-                let Some(embedding_column) = embedding_columns.first() else {
-                    return Err(Error::NoEmbeddingColumns {
-                        data_source: tbl.clone(),
-                    });
-                };
+                    let Some(embedding_table) = get_embedding_table(&table_provider).await else {
+                        return Err(Error::CannotVectorSearchDataset {
+                            data_source: tbl.clone()
+                        });
+                    };
 
-                if search_vectors.len() != 1 {
-                    return Err(Error::IncorrectNumberOfEmbeddingColumns {
-                        data_source: tbl.clone(),
-                        num_embeddings: search_vectors.len(),
-                    });
-                }
-                match search_vectors.first() {
-                    None => unreachable!(),
-                    Some(embedding) => {
-                        let result = self
-                            .individual_search(
-                                &tbl,
-                                embedding.clone(),
-                                primary_keys,
-                                embedding_column,
-                                embedding_table.is_chunked(embedding_column),
-                                additional_columns,
-                                where_cond.as_ref(),
-                                &keywords,
-                                *limit,
-                            )
-                            .await?;
-                        response.insert(tbl.clone(), result);
+                    let embedding_columns = embedding_table.get_embedding_columns();
+                    let Some(embedding_column) = embedding_columns.first() else {
+                        return Err(Error::NoEmbeddingColumns {
+                            data_source: tbl.clone(),
+                        });
+                    };
+
+                    if search_vectors.len() != 1 {
+                        return Err(Error::IncorrectNumberOfEmbeddingColumns {
+                            data_source: tbl.clone(),
+                            num_embeddings: search_vectors.len(),
+                        });
                     }
-                };
-            }
+                    match search_vectors.first() {
+                        None => unreachable!("Vector search can only be performed on one embedding column, and the column exists"),
+                        Some(embedding) => {
+                            let result = self
+                                .individual_search(
+                                    &tbl,
+                                    embedding.clone(),
+                                    primary_keys,
+                                    embedding_column,
+                                    embedding_table.is_chunked(embedding_column),
+                                    additional_columns,
+                                    where_cond.as_ref(),
+                                    &keywords,
+                                    *limit,
+                                )
+                                .await?;
+                            Ok::<_, Error>((tbl.clone(), result))
+                        }
+                    }
+                }
+            }).collect::<Vec<_>>();
+
+            let results = futures::future::try_join_all(search_futures).await?;
+            let response: VectorSearchResult = results.into_iter().collect();
             tracing::info!(target: "task_history", captured_output = ?response);
             Ok(response)
         }.instrument(span.clone()).await;

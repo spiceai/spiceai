@@ -1,6 +1,10 @@
 ---
 apiVersion: apps/v1
+{{- if .Values.stateful.enabled }}
+kind: StatefulSet
+{{- else }}
 kind: Deployment
+{{- end }}
 metadata:
   labels:
     {{- include "spiceai.labels" . | indent 4 }}
@@ -10,6 +14,9 @@ metadata:
 spec:
   {{- if .Values.replicaCount }}
   replicas: {{ .Values.replicaCount }}
+  {{- end }}
+  {{- if .Values.stateful.enabled }}
+  serviceName: {{ template "spiceai.fullname" .  }}
   {{- end }}
   selector:
     matchLabels:
@@ -89,6 +96,10 @@ spec:
             - name: spiceai-config-volume
               mountPath: /app/spicepod.yaml
               subPath: spicepod.yaml
+            {{- if .Values.stateful.enabled }}
+            - name: {{ .Release.Name }}-data
+              mountPath: {{ .Values.stateful.mountPath }}
+            {{- end }}
           {{- if .Values.resources }}
           resources: {{ toYaml .Values.resources | nindent 12 }}
           {{- end }}
@@ -99,3 +110,16 @@ spec:
         - name: spiceai-config-volume
           configMap:
             name: {{ template "spiceai.fullname" .  }}-spicepod
+  {{- if .Values.stateful.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: {{ .Release.Name }}-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- if .Values.stateful.storageClass }}
+        storageClassName: {{ .Values.stateful.storageClass }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.stateful.size }}
+  {{- end }}

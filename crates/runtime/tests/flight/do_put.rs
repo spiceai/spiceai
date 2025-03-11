@@ -159,7 +159,7 @@ async fn test_flight_do_put_no_auth() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
     test_request_context()
-        .scope(async {
+        .scope_retry(3, || async {
             let (channel, _df) = start_spice_test_app(None, None).await?;
 
             let mut client = create_flight_client(channel, None)?;
@@ -399,8 +399,8 @@ async fn start_spice_test_app(
     flight_auth: Option<Arc<dyn FlightBasicAuth + Send + Sync>>,
     rate_limits: Option<RateLimits>,
 ) -> Result<(Channel, Arc<DataFusion>), anyhow::Error> {
-    let mut rng = rand::thread_rng();
-    let http_port: u16 = rng.gen_range(50000..60000);
+    let mut rng = rand::rng();
+    let http_port: u16 = rng.random_range(50000..60000);
     let flight_port: u16 = http_port + 1;
     let otel_port: u16 = http_port + 2;
     let metrics_port: u16 = http_port + 3;

@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::{Nameable, WithDependsOn};
+use crate::semantic::Column;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
@@ -33,6 +34,9 @@ pub struct View {
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     #[serde(default)]
     pub metadata: HashMap<String, Value>,
+
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub columns: Vec<Column>,
 
     /// Inline SQL that describes a view.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -60,6 +64,7 @@ impl View {
             name,
             description: None,
             metadata: HashMap::default(),
+            columns: vec![],
             sql: None,
             sql_ref: None,
             depends_on: Vec::default(),
@@ -73,6 +78,7 @@ impl WithDependsOn<View> for View {
             name: self.name.clone(),
             description: self.description.clone(),
             metadata: self.metadata.clone(),
+            columns: vec![],
             sql: self.sql.clone(),
             sql_ref: self.sql_ref.clone(),
             depends_on: depends_on.to_vec(),

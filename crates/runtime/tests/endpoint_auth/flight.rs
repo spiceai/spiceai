@@ -42,8 +42,8 @@ async fn test_flight_auth() -> Result<(), anyhow::Error> {
         let span = tracing::info_span!("test_flight_auth");
         let _span_guard = span.enter();
 
-        let mut rng = rand::thread_rng();
-        let http_port: u16 = rng.gen_range(50000..60000);
+        let mut rng = rand::rng();
+        let http_port: u16 = rng.random_range(50000..60000);
         let flight_port: u16 = http_port + 1;
         let otel_port: u16 = http_port + 2;
         let metrics_port: u16 = http_port + 3;

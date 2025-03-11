@@ -46,8 +46,8 @@ pub(crate) fn get_random_element<T>(vec: &[T]) -> Option<&T> {
     if vec.is_empty() {
         None
     } else {
-        let mut rng = rand::thread_rng();
-        let index = rng.gen_range(0..vec.len());
+        let mut rng = rand::rng();
+        let index = rng.random_range(0..vec.len());
         Some(&vec[index])
     }
 }

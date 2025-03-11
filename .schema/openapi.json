@@ -2789,7 +2789,8 @@
           "Ready",
           "Disabled",
           "Error",
-          "Refreshing"
+          "Refreshing",
+          "ShuttingDown"
         ]
       },
       "ConnectionDetails": {

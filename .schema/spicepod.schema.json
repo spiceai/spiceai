@@ -1304,6 +1304,12 @@
         "name"
       ],
       "properties": {
+        "columns": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/Column"
+          }
+        },
         "dependsOn": {
           "type": "array",
           "items": {

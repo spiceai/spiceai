@@ -1526,8 +1526,7 @@ mod tests {
 
         assert!(result.is_err());
 
-        #[allow(clippy::unwrap_used)]
-        let err = result.unwrap_err();
+        let err = result.expect_err("Failed to unnest JSON object");
         assert_eq!(
             err.to_string(),
             "Invalid object access. Column 'a' already exists in the object."

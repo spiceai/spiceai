@@ -14,11 +14,18 @@ app = { path = "../app" }
 arrow = { workspace = true, features = ["prettyprint"] }
 async-openai.workspace = true
 clap.workspace = true
+duckdb = { workspace = true, features = [
+    "bundled",
+    "r2d2",
+    "vtab",
+    "vtab-arrow",
+]}
 flight_client = { path = "../flight_client" }
 futures.workspace = true
 indicatif = "0.17.9"
+insta.workspace = true
 octocrab = "0.43.0"
-rand = "0.8.4"
+rand = "0.9.0"
 regex.workspace = true
 reqwest.workspace = true
 rustls.workspace = true
