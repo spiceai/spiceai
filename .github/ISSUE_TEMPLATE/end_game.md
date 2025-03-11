@@ -45,13 +45,6 @@ assignees: ''
 
 ## Pre-Release Testing & Validation
 
-1. **Preparation**
-   - [ ] Prepare **QA Analytics** draft: `qa_start_time`, `human_count`, `recipes_total`, `recipes_agents`
-  
-     | qa_start_time         | qa_end_time           | human_count | human_hours | recipes_total | recipes_agents | notes                          |
-     |-----------------------|-----------------------|-------------|-------------|---------------|----------------|--------------------------------|
-     | 2025-02-10T21:00:00Z  |                       | 7           | 10.5        | 73            | 15             |                                |
-
 1. **Build Validations**
 
    - [ ] Ensure all builds (including the CUDA build) pass in `trunk` for at least one supported compute capability on **both Linux and Windows**.
