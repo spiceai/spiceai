@@ -25,6 +25,7 @@ use test_framework::{
     spicepod_utils::{from_app, make_spiceai_rw_dataset, set_read_write_api_key},
 };
 
+pub(crate) mod append;
 pub(crate) mod bench;
 pub(crate) mod data_consistency;
 pub(crate) mod dispatch;

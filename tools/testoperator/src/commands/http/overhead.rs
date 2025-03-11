@@ -58,7 +58,6 @@ pub(crate) async fn overhead_run(args: &HttpOverheadTestArgs) -> anyhow::Result<
 
     let test = SpiceTest::new(
         app.name.clone(),
-        spiced_instance,
         overhead::NotStarted::new(
             HttpConfig {
                 duration: Duration::from_secs(args.common.duration),
@@ -70,7 +69,8 @@ pub(crate) async fn overhead_run(args: &HttpOverheadTestArgs) -> anyhow::Result<
             },
             baseline_cfg,
         ),
-    );
+    )
+    .with_spiced_instance(spiced_instance);
 
     println!("{}", with_color!(Color::Blue, "Starting overhead test"));
     let test = test.start()?.wait().await?;
@@ -78,7 +78,7 @@ pub(crate) async fn overhead_run(args: &HttpOverheadTestArgs) -> anyhow::Result<
     let records = results.build_records()?;
     print_batches(&records)?;
 
-    let mut spiced_instance = test.end();
+    let mut spiced_instance = test.end()?;
     spiced_instance.stop()?;
 
     let Some(baseline) = results.metrics.iter().find(|q| q.query_name == "baseline") else {
