@@ -34,7 +34,6 @@ assignees: ''
 - [ ] **If this is a patch release**: Plan to cherry-pick each relevant commit into the release branch.
 - [ ] **If this is a minor release (vX.Y)**: Plan to merge commit from `trunk` into the release branch.
 
-
 ## Release Branch Creation
 
 - [ ] Create a release branch (`release/X.Y`) from `trunk` one day before the scheduled release (if not already created).
