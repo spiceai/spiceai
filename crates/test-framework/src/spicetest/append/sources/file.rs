@@ -99,9 +99,10 @@ impl AppendableSource for FileAppendableSource {
                     setup_sql += &format!(
                         "CREATE TABLE {name} AS SELECT * FROM {name}_gen WHERE 1=0;
                          ALTER TABLE {name} ADD COLUMN {column} TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
-                         INSERT INTO {name} SELECT *, CURRENT_TIMESTAMP AS {column} FROM {name}_gen LIMIT (SELECT COUNT(*) / {load_steps} FROM {name}_gen) OFFSET 0;
+                         INSERT INTO {name} SELECT *, CURRENT_TIMESTAMP AS {column} FROM {name}_gen
+                         LIMIT (SELECT COUNT(*) / {load_steps} FROM {name}_gen) OFFSET 0;
                          COPY {name} TO '{name}.parquet' (FORMAT 'parquet');\n",
-                         load_steps = config.load_steps
+                        load_steps = config.load_steps
                     );
                 }
 
@@ -110,7 +111,15 @@ impl AppendableSource for FileAppendableSource {
                 dest_conn.execute_batch(&setup_sql)?;
             }
             QuerySet::Clickbench => {
-                todo!("Implement ClickBench");
+                // import the parquet file into the database so we can use it for OFFSET delayed loading
+                // limit to 40 million rows because the file connector goes OOM with the full file
+                let setup_sql = "BEGIN;
+                                       CREATE TABLE hits AS SELECT * FROM read_parquet('hits.parquet') LIMIT 40000000;
+                                       CREATE TABLE hits_delayed AS SELECT * FROM hits WHERE 1=0;
+                                       ALTER TABLE hits_delayed ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+                                       COMMIT;";
+
+                dest_conn.execute_batch(setup_sql)?;
             }
         }
 
@@ -131,18 +140,18 @@ impl AppendableSource for FileAppendableSource {
             QuerySet::Tpch => {
                 let mut sql = format!(
                     "INSTALL tpch;
-                        LOAD tpch;
-                        BEGIN;
-                        CALL dbgen(sf=1, children={load_steps}, step={load_index}, suffix='_new');\n",
-                        load_steps = config.load_steps
+                     LOAD tpch;
+                     BEGIN;
+                     CALL dbgen(sf=1, children={load_steps}, step={load_index}, suffix='_new');\n",
+                    load_steps = config.load_steps
                 );
 
                 for TableWithTimeColumn { name, column } in &self.tables {
                     let parquet_path = config.temp_directory.join(format!("{name}.parquet"));
                     sql += &format!("ALTER TABLE {name}_new ADD COLUMN {column} TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
-                                        INSERT INTO {name} SELECT * FROM {name}_new;
-                                        DROP TABLE {name}_new;
-                                        COPY {name} TO '{parquet_path}' (FORMAT 'parquet');\n", parquet_path = parquet_path.to_string_lossy());
+                                     INSERT INTO {name} SELECT * FROM {name}_new;
+                                     DROP TABLE {name}_new;
+                                     COPY {name} TO '{parquet_path}' (FORMAT 'parquet');\n", parquet_path = parquet_path.to_string_lossy());
                 }
 
                 sql += "COMMIT;";
@@ -153,8 +162,11 @@ impl AppendableSource for FileAppendableSource {
                 let mut sql = "BEGIN;\n".to_string();
 
                 for TableWithTimeColumn { name, column } in &self.tables {
-                    sql += &format!("INSERT INTO {name} SELECT *, CURRENT_TIMESTAMP AS {column} FROM {name}_gen LIMIT (SELECT COUNT(*) / {load_steps} FROM {name}_gen) OFFSET (SELECT COUNT(*) / {load_steps} * {load_index} FROM {name}_gen);
-                        COPY {name} TO '{name}.parquet' (FORMAT 'parquet');\n",
+                    sql += &format!("INSERT INTO {name} SELECT *, CURRENT_TIMESTAMP AS {column}
+                                     FROM {name}_gen
+                                     LIMIT (SELECT COUNT(*) / {load_steps} FROM {name}_gen)
+                                     OFFSET (SELECT COUNT(*) / {load_steps} * {load_index} FROM {name}_gen);
+                                     COPY {name} TO '{name}.parquet' (FORMAT 'parquet');\n",
                     load_steps = config.load_steps);
                 }
 
@@ -163,7 +175,16 @@ impl AppendableSource for FileAppendableSource {
                 dest_conn.execute_batch(&sql)?;
             }
             QuerySet::Clickbench => {
-                todo!("Implement TPCDS and ClickBench");
+                let sql = format!("BEGIN;
+                                           INSERT INTO hits_delayed SELECT *, CURRENT_TIMESTAMP AS created_at
+                                           FROM hits
+                                           LIMIT (SELECT COUNT(*) / {load_steps} FROM hits)
+                                           OFFSET (SELECT COUNT(*) / {load_steps} * {load_index} FROM hits);
+                                           COPY hits_delayed TO 'hits_delayed.parquet' (FORMAT 'parquet');
+                                           COMMIT;",
+                                        load_steps = config.load_steps);
+
+                dest_conn.execute_batch(&sql)?;
             }
         }
 
