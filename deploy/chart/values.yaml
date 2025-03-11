@@ -60,7 +60,7 @@ serviceAccount:
 #   - name: config-volume
 #     mountPath: /config
 
-# Persistent volume for the StatefulSet
+# Use a StatefulSet with a PVC for the data volume
 stateful:
   enabled: false
   # Storage class for the volume claim template
