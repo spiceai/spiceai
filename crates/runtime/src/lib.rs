@@ -434,12 +434,13 @@ impl Runtime {
         let self_ref = Arc::clone(&self);
         let cloned_tls_config = tls_config.clone();
         let cloned_endpoint_auth = endpoint_auth.clone();
+        let cloned_app_ref = self_ref.app.read().await.as_ref().map(Arc::clone);
 
         let flight_future = self
             .start_server_component(FLIGHT_SERVER, Some(flight_shutdown.clone()), async move {
                 flight::start(
                     config.flight_bind_address,
-                    self_ref.app.read().await.as_ref().map(Arc::clone),
+                    cloned_app_ref,
                     Arc::clone(&self_ref.df),
                     cloned_tls_config,
                     cloned_endpoint_auth,
