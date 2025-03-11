@@ -86,8 +86,31 @@ impl AppendableSource for FileAppendableSource {
 
                 dest_conn.execute_batch(&sql)?;
             }
-            _ => {
-                todo!("Implement TPCDS and ClickBench");
+            QuerySet::Tpcds => {
+                let mut setup_sql = "INSTALL tpcds;
+                         LOAD tpcds;
+                         BEGIN;
+                         CALL dsdgen(sf=1, suffix='_gen');\n"
+                    .to_string();
+
+                for TableWithTimeColumn { name, column } in &self.tables {
+                    // DuckDB's TPCDS generation doesn't support partitioning and generating in steps
+                    // Instead, generate the whole dataset and load it with incrementally increasing OFFSET and LIMIT
+                    setup_sql += &format!(
+                        "CREATE TABLE {name} AS SELECT * FROM {name}_gen WHERE 1=0;
+                         ALTER TABLE {name} ADD COLUMN {column} TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+                         INSERT INTO {name} SELECT *, CURRENT_TIMESTAMP AS {column} FROM {name}_gen LIMIT (SELECT COUNT(*) / {load_steps} FROM {name}_gen) OFFSET 0;
+                         COPY {name} TO '{name}.parquet' (FORMAT 'parquet');\n",
+                         load_steps = config.load_steps
+                    );
+                }
+
+                setup_sql += "COMMIT;";
+
+                dest_conn.execute_batch(&setup_sql)?;
+            }
+            QuerySet::Clickbench => {
+                todo!("Implement ClickBench");
             }
         }
 
@@ -126,7 +149,20 @@ impl AppendableSource for FileAppendableSource {
 
                 dest_conn.execute_batch(&sql)?;
             }
-            _ => {
+            QuerySet::Tpcds => {
+                let mut sql = "BEGIN;\n".to_string();
+
+                for TableWithTimeColumn { name, column } in &self.tables {
+                    sql += &format!("INSERT INTO {name} SELECT *, CURRENT_TIMESTAMP AS {column} FROM {name}_gen LIMIT (SELECT COUNT(*) / {load_steps} FROM {name}_gen) OFFSET (SELECT COUNT(*) / {load_steps} * {load_index} FROM {name}_gen);
+                        COPY {name} TO '{name}.parquet' (FORMAT 'parquet');\n",
+                    load_steps = config.load_steps);
+                }
+
+                sql += "COMMIT;";
+
+                dest_conn.execute_batch(&sql)?;
+            }
+            QuerySet::Clickbench => {
                 todo!("Implement TPCDS and ClickBench");
             }
         }
