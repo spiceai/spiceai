@@ -15,6 +15,9 @@ spec:
   {{- if .Values.service.type }}
   type: {{ .Values.service.type }}
   {{- end }}
+  {{- if .Values.service.loadBalancerSourceRanges }}
+  loadBalancerSourceRanges: {{ toYaml .Values.service.loadBalancerSourceRanges | nindent 4 }}
+  {{- end }}
   ports:
     - port: 8090
       name: http
@@ -25,5 +28,9 @@ spec:
     - port: 50052
       name: otel
   selector:
+    {{- if .Values.service.selector }}
+    {{- toYaml .Values.service.selector | nindent 4 }}
+    {{- else }}
     {{- include "spiceai.labels" . | indent 4 }}
     app: {{ .Release.Name }}
+    {{- end }}
