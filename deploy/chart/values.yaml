@@ -62,7 +62,7 @@ serviceAccount:
 
 # Persistent volume for the StatefulSet
 stateful:
-  enabled: true
+  enabled: false
   # Storage class for the volume claim template
   storageClass: "standard"
   # Size of each PV in the StatefulSet
@@ -81,19 +81,19 @@ spicepod:
   version: v1
   kind: Spicepod
 
-  datasets:
+  datasets: []
   # Example:
-  - from: s3://spiceai-demo-datasets/taxi_trips/2024/
-    name: taxi_trips
-    description: Demo taxi trips in s3
-    params:
-      file_format: parquet
-    acceleration:
-      enabled: true
-      engine: duckdb
-      mode: file
-      params:
-        duckdb_file: /data/taxi_trips.db
-      # Uncomment to refresh the acceleration on a schedule
-      # refresh_check_interval: 1h
-      # refresh_mode: full
+  # - from: s3://spiceai-demo-datasets/taxi_trips/2024/
+  #   name: taxi_trips
+  #   description: Demo taxi trips in s3
+  #   params:
+  #     file_format: parquet
+  #   acceleration:
+  #     enabled: true
+  #     engine: duckdb
+  #     mode: file
+  #     params:
+  #       duckdb_file: /data/taxi_trips.db
+  #     # Uncomment to refresh the acceleration on a schedule
+  #     # refresh_check_interval: 1h
+  #     # refresh_mode: full
