@@ -14,16 +14,31 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::fmt::Display;
+
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Copy, Clone, Deserialize, Serialize, Default)]
 pub enum QuerySet {
+    #[default]
     #[serde(rename = "tpch")]
     Tpch,
     #[serde(rename = "tpcds")]
     Tpcds,
     #[serde(rename = "clickbench")]
     Clickbench,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct TableWithTimeColumn {
+    pub name: &'static str,
+    pub column: &'static str,
+}
+
+impl From<&(&'static str, &'static str)> for TableWithTimeColumn {
+    fn from((name, column): &(&'static str, &'static str)) -> Self {
+        Self { name, column }
+    }
 }
 
 impl QuerySet {
@@ -36,6 +51,68 @@ impl QuerySet {
             QuerySet::Tpch => get_tpch_test_queries(overrides),
             QuerySet::Tpcds => get_tpcds_test_queries(overrides),
             QuerySet::Clickbench => get_clickbench_test_queries(overrides),
+        }
+    }
+
+    #[must_use]
+    pub fn append_time_columns(&self) -> Vec<TableWithTimeColumn> {
+        match self {
+            QuerySet::Tpch => [
+                ("customer", "c_created_at"),
+                ("lineitem", "l_created_at"),
+                ("nation", "n_created_at"),
+                ("orders", "o_created_at"),
+                ("part", "p_created_at"),
+                ("partsupp", "ps_created_at"),
+                ("region", "r_created_at"),
+                ("supplier", "s_created_at"),
+            ]
+            .iter()
+            .map(TableWithTimeColumn::from)
+            .collect(),
+            QuerySet::Tpcds => [
+                ("call_center", "cc_created_at"),
+                ("catalog_page", "cp_created_at"),
+                ("catalog_sales", "cs_created_at"),
+                ("catalog_returns", "cr_created_at"),
+                ("income_band", "ib_created_at"),
+                ("inventory", "i_created_at"),
+                ("store_sales", "ss_created_at"),
+                ("store_returns", "sr_created_at"),
+                ("web_sales", "ws_created_at"),
+                ("web_returns", "wr_created_at"),
+                ("customer", "c_created_at"),
+                ("customer_address", "ca_created_at"),
+                ("customer_demographics", "cd_created_at"),
+                ("date_dim", "d_created_at"),
+                ("household_demographics", "hd_created_at"),
+                ("item", "i_created_at"),
+                ("promotion", "p_created_at"),
+                ("reason", "r_created_at"),
+                ("ship_mode", "sm_created_at"),
+                ("store", "s_created_at"),
+                ("time_dim", "t_created_at"),
+                ("warehouse", "w_created_at"),
+                ("web_page", "wp_created_at"),
+                ("web_site", "ws_created_at"),
+            ]
+            .iter()
+            .map(TableWithTimeColumn::from)
+            .collect(),
+            QuerySet::Clickbench => [("hits_delayed", "created_at")]
+                .iter()
+                .map(TableWithTimeColumn::from)
+                .collect(),
+        }
+    }
+}
+
+impl Display for QuerySet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            QuerySet::Tpch => write!(f, "tpch"),
+            QuerySet::Tpcds => write!(f, "tpcds"),
+            QuerySet::Clickbench => write!(f, "clickbench"),
         }
     }
 }

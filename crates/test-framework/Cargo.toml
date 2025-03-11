@@ -14,6 +14,12 @@ app = { path = "../app" }
 arrow = { workspace = true, features = ["prettyprint"] }
 async-openai.workspace = true
 clap.workspace = true
+duckdb = { workspace = true, features = [
+    "bundled",
+    "r2d2",
+    "vtab",
+    "vtab-arrow",
+]}
 flight_client = { path = "../flight_client" }
 futures.workspace = true
 indicatif = "0.17.9"

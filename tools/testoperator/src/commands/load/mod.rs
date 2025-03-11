@@ -56,12 +56,12 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
     println!("Running baseline throughput test");
     let baseline_test = SpiceTest::new(
         app.name.clone(),
-        spiced_instance,
         NotStarted::new()
             .with_parallel_count(args.common.concurrency)
             .with_query_set(queries.clone())
             .with_end_condition(EndCondition::QuerySetCompleted(test_hours.try_into()?)),
     )
+    .with_spiced_instance(spiced_instance)
     .with_progress_bars(!args.common.disable_progress_bars)
     .start()
     .await?;
@@ -76,13 +76,12 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
     println!("Baseline metrics:");
     let records = baseline_metrics.build_records()?;
     print_batches(&records)?;
-    let spiced_instance = test.end();
+    let spiced_instance = test.end()?;
 
     // load test
     println!("Running load test");
     let throughput_test = SpiceTest::<NotStarted>::new(
         app.name.clone(),
-        spiced_instance,
         NotStarted::new()
             .with_parallel_count(args.common.concurrency)
             .with_query_set(queries.clone())
@@ -90,6 +89,7 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
                 args.common.duration,
             ))),
     )
+    .with_spiced_instance(spiced_instance)
     .with_progress_bars(!args.common.disable_progress_bars)
     .start()
     .await?;
@@ -97,7 +97,7 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
     let test = throughput_test.wait().await?;
     let test_durations = test.get_query_durations().statistical_set()?;
     let metrics: QueryMetrics<_, NoExtendedMetrics> = test.collect(TestType::Load)?;
-    let mut spiced_instance = test.end();
+    let mut spiced_instance = test.end()?;
 
     println!("Baseline metrics:");
     let baseline_records = baseline_metrics.build_records()?;

@@ -95,7 +95,7 @@ impl SpiceTest<NotStarted> {
     //  - N workers to send requests to the baseline component
     //  - N (separate) workers to send requests the spice component.
     pub fn start(self) -> Result<SpiceTest<Running>> {
-        let spiced_client = self.spiced_instance.http_client()?;
+        let spiced_client = self.get_spiced()?.http_client()?;
 
         let baseline_handles = (0..self.state.config.concurrency)
             .map(|id| {

@@ -16,8 +16,11 @@ limitations under the License.
 
 use std::time::SystemTime;
 
+use anyhow::{Context, Result};
+
 use crate::spiced::SpicedInstance;
 
+pub mod append;
 pub mod datasets;
 pub mod http;
 
@@ -31,7 +34,7 @@ pub trait TestCompleted: TestState {
 /// The test queries can also be run in parallel, each with the same end condition.
 pub struct SpiceTest<S: TestState> {
     name: String,
-    spiced_instance: SpicedInstance,
+    spiced_instance: Option<SpicedInstance>,
     start_time: SystemTime,
     use_progress_bars: bool,
     api_key: Option<String>,
@@ -43,18 +46,26 @@ pub struct SpiceTest<S: TestState> {
 
 impl<S: TestCompleted> SpiceTest<S> {
     /// Once the test has completed, return ownership of the spiced instance
-    #[must_use]
-    pub fn end(self) -> SpicedInstance {
+    pub fn end(self) -> Result<SpicedInstance> {
         self.spiced_instance
+            .context("Spiced instance should be present")
+    }
+}
+
+impl<S: TestState> SpiceTest<S> {
+    pub fn get_spiced(&self) -> Result<&SpicedInstance> {
+        self.spiced_instance
+            .as_ref()
+            .context("Spiced instance should be present")
     }
 }
 
 impl<S: TestNotStarted> SpiceTest<S> {
     #[must_use]
-    pub fn new(name: String, spice_instance: SpicedInstance, state: S) -> Self {
+    pub fn new(name: String, state: S) -> Self {
         Self {
             name,
-            spiced_instance: spice_instance,
+            spiced_instance: None,
             start_time: SystemTime::now(),
             use_progress_bars: true,
             api_key: None,
@@ -62,6 +73,12 @@ impl<S: TestNotStarted> SpiceTest<S> {
             results_snapshot_predicate: None,
             state,
         }
+    }
+
+    #[must_use]
+    pub fn with_spiced_instance(mut self, spiced_instance: SpicedInstance) -> Self {
+        self.spiced_instance = Some(spiced_instance);
+        self
     }
 
     #[must_use]

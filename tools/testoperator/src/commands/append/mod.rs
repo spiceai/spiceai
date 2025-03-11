@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::{get_app_and_start_request, RowCounts};
+use super::get_app_and_start_request;
 use crate::{
     args::DatasetTestArgs,
     commands::{TEST_RESULTS_API_KEY, TEST_RESULTS_DATASET},
@@ -22,54 +22,57 @@ use crate::{
 use std::time::Duration;
 use test_framework::{
     anyhow,
+    app::App,
     arrow::util::pretty::print_batches,
     flight::put_batches,
     metrics::{MetricCollector, NoExtendedMetrics, QueryMetrics},
     queries::{QueryOverrides, QuerySet},
     spiced::SpicedInstance,
-    spicetest::{
-        datasets::{EndCondition, NotStarted},
-        SpiceTest,
-    },
+    spicepod::component::dataset::acceleration::RefreshMode,
+    spicetest::{append::NotStarted, SpiceTest},
     TestType,
 };
 
-pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
+pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
     let query_set = QuerySet::from(args.query_set.clone());
     let query_overrides = args.query_overrides.clone().map(QueryOverrides::from);
-    let queries = query_set.get_queries(query_overrides);
 
     let (app, start_request) = get_app_and_start_request(&args.common)?;
+
+    check_app_is_appendable(&app)?;
+
+    println!("Running append test");
+
+    let append_test = SpiceTest::new(
+        app.name.clone(),
+        NotStarted::new()
+            .with_query_set(query_set, query_overrides)
+            .with_parallel_count(1)
+            .with_end_duration(Duration::from_secs(60 * 60))
+            .with_tempdir_path(start_request.get_tempdir_path()),
+    )
+    .with_explain_plan_snapshot()
+    .with_results_snapshot(snapshot_predicate)
+    .with_progress_bars(false)
+    .with_api_key(if args.common.upload_results_dataset.is_some() {
+        Some(TEST_RESULTS_API_KEY.to_string())
+    } else {
+        None
+    })
+    .start_appending()
+    .await?;
+
     let mut spiced_instance = SpicedInstance::start(start_request).await?;
 
     spiced_instance
         .wait_for_ready(Duration::from_secs(args.common.ready_wait))
         .await?;
 
-    // baseline run
-    println!("Running benchmark test");
-
-    let benchmark_test = SpiceTest::new(
-        app.name.clone(),
-        NotStarted::new()
-            .with_query_set(queries.clone())
-            .with_parallel_count(1)
-            .with_end_condition(EndCondition::QuerySetCompleted(5)),
-    )
-    .with_spiced_instance(spiced_instance)
-    .with_explain_plan_snapshot()
-    .with_results_snapshot(snapshot_predicate)
-    .with_progress_bars(!args.common.disable_progress_bars)
-    .with_api_key(if args.common.upload_results_dataset.is_some() {
-        Some(TEST_RESULTS_API_KEY.to_string())
-    } else {
-        None
-    })
-    .start()
-    .await?;
-
-    let test = benchmark_test.wait().await?;
-    let row_counts = test.validate_returned_row_counts()?;
+    let append_test = append_test
+        .with_spiced_instance(spiced_instance)
+        .start_test()
+        .await?;
+    let test = append_test.wait().await?;
     let metrics: QueryMetrics<_, NoExtendedMetrics> = test.collect(TestType::Benchmark)?;
     let mut spiced_instance = test.end()?;
 
@@ -86,10 +89,36 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
 
     spiced_instance.show_memory_usage()?;
     spiced_instance.stop()?;
-    Ok(row_counts)
+    Ok(())
 }
 
 /// Only snapshot the official TPCH and TPCDS queries, not the "simple" extensions as they don't return consistent results
 fn snapshot_predicate(query_name: &str) -> bool {
     query_name.starts_with("tpch_q") || query_name.starts_with("tpcds_q")
+}
+
+fn check_app_is_appendable(app: &App) -> anyhow::Result<()> {
+    for dataset in &app.datasets {
+        // check that each dataset has an append-mode accelerator
+        if dataset
+            .acceleration
+            .as_ref()
+            .map_or(true, |a| a.refresh_mode != Some(RefreshMode::Append))
+        {
+            return Err(anyhow::anyhow!(
+                "Dataset {} does not have an append-mode accelerator",
+                dataset.name
+            ));
+        }
+
+        // check that each dataset uses a supported append-mode source
+        if dataset.from.split(':').next() != Some("file") {
+            return Err(anyhow::anyhow!(
+                "Dataset {} does not use a supported append-mode source",
+                dataset.name
+            ));
+        }
+    }
+
+    Ok(())
 }

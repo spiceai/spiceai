@@ -105,7 +105,7 @@ impl TestCompleted for Completed {
 
 impl SpiceTest<NotStarted> {
     pub fn start(self) -> Result<SpiceTest<Running>> {
-        let client = self.spiced_instance.http_client()?;
+        let client = self.get_spiced()?.http_client()?;
 
         let ConsistencyConfig {
             http:

@@ -74,6 +74,12 @@ async fn main() -> anyhow::Result<()> {
         Commands::Run(TestCommands::Evals(args)) => {
             commands::evals::run(&args).await?;
         }
+        Commands::Run(TestCommands::Append(args)) => {
+            commands::append::run(&args).await?;
+        }
+        Commands::Export(TestCommands::Append(args)) => {
+            commands::env_export(&args.common)?;
+        }
     }
 
     Ok(())
