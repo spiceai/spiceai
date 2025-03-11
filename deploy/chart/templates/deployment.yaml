@@ -1,6 +1,10 @@
 ---
 apiVersion: apps/v1
+{{- if .Values.persistence.enabled }}
 kind: StatefulSet
+{{- else }}
+kind: Deployment
+{{- end }}
 metadata:
   labels:
     {{- include "spiceai.labels" . | indent 4 }}
@@ -11,7 +15,9 @@ spec:
   {{- if .Values.replicaCount }}
   replicas: {{ .Values.replicaCount }}
   {{- end }}
+  {{- if .Values.persistence.enabled }}
   serviceName: {{ template "spiceai.fullname" .  }}
+  {{- end }}
   selector:
     matchLabels:
       {{- include "spiceai.selectorLabels" . | indent 6 }}
