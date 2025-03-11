@@ -34,6 +34,7 @@ assignees: ''
 - [ ] **If this is a patch release**: Plan to cherry-pick each relevant commit into the release branch.
 - [ ] **If this is a minor release (vX.Y)**: Plan to merge commit from `trunk` into the release branch.
 
+
 ## Release Branch Creation
 
 - [ ] Create a release branch (`release/X.Y`) from `trunk` one day before the scheduled release (if not already created).
@@ -44,26 +45,33 @@ assignees: ''
 
 ## Pre-Release Testing & Validation
 
+1. **Preparation**
+   - [ ] Prepare **QA Analytics** draft: `qa_start_time`, `human_count`, `recipes_total`, `recipes_agents`
+  
+     | qa_start_time         | qa_end_time           | human_count | human_hours | recipes_total | recipes_agents | notes                          |
+     |-----------------------|-----------------------|-------------|-------------|---------------|----------------|--------------------------------|
+     | 2025-02-10T21:00:00Z  |                       | 7           | 10.5        | 73            | 15             |                                |
+
 1. **Build Validations**
 
    - [ ] Ensure all builds (including the CUDA build) pass in `trunk` for at least one supported compute capability on **both Linux and Windows**.
    - [ ] Verify all CI workflows run successfully (no warnings or errors).
 
-2. **Unit/Integration Tests**
+1. **Unit/Integration Tests**
 
    - [ ] Confirm local and CI tests pass without major deprecations or failures.
 
-3. **E2E Tests**
+1. **E2E Tests**
 
    - [ ] Verify [E2E Test CI (core)](https://github.com/spiceai/spiceai/actions/workflows/e2e_test_ci.yml) is green on `trunk` and on the release branch.
    - [ ] Verify [E2E Test CI (models)](https://github.com/spiceai/spiceai/actions/workflows/e2e_test_ci_models.yml) is green on `trunk` and on the release branch.
 
-4. **Documentation Review**
+1. **Documentation Review**
 
    - [ ] Update and confirm accuracy of `README.md` and docs in [Spice.ai Docs](https://github.com/spiceai/docs).
    - [ ] Ensure version numbers, usage details, and references match the intended release.
 
-5. **Cookbook Recipes**
+1. **Cookbook Recipes**
 
    - **Data Connectors**
 
@@ -141,8 +149,6 @@ assignees: ''
 
 - [ ] Merge any pending [Docs PRs](https://github.com/spiceai/docs/pulls).
 
-  - [ ] Update Spice version in [docs banner](https://github.com/spiceai/docs/blob/trunk/website/docusaurus.config.ts#L95).
-
 - [ ] Merge any pending [Cookbook PRs](https://github.com/spiceai/cookbook/pulls).
 
 - [ ] Prepare and finalize release notes:
@@ -181,6 +187,7 @@ assignees: ''
 - [ ] Run the following workflows to confirm installation health:
   - [ ] [Generate Spicepod JSON schema](https://github.com/spiceai/spiceai/actions/workflows/generate_json_schema.yml)
   - [ ] [E2E Test Release Installation](https://github.com/spiceai/spiceai/actions/workflows/e2e_test_release_install.yml)
+  - [ ] [E2E Test Release Installation (AI)](https://github.com/spiceai/spiceai/blob/trunk/.github/workflows/e2e_test_release_install_ai.yml)
 
 ## Post-Release Housekeeping
 
@@ -188,6 +195,7 @@ assignees: ''
 - [ ] Update [brew taps](https://github.com/spiceai/homebrew-spiceai) after the final build completes.
 - [ ] Remove or mark the released version in the [ROADMAP](https://github.com/spiceai/spiceai/blob/trunk/docs/ROADMAP.md).
 - [ ] Update the supported version in `SECURITY.md` if necessary.
+- [ ] Submit [QA analytics](https://github.com/spiceai/spiceai/blob/trunk/docs/release_notes/qa_analytics.csv) results.
 
 ## Announcement Checklist
 
@@ -196,3 +204,4 @@ assignees: ''
 - [ ] Discord: [#announcements](https://discord.gg/zv8ahzZVpf)
 - [ ] Telegram: [spiceai](https://t.me/spiceai)
 - [ ] Blog: [spiceai.org/blog](https://spiceai.org/blog)
+  - [ ] Update Spice version in [docs banner](https://github.com/spiceai/docs/blob/trunk/website/docusaurus.config.ts#L95).
