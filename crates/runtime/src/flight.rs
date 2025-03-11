@@ -46,6 +46,7 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 use tokio::sync::broadcast::Sender;
 use tokio::sync::RwLock;
+use tokio_util::sync::CancellationToken;
 use tonic::transport::{Identity, Server, ServerTlsConfig};
 use tonic::{Request, Response, Status, Streaming};
 
@@ -321,6 +322,7 @@ pub async fn start(
     tls_config: Option<Arc<TlsConfig>>,
     endpoint_auth: EndpointAuth,
     rate_limits: Arc<RateLimits>,
+    shutdown_signal: Option<CancellationToken>,
 ) -> Result<()> {
     let service = Service {
         datafusion: Arc::clone(&df),
@@ -348,16 +350,24 @@ pub async fn start(
         .layer(BasicAuthLayer::new(endpoint_auth.flight_basic_auth))
         .into_inner();
 
-    server
+    let server = server
         .layer(RequestContextLayer::new(app))
         .layer(WriteRateLimitLayer::new(RateLimiter::direct(
             rate_limits.flight_write_limit,
         )))
         .layer(auth_layer)
-        .add_service(svc)
-        .serve(bind_address)
-        .await
-        .context(UnableToStartFlightServerSnafu)?;
+        .add_service(svc);
+
+    if let Some(token) = shutdown_signal {
+        server
+            .serve_with_shutdown(bind_address, token.cancelled())
+            .await
+    } else {
+        server.serve(bind_address).await
+    }
+    .context(UnableToStartFlightServerSnafu)?;
+
+    tracing::debug!("Spice Runtime Flight stopped");
 
     Ok(())
 }

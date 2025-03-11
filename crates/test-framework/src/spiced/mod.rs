@@ -30,7 +30,7 @@ use crate::utils::wait_until_true;
 
 pub struct SpicedInstance {
     child: Child,
-    _tempdir: TempDir,
+    tempdir: TempDir,
 }
 
 pub struct StartRequest {
@@ -119,10 +119,12 @@ impl SpicedInstance {
         cmd.arg("--telemetry-enabled=false");
         let child = cmd.spawn()?;
 
-        Ok(Self {
-            child,
-            _tempdir: tempdir,
-        })
+        Ok(Self { child, tempdir })
+    }
+
+    #[must_use]
+    pub fn get_tempdir_path(&self) -> PathBuf {
+        self.tempdir.path().to_path_buf()
     }
 
     /// Get a flight client for the spiced instance
@@ -130,18 +132,26 @@ impl SpicedInstance {
     /// # Errors
     ///
     /// - If the flight client fails to be created
-    pub async fn flight_client(&self) -> Result<FlightClient> {
+    pub async fn flight_client(&self, api_key: Option<String>) -> Result<FlightClient> {
         let mut metadata = tonic::metadata::MetadataMap::new();
         metadata.insert("user-agent", "spice-test-framework/1.0".parse()?);
-        Ok(FlightClient::try_new(
-            "http://localhost:50051".into(),
+
+        let credentials = if let Some(api_key) = api_key {
+            Credentials::UsernamePassword {
+                username: "".into(),
+                password: api_key.into(),
+            }
+        } else {
             Credentials::UsernamePassword {
                 username: "".into(),
                 password: "".into(),
-            },
-            Some(metadata),
+            }
+        };
+
+        Ok(
+            FlightClient::try_new("http://localhost:50051".into(), credentials, Some(metadata))
+                .await?,
         )
-        .await?)
     }
 
     /// Get an http client for the spiced instance

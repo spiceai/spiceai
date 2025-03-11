@@ -3,7 +3,7 @@ module github.com/spiceai/spiceai
 go 1.23.0
 
 require (
-	github.com/AzureAD/microsoft-authentication-library-for-go v1.3.3
+	github.com/AzureAD/microsoft-authentication-library-for-go v1.4.1
 	github.com/bradleyjkemp/cupaloy v2.3.0+incompatible
 	github.com/gocarina/gocsv v0.0.0-20231116093920-b87c2d0e983a
 	github.com/hashicorp/go-retryablehttp v0.7.7
@@ -13,10 +13,10 @@ require (
 	github.com/olekukonko/tablewriter v0.0.5
 	github.com/peterh/liner v1.2.2
 	github.com/pkg/browser v0.0.0-20240102092130-5ac0b6a4141c
-	github.com/spf13/cobra v1.8.1
+	github.com/spf13/cobra v1.9.1
 	github.com/spf13/viper v1.19.0
 	github.com/stretchr/testify v1.10.0
-	golang.org/x/mod v0.23.0
+	golang.org/x/mod v0.24.0
 )
 
 require (
@@ -47,10 +47,10 @@ require (
 	github.com/rivo/uniseg v0.4.6 // indirect
 	github.com/spf13/afero v1.11.0 // indirect
 	github.com/spf13/cast v1.6.0 // indirect
-	github.com/spf13/pflag v1.0.5 // indirect
+	github.com/spf13/pflag v1.0.6 // indirect
 	github.com/subosito/gotenv v1.6.0 // indirect
 	go.uber.org/multierr v1.10.0 // indirect
-	golang.org/x/sys v0.24.0
+	golang.org/x/sys v0.31.0
 	golang.org/x/text v0.17.0 // indirect
 	gopkg.in/ini.v1 v1.67.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1

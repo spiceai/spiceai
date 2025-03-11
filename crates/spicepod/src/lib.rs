@@ -16,7 +16,6 @@ limitations under the License.
 
 #![allow(clippy::missing_errors_doc)]
 
-use component::tool::Tool;
 use reader::ReadableYaml;
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
@@ -25,13 +24,14 @@ use std::{fmt::Debug, path::PathBuf};
 
 use component::{
     catalog::Catalog, dataset::Dataset, embeddings::Embeddings, eval::Eval, extension::Extension,
-    model::Model, runtime::Runtime, secret::Secret, view::View,
+    model::Model, runtime::Runtime, secret::Secret, tool::Tool, view::View,
 };
 
 use spec::{SpicepodDefinition, SpicepodVersion};
 
 pub mod component;
 pub mod reader;
+pub mod semantic;
 pub mod spec;
 
 #[derive(Debug, Snafu)]

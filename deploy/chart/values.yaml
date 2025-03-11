@@ -3,12 +3,20 @@ additionalLabels: {}
 
 image:
   repository: spiceai/spiceai
-  tag: 1.0.4
+  tag: 1.0.5
 replicaCount: 1
 
 service:
+  # type can be null, ClusterIP, NodePort, or LoadBalancer
   type: null
   additionalAnnotations: {}
+  # If service type is LoadBalancer, specify the source IP ranges to whitelist
+  # loadBalancerSourceRanges:
+  #   - 10.0.0.0/8
+  #   - 172.16.0.0/12
+  # The selector to use for the service
+  # selector:
+  #   custom-selector: value
 
 serviceAccount:
   # Specifies whether a ServiceAccount should be created
@@ -16,6 +24,51 @@ serviceAccount:
   # The name of the ServiceAccount to use.
   # If not set and create is true, a name is generated using the fullname template
   name:
+
+# Resource requests and limits
+# resources:
+#   limits:
+#     cpu: 1000m
+#     memory: 2Gi
+#   requests:
+#     cpu: 500m
+#     memory: 1Gi
+
+# Additional environment variables
+# additionalEnv:
+#   - name: ENV_VAR_NAME
+#     value: "value"
+#   - name: SECRET_ENV_VAR
+#     valueFrom:
+#       secretKeyRef:
+#         name: my-secret
+#         key: my-key
+
+# Define volumes to be mounted to the container
+# volumes:
+#   - name: custom-data
+#     persistentVolumeClaim:
+#       claimName: my-custom-pvc
+#   - name: config-volume
+#     configMap:
+#       name: custom-config
+
+# Define volume mounts for the container
+# volumeMounts:
+#   - name: custom-data
+#     mountPath: /data
+#   - name: config-volume
+#     mountPath: /config
+
+# Use a StatefulSet with a PVC for the data volume
+stateful:
+  enabled: false
+  # Storage class for the volume claim template
+  storageClass: "standard"
+  # Size of each PV in the StatefulSet
+  size: 1Gi
+  # Mount path in container
+  mountPath: /data
 
 monitoring:
   podMonitor:
@@ -37,6 +90,10 @@ spicepod:
   #     file_format: parquet
   #   acceleration:
   #     enabled: true
+  #     engine: duckdb
+  #     mode: file
+  #     params:
+  #       duckdb_file: /data/taxi_trips.db
   #     # Uncomment to refresh the acceleration on a schedule
   #     # refresh_check_interval: 1h
   #     # refresh_mode: full

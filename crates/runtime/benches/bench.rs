@@ -562,8 +562,8 @@ pub(crate) async fn run_query_and_return_result(
                         arrow::util::pretty::pretty_format_batches(&limited_records)
                             .map_err(|e| e.to_string())?;
                     tracing::info!(
-                    "Query `{connector}` `{query_name}` returned {num_rows} rows:\n{records_pretty}",
-                );
+                        "Query `{connector}` `{query_name}` returned {num_rows} rows:\n{records_pretty}",
+                    );
                     if verify_query_result {
                         let result = panic::catch_unwind(|| {
                             insta::assert_snapshot!(

@@ -32,3 +32,11 @@ pub async fn query_to_batches(client: &FlightClient, sql: &str) -> Result<Vec<Re
     }
     Ok(batches)
 }
+
+pub async fn put_batches(
+    client: &mut FlightClient,
+    dataset_path: &str,
+    batches: Vec<RecordBatch>,
+) -> Result<()> {
+    Ok(client.publish(dataset_path, batches).await?)
+}

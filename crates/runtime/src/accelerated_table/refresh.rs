@@ -417,8 +417,8 @@ impl Refresher {
     fn compute_delay(period: Duration, max_jitter: Option<Duration>) -> Duration {
         match max_jitter {
             Some(max_jitter) if !max_jitter.is_zero() => {
-                let jitter = rand::thread_rng().gen_range(Duration::from_secs(0)..max_jitter);
-                if rand::thread_rng().gen_bool(0.5) {
+                let jitter = rand::rng().random_range(Duration::from_secs(0)..max_jitter);
+                if rand::rng().random_bool(0.5) {
                     period + jitter
                 } else {
                     period.saturating_sub(jitter)
@@ -880,7 +880,7 @@ mod tests {
             wait_until_ready_status(
                 &registry,
                 status::ComponentStatus::Ready,
-                20,
+                30,
                 Duration::from_millis(50)
             )
             .await,

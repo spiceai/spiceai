@@ -57,6 +57,12 @@ pub enum Error {
 
     #[snafu(display("Failed to connect to the S3 endpoint at '{url}'.\nVerify the S3 endpoint is accessible and try again."))]
     FailedToConnectS3Endpoint { url: String },
+
+    #[snafu(display("Path must contain 'tables' segment followed by a table name"))]
+    MissingTableSegment,
+
+    #[snafu(display("Unexpected table segment in catalog path: {segment}"))]
+    UnexpectedTableSegment { segment: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -129,7 +135,7 @@ pub(crate) const PARAMETERS: &[ParameterSpec] = &[
 ];
 
 /// Maps a Spice parameter name to an Iceberg property name.
-fn map_param_name_to_iceberg_prop(param_name: &str) -> Option<String> {
+pub(crate) fn map_param_name_to_iceberg_prop(param_name: &str) -> Option<String> {
     match param_name {
         "token" => Some("token".to_string()),
         "oauth2_credential" => Some("credential".to_string()),
@@ -221,7 +227,7 @@ impl CatalogConnector for IcebergCatalog {
     }
 }
 
-async fn verify_s3_endpoint(endpoint: &str) -> Result<()> {
+pub(crate) async fn verify_s3_endpoint(endpoint: &str) -> Result<()> {
     let url = Url::parse(endpoint).context(UrlParseSnafu)?;
     let host = url.host_str().context(MissingHostSnafu)?;
     let port = url.port().unwrap_or_else(|| {
@@ -273,6 +279,35 @@ async fn verify_s3_endpoint(endpoint: &str) -> Result<()> {
 pub fn parse_catalog_url(
     url: &str,
 ) -> Result<(String, HashMap<String, String>, Option<Namespace>)> {
+    let (base_uri, props, path_info) = parse_iceberg_url(url)?;
+
+    match path_info {
+        IcebergPathInfo::RootNamespace => Ok((base_uri, props, None)),
+        IcebergPathInfo::Namespace(namespace) => Ok((base_uri, props, Some(namespace))),
+        IcebergPathInfo::Table(_namespace, table_name) => Err(Error::UnexpectedTableSegment {
+            segment: format!("/tables/{table_name}"),
+        }),
+    }
+}
+
+/// Represents the path information extracted from an Iceberg URL
+#[derive(Debug, Clone)]
+enum IcebergPathInfo {
+    /// The root namespace (e.g., `/v1/namespaces`)
+    RootNamespace,
+    /// A namespace path (e.g., `/v1/namespaces/my_namespace`)
+    Namespace(Namespace),
+    /// A table path (e.g., `/v1/namespaces/my_namespace/tables/my_table`)
+    Table(Namespace, String),
+}
+
+/// Parses an Iceberg URL into base URI, properties, and path information.
+/// This function handles both namespace and table paths.
+///
+/// For example:
+/// - `https://my.iceberg.com/v1/namespaces/spiceai_sandbox` (namespace path)
+/// - `https://my.iceberg.com/v1/namespaces/spiceai_sandbox/tables/my_table` (table path)
+fn parse_iceberg_url(url: &str) -> Result<(String, HashMap<String, String>, IcebergPathInfo)> {
     // Parse the URL
     let parsed = Url::parse(url).context(UrlParseSnafu)?;
 
@@ -324,18 +359,6 @@ pub fn parse_catalog_url(
         return InvalidSegmentOrderSnafu.fail();
     }
 
-    let mut namespace: Option<Namespace> = None;
-    if namespaces_idx + 1 < segments.len() {
-        // The namespace name is the segment immediately after "namespaces"
-        let namespace_name = HttpNamespace::from_encoded(segments[namespaces_idx + 1]);
-        let Ok(namespace_name) = NamespaceIdent::from_vec(namespace_name.parts) else {
-            unreachable!(
-        "NamespaceIdent::from_vec never fails if namespace_name.parts has at least one part"
-    )
-        };
-        namespace = Some(Namespace::new(namespace_name));
-    }
-
     // Everything between "v1" and "namespaces" is considered the prefix
     let prefix_segments = &segments[v1_idx + 1..namespaces_idx];
     let prefix = prefix_segments.join("/");
@@ -360,8 +383,59 @@ pub fn parse_catalog_url(
         }
     }
 
-    // Return the Base URI + Properties + Namespace
-    Ok((base_uri, props, namespace))
+    // The namespace name is the segment immediately after "namespaces"
+    if namespaces_idx + 1 >= segments.len() {
+        // This is the root namespace case (e.g., /v1/namespaces)
+        return Ok((base_uri, props, IcebergPathInfo::RootNamespace));
+    }
+
+    let namespace_name = HttpNamespace::from_encoded(segments[namespaces_idx + 1]);
+    let namespace_name =
+        NamespaceIdent::from_vec(namespace_name.parts).map_err(|_| Error::MissingNamespace)?;
+    let namespace = Namespace::new(namespace_name);
+
+    // Check if this is a table path
+    let path_info =
+        if namespaces_idx + 3 < segments.len() && segments[namespaces_idx + 2] == "tables" {
+            // This is a table path
+            let table_name = segments[namespaces_idx + 3].to_string();
+            IcebergPathInfo::Table(namespace, table_name)
+        } else {
+            // This is a namespace path
+            IcebergPathInfo::Namespace(namespace)
+        };
+
+    // Return the Base URI + Properties + Path Info
+    Ok((base_uri, props, path_info))
+}
+
+/// Parses a table URL into an Iceberg `RestCatalogConfig` (catalog URI + optional properties),
+/// the `Namespace`, and the table name.
+///
+/// For example:
+///
+/// `https://my.iceberg.com/v1/namespaces/spiceai_sandbox/tables/my_table`
+///
+/// Returns:
+/// ```rust
+/// (
+///   "https://my.iceberg.com",
+///   {},
+///   Namespace { name: "spiceai_sandbox", properties: {} },
+///   "my_table"
+/// )
+/// ```
+pub fn parse_table_url(url: &str) -> Result<(String, HashMap<String, String>, Namespace, String)> {
+    let (base_uri, props, path_info) = parse_iceberg_url(url)?;
+
+    match path_info {
+        IcebergPathInfo::Table(namespace, table_name) => {
+            Ok((base_uri, props, namespace, table_name))
+        }
+        IcebergPathInfo::Namespace(_) | IcebergPathInfo::RootNamespace => {
+            Err(Error::MissingTableSegment)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -501,5 +575,39 @@ mod tests {
         let url = "https://my.iceberg.com/v1/namespaces/spiceai_sandbox";
         let (_, props, _) = parse_catalog_url(url).expect("Failed to parse catalog URL");
         assert!(!props.contains_key("rest.signing-region"));
+    }
+
+    #[test]
+    fn test_parse_table_url() {
+        let url = "https://my.iceberg.com/v1/namespaces/spiceai_sandbox/tables/my_table";
+        let (base_uri, props, namespace, table_name) =
+            parse_table_url(url).expect("Failed to parse table URL");
+        assert_eq!(base_uri, "https://my.iceberg.com");
+        assert_eq!(props.len(), 0);
+        assert_eq!(namespace.name().to_url_string().as_str(), "spiceai_sandbox");
+        assert_eq!(table_name, "my_table");
+    }
+
+    #[test]
+    fn test_parse_table_url_with_prefix() {
+        let url = "https://my.iceberg.com/v1/my_prefix/namespaces/spiceai_sandbox/tables/my_table";
+        let (base_uri, props, namespace, table_name) =
+            parse_table_url(url).expect("Failed to parse table URL");
+        assert_eq!(base_uri, "https://my.iceberg.com");
+        assert_eq!(props.len(), 1);
+        assert_eq!(props.get("prefix").expect("Prefix is None"), "my_prefix");
+        assert_eq!(namespace.name().to_url_string().as_str(), "spiceai_sandbox");
+        assert_eq!(table_name, "my_table");
+    }
+
+    #[test]
+    fn test_parse_table_url_missing_table() {
+        let url = "https://my.iceberg.com/v1/namespaces/spiceai_sandbox";
+        let result = parse_table_url(url);
+        assert!(result.is_err());
+        assert!(matches!(
+            result.expect_err("Failed to parse table URL"),
+            Error::MissingTableSegment
+        ));
     }
 }

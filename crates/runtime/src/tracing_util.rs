@@ -87,7 +87,7 @@ fn dataset_acceleration_info(
 
 pub fn random_trace_id() -> TraceId {
     let mut bytes = [0u8; 16];
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     rng.fill_bytes(&mut bytes);
 
     // Ensure the TraceId is not all zeros

@@ -19,6 +19,7 @@ use crate::args::DatasetTestArgs;
 use std::time::Duration;
 use test_framework::{
     anyhow,
+    arrow::util::pretty::print_batches,
     metrics::{MetricCollector, QueryMetrics, ThroughputMetrics},
     queries::{QueryOverrides, QuerySet},
     spiced::SpicedInstance,
@@ -51,29 +52,29 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
     println!("Running baseline test");
     let baseline_test = SpiceTest::new(
         app.name.clone(),
-        spiced_instance,
         NotStarted::new()
             .with_parallel_count(1)
             .with_query_set(queries.clone())
             .with_end_condition(EndCondition::QuerySetCompleted(6)),
     )
+    .with_spiced_instance(spiced_instance)
     .with_progress_bars(!args.common.disable_progress_bars)
     .start()
     .await?;
 
     let test = baseline_test.wait().await?;
-    let spiced_instance = test.end();
+    let spiced_instance = test.end()?;
 
     // throughput test
     println!("Running throughput test");
     let throughput_test = SpiceTest::new(
         app.name.clone(),
-        spiced_instance,
         NotStarted::new()
             .with_parallel_count(args.common.concurrency)
             .with_query_set(queries.clone())
             .with_end_condition(EndCondition::QuerySetCompleted(2)),
     )
+    .with_spiced_instance(spiced_instance)
     .with_progress_bars(!args.common.disable_progress_bars)
     .start()
     .await?;
@@ -83,10 +84,11 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
     let metrics: QueryMetrics<_, ThroughputMetrics> = test
         .collect(TestType::Throughput)?
         .with_run_metric(ThroughputMetrics::new(throughput_metric));
-    let mut spiced_instance = test.end();
+    let mut spiced_instance = test.end()?;
     let memory_usage = spiced_instance.show_memory_usage()?;
 
-    metrics.show_records()?;
+    let records = metrics.build_records()?;
+    print_batches(&records)?;
     metrics.with_memory_usage(memory_usage).show_run(None)?; // no additional test pass logic applies
     spiced_instance.stop()?;
 
