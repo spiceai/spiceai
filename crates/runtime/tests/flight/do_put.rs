@@ -159,7 +159,7 @@ async fn test_flight_do_put_no_auth() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
     test_request_context()
-        .scope(async {
+        .scope_retry(3, || async {
             let (channel, _df) = start_spice_test_app(None, None).await?;
 
             let mut client = create_flight_client(channel, None)?;
