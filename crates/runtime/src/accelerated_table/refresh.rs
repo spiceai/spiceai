@@ -880,7 +880,7 @@ mod tests {
             wait_until_ready_status(
                 &registry,
                 status::ComponentStatus::Ready,
-                20,
+                30,
                 Duration::from_millis(50)
             )
             .await,

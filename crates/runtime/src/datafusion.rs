@@ -54,6 +54,7 @@ use datafusion_federation::FederatedTableProviderAdaptor;
 use error::find_datafusion_root;
 use itertools::Itertools;
 use query::QueryBuilder;
+use schema::ensure_schema_exists;
 use snafu::prelude::*;
 use tokio::spawn;
 use tokio::sync::oneshot;
@@ -1134,6 +1135,7 @@ impl DataFusion {
         if table_exists {
             return TableAlreadyExistsSnafu.fail();
         }
+        ensure_schema_exists(&self.ctx, SPICE_DEFAULT_CATALOG, &table)?;
 
         let statements = DFParser::parse_sql_with_dialect(view.as_str(), &PostgreSqlDialect {})
             .context(UnableToParseSqlSnafu)?;
