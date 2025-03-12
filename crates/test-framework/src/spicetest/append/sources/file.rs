@@ -114,10 +114,10 @@ impl AppendableSource for FileAppendableSource {
                 // import the parquet file into the database so we can use it for OFFSET delayed loading
                 // limit to 40 million rows because the file connector goes OOM with the full file
                 let setup_sql = "BEGIN;
-                                       CREATE TABLE hits AS SELECT * FROM read_parquet('hits.parquet') LIMIT 40000000;
-                                       CREATE TABLE hits_delayed AS SELECT * FROM hits WHERE 1=0;
-                                       ALTER TABLE hits_delayed ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
-                                       COMMIT;";
+                                 CREATE TABLE hits AS SELECT * FROM read_parquet('hits.parquet') LIMIT 40000000;
+                                 CREATE TABLE hits_delayed AS SELECT * FROM hits WHERE 1=0;
+                                 ALTER TABLE hits_delayed ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+                                 COMMIT;";
 
                 dest_conn.execute_batch(setup_sql)?;
             }
@@ -176,12 +176,12 @@ impl AppendableSource for FileAppendableSource {
             }
             QuerySet::Clickbench => {
                 let sql = format!("BEGIN;
-                                           INSERT INTO hits_delayed SELECT *, CURRENT_TIMESTAMP AS created_at
-                                           FROM hits
-                                           LIMIT (SELECT COUNT(*) / {load_steps} FROM hits)
-                                           OFFSET (SELECT COUNT(*) / {load_steps} * {load_index} FROM hits);
-                                           COPY hits_delayed TO 'hits_delayed.parquet' (FORMAT 'parquet');
-                                           COMMIT;",
+                                   INSERT INTO hits_delayed SELECT *, CURRENT_TIMESTAMP AS created_at
+                                   FROM hits
+                                   LIMIT (SELECT COUNT(*) / {load_steps} FROM hits)
+                                   OFFSET (SELECT COUNT(*) / {load_steps} * {load_index} FROM hits);
+                                   COPY hits_delayed TO 'hits_delayed.parquet' (FORMAT 'parquet');
+                                   COMMIT;",
                                         load_steps = config.load_steps);
 
                 dest_conn.execute_batch(&sql)?;
