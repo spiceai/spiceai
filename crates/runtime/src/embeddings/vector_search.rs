@@ -128,6 +128,8 @@ impl Display for RetrievalLimit {
 }
 
 static VECTOR_DISTANCE_COLUMN_NAME: &str = "dist";
+static VSS_TEMP_GEN_ID_COLUMN: &str = "vss_temp_gen_id";
+static VSS_TEMP_TABLE_NAME: &str = "vss_temp_table";
 
 #[derive(Debug, Clone, JsonSchema, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -685,14 +687,63 @@ impl VectorSearch {
         where_cond: &str,
         n: usize,
     ) -> String {
-        let pks = if primary_keys.is_empty() {
-            // If the dataset has no true primary keys, the only known unique key is the embedding column.
-            vec![quote_identifier(embedding_column).to_string()]
+        let (pks, distances_cte, proj_table) = if primary_keys.is_empty() {
+            // If the dataset has no primary keys, we use an additional surrogate temp table and a generated primary key.
+            // An alternative approach is using the full content as the primary key, but it is less efficient as primary keys
+            // are duplicated along with unnest, resulting in large memory allocation and inefficient final selection (join condition).
+            let distances_table =  format!(
+                    "WITH {VSS_TEMP_TABLE_NAME} AS (
+                        SELECT 
+                            ROW_NUMBER() OVER () AS {VSS_TEMP_GEN_ID_COLUMN},
+                            {additional_columns}     
+                            {embedding_column},
+                            {embed_col_offset},
+                            {embed_col_embedding}
+                        FROM {table_name}
+                        {where_cond}
+                    ), 
+                    distances as (
+                        SELECT
+                            {VSS_TEMP_GEN_ID_COLUMN},
+                            unnest({embed_col_offset}) AS offset,
+                            cosine_distance(unnest({embed_col_embedding}), {embedding:?}) AS {VECTOR_DISTANCE_COLUMN_NAME}
+                        FROM {VSS_TEMP_TABLE_NAME}
+                    )",
+                    embed_col_offset=offset_col!(quote_identifier(embedding_column).to_string()),
+                    embed_col_embedding=embedding_col!(quote_identifier(embedding_column).to_string()),
+                    additional_columns = if projection.is_empty() {
+                        String::new()
+                    } else {
+                        format!("{},", projection.iter().join(", "))
+                    },
+                );
+
+            (
+                vec![VSS_TEMP_GEN_ID_COLUMN.to_string()],
+                distances_table,
+                VSS_TEMP_TABLE_NAME.to_string(),
+            )
         } else {
-            primary_keys
+            let pks = primary_keys
                 .iter()
                 .map(|s| quote_identifier(s).to_string())
-                .collect_vec()
+                .collect_vec();
+
+            let distances_table =  format!(
+                    "WITH distances as (
+                        SELECT
+                            {pks},
+                            unnest({embed_col_offset}) AS offset,
+                            cosine_distance(unnest({embed_col_embedding}), {embedding:?}) AS {VECTOR_DISTANCE_COLUMN_NAME}
+                        FROM {table_name}
+                        {where_cond}
+                    )",
+                    pks = pks.iter().join(", "),
+                    embed_col_offset=offset_col!(quote_identifier(embedding_column).to_string()),
+                    embed_col_embedding=embedding_col!(quote_identifier(embedding_column).to_string())
+                );
+
+            (pks, distances_table, table_name.to_string())
         };
 
         let final_projection_str = if projection.is_empty() {
@@ -706,14 +757,7 @@ impl VectorSearch {
         };
 
         format!(
-            "WITH distances as (
-                SELECT
-                    {pks},
-                    unnest({embed_col_offset}) AS offset,
-                    cosine_distance(unnest({embed_col_embedding}), {embedding:?}) AS {VECTOR_DISTANCE_COLUMN_NAME}
-                FROM {table_name}
-                {where_cond}
-            ),
+            "{distances_cte},
             ranks as (
                 SELECT
                     {pks},
@@ -734,10 +778,8 @@ impl VectorSearch {
                 {projection_str}
                 rd.{VECTOR_DISTANCE_COLUMN_NAME}
             FROM ranked_docs rd
-            JOIN {table_name} t ON {join_on_conditions}",
+            JOIN {proj_table} t ON {join_on_conditions}",
                 embed_col=quote_identifier(embedding_column).to_string(),
-                embed_col_offset=offset_col!(quote_identifier(embedding_column).to_string()),
-                embed_col_embedding=embedding_col!(quote_identifier(embedding_column).to_string()),
                 pks = pks.iter().join(", "),
                 projection_str = final_projection_str,
                 join_on_conditions = pks
