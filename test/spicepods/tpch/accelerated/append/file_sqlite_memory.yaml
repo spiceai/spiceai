@@ -1,13 +1,13 @@
 version: v1
 kind: Spicepod
-name: file_duckdb_memory_append
+name: file_sqlite_memory_append
 datasets:
   - from: file:customer.parquet
     name: customer
     time_column: c_created_at
     acceleration: &acceleration
       enabled: true
-      engine: duckdb
+      engine: sqlite
       mode: memory
       refresh_mode: append
       refresh_check_interval: 3m 

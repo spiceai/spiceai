@@ -1,0 +1,104 @@
+version: v1
+kind: Spicepod
+name: file_arrow_append
+datasets:
+  - from: file:catalog_sales.parquet
+    name: catalog_sales
+    time_column: cs_created_at
+    acceleration: &acceleration
+      engine: arrow
+      enabled: true
+      refresh_mode: append
+      refresh_check_interval: 3m 
+  - from: file:catalog_returns.parquet
+    name: catalog_returns
+    time_column: cr_created_at
+    acceleration: *acceleration
+  - from: file:inventory.parquet
+    name: inventory
+    time_column: i_created_at
+    acceleration: *acceleration
+  - from: file:store_sales.parquet
+    name: store_sales
+    time_column: ss_created_at
+    acceleration: *acceleration
+  - from: file:store_returns.parquet
+    name: store_returns
+    time_column: sr_created_at
+    acceleration: *acceleration
+  - from: file:web_sales.parquet
+    name: web_sales
+    time_column: ws_created_at
+    acceleration: *acceleration
+  - from: file:web_returns.parquet
+    name: web_returns
+    time_column: wr_created_at
+    acceleration: *acceleration
+  - from: file:customer.parquet
+    name: customer
+    time_column: c_created_at
+    acceleration: *acceleration
+  - from: file:customer_address.parquet
+    name: customer_address
+    time_column: ca_created_at
+    acceleration: *acceleration
+  - from: file:customer_demographics.parquet
+    name: customer_demographics
+    time_column: cd_created_at
+    acceleration: *acceleration
+  - from: file:date_dim.parquet
+    name: date_dim
+    time_column: d_created_at
+    acceleration: *acceleration
+  - from: file:household_demographics.parquet
+    name: household_demographics
+    time_column: hd_created_at
+    acceleration: *acceleration
+  - from: file:item.parquet
+    name: item
+    time_column: i_created_at
+    acceleration: *acceleration
+  - from: file:promotion.parquet
+    name: promotion
+    time_column: p_created_at
+    acceleration: *acceleration
+  - from: file:ship_mode.parquet
+    name: ship_mode
+    time_column: sm_created_at
+    acceleration: *acceleration
+  - from: file:store.parquet
+    name: store
+    time_column: s_created_at
+    acceleration: *acceleration
+  - from: file:time_dim.parquet
+    name: time_dim
+    time_column: t_created_at
+    acceleration: *acceleration
+  - from: file:warehouse.parquet
+    name: warehouse
+    time_column: w_created_at
+    acceleration: *acceleration
+  - from: file:web_page.parquet
+    name: web_page
+    time_column: wp_created_at
+    acceleration: *acceleration
+  - from: file:web_site.parquet
+    name: web_site
+    time_column: ws_created_at
+    acceleration: *acceleration
+  - from: file:reason.parquet
+    name: reason
+    time_column: r_created_at
+    acceleration: *acceleration
+  - from: file:call_center.parquet
+    name: call_center
+    time_column: cc_created_at
+    acceleration: *acceleration
+  - from: file:income_band.parquet
+    name: income_band
+    time_column: ib_created_at
+    acceleration: *acceleration
+  - from: file:catalog_page.parquet
+    name: catalog_page
+    time_column: cp_created_at
+    acceleration: *acceleration

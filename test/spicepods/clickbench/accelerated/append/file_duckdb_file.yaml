@@ -1,0 +1,14 @@
+version: v1
+kind: Spicepod
+name: file_duckdb_file_append
+datasets:
+  - from: file:hits_delayed.parquet
+    name: hits
+    time_column: created_at
+    params:
+      file_format: parquet
+    acceleration:
+      engine: duckdb
+      mode: memory
+      refresh_mode: append
+      refresh_check_interval: 3m

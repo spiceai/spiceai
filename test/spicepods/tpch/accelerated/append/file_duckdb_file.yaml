@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: file_duckdb_memory_append
+name: file_duckdb_file_append
 datasets:
   - from: file:customer.parquet
     name: customer
@@ -8,7 +8,7 @@ datasets:
     acceleration: &acceleration
       enabled: true
       engine: duckdb
-      mode: memory
+      mode: file
       refresh_mode: append
       refresh_check_interval: 3m 
   - from: file:lineitem.parquet
