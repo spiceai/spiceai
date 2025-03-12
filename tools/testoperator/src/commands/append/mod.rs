@@ -141,6 +141,12 @@ async fn check_table_counts(
         let expected_count = f64::from(expected_count) * scale_factor;
         let sql = format!("SELECT COUNT(*) FROM {name}");
         let batches = flight.query(&sql).await?.try_collect::<Vec<_>>().await?;
+        if batches.len() != 1 {
+            return Err(anyhow::anyhow!(
+                "Expected 1 batch, got {} batches",
+                batches.len()
+            ));
+        }
         let count = batches[0]
             .column(0)
             .as_primitive_opt::<arrow::datatypes::Int64Type>()
