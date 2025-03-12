@@ -21,10 +21,11 @@ use crate::{
 };
 use std::time::Duration;
 use test_framework::{
-    anyhow,
+    anyhow::{self, Context},
     app::App,
     arrow::util::pretty::print_batches,
     flight::put_batches,
+    futures::TryStreamExt,
     metrics::{MetricCollector, NoExtendedMetrics, QueryMetrics},
     queries::{QueryOverrides, QuerySet},
     spiced::SpicedInstance,
@@ -51,8 +52,6 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
             .with_end_duration(Duration::from_secs(60 * 60))
             .with_tempdir_path(start_request.get_tempdir_path()),
     )
-    .with_explain_plan_snapshot()
-    .with_results_snapshot(snapshot_predicate)
     .with_progress_bars(false)
     .with_api_key(if args.common.upload_results_dataset.is_some() {
         Some(TEST_RESULTS_API_KEY.to_string())
@@ -76,6 +75,8 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
     let metrics: QueryMetrics<_, NoExtendedMetrics> = test.collect(TestType::Benchmark)?;
     let mut spiced_instance = test.end()?;
 
+    check_table_counts(&spiced_instance, query_set).await?;
+
     let records = metrics.build_records()?;
     print_batches(&records)?;
 
@@ -88,13 +89,9 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
     }
 
     spiced_instance.show_memory_usage()?;
+
     spiced_instance.stop()?;
     Ok(())
-}
-
-/// Only snapshot the official TPCH and TPCDS queries, not the "simple" extensions as they don't return consistent results
-fn snapshot_predicate(query_name: &str) -> bool {
-    query_name.starts_with("tpch_q") || query_name.starts_with("tpcds_q")
 }
 
 fn check_app_is_appendable(app: &App) -> anyhow::Result<()> {
@@ -118,6 +115,23 @@ fn check_app_is_appendable(app: &App) -> anyhow::Result<()> {
                 dataset.name
             ));
         }
+    }
+
+    Ok(())
+}
+
+async fn check_table_counts(spiced: &SpicedInstance, query_set: QuerySet) -> anyhow::Result<()> {
+    let flight = spiced.flight_client(None).await?;
+
+    for table in query_set.tables() {
+        let sql = format!("SELECT COUNT(*) FROM {table}");
+        let batches = flight.query(&sql).await?.try_collect::<Vec<_>>().await?;
+        let count = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<i64>()
+            .context("Count could not be downcasted")?;
+        println!("{table}: {count}");
     }
 
     Ok(())

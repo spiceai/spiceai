@@ -21,10 +21,7 @@ use std::{
 };
 
 use crate::{
-    metrics::{
-        system_time_to_unix_epoch_ms, DatasetMetrics, MetricCollector, NoExtendedMetrics,
-        QueryMetric, QueryStatus, ThroughputMetrics,
-    },
+    metrics::QueryStatus,
     queries::{QueryOverrides, QuerySet},
 };
 use anyhow::{Context, Result};
@@ -33,8 +30,8 @@ use indicatif::{MultiProgress, ProgressBar};
 use tokio::task::JoinHandle;
 
 use super::{
-    datasets::{EndCondition, SpiceTestQueryWorker, SpiceTestQueryWorkers},
-    SpiceTest, TestCompleted, TestNotStarted, TestState,
+    datasets::{self, EndCondition, SpiceTestQueryWorker, SpiceTestQueryWorkers},
+    SpiceTest, TestNotStarted, TestState,
 };
 
 mod worker;
@@ -97,7 +94,6 @@ impl NotStarted {
 }
 
 pub struct AppendStarted {
-    query_set: QuerySet,
     queries: Vec<(&'static str, &'static str)>,
     append_worker: JoinHandle<Result<()>>,
     query_count: usize,
@@ -107,37 +103,19 @@ pub struct AppendStarted {
 
 pub struct Running {
     start_time: Instant,
-    _end_duration: Duration,
+    end_duration: Duration,
     query_workers: SpiceTestQueryWorkers,
     append_worker: JoinHandle<Result<()>>,
     progress_bar: Option<MultiProgress>,
     query_count: usize,
     parallel_count: usize,
-    query_set: QuerySet,
-}
-pub struct Completed {
-    query_durations: BTreeMap<String, Vec<Duration>>,
-    query_iteration_durations: BTreeMap<String, (SystemTime, SystemTime)>,
-    row_counts: BTreeMap<String, Vec<usize>>,
-    query_statuses: BTreeMap<String, QueryStatus>,
-    test_duration: Duration,
-    end_time: SystemTime,
-    _query_count: usize,
-    _parallel_count: usize,
-    _query_set: QuerySet,
 }
 
 impl TestState for NotStarted {}
 impl TestState for AppendStarted {}
 impl TestState for Running {}
-impl TestState for Completed {}
 impl TestNotStarted for NotStarted {}
 impl TestNotStarted for AppendStarted {}
-impl TestCompleted for Completed {
-    fn end_time(&self) -> SystemTime {
-        self.end_time
-    }
-}
 
 impl SpiceTest<NotStarted> {
     pub async fn start_appending(self) -> Result<SpiceTest<AppendStarted>> {
@@ -169,7 +147,6 @@ impl SpiceTest<NotStarted> {
             explain_plan_snapshot: self.explain_plan_snapshot,
             results_snapshot_predicate: self.results_snapshot_predicate,
             state: AppendStarted {
-                query_set: self.state.query_set,
                 queries: self.state.queries.clone(),
                 append_worker,
                 query_count: self.state.query_count,
@@ -232,16 +209,15 @@ impl SpiceTest<AppendStarted> {
                 progress_bar: multi,
                 query_count: self.state.query_count,
                 parallel_count: self.state.parallel_count,
-                _end_duration: self.state.end_duration,
+                end_duration: self.state.end_duration,
                 append_worker: self.state.append_worker,
-                query_set: self.state.query_set,
             },
         })
     }
 }
 
 impl SpiceTest<Running> {
-    pub async fn wait(self) -> Result<SpiceTest<Completed>> {
+    pub async fn wait(self) -> Result<SpiceTest<datasets::Completed>> {
         let mut query_durations = BTreeMap::new();
         let mut query_iteration_durations = BTreeMap::new();
         let mut row_counts = BTreeMap::new();
@@ -317,162 +293,17 @@ impl SpiceTest<Running> {
             api_key: self.api_key,
             explain_plan_snapshot: self.explain_plan_snapshot,
             results_snapshot_predicate: self.results_snapshot_predicate,
-            state: Completed {
+            state: datasets::Completed {
                 query_durations,
                 query_iteration_durations,
                 row_counts,
                 query_statuses,
                 test_duration: self.state.start_time.elapsed(),
                 end_time: SystemTime::now(),
-                _query_count: self.state.query_count,
-                _parallel_count: self.state.parallel_count,
-                _query_set: self.state.query_set,
+                parallel_count: self.state.parallel_count,
+                end_condition: EndCondition::Duration(self.state.end_duration),
+                query_count: self.state.query_count,
             },
         })
-    }
-}
-
-impl SpiceTest<Completed> {
-    #[must_use]
-    pub fn get_query_durations(&self) -> &BTreeMap<String, Vec<Duration>> {
-        &self.state.query_durations
-    }
-
-    /// Returns the start and end time of for all consecutive query iterations of the same query in a set.
-    ///
-    /// Only valid when the `EndCondition` is `QuerySetCompleted`.
-    #[must_use]
-    pub fn get_query_iteration_durations(&self) -> &BTreeMap<String, (SystemTime, SystemTime)> {
-        &self.state.query_iteration_durations
-    }
-
-    #[must_use]
-    pub fn get_cumulative_query_duration(&self) -> Duration {
-        self.state.query_durations.values().flatten().copied().sum()
-    }
-
-    #[must_use]
-    pub fn get_test_duration(&self) -> Duration {
-        self.state.test_duration
-    }
-
-    /// Validates that row counts are consistent across queries
-    /// Each query should return the same number of rows
-    pub fn validate_returned_row_counts(&self) -> Result<BTreeMap<String, usize>> {
-        // validate that row counts are consistent across queries - each query should return the same number of rows
-        let mut returned_row_counts = BTreeMap::new();
-        for (query, counts) in &self.state.row_counts {
-            let first = counts
-                .first()
-                .ok_or_else(|| anyhow::anyhow!("No row counts found for query {}", query))?;
-            if !counts.iter().all(|count| count == first) {
-                return Err(anyhow::anyhow!(
-                    "Row counts for query {} are inconsistent",
-                    query
-                ));
-            }
-
-            returned_row_counts.insert(query.clone(), *first);
-        }
-
-        Ok(returned_row_counts)
-    }
-}
-
-impl std::fmt::Display for SpiceTest<Completed> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "SpiceTest: {} - Cumulative query duration: {} seconds, Test duration: {} seconds",
-            self.name,
-            self.get_cumulative_query_duration().as_secs_f32(),
-            self.get_test_duration().as_secs_f32()
-        )
-    }
-}
-
-impl MetricCollector<DatasetMetrics, NoExtendedMetrics> for SpiceTest<Completed> {
-    fn start_time(&self) -> SystemTime {
-        self.start_time
-    }
-
-    fn end_time(&self) -> SystemTime {
-        self.state.end_time
-    }
-
-    fn name(&self) -> String {
-        self.name.clone()
-    }
-
-    fn metrics(&self) -> Result<Vec<QueryMetric<DatasetMetrics>>> {
-        self.get_query_durations()
-            .iter()
-            .map(|(query, durations)| {
-                let query_iteration_durations = self.state.query_iteration_durations.get(query);
-                let query_start_time =
-                    query_iteration_durations.map_or(self.start_time, |(start, _)| *start);
-                let query_end_time =
-                    query_iteration_durations.map_or(self.state.end_time, |(_, end)| *end);
-                let query_status = self
-                    .state
-                    .query_statuses
-                    .get(query)
-                    .unwrap_or(&QueryStatus::Failed)
-                    .to_owned();
-
-                let metric = QueryMetric::new_from_durations(
-                    query,
-                    durations,
-                    query_status,
-                    system_time_to_unix_epoch_ms(query_start_time)?,
-                    system_time_to_unix_epoch_ms(query_end_time)?,
-                );
-
-                metric.map(|metric| {
-                    metric.with_extended_metrics(DatasetMetrics::new(self.name.clone()))
-                })
-            })
-            .collect::<Result<Vec<_>>>()
-    }
-}
-
-impl MetricCollector<NoExtendedMetrics, ThroughputMetrics> for SpiceTest<Completed> {
-    fn start_time(&self) -> SystemTime {
-        self.start_time
-    }
-
-    fn end_time(&self) -> SystemTime {
-        self.state.end_time
-    }
-
-    fn name(&self) -> String {
-        self.name.clone()
-    }
-
-    fn metrics(&self) -> Result<Vec<QueryMetric<NoExtendedMetrics>>> {
-        self.get_query_durations()
-            .iter()
-            .map(|(query, durations)| {
-                let query_iteration_durations = self.state.query_iteration_durations.get(query);
-                let query_start_time =
-                    query_iteration_durations.map_or(self.start_time, |(start, _)| *start);
-                let query_end_time =
-                    query_iteration_durations.map_or(self.state.end_time, |(_, end)| *end);
-                let query_status = self
-                    .state
-                    .query_statuses
-                    .get(query)
-                    .unwrap_or(&QueryStatus::Failed)
-                    .to_owned();
-
-                QueryMetric::new_from_durations(
-                    query,
-                    durations,
-                    query_status,
-                    system_time_to_unix_epoch_ms(query_start_time)?,
-                    system_time_to_unix_epoch_ms(query_end_time)?,
-                )
-            })
-            .collect::<Result<Vec<_>>>()
     }
 }

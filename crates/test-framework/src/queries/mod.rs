@@ -55,6 +55,43 @@ impl QuerySet {
     }
 
     #[must_use]
+    pub fn tables(&self) -> Vec<&str> {
+        match self {
+            QuerySet::Tpch => vec![
+                "customer", "lineitem", "nation", "orders", "part", "partsupp", "region",
+                "supplier",
+            ],
+            QuerySet::Tpcds => vec![
+                "call_center",
+                "catalog_page",
+                "catalog_sales",
+                "catalog_returns",
+                "income_band",
+                "inventory",
+                "store_sales",
+                "store_returns",
+                "web_sales",
+                "web_returns",
+                "customer",
+                "customer_address",
+                "customer_demographics",
+                "date_dim",
+                "household_demographics",
+                "item",
+                "promotion",
+                "reason",
+                "ship_mode",
+                "store",
+                "time_dim",
+                "warehouse",
+                "web_page",
+                "web_site",
+            ],
+            QuerySet::Clickbench => vec!["hits_delayed"],
+        }
+    }
+
+    #[must_use]
     pub fn append_time_columns(&self) -> Vec<TableWithTimeColumn> {
         match self {
             QuerySet::Tpch => [

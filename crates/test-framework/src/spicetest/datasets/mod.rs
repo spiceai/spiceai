@@ -99,15 +99,15 @@ pub struct Running {
     end_condition: EndCondition,
 }
 pub struct Completed {
-    query_durations: BTreeMap<String, Vec<Duration>>,
-    query_iteration_durations: BTreeMap<String, (SystemTime, SystemTime)>,
-    row_counts: BTreeMap<String, Vec<usize>>,
-    query_statuses: BTreeMap<String, QueryStatus>,
-    test_duration: Duration,
-    end_time: SystemTime,
-    query_count: usize,
-    parallel_count: usize,
-    end_condition: EndCondition,
+    pub(crate) query_durations: BTreeMap<String, Vec<Duration>>,
+    pub(crate) query_iteration_durations: BTreeMap<String, (SystemTime, SystemTime)>,
+    pub(crate) row_counts: BTreeMap<String, Vec<usize>>,
+    pub(crate) query_statuses: BTreeMap<String, QueryStatus>,
+    pub(crate) test_duration: Duration,
+    pub(crate) end_time: SystemTime,
+    pub(crate) query_count: usize,
+    pub(crate) parallel_count: usize,
+    pub(crate) end_condition: EndCondition,
 }
 
 impl TestState for NotStarted {}
