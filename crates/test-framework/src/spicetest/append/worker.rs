@@ -39,8 +39,8 @@ impl AppendConfig {
         Self {
             end_duration,
             query_set,
-            load_steps: 2,
-            load_interval: Duration::from_secs(60 * 2),
+            load_steps: 10,
+            load_interval: Duration::from_secs(60 * 4),
             temp_directory,
         }
     }
@@ -69,7 +69,8 @@ impl AppendWorker {
             println!("AppendWorker - Starting append data generation");
             while Instant::now() < end_time {
                 if load_index >= self.config.load_steps {
-                    break;
+                    tokio::time::sleep(self.config.load_interval).await; // don't break here - we don't want teardown to run before the end time
+                    continue;
                 }
 
                 tokio::time::sleep(self.config.load_interval).await;

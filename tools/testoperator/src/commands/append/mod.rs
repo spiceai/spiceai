@@ -27,7 +27,7 @@ use test_framework::{
     flight::put_batches,
     futures::TryStreamExt,
     metrics::{MetricCollector, NoExtendedMetrics, QueryMetrics},
-    queries::{QueryOverrides, QuerySet},
+    queries::{QueryOverrides, QuerySet, TableWithRowCount},
     spiced::SpicedInstance,
     spicepod::component::dataset::acceleration::RefreshMode,
     spicetest::{append::NotStarted, SpiceTest},
@@ -49,7 +49,7 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
         NotStarted::new()
             .with_query_set(query_set, query_overrides)
             .with_parallel_count(1)
-            .with_end_duration(Duration::from_secs(5 * 60))
+            .with_end_duration(Duration::from_secs(60 * 60))
             .with_tempdir_path(start_request.get_tempdir_path()),
     )
     .with_progress_bars(false)
@@ -75,7 +75,12 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
     let metrics: QueryMetrics<_, NoExtendedMetrics> = test.collect(TestType::Benchmark)?;
     let mut spiced_instance = test.end()?;
 
-    check_table_counts(&spiced_instance, query_set).await?;
+    check_table_counts(
+        &spiced_instance,
+        query_set,
+        args.scale_factor.unwrap_or(1.0),
+    )
+    .await?;
 
     let records = metrics.build_records()?;
     print_batches(&records)?;
@@ -120,17 +125,42 @@ fn check_app_is_appendable(app: &App) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn check_table_counts(spiced: &SpicedInstance, query_set: QuerySet) -> anyhow::Result<()> {
+async fn check_table_counts(
+    spiced: &SpicedInstance,
+    query_set: QuerySet,
+    scale_factor: f64,
+) -> anyhow::Result<()> {
     let flight = spiced.flight_client(None).await?;
 
-    for table in query_set.tables() {
-        let sql = format!("SELECT COUNT(*) FROM {table}");
+    let mut any_count_mismatch = false;
+    for TableWithRowCount {
+        name,
+        count: expected_count,
+    } in query_set.row_counts()
+    {
+        let expected_count = f64::from(expected_count) * scale_factor;
+        let sql = format!("SELECT COUNT(*) FROM {name}");
         let batches = flight.query(&sql).await?.try_collect::<Vec<_>>().await?;
         let count = batches[0]
             .column(0)
-            .as_primitive::<arrow::datatypes::UInt64Type>()
+            .as_primitive_opt::<arrow::datatypes::Int64Type>()
+            .context("Failed to get count as a Int64Type")?
             .value(0);
-        println!("{table}: {count}");
+
+        let count = f64::from(u32::try_from(count)?);
+        // Allow a 0.01% margin of error
+        let upper_bound = expected_count * 1.0001;
+        let lower_bound = expected_count * 0.9999;
+        if !(count <= upper_bound && count >= lower_bound) {
+            println!("Table {name} has {count} rows, expected {expected_count}");
+            any_count_mismatch = true;
+        }
+    }
+
+    if any_count_mismatch {
+        return Err(anyhow::anyhow!(
+            "Table row counts do not match expected values"
+        ));
     }
 
     Ok(())

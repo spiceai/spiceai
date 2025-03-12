@@ -41,6 +41,21 @@ impl From<&(&'static str, &'static str)> for TableWithTimeColumn {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct TableWithRowCount {
+    pub name: &'static str,
+    pub count: u32,
+}
+
+impl From<&(&'static str, u32)> for TableWithRowCount {
+    fn from((name, count): &(&'static str, u32)) -> Self {
+        Self {
+            name,
+            count: *count,
+        }
+    }
+}
+
 impl QuerySet {
     #[must_use]
     pub fn get_queries(
@@ -54,40 +69,56 @@ impl QuerySet {
         }
     }
 
+    /// At scale factor 1, how many rows should be present in each table for the query set
     #[must_use]
-    pub fn tables(&self) -> Vec<&str> {
+    pub fn row_counts(&self) -> Vec<TableWithRowCount> {
         match self {
-            QuerySet::Tpch => vec![
-                "customer", "lineitem", "nation", "orders", "part", "partsupp", "region",
-                "supplier",
-            ],
-            QuerySet::Tpcds => vec![
-                "call_center",
-                "catalog_page",
-                "catalog_sales",
-                "catalog_returns",
-                "income_band",
-                "inventory",
-                "store_sales",
-                "store_returns",
-                "web_sales",
-                "web_returns",
-                "customer",
-                "customer_address",
-                "customer_demographics",
-                "date_dim",
-                "household_demographics",
-                "item",
-                "promotion",
-                "reason",
-                "ship_mode",
-                "store",
-                "time_dim",
-                "warehouse",
-                "web_page",
-                "web_site",
-            ],
-            QuerySet::Clickbench => vec!["hits_delayed"],
+            QuerySet::Tpch => [
+                ("customer", 150_000),
+                ("lineitem", 6_001_215),
+                ("nation", 25),
+                ("orders", 1_500_000),
+                ("part", 200_000),
+                ("partsupp", 800_000),
+                ("region", 5),
+                ("supplier", 10_000),
+            ]
+            .iter()
+            .map(TableWithRowCount::from)
+            .collect(),
+            QuerySet::Tpcds => [
+                ("call_center", 6),
+                ("catalog_page", 1_000),
+                ("catalog_sales", 144_000),
+                ("catalog_returns", 72_000),
+                ("income_band", 20),
+                ("inventory", 11_000),
+                ("store_sales", 144_000),
+                ("store_returns", 72_000),
+                ("web_sales", 144_000),
+                ("web_returns", 72_000),
+                ("customer", 500_000),
+                ("customer_address", 150_000),
+                ("customer_demographics", 192_080),
+                ("date_dim", 73_000),
+                ("household_demographics", 7200),
+                ("item", 18_000),
+                ("promotion", 300),
+                ("reason", 35),
+                ("ship_mode", 20),
+                ("store", 1_000),
+                ("time_dim", 86_400),
+                ("warehouse", 5),
+                ("web_page", 1_000),
+                ("web_site", 1_000),
+            ]
+            .iter()
+            .map(TableWithRowCount::from)
+            .collect(),
+            QuerySet::Clickbench => [("hits_delayed", 40_000_000)]
+                .iter()
+                .map(TableWithRowCount::from)
+                .collect(),
         }
     }
 

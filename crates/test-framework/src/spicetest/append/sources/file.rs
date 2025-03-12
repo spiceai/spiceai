@@ -132,7 +132,8 @@ impl AppendableSource for FileAppendableSource {
         println!(
             "Loading append data for {query_set} benchmark suite - {load_index}/{load_steps}",
             query_set = config.query_set,
-            load_steps = config.load_steps
+            load_steps = config.load_steps,
+            load_index = load_index + 1, // display index is 1-based
         );
         let dest_conn = Connection::open(&self.dest_db_file)?;
 
