@@ -17,15 +17,15 @@ limitations under the License.
 use std::{borrow::Cow, fmt::Debug, sync::Arc};
 
 use axum::Router;
-use hyper_util::{
-    rt::{TokioExecutor, TokioIo},
-    server::conn::auto::Builder,
-    service::TowerToHyperService,
-};
+use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::server::conn::auto::Builder;
+use hyper_util::service::TowerToHyperService;
+use routes::RouterState;
 use runtime_auth::{layer::http::AuthLayer, HttpAuth};
 use snafu::prelude::*;
 use spicepod::component::runtime::CorsConfig;
-use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
+use tokio::net::TcpStream;
+use tokio::net::{TcpListener, ToSocketAddrs};
 use tokio_rustls::TlsAcceptor;
 
 use crate::{
@@ -112,7 +112,7 @@ where
     }
 }
 
-fn process_tls_tcp_stream(stream: TcpStream, acceptor: TlsAcceptor, routes: Router) {
+fn process_tls_tcp_stream(stream: TcpStream, acceptor: TlsAcceptor, routes: Router<RouterState>) {
     tokio::spawn(async move {
         let stream = acceptor.accept(stream).await;
         match stream {
@@ -126,11 +126,11 @@ fn process_tls_tcp_stream(stream: TcpStream, acceptor: TlsAcceptor, routes: Rout
     });
 }
 
-fn process_tcp_stream(stream: TcpStream, routes: Router) {
+fn process_tcp_stream(stream: TcpStream, routes: Router<RouterState>) {
     tokio::spawn(serve_connection(stream, routes));
 }
 
-async fn serve_connection<S>(stream: S, service: Router)
+async fn serve_connection<S>(stream: S, service: Router<RouterState>)
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {

@@ -21,6 +21,9 @@ pub mod embeddings;
 pub mod eval;
 pub mod iceberg;
 pub mod inference;
+
+#[cfg(feature = "mcp")]
+pub mod mcp;
 pub mod models;
 pub mod nsql;
 pub mod packages;
