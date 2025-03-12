@@ -52,6 +52,7 @@ pub enum TestCommands {
     HttpOverhead(HttpOverheadTestArgs),
     Evals(EvalsTestArgs),
     Append(DatasetTestArgs),
+    VectorSearch(CommonArgs),
 }
 
 /// Arguments Common to all [`TestCommands`].

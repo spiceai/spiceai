@@ -80,6 +80,12 @@ async fn main() -> anyhow::Result<()> {
         Commands::Export(TestCommands::Append(args)) => {
             commands::env_export(&args.common)?;
         }
+        Commands::Run(TestCommands::VectorSearch(args)) => {
+            commands::vector_search::run(&args).await?;
+        }
+        Commands::Export(TestCommands::VectorSearch(args)) => {
+            commands::env_export(&args)?;
+        }
     }
 
     Ok(())

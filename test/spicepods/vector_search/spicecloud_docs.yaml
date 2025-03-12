@@ -1,0 +1,29 @@
+version: v1
+kind: Spicepod
+name: spicecloud_docs
+datasets:
+  - from: spice.ai/spiceai/docs/datasets/spice.spiceai.cookbook
+    name: cookbook
+    params:
+      spiceai_api_key: ${ secrets:SPICEAI_API_KEY }
+    acceleration:
+      enabled: true
+    columns:
+      - name: content
+        embeddings:
+          - from: xl_embed
+  - from: spice.ai/spiceai/docs/datasets/spice.spiceai.docs
+    name: docs
+    params:
+      spiceai_api_key: ${ secrets:SPICEAI_API_KEY }
+    acceleration:
+      enabled: true
+    columns:
+      - name: content
+        embeddings:
+          - from: xl_embed
+embeddings:
+  - from: openai:text-embedding-3-small
+    name: xl_embed
+    params:
+      openai_api_key: ${ secrets:OPENAI_API_KEY }
