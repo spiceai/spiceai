@@ -39,8 +39,8 @@ impl AppendConfig {
         Self {
             end_duration,
             query_set,
-            load_steps: 10,
-            load_interval: Duration::from_secs(60 * 5),
+            load_steps: 2,
+            load_interval: Duration::from_secs(60 * 2),
             temp_directory,
         }
     }

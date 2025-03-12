@@ -23,7 +23,7 @@ use std::time::Duration;
 use test_framework::{
     anyhow::{self, Context},
     app::App,
-    arrow::util::pretty::print_batches,
+    arrow::{self, array::AsArray, util::pretty::print_batches},
     flight::put_batches,
     futures::TryStreamExt,
     metrics::{MetricCollector, NoExtendedMetrics, QueryMetrics},
@@ -49,7 +49,7 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
         NotStarted::new()
             .with_query_set(query_set, query_overrides)
             .with_parallel_count(1)
-            .with_end_duration(Duration::from_secs(60 * 60))
+            .with_end_duration(Duration::from_secs(5 * 60))
             .with_tempdir_path(start_request.get_tempdir_path()),
     )
     .with_progress_bars(false)
@@ -128,9 +128,8 @@ async fn check_table_counts(spiced: &SpicedInstance, query_set: QuerySet) -> any
         let batches = flight.query(&sql).await?.try_collect::<Vec<_>>().await?;
         let count = batches[0]
             .column(0)
-            .as_any()
-            .downcast_ref::<i64>()
-            .context("Count could not be downcasted")?;
+            .as_primitive::<arrow::datatypes::UInt64Type>()
+            .value(0);
         println!("{table}: {count}");
     }
 
