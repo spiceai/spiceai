@@ -95,19 +95,13 @@ use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 )]
 pub struct ApiDoc;
 
-#[cfg(not(feature = "mcp"))]
-pub type RouterState = ();
-
-#[cfg(feature = "mcp")]
-pub type RouterState = McpState;
-
 pub(crate) fn routes(
     rt: &Arc<Runtime>,
     config: Arc<config::Config>,
     vector_search: Arc<vector_search::VectorSearch>,
     auth_layer: Option<AuthLayer>,
     cors_config: &CorsConfig,
-) -> Router<RouterState> {
+) -> Router {
     let mut authenticated_router = Router::new()
         .route("/v1/sql", post(v1::query::post))
         .route("/v1/status", get(v1::status::get))
@@ -171,6 +165,12 @@ pub(crate) fn routes(
             .layer(Extension(Arc::clone(&rt.embeds)));
     }
 
+    if cfg!(feature = "mcp") {
+        authenticated_router = authenticated_router
+            .route("/v1/mcp/sse", get(v1::mcp::sse).post(v1::mcp::event))
+            .layer(Extension(Arc::new(McpState::default())));
+    }
+
     authenticated_router = authenticated_router
         .layer(Extension(Arc::clone(&rt.app)))
         .layer(Extension(Arc::clone(&rt.df)))
@@ -184,18 +184,10 @@ pub(crate) fn routes(
         authenticated_router = authenticated_router.route_layer(auth_layer);
     }
 
-    let mut unauthenticated_router = Router::new()
+    let unauthenticated_router = Router::new()
         .route("/health", get(|| async { "ok\n" }))
         .route("/v1/ready", get(v1::ready::get))
         .layer(Extension(Arc::clone(&rt.status)));
-
-    if cfg!(feature = "mcp") {
-        authenticated_router = authenticated_router
-            .route("v1/mcp/sse", get(v1::mcp::sse).post(v1::mcp::event))
-            .with_state(McpState::new(Arc::clone(&rt)));
-
-        unauthenticated_router = unauthenticated_router.with_state(McpState::new(Arc::clone(&rt)));
-    }
 
     unauthenticated_router
         .merge(authenticated_router)

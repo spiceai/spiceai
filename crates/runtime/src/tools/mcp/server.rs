@@ -14,16 +14,26 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::Runtime;
+use crate::{tools::Tooling, Runtime};
+use futures::StreamExt;
 use mcp_core::{
     handler::{PromptError, ResourceError},
+    protocol::{ServerCapabilities, ToolsCapability},
     Content, ToolError,
 };
 use mcp_server;
-use std::{future::Future, pin::Pin, sync::Arc};
+use serde_json::Value;
+use std::{future::Future, ops::Deref, pin::Pin, sync::Arc};
 
 #[derive(Clone)]
 pub struct RuntimeServer(Arc<Runtime>);
+impl Deref for RuntimeServer {
+    type Target = Arc<Runtime>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
 
 impl From<Arc<Runtime>> for RuntimeServer {
     fn from(rt: Arc<Runtime>) -> Self {
@@ -33,56 +43,102 @@ impl From<Arc<Runtime>> for RuntimeServer {
 
 impl mcp_server::Router for RuntimeServer {
     fn name(&self) -> String {
-        todo!()
+        "Spiced".to_string()
     }
 
     fn instructions(&self) -> String {
-        todo!()
+        "Instructions for Spiced".to_string()
     }
 
-    fn capabilities(&self) -> mcp_core::protocol::ServerCapabilities {
-        todo!()
+    fn capabilities(&self) -> ServerCapabilities {
+        ServerCapabilities {
+            prompts: None,
+            resources: None,
+            tools: Some(ToolsCapability {
+                list_changed: Some(false),
+            }),
+        }
     }
 
-    fn list_tools(&self) -> Vec<mcp_core::tool::Tool> {
-        todo!()
+    fn list_tools(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<mcp_core::tool::Tool>, ToolError>> + Send + '_>>
+    {
+        Box::pin(async move {
+            let result = self
+                .list_all_tools()
+                .map(|t| mcp_core::tool::Tool {
+                    name: t.name().to_string(),
+                    description: t.description().map(|d| d.to_string()).unwrap_or_default(),
+                    input_schema: t.parameters().unwrap_or(Value::Null),
+                })
+                .collect::<Vec<_>>()
+                .await;
+            Ok(result)
+        })
     }
 
     fn call_tool(
         &self,
         tool_name: &str,
         arguments: serde_json::Value,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<Content>, ToolError>> + Send + 'static>> {
-        todo!()
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<Content>, ToolError>> + Send + '_>> {
+        let tool_name = tool_name.to_string();
+        Box::pin(async move {
+            let Some(tool) = self.get_tool(tool_name.as_str()).await else {
+                return Err(ToolError::NotFound(format!("Tool {tool_name} not found")));
+            };
+            let args = serde_json::to_string(&arguments)
+                .map_err(|e| ToolError::InvalidParameters(e.to_string()))?;
+
+            let result = tool
+                .call(args.as_str())
+                .await
+                .map_err(|e| ToolError::ExecutionError(e.to_string()))?;
+
+            let text = serde_json::to_string(&result)
+                .map_err(|e| ToolError::ExecutionError(e.to_string()))?;
+
+            Ok(vec![Content::Text(mcp_core::TextContent {
+                text,
+                annotations: None,
+            })])
+        })
     }
 
-    fn list_resources(&self) -> Vec<mcp_core::resource::Resource> {
-        todo!()
+    fn list_resources(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<mcp_core::Resource>, ToolError>> + Send + '_>> {
+        Box::pin(async move { Ok(vec![]) })
     }
 
     fn read_resource(
         &self,
         uri: &str,
-    ) -> Pin<Box<dyn Future<Output = Result<String, ResourceError>> + Send + 'static>> {
-        todo!()
+    ) -> Pin<Box<dyn Future<Output = Result<String, ResourceError>> + Send + '_>> {
+        let uri = uri.to_string();
+        Box::pin(async move { Err(ResourceError::NotFound(uri)) })
     }
 
-    fn list_prompts(&self) -> Vec<mcp_core::prompt::Prompt> {
-        todo!()
+    fn list_prompts(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<mcp_core::prompt::Prompt>, ToolError>> + Send + '_>>
+    {
+        Box::pin(async move { Ok(vec![]) })
     }
 
     fn get_prompt(
         &self,
         prompt_name: &str,
-    ) -> Pin<Box<dyn Future<Output = Result<String, PromptError>> + Send + 'static>> {
-        todo!()
+    ) -> Pin<Box<dyn Future<Output = Result<String, PromptError>> + Send + '_>> {
+        let prompt_name = prompt_name.to_string();
+        Box::pin(async move { Err(PromptError::NotFound(prompt_name)) })
     }
 }
 
 pub(crate) mod codec {
     use tokio_util::codec::Decoder;
 
-    /// Directly from `<https://github.com/modelcontextprotocol/rust-sdk/blob/main/examples/servers/src/common/jsonrpc_frame_codec.rs>`
     #[derive(Default)]
     pub struct JsonRpcFrameCodec;
     impl Decoder for JsonRpcFrameCodec {

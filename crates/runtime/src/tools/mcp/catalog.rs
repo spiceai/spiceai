@@ -60,6 +60,50 @@ impl McpToolCatalog {
             .await
             .context(UnderlyingInitilizationSnafu)?;
 
+        let client = Arc::new(client);
+        let client_clone = Arc::clone(&client);
+        let cfg_clone = cfg.clone();
+        let name_clone = name.to_string();
+
+        let (future, heartbeat_task) = spawn_cancellable_task(None, async move {
+            let mut interval = interval(Duration::from_secs(HEARTBEAT_INTERVAL_SECONDS));
+            interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+            loop {
+                interval.tick().await;
+
+                let heartbeat_result = client_clone.write().await.ping().await;
+
+                if heartbeat_result.is_err() {
+                    tracing::warn!("MCP client heartbeat failed, attempting reconnection");
+
+                    if let Ok(new_client_rwlock) = Self::create_client(&cfg_clone).await {
+                        if new_client_rwlock
+                            .write()
+                            .await
+                            .initialize(
+                                ClientInfo {
+                                    name: "spiced".to_string(),
+                                    version: env!("CARGO_PKG_VERSION").to_string(),
+                                },
+                                ClientCapabilities::default(),
+                            )
+                            .await
+                            .is_ok()
+                        {
+                            let mut client_lock = client_clone.write().await;
+                            *client_lock = new_client_rwlock.into_inner(); // Directly assign the unwrapped Box<dyn McpClientTrait>
+                            tracing::info!(
+                                "Successfully reconnected MCP client for {}",
+                                name_clone
+                            );
+                        }
+                    }
+                }
+            }
+        });
+
+        tokio::spawn(future);
         Ok(Self {
             client: Arc::new(client),
             name: name.to_string(),
@@ -81,7 +125,7 @@ impl McpToolCatalog {
     ) -> std::result::Result<RwLock<Box<dyn McpClientTrait>>, TransportError> {
         let transport = SseTransport::new(url, HashMap::new());
         let transport_handle = transport.start().await?;
-        let service = McpService::with_timeout(transport_handle, Duration::from_secs(10));
+        let service = McpService::with_timeout(transport_handle, Duration::from_secs(100));
         Ok(RwLock::new(Box::new(McpClient::new(service))))
     }
 
