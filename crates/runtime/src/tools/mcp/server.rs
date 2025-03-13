@@ -35,9 +35,9 @@ impl Deref for RuntimeServer {
     }
 }
 
-impl From<Arc<Runtime>> for RuntimeServer {
-    fn from(rt: Arc<Runtime>) -> Self {
-        Self(rt)
+impl From<&Arc<Runtime>> for RuntimeServer {
+    fn from(rt: &Arc<Runtime>) -> Self {
+        Self(Arc::clone(rt))
     }
 }
 

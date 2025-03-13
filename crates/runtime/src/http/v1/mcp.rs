@@ -1,4 +1,3 @@
-use bytes::Bytes;
 /*
 Copyright 2024-2025 The Spice.ai OSS Authors
 
@@ -14,6 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+use bytes::Bytes;
 use futures::{stream::Stream, StreamExt, TryStreamExt};
 use mcp_server::{ByteTransport, Server};
 
@@ -37,6 +37,7 @@ use std::{collections::HashMap, sync::Arc};
 use crate::{tools::mcp::server::RuntimeServer, Runtime};
 
 const FOUR_KB: usize = 1 << 12;
+
 type C2SWriter = Arc<Mutex<io::WriteHalf<io::SimplexStream>>>;
 type SessionId = Arc<str>;
 
@@ -54,8 +55,7 @@ impl McpState {
 }
 
 fn session_id() -> SessionId {
-    let id = format!("{:016x}", rand::random::<u128>());
-    Arc::from(id)
+    Arc::from(format!("{:016x}", rand::random::<u128>()))
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -80,7 +80,7 @@ pub(crate) async fn sse(
     {
         let session = Arc::clone(&session);
         tokio::spawn(async move {
-            let server = Server::new(RouterService(RuntimeServer::from(Arc::clone(&rt))));
+            let server = Server::new(RouterService(RuntimeServer::from(&rt)));
             let bytes_transport = ByteTransport::new(c2s_read, s2c_write);
             let _result = server
                 .run(bytes_transport)
