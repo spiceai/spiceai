@@ -91,7 +91,6 @@ async fn test_acceleration_duckdb_single_instance() -> Result<(), anyhow::Error>
             runtime_ready_check(&rt).await;
 
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-            let rt = Arc::into_inner(rt).expect("only one instance");
             rt.shutdown().await;
             runtime::dataaccelerator::unregister_all().await;
             runtime::dataaccelerator::register_all().await;
