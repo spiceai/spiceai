@@ -181,7 +181,7 @@ jobs:
         if: github.event.inputs.update_snapshots == 'always'
         run: |
           # if the spiced commit is set, use that as the branch ID
-          if ${{ github.event.inputs.spiced_commit }}; then
+          if [[ ${{ github.event.inputs.spiced_commit }} ]]; then
             BRANCH_ID=${{ github.event.inputs.spiced_commit }}
           else
             BRANCH_ID=${{ github.run_id }}
@@ -201,7 +201,7 @@ jobs:
             git push origin testoperator-snapshot-update/${BRANCH_ID}
             
             # Create a PR if one is not already created for this branch
-            if ! gh pr list --state open --base trunk --head testoperator-snapshot-update/${BRANCH_ID}; then
+            if ! gh pr list --state all --base trunk --head testoperator-snapshot-update/${BRANCH_ID} | grep -q "No open pull requests"; then
               gh pr create --title "task: Update benchmark snapshots" --body "# Description\n* Updates the ${{ github.event.inputs.query_set }} benchmark snapshots for: ${{ github.event.inputs.spicepod_path }}" --base trunk --head testoperator-snapshot-update/${BRANCH_ID}
             fi
           fi
