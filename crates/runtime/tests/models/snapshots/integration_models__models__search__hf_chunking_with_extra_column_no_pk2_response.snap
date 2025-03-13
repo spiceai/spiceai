@@ -1,0 +1,17 @@
+---
+source: crates/runtime/tests/models/mod.rs
+expression: normalize_search_response(response)
+---
+{
+  "duration_ms": "duration_ms_val",
+  "matches": [
+    {
+      "dataset": "catalog_page_with_chunking_no_pk",
+      "metadata": {
+        "cp_department": "DEPARTMENT",
+        "cp_description": "In general basic characters welcome. Clearly lively friends conv"
+      },
+      "value": "In general basic characters welcome. Clearly lively friends con"
+    }
+  ]
+}

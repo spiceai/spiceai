@@ -293,6 +293,15 @@ mod search {
                         }),
                     },
                     TestCase {
+                        name: "hf_chunking_with_extra_columns2",
+                        body: json!({
+                            "text": "friends",
+                            "datasets": ["catalog_page_with_chunking"],
+                            "additional_columns": ["cp_department", "cp_description"],
+                            "limit": 1,
+                        }),
+                    },
+                    TestCase {
                         name: "hf_chunking_with_extra_columns_and_where",
                         body: json!({
                             "text": "friends",
@@ -316,6 +325,15 @@ mod search {
                             "text": "friends",
                             "datasets": ["catalog_page_with_chunking_no_pk"],
                             "additional_columns": ["cp_department"],
+                            "limit": 1,
+                        }),
+                    },
+                    TestCase {
+                        name: "hf_chunking_with_extra_column_no_pk2",
+                        body: json!({
+                            "text": "friends",
+                            "datasets": ["catalog_page_with_chunking_no_pk"],
+                            "additional_columns": ["cp_department", "cp_description"],
                             "limit": 1,
                         }),
                     },
