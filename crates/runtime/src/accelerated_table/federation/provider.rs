@@ -18,51 +18,32 @@ use std::sync::Arc;
 
 use datafusion_federation::FederationProvider;
 
-use crate::component::dataset::ReadyState;
-
 #[allow(clippy::struct_field_names)]
 pub struct AcceleratedTableFederationProvider {
     enabled: bool,
-    accelerated_table_federation_provider: Option<Arc<dyn FederationProvider>>,
-    federated_table_federation_provider: Option<Arc<dyn FederationProvider>>,
-    ready_state: ReadyState,
+    provider: Option<Arc<dyn FederationProvider>>,
     refresher: Arc<crate::accelerated_table::refresh::Refresher>,
 }
 
 impl AcceleratedTableFederationProvider {
     pub fn new(
         enabled: bool,
-        accelerated_table_federation_provider: Option<Arc<dyn FederationProvider>>,
-        federated_table_federation_provider: Option<Arc<dyn FederationProvider>>,
-        ready_state: ReadyState,
+        provider: Option<Arc<dyn FederationProvider>>,
         refresher: Arc<crate::accelerated_table::refresh::Refresher>,
     ) -> Self {
         Self {
             enabled,
-            accelerated_table_federation_provider,
-            federated_table_federation_provider,
-            ready_state,
+            provider,
             refresher,
         }
     }
 
     fn federation_provider(&self) -> Option<Arc<dyn FederationProvider>> {
-        if !self.enabled {
-            return None;
+        // If the initial load has completed and this provider is enabled, we can use the accelerated table federation provider.
+        match (self.enabled, self.refresher.initial_load_completed()) {
+            (true, true) => self.provider.clone(),
+            _ => None,
         }
-
-        // If the initial load has completed, we can use the accelerated table federation provider.
-        if self.refresher.initial_load_completed() {
-            return self.accelerated_table_federation_provider.clone();
-        }
-
-        // Otherwise, we need to use the federated table federation provider if the ready state is OnRegistration.
-        if self.ready_state == ReadyState::OnRegistration {
-            return self.federated_table_federation_provider.clone();
-        }
-
-        // If we get here then we need to wait for the initial load to complete.
-        None
     }
 }
 
@@ -75,17 +56,13 @@ impl FederationProvider for AcceleratedTableFederationProvider {
         if !self.enabled {
             return None;
         }
-        self.federation_provider()
-            .clone()
-            .and_then(|x| x.compute_context())
+        self.federation_provider().and_then(|x| x.compute_context())
     }
 
     fn analyzer(&self) -> Option<Arc<datafusion::optimizer::Analyzer>> {
         if !self.enabled {
             return None;
         }
-        self.federation_provider()
-            .clone()
-            .and_then(|x| x.analyzer())
+        self.federation_provider().and_then(|x| x.analyzer())
     }
 }

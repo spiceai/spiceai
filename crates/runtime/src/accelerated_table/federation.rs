@@ -39,24 +39,12 @@ impl AcceleratedTable {
         Some(Arc::new(poly.clone()))
     }
 
-    fn get_federation_provider_for_federated_table(&self) -> Option<Arc<dyn FederationProvider>> {
-        let federated_table = self.federated.table_provider_immediate()?;
-
-        let adaptor = federated_table
-            .as_any()
-            .downcast_ref::<FederatedTableProviderAdaptor>()?;
-
-        Some(adaptor.source.federation_provider())
-    }
-
     #[must_use]
     fn create_federated_table_source(&self) -> Arc<dyn FederatedTableSource> {
         let schema = Arc::clone(&self.schema());
         let accelerated_table_federation_provider = self
             .get_federation_provider_for_accelerator()
             .map(|x| x as Arc<dyn FederationProvider>);
-        let federated_table_federation_provider =
-            self.get_federation_provider_for_federated_table();
 
         let enabled = self.zero_results_action != ZeroResultsAction::UseSource
             && !self.disable_query_push_down;
@@ -64,8 +52,6 @@ impl AcceleratedTable {
         let fed_provider = Arc::new(AcceleratedTableFederationProvider::new(
             enabled,
             accelerated_table_federation_provider,
-            federated_table_federation_provider,
-            self.ready_state,
             self.refresher(),
         ));
 
