@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use clap::{Parser, ValueEnum};
+use clap::{ArgAction, Parser, ValueEnum};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use test_framework::{queries::QuerySet, TestType};
@@ -42,7 +42,7 @@ pub struct DispatchArgs {
     #[arg(long, env = "WORKFLOW_COMMIT", default_value = "trunk")]
     pub(crate) workflow_commit: String,
 
-    #[arg(long, default_value = "false")]
+    #[arg(long, default_value = "false", action = ArgAction::Set)]
     pub(crate) update_snapshots: bool,
 }
 
