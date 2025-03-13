@@ -108,6 +108,7 @@ impl BenchArgs {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum UpdateSnapshots {
     Always,
     No,
