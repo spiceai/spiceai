@@ -17,7 +17,9 @@ limitations under the License.
 use anyhow::Result;
 use tonic::async_trait;
 
+#[cfg(feature = "file_append")]
 mod file;
+#[cfg(feature = "file_append")]
 pub(crate) use file::FileAppendableSource;
 
 use super::worker::AppendConfig;

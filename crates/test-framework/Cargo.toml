@@ -14,7 +14,7 @@ app = { path = "../app" }
 arrow = { workspace = true, features = ["prettyprint"] }
 async-openai.workspace = true
 clap.workspace = true
-duckdb = { workspace = true, features = [
+duckdb = { optional = true, workspace = true, features = [
     "bundled",
     "r2d2",
     "vtab",
@@ -41,3 +41,28 @@ uuid = { workspace = true, features = ["v4"] }
 
 [target.'cfg(not(windows))'.dependencies]
 nix = { version = "0.29", features = ["signal"] }
+
+[features]
+anonymous_telemetry = []
+aws-secrets-manager = []
+clickhouse = []
+databricks = []
+debezium = []
+delta_lake = []
+dremio = []
+duckdb = []
+flightsql = []
+ftp = []
+keyring-secret-store = []
+imap = []
+models = []
+mssql = []
+mysql = []
+odbc = []
+postgres = []
+sharepoint = []
+snowflake = []
+spark = []
+sqlite = []
+
+file_append = ["dep:duckdb"]
