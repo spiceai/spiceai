@@ -18,25 +18,37 @@ use std::{any::Any, sync::Arc};
 
 use arrow_schema::SchemaRef;
 use datafusion::{datasource::TableType, logical_expr::TableSource};
-use datafusion_federation::{FederatedTableSource, FederationProvider};
+use datafusion_federation::{
+    table_reference::MultiPartTableReference, FederatedTableSource, FederationProvider,
+};
 
 use super::AcceleratedTableFederationProvider;
 
 pub struct AcceleratedTableFederatedTableSource {
     provider: Arc<AcceleratedTableFederationProvider>,
     schema: SchemaRef,
+    remote_table_name: Option<MultiPartTableReference>,
 }
 
 impl AcceleratedTableFederatedTableSource {
     pub fn new_with_schema(
         provider: Arc<AcceleratedTableFederationProvider>,
         schema: SchemaRef,
+        remote_table_name: Option<MultiPartTableReference>,
     ) -> Self {
-        Self { provider, schema }
+        Self {
+            provider,
+            schema,
+            remote_table_name,
+        }
     }
 }
 
 impl FederatedTableSource for AcceleratedTableFederatedTableSource {
+    fn remote_table_name(&self) -> Option<MultiPartTableReference> {
+        self.remote_table_name.clone()
+    }
+
     fn federation_provider(&self) -> Arc<dyn FederationProvider> {
         Arc::clone(&self.provider) as Arc<dyn FederationProvider>
     }
