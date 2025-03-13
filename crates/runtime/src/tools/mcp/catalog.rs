@@ -72,7 +72,7 @@ impl McpToolCatalog {
             loop {
                 interval.tick().await;
 
-                let heartbeat_result = client_clone.write().await.ping().await;
+                let heartbeat_result = client_clone.read().await.ping().await;
 
                 if heartbeat_result.is_err() {
                     tracing::warn!("MCP client heartbeat failed, attempting reconnection");
@@ -125,7 +125,7 @@ impl McpToolCatalog {
     ) -> std::result::Result<RwLock<Box<dyn McpClientTrait>>, TransportError> {
         let transport = SseTransport::new(url, HashMap::new());
         let transport_handle = transport.start().await?;
-        let service = McpService::with_timeout(transport_handle, Duration::from_secs(100));
+        let service = McpService::with_timeout(transport_handle, Duration::from_secs(10));
         Ok(RwLock::new(Box::new(McpClient::new(service))))
     }
 

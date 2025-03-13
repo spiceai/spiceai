@@ -167,7 +167,8 @@ pub(crate) fn routes(
 
     if cfg!(feature = "mcp") {
         authenticated_router = authenticated_router
-            .route("/v1/mcp/sse", get(v1::mcp::sse).post(v1::mcp::event))
+            .route("/v1/mcp/sse", get(v1::mcp::sse))
+            .route("/v1/mcp/sse", post(v1::mcp::event))
             .layer(Extension(Arc::new(McpState::default())));
     }
 

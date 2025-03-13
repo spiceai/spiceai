@@ -148,8 +148,8 @@ tokio-stream = { version = "0.1.17", features = ["sync"] }
 tokio-util = { version = "0.7.11", features = ["compat"] }
 tonic = { version = "0.12", features = ["gzip", "tls"] }
 tonic-health = { version = "0.12" }
-tower = { version = "0.5.2", features = ["util"] }
-tower-http = { version = "0.6.2", features = ["cors", "map-request-body"] }
+tower = "0.5.2"
+tower-http = { version = "0.6.2", features = ["cors"] }
 tracing = "0.1.41"
 tracing-futures = { version = "0.2.5", features = ["futures-03"] }
 tracing-opentelemetry = "0.28"
