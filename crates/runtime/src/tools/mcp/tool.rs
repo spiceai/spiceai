@@ -67,7 +67,7 @@ impl SpiceModelTool for McpToolWrapper {
         let tool_use_result: Result<Value, Box<dyn std::error::Error + Send + Sync>> = async {
             let client = self.client.read().await;
 
-            let input: Value = if arg == "" {
+            let input: Value = if arg.is_empty() {
                 Value::Null
             } else {
                 serde_json::from_str(arg).boxed()?

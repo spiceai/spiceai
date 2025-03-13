@@ -69,7 +69,7 @@ pub(crate) async fn sse(
     Extension(mcp): Extension<Arc<McpState>>,
 ) -> Sse<impl Stream<Item = Result<Event, std::io::Error>>> {
     let session = session_id();
-    println!("COnnecting to SSE: {}", session.clone());
+    tracing::trace!("New MCP connection with sessionid={session}");
     let (c2s_read, c2s_write) = tokio::io::simplex(FOUR_KB);
     let (s2c_read, s2c_write) = tokio::io::simplex(FOUR_KB);
 
@@ -115,8 +115,8 @@ pub(crate) async fn event(
     body: Bytes,
 ) -> Result<StatusCode, StatusCode> {
     const BODY_BYTES_LIMIT: usize = 1 << 22;
-    println!(
-        "Received event: {session_id}. body: {}",
+    tracing::trace!(
+        "Received POST event in SSE session_id={session_id}. Event={}",
         String::from_utf8(body.to_ascii_lowercase()).unwrap_or("ERROR".to_string())
     );
     let Some(writer) = mcp.get(session_id.as_str()).await else {

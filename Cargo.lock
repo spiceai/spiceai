@@ -7124,7 +7124,7 @@ dependencies = [
 [[package]]
 name = "mcp-client"
 version = "1.0.7"
-source = "git+https://github.com/spiceai/modelcontextprotocol-rust-sdk.git?rev=9ec894963cd70a955fee1adb5a681e2373052b1b#9ec894963cd70a955fee1adb5a681e2373052b1b"
+source = "git+https://github.com/spiceai/modelcontextprotocol-rust-sdk.git?rev=a61112adf47ffbcc591bf199d30038f661f6a6bb#a61112adf47ffbcc591bf199d30038f661f6a6bb"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7147,7 +7147,7 @@ dependencies = [
 [[package]]
 name = "mcp-core"
 version = "1.0.7"
-source = "git+https://github.com/spiceai/modelcontextprotocol-rust-sdk.git?rev=9ec894963cd70a955fee1adb5a681e2373052b1b#9ec894963cd70a955fee1adb5a681e2373052b1b"
+source = "git+https://github.com/spiceai/modelcontextprotocol-rust-sdk.git?rev=a61112adf47ffbcc591bf199d30038f661f6a6bb#a61112adf47ffbcc591bf199d30038f661f6a6bb"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7163,7 +7163,7 @@ dependencies = [
 [[package]]
 name = "mcp-macros"
 version = "1.0.7"
-source = "git+https://github.com/spiceai/modelcontextprotocol-rust-sdk.git?rev=9ec894963cd70a955fee1adb5a681e2373052b1b#9ec894963cd70a955fee1adb5a681e2373052b1b"
+source = "git+https://github.com/spiceai/modelcontextprotocol-rust-sdk.git?rev=a61112adf47ffbcc591bf199d30038f661f6a6bb#a61112adf47ffbcc591bf199d30038f661f6a6bb"
 dependencies = [
  "async-trait",
  "convert_case",
@@ -7179,7 +7179,7 @@ dependencies = [
 [[package]]
 name = "mcp-server"
 version = "1.0.7"
-source = "git+https://github.com/spiceai/modelcontextprotocol-rust-sdk.git?rev=9ec894963cd70a955fee1adb5a681e2373052b1b#9ec894963cd70a955fee1adb5a681e2373052b1b"
+source = "git+https://github.com/spiceai/modelcontextprotocol-rust-sdk.git?rev=a61112adf47ffbcc591bf199d30038f661f6a6bb#a61112adf47ffbcc591bf199d30038f661f6a6bb"
 dependencies = [
  "anyhow",
  "async-trait",

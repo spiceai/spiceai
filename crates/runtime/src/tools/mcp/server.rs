@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::{tools::Tooling, Runtime};
+use crate::Runtime;
 use futures::StreamExt;
 use mcp_core::{
     handler::{PromptError, ResourceError},

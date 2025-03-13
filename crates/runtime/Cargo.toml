@@ -76,9 +76,12 @@ keyring = { version = "3.6.2", features = [
 ], optional = true }
 llms = { path = "../llms" }
 logos = "0.15.0"
-mcp-client = { git = "https://github.com/spiceai/modelcontextprotocol-rust-sdk.git", rev = "9ec894963cd70a955fee1adb5a681e2373052b1b", package = "mcp-client", optional = true }
-mcp-core = { git = "https://github.com/spiceai/modelcontextprotocol-rust-sdk.git", rev = "9ec894963cd70a955fee1adb5a681e2373052b1b", package = "mcp-core", optional = true }
-mcp-server = { git = "https://github.com/spiceai/modelcontextprotocol-rust-sdk.git", rev = "9ec894963cd70a955fee1adb5a681e2373052b1b", package = "mcp-server", optional = true }
+# mcp-client = { path = "../../../rust-sdk/crates/mcp-client", optional = true }
+# mcp-core = { path = "../../../rust-sdk/crates/mcp-core", optional = true }
+# mcp-server = { path = "../../../rust-sdk/crates/mcp-server", optional = true }
+mcp-client = { git = "https://github.com/spiceai/modelcontextprotocol-rust-sdk.git", rev = "a61112adf47ffbcc591bf199d30038f661f6a6bb", package = "mcp-client", optional = true }
+mcp-core = { git = "https://github.com/spiceai/modelcontextprotocol-rust-sdk.git", rev = "a61112adf47ffbcc591bf199d30038f661f6a6bb", package = "mcp-core", optional = true }
+mcp-server = { git = "https://github.com/spiceai/modelcontextprotocol-rust-sdk.git", rev = "a61112adf47ffbcc591bf199d30038f661f6a6bb", package = "mcp-server", optional = true }
 mediatype = "0.19.18"
 model_components = { path = "../model_components" }
 mysql_async = { workspace = true, optional = true }
