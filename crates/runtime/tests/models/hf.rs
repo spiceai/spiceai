@@ -297,7 +297,7 @@ mod search {
                         body: json!({
                             "text": "friends",
                             "datasets": ["catalog_page_with_chunking"],
-                            "additional_columns": ["cp_department", "cp_description"],
+                            "additional_columns": ["cp_catalog_page_sk", "cp_department", "cp_description"],
                             "limit": 1,
                         }),
                     },
@@ -333,7 +333,7 @@ mod search {
                         body: json!({
                             "text": "friends",
                             "datasets": ["catalog_page_with_chunking_no_pk"],
-                            "additional_columns": ["cp_department", "cp_description"],
+                            "additional_columns": ["cp_catalog_page_sk", "cp_department", "cp_description"],
                             "limit": 1,
                         }),
                     },
