@@ -17,6 +17,11 @@ on:
           - 'load'
           - 'throughput'
           - 'http-consistency'
+      update_snapshots:
+        description: 'Update snapshots?'
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   dispatch-tests:
@@ -47,7 +52,8 @@ jobs:
         run: |
           testoperator dispatch \
             ${{ github.event.inputs.test_files_path }} \
-            --workflow ${{ github.event.inputs.workflow_type }}
+            --workflow ${{ github.event.inputs.workflow_type }} \
+            --update-snapshots ${{ github.event.inputs.update_snapshots }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
