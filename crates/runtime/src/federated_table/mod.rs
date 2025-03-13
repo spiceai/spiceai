@@ -126,13 +126,6 @@ impl FederatedTable {
         }))
     }
 
-    pub fn table_provider_immediate(&self) -> Option<Arc<dyn TableProvider>> {
-        match self {
-            Self::Immediate(table_provider) => Some(Arc::clone(table_provider)),
-            Self::Deferred(_) => None,
-        }
-    }
-
     pub async fn table_provider(&self) -> Arc<dyn TableProvider> {
         let deferred_table_provider = match self {
             Self::Immediate(table_provider) => return Arc::clone(table_provider),
