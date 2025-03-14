@@ -260,7 +260,7 @@ pub type Result<T, E = DataConnectorError> = std::result::Result<T, E>;
 pub type AnyErrorResult<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 pub type DataConnectorResult<T> = std::result::Result<T, DataConnectorError>;
 
-type NewDataConnectorResult = AnyErrorResult<Arc<dyn DataConnector>>;
+pub type NewDataConnectorResult = AnyErrorResult<Arc<dyn DataConnector>>;
 
 static DATA_CONNECTOR_FACTORY_REGISTRY: LazyLock<
     Mutex<HashMap<String, Arc<dyn DataConnectorFactory>>>,

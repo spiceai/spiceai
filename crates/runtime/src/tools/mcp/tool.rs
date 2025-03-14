@@ -67,13 +67,13 @@ impl SpiceModelTool for McpToolWrapper {
         let tool_use_result: Result<Value, Box<dyn std::error::Error + Send + Sync>> = async {
             let client = self.client.read().await;
 
-            let input = serde_json::from_str(arg).map_err(|e| {
+            let value = serde_json::from_str(arg).map_err(|e| {
                 tracing::error!(target: "task_history", parent: &span, "Failed to parse input: {e}");
                 e
             })?;
 
             let response = client
-                .call_tool(self.internal_name(), input)
+                .call_tool(self.internal_name(), value)
                 .await
                 .boxed()?;
 

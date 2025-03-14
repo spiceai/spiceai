@@ -64,7 +64,7 @@ datasets:
       mode: memory
       enabled: true
       indexes:
-        (cd_demo_sk, cd_martial_status, cd_education_status): enabled
+        (cd_demo_sk, cd_marital_status, cd_education_status): enabled
   - from: file:data/date_dim.parquet
     name: date_dim
     acceleration:
