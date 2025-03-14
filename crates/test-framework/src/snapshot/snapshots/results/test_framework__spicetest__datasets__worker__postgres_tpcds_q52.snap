@@ -1,0 +1,18 @@
+---
+source: crates/test-framework/src/spicetest/datasets/worker.rs
+description: "Query: tpcds_q52"
+---
++--------+----------+----------------------+-----------+
+| d_year | brand_id | brand                | ext_price |
++--------+----------+----------------------+-----------+
+| 2000   | 3001001  | amalgexporti #1      | 40938.81  |
+| 2000   | 7012001  | amalgamalgamalg #2   | 30386.13  |
+| 2000   | 10004005 | importounivamalg #6  | 28746.03  |
+| 2000   | 10004004 | edu packunivamalg #4 | 27813.44  |
+| 2000   | 1003001  | exportiamalg #1      | 27720.52  |
+| 2000   | 5001001  | brandunivamalg #11   | 27659.03  |
+| 2000   | 1002002  | importoamalg #2      | 26553.94  |
+| 2000   | 7008004  | namelessbrand #4     | 25127.28  |
+| 2000   | 1001002  | amalgamalg #2        | 24926.29  |
+| 2000   | 2001002  | amalgimporto #2      | 23525.92  |
++--------+----------+----------------------+-----------+

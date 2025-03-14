@@ -1,0 +1,18 @@
+---
+source: crates/test-framework/src/spicetest/datasets/worker.rs
+description: "Query: tpcds_q19"
+---
++----------+----------------------+---------------+---------------+-----------+
+| brand_id | brand                | i_manufact_id | i_manufact    | ext_price |
++----------+----------------------+---------------+---------------+-----------+
+| 7009009  | maxibrand #9         | 10            | barought      | 47009.54  |
+| 10011013 | amalgamalgamalg #13  | 551           | oughtantianti | 39551.70  |
+| 7001002  | amalgbrand #2        | 122           | ableableought | 39089.83  |
+| 5003001  | exportischolar #1    | 306           | callybarpri   | 36276.67  |
+| 10013006 | exportiamalgamalg #6 | 461           | oughtcallyese | 32821.03  |
+| 7008009  | namelessbrand #9     | 540           | bareseanti    | 32229.57  |
+| 4001001  | amalgedu pack #1     | 379           | n stationpri  | 30394.64  |
+| 6011004  | amalgbrand #4        | 9             | n st          | 30039.51  |
+| 2004002  | edu packimporto #2   | 912           | ableoughtn st | 29785.11  |
+| 9013005  | exportiunivamalg #5  | 362           | ablecallypri  | 23742.97  |
++----------+----------------------+---------------+---------------+-----------+
