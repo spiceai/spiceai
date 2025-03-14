@@ -22,7 +22,7 @@ use mcp_core::{
     Content, ToolError,
 };
 use mcp_server;
-use serde_json::Value;
+use serde_json::{json, Map, Value};
 use std::{future::Future, ops::Deref, pin::Pin, sync::Arc};
 
 #[derive(Clone)]
@@ -70,7 +70,15 @@ impl mcp_server::Router for RuntimeServer {
                 .map(|t| mcp_core::tool::Tool {
                     name: t.name().to_string(),
                     description: t.description().map(|d| d.to_string()).unwrap_or_default(),
-                    input_schema: t.parameters().unwrap_or(Value::Null),
+                    // For null inputs, we default to an empty object.
+                    input_schema: t.parameters().unwrap_or(json!({
+                        "$schema": "http://json-schema.org/draft-07/schema#",
+                        "title": "empty",
+                        "type": "object",
+                        "required": [],
+                        "properties": {}
+                        }
+                    )),
                 })
                 .collect::<Vec<_>>()
                 .await;
