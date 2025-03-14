@@ -16,7 +16,7 @@ limitations under the License.
 
 use std::sync::atomic::AtomicU8;
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Protocol {
     Invalid = 0,

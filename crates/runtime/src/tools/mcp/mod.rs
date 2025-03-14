@@ -90,7 +90,7 @@ impl MCPConfig {
                     let args = ExposeSecret::expose_secret(args);
                     Self::Stdio {
                         command: command.clone(),
-                        args: Some(args.split_whitespace().map(|s| s.to_string()).collect()),
+                        args: Some(args.split_whitespace().map(ToString::to_string).collect()),
                     }
                 }
                 None => Self::Stdio {
