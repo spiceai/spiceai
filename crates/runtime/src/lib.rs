@@ -782,7 +782,7 @@ impl Runtime {
                 let Some(Tooling::Tool(tool)) = tools.get(tool_name) else {
                     return None;
                 };
-                tool
+                Arc::clone(tool)
             };
         Some(tool)
     }

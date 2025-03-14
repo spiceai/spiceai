@@ -22,7 +22,7 @@ use mcp_core::{
     Content, ToolError,
 };
 use mcp_server;
-use serde_json::{json, Map, Value};
+use serde_json::json;
 use std::{future::Future, ops::Deref, pin::Pin, sync::Arc};
 
 #[derive(Clone)]
@@ -100,7 +100,7 @@ impl mcp_server::Router for RuntimeServer {
                 .map_err(|e| ToolError::InvalidParameters(e.to_string()))?;
 
             let result = tool
-                .call(args.as_str())
+                .call(args.as_str(), Arc::clone(self))
                 .await
                 .map_err(|e| ToolError::ExecutionError(e.to_string()))?;
 
