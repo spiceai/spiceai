@@ -33,6 +33,8 @@ use spicepod::component::view::View;
 use spicepod::component::ComponentOrReference;
 use spicepod::spec::SpicepodDefinition;
 
+use futures::StreamExt;
+
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Failed to read object from object store.\n{}", source))]
@@ -78,6 +80,26 @@ enum PathReference {
     },
 }
 
+impl std::fmt::Debug for PathReference {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PathReference::Direct(path) => write!(f, "Direct({path})"),
+            PathReference::YmlOrYaml {
+                base_path,
+                base_name,
+            } => {
+                write!(f, "YmlOrYaml({base_path:?}, {base_name})")
+            }
+            PathReference::Retrieved {
+                file_path,
+                file_bytes,
+            } => {
+                write!(f, "Retrieved({file_path:?}, {} bytes)", file_bytes.len())
+            }
+        }
+    }
+}
+
 impl PathReference {
     fn try_get_path(&self) -> Result<Path> {
         match self {
@@ -98,19 +120,56 @@ impl PathReference {
     }
 }
 
+/// Checks if the given path is a folder reference.
+fn is_folder_reference(path: &PathReference) -> bool {
+    match path {
+        // A simplified approach to check if the path is a folder, but works well for our use case
+        PathReference::Direct(path) => path.extension().is_none(),
+        PathReference::YmlOrYaml { .. } | PathReference::Retrieved { .. } => false,
+    }
+}
+
 /// Creates a zip package from the given object store and path to a spicepod.yaml.
 ///
 /// It will parse the spicepod and find all of the linked files, and add them to the returned zip archive.
 pub async fn make_zip(store: &dyn ObjectStore, spicepod_path: &Path) -> Result<Bytes> {
     let mut linked_files = Vec::new();
     let (spicepod_references, spicepods) = load_spicepods(store, spicepod_path).await?;
-    let mut linked_file_paths = find_linked_files(store, &spicepods).await?;
-    linked_file_paths.extend(spicepod_references);
-    for file_path in linked_file_paths {
+    let mut linked_paths = find_linked_files(store, &spicepods).await?;
+    linked_paths.extend(spicepod_references);
+
+    tracing::debug!(
+        "[zip package] Num linked references: {}",
+        linked_paths.len()
+    );
+
+    for linked_path in linked_paths {
         // Can get in parallel
-        let file_bytes = get_file_bytes_from_reference(store, &file_path).await?;
-        linked_files.push((file_path.try_get_path()?, file_bytes));
+        tracing::debug!("[zip package] Extracting content for linked path: {linked_path:?}");
+        if is_folder_reference(&linked_path) {
+            let files = get_files_from_folder_reference(store, &linked_path).await?;
+            tracing::debug!(
+                "[zip package] Folder reference {:?} resolved in {} files",
+                &linked_path,
+                files.len()
+            );
+            linked_files.extend(files);
+        } else {
+            let file_bytes = get_file_bytes_from_reference(store, &linked_path).await?;
+            linked_files.push((linked_path.try_get_path()?, file_bytes));
+        }
     }
+
+    tracing::info!(
+        "[zip package] Resolved {} files, {} bytes total",
+        linked_files.len(),
+        linked_files
+            .iter()
+            .map(|(_, bytes)| bytes.len())
+            .sum::<usize>()
+    );
+
+    tracing::info!("[zip package] Creating zip archive...");
 
     // Add the root spicepod to the zip
     let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
@@ -318,7 +377,8 @@ fn extract_linked_files_from_view(view: &View) -> Result<Vec<PathReference>> {
 fn extract_linked_files_from_dataset(dataset: &Dataset) -> Result<Vec<PathReference>> {
     let mut linked_files = Vec::new();
     if let Some(from) = dataset.from.strip_prefix("file:") {
-        let file_path = from.strip_prefix("//").unwrap_or(from);
+        let mut file_path = from.strip_prefix("//").unwrap_or(from);
+        file_path = file_path.strip_prefix("./").unwrap_or(file_path);
         linked_files.push(PathReference::Direct(
             Path::parse(file_path).context(LinkedFileNotAValidPathSnafu)?,
         ));
@@ -359,7 +419,25 @@ async fn get_file_bytes_from_reference(
     }
 }
 
+async fn get_files_from_folder_reference(
+    store: &dyn ObjectStore,
+    reference: &PathReference,
+) -> Result<Vec<(Path, Bytes)>> {
+    let path = reference.try_get_path()?;
+    let mut files_stream = store.list(Some(&path));
+
+    let mut linked_files = Vec::new();
+
+    while let Some(item) = files_stream.next().await {
+        let file_path = item.context(FailedToReadObjectSnafu)?.location;
+        let file_bytes = get_file_bytes(store, &file_path).await?;
+        linked_files.push((file_path, file_bytes));
+    }
+    Ok(linked_files)
+}
+
 async fn get_file_bytes(store: &dyn ObjectStore, file_path: &Path) -> Result<Bytes> {
+    tracing::trace!("[zip package] Downloading file content: {file_path:?}");
     store
         .get(file_path)
         .await

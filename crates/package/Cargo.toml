@@ -10,9 +10,11 @@ version.workspace = true
 
 [dependencies]
 object_store.workspace = true
+tracing.workspace = true
 snafu.workspace = true
 serde.workspace = true
 serde_yaml.workspace = true
 spicepod = { path = "../spicepod" }
 zip = "2.2.3"
 bytes.workspace = true
+futures.workspace = true

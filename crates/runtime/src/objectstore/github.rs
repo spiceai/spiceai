@@ -17,14 +17,19 @@ limitations under the License.
 use std::fmt::Display;
 
 use async_trait::async_trait;
+use chrono::TimeZone;
 use futures::stream::BoxStream;
-use http::{HeaderMap, HeaderValue};
+use http::{
+    header::{ACCEPT, AUTHORIZATION, USER_AGENT},
+    HeaderMap, HeaderValue,
+};
 use object_store::{
     http::{HttpBuilder, HttpStore},
     path::Path,
     ClientOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
     PutMultipartOpts, PutOptions, PutPayload, PutResult,
 };
+use serde::Deserialize;
 use snafu::prelude::*;
 
 #[derive(Debug, Snafu)]
@@ -44,6 +49,10 @@ pub enum Error {
 #[derive(Debug)]
 pub struct GitHubRawObjectStore {
     http_store: HttpStore,
+    org: String,
+    repo: String,
+    rev: String,
+    token: Option<String>,
 }
 
 impl GitHubRawObjectStore {
@@ -68,7 +77,13 @@ impl GitHubRawObjectStore {
             .with_client_options(ClientOptions::default().with_default_headers(headers))
             .build()
             .context(HttpBuilderFailedSnafu)?;
-        Ok(Self { http_store })
+        Ok(Self {
+            http_store,
+            org: org.to_string(),
+            repo: repo.to_string(),
+            rev: rev.to_string(),
+            token: token.map(ToString::to_string),
+        })
     }
 }
 
@@ -111,10 +126,51 @@ impl ObjectStore for GitHubRawObjectStore {
 
     fn list(
         &self,
-        _prefix: Option<&Path>,
+        prefix: Option<&Path>,
     ) -> BoxStream<'_, Result<ObjectMeta, object_store::Error>> {
+        // Github raw content endpoint does not support listing files in a directory, so we need to use the GitHub API
+        // to get the list of files and then create the ObjectMeta objects from the response.
+
+        // ensure prefix ends with a /
+        let prefix = prefix.map(|p| {
+            if p.to_string().ends_with('/') {
+                p.to_string()
+            } else {
+                format!("{p}/")
+            }
+        });
+
         Box::pin(async_stream::stream! {
-            yield Err(object_store::Error::NotImplemented);
+            let gh_rest_api = GithubRestClient::new(self.token.as_deref());
+            let git_tree = match gh_rest_api.fetch_git_tree(&self.org, &self.repo, &self.rev).await {
+                Ok(tree) => tree,
+                Err(e) => {
+                    yield Err(object_store::Error::Generic {
+                        store: "GitHubRawObjectStore",
+                        source: Box::new(std::io::Error::new(std::io::ErrorKind::Other, format!("GitHub API error: {e}"))),
+                    });
+                    return;
+                }
+            };
+
+            // Keep only file entries within the prefix path
+            let files: Vec<GitTreeNode> = git_tree
+                .tree
+                .into_iter()
+                .filter(|node| node.node_type == "blob" && prefix.as_ref().map_or(true, |p| node.path.starts_with(&p.to_string())))
+                .collect();
+
+            for file in files {
+                let path = Path::from(file.path);
+                let metadata = ObjectMeta {
+                    location: path.clone(),
+                    last_modified: chrono::Utc.timestamp_nanos(0),
+                    size: usize::try_from(file.size.unwrap_or(0)).unwrap_or_default(),
+                    e_tag: None,
+                    version: None,
+                };
+                yield Ok(metadata);
+            }
         })
     }
 
@@ -138,9 +194,78 @@ impl ObjectStore for GitHubRawObjectStore {
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct GitTree {
+    tree: Vec<GitTreeNode>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitTreeNode {
+    path: String,
+    #[serde(rename = "type")]
+    node_type: String,
+    size: Option<i64>,
+}
+
+static SPICE_USER_AGENT: &str = "spice";
+
+pub struct GithubRestClient {
+    client: reqwest::Client,
+    token: Option<String>,
+}
+
+impl GithubRestClient {
+    #[must_use]
+    pub fn new(token: Option<&str>) -> Self {
+        Self {
+            client: reqwest::Client::new(),
+            token: token.map(ToString::to_string),
+        }
+    }
+
+    async fn fetch_git_tree(
+        &self,
+        org: &str,
+        repo: &str,
+        rev: &str,
+    ) -> Result<GitTree, Box<dyn std::error::Error + Send + Sync + 'static>> {
+        let endpoint =
+            format!("https://api.github.com/repos/{org}/{repo}/git/trees/{rev}?recursive=true");
+
+        let mut headers = HeaderMap::new();
+        headers.insert(USER_AGENT, HeaderValue::from_static(SPICE_USER_AGENT));
+        headers.insert(
+            ACCEPT,
+            HeaderValue::from_static("application/vnd.github.v3+json"),
+        );
+
+        if let Some(token) = self.token.as_ref() {
+            if let Ok(header) = HeaderValue::from_str(&format!("token {token}")) {
+                headers.insert(AUTHORIZATION, header);
+            }
+        }
+
+        tracing::debug!("fetch_git_tree: endpoint: {}", endpoint);
+
+        let response = self.client.get(&endpoint).headers(headers).send().await?;
+
+        if response.status().is_success() {
+            let git_tree = response.json::<GitTree>().await?;
+            tracing::trace!("fetch_git_tree returned {} entities", git_tree.tree.len());
+            return Ok(git_tree);
+        }
+
+        let response_status = response.status().as_u16();
+        let err_msg =
+            format!("The Github API ({endpoint}) failed with status code {response_status}",);
+        Err(err_msg.into())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::StreamExt;
 
     #[tokio::test]
     async fn test_get_opts() {
@@ -151,5 +276,12 @@ mod tests {
             .await
             .expect("failed to get README");
         println!("{result:?}");
+
+        let files: Vec<_> = store
+            .list(Some(&Path::from("docs/release_notes/rc")))
+            .collect::<Vec<_>>()
+            .await;
+        println!("{files:?}");
+        assert!(!files.is_empty());
     }
 }
