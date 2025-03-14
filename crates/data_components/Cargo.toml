@@ -54,6 +54,7 @@ imap = { workspace = true, optional = true }
 indexmap.workspace = true
 itertools.workspace = true
 mailparse = { workspace = true, optional = true }
+mail-parser = "0.10.2"
 object_store = { workspace = true }
 rdkafka = { version = "0.37.0", features = ["ssl-vendored"], optional = true }
 regex = "1.10.4"

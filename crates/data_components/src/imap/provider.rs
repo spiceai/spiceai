@@ -25,7 +25,7 @@ use datafusion::{
     logical_expr::Expr,
     physical_plan::ExecutionPlan,
 };
-use mailparse::dateparse;
+use mailparse::{dateparse};
 use snafu::prelude::*;
 
 use crate::arrow::write::MemTable;
@@ -33,6 +33,7 @@ use crate::arrow::write::MemTable;
 use super::{
     EmailMessage, Error, FailedToLogoutSnafu, FailedToParseHeaderSnafu, FetchMessagesSnafu,
     GetMailboxStatusSnafu, ImapTableProvider,
+    attachments::AttachmentRecords,
 };
 
 fn decode(value: &[u8]) -> String {
@@ -70,6 +71,9 @@ macro_rules! parse_addreses_from_envelope {
             .transpose()?
     };
 }
+
+
+
 
 #[async_trait]
 impl TableProvider for ImapTableProvider {
@@ -112,6 +116,21 @@ impl TableProvider for ImapTableProvider {
 
         if self.fetch_content {
             fields.push(Field::new("content", DataType::Utf8, true));
+
+            fields.push(
+                Field::new(
+                "attachment_name", //FIXME: what to use as field name? attachments.rs uses filename
+                DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+            true)
+            );
+
+            fields.push(
+                Field::new(
+                    "attachment_mime_type",
+                    DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+                    true)
+            );
+
         }
 
         Arc::new(Schema::new(fields))
@@ -172,6 +191,15 @@ impl TableProvider for ImapTableProvider {
                 None
             };
 
+
+            let attachment_records = body
+                .as_ref()
+                .and_then(|body| AttachmentRecords::try_from(body).ok());
+
+            let (attachment_names, attachment_mime_types) = attachment_records
+                .map_or((None, None), |records| records.into_tuple());
+
+
             messages.push(EmailMessage {
                 date,
                 subject,
@@ -183,6 +211,8 @@ impl TableProvider for ImapTableProvider {
                 message_id,
                 in_reply_to,
                 body,
+                attachment_names,
+                attachment_mime_types,
             });
         }
 
@@ -194,3 +224,5 @@ impl TableProvider for ImapTableProvider {
         table.scan(state, projection, filters, limit).await
     }
 }
+
+

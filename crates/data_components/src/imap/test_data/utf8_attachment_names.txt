@@ -1,0 +1,74 @@
+MIME-Version: 1.0
+From: sender@example.com
+To: recipient@example.com
+Subject: Edge Case MIME Email
+Content-Type: multipart/mixed; boundary="boundary42"
+
+--boundary42
+Content-Type: multipart/alternative; boundary="boundary43"
+
+--boundary43
+Content-Type: text/plain; charset="UTF-8"
+
+This is the plain text version of the email.
+
+--boundary43
+Content-Type: text/html; charset="UTF-8"
+
+<html>
+<body>
+<p>This is the <b>HTML</b> version of the email.</p>
+</body>
+</html>
+
+--boundary43--
+
+--boundary42
+Content-Type: application/pdf; name="report \"Q1 2024\" (final).pdf"
+Content-Disposition: attachment; filename="report \"Q1 2024\" (final).pdf"; filename*=UTF-8''report%20%22Q1%202024%22%20(final).pdf
+Content-Transfer-Encoding: base64
+
+JVBERi0xLjQKJ...(Base64 PDF data)...
+
+--boundary42
+Content-Type: image/png; name="data; Q1-2024.png"
+Content-Disposition: attachment; filename="data; Q1-2024.png"; filename*=UTF-8''data%3B%20Q1-2024.png
+Content-Transfer-Encoding: base64
+
+iVBORw0KGgoAAA...(Base64 PNG data)...
+
+--boundary42
+Content-Type: text/plain; name="résumé.txt"
+Content-Disposition: attachment; filename="résumé.txt"; filename*=UTF-8''r%C3%A9sum%C3%A9.txt
+Content-Transfer-Encoding: base64
+
+VGhpcyBpcyBhIHRlc3Qgbm90ZXMgZmlsZS4K
+
+
+--boundary42
+Content-Type: text/plain; name="vlfn_broken_fallback.txt"
+Content-Disposition: attachment; filename="BROKEN_PARSE_BUG";
+ filename*0*=UTF-8''CORRECT_PARSE;
+ filename*1*=_a;
+ filename*2*=_b;
+ filename*3*=_c.txt;
+Content-Transfer-Encoding: base64
+
+// This is a bug. The filename reconstructor fails.
+
+VGhpcyBpcyBhIHRlc3Qgbm90ZXMgZmlsZS4K
+
+
+--boundary42
+Content-Type: text/plain; name="vlfn_fallback.txt"
+Content-Disposition: attachment;
+ filename*0*=UTF-8''CORRECT;
+ filename*1*=_a;
+ filename*2*=_b;
+ filename*3*=_c.txt;
+Content-Transfer-Encoding: base64
+
+VGhpcyBpcyBhIHRlc3Qgbm90ZXMgZmlsZS4K
+
+
+--boundary42--

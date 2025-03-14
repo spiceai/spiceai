@@ -1,0 +1,69 @@
+MIME-Version: 1.0
+From: sender@example.com
+To: recipient@example.com
+Subject: Sample MIME Email
+Content-Type: multipart/mixed; boundary="boundary42"
+
+--boundary42
+Content-Type: multipart/alternative; boundary="boundary43"
+
+--boundary43
+Content-Type: text/plain; charset="UTF-8"
+
+This is the plain text version of the email.
+
+--boundary43
+Content-Type: text/html; charset="UTF-8"
+
+<html>
+<body>
+<p>This is the <b>HTML</b> version of the email.</p>
+</body>
+</html>
+
+--boundary43--
+
+
+
+--boundary42
+Content-Type: application/pdf; name="document.pdf"
+Content-Disposition: attachment; filename="document.pdf"
+Content-Transfer-Encoding: base64
+
+Valid headers.
+
+
+
+--boundary42
+Content-Type: application/pdf
+Content-Disposition: attachment;
+Content-Transfer-Encoding: base64
+
+No filename info.
+
+
+
+--boundary42
+Content-Disposition: attachment;
+Content-Transfer-Encoding: base64
+
+No filename. No mime type.
+
+
+
+--boundary42
+Content-Disposition: attachment; filename="no_mime_type.png"
+Content-Transfer-Encoding: base64
+
+Filename. No mime type.
+
+
+
+--boundary42
+Content-Type: text/plain; name="notes.txt"
+Content-Disposition: attachment; filename="notes.tx_t
+Content-Transfer-Encoding: base64
+
+filename specified for disposition header has no closing "
+
+--boundary42--

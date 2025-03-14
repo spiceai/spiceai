@@ -1,0 +1,26 @@
+MIME-Version: 1.0
+From: sender@example.com
+To: recipient@example.com
+Subject: Sample MIME Email
+Content-Type: multipart/mixed; boundary="boundary42"
+
+--boundary42
+Content-Type: multipart/alternative; boundary="boundary43"
+
+--boundary43
+Content-Type: text/plain; charset="UTF-8"
+
+This is the plain text version of the email.
+
+--boundary43
+Content-Type: text/html; charset="UTF-8"
+
+<html>
+<body>
+<p>This is the <b>HTML</b> version of the email.</p>
+</body>
+</html>
+
+--boundary43--
+
+--boundary42--

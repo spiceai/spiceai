@@ -1,0 +1,47 @@
+MIME-Version: 1.0
+From: sender@example.com
+To: recipient@example.com
+Subject: Sample MIME Email
+Content-Type: multipart/mixed; boundary="boundary42"
+
+--boundary42
+Content-Type: multipart/alternative; boundary="boundary43"
+
+--boundary43
+Content-Type: text/plain; charset="UTF-8"
+
+This is the plain text version of the email.
+
+--boundary43
+Content-Type: text/html; charset="UTF-8"
+
+<html>
+<body>
+<p>This is the <b>HTML</b> version of the email.</p>
+</body>
+</html>
+
+--boundary43--
+
+--boundary42
+Content-Type: application/pdf; name="document.pdf"
+Content-Disposition: attachment; filename="document.pdf"
+Content-Transfer-Encoding: base64
+
+JVBERi0xLjQKJ...(Base64 PDF data)...
+
+--boundary42
+Content-Type: image/png; name="image.png"
+Content-Disposition: attachment; filename="image.png"
+Content-Transfer-Encoding: base64
+
+iVBORw0KGgoAAA...(Base64 PNG data)...
+
+--boundary42
+Content-Type: text/plain; name="notes.txt"
+Content-Disposition: attachment; filename="notes.txt"
+Content-Transfer-Encoding: base64
+
+VGhpcyBpcyBhIHRlc3Qgbm90ZXMgZmlsZS4K
+
+--boundary42--

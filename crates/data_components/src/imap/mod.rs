@@ -29,6 +29,8 @@ use snafu::prelude::*;
 pub mod provider;
 pub mod session;
 
+mod attachments;
+
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Error fetching messages: {source}"))]
@@ -97,6 +99,8 @@ impl ImapTableProvider {
         let mut message_ids = vec![];
         let mut in_reply_tos = vec![];
         let mut bodies = vec![];
+        let mut attachment_names = vec![];
+        let mut attachment_mime_types = vec![];
 
         for message in messages {
             dates.push(message.date);
@@ -109,6 +113,8 @@ impl ImapTableProvider {
             message_ids.push(message.message_id);
             in_reply_tos.push(message.in_reply_to);
             bodies.push(message.body);
+            attachment_names.push(message.attachment_names);
+            attachment_mime_types.push(message.attachment_mime_types);
         }
 
         let mut fields: Vec<ArrayRef> = vec![
@@ -125,6 +131,12 @@ impl ImapTableProvider {
 
         if self.fetch_content {
             fields.push(Arc::new(StringArray::from(bodies)));
+
+            //FIXME: not sure if this is the correct place to add our records to the fields vec
+            //if we don't have a bodies blob we cant process it for attachments
+            fields.push(Arc::new(build_listarray_for_strings(attachment_names)));
+            fields.push(Arc::new(build_listarray_for_strings(attachment_mime_types)));
+
         }
 
         RecordBatch::try_new(self.schema(), fields)
@@ -148,4 +160,7 @@ pub(crate) struct EmailMessage {
     message_id: Option<String>,
     in_reply_to: Option<String>,
     body: Option<String>,
+    attachment_names: Option<Vec<Option<String>>>,
+    attachment_mime_types: Option<Vec<Option<String>>>,
 }
+
