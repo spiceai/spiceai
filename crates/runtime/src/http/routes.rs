@@ -38,10 +38,11 @@ use utoipa::OpenApi;
 #[cfg(feature = "dev")]
 use utoipa_swagger_ui::SwaggerUi;
 
-use super::{
-    metrics,
-    v1::{self, mcp::McpState},
-};
+use super::{metrics, v1};
+
+#[cfg(feature = "mcp")]
+use super::v1::mcp::McpState;
+
 use axum::{
     body::Body,
     extract::MatchedPath,
@@ -165,7 +166,8 @@ pub(crate) fn routes(
             .layer(Extension(Arc::clone(&rt.embeds)));
     }
 
-    if cfg!(feature = "mcp") {
+    #[cfg(feature = "mcp")]
+    {
         authenticated_router = authenticated_router
             .route("/v1/mcp/sse", get(v1::mcp::sse))
             .route("/v1/mcp/sse", post(v1::mcp::event))
