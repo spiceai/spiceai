@@ -52,10 +52,14 @@ use datafusion_federation::{
 use datafusion_federation_sql::{SQLExecutor, SQLFederationProvider, SQLTableSource};
 use futures::{Stream, TryStreamExt};
 use runtime::{
-    component::dataset::Dataset, dataconnector::{
+    component::dataset::Dataset,
+    dataconnector::{
         self, ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError,
         DataConnectorFactory, NewDataConnectorResult,
-    }, parameters::ParameterSpec, request::{AsyncMarker, Protocol, RequestContext}, status, Runtime
+    },
+    parameters::ParameterSpec,
+    request::{AsyncMarker, Protocol, RequestContext},
+    status, Runtime,
 };
 use spicepod::component::dataset::{
     acceleration::Acceleration, Dataset as SpicepodDataset, ReadyState,
@@ -103,7 +107,7 @@ fn mock_data_mem_table() -> Arc<dyn TableProvider> {
 
     let mock_table =
         Arc::new(MemTable::try_new(schema, vec![vec![data]]).expect("Failed to create mock table"));
-    mock_table as Arc<dyn TableProvider>    
+    mock_table as Arc<dyn TableProvider>
 }
 
 // Native data connector implementation
@@ -192,7 +196,8 @@ impl DataConnector for SlowFederatedDataConnector {
         }) as Arc<dyn TableProvider>;
 
         // Create the federated table provider adaptor
-        let provider = FederatedTableProviderAdaptor::new_with_provider(Arc::new(source), fallback_provider);
+        let provider =
+            FederatedTableProviderAdaptor::new_with_provider(Arc::new(source), fallback_provider);
 
         Ok(Arc::new(provider) as Arc<dyn TableProvider>)
     }
@@ -475,9 +480,10 @@ fn get_native_dataset(
 }
 
 fn get_federated_dataset(
-    name: &str, 
+    name: &str,
     ready_state: ReadyState,
-    engine: Option<String>) -> SpicepodDataset {
+    engine: Option<String>,
+) -> SpicepodDataset {
     let mut dataset = SpicepodDataset::new("slow-loading-federated://dummy", name);
     dataset.ready_state = ready_state;
     dataset.acceleration = Some(Acceleration {
@@ -659,37 +665,75 @@ async fn run_ready_state_test(
 #[tokio::test]
 async fn test_ready_state_on_registration_native_arrow_acceleration() -> Result<(), anyhow::Error> {
     // Native provider, OnRegistration, Arrow engine, should not error initially
-    run_ready_state_test(true, ReadyState::OnRegistration, None, false, "test_ready_state_on_registration_native_arrow_acceleration").await
+    run_ready_state_test(
+        true,
+        ReadyState::OnRegistration,
+        None,
+        false,
+        "test_ready_state_on_registration_native_arrow_acceleration",
+    )
+    .await
 }
 
 // Test that the runtime is ready immediately with ready_state = on_registration for native provider
 #[cfg(feature = "duckdb")]
 #[tokio::test]
-async fn test_ready_state_on_registration_native_duckdb_acceleration() -> Result<(), anyhow::Error> {
+async fn test_ready_state_on_registration_native_duckdb_acceleration() -> Result<(), anyhow::Error>
+{
     // Native provider, OnRegistration, DuckDB engine, should not error initially
-    run_ready_state_test(true, ReadyState::OnRegistration, Some("duckdb".to_string()), false, "test_ready_state_on_registration_native_duckdb_acceleration").await
+    run_ready_state_test(
+        true,
+        ReadyState::OnRegistration,
+        Some("duckdb".to_string()),
+        false,
+        "test_ready_state_on_registration_native_duckdb_acceleration",
+    )
+    .await
 }
 
 // Test that the runtime is ready immediately with ready_state = on_registration for federated provider
 #[tokio::test]
-async fn test_ready_state_on_registration_federated_arrow_acceleration() -> Result<(), anyhow::Error> {
+async fn test_ready_state_on_registration_federated_arrow_acceleration() -> Result<(), anyhow::Error>
+{
     // Federated provider, OnRegistration, Arrow engine, should not error initially
-    run_ready_state_test(false, ReadyState::OnRegistration, None, false, "test_ready_state_on_registration_federated_arrow_acceleration").await
+    run_ready_state_test(
+        false,
+        ReadyState::OnRegistration,
+        None,
+        false,
+        "test_ready_state_on_registration_federated_arrow_acceleration",
+    )
+    .await
 }
 
 // Test that the runtime is ready immediately with ready_state = on_registration for federated provider
 #[cfg(feature = "duckdb")]
 #[tokio::test]
-async fn test_ready_state_on_registration_federated_duckdb_acceleration() -> Result<(), anyhow::Error> {
+async fn test_ready_state_on_registration_federated_duckdb_acceleration(
+) -> Result<(), anyhow::Error> {
     // Federated provider, OnRegistration, DuckDB engine, should not error initially
-    run_ready_state_test(false, ReadyState::OnRegistration, Some("duckdb".to_string()), false, "test_ready_state_on_registration_federated_duckdb_acceleration").await
+    run_ready_state_test(
+        false,
+        ReadyState::OnRegistration,
+        Some("duckdb".to_string()),
+        false,
+        "test_ready_state_on_registration_federated_duckdb_acceleration",
+    )
+    .await
 }
 
 // Test that the runtime is NOT ready until data loads with ready_state = on_load for native provider
 #[tokio::test]
 async fn test_ready_state_on_load_native_arrow_acceleration() -> Result<(), anyhow::Error> {
     // Native provider, OnLoad, Arrow engine, should error initially
-    run_ready_state_test(true, ReadyState::OnLoad, None, true, "test_ready_state_on_load_native_arrow_acceleration").await
+    run_ready_state_test(
+        true,
+        ReadyState::OnLoad,
+        None,
+        true,
+        "test_ready_state_on_load_native_arrow_acceleration",
+    )
+    .await
 }
 
 // Test that the runtime is NOT ready until data loads with ready_state = on_load for native provider
@@ -697,14 +741,28 @@ async fn test_ready_state_on_load_native_arrow_acceleration() -> Result<(), anyh
 #[tokio::test]
 async fn test_ready_state_on_load_native_duckdb_acceleration() -> Result<(), anyhow::Error> {
     // Native provider, OnLoad, DuckDB engine, should error initially
-    run_ready_state_test(true, ReadyState::OnLoad, Some("duckdb".to_string()), true, "test_ready_state_on_load_native_duckdb_acceleration").await
+    run_ready_state_test(
+        true,
+        ReadyState::OnLoad,
+        Some("duckdb".to_string()),
+        true,
+        "test_ready_state_on_load_native_duckdb_acceleration",
+    )
+    .await
 }
 
 // Test that the runtime is NOT ready until data loads with ready_state = on_load for federated provider
 #[tokio::test]
 async fn test_ready_state_on_load_federated_arrow_acceleration() -> Result<(), anyhow::Error> {
     // Federated provider, OnLoad, Arrow engine, should error initially
-    run_ready_state_test(false, ReadyState::OnLoad, None, true, "test_ready_state_on_load_federated_arrow_acceleration").await
+    run_ready_state_test(
+        false,
+        ReadyState::OnLoad,
+        None,
+        true,
+        "test_ready_state_on_load_federated_arrow_acceleration",
+    )
+    .await
 }
 
 // Test that the runtime is NOT ready until data loads with ready_state = on_load for federated provider
@@ -712,7 +770,14 @@ async fn test_ready_state_on_load_federated_arrow_acceleration() -> Result<(), a
 #[tokio::test]
 async fn test_ready_state_on_load_federated_duckdb_acceleration() -> Result<(), anyhow::Error> {
     // Federated provider, OnLoad, DuckDB engine, should error initially
-    run_ready_state_test(false, ReadyState::OnLoad, Some("duckdb".to_string()), true, "test_ready_state_on_load_federated_duckdb_acceleration").await
+    run_ready_state_test(
+        false,
+        ReadyState::OnLoad,
+        Some("duckdb".to_string()),
+        true,
+        "test_ready_state_on_load_federated_duckdb_acceleration",
+    )
+    .await
 }
 
 // Test both native and federated providers together with different ready states
