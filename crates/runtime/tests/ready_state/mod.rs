@@ -836,98 +836,118 @@ async fn test_ready_state_on_registration_federated_arrow_acceleration() -> Resu
         .await
 }
 
-// // Test that the runtime is ready immediately with ready_state = on_registration for federated provider
-// #[tokio::test]
-// async fn test_ready_state_on_registration_federated_duckdb_acceleration(
-// ) -> Result<(), anyhow::Error> {
-//     let _tracing = init_tracing(Some("integration=debug,info"));
+// Test that the runtime is ready immediately with ready_state = on_registration for federated provider
+#[cfg(feature = "duckdb")]
+#[tokio::test]
+async fn test_ready_state_on_registration_federated_duckdb_acceleration() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
 
-//     // register_slow_loading_providers();
+    register_slow_loading_providers().await;
 
-//     test_request_context()
-//         .scope(async {
-//             let app = AppBuilder::new("ready_state_federated_tests")
-//                 .with_dataset(get_federated_dataset(
-//                     "federated_on_registration",
-//                     ReadyState::OnRegistration,
-//                 ))
-//                 .build();
+    let request_context = Arc::new(RequestContext::builder(Protocol::Http).build());
+    request_context
+        .scope(async {
+            let app = AppBuilder::new("ready_state_federated_tests")
+                .with_dataset(get_federated_dataset(
+                    "federated_on_registration",
+                    ReadyState::OnRegistration,
+                    Some("duckdb".to_string()),
+                ))
+                .build();
 
-//             let status = status::RuntimeStatus::new();
-//             let df = get_test_datafusion(Arc::clone(&status));
+            let status = status::RuntimeStatus::new();
+            let df = get_test_datafusion(Arc::clone(&status));
 
-//             let runtime = Runtime::builder()
-//                 .with_datafusion(df)
-//                 .with_app(app)
-//                 .build()
-//                 .await;
+            let rt = Runtime::builder()
+                .with_datafusion(df)
+                .with_app(app)
+                .build()
+                .await;
 
-//             // Start loading datasets, but don't wait for them to finish
-//             let load_task = tokio::spawn(runtime.load_components());
+            tracing::info!("Loading components");
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
+                }
+                () = rt.load_components() => {}
+            }
 
-//             // Wait for the runtime to become ready - should be quick since we use on_registration
-//             let ready_timeout = Duration::from_secs(5);
-//             let ready_status =
-//                 tokio::time::timeout(ready_timeout, runtime.status().wait_ready()).await;
-//             assert!(
-//                 ready_status.is_ok(),
-//                 "Runtime should become ready within timeout with on_registration"
-//             );
-
-//             // Now run a query before data is loaded - it should succeed by falling back to the source
-//             let query_result = runtime
-//                 .datafusion()
-//                 .query_builder("SELECT * FROM federated_on_registration")
-//                 .build()
-//                 .run()
-//                 .await
-//                 .map_err(|e| anyhow::anyhow!(e))?;
-
-//             // Convert the stream to a vector
-//             let results: Result<Vec<RecordBatch>, _> = query_result.data.collect().await;
-
-//             // Since we haven't triggered data load, this should be pending/empty
-//             assert!(
-//                 results.is_err() || results.as_ref().map(|r| r.is_empty()).unwrap_or(false),
-//                 "Query should not return results before trigger"
-//             );
-
-//             // Now trigger the data load
-//             trigger_load("federated_on_registration-signal");
-
-//             // Wait a bit for data to load
-//             tokio::time::sleep(Duration::from_millis(100)).await;
-
-//             // Query again, now we should get results
-//             let query_result = runtime
-//                 .datafusion()
-//                 .query_builder("SELECT * FROM federated_on_registration")
-//                 .build()
-//                 .run()
-//                 .await
-//                 .map_err(|e| anyhow::anyhow!(e))?;
-
-//             // Convert the stream to a vector
-//             let results: Vec<RecordBatch> = query_result
-//                 .data
-//                 .collect::<Vec<_>>()
-//                 .await
-//                 .into_iter()
-//                 .collect::<Result<Vec<_>, _>>()?;
-
-//             assert!(
-//                 !results.is_empty(),
-//                 "Query should return results after trigger"
-//             );
-//             assert_eq!(results[0].num_rows(), 5, "Should have 5 rows of data");
-
-//             // Clean up the load task
-//             let _ = load_task.await;
-
-//             Ok(())
-//         })
-//         .await
-// }
+            // Now run a query before data is loaded - it should succeed by falling back to the source
+            let query_result = rt
+                .datafusion()
+                .query_builder("SELECT * FROM federated_on_registration")
+                .build()
+                .run()
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?;
+            tracing::info!("Query complete");
+            // Convert the stream to a vector with timeout
+            let results: Result<Vec<RecordBatch>, _> = tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+                    Err(DataFusionError::Execution("Timed out waiting for query results".to_string()))
+                }
+                result = query_result.data.try_collect::<Vec<_>>() => {
+                    result
+                }
+            };
+            tracing::info!("Results collected");
+            let results = results.expect("Query should not return an error");
+            assert_eq!(results.len(), 1, "Query should return 1 record batch");
+            assert_eq!(results[0].num_rows(), 5, "Should have 5 rows of data");
+    
+            let explain_result = tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for query to complete"));
+                }
+                result = rt
+                    .datafusion()
+                    .query_builder("EXPLAIN SELECT * FROM federated_on_registration")
+                    .build()
+                    .run() => {
+                    result.map_err(|e| anyhow::anyhow!(e))?
+                }
+            };
+            let explain_result = explain_result.data.try_collect::<Vec<RecordBatch>>().await.expect("Explain should not return an error");
+            let explain_str_fallback =
+                arrow::util::pretty::pretty_format_batches(&explain_result).expect("pretty batches");
+            insta::assert_snapshot!(explain_str_fallback);
+    
+            // Wait for acceleration to load
+            tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+    
+            // Query again, now we should get the same results
+            let query_result = rt
+                .datafusion()
+                .query_builder("SELECT * FROM federated_on_registration")
+                .build()
+                .run()
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?;
+    
+            // Convert the stream to a vector
+            let results: Vec<RecordBatch> = query_result.data.try_collect::<Vec<RecordBatch>>().await.expect("Query should not return an error");
+    
+            assert_eq!(results.len(), 1, "Query should return 1 record batch");
+            assert_eq!(results[0].num_rows(), 5, "Should have 5 rows of data");
+    
+            // Now re-run the explain query
+            let explain_result = tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for query to complete"));
+                }
+                result = rt.datafusion().query_builder("EXPLAIN SELECT * FROM federated_on_registration").build().run() => {
+                    result.map_err(|e| anyhow::anyhow!(e))?
+                }
+            };
+            let explain_result = explain_result.data.try_collect::<Vec<RecordBatch>>().await.expect("Explain should not return an error");
+            let explain_str_acceleration =
+                arrow::util::pretty::pretty_format_batches(&explain_result).expect("pretty batches");
+            insta::assert_snapshot!(explain_str_acceleration);
+    
+            Ok(())
+        })
+        .await
+}
 
 // Test that the runtime is NOT ready until data loads with ready_state = on_load for native provider
 #[tokio::test]
@@ -1034,486 +1054,548 @@ async fn test_ready_state_on_load_native_arrow_acceleration() -> Result<(), anyh
         .await
 }
 
-// // Test that the runtime is NOT ready until data loads with ready_state = on_load for native provider
-// #[tokio::test]
-// async fn test_ready_state_on_load_native_duckdb_acceleration() -> Result<(), anyhow::Error> {
-//     let _tracing = init_tracing(Some("integration=debug,info"));
-
-//     // register_slow_loading_providers();
-
-//     test_request_context()
-//         .scope(async {
-//             let app = AppBuilder::new("ready_state_on_load_tests")
-//                 .with_dataset(get_native_dataset("native_on_load", ReadyState::OnLoad))
-//                 .build();
-
-//             let status = status::RuntimeStatus::new();
-//             let df = get_test_datafusion(Arc::clone(&status));
-
-//             let runtime = Runtime::builder()
-//                 .with_datafusion(df)
-//                 .with_app(app)
-//                 .build()
-//                 .await;
-
-//             // Start loading datasets, but don't wait for them to finish
-//             let load_task = tokio::spawn(runtime.load_components());
-
-//             // Wait for a short time to ensure ready_state is still pending
-//             tokio::time::sleep(Duration::from_millis(100)).await;
-
-//             // Runtime should not be ready yet
-//             assert!(
-//                 !runtime.status().is_ready(),
-//                 "Runtime should not be ready before data is loaded with on_load"
-//             );
-
-//             // Now trigger the data load
-//             trigger_load("native_on_load-signal");
-
-//             // Now the runtime should become ready
-//             let ready_timeout = Duration::from_secs(5);
-//             let ready_status =
-//                 tokio::time::timeout(ready_timeout, runtime.status().wait_ready()).await;
-//             assert!(
-//                 ready_status.is_ok(),
-//                 "Runtime should become ready after data is loaded"
-//             );
-
-//             // Query data and verify results
-//             let query_result = runtime
-//                 .datafusion()
-//                 .query_builder("SELECT * FROM native_on_load")
-//                 .build()
-//                 .run()
-//                 .await
-//                 .map_err(|e| anyhow::anyhow!(e))?;
-
-//             // Convert the stream to a vector
-//             let results: Vec<RecordBatch> = query_result
-//                 .data
-//                 .collect::<Vec<_>>()
-//                 .await
-//                 .into_iter()
-//                 .collect::<Result<Vec<_>, _>>()?;
-
-//             assert!(!results.is_empty(), "Query should return results");
-//             assert_eq!(results[0].num_rows(), 5, "Should have 5 rows of data");
-
-//             // Clean up the load task
-//             let _ = load_task.await;
-
-//             Ok(())
-//         })
-//         .await
-// }
-
-// // Test that the runtime is NOT ready until data loads with ready_state = on_load for federated provider
-// #[tokio::test]
-// async fn test_ready_state_on_load_federated_arrow_acceleration() -> Result<(), anyhow::Error> {
-//     let _tracing = init_tracing(Some("integration=debug,info"));
-
-//     // register_slow_loading_providers();
-
-//     test_request_context()
-//         .scope(async {
-//             let app = AppBuilder::new("ready_state_on_load_fed_tests")
-//                 .with_dataset(get_federated_dataset(
-//                     "federated_on_load",
-//                     ReadyState::OnLoad,
-//                 ))
-//                 .build();
-
-//             let status = status::RuntimeStatus::new();
-//             let df = get_test_datafusion(Arc::clone(&status));
-
-//             let runtime = Runtime::builder()
-//                 .with_datafusion(df)
-//                 .with_app(app)
-//                 .build()
-//                 .await;
-
-//             // Start loading datasets, but don't wait for them to finish
-//             let load_task = tokio::spawn(runtime.load_components());
-
-//             // Wait for a short time to ensure ready_state is still pending
-//             tokio::time::sleep(Duration::from_millis(100)).await;
-
-//             // Runtime should not be ready yet
-//             assert!(
-//                 !runtime.status().is_ready(),
-//                 "Runtime should not be ready before data is loaded with on_load"
-//             );
-
-//             // Now trigger the data load
-//             trigger_load("federated_on_load-signal");
-
-//             // Now the runtime should become ready
-//             let ready_timeout = Duration::from_secs(5);
-//             let ready_status =
-//                 tokio::time::timeout(ready_timeout, runtime.status().wait_ready()).await;
-//             assert!(
-//                 ready_status.is_ok(),
-//                 "Runtime should become ready after data is loaded"
-//             );
-
-//             // Query data and verify results
-//             let query_result = runtime
-//                 .datafusion()
-//                 .query_builder("SELECT * FROM federated_on_load")
-//                 .build()
-//                 .run()
-//                 .await
-//                 .map_err(|e| anyhow::anyhow!(e))?;
-
-//             // Convert the stream to a vector
-//             let results: Vec<RecordBatch> = query_result
-//                 .data
-//                 .collect::<Vec<_>>()
-//                 .await
-//                 .into_iter()
-//                 .collect::<Result<Vec<_>, _>>()?;
-
-//             assert!(!results.is_empty(), "Query should return results");
-//             assert_eq!(results[0].num_rows(), 5, "Should have 5 rows of data");
-
-//             // Clean up the load task
-//             let _ = load_task.await;
-
-//             Ok(())
-//         })
-//         .await
-// }
-
-// // Test that the runtime is NOT ready until data loads with ready_state = on_load for federated provider
-// #[tokio::test]
-// async fn test_ready_state_on_load_federated_duckdb_acceleration() -> Result<(), anyhow::Error> {
-//     let _tracing = init_tracing(Some("integration=debug,info"));
-
-//     // register_slow_loading_providers();
-
-//     test_request_context()
-//         .scope(async {
-//             let app = AppBuilder::new("ready_state_on_load_fed_tests")
-//                 .with_dataset(get_federated_dataset(
-//                     "federated_on_load",
-//                     ReadyState::OnLoad,
-//                 ))
-//                 .build();
-
-//             let status = status::RuntimeStatus::new();
-//             let df = get_test_datafusion(Arc::clone(&status));
-
-//             let runtime = Runtime::builder()
-//                 .with_datafusion(df)
-//                 .with_app(app)
-//                 .build()
-//                 .await;
-
-//             // Start loading datasets, but don't wait for them to finish
-//             let load_task = tokio::spawn(runtime.load_components());
-
-//             // Wait for a short time to ensure ready_state is still pending
-//             tokio::time::sleep(Duration::from_millis(100)).await;
-
-//             // Runtime should not be ready yet
-//             assert!(
-//                 !runtime.status().is_ready(),
-//                 "Runtime should not be ready before data is loaded with on_load"
-//             );
-
-//             // Now trigger the data load
-//             trigger_load("federated_on_load-signal");
-
-//             // Now the runtime should become ready
-//             let ready_timeout = Duration::from_secs(5);
-//             let ready_status =
-//                 tokio::time::timeout(ready_timeout, runtime.status().wait_ready()).await;
-//             assert!(
-//                 ready_status.is_ok(),
-//                 "Runtime should become ready after data is loaded"
-//             );
-
-//             // Query data and verify results
-//             let query_result = runtime
-//                 .datafusion()
-//                 .query_builder("SELECT * FROM federated_on_load")
-//                 .build()
-//                 .run()
-//                 .await
-//                 .map_err(|e| anyhow::anyhow!(e))?;
-
-//             // Convert the stream to a vector
-//             let results: Vec<RecordBatch> = query_result
-//                 .data
-//                 .collect::<Vec<_>>()
-//                 .await
-//                 .into_iter()
-//                 .collect::<Result<Vec<_>, _>>()?;
-
-//             assert!(!results.is_empty(), "Query should return results");
-//             assert_eq!(results[0].num_rows(), 5, "Should have 5 rows of data");
-
-//             // Clean up the load task
-//             let _ = load_task.await;
-
-//             Ok(())
-//         })
-//         .await
-// }
-
-// // Test both native and federated providers together with different ready states
-// #[tokio::test]
-// async fn test_ready_state_mixed_arrow_acceleration() -> Result<(), anyhow::Error> {
-//     let _tracing = init_tracing(Some("integration=debug,info"));
-
-//     // register_slow_loading_providers();
-
-//     test_request_context()
-//         .scope(async {
-//             let app = AppBuilder::new("ready_state_mixed_tests")
-//                 .with_dataset(get_native_dataset(
-//                     "native_on_registration_mixed",
-//                     ReadyState::OnRegistration,
-//                 ))
-//                 .with_dataset(get_federated_dataset(
-//                     "federated_on_load_mixed",
-//                     ReadyState::OnLoad,
-//                 ))
-//                 .build();
-
-//             let status = status::RuntimeStatus::new();
-//             let df = get_test_datafusion(Arc::clone(&status));
-
-//             let runtime = Runtime::builder()
-//                 .with_datafusion(df)
-//                 .with_app(app)
-//                 .build()
-//                 .await;
-
-//             // Start loading datasets, but don't wait for them to finish
-//             let load_task = tokio::spawn(runtime.load_components());
-
-//             // Wait for a short time to ensure ready_state is still pending
-//             tokio::time::sleep(Duration::from_millis(100)).await;
-
-//             // Runtime should not be ready yet because the federated_on_load_mixed is not ready
-//             assert!(
-//                 !runtime.status().is_ready(),
-//                 "Runtime should not be ready when any component has on_load not yet loaded"
-//             );
-
-//             // Queries to native_on_registration_mixed should pend since we haven't triggered it
-//             let query_result = runtime
-//                 .datafusion()
-//                 .query_builder("SELECT * FROM native_on_registration_mixed")
-//                 .build()
-//                 .run()
-//                 .await
-//                 .map_err(|e| anyhow::anyhow!(e))?;
-
-//             // Convert the stream to a vector
-//             let results: Result<Vec<RecordBatch>, _> = query_result.data.collect().await;
-
-//             // Since we haven't triggered data load, this should be pending/empty
-//             assert!(
-//                 results.is_err() || results.as_ref().map(|r| r.is_empty()).unwrap_or(false),
-//                 "Query should not return results before trigger"
-//             );
-
-//             // Now trigger both data loads
-//             trigger_load("native_on_registration_mixed-signal");
-//             trigger_load("federated_on_load_mixed-signal");
-
-//             // Now the runtime should become ready
-//             let ready_timeout = Duration::from_secs(5);
-//             let ready_status =
-//                 tokio::time::timeout(ready_timeout, runtime.status().wait_ready()).await;
-//             assert!(
-//                 ready_status.is_ok(),
-//                 "Runtime should become ready after all data is loaded"
-//             );
-
-//             // Wait a bit for data to stabilize
-//             tokio::time::sleep(Duration::from_millis(100)).await;
-
-//             // Query both datasets and verify results
-//             let query_result = runtime
-//                 .datafusion()
-//                 .query_builder("SELECT * FROM native_on_registration_mixed")
-//                 .build()
-//                 .run()
-//                 .await
-//                 .map_err(|e| anyhow::anyhow!(e))?;
-
-//             // Convert the stream to a vector
-//             let results: Vec<RecordBatch> = query_result
-//                 .data
-//                 .collect::<Vec<_>>()
-//                 .await
-//                 .into_iter()
-//                 .collect::<Result<Vec<_>, _>>()?;
-
-//             assert!(
-//                 !results.is_empty(),
-//                 "Query to native_on_registration_mixed should return results"
-//             );
-//             assert_eq!(results[0].num_rows(), 5, "Should have 5 rows of data");
-
-//             let query_result = runtime
-//                 .datafusion()
-//                 .query_builder("SELECT * FROM federated_on_load_mixed")
-//                 .build()
-//                 .run()
-//                 .await
-//                 .map_err(|e| anyhow::anyhow!(e))?;
-
-//             // Convert the stream to a vector
-//             let results: Vec<RecordBatch> = query_result
-//                 .data
-//                 .collect::<Vec<_>>()
-//                 .await
-//                 .into_iter()
-//                 .collect::<Result<Vec<_>, _>>()?;
-
-//             assert!(
-//                 !results.is_empty(),
-//                 "Query to federated_on_load_mixed should return results"
-//             );
-//             assert_eq!(results[0].num_rows(), 5, "Should have 5 rows of data");
-
-//             // Clean up the load task
-//             let _ = load_task.await;
-
-//             Ok(())
-//         })
-//         .await
-// }
-
-// // Test both native and federated providers together with different ready states
-// #[tokio::test]
-// async fn test_ready_state_mixed_duckdb_acceleration() -> Result<(), anyhow::Error> {
-//     let _tracing = init_tracing(Some("integration=debug,info"));
-
-//     // register_slow_loading_providers();
-
-//     test_request_context()
-//         .scope(async {
-//             let app = AppBuilder::new("ready_state_mixed_tests")
-//                 .with_dataset(get_native_dataset(
-//                     "native_on_registration_mixed",
-//                     ReadyState::OnRegistration,
-//                 ))
-//                 .with_dataset(get_federated_dataset(
-//                     "federated_on_load_mixed",
-//                     ReadyState::OnLoad,
-//                 ))
-//                 .build();
-
-//             let status = status::RuntimeStatus::new();
-//             let df = get_test_datafusion(Arc::clone(&status));
-
-//             let runtime = Runtime::builder()
-//                 .with_datafusion(df)
-//                 .with_app(app)
-//                 .build()
-//                 .await;
-
-//             // Start loading datasets, but don't wait for them to finish
-//             let load_task = tokio::spawn(runtime.load_components());
-
-//             // Wait for a short time to ensure ready_state is still pending
-//             tokio::time::sleep(Duration::from_millis(100)).await;
-
-//             // Runtime should not be ready yet because the federated_on_load_mixed is not ready
-//             assert!(
-//                 !runtime.status().is_ready(),
-//                 "Runtime should not be ready when any component has on_load not yet loaded"
-//             );
-
-//             // Queries to native_on_registration_mixed should pend since we haven't triggered it
-//             let query_result = runtime
-//                 .datafusion()
-//                 .query_builder("SELECT * FROM native_on_registration_mixed")
-//                 .build()
-//                 .run()
-//                 .await
-//                 .map_err(|e| anyhow::anyhow!(e))?;
-
-//             // Convert the stream to a vector
-//             let results: Result<Vec<RecordBatch>, _> = query_result.data.collect().await;
-
-//             // Since we haven't triggered data load, this should be pending/empty
-//             assert!(
-//                 results.is_err() || results.as_ref().map(|r| r.is_empty()).unwrap_or(false),
-//                 "Query should not return results before trigger"
-//             );
-
-//             // Now trigger both data loads
-//             trigger_load("native_on_registration_mixed-signal");
-//             trigger_load("federated_on_load_mixed-signal");
-
-//             // Now the runtime should become ready
-//             let ready_timeout = Duration::from_secs(5);
-//             let ready_status =
-//                 tokio::time::timeout(ready_timeout, runtime.status().wait_ready()).await;
-//             assert!(
-//                 ready_status.is_ok(),
-//                 "Runtime should become ready after all data is loaded"
-//             );
-
-//             // Wait a bit for data to stabilize
-//             tokio::time::sleep(Duration::from_millis(100)).await;
-
-//             // Query both datasets and verify results
-//             let query_result = runtime
-//                 .datafusion()
-//                 .query_builder("SELECT * FROM native_on_registration_mixed")
-//                 .build()
-//                 .run()
-//                 .await
-//                 .map_err(|e| anyhow::anyhow!(e))?;
-
-//             // Convert the stream to a vector
-//             let results: Vec<RecordBatch> = query_result
-//                 .data
-//                 .collect::<Vec<_>>()
-//                 .await
-//                 .into_iter()
-//                 .collect::<Result<Vec<_>, _>>()?;
-
-//             assert!(
-//                 !results.is_empty(),
-//                 "Query to native_on_registration_mixed should return results"
-//             );
-//             assert_eq!(results[0].num_rows(), 5, "Should have 5 rows of data");
-
-//             let query_result = runtime
-//                 .datafusion()
-//                 .query_builder("SELECT * FROM federated_on_load_mixed")
-//                 .build()
-//                 .run()
-//                 .await
-//                 .map_err(|e| anyhow::anyhow!(e))?;
-
-//             // Convert the stream to a vector
-//             let results: Vec<RecordBatch> = query_result
-//                 .data
-//                 .collect::<Vec<_>>()
-//                 .await
-//                 .into_iter()
-//                 .collect::<Result<Vec<_>, _>>()?;
-
-//             assert!(
-//                 !results.is_empty(),
-//                 "Query to federated_on_load_mixed should return results"
-//             );
-//             assert_eq!(results[0].num_rows(), 5, "Should have 5 rows of data");
-
-//             // Clean up the load task
-//             let _ = load_task.await;
-
-//             Ok(())
-//         })
-//         .await
-// }
+// Test that the runtime is NOT ready until data loads with ready_state = on_load for native provider
+#[cfg(feature = "duckdb")]
+#[tokio::test]
+async fn test_ready_state_on_load_native_duckdb_acceleration() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    register_slow_loading_providers().await;
+
+    let request_context = Arc::new(RequestContext::builder(Protocol::Http).build());
+    request_context
+        .scope(async {
+            let app = AppBuilder::new("ready_state_on_load_tests")
+                .with_dataset(get_native_dataset(
+                    "native_on_load",
+                    ReadyState::OnLoad,
+                    Some("duckdb".to_string()),
+                ))
+                .build();
+
+            let status = status::RuntimeStatus::new();
+            let df = get_test_datafusion(Arc::clone(&status));
+
+            let rt = Runtime::builder()
+                .with_datafusion(df)
+                .with_app(app)
+                .build()
+                .await;
+
+            tracing::info!("Loading components");
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
+                }
+                () = rt.load_components() => {}
+            }
+
+            tracing::info!("Running query");
+            // Now run a query before data is loaded - it should return an error indicating the data is still loading
+            let query_result = tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for query to complete"));
+                }
+                result = rt
+                    .datafusion()
+                    .query_builder("SELECT * FROM native_on_load")
+                    .build()
+                    .run() => {result}
+            };
+            tracing::info!("Query complete");
+            let results = query_result.expect_err("Query should return an error - the acceleration should still be loading data");
+            assert!(results.to_string().contains("Acceleration not ready; loading initial data for native_on_load"));
+    
+            let explain_result = tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for query to complete"));
+                }
+                result = rt
+                    .datafusion()
+                    .query_builder("EXPLAIN SELECT * FROM native_on_load")
+                    .build()
+                    .run() => {
+                    result.map_err(|e| anyhow::anyhow!(e))?
+                }
+            };
+            let explain_result = explain_result.data.try_collect::<Vec<RecordBatch>>().await.expect("Explain should not return an error");
+            let explain_str_fallback =
+                arrow::util::pretty::pretty_format_batches(&explain_result).expect("pretty batches");
+            insta::assert_snapshot!(explain_str_fallback);
+    
+            // Wait for acceleration to load
+            tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+    
+            // Query again, now we should get the results
+            let query_result = rt
+                .datafusion()
+                .query_builder("SELECT * FROM native_on_load")
+                .build()
+                .run()
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?;
+    
+            // Convert the stream to a vector
+            let results: Vec<RecordBatch> = query_result.data.try_collect::<Vec<RecordBatch>>().await.expect("Query should not return an error");
+    
+            assert_eq!(results.len(), 1, "Query should return 1 record batch");
+            assert_eq!(results[0].num_rows(), 5, "Should have 5 rows of data");
+    
+            // Now re-run the explain query
+            let explain_result = tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for query to complete"));
+                }
+                result = rt.datafusion().query_builder("EXPLAIN SELECT * FROM native_on_load").build().run() => {
+                    result.map_err(|e| anyhow::anyhow!(e))?
+                }
+            };
+            let explain_result = explain_result.data.try_collect::<Vec<RecordBatch>>().await.expect("Explain should not return an error");
+            let explain_str_acceleration =
+                arrow::util::pretty::pretty_format_batches(&explain_result).expect("pretty batches");
+            insta::assert_snapshot!(explain_str_acceleration);
+    
+            Ok(())
+        })
+        .await
+}
+
+// Test that the runtime is NOT ready until data loads with ready_state = on_load for federated provider
+#[tokio::test]
+async fn test_ready_state_on_load_federated_arrow_acceleration() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    register_slow_loading_providers().await;
+
+    let request_context = Arc::new(RequestContext::builder(Protocol::Http).build());
+    request_context
+        .scope(async {
+            let app = AppBuilder::new("ready_state_on_load_fed_tests")
+                .with_dataset(get_federated_dataset(
+                    "federated_on_load",
+                    ReadyState::OnLoad,
+                    None,
+                ))
+                .build();
+
+            let status = status::RuntimeStatus::new();
+            let df = get_test_datafusion(Arc::clone(&status));
+
+            let rt = Runtime::builder()
+                .with_datafusion(df)
+                .with_app(app)
+                .build()
+                .await;
+
+            tracing::info!("Loading components");
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
+                }
+                () = rt.load_components() => {}
+            }
+
+            tracing::info!("Running query");
+            // Now run a query before data is loaded - it should return an error indicating the data is still loading
+            let query_result = tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for query to complete"));
+                }
+                result = rt
+                    .datafusion()
+                    .query_builder("SELECT * FROM federated_on_load")
+                    .build()
+                    .run() => {result}
+            };
+            tracing::info!("Query complete");
+            let results = query_result.expect_err("Query should return an error - the acceleration should still be loading data");
+            assert!(results.to_string().contains("Acceleration not ready; loading initial data for federated_on_load"));
+    
+            let explain_result = tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for query to complete"));
+                }
+                result = rt
+                    .datafusion()
+                    .query_builder("EXPLAIN SELECT * FROM federated_on_load")
+                    .build()
+                    .run() => {
+                    result.map_err(|e| anyhow::anyhow!(e))?
+                }
+            };
+            let explain_result = explain_result.data.try_collect::<Vec<RecordBatch>>().await.expect("Explain should not return an error");
+            let explain_str_fallback =
+                arrow::util::pretty::pretty_format_batches(&explain_result).expect("pretty batches");
+            insta::assert_snapshot!(explain_str_fallback);
+    
+            // Wait for acceleration to load
+            tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+    
+            // Query again, now we should get the results
+            let query_result = rt
+                .datafusion()
+                .query_builder("SELECT * FROM federated_on_load")
+                .build()
+                .run()
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?;
+    
+            // Convert the stream to a vector
+            let results: Vec<RecordBatch> = query_result.data.try_collect::<Vec<RecordBatch>>().await.expect("Query should not return an error");
+    
+            assert_eq!(results.len(), 1, "Query should return 1 record batch");
+            assert_eq!(results[0].num_rows(), 5, "Should have 5 rows of data");
+    
+            // Now re-run the explain query
+            let explain_result = tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for query to complete"));
+                }
+                result = rt.datafusion().query_builder("EXPLAIN SELECT * FROM federated_on_load").build().run() => {
+                    result.map_err(|e| anyhow::anyhow!(e))?
+                }
+            };
+            let explain_result = explain_result.data.try_collect::<Vec<RecordBatch>>().await.expect("Explain should not return an error");
+            let explain_str_acceleration =
+                arrow::util::pretty::pretty_format_batches(&explain_result).expect("pretty batches");
+            insta::assert_snapshot!(explain_str_acceleration);
+    
+            Ok(())
+        })
+        .await
+}
+
+// Test that the runtime is NOT ready until data loads with ready_state = on_load for federated provider
+#[cfg(feature = "duckdb")]
+#[tokio::test]
+async fn test_ready_state_on_load_federated_duckdb_acceleration() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    register_slow_loading_providers().await;
+
+    let request_context = Arc::new(RequestContext::builder(Protocol::Http).build());
+    request_context
+        .scope(async {
+            let app = AppBuilder::new("ready_state_on_load_fed_tests")
+                .with_dataset(get_federated_dataset(
+                    "federated_on_load",
+                    ReadyState::OnLoad,
+                    Some("duckdb".to_string()),
+                ))
+                .build();
+
+            let status = status::RuntimeStatus::new();
+            let df = get_test_datafusion(Arc::clone(&status));
+
+            let rt = Runtime::builder()
+                .with_datafusion(df)
+                .with_app(app)
+                .build()
+                .await;
+
+            tracing::info!("Loading components");
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
+                }
+                () = rt.load_components() => {}
+            }
+
+            tracing::info!("Running query");
+            // Now run a query before data is loaded - it should return an error indicating the data is still loading
+            let query_result = tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for query to complete"));
+                }
+                result = rt
+                    .datafusion()
+                    .query_builder("SELECT * FROM federated_on_load")
+                    .build()
+                    .run() => {result}
+            };
+            tracing::info!("Query complete");
+            let results = query_result.expect_err("Query should return an error - the acceleration should still be loading data");
+            assert!(results.to_string().contains("Acceleration not ready; loading initial data for federated_on_load"));
+    
+            let explain_result = tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for query to complete"));
+                }
+                result = rt
+                    .datafusion()
+                    .query_builder("EXPLAIN SELECT * FROM federated_on_load")
+                    .build()
+                    .run() => {
+                    result.map_err(|e| anyhow::anyhow!(e))?
+                }
+            };
+            let explain_result = explain_result.data.try_collect::<Vec<RecordBatch>>().await.expect("Explain should not return an error");
+            let explain_str_fallback =
+                arrow::util::pretty::pretty_format_batches(&explain_result).expect("pretty batches");
+            insta::assert_snapshot!(explain_str_fallback);
+    
+            // Wait for acceleration to load
+            tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+    
+            // Query again, now we should get the results
+            let query_result = rt
+                .datafusion()
+                .query_builder("SELECT * FROM federated_on_load")
+                .build()
+                .run()
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?;
+    
+            // Convert the stream to a vector
+            let results: Vec<RecordBatch> = query_result.data.try_collect::<Vec<RecordBatch>>().await.expect("Query should not return an error");
+    
+            assert_eq!(results.len(), 1, "Query should return 1 record batch");
+            assert_eq!(results[0].num_rows(), 5, "Should have 5 rows of data");
+    
+            // Now re-run the explain query
+            let explain_result = tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for query to complete"));
+                }
+                result = rt.datafusion().query_builder("EXPLAIN SELECT * FROM federated_on_load").build().run() => {
+                    result.map_err(|e| anyhow::anyhow!(e))?
+                }
+            };
+            let explain_result = explain_result.data.try_collect::<Vec<RecordBatch>>().await.expect("Explain should not return an error");
+            let explain_str_acceleration =
+                arrow::util::pretty::pretty_format_batches(&explain_result).expect("pretty batches");
+            insta::assert_snapshot!(explain_str_acceleration);
+    
+            Ok(())
+        })
+        .await
+}
+
+// Test both native and federated providers together with different ready states
+#[tokio::test]
+async fn test_ready_state_mixed_arrow_acceleration() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    register_slow_loading_providers().await;
+
+    let request_context = Arc::new(RequestContext::builder(Protocol::Http).build());
+    request_context
+        .scope(async {
+            let app = AppBuilder::new("ready_state_mixed_tests")
+                .with_dataset(get_native_dataset(
+                    "native_on_registration_mixed",
+                    ReadyState::OnRegistration,
+                    None,
+                ))
+                .with_dataset(get_federated_dataset(
+                    "federated_on_load_mixed",
+                    ReadyState::OnLoad,
+                    None,
+                ))
+                .build();
+
+            let status = status::RuntimeStatus::new();
+            let df = get_test_datafusion(Arc::clone(&status));
+
+            let rt = Runtime::builder()
+                .with_datafusion(df)
+                .with_app(app)
+                .build()
+                .await;
+
+            tracing::info!("Loading components");
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
+                }
+                () = rt.load_components() => {}
+            }
+
+            // Queries to native_on_registration_mixed should work right away
+            let query_result = rt
+                .datafusion()
+                .query_builder("SELECT * FROM native_on_registration_mixed")
+                .build()
+                .run()
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?;
+
+            // Convert the stream to a vector with timeout
+            let results: Result<Vec<RecordBatch>, _> = tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+                    Err(DataFusionError::Execution("Timed out waiting for query results".to_string()))
+                }
+                result = query_result.data.try_collect::<Vec<_>>() => {
+                    result
+                }
+            };
+            let results = results.expect("Query to native_on_registration_mixed should not return an error");
+            assert_eq!(results.len(), 1, "Query should return 1 record batch");
+            assert_eq!(results[0].num_rows(), 5, "Should have 5 rows of data");
+
+            // But queries to federated_on_load_mixed should fail because it's not ready yet
+            let query_result = tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for query to complete"));
+                }
+                result = rt
+                    .datafusion()
+                    .query_builder("SELECT * FROM federated_on_load_mixed")
+                    .build()
+                    .run() => {result}
+            };
+            let results = query_result.expect_err("Query should return an error - the acceleration should still be loading data");
+            assert!(results.to_string().contains("Acceleration not ready; loading initial data for federated_on_load_mixed"));
+
+            // Wait for acceleration to load for the second dataset
+            tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+
+            // Now queries to federated_on_load_mixed should work
+            let query_result = rt
+                .datafusion()
+                .query_builder("SELECT * FROM federated_on_load_mixed")
+                .build()
+                .run()
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?;
+
+            // Convert the stream to a vector
+            let results: Vec<RecordBatch> = query_result.data.try_collect::<Vec<RecordBatch>>().await.expect("Query should not return an error");
+            
+            assert_eq!(results.len(), 1, "Query should return 1 record batch");
+            assert_eq!(results[0].num_rows(), 5, "Should have 5 rows of data");
+
+            // Make sure the first dataset still works
+            let query_result = rt
+                .datafusion()
+                .query_builder("SELECT * FROM native_on_registration_mixed")
+                .build()
+                .run()
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?;
+
+            // Convert the stream to a vector
+            let results: Vec<RecordBatch> = query_result.data.try_collect::<Vec<RecordBatch>>().await.expect("Query should not return an error");
+            
+            assert_eq!(results.len(), 1, "Query should return 1 record batch");
+            assert_eq!(results[0].num_rows(), 5, "Should have 5 rows of data");
+
+            Ok(())
+        })
+        .await
+}
+
+// Test both native and federated providers together with different ready states
+#[cfg(feature = "duckdb")]
+#[tokio::test]
+async fn test_ready_state_mixed_duckdb_acceleration() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    register_slow_loading_providers().await;
+
+    let request_context = Arc::new(RequestContext::builder(Protocol::Http).build());
+    request_context
+        .scope(async {
+            let app = AppBuilder::new("ready_state_mixed_tests")
+                .with_dataset(get_native_dataset(
+                    "native_on_registration_mixed",
+                    ReadyState::OnRegistration,
+                    Some("duckdb".to_string()),
+                ))
+                .with_dataset(get_federated_dataset(
+                    "federated_on_load_mixed",
+                    ReadyState::OnLoad,
+                    Some("duckdb".to_string()),
+                ))
+                .build();
+
+            let status = status::RuntimeStatus::new();
+            let df = get_test_datafusion(Arc::clone(&status));
+
+            let rt = Runtime::builder()
+                .with_datafusion(df)
+                .with_app(app)
+                .build()
+                .await;
+
+            tracing::info!("Loading components");
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
+                }
+                () = rt.load_components() => {}
+            }
+
+            // Queries to native_on_registration_mixed should work right away
+            let query_result = rt
+                .datafusion()
+                .query_builder("SELECT * FROM native_on_registration_mixed")
+                .build()
+                .run()
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?;
+
+            // Convert the stream to a vector with timeout
+            let results: Result<Vec<RecordBatch>, _> = tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+                    Err(DataFusionError::Execution("Timed out waiting for query results".to_string()))
+                }
+                result = query_result.data.try_collect::<Vec<_>>() => {
+                    result
+                }
+            };
+            let results = results.expect("Query to native_on_registration_mixed should not return an error");
+            assert_eq!(results.len(), 1, "Query should return 1 record batch");
+            assert_eq!(results[0].num_rows(), 5, "Should have 5 rows of data");
+
+            // But queries to federated_on_load_mixed should fail because it's not ready yet
+            let query_result = tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for query to complete"));
+                }
+                result = rt
+                    .datafusion()
+                    .query_builder("SELECT * FROM federated_on_load_mixed")
+                    .build()
+                    .run() => {result}
+            };
+            let results = query_result.expect_err("Query should return an error - the acceleration should still be loading data");
+            assert!(results.to_string().contains("Acceleration not ready; loading initial data for federated_on_load_mixed"));
+
+            // Wait for acceleration to load for the second dataset
+            tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+
+            // Now queries to federated_on_load_mixed should work
+            let query_result = rt
+                .datafusion()
+                .query_builder("SELECT * FROM federated_on_load_mixed")
+                .build()
+                .run()
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?;
+
+            // Convert the stream to a vector
+            let results: Vec<RecordBatch> = query_result.data.try_collect::<Vec<RecordBatch>>().await.expect("Query should not return an error");
+            
+            assert_eq!(results.len(), 1, "Query should return 1 record batch");
+            assert_eq!(results[0].num_rows(), 5, "Should have 5 rows of data");
+
+            // Make sure the first dataset still works
+            let query_result = rt
+                .datafusion()
+                .query_builder("SELECT * FROM native_on_registration_mixed")
+                .build()
+                .run()
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?;
+
+            // Convert the stream to a vector
+            let results: Vec<RecordBatch> = query_result.data.try_collect::<Vec<RecordBatch>>().await.expect("Query should not return an error");
+            
+            assert_eq!(results.len(), 1, "Query should return 1 record batch");
+            assert_eq!(results[0].num_rows(), 5, "Should have 5 rows of data");
+
+            Ok(())
+        })
+        .await
+}

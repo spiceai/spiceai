@@ -1,0 +1,10 @@
+---
+source: crates/runtime/tests/ready_state/mod.rs
+expression: explain_str_fallback
+---
++--------------+------------------------------------------------+
+| plan_type    | plan                                           |
++--------------+------------------------------------------------+
+| logical_plan | BytesProcessedNode                             |
+|              |   TableScan: federated_on_load projection=[id] |
++--------------+------------------------------------------------+
