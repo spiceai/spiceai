@@ -770,6 +770,7 @@ impl Runtime {
             }
         }
     }
+
     pub async fn get_tool(self: &Arc<Self>, tool_name: &str) -> Option<Arc<dyn SpiceModelTool>> {
         let tools = self.tools.read().await;
         let tool: Arc<dyn SpiceModelTool> =
