@@ -1,0 +1,9 @@
+---
+source: crates/test-framework/src/spicetest/datasets/worker.rs
+description: "Query: tpcds_q38"
+---
++----------+
+| count(*) |
++----------+
+| 111      |
++----------+
