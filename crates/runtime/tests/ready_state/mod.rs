@@ -561,12 +561,12 @@ async fn run_ready_state_test(
                 result
             }
         };
-        
+
         // Check if we expect an error for OnLoad strategy
         if expect_error_initially {
             let error = query_result.expect_err("Query should return an error - the acceleration should still be loading data");
             assert!(error.to_string().contains(&format!("Acceleration not ready; loading initial data for {dataset_name}")));
-            
+
             // Run EXPLAIN to see execution plan
             let explain_sql = format!("EXPLAIN {query_sql}");
             let explain_result = tokio::select! {
@@ -577,7 +577,7 @@ async fn run_ready_state_test(
                     result.map_err(|e| anyhow::anyhow!(e))?
                 }
             };
-            
+
             let explain_batches = explain_result.data.try_collect::<Vec<RecordBatch>>().await
                 .expect("Explain should not return an error");
             let explain_str = arrow::util::pretty::pretty_format_batches(&explain_batches)
@@ -586,7 +586,7 @@ async fn run_ready_state_test(
         } else {
             // For OnRegistration, we expect the query to succeed with fallback to the source
             let query_result = query_result.map_err(|e| anyhow::anyhow!(e))?;
-            
+
             // Convert the stream to a vector with timeout
             let results: Result<Vec<RecordBatch>, _> = tokio::select! {
                 () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
@@ -596,11 +596,11 @@ async fn run_ready_state_test(
                     result
                 }
             };
-            
+
             let results = results.expect("Query should not return an error");
             assert_eq!(results.len(), 1, "Query should return 1 record batch");
             assert_eq!(results[0].num_rows(), 5, "Should have 5 rows of data");
-            
+
             // Run EXPLAIN
             let explain_sql = format!("EXPLAIN {query_sql}");
             let explain_result = tokio::select! {
@@ -611,7 +611,7 @@ async fn run_ready_state_test(
                     result.map_err(|e| anyhow::anyhow!(e))?
                 }
             };
-            
+
             let explain_batches = explain_result.data.try_collect::<Vec<RecordBatch>>().await
                 .expect("Explain should not return an error");
             let explain_str = arrow::util::pretty::pretty_format_batches(&explain_batches)
@@ -650,7 +650,7 @@ async fn run_ready_state_test(
                 result.map_err(|e| anyhow::anyhow!(e))?
             }
         };
-        
+
         let explain_batches = explain_result.data.try_collect::<Vec<RecordBatch>>().await
             .expect("Explain should not return an error");
         let explain_str = arrow::util::pretty::pretty_format_batches(&explain_batches)
@@ -870,7 +870,7 @@ async fn test_ready_state_mixed_arrow_acceleration() -> Result<(), anyhow::Error
 
             // Convert the stream to a vector
             let results: Vec<RecordBatch> = query_result.data.try_collect::<Vec<RecordBatch>>().await.expect("Query should not return an error");
-            
+
             assert_eq!(results.len(), 1, "Query should return 1 record batch");
             assert_eq!(results[0].num_rows(), 5, "Should have 5 rows of data");
 
@@ -885,7 +885,7 @@ async fn test_ready_state_mixed_arrow_acceleration() -> Result<(), anyhow::Error
 
             // Convert the stream to a vector
             let results: Vec<RecordBatch> = query_result.data.try_collect::<Vec<RecordBatch>>().await.expect("Query should not return an error");
-            
+
             assert_eq!(results.len(), 1, "Query should return 1 record batch");
             assert_eq!(results[0].num_rows(), 5, "Should have 5 rows of data");
 
@@ -985,7 +985,7 @@ async fn test_ready_state_mixed_duckdb_acceleration() -> Result<(), anyhow::Erro
 
             // Convert the stream to a vector
             let results: Vec<RecordBatch> = query_result.data.try_collect::<Vec<RecordBatch>>().await.expect("Query should not return an error");
-            
+
             assert_eq!(results.len(), 1, "Query should return 1 record batch");
             assert_eq!(results[0].num_rows(), 5, "Should have 5 rows of data");
 
@@ -1000,7 +1000,7 @@ async fn test_ready_state_mixed_duckdb_acceleration() -> Result<(), anyhow::Erro
 
             // Convert the stream to a vector
             let results: Vec<RecordBatch> = query_result.data.try_collect::<Vec<RecordBatch>>().await.expect("Query should not return an error");
-            
+
             assert_eq!(results.len(), 1, "Query should return 1 record batch");
             assert_eq!(results[0].num_rows(), 5, "Should have 5 rows of data");
 
