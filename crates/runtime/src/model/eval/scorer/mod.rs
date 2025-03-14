@@ -25,6 +25,7 @@ use super::{DatasetInput, DatasetOutput};
 pub mod fuzzy_match;
 pub mod includes;
 pub mod json_match;
+pub mod levenshtein;
 pub mod match_;
 
 #[async_trait]
@@ -81,4 +82,14 @@ fn mean(values: &[f32]) -> f32 {
     }
 
     values.iter().sum::<f32>() / n as f32
+}
+
+fn extract_text(output: &DatasetOutput) -> String {
+    match output {
+        DatasetOutput::AssistantResponse(text) => text.clone(),
+        DatasetOutput::Choices(choices) => choices
+            .first()
+            .map(|choice| choice.message.content.clone().unwrap_or_default())
+            .unwrap_or_default(),
+    }
 }
