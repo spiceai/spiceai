@@ -341,23 +341,22 @@ async fn run_eval_step(
             eval_name: eval_name.to_string(),
         })?;
 
-    let choices = model
+    let resp = model
         .chat_request(req)
         .await
         .context(FailedToRunModelSnafu {
             eval_name: eval_name.to_string(),
-        })?
-        .choices;
+        })?;
 
     let output = match output_format {
         DatasetOutput::AssistantResponse(_) => DatasetOutput::AssistantResponse(
-            choices
+            resp.choices
                 .into_iter()
                 .next()
                 .and_then(|mut c| c.message.content.take())
                 .unwrap_or_default(),
         ),
-        DatasetOutput::Choices(_) => DatasetOutput::Choices(choices),
+        DatasetOutput::Choices(_) => DatasetOutput::Choices(resp.choices),
     };
     Ok(output)
 }
