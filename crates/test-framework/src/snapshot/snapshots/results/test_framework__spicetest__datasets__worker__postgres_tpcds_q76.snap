@@ -1,0 +1,18 @@
+---
+source: crates/test-framework/src/spicetest/datasets/worker.rs
+description: "Query: tpcds_q76"
+---
++---------+---------------------+--------+-------+-------------+-----------+-----------+
+| channel | col_name            | d_year | d_qoy | i_category  | sales_cnt | sales_amt |
++---------+---------------------+--------+-------+-------------+-----------+-----------+
+| catalog | cs_bill_customer_sk | 1998   | 1     | Books       | 5         | 207.84    |
+| catalog | cs_bill_customer_sk | 1998   | 1     | Children    | 3         | 5168.32   |
+| catalog | cs_bill_customer_sk | 1998   | 1     | Electronics | 7         | 673.34    |
+| catalog | cs_bill_customer_sk | 1998   | 1     | Home        | 4         | 2108.00   |
+| catalog | cs_bill_customer_sk | 1998   | 1     | Jewelry     | 2         |           |
+| catalog | cs_bill_customer_sk | 1998   | 1     | Men         | 2         | 9459.25   |
+| catalog | cs_bill_customer_sk | 1998   | 1     | Music       | 1         |           |
+| catalog | cs_bill_customer_sk | 1998   | 1     | Shoes       | 4         | 1485.80   |
+| catalog | cs_bill_customer_sk | 1998   | 1     | Sports      | 4         | 26853.68  |
+| catalog | cs_bill_customer_sk | 1998   | 1     | Women       | 3         | 7085.16   |
++---------+---------------------+--------+-------+-------------+-----------+-----------+

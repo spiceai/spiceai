@@ -70,7 +70,10 @@ impl SpiceModelTool for McpToolWrapper {
             let input: Value = if arg.is_empty() {
                 Value::Null
             } else {
-                serde_json::from_str(arg).boxed()?
+                serde_json::from_str(arg).map_err(|e| {
+                    tracing::error!(target: "task_history", parent: &span, "Failed to parse input: {e}");
+                    e
+                })?
             };
             let response = client
                 .call_tool(self.internal_name(), input)

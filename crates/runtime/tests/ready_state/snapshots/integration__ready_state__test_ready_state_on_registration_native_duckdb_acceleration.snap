@@ -1,0 +1,13 @@
+---
+source: crates/runtime/tests/ready_state/mod.rs
+expression: explain_str
+---
++---------------+------------------------------------------------------------+
+| plan_type     | plan                                                       |
++---------------+------------------------------------------------------------+
+| logical_plan  | BytesProcessedNode                                         |
+|               |   TableScan: native_on_registration_duckdb projection=[id] |
+| physical_plan | BytesProcessedExec                                         |
+|               |   MemoryExec: partitions=1, partition_sizes=[1]            |
+|               |                                                            |
++---------------+------------------------------------------------------------+

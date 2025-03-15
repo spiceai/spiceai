@@ -66,6 +66,15 @@ pub struct QueryResult {
     pub results_cache_status: QueryResultsCacheStatus,
 }
 
+impl std::fmt::Debug for QueryResult {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QueryResult")
+            .field("data", &"<stream>")
+            .field("results_cache_status", &self.results_cache_status)
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueryResultsCacheStatus {
     // The request was not eligible for caching, and thus the results cache was not checked.

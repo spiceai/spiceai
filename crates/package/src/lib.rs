@@ -24,9 +24,16 @@ use std::{collections::HashSet, io::Write};
 use bytes::Bytes;
 use object_store::{path::Path, ObjectStore};
 use snafu::prelude::*;
+use spicepod::component::catalog::Catalog;
+use spicepod::component::dataset::Dataset;
+use spicepod::component::embeddings::Embeddings;
+use spicepod::component::model::Model;
+use spicepod::component::tool::Tool;
 use spicepod::component::view::View;
 use spicepod::component::ComponentOrReference;
 use spicepod::spec::SpicepodDefinition;
+
+use futures::StreamExt;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -73,6 +80,26 @@ enum PathReference {
     },
 }
 
+impl std::fmt::Debug for PathReference {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PathReference::Direct(path) => write!(f, "Direct({path})"),
+            PathReference::YmlOrYaml {
+                base_path,
+                base_name,
+            } => {
+                write!(f, "YmlOrYaml({base_path:?}, {base_name})")
+            }
+            PathReference::Retrieved {
+                file_path,
+                file_bytes,
+            } => {
+                write!(f, "Retrieved({file_path:?}, {} bytes)", file_bytes.len())
+            }
+        }
+    }
+}
+
 impl PathReference {
     fn try_get_path(&self) -> Result<Path> {
         match self {
@@ -93,27 +120,61 @@ impl PathReference {
     }
 }
 
+/// Checks if the given path is a folder reference.
+fn is_folder_reference(path: &PathReference) -> bool {
+    match path {
+        // A simplified approach to check if the path is a folder, but works well for our use case
+        PathReference::Direct(path) => path.extension().is_none(),
+        PathReference::YmlOrYaml { .. } | PathReference::Retrieved { .. } => false,
+    }
+}
+
 /// Creates a zip package from the given object store and path to a spicepod.yaml.
 ///
 /// It will parse the spicepod and find all of the linked files, and add them to the returned zip archive.
 pub async fn make_zip(store: &dyn ObjectStore, spicepod_path: &Path) -> Result<Bytes> {
-    let (spicepod_bytes, spicepod) = get_root_spicepod(store, spicepod_path).await?;
-    let linked_file_paths = find_linked_files(store, &spicepod).await?;
     let mut linked_files = Vec::new();
-    for file_path in linked_file_paths {
+    let (spicepod_references, spicepods) = load_spicepods(store, spicepod_path).await?;
+    let mut linked_paths = find_linked_files(store, &spicepods).await?;
+    linked_paths.extend(spicepod_references);
+
+    tracing::debug!(
+        "[zip package] Num linked references: {}",
+        linked_paths.len()
+    );
+
+    for linked_path in linked_paths {
         // Can get in parallel
-        let file_bytes = get_file_bytes_from_reference(store, &file_path).await?;
-        linked_files.push((file_path.try_get_path()?, file_bytes));
+        tracing::debug!("[zip package] Extracting content for linked path: {linked_path:?}");
+        if is_folder_reference(&linked_path) {
+            let files = get_files_from_folder_reference(store, &linked_path).await?;
+            tracing::debug!(
+                "[zip package] Folder reference {:?} resolved in {} files",
+                &linked_path,
+                files.len()
+            );
+            linked_files.extend(files);
+        } else {
+            let file_bytes = get_file_bytes_from_reference(store, &linked_path).await?;
+            linked_files.push((linked_path.try_get_path()?, file_bytes));
+        }
     }
+
+    tracing::info!(
+        "[zip package] Resolved {} files, {} bytes total",
+        linked_files.len(),
+        linked_files
+            .iter()
+            .map(|(_, bytes)| bytes.len())
+            .sum::<usize>()
+    );
+
+    tracing::info!("[zip package] Creating zip archive...");
 
     // Add the root spicepod to the zip
     let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
     let options = zip::write::SimpleFileOptions::default()
         .compression_method(zip::CompressionMethod::Deflated);
-    zip.start_file("spicepod.yaml", options)
-        .context(FailedToCreateZipSnafu)?;
-    zip.write_all(&spicepod_bytes)
-        .context(FailedToWriteZipFileSnafu)?;
 
     // Add all of the linked files to the zip
     let mut directories = HashSet::new();
@@ -133,7 +194,42 @@ pub async fn make_zip(store: &dyn ObjectStore, spicepod_path: &Path) -> Result<B
     ))
 }
 
-async fn get_root_spicepod(
+async fn load_spicepods(
+    store: &dyn ObjectStore,
+    spicepod_path: &Path,
+) -> Result<(Vec<PathReference>, Vec<SpicepodDefinition>)> {
+    let mut spicepod_references = Vec::new();
+    let mut spicepods = Vec::new();
+
+    let (root_spicepod_bytes, root_spicepod) = get_spicepod(store, spicepod_path).await?;
+
+    for dependency in &root_spicepod.dependencies {
+        let dependency_pathbuf = PathBuf::from("spicepods")
+            .join(dependency)
+            .join("spicepod.yaml");
+        let dependency_path = Path::parse(dependency_pathbuf.to_string_lossy())
+            .context(LinkedFileNotAValidPathSnafu)?;
+        let (dependency_spicepod_bytes, dependency_spicepod) =
+            get_spicepod(store, &dependency_path).await?;
+        spicepod_references.push(PathReference::Retrieved {
+            file_path: dependency_pathbuf,
+            file_bytes: dependency_spicepod_bytes,
+        });
+        spicepods.push(dependency_spicepod);
+    }
+    spicepod_references.insert(
+        0,
+        PathReference::Retrieved {
+            file_path: PathBuf::from("spicepod.yaml"),
+            file_bytes: root_spicepod_bytes,
+        },
+    );
+    spicepods.insert(0, root_spicepod);
+
+    Ok((spicepod_references, spicepods))
+}
+
+async fn get_spicepod(
     store: &dyn ObjectStore,
     spicepod_path: &Path,
 ) -> Result<(Bytes, SpicepodDefinition)> {
@@ -152,96 +248,142 @@ async fn get_root_spicepod(
 /// - `dependencies` to other Spicepods
 /// - `ref` for component references
 /// - `views.sql_ref` for references to SQL files
-///
-/// This could be improved to also include references to local data files for the file data connector.
+/// - `datasets.from: file://<path>` for references to local data files
 async fn find_linked_files(
     store: &dyn ObjectStore,
-    spicepod: &SpicepodDefinition,
+    spicepods: &[SpicepodDefinition],
 ) -> Result<Vec<PathReference>> {
     let mut linked_files = Vec::new();
 
-    for dependency in &spicepod.dependencies {
-        let dependency_path = PathBuf::from("spicepods").join(dependency);
-        linked_files.push(PathReference::YmlOrYaml {
-            base_path: dependency_path,
-            base_name: "spicepod",
-        });
+    for spicepod in spicepods {
+        add_linked_components(
+            store,
+            &mut linked_files,
+            &spicepod.catalogs,
+            "catalog",
+            None::<fn(&Catalog) -> Result<Vec<PathReference>>>,
+        )
+        .await?;
+        add_linked_components(
+            store,
+            &mut linked_files,
+            &spicepod.datasets,
+            "dataset",
+            Some(extract_linked_files_from_dataset),
+        )
+        .await?;
+        add_linked_components(
+            store,
+            &mut linked_files,
+            &spicepod.views,
+            "view",
+            Some(extract_linked_files_from_view),
+        )
+        .await?;
+        add_linked_components(
+            store,
+            &mut linked_files,
+            &spicepod.models,
+            "model",
+            None::<fn(&Model) -> Result<Vec<PathReference>>>,
+        )
+        .await?;
+        add_linked_components(
+            store,
+            &mut linked_files,
+            &spicepod.embeddings,
+            "embeddings",
+            None::<fn(&Embeddings) -> Result<Vec<PathReference>>>,
+        )
+        .await?;
+        add_linked_components(
+            store,
+            &mut linked_files,
+            &spicepod.tools,
+            "tool",
+            None::<fn(&Tool) -> Result<Vec<PathReference>>>,
+        )
+        .await?;
     }
-
-    add_linked_components(&mut linked_files, &spicepod.catalogs, "catalog");
-    add_linked_components(&mut linked_files, &spicepod.datasets, "dataset");
-    add_linked_views(store, &mut linked_files, &spicepod.views).await?;
-    add_linked_components(&mut linked_files, &spicepod.models, "model");
-    add_linked_components(&mut linked_files, &spicepod.embeddings, "embeddings");
-    add_linked_components(&mut linked_files, &spicepod.tools, "tool");
 
     Ok(linked_files)
 }
 
-fn add_linked_components<ComponentType>(
+#[allow(clippy::needless_pass_by_value)]
+async fn add_linked_components<ComponentType>(
+    store: &dyn ObjectStore,
     linked_files: &mut Vec<PathReference>,
     components: &Vec<ComponentOrReference<ComponentType>>,
     component_name: &'static str,
-) {
+    extract_linked_files: Option<impl Fn(&ComponentType) -> Result<Vec<PathReference>>>,
+) -> Result<()>
+where
+    ComponentType: serde::de::DeserializeOwned,
+{
     for component in components {
+        if let ComponentOrReference::Component(component) = component {
+            if let Some(ref extract_linked_files) = extract_linked_files {
+                linked_files.extend(extract_linked_files(component)?);
+            }
+        }
+
         let ComponentOrReference::Reference(component_ref) = component else {
             continue;
         };
 
-        linked_files.push(PathReference::YmlOrYaml {
-            base_path: PathBuf::from(component_ref.r#ref.clone()),
-            base_name: component_name,
-        });
-    }
-}
+        // If we have a method to extract linked files, we need to materialize the component and call it.
+        // Otherwise, we just add the reference to the linked_files list.
+        if let Some(ref extract_linked_files) = extract_linked_files {
+            let component_bytes = get_file_bytes_from_reference(
+                store,
+                &PathReference::YmlOrYaml {
+                    base_path: PathBuf::from(component_ref.r#ref.clone()),
+                    base_name: component_name,
+                },
+            )
+            .await?;
+            let file_path =
+                PathBuf::from(component_ref.r#ref.clone()).join(format!("{component_name}.yaml"));
+            linked_files.push(PathReference::Retrieved {
+                file_path: file_path.clone(),
+                file_bytes: component_bytes.clone(),
+            });
 
-/// Views are a special case since their referenced components can also reference other SQL files.
-async fn add_linked_views(
-    store: &dyn ObjectStore,
-    linked_files: &mut Vec<PathReference>,
-    views: &Vec<ComponentOrReference<View>>,
-) -> Result<()> {
-    for view in views {
-        if let ComponentOrReference::Component(view) = &view {
-            if let Some(sql_ref) = &view.sql_ref {
-                linked_files.push(PathReference::Direct(
-                    Path::parse(sql_ref).context(LinkedFileNotAValidPathSnafu)?,
-                ));
-            }
-        }
-
-        let ComponentOrReference::Reference(component_ref) = view else {
-            continue;
-        };
-
-        // Need to download the view file to see if there are any `sql_ref`s
-        let referenced_view_bytes = get_file_bytes_from_reference(
-            store,
-            &PathReference::YmlOrYaml {
+            let component_rdr = std::io::Cursor::new(component_bytes);
+            let component: ComponentType = serde_yaml::from_reader(component_rdr)
+                .context(UnableToParseSpicepodComponentSnafu)?;
+            linked_files.extend(extract_linked_files(&component)?);
+        } else {
+            linked_files.push(PathReference::YmlOrYaml {
                 base_path: PathBuf::from(component_ref.r#ref.clone()),
-                base_name: "view",
-            },
-        )
-        .await?;
-
-        let file_path = PathBuf::from(component_ref.r#ref.clone()).join("view.yaml");
-        linked_files.push(PathReference::Retrieved {
-            file_path: file_path.clone(),
-            file_bytes: referenced_view_bytes.clone(),
-        });
-
-        let view_rdr = std::io::Cursor::new(referenced_view_bytes);
-        let view: View =
-            serde_yaml::from_reader(view_rdr).context(UnableToParseSpicepodComponentSnafu)?;
-
-        if let Some(sql_ref) = &view.sql_ref {
-            linked_files.push(PathReference::Direct(
-                Path::parse(sql_ref).context(LinkedFileNotAValidPathSnafu)?,
-            ));
+                base_name: component_name,
+            });
         }
     }
 
     Ok(())
+}
+
+fn extract_linked_files_from_view(view: &View) -> Result<Vec<PathReference>> {
+    let mut linked_files = Vec::new();
+    if let Some(sql_ref) = &view.sql_ref {
+        linked_files.push(PathReference::Direct(
+            Path::parse(sql_ref).context(LinkedFileNotAValidPathSnafu)?,
+        ));
+    }
+    Ok(linked_files)
+}
+
+fn extract_linked_files_from_dataset(dataset: &Dataset) -> Result<Vec<PathReference>> {
+    let mut linked_files = Vec::new();
+    if let Some(from) = dataset.from.strip_prefix("file:") {
+        let mut file_path = from.strip_prefix("//").unwrap_or(from);
+        file_path = file_path.strip_prefix("./").unwrap_or(file_path);
+        linked_files.push(PathReference::Direct(
+            Path::parse(file_path).context(LinkedFileNotAValidPathSnafu)?,
+        ));
+    }
+    Ok(linked_files)
 }
 
 async fn get_file_bytes_from_reference(
@@ -277,7 +419,25 @@ async fn get_file_bytes_from_reference(
     }
 }
 
+async fn get_files_from_folder_reference(
+    store: &dyn ObjectStore,
+    reference: &PathReference,
+) -> Result<Vec<(Path, Bytes)>> {
+    let path = reference.try_get_path()?;
+    let mut files_stream = store.list(Some(&path));
+
+    let mut linked_files = Vec::new();
+
+    while let Some(item) = files_stream.next().await {
+        let file_path = item.context(FailedToReadObjectSnafu)?.location;
+        let file_bytes = get_file_bytes(store, &file_path).await?;
+        linked_files.push((file_path, file_bytes));
+    }
+    Ok(linked_files)
+}
+
 async fn get_file_bytes(store: &dyn ObjectStore, file_path: &Path) -> Result<Bytes> {
+    tracing::trace!("[zip package] Downloading file content: {file_path:?}");
     store
         .get(file_path)
         .await
