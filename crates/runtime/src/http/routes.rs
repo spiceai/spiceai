@@ -117,7 +117,7 @@ pub fn get_api_doc() -> utoipa::openapi::OpenApi {
                 .tag("mcp")
                 .summary(Some("Establish an MCP SSE Connection"))
                 .description(Some(
-                    Initiates a Server-Sent Events (SSE) connection using the Model Context Protocol (MCP) to interact with Spice tools.\n\n
+                    "Initiates a Server-Sent Events (SSE) connection using the Model Context Protocol (MCP) to interact with Spice tools.\n\n
              Once connected, clients can send messages via `POST /v1/mcp/event` and receive responses through this SSE stream.",
                 ))
                 .build(),
