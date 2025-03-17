@@ -10,31 +10,37 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 
 ## v1.1 (Feb 2025)
 
-- [#3320](https://github.com/spiceai/spiceai/issues/3320) Eval datasets
-- [#3318](https://github.com/spiceai/spiceai/issues/3318) AI/LLM benchmarks in CI
-- Model Providers: HuggingFace, File (Release Candidate)
-- Spice Cloud Catalog Connector (Beta)
+- DataFusion v44
+- DuckDB v1.2.x
+- [#4910](https://github.com/spiceai/spiceai/issues/4910) Parameterized queries
+- [#3318](https://github.com/spiceai/spiceai/issues/3318) AI/LLM benchmarks in CI (FinanceBench)
+- MCP Server and Client support
 
 ## v1.2 (Mar 2025)
 
+- Model Providers: HuggingFace, File (Release Candidate)
 - Enterprise Search and Retrieval improvements
   - [#3006](https://github.com/spiceai/spiceai/issues/3006) Search with keyword filtering
-  - [#3016](https://github.com/spiceai/spiceai/issues/3016) Hybrid-Search (DB + Vector)
-  - [#3015](https://github.com/spiceai/spiceai/issues/3015) DataFusion Search
-- AWS Glue Catalog Connector (Alpha)
-- [#3018](https://github.com/spiceai/spiceai/issues/3018) Results caching for embeddings and search
+- [#3320](https://github.com/spiceai/spiceai/issues/3320) Eval datasets
 - Spice Cloud Data Connector (Stable)
+- Orchestration and workers
 
 ## v1.3 (Apr 2025)
 
-- Data Accelerators: PostgreSQL (Stable)
 - Ingestion
-  - PostgreSQL write
-  - Delta Lake write
   - Iceberg write
+- [#3018](https://github.com/spiceai/spiceai/issues/3018) Results caching for embeddings and search
+- [#3016](https://github.com/spiceai/spiceai/issues/3016) Hybrid-Search (DB + Vector)
+  - [#3015](https://github.com/spiceai/spiceai/issues/3015) DataFusion Search
+- AWS Glue Catalog Connector (Alpha)
+- Data Accelerators: PostgreSQL (Stable)
+- Spice Cloud Catalog Connector (Beta)
 
 ## v2 (H2 2025)
 
+- Ingestion
+  - PostgreSQL write
+  - Delta Lake write
 - Policy
   - Security
   - Data Access
