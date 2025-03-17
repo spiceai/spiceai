@@ -2221,7 +2221,7 @@ dependencies = [
 [[package]]
 name = "candle-core"
 version = "0.8.0"
-source = "git+https://github.com/spiceai/candle.git?rev=708efab695fd7b4aa138ff3f4c631e489e0e6865#708efab695fd7b4aa138ff3f4c631e489e0e6865"
+source = "git+https://github.com/spiceai/candle.git?rev=e9db971395936b520439083f57ef28c86a04d92a#e9db971395936b520439083f57ef28c86a04d92a"
 dependencies = [
  "byteorder",
  "candle-kernels 0.8.0",
@@ -2284,7 +2284,7 @@ dependencies = [
 [[package]]
 name = "candle-flash-attn"
 version = "0.8.0"
-source = "git+https://github.com/spiceai/candle.git?rev=708efab695fd7b4aa138ff3f4c631e489e0e6865#708efab695fd7b4aa138ff3f4c631e489e0e6865"
+source = "git+https://github.com/spiceai/candle.git?rev=e9db971395936b520439083f57ef28c86a04d92a#e9db971395936b520439083f57ef28c86a04d92a"
 dependencies = [
  "anyhow",
  "bindgen_cuda 0.1.5",
@@ -2316,7 +2316,7 @@ dependencies = [
 [[package]]
 name = "candle-kernels"
 version = "0.8.0"
-source = "git+https://github.com/spiceai/candle.git?rev=708efab695fd7b4aa138ff3f4c631e489e0e6865#708efab695fd7b4aa138ff3f4c631e489e0e6865"
+source = "git+https://github.com/spiceai/candle.git?rev=e9db971395936b520439083f57ef28c86a04d92a#e9db971395936b520439083f57ef28c86a04d92a"
 dependencies = [
  "bindgen_cuda 0.1.5",
 ]
@@ -2345,7 +2345,7 @@ dependencies = [
 [[package]]
 name = "candle-metal-kernels"
 version = "0.8.0"
-source = "git+https://github.com/spiceai/candle.git?rev=708efab695fd7b4aa138ff3f4c631e489e0e6865#708efab695fd7b4aa138ff3f4c631e489e0e6865"
+source = "git+https://github.com/spiceai/candle.git?rev=e9db971395936b520439083f57ef28c86a04d92a#e9db971395936b520439083f57ef28c86a04d92a"
 dependencies = [
  "metal 0.27.0",
  "once_cell",
@@ -2368,7 +2368,7 @@ dependencies = [
 [[package]]
 name = "candle-nn"
 version = "0.8.0"
-source = "git+https://github.com/spiceai/candle.git?rev=708efab695fd7b4aa138ff3f4c631e489e0e6865#708efab695fd7b4aa138ff3f4c631e489e0e6865"
+source = "git+https://github.com/spiceai/candle.git?rev=e9db971395936b520439083f57ef28c86a04d92a#e9db971395936b520439083f57ef28c86a04d92a"
 dependencies = [
  "candle-core 0.8.0",
  "candle-metal-kernels 0.8.0",
@@ -2791,6 +2791,15 @@ name = "constant_time_eq"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c74b8349d32d297c9134b8c88677813a227df8f779daa29bfc29c183fe3dca6"
+
+[[package]]
+name = "convert_case"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ec182b0ca2f35d8fc196cf3404988fd8b8c739a4d270ff118a398feb0cbec1ca"
+dependencies = [
+ "unicode-segmentation",
+]
 
 [[package]]
 name = "core-foundation"
@@ -3627,7 +3636,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=47b06460a6f743cf1bdf489767c4f33c4c1068d9#47b06460a6f743cf1bdf489767c4f33c4c1068d9"
+source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=584408f375fea318f22eb2dcef48956c57610b95#584408f375fea318f22eb2dcef48956c57610b95"
 dependencies = [
  "arrow",
  "arrow-json",
@@ -7231,8 +7240,8 @@ dependencies = [
 
 [[package]]
 name = "mcp-client"
-version = "0.1.0"
-source = "git+https://github.com/spiceai/goose.git?rev=5bacbba75925d76cbda53421115151d9097bed17#5bacbba75925d76cbda53421115151d9097bed17"
+version = "1.0.7"
+source = "git+https://github.com/spiceai/modelcontextprotocol-rust-sdk.git?rev=a61112adf47ffbcc591bf199d30038f661f6a6bb#a61112adf47ffbcc591bf199d30038f661f6a6bb"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7254,8 +7263,8 @@ dependencies = [
 
 [[package]]
 name = "mcp-core"
-version = "0.1.0"
-source = "git+https://github.com/spiceai/goose.git?rev=5bacbba75925d76cbda53421115151d9097bed17#5bacbba75925d76cbda53421115151d9097bed17"
+version = "1.0.7"
+source = "git+https://github.com/spiceai/modelcontextprotocol-rust-sdk.git?rev=a61112adf47ffbcc591bf199d30038f661f6a6bb#a61112adf47ffbcc591bf199d30038f661f6a6bb"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7266,6 +7275,45 @@ dependencies = [
  "serde_json",
  "thiserror 1.0.69",
  "url",
+]
+
+[[package]]
+name = "mcp-macros"
+version = "1.0.7"
+source = "git+https://github.com/spiceai/modelcontextprotocol-rust-sdk.git?rev=a61112adf47ffbcc591bf199d30038f661f6a6bb#a61112adf47ffbcc591bf199d30038f661f6a6bb"
+dependencies = [
+ "async-trait",
+ "convert_case",
+ "mcp-core",
+ "proc-macro2",
+ "quote",
+ "schemars",
+ "serde",
+ "serde_json",
+ "syn 2.0.98",
+]
+
+[[package]]
+name = "mcp-server"
+version = "1.0.7"
+source = "git+https://github.com/spiceai/modelcontextprotocol-rust-sdk.git?rev=a61112adf47ffbcc591bf199d30038f661f6a6bb#a61112adf47ffbcc591bf199d30038f661f6a6bb"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "futures",
+ "mcp-core",
+ "mcp-macros",
+ "pin-project",
+ "schemars",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tower 0.4.13",
+ "tower-service",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -7419,7 +7467,7 @@ dependencies = [
 [[package]]
 name = "mistralrs"
 version = "0.4.0"
-source = "git+https://github.com/spiceai/mistral.rs?rev=0e025c11deb7bbbbcb73371b06180d655470d033#0e025c11deb7bbbbcb73371b06180d655470d033"
+source = "git+https://github.com/spiceai/mistral.rs?rev=4dde9014e12314fc365d5d8f61c4551e72de860c#4dde9014e12314fc365d5d8f61c4551e72de860c"
 dependencies = [
  "anyhow",
  "candle-core 0.8.0",
@@ -7440,7 +7488,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-core"
 version = "0.4.0"
-source = "git+https://github.com/spiceai/mistral.rs?rev=0e025c11deb7bbbbcb73371b06180d655470d033#0e025c11deb7bbbbcb73371b06180d655470d033"
+source = "git+https://github.com/spiceai/mistral.rs?rev=4dde9014e12314fc365d5d8f61c4551e72de860c#4dde9014e12314fc365d5d8f61c4551e72de860c"
 dependencies = [
  "akin",
  "anyhow",
@@ -7516,7 +7564,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-paged-attn"
 version = "0.4.0"
-source = "git+https://github.com/spiceai/mistral.rs?rev=0e025c11deb7bbbbcb73371b06180d655470d033#0e025c11deb7bbbbcb73371b06180d655470d033"
+source = "git+https://github.com/spiceai/mistral.rs?rev=4dde9014e12314fc365d5d8f61c4551e72de860c#4dde9014e12314fc365d5d8f61c4551e72de860c"
 dependencies = [
  "anyhow",
  "bindgen_cuda 0.1.6",
@@ -7531,7 +7579,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-quant"
 version = "0.4.0"
-source = "git+https://github.com/spiceai/mistral.rs?rev=0e025c11deb7bbbbcb73371b06180d655470d033#0e025c11deb7bbbbcb73371b06180d655470d033"
+source = "git+https://github.com/spiceai/mistral.rs?rev=4dde9014e12314fc365d5d8f61c4551e72de860c#4dde9014e12314fc365d5d8f61c4551e72de860c"
 dependencies = [
  "bindgen_cuda 0.1.5",
  "byteorder",
@@ -7557,7 +7605,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-vision"
 version = "0.4.0"
-source = "git+https://github.com/spiceai/mistral.rs?rev=0e025c11deb7bbbbcb73371b06180d655470d033#0e025c11deb7bbbbcb73371b06180d655470d033"
+source = "git+https://github.com/spiceai/mistral.rs?rev=4dde9014e12314fc365d5d8f61c4551e72de860c#4dde9014e12314fc365d5d8f61c4551e72de860c"
 dependencies = [
  "candle-core 0.8.0",
  "image 0.25.5",
@@ -10451,6 +10499,7 @@ dependencies = [
  "logos",
  "mcp-client",
  "mcp-core",
+ "mcp-server",
  "mediatype",
  "model_components",
  "mysql_async",
@@ -12737,6 +12786,18 @@ dependencies = [
  "pin-project-lite",
  "tracing-attributes",
  "tracing-core",
+]
+
+[[package]]
+name = "tracing-appender"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3566e8ce28cc0a3fe42519fc80e6b4c943cc4c8cef275620eb8dac2d3d4e06cf"
+dependencies = [
+ "crossbeam-channel",
+ "thiserror 1.0.69",
+ "time",
+ "tracing-subscriber",
 ]
 
 [[package]]
