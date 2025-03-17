@@ -22,7 +22,6 @@ mod mcp {
     use crate::init_tracing_with_task_history;
     use crate::models::create_api_bindings_config;
 
-    use crate::init_tracing;
     use crate::utils::runtime_ready_check;
     use crate::Runtime;
     use app::AppBuilder;
@@ -41,12 +40,12 @@ mod mcp {
     /// Test that spiced can run a stdio MCP server.
     #[tokio::test]
     async fn test_mcp_stdio() -> Result<(), anyhow::Error> {
-        let tool_yaml = r#"
+        let tool_yaml = r"
 name: mcp_fetch
 from: mcp:docker
 params:
   mcp_args: run -i --rm mcp/fetch
-"#;
+";
         let http_base_url = start_spiced_with_tools(vec![serde_yaml::from_str(tool_yaml)
             .expect("Tool spicepod component is not in expected format")])
         .await
@@ -54,7 +53,7 @@ params:
 
         let tools_list = call_tool_list(http_base_url.as_str()).await?;
 
-        let mut mcp_fetch = tools_list
+        let mcp_fetch = tools_list
             .into_iter()
             .find(|t| t.get("name") == Some(&Value::String("mcp_fetch/fetch".to_string())))
             .expect("'mcp_fetch' tool not found");
@@ -78,7 +77,7 @@ params:
             .await
             .expect("Failed to start spiced with tools");
 
-        let mut tools_list = call_tool_list(http_client_url.as_str()).await?;
+        let tools_list = call_tool_list(http_client_url.as_str()).await?;
         assert_json_snapshot!("mcp_spiced_list", tools_list);
 
         Ok(())
@@ -98,8 +97,7 @@ params:
 
         let rt = Arc::new(Runtime::builder().with_app(app).build().await);
 
-        let (_tracing, trace_provider) =
-            init_tracing_with_task_history(Some("integration=debug,info"), &rt);
+        let _tracing = init_tracing_with_task_history(Some("integration=debug,info"), &rt);
 
         let rt_ref_copy = Arc::clone(&rt);
         tokio::spawn(async move {
@@ -131,7 +129,6 @@ params:
         if let Value::Array(mut body) = values {
             body.sort_by_key(|v| {
                 v.get("name")
-                    .clone()
                     .map(|n| n.as_str().unwrap_or_default().to_string())
             });
             Ok(body)
