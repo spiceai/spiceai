@@ -83,9 +83,9 @@ impl McpToolCatalog {
 
                 let heartbeat_result = client_clone.read().await.ping().await;
 
-                if heartbeat_result.is_err() {
+                if let Err(ref e) = heartbeat_result {
                     tracing::warn!("MCP client heartbeat failed, attempting reconnection");
-
+                    tracing::debug!("MCP client heartbeat failed with error: {e}");
                     if let Ok(new_client_rwlock) = Self::create_client(&cfg_clone).await {
                         if new_client_rwlock
                             .write()

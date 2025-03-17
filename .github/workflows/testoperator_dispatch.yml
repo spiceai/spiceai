@@ -1,6 +1,9 @@
 name: testoperator dispatch
 
 on:
+  schedule:
+    # Every 2nd day, at 9:00 AM UTC
+    - cron: '0 9 */2 * *'
   workflow_dispatch:
     inputs:
       test_files_path:
@@ -59,18 +62,26 @@ jobs:
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
           WORKFLOW_COMMIT: ${{ github.ref }}
 
-      - name: Dispatch Testoperator - Scheduled Bench
+      - name: Dispatch Testoperator - Scheduled Bench - TPCH
         if: ${{ github.event_name == 'schedule' }}
         run: |
-          testoperator dispatch ./tools/testoperator/dispatch --workflow bench
+          testoperator dispatch ./tools/testoperator/dispatch/tpch --workflow bench
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
-      
-      - name: Dispatch Testoperator - Scheduled Throughput
-        if: ${{ github.event_name == 'schedule' && github.event.schedule == '10 22 */3 * *' }}
+
+      - name: Dispatch Testoperator - Scheduled Bench - TPCDS
+        if: ${{ github.event_name == 'schedule' }}
         run: |
-          testoperator dispatch ./tools/testoperator/dispatch --workflow throughput
+          testoperator dispatch ./tools/testoperator/dispatch/tpcds --workflow bench
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
+
+      - name: Dispatch Testoperator - Scheduled Bench - ClickBench
+        if: ${{ github.event_name == 'schedule' }}
+        run: |
+          testoperator dispatch ./tools/testoperator/dispatch/clickbench --workflow bench
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}

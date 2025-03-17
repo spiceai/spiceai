@@ -23,6 +23,7 @@ use axum::{
     Extension, Json,
 };
 use futures::{stream, StreamExt};
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tools::{ListToolElement, SpiceModelTool};
 
@@ -30,6 +31,17 @@ use crate::{
     tools::{factory::default_available_catalogs, Tooling},
     Runtime,
 };
+
+use crate::Runtime;
+
+/// Summary of a tool available to run, and the schema of its input parameters.
+#[derive(Serialize, Debug, Clone, PartialEq, Eq, Hash, Default, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+struct ListToolElement {
+    name: String,
+    description: Option<String>,
+    parameters: Option<serde_json::Value>,
+}
 
 /// List Tools
 ///
@@ -88,10 +100,7 @@ pub(crate) async fn list(Extension(rt): Extension<Arc<Runtime>>) -> Response {
             }
         })
         .collect::<Vec<_>>()
-        .await
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>();
+        .await;
 
     (StatusCode::OK, Json(tools)).into_response()
 }
@@ -146,26 +155,8 @@ pub(crate) async fn post(
     Path(tool_name): Path<String>,
     body: String,
 ) -> Response {
-    let tools = &*rt.tools.read().await;
-
-    // Find tool by first checking if it is a tool catalog (i.e. has a '/'), if not find it as regular tool.
-    let tool: Arc<dyn SpiceModelTool> = if let Some((catalog_name, name)) =
-        tool_name.split_once('/')
-    {
-        let Some(Tooling::Catalog(catalog)) = tools.get(catalog_name) else {
-            return not_found(format!("Tool '{tool_name}' not found").as_str());
-        };
-        match catalog.get(name).await {
-            Some(tool) => tool,
-            None => {
-                return not_found(format!("Tool '{name}' not found in '{catalog_name}'").as_str());
-            }
-        }
-    } else {
-        let Some(Tooling::Tool(tool)) = tools.get(&tool_name) else {
-            return not_found(format!("Tool {tool_name} not found").as_str());
-        };
-        Arc::clone(tool)
+    let Some(tool) = rt.get_tool(tool_name.as_str()).await else {
+        return not_found(format!("Tool '{tool_name}' not found").as_str());
     };
 
     match tool.call(body.as_str()).await {
