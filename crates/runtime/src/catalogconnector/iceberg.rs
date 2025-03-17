@@ -102,37 +102,12 @@ pub(crate) const PARAMETERS: &[ParameterSpec] = &[
 
     // Catalog AWS Glue options
     ParameterSpec::component("sigv4_enabled")
-        .description("Enable SigV4 authentication for the catalog (for connecting to AWS Glue).")
-        .deprecated("Use iceberg_catalog_sigv4_enabled instead."),
+        .description("Enable SigV4 authentication for the catalog (for connecting to AWS Glue)."),
     ParameterSpec::component("signing_region")
-        .description("The region to use when signing the request for SigV4. Defaults to the region in the catalog URL if available.")
-        .deprecated("Use iceberg_catalog_signing_region instead."),
+        .description("The region to use when signing the request for SigV4. Defaults to the region in the catalog URL if available."),
     ParameterSpec::component("signing_name")
         .description("The name to use when signing the request for SigV4.")
-        .default("glue")
-        .deprecated("Use iceberg_catalog_signing_name instead."),
-    ParameterSpec::component("catalog_sigv4_enabled")
-        .description("Enable SigV4 authentication for the catalog (for connecting to AWS Glue)."),
-    ParameterSpec::component("catalog_signing_region")
-        .description("The region to use when signing the request for SigV4. Defaults to the region in the catalog URL if available."),
-    ParameterSpec::component("catalog_signing_name")
-        .description("The name to use when signing the request for SigV4.")
         .default("glue"),
-    ParameterSpec::component("catalog_access_key_id")
-        .description("The AWS access key ID to use for the catalog.")
-        .secret(),
-    ParameterSpec::component("catalog_secret_access_key")
-        .description("The AWS secret access key to use for the catalog.")
-        .secret(),
-    ParameterSpec::component("catalog_session_token")
-        .description("The session token to use for the catalog.")
-        .secret(),
-    ParameterSpec::component("catalog_role_arn")
-        .description("The Amazon Resource Name (ARN) of the role to assume. If provided instead of catalog_access_key_id and catalog_secret_access_key, temporary credentials will be fetched by assuming this role")
-        .secret(),
-    ParameterSpec::component("catalog_role_session_name")
-        .description("An optional identifier for the assumed role session for auditing purposes.")
-        .secret(),
 
     // S3 storage options
     ParameterSpec::component("s3_endpoint")
@@ -163,27 +138,37 @@ pub(crate) const PARAMETERS: &[ParameterSpec] = &[
 ];
 
 /// Maps a Spice parameter name to an Iceberg property name.
-pub(crate) fn map_param_name_to_iceberg_prop(param_name: &str) -> Option<String> {
+pub(crate) fn map_param_name_to_iceberg_prop(param_name: &str) -> Option<Vec<String>> {
     match param_name {
-        "token" => Some("token".to_string()),
-        "oauth2_credential" => Some("credential".to_string()),
-        "oauth2_server_url" => Some("oauth2-server-uri".to_string()),
-        "oauth2_scope" => Some("scope".to_string()),
-        "s3_endpoint" => Some("s3.endpoint".to_string()),
-        "s3_access_key_id" => Some("s3.access-key-id".to_string()),
-        "s3_secret_access_key" => Some("s3.secret-access-key".to_string()),
-        "s3_session_token" => Some("s3.session-token".to_string()),
-        "s3_region" => Some("s3.region".to_string()),
-        "s3_role_session_name" => Some("client.assume-role.session-name".to_string()),
-        "s3_role_arn" => Some("client.assume-role.arn".to_string()),
-        "sigv4_enabled" | "catalog_sigv4_enabled" => Some("rest.sigv4-enabled".to_string()),
-        "signing_region" | "catalog_signing_region" => Some("rest.signing-region".to_string()),
-        "signing_name" | "catalog_signing_name" => Some("rest.signing-name".to_string()),
-        "catalog_access_key_id" => Some("rest.access-key-id".to_string()),
-        "catalog_secret_access_key" => Some("rest.secret-access-key".to_string()),
-        "catalog_session_token" => Some("rest.session-token".to_string()),
-        "catalog_role_session_name" => Some("rest.assume-role.session-name".to_string()),
-        "catalog_role_arn" => Some("rest.assume-role.arn".to_string()),
+        "token" => Some(vec!["token".to_string()]),
+        "oauth2_credential" => Some(vec!["credential".to_string()]),
+        "oauth2_server_url" => Some(vec!["oauth2-server-uri".to_string()]),
+        "oauth2_scope" => Some(vec!["scope".to_string()]),
+        "s3_endpoint" => Some(vec!["s3.endpoint".to_string()]),
+        "s3_access_key_id" => Some(vec![
+            "s3.access-key-id".to_string(),
+            "rest.access-key-id".to_string(),
+        ]),
+        "s3_secret_access_key" => Some(vec![
+            "s3.secret-access-key".to_string(),
+            "rest.secret-access-key".to_string(),
+        ]),
+        "s3_session_token" => Some(vec![
+            "s3.session-token".to_string(),
+            "rest.session-token".to_string(),
+        ]),
+        "s3_region" => Some(vec!["s3.region".to_string()]),
+        "s3_role_session_name" => Some(vec![
+            "client.assume-role.session-name".to_string(),
+            "rest.client.assume-role.session-name".to_string(),
+        ]),
+        "s3_role_arn" => Some(vec![
+            "client.assume-role.arn".to_string(),
+            "rest.client.assume-role.arn".to_string(),
+        ]),
+        "sigv4_enabled" => Some(vec!["rest.sigv4-enabled".to_string()]),
+        "signing_region" => Some(vec!["rest.signing-region".to_string()]),
+        "signing_name" => Some(vec!["rest.signing-name".to_string()]),
         _ => None,
     }
 }
@@ -222,8 +207,10 @@ impl CatalogConnector for IcebergCatalog {
         };
 
         for (key, value) in &self.params {
-            if let Some(prop) = map_param_name_to_iceberg_prop(key.as_str()) {
-                props.insert(prop, value.expose_secret().to_string());
+            if let Some(prop_vec) = map_param_name_to_iceberg_prop(key.as_str()) {
+                for prop in prop_vec {
+                    props.insert(prop.clone(), value.expose_secret().to_string());
+                }
             }
         }
 

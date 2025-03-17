@@ -118,8 +118,10 @@ impl DataConnector for IcebergDataConnector {
         };
 
         for (key, value) in &self.params {
-            if let Some(prop) = map_param_name_to_iceberg_prop(key.as_str()) {
-                props.insert(prop, value.expose_secret().to_string());
+            if let Some(prop_vec) = map_param_name_to_iceberg_prop(key.as_str()) {
+                for prop in prop_vec {
+                    props.insert(prop.clone(), value.expose_secret().to_string());
+                }
             }
         }
 

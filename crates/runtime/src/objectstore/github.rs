@@ -157,7 +157,7 @@ impl ObjectStore for GitHubRawObjectStore {
             let files: Vec<GitTreeNode> = git_tree
                 .tree
                 .into_iter()
-                .filter(|node| node.node_type == "blob" && prefix.as_ref().map_or(true, |p| node.path.starts_with(&p.to_string())))
+                .filter(|node| node.node_type == "blob" && prefix.as_ref().is_none_or(|p| node.path.starts_with(&p.to_string())))
                 .collect();
 
             for file in files {
