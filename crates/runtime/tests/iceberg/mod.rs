@@ -14,13 +14,22 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::{get_test_datafusion, init_tracing, utils::test_request_context};
+use crate::{
+    get_test_datafusion, init_tracing,
+    utils::{runtime_ready_check, test_request_context},
+};
 use anyhow::Context;
 use app::AppBuilder;
 use arrow::array::RecordBatch;
 use futures::StreamExt;
 use runtime::{status, Runtime};
-use spicepod::component::{dataset::Dataset, params::Params as DatasetParams};
+use spicepod::component::{
+    dataset::{
+        acceleration::{Acceleration, Mode},
+        Dataset,
+    },
+    params::Params as DatasetParams,
+};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -30,59 +39,109 @@ async fn iceberg_integration_test_dataset() -> Result<(), anyhow::Error> {
         rustls::crypto::aws_lc_rs::default_provider(),
     );
     let _tracing = init_tracing(None);
+    test_request_context()
+        .scope(async {
+            let dataset = make_iceberg_dataset("tpch_sf1", "customer", "customer")?;
 
+            let _ = run_iceberg_test(
+                "iceberg_dataset_test",
+                dataset,
+                "SELECT * FROM customer LIMIT 10",
+                "iceberg_integration_test_dataset",
+            )
+            .await?;
+
+            Ok(())
+        })
+        .await
+}
+
+#[tokio::test]
+async fn iceberg_integration_test_duckdb_acceleration() -> Result<(), anyhow::Error> {
+    let _ = rustls::crypto::CryptoProvider::install_default(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    );
+    let _tracing = init_tracing(None);
+    test_request_context()
+        .scope(async {
+            let mut dataset = make_iceberg_dataset("tpch_sf1", "customer", "customer")?;
+            dataset.acceleration = Some(Acceleration {
+                enabled: true,
+                engine: Some("duckdb".to_string()),
+                mode: Mode::File,
+                ..Default::default()
+            });
+
+            let _ = run_iceberg_test(
+                "iceberg_dataset_test",
+                dataset,
+                "SELECT * FROM customer LIMIT 10",
+                "iceberg_integration_test_duckdb_acceleration",
+            )
+            .await?;
+
+            Ok(())
+        })
+        .await
+}
+
+async fn run_iceberg_test(
+    app_name: &str,
+    dataset: Dataset,
+    query: &str,
+    snapshot_name: &str,
+) -> Result<Runtime, anyhow::Error> {
+    let app = AppBuilder::new(app_name).with_dataset(dataset).build();
+
+    let status = status::RuntimeStatus::new();
+    let df = get_test_datafusion(Arc::clone(&status));
+
+    let rt = Runtime::builder()
+        .with_app(app)
+        .with_datafusion(df)
+        .with_runtime_status(status)
+        .build()
+        .await;
+
+    tokio::select! {
+        () = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+            panic!("Timeout waiting for components to load");
+        }
+        () = rt.load_components() => {}
+    }
+
+    runtime_ready_check(&rt).await;
+
+    let mut result = rt.datafusion().query_builder(query).build().run().await?;
+
+    let mut results: Vec<RecordBatch> = vec![];
+    while let Some(batch) = result.data.next().await {
+        results.push(batch?);
+    }
+
+    let pretty = arrow::util::pretty::pretty_format_batches(&results)
+        .map_err(|e| anyhow::Error::msg(e.to_string()))?;
+
+    insta::assert_snapshot!(snapshot_name, pretty);
+    Ok(rt)
+}
+
+fn make_iceberg_dataset(
+    namespace: &str,
+    table: &str,
+    name: &str,
+) -> Result<Dataset, anyhow::Error> {
     let account_id =
         std::env::var("AWS_ICEBERG_ACCOUNT_ID").context("AWS_ICEBERG_ACCOUNT_ID is not set")?;
     let region = std::env::var("AWS_ICEBERG_REGION").context("AWS_ICEBERG_REGION is not set")?;
     let _ = std::env::var("AWS_ACCESS_KEY_ID").context("AWS_ACCESS_KEY_ID is not set")?;
     let _ = std::env::var("AWS_SECRET_ACCESS_KEY").context("AWS_SECRET_ACCESS_KEY is not set")?;
 
-    let from = format!("iceberg:https://glue.ap-northeast-2.amazonaws.com/iceberg/v1/catalogs/{account_id}/namespaces/tpch_sf1/tables/customer");
-    let mut dataset = Dataset::new(from, "customer");
+    let from = format!("iceberg:https://glue.ap-northeast-2.amazonaws.com/iceberg/v1/catalogs/{account_id}/namespaces/{namespace}/tables/{table}");
+    let mut dataset = Dataset::new(from, name);
     dataset.params = Some(DatasetParams::from_string_map(HashMap::from([(
         "iceberg_s3_region".to_string(),
         region,
     )])));
-
-    test_request_context()
-        .scope(async {
-            let app = AppBuilder::new("iceberg_dataset_test")
-                .with_dataset(dataset)
-                .build();
-
-            let status = status::RuntimeStatus::new();
-            let df = get_test_datafusion(Arc::clone(&status));
-
-            let rt = Runtime::builder()
-                .with_app(app)
-                .with_datafusion(df)
-                .with_runtime_status(status)
-                .build()
-                .await;
-
-            tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
-                    panic!("Timeout waiting for components to load");
-                }
-                () = rt.load_components() => {}
-            }
-
-            let mut result = rt
-                .datafusion()
-                .query_builder("SELECT * FROM customer LIMIT 10")
-                .build()
-                .run()
-                .await?;
-
-            let mut results: Vec<RecordBatch> = vec![];
-            while let Some(batch) = result.data.next().await {
-                results.push(batch?);
-            }
-
-            assert_eq!(results.len(), 1);
-            assert_eq!(results[0].num_rows(), 10);
-
-            Ok(())
-        })
-        .await
+    Ok(dataset)
 }
