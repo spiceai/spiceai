@@ -1,4 +1,4 @@
-name: benchmark e2e tests
+name: benchmark e2e tests - ${{ github.event.inputs.spicepod_path | split("/") | last | split(".")[0] }}
 
 on:
   workflow_dispatch:

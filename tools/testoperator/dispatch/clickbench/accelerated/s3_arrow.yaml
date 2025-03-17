@@ -3,3 +3,4 @@ tests:
     spicepod_path: ./test/spicepods/clickbench/accelerated/s3_arrow.yaml
     query_set: clickbench
     runner_type: spiceai-large-runners
+    ready_wait: 1800
