@@ -31,6 +31,7 @@ use opentelemetry::KeyValue;
 use spicepod::component::runtime::CorsConfig;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use utoipa::openapi::{path::Operation, HttpMethod};
 
 #[cfg(feature = "openapi")]
 use utoipa::OpenApi;
@@ -82,6 +83,8 @@ use tower_http::cors::{AllowOrigin, Any, CorsLayer};
         v1::search::post,
         v1::chat::post,
         v1::models::get,
+        #[cfg(feature = "mcp")]
+        v1::mcp::event,
         v1::nsql::post,
         v1::eval::list,
         v1::eval::post,
@@ -94,7 +97,37 @@ use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 
     components(schemas(DatasetQueryParams, DatasetFilter, Format)) // These schemas, for some reason, weren't getting picked up.
 )]
-pub struct ApiDoc;
+pub(crate) struct ApiDoc;
+
+/// Returns the `OpenAPI` documentation for the HTTP API. Adds MCP endpoints if the feature is enabled.
+#[cfg(feature = "openapi")]
+#[must_use]
+pub fn get_api_doc() -> utoipa::openapi::OpenApi {
+    let mut openai = ApiDoc::openapi();
+
+    #[cfg(feature = "mcp")]
+    {
+        openai.paths.add_path_operation(
+            "/v1/mcp/sse",
+            vec![HttpMethod::Get],
+            Operation::builder()
+                .operation_id(Some("operation_id"))
+                .tag("mcp")
+                .summary(Some("Connect to Spice over MCP"))
+                .description(Some(
+                    "Connect to Spice tools with Model Context Protocol (MCP) over SSE transport.\n\nThis endpoint sets up a connection whereby the client can send messages over `POST v1/mcp/event` and receive responses over this established SSE stream.",
+                ))
+                .build(),
+        );
+
+        // openai.paths.add_path_operation(
+        //     "/v1/mcp/sse",
+        //     vec![HttpMethod::Post],
+        //     v1::mcp::__path_event,
+        // );
+    }
+    openai
+}
 
 pub(crate) fn routes(
     rt: &Arc<Runtime>,
@@ -141,7 +174,7 @@ pub(crate) fn routes(
     #[cfg(feature = "dev")]
     {
         authenticated_router = authenticated_router
-            .merge(SwaggerUi::new("/docs").url("/docs/openapi.json", ApiDoc::openapi()));
+            .merge(SwaggerUi::new("/docs").url("/docs/openapi.json", get_api_doc()));
     }
 
     if cfg!(feature = "models") {
