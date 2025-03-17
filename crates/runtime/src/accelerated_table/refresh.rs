@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::accelerated_table::refresh_task::RefreshTask;
-use crate::component::dataset::acceleration::RefreshMode;
+use crate::component::dataset::acceleration::{RefreshMode, RefreshOnStartup};
 use crate::component::dataset::TimeFormat;
 use crate::dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint;
 use crate::federated_table::FederatedTable;
@@ -355,6 +355,7 @@ pub struct Refresher {
     cache_provider: Option<Arc<QueryResultsCacheProvider>>,
     refresh_task_runner: Option<RefreshTaskRunner>,
     checkpointer: Option<Arc<DatasetCheckpoint>>,
+    refresh_on_startup: Arc<RefreshOnStartup>,
     synchronize_with: Option<SynchronizedTable>,
 
     initial_load_completed: Arc<AtomicBool>,
@@ -379,6 +380,7 @@ impl Refresher {
             cache_provider: None,
             refresh_task_runner: None,
             checkpointer: None,
+            refresh_on_startup: Arc::new(RefreshOnStartup::default()),
             synchronize_with: None,
             initial_load_completed: Arc::new(AtomicBool::new(false)),
         }
@@ -394,6 +396,11 @@ impl Refresher {
 
     pub fn checkpointer(&mut self, checkpointer: Option<DatasetCheckpoint>) -> &mut Self {
         self.checkpointer = checkpointer.map(Arc::new);
+        self
+    }
+
+    pub fn refresh_on_startup(&mut self, refresh_on_startup: RefreshOnStartup) -> &mut Self {
+        self.refresh_on_startup = Arc::new(refresh_on_startup);
         self
     }
 

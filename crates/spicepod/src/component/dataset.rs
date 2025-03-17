@@ -236,6 +236,24 @@ pub mod acceleration {
         }
     }
 
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+    #[cfg_attr(feature = "schemars", derive(JsonSchema))]
+    #[serde(rename_all = "lowercase")]
+    pub enum RefreshOnStartup {
+        Always,
+        #[default]
+        Auto,
+    }
+
+    impl Display for RefreshOnStartup {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                RefreshOnStartup::Always => write!(f, "always"),
+                RefreshOnStartup::Auto => write!(f, "auto"),
+            }
+        }
+    }
+
     /// Behavior when a query on an accelerated table returns zero results.
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
     #[cfg_attr(feature = "schemars", derive(JsonSchema))]
@@ -303,6 +321,9 @@ pub mod acceleration {
 
         #[serde(default)]
         pub mode: Mode,
+
+        #[serde(default)]
+        pub refresh_on_startup: RefreshOnStartup,
 
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub engine: Option<String>,
@@ -378,6 +399,7 @@ pub mod acceleration {
             Self {
                 enabled: true,
                 mode: Mode::Memory,
+                refresh_on_startup: RefreshOnStartup::default(),
                 engine: None,
                 refresh_mode: None,
                 refresh_check_interval: None,

@@ -17,7 +17,7 @@ limitations under the License.
 use std::time::SystemTime;
 use std::{any::Any, sync::Arc, time::Duration};
 
-use crate::component::dataset::acceleration::{RefreshMode, ZeroResultsAction};
+use crate::component::dataset::acceleration::{RefreshMode, RefreshOnStartup, ZeroResultsAction};
 use crate::component::dataset::{ReadyState, TimeFormat};
 use crate::dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint;
 use crate::datafusion::error::SpiceExternalError;
@@ -210,6 +210,7 @@ pub struct Builder {
     refresh: refresh::Refresh,
     retention: Option<Retention>,
     zero_results_action: ZeroResultsAction,
+    refresh_on_startup: RefreshOnStartup,
     ready_state: ReadyState,
     cache_provider: Option<Arc<QueryResultsCacheProvider>>,
     changes_stream: Option<ChangesStream>,
@@ -238,6 +239,7 @@ impl Builder {
             refresh,
             retention: None,
             zero_results_action: ZeroResultsAction::default(),
+            refresh_on_startup: RefreshOnStartup::default(),
             ready_state: ReadyState::default(),
             cache_provider: None,
             changes_stream: None,
@@ -256,6 +258,11 @@ impl Builder {
 
     pub fn zero_results_action(&mut self, zero_results_action: ZeroResultsAction) -> &mut Self {
         self.zero_results_action = zero_results_action;
+        self
+    }
+
+    pub fn refresh_on_startup(&mut self, refresh_on_startup: RefreshOnStartup) -> &mut Self {
+        self.refresh_on_startup = refresh_on_startup;
         self
     }
 
@@ -407,6 +414,7 @@ impl Builder {
         );
         refresher.cache_provider(self.cache_provider.clone());
         refresher.checkpointer(self.checkpointer);
+        refresher.refresh_on_startup(self.refresh_on_startup);
         refresher.set_initial_load_completed(self.initial_load_complete);
         if let Some(synchronize_with) = &self.synchronize_with {
             refresher.synchronize_with(synchronize_with.clone());
