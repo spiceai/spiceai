@@ -85,11 +85,3 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
-      
-      # - name: Dispatch Testoperator - Scheduled Throughput
-      #   if: ${{ github.event_name == 'schedule' && github.event.schedule == '10 22 */3 * *' }}
-      #   run: |
-      #     testoperator dispatch ./tools/testoperator/dispatch --workflow throughput
-      #   env:
-      #     GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      #     SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
