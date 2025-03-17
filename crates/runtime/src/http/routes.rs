@@ -39,6 +39,10 @@ use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 
 use super::{metrics, v1};
+
+#[cfg(feature = "mcp")]
+use super::v1::mcp::McpState;
+
 use axum::{
     body::Body,
     extract::MatchedPath,
@@ -161,6 +165,15 @@ pub(crate) fn routes(
             .layer(Extension(vector_search))
             .layer(Extension(Arc::clone(&rt.embeds)));
     }
+
+    #[cfg(feature = "mcp")]
+    {
+        authenticated_router = authenticated_router
+            .route("/v1/mcp/sse", get(v1::mcp::sse))
+            .route("/v1/mcp/sse", post(v1::mcp::event))
+            .layer(Extension(Arc::new(McpState::default())));
+    }
+
     authenticated_router = authenticated_router
         .layer(Extension(Arc::clone(&rt.app)))
         .layer(Extension(Arc::clone(&rt.df)))

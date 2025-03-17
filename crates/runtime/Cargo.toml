@@ -76,8 +76,9 @@ keyring = { version = "3.6.2", features = [
 ], optional = true }
 llms = { path = "../llms" }
 logos = "0.15.0"
-mcp-client = { git = "https://github.com/block/goose", package = "mcp-client", optional = true }
-mcp-core = { git = "https://github.com/block/goose", package = "mcp-core", optional = true }
+mcp-client = { git = "https://github.com/spiceai/modelcontextprotocol-rust-sdk.git", rev = "a61112adf47ffbcc591bf199d30038f661f6a6bb", package = "mcp-client", optional = true }
+mcp-core = { git = "https://github.com/spiceai/modelcontextprotocol-rust-sdk.git", rev = "a61112adf47ffbcc591bf199d30038f661f6a6bb", package = "mcp-core", optional = true }
+mcp-server = { git = "https://github.com/spiceai/modelcontextprotocol-rust-sdk.git", rev = "a61112adf47ffbcc591bf199d30038f661f6a6bb", package = "mcp-server", optional = true }
 mediatype = "0.19.18"
 model_components = { path = "../model_components" }
 mysql_async = { workspace = true, optional = true }
@@ -188,9 +189,9 @@ flightsql = ["data_components/flightsql"]
 ftp = ["dep:suppaftp", "dep:ssh2"]
 imap = ["data_components/imap", "dep:imap"]
 keyring-secret-store = ["dep:keyring"]
-mcp = ["dep:mcp-client", "dep:mcp-core"]
+mcp = ["dep:mcp-client", "dep:mcp-core", "dep:mcp-server"]
 metal = ["llms/metal"]
-models = ["model_components/full"]
+models = ["model_components/full", "mcp"]
 mssql = ["dep:tiberius", "data_components/mssql"]
 mysql = ["dep:mysql_async", "db_connection_pool/mysql", "data_components/mysql"]
 odbc = ["db_connection_pool/odbc", "data_components/odbc"]

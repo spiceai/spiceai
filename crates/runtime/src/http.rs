@@ -17,15 +17,14 @@ limitations under the License.
 use std::{borrow::Cow, fmt::Debug, sync::Arc};
 
 use axum::Router;
-use hyper_util::{
-    rt::{TokioExecutor, TokioIo},
-    server::conn::auto::Builder,
-    service::TowerToHyperService,
-};
+use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::server::conn::auto::Builder;
+use hyper_util::service::TowerToHyperService;
 use runtime_auth::{layer::http::AuthLayer, HttpAuth};
 use snafu::prelude::*;
 use spicepod::component::runtime::CorsConfig;
-use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
+use tokio::net::TcpStream;
+use tokio::net::{TcpListener, ToSocketAddrs};
 use tokio_rustls::TlsAcceptor;
 
 use crate::{

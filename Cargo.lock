@@ -2744,6 +2744,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c74b8349d32d297c9134b8c88677813a227df8f779daa29bfc29c183fe3dca6"
 
 [[package]]
+name = "convert_case"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ec182b0ca2f35d8fc196cf3404988fd8b8c739a4d270ff118a398feb0cbec1ca"
+dependencies = [
+ "unicode-segmentation",
+]
+
+[[package]]
 name = "core-foundation"
 version = "0.9.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7115,8 +7124,8 @@ dependencies = [
 
 [[package]]
 name = "mcp-client"
-version = "0.1.0"
-source = "git+https://github.com/block/goose#6220ef054f55f044b9bf6923c38783faed8b7023"
+version = "1.0.7"
+source = "git+https://github.com/spiceai/modelcontextprotocol-rust-sdk.git?rev=a61112adf47ffbcc591bf199d30038f661f6a6bb#a61112adf47ffbcc591bf199d30038f661f6a6bb"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7138,8 +7147,8 @@ dependencies = [
 
 [[package]]
 name = "mcp-core"
-version = "0.1.0"
-source = "git+https://github.com/block/goose#6220ef054f55f044b9bf6923c38783faed8b7023"
+version = "1.0.7"
+source = "git+https://github.com/spiceai/modelcontextprotocol-rust-sdk.git?rev=a61112adf47ffbcc591bf199d30038f661f6a6bb#a61112adf47ffbcc591bf199d30038f661f6a6bb"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7150,6 +7159,45 @@ dependencies = [
  "serde_json",
  "thiserror 1.0.69",
  "url",
+]
+
+[[package]]
+name = "mcp-macros"
+version = "1.0.7"
+source = "git+https://github.com/spiceai/modelcontextprotocol-rust-sdk.git?rev=a61112adf47ffbcc591bf199d30038f661f6a6bb#a61112adf47ffbcc591bf199d30038f661f6a6bb"
+dependencies = [
+ "async-trait",
+ "convert_case",
+ "mcp-core",
+ "proc-macro2",
+ "quote",
+ "schemars",
+ "serde",
+ "serde_json",
+ "syn 2.0.98",
+]
+
+[[package]]
+name = "mcp-server"
+version = "1.0.7"
+source = "git+https://github.com/spiceai/modelcontextprotocol-rust-sdk.git?rev=a61112adf47ffbcc591bf199d30038f661f6a6bb#a61112adf47ffbcc591bf199d30038f661f6a6bb"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "futures",
+ "mcp-core",
+ "mcp-macros",
+ "pin-project",
+ "schemars",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tower 0.4.13",
+ "tower-service",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -10314,6 +10362,7 @@ dependencies = [
  "logos",
  "mcp-client",
  "mcp-core",
+ "mcp-server",
  "mediatype",
  "model_components",
  "mysql_async",
@@ -12587,6 +12636,18 @@ dependencies = [
  "pin-project-lite",
  "tracing-attributes",
  "tracing-core",
+]
+
+[[package]]
+name = "tracing-appender"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3566e8ce28cc0a3fe42519fc80e6b4c943cc4c8cef275620eb8dac2d3d4e06cf"
+dependencies = [
+ "crossbeam-channel",
+ "thiserror 1.0.69",
+ "time",
+ "tracing-subscriber",
 ]
 
 [[package]]

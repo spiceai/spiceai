@@ -15,6 +15,8 @@ limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
 
+use async_stream::stream;
+use std::collections::HashSet;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -36,10 +38,12 @@ use datasets_health_monitor::DatasetsHealthMonitor;
 use extension::ExtensionFactory;
 use flight::RateLimits;
 use futures::future::join_all;
+use futures::Stream;
 #[cfg(feature = "openapi")]
 pub use http::ApiDoc;
 use model::{EmbeddingModelStore, EvalScorerRegistry, LLMModelStore};
 
+use crate::tools::{with_name, SpiceModelTool};
 use model_components::model::Model;
 pub use notify::Error as NotifyError;
 use secrecy::SecretString;
@@ -731,6 +735,57 @@ impl Runtime {
             .insert(component_name.to_string(), handle);
 
         future
+    }
+
+    /// List all tools available in the runtime, either within a catalog or standalone.
+    ///
+    /// Tools from default catalogs are also loaded individually, so the default catalogs must be ignored.
+    ///
+    /// For tools from catalog, the name is prefixed with the catalog name. e.g. `catalog_name/tool_name`.
+    fn list_all_tools(self: &Arc<Self>) -> impl Stream<Item = Arc<dyn SpiceModelTool>> {
+        let default_catalogs = default_available_catalogs();
+        let stream_self = Arc::clone(self);
+        stream! {
+            let tool_lock = stream_self.tools.read().await;
+            let default_catalog_names = default_catalogs
+                .iter()
+                .map(|c| c.name())
+                .collect::<HashSet<_>>();
+            for (name, tooling) in tool_lock.iter() {
+                match tooling {
+                    Tooling::Tool(tool) => {
+                        yield Arc::clone(tool);
+                    }
+                    Tooling::Catalog(catalog) => {
+                        // Do not list tools from default catalogs. They are already listed individually as tools.
+                        if default_catalog_names.contains(&name.as_str()) {
+                            continue;
+                        }
+                        let all = catalog.all().await;
+                        for tool in all {
+                            yield with_name(&tool, format!("{}/{}", catalog.name(), tool.name()).as_str());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    pub async fn get_tool(self: &Arc<Self>, tool_name: &str) -> Option<Arc<dyn SpiceModelTool>> {
+        let tools = self.tools.read().await;
+        let tool: Arc<dyn SpiceModelTool> =
+            if let Some((catalog_name, name)) = tool_name.split_once('/') {
+                let Some(Tooling::Catalog(catalog)) = tools.get(catalog_name) else {
+                    return None;
+                };
+                return catalog.get(name).await;
+            } else {
+                let Some(Tooling::Tool(tool)) = tools.get(tool_name) else {
+                    return None;
+                };
+                Arc::clone(tool)
+            };
+        Some(tool)
     }
 }
 
