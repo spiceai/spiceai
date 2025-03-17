@@ -1,4 +1,4 @@
-name: benchmark e2e tests - ${{ github.event.inputs.spicepod_path | split("/") | last | split(".")[0] }}
+name: benchmark e2e tests
 
 on:
   workflow_dispatch:
@@ -61,7 +61,7 @@ on:
 
 jobs:
   run-bench:
-    name: Run benchmark e2e tests
+    name: Run benchmark e2e tests - ${{ github.event.inputs.spicepod_path | split("/") | last | split(".")[0] }}
     runs-on: ${{ github.event.inputs.runner_type }}
     timeout-minutes: 600
     steps:
