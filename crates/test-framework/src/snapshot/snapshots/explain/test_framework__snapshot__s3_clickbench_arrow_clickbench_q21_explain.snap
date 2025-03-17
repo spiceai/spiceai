@@ -1,0 +1,24 @@
+---
+source: crates/test-framework/src/snapshot/mod.rs
+description: "Query: clickbench_q21"
+---
++---------------+---------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                  |
++---------------+---------------------------------------------------------------------------------------+
+| logical_plan  | Aggregate: groupBy=[[]], aggr=[[count(Int64(1)) AS count(*)]]                         |
+|               |   Projection:                                                                         |
+|               |     BytesProcessedNode                                                                |
+|               |       Filter: hits.URL LIKE LargeUtf8("%google%")                                     |
+|               |         TableScan: hits projection=[URL]                                              |
+| physical_plan | AggregateExec: mode=Final, gby=[], aggr=[count(*)]                                    |
+|               |   CoalescePartitionsExec                                                              |
+|               |     AggregateExec: mode=Partial, gby=[], aggr=[count(*)]                              |
+|               |       ProjectionExec: expr=[]                                                         |
+|               |         BytesProcessedExec                                                            |
+|               |           CoalesceBatchesExec: target_batch_size=8192                                 |
+|               |             FilterExec: URL@0 LIKE %google%                                           |
+|               |               SchemaCastScanExec                                                      |
+|               |                 RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1 |
+|               |                   MemoryExec: partitions=1, partition_sizes=[12218]                   |
+|               |                                                                                       |
++---------------+---------------------------------------------------------------------------------------+
