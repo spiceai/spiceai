@@ -41,6 +41,7 @@ async fn acceleration_with_and_without_federation() -> Result<(), anyhow::Error>
     use datafusion::error::DataFusionError;
     use runtime::datafusion::error::SpiceExternalError;
     use runtime::status;
+    use spicepod::component::dataset::ReadyState;
     use std::sync::Arc;
 
     let _guard = super::ACCELERATION_MUTEX.lock().await;
@@ -77,6 +78,8 @@ async fn acceleration_with_and_without_federation() -> Result<(), anyhow::Error>
                 .await.expect("inserted data");
 
             let mut federated_acc = Dataset::new("postgres:test", "abc");
+            federated_acc.ready_state = ReadyState::OnRegistration;
+
             let mut params = Params::from_string_map(
                 vec![
                     ("pg_host".to_string(), "localhost".to_string()),
