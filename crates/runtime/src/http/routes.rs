@@ -31,10 +31,12 @@ use opentelemetry::KeyValue;
 use spicepod::component::runtime::CorsConfig;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use utoipa::openapi::{path::Operation, HttpMethod};
 
 #[cfg(feature = "openapi")]
-use utoipa::OpenApi;
+use utoipa::{
+    openapi::{path::Operation, HttpMethod},
+    OpenApi,
+};
 
 #[cfg(feature = "dev")]
 use utoipa_swagger_ui::SwaggerUi;
