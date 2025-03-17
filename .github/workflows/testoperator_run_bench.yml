@@ -95,7 +95,15 @@ jobs:
             echo "MYSQL_DB=tpch_sf1" >> $GITHUB_ENV
           fi
 
-      - name: Run the benchmark test
+      - name: Extract spicepod filename path
+        id: extract_spicepod_filename
+        run: |
+          SPICEPOD_PATH="${{ github.event.inputs.spicepod_path }}"
+          SPICEPOD_FILENAME=$(basename $SPICEPOD_PATH)
+          echo "SPICEPOD_FILENAME=${SPICEPOD_FILENAME}" >> $GITHUB_OUTPUT
+
+
+      - name: Run the benchmark test - ${{ steps.extract_spicepod_filename.outputs.SPICEPOD_FILENAME }}
         if: ${{ github.event.inputs.query_overrides == '' }}
         run: |
           rm -rf .spice/data
@@ -133,7 +141,7 @@ jobs:
           DREMIO_PASSWORD: ${{ secrets.SPICE_DREMIO_PASSWORD}}
           INSTA_UPDATE: ${{ github.event.inputs.update_snapshots}}
 
-      - name: Run the benchmark test (with overrides)
+      - name: Run the benchmark test (with overrides) - ${{ steps.extract_spicepod_filename.outputs.SPICEPOD_FILENAME }}
         if: ${{ github.event.inputs.query_overrides != '' }}
         run: |
           rm -rf .spice/data
