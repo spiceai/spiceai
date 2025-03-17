@@ -12,6 +12,6 @@ description: "Query: clickbench_q1"
 |               |     TableScan: hits projection=[]                                                                                                                                              |
 | physical_plan | BytesProcessedExec                                                                                                                                                             |
 |               |   SchemaCastScanExec                                                                                                                                                           |
-|               |     VirtualExecutionPlan name=duckdb compute_context=/tmp/.tmpZn1S2T/.spice/data/accelerated_duckdb.db sql=SELECT count(*) FROM hits rewritten_sql=SELECT count(*) FROM "hits" |
+|               |     VirtualExecutionPlan name=duckdb compute_context=/tmp/.tmptNBFik/.spice/data/accelerated_duckdb.db sql=SELECT count(*) FROM hits rewritten_sql=SELECT count(*) FROM "hits" |
 |               |                                                                                                                                                                                |
 +---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
