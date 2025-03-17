@@ -6203,6 +6203,7 @@ dependencies = [
  "once_cell",
  "pin-project",
  "regex",
+ "serde",
  "similar",
 ]
 
