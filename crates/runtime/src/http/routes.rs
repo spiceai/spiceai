@@ -115,9 +115,10 @@ pub fn get_api_doc() -> utoipa::openapi::OpenApi {
             Operation::builder()
                 .operation_id(Some("operation_id"))
                 .tag("mcp")
-                .summary(Some("Connect to Spice over MCP"))
+                .summary(Some("Establish an MCP SSE Connection"))
                 .description(Some(
-                    "Connect to Spice tools with Model Context Protocol (MCP) over SSE transport.\n\nThis endpoint sets up a connection whereby the client can send messages over `POST v1/mcp/event` and receive responses over this established SSE stream.",
+                    Initiates a Server-Sent Events (SSE) connection using the Model Context Protocol (MCP) to interact with Spice tools.\n\n
+             Once connected, clients can send messages via `POST /v1/mcp/event` and receive responses through this SSE stream.",
                 ))
                 .build(),
         );

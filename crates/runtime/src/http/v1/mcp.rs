@@ -120,11 +120,11 @@ pub(crate) async fn sse(
         tag = "mcp",
         params(PostEventQuery),
         responses(
-            (status = 202, description = "Message successfully sent to SSE session. Response will be available on SSE stream."),
-            (status = 404, description = "Session based on `session_id` not found."),
-            (status = 413, description = "POST body payload is too large (max 4MB)."),
-            (status = 500, description = "Internal server error.")
-        )
+    (status = 202, description = "Message accepted. Response will stream via SSE."),
+    (status = 404, description = "Session not found. No active session for the given `session_id`."),
+    (status = 413, description = "Payload too large. Maximum allowed size is 4MB."),
+    (status = 500, description = "Internal server error. An unexpected issue occurred."),
+)
     )
 )]
 pub(crate) async fn event(
