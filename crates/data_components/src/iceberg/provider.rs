@@ -223,7 +223,11 @@ impl IcebergSchemaProvider {
                 let err_msg = e.to_string();
                 if err_msg.contains("NoSuchIcebergTableException") || err_msg.contains("code: 404")
                 {
-                    tracing::warn!("Table '{}.{}' could not be loaded as an Iceberg table: it may not exist or may not be in Iceberg format.", table_name.namespace().join("."), table_name.name());
+                    tracing::warn!(
+            "Failed to load '{}.{}' as an Iceberg table: table may not exist or is not in Iceberg format.",
+            table_name.namespace().join("."),
+            table_name.name()
+        );
                     Ok(None)
                 } else {
                     Err(handle_iceberg_error(e))
