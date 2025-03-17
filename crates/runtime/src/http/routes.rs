@@ -119,12 +119,6 @@ pub fn get_api_doc() -> utoipa::openapi::OpenApi {
                 ))
                 .build(),
         );
-
-        // openai.paths.add_path_operation(
-        //     "/v1/mcp/sse",
-        //     vec![HttpMethod::Post],
-        //     v1::mcp::__path_event,
-        // );
     }
     openai
 }
