@@ -405,15 +405,17 @@ impl Runtime {
         let cloned_config = config.clone();
         let http_auth = endpoint_auth.http_auth.clone();
         let self_ref = Arc::clone(&self);
+        let http_shutdown = CancellationToken::new();
 
         let http_future = self
-            .start_server_component(HTTP_SERVER, None, async move {
+            .start_server_component(HTTP_SERVER, Some(http_shutdown.clone()), async move {
                 http::start(
                     cloned_config.http_bind_address,
                     self_ref,
                     cloned_config.into(),
                     cloned_tls_config,
                     http_auth,
+                    Some(http_shutdown),
                 )
                 .await
                 .context(UnableToStartHttpServerSnafu)
