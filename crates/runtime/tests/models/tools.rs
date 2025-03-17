@@ -17,7 +17,7 @@ limitations under the License.
 #[allow(clippy::expect_used)]
 mod mcp {
 
-    use crate::models::http_get;
+    use crate::models::{http_get, sort_json_keys};
 
     use crate::init_tracing_with_task_history;
     use crate::models::create_api_bindings_config;
@@ -47,14 +47,14 @@ from: mcp:docker
 params:
   mcp_args: run -i --rm mcp/fetch
 "#;
-        let (rt, http_base_url) = start_spiced_with_tools(vec![serde_yaml::from_str(tool_yaml)
+        let http_base_url = start_spiced_with_tools(vec![serde_yaml::from_str(tool_yaml)
             .expect("Tool spicepod component is not in expected format")])
         .await
         .expect("Failed to start spiced with tools");
 
         let tools_list = call_tool_list(http_base_url.as_str()).await?;
 
-        let mcp_fetch = tools_list
+        let mut mcp_fetch = tools_list
             .into_iter()
             .find(|t| t.get("name") == Some(&Value::String("mcp_fetch/fetch".to_string())))
             .expect("'mcp_fetch' tool not found");
@@ -67,26 +67,25 @@ params:
     /// Test that spiced can connect to an SSE MCP server, as well as be an MCP server.
     #[tokio::test]
     async fn test_mcp_sse() -> Result<(), anyhow::Error> {
-        let (rt_server, http_server_url) = start_spiced_with_tools(vec![])
+        let http_server_url = start_spiced_with_tools(vec![])
             .await
             .expect("Failed to start spiced with tools");
 
         let tool_yaml = format!("name: mcp_from_spiced\nfrom: mcp:{http_server_url}/v1/mcp/sse");
-        let (rt_client, http_client_url) =
+        let http_client_url =
             start_spiced_with_tools(vec![serde_yaml::from_str(tool_yaml.as_str())
                 .expect("Tool spicepod component is not in expected format")])
             .await
             .expect("Failed to start spiced with tools");
 
-        let tools_list = call_tool_list(http_client_url.as_str()).await?;
-
+        let mut tools_list = call_tool_list(http_client_url.as_str()).await?;
         assert_json_snapshot!("mcp_spiced_list", tools_list);
 
         Ok(())
     }
 
     /// Returns the runtime (with all components ready) and the base URL of the HTTP server.
-    async fn start_spiced_with_tools(tools: Vec<Tool>) -> anyhow::Result<(Arc<Runtime>, String)> {
+    async fn start_spiced_with_tools(tools: Vec<Tool>) -> anyhow::Result<String> {
         let mut app_builder = AppBuilder::new("mcp-stdio");
 
         for tool in tools {
@@ -116,18 +115,28 @@ params:
 
         runtime_ready_check(&rt).await;
 
-        Ok((rt, http_base_url))
+        Ok(http_base_url)
     }
 
     async fn call_tool_list(base_url: &str) -> anyhow::Result<Vec<Value>> {
         let mut headers = HeaderMap::new();
         headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        let Ok(Value::Array(body)) =
-            http_get(format!("{base_url}/v1/tools").as_str(), headers).await
+        let Ok(mut values) = http_get(format!("{base_url}/v1/tools").as_str(), headers).await
         else {
             return Err(anyhow::anyhow!("Failed to get tools list"));
         };
-        Ok(body)
+
+        sort_json_keys(&mut values);
+        if let Value::Array(mut body) = values {
+            body.sort_by_key(|v| {
+                v.get("name")
+                    .clone()
+                    .map(|n| n.as_str().unwrap_or_default().to_string())
+            });
+            Ok(body)
+        } else {
+            Err(anyhow::anyhow!("Failed to get tools list"))
+        }
     }
 }
