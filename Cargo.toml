@@ -120,7 +120,7 @@ pin-project = "1.1"
 prometheus = "0.13"
 r2d2 = "0.8.10"
 regex = "1.10.3"
-reqwest = { version = "0.12.5", features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12.14", features = ["json", "rustls-tls"] }
 rusqlite = { version = "0.31.0", features = ["bundled-decimal"] }
 rustls = "0.23"
 rustls-pemfile = "2.1.3"
