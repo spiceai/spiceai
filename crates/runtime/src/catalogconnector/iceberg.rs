@@ -99,13 +99,41 @@ pub(crate) const PARAMETERS: &[ParameterSpec] = &[
         .default("catalog"),
     ParameterSpec::component("oauth2_server_url")
         .description("URL of the OAuth2 server tokens endpoint."),
+
+    // Catalog AWS Glue options
     ParameterSpec::component("sigv4_enabled")
-        .description("Enable SigV4 authentication for the catalog (for connecting to AWS Glue)."),
+        .description("Enable SigV4 authentication for the catalog (for connecting to AWS Glue).")
+        .deprecated("Use iceberg_catalog_sigv4_enabled instead."),
     ParameterSpec::component("signing_region")
-        .description("The region to use when signing the request for SigV4. Defaults to the region in the catalog URL if available."),
+        .description("The region to use when signing the request for SigV4. Defaults to the region in the catalog URL if available.")
+        .deprecated("Use iceberg_catalog_signing_region instead."),
     ParameterSpec::component("signing_name")
         .description("The name to use when signing the request for SigV4.")
+        .default("glue")
+        .deprecated("Use iceberg_catalog_signing_name instead."),
+    ParameterSpec::component("catalog_sigv4_enabled")
+        .description("Enable SigV4 authentication for the catalog (for connecting to AWS Glue)."),
+    ParameterSpec::component("catalog_signing_region")
+        .description("The region to use when signing the request for SigV4. Defaults to the region in the catalog URL if available."),
+    ParameterSpec::component("catalog_signing_name")
+        .description("The name to use when signing the request for SigV4.")
         .default("glue"),
+    ParameterSpec::component("catalog_access_key_id")
+        .description("The AWS access key ID to use for the catalog.")
+        .secret(),
+    ParameterSpec::component("catalog_secret_access_key")
+        .description("The AWS secret access key to use for the catalog.")
+        .secret(),
+    ParameterSpec::component("catalog_session_token")
+        .description("The session token to use for the catalog.")
+        .secret(),
+    ParameterSpec::component("catalog_role_arn")
+        .description("The Amazon Resource Name (ARN) of the role to assume. If provided instead of catalog_access_key_id and catalog_secret_access_key, temporary credentials will be fetched by assuming this role")
+        .secret(),
+    ParameterSpec::component("catalog_role_session_name")
+        .description("An optional identifier for the assumed role session for auditing purposes.")
+        .secret(),
+
     // S3 storage options
     ParameterSpec::component("s3_endpoint")
         .description(
@@ -148,9 +176,14 @@ pub(crate) fn map_param_name_to_iceberg_prop(param_name: &str) -> Option<String>
         "s3_region" => Some("s3.region".to_string()),
         "s3_role_session_name" => Some("client.assume-role.session-name".to_string()),
         "s3_role_arn" => Some("client.assume-role.arn".to_string()),
-        "sigv4_enabled" => Some("rest.sigv4-enabled".to_string()),
-        "signing_region" => Some("rest.signing-region".to_string()),
-        "signing_name" => Some("rest.signing-name".to_string()),
+        "sigv4_enabled" | "catalog_sigv4_enabled" => Some("rest.sigv4-enabled".to_string()),
+        "signing_region" | "catalog_signing_region" => Some("rest.signing-region".to_string()),
+        "signing_name" | "catalog_signing_name" => Some("rest.signing-name".to_string()),
+        "catalog_access_key_id" => Some("rest.access-key-id".to_string()),
+        "catalog_secret_access_key" => Some("rest.secret-access-key".to_string()),
+        "catalog_session_token" => Some("rest.session-token".to_string()),
+        "catalog_role_session_name" => Some("rest.assume-role.session-name".to_string()),
+        "catalog_role_arn" => Some("rest.assume-role.arn".to_string()),
         _ => None,
     }
 }

@@ -24,7 +24,7 @@ use async_trait::async_trait;
 use datafusion::catalog::{CatalogProvider, SchemaProvider, TableProvider};
 use datafusion::error::Result as DFResult;
 use futures::future::try_join_all;
-use iceberg::{Catalog, NamespaceIdent};
+use iceberg::{Catalog, NamespaceIdent, TableIdent};
 use iceberg_datafusion::IcebergTableProvider;
 use snafu::prelude::*;
 
@@ -180,34 +180,56 @@ impl IcebergSchemaProvider {
             .await
             .map_err(handle_iceberg_error)?;
 
-        let iceberg_tables = try_join_all(
-            table_names
-                .iter()
-                .map(|name| client.load_table(name))
-                .collect::<Vec<_>>(),
-        )
-        .await
-        .map_err(handle_iceberg_error)?;
-
-        let table_providers: Vec<_> = try_join_all(
-            iceberg_tables
-                .into_iter()
-                .map(IcebergTableProvider::try_new_from_table)
-                .collect::<Vec<_>>(),
-        )
-        .await
-        .map_err(handle_iceberg_error)?;
-
-        let tables: HashMap<String, Arc<dyn TableProvider>> = table_names
-            .into_iter()
-            .zip(table_providers.into_iter())
-            .map(|(name, provider)| {
-                let provider = Arc::new(provider) as Arc<dyn TableProvider>;
-                (name.name().to_string(), provider)
+        // Transform each load_table call to return Result<(TableIdent, Option<Arc<dyn TableProvider>>)>
+        let table_futures: Vec<_> = table_names
+            .iter()
+            .map(|name| {
+                let client_clone = Arc::clone(&client);
+                let name_clone = name.clone();
+                async move {
+                    // Map the inner Result to include the table name
+                    Self::load_table(client_clone, &name_clone)
+                        .await
+                        .map(|opt_provider| (name_clone, opt_provider))
+                }
             })
             .collect();
 
+        // Execute all futures in parallel, short-circuiting on first error
+        let table_results = try_join_all(table_futures).await?;
+
+        // Filter out None values, only keeping successful loads
+        let mut tables = HashMap::new();
+        for (name, opt_provider) in table_results {
+            if let Some(provider) = opt_provider {
+                tables.insert(name.name().to_string(), provider);
+            }
+        }
+
         Ok(IcebergSchemaProvider { tables })
+    }
+
+    async fn load_table(
+        client: Arc<RestCatalog>,
+        table_name: &TableIdent,
+    ) -> Result<Option<Arc<dyn TableProvider>>> {
+        match client.load_table(table_name).await {
+            Ok(table) => match IcebergTableProvider::try_new_from_table(table).await {
+                Ok(provider) => Ok(Some(Arc::new(provider) as Arc<dyn TableProvider>)),
+                Err(e) => Err(handle_iceberg_error(e)),
+            },
+            Err(e) => {
+                // If the table doesn't exist, return None instead of an error
+                let err_msg = e.to_string();
+                if err_msg.contains("NoSuchIcebergTableException") || err_msg.contains("code: 404")
+                {
+                    tracing::warn!("Table '{}.{}' could not be loaded as an Iceberg table: it may not exist or may not be in Iceberg format.", table_name.namespace().join("."), table_name.name());
+                    Ok(None)
+                } else {
+                    Err(handle_iceberg_error(e))
+                }
+            }
+        }
     }
 }
 
