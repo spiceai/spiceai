@@ -99,7 +99,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - aws-sdk-secretsmanager 1.54.0, Apache-2.0 
   <br/>https://github.com/awslabs/aws-sdk-rust
 
-- aws-sdk-sts 1.54.0, Apache-2.0 
+- aws-sdk-sts 1.63.0, Apache-2.0 
   <br/>https://github.com/awslabs/aws-sdk-rust
 
 - axum 0.7.9, MIT 
@@ -141,7 +141,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - byte-unit 5.1.6, MIT 
   <br/>https://github.com/magiclen/byte-unit
 
-- bytes 1.9.0, MIT 
+- bytes 1.10.1, MIT 
   <br/>https://github.com/tokio-rs/bytes
 
 - chrono 0.4.39, Apache-2.0 OR MIT 
@@ -195,7 +195,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - dotenvy 0.15.7, MIT 
   <br/>https://github.com/allan2/dotenvy
 
-- duckdb 1.2.0, MIT  
+- duckdb 1.1.3, MIT 
   <br/>https://github.com/duckdb/duckdb-rs
 
 - dyn-clone 1.0.17, Apache-2.0 OR MIT 
@@ -255,7 +255,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - hyper 0.14.31, MIT 
   <br/>https://github.com/hyperium/hyper
 
-- hyper 1.5.1, MIT 
+- hyper 1.6.0, MIT 
   <br/>https://github.com/hyperium/hyper
 
 - hyper-util 0.1.10, MIT 
@@ -420,7 +420,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - reqwest 0.11.27, Apache-2.0 OR MIT 
   <br/>https://github.com/seanmonstar/reqwest
 
-- reqwest 0.12.9, Apache-2.0 OR MIT 
+- reqwest 0.12.14, Apache-2.0 OR MIT 
   <br/>https://github.com/seanmonstar/reqwest
 
 - reqwest-eventsource 0.6.0, Apache-2.0 OR MIT 
