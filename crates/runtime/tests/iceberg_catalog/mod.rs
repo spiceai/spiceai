@@ -33,8 +33,8 @@ async fn glue_iceberg_integration_test_catalog() -> Result<(), anyhow::Error> {
         rustls::crypto::aws_lc_rs::default_provider(),
     );
 
-    let account_id =
-        std::env::var("AWS_ICEBERG_ACCOUNT_ID").context("AWS_ICEBERG_ACCOUNT_ID is not set")?;
+    let account_id = std::env::var("SPICE_AWS_ICEBERG_ACCOUNT_ID")
+        .context("AWS_ICEBERG_ACCOUNT_ID is not set")?;
 
     test_request_context()
         .scope(async {
@@ -89,15 +89,15 @@ fn get_params() -> Params {
         vec![
             (
                 "iceberg_s3_region".to_string(),
-                "${ env:AWS_ICEBERG_REGION }".to_string(),
+                "${ env:SPICE_AWS_ICEBERG_REGION }".to_string(),
             ),
             (
                 "iceberg_s3_access_key_id".to_string(),
-                "${ env:AWS_ACCESS_KEY_ID }".to_string(),
+                "${ env:SPICE_AWS_ACCESS_KEY_ID }".to_string(),
             ),
             (
                 "iceberg_s3_secret_access_key".to_string(),
-                "${ env:AWS_SECRET_ACCESS_KEY }".to_string(),
+                "${ env:SPICE_AWS_SECRET_ACCESS_KEY }".to_string(),
             ),
         ]
         .into_iter()
