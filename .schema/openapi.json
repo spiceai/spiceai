@@ -343,10 +343,12 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/AccelerationRequest"
+                "$ref": "#/components/schemas/RefreshOverrides"
               },
               "example": {
-                "refresh_sql": "SELECT * FROM taxi_trips WHERE tip_amount > 10.0"
+                "refresh_sql": "SELECT * FROM taxi_trips WHERE tip_amount > 10.0",
+                "refresh_mode": "full",
+                "refresh_jitter_max": "10s"
               }
             }
           },
@@ -4021,6 +4023,47 @@
           "medium",
           "high"
         ]
+      },
+      "RefreshMode": {
+        "type": "string",
+        "enum": [
+          "disabled",
+          "full",
+          "append",
+          "changes"
+        ]
+      },
+      "RefreshOverrides": {
+        "type": "object",
+        "description": "[`RefreshOverrides`] specifies the configurable options for a individual run of a refresh task.",
+        "properties": {
+          "refresh_jitter_max": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The maximum amount of jitter to add to the refresh. Defaults to the `refresh_jitter_max` specified in the spicepod, or 10% of the `refresh_check_interval`.",
+            "example": "10s"
+          },
+          "refresh_mode": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/RefreshMode",
+                "description": "The refresh mode to use for this refresh. Defaults to the `refresh_mode` specified in the spicepod, or `full`."
+              }
+            ]
+          },
+          "refresh_sql": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The SQL statement used for this refresh. Defaults to the `refresh_sql` specified in the spicepod, if any."
+          }
+        }
       },
       "Request": {
         "type": "object",
