@@ -47,7 +47,8 @@ async fn iceberg_integration_test_dataset() -> Result<(), anyhow::Error> {
                 "iceberg_dataset_test",
                 dataset,
                 "SELECT * FROM customer LIMIT 10",
-                "iceberg_integration_test_dataset",
+                true,
+                Some("iceberg_integration_test_dataset"),
             )
             .await?;
 
@@ -76,7 +77,49 @@ async fn iceberg_integration_test_duckdb_acceleration() -> Result<(), anyhow::Er
                 "iceberg_dataset_test",
                 dataset,
                 "SELECT * FROM customer LIMIT 10",
-                "iceberg_integration_test_duckdb_acceleration",
+                true,
+                Some("iceberg_integration_test_duckdb_acceleration"),
+            )
+            .await?;
+
+            Ok(())
+        })
+        .await
+}
+
+#[tokio::test]
+async fn iceberg_integration_test_duckdb_acceleration_restart() -> Result<(), anyhow::Error> {
+    let _ = rustls::crypto::CryptoProvider::install_default(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    );
+    let _tracing = init_tracing(None);
+    test_request_context()
+        .scope(async {
+            let mut dataset = make_iceberg_dataset("tpch_sf1", "customer", "customer")?;
+            dataset.acceleration = Some(Acceleration {
+                enabled: true,
+                engine: Some("duckdb".to_string()),
+                mode: Mode::File,
+                ..Default::default()
+            });
+
+            let rt = run_iceberg_test(
+                "iceberg_dataset_test",
+                dataset.clone(),
+                "SELECT * FROM customer LIMIT 10",
+                false,
+                None,
+            )
+            .await?;
+
+            drop(rt);
+
+            let _ = run_iceberg_test(
+                "iceberg_dataset_test",
+                dataset,
+                "SELECT * FROM customer LIMIT 10",
+                true,
+                Some("iceberg_integration_test_duckdb_acceleration_restart"),
             )
             .await?;
 
@@ -89,7 +132,8 @@ async fn run_iceberg_test(
     app_name: &str,
     dataset: Dataset,
     query: &str,
-    snapshot_name: &str,
+    assert_snapshot: bool,
+    snapshot_name: Option<&str>,
 ) -> Result<Runtime, anyhow::Error> {
     let app = AppBuilder::new(app_name).with_dataset(dataset).build();
 
@@ -119,10 +163,13 @@ async fn run_iceberg_test(
         results.push(batch?);
     }
 
-    let pretty = arrow::util::pretty::pretty_format_batches(&results)
-        .map_err(|e| anyhow::Error::msg(e.to_string()))?;
+    if assert_snapshot {
+        let pretty = arrow::util::pretty::pretty_format_batches(&results)
+            .map_err(|e| anyhow::Error::msg(e.to_string()))?;
 
-    insta::assert_snapshot!(snapshot_name, pretty);
+        insta::assert_snapshot!(snapshot_name.unwrap_or_default(), pretty);
+    }
+
     Ok(rt)
 }
 
