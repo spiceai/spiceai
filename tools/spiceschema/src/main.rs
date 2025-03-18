@@ -1,12 +1,11 @@
 use clap::{ArgGroup, CommandFactory, Parser, Subcommand, ValueEnum};
-use runtime::ApiDoc;
+use runtime::get_api_doc;
 use serde_json::Value;
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum OutputFormat {
     Json,
     Yaml,
 }
-use utoipa::OpenApi;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -53,7 +52,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match &cli.cmd {
         Some(Command::Http { format, json, yaml }) => {
-            let Ok(json_str) = ApiDoc::openapi().to_json() else {
+            let Ok(json_str) = get_api_doc().to_json() else {
                 return Err(Box::from("Failed to generate OpenAPI schema"));
             };
 

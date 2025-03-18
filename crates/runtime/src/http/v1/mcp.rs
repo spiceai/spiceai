@@ -13,14 +13,12 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use bytes::Bytes;
 use futures::{stream::Stream, StreamExt, TryStreamExt};
-use mcp_server::{ByteTransport, Server};
+use mcp_server::{router::RouterService, ByteTransport, Server};
 
 use tokio_util::codec::FramedRead;
 
 use http::StatusCode;
-use mcp_server::router::RouterService;
 
 use tokio::{
     io::{self, AsyncWriteExt},
@@ -59,11 +57,13 @@ fn session_id() -> SessionId {
 }
 
 #[derive(Debug, serde::Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::IntoParams))]
 #[serde(rename_all = "camelCase")]
 pub struct PostEventQuery {
     pub session_id: String,
 }
 
+/// Openapi documentation for this endpoint is in [`crate::http::get_api_doc`].
 pub(crate) async fn sse(
     Extension(rt): Extension<Arc<Runtime>>,
     Extension(mcp): Extension<Arc<McpState>>,
@@ -108,16 +108,34 @@ pub(crate) async fn sse(
     );
     Sse::new(stream)
 }
-
+/// Send message to MCP server
+///
+/// Send message to the MCP endoint, for a given session.
+#[cfg_attr(
+    feature = "openapi",
+    utoipa::path(
+        post,
+        path = "/v1/mcp/event",
+        operation_id = "mcp_event",
+        tag = "mcp",
+        params(PostEventQuery),
+        responses(
+    (status = 202, description = "Message accepted. Response will stream via SSE."),
+    (status = 404, description = "Session not found. No active session for the given `session_id`."),
+    (status = 413, description = "Payload too large. Maximum allowed size is 4MB."),
+    (status = 500, description = "Internal server error. An unexpected issue occurred."),
+)
+    )
+)]
 pub(crate) async fn event(
     Extension(mcp): Extension<Arc<McpState>>,
     Query(PostEventQuery { session_id }): Query<PostEventQuery>,
-    body: Bytes,
+    body: String,
 ) -> Result<StatusCode, StatusCode> {
     const BODY_BYTES_LIMIT: usize = 1 << 22;
     tracing::trace!(
         "Received POST event in SSE session_id={session_id}. Event={}",
-        String::from_utf8(body.to_ascii_lowercase()).unwrap_or("ERROR".to_string())
+        body
     );
     let Some(writer) = mcp.get(session_id.as_str()).await else {
         return Err(StatusCode::NOT_FOUND);
