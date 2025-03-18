@@ -38,6 +38,8 @@ pub async fn record_explain_plan(
     let mut assertion_err: Option<String> = None;
 
     let temp_dir = std::env::temp_dir();
+
+    println!("Temp dir: {:?}", temp_dir);
     let temp_dir_str = temp_dir.to_str().unwrap_or_default();
     let temp_dir_clean = temp_dir_str.trim_end_matches('/');
     let temp_dir_pattern = regex::escape(temp_dir_clean);
