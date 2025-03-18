@@ -21,8 +21,11 @@ limitations under the License.
 //!     `updated_at` TIMESTAMP DEFAULT `CURRENT_TIMESTAMP` ON UPDATE `CURRENT_TIMESTAMP`,
 //! );
 
+use std::sync::Arc;
+
 use super::{acceleration_connection, AccelerationConnection, Result};
 use crate::component::dataset::Dataset;
+use async_trait::async_trait;
 use datafusion::arrow::datatypes::{Schema, SchemaRef};
 use serde_json;
 
@@ -37,19 +40,41 @@ mod postgres;
 #[cfg(feature = "sqlite")]
 mod sqlite;
 
+#[async_trait]
+pub trait DatasetCheckpointer: Send + Sync {
+    async fn exists(&self) -> bool;
+    async fn checkpoint(&self, schema: &SchemaRef) -> Result<()>;
+    async fn get_schema(&self) -> Result<Option<SchemaRef>>;
+}
+
+#[async_trait]
+impl DatasetCheckpointer for DatasetCheckpoint {
+    async fn exists(&self) -> bool {
+        self.exists().await
+    }
+
+    async fn checkpoint(&self, schema: &SchemaRef) -> Result<()> {
+        self.checkpoint(schema).await
+    }
+
+    async fn get_schema(&self) -> Result<Option<SchemaRef>> {
+        self.get_schema().await
+    }
+}
+
 pub struct DatasetCheckpoint {
     dataset_name: String,
     acceleration_connection: AccelerationConnection,
 }
 
 impl DatasetCheckpoint {
-    pub async fn try_new(dataset: &Dataset) -> Result<Self> {
+    pub async fn try_new(dataset: &Dataset) -> Result<Arc<dyn DatasetCheckpointer>> {
         let acceleration_connection = acceleration_connection(dataset, true).await?;
         Self::init(&acceleration_connection).await?;
-        Ok(Self {
+        Ok(Arc::new(Self {
             dataset_name: dataset.name.to_string(),
             acceleration_connection,
-        })
+        }) as Arc<dyn DatasetCheckpointer>)
     }
 
     async fn init(connection: &AccelerationConnection) -> Result<()> {

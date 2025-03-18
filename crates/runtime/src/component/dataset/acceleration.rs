@@ -66,6 +66,33 @@ impl Display for Mode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum RefreshOnStartup {
+    /// Always start a new refresh when Spice starts.
+    Always,
+    /// Only start a refresh if an existing acceleration is not available.
+    #[default]
+    Auto,
+}
+
+impl From<spicepod_acceleration::RefreshOnStartup> for RefreshOnStartup {
+    fn from(refresh_on_startup: spicepod_acceleration::RefreshOnStartup) -> Self {
+        match refresh_on_startup {
+            spicepod_acceleration::RefreshOnStartup::Always => RefreshOnStartup::Always,
+            spicepod_acceleration::RefreshOnStartup::Auto => RefreshOnStartup::Auto,
+        }
+    }
+}
+
+impl Display for RefreshOnStartup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RefreshOnStartup::Always => write!(f, "always"),
+            RefreshOnStartup::Auto => write!(f, "auto"),
+        }
+    }
+}
+
 /// Behavior when a query on an accelerated table returns zero results.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub enum ZeroResultsAction {
@@ -218,6 +245,8 @@ pub struct Acceleration {
 
     pub refresh_mode: Option<RefreshMode>,
 
+    pub refresh_on_startup: RefreshOnStartup,
+
     pub refresh_check_interval: Option<Duration>,
 
     pub refresh_sql: Option<String>,
@@ -349,6 +378,7 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
             mode: Mode::from(acceleration.mode),
             engine,
             refresh_mode: acceleration.refresh_mode.map(RefreshMode::from),
+            refresh_on_startup: RefreshOnStartup::from(acceleration.refresh_on_startup),
             refresh_check_interval,
             refresh_sql: acceleration.refresh_sql,
             refresh_data_window: acceleration.refresh_data_window,
@@ -400,6 +430,7 @@ impl Default for Acceleration {
             primary_key: None,
             on_conflict: HashMap::default(),
             disable_query_push_down: false,
+            refresh_on_startup: RefreshOnStartup::default(),
         }
     }
 }

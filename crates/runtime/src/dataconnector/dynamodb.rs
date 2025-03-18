@@ -145,7 +145,7 @@ impl DataConnector for DynamoDB {
                     "DynamoDBTableProvider",
                 );
 
-                aws_config::defaults(BehaviorVersion::v2024_03_28())
+                aws_config::defaults(BehaviorVersion::v2025_01_17())
                     .region(Region::new(region))
                     .credentials_provider(credentials)
                     .load()
@@ -153,7 +153,7 @@ impl DataConnector for DynamoDB {
             }
             _ => {
                 // This will automatically load AWS credentials from the environment, via IAM roles if configured.
-                aws_config::defaults(BehaviorVersion::v2024_03_28())
+                aws_config::defaults(BehaviorVersion::v2025_01_17())
                     .region(Region::new(region))
                     .load()
                     .await

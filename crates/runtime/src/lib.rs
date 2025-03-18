@@ -40,7 +40,7 @@ use flight::RateLimits;
 use futures::future::join_all;
 use futures::Stream;
 #[cfg(feature = "openapi")]
-pub use http::ApiDoc;
+pub use http::get_api_doc;
 use model::{EmbeddingModelStore, EvalScorerRegistry, LLMModelStore};
 
 use crate::tools::{with_name, SpiceModelTool};

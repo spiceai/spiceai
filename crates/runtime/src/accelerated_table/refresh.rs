@@ -20,9 +20,9 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::accelerated_table::refresh_task::RefreshTask;
-use crate::component::dataset::acceleration::RefreshMode;
+use crate::component::dataset::acceleration::{RefreshMode, RefreshOnStartup};
 use crate::component::dataset::TimeFormat;
-use crate::dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint;
+use crate::dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpointer;
 use crate::federated_table::FederatedTable;
 use crate::status;
 use arrow::datatypes::Schema;
@@ -234,6 +234,33 @@ impl Refresh {
 
         Ok(())
     }
+
+    pub(crate) async fn should_refresh(
+        &self,
+        last_checkpoint: Option<Arc<dyn DatasetCheckpointer>>,
+    ) -> bool {
+        // If there is no checkpoint, we need to start a refresh.
+        let Some(last_checkpoint) = last_checkpoint else {
+            return true;
+        };
+
+        let has_previous_checkpoint = match self.mode {
+            RefreshMode::Full => last_checkpoint.exists().await,
+            // Append and Changes modes are always refreshed since they stream changes from the source table.
+            RefreshMode::Append | RefreshMode::Changes => return true,
+            RefreshMode::Disabled => return false,
+        };
+
+        // If there is no previous checkpoint, we need to start a refresh.
+        if !has_previous_checkpoint {
+            return true;
+        }
+
+        // Current behavior is temporary - we simply refresh if an interval is set.
+        // Future implementation should compare the elapsed time since last checkpoint against the refresh interval
+        // to determine if a refresh is needed.
+        self.check_interval.is_some()
+    }
 }
 
 fn validate_time_partition_format(
@@ -354,7 +381,8 @@ pub struct Refresher {
     accelerator: Arc<dyn TableProvider>,
     cache_provider: Option<Arc<QueryResultsCacheProvider>>,
     refresh_task_runner: Option<RefreshTaskRunner>,
-    checkpointer: Option<Arc<DatasetCheckpoint>>,
+    checkpointer: Option<Arc<dyn DatasetCheckpointer>>,
+    refresh_on_startup: RefreshOnStartup,
     synchronize_with: Option<SynchronizedTable>,
 
     initial_load_completed: Arc<AtomicBool>,
@@ -379,6 +407,7 @@ impl Refresher {
             cache_provider: None,
             refresh_task_runner: None,
             checkpointer: None,
+            refresh_on_startup: RefreshOnStartup::default(),
             synchronize_with: None,
             initial_load_completed: Arc::new(AtomicBool::new(false)),
         }
@@ -392,8 +421,16 @@ impl Refresher {
         self
     }
 
-    pub fn checkpointer(&mut self, checkpointer: Option<DatasetCheckpoint>) -> &mut Self {
-        self.checkpointer = checkpointer.map(Arc::new);
+    pub fn checkpointer(
+        &mut self,
+        checkpointer: Option<Arc<dyn DatasetCheckpointer>>,
+    ) -> &mut Self {
+        self.checkpointer = checkpointer;
+        self
+    }
+
+    pub fn refresh_on_startup(&mut self, refresh_on_startup: RefreshOnStartup) -> &mut Self {
+        self.refresh_on_startup = refresh_on_startup;
         self
     }
 
@@ -428,12 +465,28 @@ impl Refresher {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     pub(crate) async fn start(
         &mut self,
         acceleration_refresh_mode: AccelerationRefreshMode,
         ready_sender: oneshot::Sender<()>,
     ) -> Option<tokio::task::JoinHandle<()>> {
         let time_column = self.refresh.read().await.time_column.clone();
+        {
+            let refresh = self.refresh.read().await;
+
+            // If the table already has an existing acceleration and the refresh options wouldn't start a new refresh,
+            // we can exit early.
+            if self.refresh_on_startup == RefreshOnStartup::Auto
+                && !refresh.should_refresh(self.checkpointer.clone()).await
+            {
+                tracing::debug!(
+                    "Skipped refresh for {}: existing acceleration is available",
+                    self.dataset_name
+                );
+                return None;
+            }
+        }
 
         let mut on_start_refresh_external = match (acceleration_refresh_mode, time_column) {
             (AccelerationRefreshMode::Disabled, _) => return None,
@@ -1659,5 +1712,79 @@ mod tests {
                 Err(Error::TimeFormatMismatch { .. })
             ));
         }
+    }
+
+    #[tokio::test]
+    async fn test_should_refresh() {
+        use crate::dataaccelerator::spice_sys::{dataset_checkpoint::DatasetCheckpointer, Result};
+        use arrow::datatypes::SchemaRef;
+        use async_trait::async_trait;
+
+        // Mock implementation of DatasetCheckpointer trait
+        struct MockCheckpointer {
+            exists_value: bool,
+        }
+
+        impl MockCheckpointer {
+            fn new_arc(exists_value: bool) -> Arc<dyn DatasetCheckpointer> {
+                Arc::new(Self { exists_value })
+            }
+        }
+
+        #[async_trait]
+        impl DatasetCheckpointer for MockCheckpointer {
+            async fn exists(&self) -> bool {
+                self.exists_value
+            }
+
+            async fn checkpoint(&self, _schema: &SchemaRef) -> Result<()> {
+                // Not needed for this test
+                Ok(())
+            }
+
+            async fn get_schema(&self) -> Result<Option<SchemaRef>> {
+                // Not needed for this test
+                Ok(None)
+            }
+        }
+
+        // Test case 1: No checkpoint, should refresh regardless of mode
+        let refresh = Refresh::new(RefreshMode::Full);
+        assert!(refresh.should_refresh(None).await);
+
+        let refresh = Refresh::new(RefreshMode::Append);
+        assert!(refresh.should_refresh(None).await);
+
+        let refresh = Refresh::new(RefreshMode::Changes);
+        assert!(refresh.should_refresh(None).await);
+
+        let refresh = Refresh::new(RefreshMode::Disabled);
+        assert!(refresh.should_refresh(None).await);
+
+        // Test case 2: Checkpoint exists, but mode is Append or Changes - should always refresh
+        let checkpoint = MockCheckpointer::new_arc(true);
+
+        let refresh = Refresh::new(RefreshMode::Append);
+        assert!(refresh.should_refresh(Some(Arc::clone(&checkpoint))).await);
+
+        let refresh = Refresh::new(RefreshMode::Changes);
+        assert!(refresh.should_refresh(Some(Arc::clone(&checkpoint))).await);
+
+        // Test case 3: Checkpoint exists, mode is Disabled - should never refresh
+        let refresh = Refresh::new(RefreshMode::Disabled);
+        assert!(!refresh.should_refresh(Some(Arc::clone(&checkpoint))).await);
+
+        // Test case 4: Checkpoint exists, mode is Full, previous checkpoint exists
+        let refresh = Refresh::new(RefreshMode::Full);
+        assert!(!refresh.should_refresh(Some(Arc::clone(&checkpoint))).await);
+
+        // Test case 5: Checkpoint exists, mode is Full, previous checkpoint exists, check_interval is set
+        let refresh = Refresh::new(RefreshMode::Full).check_interval(Duration::from_secs(60));
+        assert!(refresh.should_refresh(Some(checkpoint)).await);
+
+        // Test case 6: Checkpoint exists, mode is Full, previous checkpoint doesn't exist
+        let non_existing_checkpoint = MockCheckpointer::new_arc(false);
+        let refresh = Refresh::new(RefreshMode::Full);
+        assert!(refresh.should_refresh(Some(non_existing_checkpoint)).await);
     }
 }

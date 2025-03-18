@@ -1,0 +1,18 @@
+---
+source: crates/runtime/tests/iceberg/iceberg_connector/mod.rs
+expression: pretty
+---
++-----------+--------------------+---------------------------------------+-------------+-----------------+-----------+--------------+-------------------------------------------------------------------------------------------------------------------+
+| c_custkey | c_name             | c_address                             | c_nationkey | c_phone         | c_acctbal | c_mktsegment | c_comment                                                                                                         |
++-----------+--------------------+---------------------------------------+-------------+-----------------+-----------+--------------+-------------------------------------------------------------------------------------------------------------------+
+| 1         | Customer#000000001 | j5JsirBM9PsCy0O1m                     | 15          | 25-989-741-2988 | 711.56    | BUILDING     | y final requests wake slyly quickly special accounts. blithely                                                    |
+| 2         | Customer#000000002 | 487LW1dovn6Q4dMVymKwwLE9OKf3QG        | 13          | 23-768-687-3665 | 121.65    | AUTOMOBILE   | y carefully regular foxes. slyly regular requests about the bli                                                   |
+| 3         | Customer#000000003 | fkRGN8nY4pkE                          | 1           | 11-719-748-3364 | 7498.12   | AUTOMOBILE   | fully. carefully silent instructions sleep alongside of the slyly regular asymptotes. quickly regular             |
+| 4         | Customer#000000004 | 4u58h fqkyE                           | 4           | 14-128-190-5944 | 2866.83   | MACHINERY    |  sublate. fluffily even instructions are about th                                                                 |
+| 5         | Customer#000000005 | hwBtxkoBF qSW4KrIk5U 2B1AU7H          | 3           | 13-750-942-6364 | 794.47    | HOUSEHOLD    | equests haggle furiously against the pending packa                                                                |
+| 6         | Customer#000000006 |  g1s,pzDenUEBW3O,2 pxu0f9n2g64rJrt5E  | 20          | 30-114-968-4951 | 7638.57   | AUTOMOBILE   |  quickly silent asymptotes are slyly regular excuses. instructions wake furiously? quickly bold courts p          |
+| 7         | Customer#000000007 | 8OkMVLQ1dK6Mbu6WG9 w4pLGQ n7MQ        | 18          | 28-190-982-9759 | 9561.95   | AUTOMOBILE   | ounts. ironic, regular accounts sleep. final requests haggle quickly after the                                    |
+| 8         | Customer#000000008 | j,pZ,Qp,qtFEo0r0c 92qobZtlhSuOqbE4JGV | 17          | 27-147-574-9335 | 6819.74   | BUILDING     | riously final excuses sublate quickly among the fluffily even foxes. quickly final packages haggle furiously furi |
+| 9         | Customer#000000009 | vgIql8H6zoyuLMFNdAMLyE7 H9            | 8           | 18-338-906-3675 | 8324.07   | FURNITURE    | ss pinto beans believe slyly quiet deposits-- doggedly bold packages boost. quickly ironic de                     |
+| 10        | Customer#000000010 | Vf mQ6Ug9Ucf5OKGYq fsaX AtfsO7,rwY    | 5           | 15-741-346-9870 | 2753.54   | HOUSEHOLD    | g quickly after the evenly bold                                                                                   |
++-----------+--------------------+---------------------------------------+-------------+-----------------+-----------+--------------+-------------------------------------------------------------------------------------------------------------------+
