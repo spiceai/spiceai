@@ -37,11 +37,23 @@ pub async fn record_explain_plan(
 
     let mut assertion_err: Option<String> = None;
 
+    let temp_dir = std::env::temp_dir();
+    let temp_dir_str = temp_dir.to_str().unwrap_or_default();
+    let temp_dir_clean = temp_dir_str.trim_end_matches('/');
+    let temp_dir_pattern = regex::escape(temp_dir_clean);
+
+    // Match two patterns:
+    // 1. Exact match starting with the temp_dir: {temp_dir}/dir1/data
+    // 2. (macos) Match with "private" prefix: private{temp_dir}/dir1/data
+    let path_filter_pattern =
+        format!(r"(?:{temp_dir_pattern}|private{temp_dir_pattern})/[^/]*/data",);
+
     insta::with_settings!({
         description => format!("Query: {query_name}"),
         omit_expression => true,
         snapshot_path => "snapshots/explain",
         filters => vec![
+            (path_filter_pattern.as_str(), "/data"),
             (r"required_guarantees=\[[^\]]*\]", "required_guarantees=[N]"),
         ],
     }, {
