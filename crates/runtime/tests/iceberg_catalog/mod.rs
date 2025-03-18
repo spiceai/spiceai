@@ -19,13 +19,13 @@ use crate::{
     utils::{runtime_ready_check, test_request_context},
     ValidateFn,
 };
+use anyhow::Context;
 use app::AppBuilder;
+use arrow::record_batch::RecordBatch;
+use futures::StreamExt;
 use runtime::{status, Runtime};
 use spicepod::component::{catalog::Catalog, params::Params};
 use std::sync::Arc;
-use arrow::record_batch::RecordBatch;
-use anyhow::Context;
-use futures::StreamExt;
 
 #[tokio::test]
 async fn glue_iceberg_integration_test_catalog() -> Result<(), anyhow::Error> {
@@ -45,7 +45,7 @@ async fn glue_iceberg_integration_test_catalog() -> Result<(), anyhow::Error> {
         .scope(async {
             let mut db_catalog =
                 Catalog::new(format!("iceberg:https://glue.ap-northeast-2.amazonaws.com/iceberg/v1/catalogs/{account_id}/namespaces"), "ice_glue".to_string());
-            
+
             db_catalog.include = vec!["testdb_001.*".to_string(), "testdb_002.*".to_string()];
             db_catalog.params = Some(get_params());
 
@@ -55,33 +55,33 @@ async fn glue_iceberg_integration_test_catalog() -> Result<(), anyhow::Error> {
 
             let status = status::RuntimeStatus::new();
             let df = get_test_datafusion(Arc::clone(&status));
-        
+
             let rt = Runtime::builder()
                 .with_app(app)
                 .with_datafusion(df)
                 .with_runtime_status(status)
                 .build()
                 .await;
-        
+
             tokio::select! {
                 () = tokio::time::sleep(std::time::Duration::from_secs(600)) => {
                     panic!("Timeout waiting for components to load");
                 }
                 () = rt.load_components() => {}
             }
-        
+
             runtime_ready_check(&rt).await;
-        
+
             let mut result = rt.datafusion().query_builder( "SELECT * FROM ice_glue.testdb_001.iceberg_table_001 LIMIT 10").build().run().await?;
-        
+
             let mut results: Vec<RecordBatch> = vec![];
             while let Some(batch) = result.data.next().await {
                 results.push(batch?);
             }
-        
+
             let pretty = arrow::util::pretty::pretty_format_batches(&results)
                 .map_err(|e| anyhow::Error::msg(e.to_string()))?;
-        
+
             insta::assert_snapshot!("glue_iceberg_integration_test_catalog", pretty);
 
             Ok(())
@@ -109,4 +109,3 @@ fn get_params() -> Params {
         .collect(),
     )
 }
-
