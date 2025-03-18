@@ -44,7 +44,7 @@ async fn glue_iceberg_integration_test_catalog() -> Result<(), anyhow::Error> {
             db_catalog.include = vec!["testdb_001.*".to_string(), "testdb_002.*".to_string()];
             db_catalog.params = Some(get_params());
 
-            let app = AppBuilder::new("databricks_delta_lake_catalog_test")
+            let app = AppBuilder::new("glue_iceberg_integration_test_catalog")
                 .with_catalog(db_catalog)
                 .build();
 
