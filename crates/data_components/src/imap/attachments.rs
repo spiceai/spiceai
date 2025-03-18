@@ -46,11 +46,6 @@ pub struct AttachmentRecords{
 }
 
 
-impl AttachmentRecords {
-    //FIXME: empty impl
-}
-
-
 impl TryFrom<&String> for AttachmentRecords{
     type Error = String;
 
@@ -99,11 +94,12 @@ impl TryFrom<&String> for AttachmentRecords{
                 match (filename, mime_type) {
                     (None, None) => {
                         // We have encountered the rare MIME record where there is no filename and no mime_type data.
-                        // invalid_attachment_action::warn
 
-                        // FIXME: Is this attachment probably text?
-                        // FIXME: Further research?
-                        // FIXME: Cite exact RFC passage?
+                        //FIXME: invalid_attachment_action::warn ?
+
+                        //FIXME: Is this attachment probably text?
+                        // Further research?
+                        // Cite exact RFC passage?
                     },
                     (filename, mime_type) => {
                         // Any other combo of filename and mime_type gives us a useful decode.

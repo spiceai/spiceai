@@ -18,13 +18,15 @@ use std::sync::Arc;
 
 use arrow::{
     array::{
-        ArrayRef, Date64Array, ListArray, ListBuilder, RecordBatch, StringArray, StringBuilder,
+        ArrayRef, Date64Array, ListArray, ListBuilder, RecordBatch, StringArray, StringBuilder, StructBuilder,
     },
+    datatypes::{DataType, Field, Fields},
     error::ArrowError,
 };
 use datafusion::{catalog::TableProvider, error::DataFusionError};
 use session::ImapSession;
 use snafu::prelude::*;
+use crate::imap::attachments::AttachmentInfo;
 
 pub mod provider;
 pub mod session;
@@ -76,6 +78,49 @@ fn build_listarray_for_strings(values: Vec<Option<Vec<Option<String>>>>) -> List
     builder.finish()
 }
 
+
+fn build_listarray_for_attachments(values: Vec<Option<Vec<AttachmentInfo>>>) -> ListArray {
+
+    //FIXME: This fn was written with help from GPT. It seems plausible but I am not
+    // versed in the construction of Arrow suitable structures.
+    // I had a look at snowflakeconn.rs - seems similar.
+
+    //panic!("Fn needs review to ensure correct Arrow data struct.");
+
+    let struct_builder = StructBuilder::new(
+        Fields::from(vec![
+            Field::new("filename", DataType::Utf8, true),
+            Field::new("mime_type", DataType::Utf8, true),
+        ]),
+        vec![Box::new(StringBuilder::new()), Box::new(StringBuilder::new())],
+    );
+
+    let mut list_builder = ListBuilder::new(struct_builder);
+
+    for attachment_list in values {
+        if let Some(attachments) = attachment_list {
+            for attachment in attachments {
+                let struct_builder = list_builder.values();
+                struct_builder
+                    .field_builder::<StringBuilder>(0)
+                    .expect("Should return a field builder")
+                    .append_option(attachment.filename.as_deref());
+                struct_builder
+                    .field_builder::<StringBuilder>(1)
+                    .expect("Should return a field builder")
+                    .append_option(attachment.mime_type.as_deref());
+                struct_builder.append(true);
+            }
+            list_builder.append(true);
+        } else {
+            list_builder.append(false);
+        }
+    }
+
+    list_builder.finish()
+}
+
+
 impl ImapTableProvider {
     #[must_use]
     pub fn new(session: ImapSession, fetch_content: bool) -> Self {
@@ -99,8 +144,7 @@ impl ImapTableProvider {
         let mut message_ids = vec![];
         let mut in_reply_tos = vec![];
         let mut bodies = vec![];
-        let mut attachment_names = vec![];
-        let mut attachment_mime_types = vec![];
+        let mut attachments = vec![];
 
         for message in messages {
             dates.push(message.date);
@@ -113,8 +157,7 @@ impl ImapTableProvider {
             message_ids.push(message.message_id);
             in_reply_tos.push(message.in_reply_to);
             bodies.push(message.body);
-            attachment_names.push(message.attachment_names);
-            attachment_mime_types.push(message.attachment_mime_types);
+            attachments.push(message.attachments);
         }
 
         let mut fields: Vec<ArrayRef> = vec![
@@ -127,16 +170,11 @@ impl ImapTableProvider {
             Arc::new(build_listarray_for_strings(reply_tos)),
             Arc::new(StringArray::from(message_ids)),
             Arc::new(StringArray::from(in_reply_tos)),
+            Arc::new(build_listarray_for_attachments(attachments)),
         ];
 
         if self.fetch_content {
             fields.push(Arc::new(StringArray::from(bodies)));
-
-            //FIXME: not sure if this is the correct place to add our records to the fields vec
-            //if we don't have a bodies blob we cant process it for attachments
-            fields.push(Arc::new(build_listarray_for_strings(attachment_names)));
-            fields.push(Arc::new(build_listarray_for_strings(attachment_mime_types)));
-
         }
 
         RecordBatch::try_new(self.schema(), fields)
@@ -160,7 +198,6 @@ pub(crate) struct EmailMessage {
     message_id: Option<String>,
     in_reply_to: Option<String>,
     body: Option<String>,
-    attachment_names: Option<Vec<Option<String>>>,
-    attachment_mime_types: Option<Vec<Option<String>>>,
+    attachments: Option<Vec<AttachmentInfo>>,
 }
 

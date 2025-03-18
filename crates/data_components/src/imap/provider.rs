@@ -16,7 +16,7 @@ limitations under the License.
 
 use std::{any::Any, sync::Arc};
 
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow::datatypes::{DataType, Field, Fields, Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::{
     catalog::{Session, TableProvider},
@@ -112,25 +112,22 @@ impl TableProvider for ImapTableProvider {
             ),
             Field::new("message_id", DataType::Utf8, true),
             Field::new("in_reply_to", DataType::Utf8, true),
+
+            Field::new(
+               "attachments",
+               DataType::List(Arc::new(Field::new_list_field(
+                   DataType::Struct(Fields::from(vec![
+                       Field::new("filename", DataType::Utf8, true),
+                       Field::new("mime_type", DataType::Utf8, true),
+                   ])),
+                   true,
+               ))),
+               true,
+           ),
         ];
 
         if self.fetch_content {
             fields.push(Field::new("content", DataType::Utf8, true));
-
-            fields.push(
-                Field::new(
-                "attachment_name", //FIXME: what to use as field name? attachments.rs uses filename
-                DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
-            true)
-            );
-
-            fields.push(
-                Field::new(
-                    "attachment_mime_type",
-                    DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
-                    true)
-            );
-
         }
 
         Arc::new(Schema::new(fields))
@@ -191,13 +188,15 @@ impl TableProvider for ImapTableProvider {
                 None
             };
 
+            //FIXME: if we do not self.fetch_content then body == None
+            // if body == None then the AttachmentRecords::try_from() will fail.
 
             let attachment_records = body
                 .as_ref()
                 .and_then(|body| AttachmentRecords::try_from(body).ok());
 
-            let (attachment_names, attachment_mime_types) = attachment_records
-                .map_or((None, None), |records| records.into_tuple());
+            let attachments = attachment_records
+                .map_or(None, |records| Some(records.attachments));
 
 
             messages.push(EmailMessage {
@@ -211,8 +210,7 @@ impl TableProvider for ImapTableProvider {
                 message_id,
                 in_reply_to,
                 body,
-                attachment_names,
-                attachment_mime_types,
+                attachments
             });
         }
 
