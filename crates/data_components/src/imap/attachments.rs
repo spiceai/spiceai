@@ -42,81 +42,12 @@ pub struct AttachmentInfo {
 #[derive(Debug)]
 #[derive(PartialEq)]
 pub struct AttachmentRecords{
-    pub mime_types: Vec<Option<String>>,
-    pub filenames: Vec<Option<String>>,
+    pub attachments: Vec<AttachmentInfo>,
 }
 
 
 impl AttachmentRecords {
-    #[cfg(test)]
-    pub fn collate(&self) -> Vec<AttachmentInfo>{
-        // convenience fn to restructure the two member vecs into a single Vec<AttachmentInfo> struct
-
-        let mut ret = Vec::<AttachmentInfo>::new();
-
-        for (filename, mime_type) in self.filenames.iter().zip( self.mime_types.iter() ){
-
-
-            // This fails the unit test! :-(
-            // This clones all records including None,None.
-            // The match tree filters it out as a dead row.
-            /*
-            ret.push(
-                AttachmentInfo {
-                    filename: filename.clone(),
-                    mime_type: mime_type.clone(),
-                }
-            );
-            */
-
-
-            match( filename, mime_type ){
-                (Some(f), Some(t)) => {
-                    //filename and mime type
-                    ret.push(
-                        AttachmentInfo{
-                            filename: Some(f.clone()),
-                            mime_type: Some(t.clone()),
-                        }
-                    )
-                },
-                (Some(f), None) => {
-                    //filename, no mime type
-                    ret.push(
-                        AttachmentInfo{
-                            filename: Some(f.clone()),
-                            mime_type: None,
-                        }
-                    )
-                },
-                (None, Some(t)) => {
-                    //no filename, mime type only
-                    ret.push(
-                        AttachmentInfo{
-                            filename: None,
-                            mime_type: Some(t.clone()),
-                        }
-                    )
-                },
-                (None,None) => {
-                    //panic!("no filename and no mime type.");
-                    //FIXME: This is a legal MIME state. How to handle for Spice?
-                }
-            }
-        }
-
-        ret
-
-    }
-
-
-    pub fn into_tuple(self) -> (Option<Vec<Option<String>>>, Option<Vec<Option<String>>>){
-        (
-            Some(self.filenames),
-            Some(self.mime_types)
-        )
-    }
-
+    //FIXME: empty impl
 }
 
 
@@ -124,77 +55,83 @@ impl TryFrom<&String> for AttachmentRecords{
     type Error = String;
 
     fn try_from(raw_email: &String) -> Result<Self, Self::Error> {
-        // This fn parses a raw email into a list of filenames and mime types for any attachments.
 
-        let mut filenames = Vec::<Option<String>>::new();
-        let mut mime_types = Vec::<Option<String>>::new();
+        let mut attachments = Vec::<AttachmentInfo>::new();
 
         if let Some(message) = MessageParser::default().parse(raw_email) {
 
             for attachment in message.attachments() {
 
                 //extract filename
-                if let Some(attachment_name) = attachment.attachment_name() {
-                    filenames.push(Some(attachment_name.to_string()));
-
+                let filename = if let Some(attachment_name) = attachment.attachment_name() {
+                    Some(attachment_name.to_string())
                 }else{
-                    //unable to extract filename
-                    filenames.push(None);
-                }
+                    None
+                };
 
                 //extract mime type
-                if let Some(content_type_struct) = attachment.content_type() {
+                let mime_type = if let Some(content_type_struct) = attachment.content_type() {
                     //reconstruct the mime type as a string
+                    //returns either "{major_type_val}" or "{major_type_val}/{subtype_val}"
+
+                    let major_type_val = content_type_struct.c_type.to_string();
+
                     let mime_type = match &content_type_struct.c_subtype {
                         Some(subtype_val) => {
                             // concat major type and subtype into a string like "text/plain"
-                            let type_val = content_type_struct.c_type.to_string();
-                            format!("{}/{}", type_val, subtype_val)
+                            format!("{}/{}", major_type_val, subtype_val)
                         }
                         None => {
                             // no subtype: returns eg "text"
-                            content_type_struct.c_type.to_string()
+                            major_type_val
                         }
                     };
 
-                    mime_types.push(Some(mime_type));
+                    Some(mime_type)
 
                 }else{
                     //unable to extract mime type
-                    mime_types.push(None);
-                }
+                    None
+                };
 
-                //FIXME: This might be a good place to deal with None,None case where there's no filename AND no mime_type
+
+                // Deal with None,None case where there's no filename AND no mime_type
+                match (filename, mime_type) {
+                    (None, None) => {
+                        // We have encountered the rare MIME record where there is no filename and no mime_type data.
+                        // invalid_attachment_action::warn
+
+                        // FIXME: Is this attachment probably text?
+                        // FIXME: Further research?
+                        // FIXME: Cite exact RFC passage?
+                    },
+                    (filename, mime_type) => {
+                        // Any other combo of filename and mime_type gives us a useful decode.
+                        attachments.push( AttachmentInfo{ filename, mime_type } );
+                    }
+                };
 
             } //loop attachments for email
 
         } //can we parse this email?
 
 
-        if mime_types.len() != filenames.len() {
-            //FIXME: should probably throw/log some kind of error if we get a mismatch in vector sizes?
-            //FIXME: snafu error handling here?
-            panic!("attachment record parse failed. mismatched vec sizes.");
-        }
-
-
-        if filenames.is_empty() {
+        if attachments.is_empty() {
             Err("No attachments found.".to_string())
         }else{
 
-            //sane parse, collate vecs as return struct
+            //sane parse
             Ok(
                 AttachmentRecords{
-                    filenames,
-                    mime_types,
+                    attachments
                 }
             )
 
         }
 
-    }
+    } //try_from(..)
 
-}
+} // impl ... AttachmentRecords
 
 
 
@@ -211,7 +148,7 @@ fn eml_utf8() {
     // println!("\nutf8 check");
     let attachment_records = AttachmentRecords::try_from( &raw_email ).unwrap();
 
-    let collated = attachment_records.collate();
+    let extracted_set = attachment_records.attachments;
     // for rec in &collated{
     //     println!("-rec: {:?}", rec);
     // }
@@ -248,7 +185,7 @@ fn eml_utf8() {
         },
     );
 
-    assert_eq!( collated, correct_set, "mismatched sets" );
+    assert_eq!( extracted_set, correct_set, "mismatched sets" );
 
 }
 
@@ -272,7 +209,7 @@ fn eml_three_attachments(){
     // println!("\nthree attachments");
     let attachment_records = AttachmentRecords::try_from( &raw_email ).unwrap();
 
-    let collated = attachment_records.collate();
+    let extracted_set = attachment_records.attachments;
     // for rec in &collated{
     //     println!("-rec: {:?}", rec);
     // }
@@ -292,7 +229,7 @@ fn eml_three_attachments(){
         },
     );
 
-    assert_eq!( collated, correct_set, "mismatched sets" );
+    assert_eq!( extracted_set, correct_set, "mismatched sets" );
 
 }
 
@@ -307,7 +244,7 @@ fn eml_malformed(){
     //println!("\nmalformed headers");
     let attachment_records = AttachmentRecords::try_from( &raw_email ).unwrap();
 
-    let collated = attachment_records.collate();
+    let extracted_set = attachment_records.attachments;
     // for rec in &collated{
     //     println!("-rec: {:?}", rec);
     // }
@@ -321,6 +258,10 @@ fn eml_malformed(){
             filename: None,
             mime_type: Some("application/pdf".to_string()),
         },
+        // AttachmentInfo{
+        //     filename: None,
+        //     mime_type: None,
+        // },
         AttachmentInfo{
             filename: Some("no_mime_type.png".to_string()),
             mime_type: None,
@@ -331,37 +272,37 @@ fn eml_malformed(){
         },
     );
 
-    assert_eq!( collated, correct_set, "mismatched sets" );
+    assert_eq!( extracted_set, correct_set, "mismatched sets" );
 
 }
 
 
 
 
-
-#[test]
-fn eml_integration_tuple(){
-    let raw_email = include_str!("test_data/three_attachments.txt").to_string(); // Load an email file
-
-    //println!("\nintegration tuple");
-    let attachment_records = AttachmentRecords::try_from( &raw_email ).unwrap();
-
-    let (filenames,mime_types) = attachment_records.into_tuple();
-
-    let correct_set_filenames = Some(vec!(
-        Some(String::from("document.pdf")),
-        Some(String::from("image.png")),
-        Some(String::from("notes.txt")),
-    ));
-    assert_eq!( filenames, correct_set_filenames, "filename set mismatch" );
-
-    let correct_set_mime_types = Some(vec!(
-        Some(String::from("application/pdf")),
-        Some(String::from("image/png")),
-        Some(String::from("text/plain")),
-    ));
-    assert_eq!( mime_types, correct_set_mime_types, "mime_type set mismatch" );
-
-}
+//
+// #[test]
+// fn eml_integration_tuple(){
+//     let raw_email = include_str!("test_data/three_attachments.txt").to_string(); // Load an email file
+//
+//     //println!("\nintegration tuple");
+//     let attachment_records = AttachmentRecords::try_from( &raw_email ).unwrap();
+//
+//     let (filenames,mime_types) = attachment_records.into_tuple();
+//
+//     let correct_set_filenames = Some(vec!(
+//         Some(String::from("document.pdf")),
+//         Some(String::from("image.png")),
+//         Some(String::from("notes.txt")),
+//     ));
+//     assert_eq!( filenames, correct_set_filenames, "filename set mismatch" );
+//
+//     let correct_set_mime_types = Some(vec!(
+//         Some(String::from("application/pdf")),
+//         Some(String::from("image/png")),
+//         Some(String::from("text/plain")),
+//     ));
+//     assert_eq!( mime_types, correct_set_mime_types, "mime_type set mismatch" );
+//
+// }
 
 
