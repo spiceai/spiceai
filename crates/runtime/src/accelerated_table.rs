@@ -19,7 +19,7 @@ use std::{any::Any, sync::Arc, time::Duration};
 
 use crate::component::dataset::acceleration::{RefreshMode, RefreshOnStartup, ZeroResultsAction};
 use crate::component::dataset::{ReadyState, TimeFormat};
-use crate::dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint;
+use crate::dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpointer;
 use crate::datafusion::error::SpiceExternalError;
 use crate::datafusion::is_spice_internal_dataset;
 use crate::federated_table::FederatedTable;
@@ -216,7 +216,7 @@ pub struct Builder {
     changes_stream: Option<ChangesStream>,
     append_stream: Option<ChangesStream>,
     disable_query_push_down: bool,
-    checkpointer: Option<DatasetCheckpoint>,
+    checkpointer: Option<Arc<dyn DatasetCheckpointer>>,
     synchronize_with: Option<SynchronizedTable>,
     initial_load_complete: bool,
 }
@@ -307,13 +307,16 @@ impl Builder {
     }
 
     /// Set the checkpointer for the accelerated table
-    pub fn checkpointer(&mut self, checkpointer: DatasetCheckpoint) -> &mut Self {
+    pub fn checkpointer(&mut self, checkpointer: Arc<dyn DatasetCheckpointer>) -> &mut Self {
         self.checkpointer = Some(checkpointer);
         self
     }
 
     /// Set the checkpointer for the accelerated table
-    pub fn checkpointer_opt(&mut self, checkpointer: Option<DatasetCheckpoint>) -> &mut Self {
+    pub fn checkpointer_opt(
+        &mut self,
+        checkpointer: Option<Arc<dyn DatasetCheckpointer>>,
+    ) -> &mut Self {
         self.checkpointer = checkpointer;
         self
     }

@@ -240,7 +240,9 @@ pub mod acceleration {
     #[cfg_attr(feature = "schemars", derive(JsonSchema))]
     #[serde(rename_all = "lowercase")]
     pub enum RefreshOnStartup {
+        /// Always start a new refresh when Spice starts.
         Always,
+        /// Only start a refresh if an existing acceleration is not available.
         #[default]
         Auto,
     }

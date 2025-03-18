@@ -68,7 +68,9 @@ impl Display for Mode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum RefreshOnStartup {
+    /// Always start a new refresh when Spice starts.
     Always,
+    /// Only start a refresh if an existing acceleration is not available.
     #[default]
     Auto,
 }
