@@ -37,6 +37,7 @@ sysinfo = "0.33.1"
 tempfile.workspace = true
 tokio.workspace = true
 tonic.workspace = true
+tokio-util.workspace = true
 uuid = { workspace = true, features = ["v4"] }
 
 [target.'cfg(not(windows))'.dependencies]

@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use super::get_app_and_start_request;
-use crate::args::DatasetTestArgs;
+use crate::{args::DatasetTestArgs, wait_test_and_memory};
 use std::time::Duration;
 use test_framework::{
     anyhow,
@@ -27,6 +27,8 @@ use test_framework::{
         datasets::{EndCondition, NotStarted},
         SpiceTest,
     },
+    tokio_util::sync::CancellationToken,
+    utils::observe_memory,
     TestType,
 };
 
@@ -64,6 +66,8 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
 
     let test = baseline_test.wait().await?;
     let spiced_instance = test.end()?;
+    let memory_token = CancellationToken::new();
+    let memory_readings = spiced_instance.process().watch_memory(&memory_token);
 
     // throughput test
     println!("Running throughput test");
@@ -79,17 +83,17 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
     .start()
     .await?;
 
-    let test = throughput_test.wait().await?;
+    let test = wait_test_and_memory!(throughput_test, memory_token, memory_readings);
     let throughput_metric = test.get_throughput_metric(args.scale_factor.unwrap_or(1.0))?;
     let metrics: QueryMetrics<_, ThroughputMetrics> = test
         .collect(TestType::Throughput)?
         .with_run_metric(ThroughputMetrics::new(throughput_metric));
     let mut spiced_instance = test.end()?;
-    let memory_usage = spiced_instance.show_memory_usage()?;
+    let (max_memory, _) = observe_memory(memory_token, memory_readings).await?;
 
     let records = metrics.build_records()?;
     print_batches(&records)?;
-    metrics.with_memory_usage(memory_usage).show_run(None)?; // no additional test pass logic applies
+    metrics.with_memory_usage(max_memory).show_run(None)?; // no additional test pass logic applies
     spiced_instance.stop()?;
 
     println!(
