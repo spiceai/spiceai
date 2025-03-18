@@ -17,15 +17,19 @@ limitations under the License.
 use std::{collections::HashMap, sync::Arc};
 
 use async_trait::async_trait;
-use match_::MatchScorer;
 use tokio::sync::RwLock;
 
 use super::{DatasetInput, DatasetOutput};
 
+#[cfg(feature = "models")]
 pub mod fuzzy_match;
+#[cfg(feature = "models")]
 pub mod includes;
+#[cfg(feature = "models")]
 pub mod json_match;
+#[cfg(feature = "models")]
 pub mod levenshtein;
+#[cfg(feature = "models")]
 pub mod match_;
 
 #[async_trait]
@@ -66,13 +70,20 @@ pub(crate) async fn score_results(
 
 #[must_use]
 pub fn builtin_scorer() -> Vec<(&'static str, Arc<dyn Scorer>)> {
-    vec![
-        ("levenshtein", Arc::new(levenshtein::Levenshtein {})),
-        ("match", Arc::new(MatchScorer {})),
-        ("json_match", Arc::new(json_match::JsonMatch {})),
-        ("includes", Arc::new(includes::Includes {})),
-        ("fuzzy_match", Arc::new(fuzzy_match::FuzzyMatch {})),
-    ]
+    #[cfg(feature = "models")]
+    {
+        vec![
+            ("levenshtein", Arc::new(levenshtein::Levenshtein {})),
+            ("match", Arc::new(match_::MatchScorer {})),
+            ("json_match", Arc::new(json_match::JsonMatch {})),
+            ("includes", Arc::new(includes::Includes {})),
+            ("fuzzy_match", Arc::new(fuzzy_match::FuzzyMatch {})),
+        ]
+    }
+    #[cfg(not(feature = "models"))]
+    {
+        vec![]
+    }
 }
 
 #[allow(clippy::cast_precision_loss)]
