@@ -96,7 +96,7 @@ pub struct RefreshOverrides {
         rename = "refresh_jitter_max",
         deserialize_with = "parse_max_jitter"
     )]
-    #[schema(value_type = Option<String>, example = "10s")]
+    #[cfg_attr(feature = "openapi", schema(value_type = Option<String>, example = "10s"))]
     pub max_jitter: Option<Duration>,
 }
 
