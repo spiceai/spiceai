@@ -93,7 +93,7 @@ where
 
     runtime_metrics::spiced_runtime::HTTP_SERVER_START.add(1, &[]);
 
-    let shutdown_signal = shutdown_signal.unwrap_or_else(CancellationToken::new);
+    let shutdown_signal = shutdown_signal.unwrap_or_default();
 
     let (shutdown_notify, _) = watch::channel(());
 
@@ -111,15 +111,15 @@ where
                 match tls_config {
                     Some(ref config) => {
                         let acceptor = TlsAcceptor::from(Arc::clone(&config.server_config));
-                        process_tls_tcp_stream(stream, acceptor, routes.clone(), shutdown_notify.subscribe())
+                        process_tls_tcp_stream(stream, acceptor, routes.clone(), shutdown_notify.subscribe());
                     }
                     None => {
-                        process_tcp_stream(stream, routes.clone(), shutdown_notify.subscribe())
+                        process_tcp_stream(stream, routes.clone(), shutdown_notify.subscribe());
                     }
                 };
             },
-            _ = shutdown_signal.cancelled() => {
-                tracing::debug!("Received shutdown signal, shutting down HTTP server");
+            () = shutdown_signal.cancelled() => {
+                tracing::debug!("Received shutdown signal");
                 drop(listener); // stop accepting new connections while shutting down
                 let num_active = shutdown_notify.receiver_count();
                 if num_active > 0 {
@@ -128,22 +128,16 @@ where
                     );
                 }
                 shutdown_notify.send(()).ok();
+                // Wait for all active connections to close
                 shutdown_notify.closed().await;
                 break;
             }
         }
     }
 
-    tracing::debug!("Spice Runtime HTTP stopped");
+    tracing::debug!("Stopped");
 
     Ok(())
-}
-
-fn process_tcp_stream(stream: TcpStream, routes: Router, on_shutdown: Receiver<()>) {
-    tokio::spawn({
-        let conn = serve_connection(stream, routes);
-        async move { handle_connection(conn, on_shutdown).await }
-    });
 }
 
 fn process_tls_tcp_stream(
@@ -162,6 +156,13 @@ fn process_tls_tcp_stream(
                 tracing::debug!("Error accepting TLS connection: {e}");
             }
         }
+    });
+}
+
+fn process_tcp_stream(stream: TcpStream, routes: Router, on_shutdown: Receiver<()>) {
+    tokio::spawn({
+        let conn = serve_connection(stream, routes);
+        async move { handle_connection(conn, on_shutdown).await }
     });
 }
 
@@ -191,11 +192,11 @@ async fn handle_connection<S>(
     tokio::select! {
         result = &mut conn.as_mut() => {
             if let Err(e) = result {
-                tracing::debug!(error = ?e, "Error serving connection.");
+                tracing::debug!(error = ?e, "Error serving HTTP connection.");
             }
         },
         _ = on_shutdown.changed() => {
-            tracing::trace!("Received shutdown signal, starting graceful HTTP connection shutdown");
+            tracing::trace!("Received shutdown signal, starting graceful connection shutdown");
             conn.as_mut().graceful_shutdown();
             let _ = conn.as_mut().await;
         }

@@ -716,7 +716,7 @@ impl Runtime {
 
         join_all(shutdown_futures).await;
 
-        tracing::debug!("Shutdown complete.");
+        tracing::debug!("Shutdown completed");
     }
 
     /// Spawns and registers a server component with optional cancellation support.
