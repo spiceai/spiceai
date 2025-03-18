@@ -476,8 +476,12 @@ impl Refresher {
             // If the table already has an existing acceleration and the refresh options wouldn't start a new refresh,
             // we can exit early.
             if self.refresh_on_startup == RefreshOnStartup::Auto
-                && refresh.should_refresh(self.checkpointer.clone()).await
+                && !refresh.should_refresh(self.checkpointer.clone()).await
             {
+                tracing::debug!(
+                    "Refresh not started for {} - an existing acceleration is available",
+                    self.dataset_name
+                );
                 return None;
             }
         }
