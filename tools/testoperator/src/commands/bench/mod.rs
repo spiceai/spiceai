@@ -77,6 +77,7 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
 
     let row_counts = test.validate_returned_row_counts()?;
     let metrics: QueryMetrics<_, NoExtendedMetrics> = test.collect(TestType::Benchmark)?;
+    let test_succeeded = test.succeeded();
     let mut spiced_instance = test.end()?;
     let (max_memory, _) = observe_memory(memory_token, memory_readings).await?;
 
@@ -92,6 +93,13 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
     }
 
     spiced_instance.stop()?;
+
+    if !test_succeeded {
+        return Err(anyhow::anyhow!(
+            "Benchmark test failed due to failed queries"
+        ));
+    }
+
     Ok(row_counts)
 }
 
