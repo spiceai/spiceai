@@ -18,6 +18,7 @@ use super::{get_app_and_start_request, RowCounts};
 use crate::{
     args::DatasetTestArgs,
     commands::{TEST_RESULTS_API_KEY, TEST_RESULTS_DATASET},
+    wait_test_and_memory,
 };
 use std::time::Duration;
 use test_framework::{
@@ -31,6 +32,8 @@ use test_framework::{
         datasets::{EndCondition, NotStarted},
         SpiceTest,
     },
+    tokio_util::sync::CancellationToken,
+    utils::observe_memory,
     TestType,
 };
 
@@ -41,6 +44,8 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
 
     let (app, start_request) = get_app_and_start_request(&args.common)?;
     let mut spiced_instance = SpicedInstance::start(start_request).await?;
+    let memory_token = CancellationToken::new();
+    let memory_readings = spiced_instance.process().watch_memory(&memory_token);
 
     spiced_instance
         .wait_for_ready(Duration::from_secs(args.common.ready_wait))
@@ -68,12 +73,14 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
     .start()
     .await?;
 
-    let test = benchmark_test.wait().await?;
+    let test = wait_test_and_memory!(benchmark_test, memory_token, memory_readings);
+
     let row_counts = test.validate_returned_row_counts()?;
     let metrics: QueryMetrics<_, NoExtendedMetrics> = test.collect(TestType::Benchmark)?;
     let mut spiced_instance = test.end()?;
+    let (max_memory, _) = observe_memory(memory_token, memory_readings).await?;
 
-    let records = metrics.build_records()?;
+    let records = metrics.with_memory_usage(max_memory).build_records()?;
     print_batches(&records)?;
 
     if args.common.upload_results_dataset.is_some() {
@@ -84,7 +91,6 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
         put_batches(&mut flight_client, TEST_RESULTS_DATASET, records).await?;
     }
 
-    spiced_instance.show_memory_usage()?;
     spiced_instance.stop()?;
     Ok(row_counts)
 }

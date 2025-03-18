@@ -11988,6 +11988,7 @@ dependencies = [
  "sysinfo 0.33.1",
  "tempfile",
  "tokio",
+ "tokio-util",
  "tonic",
  "uuid 1.13.1",
 ]
