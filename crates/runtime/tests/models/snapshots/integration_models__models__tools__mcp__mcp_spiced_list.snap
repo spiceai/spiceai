@@ -1,0 +1,539 @@
+---
+source: crates/runtime/tests/models/tools.rs
+expression: tools_list
+snapshot_kind: text
+---
+[
+  {
+    "description": null,
+    "name": "document_similarity",
+    "parameters": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "properties": {
+        "additional_columns": {
+          "default": [],
+          "description": "Additional columns to return from the dataset.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "datasets": {
+          "default": null,
+          "description": "The datasets to search for similarity. If None, search across all datasets. For available datasets, use the `list_datasets` tool and ensure `can_search_documents==true`.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "keywords": {
+          "description": "At least one keyword should be supplied for a vector search. Keywords should be individual words. Keywords are used to pre-filter the embedding column, applied as a `WHERE col LIKE '%keyword%'` condition. Keywords should not contain column names, special characters, or other operators.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "limit": {
+          "default": null,
+          "description": "Number of documents to return for each dataset",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "text": {
+          "description": "The text to search documents for similarity",
+          "type": "string"
+        },
+        "where": {
+          "default": null,
+          "description": "An SQL filter predicate to apply. Format: 'WHERE `where_cond`'.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "keywords",
+        "text"
+      ],
+      "title": "SearchRequestAIJson",
+      "type": "object"
+    }
+  },
+  {
+    "description": null,
+    "name": "get_readiness",
+    "parameters": null
+  },
+  {
+    "description": null,
+    "name": "list_datasets",
+    "parameters": null
+  },
+  {
+    "description": "Load memories previously saved by the language model.",
+    "name": "load_memory",
+    "parameters": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "properties": {
+        "last": {
+          "description": "Retrieve memories created in the 'last' interval. ISO 8601 Format, e.g: \"1h\", \"2m30s\".",
+          "type": "string"
+        }
+      },
+      "required": [
+        "last"
+      ],
+      "title": "LoadMemoryParams",
+      "type": "object"
+    }
+  },
+  {
+    "description": "",
+    "name": "mcp_from_spiced/document_similarity",
+    "parameters": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "properties": {
+        "additional_columns": {
+          "default": [],
+          "description": "Additional columns to return from the dataset.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "datasets": {
+          "default": null,
+          "description": "The datasets to search for similarity. If None, search across all datasets. For available datasets, use the `list_datasets` tool and ensure `can_search_documents==true`.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "keywords": {
+          "description": "At least one keyword should be supplied for a vector search. Keywords should be individual words. Keywords are used to pre-filter the embedding column, applied as a `WHERE col LIKE '%keyword%'` condition. Keywords should not contain column names, special characters, or other operators.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "limit": {
+          "default": null,
+          "description": "Number of documents to return for each dataset",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "text": {
+          "description": "The text to search documents for similarity",
+          "type": "string"
+        },
+        "where": {
+          "default": null,
+          "description": "An SQL filter predicate to apply. Format: 'WHERE `where_cond`'.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "keywords",
+        "text"
+      ],
+      "title": "SearchRequestAIJson",
+      "type": "object"
+    }
+  },
+  {
+    "description": "",
+    "name": "mcp_from_spiced/get_readiness",
+    "parameters": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "properties": {},
+      "required": [],
+      "title": "empty",
+      "type": "object"
+    }
+  },
+  {
+    "description": "",
+    "name": "mcp_from_spiced/list_datasets",
+    "parameters": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "properties": {},
+      "required": [],
+      "title": "empty",
+      "type": "object"
+    }
+  },
+  {
+    "description": "Load memories previously saved by the language model.",
+    "name": "mcp_from_spiced/load_memory",
+    "parameters": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "properties": {
+        "last": {
+          "description": "Retrieve memories created in the 'last' interval. ISO 8601 Format, e.g: \"1h\", \"2m30s\".",
+          "type": "string"
+        }
+      },
+      "required": [
+        "last"
+      ],
+      "title": "LoadMemoryParams",
+      "type": "object"
+    }
+  },
+  {
+    "description": "Sample random rows from a table.",
+    "name": "mcp_from_spiced/random_sample",
+    "parameters": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "properties": {
+        "dataset": {
+          "description": "The SQL dataset to sample data from.",
+          "type": "string"
+        },
+        "limit": {
+          "description": "The number of rows, each with distinct values per column, to sample.",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "dataset",
+        "limit"
+      ],
+      "title": "RandomSampleParams",
+      "type": "object"
+    }
+  },
+  {
+    "description": "Generate synthetic data by sampling distinct column values from a table.",
+    "name": "mcp_from_spiced/sample_distinct_columns",
+    "parameters": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "properties": {
+        "cols": {
+          "description": "The columns to sample distinct values from. If None, all columns are sampled.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "dataset": {
+          "description": "The SQL dataset to sample data from.",
+          "type": "string"
+        },
+        "limit": {
+          "description": "The number of rows, each with distinct values per column, to sample.",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "dataset",
+        "limit"
+      ],
+      "title": "DistinctColumnsParams",
+      "type": "object"
+    }
+  },
+  {
+    "description": "",
+    "name": "mcp_from_spiced/sql",
+    "parameters": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "properties": {
+        "query": {
+          "description": "The SQL query to run. Double quote all select columns and never select columns ending in '_embedding'. The `table_catalog` is 'spice'. Always use it in the query",
+          "type": "string"
+        }
+      },
+      "required": [
+        "query"
+      ],
+      "title": "SqlToolParams",
+      "type": "object"
+    }
+  },
+  {
+    "description": "Record any details from 'user' messages that are worth remembering for future conversations.",
+    "name": "mcp_from_spiced/store_memory",
+    "parameters": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "properties": {
+        "thoughts": {
+          "description": "A list of details to persist",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "thoughts"
+      ],
+      "title": "StoreMemoryParams",
+      "type": "object"
+    }
+  },
+  {
+    "description": "",
+    "name": "mcp_from_spiced/table_schema",
+    "parameters": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "definitions": {
+        "OutputType": {
+          "enum": [
+            "full",
+            "minimal"
+          ],
+          "type": "string"
+        }
+      },
+      "description": "A tool to retrieve the schema of one or more available SQL tables.",
+      "properties": {
+        "output": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/OutputType"
+            }
+          ],
+          "default": "full",
+          "description": "If `full` return metadata and semantic details about the columns."
+        },
+        "tables": {
+          "description": "Which tables to return the schema of.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "tables"
+      ],
+      "title": "TableSchemaToolParams",
+      "type": "object"
+    }
+  },
+  {
+    "description": "Sample the top N rows from a table based on a specified ordering",
+    "name": "mcp_from_spiced/top_n_sample",
+    "parameters": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "properties": {
+        "dataset": {
+          "description": "The SQL dataset to sample data from.",
+          "type": "string"
+        },
+        "limit": {
+          "description": "The number of rows, each with distinct values per column, to sample.",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "order_by": {
+          "description": "How to order the samples before retrieving the top N.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "dataset",
+        "limit",
+        "order_by"
+      ],
+      "title": "TopSamplesParams",
+      "type": "object"
+    }
+  },
+  {
+    "description": "Sample random rows from a table.",
+    "name": "random_sample",
+    "parameters": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "properties": {
+        "dataset": {
+          "description": "The SQL dataset to sample data from.",
+          "type": "string"
+        },
+        "limit": {
+          "description": "The number of rows, each with distinct values per column, to sample.",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "dataset",
+        "limit"
+      ],
+      "title": "RandomSampleParams",
+      "type": "object"
+    }
+  },
+  {
+    "description": "Generate synthetic data by sampling distinct column values from a table.",
+    "name": "sample_distinct_columns",
+    "parameters": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "properties": {
+        "cols": {
+          "description": "The columns to sample distinct values from. If None, all columns are sampled.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "dataset": {
+          "description": "The SQL dataset to sample data from.",
+          "type": "string"
+        },
+        "limit": {
+          "description": "The number of rows, each with distinct values per column, to sample.",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "dataset",
+        "limit"
+      ],
+      "title": "DistinctColumnsParams",
+      "type": "object"
+    }
+  },
+  {
+    "description": null,
+    "name": "sql",
+    "parameters": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "properties": {
+        "query": {
+          "description": "The SQL query to run. Double quote all select columns and never select columns ending in '_embedding'. The `table_catalog` is 'spice'. Always use it in the query",
+          "type": "string"
+        }
+      },
+      "required": [
+        "query"
+      ],
+      "title": "SqlToolParams",
+      "type": "object"
+    }
+  },
+  {
+    "description": "Record any details from 'user' messages that are worth remembering for future conversations.",
+    "name": "store_memory",
+    "parameters": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "properties": {
+        "thoughts": {
+          "description": "A list of details to persist",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "thoughts"
+      ],
+      "title": "StoreMemoryParams",
+      "type": "object"
+    }
+  },
+  {
+    "description": null,
+    "name": "table_schema",
+    "parameters": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "definitions": {
+        "OutputType": {
+          "enum": [
+            "full",
+            "minimal"
+          ],
+          "type": "string"
+        }
+      },
+      "description": "A tool to retrieve the schema of one or more available SQL tables.",
+      "properties": {
+        "output": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/OutputType"
+            }
+          ],
+          "default": "full",
+          "description": "If `full` return metadata and semantic details about the columns."
+        },
+        "tables": {
+          "description": "Which tables to return the schema of.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "tables"
+      ],
+      "title": "TableSchemaToolParams",
+      "type": "object"
+    }
+  },
+  {
+    "description": "Sample the top N rows from a table based on a specified ordering",
+    "name": "top_n_sample",
+    "parameters": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "properties": {
+        "dataset": {
+          "description": "The SQL dataset to sample data from.",
+          "type": "string"
+        },
+        "limit": {
+          "description": "The number of rows, each with distinct values per column, to sample.",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "order_by": {
+          "description": "How to order the samples before retrieving the top N.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "dataset",
+        "limit",
+        "order_by"
+      ],
+      "title": "TopSamplesParams",
+      "type": "object"
+    }
+  }
+]

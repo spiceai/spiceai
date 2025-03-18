@@ -99,6 +99,8 @@ pub(crate) const PARAMETERS: &[ParameterSpec] = &[
         .default("catalog"),
     ParameterSpec::component("oauth2_server_url")
         .description("URL of the OAuth2 server tokens endpoint."),
+
+    // Catalog AWS Glue options
     ParameterSpec::component("sigv4_enabled")
         .description("Enable SigV4 authentication for the catalog (for connecting to AWS Glue)."),
     ParameterSpec::component("signing_region")
@@ -106,6 +108,7 @@ pub(crate) const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("signing_name")
         .description("The name to use when signing the request for SigV4.")
         .default("glue"),
+
     // S3 storage options
     ParameterSpec::component("s3_endpoint")
         .description(
@@ -135,22 +138,37 @@ pub(crate) const PARAMETERS: &[ParameterSpec] = &[
 ];
 
 /// Maps a Spice parameter name to an Iceberg property name.
-pub(crate) fn map_param_name_to_iceberg_prop(param_name: &str) -> Option<String> {
+pub(crate) fn map_param_name_to_iceberg_prop(param_name: &str) -> Option<Vec<String>> {
     match param_name {
-        "token" => Some("token".to_string()),
-        "oauth2_credential" => Some("credential".to_string()),
-        "oauth2_server_url" => Some("oauth2-server-uri".to_string()),
-        "oauth2_scope" => Some("scope".to_string()),
-        "s3_endpoint" => Some("s3.endpoint".to_string()),
-        "s3_access_key_id" => Some("s3.access-key-id".to_string()),
-        "s3_secret_access_key" => Some("s3.secret-access-key".to_string()),
-        "s3_session_token" => Some("s3.session-token".to_string()),
-        "s3_region" => Some("s3.region".to_string()),
-        "s3_role_session_name" => Some("client.assume-role.session-name".to_string()),
-        "s3_role_arn" => Some("client.assume-role.arn".to_string()),
-        "sigv4_enabled" => Some("rest.sigv4-enabled".to_string()),
-        "signing_region" => Some("rest.signing-region".to_string()),
-        "signing_name" => Some("rest.signing-name".to_string()),
+        "token" => Some(vec!["token".to_string()]),
+        "oauth2_credential" => Some(vec!["credential".to_string()]),
+        "oauth2_server_url" => Some(vec!["oauth2-server-uri".to_string()]),
+        "oauth2_scope" => Some(vec!["scope".to_string()]),
+        "s3_endpoint" => Some(vec!["s3.endpoint".to_string()]),
+        "s3_access_key_id" => Some(vec![
+            "s3.access-key-id".to_string(),
+            "rest.access-key-id".to_string(),
+        ]),
+        "s3_secret_access_key" => Some(vec![
+            "s3.secret-access-key".to_string(),
+            "rest.secret-access-key".to_string(),
+        ]),
+        "s3_session_token" => Some(vec![
+            "s3.session-token".to_string(),
+            "rest.session-token".to_string(),
+        ]),
+        "s3_region" => Some(vec!["s3.region".to_string()]),
+        "s3_role_session_name" => Some(vec![
+            "client.assume-role.session-name".to_string(),
+            "rest.client.assume-role.session-name".to_string(),
+        ]),
+        "s3_role_arn" => Some(vec![
+            "client.assume-role.arn".to_string(),
+            "rest.client.assume-role.arn".to_string(),
+        ]),
+        "sigv4_enabled" => Some(vec!["rest.sigv4-enabled".to_string()]),
+        "signing_region" => Some(vec!["rest.signing-region".to_string()]),
+        "signing_name" => Some(vec!["rest.signing-name".to_string()]),
         _ => None,
     }
 }
@@ -189,8 +207,10 @@ impl CatalogConnector for IcebergCatalog {
         };
 
         for (key, value) in &self.params {
-            if let Some(prop) = map_param_name_to_iceberg_prop(key.as_str()) {
-                props.insert(prop, value.expose_secret().to_string());
+            if let Some(prop_vec) = map_param_name_to_iceberg_prop(key.as_str()) {
+                for prop in prop_vec {
+                    props.insert(prop.clone(), value.expose_secret().to_string());
+                }
             }
         }
 

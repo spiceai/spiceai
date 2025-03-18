@@ -1,0 +1,26 @@
+---
+source: crates/test-framework/src/snapshot/mod.rs
+description: "Query: clickbench_q17"
+---
++---------------+---------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                |
++---------------+---------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Sort: count(*) DESC NULLS FIRST, fetch=10                                                                           |
+|               |   Aggregate: groupBy=[[hits.UserID, hits.SearchPhrase]], aggr=[[count(Int64(1)) AS count(*)]]                       |
+|               |     BytesProcessedNode                                                                                              |
+|               |       TableScan: hits projection=[UserID, SearchPhrase]                                                             |
+| physical_plan | SortExec: TopK(fetch=10), expr=[count(*)@2 DESC], preserve_partitioning=[false]                                     |
+|               |   CoalescePartitionsExec                                                                                            |
+|               |     AggregateExec: mode=FinalPartitioned, gby=[UserID@0 as UserID, SearchPhrase@1 as SearchPhrase], aggr=[count(*)] |
+|               |       CoalesceBatchesExec: target_batch_size=8192                                                                   |
+|               |         RepartitionExec: partitioning=Hash([UserID@0, SearchPhrase@1], 16), input_partitions=16                     |
+|               |           AggregateExec: mode=Partial, gby=[UserID@0 as UserID, SearchPhrase@1 as SearchPhrase], aggr=[count(*)]    |
+|               |             BytesProcessedExec                                                                                      |
+|               |               SchemaCastScanExec                                                                                    |
+|               |                 RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                               |
+|               |                   FallbackOnZeroResultsScanExec                                                                     |
+|               |                     CoalescePartitionsExec                                                                          |
+|               |                       RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                         |
+|               |                         DuckSqlExec sql= SELECT "UserID", "SearchPhrase" FROM hits                                  |
+|               |                                                                                                                     |
++---------------+---------------------------------------------------------------------------------------------------------------------+

@@ -71,7 +71,7 @@ impl AwsSecretsManager {
     /// - If the AWS configuration cannot be loaded.
     /// - If the call to STS `get_caller_identity` fails, which might be due to invalid or expired AWS credentials.
     pub async fn init(&self) -> Result<()> {
-        let config = aws_config::defaults(BehaviorVersion::v2024_03_28())
+        let config = aws_config::defaults(BehaviorVersion::v2025_01_17())
             .load()
             .await;
 
@@ -96,7 +96,7 @@ impl SecretStore for AwsSecretsManager {
             self.secret_name
         );
 
-        let config = aws_config::defaults(BehaviorVersion::v2024_03_28())
+        let config = aws_config::defaults(BehaviorVersion::v2025_01_17())
             .load()
             .await;
 
