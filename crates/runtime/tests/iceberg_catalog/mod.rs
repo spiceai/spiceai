@@ -67,7 +67,7 @@ async fn glue_iceberg_integration_test_catalog() -> Result<(), anyhow::Error> {
 
             runtime_ready_check(&rt).await;
 
-            let mut result = rt.datafusion().query_builder( "SELECT * FROM ice_glue.testdb_001.iceberg_table_001 LIMIT 10").build().run().await?;
+            let mut result = rt.datafusion().query_builder("SELECT * FROM ice_glue.testdb_001.iceberg_table_001 LIMIT 10").build().run().await?;
 
             let mut results: Vec<RecordBatch> = vec![];
             while let Some(batch) = result.data.next().await {
