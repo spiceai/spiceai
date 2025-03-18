@@ -744,6 +744,51 @@
         }
       }
     },
+    "/v1/mcp/event": {
+      "post": {
+        "tags": [
+          "mcp"
+        ],
+        "summary": "Send message to MCP server",
+        "description": "Send message to the MCP endoint, for a given session.",
+        "operationId": "mcp_event",
+        "parameters": [
+          {
+            "name": "sessionId",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "Message accepted. Response will stream via SSE."
+          },
+          "404": {
+            "description": "Session not found. No active session for the given `session_id`."
+          },
+          "413": {
+            "description": "Payload too large. Maximum allowed size is 4MB."
+          },
+          "500": {
+            "description": "Internal server error. An unexpected issue occurred."
+          }
+        }
+      }
+    },
+    "/v1/mcp/sse": {
+      "get": {
+        "tags": [
+          "mcp"
+        ],
+        "summary": "Establish an MCP SSE Connection",
+        "description": "Initiates a Server-Sent Events (SSE) connection using the Model Context Protocol (MCP) to interact with Spice tools.\n\n\n             Once connected, clients can send messages via `POST /v1/mcp/event` and receive responses through this SSE stream.",
+        "operationId": "operation_id",
+        "responses": {}
+      }
+    },
     "/v1/models": {
       "get": {
         "tags": [
