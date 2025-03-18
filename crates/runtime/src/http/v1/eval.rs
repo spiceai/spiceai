@@ -103,6 +103,7 @@ pub(crate) async fn post(
 
     let evals = rt.evals.read().await;
     let Some(eval) = evals.iter().find(|e| e.name == eval_name) else {
+        tracing::error!("Failed to run the eval `{eval_name}`. The eval does not exist.\nVerify the configuration and try again.");
         return (
             StatusCode::NOT_FOUND,
             format!("eval '{eval_name}' not found"),
@@ -111,6 +112,7 @@ pub(crate) async fn post(
     };
 
     if !llms.read().await.contains_key(&model) {
+        tracing::error!("Failed to run the eval '{eval_name}'. The specified eval model '{model}' does not exist.\nVerify the configuration and try again.");
         return (StatusCode::NOT_FOUND, format!("model '{model}' not found")).into_response();
     };
 
@@ -118,6 +120,7 @@ pub(crate) async fn post(
         .has_table(&TableReference::parse_str(eval.dataset.as_str()))
         .await
     {
+        tracing::error!("Failed to run the eval '{eval_name}'. The dataset '{}' does not exist.\nVerify the configuration and try again.", eval.dataset);
         return (
             StatusCode::NOT_FOUND,
             format!("dataset '{}' not found", eval.dataset),
