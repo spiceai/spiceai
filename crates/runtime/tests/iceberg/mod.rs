@@ -114,7 +114,7 @@ async fn iceberg_integration_test_duckdb_acceleration_restart() -> Result<(), an
 
             drop(rt);
 
-            let rt = run_iceberg_test(
+            let _ = run_iceberg_test(
                 "iceberg_dataset_test",
                 dataset,
                 "SELECT * FROM customer LIMIT 10",
