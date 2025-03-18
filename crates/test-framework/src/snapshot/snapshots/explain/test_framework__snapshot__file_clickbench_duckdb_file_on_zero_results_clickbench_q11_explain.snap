@@ -1,0 +1,36 @@
+---
+source: crates/test-framework/src/snapshot/mod.rs
+description: "Query: clickbench_q11"
+---
++---------------+-------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                          |
++---------------+-------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Sort: u DESC NULLS FIRST, fetch=10                                                                                            |
+|               |   Projection: hits.MobilePhoneModel, count(alias1) AS u                                                                       |
+|               |     Aggregate: groupBy=[[hits.MobilePhoneModel]], aggr=[[count(alias1)]]                                                      |
+|               |       Aggregate: groupBy=[[hits.MobilePhoneModel, hits.UserID AS alias1]], aggr=[[]]                                          |
+|               |         BytesProcessedNode                                                                                                    |
+|               |           Filter: hits.MobilePhoneModel != LargeBinary("")                                                                    |
+|               |             TableScan: hits projection=[UserID, MobilePhoneModel], partial_filters=[hits.MobilePhoneModel != LargeBinary("")] |
+| physical_plan | SortExec: TopK(fetch=10), expr=[u@1 DESC], preserve_partitioning=[false]                                                      |
+|               |   CoalescePartitionsExec                                                                                                      |
+|               |     ProjectionExec: expr=[MobilePhoneModel@0 as MobilePhoneModel, count(alias1)@1 as u]                                       |
+|               |       AggregateExec: mode=FinalPartitioned, gby=[MobilePhoneModel@0 as MobilePhoneModel], aggr=[count(alias1)]                |
+|               |         CoalesceBatchesExec: target_batch_size=8192                                                                           |
+|               |           RepartitionExec: partitioning=Hash([MobilePhoneModel@0], 16), input_partitions=16                                   |
+|               |             AggregateExec: mode=Partial, gby=[MobilePhoneModel@0 as MobilePhoneModel], aggr=[count(alias1)]                   |
+|               |               AggregateExec: mode=FinalPartitioned, gby=[MobilePhoneModel@0 as MobilePhoneModel, alias1@1 as alias1], aggr=[] |
+|               |                 CoalesceBatchesExec: target_batch_size=8192                                                                   |
+|               |                   RepartitionExec: partitioning=Hash([MobilePhoneModel@0, alias1@1], 16), input_partitions=16                 |
+|               |                     AggregateExec: mode=Partial, gby=[MobilePhoneModel@1 as MobilePhoneModel, UserID@0 as alias1], aggr=[]    |
+|               |                       BytesProcessedExec                                                                                      |
+|               |                         CoalesceBatchesExec: target_batch_size=8192                                                           |
+|               |                           FilterExec: MobilePhoneModel@1 !=                                                                   |
+|               |                             SchemaCastScanExec                                                                                |
+|               |                               RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                           |
+|               |                                 FallbackOnZeroResultsScanExec                                                                 |
+|               |                                   CoalescePartitionsExec                                                                      |
+|               |                                     RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                     |
+|               |                                       DuckSqlExec sql=                                                                        |
+|               |                                                                                                                               |
++---------------+-------------------------------------------------------------------------------------------------------------------------------+

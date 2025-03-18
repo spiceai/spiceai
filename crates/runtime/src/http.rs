@@ -36,7 +36,7 @@ use crate::{
 };
 
 #[cfg(feature = "openapi")]
-pub use routes::ApiDoc;
+pub use routes::get_api_doc;
 mod metrics;
 mod routes;
 mod traceparent;

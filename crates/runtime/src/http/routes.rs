@@ -33,7 +33,10 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 #[cfg(feature = "openapi")]
-use utoipa::OpenApi;
+use utoipa::{
+    openapi::{path::Operation, HttpMethod},
+    OpenApi,
+};
 
 #[cfg(feature = "dev")]
 use utoipa_swagger_ui::SwaggerUi;
@@ -82,6 +85,8 @@ use tower_http::cors::{AllowOrigin, Any, CorsLayer};
         v1::search::post,
         v1::chat::post,
         v1::models::get,
+        #[cfg(feature = "mcp")]
+        v1::mcp::event,
         v1::nsql::post,
         v1::eval::list,
         v1::eval::post,
@@ -94,7 +99,32 @@ use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 
     components(schemas(DatasetQueryParams, DatasetFilter, Format)) // These schemas, for some reason, weren't getting picked up.
 )]
-pub struct ApiDoc;
+pub(crate) struct ApiDoc;
+
+/// Returns the `OpenAPI` documentation for the HTTP API. Adds MCP endpoints if the feature is enabled.
+#[cfg(feature = "openapi")]
+#[must_use]
+pub fn get_api_doc() -> utoipa::openapi::OpenApi {
+    let mut openai = ApiDoc::openapi();
+
+    #[cfg(feature = "mcp")]
+    {
+        openai.paths.add_path_operation(
+            "/v1/mcp/sse",
+            vec![HttpMethod::Get],
+            Operation::builder()
+                .operation_id(Some("operation_id"))
+                .tag("mcp")
+                .summary(Some("Establish an MCP SSE Connection"))
+                .description(Some(
+                    "Initiates a Server-Sent Events (SSE) connection using the Model Context Protocol (MCP) to interact with Spice tools.\n\n
+             Once connected, clients can send messages via `POST /v1/mcp/event` and receive responses through this SSE stream.",
+                ))
+                .build(),
+        );
+    }
+    openai
+}
 
 pub(crate) fn routes(
     rt: &Arc<Runtime>,
@@ -141,7 +171,7 @@ pub(crate) fn routes(
     #[cfg(feature = "dev")]
     {
         authenticated_router = authenticated_router
-            .merge(SwaggerUi::new("/docs").url("/docs/openapi.json", ApiDoc::openapi()));
+            .merge(SwaggerUi::new("/docs").url("/docs/openapi.json", get_api_doc()));
     }
 
     if cfg!(feature = "models") {

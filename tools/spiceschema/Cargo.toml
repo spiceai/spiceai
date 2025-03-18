@@ -10,7 +10,11 @@ version.workspace = true
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
-runtime = { path = "../../crates/runtime", features = ["openapi", "models"] }
+runtime = { path = "../../crates/runtime", features = [
+    "openapi",
+    "models",
+    "mcp",
+] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_yaml = "0.9"

@@ -24,9 +24,10 @@ use async_trait::async_trait;
 use datafusion::catalog::{CatalogProvider, SchemaProvider, TableProvider};
 use datafusion::error::Result as DFResult;
 use futures::future::try_join_all;
-use iceberg::{Catalog, NamespaceIdent};
+use iceberg::{Catalog, NamespaceIdent, TableIdent};
 use iceberg_datafusion::IcebergTableProvider;
 use snafu::prelude::*;
+use tokio::sync::Semaphore;
 
 use crate::RefreshableCatalogProvider;
 
@@ -50,6 +51,11 @@ pub enum Error {
 
     #[snafu(display("Failed to connect to the Iceberg catalog or object store at {url}, verify the Iceberg catalog is accessible and try again."))]
     FailedToConnect { url: String, source: iceberg::Error },
+
+    #[snafu(display(
+        "Internal error: could not acquire a semaphore permit for concurrency control: {source}"
+    ))]
+    SemaphoreError { source: tokio::sync::AcquireError },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -79,6 +85,9 @@ impl IcebergCatalogProvider {
         client: Arc<RestCatalog>,
         root_namespace: Option<NamespaceIdent>,
     ) -> Result<Self> {
+        // Create the semaphore first, so we can use it in the closures below
+        let load_semaphore = Arc::new(Semaphore::new(10));
+
         let schema_names: Vec<_> = match client.list_namespaces(root_namespace.as_ref()).await {
             Ok(namespaces) => namespaces
                 .iter()
@@ -109,9 +118,11 @@ impl IcebergCatalogProvider {
             schema_names
                 .iter()
                 .map(|name| {
+                    let semaphore_clone = Arc::clone(&load_semaphore);
                     IcebergSchemaProvider::try_new(
                         Arc::clone(&client),
                         NamespaceIdent::new(name.clone()),
+                        semaphore_clone,
                     )
                 })
                 .collect::<Vec<_>>(),
@@ -174,40 +185,75 @@ impl IcebergSchemaProvider {
     pub(crate) async fn try_new(
         client: Arc<RestCatalog>,
         namespace: NamespaceIdent,
+        load_semaphore: Arc<Semaphore>,
     ) -> Result<Self> {
         let table_names: Vec<_> = client
             .list_tables(&namespace)
             .await
             .map_err(handle_iceberg_error)?;
 
-        let iceberg_tables = try_join_all(
-            table_names
-                .iter()
-                .map(|name| client.load_table(name))
-                .collect::<Vec<_>>(),
-        )
-        .await
-        .map_err(handle_iceberg_error)?;
-
-        let table_providers: Vec<_> = try_join_all(
-            iceberg_tables
-                .into_iter()
-                .map(IcebergTableProvider::try_new_from_table)
-                .collect::<Vec<_>>(),
-        )
-        .await
-        .map_err(handle_iceberg_error)?;
-
-        let tables: HashMap<String, Arc<dyn TableProvider>> = table_names
-            .into_iter()
-            .zip(table_providers.into_iter())
-            .map(|(name, provider)| {
-                let provider = Arc::new(provider) as Arc<dyn TableProvider>;
-                (name.name().to_string(), provider)
+        // Transform each load_table call to return Result<(TableIdent, Option<Arc<dyn TableProvider>>)>
+        let table_futures: Vec<_> = table_names
+            .iter()
+            .map(|name| {
+                let client_clone = Arc::clone(&client);
+                let name_clone = name.clone();
+                let semaphore_clone = Arc::clone(&load_semaphore);
+                async move {
+                    // Map the inner Result to include the table name
+                    Self::load_table(client_clone, &name_clone, semaphore_clone)
+                        .await
+                        .map(|opt_provider| (name_clone, opt_provider))
+                }
             })
             .collect();
 
+        // Execute all futures in parallel, short-circuiting on first error
+        let table_results = try_join_all(table_futures).await?;
+
+        // Filter out None values, only keeping successful loads
+        let mut tables = HashMap::new();
+        for (name, opt_provider) in table_results {
+            if let Some(provider) = opt_provider {
+                tables.insert(name.name().to_string(), provider);
+            }
+        }
+
         Ok(IcebergSchemaProvider { tables })
+    }
+
+    async fn load_table(
+        client: Arc<RestCatalog>,
+        table_name: &TableIdent,
+        semaphore: Arc<Semaphore>,
+    ) -> Result<Option<Arc<dyn TableProvider>>> {
+        // Acquire a permit from the semaphore to limit concurrent table loads
+        let _permit = semaphore
+            .acquire()
+            .await
+            .map_err(|e| Error::SemaphoreError { source: e })?;
+
+        match client.load_table(table_name).await {
+            Ok(table) => match IcebergTableProvider::try_new_from_table(table).await {
+                Ok(provider) => Ok(Some(Arc::new(provider) as Arc<dyn TableProvider>)),
+                Err(e) => Err(handle_iceberg_error(e)),
+            },
+            Err(e) => {
+                // If the table doesn't exist, return None instead of an error
+                let err_msg = e.to_string();
+                if err_msg.contains("NoSuchIcebergTableException") || err_msg.contains("code: 404")
+                {
+                    tracing::warn!(
+                        "Failed to load '{}.{}' as an Iceberg table: table may not exist or is not in Iceberg format.",
+                        table_name.namespace().join("."),
+                        table_name.name()
+                    );
+                    Ok(None)
+                } else {
+                    Err(handle_iceberg_error(e))
+                }
+            }
+        }
     }
 }
 

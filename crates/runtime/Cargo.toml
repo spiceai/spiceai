@@ -152,7 +152,7 @@ bollard = "0.18.1"
 dirs = "5.0.1"
 flightrepl = { path = "../flightrepl" }
 hf-hub = { workspace = true }
-insta.workspace = true
+insta = { workspace = true, features = ["json"] }
 jsonpath-rust = "0.7.3"
 opentelemetry_sdk = { workspace = true, features = ["rt-tokio-current-thread"] }
 paste.workspace = true
@@ -195,7 +195,7 @@ models = ["model_components/full", "mcp"]
 mssql = ["dep:tiberius", "data_components/mssql"]
 mysql = ["dep:mysql_async", "db_connection_pool/mysql", "data_components/mysql"]
 odbc = ["db_connection_pool/odbc", "data_components/odbc"]
-openapi = ["dep:utoipa-swagger-ui", "dep:utoipa"]
+openapi = ["dep:utoipa-swagger-ui", "dep:utoipa", "mcp"]
 postgres = [
     "db_connection_pool/postgres",
     "data_components/postgres",
