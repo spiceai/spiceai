@@ -37,6 +37,7 @@ mod embedding;
 mod hf;
 mod local;
 mod openai;
+mod tools;
 
 mod nsql {
     use chrono::{DateTime, Utc};
@@ -432,6 +433,29 @@ pub async fn http_post(url: &str, body: &str, headers: HeaderMap) -> Result<Stri
         .text()
         .await
         .map_err(|e| anyhow::anyhow!("Error reading response body: {e}")) // Map body read error to anyhow
+}
+
+pub async fn http_get(url: &str, headers: HeaderMap) -> Result<Value, anyhow::Error> {
+    let response = Client::new()
+        .get(url)
+        .headers(headers)
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("Request error: {e}"))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let message = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "No error message".to_string());
+        return Err(anyhow::anyhow!("HTTP error: {status} - {message}"));
+    }
+
+    response
+        .json::<Value>()
+        .await
+        .map_err(|e| anyhow::anyhow!("Error reading response body: {e}"))
 }
 
 /// Returns a human-readable representation of the SQL query result against a [`Runtime`].

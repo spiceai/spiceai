@@ -1,0 +1,28 @@
+---
+source: crates/test-framework/src/snapshot/mod.rs
+description: "Query: clickbench_q34"
+---
++---------------+-----------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                          |
++---------------+-----------------------------------------------------------------------------------------------+
+| logical_plan  | Sort: c DESC NULLS FIRST, fetch=10                                                            |
+|               |   Projection: hits.URL, count(*) AS c                                                         |
+|               |     Aggregate: groupBy=[[hits.URL]], aggr=[[count(Int64(1)) AS count(*)]]                     |
+|               |       BytesProcessedNode                                                                      |
+|               |         TableScan: hits projection=[URL]                                                      |
+| physical_plan | SortExec: TopK(fetch=10), expr=[c@1 DESC], preserve_partitioning=[false]                      |
+|               |   CoalescePartitionsExec                                                                      |
+|               |     ProjectionExec: expr=[URL@0 as URL, count(*)@1 as c]                                      |
+|               |       AggregateExec: mode=FinalPartitioned, gby=[URL@0 as URL], aggr=[count(*)]               |
+|               |         CoalesceBatchesExec: target_batch_size=8192                                           |
+|               |           RepartitionExec: partitioning=Hash([URL@0], 16), input_partitions=16                |
+|               |             AggregateExec: mode=Partial, gby=[URL@0 as URL], aggr=[count(*)]                  |
+|               |               BytesProcessedExec                                                              |
+|               |                 SchemaCastScanExec                                                            |
+|               |                   RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1       |
+|               |                     FallbackOnZeroResultsScanExec                                             |
+|               |                       CoalescePartitionsExec                                                  |
+|               |                         RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1 |
+|               |                           DuckSqlExec sql= SELECT "URL" FROM hits                             |
+|               |                                                                                               |
++---------------+-----------------------------------------------------------------------------------------------+

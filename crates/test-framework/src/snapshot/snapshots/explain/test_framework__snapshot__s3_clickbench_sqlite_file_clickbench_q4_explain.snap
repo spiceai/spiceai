@@ -12,6 +12,6 @@ description: "Query: clickbench_q4"
 |               |     TableScan: hits projection=[UserID]                                                                                                                                                            |
 | physical_plan | BytesProcessedExec                                                                                                                                                                                 |
 |               |   SchemaCastScanExec                                                                                                                                                                               |
-|               |     VirtualExecutionPlan name=sqlite compute_context=/tmp/.tmpBUEApZ/.spice/data/accelerated_sqlite.db sql=SELECT avg(hits.UserID) FROM hits rewritten_sql=SELECT avg(`hits`.`UserID`) FROM `hits` |
+|               |     VirtualExecutionPlan name=sqlite compute_context=/tmp/.tmpcHLWhJ/.spice/data/accelerated_sqlite.db sql=SELECT avg(hits.UserID) FROM hits rewritten_sql=SELECT avg(`hits`.`UserID`) FROM `hits` |
 |               |                                                                                                                                                                                                    |
 +---------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
