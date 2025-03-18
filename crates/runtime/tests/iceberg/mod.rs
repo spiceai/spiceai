@@ -190,7 +190,7 @@ fn make_iceberg_dataset(
         ),
         (
             "iceberg_s3_access_key_id".to_string(),
-            "${ env:AWS_ICEBERG_ACCOUNT_ID }".to_string(),
+            "${ env:AWS_ICEBERG_ACCESS_KEY_ID }".to_string(),
         ),
         (
             "iceberg_s3_secret_access_key".to_string(),
