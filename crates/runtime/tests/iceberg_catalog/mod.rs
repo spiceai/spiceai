@@ -34,7 +34,7 @@ async fn glue_iceberg_integration_test_catalog() -> Result<(), anyhow::Error> {
     );
 
     let account_id =
-        std::env::var("AWS_ICEBERG_ACCESS_KEY_ID").context("AWS_ICEBERG_ACCOUNT_ID is not set")?;
+        std::env::var("AWS_ICEBERG_ACCOUNT_ID").context("AWS_ICEBERG_ACCOUNT_ID is not set")?;
 
     test_request_context()
         .scope(async {

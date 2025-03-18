@@ -179,7 +179,7 @@ fn make_iceberg_dataset(
     name: &str,
 ) -> Result<Dataset, anyhow::Error> {
     let account_id =
-        std::env::var("AWS_ICEBERG_ACCESS_KEY_ID").context("AWS_ICEBERG_ACCOUNT_ID is not set")?;
+        std::env::var("AWS_ICEBERG_ACCOUNT_ID").context("AWS_ICEBERG_ACCOUNT_ID is not set")?;
 
     let from = format!("iceberg:https://glue.ap-northeast-2.amazonaws.com/iceberg/v1/catalogs/{account_id}/namespaces/{namespace}/tables/{table}");
     let mut dataset = Dataset::new(from, name);
