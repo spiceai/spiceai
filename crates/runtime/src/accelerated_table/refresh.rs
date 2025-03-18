@@ -256,7 +256,9 @@ impl Refresh {
             return true;
         }
 
-        // If we have a previous checkpoint and the refresh interval is set, then we need to refresh - otherwise we don't.
+        // Current behavior is temporary - we simply refresh if an interval is set.
+        // Future implementation should compare the elapsed time since last checkpoint against the refresh interval
+        // to determine if a refresh is needed.
         self.check_interval.is_some()
     }
 }
@@ -479,7 +481,7 @@ impl Refresher {
                 && !refresh.should_refresh(self.checkpointer.clone()).await
             {
                 tracing::debug!(
-                    "Refresh not started for {} - an existing acceleration is available",
+                    "Skipped refresh for {}: existing acceleration is available",
                     self.dataset_name
                 );
                 return None;
