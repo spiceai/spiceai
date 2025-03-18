@@ -24,6 +24,7 @@ pub mod on_conflict;
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub enum RefreshMode {
     Disabled,
     Full,
