@@ -178,23 +178,23 @@ fn make_iceberg_dataset(
     table: &str,
     name: &str,
 ) -> Result<Dataset, anyhow::Error> {
-    let account_id = std::env::var("SPICE_AWS_ICEBERG_ACCOUNT_ID")
-        .context("AWS_ICEBERG_ACCOUNT_ID is not set")?;
+    let account_id =
+        std::env::var("AWS_ICEBERG_ACCESS_KEY_ID").context("AWS_ICEBERG_ACCOUNT_ID is not set")?;
 
     let from = format!("iceberg:https://glue.ap-northeast-2.amazonaws.com/iceberg/v1/catalogs/{account_id}/namespaces/{namespace}/tables/{table}");
     let mut dataset = Dataset::new(from, name);
     dataset.params = Some(DatasetParams::from_string_map(HashMap::from([
         (
             "iceberg_s3_region".to_string(),
-            "${ env:SPICE_AWS_ICEBERG_REGION }".to_string(),
+            "${ env:AWS_ICEBERG_REGION }".to_string(),
         ),
         (
             "iceberg_s3_access_key_id".to_string(),
-            "${ env:SPICE_AWS_ACCESS_KEY_ID }".to_string(),
+            "${ env:AWS_ICEBERG_ACCOUNT_ID }".to_string(),
         ),
         (
             "iceberg_s3_secret_access_key".to_string(),
-            "${ env:SPICE_AWS_SECRET_ACCESS_KEY }".to_string(),
+            "${ env:AWS_ICEBERG_SECRET_ACCESS_KEY }".to_string(),
         ),
     ])));
     Ok(dataset)
