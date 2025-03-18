@@ -44,11 +44,6 @@ async fn glue_iceberg_integration_test_catalog() -> Result<(), anyhow::Error> {
             db_catalog.include = vec!["testdb_001.*".to_string(), "testdb_002.*".to_string()];
             db_catalog.params = Some(get_params());
 
-            // Unset the environment variables
-            std::env::remove_var("AWS_ICEBERG_REGION");
-            std::env::remove_var("AWS_ACCESS_KEY_ID");
-            std::env::remove_var("AWS_SECRET_ACCESS_KEY");
-
             let app = AppBuilder::new("databricks_delta_lake_catalog_test")
                 .with_catalog(db_catalog)
                 .build();
