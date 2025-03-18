@@ -1,0 +1,14 @@
+---
+source: crates/runtime/tests/ready_state/mod.rs
+expression: explain_str
+---
++---------------+------------------------------------------------------+
+| plan_type     | plan                                                 |
++---------------+------------------------------------------------------+
+| logical_plan  | BytesProcessedNode                                   |
+|               |   TableScan: federated_on_load_arrow projection=[id] |
+| physical_plan | BytesProcessedExec                                   |
+|               |   SchemaCastScanExec                                 |
+|               |     MemoryExec: partitions=1, partition_sizes=[1]    |
+|               |                                                      |
++---------------+------------------------------------------------------+

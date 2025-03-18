@@ -38,6 +38,7 @@ impl McpToolWrapper {
         Self { client, spec }
     }
 
+    #[must_use]
     pub fn internal_name(&self) -> &str {
         self.spec.name.as_str()
     }
@@ -66,8 +67,16 @@ impl SpiceModelTool for McpToolWrapper {
         let tool_use_result: Result<Value, Box<dyn std::error::Error + Send + Sync>> = async {
             let client = self.client.read().await;
 
+            let input: Value = if arg.is_empty() {
+                Value::Null
+            } else {
+                serde_json::from_str(arg).map_err(|e| {
+                    tracing::error!(target: "task_history", parent: &span, "Failed to parse input: {e}");
+                    e
+                })?
+            };
             let response = client
-                .call_tool(self.internal_name(), serde_json::from_str(arg).unwrap())
+                .call_tool(self.internal_name(), input)
                 .await
                 .boxed()?;
 

@@ -1,0 +1,10 @@
+---
+source: crates/runtime/tests/ready_state/mod.rs
+expression: explain_str
+---
++--------------+----------------------------------------------------+
+| plan_type    | plan                                               |
++--------------+----------------------------------------------------+
+| logical_plan | BytesProcessedNode                                 |
+|              |   TableScan: native_on_load_duckdb projection=[id] |
++--------------+----------------------------------------------------+
