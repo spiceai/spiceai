@@ -15,9 +15,8 @@ limitations under the License.
 */
 
 use crate::{
-    get_test_datafusion, init_tracing, run_query_and_check_results,
+    get_test_datafusion, init_tracing,
     utils::{runtime_ready_check, test_request_context},
-    ValidateFn,
 };
 use anyhow::Context;
 use app::AppBuilder;
@@ -29,7 +28,6 @@ use std::sync::Arc;
 
 #[tokio::test]
 async fn glue_iceberg_integration_test_catalog() -> Result<(), anyhow::Error> {
-    type QueryTests<'a> = Vec<(&'a str, &'a str, Option<Box<ValidateFn>>)>;
     let _tracing = init_tracing(None);
     let _ = rustls::crypto::CryptoProvider::install_default(
         rustls::crypto::aws_lc_rs::default_provider(),
@@ -37,9 +35,6 @@ async fn glue_iceberg_integration_test_catalog() -> Result<(), anyhow::Error> {
 
     let account_id =
         std::env::var("AWS_ICEBERG_ACCOUNT_ID").context("AWS_ICEBERG_ACCOUNT_ID is not set")?;
-    let region = std::env::var("AWS_ICEBERG_REGION").context("AWS_ICEBERG_REGION is not set")?;
-    let _ = std::env::var("AWS_ACCESS_KEY_ID").context("AWS_ACCESS_KEY_ID is not set")?;
-    let _ = std::env::var("AWS_SECRET_ACCESS_KEY").context("AWS_SECRET_ACCESS_KEY is not set")?;
 
     test_request_context()
         .scope(async {
