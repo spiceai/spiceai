@@ -24,29 +24,43 @@ use anyhow::Result;
 use flight_client::{Credentials, FlightClient};
 use spicepod::spec::SpicepodDefinition;
 use sysinfo::{Pid, ProcessesToUpdate, System};
-use tempfile::TempDir;
 
 use crate::utils::wait_until_true;
 
 pub struct SpicedInstance {
     child: Child,
-    tempdir: TempDir,
+    tempdir: PathBuf,
 }
 
 pub struct StartRequest {
     spiced_path: PathBuf,
     spicepod: SpicepodDefinition,
-    tempdir: TempDir,
+    tempdir: PathBuf,
     data_dir: Option<PathBuf>,
     prepared: bool,
 }
 
 impl StartRequest {
     pub fn new(spiced_path: PathBuf, spicepod: SpicepodDefinition) -> Result<Self> {
+        let tempdir = {
+            #[cfg(not(target_os = "windows"))]
+            {
+                let path = PathBuf::from("/tmp/spice_test_operator");
+                std::fs::create_dir_all(&path)?;
+                path
+            }
+            #[cfg(target_os = "windows")]
+            {
+                // For Windows, use the default temp directory
+                let path = TempDir::new()?;
+                path.path().to_path_buf()
+            }
+        };
+
         Ok(Self {
             spiced_path,
             spicepod,
-            tempdir: TempDir::new()?,
+            tempdir,
             prepared: false,
             data_dir: None,
         })
@@ -60,13 +74,13 @@ impl StartRequest {
 
     #[must_use]
     pub fn get_tempdir_path(&self) -> PathBuf {
-        self.tempdir.path().to_path_buf()
+        self.tempdir.clone()
     }
 
     pub fn prepare(&mut self) -> Result<()> {
         // Serialize spicepod to `spicepod.yaml` in the tempdir
         let spicepod_yaml = serde_yaml::to_string(&self.spicepod)?;
-        let spicepod_yaml_path = self.tempdir.path().join("spicepod.yaml");
+        let spicepod_yaml_path = self.tempdir.join("spicepod.yaml");
         std::fs::write(spicepod_yaml_path.clone(), spicepod_yaml)?;
 
         // Create a symlink to the data directory if one is set
@@ -74,7 +88,7 @@ impl StartRequest {
             // resolve the data directory path to an absolute path
             let data_dir = data_dir.canonicalize()?;
 
-            let data_dir_symlink = self.tempdir.path().join("data");
+            let data_dir_symlink = self.tempdir.join("data");
             #[cfg(not(target_os = "windows"))]
             {
                 std::os::unix::fs::symlink(data_dir, data_dir_symlink)?;
@@ -115,7 +129,7 @@ impl SpicedInstance {
 
         // Start the spiced instance
         let mut cmd = Command::new(start_request.spiced_path);
-        cmd.current_dir(tempdir.path());
+        cmd.current_dir(tempdir.clone());
         cmd.arg("--telemetry-enabled=false");
         let child = cmd.spawn()?;
 
@@ -124,7 +138,7 @@ impl SpicedInstance {
 
     #[must_use]
     pub fn get_tempdir_path(&self) -> PathBuf {
-        self.tempdir.path().to_path_buf()
+        self.tempdir.clone()
     }
 
     /// Get a flight client for the spiced instance
