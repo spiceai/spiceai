@@ -67,6 +67,7 @@ pub(crate) async fn score_results(
 #[must_use]
 pub fn builtin_scorer() -> Vec<(&'static str, Arc<dyn Scorer>)> {
     vec![
+        ("levenshtein", Arc::new(levenshtein::Levenshtein {})),
         ("match", Arc::new(MatchScorer {})),
         ("json_match", Arc::new(json_match::JsonMatch {})),
         ("includes", Arc::new(includes::Includes {})),
