@@ -32,6 +32,9 @@ pub struct Tool {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub params: HashMap<String, String>,
 
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub env: HashMap<String, String>,
+
     #[serde(skip_serializing_if = "Vec::is_empty")]
     #[serde(rename = "dependsOn", default)]
     pub depends_on: Vec<String>,
@@ -50,6 +53,7 @@ impl WithDependsOn<Tool> for Tool {
             name: self.name.clone(),
             description: self.description.clone(),
             params: self.params.clone(),
+            env: self.env.clone(),
             depends_on: depends_on.to_vec(),
         }
     }

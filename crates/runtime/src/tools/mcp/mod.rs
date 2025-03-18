@@ -77,29 +77,37 @@ impl FromStr for MCPType {
 pub(crate) enum MCPConfig {
     Stdio {
         command: String,
-        args: Option<Vec<String>>,
+        args: Vec<String>,
+        env: HashMap<String, String>,
     },
     Https {
         url: url::Url,
     },
 }
 impl MCPConfig {
-    fn from_type(mcp_type: &MCPType, params: &HashMap<String, SecretString>) -> Self {
-        match mcp_type {
-            MCPType::Stdio(command) => match params.get("mcp_args") {
-                Some(args) => {
-                    let args = ExposeSecret::expose_secret(args);
-                    Self::Stdio {
-                        command: command.clone(),
-                        args: Some(args.split_whitespace().map(ToString::to_string).collect()),
-                    }
-                }
-                None => Self::Stdio {
-                    command: command.clone(),
-                    args: None,
-                },
-            },
-            MCPType::Https(url) => Self::Https { url: url.clone() },
+    fn from_type(
+        mcp_type: &MCPType,
+        params: &HashMap<String, SecretString>,
+        env: &HashMap<String, SecretString>,
+    ) -> Self {
+        match mcp_type.clone() {
+            MCPType::Stdio(command) => {
+                let args = params
+                    .get("mcp_args")
+                    .map(ExposeSecret::expose_secret)
+                    .unwrap_or_default()
+                    .split_whitespace()
+                    .map(ToString::to_string)
+                    .collect();
+
+                let env = env
+                    .iter()
+                    .map(|(k, v)| (k.clone(), ExposeSecret::expose_secret(v).to_string()))
+                    .collect();
+
+                Self::Stdio { command, args, env }
+            }
+            MCPType::Https(url) => Self::Https { url },
         }
     }
 }

@@ -123,8 +123,8 @@ impl McpToolCatalog {
         cfg: &MCPConfig,
     ) -> std::result::Result<RwLock<Box<dyn McpClientTrait>>, TransportError> {
         match cfg {
-            MCPConfig::Stdio { command, args } => {
-                Self::stdio_client(command.as_str(), args.clone()).await
+            MCPConfig::Stdio { command, args, env } => {
+                Self::stdio_client(command.as_str(), args, env).await
             }
             MCPConfig::Https { url } => Self::https_client(url.clone()).await,
         }
@@ -132,9 +132,10 @@ impl McpToolCatalog {
 
     async fn stdio_client(
         command: &str,
-        args: Option<Vec<String>>,
+        args: &[String],
+        env: &HashMap<String, String>,
     ) -> std::result::Result<RwLock<Box<dyn McpClientTrait>>, TransportError> {
-        let transport = StdioTransport::new(command, args.unwrap_or_default(), HashMap::new());
+        let transport = StdioTransport::new(command, args.to_vec(), env.clone());
         let transport_handle = transport.start().await?;
         let service = McpService::with_timeout(transport_handle, Duration::from_secs(10));
         Ok(RwLock::new(Box::new(McpClient::new(service))))
