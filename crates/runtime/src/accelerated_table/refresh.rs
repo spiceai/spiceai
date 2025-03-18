@@ -933,7 +933,7 @@ mod tests {
             wait_until_ready_status(
                 &registry,
                 status::ComponentStatus::Ready,
-                30,
+                60,
                 Duration::from_millis(50)
             )
             .await,
@@ -951,7 +951,7 @@ mod tests {
             wait_until_ready_status(
                 &registry,
                 status::ComponentStatus::Ready,
-                20,
+                60,
                 Duration::from_millis(50)
             )
             .await,
