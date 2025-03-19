@@ -29,7 +29,7 @@ on:
 
   workflow_dispatch:
     inputs:
-      run_slow_tests:
+      run_all_tests:
         description: 'Run all tests'
         type: boolean
         required: false
