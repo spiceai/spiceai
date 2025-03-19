@@ -1,2 +1,2 @@
-mod iceberg_catalog;
-mod iceberg_connector;
+mod catalog;
+mod connector;
