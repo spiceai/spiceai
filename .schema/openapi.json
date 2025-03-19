@@ -343,10 +343,12 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/AccelerationRequest"
+                "$ref": "#/components/schemas/RefreshOverrides"
               },
               "example": {
-                "refresh_sql": "SELECT * FROM taxi_trips WHERE tip_amount > 10.0"
+                "refresh_sql": "SELECT * FROM taxi_trips WHERE tip_amount > 10.0",
+                "refresh_mode": "full",
+                "refresh_jitter_max": "10s"
               }
             }
           },
@@ -742,6 +744,51 @@
             "description": "Namespace does not exist"
           }
         }
+      }
+    },
+    "/v1/mcp/event": {
+      "post": {
+        "tags": [
+          "mcp"
+        ],
+        "summary": "Send message to MCP server",
+        "description": "Send message to the MCP endoint, for a given session.",
+        "operationId": "mcp_event",
+        "parameters": [
+          {
+            "name": "sessionId",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "Message accepted. Response will stream via SSE."
+          },
+          "404": {
+            "description": "Session not found. No active session for the given `session_id`."
+          },
+          "413": {
+            "description": "Payload too large. Maximum allowed size is 4MB."
+          },
+          "500": {
+            "description": "Internal server error. An unexpected issue occurred."
+          }
+        }
+      }
+    },
+    "/v1/mcp/sse": {
+      "get": {
+        "tags": [
+          "mcp"
+        ],
+        "summary": "Establish an MCP SSE Connection",
+        "description": "Initiates a Server-Sent Events (SSE) connection using the Model Context Protocol (MCP) to interact with Spice tools.\n\n\n             Once connected, clients can send messages via `POST /v1/mcp/event` and receive responses through this SSE stream.",
+        "operationId": "operation_id",
+        "responses": {}
       }
     },
     "/v1/models": {
@@ -3976,6 +4023,47 @@
           "medium",
           "high"
         ]
+      },
+      "RefreshMode": {
+        "type": "string",
+        "enum": [
+          "disabled",
+          "full",
+          "append",
+          "changes"
+        ]
+      },
+      "RefreshOverrides": {
+        "type": "object",
+        "description": "[`RefreshOverrides`] specifies the configurable options for a individual run of a refresh task.",
+        "properties": {
+          "refresh_jitter_max": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The maximum amount of jitter to add to the refresh. Defaults to the `refresh_jitter_max` specified in the spicepod, or 10% of the `refresh_check_interval`.",
+            "example": "10s"
+          },
+          "refresh_mode": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/RefreshMode",
+                "description": "The refresh mode to use for this refresh. Defaults to the `refresh_mode` specified in the spicepod, or `full`."
+              }
+            ]
+          },
+          "refresh_sql": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The SQL statement used for this refresh. Defaults to the `refresh_sql` specified in the spicepod, if any."
+          }
+        }
       },
       "Request": {
         "type": "object",

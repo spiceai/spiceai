@@ -7398,7 +7398,7 @@ dependencies = [
 [[package]]
 name = "mistralrs"
 version = "0.4.0"
-source = "git+https://github.com/spiceai/mistral.rs?rev=4dde9014e12314fc365d5d8f61c4551e72de860c#4dde9014e12314fc365d5d8f61c4551e72de860c"
+source = "git+https://github.com/spiceai/mistral.rs?rev=808f39b59fb62ed98612be6207bebe80e735f5ee#808f39b59fb62ed98612be6207bebe80e735f5ee"
 dependencies = [
  "anyhow",
  "candle-core 0.8.0",
@@ -7419,7 +7419,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-core"
 version = "0.4.0"
-source = "git+https://github.com/spiceai/mistral.rs?rev=4dde9014e12314fc365d5d8f61c4551e72de860c#4dde9014e12314fc365d5d8f61c4551e72de860c"
+source = "git+https://github.com/spiceai/mistral.rs?rev=808f39b59fb62ed98612be6207bebe80e735f5ee#808f39b59fb62ed98612be6207bebe80e735f5ee"
 dependencies = [
  "akin",
  "anyhow",
@@ -7475,6 +7475,7 @@ dependencies = [
  "serde_json",
  "serde_plain",
  "serde_yaml",
+ "signal-hook",
  "strum 0.26.3",
  "sysinfo 0.30.13",
  "thiserror 1.0.69",
@@ -7495,7 +7496,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-paged-attn"
 version = "0.4.0"
-source = "git+https://github.com/spiceai/mistral.rs?rev=4dde9014e12314fc365d5d8f61c4551e72de860c#4dde9014e12314fc365d5d8f61c4551e72de860c"
+source = "git+https://github.com/spiceai/mistral.rs?rev=808f39b59fb62ed98612be6207bebe80e735f5ee#808f39b59fb62ed98612be6207bebe80e735f5ee"
 dependencies = [
  "anyhow",
  "bindgen_cuda 0.1.6",
@@ -7510,7 +7511,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-quant"
 version = "0.4.0"
-source = "git+https://github.com/spiceai/mistral.rs?rev=4dde9014e12314fc365d5d8f61c4551e72de860c#4dde9014e12314fc365d5d8f61c4551e72de860c"
+source = "git+https://github.com/spiceai/mistral.rs?rev=808f39b59fb62ed98612be6207bebe80e735f5ee#808f39b59fb62ed98612be6207bebe80e735f5ee"
 dependencies = [
  "bindgen_cuda 0.1.5",
  "byteorder",
@@ -7536,7 +7537,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-vision"
 version = "0.4.0"
-source = "git+https://github.com/spiceai/mistral.rs?rev=4dde9014e12314fc365d5d8f61c4551e72de860c#4dde9014e12314fc365d5d8f61c4551e72de860c"
+source = "git+https://github.com/spiceai/mistral.rs?rev=808f39b59fb62ed98612be6207bebe80e735f5ee#808f39b59fb62ed98612be6207bebe80e735f5ee"
 dependencies = [
  "candle-core 0.8.0",
  "image 0.25.5",
@@ -11988,6 +11989,7 @@ dependencies = [
  "sysinfo 0.33.1",
  "tempfile",
  "tokio",
+ "tokio-util",
  "tonic",
  "uuid 1.13.1",
 ]

@@ -225,9 +225,11 @@ pub struct AccelerationRequest {
     request_body(
         description = "On-demand refresh request for a specific dataset.",
         content((
-            AccelerationRequest = "application/json",
+            RefreshOverrides = "application/json",
             example = json!({
-                "refresh_sql": "SELECT * FROM taxi_trips WHERE tip_amount > 10.0"
+                "refresh_sql": "SELECT * FROM taxi_trips WHERE tip_amount > 10.0",
+                "refresh_mode": "full",
+                "refresh_jitter_max": "10s"
             })
         ))
     ),

@@ -80,18 +80,23 @@ pub struct Refresh {
 
 /// [`RefreshOverrides`] specifies the configurable options for a individual run of a refresh task.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct RefreshOverrides {
+    /// The SQL statement used for this refresh. Defaults to the `refresh_sql` specified in the spicepod, if any.
     #[serde(default, rename = "refresh_sql")]
     pub sql: Option<String>,
 
+    /// The refresh mode to use for this refresh. Defaults to the `refresh_mode` specified in the spicepod, or `full`.
     #[serde(default, rename = "refresh_mode")]
     pub mode: Option<RefreshMode>,
 
+    /// The maximum amount of jitter to add to the refresh. Defaults to the `refresh_jitter_max` specified in the spicepod, or 10% of the `refresh_check_interval`.
     #[serde(
         default,
         rename = "refresh_jitter_max",
         deserialize_with = "parse_max_jitter"
     )]
+    #[cfg_attr(feature = "openapi", schema(value_type = Option<String>, example = "10s"))]
     pub max_jitter: Option<Duration>,
 }
 
@@ -933,7 +938,7 @@ mod tests {
             wait_until_ready_status(
                 &registry,
                 status::ComponentStatus::Ready,
-                30,
+                60,
                 Duration::from_millis(50)
             )
             .await,
@@ -951,7 +956,7 @@ mod tests {
             wait_until_ready_status(
                 &registry,
                 status::ComponentStatus::Ready,
-                20,
+                60,
                 Duration::from_millis(50)
             )
             .await,

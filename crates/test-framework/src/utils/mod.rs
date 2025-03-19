@@ -23,6 +23,9 @@ use std::{
     sync::LazyLock,
     time::Duration,
 };
+use tokio_util::sync::CancellationToken;
+
+use crate::process::{MemoryReading, MemoryReadingsHandle};
 
 pub async fn wait_until_true<F, Fut>(max_wait: Duration, mut f: F) -> bool
 where
@@ -99,4 +102,43 @@ pub fn scan_directory_for_yamls(path: &PathBuf) -> anyhow::Result<Vec<PathBuf>> 
     }
 
     Ok(files)
+}
+
+/// From a list of memory readings, return the maximum observed memory usage
+pub fn max_observed_memory(readings: &[MemoryReading]) -> f64 {
+    readings
+        .iter()
+        .map(|reading| reading.memory_usage)
+        .fold(0.0, f64::max)
+}
+
+/// From a list of memory readings, return the median observed memory usage
+pub fn median_observed_memory(readings: &[MemoryReading]) -> anyhow::Result<f64> {
+    let mut memory_usages: Vec<f64> = readings
+        .iter()
+        .map(|reading| reading.memory_usage)
+        .collect();
+    memory_usages.sort_by(f64::total_cmp);
+
+    let len = memory_usages.len();
+    if len % 2 == 0 {
+        Ok((memory_usages[len / 2] + memory_usages[len / 2 - 1]) / 2.0)
+    } else {
+        Ok(memory_usages[len / 2])
+    }
+}
+
+/// Collect memory readings from a join handle, using a cancellation token to end the handle
+/// Print the maximum and median memory usage, then return then in a tuple as floats
+pub async fn observe_memory(
+    cancellation_token: CancellationToken,
+    memory_readings: MemoryReadingsHandle,
+) -> anyhow::Result<(f64, f64)> {
+    cancellation_token.cancel();
+    let memory_readings = memory_readings.await??;
+    let max_memory = max_observed_memory(&memory_readings);
+    let median_memory = median_observed_memory(&memory_readings)?;
+    println!("Max memory usage: {max_memory:.2} GB");
+    println!("Median memory usage: {median_memory:.2} GB");
+    Ok((max_memory, median_memory))
 }
