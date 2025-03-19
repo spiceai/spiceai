@@ -215,6 +215,7 @@ sqlite = [
     "data_components/sqlite",
     "dep:rusqlite",
 ]
+slow_tests = []
 
 [[bench]]
 harness = false
