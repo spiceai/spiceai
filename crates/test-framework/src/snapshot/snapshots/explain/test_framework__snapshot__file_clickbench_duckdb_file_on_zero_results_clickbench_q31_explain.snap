@@ -1,0 +1,33 @@
+---
+source: crates/test-framework/src/snapshot/mod.rs
+description: "Query: clickbench_q31"
+---
++---------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                                                                                           |
++---------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Sort: c DESC NULLS FIRST, fetch=10                                                                                                                                                                             |
+|               |   Projection: hits.SearchEngineID, hits.ClientIP, count(*) AS c, sum(hits.IsRefresh), avg(hits.ResolutionWidth)                                                                                                |
+|               |     Aggregate: groupBy=[[hits.SearchEngineID, hits.ClientIP]], aggr=[[count(Int64(1)) AS count(*), sum(CAST(hits.IsRefresh AS Int64)), avg(CAST(hits.ResolutionWidth AS Float64))]]                            |
+|               |       Projection: hits.ClientIP, hits.IsRefresh, hits.ResolutionWidth, hits.SearchEngineID                                                                                                                     |
+|               |         BytesProcessedNode                                                                                                                                                                                     |
+|               |           Filter: hits.SearchPhrase != LargeBinary("")                                                                                                                                                         |
+|               |             TableScan: hits projection=[ClientIP, IsRefresh, ResolutionWidth, SearchEngineID, SearchPhrase], partial_filters=[hits.SearchPhrase != LargeBinary("")]                                            |
+| physical_plan | SortExec: TopK(fetch=10), expr=[c@2 DESC], preserve_partitioning=[false]                                                                                                                                       |
+|               |   CoalescePartitionsExec                                                                                                                                                                                       |
+|               |     ProjectionExec: expr=[SearchEngineID@0 as SearchEngineID, ClientIP@1 as ClientIP, count(*)@2 as c, sum(hits.IsRefresh)@3 as sum(hits.IsRefresh), avg(hits.ResolutionWidth)@4 as avg(hits.ResolutionWidth)] |
+|               |       AggregateExec: mode=FinalPartitioned, gby=[SearchEngineID@0 as SearchEngineID, ClientIP@1 as ClientIP], aggr=[count(*), sum(hits.IsRefresh), avg(hits.ResolutionWidth)]                                  |
+|               |         CoalesceBatchesExec: target_batch_size=8192                                                                                                                                                            |
+|               |           RepartitionExec: partitioning=Hash([SearchEngineID@0, ClientIP@1], 16), input_partitions=16                                                                                                          |
+|               |             AggregateExec: mode=Partial, gby=[SearchEngineID@3 as SearchEngineID, ClientIP@0 as ClientIP], aggr=[count(*), sum(hits.IsRefresh), avg(hits.ResolutionWidth)]                                     |
+|               |               ProjectionExec: expr=[ClientIP@0 as ClientIP, IsRefresh@1 as IsRefresh, ResolutionWidth@2 as ResolutionWidth, SearchEngineID@3 as SearchEngineID]                                                |
+|               |                 BytesProcessedExec                                                                                                                                                                             |
+|               |                   CoalesceBatchesExec: target_batch_size=8192                                                                                                                                                  |
+|               |                     FilterExec: SearchPhrase@4 !=                                                                                                                                                              |
+|               |                       SchemaCastScanExec                                                                                                                                                                       |
+|               |                         RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                                                                                  |
+|               |                           FallbackOnZeroResultsScanExec                                                                                                                                                        |
+|               |                             CoalescePartitionsExec                                                                                                                                                             |
+|               |                               RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                                                                            |
+|               |                                 DuckSqlExec sql=                                                                                                                                                               |
+|               |                                                                                                                                                                                                                |
++---------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+

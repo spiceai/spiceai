@@ -20,6 +20,7 @@ pub mod flight;
 pub mod gh_utils;
 pub mod git;
 pub mod metrics;
+pub mod process;
 pub mod queries;
 pub mod snapshot;
 pub mod spiced;
@@ -38,6 +39,7 @@ pub use octocrab;
 pub use rustls;
 pub use serde_yaml;
 pub use spicepod;
+pub use tokio_util;
 
 #[derive(Debug, Clone, Copy)]
 pub enum TestType {

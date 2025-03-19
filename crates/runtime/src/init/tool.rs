@@ -77,7 +77,10 @@ impl Runtime {
         let params_with_secrets: HashMap<String, SecretString> =
             get_params_with_secrets(self.secrets(), &tool.params).await;
 
-        match tools::factory::forge(tool, params_with_secrets)
+        let env_with_secrets: HashMap<String, SecretString> =
+            get_params_with_secrets(self.secrets(), &tool.env).await;
+
+        match tools::factory::forge(tool, params_with_secrets, env_with_secrets)
             .await
             .context(UnableToInitializeLlmToolSnafu)
         {

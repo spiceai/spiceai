@@ -21,7 +21,7 @@ datasets:
       refresh_check_interval: &default_refresh_check_interval 1s
       primary_key: Id
       indexes:
-        DateCreated: enabled
+        Id: enabled
       on_conflict:
         Id: upsert
 
@@ -36,7 +36,7 @@ datasets:
       refresh_check_interval: *default_refresh_check_interval
       primary_key: Id
       indexes:
-        DateCreated: enabled
+        Id: enabled
       on_conflict:
         Id: drop
 
