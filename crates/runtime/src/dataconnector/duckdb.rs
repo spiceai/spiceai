@@ -52,7 +52,7 @@ pub struct DuckDB {
 impl DuckDB {
     pub(crate) fn create_in_memory(params: &ConnectorParams) -> AnyErrorResult<DuckDBTableFactory> {
         let pool = Arc::new(
-            DuckDbConnectionPool::new_memory()
+            DuckDbConnectionPool::new_memory(None)
                 .map_err(|source| DataConnectorError::UnableToConnectInternal {
                     dataconnector: "duckdb".to_string(),
                     connector_component: params.component.clone(),
@@ -73,7 +73,7 @@ impl DuckDB {
         params: &ConnectorParams,
     ) -> AnyErrorResult<DuckDBTableFactory> {
         let pool = Arc::new(
-            DuckDbConnectionPool::new_file(path, &AccessMode::ReadOnly)
+            DuckDbConnectionPool::new_file(path, &AccessMode::ReadOnly, None)
                 .map_err(|source| DataConnectorError::UnableToConnectInternal {
                     dataconnector: "duckdb".to_string(),
                     connector_component: params.component.clone(),
@@ -105,7 +105,11 @@ impl DuckDBFactory {
     }
 }
 
-const PARAMETERS: &[ParameterSpec] = &[ParameterSpec::component("open")];
+const PARAMETERS: &[ParameterSpec] = &[
+    ParameterSpec::component("open"),
+    ParameterSpec::runtime("connection_pool_size")
+        .description("The maximum number of connections created in the connection pool"),
+];
 
 impl DataConnectorFactory for DuckDBFactory {
     fn as_any(&self) -> &dyn Any {

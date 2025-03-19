@@ -72,6 +72,9 @@ pub enum Error {
 
     #[snafu(display("Invalid DuckDB acceleration configuration: {detail}"))]
     InvalidConfiguration { detail: Arc<str> },
+
+    #[snafu(display(r#"Invalid value "{value}" for "connection_pool_size": must be a positive integer greater than zero."#))]
+    InvalidConnectionPoolSize { value: String },
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -125,16 +128,36 @@ impl DuckDBAccelerator {
                 dataset: dataset.name.to_string(),
             })?;
 
+        let connection_pool_size = acceleration
+            .params
+            .get("connection_pool_size")
+            .map(|s| {
+                s.parse::<u32>()
+                    .map_err(|_| Error::InvalidConnectionPoolSize {
+                        value: s.to_string(),
+                    })
+                    .and_then(|size| {
+                        if size > 0 {
+                            Ok(size)
+                        } else {
+                            Err(Error::InvalidConnectionPoolSize {
+                                value: s.to_string(),
+                            })
+                        }
+                    })
+            })
+            .transpose()?;
+
         let pool = match (duckdb_file, acceleration.mode) {
             (Ok(duckdb_file), Mode::File) => self
                 .duckdb_factory
-                .get_or_init_file_instance(duckdb_file)
+                .get_or_init_file_instance(duckdb_file, connection_pool_size)
                 .await
                 .boxed()
                 .context(AccelerationCreationFailedSnafu)?,
             (_, Mode::Memory) => self
                 .duckdb_factory
-                .get_or_init_memory_instance()
+                .get_or_init_memory_instance(connection_pool_size)
                 .await
                 .boxed()
                 .context(AccelerationCreationFailedSnafu)?,
@@ -159,6 +182,8 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("file"),
     ParameterSpec::runtime("file_watcher"),
     ParameterSpec::component("memory_limit"),
+    ParameterSpec::runtime("connection_pool_size")
+        .description("The maximum number of connections created in the connection pool"),
 ];
 
 #[async_trait]

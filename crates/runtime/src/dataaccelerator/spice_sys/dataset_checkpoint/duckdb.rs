@@ -132,7 +132,8 @@ mod tests {
 
     fn create_in_memory_duckdb_checkpoint() -> (DatasetCheckpoint, Arc<DuckDbConnectionPool>) {
         let pool = Arc::new(
-            DuckDbConnectionPool::new_memory().expect("Failed to create in-memory DuckDB database"),
+            DuckDbConnectionPool::new_memory(None)
+                .expect("Failed to create in-memory DuckDB database"),
         );
         DatasetCheckpoint::init_duckdb(&pool).expect("Failed to initialize DuckDB");
         DatasetCheckpoint::migrate_duckdb(&pool).expect("Failed to migrate DuckDB");
@@ -207,7 +208,8 @@ mod tests {
     #[tokio::test]
     async fn test_duckdb_migration() {
         let pool = Arc::new(
-            DuckDbConnectionPool::new_memory().expect("Failed to create in-memory DuckDB database"),
+            DuckDbConnectionPool::new_memory(None)
+                .expect("Failed to create in-memory DuckDB database"),
         );
 
         // Create legacy table format
