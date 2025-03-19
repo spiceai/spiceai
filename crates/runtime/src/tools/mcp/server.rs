@@ -96,6 +96,17 @@ impl mcp_server::Router for RuntimeServer {
             let Some(tool) = self.get_tool(tool_name.as_str()).await else {
                 return Err(ToolError::NotFound(format!("Tool {tool_name} not found")));
             };
+
+            // If possible, we pass the call through to the MCP server.
+            if let Some(mcp_proxy) = tool.as_mcp_proxy().await {
+                tracing::debug!("{tool_name} uses MCP. Will call directly");
+                return mcp_proxy
+                    .call_tool(arguments)
+                    .await
+                    .map(|r| r.content)
+                    .map_err(|e| ToolError::ExecutionError(e.to_string()));
+            }
+
             let args = serde_json::to_string(&arguments)
                 .map_err(|e| ToolError::InvalidParameters(e.to_string()))?;
 
