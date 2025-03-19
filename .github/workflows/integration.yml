@@ -65,7 +65,7 @@ jobs:
       - name: Build integration test binary
         run: |
           FEATURES="postgres,mysql,delta_lake,duckdb,sqlite,spark,databricks,spark"
-          if [[ "${{ github.event.inputs.run_slow_tests }}" == "true" ]] || [[ "${{ github.ref }}" == "refs/heads/release-"* ]]; then
+          if [[ "${{ github.event.inputs.run_slow_tests }}" == "true" ]] || [[ "${{ github.ref }}" == "refs/heads/release"* ]]; then
             FEATURES="${FEATURES},slow_tests"
             echo "Including slow tests"
           else
