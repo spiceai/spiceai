@@ -103,6 +103,8 @@ pub mod snowflake;
 #[cfg(feature = "spark")]
 pub mod spark;
 pub mod spiceai;
+#[cfg(feature = "mongodb")]
+pub mod mongodb;
 
 #[derive(Debug, Snafu)]
 pub enum DataConnectorError {
@@ -351,6 +353,8 @@ pub async fn register_all() {
     #[cfg(feature = "dynamodb")]
     register_connector_factory("dynamodb", dynamodb::DynamoDBFactory::new_arc()).await;
     register_connector_factory("iceberg", iceberg::IcebergDataConnectorFactory::new_arc()).await;
+    #[cfg(feature = "mongodb")]
+    register_connector_factory("mongodb", mongodb::MongoDBFactory::new_arc()).await;
 }
 
 pub async fn unregister_all() {

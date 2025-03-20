@@ -64,6 +64,7 @@ default = [
   "mssql",
   "dynamodb",
   "imap",
+  "mongodb",
 ]
 delta_lake = ["runtime/delta_lake"]
 dev = ["runtime/dev"]
@@ -88,3 +89,4 @@ snowflake = ["runtime/snowflake"]
 spark = ["runtime/spark"]
 sqlite = ["runtime/sqlite"]
 tpc-extension = ["dep:tpc-extension"]
+mongodb = ["runtime/mongodb"]

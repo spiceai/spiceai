@@ -62,6 +62,8 @@ pub mod spice_cloud;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
 pub mod unity_catalog;
+#[cfg(feature = "mongodb")]
+pub mod mongodb;
 
 pub mod github;
 pub mod rate_limit;

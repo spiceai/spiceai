@@ -81,3 +81,6 @@ jobs:
 
       - name: Build with only dynamodb
         run: cargo check --no-default-features --features dynamodb
+
+      - name: Build with only mongodb
+        run: cargo check --no-default-features --features mongodb
