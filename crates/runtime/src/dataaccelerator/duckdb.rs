@@ -168,12 +168,8 @@ impl DuckDBAccelerator {
 
     pub fn get_file_instance_usage(&self, path: &str) -> Result<Option<u32>> {
         match self.file_instance_usage.lock() {
-            Ok(guard) => {
-                return Ok(guard.get(path).copied());
-            }
-            Err(_) => {
-                return Err(Error::UnableToGetInstanceUsage {});
-            }
+            Ok(guard) => Ok(guard.get(path).copied()),
+            Err(_) => Err(Error::UnableToGetInstanceUsage {}),
         }
     }
 
