@@ -51,12 +51,12 @@ async fn glue_iceberg_integration_test_catalog() -> Result<(), anyhow::Error> {
             let status = status::RuntimeStatus::new();
             let df = get_test_datafusion(Arc::clone(&status));
 
-            let rt = Runtime::builder()
+            let rt = Arc::new(Runtime::builder()
                 .with_app(app)
                 .with_datafusion(df)
                 .with_runtime_status(status)
                 .build()
-                .await;
+                .await);
 
             tokio::select! {
                 () = tokio::time::sleep(std::time::Duration::from_secs(1200)) => {

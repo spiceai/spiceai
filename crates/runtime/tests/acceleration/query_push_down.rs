@@ -129,12 +129,12 @@ async fn acceleration_with_and_without_federation() -> Result<(), anyhow::Error>
                 .with_dataset(non_federated_acc)
                 .build();
 
-            let rt = Runtime::builder()
+            let rt = Arc::new(Runtime::builder()
                 .with_app(app)
                 .with_datafusion(df)
                 .with_runtime_status(status)
                 .build()
-                .await;
+                .await);
 
             // Set a timeout for the test
             tokio::select! {

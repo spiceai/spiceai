@@ -171,11 +171,13 @@ async fn mysql_refresh_retries() -> Result<(), String> {
             let status = runtime::status::RuntimeStatus::new();
             let df = crate::get_test_datafusion(Arc::clone(&status));
 
-            let rt = Runtime::builder()
-                .with_app(app)
-                .with_datafusion(df)
-                .build()
-                .await;
+            let rt = Arc::new(
+                Runtime::builder()
+                    .with_app(app)
+                    .with_datafusion(df)
+                    .build()
+                    .await,
+            );
 
             tokio::select! {
                 () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {

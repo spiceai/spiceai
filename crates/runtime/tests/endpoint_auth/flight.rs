@@ -59,10 +59,10 @@ async fn test_flight_auth() -> Result<(), anyhow::Error> {
 
         let registry = prometheus::Registry::new();
 
-        let rt = Runtime::builder()
+        let rt = Arc::new(Runtime::builder()
             .with_metrics_server(SocketAddr::new(LOCALHOST, metrics_port), registry)
             .build()
-            .await;
+            .await);
 
         let api_key_auth = Arc::new(ApiKeyAuth::new(vec![ApiKey::parse_str("valid")]))
             as Arc<dyn FlightBasicAuth + Send + Sync>;

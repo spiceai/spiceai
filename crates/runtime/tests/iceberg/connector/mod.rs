@@ -140,12 +140,14 @@ async fn run_iceberg_test(
     let status = status::RuntimeStatus::new();
     let df = get_test_datafusion(Arc::clone(&status));
 
-    let rt = Runtime::builder()
-        .with_app(app)
-        .with_datafusion(df)
-        .with_runtime_status(status)
-        .build()
-        .await;
+    let rt = Arc::new(
+        Runtime::builder()
+            .with_app(app)
+            .with_datafusion(df)
+            .with_runtime_status(status)
+            .build()
+            .await,
+    );
 
     tokio::select! {
         () = tokio::time::sleep(std::time::Duration::from_secs(30)) => {

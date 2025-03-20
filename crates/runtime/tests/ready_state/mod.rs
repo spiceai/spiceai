@@ -536,11 +536,11 @@ async fn run_ready_state_test(
         let status = status::RuntimeStatus::new();
         let df = get_test_datafusion(Arc::clone(&status));
 
-        let rt = Runtime::builder()
+        let rt = Arc::new(Runtime::builder()
             .with_datafusion(df)
             .with_app(app)
             .build()
-            .await;
+            .await);
 
         tracing::info!("Loading components");
         tokio::select! {
@@ -806,11 +806,11 @@ async fn test_ready_state_mixed_arrow_acceleration() -> Result<(), anyhow::Error
             let status = status::RuntimeStatus::new();
             let df = get_test_datafusion(Arc::clone(&status));
 
-            let rt = Runtime::builder()
+            let rt = Arc::new(Runtime::builder()
                 .with_datafusion(df)
                 .with_app(app)
                 .build()
-                .await;
+                .await);
 
             tracing::info!("Loading components");
             tokio::select! {
@@ -921,11 +921,11 @@ async fn test_ready_state_mixed_duckdb_acceleration() -> Result<(), anyhow::Erro
             let status = status::RuntimeStatus::new();
             let df = get_test_datafusion(Arc::clone(&status));
 
-            let rt = Runtime::builder()
+            let rt = Arc::new(Runtime::builder()
                 .with_datafusion(df)
                 .with_app(app)
                 .build()
-                .await;
+                .await);
 
             tracing::info!("Loading components");
             tokio::select! {

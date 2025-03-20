@@ -83,7 +83,7 @@ async fn duckdb_from_functions() -> Result<(), String> {
         ))
         .build();
 
-            let rt = Runtime::builder().with_app(app).build().await;
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
 
             // Set a timeout for the test
             tokio::select! {

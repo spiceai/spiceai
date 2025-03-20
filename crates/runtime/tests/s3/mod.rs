@@ -66,11 +66,13 @@ async fn s3_federation() -> Result<(), anyhow::Error> {
             let status = status::RuntimeStatus::new();
             let df = get_test_datafusion(Arc::clone(&status));
 
-            let rt = Runtime::builder()
-                .with_datafusion(df)
-                .with_app(app)
-                .build()
-                .await;
+            let rt = Arc::new(
+                Runtime::builder()
+                    .with_datafusion(df)
+                    .with_app(app)
+                    .build()
+                    .await,
+            );
 
             // Set a timeout for the test
             tokio::select! {
@@ -114,11 +116,13 @@ async fn s3_hive_partitioning() -> Result<(), anyhow::Error> {
             let status = status::RuntimeStatus::new();
             let df = get_test_datafusion(Arc::clone(&status));
 
-            let rt = Runtime::builder()
-                .with_app(app)
-                .with_datafusion(df)
-                .build()
-                .await;
+            let rt = Arc::new(
+                Runtime::builder()
+                    .with_app(app)
+                    .with_datafusion(df)
+                    .build()
+                    .await,
+            );
 
             // Set a timeout for the test
             tokio::select! {
