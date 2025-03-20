@@ -623,7 +623,7 @@ impl Runtime {
             }
         });
 
-        let eval_scorer = tokio::spawn({
+        let evals = tokio::spawn({
             let self_clone = self.clone();
             async move {
                 let app_lock = self_clone.app.read().await;
@@ -637,6 +637,7 @@ impl Runtime {
                 #[cfg(feature = "models")]
                 {
                     self_clone.load_eval_scorer().await;
+                    let () = self_clone.verify_evals().await;
                     let an_eval_exists = app_lock.as_ref().is_some_and(|app| !app.evals.is_empty());
                     if !an_eval_exists {
                         tracing::trace!("No eval spice components defined. Therefore not loading eval tables into database.");
@@ -654,7 +655,7 @@ impl Runtime {
             datasets,
             catalogs,
             models,
-            eval_scorer
+            evals
         );
 
         if let Err(err) = load_result {

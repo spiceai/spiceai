@@ -118,6 +118,7 @@ snafu.workspace = true
 snowflake-api = { workspace = true, optional = true }
 spicepod = { path = "../spicepod" }
 ssh2 = { workspace = true, optional = true }
+strsim = { version = "0.11.1", optional = true }
 suppaftp = { workspace = true, optional = true }
 telemetry = { path = "../telemetry" }
 tiberius = { workspace = true, optional = true }
@@ -191,7 +192,7 @@ imap = ["data_components/imap", "dep:imap"]
 keyring-secret-store = ["dep:keyring"]
 mcp = ["dep:mcp-client", "dep:mcp-core", "dep:mcp-server"]
 metal = ["llms/metal"]
-models = ["model_components/full", "mcp"]
+models = ["model_components/full", "mcp", "dep:strsim"]
 mssql = ["dep:tiberius", "data_components/mssql"]
 mysql = ["dep:mysql_async", "db_connection_pool/mysql", "data_components/mysql"]
 odbc = ["db_connection_pool/odbc", "data_components/odbc"]
