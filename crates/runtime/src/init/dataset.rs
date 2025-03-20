@@ -637,6 +637,8 @@ impl Runtime {
     async fn initialize_accelerators(&self, datasets: &[Arc<Dataset>]) -> Vec<Arc<Dataset>> {
         let spaced_tracer = Arc::clone(&self.spaced_tracer);
 
+        dataaccelerator::update_all_accelerator_stats(datasets).await;
+
         let mut initialized_datasets = vec![];
         for ds in datasets {
             if let Some(acceleration) = &ds.acceleration {

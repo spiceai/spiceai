@@ -14,6 +14,16 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::{
+    component::dataset::{
+        acceleration::{Engine, Mode},
+        Dataset,
+    },
+    datafusion::dialect::new_duckdb_dialect,
+    make_spice_data_directory,
+    parameters::ParameterSpec,
+    spice_data_base_path, Runtime,
+};
 use async_trait::async_trait;
 use data_components::poly::PolyTableProvider;
 use datafusion::{
@@ -26,17 +36,11 @@ use datafusion_table_providers::{
 };
 use duckdb::AccessMode;
 use snafu::prelude::*;
-use std::{any::Any, ffi::OsStr, sync::Arc};
-
-use crate::{
-    component::dataset::{
-        acceleration::{Engine, Mode},
-        Dataset,
-    },
-    datafusion::dialect::new_duckdb_dialect,
-    make_spice_data_directory,
-    parameters::ParameterSpec,
-    spice_data_base_path, Runtime,
+use std::{
+    any::Any,
+    collections::HashMap,
+    ffi::OsStr,
+    sync::{Arc, Mutex},
 };
 
 use super::{DataAccelerator, Error as DataAcceleratorError};
@@ -73,14 +77,19 @@ pub enum Error {
     #[snafu(display("Invalid DuckDB acceleration configuration: {detail}"))]
     InvalidConfiguration { detail: Arc<str> },
 
-    #[snafu(display(r#"Invalid value "{value}" for "connection_pool_size": must be a positive integer greater than zero."#))]
-    InvalidConnectionPoolSize { value: String },
+    #[snafu(display("Failed to retrieve DuckDB instance usage statistics. This is an internal error, please report it at github.com/spiceai/spiceai/issues"))]
+    UnableToGetInstanceUsage {},
+
+    #[snafu(display("Failed to update DuckDB instance usage statistics. This is an internal error, please report it at github.com/spiceai/spiceai/issues"))]
+    UnableToUpdateInstanceUsage {},
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct DuckDBAccelerator {
     duckdb_factory: DuckDBTableProviderFactory,
+    file_instance_usage: Mutex<HashMap<String, u32>>,
+    memory_instance_usage: Mutex<Option<u32>>,
 }
 
 impl DuckDBAccelerator {
@@ -90,6 +99,8 @@ impl DuckDBAccelerator {
             // DuckDB accelerator uses params.duckdb_file for file connection
             duckdb_factory: DuckDBTableProviderFactory::new(AccessMode::ReadWrite)
                 .with_dialect(new_duckdb_dialect()),
+            file_instance_usage: Mutex::new(HashMap::new()),
+            memory_instance_usage: Mutex::new(None),
         }
     }
 
@@ -128,39 +139,23 @@ impl DuckDBAccelerator {
                 dataset: dataset.name.to_string(),
             })?;
 
-        let connection_pool_size = acceleration
-            .params
-            .get("connection_pool_size")
-            .map(|s| {
-                s.parse::<u32>()
-                    .map_err(|_| Error::InvalidConnectionPoolSize {
-                        value: s.to_string(),
-                    })
-                    .and_then(|size| {
-                        if size > 0 {
-                            Ok(size)
-                        } else {
-                            Err(Error::InvalidConnectionPoolSize {
-                                value: s.to_string(),
-                            })
-                        }
-                    })
-            })
-            .transpose()?;
-
         let pool = match (duckdb_file, acceleration.mode) {
-            (Ok(duckdb_file), Mode::File) => self
-                .duckdb_factory
-                .get_or_init_file_instance(duckdb_file, connection_pool_size)
-                .await
-                .boxed()
-                .context(AccelerationCreationFailedSnafu)?,
-            (_, Mode::Memory) => self
-                .duckdb_factory
-                .get_or_init_memory_instance(connection_pool_size)
-                .await
-                .boxed()
-                .context(AccelerationCreationFailedSnafu)?,
+            (Ok(duckdb_file), Mode::File) => {
+                let file_instance_usage = self.get_file_instance_usage(duckdb_file.as_str())?;
+                self.duckdb_factory
+                    .get_or_init_file_instance(duckdb_file, file_instance_usage)
+                    .await
+                    .boxed()
+                    .context(AccelerationCreationFailedSnafu)?
+            }
+            (_, Mode::Memory) => {
+                let memory_instance_usage = self.get_memory_instance_usage()?;
+                self.duckdb_factory
+                    .get_or_init_memory_instance(memory_instance_usage)
+                    .await
+                    .boxed()
+                    .context(AccelerationCreationFailedSnafu)?
+            }
             (Err(e), Mode::File) => {
                 return Err(Error::InvalidConfiguration {
                     detail: Arc::from(e.to_string()),
@@ -169,6 +164,27 @@ impl DuckDBAccelerator {
         };
 
         Ok(pool)
+    }
+
+    pub fn get_file_instance_usage(&self, path: &str) -> Result<Option<u32>> {
+        match self.file_instance_usage.lock() {
+            Ok(guard) => {
+                return Ok(guard.get(path).copied());
+            }
+            Err(_) => {
+                return Err(Error::UnableToGetInstanceUsage {});
+            }
+        }
+    }
+
+    pub fn get_memory_instance_usage(&self) -> Result<Option<u32>> {
+        match self.memory_instance_usage.lock() {
+            Ok(guard) => {
+                let usage_count = *guard;
+                Ok(usage_count)
+            }
+            Err(_) => Err(Error::UnableToGetInstanceUsage {}),
+        }
     }
 }
 
@@ -182,8 +198,6 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("file"),
     ParameterSpec::runtime("file_watcher"),
     ParameterSpec::component("memory_limit"),
-    ParameterSpec::runtime("connection_pool_size")
-        .description("The maximum number of connections created in the connection pool"),
 ];
 
 #[async_trait]
@@ -332,6 +346,52 @@ impl DataAccelerator for DuckDBAccelerator {
 
     fn parameters(&self) -> &'static [ParameterSpec] {
         PARAMETERS
+    }
+
+    fn update_stats(
+        &self,
+        datasets: &[Arc<Dataset>],
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mut file_usage: HashMap<String, u32> = HashMap::new();
+        let mut memory_usage: Option<u32> = None;
+
+        for ds in datasets {
+            if let Some(acceleration) = &ds.acceleration {
+                if acceleration.engine != Engine::DuckDB {
+                    continue;
+                }
+
+                if acceleration.mode == Mode::File {
+                    if let Ok(path) = self.file_path(ds) {
+                        *file_usage.entry(path).or_insert(0) += 1;
+                    }
+                } else {
+                    *memory_usage.get_or_insert(0) += 1;
+                }
+            }
+        }
+
+        match self.file_instance_usage.lock() {
+            Ok(mut guard) => {
+                for (path, count) in file_usage {
+                    *guard.entry(path).or_insert(0) += count;
+                }
+            }
+            Err(_) => {
+                tracing::warn!("{}", Error::UnableToUpdateInstanceUsage {});
+            }
+        }
+
+        match self.memory_instance_usage.lock() {
+            Ok(mut guard) => {
+                *guard = memory_usage;
+            }
+            Err(_) => {
+                tracing::warn!("{}", Error::UnableToUpdateInstanceUsage {});
+            }
+        }
+
+        Ok(())
     }
 }
 
