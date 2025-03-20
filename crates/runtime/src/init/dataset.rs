@@ -641,15 +641,6 @@ impl Runtime {
     async fn initialize_accelerators(&self, datasets: &[Arc<Dataset>]) -> Vec<Arc<Dataset>> {
         let spaced_tracer = Arc::clone(&self.spaced_tracer);
 
-        let mut duckdb_dataset_cnt = 0;
-        for ds in datasets {
-            if let Some(acc) = &ds.acceleration {
-                if acc.engine == Engine::DuckDB {
-                    duckdb_dataset_cnt += 1;
-                }
-            }
-        }
-
         let mut initialized_datasets = vec![];
         for ds in datasets {
             if let Some(acceleration) = &ds.acceleration {
