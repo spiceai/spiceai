@@ -245,9 +245,7 @@ mod tests {
             let delay = backoff.next_backoff().expect("should get a duration");
             assert!(
                 delay <= max_duration,
-                "delay {:?} exceeds max_duration {:?}",
-                delay,
-                max_duration
+                "delay {delay:?} exceeds max_duration {max_duration:?}",
             );
         }
     }
