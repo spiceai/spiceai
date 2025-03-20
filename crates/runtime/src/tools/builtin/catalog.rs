@@ -93,15 +93,15 @@ impl BuiltinToolCatalog {
             ))),
             "sample_distinct_columns" => Ok(Arc::new(
                 SampleDataTool::new(self.rt.datafusion(), SampleTableMethod::DistinctColumns)
-                    .with_overrides(Some(name), description.as_deref()),
+                    .with_overrides(Some(name), description),
             )),
             "random_sample" => Ok(Arc::new(
                 SampleDataTool::new(self.rt.datafusion(), SampleTableMethod::RandomSample)
-                    .with_overrides(Some(name), description.as_deref()),
+                    .with_overrides(Some(name), description),
             )),
             "top_n_sample" => Ok(Arc::new(
                 SampleDataTool::new(self.rt.datafusion(), SampleTableMethod::TopNSample)
-                    .with_overrides(Some(name), description.as_deref()),
+                    .with_overrides(Some(name), description),
             )),
             "list_datasets" => {
                 let table_allowlist: Option<Vec<&str>> = params
