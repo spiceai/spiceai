@@ -202,3 +202,114 @@ async fn handle_connection<S>(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{routing::get, Router};
+    use futures::future;
+    use http::StatusCode;
+    use std::time::Duration;
+    use tokio::{
+        net::TcpListener,
+        sync::watch,
+        time::{sleep, timeout},
+    };
+
+    // Router that immediately responds with "ok"
+    fn ok_router() -> Router {
+        Router::new().route("/", get(|| async { "ok" }))
+    }
+
+    // Router that never responds (simulate a hanging request)
+    fn pending_router() -> Router {
+        Router::new().route(
+            "/",
+            get(|| async {
+                future::pending::<()>().await;
+                "pending"
+            }),
+        )
+    }
+
+    #[tokio::test]
+    async fn test_process_tcp_stream_request_completed() {
+        // Bind a listener on a system assigned available port
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("to create listener");
+        let addr = listener.local_addr().expect("to get local addr");
+        let (shutdown_notify, shutdown_rx) = watch::channel(());
+
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("to accept connection");
+            process_tcp_stream(stream, ok_router(), shutdown_rx);
+        });
+        let client = reqwest::Client::new();
+        let resp = timeout(
+            Duration::from_secs(2),
+            client.get(format!("http://{addr}/")).send(),
+        )
+        .await
+        .expect("to complete request before timeout")
+        .expect("to get response");
+
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        drop(client);
+        // Add extra delay to ensure enough time for the connection to be closed
+        sleep(Duration::from_millis(500)).await;
+
+        assert_eq!(
+            shutdown_notify.receiver_count(),
+            0,
+            "Should be no active connections"
+        );
+
+        // Verify that the shutdown does not fail if there are no active connections
+        shutdown_notify.send(()).ok();
+        assert!(timeout(Duration::from_secs(1), shutdown_notify.closed())
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_process_tcp_stream_graceful_shutdown() {
+        // Bind a listener on a system assigned available port
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("to create listener");
+        let addr = listener.local_addr().expect("to get local addr");
+        let (shutdown_notify, shutdown_rx) = watch::channel(());
+
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("to accept connection");
+            process_tcp_stream(stream, pending_router(), shutdown_rx);
+        });
+
+        // the request handler will hang until the connection is closed
+        let request_completion_handle = tokio::spawn(async move {
+            let client = reqwest::Client::new();
+            client.get(format!("http://{addr}/")).send().await
+        });
+
+        assert_eq!(
+            shutdown_notify.receiver_count(),
+            1,
+            "Must be one active connection"
+        );
+        assert!(
+            !request_completion_handle.is_finished(),
+            "Request should not be completed"
+        );
+
+        // Verify that the shutdown will close the active request and drop all receivers
+        shutdown_notify.send(()).ok();
+        assert!(timeout(Duration::from_secs(5), request_completion_handle)
+            .await
+            .is_ok());
+        assert!(timeout(Duration::from_secs(1), shutdown_notify.closed())
+            .await
+            .is_ok());
+    }
+}
