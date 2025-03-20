@@ -39,11 +39,11 @@ use futures::{Stream, StreamExt};
 use serde_json::Value;
 
 use tokio::sync::mpsc;
+use tools::SpiceModelTool;
 use tracing::{Instrument, Span};
 
 use crate::request::{AsyncMarker, RequestContext};
 use crate::tools::builtin::list_datasets::ListDatasetsTool;
-use crate::tools::SpiceModelTool;
 use crate::Runtime;
 
 pub struct ToolUsingChat {
@@ -105,9 +105,9 @@ impl ToolUsingChat {
     async fn create_list_dataset_messages(
         &self,
     ) -> Result<Vec<ChatCompletionRequestMessage>, OpenAIError> {
-        let t = ListDatasetsTool::default();
+        let t = ListDatasetsTool::from(&self.rt);
         let t_resp = t
-            .call("", Arc::<Runtime>::clone(&self.rt))
+            .call("")
             .await
             .map_err(|e| OpenAIError::InvalidArgument(e.to_string()))?;
         Ok(vec![
@@ -142,18 +142,13 @@ impl ToolUsingChat {
     /// Return the result as a JSON value.
     async fn call_tool(&self, func: &FunctionCall) -> Value {
         match self.tools.iter().find(|t| t.name() == func.name) {
-            Some(t) => {
-                match t
-                    .call(&func.arguments, Arc::<Runtime>::clone(&self.rt))
-                    .await
-                {
-                    Ok(v) => v,
-                    Err(e) => Value::String(format!(
-                        "Failed to call the tool {}.\nAn error occurred: {e}",
-                        t.name()
-                    )),
-                }
-            }
+            Some(t) => match t.call(&func.arguments).await {
+                Ok(v) => v,
+                Err(e) => Value::String(format!(
+                    "Failed to call the tool {}.\nAn error occurred: {e}",
+                    t.name()
+                )),
+            },
             None => Value::Null,
         }
     }

@@ -20,6 +20,7 @@ members = [
     "crates/spicepod",
     "crates/telemetry",
     "crates/test-framework",
+    "crates/tools",
     "crates/util",
     "tools/evalconverter",
     "tools/flightpublisher/",

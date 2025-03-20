@@ -111,7 +111,7 @@ impl mcp_server::Router for RuntimeServer {
                 .map_err(|e| ToolError::InvalidParameters(e.to_string()))?;
 
             let result = tool
-                .call(args.as_str(), Arc::clone(self))
+                .call(args.as_str())
                 .await
                 .map_err(|e| ToolError::ExecutionError(e.to_string()))?;
 

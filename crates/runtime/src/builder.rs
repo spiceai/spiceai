@@ -17,7 +17,7 @@ limitations under the License.
 use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 
 use app::App;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 use crate::{
     catalogconnector, dataaccelerator, dataconnector,
@@ -134,7 +134,6 @@ impl RuntimeBuilder {
         dataconnector::register_all().await;
         catalogconnector::register_all().await;
         dataaccelerator::register_all().await;
-        tools::factory::register_all_factories().await;
         document_parse::register_all().await;
 
         let status = match self.runtime_status {
@@ -177,6 +176,7 @@ impl RuntimeBuilder {
             evals: Arc::new(RwLock::new(evals)),
             eval_scorers: Arc::new(RwLock::new(HashMap::new())),
             tools: Arc::new(RwLock::new(HashMap::new())),
+            tool_factories: Arc::new(Mutex::new(HashMap::new())),
             pods_watcher: Arc::new(RwLock::new(self.pods_watcher)),
             secrets: Arc::new(RwLock::new(secrets)),
             spaced_tracer: Arc::new(tracers::SpacedTracer::new(Duration::from_secs(15))),
@@ -201,6 +201,7 @@ impl RuntimeBuilder {
             };
         }
         rt.extensions = Arc::new(RwLock::new(extensions));
+        tools::factory::register_all_factories(Arc::new(rt.clone())).await;
 
         rt
     }

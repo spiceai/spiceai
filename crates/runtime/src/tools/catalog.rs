@@ -15,8 +15,8 @@ limitations under the License.
 */
 use async_openai::types::{ChatCompletionTool, ChatCompletionToolType, FunctionObject};
 use async_trait::async_trait;
+use tools::SpiceModelTool;
 
-use super::SpiceModelTool;
 use std::sync::Arc;
 
 #[async_trait]

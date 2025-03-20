@@ -52,7 +52,7 @@ pub enum Error {
 }
 
 impl Runtime {
-    pub(crate) async fn load_models(&self) {
+    pub(crate) async fn load_models(self: Arc<Self>) {
         let app_lock = self.app.read().await;
 
         if !cfg!(feature = "models") && app_lock.as_ref().is_some_and(|s| !s.models.is_empty()) {
@@ -61,7 +61,7 @@ impl Runtime {
         }
 
         // Load tools before loading models.
-        self.load_tools().await;
+        Arc::clone(&self).load_tools().await;
 
         if let Some(app) = app_lock.as_ref() {
             for model in &app.models {

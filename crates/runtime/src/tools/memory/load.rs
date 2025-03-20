@@ -39,25 +39,26 @@ pub struct LoadMemoryParams {
 
 pub struct LoadMemoryTool {
     name: String,
-    description: Option<String>,
+    description: String,
+    rt: Arc<Runtime>,
 }
 
 impl LoadMemoryTool {
     #[must_use]
-    pub fn new(name: &str, description: Option<String>) -> Self {
+    pub fn new(rt: Arc<Runtime>, name: Option<&str>, description: Option<&str>) -> Self {
         Self {
-            name: name.to_string(),
-            description,
+            rt,
+            name: name.unwrap_or("load_memory").to_string(),
+            description: description
+                .unwrap_or("Load memories previously saved by the language model.")
+                .to_string(),
         }
     }
 }
 
-impl Default for LoadMemoryTool {
-    fn default() -> Self {
-        Self::new(
-            "load_memory",
-            Some("Load memories previously saved by the language model.".to_string()),
-        )
+impl From<&Arc<Runtime>> for LoadMemoryTool {
+    fn from(rt: &Arc<Runtime>) -> Self {
+        Self::new(Arc::clone(rt), None, None)
     }
 }
 
@@ -68,26 +69,22 @@ impl SpiceModelTool for LoadMemoryTool {
     }
 
     fn description(&self) -> Option<Cow<'_, str>> {
-        self.description.as_deref().map(Cow::Borrowed)
+        Some(Cow::Borrowed(&self.description))
     }
 
     fn parameters(&self) -> Option<Value> {
         parameters::<LoadMemoryParams>()
     }
 
-    async fn call(
-        &self,
-        arg: &str,
-        rt: Arc<Runtime>,
-    ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+    async fn call(&self, arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::load_memory", tool = self.name().to_string(), input = arg);
 
-        let table_name = memory_table_name(&rt).await?;
+        let table_name = memory_table_name(&self.rt).await?;
         let result: Result<Value, Box<dyn std::error::Error + Send + Sync>> = async {
             let params: LoadMemoryParams = serde_json::from_str(arg).boxed()?;
             let last_interval = fundu::parse_duration(params.last.as_str()).boxed()?;
 
-            let batches = rt
+            let batches = self.rt
                 .datafusion()
                 .query_builder(
                     &format!(

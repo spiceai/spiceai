@@ -19,25 +19,44 @@ use secrecy::SecretString;
 use spicepod::component::tool::Tool;
 use std::{collections::HashMap, sync::Arc};
 
-use crate::tools::{
-    catalog::SpiceToolCatalog, factory::IndividualToolFactory, memory::store::StoreMemoryTool,
-    SpiceModelTool,
+use crate::{
+    tools::{
+        catalog::SpiceToolCatalog, factory::IndividualToolFactory, memory::store::StoreMemoryTool,
+        SpiceModelTool,
+    },
+    Runtime,
 };
 
 use super::load::LoadMemoryTool;
 
-pub struct MemoryToolCatalog {}
+pub struct MemoryToolCatalog {
+    rt: Arc<Runtime>,
+}
 
 impl MemoryToolCatalog {
+    #[must_use]
+    pub fn new(rt: Arc<Runtime>) -> Self {
+        Self { rt }
+    }
+
     fn get_tool(
+        &self,
         id: &str,
         name: Option<&str>,
-        description: Option<String>,
+        description: Option<&str>,
     ) -> Option<Arc<dyn SpiceModelTool>> {
         let name = name.unwrap_or(id);
         match id {
-            "load" => Some(Arc::new(LoadMemoryTool::new(name, description))),
-            "store" => Some(Arc::new(StoreMemoryTool::new(name, description))),
+            "load" => Some(Arc::new(LoadMemoryTool::new(
+                Arc::clone(&self.rt),
+                Some(name),
+                description,
+            ))),
+            "store" => Some(Arc::new(StoreMemoryTool::new(
+                Arc::clone(&self.rt),
+                Some(name),
+                description,
+            ))),
             _ => None,
         }
     }
@@ -57,10 +76,10 @@ impl IndividualToolFactory for MemoryToolCatalog {
             .into());
         };
 
-        Self::get_tool(
+        self.get_tool(
             id,
             Some(component.name.as_str()),
-            component.description.clone(),
+            component.description.as_deref(),
         )
         .ok_or_else(|| format!("Tool with id `{id}` not found in memory tool catalog").into())
     }
@@ -74,12 +93,12 @@ impl SpiceToolCatalog for MemoryToolCatalog {
 
     async fn all(&self) -> Vec<Arc<dyn SpiceModelTool>> {
         vec![
-            Arc::new(LoadMemoryTool::default()),
-            Arc::new(StoreMemoryTool::default()),
+            Arc::new(LoadMemoryTool::new(Arc::clone(&self.rt), None, None)),
+            Arc::new(StoreMemoryTool::new(Arc::clone(&self.rt), None, None)),
         ]
     }
 
     async fn get(&self, name: &str) -> Option<Arc<dyn SpiceModelTool>> {
-        Self::get_tool(name, None, None)
+        self.get_tool(name, None, None)
     }
 }

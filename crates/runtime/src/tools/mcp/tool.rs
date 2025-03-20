@@ -21,12 +21,13 @@ use serde_json::Value;
 use snafu::ResultExt;
 use std::{borrow::Cow, sync::Arc};
 use tokio::sync::RwLock;
+use tools::McpProxy;
 use tracing::Span;
 use tracing_futures::Instrument;
 
-use crate::{tools::SpiceModelTool, Runtime};
+use crate::tools::SpiceModelTool;
 
-use super::{McpProxy, Result};
+use super::Result;
 
 pub struct McpToolWrapper {
     client: Arc<RwLock<Box<dyn McpClientTrait>>>,
@@ -62,11 +63,7 @@ impl SpiceModelTool for McpToolWrapper {
         Some(self)
     }
 
-    async fn call(
-        &self,
-        arg: &str,
-        _rt: Arc<Runtime>,
-    ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+    async fn call(&self, arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
         let span: Span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::mcp", tool = self.name().to_string(), input = arg);
         let tool_use_result: Result<Value, Box<dyn std::error::Error + Send + Sync>> = async {
             let client = self.client.read().await;
