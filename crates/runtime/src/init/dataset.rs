@@ -18,11 +18,7 @@ use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc};
 
 use crate::{
     accelerated_table::AcceleratedTable,
-    component::dataset::{
-        self,
-        acceleration::{Engine, RefreshMode},
-        Dataset,
-    },
+    component::dataset::{self, acceleration::RefreshMode, Dataset},
     dataaccelerator,
     dataconnector::{
         self,
