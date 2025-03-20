@@ -18,7 +18,11 @@ use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc};
 
 use crate::{
     accelerated_table::AcceleratedTable,
-    component::dataset::{self, acceleration::RefreshMode, Dataset},
+    component::dataset::{
+        self,
+        acceleration::{Engine, RefreshMode},
+        Dataset,
+    },
     dataaccelerator,
     dataconnector::{
         self,
@@ -636,6 +640,15 @@ impl Runtime {
     /// which is important for acceleration federation for some acceleration engines (e.g. `SQLite`).
     async fn initialize_accelerators(&self, datasets: &[Arc<Dataset>]) -> Vec<Arc<Dataset>> {
         let spaced_tracer = Arc::clone(&self.spaced_tracer);
+
+        let mut duckdb_dataset_cnt = 0;
+        for ds in datasets {
+            if let Some(acc) = &ds.acceleration {
+                if acc.engine == Engine::DuckDB {
+                    duckdb_dataset_cnt += 1;
+                }
+            }
+        }
 
         let mut initialized_datasets = vec![];
         for ds in datasets {

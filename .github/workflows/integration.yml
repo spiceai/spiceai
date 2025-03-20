@@ -65,11 +65,11 @@ jobs:
       - name: Build integration test binary
         run: |
           FEATURES="postgres,mysql,delta_lake,duckdb,sqlite,spark,databricks,spark"
-          if [[ "${{ github.event.inputs.run_slow_tests }}" == "true" ]] || [[ "${{ github.ref }}" == "refs/heads/release"* ]]; then
-            FEATURES="${FEATURES},slow_tests"
-            echo "Including slow tests"
+          if [[ "${{ github.event.inputs.run_all_tests }}" == "true" ]] || [[ "${{ github.ref }}" == "refs/heads/release"* ]]; then
+            FEATURES="${FEATURES},extended_tests"
+            echo "Including extended_tests"
           else
-            echo "Excluding slow tests"
+            echo "Excluding extended_tests"
           fi
           
           TEST_BINARY_PATH=$(cargo test -p runtime --test integration --features ${FEATURES} --no-run --message-format=json | jq -r 'select(.reason == "compiler-artifact" and (.target.kind | contains(["test"])) and .executable != null) | .executable')
