@@ -108,7 +108,7 @@ params:
             () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
                 return Err(anyhow::anyhow!("Timed out waiting for components to load"));
             }
-            () = rt.load_components() => {}
+            () = Arc::clone(&rt).load_components() => {}
         }
 
         runtime_ready_check(&rt).await;

@@ -152,7 +152,7 @@ async fn run_queries() -> Result<(), anyhow::Error> {
         () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
             return Err(anyhow!("Timed out waiting for datasets to load".to_string()));
         }
-        () = rt.load_components() => {}
+        () = Arc::clone(&rt).load_components() => {}
     }
 
     let queries = vec![

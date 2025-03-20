@@ -85,7 +85,7 @@ async fn test_acceleration_duckdb_single_instance() -> Result<(), anyhow::Error>
                 () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
                     return Err(anyhow::Error::msg("Timed out waiting for datasets to load"));
                 }
-                () = rt.load_components() => {}
+                () = Arc::clone(&rt).load_components() => {}
             }
 
             runtime_ready_check(&rt).await;
