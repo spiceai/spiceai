@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use arrow::array::RecordBatch;
 use datafusion::sql::TableReference;
@@ -46,7 +46,7 @@ pub(crate) type QueryRelevance = HashMap<String, HashMap<String, i32>>;
 pub(crate) async fn setup_benchmark(
     config: &SearchBenchmarkConfiguration,
     upload_results_dataset: Option<&String>,
-) -> Result<(Runtime, SearchBenchmarkResultBuilder), String> {
+) -> Result<(Arc<Runtime>, SearchBenchmarkResultBuilder), String> {
     init_tracing(Some(
         "runtime=DEBUG,task_history=WARN,runtime::embeddings=WARN,INFO",
     ));
@@ -72,7 +72,7 @@ pub(crate) async fn setup_benchmark(
         None => app_builder.build(),
     };
 
-    let rt = Runtime::builder().with_app(app).build().await;
+    let rt = Arc::new(Runtime::builder().with_app(app).build().await);
 
     // include embeddings initial loading time to indexing time
     benchmark_result.start_index();
@@ -81,7 +81,7 @@ pub(crate) async fn setup_benchmark(
         () = tokio::time::sleep(std::time::Duration::from_secs(5 * 60)) => {
             panic!("Timed out waiting for datasets to load in setup_benchmark()");
         }
-        () = rt.load_components() => {}
+        () = Arc::clone(&rt).load_components() => {}
     }
 
     Ok((rt, benchmark_result))

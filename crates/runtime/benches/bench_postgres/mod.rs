@@ -19,7 +19,7 @@ use crate::results::BenchmarkResultsBuilder;
 use spicepod::component::{dataset::Dataset, params::Params};
 
 pub(crate) async fn run(
-    rt: &mut Runtime,
+    rt: &Runtime,
     benchmark_results: &mut BenchmarkResultsBuilder,
     bench_name: &str,
 ) -> Result<(), String> {

@@ -278,47 +278,47 @@ async fn run_connector_bench(
 
     match connector {
         "spice.ai" => {
-            bench_spicecloud::run(&mut rt, &mut benchmark_results, bench_name).await?;
+            bench_spicecloud::run(&rt, &mut benchmark_results, bench_name).await?;
         }
         "s3" | "abfs" | "file" => {
-            bench_object_store::run(connector, &mut rt, &mut benchmark_results, None, bench_name)
+            bench_object_store::run(connector, &rt, &mut benchmark_results, None, bench_name)
                 .await?;
         }
         #[cfg(feature = "spark")]
         "spark" => {
-            bench_spark::run(&mut rt, &mut benchmark_results, bench_name).await?;
+            bench_spark::run(&rt, &mut benchmark_results, bench_name).await?;
         }
         #[cfg(feature = "postgres")]
         "postgres" => {
-            bench_postgres::run(&mut rt, &mut benchmark_results, bench_name).await?;
+            bench_postgres::run(&rt, &mut benchmark_results, bench_name).await?;
         }
         #[cfg(feature = "mysql")]
         "mysql" => {
-            bench_mysql::run(&mut rt, &mut benchmark_results, bench_name).await?;
+            bench_mysql::run(&rt, &mut benchmark_results, bench_name).await?;
         }
         #[cfg(feature = "duckdb")]
         "duckdb" => {
-            bench_duckdb::run(&mut rt, &mut benchmark_results, bench_name).await?;
+            bench_duckdb::run(&rt, &mut benchmark_results, bench_name).await?;
         }
         #[cfg(feature = "odbc")]
         "odbc-databricks" => {
-            bench_odbc_databricks::run(&mut rt, &mut benchmark_results, bench_name).await?;
+            bench_odbc_databricks::run(&rt, &mut benchmark_results, bench_name).await?;
         }
         #[cfg(feature = "odbc")]
         "odbc-athena" => {
-            bench_odbc_athena::run(&mut rt, &mut benchmark_results).await?;
+            bench_odbc_athena::run(&rt, &mut benchmark_results).await?;
         }
         #[cfg(feature = "delta_lake")]
         "delta_lake" => {
-            bench_delta::run(&mut rt, &mut benchmark_results, bench_name).await?;
+            bench_delta::run(&rt, &mut benchmark_results, bench_name).await?;
         }
         #[cfg(feature = "mssql")]
         "mssql" => {
-            bench_mssql::run(&mut rt, &mut benchmark_results, bench_name).await?;
+            bench_mssql::run(&rt, &mut benchmark_results, bench_name).await?;
         }
         #[cfg(feature = "dremio")]
         "dremio" => {
-            bench_dremio::run(&mut rt, &mut benchmark_results, bench_name).await?;
+            bench_dremio::run(&rt, &mut benchmark_results, bench_name).await?;
         }
         _ => {}
     }
@@ -385,7 +385,7 @@ async fn run_accelerator_bench(
                 }
             }
 
-            let (mut benchmark_results, mut rt) = setup::setup_benchmark(
+            let (mut benchmark_results, rt) = setup::setup_benchmark(
                 upload_results_dataset,
                 connector,
                 Some(accelerator.clone()),
@@ -394,7 +394,7 @@ async fn run_accelerator_bench(
             .await?;
 
             bench_object_store::file::run_file_append(
-                &mut rt,
+                &rt,
                 &mut benchmark_results,
                 bench_name,
                 Some(accelerator),
@@ -413,7 +413,7 @@ async fn run_accelerator_bench(
             ));
         }
         (None, "s3" | "abfs") => {
-            let (mut benchmark_results, mut rt) = setup::setup_benchmark(
+            let (mut benchmark_results, rt) = setup::setup_benchmark(
                 upload_results_dataset,
                 connector,
                 Some(accelerator.clone()),
@@ -423,7 +423,7 @@ async fn run_accelerator_bench(
 
             bench_object_store::run(
                 connector,
-                &mut rt,
+                &rt,
                 &mut benchmark_results,
                 Some(accelerator),
                 bench_name,
@@ -492,7 +492,7 @@ fn get_current_unix_ms() -> i64 {
 
 #[allow(clippy::too_many_lines)]
 pub(crate) async fn run_query_and_return_result(
-    rt: &mut Runtime,
+    rt: &Runtime,
     iterations: i32,
     connector: &str,
     query_name: &str,
@@ -632,7 +632,7 @@ pub(crate) async fn run_query_and_return_result(
 }
 
 pub(crate) async fn run_query_and_record_result(
-    rt: &mut Runtime,
+    rt: &Runtime,
     benchmark_results: &mut BenchmarkResultsBuilder,
     connector: &str,
     query_name: &str,
@@ -655,7 +655,7 @@ pub(crate) async fn run_query_and_record_result(
 }
 
 async fn run_query(
-    rt: &mut Runtime,
+    rt: &Runtime,
     connector: &str,
     query_name: &str,
     query: &str,
@@ -680,7 +680,7 @@ async fn run_query(
 const ENABLED_SNAPSHOT_CONNECTORS: &[&str] = &["spice.ai", "s3", "s3_arrow_memory"];
 
 async fn record_explain_plan(
-    rt: &mut Runtime,
+    rt: &Runtime,
     connector: &str,
     query_name: &str,
     query: &str,

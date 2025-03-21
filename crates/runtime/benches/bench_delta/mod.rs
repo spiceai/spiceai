@@ -22,7 +22,7 @@ use spicepod::component::{dataset::Dataset, params::Params};
 use test_framework::queries::{get_tpcds_test_queries, get_tpch_test_queries};
 
 pub(crate) async fn run(
-    rt: &mut Runtime,
+    rt: &Runtime,
     benchmark_results: &mut BenchmarkResultsBuilder,
     bench_name: &str,
 ) -> Result<(), String> {

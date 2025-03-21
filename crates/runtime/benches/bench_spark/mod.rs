@@ -22,7 +22,7 @@ use test_framework::queries::{get_tpcds_test_queries, get_tpch_test_queries, Que
 use crate::results::BenchmarkResultsBuilder;
 
 pub(crate) async fn run(
-    rt: &mut Runtime,
+    rt: &Runtime,
     benchmark_results: &mut BenchmarkResultsBuilder,
     bench_name: &str,
 ) -> Result<(), String> {

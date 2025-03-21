@@ -26,7 +26,7 @@ use std::time::Duration;
 use tokio::{task::JoinHandle, time::sleep};
 
 pub(crate) async fn run(
-    rt: &mut Runtime,
+    rt: &Runtime,
     benchmark_results: &mut BenchmarkResultsBuilder,
     bench_name: &str,
 ) -> Result<(), String> {

@@ -63,24 +63,26 @@ pub(crate) async fn setup_benchmark(
     connector: &str,
     acceleration: Option<Acceleration>,
     bench_name: &str,
-) -> Result<(BenchmarkResultsBuilder, Runtime), String> {
+) -> Result<(BenchmarkResultsBuilder, Arc<Runtime>), String> {
     init_tracing(None);
 
     let app = build_app(upload_results_dataset, connector, acceleration, bench_name)?;
 
     let status = status::RuntimeStatus::new();
-    let rt = Runtime::builder()
-        .with_app(app)
-        .with_datafusion(get_test_datafusion(Arc::clone(&status)))
-        .with_runtime_status(status)
-        .build()
-        .await;
+    let rt = Arc::new(
+        Runtime::builder()
+            .with_app(app)
+            .with_datafusion(get_test_datafusion(Arc::clone(&status)))
+            .with_runtime_status(status)
+            .build()
+            .await,
+    );
 
     tokio::select! {
         () = tokio::time::sleep(std::time::Duration::from_secs(20 * 60)) => { // Databricks can take awhile to start up
             panic!("Timed out waiting for datasets to load in setup_benchmark()");
         }
-        () = rt.load_components() => {}
+        () = Arc::clone(&rt).load_components() => {}
     }
 
     let wait_time = match bench_name {

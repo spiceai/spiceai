@@ -36,7 +36,7 @@ use super::{
 
 #[allow(clippy::too_many_lines)]
 pub(crate) async fn run_file_append(
-    rt: &mut Runtime,
+    rt: &Runtime,
     benchmark_results: &mut BenchmarkResultsBuilder,
     bench_name: &str,
     accelerator: Option<Acceleration>,

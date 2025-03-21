@@ -43,7 +43,7 @@ pub(crate) fn build_app(
 #[allow(clippy::too_many_lines)]
 pub(crate) async fn run(
     connector: &str,
-    rt: &mut Runtime,
+    rt: &Runtime,
     benchmark_results: &mut BenchmarkResultsBuilder,
     acceleration: Option<Acceleration>,
     bench_name: &str,
