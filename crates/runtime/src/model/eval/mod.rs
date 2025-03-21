@@ -31,6 +31,7 @@ use scorer::score_results;
 use snafu::{ensure, ResultExt, Snafu};
 use spicepod::component::eval::Eval;
 use tracing_futures::Instrument;
+use tract_core::tract_data::itertools::Itertools;
 
 use crate::datafusion::DataFusion;
 
@@ -237,9 +238,25 @@ async fn run_eval(
 
     // Score the results
     let scorers_to_use = get_scorers_for_eval(eval, Arc::clone(&scorer_registry)).await?;
-    let scores = score_results(&input, &actual, &ideal, &scorers_to_use)
+
+    let span = tracing::span!(
+        target: "task_history",
+        tracing::Level::INFO,
+        "eval_scoring",
+        scorers = %serde_json::to_string(&scorers_to_use.keys().collect_vec()).unwrap_or_default(),
+    );
+
+    let scores = match score_results(&input, &actual, &ideal, &scorers_to_use)
+        .instrument(span.clone())
         .await
-        .context(FailedToScoreEvalRunSnafu)?;
+    {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(target: "task_history", parent: &span, "{e}");
+            return Err(Error::FailedToScoreEvalRun { source: e });
+        }
+    };
+
     write_results(id, Arc::clone(&df), &input, &actual, &ideal, &scores).await?;
 
     // Compute metrics
