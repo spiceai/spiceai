@@ -136,14 +136,11 @@ impl ChatWrapper {
             // Template existing system prompt
             (Some(prompt), true) => {
                 let ctx = match req.metadata.as_ref() {
-                    Some(serde_json::Value::Object(m)) => m
-                        .clone()
-                        .into_iter()
-                        .map(|(k, v)| match v {
-                            serde_json::Value::String(s) => (k, s),
-                            _ => (k, v.to_string()),
-                        })
-                        .collect::<HashMap<String, String>>(),
+                    Some(serde_json::Value::Object(m)) => {
+                        m.clone()
+                            .into_iter()
+                            .collect::<HashMap<String, serde_json::Value>>()
+                    }
                     Some(_) | None => HashMap::new(),
                 };
 
@@ -435,7 +432,10 @@ impl<S> Drop for TracedChatCompletionStream<S> {
     }
 }
 
-fn template_system_prompt(prompt: &str, inputs: &HashMap<String, String>) -> tera::Result<String> {
+fn template_system_prompt(
+    prompt: &str,
+    inputs: &HashMap<String, serde_json::Value>,
+) -> tera::Result<String> {
     let mut t = Tera::default();
     t.add_raw_template("system_prompt", prompt)?;
     let mut context = tera::Context::new();
