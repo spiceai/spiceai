@@ -188,7 +188,7 @@ jobs:
         if: github.event.inputs.update_snapshots == 'always'
         run: |
           # if the spiced commit is set, use that as the branch ID
-          if [[ ${{ github.event.inputs.spiced_commit }} ]]; then
+          if [ -n "${{ github.event.inputs.spiced_commit || '' }}" ]; then
             BRANCH_ID=${{ github.event.inputs.spiced_commit }}
           else
             BRANCH_ID=${{ github.run_id }}

@@ -77,7 +77,7 @@ impl ToolUsingChat {
                 r#type: ChatCompletionToolType::Function,
                 function: FunctionObject {
                     strict: t.strict(),
-                    name: t.name().to_string(),
+                    name: encode_tool_name(t.name().to_string().as_str()),
                     description: t.description().map(|d| d.to_string()),
                     parameters: t.parameters(),
                 },
@@ -85,17 +85,12 @@ impl ToolUsingChat {
             .collect_vec()
     }
 
-    #[must_use]
-    pub fn tool_exists(&self, name: &str) -> bool {
-        self.tools.iter().any(|t| t.name() == name)
-    }
-
     /// Create a new [`CreateChatCompletionRequest`] with the system prompt injected as the first message.
     async fn prepare_req(
         &self,
         mut req: CreateChatCompletionRequest,
     ) -> Result<CreateChatCompletionRequest, OpenAIError> {
-        if self.tool_exists("list_datasets") {
+        if self.tools.iter().any(|t| t.name() == "list_datasets") {
             // Add messages to start of message list to pretend it has already asked to list the available datasets.
             let mut list_dataset_messages = self.create_list_dataset_messages().await?;
             list_dataset_messages.extend_from_slice(req.messages.as_slice());
@@ -137,7 +132,9 @@ impl ToolUsingChat {
 
     /// Check if a tool call is a spiced runtime tool.
     fn is_spiced_tool(&self, t: &ChatCompletionMessageToolCall) -> bool {
-        self.tools.iter().any(|tool| tool.name() == t.function.name)
+        self.tools
+            .iter()
+            .any(|tool| encode_tool_name(tool.name().as_ref()) == t.function.name)
     }
 
     /// Call a spiced runtime tool.
@@ -694,4 +691,13 @@ fn make_a_stream(
             .instrument(span),
     );
     Box::pin(CustomStream { receiver }) as ChatCompletionResponseStream
+}
+
+// OpenAI tools must satisfy '^[a-zA-Z0-9_-]+$'. Commonly external tools may have '/' in their name.
+fn encode_tool_name(name: &str) -> String {
+    if name.contains('/') {
+        name.replace('_', "__").replace('/', "_")
+    } else {
+        name.to_string()
+    }
 }

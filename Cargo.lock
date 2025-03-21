@@ -10447,6 +10447,7 @@ dependencies = [
  "spice-cloud",
  "spicepod",
  "ssh2",
+ "strsim 0.11.1",
  "suppaftp",
  "telemetry",
  "test-framework",
