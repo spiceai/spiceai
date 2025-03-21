@@ -42,10 +42,11 @@ use datafusion::error::DataFusionError;
 use datafusion::execution::config::SessionConfig;
 use datafusion::execution::context::SessionContext;
 use futures::TryStreamExt;
+use object_store::path::Path;
+use object_store::ObjectMeta;
 use object_store::ObjectStore;
 use snafu::prelude::*;
 use std::any::Any;
-use std::collections::HashSet;
 use std::fmt::Display;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -331,6 +332,139 @@ pub trait ListingTableConnector: DataConnector {
             source: error.into(),
         }
     }
+
+    async fn create_text_table(
+        &self,
+        dataset: &Dataset,
+        url: &Url,
+        extension: &str,
+    ) -> DataConnectorResult<Arc<dyn TableProvider>>
+    where
+        Self: Display,
+    {
+        let content_formatter =
+            document_parse::get_parser_factory(extension)
+                .await
+                .map(|factory| {
+                    // TODO: add opts.
+                    factory.default()
+                });
+
+        Ok(ObjectStoreTextTable::try_new(
+            self.get_object_store(dataset)?,
+            &url.clone(),
+            Some(extension.to_string()),
+            content_formatter,
+        )
+        .context(crate::dataconnector::InvalidConfigurationSnafu {
+            dataconnector: format!("{self}"),
+            connector_component: ConnectorComponent::from(dataset),
+            message: format!(
+                "Invalid file extension ({extension}) for source ({})",
+                dataset.name
+            ),
+        })?)
+    }
+
+    async fn create_listing_table(
+        &self,
+        dataset: &Dataset,
+        url: &Url,
+        extension: &str,
+        file_format: Arc<dyn FileFormat>,
+    ) -> DataConnectorResult<Arc<dyn TableProvider>>
+    where
+        Self: Display,
+    {
+        // This shouldn't error because we've already validated the URL in `get_object_store_url`.
+        let table_path = ListingTableUrl::parse(url.clone()).boxed().context(
+            crate::dataconnector::InternalSnafu {
+                dataconnector: format!("{self}"),
+                connector_component: ConnectorComponent::from(dataset),
+                code: "LTC-RP-LTUP".to_string(), // ListingTableConnector-ReadProvider-ListingTableUrlParse
+            },
+        )?;
+
+        let object_store = self.get_object_store(dataset)?;
+
+        let ctx: SessionContext = Self::get_session_context();
+
+        // Get the last modified object for the provided ObjectStore to infer the schema.
+        // Report an error if no files matching required extension are found.
+        let last_updated = get_last_modified(
+            format!("{self}"),
+            dataset,
+            extension,
+            table_path.clone(),
+            &ctx,
+            &object_store,
+        )
+        .await?;
+
+        let last_updated_url =
+            to_listing_table_url(url, &last_updated.location, dataset, &format!("{self}"))?;
+
+        let mut options = ListingOptions::new(file_format).with_file_extension(extension);
+
+        let resolved_schema = options
+            .infer_schema(&ctx.state(), &last_updated_url)
+            .await
+            .map_err(|e| match e {
+                DataFusionError::ObjectStore(object_store_error) => {
+                    self.handle_object_store_error(dataset, object_store_error)
+                }
+                e => crate::dataconnector::DataConnectorError::UnableToConnectInternal {
+                    dataconnector: format!("{self}"),
+                    connector_component: ConnectorComponent::from(dataset),
+                    source: e.into(),
+                },
+            })?;
+
+        let expanded_schema = Arc::new(expand_views_schema(&resolved_schema));
+
+        // Add the `last_modified` metadata column if it is defined as a `time_column` or
+        // `time_partition_column` and it doesn't already exist in the schema.
+        options = add_last_modified_metadata_column_if_required(options, &expanded_schema, dataset);
+
+        // If we should infer partitions and the path is a folder, infer the partitions from the folder structure.
+        if dataset.get_param("hive_partitioning_enabled", false) && table_path.is_collection() {
+            let inferred_partitions =
+                infer_partitions_with_types(&ctx.state(), &table_path, extension).await;
+            match inferred_partitions {
+                Ok(partitions) => {
+                    tracing::debug!(
+                        "Inferred partitions for {:?}: {:?}",
+                        table_path,
+                        partitions
+                            .iter()
+                            .map(|(k, _)| k.as_str())
+                            .collect::<Vec<_>>()
+                    );
+                    options = options.with_table_partition_cols(partitions);
+                }
+                Err(e) => {
+                    // This might not be an error, it could be that the table is not partitioned.
+                    tracing::debug!("Failed to infer partitions for {:?}: {e}", table_path);
+                }
+            }
+        }
+
+        let config = ListingTableConfig::new(table_path)
+            .with_listing_options(options)
+            .with_schema(expanded_schema);
+
+        // This shouldn't error because we're passing the schema and options correctly.
+        let table =
+            ListingTable::try_new(config)
+                .boxed()
+                .context(crate::dataconnector::InternalSnafu {
+                    dataconnector: format!("{self}"),
+                    connector_component: ConnectorComponent::from(dataset),
+                    code: "LTC-RP-LTTN".to_string(), // ListingTableConnector-ReadProvider-ListingTableTryNew
+                })?;
+
+        Ok(Arc::new(table))
+    }
 }
 
 #[async_trait]
@@ -354,121 +488,17 @@ impl<T: ListingTableConnector + Display> DataConnector for T {
         &self,
         dataset: &Dataset,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
-        let ctx: SessionContext = Self::get_session_context();
         let url = self.get_object_store_url(dataset)?;
-
-        // This shouldn't error because we've already validated the URL in `get_object_store_url`.
-        let table_path = ListingTableUrl::parse(url.clone()).boxed().context(
-            crate::dataconnector::InternalSnafu {
-                dataconnector: format!("{self}"),
-                connector_component: ConnectorComponent::from(dataset),
-                code: "LTC-RP-LTUP".to_string(), // ListingTableConnector-ReadProvider-ListingTableUrlParse
-            },
-        )?;
 
         let (file_format_opt, extension) = self.get_file_format_and_extension(dataset)?;
         match file_format_opt {
             None => {
                 // Assume its unstructured text data. Use a [`ObjectStoreTextTable`].
-                let content_formatter = document_parse::get_parser_factory(extension.as_str())
-                    .await
-                    .map(|factory| {
-                        // TODO: add opts.
-                        factory.default()
-                    });
-
-                Ok(ObjectStoreTextTable::try_new(
-                    self.get_object_store(dataset)?,
-                    &url.clone(),
-                    Some(extension.clone()),
-                    content_formatter,
-                )
-                .context(crate::dataconnector::InvalidConfigurationSnafu {
-                    dataconnector: format!("{self}"),
-                    connector_component: ConnectorComponent::from(dataset),
-                    message: format!(
-                        "Invalid file extension ({extension}) for source ({})",
-                        dataset.name
-                    ),
-                })?)
+                self.create_text_table(dataset, &url, &extension).await
             }
             Some(file_format) => {
-                let object_store = self.get_object_store(dataset)?;
-                check_for_files_and_extensions(
-                    format!("{self}"),
-                    dataset,
-                    &extension,
-                    table_path.clone(),
-                    &ctx,
-                    &object_store,
-                )
-                .await?;
-
-                let mut options = ListingOptions::new(file_format).with_file_extension(&extension);
-
-                let resolved_schema = options
-                    .infer_schema(&ctx.state(), &table_path)
+                self.create_listing_table(dataset, &url, &extension, file_format)
                     .await
-                    .map_err(|e| match e {
-                        DataFusionError::ObjectStore(object_store_error) => {
-                            self.handle_object_store_error(dataset, object_store_error)
-                        }
-                        e => crate::dataconnector::DataConnectorError::UnableToConnectInternal {
-                            dataconnector: format!("{self}"),
-                            connector_component: ConnectorComponent::from(dataset),
-                            source: e.into(),
-                        },
-                    })?;
-
-                let expanded_schema = Arc::new(expand_views_schema(&resolved_schema));
-
-                // Add the `last_modified` metadata column if it is defined as a `time_column` or
-                // `time_partition_column` and it doesn't already exist in the schema.
-                options = add_last_modified_metadata_column_if_required(
-                    options,
-                    &expanded_schema,
-                    dataset,
-                );
-
-                // If we should infer partitions and the path is a folder, infer the partitions from the folder structure.
-                if dataset.get_param("hive_partitioning_enabled", false)
-                    && table_path.is_collection()
-                {
-                    let inferred_partitions =
-                        infer_partitions_with_types(&ctx.state(), &table_path, &extension).await;
-                    match inferred_partitions {
-                        Ok(partitions) => {
-                            tracing::debug!(
-                                "Inferred partitions for {:?}: {:?}",
-                                table_path,
-                                partitions
-                                    .iter()
-                                    .map(|(k, _)| k.as_str())
-                                    .collect::<Vec<_>>()
-                            );
-                            options = options.with_table_partition_cols(partitions);
-                        }
-                        Err(e) => {
-                            // This might not be an error, it could be that the table is not partitioned.
-                            tracing::debug!("Failed to infer partitions for {:?}: {e}", table_path);
-                        }
-                    }
-                }
-
-                let config = ListingTableConfig::new(table_path)
-                    .with_listing_options(options)
-                    .with_schema(expanded_schema);
-
-                // This shouldn't error because we're passing the schema and options correctly.
-                let table = ListingTable::try_new(config).boxed().context(
-                    crate::dataconnector::InternalSnafu {
-                        dataconnector: format!("{self}"),
-                        connector_component: ConnectorComponent::from(dataset),
-                        code: "LTC-RP-LTTN".to_string(), // ListingTableConnector-ReadProvider-ListingTableTryNew
-                    },
-                )?;
-
-                Ok(Arc::new(table))
             }
         }
     }
@@ -516,30 +546,24 @@ fn add_last_modified_metadata_column_if_required(
     options
 }
 
-/// Lists the available files for a ListingTableConnector/ObjectStore
+/// Identifies the last modified object for a provided ListingTableConnector/ObjectStore
 /// Infers if the `file_format` specified is valid, based on the existence of files with the required extension
 ///
 /// # Errors
 ///
 /// - If no files are found at the specified path
 /// - If no files with the specified extension are found
-async fn check_for_files_and_extensions(
+async fn get_last_modified(
     dataconnector: String,
     dataset: &Dataset,
     extension: &str,
     table_path: ListingTableUrl,
     ctx: &SessionContext,
     object_store: &Arc<dyn ObjectStore>,
-) -> DataConnectorResult<()> {
-    let files: Vec<_> = table_path
-        .list_all_files(&ctx.state(), object_store, "")
-        .await
-        .map_err(|err| DataConnectorError::UnableToConnectInternal {
-            dataconnector: dataconnector.clone(),
-            connector_component: ConnectorComponent::from(dataset),
-            source: err.into(),
-        })?
-        .try_collect()
+) -> DataConnectorResult<ObjectMeta> {
+    let state = ctx.state();
+    let mut file_stream = table_path
+        .list_all_files(&state, object_store, "")
         .await
         .map_err(|err| DataConnectorError::UnableToConnectInternal {
             dataconnector: dataconnector.clone(),
@@ -547,45 +571,75 @@ async fn check_for_files_and_extensions(
             source: err.into(),
         })?;
 
-    if files.is_empty() {
+    let mut best_match: Option<ObjectMeta> = None;
+    let mut found_extensions: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    while let Some(file) =
+        file_stream
+            .try_next()
+            .await
+            .map_err(|err| DataConnectorError::UnableToConnectInternal {
+                dataconnector: dataconnector.clone(),
+                connector_component: ConnectorComponent::from(dataset),
+                source: err.into(),
+            })?
+    {
+        if let Some(ext) = file.location.extension() {
+            let file_ext = format!(".{ext}");
+            found_extensions.insert(file_ext.clone());
+            if file_ext == extension {
+                if let Some(ref current) = best_match {
+                    if current.last_modified < file.last_modified {
+                        best_match = Some(file);
+                    }
+                } else {
+                    best_match = Some(file);
+                }
+            }
+        }
+    }
+
+    if found_extensions.is_empty() {
         return Err(DataConnectorError::InvalidConfigurationNoSource {
             dataconnector: dataconnector.clone(),
             connector_component: ConnectorComponent::from(dataset),
-            message:
-                // Url could contain access keys from e.g. S3, so we don't want to log it.
-                "Failed to find any files at the specified path. Check the path and try again."
-                    .to_string(),
-        });
+            message: format!("Failed to find any files matching the extension '{extension}'.\nSpice could not find any files with extensions at the specified path. Check the path and try again."),
+            });
     }
 
-    let extensions = files
-        .iter()
-        .filter_map(|file| file.location.extension().map(|e| format!(".{e}")))
-        .collect::<HashSet<_>>();
-
-    if !extensions.contains(extension) {
-        if extensions.is_empty() {
-            return Err(DataConnectorError::InvalidConfigurationNoSource {
-                dataconnector: dataconnector.clone(),
-            connector_component: ConnectorComponent::from(dataset),
-                message: format!("Failed to find any files matching the extension '{extension}'.\nSpice could not find any files with extensions at the specified path. Check the path and try again."),
-            });
-        }
-
-        let display_extensions = extensions
+    if let Some(best) = best_match {
+        Ok(best)
+    } else {
+        let display_extensions = found_extensions
             .iter()
             .map(|e| format!("'{e}'"))
             .collect::<Vec<_>>()
             .join(", ");
-
-        return Err(DataConnectorError::InvalidConfigurationNoSource {
+        Err(DataConnectorError::InvalidConfigurationNoSource {
             dataconnector: dataconnector.clone(),
             connector_component: ConnectorComponent::from(dataset),
-            message: format!("Failed to find any files matching the extension '{extension}'.\nIs your `file_format` parameter correct? Spice found the following file extensions: {display_extensions}.\nFor details, visit: https://spiceai.org/docs/components/data-connectors#object-store-file-formats")
-        });
+            message: format!(
+                "Failed to find any files matching the extension '{extension}'.\nIs your `file_format` parameter correct? Spice found the following file extensions: {display_extensions}.\nFor details, visit: https://spiceai.org/docs/components/data-connectors#object-store-file-formats"
+            ),
+        })
     }
+}
 
-    Ok(())
+fn to_listing_table_url(
+    original_url: &Url,
+    path: &Path,
+    dataset: &Dataset,
+    dataconnector: &str,
+) -> DataConnectorResult<ListingTableUrl> {
+    let mut new_url = original_url.clone();
+    new_url.set_path(&format!("/{path}"));
+
+    ListingTableUrl::parse(new_url).boxed().context(
+        crate::dataconnector::UnableToGetSchemaInternalSnafu {
+            dataconnector: dataconnector.to_string(),
+            connector_component: ConnectorComponent::from(dataset),
+        },
+    )
 }
 
 #[cfg(test)]
