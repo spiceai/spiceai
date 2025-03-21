@@ -31,7 +31,7 @@ impl Scorer for FuzzyMatch {
         _input: &DatasetInput,
         actual: &DatasetOutput,
         ideal: &DatasetOutput,
-    ) -> f32 {
+    ) -> super::Result<f32> {
         // Extract strings from outputs
         let actual_str: Vec<_> = match actual {
             DatasetOutput::AssistantResponse(a) => vec![a.clone()],
@@ -50,7 +50,7 @@ impl Scorer for FuzzyMatch {
         };
 
         if ideal_strs.len() != actual_str.len() {
-            return 0.0;
+            return Ok(0.0);
         }
 
         // Perform fuzzy matching on all corresponding pairs
@@ -67,9 +67,9 @@ impl Scorer for FuzzyMatch {
 
         // TODO: Also use F1 Score, see https://github.com/spiceai/spiceai/issues/3932
         if is_match {
-            1.0
+            Ok(1.0)
         } else {
-            0.0
+            Ok(0.0)
         }
     }
 

@@ -32,7 +32,7 @@ impl Scorer for Includes {
         _input: &DatasetInput,
         actual: &DatasetOutput,
         ideal: &DatasetOutput,
-    ) -> f32 {
+    ) -> super::Result<f32> {
         let actual_str: Vec<_> = match actual {
             DatasetOutput::AssistantResponse(a) => vec![a.clone()],
             DatasetOutput::Choices(c) => c
@@ -49,7 +49,7 @@ impl Scorer for Includes {
                 .collect(),
         };
         if ideal_strs.len() != actual_str.len() {
-            return 0.0;
+            return Ok(0.0);
         }
 
         let is_match = actual_str
@@ -58,9 +58,9 @@ impl Scorer for Includes {
             .all(|(a, i)| a.contains(i));
 
         if is_match {
-            1.0
+            Ok(1.0)
         } else {
-            0.0
+            Ok(0.0)
         }
     }
 

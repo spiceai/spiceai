@@ -58,6 +58,24 @@ pub enum DatasetOutput {
     AssistantResponse(String),
 }
 
+impl std::fmt::Display for DatasetInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DatasetInput::Messages(m) => write!(f, "{:?}", m),
+            DatasetInput::UserInput(s) => write!(f, "{}", s),
+        }
+    }
+}
+
+impl std::fmt::Display for DatasetOutput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DatasetOutput::Choices(c) => write!(f, "{:?}", c),
+            DatasetOutput::AssistantResponse(s) => write!(f, "{}", s),
+        }
+    }
+}
+
 /// Retrieve and prepare the data needed to run a given [`Eval`].
 pub async fn get_eval_data(
     df: Arc<DataFusion>,

@@ -36,7 +36,7 @@ impl Scorer for Levenshtein {
         _input: &DatasetInput,
         actual: &DatasetOutput,
         ideal: &DatasetOutput,
-    ) -> f32 {
+    ) -> super::Result<f32> {
         let actual_text = extract_text(actual);
         let ideal_text = extract_text(ideal);
 
@@ -46,11 +46,11 @@ impl Scorer for Levenshtein {
 
         // If both strings are empty, treat it as an exact match.
         if max_len == 0 {
-            return 1.0;
+            return Ok(1.0);
         }
 
         // Normalize
-        1.0 - (distance as f32 / max_len as f32)
+        Ok(1.0 - (distance as f32 / max_len as f32))
     }
 
     fn metrics(&self, scores: &[f32]) -> Vec<(String, f32)> {

@@ -32,7 +32,7 @@ impl Scorer for MatchScorer {
         _input: &DatasetInput,
         actual: &DatasetOutput,
         ideal: &DatasetOutput,
-    ) -> f32 {
+    ) -> super::Result<f32> {
         let is_equal = match (actual, ideal) {
             (DatasetOutput::AssistantResponse(a), DatasetOutput::AssistantResponse(b)) => *a == *b,
             (DatasetOutput::Choices(a), DatasetOutput::Choices(b)) => a == b,
@@ -46,9 +46,9 @@ impl Scorer for MatchScorer {
             }
         };
         if is_equal {
-            1.0_f32
+            Ok(1.0_f32)
         } else {
-            0.0_f32
+            Ok(0.0_f32)
         }
     }
 
