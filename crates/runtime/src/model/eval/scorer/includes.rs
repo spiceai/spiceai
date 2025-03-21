@@ -84,7 +84,7 @@ mod tests {
             paste! {
                 #[tokio::test]
                 async fn [<test_ $test_case_name>]() {
-                    let actual_score = Includes{}.score(&DatasetInput::UserInput(String::new()), &DatasetOutput::AssistantResponse($actual.to_string()), &DatasetOutput::AssistantResponse($ideal.to_string())).await;
+                    let actual_score = Includes{}.score(&DatasetInput::UserInput(String::new()), &DatasetOutput::AssistantResponse($actual.to_string()), &DatasetOutput::AssistantResponse($ideal.to_string())).await.expect("Includes' 'score' returned an error");
                     assert!(
                         ($score - actual_score).abs() < f32::EPSILON,
                         "Test case `{}` failed: expected {}, got {}",

@@ -115,7 +115,7 @@ mod tests {
                     let score = $score;
                     let actual_output = DatasetOutput::AssistantResponse(actual);
                     let ideal_output = DatasetOutput::AssistantResponse(ideal);
-                    let actual_score = JsonMatch{}.score(&DatasetInput::UserInput(String::new()), &actual_output, &ideal_output).await;
+                    let actual_score = JsonMatch{}.score(&DatasetInput::UserInput(String::new()), &actual_output, &ideal_output).expect("JsonMatch's score returned an error").await;
                     assert!((score-actual_score).abs() < f32::EPSILON);
                 }
             }

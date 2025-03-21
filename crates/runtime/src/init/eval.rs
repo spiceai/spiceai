@@ -44,6 +44,12 @@ impl Runtime {
             reg.insert(name.to_string(), Arc::clone(&scorer));
             tracing::debug!("Successfully loaded eval scorer {name}");
         }
+
+        // Load all LLMs are [`ModelGradedScorer`]
+        let model_lock = self.llms.read().await;
+        for model in model_lock.values() {}
+
+        // Load all Embedding models as [`EmbedScorer`].
     }
 
     pub(crate) async fn verify_evals(&self) {

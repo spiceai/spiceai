@@ -61,8 +61,8 @@ pub enum DatasetOutput {
 impl std::fmt::Display for DatasetInput {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            DatasetInput::Messages(m) => write!(f, "{:?}", m),
-            DatasetInput::UserInput(s) => write!(f, "{}", s),
+            DatasetInput::Messages(m) => write!(f, "{m:?}"),
+            DatasetInput::UserInput(s) => write!(f, "{s}"),
         }
     }
 }
@@ -70,8 +70,8 @@ impl std::fmt::Display for DatasetInput {
 impl std::fmt::Display for DatasetOutput {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            DatasetOutput::Choices(c) => write!(f, "{:?}", c),
-            DatasetOutput::AssistantResponse(s) => write!(f, "{}", s),
+            DatasetOutput::Choices(c) => write!(f, "{c:?}"),
+            DatasetOutput::AssistantResponse(s) => write!(f, "{s}"),
         }
     }
 }

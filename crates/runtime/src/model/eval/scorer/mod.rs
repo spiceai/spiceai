@@ -34,6 +34,8 @@ pub mod json_match;
 pub mod levenshtein;
 #[cfg(feature = "models")]
 pub mod match_;
+#[cfg(feature = "models")]
+pub mod modelgraded;
 
 #[async_trait]
 pub trait Scorer: Sync + Send {

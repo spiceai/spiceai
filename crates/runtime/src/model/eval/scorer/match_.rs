@@ -72,6 +72,7 @@ mod tests {
                     &DatasetOutput::from_raw("Hello")
                 )
                 .await
+                .expect("MatchScorer returned error")
                 - 1.0_f32)
                 .abs()
                 < f32::EPSILON
@@ -88,6 +89,7 @@ mod tests {
                     &DatasetOutput::from_raw("Hi")
                 )
                 .await
+                .expect("MatchScorer returned error")
                 < f32::EPSILON
         );
     }
@@ -122,6 +124,7 @@ mod tests {
                     .expect("Failed to parse ideal DatasetOutput")
                 )
                 .await
+                .expect("MatchScorer returned error")
                 - 1.0_f32)
                 .abs()
                 < f32::EPSILON
@@ -158,6 +161,7 @@ mod tests {
                     .expect("Failed to parse ideal DatasetOutput")
                 )
                 .await
+                .expect("MatchScorer returned error")
                 < f32::EPSILON
         );
     }
@@ -182,6 +186,7 @@ mod tests {
                     .expect("Failed to parse ideal DatasetOutput")
                 )
                 .await
+                .expect("MatchScorer returned error")
                 - 1.0_f32)
                 .abs()
                 < f32::EPSILON
@@ -208,6 +213,7 @@ mod tests {
                     .expect("Failed to parse ideal DatasetOutput")
                 )
                 .await
+                .expect("MatchScorer returned error")
                 < f32::EPSILON
         );
     }
