@@ -64,6 +64,10 @@ async fn s3_federation() -> Result<(), anyhow::Error> {
                     "s3://spiceai-demo-datasets/taxi_trips/2024/",
                     "taxi_trips",
                 ))
+                .with_dataset(get_s3_dataset(
+                    "s3://spiceai-public-datasets/taxi_small_samples/taxi_sample.parquet",
+                    "taxi_sample",
+                ))
                 .build();
 
             let status = status::RuntimeStatus::new();
@@ -90,6 +94,22 @@ async fn s3_federation() -> Result<(), anyhow::Error> {
                 .run()
                 .await
                 .map_err(|e| anyhow::anyhow!(e))?;
+            let mut batches = vec![];
+            while let Some(batch) = query_result.data.next().await {
+                batches.push(batch?);
+            }
+
+            assert_eq!(batches.len(), 1);
+            assert_eq!(batches[0].num_rows(), 10);
+
+            let mut query_result = rt
+                .datafusion()
+                .query_builder("SELECT * FROM taxi_sample LIMIT 10")
+                .build()
+                .run()
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?;
+
             let mut batches = vec![];
             while let Some(batch) = query_result.data.next().await {
                 batches.push(batch?);

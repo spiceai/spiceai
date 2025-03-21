@@ -47,6 +47,7 @@ use object_store::ObjectMeta;
 use object_store::ObjectStore;
 use snafu::prelude::*;
 use std::any::Any;
+use std::collections::HashSet;
 use std::fmt::Display;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -391,7 +392,7 @@ pub trait ListingTableConnector: DataConnector {
 
         // Get the last modified object for the provided ObjectStore to infer the schema.
         // Report an error if no files matching required extension are found.
-        let last_updated = get_last_modified(
+        let last_modified_or_added = get_last_modified(
             format!("{self}"),
             dataset,
             extension,
@@ -401,19 +402,22 @@ pub trait ListingTableConnector: DataConnector {
         )
         .await?;
 
-        let last_updated_url =
-            to_listing_table_url(url, &last_updated.location, dataset, &format!("{self}"))?;
+        let schema_infer_url = to_listing_table_url(
+            url,
+            &last_modified_or_added.location,
+            dataset,
+            &format!("{self}"),
+        )?;
 
         tracing::debug!(
-            "Dataset '{}' schema will be resolved using the path: {}",
-            dataset.name,
-            last_updated_url
+            "Dataset '{}' schema will be resolved based on {schema_infer_url}",
+            dataset.name
         );
 
         let mut options = ListingOptions::new(file_format).with_file_extension(extension);
 
         let resolved_schema = options
-            .infer_schema(&ctx.state(), &last_updated_url)
+            .infer_schema(&ctx.state(), &schema_infer_url)
             .await
             .map_err(|e| match e {
                 DataFusionError::ObjectStore(object_store_error) => {
@@ -583,8 +587,8 @@ async fn get_last_modified(
             source: err.into(),
         })?;
 
-    let mut best_match: Option<ObjectMeta> = None;
-    let mut found_extensions: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut last_modified_file: Option<ObjectMeta> = None;
+    let mut found_extensions = HashSet::new();
 
     let mut file_count = 0;
     let mut total_size = 0;
@@ -615,12 +619,12 @@ async fn get_last_modified(
             let file_ext = format!(".{ext}");
             found_extensions.insert(file_ext.clone());
             if file_ext == extension {
-                if let Some(ref current) = best_match {
+                if let Some(ref current) = last_modified_file {
                     if current.last_modified < file.last_modified {
-                        best_match = Some(file);
+                        last_modified_file = Some(file);
                     }
                 } else {
-                    best_match = Some(file);
+                    last_modified_file = Some(file);
                 }
             }
         }
@@ -634,7 +638,7 @@ async fn get_last_modified(
             });
     }
 
-    if let Some(best) = best_match {
+    if let Some(best) = last_modified_file {
         Ok(best)
     } else {
         let display_extensions = found_extensions
