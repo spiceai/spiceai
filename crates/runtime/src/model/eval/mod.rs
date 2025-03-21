@@ -31,7 +31,6 @@ use scorer::score_results;
 use snafu::{ensure, ResultExt, Snafu};
 use spicepod::component::eval::Eval;
 use tracing_futures::Instrument;
-use tract_core::tract_data::itertools::Itertools;
 
 use crate::datafusion::DataFusion;
 
@@ -243,7 +242,7 @@ async fn run_eval(
         target: "task_history",
         tracing::Level::INFO,
         "eval_scoring",
-        scorers = %serde_json::to_string(&scorers_to_use.keys().collect_vec()).unwrap_or_default(),
+        scorers = %serde_json::to_string(&scorers_to_use.keys().collect::<Vec<_>>()).unwrap_or_default(),
     );
 
     let scores = match score_results(&input, &actual, &ideal, &scorers_to_use)
