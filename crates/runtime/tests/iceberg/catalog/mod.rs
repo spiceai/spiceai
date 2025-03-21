@@ -27,6 +27,10 @@ use spicepod::component::{catalog::Catalog, params::Params};
 use std::sync::Arc;
 
 #[tokio::test]
+#[cfg_attr(
+    not(feature = "extended_tests"),
+    ignore = "Extended test - run with --features extended_tests"
+)]
 async fn glue_iceberg_integration_test_catalog() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(None);
     let _ = rustls::crypto::CryptoProvider::install_default(
