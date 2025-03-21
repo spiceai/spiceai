@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 #![allow(clippy::implicit_hasher)]
-use std::pin::Pin;
+use std::{collections::HashMap, pin::Pin};
 
 use async_openai::{
     error::OpenAIError,
@@ -32,6 +32,10 @@ use llms::{
     chat::{nsql::SqlGeneration, Chat, Result as ChatResult},
 };
 use opentelemetry::KeyValue;
+use tera::{
+    ast::{Expr, ExprVal, Node},
+    Tera,
+};
 use tokio::time::Instant;
 use tracing_futures::Instrument;
 
@@ -47,6 +51,9 @@ pub struct ChatWrapper {
     pub public_name: String,
     pub chat: Box<dyn Chat>,
     pub system_prompt: Option<String>,
+
+    /// If true, the system prompt will be treated as a template and will be parameterized with the input prompt.
+    pub attempt_to_template_system_prompt: bool,
     pub defaults: Vec<(String, serde_json::Value)>,
 }
 
@@ -83,6 +90,7 @@ impl ChatWrapper {
             chat,
             system_prompt: system_prompt.map(ToString::to_string),
             defaults,
+            attempt_to_template_system_prompt: false,
         };
 
         // Check defaults provided are valid at startup.
@@ -90,6 +98,19 @@ impl ChatWrapper {
         s.with_model_defaults(CreateChatCompletionRequest::default());
 
         s
+    }
+
+    /// If it is allowed to parameterised, check if there is a system prompt, and the system prompt is a template.
+    /// If its not a template, or there is no system prompt, no reason to attempt templating on each [`ChatWrapper::chat_request`] call.
+    pub fn allowed_to_parameterise(mut self) -> Self {
+        if self
+            .system_prompt
+            .as_ref()
+            .is_some_and(|p| system_prompt_is_template_with_variables(p.as_str()))
+        {
+            self.attempt_to_template_system_prompt = true;
+        }
+        self
     }
 
     fn prepare_req(
@@ -108,7 +129,46 @@ impl ChatWrapper {
         &self,
         mut req: CreateChatCompletionRequest,
     ) -> Result<CreateChatCompletionRequest, OpenAIError> {
-        if let Some(prompt) = self.system_prompt.clone() {
+        let prompt_opt = match (
+            self.system_prompt.as_ref(),
+            self.attempt_to_template_system_prompt,
+        ) {
+            // Template existing system prompt
+            (Some(prompt), true) => {
+                let ctx = match req.metadata.as_ref() {
+                    Some(serde_json::Value::Object(m)) => m
+                        .clone()
+                        .into_iter()
+                        .map(|(k, v)| match v {
+                            serde_json::Value::String(s) => (k, s),
+                            _ => (k, v.to_string()),
+                        })
+                        .collect::<HashMap<String, String>>(),
+                    Some(_) | None => HashMap::new(),
+                };
+
+                // If request `store` is not set, remove metadata.
+                if !req.store.is_some_and(|s| s) {
+                    req.metadata = None;
+                };
+
+                match template_system_prompt(prompt.as_str(), &ctx) {
+                    Ok(templated_prompt) => Some(templated_prompt),
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to template system prompt for model='{}': {}. Using system_prompt as is.",
+                            self.public_name,
+                            e
+                        );
+                        Some(prompt.clone())
+                    }
+                }
+            }
+            // Don't template, just use system prompt as is.
+            (Some(prompt), false) => Some(prompt.clone()),
+            _ => None,
+        };
+        if let Some(prompt) = prompt_opt {
             let system_message = ChatCompletionRequestSystemMessageArgs::default()
                 .content(prompt)
                 .build()?;
@@ -373,4 +433,125 @@ impl<S> Drop for TracedChatCompletionStream<S> {
             );
         }
     }
+}
+
+fn template_system_prompt(prompt: &str, inputs: &HashMap<String, String>) -> tera::Result<String> {
+    let mut t = Tera::default();
+    t.add_raw_template("system_prompt", prompt)?;
+    let mut context = tera::Context::new();
+    for (k, v) in inputs {
+        context.insert(k, v);
+    }
+    t.render("system_prompt", &context)
+}
+
+/// Return true if the system prompt is a template that would have its variables replaced with the input values.
+fn system_prompt_is_template_with_variables(prompt: &str) -> bool {
+    let mut t = Tera::default();
+    if t.add_raw_template("system_prompt", prompt).is_err() {
+        return false;
+    };
+
+    let Ok(tt) = t.get_template("system_prompt") else {
+        return false;
+    };
+    let result = has_variables_in_ast(&tt.ast);
+    tracing::debug!("Early check if system prompt='{prompt:?}' is template has result='{result}'. Not gating prompts.");
+    true
+}
+
+fn has_variables_in_ast(ast: &[Node]) -> bool {
+    ast.iter().any(has_variables_in_node)
+}
+
+fn has_variables_in_node(node: &tera::ast::Node) -> bool {
+    match node {
+        Node::VariableBlock(_, _) => true,
+        Node::MacroDefinition(_, macro_def, _) => {
+            !macro_def.args.is_empty() || has_variables_in_ast(&macro_def.body)
+        }
+        Node::Set(_, set) => has_variables_in_expr(&set.value),
+        Node::If(
+            tera::ast::If {
+                conditions,
+                otherwise,
+            },
+            _,
+        ) => {
+            conditions
+                .iter()
+                .any(|(_, expr, nodes)| has_variables_in_expr(expr) || has_variables_in_ast(nodes))
+                || otherwise
+                    .as_ref()
+                    .is_some_and(|(_, nodes)| has_variables_in_ast(nodes))
+        }
+        Node::Forloop(
+            _,
+            tera::ast::Forloop {
+                container,
+                body,
+                empty_body,
+                ..
+            },
+            _,
+        ) => {
+            has_variables_in_expr(container)
+                || has_variables_in_ast(body)
+                || empty_body
+                    .as_ref()
+                    .is_some_and(|nodes| has_variables_in_ast(nodes))
+        }
+        Node::Block(_, block, _) => has_variables_in_ast(&block.body),
+        Node::FilterSection(_, filter, _) => has_variables_in_ast(&filter.body),
+        Node::Raw(_, _, _)
+        | Node::Super
+        | Node::Extends(_, _)
+        | Node::Include(_, _, _)
+        | Node::ImportMacro(_, _, _)
+        | Node::Break(_)
+        | Node::Continue(_)
+        | Node::Comment(_, _)
+        | Node::Text(_) => false,
+    }
+}
+
+fn has_variables_in_expr(expr: &Expr) -> bool {
+    has_variables_in_expr_val(&expr.val) || expr.filters.iter().any(has_variables_in_function_call)
+}
+
+fn has_variables_in_expr_val(expr_val: &ExprVal) -> bool {
+    match expr_val {
+        ExprVal::String(_) | ExprVal::Int(_) | ExprVal::Float(_) | ExprVal::Bool(_) => false,
+        ExprVal::Ident(_) => true,
+        ExprVal::Math(math_expr) => {
+            has_variables_in_expr(&math_expr.lhs) || has_variables_in_expr(&math_expr.rhs)
+        }
+        ExprVal::Logic(logic_expr) => {
+            has_variables_in_expr(&logic_expr.lhs) || has_variables_in_expr(&logic_expr.rhs)
+        }
+        ExprVal::Test(test) => has_variables_in_test(test),
+        ExprVal::MacroCall(macro_call) => has_variables_in_macro_call(macro_call),
+        ExprVal::FunctionCall(function_call) => has_variables_in_function_call(function_call),
+        ExprVal::Array(exprs) => exprs.iter().any(has_variables_in_expr),
+        ExprVal::StringConcat(string_concat) => has_variables_in_string_concat(string_concat),
+        ExprVal::In(in_expr) => {
+            has_variables_in_expr(&in_expr.lhs) || has_variables_in_expr(&in_expr.rhs)
+        }
+    }
+}
+
+fn has_variables_in_test(test: &tera::ast::Test) -> bool {
+    test.args.iter().any(has_variables_in_expr)
+}
+
+fn has_variables_in_macro_call(macro_call: &tera::ast::MacroCall) -> bool {
+    macro_call.args.values().any(has_variables_in_expr)
+}
+
+fn has_variables_in_function_call(function_call: &tera::ast::FunctionCall) -> bool {
+    function_call.args.values().any(has_variables_in_expr)
+}
+
+fn has_variables_in_string_concat(string_concat: &tera::ast::StringConcat) -> bool {
+    string_concat.values.iter().any(has_variables_in_expr_val)
 }
