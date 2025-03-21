@@ -14,35 +14,32 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::sync::Arc;
+
 use async_openai::types::EmbeddingInput;
 use async_trait::async_trait;
-use llms::embeddings::Embed;
+use tokio::sync::RwLock;
 
-use crate::model::eval::scorer::mean;
+use crate::model::{eval::scorer::mean, EmbeddingModelStore};
 
 use super::{extract_text, DatasetInput, DatasetOutput, Error, Scorer};
 
 /// [`EmbedScorer`] scores based on the similarity of two [`DatasetOutput`] using the L2 distance of the outputs' embeddings.
 pub struct EmbedScorer {
-    model: Box<dyn Embed>,
+    models: Arc<RwLock<EmbeddingModelStore>>,
+    model_name: String,
 
     /// Provide domain context for improved embedding comparison.
     prefix: Option<String>,
 }
 
-impl From<Box<dyn Embed>> for EmbedScorer {
-    fn from(model: Box<dyn Embed>) -> Self {
+impl EmbedScorer {
+    pub fn new(models: Arc<RwLock<EmbeddingModelStore>>, model_name: String) -> Self {
         Self {
-            model,
+            models,
+            model_name,
             prefix: None,
         }
-    }
-}
-
-impl EmbedScorer {
-    pub fn with_prefix(mut self, prefix: String) -> Self {
-        self.prefix = Some(prefix);
-        self
     }
 }
 
@@ -58,8 +55,20 @@ impl Scorer for EmbedScorer {
         let actual_input = format!("{prefix}{}", extract_text(actual),);
         let ideal_input = format!("{prefix}{}", extract_text(ideal));
 
-        let embeddings = self
-            .model
+        let model_lock = self.models.read().await;
+        let Some(model) = model_lock.get(&self.model_name) else {
+            return Err(Error::ErrorScoringCase {
+                input: input.clone(),
+                actual: actual.clone(),
+                ideal: ideal.clone(),
+                source: Box::from(format!(
+                    "Embedding model {} not found in store. This is unexpected.",
+                    self.model_name
+                )),
+            });
+        };
+
+        let embeddings = model
             .embed(EmbeddingInput::StringArray(vec![actual_input, ideal_input]))
             .await
             .map_err(|e| Error::ErrorScoringCase {
@@ -71,7 +80,7 @@ impl Scorer for EmbedScorer {
                 )),
             })?;
 
-        let (Some(actual_vector), Some(ideal_vector)) = (embeddings.get(0), embeddings.get(1))
+        let (Some(actual_vector), Some(ideal_vector)) = (embeddings.first(), embeddings.get(1))
         else {
             return Err(Error::ErrorScoringCase {
                 input: input.clone(),

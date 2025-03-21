@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::sync::Arc;
+
 use async_openai::{
     error::OpenAIError,
     types::{
@@ -22,10 +24,10 @@ use async_openai::{
     },
 };
 use async_trait::async_trait;
-use llms::chat::Chat;
 use serde_json::{json, Number, Value};
+use tokio::sync::RwLock;
 
-use crate::model::eval::scorer::mean;
+use crate::model::{eval::scorer::mean, LLMModelStore};
 
 use super::{DatasetInput, DatasetOutput, Error, Scorer};
 
@@ -33,16 +35,15 @@ use super::{DatasetInput, DatasetOutput, Error, Scorer};
 ///
 /// The [`DatasetInput`] and both [`DatasetOutput`]s are provided to the [`Chat`] model via request metadata (i.e. [`CreateChatCompletionRequest`]'s metadata field]).
 pub struct ModelGradedScorer {
-    model: Box<dyn Chat>,
-}
-
-impl From<Box<dyn Chat>> for ModelGradedScorer {
-    fn from(model: Box<dyn Chat>) -> Self {
-        Self { model }
-    }
+    models: Arc<RwLock<LLMModelStore>>,
+    model_name: String,
 }
 
 impl ModelGradedScorer {
+    pub fn new(models: Arc<RwLock<LLMModelStore>>, model_name: String) -> Self {
+        Self { models, model_name }
+    }
+
     fn construct_request(
         input: &DatasetInput,
         actual: &DatasetOutput,
@@ -89,8 +90,21 @@ impl Scorer for ModelGradedScorer {
                     "Failed to build request for model graded scorer: {e}"
                 )),
             })?;
-        let response = self
-            .model
+
+        let model_lock = self.models.read().await;
+        let Some(model) = model_lock.get(&self.model_name) else {
+            return Err(Error::ErrorScoringCase {
+                input: input.clone(),
+                actual: actual.clone(),
+                ideal: ideal.clone(),
+                source: Box::from(format!(
+                    "Model {} not found in store. This is unexpected.",
+                    self.model_name
+                )),
+            });
+        };
+
+        let response = model
             .chat_request(req)
             .await
             .map_err(|e| Error::ErrorScoringCase {

@@ -138,7 +138,7 @@ mod tests {
                         }
                     }).collect();
 
-                    let actual_score = Includes{}.score(&DatasetInput::UserInput(String::new()), &DatasetOutput::Choices(actual_choices), &DatasetOutput::Choices(ideal_choices)).await;
+                    let actual_score = Includes{}.score(&DatasetInput::UserInput(String::new()), &DatasetOutput::Choices(actual_choices), &DatasetOutput::Choices(ideal_choices)).await.expect("Includes' 'score' returned an error");
                     assert!(
                         ($score - actual_score).abs() < f32::EPSILON,
                         "Test case `{}` failed: expected {}, got {}",

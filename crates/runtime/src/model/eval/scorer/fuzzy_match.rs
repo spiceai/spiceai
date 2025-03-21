@@ -123,7 +123,7 @@ mod tests {
                     let fuzzy_match = FuzzyMatch;
                     let actual_output = DatasetOutput::AssistantResponse($actual.to_string());
                     let ideal_output = DatasetOutput::AssistantResponse($ideal.to_string());
-                    let actual_score = fuzzy_match.score(&DatasetInput::UserInput(String::new()), &actual_output, &ideal_output).expect("FuzzyMatch's score returned an error").await;
+                    let actual_score = fuzzy_match.score(&DatasetInput::UserInput(String::new()), &actual_output, &ideal_output).await.expect("FuzzyMatch's score returned an error");
                     assert!(
                         ($score - actual_score).abs() < f32::EPSILON,
                         "Test case `{}` failed: expected {}, got {}",
@@ -180,7 +180,7 @@ mod tests {
 
                     let actual_output = DatasetOutput::Choices(actual_choices);
                     let ideal_output = DatasetOutput::Choices(ideal_choices);
-                    let actual_score = fuzzy_match.score(&DatasetInput::UserInput(String::new()), &actual_output, &ideal_output).await;
+                    let actual_score = fuzzy_match.score(&DatasetInput::UserInput(String::new()), &actual_output, &ideal_output).await.expect("FuzzyMatch's score returned an error");
                     assert!(
                         ($score - actual_score).abs() < f32::EPSILON,
                         "Test case `{}` failed: expected {}, got {}",

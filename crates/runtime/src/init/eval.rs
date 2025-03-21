@@ -27,6 +27,7 @@ use crate::{
     component::dataset::{acceleration::Acceleration, TimeFormat},
     datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA, SPICE_EVAL_SCHEMA},
     internal_table::create_internal_accelerated_table,
+    model::eval::scorer::{EmbedScorer, ModelGradedScorer},
     model::{
         builtin_scorer, EVAL_RESULTS_TABLE_REFERENCE, EVAL_RESULTS_TABLE_SCHEMA,
         EVAL_RESULTS_TABLE_TIME_COLUMN, EVAL_RUNS_TABLE_PRIMARY_KEY, EVAL_RUNS_TABLE_REFERENCE,
@@ -47,9 +48,27 @@ impl Runtime {
 
         // Load all LLMs are [`ModelGradedScorer`]
         let model_lock = self.llms.read().await;
-        for model in model_lock.values() {}
+        for model in model_lock.keys() {
+            let mut reg = self.eval_scorers.write().await;
+            reg.insert(
+                model.to_string(),
+                Arc::new(ModelGradedScorer::new(
+                    Arc::clone(&self.llms),
+                    model.to_string(),
+                )),
+            );
+        }
 
         // Load all Embedding models as [`EmbedScorer`].
+        let embeddings = self.embeds();
+        let model_lock = embeddings.read().await;
+        for model in model_lock.keys() {
+            let mut reg = self.eval_scorers.write().await;
+            reg.insert(
+                model.to_string(),
+                Arc::new(EmbedScorer::new(self.embeds(), model.to_string())),
+            );
+        }
     }
 
     pub(crate) async fn verify_evals(&self) {

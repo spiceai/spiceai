@@ -25,6 +25,8 @@ use super::{DatasetInput, DatasetOutput};
 #[cfg(feature = "models")]
 pub mod embed;
 #[cfg(feature = "models")]
+pub use embed::EmbedScorer;
+#[cfg(feature = "models")]
 pub mod fuzzy_match;
 #[cfg(feature = "models")]
 pub mod includes;
@@ -36,6 +38,8 @@ pub mod levenshtein;
 pub mod match_;
 #[cfg(feature = "models")]
 pub mod modelgraded;
+#[cfg(feature = "models")]
+pub use modelgraded::ModelGradedScorer;
 
 #[async_trait]
 pub trait Scorer: Sync + Send {
