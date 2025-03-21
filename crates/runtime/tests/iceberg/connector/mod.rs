@@ -134,7 +134,7 @@ async fn run_iceberg_test(
     query: &str,
     assert_snapshot: bool,
     snapshot_name: Option<&str>,
-) -> Result<Runtime, anyhow::Error> {
+) -> Result<Arc<Runtime>, anyhow::Error> {
     let app = AppBuilder::new(app_name).with_dataset(dataset).build();
 
     let status = status::RuntimeStatus::new();
@@ -153,7 +153,7 @@ async fn run_iceberg_test(
         () = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
             panic!("Timeout waiting for components to load");
         }
-        () = rt.load_components() => {}
+        () = Arc::clone(&rt).load_components() => {}
     }
 
     runtime_ready_check(&rt).await;

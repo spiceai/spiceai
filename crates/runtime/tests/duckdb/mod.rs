@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::sync::Arc;
+
 use crate::{init_tracing, utils::test_request_context, RecordBatch};
 use app::AppBuilder;
 use datafusion::assert_batches_eq;
@@ -90,7 +92,7 @@ async fn duckdb_from_functions() -> Result<(), String> {
                 () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
                     return Err("Timed out waiting for datasets to load".to_string());
                 }
-                () = rt.load_components() => {}
+                () = Arc::clone(&rt).load_components() => {}
             }
 
             let queries = vec![

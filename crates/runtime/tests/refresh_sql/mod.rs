@@ -74,7 +74,7 @@ async fn spiceai_integration_test_refresh_sql_override_append() -> Result<(), an
                 () = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
                     panic!("Timeout waiting for components to load");
                 }
-                () = rt.load_components() => {}
+                () = Arc::clone(&rt).load_components() => {}
             }
 
             runtime_ready_check(&rt).await;

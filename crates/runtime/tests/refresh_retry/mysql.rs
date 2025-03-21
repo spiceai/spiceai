@@ -97,7 +97,7 @@ async fn prepare_test_environment() -> Result<RunningContainer<'static>, String>
 }
 
 async fn create_refresh_task(
-    rt: &Runtime,
+    rt: &Arc<Runtime>,
     table_name: &str,
 ) -> Result<(RefreshTask, Refresh), String> {
     let table = rt
@@ -183,7 +183,7 @@ async fn mysql_refresh_retries() -> Result<(), String> {
                 () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
                     return Err("Timed out waiting for datasets to load".to_string());
                 }
-                () = rt.load_components() => {}
+                () = Arc::clone(&rt).load_components() => {}
             }
 
             let (refresh_task_no_retries, request) =

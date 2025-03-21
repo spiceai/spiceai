@@ -250,18 +250,20 @@ async fn test_graphql() -> Result<(), String> {
                 .build();
             let status = status::RuntimeStatus::new();
             let df = get_test_datafusion(Arc::clone(&status));
-            let mut rt = Runtime::builder()
-                .with_app(app)
-                .with_datafusion(df)
-                .with_runtime_status(status)
-                .build()
-                .await;
+            let rt = Arc::new(
+                Runtime::builder()
+                    .with_app(app)
+                    .with_datafusion(df)
+                    .with_runtime_status(status)
+                    .build()
+                    .await,
+            );
 
             tokio::select! {
                 () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
                     return Err("Timed out waiting for datasets to load".to_string());
                 }
-                () = rt.load_components() => {}
+                () = Arc::clone(&rt).load_components() => {}
             }
 
             let queries: QueryTests = vec![
@@ -289,7 +291,7 @@ async fn test_graphql() -> Result<(), String> {
 
             for (query, snapshot_suffix, validate_result) in queries {
                 run_query_and_check_results(
-                    &mut rt,
+                    Arc::clone(&rt),
                     &format!("test_graphql_{snapshot_suffix}"),
                     query,
                     true,
@@ -327,18 +329,18 @@ async fn test_graphql_pagination() -> Result<(), String> {
             .build();
         let status = status::RuntimeStatus::new();
         let df = get_test_datafusion(Arc::clone(&status));
-        let mut rt = Runtime::builder()
+        let rt = Arc::new(Runtime::builder()
             .with_app(app)
             .with_datafusion(df)
             .with_runtime_status(status)
             .build()
-            .await;
+            .await);
 
         tokio::select! {
             () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
                 return Err("Timed out waiting for datasets to load".to_string());
             }
-            () = rt.load_components() => {}
+            () = Arc::clone(&rt).load_components() => {}
         }
 
         let queries: QueryTests = vec![
@@ -372,7 +374,7 @@ async fn test_graphql_pagination() -> Result<(), String> {
 
         for (query, snapshot_suffix, validate_result) in queries {
             run_query_and_check_results(
-                &mut rt,
+                Arc::clone(&rt),
                 &format!("test_graphql_pagination_{snapshot_suffix}"),
                 query,
                 true,

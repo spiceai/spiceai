@@ -46,18 +46,18 @@ async fn databricks_spark_connect_integration_test_catalog() -> Result<(), anyho
             let status = status::RuntimeStatus::new();
             let df = get_test_datafusion(Arc::clone(&status));
 
-            let mut rt = Runtime::builder()
+            let rt = Arc::new(Runtime::builder()
                 .with_app(app)
                 .with_datafusion(df)
                 .with_runtime_status(status)
                 .build()
-                .await;
+                .await);
 
             tokio::select! {
                 () = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
                     panic!("Timeout waiting for components to load");
                 }
-                () = rt.load_components() => {}
+                () = Arc::clone(&rt).load_components() => {}
             }
 
             runtime_ready_check(&rt).await;
@@ -108,7 +108,7 @@ async fn databricks_spark_connect_integration_test_catalog() -> Result<(), anyho
 
             for (query, snapshot_suffix, validate_result) in queries {
                 run_query_and_check_results(
-                    &mut rt,
+                    Arc::clone(&rt),
                     &format!("test_select_{snapshot_suffix}"),
                     query,
                     false,

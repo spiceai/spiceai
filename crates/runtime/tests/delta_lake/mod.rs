@@ -72,7 +72,7 @@ async fn run_delta_lake_test(
     dataset_name: &str,
     query: &str,
     expected_results: &[&str],
-) -> Result<Runtime, String> {
+) -> Result<Arc<Runtime>, String> {
     let app = AppBuilder::new(app_name)
         .with_dataset(make_delta_lake_dataset(dataset_path, dataset_name, false))
         .build();
@@ -92,7 +92,7 @@ async fn run_delta_lake_test(
         () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
             return Err("Timed out waiting for datasets to load".to_string());
         }
-        () = rt.load_components() => {}
+        () = Arc::clone(&rt).load_components() => {}
     }
 
     let query_result = rt

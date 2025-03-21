@@ -130,7 +130,7 @@ async fn get_tpch_lineitem() -> Result<Vec<RecordBatch>, anyhow::Error> {
 type ValidateFn = dyn FnOnce(Vec<RecordBatch>);
 
 async fn run_query_and_check_results<F>(
-    rt: &mut Runtime,
+    rt: Arc<Runtime>,
     snapshot_name: &str,
     query: &str,
     snapshot_plan: bool,
@@ -192,7 +192,7 @@ where
 type PlanCheckFn = Box<dyn Fn(&str) -> bool>;
 
 async fn run_query_and_check_results_with_plan_checks<F>(
-    rt: &mut Runtime,
+    rt: &Arc<Runtime>,
     query: &str,
     expected_plan_checks: Vec<(&str, PlanCheckFn)>,
     validate_result: Option<F>,

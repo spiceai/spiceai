@@ -132,19 +132,21 @@ async fn test_sqlite_decimal_memory() -> anyhow::Result<()> {
             let status = status::RuntimeStatus::new();
             let df = get_test_datafusion(Arc::clone(&status));
 
-            let mut rt = Runtime::builder()
-                .with_app(app)
-                .with_datafusion(df)
-                .with_runtime_status(status)
-                .build()
-                .await;
+            let mut rt = Arc::new(
+                Runtime::builder()
+                    .with_app(app)
+                    .with_datafusion(df)
+                    .with_runtime_status(status)
+                    .build()
+                    .await,
+            );
 
             // Set a timeout for the test
             tokio::select! {
                 () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
                 }
-                () = rt.load_components() => {}
+                () = Arc::clone(&rt).load_components() => {}
             }
 
             runtime_ready_check(&rt).await;
@@ -155,7 +157,7 @@ async fn test_sqlite_decimal_memory() -> anyhow::Result<()> {
                 match check_function {
                     CheckFunction::ValidateFullPlan(snapshot_name) => {
                         run_query_and_check_results(
-                            &mut rt,
+                            Arc::clone(&rt),
                             &snapshot_name,
                             query,
                             true,
@@ -165,7 +167,7 @@ async fn test_sqlite_decimal_memory() -> anyhow::Result<()> {
                     }
                     CheckFunction::ValidateSubPlan(plan_checks) => {
                         run_query_and_check_results_with_plan_checks(
-                            &mut rt,
+                            &rt,
                             query,
                             plan_checks,
                             validate_result,
@@ -194,19 +196,21 @@ async fn test_sqlite_decimal_file() -> anyhow::Result<()> {
             let status = status::RuntimeStatus::new();
             let df = get_test_datafusion(Arc::clone(&status));
 
-            let mut rt = Runtime::builder()
-                .with_app(app)
-                .with_datafusion(df)
-                .with_runtime_status(status)
-                .build()
-                .await;
+            let mut rt = Arc::new(
+                Runtime::builder()
+                    .with_app(app)
+                    .with_datafusion(df)
+                    .with_runtime_status(status)
+                    .build()
+                    .await,
+            );
 
             // Set a timeout for the test
             tokio::select! {
                 () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
                 }
-                () = rt.load_components() => {}
+                () = Arc::clone(&rt).load_components() => {}
             }
 
             runtime_ready_check(&rt).await;
@@ -217,7 +221,7 @@ async fn test_sqlite_decimal_file() -> anyhow::Result<()> {
                 match check_function {
                     CheckFunction::ValidateFullPlan(snapshot_name) => {
                         run_query_and_check_results(
-                            &mut rt,
+                            Arc::clone(&rt),
                             &snapshot_name,
                             query,
                             true,
@@ -227,7 +231,7 @@ async fn test_sqlite_decimal_file() -> anyhow::Result<()> {
                     }
                     CheckFunction::ValidateSubPlan(plan_checks) => {
                         run_query_and_check_results_with_plan_checks(
-                            &mut rt,
+                            &rt,
                             query,
                             plan_checks,
                             validate_result,

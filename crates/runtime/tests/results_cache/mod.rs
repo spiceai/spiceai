@@ -66,7 +66,7 @@ async fn results_cache_system_queries() -> Result<(), String> {
                     .await,
             );
 
-            rt.load_components().await;
+            Arc::clone(&rt).load_components().await;
 
             assert!(execute_query_and_check_cache_status(
                 &rt,

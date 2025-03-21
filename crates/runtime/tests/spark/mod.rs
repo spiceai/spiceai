@@ -65,18 +65,20 @@ async fn spark_integration_test() -> Result<(), anyhow::Error> {
             let status = status::RuntimeStatus::new();
             let df = get_test_datafusion(Arc::clone(&status));
 
-            let mut rt = Runtime::builder()
-                .with_datafusion(df)
-                .with_app(app)
-                .build()
-                .await;
+            let mut rt = Arc::new(
+                Runtime::builder()
+                    .with_datafusion(df)
+                    .with_app(app)
+                    .build()
+                    .await,
+            );
 
             // Set a timeout for the test
             tokio::select! {
                 () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
                 }
-                () = rt.load_components() => {}
+                () = Arc::clone(&rt).load_components() => {}
             }
 
             let queries: QueryTests = vec![(
@@ -103,7 +105,7 @@ async fn spark_integration_test() -> Result<(), anyhow::Error> {
 
             for (query, snapshot_suffix, validate_result) in queries {
                 run_query_and_check_results(
-                    &mut rt,
+                    Arc::clone(&rt),
                     &format!("spark_test_{snapshot_suffix}"),
                     query,
                     true,

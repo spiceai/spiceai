@@ -200,19 +200,21 @@ async fn mssql_integration_test() -> Result<(), String> {
             let status = status::RuntimeStatus::new();
             let df = get_test_datafusion(Arc::clone(&status));
 
-            let mut rt = Runtime::builder()
-                .with_app(app)
-                .with_datafusion(df)
-                .with_runtime_status(status)
-                .build()
-                .await;
+            let rt = Arc::new(
+                Runtime::builder()
+                    .with_app(app)
+                    .with_datafusion(df)
+                    .with_runtime_status(status)
+                    .build()
+                    .await,
+            );
 
             // Set a timeout for the test
             tokio::select! {
                 () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
                     return Err("Timed out waiting for datasets to load".to_string());
                 }
-                () = rt.load_components() => {}
+                () = Arc::clone(&rt).load_components() => {}
             }
 
             let queries: QueryTests = vec![(
@@ -239,7 +241,7 @@ async fn mssql_integration_test() -> Result<(), String> {
 
             for (query, snapshot_suffix, validate_result) in queries {
                 run_query_and_check_results(
-                    &mut rt,
+                    Arc::clone(&rt),
                     &format!("mssql_integration_test_{snapshot_suffix}"),
                     query,
                     true,

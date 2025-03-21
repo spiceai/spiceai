@@ -62,7 +62,7 @@ async fn glue_iceberg_integration_test_catalog() -> Result<(), anyhow::Error> {
                 () = tokio::time::sleep(std::time::Duration::from_secs(1200)) => {
                     panic!("Timeout waiting for components to load");
                 }
-                () = rt.load_components() => {}
+                () = Arc::clone(&rt).load_components() => {}
             }
 
             runtime_ready_check(&rt).await;

@@ -69,7 +69,7 @@ async fn test_flight_auth() -> Result<(), anyhow::Error> {
 
         // Start the servers
         tokio::spawn(async move {
-            Box::pin(Arc::new(rt).start_servers(
+            Box::pin(Arc::clone(&rt).start_servers(
                 api_config,
                 None,
                 EndpointAuth::default().with_flight_basic_auth(api_key_auth),

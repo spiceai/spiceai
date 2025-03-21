@@ -57,24 +57,26 @@ async fn test_github_issues() -> Result<(), String> {
                 .build();
             let status = status::RuntimeStatus::new();
             let df = get_test_datafusion(Arc::clone(&status));
-            let mut rt = Runtime::builder()
-                .with_app(app)
-                .with_datafusion(df)
-                .with_runtime_status(status)
-                .build()
-                .await;
+            let mut rt = Arc::new(
+                Runtime::builder()
+                    .with_app(app)
+                    .with_datafusion(df)
+                    .with_runtime_status(status)
+                    .build()
+                    .await,
+            );
 
             tokio::select! {
                 () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
                     return Err("Timed out waiting for datasets to load".to_string());
                 }
-                () = rt.load_components() => {}
+                () = Arc::clone(&rt).load_components() => {}
             }
 
             let mut now = std::time::Instant::now();
 
             run_query_and_check_results(
-                &mut rt,
+                Arc::clone(&rt),
                 "test_github_issues_auto",
                 "SELECT * FROM spiceai_issues_auto LIMIT 10",
                 false, // can't snapshot this plan, as the partition size increases with more issues
@@ -92,7 +94,7 @@ async fn test_github_issues() -> Result<(), String> {
             now = std::time::Instant::now();
 
             run_query_and_check_results(
-                &mut rt,
+                Arc::clone(&rt),
                 "test_github_issues_search",
                 "SELECT * FROM spiceai_issues_search LIMIT 10",
                 false, // can't snapshot this plan, as the partition size increases with more issues
@@ -123,7 +125,7 @@ async fn test_github_issues() -> Result<(), String> {
             now = std::time::Instant::now();
 
             run_query_and_check_results(
-                &mut rt,
+                Arc::clone(&rt),
                 "test_github_issues_search_author",
                 "SELECT * FROM spiceai_issues_search WHERE author = 'peasee' LIMIT 100",
                 false, // can't snapshot this plan, as the partition size increases with more issues
@@ -162,24 +164,26 @@ async fn test_github_commits() -> Result<(), String> {
                 .build();
             let status = status::RuntimeStatus::new();
             let df = get_test_datafusion(Arc::clone(&status));
-            let mut rt = Runtime::builder()
-                .with_app(app)
-                .with_datafusion(df)
-                .with_runtime_status(status)
-                .build()
-                .await;
+            let rt = Arc::new(
+                Runtime::builder()
+                    .with_app(app)
+                    .with_datafusion(df)
+                    .with_runtime_status(status)
+                    .build()
+                    .await,
+            );
 
             tokio::select! {
                 () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
                     return Err("Timed out waiting for datasets to load".to_string());
                 }
-                () = rt.load_components() => {}
+                () = Arc::clone(&rt).load_components() => {}
             }
 
             let now = std::time::Instant::now();
 
             run_query_and_check_results(
-                &mut rt,
+                Arc::clone(&rt),
                 "test_github_commits_auto",
                 "SELECT * FROM spiceai_commits_auto LIMIT 10",
                 true,
@@ -221,24 +225,26 @@ async fn test_github_stargazers() -> Result<(), String> {
                 .build();
             let status = status::RuntimeStatus::new();
             let df = get_test_datafusion(Arc::clone(&status));
-            let mut rt = Runtime::builder()
-                .with_app(app)
-                .with_datafusion(df)
-                .with_runtime_status(status)
-                .build()
-                .await;
+            let rt = Arc::new(
+                Runtime::builder()
+                    .with_app(app)
+                    .with_datafusion(df)
+                    .with_runtime_status(status)
+                    .build()
+                    .await,
+            );
 
             tokio::select! {
                 () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
                     return Err("Timed out waiting for datasets to load".to_string());
                 }
-                () = rt.load_components() => {}
+                () = Arc::clone(&rt).load_components() => {}
             }
 
             let now = std::time::Instant::now();
 
             run_query_and_check_results(
-                &mut rt,
+                Arc::clone(&rt),
                 "test_github_stargazers_auto",
                 "SELECT * FROM spiceai_stargazers_auto LIMIT 10",
                 true,

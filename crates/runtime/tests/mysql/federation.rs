@@ -97,19 +97,21 @@ async fn mysql_federation_push_down() -> Result<(), String> {
             let status = status::RuntimeStatus::new();
             let df = get_test_datafusion(Arc::clone(&status));
 
-            let mut rt = Runtime::builder()
-                .with_app(app)
-                .with_datafusion(df)
-                .with_runtime_status(status)
-                .build()
-                .await;
+            let rt = Arc::new(
+                Runtime::builder()
+                    .with_app(app)
+                    .with_datafusion(df)
+                    .with_runtime_status(status)
+                    .build()
+                    .await,
+            );
 
             // Set a timeout for the test
             tokio::select! {
                 () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
                     return Err("Timed out waiting for datasets to load".to_string());
                 }
-                () = rt.load_components() => {}
+                () = Arc::clone(&rt).load_components() => {}
             }
 
             let queries: QueryTests = vec![
@@ -147,7 +149,7 @@ async fn mysql_federation_push_down() -> Result<(), String> {
 
             for (query, snapshot_suffix, validate_result) in queries {
                 run_query_and_check_results(
-                    &mut rt,
+                    Arc::clone(&rt),
                     &format!("mysql_federation_push_down_{snapshot_suffix}"),
                     query,
                     true,
@@ -203,18 +205,18 @@ async fn mysql_federation_inner_join_with_acc() -> Result<(), String> {
         let status = status::RuntimeStatus::new();
         let df = get_test_datafusion(Arc::clone(&status));
 
-        let mut rt = Runtime::builder()
+        let rt = Arc::new(Runtime::builder()
             .with_app(app)
             .with_datafusion(df)
             .with_runtime_status(status)
             .build()
-            .await;
+            .await);
         // Set a timeout for the test
         tokio::select! {
             () = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
                 return Err("Timed out waiting for datasets to load".to_string());
             }
-            () = rt.load_components() => {}
+            () = Arc::clone(&rt).load_components() => {}
         }
 
         runtime_ready_check(&rt).await;
@@ -246,7 +248,7 @@ async fn mysql_federation_inner_join_with_acc() -> Result<(), String> {
 
         for (query, snapshot_suffix, validate_result) in queries {
             run_query_and_check_results(
-                &mut rt,
+                Arc::clone(&rt),
                 &format!("mysql_federation_inner_join_with_acc_{snapshot_suffix}"),
                 query,
                 true,
