@@ -644,7 +644,10 @@ fn to_listing_table_url(
 
 #[cfg(test)]
 mod tests {
+    use chrono::{TimeZone, Utc};
     use datafusion_table_providers::util::secrets::to_secret_map;
+    use futures::stream::{self, BoxStream};
+    use futures::StreamExt;
     use std::collections::HashMap;
     use std::future::Future;
     use std::pin::Pin;
@@ -810,5 +813,159 @@ mod tests {
         } else {
             panic!("Unexpected error");
         }
+    }
+
+    #[derive(Debug)]
+    struct TestObjectStore {
+        meta: Vec<ObjectMeta>,
+    }
+
+    impl TestObjectStore {
+        fn new(meta: Vec<ObjectMeta>) -> Self {
+            Self { meta }
+        }
+    }
+
+    impl std::fmt::Display for TestObjectStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "TestObjectStore")
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for TestObjectStore {
+        fn list(&self, _prefix: Option<&Path>) -> BoxStream<'_, object_store::Result<ObjectMeta>> {
+            stream::iter(self.meta.clone().into_iter().map(Ok)).boxed()
+        }
+
+        async fn put(
+            &self,
+            _location: &Path,
+            _payload: object_store::PutPayload,
+        ) -> object_store::Result<object_store::PutResult> {
+            unimplemented!()
+        }
+        async fn put_opts(
+            &self,
+            _location: &Path,
+            _payload: object_store::PutPayload,
+            _opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            unimplemented!()
+        }
+        async fn put_multipart(
+            &self,
+            _location: &Path,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            unimplemented!()
+        }
+        async fn put_multipart_opts(
+            &self,
+            _location: &Path,
+            _opts: object_store::PutMultipartOpts,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            unimplemented!()
+        }
+        async fn get(&self, _location: &Path) -> object_store::Result<object_store::GetResult> {
+            unimplemented!()
+        }
+        async fn get_opts(
+            &self,
+            _location: &Path,
+            _options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            unimplemented!()
+        }
+        async fn delete(&self, _location: &Path) -> object_store::Result<()> {
+            unimplemented!()
+        }
+        fn delete_stream<'a>(
+            &'a self,
+            _locations: BoxStream<'a, object_store::Result<Path>>,
+        ) -> BoxStream<'a, object_store::Result<Path>> {
+            unimplemented!()
+        }
+        async fn list_with_delimiter(
+            &self,
+            _prefix: Option<&Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            unimplemented!()
+        }
+        async fn copy(&self, _from: &Path, _to: &Path) -> object_store::Result<()> {
+            unimplemented!()
+        }
+        async fn copy_if_not_exists(&self, _from: &Path, _to: &Path) -> object_store::Result<()> {
+            unimplemented!()
+        }
+    }
+
+    fn create_meta(location: &str, last_modified_secs: i64, size: usize) -> ObjectMeta {
+        ObjectMeta {
+            location: Path::from(location),
+            last_modified: Utc
+                .timestamp_opt(last_modified_secs, 0)
+                .single()
+                .expect("valid timestamp"),
+            size,
+            e_tag: None,
+            version: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_last_modified_returns_latest() {
+        let url = Url::parse("s3://bucket/").expect("to parse url");
+        let table_path = ListingTableUrl::parse(url.clone()).expect("to parse url");
+        let ctx = SessionContext::new();
+        let dataset = Dataset::try_new("s3://bucket/".to_string(), "test").expect("valid dataset");
+
+        let meta_files = vec![
+            create_meta("file_old.parquet", 100, 100),
+            create_meta("file_new.parquet", 200, 200),
+            create_meta("file_other.csv", 300, 300),
+            create_meta("file_other.parquet", 150, 200),
+        ];
+
+        let test_store = Arc::new(TestObjectStore::new(meta_files)) as Arc<dyn ObjectStore>;
+
+        let last_modified = get_last_modified(
+            "TestListingConnector".to_string(),
+            &dataset,
+            ".parquet",
+            table_path,
+            &ctx,
+            &test_store,
+        )
+        .await
+        .expect("to get last modified");
+
+        assert_eq!(last_modified.location.as_ref(), "file_new.parquet");
+    }
+
+    #[tokio::test]
+    async fn test_get_last_modified_no_matching_extension() {
+        let url = Url::parse("s3://bucket/").expect("to parse url");
+        let table_path = ListingTableUrl::parse(url.clone()).expect("to parse url");
+        let ctx = SessionContext::new();
+        let dataset = Dataset::try_new("s3://bucket/".to_string(), "test").expect("valid dataset");
+
+        let meta_files = vec![
+            create_meta("file_old.parquet", 100, 100),
+            create_meta("file_new.parquet", 200, 200),
+        ];
+
+        let test_store = Arc::new(TestObjectStore::new(meta_files)) as Arc<dyn ObjectStore>;
+
+        let result = get_last_modified(
+            "TestListingConnector".to_string(),
+            &dataset,
+            ".csv",
+            table_path,
+            &ctx,
+            &test_store,
+        )
+        .await;
+
+        assert!(result.is_err());
     }
 }
