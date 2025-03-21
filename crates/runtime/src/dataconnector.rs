@@ -235,7 +235,7 @@ pub enum DataConnectorError {
     },
 
     #[snafu(display(
-        "Failed to load the {connector_component} ({dataconnector}).\nFailed to detect a table schema.\nReport a bug on GitHub (https://github.com/spiceai/spiceai/issues) and reference the error: {source}"
+        "Failed to load the {connector_component} ({dataconnector}).\nFailed to infer the table schema.\nReport a bug on GitHub (https://github.com/spiceai/spiceai/issues) and reference the error: {source}"
     ))]
     UnableToGetSchemaInternal {
         dataconnector: String,
