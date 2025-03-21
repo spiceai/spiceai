@@ -15,6 +15,75 @@ pub struct MongoDB {
     params: Parameters,
 }
 
+impl MongoDB {
+    async fn parse_connection_string(
+        connection_string: String,
+        dataset: &Dataset,
+    ) -> DataConnectorResult<ClientOptions> {
+        ClientOptions::parse(connection_string).await
+            .map_err(|e| DataConnectorError::InvalidConfiguration {
+                dataconnector: "mongodb".to_string(),
+                connector_component: ConnectorComponent::from(dataset),
+                message: "failed to parse connection string".to_string(),
+                source: Box::new(e),
+            })
+    }
+
+    fn parse_params(
+        params: &Parameters,
+        dataset: &Dataset,
+    ) -> DataConnectorResult<ClientOptions> {
+        let host = params
+            .get("host")
+            .expose()
+            .ok_or_else(|_| DataConnectorError::InvalidConfigurationNoSource {
+                dataconnector: "mongodb".to_string(),
+                connector_component: ConnectorComponent::from(dataset),
+                message: "host is required".to_string(),
+            })?
+            .to_string();
+
+        let port = params
+            .get("port")
+            .expose()
+            .ok()
+            .and_then(|s| s.parse::<u16>().ok())
+            .unwrap_or(27017); // default port of mongodb
+
+        let username = params
+            .get("username")
+            .expose()
+            .ok()
+            .map(ToString::to_string);
+
+        let password = params
+            .get("password")
+            .expose()
+            .ok()
+            .map(ToString::to_string);
+
+        let auth_source = params
+            .get("auth_source")
+            .expose()
+            .ok()
+            .map(ToString::to_string);
+
+        Ok(ClientOptions::builder()
+            .hosts(
+                vec![ServerAddress::Tcp {
+                    host,
+                    port: Some(port),
+                }])
+            .credential(
+                Credential::builder()
+                    .username(username)
+                    .password(password)
+                    .source(auth_source)// `--authenticationDatabase` in mongodb shell, `authSource` in connection string
+                    .build()
+            ).build())
+    }
+}
+
 pub struct MongoDBFactory {}
 
 impl MongoDBFactory {
@@ -30,7 +99,8 @@ impl MongoDBFactory {
 }
 
 const PARAMETERS: &[ParameterSpec] = &[
-    ParameterSpec::component("connection_string").secret(),
+    ParameterSpec::component("connection_string").secret(), // especially recommended when connecting to cloud environment (MongoDB Atlas, Amazon DocumentDB)
+
     ParameterSpec::component("username").secret(),
     ParameterSpec::component("password").secret(),
     ParameterSpec::component("host"),
@@ -91,62 +161,9 @@ impl DataConnector for MongoDB {
             .map(ToString::to_string);
 
         let client_options = if let Some(connection_string) = connection_string {
-            ClientOptions::parse(connection_string).await
-                .map_err(|e| DataConnectorError::InvalidConfiguration {
-                    dataconnector: "mongodb".to_string(),
-                    connector_component: ConnectorComponent::from(dataset),
-                    message: "failed to parse connection string".to_string(),
-                    source: Box::new(e),
-                })?
+            Self::parse_connection_string(connection_string, dataset).await?
         } else {
-            let host = self.params
-                .get("host")
-                .expose()
-                .ok_or_else(|_| DataConnectorError::InvalidConfigurationNoSource {
-                    dataconnector: "mongodb".to_string(),
-                    connector_component: ConnectorComponent::from(dataset),
-                    message: "host is required".to_string(),
-                })?
-                .to_string();
-
-            let port = self.params
-                .get("port")
-                .expose()
-                .ok()
-                .and_then(|s| s.parse::<u16>().ok())
-                .unwrap_or(27017); // default port of mongodb
-
-            let username = self.params
-                .get("username")
-                .expose()
-                .ok()
-                .map(ToString::to_string);
-
-            let password = self.params
-                .get("password")
-                .expose()
-                .ok()
-                .map(ToString::to_string);
-
-            let auth_source = self.params
-                .get("auth_source")
-                .expose()
-                .ok()
-                .map(ToString::to_string);
-
-            ClientOptions::builder()
-                .hosts(
-                    vec![ServerAddress::Tcp {
-                        host,
-                        port: Some(port),
-                    }])
-                .credential(
-                    Credential::builder()
-                        .username(username)
-                        .password(password)
-                        .source(auth_source)// `--authenticationDatabase` in mongodb shell, `authSource` in connection string
-                        .build()
-                ).build()
+            Self::parse_params(&self.params, dataset)?
         };
 
         let client = Client::with_options(client_options)

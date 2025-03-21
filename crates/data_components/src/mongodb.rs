@@ -40,6 +40,8 @@ pub enum Error {
     SchemaInferenceError { source: arrow::error::ArrowError },
 }
 
+const THE_NUMBER_OF_DOCUMENTS_FOR_INFERRING_SCHEMA: i64 = 20;
+
 #[derive(Debug)]
 pub struct MongoDBTableProvider {
     client: Arc<Client>,
@@ -51,13 +53,7 @@ pub struct MongoDBTableProvider {
 
 impl MongoDBTableProvider {
     pub async fn try_new(client: Arc<Client>, database_name: Arc<str>, collection_name: Arc<str>, query_body: Arc<str>) -> Result<Self, Error> {
-        let existing_collections = client.database(&database_name)
-            .list_collection_names().await
-            .map_err(|e| Error::CollectionListSearchingError { source: e })?;
-
-        if !existing_collections.contains(&collection_name.to_string()) {
-            return CollectionDoesNotExistSnafu { collection_name }.fail()
-        }
+        Self::check_collection_exists(Arc::clone(&client), &database_name, &collection_name).await?;
 
         let table_schema = Self::infer_schema(Arc::clone(&client), &database_name, &collection_name).await?;
         let filter_document = Self::parse_query(&query_body)
@@ -72,6 +68,22 @@ impl MongoDBTableProvider {
         })
     }
 
+    async fn check_collection_exists(
+        client: Arc<Client>,
+        database_name: &str,
+        collection_name: &str,
+    ) -> Result<(), Error> {
+        let existing_collections = client.database(&database_name)
+            .list_collection_names().await
+            .map_err(|e| Error::CollectionListSearchingError { source: e })?;
+
+        if !existing_collections.contains(&collection_name.to_string()) {
+            return CollectionDoesNotExistSnafu { collection_name }.fail();
+        }
+
+        Ok(())
+    }
+
     async fn infer_schema(client: Arc<Client>, database_name: &str, collection_name: &str) -> Result<SchemaRef, Error> {
         let collection = client
             .database(database_name)
@@ -79,10 +91,12 @@ impl MongoDBTableProvider {
 
         let mut cursor = collection.find(
             Document::new()
-        ).limit(20).await.context(DocumentFindSnafu)?;
+        ).limit(THE_NUMBER_OF_DOCUMENTS_FOR_INFERRING_SCHEMA).await
+            .context(DocumentFindSnafu)?;
 
         let mut extracted_schema_info = Vec::new();
-        while let Some(document) = cursor.try_next().await.context(DocumentStreamingSnafu)? { //
+        while let Some(document) = cursor.try_next().await
+            .context(DocumentStreamingSnafu)? {
             extracted_schema_info.push(document_to_json_value(&document))
         }
 
@@ -92,7 +106,7 @@ impl MongoDBTableProvider {
         Ok(Arc::new(schema))
     }
 
-    pub fn parse_query(input: &str) -> Result<Document, Box<dyn std::error::Error>> {
+    fn parse_query(input: &str) -> Result<Document, Box<dyn std::error::Error>> {
         let json_value: Value = from_str(input)?;
         let bson_value = to_bson(&json_value)?;
 
@@ -103,7 +117,7 @@ impl MongoDBTableProvider {
     }
 }
 
-pub fn document_to_json_value(document: &Document) -> Value {
+fn document_to_json_value(document: &Document) -> Value {
     Value::Object(
         document.iter()
             .map(|(k, v)| (k.clone(), to_value(v).unwrap_or(Value::Null)))
@@ -152,14 +166,14 @@ impl TableProvider for MongoDBTableProvider {
 
         Ok(Arc::new(MongoDBTableProviderExec::new(
             collection,
-            self.filter_document.clone(), //
+            self.filter_document.clone(),
             Some(find_options),
             projected_schema,
         )))
     }
 }
 
-pub fn build_mongodb_projection(
+fn build_mongodb_projection(
     table_schema: &SchemaRef,
     projection: Option<&Vec<usize>>,
 ) -> Option<Document> {
