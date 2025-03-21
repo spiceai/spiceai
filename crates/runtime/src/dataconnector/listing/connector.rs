@@ -404,6 +404,12 @@ pub trait ListingTableConnector: DataConnector {
         let last_updated_url =
             to_listing_table_url(url, &last_updated.location, dataset, &format!("{self}"))?;
 
+        tracing::debug!(
+            "Dataset '{}' schema will be resolved using the path: {}",
+            dataset.name,
+            last_updated_url
+        );
+
         let mut options = ListingOptions::new(file_format).with_file_extension(extension);
 
         let resolved_schema = options
@@ -497,6 +503,7 @@ impl<T: ListingTableConnector + Display> DataConnector for T {
                 self.create_text_table(dataset, &url, &extension).await
             }
             Some(file_format) => {
+                // Structured tabular data, use a [`ListingTable`].
                 self.create_listing_table(dataset, &url, &extension, file_format)
                     .await
             }
@@ -546,6 +553,9 @@ fn add_last_modified_metadata_column_if_required(
     options
 }
 
+// 1024³
+const BYTES_PER_GIB: f64 = 1_073_741_824.0;
+
 /// Identifies the last modified object for a provided ListingTableConnector/ObjectStore
 /// Infers if the `file_format` specified is valid, based on the existence of files with the required extension
 ///
@@ -561,6 +571,8 @@ async fn get_last_modified(
     ctx: &SessionContext,
     object_store: &Arc<dyn ObjectStore>,
 ) -> DataConnectorResult<ObjectMeta> {
+    tracing::debug!("Detecting the most recently modified object for the path: {table_path}");
+
     let state = ctx.state();
     let mut file_stream = table_path
         .list_all_files(&state, object_store, "")
@@ -574,6 +586,9 @@ async fn get_last_modified(
     let mut best_match: Option<ObjectMeta> = None;
     let mut found_extensions: std::collections::HashSet<String> = std::collections::HashSet::new();
 
+    let mut file_count = 0;
+    let mut total_size = 0;
+
     while let Some(file) =
         file_stream
             .try_next()
@@ -584,6 +599,18 @@ async fn get_last_modified(
                 source: err.into(),
             })?
     {
+        file_count += 1;
+        total_size += file.size;
+
+        #[allow(clippy::cast_precision_loss)]
+        if file_count % 1_000_000 == 0 {
+            tracing::debug!(
+            "Continuing to process {table_path} metadata... {} objects processed so far, representing a total size of: {:.2} GiB",
+            file_count,
+            total_size as f64 / BYTES_PER_GIB
+            );
+        }
+
         if let Some(ext) = file.location.extension() {
             let file_ext = format!(".{ext}");
             found_extensions.insert(file_ext.clone());
