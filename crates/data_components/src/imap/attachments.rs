@@ -259,7 +259,10 @@ fn eml_three_attachments(){
     }
 
 
-    let image_bytes = include_bytes!("test_data/Mark - Orange on White.png");
+    //let image_bytes = include_bytes!("test_data/Mark - Orange on White.png");
+
+    //not sure if path is correct
+    let image_bytes = include_bytes!("../../../../media/Mark - Orange on White.png");
 
 
     let correct_set = vec!(
