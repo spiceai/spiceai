@@ -119,6 +119,7 @@ impl TableProvider for ImapTableProvider {
                    DataType::Struct(Fields::from(vec![
                        Field::new("filename", DataType::Utf8, true),
                        Field::new("mime_type", DataType::Utf8, true),
+                       Field::new("blob", DataType::Binary, true),
                    ])),
                    true,
                ))),
@@ -188,7 +189,7 @@ impl TableProvider for ImapTableProvider {
             let body_raw = message.body().as_ref().map(|v| decode(v));
 
             let body = if self.fetch_content {
-                //FIXME: rename flag to store_content?
+                //FIXME: rename flag from fetch_content to store_content?
                 // body data seems to be always fetched and optionally stored.
 
                 body_raw.clone()
@@ -201,13 +202,14 @@ impl TableProvider for ImapTableProvider {
                 .as_ref()
                 .and_then(|body|
                               {
+                                  //FIXME: this only exists so I can pass two args into the try_from trait impl
+                                  // might be a better way?
+                                  // try_from(&String) seemed cheaper as there was no clone.
                                   let options = AttachmentParseOptions{
-                                      raw_email: body.clone(), //FIXME: eww. clone.
-                                      parse_blobs: true,
+                                      raw_email: body.clone(), //FIXME: eww. clone. lambda/closure param instance.
+                                      store_blobs: self.fetch_content,
                                   };
                                   AttachmentRecords::try_from(options).ok()
-
-                                  //AttachmentRecords::try_from(body).ok()
                               }
                 );
 

@@ -28,16 +28,6 @@ limitations under the License.
 // https://www.rfc-editor.org/rfc/rfc2231
 
 
-use arrow::{
-    array::{
-        ArrayRef, Date64Array, ListArray, ListBuilder, RecordBatch, StringArray, StringBuilder, StructBuilder,
-    },
-    datatypes::{DataType, Field, Fields},
-    error::ArrowError,
-};
-
-
-
 use mail_parser::{MessageParser, MimeHeaders};
 
 
@@ -46,7 +36,7 @@ use mail_parser::{MessageParser, MimeHeaders};
 pub struct AttachmentInfo {
     pub mime_type: Option<String>,
     pub filename: Option<String>,
-    pub blob: Option<Result<Vec<u8>, String>>,
+    pub blob: Option<Vec<u8>>,
 }
 
 
@@ -68,7 +58,7 @@ pub struct AttachmentRecords{
 
 pub struct AttachmentParseOptions{
     pub raw_email: String,
-    pub parse_blobs: bool, //spend cpu decoding the attachments from base64/other
+    pub store_blobs: bool, //spend cpu decoding the attachments from base64/other
 }
 
 
@@ -117,28 +107,14 @@ impl TryFrom<AttachmentParseOptions> for AttachmentRecords {
                 };
 
 
-                //decoding the attachment blobs is optional.
-                let attachment_blob = if options.parse_blobs {
+                //attachments are decoded automatically by mail_parse
+                //encoding type is available. not sure if encoded bytes are.
+                let attachment_blob = if options.store_blobs {
                     Some(
-                        Ok( // collapse this into the match statement so we can bubble up errors cleanly.
-                            match attachment.encoding {
-                                mail_parser::Encoding::None => {
-                                    attachment.contents().to_vec()
-                                },
-                                mail_parser::Encoding::QuotedPrintable => {
-                                    //FIXME: snafu error handling here
-                                    mail_parser::decoders::quoted_printable::quoted_printable_decode( attachment.contents() ).expect("IMAP provider: Failed to decoded Quoted-Printable attachment.")
-                                },
-                                mail_parser::Encoding::Base64 => {
-                                    //FIXME: snafu error handling here
-                                    mail_parser::decoders::base64::base64_decode(attachment.contents()).expect("IMAP provider: Failed to decoded base64 attachment.")
-                                },
-                            }
-                        )
+                        attachment.contents().to_vec()
                     )
 
                 } else {
-                    //if ! options.parse_blobs
                     None
                 };
 
@@ -183,18 +159,6 @@ impl TryFrom<AttachmentParseOptions> for AttachmentRecords {
 
 
 
-impl TryFrom<&String> for AttachmentRecords{
-    type Error = String;
-
-    fn try_from(raw_email: &String) -> Result<Self, Self::Error> {
-
-        todo!()
-
-    } //try_from(..)
-
-} // impl ... AttachmentRecords
-
-
 
 
 
@@ -206,8 +170,10 @@ fn eml_utf8() {
     // If the Content-Disposition header has a filename= AND a filename*0*= field the fallback field
     // is used as the first component of the reconstructed long filename.
 
+    let options = AttachmentParseOptions{ raw_email, store_blobs: false };
+
     // println!("\nutf8 check");
-    let attachment_records = AttachmentRecords::try_from( &raw_email ).unwrap();
+    let attachment_records = AttachmentRecords::try_from( options ).unwrap();
 
     let extracted_set = attachment_records.attachments;
     // for rec in &collated{
@@ -260,8 +226,10 @@ fn eml_utf8() {
 fn eml_no_attachments(){
     let raw_email = include_str!("test_data/no_attachments.txt").to_string(); // Load an email file
 
+    let options = AttachmentParseOptions{ raw_email, store_blobs: false };
+
     // println!("\nno attachments");
-    let attachment_records = AttachmentRecords::try_from( &raw_email );
+    let attachment_records = AttachmentRecords::try_from( options );
 
     assert!( attachment_records.is_err() );
 
@@ -272,29 +240,43 @@ fn eml_no_attachments(){
 fn eml_three_attachments(){
     let raw_email = include_str!("test_data/three_attachments.txt").to_string(); // Load an email file
 
-    // println!("\nthree attachments");
-    let attachment_records = AttachmentRecords::try_from( &raw_email ).unwrap();
+    let options = AttachmentParseOptions{ raw_email, store_blobs: true };
+
+    println!("\nthree attachments");
+    let attachment_records = AttachmentRecords::try_from( options ).unwrap();
 
     let extracted_set = attachment_records.attachments;
-    // for rec in &collated{
-    //     println!("-rec: {:?}", rec);
-    // }
+    for rec in &extracted_set{
+        let blob = rec.blob.clone().unwrap();
+
+        let blob_str = if let Ok(blob) = String::from_utf8(blob){
+            blob
+        }else{
+            format!("[{}] Could not decode into utf8 for display", rec.mime_type.clone().unwrap())
+        };
+        println!("-rec: {:?}", &blob_str );
+        println!("");
+    }
+
+
+    let image_bytes = include_bytes!("test_data/Mark - Orange on White.png");
+
 
     let correct_set = vec!(
         AttachmentInfo{
             filename: Some("document.pdf".to_string()),
             mime_type: Some("application/pdf".to_string()),
-            blob: None
+            blob: Some("Test content encoded as b64".as_bytes().to_vec())
         },
         AttachmentInfo{
             filename: Some("image.png".to_string()),
             mime_type: Some("image/png".to_string()),
-            blob: None
+            blob: Some(image_bytes.to_vec())
         },
         AttachmentInfo{
             filename: Some("notes.txt".to_string()),
             mime_type: Some("text/plain".to_string()),
-            blob: None
+            blob: Some("Sample text content in the file.\n".as_bytes().to_vec())
         },
     );
 
@@ -310,8 +292,10 @@ fn eml_malformed(){
 
     let raw_email = include_str!("test_data/malformed_headers.txt").to_string(); // Load an email file
 
+    let options = AttachmentParseOptions{ raw_email, store_blobs: false };
+
     //println!("\nmalformed headers");
-    let attachment_records = AttachmentRecords::try_from( &raw_email ).unwrap();
+    let attachment_records = AttachmentRecords::try_from( options ).unwrap();
 
     let extracted_set = attachment_records.attachments;
     // for rec in &collated{

@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use arrow::{
     array::{
-        ArrayRef, Date64Array, ListArray, ListBuilder, RecordBatch, StringArray, StringBuilder, StructBuilder,
+        ArrayRef, BinaryBuilder, Date64Array, ListArray, ListBuilder, RecordBatch, StringArray, StringBuilder, StructBuilder,
     },
     datatypes::{DataType, Field, Fields},
     error::ArrowError,
@@ -91,6 +91,7 @@ fn build_listarray_for_attachments(values: Vec<Option<Vec<AttachmentInfo>>>) -> 
         Fields::from(vec![
             Field::new("filename", DataType::Utf8, true),
             Field::new("mime_type", DataType::Utf8, true),
+            Field::new("blob", DataType::Binary, true),
         ]),
         vec![Box::new(StringBuilder::new()), Box::new(StringBuilder::new())],
     );
@@ -101,14 +102,24 @@ fn build_listarray_for_attachments(values: Vec<Option<Vec<AttachmentInfo>>>) -> 
         if let Some(attachments) = attachment_list {
             for attachment in attachments {
                 let struct_builder = list_builder.values();
+
+                //FIXME: the expect() msgs in this code seem like they could be improved?
+
                 struct_builder
                     .field_builder::<StringBuilder>(0)
                     .expect("Should return a field builder")
                     .append_option(attachment.filename.as_deref());
+
                 struct_builder
                     .field_builder::<StringBuilder>(1)
                     .expect("Should return a field builder")
                     .append_option(attachment.mime_type.as_deref());
+
+                struct_builder
+                    .field_builder::<BinaryBuilder>(2)
+                    .expect("Should return a field builder")
+                    .append_option(attachment.blob.as_deref());
+
                 struct_builder.append(true);
             }
             list_builder.append(true);
