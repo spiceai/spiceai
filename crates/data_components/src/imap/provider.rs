@@ -29,7 +29,7 @@ use mailparse::{dateparse};
 use snafu::prelude::*;
 
 use crate::arrow::write::MemTable;
-
+use crate::imap::attachments::AttachmentParseOptions;
 use super::{
     EmailMessage, Error, FailedToLogoutSnafu, FailedToParseHeaderSnafu, FetchMessagesSnafu,
     GetMailboxStatusSnafu, ImapTableProvider,
@@ -182,18 +182,34 @@ impl TableProvider for ImapTableProvider {
             let message_ccs = parse_addreses_from_envelope!(envelope, cc);
             let message_blind_ccs = parse_addreses_from_envelope!(envelope, bcc);
             let message_reply_tos = parse_addreses_from_envelope!(envelope, reply_to);
+
+            //we need this data to decode attachments and other headers.
+            //it is optionally stored in the Spice records
+            let body_raw = message.body().as_ref().map(|v| decode(v));
+
             let body = if self.fetch_content {
-                message.body().as_ref().map(|v| decode(v))
+                //FIXME: rename flag to store_content?
+                // body data seems to be always fetched and optionally stored.
+
+                body_raw.clone()
             } else {
                 None
             };
 
-            //FIXME: if we do not self.fetch_content then body == None
-            // if body == None then the AttachmentRecords::try_from() will fail.
 
-            let attachment_records = body
+            let attachment_records = body_raw
                 .as_ref()
-                .and_then(|body| AttachmentRecords::try_from(body).ok());
+                .and_then(|body|
+                              {
+                                  let options = AttachmentParseOptions{
+                                      raw_email: body.clone(), //FIXME: eww. clone.
+                                      parse_blobs: true,
+                                  };
+                                  AttachmentRecords::try_from(options).ok()
+
+                                  //AttachmentRecords::try_from(body).ok()
+                              }
+                );
 
             let attachments = attachment_records
                 .map_or(None, |records| Some(records.attachments));

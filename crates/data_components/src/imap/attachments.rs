@@ -28,6 +28,16 @@ limitations under the License.
 // https://www.rfc-editor.org/rfc/rfc2231
 
 
+use arrow::{
+    array::{
+        ArrayRef, Date64Array, ListArray, ListBuilder, RecordBatch, StringArray, StringBuilder, StructBuilder,
+    },
+    datatypes::{DataType, Field, Fields},
+    error::ArrowError,
+};
+
+
+
 use mail_parser::{MessageParser, MimeHeaders};
 
 
@@ -36,6 +46,7 @@ use mail_parser::{MessageParser, MimeHeaders};
 pub struct AttachmentInfo {
     pub mime_type: Option<String>,
     pub filename: Option<String>,
+    pub blob: Option<Result<Vec<u8>, String>>,
 }
 
 
@@ -46,14 +57,30 @@ pub struct AttachmentRecords{
 }
 
 
-impl TryFrom<&String> for AttachmentRecords{
+
+// This is not a useful pattern because we down-convert into a pure Vec before we call
+// for build_recordbatch
+// impl Into<ListArray> for AttachmentRecords {
+//     fn into(self) -> ListArray {
+//     }
+// }
+
+
+pub struct AttachmentParseOptions{
+    pub raw_email: String,
+    pub parse_blobs: bool, //spend cpu decoding the attachments from base64/other
+}
+
+
+
+impl TryFrom<AttachmentParseOptions> for AttachmentRecords {
     type Error = String;
 
-    fn try_from(raw_email: &String) -> Result<Self, Self::Error> {
+    fn try_from(options: AttachmentParseOptions) -> Result<Self, Self::Error> {
 
         let mut attachments = Vec::<AttachmentInfo>::new();
 
-        if let Some(message) = MessageParser::default().parse(raw_email) {
+        if let Some(message) = MessageParser::default().parse(&options.raw_email) {
 
             for attachment in message.attachments() {
 
@@ -90,6 +117,32 @@ impl TryFrom<&String> for AttachmentRecords{
                 };
 
 
+                //decoding the attachment blobs is optional.
+                let attachment_blob = if options.parse_blobs {
+                    Some(
+                        Ok( // collapse this into the match statement so we can bubble up errors cleanly.
+                            match attachment.encoding {
+                                mail_parser::Encoding::None => {
+                                    attachment.contents().to_vec()
+                                },
+                                mail_parser::Encoding::QuotedPrintable => {
+                                    //FIXME: snafu error handling here
+                                    mail_parser::decoders::quoted_printable::quoted_printable_decode( attachment.contents() ).expect("IMAP provider: Failed to decoded Quoted-Printable attachment.")
+                                },
+                                mail_parser::Encoding::Base64 => {
+                                    //FIXME: snafu error handling here
+                                    mail_parser::decoders::base64::base64_decode(attachment.contents()).expect("IMAP provider: Failed to decoded base64 attachment.")
+                                },
+                            }
+                        )
+                    )
+
+                } else {
+                    //if ! options.parse_blobs
+                    None
+                };
+
+
                 // Deal with None,None case where there's no filename AND no mime_type
                 match (filename, mime_type) {
                     (None, None) => {
@@ -103,7 +156,7 @@ impl TryFrom<&String> for AttachmentRecords{
                     },
                     (filename, mime_type) => {
                         // Any other combo of filename and mime_type gives us a useful decode.
-                        attachments.push( AttachmentInfo{ filename, mime_type } );
+                        attachments.push( AttachmentInfo{ filename, mime_type, blob:attachment_blob } );
                     }
                 };
 
@@ -124,6 +177,18 @@ impl TryFrom<&String> for AttachmentRecords{
             )
 
         }
+
+    }
+}
+
+
+
+impl TryFrom<&String> for AttachmentRecords{
+    type Error = String;
+
+    fn try_from(raw_email: &String) -> Result<Self, Self::Error> {
+
+        todo!()
 
     } //try_from(..)
 
@@ -155,29 +220,34 @@ fn eml_utf8() {
         AttachmentInfo{
             filename: Some("report \"Q1 2024\" (final).pdf".to_string()),
             mime_type: Some("application/pdf".to_string()),
+            blob: None
         },
 
         //filename has an embedded ; char
         AttachmentInfo{
             filename: Some("data; Q1-2024.png".to_string()),
             mime_type: Some("image/png".to_string()),
+            blob: None
         },
 
         //filename is multibyte
         AttachmentInfo{
             filename: Some("résumé.txt".to_string()),
             mime_type: Some("text/plain".to_string()),
+            blob: None
         },
 
         //FIXME: the mail-parser crate has a bug and this test relies on it's broken behaviour.
         AttachmentInfo{
             filename: Some("BROKEN_PARSE_BUG_a_b_c.txt".to_string()),
             mime_type: Some("text/plain".to_string()),
+            blob: None
         },
 
         AttachmentInfo{
             filename: Some("CORRECT_a_b_c.txt".to_string()),
             mime_type: Some("text/plain".to_string()),
+            blob: None
         },
     );
 
@@ -214,14 +284,17 @@ fn eml_three_attachments(){
         AttachmentInfo{
             filename: Some("document.pdf".to_string()),
             mime_type: Some("application/pdf".to_string()),
+            blob: None
         },
         AttachmentInfo{
             filename: Some("image.png".to_string()),
             mime_type: Some("image/png".to_string()),
+            blob: None
         },
         AttachmentInfo{
             filename: Some("notes.txt".to_string()),
             mime_type: Some("text/plain".to_string()),
+            blob: None
         },
     );
 
@@ -249,10 +322,12 @@ fn eml_malformed(){
         AttachmentInfo{
             filename: Some("document.pdf".to_string()),
             mime_type: Some("application/pdf".to_string()),
+            blob: None
         },
         AttachmentInfo{
             filename: None,
             mime_type: Some("application/pdf".to_string()),
+            blob: None
         },
         // AttachmentInfo{
         //     filename: None,
@@ -261,10 +336,12 @@ fn eml_malformed(){
         AttachmentInfo{
             filename: Some("no_mime_type.png".to_string()),
             mime_type: None,
+            blob: None
         },
         AttachmentInfo{
             filename: Some("notes.tx_t".to_string()),
             mime_type: Some("text/plain".to_string()),
+            blob: None
         },
     );
 
@@ -272,33 +349,5 @@ fn eml_malformed(){
 
 }
 
-
-
-
-//
-// #[test]
-// fn eml_integration_tuple(){
-//     let raw_email = include_str!("test_data/three_attachments.txt").to_string(); // Load an email file
-//
-//     //println!("\nintegration tuple");
-//     let attachment_records = AttachmentRecords::try_from( &raw_email ).unwrap();
-//
-//     let (filenames,mime_types) = attachment_records.into_tuple();
-//
-//     let correct_set_filenames = Some(vec!(
-//         Some(String::from("document.pdf")),
-//         Some(String::from("image.png")),
-//         Some(String::from("notes.txt")),
-//     ));
-//     assert_eq!( filenames, correct_set_filenames, "filename set mismatch" );
-//
-//     let correct_set_mime_types = Some(vec!(
-//         Some(String::from("application/pdf")),
-//         Some(String::from("image/png")),
-//         Some(String::from("text/plain")),
-//     ));
-//     assert_eq!( mime_types, correct_set_mime_types, "mime_type set mismatch" );
-//
-// }
 
 
