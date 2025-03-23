@@ -235,6 +235,15 @@ pub enum DataConnectorError {
     },
 
     #[snafu(display(
+        "Failed to load the {connector_component} ({dataconnector}).\nFailed to infer the table schema.\nReport a bug on GitHub (https://github.com/spiceai/spiceai/issues) and reference the error: {source}"
+    ))]
+    UnableToGetSchemaInternal {
+        dataconnector: String,
+        connector_component: ConnectorComponent,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display(
         "Failed to load the {connector_component} ({dataconnector}).\nUnsupported type action is not enabled for the {dataconnector} Data Connector.\nRemove the parameter from your dataset configuration."
     ))]
     UnsupportedTypeAction {
