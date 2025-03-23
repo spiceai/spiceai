@@ -218,7 +218,7 @@ async fn run_eval(
         })?;
 
     let actual: Vec<DatasetOutput> = if let Some(first_ideal) = ideal.first() {
-        run_model(eval.name.clone(), &**model, &input, first_ideal).await?
+        run_model(eval.name.as_str(), &**model, &input, first_ideal).await?
     } else {
         // Not an error, no data in dataset
         vec![]
@@ -296,38 +296,67 @@ async fn write_results(
 
 /// Return format of [`DatasetOutput`] determined by `output_format`. `output_format` can be empty, is only used for its enum type.
 async fn run_model(
-    eval_name: String,
+    eval_name: &str,
     model: &dyn Chat,
     inputs: &[DatasetInput],
     output_format: &DatasetOutput,
 ) -> Result<Vec<DatasetOutput>> {
     let mut outputs = Vec::with_capacity(inputs.len());
     for input in inputs {
-        let req = TryInto::<CreateChatCompletionRequest>::try_into(input).context(
-            FailedToRunModelSnafu {
-                eval_name: eval_name.clone(),
-            },
-        )?;
-
-        let choices = model
-            .chat_request(req)
+        let span = tracing::span!(
+            target: "task_history",
+            tracing::Level::INFO,
+            "eval_step",
+            input = %serde_json::to_string(&input).unwrap_or_default(),
+        );
+        match run_eval_step(eval_name, model, input, output_format)
+            .instrument(span.clone())
             .await
-            .context(FailedToRunModelSnafu {
-                eval_name: eval_name.clone(),
-            })?
-            .choices;
-
-        let output = match output_format {
-            DatasetOutput::AssistantResponse(_) => DatasetOutput::AssistantResponse(
-                choices
-                    .into_iter()
-                    .next()
-                    .and_then(|mut c| c.message.content.take())
-                    .unwrap_or_default(),
-            ),
-            DatasetOutput::Choices(_) => DatasetOutput::Choices(choices),
-        };
-        outputs.push(output);
+        {
+            Ok(output) => {
+                if let Ok(captured_output) = serde_json::to_string(&output) {
+                    tracing::info!(target: "task_history", parent: &span, captured_output = %captured_output);
+                } else {
+                    tracing::warn!("Failed to serialize output for logging");
+                };
+                outputs.push(output);
+            }
+            Err(e) => {
+                tracing::error!(target: "task_history", parent: &span, "{e}");
+                return Err(e);
+            }
+        }
     }
     Ok(outputs)
+}
+
+async fn run_eval_step(
+    eval_name: &str,
+    model: &dyn Chat,
+    input: &DatasetInput,
+    output_format: &DatasetOutput,
+) -> Result<DatasetOutput> {
+    let req =
+        TryInto::<CreateChatCompletionRequest>::try_into(input).context(FailedToRunModelSnafu {
+            eval_name: eval_name.to_string(),
+        })?;
+
+    let resp = model
+        .chat_request(req)
+        .await
+        .context(FailedToRunModelSnafu {
+            eval_name: eval_name.to_string(),
+        })?;
+
+    let output = match output_format {
+        DatasetOutput::AssistantResponse(_) => DatasetOutput::AssistantResponse(
+            resp.choices
+                .into_iter()
+                .next()
+                .and_then(|mut c| c.message.content.take())
+                .unwrap_or_default(),
+        ),
+        DatasetOutput::Choices(_) => DatasetOutput::Choices(resp.choices),
+    };
+    Ok(output)
 }

@@ -102,7 +102,6 @@ jobs:
           SPICEPOD_FILENAME=$(basename $SPICEPOD_PATH)
           echo "SPICEPOD_FILENAME=${SPICEPOD_FILENAME}" >> $GITHUB_OUTPUT
 
-
       - name: Run the benchmark test - ${{ steps.extract_spicepod_filename.outputs.SPICEPOD_FILENAME }}
         if: ${{ github.event.inputs.query_overrides == '' }}
         run: |
@@ -189,7 +188,7 @@ jobs:
         if: github.event.inputs.update_snapshots == 'always'
         run: |
           # if the spiced commit is set, use that as the branch ID
-          if [[ ${{ github.event.inputs.spiced_commit }} ]]; then
+          if [ -n "${{ github.event.inputs.spiced_commit || '' }}" ]; then
             BRANCH_ID=${{ github.event.inputs.spiced_commit }}
           else
             BRANCH_ID=${{ github.run_id }}

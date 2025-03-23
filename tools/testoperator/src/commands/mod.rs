@@ -84,3 +84,16 @@ pub(crate) fn env_export(args: &CommonArgs) -> anyhow::Result<()> {
 
     Ok(())
 }
+
+#[macro_export]
+macro_rules! wait_test_and_memory {
+    ($test:expr, $memory_token:expr, $memory_readings:expr) => {
+        match $test.wait().await {
+            Ok(test) => test,
+            Err(e) => {
+                observe_memory($memory_token, $memory_readings).await?;
+                return Err(e);
+            }
+        }
+    };
+}

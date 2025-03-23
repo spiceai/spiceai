@@ -21,9 +21,12 @@ pub mod tool;
 
 use std::{collections::HashMap, str::FromStr};
 
+use async_trait::async_trait;
 use mcp_client::{transport::Error as TransportError, Error as McpError};
+use mcp_core::protocol::CallToolResult;
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use snafu::Snafu;
 
 #[derive(Debug, Snafu)]
@@ -77,29 +80,47 @@ impl FromStr for MCPType {
 pub(crate) enum MCPConfig {
     Stdio {
         command: String,
-        args: Option<Vec<String>>,
+        args: Vec<String>,
+        env: HashMap<String, String>,
     },
     Https {
         url: url::Url,
     },
 }
 impl MCPConfig {
-    fn from_type(mcp_type: &MCPType, params: &HashMap<String, SecretString>) -> Self {
-        match mcp_type {
-            MCPType::Stdio(command) => match params.get("mcp_args") {
-                Some(args) => {
-                    let args = ExposeSecret::expose_secret(args);
-                    Self::Stdio {
-                        command: command.clone(),
-                        args: Some(args.split_whitespace().map(ToString::to_string).collect()),
-                    }
-                }
-                None => Self::Stdio {
-                    command: command.clone(),
-                    args: None,
-                },
-            },
-            MCPType::Https(url) => Self::Https { url: url.clone() },
+    fn from_type(
+        mcp_type: &MCPType,
+        params: &HashMap<String, SecretString>,
+        env: &HashMap<String, SecretString>,
+    ) -> Self {
+        match mcp_type.clone() {
+            MCPType::Stdio(command) => {
+                let args = params
+                    .get("mcp_args")
+                    .map(ExposeSecret::expose_secret)
+                    .unwrap_or_default()
+                    .split_whitespace()
+                    .map(ToString::to_string)
+                    .collect();
+
+                let env = env
+                    .iter()
+                    .map(|(k, v)| (k.clone(), ExposeSecret::expose_secret(v).to_string()))
+                    .collect();
+
+                Self::Stdio { command, args, env }
+            }
+            MCPType::Https(url) => Self::Https { url },
         }
     }
+}
+
+/// [`McpProxy`] is the minimal interface from [`mcp_client::McpClientTrait`] for tools that are fundamentally proxies around MCP tools.
+///
+/// This trait lets Spice pass through all details from the underlying MCP server in its (i.e. Spiced's) MCP server implementation.
+///
+#[async_trait]
+pub trait McpProxy: Send + Sync {
+    /// Unlike [`mcp_client::McpClientTrait`], the implementation should track the appropriate underlying tool name.
+    async fn call_tool(&self, arguments: Value) -> Result<CallToolResult, mcp_client::Error>;
 }

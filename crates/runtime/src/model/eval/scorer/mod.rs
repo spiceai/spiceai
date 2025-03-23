@@ -17,14 +17,19 @@ limitations under the License.
 use std::{collections::HashMap, sync::Arc};
 
 use async_trait::async_trait;
-use match_::MatchScorer;
 use tokio::sync::RwLock;
 
 use super::{DatasetInput, DatasetOutput};
 
+#[cfg(feature = "models")]
 pub mod fuzzy_match;
+#[cfg(feature = "models")]
 pub mod includes;
+#[cfg(feature = "models")]
 pub mod json_match;
+#[cfg(feature = "models")]
+pub mod levenshtein;
+#[cfg(feature = "models")]
 pub mod match_;
 
 #[async_trait]
@@ -65,12 +70,20 @@ pub(crate) async fn score_results(
 
 #[must_use]
 pub fn builtin_scorer() -> Vec<(&'static str, Arc<dyn Scorer>)> {
-    vec![
-        ("match", Arc::new(MatchScorer {})),
-        ("json_match", Arc::new(json_match::JsonMatch {})),
-        ("includes", Arc::new(includes::Includes {})),
-        ("fuzzy_match", Arc::new(fuzzy_match::FuzzyMatch {})),
-    ]
+    #[cfg(feature = "models")]
+    {
+        vec![
+            ("levenshtein", Arc::new(levenshtein::Levenshtein {})),
+            ("match", Arc::new(match_::MatchScorer {})),
+            ("json_match", Arc::new(json_match::JsonMatch {})),
+            ("includes", Arc::new(includes::Includes {})),
+            ("fuzzy_match", Arc::new(fuzzy_match::FuzzyMatch {})),
+        ]
+    }
+    #[cfg(not(feature = "models"))]
+    {
+        vec![]
+    }
 }
 
 #[allow(clippy::cast_precision_loss)]
@@ -81,4 +94,14 @@ fn mean(values: &[f32]) -> f32 {
     }
 
     values.iter().sum::<f32>() / n as f32
+}
+
+fn extract_text(output: &DatasetOutput) -> String {
+    match output {
+        DatasetOutput::AssistantResponse(text) => text.clone(),
+        DatasetOutput::Choices(choices) => choices
+            .first()
+            .map(|choice| choice.message.content.clone().unwrap_or_default())
+            .unwrap_or_default(),
+    }
 }

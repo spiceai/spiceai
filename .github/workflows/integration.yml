@@ -28,6 +28,12 @@ on:
       - 'bin/spice/**'
 
   workflow_dispatch:
+    inputs:
+      run_all_tests:
+        description: 'Run all tests'
+        type: boolean
+        required: false
+        default: false
 
 concurrency:
   # Allow only one workflow per any non-trunk branch.
@@ -58,7 +64,15 @@ jobs:
       # Build the test binary without running tests
       - name: Build integration test binary
         run: |
-          TEST_BINARY_PATH=$(cargo test -p runtime --test integration --features postgres,mysql,delta_lake,duckdb,sqlite,spark,databricks,spark --no-run --message-format=json | jq -r 'select(.reason == "compiler-artifact" and (.target.kind | contains(["test"])) and .executable != null) | .executable')
+          FEATURES="postgres,mysql,delta_lake,duckdb,sqlite,spark,databricks,spark"
+          if [[ "${{ github.event.inputs.run_all_tests }}" == "true" ]] || [[ "${{ github.ref }}" == "refs/heads/release"* ]]; then
+            FEATURES="${FEATURES},extended_tests"
+            echo "Including extended_tests"
+          else
+            echo "Excluding extended_tests"
+          fi
+          
+          TEST_BINARY_PATH=$(cargo test -p runtime --test integration --features ${FEATURES} --no-run --message-format=json | jq -r 'select(.reason == "compiler-artifact" and (.target.kind | contains(["test"])) and .executable != null) | .executable')
           cp $TEST_BINARY_PATH ./integration_test
 
       # Upload the test binary as an artifact
@@ -128,8 +142,8 @@ jobs:
           AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ secrets.AWS_DATABRICKS_DELTA_ACCESS_KEY_ID }}
           AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ secrets.AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY }}
           SPICEAI_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TPCH_BENCHMARK_KEY }}
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ICEBERG_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_ICEBERG_SECRET_ACCESS_KEY }}
+          AWS_ICEBERG_ACCESS_KEY_ID: ${{ secrets.AWS_ICEBERG_ACCESS_KEY_ID }}
+          AWS_ICEBERG_SECRET_ACCESS_KEY: ${{ secrets.AWS_ICEBERG_SECRET_ACCESS_KEY }}
           AWS_ICEBERG_REGION: ${{ secrets.AWS_ICEBERG_REGION }}
           AWS_ICEBERG_ACCOUNT_ID: ${{ secrets.AWS_ICEBERG_ACCOUNT_ID }}
         run: |

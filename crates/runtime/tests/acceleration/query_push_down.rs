@@ -14,22 +14,17 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::time::Duration;
-
 use app::AppBuilder;
 use datafusion::assert_batches_eq;
 use futures::StreamExt;
 use futures::TryStreamExt;
-use runtime::{datafusion::query, Runtime};
+use runtime::Runtime;
 use spicepod::component::{
     dataset::{acceleration::Acceleration, Dataset},
     params::Params,
 };
 
-use crate::{
-    init_tracing,
-    utils::{test_request_context, wait_until_true},
-};
+use crate::{init_tracing, utils::test_request_context};
 
 #[cfg(feature = "postgres")]
 #[allow(clippy::too_many_lines)]
@@ -37,11 +32,9 @@ use crate::{
 async fn acceleration_with_and_without_federation() -> Result<(), anyhow::Error> {
     use crate::get_test_datafusion;
     use crate::postgres::common;
+    use crate::utils::runtime_ready_check;
     use arrow::array::RecordBatch;
-    use datafusion::error::DataFusionError;
-    use runtime::datafusion::error::SpiceExternalError;
     use runtime::status;
-    use spicepod::component::dataset::ReadyState;
     use std::sync::Arc;
 
     let _guard = super::ACCELERATION_MUTEX.lock().await;
@@ -78,7 +71,6 @@ async fn acceleration_with_and_without_federation() -> Result<(), anyhow::Error>
                 .await.expect("inserted data");
 
             let mut federated_acc = Dataset::new("postgres:test", "abc");
-            federated_acc.ready_state = ReadyState::OnRegistration;
 
             let mut params = Params::from_string_map(
                 vec![
@@ -152,60 +144,33 @@ async fn acceleration_with_and_without_federation() -> Result<(), anyhow::Error>
                 () = rt.load_components() => {}
             }
 
-            assert!(
-                wait_until_true(Duration::from_secs(30), || async {
-                    let mut query_result = rt
-                        .datafusion()
-                        .query_builder("SELECT * FROM abc LIMIT 1")
-                        .build()
-                        .run()
-                        .await
-                        .expect("result returned");
-                    let mut batches = vec![];
-                    while let Some(batch) = query_result.data.next().await {
-                        batches.push(batch.expect("batch"));
-                    }
-                    !batches.is_empty() && batches[0].num_rows() == 1
-                })
-                .await,
-                "Expected 1 rows returned"
-            );
-            assert!(
-                wait_until_true(Duration::from_secs(30), || async {
-                    let mut query_result = match rt
-                        .datafusion()
-                        .query_builder("SELECT * FROM non_federated_abc LIMIT 1")
-                        .build()
-                        .run()
-                        .await
-                    {
-                        Ok(result) => result,
-                        Err(e) => match e {
-                            query::Error::UnableToExecuteQuery { source } => match source {
-                                DataFusionError::External(e) => {
-                                    if let Some(e) = e.downcast_ref::<SpiceExternalError>() {
-                                        match e {
-                                            SpiceExternalError::AccelerationNotReady { .. } => {
-                                                return false;
-                                            }
-                                        }
-                                    }
-                                    panic!("Expected SpiceExternalError");
-                                }
-                                _ => panic!("Expected SpiceExternalError"),
-                            },
-                            _ => panic!("Expected query::Error::UnableToExecuteQuery"),
-                        },
-                    };
-                    let mut batches = vec![];
-                    while let Some(batch) = query_result.data.next().await {
-                        batches.push(batch.expect("batch"));
-                    }
-                    !batches.is_empty() && batches[0].num_rows() == 1
-                })
-                .await,
-                "Expected 1 rows returned"
-            );
+            runtime_ready_check(&rt).await;
+
+            let mut query_result = rt
+                .datafusion()
+                .query_builder("SELECT * FROM abc LIMIT 1")
+                .build()
+                .run()
+                .await
+                .expect("result returned");
+            let mut batches = vec![];
+            while let Some(batch) = query_result.data.next().await {
+                batches.push(batch.expect("batch"));
+            }
+            assert!(!batches.is_empty() && batches[0].num_rows() == 1, "Expected 1 rows returned");
+
+            let mut query_result = rt
+                .datafusion()
+                .query_builder("SELECT * FROM non_federated_abc LIMIT 1")
+                .build()
+                .run()
+                .await
+                .expect("result returned");
+            let mut batches = vec![];
+            while let Some(batch) = query_result.data.next().await {
+                batches.push(batch.expect("batch"));
+            }
+            assert!(!batches.is_empty() && batches[0].num_rows() == 1, "Expected 1 rows returned");
 
             let plan_results: Vec<RecordBatch> = rt
                 .datafusion()

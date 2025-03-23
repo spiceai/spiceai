@@ -335,6 +335,15 @@ impl SpiceTest<Completed> {
 
         Ok(returned_row_counts)
     }
+
+    /// Returns true if every query status is passed. Returns false if any query status is failed.
+    #[must_use]
+    pub fn succeeded(&self) -> bool {
+        self.state
+            .query_statuses
+            .values()
+            .all(|status| status == &QueryStatus::Passed)
+    }
 }
 
 impl std::fmt::Display for SpiceTest<Completed> {

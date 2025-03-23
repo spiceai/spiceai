@@ -6,6 +6,10 @@ on:
     - cron: '0 9 */2 * *'
   workflow_dispatch:
     inputs:
+      spiced_commit:
+        description: 'An optional commit hash to use for spiced'
+        required: false
+        type: string
       test_files_path:
         description: 'path to load test files to dispatch'
         required: true
@@ -43,6 +47,8 @@ jobs:
       - name: Setup spiced
         uses: ./.github/actions/setup-spiced
         id: setup-spiced
+        with:
+          spiced_commit: ${{ github.event.inputs.spiced_commit }}
       
       - name: Display spiced commit
         run: echo "SPICED_COMMIT=${{ steps.setup-spiced.outputs.SPICED_COMMIT }}"

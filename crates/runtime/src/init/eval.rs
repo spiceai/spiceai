@@ -19,12 +19,13 @@ use std::sync::Arc;
 
 use datafusion::sql::TableReference;
 use snafu::ResultExt;
+use spicepod::component::Nameable;
 use tokio::sync::RwLock;
 
 use crate::{
     accelerated_table::{refresh::Refresh, Retention},
     component::dataset::{acceleration::Acceleration, TimeFormat},
-    datafusion::SPICE_EVAL_SCHEMA,
+    datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA, SPICE_EVAL_SCHEMA},
     internal_table::create_internal_accelerated_table,
     model::{
         builtin_scorer, EVAL_RESULTS_TABLE_REFERENCE, EVAL_RESULTS_TABLE_SCHEMA,
@@ -42,6 +43,43 @@ impl Runtime {
             let mut reg = self.eval_scorers.write().await;
             reg.insert(name.to_string(), Arc::clone(&scorer));
             tracing::debug!("Successfully loaded eval scorer {name}");
+        }
+    }
+
+    pub(crate) async fn verify_evals(&self) {
+        let app_lock_opt = self.app.read().await;
+        let Some(app_lock) = app_lock_opt.as_deref() else {
+            return;
+        };
+        for eval in &app_lock.evals {
+            let eval_dataset = TableReference::parse_str(eval.dataset.as_str())
+                .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
+                .to_string();
+
+            // Check if it is a dataset
+            if app_lock.datasets.iter().any(|d| {
+                TableReference::parse_str(d.name())
+                    .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
+                    .to_string()
+                    == eval_dataset
+            }) {
+                continue;
+            };
+
+            // Check if it is a view
+            if app_lock.views.iter().any(|v| {
+                TableReference::parse_str(v.name())
+                    .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
+                    .to_string()
+                    == eval_dataset
+            }) {
+                continue;
+            };
+            tracing::warn!(
+                "Eval '{}' expects table '{}', but it does not exist.",
+                eval.name.clone(),
+                eval_dataset
+            );
         }
     }
 

@@ -212,6 +212,14 @@
             }
           ]
         },
+        "refresh_on_startup": {
+          "default": "auto",
+          "allOf": [
+            {
+              "$ref": "#/definitions/RefreshOnStartup"
+            }
+          ]
+        },
         "refresh_retry_enabled": {
           "default": true,
           "type": "boolean"
@@ -986,6 +994,24 @@
         "full",
         "append",
         "changes"
+      ]
+    },
+    "RefreshOnStartup": {
+      "oneOf": [
+        {
+          "description": "Always start a new refresh when Spice starts.",
+          "type": "string",
+          "enum": [
+            "always"
+          ]
+        },
+        {
+          "description": "Only start a refresh if an existing acceleration is not available.",
+          "type": "string",
+          "enum": [
+            "auto"
+          ]
+        }
       ]
     },
     "Replication": {
