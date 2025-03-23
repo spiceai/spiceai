@@ -1,12 +1,14 @@
 use std::any::Any;
 use std::future::Future;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 use async_trait::async_trait;
 use datafusion::catalog::TableProvider;
 use mongodb::Client;
-use mongodb::options::{ClientOptions, Credential, ServerAddress};
+use mongodb::options::{ClientOptions, Credential, ServerAddress, Tls, TlsOptions};
 use data_components::mongodb::MongoDBTableProvider;
+use regex::Regex;
 use crate::component::dataset::Dataset;
 use crate::dataconnector::{ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory, DataConnectorResult};
 use crate::parameters::{ParameterSpec, Parameters};
@@ -20,13 +22,61 @@ impl MongoDB {
         connection_string: String,
         dataset: &Dataset,
     ) -> DataConnectorResult<ClientOptions> {
-        ClientOptions::parse(connection_string).await
-            .map_err(|e| DataConnectorError::InvalidConfiguration {
-                dataconnector: "mongodb".to_string(),
-                connector_component: ConnectorComponent::from(dataset),
-                message: "failed to parse connection string".to_string(),
-                source: Box::new(e),
-            })
+        let mut client_options;
+
+        if connection_string.contains("tlsAllowInvalidHostnames=true")
+            || connection_string.contains("sslAllowInvalidHostnames=true") { // suppose user is trying to connect documentdb through ssh tunneling
+            let parsable_connection_string = Self::remove_tls_allow_invalid_hostnames_option(connection_string.as_str());
+
+            client_options = ClientOptions::parse(parsable_connection_string).await
+                .map_err(|e| DataConnectorError::InvalidConfiguration {
+                    dataconnector: "mongodb".to_string(),
+                    connector_component: ConnectorComponent::from(dataset),
+                    message: "failed to parse connection string".to_string(),
+                    source: Box::new(e),
+                })?;
+
+            // parsing tlsAllowInvalidHostnames(sslAllowInvalidHostnames) option in connection string
+            // is not supported by ClientOptions::parse() function,
+            // so injecting the option through TlsOptions is needed.
+            if let Some(_tls_options) = client_options.tls.take() {
+                let pem_file_path = Self::get_pem_file_path(connection_string.as_str())
+                    .unwrap_or("".to_string());
+                let new_tls = TlsOptions::builder()
+                    .ca_file_path(Some(PathBuf::from(pem_file_path)))
+                    .allow_invalid_hostnames(true)
+                    .build();
+
+                client_options.tls = Some(Tls::Enabled(new_tls));
+                client_options.direct_connection = Some(true); // to make connection directly to 'localhost', not amazon domain which leads to connection failure.
+            }
+        } else {
+            client_options = ClientOptions::parse(connection_string).await
+                .map_err(|e| DataConnectorError::InvalidConfiguration {
+                    dataconnector: "mongodb".to_string(),
+                    connector_component: ConnectorComponent::from(dataset),
+                    message: "failed to parse connection string".to_string(),
+                    source: Box::new(e),
+                })?;
+        }
+
+        Ok(client_options)
+    }
+
+    fn get_pem_file_path(connection_string: &str) -> Option<String> {
+        let ca_file_regex = Regex::new(r"tlsCAFile=([^&]+)").unwrap();
+        let ca_file = ca_file_regex
+            .captures(connection_string)
+            .and_then(|caps| caps.get(1).map(|m| m.as_str().to_string()));
+
+        ca_file
+    }
+
+    fn remove_tls_allow_invalid_hostnames_option(connection_string: &str) -> String {
+        let target_regex = Regex::new(r"(&)?(tls|ssl)AllowInvalidHostnames=true").unwrap();
+        let cleaned = target_regex.replace_all(connection_string, "").to_string();
+
+        cleaned
     }
 
     fn parse_params(

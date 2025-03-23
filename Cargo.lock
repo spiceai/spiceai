@@ -7635,6 +7635,8 @@ dependencies = [
  "md-5",
  "mongodb-internal-macros",
  "once_cell",
+ "openssl",
+ "openssl-probe",
  "pbkdf2 0.11.0",
  "percent-encoding",
  "rand 0.8.5",
@@ -7652,6 +7654,7 @@ dependencies = [
  "take_mut",
  "thiserror 1.0.69",
  "tokio",
+ "tokio-openssl",
  "tokio-rustls 0.24.1",
  "tokio-util",
  "typed-builder 0.10.0",
@@ -12447,6 +12450,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bbae76ab933c85776efabc971569dd6119c580d8f5d448769dec1764bf796ef2"
 dependencies = [
  "native-tls",
+ "tokio",
+]
+
+[[package]]
+name = "tokio-openssl"
+version = "0.6.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "59df6849caa43bb7567f9a36f863c447d95a11d5903c9cc334ba32576a27eadd"
+dependencies = [
+ "openssl",
+ "openssl-sys",
  "tokio",
 ]
 

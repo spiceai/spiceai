@@ -156,7 +156,7 @@ tracing-opentelemetry = "0.28"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 uuid = "1"
 x509-certificate = "0.23.1"
-mongodb = "3.2.2"
+mongodb = { version = "3.2.2", features = ["openssl-tls"] }
 
 [patch.crates-io]
 datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "0479dfdef8ecb21a6f043464fc9da5d3dc5f5902" }
