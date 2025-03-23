@@ -27,11 +27,13 @@ impl Runtime {
         let mut rx = pods_watcher.watch()?;
 
         while let Some(new_app) = rx.recv().await {
-            let mut app_lock = self.app.write().await;
-            if let Some(current_app) = app_lock.as_mut() {
+            // It is safe to operate by read lock until we actually need to update the app state
+            // as there is no other logic that can update the app, so write lock is not needed
+            let app_read_lock = self.app.read().await;
+            if let Some(current_app) = app_read_lock.as_ref() {
                 let new_app = Arc::new(new_app);
                 if *current_app == new_app {
-                    drop(app_lock);
+                    drop(app_read_lock);
                     continue;
                 }
 
@@ -43,11 +45,18 @@ impl Runtime {
                 self.apply_view_diff(current_app, &new_app);
                 self.apply_model_diff(current_app, &new_app).await;
 
+                drop(app_read_lock);
+
+                let mut app_write_lock = self.app.write().await;
+                let Some(current_app) = app_write_lock.as_mut() else {
+                    unreachable!("current app must exist");
+                };
                 *current_app = new_app;
             } else {
-                *app_lock = Some(Arc::new(new_app));
+                drop(app_read_lock);
+                let mut app_write_lock = self.app.write().await;
+                *app_write_lock = Some(Arc::new(new_app));
             }
-            drop(app_lock);
         }
 
         Ok(())

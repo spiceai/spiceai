@@ -23,10 +23,10 @@ use std::{
 use anyhow::Result;
 use flight_client::{Credentials, FlightClient};
 use spicepod::spec::SpicepodDefinition;
-use sysinfo::{Pid, ProcessesToUpdate, System};
+use sysinfo::Pid;
 use tempfile::TempDir;
 
-use crate::utils::wait_until_true;
+use crate::{process::Process, utils::wait_until_true};
 
 pub struct SpicedInstance {
     child: Child,
@@ -227,29 +227,11 @@ impl SpicedInstance {
         Ok(())
     }
 
-    /// Returns the memory usage in bytes for the process
-    pub fn memory_usage(&self) -> Result<u64> {
-        let mut system = System::new();
-        let pid = Pid::from_u32(self.child.id());
-        system.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
-
-        let Some(process) = system.process(pid) else {
-            return Err(anyhow::anyhow!("Failed to get process"));
-        };
-
-        Ok(process.memory())
-    }
-
-    /// Show the memory usage of the spiced instance in GB
-    /// Also returns the memory usage in GB as a float
-    pub fn show_memory_usage(&self) -> Result<f64> {
-        let memory_usage = self.memory_usage()?;
-        // drop memory usage to MB as a u32 before converting to GB as a float
-        // we don't really care about the fractional memory usage of KB/MB
-        let memory_usage_gb = f64::from(u32::try_from(memory_usage / 1024 / 1024)?) / 1024.0;
-        println!("Memory usage: {memory_usage_gb:.2} GB");
-
-        Ok(memory_usage_gb)
+    /// Returns an instance of a `Process` for the spiced instance
+    /// This allows tracking the spiced process, without owning the spiced instance
+    #[must_use]
+    pub fn process(&self) -> Process {
+        Process::new(Pid::from_u32(self.child.id()))
     }
 }
 

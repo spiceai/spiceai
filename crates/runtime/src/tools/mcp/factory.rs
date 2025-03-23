@@ -33,6 +33,7 @@ impl ToolCatalogFactory for McpCatalogFactory {
         &self,
         component: &Tool,
         params_with_secrets: HashMap<String, SecretString>,
+        env: HashMap<String, SecretString>,
     ) -> Result<Arc<dyn SpiceToolCatalog>, Box<dyn std::error::Error + Send + Sync>> {
         let Some(("mcp", id)) = component.from.split_once(':') else {
             return Err(format!(
@@ -43,7 +44,7 @@ impl ToolCatalogFactory for McpCatalogFactory {
         };
 
         let mcp_type = MCPType::from_str(id)?;
-        let cfg = MCPConfig::from_type(&mcp_type, &params_with_secrets);
+        let cfg = MCPConfig::from_type(&mcp_type, &params_with_secrets, &env);
 
         let ctlg = McpToolCatalog::try_new(cfg, component.name.as_str())
             .await

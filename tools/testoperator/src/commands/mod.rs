@@ -25,6 +25,7 @@ use test_framework::{
     spicepod_utils::{from_app, make_spiceai_rw_dataset, set_read_write_api_key},
 };
 
+#[cfg(feature = "append")]
 pub(crate) mod append;
 pub(crate) mod bench;
 pub(crate) mod data_consistency;
@@ -82,4 +83,17 @@ pub(crate) fn env_export(args: &CommonArgs) -> anyhow::Result<()> {
     std::io::stdin().read_line(&mut String::new())?;
 
     Ok(())
+}
+
+#[macro_export]
+macro_rules! wait_test_and_memory {
+    ($test:expr, $memory_token:expr, $memory_readings:expr) => {
+        match $test.wait().await {
+            Ok(test) => test,
+            Err(e) => {
+                observe_memory($memory_token, $memory_readings).await?;
+                return Err(e);
+            }
+        }
+    };
 }

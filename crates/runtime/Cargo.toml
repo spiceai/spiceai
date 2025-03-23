@@ -76,8 +76,9 @@ keyring = { version = "3.6.2", features = [
 ], optional = true }
 llms = { path = "../llms" }
 logos = "0.15.0"
-mcp-client = { git = "https://github.com/block/goose", package = "mcp-client", optional = true }
-mcp-core = { git = "https://github.com/block/goose", package = "mcp-core", optional = true }
+mcp-client = { git = "https://github.com/spiceai/modelcontextprotocol-rust-sdk.git", rev = "a61112adf47ffbcc591bf199d30038f661f6a6bb", package = "mcp-client", optional = true }
+mcp-core = { git = "https://github.com/spiceai/modelcontextprotocol-rust-sdk.git", rev = "a61112adf47ffbcc591bf199d30038f661f6a6bb", package = "mcp-core", optional = true }
+mcp-server = { git = "https://github.com/spiceai/modelcontextprotocol-rust-sdk.git", rev = "a61112adf47ffbcc591bf199d30038f661f6a6bb", package = "mcp-server", optional = true }
 mediatype = "0.19.18"
 model_components = { path = "../model_components" }
 mysql_async = { workspace = true, optional = true }
@@ -117,6 +118,7 @@ snafu.workspace = true
 snowflake-api = { workspace = true, optional = true }
 spicepod = { path = "../spicepod" }
 ssh2 = { workspace = true, optional = true }
+strsim = { version = "0.11.1", optional = true }
 suppaftp = { workspace = true, optional = true }
 telemetry = { path = "../telemetry" }
 tiberius = { workspace = true, optional = true }
@@ -152,7 +154,7 @@ bollard = "0.18.1"
 dirs = "5.0.1"
 flightrepl = { path = "../flightrepl" }
 hf-hub = { workspace = true }
-insta.workspace = true
+insta = { workspace = true, features = ["json"] }
 jsonpath-rust = "0.7.3"
 opentelemetry_sdk = { workspace = true, features = ["rt-tokio-current-thread"] }
 paste.workspace = true
@@ -189,13 +191,13 @@ flightsql = ["data_components/flightsql"]
 ftp = ["dep:suppaftp", "dep:ssh2"]
 imap = ["data_components/imap", "dep:imap"]
 keyring-secret-store = ["dep:keyring"]
-mcp = ["dep:mcp-client", "dep:mcp-core"]
+mcp = ["dep:mcp-client", "dep:mcp-core", "dep:mcp-server"]
 metal = ["llms/metal"]
-models = ["model_components/full"]
+models = ["model_components/full", "mcp", "dep:strsim"]
 mssql = ["dep:tiberius", "data_components/mssql"]
 mysql = ["dep:mysql_async", "db_connection_pool/mysql", "data_components/mysql"]
 odbc = ["db_connection_pool/odbc", "data_components/odbc"]
-openapi = ["dep:utoipa-swagger-ui", "dep:utoipa"]
+openapi = ["dep:utoipa-swagger-ui", "dep:utoipa", "mcp"]
 postgres = [
     "db_connection_pool/postgres",
     "data_components/postgres",
@@ -216,6 +218,7 @@ sqlite = [
     "dep:rusqlite",
 ]
 mongodb = ["dep:mongodb", "data_components/mongodb"]
+extended_tests = []
 
 [[bench]]
 harness = false

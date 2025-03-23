@@ -16,6 +16,8 @@ limitations under the License.
 
 use async_trait::async_trait;
 use catalog::SpiceToolCatalog;
+#[cfg(feature = "mcp")]
+use mcp::McpProxy;
 use serde_json::Value;
 use std::{borrow::Cow, sync::Arc};
 
@@ -82,4 +84,53 @@ pub trait SpiceModelTool: Sync + Send {
         arg: &str,
         rt: Arc<Runtime>,
     ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>>;
+
+    /// If the tool is a proxy around an MCP tool, this method should return the proxy. Otherwise, it should return None.
+    ///
+    /// This enables direct pass through of MCP tool calls.
+    #[cfg(feature = "mcp")]
+    async fn as_mcp_proxy(&self) -> Option<&dyn McpProxy> {
+        None
+    }
+}
+
+/// Recreate a tool with a new name.
+///
+/// Underlying tool is not modified.
+pub fn with_name(tool: &Arc<dyn SpiceModelTool>, name: &str) -> Arc<dyn SpiceModelTool> {
+    Arc::new(RenamedTool {
+        name: name.into(),
+        tool: Arc::clone(tool),
+    })
+}
+
+/// Wraps [`SpiceModelTool`]s to enable renaming them.
+///
+/// Not intended for broad use, solely [`with_name`].
+struct RenamedTool {
+    name: String,
+    tool: Arc<dyn SpiceModelTool>,
+}
+
+#[async_trait]
+impl SpiceModelTool for RenamedTool {
+    fn name(&self) -> Cow<'_, str> {
+        Cow::Borrowed(&self.name)
+    }
+
+    fn description(&self) -> Option<Cow<'_, str>> {
+        self.tool.description()
+    }
+
+    fn parameters(&self) -> Option<Value> {
+        self.tool.parameters()
+    }
+
+    async fn call(
+        &self,
+        arg: &str,
+        rt: Arc<Runtime>,
+    ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+        self.tool.call(arg, rt).await
+    }
 }

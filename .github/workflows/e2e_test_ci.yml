@@ -1611,3 +1611,121 @@ jobs:
         run: |
           killall spice || true
           cat spice.log
+
+  graceful_shutdown_test:
+    name: 'DuckDB graceful shutdown on ${{ matrix.target.name }}'
+    runs-on: ${{ matrix.target.runner }}
+    needs:
+      - build
+      - setup-matrix
+    timeout-minutes: 5
+
+    strategy:
+      matrix:
+        target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
+        # run only on "Linux x64"
+        exclude:
+          - target:
+              target_os: 'darwin'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
+        uses: actions/download-artifact@v4
+        with:
+          name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
+          path: ./build
+
+      - name: Install spice
+        uses: ./.github/actions/install-spice
+        with:
+          build-path: ./build
+
+      - name: check installation
+        run: |
+          spice version
+
+      - name: Install DuckDB CLI
+        run: |
+          curl https://install.duckdb.org | sh
+          echo "$HOME/.duckdb/cli/latest" >> $GITHUB_PATH
+
+      - name: Install oha (macOS)
+        if: matrix.target.target_os == 'darwin'
+        run: |
+          brew install oha
+
+      - name : Install oha (Linux)
+        if: matrix.target.target_os == 'linux'
+        working-directory: ./test/spicepods/tpch/accelerated/constraints
+        run: |
+          wget -O oha https://github.com/hatoo/oha/releases/latest/download/oha-linux-amd64
+          chmod +x ./oha
+          ./oha --version
+
+      - name: Start append data simulation
+        working-directory: ./test/spicepods/tpch/accelerated/constraints
+        run: |
+          ./simulate_append_data.sh &
+
+      - name: Configure Spicepod
+        working-directory: ./test/spicepods/tpch/accelerated/constraints
+        run: |
+          mv duckdb_append_with_pk_and_indexes.yaml spicepod.yaml
+          cat spicepod.yaml
+
+      - name: Start Spice runtime
+        working-directory: ./test/spicepods/tpch/accelerated/constraints
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          spice run &> spice.log &
+
+      - name: Wait for dataset to be ready
+        working-directory: ./test/spicepods/tpch/accelerated/constraints
+        timeout-minutes: 1
+        run: |
+          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
+
+      - name: Run test workfload for 30s
+        working-directory: ./test/spicepods/tpch/accelerated/constraints
+        run: |
+          ./oha --method POST "http://127.0.0.1:8090/v1/sql" -D append_query.sql -z 30s -c 10
+
+      - name: Send SIGTERM to Spice
+        working-directory: ./test/spicepods/tpch/accelerated/constraints
+        timeout-minutes: 0.5
+        run: |
+          killall spice
+          while pgrep spice > /dev/null; do sleep 1; done
+
+      - name: Verify local DuckDB database
+        working-directory: ./test/spicepods/tpch/accelerated/constraints
+        run: |
+          ls -la .spice/data
+  
+          if [ -f .spice/data/accelerated_duckdb.db ]; then
+            echo "Verification successful: accelerated_duckdb.db exists."
+          else
+            echo "Verification failed: accelerated_duckdb.db does not exist."
+            exit 1
+          fi
+
+          if [ ! -f .spice/data/accelerated_duckdb.db.wal ]; then
+            echo "Verification successful: accelerated_duckdb.db.wal does not exist."
+          else
+            echo "Verification failed: accelerated_duckdb.db.wal exists."
+            exit 1
+          fi
+  
+      - name: Check logs
+        working-directory: ./test/spicepods/tpch/accelerated/constraints
+        if: always()
+        run: |
+          killall spice || true
+          cat spice.log
+          if grep -iE "(failed|error)" spice.log; then
+            echo "Failures detected in spice.log"
+            exit 1
+          fi

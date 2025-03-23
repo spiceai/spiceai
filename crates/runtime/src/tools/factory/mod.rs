@@ -40,10 +40,11 @@ impl ToolFactory {
         &self,
         component: &Tool,
         params_with_secrets: HashMap<String, SecretString>,
+        env: HashMap<String, SecretString>,
     ) -> Result<Tooling, Box<dyn std::error::Error + Send + Sync>> {
         match self {
             ToolFactory::Catalog(c) => c
-                .construct(component, params_with_secrets)
+                .construct(component, params_with_secrets, env)
                 .await
                 .map(Into::into),
             ToolFactory::Tool(t) => t.construct(component, params_with_secrets).map(Into::into),
@@ -79,6 +80,7 @@ pub trait ToolCatalogFactory: Send + Sync {
         &self,
         component: &Tool,
         params_with_secrets: HashMap<String, SecretString>,
+        env: HashMap<String, SecretString>,
     ) -> Result<Arc<dyn SpiceToolCatalog>, Box<dyn std::error::Error + Send + Sync>>;
 }
 
@@ -121,6 +123,7 @@ pub fn default_available_catalogs() -> Vec<Arc<dyn SpiceToolCatalog>> {
 pub async fn forge(
     component: &Tool,
     secrets: HashMap<String, SecretString>,
+    env: HashMap<String, SecretString>,
 ) -> Result<Tooling, Box<dyn std::error::Error + Send + Sync>> {
     let from_source = component
         .from
@@ -130,7 +133,7 @@ pub async fn forge(
     let registry = TOOL_SHED_FACTORY.lock().await;
 
     match registry.get(from_source) {
-        Some(factory) => factory.construct(component, secrets).await,
+        Some(factory) => factory.construct(component, secrets, env).await,
         None => Err(format!("Tool factory not found for source: {from_source}").into()),
     }
 }

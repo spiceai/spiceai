@@ -1,0 +1,14 @@
+---
+source: crates/test-framework/src/spicetest/datasets/worker.rs
+description: "Query: tpcds_q99"
+---
++-------------------------------------------------------+-----------+----------+---------+------------+------------+-------------+-----------+
+| substr(warehouse.w_warehouse_name,Int64(1),Int64(20)) | sm_type   | cc_name  | 30 days | 31-60 days | 61-90 days | 91-120 days | >120 days |
++-------------------------------------------------------+-----------+----------+---------+------------+------------+-------------+-----------+
+| Conventional childr                                   | EXPRESS   | NY Metro | 5497    | 5888       | 5596       | 0           | 0         |
+| Conventional childr                                   | LIBRARY   | NY Metro | 4066    | 4338       | 4265       | 0           | 0         |
+| Conventional childr                                   | NEXT DAY  | NY Metro | 5489    | 5822       | 5628       | 0           | 0         |
+| Conventional childr                                   | OVERNIGHT | NY Metro | 4103    | 4232       | 4359       | 0           | 0         |
+| Conventional childr                                   | REGULAR   | NY Metro | 4211    | 4327       | 4298       | 0           | 0         |
+| Conventional childr                                   | TWO DAY   | NY Metro | 4104    | 4288       | 4285       | 0           | 0         |
++-------------------------------------------------------+-----------+----------+---------+------------+------------+-------------+-----------+

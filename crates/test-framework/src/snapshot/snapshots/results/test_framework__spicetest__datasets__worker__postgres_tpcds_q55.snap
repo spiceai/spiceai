@@ -1,0 +1,18 @@
+---
+source: crates/test-framework/src/spicetest/datasets/worker.rs
+description: "Query: tpcds_q55"
+---
++----------+----------------------+-----------+
+| brand_id | brand                | ext_price |
++----------+----------------------+-----------+
+| 5001001  | amalgscholar #1      | 63210.35  |
+| 10008003 | namelessunivamalg #3 | 40660.57  |
+| 4001001  | amalgedu pack #1     | 37965.31  |
+| 2001001  | amalgimporto #1      | 37821.59  |
+| 3003002  | exportiexporti #2    | 37736.84  |
+| 3001001  | amalgexporti #1      | 37015.07  |
+| 9015008  | scholarunivamalg #8  | 36910.29  |
+| 10013006 | exportiamalgamalg #6 | 35078.79  |
+| 7010005  | univnameless #5      | 32956.29  |
+| 8005003  | scholarnameless #3   | 31513.43  |
++----------+----------------------+-----------+

@@ -40,3 +40,5 @@ sharepoint = []
 snowflake = []
 spark = []
 sqlite = []
+
+append = ["test-framework/file_append"]

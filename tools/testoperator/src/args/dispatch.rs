@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use clap::{Parser, ValueEnum};
+use clap::{ArgAction, Parser, ValueEnum};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use test_framework::{queries::QuerySet, TestType};
@@ -41,6 +41,9 @@ pub struct DispatchArgs {
 
     #[arg(long, env = "WORKFLOW_COMMIT", default_value = "trunk")]
     pub(crate) workflow_commit: String,
+
+    #[arg(long, default_value = "false", action = ArgAction::Set)]
+    pub(crate) update_snapshots: bool,
 }
 
 #[derive(Debug, Copy, Clone, ValueEnum)]
@@ -92,6 +95,33 @@ pub struct BenchArgs {
     pub query_overrides: Option<QueryOverridesArg>,
     pub ready_wait: Option<u64>,
     pub runner_type: RunnerType,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub update_snapshots: Option<UpdateSnapshots>,
+}
+
+impl BenchArgs {
+    #[must_use]
+    pub fn with_update_snapshots(mut self, update_snapshots: UpdateSnapshots) -> Self {
+        self.update_snapshots = Some(update_snapshots);
+        self
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UpdateSnapshots {
+    Always,
+    No,
+}
+
+impl From<bool> for UpdateSnapshots {
+    fn from(value: bool) -> Self {
+        if value {
+            UpdateSnapshots::Always
+        } else {
+            UpdateSnapshots::No
+        }
+    }
 }
 
 /// Load workflow arguments, defined in the test files

@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use super::get_app_and_start_request;
-use crate::args::DatasetTestArgs;
+use crate::{args::DatasetTestArgs, wait_test_and_memory};
 use std::time::Duration;
 use test_framework::{
     anyhow,
@@ -27,6 +27,8 @@ use test_framework::{
         datasets::{EndCondition, NotStarted},
         SpiceTest,
     },
+    tokio_util::sync::CancellationToken,
+    utils::observe_memory,
     TestType,
 };
 
@@ -77,6 +79,8 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
     let records = baseline_metrics.build_records()?;
     print_batches(&records)?;
     let spiced_instance = test.end()?;
+    let memory_token = CancellationToken::new();
+    let memory_readings = spiced_instance.process().watch_memory(&memory_token);
 
     // load test
     println!("Running load test");
@@ -94,20 +98,20 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
     .start()
     .await?;
 
-    let test = throughput_test.wait().await?;
+    let test = wait_test_and_memory!(throughput_test, memory_token, memory_readings);
     let test_durations = test.get_query_durations().statistical_set()?;
     let metrics: QueryMetrics<_, NoExtendedMetrics> = test.collect(TestType::Load)?;
     let mut spiced_instance = test.end()?;
+    let (max_memory, _) = observe_memory(memory_token, memory_readings).await?;
 
     println!("Baseline metrics:");
     let baseline_records = baseline_metrics.build_records()?;
     print_batches(&baseline_records)?;
     println!("{}", vec!["-"; 30].join(""));
     println!("Load test metrics:");
-    let records = metrics.build_records()?;
+    let records = metrics.with_memory_usage(max_memory).build_records()?;
     print_batches(&records)?;
 
-    spiced_instance.show_memory_usage()?;
     spiced_instance.stop()?;
 
     let mut test_passed = true;

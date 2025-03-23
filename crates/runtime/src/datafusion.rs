@@ -375,12 +375,7 @@ impl DataFusion {
                     self.ctx
                         .register_table(
                             dataset_table_ref.clone(),
-                            Arc::new(
-                                Arc::new(accelerated_table)
-                                    .create_federated_table_provider()
-                                    .map_err(find_datafusion_root)
-                                    .context(UnableToRegisterTableToDataFusionSnafu)?,
-                            ),
+                            Arc::new(Arc::new(accelerated_table).create_federated_table_provider()),
                         )
                         .map_err(find_datafusion_root)
                         .context(UnableToRegisterTableToDataFusionSnafu)?;
@@ -837,6 +832,8 @@ impl DataFusion {
 
         accelerated_table_builder.zero_results_action(acceleration_settings.on_zero_results);
 
+        accelerated_table_builder.refresh_on_startup(acceleration_settings.refresh_on_startup);
+
         accelerated_table_builder.ready_state(dataset.ready_state);
 
         accelerated_table_builder.cache_provider(self.cache_provider());
@@ -954,12 +951,7 @@ impl DataFusion {
         self.ctx
             .register_table(
                 dataset.name.clone(),
-                Arc::new(
-                    Arc::new(accelerated_table)
-                        .create_federated_table_provider()
-                        .map_err(find_datafusion_root)
-                        .context(UnableToRegisterTableToDataFusionSnafu)?,
-                ),
+                Arc::new(Arc::new(accelerated_table).create_federated_table_provider()),
             )
             .map_err(find_datafusion_root)
             .context(UnableToRegisterTableToDataFusionSnafu)?;

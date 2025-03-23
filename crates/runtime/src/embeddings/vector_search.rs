@@ -694,6 +694,21 @@ impl VectorSearch {
             // If the dataset has no primary keys, we use an additional surrogate temp table and a generated primary key.
             // An alternative approach is using the full content as the primary key, but it is less efficient as primary keys
             // are duplicated along with unnest, resulting in large memory allocation and inefficient final selection (join condition).
+
+            // embedding_column is always added so we must filter it out from the projection if it is duplicated in the additional columns.
+            let additional_columns = {
+                let filtered: Vec<_> = projection
+                    .iter()
+                    .filter(|&c| c != embedding_column)
+                    .collect();
+
+                if filtered.is_empty() {
+                    String::new()
+                } else {
+                    format!("{},", filtered.iter().join(", "))
+                }
+            };
+
             let distances_table =  format!(
                     "WITH {VSS_TEMP_TABLE_NAME} AS (
                         SELECT 
@@ -713,12 +728,7 @@ impl VectorSearch {
                         FROM {VSS_TEMP_TABLE_NAME}
                     )",
                     embed_col_offset=offset_col!(quote_identifier(embedding_column).to_string()),
-                    embed_col_embedding=embedding_col!(quote_identifier(embedding_column).to_string()),
-                    additional_columns = if projection.is_empty() {
-                        String::new()
-                    } else {
-                        format!("{},", projection.iter().join(", "))
-                    },
+                    embed_col_embedding=embedding_col!(quote_identifier(embedding_column).to_string())
                 );
 
             (
