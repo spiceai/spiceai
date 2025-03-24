@@ -130,6 +130,8 @@ impl TableProvider for ImapTableProvider {
 
 
 
+            //FIXME: These contain the extracted text/html or text/plain user-content sections
+            // field names feel clunky.
             Field::new(
                 "body_content_records",
                 DataType::List(Arc::new(Field::new_list_field(
@@ -148,6 +150,9 @@ impl TableProvider for ImapTableProvider {
         if self.fetch_content {
             fields.push(Field::new("content", DataType::Utf8, true));
         }
+
+        
+        fields.push(Field::new("headers", DataType::Utf8, true));
 
         Arc::new(Schema::new(fields))
     }
@@ -218,34 +223,46 @@ impl TableProvider for ImapTableProvider {
 
 
 
-            let (attachment_records, body_content_records) =
+            //FIXME: tuple is quick but crude. fragile if order of ret values inside the {} changes for any reason.
+            let (attachment_records, body_content_records, headers) =
                 if let Some(body_raw) = body_raw {
                     let eml_msg = MessageParser::default().parse(&body_raw);
 
-                    let ret_tpl = if let Some(eml_msg) = eml_msg {
+                    let ret = if let Some(eml_msg) = eml_msg {
                         let attachment_records = AttachmentRecords::try_from(&eml_msg, self.fetch_content).ok();
                         let body_content_records = ContentRecords::try_from(&eml_msg).ok();
 
-                        (attachment_records, body_content_records)
+                        //reconstruct the email headers into a string blob
+                        let headers_blob: String = eml_msg.headers_raw()
+                            .map(|(k, v)| format!("{}:{}", k, v))
+                            .collect::<Vec<_>>()
+                            .join("");
+                        //println!("headers blob: [{}]", headers_blob);
+
+                        (
+                            attachment_records,
+                            body_content_records,
+                            Some(headers_blob),
+                        )
+
                     } else {
-                        (None, None)
+                        (None,None,None)
                     };
 
-                    ret_tpl
+                    ret
                 }else{
-                    (None,None)
+                    (None,None,None)
                 };
+
 
 
             //FIXME: this is ugly and all we're doing is acting as a getter
             let attachments = attachment_records
                 .map_or(None, |records| Some(records.attachments));
 
-
             //FIXME: this is ugly and all we're doing is acting as a getter
             let body_content_records = body_content_records
                 .map_or(None, |records| Some(records.sections));
-
 
 
 
@@ -261,7 +278,8 @@ impl TableProvider for ImapTableProvider {
                 in_reply_to,
                 body,
                 attachments,
-                body_content_records
+                body_content_records,
+                headers,
             });
         }
 

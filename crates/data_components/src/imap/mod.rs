@@ -159,6 +159,7 @@ impl ImapTableProvider {
         let mut bodies = vec![];
         let mut attachments = vec![];
         let mut body_content_records = vec![];
+        let mut headers = vec![];
 
         for message in messages {
             dates.push(message.date);
@@ -172,6 +173,7 @@ impl ImapTableProvider {
             in_reply_tos.push(message.in_reply_to);
             bodies.push(message.body);
             body_content_records.push(message.body_content_records);
+            headers.push(message.headers);
         }
 
         let mut fields: Vec<ArrayRef> = vec![
@@ -186,6 +188,7 @@ impl ImapTableProvider {
             Arc::new(StringArray::from(in_reply_tos)),
             Arc::new(build_listarray_for_attachments(attachments)),
             //Arc::new(build_listarray_for_attachments(attachments)), //FIXME: body_content_records
+            //Arc::new(StringArray::from(headers)), //FIXME: headers
         ];
 
         if self.fetch_content {
@@ -215,5 +218,6 @@ pub(crate) struct EmailMessage {
     body: Option<String>,
     attachments: Option<Vec<AttachmentInfo>>,
     body_content_records: Option<Vec<ContentInfo>>,
+    headers: Option<String>,
 }
 
