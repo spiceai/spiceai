@@ -25,6 +25,7 @@ use datafusion::{
     logical_expr::Expr,
     physical_plan::ExecutionPlan,
 };
+use mail_parser::MessageParser;
 use mailparse::{dateparse};
 use snafu::prelude::*;
 
@@ -33,6 +34,7 @@ use super::{
     EmailMessage, Error, FailedToLogoutSnafu, FailedToParseHeaderSnafu, FetchMessagesSnafu,
     GetMailboxStatusSnafu, ImapTableProvider,
     attachments::AttachmentRecords,
+    body_content::ContentRecords,
 };
 
 fn decode_string(value: &[u8]) -> String {
@@ -118,12 +120,29 @@ impl TableProvider for ImapTableProvider {
                    DataType::Struct(Fields::from(vec![
                        Field::new("filename", DataType::Utf8, true),
                        Field::new("mime_type", DataType::Utf8, true),
+                       //FIXME:         if self.fetch_content { ??
                        Field::new("blob", DataType::Binary, true),
                    ])),
                    true,
                ))),
                true,
            ),
+
+
+
+            Field::new(
+                "body_content_records",
+                DataType::List(Arc::new(Field::new_list_field(
+                    DataType::Struct(Fields::from(vec![
+                        Field::new("content", DataType::Utf8, true),
+                        Field::new("mime_type", DataType::Utf8, true),
+                    ])),
+                    true,
+                ))),
+                true,
+            ),
+
+
         ];
 
         if self.fetch_content {
@@ -198,16 +217,36 @@ impl TableProvider for ImapTableProvider {
             };
 
 
-            let attachment_records = body_raw
-                .as_ref()
-                .and_then(|body|
-                              {
-                                  AttachmentRecords::try_from(&body, self.fetch_content).ok()
-                              }
-                );
 
+            let (attachment_records, body_content_records) =
+                if let Some(body_raw) = body_raw {
+                    let eml_msg = MessageParser::default().parse(&body_raw);
+
+                    let ret_tpl = if let Some(eml_msg) = eml_msg {
+                        let attachment_records = AttachmentRecords::try_from(&eml_msg, self.fetch_content).ok();
+                        let body_content_records = ContentRecords::try_from(&eml_msg).ok();
+
+                        (attachment_records, body_content_records)
+                    } else {
+                        (None, None)
+                    };
+
+                    ret_tpl
+                }else{
+                    (None,None)
+                };
+
+
+            //FIXME: this is ugly and all we're doing is acting as a getter
             let attachments = attachment_records
                 .map_or(None, |records| Some(records.attachments));
+
+
+            //FIXME: this is ugly and all we're doing is acting as a getter
+            let body_content_records = body_content_records
+                .map_or(None, |records| Some(records.sections));
+
+
 
 
             messages.push(EmailMessage {
@@ -221,7 +260,8 @@ impl TableProvider for ImapTableProvider {
                 message_id,
                 in_reply_to,
                 body,
-                attachments
+                attachments,
+                body_content_records
             });
         }
 

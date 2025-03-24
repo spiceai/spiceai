@@ -27,11 +27,13 @@ use datafusion::{catalog::TableProvider, error::DataFusionError};
 use session::ImapSession;
 use snafu::prelude::*;
 use crate::imap::attachments::AttachmentInfo;
+use crate::imap::body_content::ContentInfo;
 
 pub mod provider;
 pub mod session;
 
 mod attachments;
+mod body_content;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -156,6 +158,7 @@ impl ImapTableProvider {
         let mut in_reply_tos = vec![];
         let mut bodies = vec![];
         let mut attachments = vec![];
+        let mut body_content_records = vec![];
 
         for message in messages {
             dates.push(message.date);
@@ -168,7 +171,7 @@ impl ImapTableProvider {
             message_ids.push(message.message_id);
             in_reply_tos.push(message.in_reply_to);
             bodies.push(message.body);
-            attachments.push(message.attachments);
+            body_content_records.push(message.body_content_records);
         }
 
         let mut fields: Vec<ArrayRef> = vec![
@@ -182,6 +185,7 @@ impl ImapTableProvider {
             Arc::new(StringArray::from(message_ids)),
             Arc::new(StringArray::from(in_reply_tos)),
             Arc::new(build_listarray_for_attachments(attachments)),
+            //Arc::new(build_listarray_for_attachments(attachments)), //FIXME: body_content_records
         ];
 
         if self.fetch_content {
@@ -210,5 +214,6 @@ pub(crate) struct EmailMessage {
     in_reply_to: Option<String>,
     body: Option<String>,
     attachments: Option<Vec<AttachmentInfo>>,
+    body_content_records: Option<Vec<ContentInfo>>,
 }
 
