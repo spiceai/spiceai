@@ -270,7 +270,7 @@ dependencies = [
  "strum_macros 0.26.4",
  "thiserror 1.0.69",
  "typed-builder 0.19.1",
- "uuid 1.13.1",
+ "uuid 1.16.0",
 ]
 
 [[package]]
@@ -592,7 +592,7 @@ dependencies = [
  "clickhouse-rs",
  "datafusion-table-providers",
  "snafu",
- "uuid 1.13.1",
+ "uuid 1.16.0",
 ]
 
 [[package]]
@@ -1085,7 +1085,7 @@ dependencies = [
  "percent-encoding",
  "pin-project-lite",
  "tracing",
- "uuid 1.13.1",
+ "uuid 1.16.0",
 ]
 
 [[package]]
@@ -1554,7 +1554,7 @@ dependencies = [
  "time",
  "tracing",
  "url",
- "uuid 1.13.1",
+ "uuid 1.16.0",
 ]
 
 [[package]]
@@ -1594,7 +1594,7 @@ dependencies = [
  "time",
  "tracing",
  "url",
- "uuid 1.13.1",
+ "uuid 1.16.0",
 ]
 
 [[package]]
@@ -1615,7 +1615,7 @@ dependencies = [
  "time",
  "tracing",
  "url",
- "uuid 1.13.1",
+ "uuid 1.16.0",
 ]
 
 [[package]]
@@ -2668,7 +2668,7 @@ dependencies = [
  "tokio",
  "tokio-native-tls",
  "url",
- "uuid 1.13.1",
+ "uuid 1.16.0",
 ]
 
 [[package]]
@@ -3204,7 +3204,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
- "uuid 1.13.1",
+ "uuid 1.16.0",
 ]
 
 [[package]]
@@ -3258,7 +3258,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "url",
- "uuid 1.13.1",
+ "uuid 1.16.0",
  "xz2",
  "zstd",
 ]
@@ -3412,7 +3412,7 @@ dependencies = [
  "regex",
  "sha2",
  "unicode-segmentation",
- "uuid 1.13.1",
+ "uuid 1.16.0",
 ]
 
 [[package]]
@@ -3676,7 +3676,7 @@ dependencies = [
  "tracing",
  "trust-dns-resolver",
  "url",
- "uuid 1.13.1",
+ "uuid 1.16.0",
 ]
 
 [[package]]
@@ -3752,7 +3752,7 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
- "uuid 1.13.1",
+ "uuid 1.16.0",
  "visibility",
  "z85",
 ]
@@ -5144,7 +5144,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "url",
- "uuid 1.13.1",
+ "uuid 1.16.0",
  "x509-parser",
 ]
 
@@ -5198,7 +5198,7 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
- "uuid 1.13.1",
+ "uuid 1.16.0",
 ]
 
 [[package]]
@@ -5394,7 +5394,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "url",
- "uuid 1.13.1",
+ "uuid 1.16.0",
  "whoami",
 ]
 
@@ -5896,7 +5896,7 @@ dependencies = [
  "tokio",
  "typed-builder 0.20.0",
  "url",
- "uuid 1.13.1",
+ "uuid 1.16.0",
  "zstd",
 ]
 
@@ -5923,7 +5923,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "typed-builder 0.20.0",
- "uuid 1.13.1",
+ "uuid 1.16.0",
 ]
 
 [[package]]
@@ -6720,7 +6720,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc2f4eb4bc735547cfed7c0a4922cbd04a4655978c09b54f1f7b228750664c34"
 dependencies = [
  "cfg-if",
- "windows-targets 0.52.6",
+ "windows-targets 0.48.5",
 ]
 
 [[package]]
@@ -7488,7 +7488,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "ureq",
- "uuid 1.13.1",
+ "uuid 1.16.0",
  "variantly",
  "vob",
 ]
@@ -7593,7 +7593,7 @@ dependencies = [
  "smallvec",
  "tagptr",
  "thiserror 1.0.69",
- "uuid 1.13.1",
+ "uuid 1.16.0",
 ]
 
 [[package]]
@@ -7731,7 +7731,7 @@ dependencies = [
  "subprocess",
  "thiserror 1.0.69",
  "time",
- "uuid 1.13.1",
+ "uuid 1.16.0",
  "zstd",
 ]
 
@@ -8441,7 +8441,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
- "uuid 1.13.1",
+ "uuid 1.16.0",
 ]
 
 [[package]]
@@ -9195,7 +9195,7 @@ dependencies = [
  "postgres-protocol",
  "serde",
  "serde_json",
- "uuid 1.13.1",
+ "uuid 1.16.0",
 ]
 
 [[package]]
@@ -10275,7 +10275,7 @@ dependencies = [
  "rkyv_derive",
  "seahash",
  "tinyvec",
- "uuid 1.13.1",
+ "uuid 1.16.0",
 ]
 
 [[package]]
@@ -10470,7 +10470,7 @@ dependencies = [
  "util",
  "utoipa",
  "utoipa-swagger-ui",
- "uuid 1.13.1",
+ "uuid 1.16.0",
  "winver",
  "x509-certificate",
 ]
@@ -11377,7 +11377,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "url",
- "uuid 1.13.1",
+ "uuid 1.16.0",
 ]
 
 [[package]]
@@ -11433,7 +11433,7 @@ dependencies = [
  "tonic",
  "tonic-build",
  "url",
- "uuid 1.13.1",
+ "uuid 1.16.0",
 ]
 
 [[package]]
@@ -11992,7 +11992,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tonic",
- "uuid 1.13.1",
+ "uuid 1.16.0",
 ]
 
 [[package]]
@@ -12178,7 +12178,7 @@ dependencies = [
  "tokio-rustls 0.24.1",
  "tokio-util",
  "tracing",
- "uuid 1.13.1",
+ "uuid 1.16.0",
 ]
 
 [[package]]
@@ -13123,7 +13123,7 @@ dependencies = [
  "tracing",
  "typespec",
  "url",
- "uuid 1.13.1",
+ "uuid 1.16.0",
 ]
 
 [[package]]
@@ -13396,9 +13396,9 @@ dependencies = [
 
 [[package]]
 name = "uuid"
-version = "1.13.1"
+version = "1.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ced87ca4be083373936a67f8de945faa23b6b42384bd5b64434850802c6dccd0"
+checksum = "458f7a779bf54acc9f347480ac654f68407d3aab21269a6e3c9f922acd9e2da9"
 dependencies = [
  "getrandom 0.3.1",
  "rand 0.9.0",
