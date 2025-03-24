@@ -24,8 +24,10 @@ impl MongoDB {
     ) -> DataConnectorResult<ClientOptions> {
         let mut client_options;
 
-        if connection_string.contains("tlsAllowInvalidHostnames=true")
-            || connection_string.contains("sslAllowInvalidHostnames=true") { // suppose user is trying to connect documentdb through ssh tunneling
+        let is_allowing_tls_invalid_hostnames = Regex::new(r"(?i:(tls|ssl)allowinvalidhostnames)=true").unwrap()
+            .is_match(connection_string.as_str());
+
+        if is_allowing_tls_invalid_hostnames { // suppose user is trying to connect documentdb through ssh tunneling
             let parsable_connection_string = Self::remove_tls_allow_invalid_hostnames_option(connection_string.as_str());
 
             client_options = ClientOptions::parse(parsable_connection_string).await
@@ -73,7 +75,7 @@ impl MongoDB {
     }
 
     fn remove_tls_allow_invalid_hostnames_option(connection_string: &str) -> String {
-        let target_regex = Regex::new(r"(&)?(tls|ssl)AllowInvalidHostnames=true").unwrap();
+        let target_regex = Regex::new(r"(&)?(?i:(tls|ssl)allowinvalidhostnames)=true").unwrap();
         let cleaned = target_regex.replace_all(connection_string, "").to_string();
 
         cleaned
