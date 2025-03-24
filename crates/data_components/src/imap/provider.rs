@@ -29,14 +29,13 @@ use mailparse::{dateparse};
 use snafu::prelude::*;
 
 use crate::arrow::write::MemTable;
-use crate::imap::attachments::AttachmentParseOptions;
 use super::{
     EmailMessage, Error, FailedToLogoutSnafu, FailedToParseHeaderSnafu, FetchMessagesSnafu,
     GetMailboxStatusSnafu, ImapTableProvider,
     attachments::AttachmentRecords,
 };
 
-fn decode(value: &[u8]) -> String {
+fn decode_string(value: &[u8]) -> String {
     match String::from_utf8(value.to_vec()) {
         Ok(s) => s,
         Err(_) => charset::decode_latin1(value).to_string(),
@@ -51,8 +50,8 @@ macro_rules! parse_addreses_from_envelope {
             .map(|v| {
                 let mut froms = vec![];
                 for address in v {
-                    let mailbox = address.mailbox.as_ref().map(|v| decode(v));
-                    let host = address.host.as_ref().map(|v| decode(v));
+                    let mailbox = address.mailbox.as_ref().map(|v| decode_string(v));
+                    let host = address.host.as_ref().map(|v| decode_string(v));
                     match (mailbox, host) {
                         (Some(mailbox), Some(host)) => {
                             froms.push(Some(format!("{mailbox}@{host}")));
@@ -169,15 +168,15 @@ impl TableProvider for ImapTableProvider {
             let envelope = message.envelope().ok_or(Error::EnvelopeNotFound {
                 segment: "envelope".to_string(),
             })?;
-            let subject = envelope.subject.as_ref().map(|v| decode(v));
-            let date = dateparse(&decode(envelope.date.as_ref().ok_or(
-                Error::EnvelopeNotFound {
+            let subject = envelope.subject.as_ref().map(|v| decode_string(v));
+            let date = dateparse(&decode_string(envelope.date.as_ref().ok_or( //FIXME: mailparse crate is used here only?
+                                                                              Error::EnvelopeNotFound {
                     segment: "date".to_string(),
                 },
             )?))
             .context(FailedToParseHeaderSnafu)?;
-            let message_id = envelope.message_id.as_ref().map(|v| decode(v));
-            let in_reply_to = envelope.in_reply_to.as_ref().map(|v| decode(v));
+            let message_id = envelope.message_id.as_ref().map(|v| decode_string(v));
+            let in_reply_to = envelope.in_reply_to.as_ref().map(|v| decode_string(v));
             let message_froms = parse_addreses_from_envelope!(envelope, from);
             let message_tos = parse_addreses_from_envelope!(envelope, to);
             let message_ccs = parse_addreses_from_envelope!(envelope, cc);
@@ -186,8 +185,9 @@ impl TableProvider for ImapTableProvider {
 
             //we need this data to decode attachments and other headers.
             //it is optionally stored in the Spice records
-            let body_raw = message.body().as_ref().map(|v| decode(v));
+            let body_raw = message.body().as_ref().map(|v| decode_string(v));
 
+            //"body" is consumed by messages.push()
             let body = if self.fetch_content {
                 //FIXME: rename flag from fetch_content to store_content?
                 // body data seems to be always fetched and optionally stored.
@@ -202,14 +202,7 @@ impl TableProvider for ImapTableProvider {
                 .as_ref()
                 .and_then(|body|
                               {
-                                  //FIXME: this only exists so I can pass two args into the try_from trait impl
-                                  // might be a better way?
-                                  // try_from(&String) seemed cheaper as there was no clone.
-                                  let options = AttachmentParseOptions{
-                                      raw_email: body.clone(), //FIXME: eww. clone. lambda/closure param instance.
-                                      store_blobs: self.fetch_content,
-                                  };
-                                  AttachmentRecords::try_from(options).ok()
+                                  AttachmentRecords::try_from(&body, self.fetch_content).ok()
                               }
                 );
 

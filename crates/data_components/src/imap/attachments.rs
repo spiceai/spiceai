@@ -55,22 +55,23 @@ pub struct AttachmentRecords{
 //     }
 // }
 
+//
+// pub struct AttachmentParseOptions{
+//     pub raw_email: String,
+//     pub store_blobs: bool, //spend cpu decoding the attachments from base64/other
+// }
 
-pub struct AttachmentParseOptions{
-    pub raw_email: String,
-    pub store_blobs: bool, //spend cpu decoding the attachments from base64/other
-}
 
 
+// impl TryFrom<AttachmentParseOptions> for AttachmentRecords {
+//     type Error = String;
 
-impl TryFrom<AttachmentParseOptions> for AttachmentRecords {
-    type Error = String;
-
-    fn try_from(options: AttachmentParseOptions) -> Result<Self, Self::Error> {
+impl AttachmentRecords{
+    pub fn try_from(raw_email: &str, store_blobs: bool) -> Result<Self, String> {
 
         let mut attachments = Vec::<AttachmentInfo>::new();
 
-        if let Some(message) = MessageParser::default().parse(&options.raw_email) {
+        if let Some(message) = MessageParser::default().parse(raw_email) {
 
             for attachment in message.attachments() {
 
@@ -109,7 +110,7 @@ impl TryFrom<AttachmentParseOptions> for AttachmentRecords {
 
                 //attachments are decoded automatically by mail_parse
                 //encoding type is available. not sure if encoded bytes are.
-                let attachment_blob = if options.store_blobs {
+                let attachment_blob = if store_blobs {
                     Some(
                         attachment.contents().to_vec()
                     )
@@ -170,10 +171,8 @@ fn eml_utf8() {
     // If the Content-Disposition header has a filename= AND a filename*0*= field the fallback field
     // is used as the first component of the reconstructed long filename.
 
-    let options = AttachmentParseOptions{ raw_email, store_blobs: false };
-
     // println!("\nutf8 check");
-    let attachment_records = AttachmentRecords::try_from( options ).unwrap();
+    let attachment_records = AttachmentRecords::try_from( &raw_email,false ).unwrap();
 
     let extracted_set = attachment_records.attachments;
     // for rec in &collated{
@@ -226,10 +225,8 @@ fn eml_utf8() {
 fn eml_no_attachments(){
     let raw_email = include_str!("test_data/no_attachments.txt").to_string(); // Load an email file
 
-    let options = AttachmentParseOptions{ raw_email, store_blobs: false };
-
     // println!("\nno attachments");
-    let attachment_records = AttachmentRecords::try_from( options );
+    let attachment_records = AttachmentRecords::try_from( &raw_email,false );
 
     assert!( attachment_records.is_err() );
 
@@ -240,10 +237,8 @@ fn eml_no_attachments(){
 fn eml_three_attachments(){
     let raw_email = include_str!("test_data/three_attachments.txt").to_string(); // Load an email file
 
-    let options = AttachmentParseOptions{ raw_email, store_blobs: true };
-
     println!("\nthree attachments");
-    let attachment_records = AttachmentRecords::try_from( options ).unwrap();
+    let attachment_records = AttachmentRecords::try_from( &raw_email,true ).unwrap();
 
     let extracted_set = attachment_records.attachments;
     for rec in &extracted_set{
@@ -258,10 +253,8 @@ fn eml_three_attachments(){
         println!("");
     }
 
-
+    // Mark - Orange on White.png
     //let image_bytes = include_bytes!("test_data/Mark - Orange on White.png");
-
-    //not sure if path is correct
     let image_bytes = include_bytes!("../../../../media/Mark - Orange on White.png");
 
 
@@ -295,10 +288,8 @@ fn eml_malformed(){
 
     let raw_email = include_str!("test_data/malformed_headers.txt").to_string(); // Load an email file
 
-    let options = AttachmentParseOptions{ raw_email, store_blobs: false };
-
     //println!("\nmalformed headers");
-    let attachment_records = AttachmentRecords::try_from( options ).unwrap();
+    let attachment_records = AttachmentRecords::try_from( &raw_email, false ).unwrap();
 
     let extracted_set = attachment_records.attachments;
     // for rec in &collated{
