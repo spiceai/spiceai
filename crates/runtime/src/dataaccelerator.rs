@@ -113,21 +113,6 @@ pub async fn get_accelerator_engine(engine: Engine) -> Option<Arc<dyn DataAccele
     }
 }
 
-pub async fn update_all_accelerator_stats(datasets: &[Arc<Dataset>]) {
-    let registry = DATA_ACCELERATOR_ENGINES.lock().await;
-
-    for (_engine, accelerator) in registry.iter() {
-        let _ = accelerator.update_stats(datasets);
-    }
-
-    if !registry.is_empty() {
-        tracing::debug!(
-            "Updated statistics for {} data accelerator engines",
-            registry.len()
-        );
-    }
-}
-
 /// A `DataAccelerator` knows how to read, write and create new tables.
 #[async_trait]
 pub trait DataAccelerator: Send + Sync {
@@ -195,14 +180,6 @@ pub trait DataAccelerator: Send + Sync {
         } else {
             false
         }
-    }
-
-    /// For file based accelerator, update instance - datasets information
-    fn update_stats(
-        &self,
-        _datasets: &[Arc<Dataset>],
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        Ok(())
     }
 }
 

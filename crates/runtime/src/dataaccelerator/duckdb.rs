@@ -22,7 +22,7 @@ use crate::{
     datafusion::dialect::new_duckdb_dialect,
     make_spice_data_directory,
     parameters::ParameterSpec,
-    spice_data_base_path, Runtime,
+    spice_data_base_path, App, Runtime,
 };
 use async_trait::async_trait;
 use data_components::poly::PolyTableProvider;
@@ -36,12 +36,7 @@ use datafusion_table_providers::{
 };
 use duckdb::AccessMode;
 use snafu::prelude::*;
-use std::{
-    any::Any,
-    collections::HashMap,
-    ffi::OsStr,
-    sync::{Arc, Mutex},
-};
+use std::{any::Any, ffi::OsStr, sync::Arc};
 
 use super::{DataAccelerator, Error as DataAcceleratorError};
 
@@ -88,8 +83,6 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct DuckDBAccelerator {
     duckdb_factory: DuckDBTableProviderFactory,
-    file_instance_usage: Mutex<HashMap<String, u32>>,
-    memory_instance_usage: Mutex<Option<u32>>,
 }
 
 impl DuckDBAccelerator {
@@ -99,8 +92,6 @@ impl DuckDBAccelerator {
             // DuckDB accelerator uses params.duckdb_file for file connection
             duckdb_factory: DuckDBTableProviderFactory::new(AccessMode::ReadWrite)
                 .with_dialect(new_duckdb_dialect()),
-            file_instance_usage: Mutex::new(HashMap::new()),
-            memory_instance_usage: Mutex::new(None),
         }
     }
 
@@ -141,7 +132,8 @@ impl DuckDBAccelerator {
 
         let pool = match (duckdb_file, acceleration.mode) {
             (Ok(duckdb_file), Mode::File) => {
-                let file_instance_usage = self.get_file_instance_usage(duckdb_file.as_str())?;
+                let file_instance_usage =
+                    self.get_file_instance_usage(duckdb_file.as_str(), dataset.app());
                 self.duckdb_factory
                     .get_or_init_file_instance(duckdb_file, file_instance_usage)
                     .await
@@ -149,7 +141,7 @@ impl DuckDBAccelerator {
                     .context(AccelerationCreationFailedSnafu)?
             }
             (_, Mode::Memory) => {
-                let memory_instance_usage = self.get_memory_instance_usage()?;
+                let memory_instance_usage = self.get_memory_instance_usage(dataset.app());
                 self.duckdb_factory
                     .get_or_init_memory_instance(memory_instance_usage)
                     .await
@@ -166,21 +158,52 @@ impl DuckDBAccelerator {
         Ok(pool)
     }
 
-    pub fn get_file_instance_usage(&self, path: &str) -> Result<Option<u32>> {
-        match self.file_instance_usage.lock() {
-            Ok(guard) => Ok(guard.get(path).copied()),
-            Err(_) => Err(Error::UnableToGetInstanceUsage {}),
+    fn get_file_instance_usage(&self, path: &str, app: Option<Arc<App>>) -> Option<u32> {
+        let mut file_instance_usage: Option<u32> = None;
+
+        if let Some(this_app) = app {
+            let datasets = Runtime::get_valid_datasets(&this_app, crate::LogErrors(false));
+            for ds in datasets {
+                if let Some(acceleration) = &ds.acceleration {
+                    if acceleration.engine != Engine::DuckDB {
+                        continue;
+                    }
+
+                    if acceleration.mode == Mode::File {
+                        if let Ok(file_path) = self.file_path(&ds) {
+                            if file_path == path {
+                                file_instance_usage =
+                                    Some(file_instance_usage.map_or(1, |count| count + 1));
+                            }
+                        }
+                    }
+                }
+            }
         }
+
+        file_instance_usage
     }
 
-    pub fn get_memory_instance_usage(&self) -> Result<Option<u32>> {
-        match self.memory_instance_usage.lock() {
-            Ok(guard) => {
-                let usage_count = *guard;
-                Ok(usage_count)
+    fn get_memory_instance_usage(&self, app: Option<Arc<App>>) -> Option<u32> {
+        let mut memory_instance_usage: Option<u32> = None;
+
+        if let Some(this_app) = app {
+            let datasets = Runtime::get_valid_datasets(&this_app, crate::LogErrors(false));
+            for ds in datasets {
+                if let Some(acceleration) = &ds.acceleration {
+                    if acceleration.engine != Engine::DuckDB {
+                        continue;
+                    }
+
+                    if acceleration.mode == Mode::Memory {
+                        memory_instance_usage =
+                            Some(memory_instance_usage.map_or(1, |count| count + 1));
+                    }
+                }
             }
-            Err(_) => Err(Error::UnableToGetInstanceUsage {}),
         }
+
+        memory_instance_usage
     }
 }
 
@@ -342,52 +365,6 @@ impl DataAccelerator for DuckDBAccelerator {
 
     fn parameters(&self) -> &'static [ParameterSpec] {
         PARAMETERS
-    }
-
-    fn update_stats(
-        &self,
-        datasets: &[Arc<Dataset>],
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let mut file_usage: HashMap<String, u32> = HashMap::new();
-        let mut memory_usage: Option<u32> = None;
-
-        for ds in datasets {
-            if let Some(acceleration) = &ds.acceleration {
-                if acceleration.engine != Engine::DuckDB {
-                    continue;
-                }
-
-                if acceleration.mode == Mode::File {
-                    if let Ok(path) = self.file_path(ds) {
-                        *file_usage.entry(path).or_insert(0) += 1;
-                    }
-                } else {
-                    *memory_usage.get_or_insert(0) += 1;
-                }
-            }
-        }
-
-        match self.file_instance_usage.lock() {
-            Ok(mut guard) => {
-                for (path, count) in file_usage {
-                    *guard.entry(path).or_insert(0) += count;
-                }
-            }
-            Err(_) => {
-                tracing::warn!("{}", Error::UnableToUpdateInstanceUsage {});
-            }
-        }
-
-        match self.memory_instance_usage.lock() {
-            Ok(mut guard) => {
-                *guard = memory_usage;
-            }
-            Err(_) => {
-                tracing::warn!("{}", Error::UnableToUpdateInstanceUsage {});
-            }
-        }
-
-        Ok(())
     }
 }
 
