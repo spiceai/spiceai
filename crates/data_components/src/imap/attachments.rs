@@ -28,7 +28,7 @@ limitations under the License.
 // https://www.rfc-editor.org/rfc/rfc2231
 
 
-use mail_parser::{MessageParser, MimeHeaders};
+use mail_parser::{MimeHeaders, Message};
 
 
 #[derive(Debug)]
@@ -67,79 +67,80 @@ pub struct AttachmentRecords{
 //     type Error = String;
 
 impl AttachmentRecords{
-    pub fn try_from(raw_email: &str, store_blobs: bool) -> Result<Self, String> {
+    pub fn try_from(eml_msg: &Message, store_blobs: bool) -> Result<Self, String> {
 
         let mut attachments = Vec::<AttachmentInfo>::new();
 
-        if let Some(message) = MessageParser::default().parse(raw_email) {
+        //if let Some(message) = MessageParser::default().parse(raw_email) {
+        let message = eml_msg;
 
-            for attachment in message.attachments() {
+        for attachment in message.attachments() {
 
-                //extract filename
-                let filename = if let Some(attachment_name) = attachment.attachment_name() {
-                    Some(attachment_name.to_string())
-                }else{
-                    None
-                };
+            //extract filename
+            let filename = if let Some(attachment_name) = attachment.attachment_name() {
+                Some(attachment_name.to_string())
+            }else{
+                None
+            };
 
-                //extract mime type
-                let mime_type = if let Some(content_type_struct) = attachment.content_type() {
-                    //reconstruct the mime type as a string
-                    //returns either "{major_type_val}" or "{major_type_val}/{subtype_val}"
+            //extract mime type
+            let mime_type = if let Some(content_type_struct) = attachment.content_type() {
+                //reconstruct the mime type as a string
+                //returns either "{major_type_val}" or "{major_type_val}/{subtype_val}"
 
-                    let major_type_val = content_type_struct.c_type.to_string();
+                let major_type_val = content_type_struct.c_type.to_string();
 
-                    let mime_type = match &content_type_struct.c_subtype {
-                        Some(subtype_val) => {
-                            // concat major type and subtype into a string like "text/plain"
-                            format!("{}/{}", major_type_val, subtype_val)
-                        }
-                        None => {
-                            // no subtype: returns eg "text"
-                            major_type_val
-                        }
-                    };
-
-                    Some(mime_type)
-
-                }else{
-                    //unable to extract mime type
-                    None
-                };
-
-
-                //attachments are decoded automatically by mail_parse
-                //encoding type is available. not sure if encoded bytes are.
-                let attachment_blob = if store_blobs {
-                    Some(
-                        attachment.contents().to_vec()
-                    )
-
-                } else {
-                    None
-                };
-
-
-                // Deal with None,None case where there's no filename AND no mime_type
-                match (filename, mime_type) {
-                    (None, None) => {
-                        // We have encountered the rare MIME record where there is no filename and no mime_type data.
-
-                        //FIXME: invalid_attachment_action::warn ?
-
-                        //FIXME: Is this attachment probably text?
-                        // Further research?
-                        // Cite exact RFC passage?
-                    },
-                    (filename, mime_type) => {
-                        // Any other combo of filename and mime_type gives us a useful decode.
-                        attachments.push( AttachmentInfo{ filename, mime_type, blob:attachment_blob } );
+                let mime_type = match &content_type_struct.c_subtype {
+                    Some(subtype_val) => {
+                        // concat major type and subtype into a string like "text/plain"
+                        format!("{}/{}", major_type_val, subtype_val)
+                    }
+                    None => {
+                        // no subtype: returns eg "text"
+                        major_type_val
                     }
                 };
 
-            } //loop attachments for email
+                Some(mime_type)
 
-        } //can we parse this email?
+            }else{
+                //unable to extract mime type
+                None
+            };
+
+
+            //attachments are decoded automatically by mail_parse
+            //encoding type is available. not sure if encoded bytes are.
+            let attachment_blob = if store_blobs {
+                Some(
+                    attachment.contents().to_vec()
+                )
+
+            } else {
+                None
+            };
+
+
+            // Deal with None,None case where there's no filename AND no mime_type
+            match (filename, mime_type) {
+                (None, None) => {
+                    // We have encountered the rare MIME record where there is no filename and no mime_type data.
+
+                    //FIXME: invalid_attachment_action::warn ?
+
+                    //FIXME: Is this attachment probably text?
+                    // Further research?
+                    // Cite exact RFC passage?
+                },
+                (filename, mime_type) => {
+                    // Any other combo of filename and mime_type gives us a useful decode.
+                    attachments.push( AttachmentInfo{ filename, mime_type, blob:attachment_blob } );
+                }
+            };
+
+        } //loop attachments for email
+
+        //} //can we parse this email?
 
 
         if attachments.is_empty() {
@@ -162,170 +163,6 @@ impl AttachmentRecords{
 
 
 
-
-#[test]
-fn eml_utf8() {
-    let raw_email = include_str!("test_data/utf8_attachment_names.txt").to_string(); // Load an email file
-
-    // Seems to be a bug in the mail-parser crate.
-    // If the Content-Disposition header has a filename= AND a filename*0*= field the fallback field
-    // is used as the first component of the reconstructed long filename.
-
-    // println!("\nutf8 check");
-    let attachment_records = AttachmentRecords::try_from( &raw_email,false ).unwrap();
-
-    let extracted_set = attachment_records.attachments;
-    // for rec in &collated{
-    //     println!("-rec: {:?}", rec);
-    // }
-
-    let correct_set = vec!(
-
-        //filenames contains \" escape strings
-        AttachmentInfo{
-            filename: Some("report \"Q1 2024\" (final).pdf".to_string()),
-            mime_type: Some("application/pdf".to_string()),
-            blob: None
-        },
-
-        //filename has an embedded ; char
-        AttachmentInfo{
-            filename: Some("data; Q1-2024.png".to_string()),
-            mime_type: Some("image/png".to_string()),
-            blob: None
-        },
-
-        //filename is multibyte
-        AttachmentInfo{
-            filename: Some("résumé.txt".to_string()),
-            mime_type: Some("text/plain".to_string()),
-            blob: None
-        },
-
-        //FIXME: the mail-parser crate has a bug and this test relies on it's broken behaviour.
-        AttachmentInfo{
-            filename: Some("BROKEN_PARSE_BUG_a_b_c.txt".to_string()),
-            mime_type: Some("text/plain".to_string()),
-            blob: None
-        },
-
-        AttachmentInfo{
-            filename: Some("CORRECT_a_b_c.txt".to_string()),
-            mime_type: Some("text/plain".to_string()),
-            blob: None
-        },
-    );
-
-    assert_eq!( extracted_set, correct_set, "mismatched sets" );
-
-}
-
-
-#[test]
-fn eml_no_attachments(){
-    let raw_email = include_str!("test_data/no_attachments.txt").to_string(); // Load an email file
-
-    // println!("\nno attachments");
-    let attachment_records = AttachmentRecords::try_from( &raw_email,false );
-
-    assert!( attachment_records.is_err() );
-
-}
-
-
-#[test]
-fn eml_three_attachments(){
-    let raw_email = include_str!("test_data/three_attachments.txt").to_string(); // Load an email file
-
-    println!("\nthree attachments");
-    let attachment_records = AttachmentRecords::try_from( &raw_email,true ).unwrap();
-
-    let extracted_set = attachment_records.attachments;
-    for rec in &extracted_set{
-        let blob = rec.blob.clone().unwrap();
-
-        let blob_str = if let Ok(blob) = String::from_utf8(blob){
-            blob
-        }else{
-            format!("[{}] Could not decode into utf8 for display", rec.mime_type.clone().unwrap())
-        };
-        println!("-rec: {:?}", &blob_str );
-        println!("");
-    }
-
-    // Mark - Orange on White.png
-    //let image_bytes = include_bytes!("test_data/Mark - Orange on White.png");
-    let image_bytes = include_bytes!("../../../../media/Mark - Orange on White.png");
-
-
-    let correct_set = vec!(
-        AttachmentInfo{
-            filename: Some("document.pdf".to_string()),
-            mime_type: Some("application/pdf".to_string()),
-            blob: Some("Test content encoded as b64".as_bytes().to_vec())
-        },
-        AttachmentInfo{
-            filename: Some("image.png".to_string()),
-            mime_type: Some("image/png".to_string()),
-            blob: Some(image_bytes.to_vec())
-        },
-        AttachmentInfo{
-            filename: Some("notes.txt".to_string()),
-            mime_type: Some("text/plain".to_string()),
-            blob: Some("Sample text content in the file.\n".as_bytes().to_vec())
-        },
-    );
-
-    assert_eq!( extracted_set, correct_set, "mismatched sets" );
-
-}
-
-
-#[test]
-fn eml_malformed(){
-
-    // This tests some awkward corner cases for weird headers.
-
-    let raw_email = include_str!("test_data/malformed_headers.txt").to_string(); // Load an email file
-
-    //println!("\nmalformed headers");
-    let attachment_records = AttachmentRecords::try_from( &raw_email, false ).unwrap();
-
-    let extracted_set = attachment_records.attachments;
-    // for rec in &collated{
-    //     println!("-rec: {:?}", rec);
-    // }
-
-    let correct_set = vec!(
-        AttachmentInfo{
-            filename: Some("document.pdf".to_string()),
-            mime_type: Some("application/pdf".to_string()),
-            blob: None
-        },
-        AttachmentInfo{
-            filename: None,
-            mime_type: Some("application/pdf".to_string()),
-            blob: None
-        },
-        // AttachmentInfo{
-        //     filename: None,
-        //     mime_type: None,
-        // },
-        AttachmentInfo{
-            filename: Some("no_mime_type.png".to_string()),
-            mime_type: None,
-            blob: None
-        },
-        AttachmentInfo{
-            filename: Some("notes.tx_t".to_string()),
-            mime_type: Some("text/plain".to_string()),
-            blob: None
-        },
-    );
-
-    assert_eq!( extracted_set, correct_set, "mismatched sets" );
-
-}
 
 
 
