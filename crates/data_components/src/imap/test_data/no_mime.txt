@@ -1,0 +1,5 @@
+From: sender@example.com
+To: recipient@example.com
+Subject: Sample basic no mime Email
+
+This is the plain text version of the no-mime email.

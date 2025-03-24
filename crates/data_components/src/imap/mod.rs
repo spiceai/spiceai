@@ -34,6 +34,7 @@ pub mod session;
 
 mod attachments;
 mod body_content;
+mod tests;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -172,6 +173,7 @@ impl ImapTableProvider {
             message_ids.push(message.message_id);
             in_reply_tos.push(message.in_reply_to);
             bodies.push(message.body);
+            attachments.push(message.attachments);
             body_content_records.push(message.body_content_records);
             headers.push(message.headers);
         }
