@@ -25,13 +25,16 @@ use datafusion::{
     sql::TableReference,
 };
 use datafusion_table_providers::{
-    duckdb::{write::DuckDBTableWriter, DuckDB, DuckDBTableFactory},
+    duckdb::{write::DuckDBTableWriter, DuckDB, DuckDBTableFactory, TableDefinition},
     sql::{
-        db_connection_pool::dbconnection::duckdbconn::DuckDbConnection,
+        db_connection_pool::{
+            dbconnection::duckdbconn::DuckDbConnection, duckdbpool::DuckDbConnectionPool,
+        },
         sql_provider_datafusion::expr::Engine,
     },
     util,
 };
+use duckdb::Transaction;
 use snafu::prelude::*;
 use std::sync::Arc;
 
@@ -60,21 +63,31 @@ impl DeletionTableProvider for DuckDBTableWriter {
         filters: &[Expr],
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
         Ok(Arc::new(DeletionExec::new(
-            Arc::new(DuckDBDeletionSink::new(self.duckdb(), filters)),
+            Arc::new(DuckDBDeletionSink::new(
+                self.pool(),
+                self.table_definition(),
+                filters,
+            )),
             &self.schema(),
         )))
     }
 }
 
 struct DuckDBDeletionSink {
-    duckdb: Arc<DuckDB>,
+    pool: Arc<DuckDbConnectionPool>,
+    table_definition: Arc<TableDefinition>,
     filters: Vec<Expr>,
 }
 
 impl DuckDBDeletionSink {
-    fn new(duckdb: Arc<DuckDB>, filters: &[Expr]) -> Self {
+    fn new(
+        pool: Arc<DuckDbConnectionPool>,
+        table_definition: Arc<TableDefinition>,
+        filters: &[Expr],
+    ) -> Self {
         Self {
-            duckdb,
+            pool,
+            table_definition,
             filters: filters.to_vec(),
         }
     }
@@ -83,10 +96,20 @@ impl DuckDBDeletionSink {
 #[async_trait]
 impl DeletionSink for DuckDBDeletionSink {
     async fn delete_from(&self) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
-        let mut db_conn = self.duckdb.connect_sync()?;
+        let pool = Arc::clone(&self.pool);
+        let mut db_conn = pool.connect_sync()?;
         let duckdb_conn = DuckDB::duckdb_conn(&mut db_conn)?;
+        let tx = duckdb_conn
+            .conn
+            .transaction()
+            .context(UnableToBeginTransactionSnafu)?;
+        let mut internal_tables = self.table_definition.list_internal_tables(&tx)?;
+        let Some((table_name, _)) = internal_tables.pop() else {
+            return Ok(0);
+        };
+
         let sql = util::filters_to_sql(&self.filters, Some(Engine::DuckDB))?;
-        let count = delete_from(self.duckdb.table_name(), duckdb_conn, &sql)?;
+        let count = delete_from(&table_name.to_string(), tx, &sql)?;
 
         Ok(count)
     }
@@ -114,16 +137,7 @@ impl ReadWrite for DuckDBTableFactory {
     }
 }
 
-fn delete_from(
-    table_name: &str,
-    duckdb_conn: &mut DuckDbConnection,
-    where_clause: &str,
-) -> Result<u64> {
-    let tx = duckdb_conn
-        .conn
-        .transaction()
-        .context(UnableToBeginTransactionSnafu)?;
-
+fn delete_from(table_name: &str, tx: Transaction<'_>, where_clause: &str) -> Result<u64> {
     let count_sql = format!(r#"SELECT COUNT(*) FROM "{table_name}" WHERE {where_clause}"#);
 
     let mut count: u64 = tx
