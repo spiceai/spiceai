@@ -95,7 +95,7 @@ func GetRelease(gh *GitHubClient, version string) (*RepoRelease, error) {
 		}
 	}
 
-	return nil, fmt.Errorf("No matching release is found for version %s", version)
+	return nil, fmt.Errorf("no matching release is found for version %s", version)
 }
 
 func GetLatestRelease(gh *GitHubClient, assetName string) (*RepoRelease, error) {
