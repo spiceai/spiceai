@@ -1331,7 +1331,6 @@ jobs:
   #         echo "      enabled: true" >> spicepod.yaml
   #         echo "      refresh_sql: 'SELECT * FROM spiceai.commits LIMIT 20'" >> spicepod.yaml
 
-
   #         echo "  - from: github:github.com/spiceai/spiceai/stargazers" >> spicepod.yaml
   #         echo "    name: spiceai.stargazers" >> spicepod.yaml
   #         echo "    params:" >> spicepod.yaml
@@ -1567,7 +1566,6 @@ jobs:
   #         echo "      databricks_endpoint: \${ secrets:DATABRICKS_ENDPOINT }" >> spicepod.yaml
   #         echo "      databricks_token: \${ secrets:DATABRICKS_TOKEN }" >> spicepod.yaml
 
-
   #         cat spicepod.yaml
 
   #     - name: Start spice runtime
@@ -1656,7 +1654,7 @@ jobs:
         run: |
           brew install oha
 
-      - name : Install oha (Linux)
+      - name: Install oha (Linux)
         if: matrix.target.target_os == 'linux'
         working-directory: ./test/spicepods/tpch/accelerated/constraints
         run: |
@@ -1705,7 +1703,7 @@ jobs:
         working-directory: ./test/spicepods/tpch/accelerated/constraints
         run: |
           ls -la .spice/data
-  
+
           if [ -f .spice/data/accelerated_duckdb.db ]; then
             echo "Verification successful: accelerated_duckdb.db exists."
           else
@@ -1719,7 +1717,41 @@ jobs:
             echo "Verification failed: accelerated_duckdb.db.wal exists."
             exit 1
           fi
-  
+
+      - name: Check logs
+        working-directory: ./test/spicepods/tpch/accelerated/constraints
+        if: always()
+        run: |
+          killall spice || true
+          cat spice.log
+          if grep -iE "(failed|error)" spice.log; then
+            echo "Failures detected in spice.log"
+            exit 1
+          fi
+
+      - name: Restart Spice runtime
+        working-directory: ./test/spicepods/tpch/accelerated/constraints
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          spice run &> spice.log &
+
+      - name: Wait for dataset to be ready
+        working-directory: ./test/spicepods/tpch/accelerated/constraints
+        timeout-minutes: 1
+        run: |
+          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
+
+      - name: Verify dataset
+        uses: ./.github/actions/verify-dataset
+        with:
+          name: data_upsert
+
+      - name: Verify dataset
+        uses: ./.github/actions/verify-dataset
+        with:
+          name: data_drop
+
       - name: Check logs
         working-directory: ./test/spicepods/tpch/accelerated/constraints
         if: always()
@@ -1775,7 +1807,7 @@ jobs:
         run: |
           brew install oha
 
-      - name : Install oha (Linux)
+      - name: Install oha (Linux)
         if: matrix.target.target_os == 'linux'
         working-directory: ./test/spicepods/tpch/accelerated/constraints
         run: |
@@ -1793,17 +1825,13 @@ jobs:
         run: |
           mv duckdb_full_with_pk_and_indexes.yaml spicepod.yaml
           cat spicepod.yaml
-      
-      - name: Ensure no existing DuckDB database
-        working-directory: ./test/spicepods/tpch/accelerated/constraints
-        run: |
-          rm -rf .spice/tpch.db
 
       - name: Start Spice runtime
         working-directory: ./test/spicepods/tpch/accelerated/constraints
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          rm -f .spice/tpch.db
           spice run &> spice.log &
 
       - name: Wait for dataset to be ready
@@ -1829,7 +1857,7 @@ jobs:
         working-directory: ./test/spicepods/tpch/accelerated/constraints
         run: |
           ls -la .spice/data
-  
+
           if [ -f .spice/data/accelerated_duckdb.db ]; then
             echo "Verification successful: accelerated_duckdb.db exists."
           else
@@ -1843,7 +1871,37 @@ jobs:
             echo "Verification failed: accelerated_duckdb.db.wal exists."
             exit 1
           fi
-  
+
+      - name: Check logs
+        working-directory: ./test/spicepods/tpch/accelerated/constraints
+        if: always()
+        run: |
+          killall spice || true
+          cat spice.log
+          if grep -iE "(failed|error)" spice.log; then
+            echo "Failures detected in spice.log"
+            exit 1
+          fi
+
+      - name: Restart Spice runtime
+        working-directory: ./test/spicepods/tpch/accelerated/constraints
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          rm -f .spice/tpch.db
+          spice run &> spice.log &
+
+      - name: Wait for dataset to be ready
+        working-directory: ./test/spicepods/tpch/accelerated/constraints
+        timeout-minutes: 3
+        run: |
+          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
+
+      - name: Verify dataset
+        uses: ./.github/actions/verify-dataset
+        with:
+          name: customer
+
       - name: Check logs
         working-directory: ./test/spicepods/tpch/accelerated/constraints
         if: always()
