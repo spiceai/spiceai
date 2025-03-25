@@ -1777,7 +1777,8 @@ jobs:
       fail-fast: false
       matrix:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
-        spicepod: [duckdb_full_with_pk_and_indexes.yaml, duckdb_full_with_pk.yaml, duckdb_full_with_indexes.yaml]
+        # 'duckdb_full_with_indexes.yaml' is disabled due to https://github.com/spiceai/spiceai/issues/5148
+        spicepod: [duckdb_full_with_pk_and_indexes.yaml, duckdb_full_with_pk.yaml]
         # run only on "Linux x64"
         exclude:
           - target:
