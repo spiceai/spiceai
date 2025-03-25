@@ -224,45 +224,38 @@ impl TableProvider for ImapTableProvider {
 
 
             //FIXME: tuple is quick but crude. fragile if order of ret values inside the {} changes for any reason.
-            let (attachment_records, body_content_records, headers) =
+            let (attachment_records,
+                body_content_records,
+                headers) =
                 if let Some(body_raw) = body_raw {
+                    // eml_msg contains a decoded MIME email msg.
                     let eml_msg = MessageParser::default().parse(&body_raw);
 
-                    let ret = if let Some(eml_msg) = eml_msg {
+                    let ret_bubble = if let Some(eml_msg) = eml_msg {
                         let attachment_records = AttachmentRecords::try_from(&eml_msg, self.fetch_content).ok();
                         let body_content_records = ContentRecords::try_from(&eml_msg).ok();
 
                         //reconstruct the email headers into a string blob
                         let headers_blob: String = eml_msg.headers_raw()
                             .map(|(k, v)| format!("{}:{}", k, v))
-                            .collect::<Vec<_>>()
+                            .collect()
                             .join("");
-                        //println!("headers blob: [{}]", headers_blob);
 
+                        //return a tuple of useful data
                         (
-                            attachment_records,
-                            body_content_records,
+                            attachment_records.map(|r| r.attachments),
+                            body_content_records.map(|r| r.sections),
                             Some(headers_blob),
                         )
 
                     } else {
                         (None,None,None)
-                    };
+                    }; //MIME decoded?
 
-                    ret
+                    ret_bubble
                 }else{
                     (None,None,None)
-                };
-
-
-
-            //FIXME: this is ugly and all we're doing is acting as a getter
-            let attachments = attachment_records
-                .map_or(None, |records| Some(records.attachments));
-
-            //FIXME: this is ugly and all we're doing is acting as a getter
-            let body_content_records = body_content_records
-                .map_or(None, |records| Some(records.sections));
+                };//do we have body data to parse?
 
 
 
@@ -277,7 +270,7 @@ impl TableProvider for ImapTableProvider {
                 message_id,
                 in_reply_to,
                 body,
-                attachments,
+                attachments: attachment_records,
                 body_content_records,
                 headers,
             });
