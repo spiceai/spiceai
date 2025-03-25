@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"strings"
@@ -107,7 +108,11 @@ func (g *GitHubClient) call(method string, url string, payload []byte, accept st
 		return nil, err
 	}
 
-	defer response.Body.Close()
+	defer func() {
+		if err := response.Body.Close(); err != nil {
+			slog.Error("closing response body", "error", err)
+		}
+	}()
 
 	body, err := io.ReadAll(response.Body)
 	if err != nil {

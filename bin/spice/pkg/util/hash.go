@@ -20,6 +20,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"io"
+	"log/slog"
 	"os"
 )
 
@@ -38,7 +39,11 @@ func ComputeFileHash(filePath string) (string, error) {
 		return "", err
 	}
 
-	defer file.Close()
+	defer func() {
+		if err := file.Close(); err != nil {
+			slog.Error("failed to close file", "error", err)
+		}
+	}()
 
 	hash, err := ComputeHash(file)
 	if err != nil {

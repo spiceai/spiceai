@@ -20,6 +20,7 @@ import (
 	"archive/zip"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -33,7 +34,11 @@ func ProcessAFileInZipArchive(zipArchive string, filename string, processFunc Pr
 	if err != nil {
 		return err
 	}
-	defer r.Close()
+	defer func() {
+		if err := r.Close(); err != nil {
+			slog.Error("failed to close reader", "error", err)
+		}
+	}()
 
 	for _, f := range r.File {
 		if f.Name == filename {
@@ -41,7 +46,11 @@ func ProcessAFileInZipArchive(zipArchive string, filename string, processFunc Pr
 			if err != nil {
 				return err
 			}
-			defer reader.Close()
+			defer func() {
+				if err := reader.Close(); err != nil {
+					slog.Error("failed to close reader", "error", err)
+				}
+			}()
 
 			contents, err := io.ReadAll(reader)
 			if err != nil {
@@ -63,14 +72,22 @@ func ExtractZipFileToDir(zipArchive string, targetDirectory string) error {
 	if err != nil {
 		return err
 	}
-	defer r.Close()
+	defer func() {
+		if err := r.Close(); err != nil {
+			slog.Error("failed to close reader", "error", err)
+		}
+	}()
 
 	for _, f := range r.File {
 		reader, err := f.Open()
 		if err != nil {
 			return err
 		}
-		defer reader.Close()
+		defer func() {
+			if err := reader.Close(); err != nil {
+				slog.Error("failed to close reader", "error", err)
+			}
+		}()
 
 		if err := SanitizeExtractPath(f.Name, targetDirectory); err != nil {
 			return err
@@ -94,7 +111,11 @@ func ExtractZipFileToDir(zipArchive string, targetDirectory string) error {
 		if err != nil {
 			return err
 		}
-		defer fileHandle.Close()
+		defer func() {
+			if err := fileHandle.Close(); err != nil {
+				slog.Error("failed to close file", "error", err)
+			}
+		}()
 
 		_, err = io.Copy(fileHandle, reader)
 		if err != nil {
