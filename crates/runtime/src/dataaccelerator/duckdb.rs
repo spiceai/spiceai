@@ -141,7 +141,7 @@ impl DuckDBAccelerator {
                     .context(AccelerationCreationFailedSnafu)?
             }
             (_, Mode::Memory) => {
-                let memory_instance_usage = self.get_memory_instance_usage(dataset.app());
+                let memory_instance_usage = Self::get_memory_instance_usage(dataset.app());
                 self.duckdb_factory
                     .get_or_init_memory_instance(memory_instance_usage)
                     .await
@@ -184,7 +184,7 @@ impl DuckDBAccelerator {
         file_instance_usage
     }
 
-    fn get_memory_instance_usage(&self, app: Option<Arc<App>>) -> Option<u32> {
+    fn get_memory_instance_usage(app: Option<Arc<App>>) -> Option<u32> {
         let mut memory_instance_usage: Option<u32> = None;
 
         if let Some(this_app) = app {
