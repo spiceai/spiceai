@@ -60,23 +60,13 @@ _T: Time-Bound_
 
 <!-- _Provide threat model and security review._ -->
 
-## How/Plan
+## How/Implementation Plan
 
 <!-- _A clear and concise plan of how this should be implemented._ -->
 
-### Implementation (Sub-Issues)
+## QA Plan
 
-<!--
-- [ ] _Sub-Issue 1_
-- [ ] _Sub-Issue 2_
--->
-
-### QA
-
-<!--
-- [ ] _Sub-Issue 1_
-- [ ] _Sub-Issue 2_
--->
+<!-- _Plan to ensure quality_ -->
 
 ## Release Notes
 
