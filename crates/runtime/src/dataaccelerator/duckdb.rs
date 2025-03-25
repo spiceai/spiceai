@@ -71,12 +71,6 @@ pub enum Error {
 
     #[snafu(display("Invalid DuckDB acceleration configuration: {detail}"))]
     InvalidConfiguration { detail: Arc<str> },
-
-    #[snafu(display("Failed to retrieve DuckDB instance usage statistics. This is an internal error, please report it at github.com/spiceai/spiceai/issues"))]
-    UnableToGetInstanceUsage {},
-
-    #[snafu(display("Failed to update DuckDB instance usage statistics. This is an internal error, please report it at github.com/spiceai/spiceai/issues"))]
-    UnableToUpdateInstanceUsage {},
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -132,18 +126,19 @@ impl DuckDBAccelerator {
 
         let pool = match (duckdb_file, acceleration.mode) {
             (Ok(duckdb_file), Mode::File) => {
-                let file_instance_usage =
-                    self.get_file_instance_usage(duckdb_file.as_str(), dataset.app());
+                let num_accelerating_datasets =
+                    self.get_num_accelerating_datasets(Some(duckdb_file.as_str()), dataset.app());
                 self.duckdb_factory
-                    .get_or_init_file_instance(duckdb_file, file_instance_usage)
+                    .get_or_init_file_instance(duckdb_file, Some(num_accelerating_datasets))
                     .await
                     .boxed()
                     .context(AccelerationCreationFailedSnafu)?
             }
             (_, Mode::Memory) => {
-                let memory_instance_usage = Self::get_memory_instance_usage(dataset.app());
+                let num_accelerating_datasets =
+                    self.get_num_accelerating_datasets(None, dataset.app());
                 self.duckdb_factory
-                    .get_or_init_memory_instance(memory_instance_usage)
+                    .get_or_init_memory_instance(Some(num_accelerating_datasets))
                     .await
                     .boxed()
                     .context(AccelerationCreationFailedSnafu)?
@@ -158,8 +153,8 @@ impl DuckDBAccelerator {
         Ok(pool)
     }
 
-    fn get_file_instance_usage(&self, path: &str, app: Option<Arc<App>>) -> Option<u32> {
-        let mut file_instance_usage: Option<u32> = None;
+    fn get_num_accelerating_datasets(&self, path: Option<&str>, app: Option<Arc<App>>) -> u32 {
+        let mut instance_usage: u32 = 1;
 
         if let Some(this_app) = app {
             let datasets = Runtime::get_valid_datasets(&this_app, crate::LogErrors(false));
@@ -169,41 +164,26 @@ impl DuckDBAccelerator {
                         continue;
                     }
 
-                    if acceleration.mode == Mode::File {
-                        if let Ok(file_path) = self.file_path(&ds) {
-                            if file_path == path {
-                                file_instance_usage =
-                                    Some(file_instance_usage.map_or(1, |count| count + 1));
+                    // If the path is Some, we're counting the number of file instances
+                    if let Some(this_file_path) = path {
+                        if acceleration.mode == Mode::File {
+                            if let Ok(file_path) = self.file_path(&ds) {
+                                if this_file_path == file_path {
+                                    instance_usage += 1;
+                                }
                             }
+                        }
+                    } else {
+                        // If the path is None, we're just counting the number of memory instances
+                        if acceleration.mode == Mode::Memory {
+                            instance_usage += 1;
                         }
                     }
                 }
             }
         }
 
-        file_instance_usage
-    }
-
-    fn get_memory_instance_usage(app: Option<Arc<App>>) -> Option<u32> {
-        let mut memory_instance_usage: Option<u32> = None;
-
-        if let Some(this_app) = app {
-            let datasets = Runtime::get_valid_datasets(&this_app, crate::LogErrors(false));
-            for ds in datasets {
-                if let Some(acceleration) = &ds.acceleration {
-                    if acceleration.engine != Engine::DuckDB {
-                        continue;
-                    }
-
-                    if acceleration.mode == Mode::Memory {
-                        memory_instance_usage =
-                            Some(memory_instance_usage.map_or(1, |count| count + 1));
-                    }
-                }
-            }
-        }
-
-        memory_instance_usage
+        instance_usage
     }
 }
 

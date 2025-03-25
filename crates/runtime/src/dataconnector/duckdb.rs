@@ -52,7 +52,7 @@ pub struct DuckDB {
 impl DuckDB {
     pub(crate) fn create_in_memory(params: &ConnectorParams) -> AnyErrorResult<DuckDBTableFactory> {
         let pool = Arc::new(
-            DuckDbConnectionPool::new_memory(None)
+            DuckDbConnectionPool::new_memory()
                 .map_err(|source| DataConnectorError::UnableToConnectInternal {
                     dataconnector: "duckdb".to_string(),
                     connector_component: params.component.clone(),
@@ -73,7 +73,7 @@ impl DuckDB {
         params: &ConnectorParams,
     ) -> AnyErrorResult<DuckDBTableFactory> {
         let pool = Arc::new(
-            DuckDbConnectionPool::new_file(path, &AccessMode::ReadOnly, None)
+            DuckDbConnectionPool::new_file(path, &AccessMode::ReadOnly)
                 .map_err(|source| DataConnectorError::UnableToConnectInternal {
                     dataconnector: "duckdb".to_string(),
                     connector_component: params.component.clone(),
