@@ -25,7 +25,6 @@ use datafusion::{
     logical_expr::Expr,
     physical_plan::ExecutionPlan,
 };
-use mail_parser::MessageParser;
 use mailparse::{dateparse};
 use snafu::prelude::*;
 
@@ -33,10 +32,9 @@ use crate::arrow::write::MemTable;
 use super::{
     EmailMessage, Error, FailedToLogoutSnafu, FailedToParseHeaderSnafu, FetchMessagesSnafu,
     GetMailboxStatusSnafu, ImapTableProvider,
-    mime::AttachmentRecords,
-    mime::AttachmentInfo,
-    body_content::ContentSectionRecords,
-    body_content::ContentSectionInfo,
+    mime::{
+        MimeExtract,
+    },
 };
 
 fn decode_string(value: &[u8]) -> String {
@@ -223,19 +221,7 @@ impl TableProvider for ImapTableProvider {
             };
 
 
-            // Attempt to convert email into parsed mime data and extract attachments and content_sections
-            let (attachments, content_sections) =
-                body.as_ref().and_then(|body_raw| {
-                        MessageParser::default().parse(body_raw).and_then(|eml_msg| {
-                            // We now have a parsed mime msg to work with: eml_msg
-                            Some(
-                                (
-                                AttachmentRecords::try_from(&eml_msg).ok().map(|r| r.attachments),
-                                ContentSectionRecords::try_from(&eml_msg).ok().map(|r| r.sections),
-                                )
-                            )
-                        })
-                    }).unwrap();
+            let mime_extract = MimeExtract::try_from(&body).ok().unwrap();
 
 
             messages.push(EmailMessage {
@@ -250,8 +236,8 @@ impl TableProvider for ImapTableProvider {
                 in_reply_to,
                 header,
                 body,
-                attachments,
-                content_sections,
+                attachments: mime_extract.attachments,
+                content_sections: mime_extract.content_sections,
             });
         }
 

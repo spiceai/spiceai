@@ -26,14 +26,13 @@ use arrow::{
 use datafusion::{catalog::TableProvider, error::DataFusionError};
 use session::ImapSession;
 use snafu::prelude::*;
-use mime::AttachmentInfo;
-use body_content::ContentSectionInfo;
+
+use mime::{AttachmentInfo,ContentSectionInfo};
 
 pub mod provider;
 pub mod session;
 
 mod mime;
-mod body_content;
 
 #[cfg(test)]
 mod tests;
@@ -135,7 +134,7 @@ fn build_listarray_for_attachments(values: Vec<Option<Vec<AttachmentInfo>>>) -> 
     //FIXME: This fn was written with help from GPT. It seems plausible but I am not
     // versed in the construction of Arrow suitable structures.
     // I had a look at snowflakeconn.rs - seems similar.
-    
+
     let struct_builder = StructBuilder::new(
         Fields::from(vec![
             Field::new("filename", DataType::Utf8, true),
@@ -176,7 +175,7 @@ fn build_listarray_for_attachments(values: Vec<Option<Vec<AttachmentInfo>>>) -> 
             list_builder.append(false);
         }
     }
-    
+
     panic!("Fn needs review to ensure correct Arrow data struct.");
     list_builder.finish()
 }

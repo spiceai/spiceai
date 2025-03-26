@@ -28,7 +28,50 @@ limitations under the License.
 // https://www.rfc-editor.org/rfc/rfc2231
 
 
-use mail_parser::{MimeHeaders, Message};
+use mail_parser::{MimeHeaders, Message, MessageParser};
+
+
+pub struct MimeExtract{
+    pub attachments: Option<Vec<AttachmentInfo>>,
+    pub content_sections: Option<Vec<ContentSectionInfo>>,
+}
+
+
+impl MimeExtract {
+    pub fn try_from(raw_email: &Option<String>) -> Result<Self, String> {
+
+        let body = raw_email;
+
+        // Attempt to convert email into parsed mime data and extract attachments and content_sections
+        let (attachments, content_sections) =
+            body.as_ref().and_then(|body_raw| {
+                MessageParser::default().parse(body_raw).and_then(|eml_msg| {
+                    // We now have a parsed mime msg to work with: eml_msg
+                    Some(
+                        (
+                            AttachmentRecords::try_from(&eml_msg).ok().map(|r| r.attachments),
+                            ContentSectionRecords::try_from(&eml_msg).ok().map(|r| r.sections),
+                        )
+                    )
+                })
+            }).unwrap();
+
+        Ok(
+            MimeExtract{
+            attachments,
+            content_sections,
+            }
+        )
+
+    }
+}
+
+
+
+
+
+
+
 
 
 #[derive(Debug)]
@@ -130,6 +173,64 @@ impl AttachmentRecords{
 
 
 
+
+
+// Content Section code.
+// Extracts the user-relevant content in text/plain and text/html sections.
+
+#[derive(Debug)]
+#[derive(PartialEq)]
+pub struct ContentSectionInfo {
+    pub mime_type: Option<String>,
+    pub content: Option<String>,
+}
+
+
+#[derive(Debug)]
+#[derive(PartialEq)]
+pub struct ContentSectionRecords {
+    pub sections: Vec<ContentSectionInfo>,
+}
+
+
+impl ContentSectionRecords {
+    pub fn try_from( eml_msg: &Message ) -> Result<ContentSectionRecords, String > {
+
+        let mut content_records = Vec::<ContentSectionInfo>::new();
+
+        let mut html_iter = eml_msg.html_bodies();
+        while let Some(rec) = html_iter.next() {
+            content_records.push(
+                ContentSectionInfo {
+                    mime_type: Some("text/html".to_string()),
+                    content: Some(rec.to_string()),
+                }
+            );
+        }
+
+        let mut text_iter = eml_msg.text_bodies();
+        while let Some(rec) = text_iter.next() {
+            content_records.push(
+                ContentSectionInfo {
+                    mime_type: Some("text/plain".to_string()),
+                    content: Some(rec.to_string()),
+                }
+            );
+        }
+
+
+        if content_records.is_empty() {
+            Err("No content sections found.".to_string())
+        }else{
+            Ok(
+                ContentSectionRecords {
+                    sections: content_records
+                }
+            )
+        }
+
+    }
+}
 
 
 
