@@ -17,6 +17,7 @@ limitations under the License.
 
 // RFC for MIME
 // https://www.rfc-editor.org/rfc/rfc2045
+// https://www.rfc-editor.org/rfc/rfc2046
 // re: Content-Type headers
 // https://www.rfc-editor.org/rfc/rfc2045#page-10
 
@@ -77,6 +78,7 @@ pub struct AttachmentInfo {
     pub mime_type: Option<String>,
     pub filename: Option<String>,
     pub blob: Option<Vec<u8>>,
+    //FIXME: store charset?
 }
 
 
@@ -146,9 +148,11 @@ impl TryFrom<&Message<'_>> for AttachmentRecords{
 
                     //FIXME: invalid_attachment_action::warn ?
 
-                    //FIXME: Is this attachment probably text?
-                    // Further research?
-                    // Cite exact RFC passage?
+                    attachments.push( AttachmentInfo{
+                        filename: None,
+                        mime_type: Some("application/octet-stream".to_string()), //mime_type,
+                        blob:attachment_blob } );
+
                 },
                 (filename, mime_type) => {
                     // Any other combo of filename and mime_type gives us a useful decode.
