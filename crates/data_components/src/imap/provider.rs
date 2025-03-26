@@ -130,28 +130,28 @@ impl TableProvider for ImapTableProvider {
                true,
            ),
 
-
-
-            //FIXME: These contain the extracted text/html or text/plain user-content sections
-            // field names feel clunky.
-            Field::new(
-                "body_content_records",
-                DataType::List(Arc::new(Field::new_list_field(
-                    DataType::Struct(Fields::from(vec![
-                        Field::new("content", DataType::Utf8, true),
-                        Field::new("mime_type", DataType::Utf8, true),
-                    ])),
-                    true,
-                ))),
-                true,
-            ),
-
-
         ];
 
         if self.fetch_content {
-            fields.push(Field::new("content", DataType::Utf8, true));
-        }
+            fields.push(
+                Field::new("content", DataType::Utf8, true)
+            );
+
+            // These contain the extracted text/html or text/plain user-content sections
+            fields.push(
+                Field::new(
+                    "content_sections",
+                    DataType::List(Arc::new(Field::new_list_field(
+                        DataType::Struct(Fields::from(vec![
+                            Field::new("content", DataType::Utf8, true),
+                            Field::new("mime_type", DataType::Utf8, true),
+                        ])),
+                        true,
+                    ))),
+                    true,
+                )
+            );
+        };
 
         
         fields.push(Field::new("headers", DataType::Utf8, true));
