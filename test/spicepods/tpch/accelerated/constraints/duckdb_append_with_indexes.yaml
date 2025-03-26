@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: append-refresh-with-pk-and-indexes
+name: append-refresh-with-indexes
 
 runtime:
   task_history:
@@ -19,11 +19,8 @@ datasets:
       mode: file
       refresh_mode: append
       refresh_check_interval: &default_refresh_check_interval 1s
-      primary_key: Id
       indexes:
         Id: enabled
-      on_conflict:
-        Id: upsert
 
   - from: duckdb:read_parquet('.spice/service_data.parquet')
     name: data_drop
@@ -34,8 +31,3 @@ datasets:
       mode: file
       refresh_mode: append
       refresh_check_interval: *default_refresh_check_interval
-      primary_key: Id
-      indexes:
-        Id: enabled
-      on_conflict:
-        Id: drop
