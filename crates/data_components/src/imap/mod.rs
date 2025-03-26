@@ -34,6 +34,8 @@ pub mod session;
 
 mod attachments;
 mod body_content;
+
+#[cfg(test)]
 mod tests;
 
 #[derive(Debug, Snafu)]
