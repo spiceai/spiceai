@@ -37,8 +37,10 @@ pub struct MimeExtract{
 }
 
 
-impl MimeExtract {
-    pub fn try_from(raw_email: &Option<String>) -> Result<Self, String> {
+impl TryFrom<&Option<String>> for MimeExtract {
+    type Error = String;
+
+    fn try_from(raw_email: &Option<String>) -> Result<Self, Self::Error> {
 
         let body = raw_email;
 
@@ -90,8 +92,10 @@ pub struct AttachmentRecords{
 }
 
 
-impl AttachmentRecords{
-    pub fn try_from(message: &Message) -> Result<Self, String> {
+impl TryFrom<&Message<'_>> for AttachmentRecords{
+    type Error = String;
+
+    fn try_from(message: &Message) -> Result<Self, Self::Error> {
 
         let mut attachments = Vec::<AttachmentInfo>::new();
 
@@ -193,8 +197,10 @@ pub struct ContentSectionRecords {
 }
 
 
-impl ContentSectionRecords {
-    pub fn try_from( eml_msg: &Message ) -> Result<ContentSectionRecords, String > {
+impl TryFrom<&Message<'_>> for ContentSectionRecords {
+    type Error = String;
+
+    fn try_from( eml_msg: &Message ) -> Result<ContentSectionRecords, Self::Error> {
 
         let mut content_records = Vec::<ContentSectionInfo>::new();
 
