@@ -84,8 +84,49 @@ fn build_listarray_for_strings(values: Vec<Option<Vec<Option<String>>>>) -> List
 }
 
 
-fn build_listarray_for_body_content_sections(values: Vec<Option<Vec<ContentSectionInfo>>>) -> ListArray {
-    todo!("content sections logic mostly same as attachments");
+fn build_listarray_for_content_sections(values: Vec<Option<Vec<ContentSectionInfo>>>) -> ListArray {
+
+    //FIXME: This fn was written with help from GPT. It seems plausible but I am not
+    // versed in the construction of Arrow suitable structures.
+    // I had a look at snowflakeconn.rs - seems similar.
+
+    let struct_builder = StructBuilder::new(
+        Fields::from(vec![
+            Field::new("content", DataType::Utf8, true),
+            Field::new("mime_type", DataType::Utf8, true),
+        ]),
+        vec![Box::new(StringBuilder::new()), Box::new(StringBuilder::new())],
+    );
+
+    let mut list_builder = ListBuilder::new(struct_builder);
+
+    for attachment_list in values {
+        if let Some(attachments) = attachment_list {
+            for content_section in attachments {
+                let struct_builder = list_builder.values();
+
+                //FIXME: the expect() msgs in this code seem like they could be improved?
+
+                struct_builder
+                    .field_builder::<StringBuilder>(0)
+                    .expect("Should return a field builder")
+                    .append_option(content_section.content.as_deref());
+
+                struct_builder
+                    .field_builder::<StringBuilder>(1)
+                    .expect("Should return a field builder")
+                    .append_option(content_section.mime_type.as_deref());
+
+                struct_builder.append(true);
+            }
+            list_builder.append(true);
+        } else {
+            list_builder.append(false);
+        }
+    }
+
+    panic!("Fn needs review to ensure correct Arrow data struct.");
+    list_builder.finish()
 }
 
 
@@ -94,9 +135,7 @@ fn build_listarray_for_attachments(values: Vec<Option<Vec<AttachmentInfo>>>) -> 
     //FIXME: This fn was written with help from GPT. It seems plausible but I am not
     // versed in the construction of Arrow suitable structures.
     // I had a look at snowflakeconn.rs - seems similar.
-
-    //panic!("Fn needs review to ensure correct Arrow data struct.");
-
+    
     let struct_builder = StructBuilder::new(
         Fields::from(vec![
             Field::new("filename", DataType::Utf8, true),
@@ -137,7 +176,8 @@ fn build_listarray_for_attachments(values: Vec<Option<Vec<AttachmentInfo>>>) -> 
             list_builder.append(false);
         }
     }
-
+    
+    panic!("Fn needs review to ensure correct Arrow data struct.");
     list_builder.finish()
 }
 
@@ -203,7 +243,7 @@ impl ImapTableProvider {
             fields.push(Arc::new(StringArray::from(bodies))); // field name mismatch. "content" in schema
 
             fields.push(
-                Arc::new(build_listarray_for_body_content_sections(content_sections))
+                Arc::new(build_listarray_for_content_sections(content_sections))
             );
 
             fields.push(
