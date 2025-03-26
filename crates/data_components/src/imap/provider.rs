@@ -223,34 +223,19 @@ impl TableProvider for ImapTableProvider {
             };
 
 
-            struct ExtractRet {
-                attachments: Option<Vec<AttachmentInfo>>,
-                content_sections: Option<Vec<ContentSectionInfo>>,
-            }
-
-
-            
-            let extract_ret = body.as_ref().and_then(|body_raw| {
-                MessageParser::default().parse(body_raw).and_then(|eml_msg| {
-                    // We now have a parsed mime msg to work with: eml_msg
-
-                    Some(ExtractRet {
-                        attachments: AttachmentRecords::try_from(&eml_msg).ok().map(|r| r.attachments),
-                        content_sections: ContentSectionRecords::try_from(&eml_msg).ok().map(|r| r.sections),
-                    })
-                })
-            });
-
-            //destructure extract_ret
-            // Feels like this is better long-term than a simple tuple.
-            // The destructure code is all in one place. Less room for bugs.
-            let (attachments,
-                content_sections,
-                ) =
-            extract_ret
-                .map(|r| (r.attachments, r.content_sections) )
-                .unwrap_or_else(|| (None,None));
-
+            // Attempt to convert email into parsed mime data and extract attachments and content_sections
+            let (attachments, content_sections) =
+                body.as_ref().and_then(|body_raw| {
+                        MessageParser::default().parse(body_raw).and_then(|eml_msg| {
+                            // We now have a parsed mime msg to work with: eml_msg
+                            Some(
+                                (
+                                AttachmentRecords::try_from(&eml_msg).ok().map(|r| r.attachments),
+                                ContentSectionRecords::try_from(&eml_msg).ok().map(|r| r.sections),
+                                )
+                            )
+                        })
+                    }).unwrap();
 
 
             messages.push(EmailMessage {
