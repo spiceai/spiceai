@@ -115,21 +115,7 @@ impl TableProvider for ImapTableProvider {
             ),
             Field::new("message_id", DataType::Utf8, true),
             Field::new("in_reply_to", DataType::Utf8, true),
-
-            Field::new(
-               "attachments",
-               DataType::List(Arc::new(Field::new_list_field(
-                   DataType::Struct(Fields::from(vec![
-                       Field::new("filename", DataType::Utf8, true),
-                       Field::new("mime_type", DataType::Utf8, true),
-                       //FIXME:         if self.fetch_content { ??
-                       Field::new("blob", DataType::Binary, true),
-                   ])),
-                   true,
-               ))),
-               true,
-           ),
-
+            Field::new("headers", DataType::Utf8, true), //FIXME: field name pluralised by convention
         ];
 
         if self.fetch_content {
@@ -151,10 +137,23 @@ impl TableProvider for ImapTableProvider {
                     true,
                 )
             );
-        };
 
-        
-        fields.push(Field::new("headers", DataType::Utf8, true));
+            fields.push(
+                Field::new(
+                    "attachments",
+                    DataType::List(Arc::new(Field::new_list_field(
+                        DataType::Struct(Fields::from(vec![
+                            Field::new("filename", DataType::Utf8, true),
+                            Field::new("mime_type", DataType::Utf8, true),
+                            Field::new("blob", DataType::Binary, true),
+                        ])),
+                        true,
+                    ))),
+                    true,
+                )
+            );
+
+        };
 
         Arc::new(Schema::new(fields))
     }
@@ -227,16 +226,19 @@ impl TableProvider for ImapTableProvider {
 
             struct ExtractRet {
                 attachments: Option<Vec<AttachmentInfo>>,
-                body_content_records: Option<Vec<ContentInfo>>,
+                content_sections: Option<Vec<ContentInfo>>,
                 email_headers: Option<String>,
             }
+
+
+            let store_attachment_blobs = true; //FIXME: can prob delete this option
 
             let extract_ret = body.as_ref().and_then(|body_raw| {
                 MessageParser::default().parse(body_raw).and_then(|eml_msg| {
                     Some(ExtractRet {
                         // We now have a parsed mime msg to work with: eml_msg
-                        attachments: AttachmentRecords::try_from(&eml_msg, self.fetch_content).ok().map(|r| r.attachments),
-                        body_content_records: ContentRecords::try_from(&eml_msg).ok().map(|r| r.sections),
+                        attachments: AttachmentRecords::try_from(&eml_msg, store_attachment_blobs).ok().map(|r| r.attachments),
+                        content_sections: ContentRecords::try_from(&eml_msg).ok().map(|r| r.sections),
                         email_headers: Some(eml_msg.headers_raw()
                             .map(|(k, v)| format!("{}:{}", k, v))
                             .collect::<Vec<_>>()
@@ -249,10 +251,10 @@ impl TableProvider for ImapTableProvider {
             // Feels like this is better long-term than a simple tuple.
             // The destructure code is all in one place. Less room for bugs.
             let (attachments,
-                body_content_records,
+                content_sections,
                 headers ) =
             extract_ret
-                .map(|r| (r.attachments, r.body_content_records, r.email_headers) )
+                .map(|r| (r.attachments, r.content_sections, r.email_headers) )
                 .unwrap_or_else(|| (None,None,None));
 
 
@@ -269,7 +271,7 @@ impl TableProvider for ImapTableProvider {
                 in_reply_to,
                 body,
                 attachments,
-                body_content_records,
+                content_sections,
                 headers,
             });
         }

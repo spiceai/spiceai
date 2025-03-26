@@ -20,7 +20,7 @@ use mail_parser::{Message};
 
 #[derive(Debug)]
 #[derive(PartialEq)]
-pub struct ContentInfo {
+pub struct ContentInfo { //FIXME: rename struct: ContentSectionInfo?
     pub mime_type: Option<String>,
     pub content: Option<String>,
 }

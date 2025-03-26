@@ -26,8 +26,8 @@ use arrow::{
 use datafusion::{catalog::TableProvider, error::DataFusionError};
 use session::ImapSession;
 use snafu::prelude::*;
-use crate::imap::attachments::AttachmentInfo;
-use crate::imap::body_content::ContentInfo;
+use attachments::AttachmentInfo;
+use body_content::ContentInfo;
 
 pub mod provider;
 pub mod session;
@@ -81,6 +81,11 @@ fn build_listarray_for_strings(values: Vec<Option<Vec<Option<String>>>>) -> List
     }
 
     builder.finish()
+}
+
+
+fn build_listarray_for_body_content_sections(values: Vec<Option<Vec<ContentInfo>>>) -> ListArray {
+    todo!("FIXME");
 }
 
 
@@ -159,10 +164,10 @@ impl ImapTableProvider {
         let mut reply_tos = vec![];
         let mut message_ids = vec![];
         let mut in_reply_tos = vec![];
+        let mut headers = vec![];
         let mut bodies = vec![];
         let mut attachments = vec![];
-        let mut body_content_records = vec![];
-        let mut headers = vec![];
+        let mut content_sections = vec![];
 
         for message in messages {
             dates.push(message.date);
@@ -174,10 +179,11 @@ impl ImapTableProvider {
             reply_tos.push(message.reply_to);
             message_ids.push(message.message_id);
             in_reply_tos.push(message.in_reply_to);
+            headers.push(message.headers);
+
             bodies.push(message.body);
             attachments.push(message.attachments);
-            body_content_records.push(message.body_content_records);
-            headers.push(message.headers);
+            content_sections.push(message.content_sections);
         }
 
         let mut fields: Vec<ArrayRef> = vec![
@@ -190,14 +196,21 @@ impl ImapTableProvider {
             Arc::new(build_listarray_for_strings(reply_tos)),
             Arc::new(StringArray::from(message_ids)),
             Arc::new(StringArray::from(in_reply_tos)),
-            Arc::new(build_listarray_for_attachments(attachments)),
-            //Arc::new(build_listarray_for_attachments(attachments)), //FIXME: body_content_records
-            //Arc::new(StringArray::from(headers)), //FIXME: headers
+            Arc::new(StringArray::from(headers)),
         ];
 
         if self.fetch_content {
-            fields.push(Arc::new(StringArray::from(bodies)));
-        }
+            fields.push(Arc::new(StringArray::from(bodies))); //FIXME: mismatch. "content" in schema
+
+            fields.push(
+                Arc::new(build_listarray_for_body_content_sections(content_sections))
+            );
+
+            fields.push(
+                Arc::new(build_listarray_for_attachments(attachments))
+            );
+
+        };
 
         RecordBatch::try_new(self.schema(), fields)
     }
@@ -219,9 +232,10 @@ pub(crate) struct EmailMessage {
     reply_to: Option<Vec<Option<String>>>,
     message_id: Option<String>,
     in_reply_to: Option<String>,
+    headers: Option<String>,
+
     body: Option<String>,
     attachments: Option<Vec<AttachmentInfo>>,
-    body_content_records: Option<Vec<ContentInfo>>,
-    headers: Option<String>,
+    content_sections: Option<Vec<ContentInfo>>,
 }
 
