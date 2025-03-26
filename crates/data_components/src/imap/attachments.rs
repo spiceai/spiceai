@@ -48,7 +48,7 @@ pub struct AttachmentRecords{
 
 
 impl AttachmentRecords{
-    pub fn try_from(message: &Message, store_blobs: bool) -> Result<Self, String> {
+    pub fn try_from(message: &Message) -> Result<Self, String> {
 
         let mut attachments = Vec::<AttachmentInfo>::new();
 
@@ -89,13 +89,7 @@ impl AttachmentRecords{
 
             //attachments are decoded automatically by mail_parse
             //encoding type is available. not sure if encoded bytes(base64/etc) are.
-            let attachment_blob = if store_blobs {
-                Some(
-                    attachment.contents().to_vec()
-                )
-            } else {
-                None
-            };
+            let attachment_blob = Some( attachment.contents().to_vec() );
 
 
             // Deal with None,None case where there's no filename AND no mime_type

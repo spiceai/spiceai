@@ -229,14 +229,13 @@ impl TableProvider for ImapTableProvider {
             }
 
 
-            let store_attachment_blobs = true; //FIXME: can prob delete this option
-
+            
             let extract_ret = body.as_ref().and_then(|body_raw| {
                 MessageParser::default().parse(body_raw).and_then(|eml_msg| {
                     // We now have a parsed mime msg to work with: eml_msg
 
                     Some(ExtractRet {
-                        attachments: AttachmentRecords::try_from(&eml_msg, store_attachment_blobs).ok().map(|r| r.attachments),
+                        attachments: AttachmentRecords::try_from(&eml_msg).ok().map(|r| r.attachments),
                         content_sections: ContentSectionRecords::try_from(&eml_msg).ok().map(|r| r.sections),
                     })
                 })
