@@ -200,7 +200,7 @@ impl ImapTableProvider {
         ];
 
         if self.fetch_content {
-            fields.push(Arc::new(StringArray::from(bodies))); //FIXME: field name mismatch. "content" in schema
+            fields.push(Arc::new(StringArray::from(bodies))); // field name mismatch. "content" in schema
 
             fields.push(
                 Arc::new(build_listarray_for_body_content_sections(content_sections))
