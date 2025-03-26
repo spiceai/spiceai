@@ -29,41 +29,33 @@ Content-Type: text/html; charset="UTF-8"
 Content-Type: application/pdf; name="document.pdf"
 Content-Disposition: attachment; filename="document.pdf"
 Content-Transfer-Encoding: base64
-
-Valid headers.
-
+Error-Description: Valid headers.
 
 
 --boundary42
 Content-Type: application/pdf
 Content-Disposition: attachment;
 Content-Transfer-Encoding: base64
-
-No filename info.
-
+Error-Description: No filename info.
 
 
 --boundary42
 Content-Disposition: attachment;
 Content-Transfer-Encoding: base64
-
-No filename. No mime type.
-
+Error-Description: No filename. No mime type.
 
 
 --boundary42
 Content-Disposition: attachment; filename="no_mime_type.png"
 Content-Transfer-Encoding: base64
-
-Filename. No mime type.
-
+Error-Description: Filename. No mime type.
 
 
 --boundary42
 Content-Type: text/plain; name="notes.txt"
 Content-Disposition: attachment; filename="notes.tx_t
 Content-Transfer-Encoding: base64
+Error-Description: filename specified for disposition header has no closing "
 
-filename specified for disposition header has no closing "
 
 --boundary42--

@@ -131,7 +131,12 @@ impl TryFrom<&Message<'_>> for AttachmentRecords{
 
             //attachments are decoded automatically by mail_parse
             //encoding type is available. not sure if encoded bytes(base64/etc) are.
-            let attachment_blob = Some( attachment.contents().to_vec() );
+            let attachment_blob =
+                if attachment.contents().is_empty() {
+                    None
+                }else{
+                    Some( attachment.contents().to_vec() )
+                };
 
 
             // Deal with None,None case where there's no filename AND no mime_type

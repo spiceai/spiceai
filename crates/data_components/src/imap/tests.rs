@@ -2,8 +2,7 @@
 
 #[cfg(test)]
 use mail_parser::MessageParser;
-use super::mime::{AttachmentInfo, AttachmentRecords};
-use super::body_content::ContentSectionRecords;
+use super::mime::{AttachmentInfo, AttachmentRecords,ContentSectionRecords};
 
 
 
@@ -27,7 +26,7 @@ fn eml_utf8() {
         //println!("\ncontent_records = {:#?}", content_records);
 
 
-        let attachment_records = AttachmentRecords::try_from( &message,false ).unwrap();
+        let attachment_records = AttachmentRecords::try_from( &message ).unwrap();
 
         let extracted_set = attachment_records.attachments;
         // for rec in &collated{
@@ -93,7 +92,7 @@ fn eml_no_attachments(){
         let _content_records = ContentSectionRecords::try_from( &message ).unwrap();
         //println!("\ncontent_records = {:#?}", content_records);
 
-        let attachment_records = AttachmentRecords::try_from(&message, false);
+        let attachment_records = AttachmentRecords::try_from(&message);
 
         //reconstruct the email headers into a string blob
         let headers_blob: String = message.headers_raw()
@@ -122,7 +121,7 @@ fn eml_three_attachments(){
         //println!("\ncontent_records = {:#?}", content_records);
 
 
-        let attachment_records = AttachmentRecords::try_from(&message, true).unwrap();
+        let attachment_records = AttachmentRecords::try_from(&message).unwrap();
 
         let extracted_set = attachment_records.attachments;
         for rec in &extracted_set {
@@ -182,7 +181,7 @@ fn eml_malformed(){
         //println!("\ncontent_records = {:#?}", content_records);
 
 
-        let attachment_records = AttachmentRecords::try_from(&message, false).unwrap();
+        let attachment_records = AttachmentRecords::try_from(&message).unwrap();
 
         let extracted_set = attachment_records.attachments;
         // for rec in &collated{
