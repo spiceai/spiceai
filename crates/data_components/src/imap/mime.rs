@@ -40,9 +40,7 @@ pub struct MimeExtract{
 impl TryFrom<&Option<String>> for MimeExtract {
     type Error = String;
 
-    fn try_from(raw_email: &Option<String>) -> Result<Self, Self::Error> {
-
-        let body = raw_email;
+    fn try_from(body: &Option<String>) -> Result<Self, Self::Error> {
 
         // Attempt to convert email into parsed mime data and extract attachments and content_sections
         let (attachments, content_sections) =
@@ -70,11 +68,8 @@ impl TryFrom<&Option<String>> for MimeExtract {
 
 
 
-
-
-
-
-
+// Attachment extraction code.
+// filename, mime-type, blob
 
 #[derive(Debug)]
 #[derive(PartialEq)]
@@ -177,8 +172,6 @@ impl TryFrom<&Message<'_>> for AttachmentRecords{
 
 
 
-
-
 // Content Section code.
 // Extracts the user-relevant content in text/plain and text/html sections.
 
@@ -237,7 +230,6 @@ impl TryFrom<&Message<'_>> for ContentSectionRecords {
 
     }
 }
-
 
 
 
