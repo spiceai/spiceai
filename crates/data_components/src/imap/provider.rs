@@ -115,7 +115,7 @@ impl TableProvider for ImapTableProvider {
             ),
             Field::new("message_id", DataType::Utf8, true),
             Field::new("in_reply_to", DataType::Utf8, true),
-            Field::new("headers", DataType::Utf8, true), //FIXME: field name pluralised by convention
+            Field::new("header", DataType::Utf8, true), //field name pluralised by convention
         ];
 
         if self.fetch_content {
@@ -214,8 +214,7 @@ impl TableProvider for ImapTableProvider {
             let message_ccs = parse_addreses_from_envelope!(envelope, cc);
             let message_blind_ccs = parse_addreses_from_envelope!(envelope, bcc);
             let message_reply_tos = parse_addreses_from_envelope!(envelope, reply_to);
-
-
+            let header = message.header().as_ref().map(|v| decode_string(v));
 
             let body = if self.fetch_content {
                 message.body().as_ref().map(|v| decode_string(v))
@@ -227,7 +226,6 @@ impl TableProvider for ImapTableProvider {
             struct ExtractRet {
                 attachments: Option<Vec<AttachmentInfo>>,
                 content_sections: Option<Vec<ContentInfo>>,
-                email_headers: Option<String>,
             }
 
 
@@ -235,14 +233,11 @@ impl TableProvider for ImapTableProvider {
 
             let extract_ret = body.as_ref().and_then(|body_raw| {
                 MessageParser::default().parse(body_raw).and_then(|eml_msg| {
+
                     Some(ExtractRet {
                         // We now have a parsed mime msg to work with: eml_msg
                         attachments: AttachmentRecords::try_from(&eml_msg, store_attachment_blobs).ok().map(|r| r.attachments),
                         content_sections: ContentRecords::try_from(&eml_msg).ok().map(|r| r.sections),
-                        email_headers: Some(eml_msg.headers_raw()
-                            .map(|(k, v)| format!("{}:{}", k, v))
-                            .collect::<Vec<_>>()
-                            .join("")),
                     })
                 })
             });
@@ -252,10 +247,10 @@ impl TableProvider for ImapTableProvider {
             // The destructure code is all in one place. Less room for bugs.
             let (attachments,
                 content_sections,
-                headers ) =
+                ) =
             extract_ret
-                .map(|r| (r.attachments, r.content_sections, r.email_headers) )
-                .unwrap_or_else(|| (None,None,None));
+                .map(|r| (r.attachments, r.content_sections) )
+                .unwrap_or_else(|| (None,None));
 
 
 
@@ -269,10 +264,10 @@ impl TableProvider for ImapTableProvider {
                 reply_to: message_reply_tos,
                 message_id,
                 in_reply_to,
+                header,
                 body,
                 attachments,
                 content_sections,
-                headers,
             });
         }
 

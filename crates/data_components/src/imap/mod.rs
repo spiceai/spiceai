@@ -179,7 +179,7 @@ impl ImapTableProvider {
             reply_tos.push(message.reply_to);
             message_ids.push(message.message_id);
             in_reply_tos.push(message.in_reply_to);
-            headers.push(message.headers);
+            headers.push(message.header);
 
             bodies.push(message.body);
             attachments.push(message.attachments);
@@ -232,7 +232,7 @@ pub(crate) struct EmailMessage {
     reply_to: Option<Vec<Option<String>>>,
     message_id: Option<String>,
     in_reply_to: Option<String>,
-    headers: Option<String>,
+    header: Option<String>,
 
     body: Option<String>,
     attachments: Option<Vec<AttachmentInfo>>,
