@@ -181,10 +181,17 @@ impl TableProvider for ImapTableProvider {
             status.exists as usize
         };
 
+
+        let imap_query_msg: String = if self.fetch_content{
+            "(ENVELOPE BODY.PEEK[HEADER] BODY.PEEK[])".to_string()
+        }else{
+            "(ENVELOPE BODY.PEEK[HEADER]".to_string()
+        };
+
         let fetch_messages = session
             .fetch(
                 format!("1:{message_count}"),
-                "(ENVELOPE BODY.PEEK[HEADER] BODY.PEEK[])",
+                &imap_query_msg,
             )
             .context(FetchMessagesSnafu)?;
         let mut messages = vec![];
@@ -208,21 +215,15 @@ impl TableProvider for ImapTableProvider {
             let message_ccs = parse_addreses_from_envelope!(envelope, cc);
             let message_blind_ccs = parse_addreses_from_envelope!(envelope, bcc);
             let message_reply_tos = parse_addreses_from_envelope!(envelope, reply_to);
+            
 
-            //we need this data to decode attachments and other headers.
-            //it is optionally stored in the Spice records
-            let body_raw = message.body().as_ref().map(|v| decode_string(v));
 
-            //"body" is consumed by messages.push()
             let body = if self.fetch_content {
-                //FIXME: rename flag from fetch_content to store_content?
-                // body data seems to be always fetched and optionally stored.
-
-                body_raw.clone()
+                message.body().as_ref().map(|v| decode_string(v))
             } else {
                 None
             };
-
+            
 
             struct ExtractRet {
                 attachments: Option<Vec<AttachmentInfo>>,
@@ -231,9 +232,9 @@ impl TableProvider for ImapTableProvider {
             }
 
             let extract_ret =
-                if let Some(body_raw) = body_raw {
+                if let Some(body_raw) = &body {
                     // eml_msg contains a decoded MIME email msg.
-                    let eml_msg = MessageParser::default().parse(&body_raw);
+                    let eml_msg = MessageParser::default().parse(body_raw);
 
                     let ret_bubble = if let Some(eml_msg) = eml_msg {
                         // We now have a parsed MIME email to work with.
