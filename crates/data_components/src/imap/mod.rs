@@ -83,11 +83,15 @@ fn build_listarray_for_strings(values: Vec<Option<Vec<Option<String>>>>) -> List
 }
 
 
-fn build_listarray_for_content_sections(values: Vec<Option<Vec<ContentSectionInfo>>>) -> ListArray {
+//FIXME: The following fn were written with help from GPT.
+// They seem plausible but I am not versed in the construction of Arrow suitable structures.
+// I had a look at snowflakeconn.rs - seems similar.
+// - build_listarray_for_content_sections(..)
+// - build_listarray_for_attachments(..)
 
-    //FIXME: This fn was written with help from GPT. It seems plausible but I am not
-    // versed in the construction of Arrow suitable structures.
-    // I had a look at snowflakeconn.rs - seems similar.
+
+
+fn build_listarray_for_content_sections(values: Vec<Option<Vec<ContentSectionInfo>>>) -> ListArray {
 
     let struct_builder = StructBuilder::new(
         Fields::from(vec![
@@ -104,7 +108,7 @@ fn build_listarray_for_content_sections(values: Vec<Option<Vec<ContentSectionInf
             for content_section in attachments {
                 let struct_builder = list_builder.values();
 
-                //FIXME: the expect() msgs in this code seem like they could be improved?
+                //FIXME: the expect() msgs in this code seem like they could be improved? (content_sections)
 
                 struct_builder
                     .field_builder::<StringBuilder>(0)
@@ -131,10 +135,6 @@ fn build_listarray_for_content_sections(values: Vec<Option<Vec<ContentSectionInf
 
 fn build_listarray_for_attachments(values: Vec<Option<Vec<AttachmentInfo>>>) -> ListArray {
 
-    //FIXME: This fn was written with help from GPT. It seems plausible but I am not
-    // versed in the construction of Arrow suitable structures.
-    // I had a look at snowflakeconn.rs - seems similar.
-
     let struct_builder = StructBuilder::new(
         Fields::from(vec![
             Field::new("filename", DataType::Utf8, true),
@@ -151,7 +151,7 @@ fn build_listarray_for_attachments(values: Vec<Option<Vec<AttachmentInfo>>>) -> 
             for attachment in attachments {
                 let struct_builder = list_builder.values();
 
-                //FIXME: the expect() msgs in this code seem like they could be improved?
+                //FIXME: the expect() msgs in this code seem like they could be improved? (attachments)
 
                 struct_builder
                     .field_builder::<StringBuilder>(0)
