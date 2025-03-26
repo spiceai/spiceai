@@ -34,7 +34,9 @@ use super::{
     EmailMessage, Error, FailedToLogoutSnafu, FailedToParseHeaderSnafu, FetchMessagesSnafu,
     GetMailboxStatusSnafu, ImapTableProvider,
     attachments::AttachmentRecords,
+    attachments::AttachmentInfo,
     body_content::ContentRecords,
+    body_content::ContentInfo,
 };
 
 fn decode_string(value: &[u8]) -> String {
@@ -222,41 +224,61 @@ impl TableProvider for ImapTableProvider {
             };
 
 
+            struct ExtractRet {
+                attachments: Option<Vec<AttachmentInfo>>,
+                body_content_records: Option<Vec<ContentInfo>>,
+                email_headers: Option<String>,
+            }
 
-            //FIXME: tuple is quick but crude. fragile if order of ret values inside the {} changes for any reason.
-            let (attachment_records,
-                body_content_records,
-                headers) =
+            let extract_ret =
                 if let Some(body_raw) = body_raw {
                     // eml_msg contains a decoded MIME email msg.
                     let eml_msg = MessageParser::default().parse(&body_raw);
 
                     let ret_bubble = if let Some(eml_msg) = eml_msg {
+                        // We now have a parsed MIME email to work with.
+
                         let attachment_records = AttachmentRecords::try_from(&eml_msg, self.fetch_content).ok();
+
                         let body_content_records = ContentRecords::try_from(&eml_msg).ok();
 
                         //reconstruct the email headers into a string blob
-                        let headers_blob: String = eml_msg.headers_raw()
+                        let email_headers_blob: String = eml_msg.headers_raw()
                             .map(|(k, v)| format!("{}:{}", k, v))
-                            .collect()
+                            .collect::<Vec<_>>()
                             .join("");
 
-                        //return a tuple of useful data
-                        (
-                            attachment_records.map(|r| r.attachments),
-                            body_content_records.map(|r| r.sections),
-                            Some(headers_blob),
+
+                        Some(
+                            ExtractRet{
+                                attachments: attachment_records.map(|r|r.attachments),
+                                body_content_records: body_content_records.map(|r|r.sections),
+                                email_headers: Some(email_headers_blob),
+                            }
                         )
 
                     } else {
-                        (None,None,None)
-                    }; //MIME decoded?
+                        //could not decode as mime
+                        None
+                    };
 
                     ret_bubble
-                }else{
-                    (None,None,None)
-                };//do we have body data to parse?
 
+                }else{
+                    //no email body data to parse from imap
+                    None
+                };
+
+
+            //destructure extract_ret
+            // Feels like this is better long-term than a simple tuple.
+            // The destructure code is all in one place. Less room for bugs.
+            let (attachments,
+                body_content_records,
+                headers ) =
+            extract_ret
+                .map(|r| (r.attachments, r.body_content_records, r.email_headers) )
+                .unwrap_or_else(|| (None,None,None));
 
 
             messages.push(EmailMessage {
@@ -270,7 +292,7 @@ impl TableProvider for ImapTableProvider {
                 message_id,
                 in_reply_to,
                 body,
-                attachments: attachment_records,
+                attachments,
                 body_content_records,
                 headers,
             });
