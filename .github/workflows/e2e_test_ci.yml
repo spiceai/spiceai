@@ -652,6 +652,8 @@ jobs:
       - name: Install MySQL (MacOS)
         if: matrix.target.target_os == 'darwin'
         run: |
+          # macos-14 runner bug requires 'brew update': https://github.com/actions/runner-images/issues/11855#issuecomment-2754201066
+          brew update
           brew install mysql@8.4
           brew link mysql@8.4 --force --overwrite
           brew services start mysql@8.4
