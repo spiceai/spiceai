@@ -260,7 +260,7 @@ static QUERY_EVAL_BENCHMARK_FAILED_TESTS: &str = "
 WITH latest_run AS (
     SELECT id FROM spice.eval.runs ORDER BY created_at DESC LIMIT 1
 )
-SELECT run_id, input, output, actual as expected, value as score
+SELECT run_id, input, expected, actual, value as score
 FROM eval.results
 WHERE run_id = (SELECT id FROM latest_run) and value < 1;
 ";

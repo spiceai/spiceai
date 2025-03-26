@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: tpch-pk-indexes
+name: tpch-indexes
 
 extensions:
   tpc:
@@ -29,7 +29,6 @@ datasets:
       engine: duckdb
       mode: file
       refresh_check_interval: &default_refresh_check_interval 10s
-      primary_key: c_custkey
       indexes:
         c_mktsegment: enabled
 
@@ -41,7 +40,6 @@ datasets:
       engine: duckdb
       mode: file
       refresh_check_interval: *default_refresh_check_interval
-      primary_key: '(l_orderkey, l_linenumber)'
       indexes:
         l_orderkey: enabled
         l_shipdate: enabled
@@ -54,7 +52,6 @@ datasets:
       engine: duckdb
       mode: file
       refresh_check_interval: *default_refresh_check_interval
-      primary_key: n_nationkey
       indexes:
         n_regionkey: enabled
     
@@ -66,7 +63,6 @@ datasets:
       engine: duckdb
       mode: file
       refresh_check_interval: *default_refresh_check_interval
-      primary_key: o_orderkey
       indexes:
         '(o_custkey, o_orderkey)': unique
 
@@ -78,7 +74,6 @@ datasets:
       engine: duckdb
       mode: file
       refresh_check_interval: *default_refresh_check_interval
-      primary_key: p_partkey
 
   - from: duckdb:partsupp
     name: partsupp
@@ -88,7 +83,6 @@ datasets:
       engine: duckdb
       mode: file
       refresh_check_interval: *default_refresh_check_interval
-      primary_key: '(ps_partkey, ps_suppkey)'
 
   - from: duckdb:region
     name: region
@@ -107,4 +101,4 @@ datasets:
       engine: duckdb
       mode: file
       refresh_check_interval: *default_refresh_check_interval
-      primary_key: s_suppkey
+  
