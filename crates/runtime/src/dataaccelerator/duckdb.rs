@@ -240,6 +240,15 @@ impl DataAccelerator for DuckDBAccelerator {
         }
 
         if let Some(this_dataset) = dataset {
+            if let Some(temp_directory) = &this_dataset
+                .app
+                .as_ref()
+                .and_then(|app| app.runtime.temp_directory.clone())
+            {
+                cmd.options
+                    .insert("temp_directory".to_string(), temp_directory.to_string());
+            }
+
             if this_dataset.is_file_accelerated() {
                 // If the user didn't specify a DuckDB file and this is a file-mode DuckDB,
                 // then use the shared DuckDB file `accelerated_duckdb.db`
