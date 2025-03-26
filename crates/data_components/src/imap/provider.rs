@@ -33,8 +33,8 @@ use crate::arrow::write::MemTable;
 use super::{
     EmailMessage, Error, FailedToLogoutSnafu, FailedToParseHeaderSnafu, FetchMessagesSnafu,
     GetMailboxStatusSnafu, ImapTableProvider,
-    attachments::AttachmentRecords,
-    attachments::AttachmentInfo,
+    mime::AttachmentRecords,
+    mime::AttachmentInfo,
     body_content::ContentSectionRecords,
     body_content::ContentSectionInfo,
 };

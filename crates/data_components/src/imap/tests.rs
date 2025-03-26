@@ -2,7 +2,7 @@
 
 #[cfg(test)]
 use mail_parser::MessageParser;
-use super::attachments::{AttachmentInfo, AttachmentRecords};
+use super::mime::{AttachmentInfo, AttachmentRecords};
 use super::body_content::ContentSectionRecords;
 
 

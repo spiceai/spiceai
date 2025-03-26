@@ -26,13 +26,13 @@ use arrow::{
 use datafusion::{catalog::TableProvider, error::DataFusionError};
 use session::ImapSession;
 use snafu::prelude::*;
-use attachments::AttachmentInfo;
+use mime::AttachmentInfo;
 use body_content::ContentSectionInfo;
 
 pub mod provider;
 pub mod session;
 
-mod attachments;
+mod mime;
 mod body_content;
 
 #[cfg(test)]
