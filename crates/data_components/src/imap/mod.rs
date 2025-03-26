@@ -27,7 +27,7 @@ use datafusion::{catalog::TableProvider, error::DataFusionError};
 use session::ImapSession;
 use snafu::prelude::*;
 use attachments::AttachmentInfo;
-use body_content::ContentInfo;
+use body_content::ContentSectionInfo;
 
 pub mod provider;
 pub mod session;
@@ -84,8 +84,8 @@ fn build_listarray_for_strings(values: Vec<Option<Vec<Option<String>>>>) -> List
 }
 
 
-fn build_listarray_for_body_content_sections(values: Vec<Option<Vec<ContentInfo>>>) -> ListArray {
-    todo!("FIXME");
+fn build_listarray_for_body_content_sections(values: Vec<Option<Vec<ContentSectionInfo>>>) -> ListArray {
+    todo!("content sections logic mostly same as attachments");
 }
 
 
@@ -200,7 +200,7 @@ impl ImapTableProvider {
         ];
 
         if self.fetch_content {
-            fields.push(Arc::new(StringArray::from(bodies))); //FIXME: mismatch. "content" in schema
+            fields.push(Arc::new(StringArray::from(bodies))); //FIXME: field name mismatch. "content" in schema
 
             fields.push(
                 Arc::new(build_listarray_for_body_content_sections(content_sections))
@@ -236,6 +236,6 @@ pub(crate) struct EmailMessage {
 
     body: Option<String>,
     attachments: Option<Vec<AttachmentInfo>>,
-    content_sections: Option<Vec<ContentInfo>>,
+    content_sections: Option<Vec<ContentSectionInfo>>,
 }
 

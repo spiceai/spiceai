@@ -20,7 +20,7 @@ use mail_parser::{Message};
 
 #[derive(Debug)]
 #[derive(PartialEq)]
-pub struct ContentInfo { //FIXME: rename struct: ContentSectionInfo?
+pub struct ContentSectionInfo {
     pub mime_type: Option<String>,
     pub content: Option<String>,
 }
@@ -28,21 +28,21 @@ pub struct ContentInfo { //FIXME: rename struct: ContentSectionInfo?
 
 #[derive(Debug)]
 #[derive(PartialEq)]
-pub struct ContentRecords{
-    pub sections: Vec<ContentInfo>,
+pub struct ContentSectionRecords {
+    pub sections: Vec<ContentSectionInfo>,
 }
 
 
 
-impl ContentRecords {
-    pub fn try_from( eml_msg: &Message ) -> Result< ContentRecords, String > {
+impl ContentSectionRecords {
+    pub fn try_from( eml_msg: &Message ) -> Result<ContentSectionRecords, String > {
 
-        let mut content_records = Vec::<ContentInfo>::new();
+        let mut content_records = Vec::<ContentSectionInfo>::new();
 
         let mut html_iter = eml_msg.html_bodies();
         while let Some(rec) = html_iter.next() {
             content_records.push(
-                ContentInfo{
+                ContentSectionInfo {
                     mime_type: Some("text/html".to_string()),
                     content: Some(rec.to_string()),
                 }
@@ -52,7 +52,7 @@ impl ContentRecords {
         let mut text_iter = eml_msg.text_bodies();
         while let Some(rec) = text_iter.next() {
             content_records.push(
-                ContentInfo{
+                ContentSectionInfo {
                     mime_type: Some("text/plain".to_string()),
                     content: Some(rec.to_string()),
                 }
@@ -64,7 +64,7 @@ impl ContentRecords {
             Err("No content sections found.".to_string())
         }else{
             Ok(
-                ContentRecords{
+                ContentSectionRecords {
                     sections: content_records
                 }
             )

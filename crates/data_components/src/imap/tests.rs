@@ -3,7 +3,7 @@
 #[cfg(test)]
 use mail_parser::MessageParser;
 use super::attachments::{AttachmentInfo, AttachmentRecords};
-use super::body_content::ContentRecords;
+use super::body_content::ContentSectionRecords;
 
 
 
@@ -23,7 +23,7 @@ fn eml_utf8() {
 
     if let Some(message) = eml_msg {
         //println!("message html_body_count: {}", message.html_body_count());
-        let _content_records = ContentRecords::try_from( &message ).unwrap();
+        let _content_records = ContentSectionRecords::try_from( &message ).unwrap();
         //println!("\ncontent_records = {:#?}", content_records);
 
 
@@ -90,7 +90,7 @@ fn eml_no_attachments(){
 
     if let Some(message) = eml_msg {
         //println!("message html_body_count: {}", message.html_body_count());
-        let _content_records = ContentRecords::try_from( &message ).unwrap();
+        let _content_records = ContentSectionRecords::try_from( &message ).unwrap();
         //println!("\ncontent_records = {:#?}", content_records);
 
         let attachment_records = AttachmentRecords::try_from(&message, false);
@@ -118,7 +118,7 @@ fn eml_three_attachments(){
 
     if let Some(message) = eml_msg {
         //println!("message html_body_count: {}", message.html_body_count());
-        let _content_records = ContentRecords::try_from( &message ).unwrap();
+        let _content_records = ContentSectionRecords::try_from( &message ).unwrap();
         //println!("\ncontent_records = {:#?}", content_records);
 
 
@@ -178,7 +178,7 @@ fn eml_malformed(){
 
     if let Some(message) = eml_msg {
         //println!("message html_body_count: {}", message.html_body_count());
-        let _content_records = ContentRecords::try_from( &message ).unwrap();
+        let _content_records = ContentSectionRecords::try_from( &message ).unwrap();
         //println!("\ncontent_records = {:#?}", content_records);
 
 

@@ -35,8 +35,8 @@ use super::{
     GetMailboxStatusSnafu, ImapTableProvider,
     attachments::AttachmentRecords,
     attachments::AttachmentInfo,
-    body_content::ContentRecords,
-    body_content::ContentInfo,
+    body_content::ContentSectionRecords,
+    body_content::ContentSectionInfo,
 };
 
 fn decode_string(value: &[u8]) -> String {
@@ -225,7 +225,7 @@ impl TableProvider for ImapTableProvider {
 
             struct ExtractRet {
                 attachments: Option<Vec<AttachmentInfo>>,
-                content_sections: Option<Vec<ContentInfo>>,
+                content_sections: Option<Vec<ContentSectionInfo>>,
             }
 
 
@@ -237,7 +237,7 @@ impl TableProvider for ImapTableProvider {
                     Some(ExtractRet {
                         // We now have a parsed mime msg to work with: eml_msg
                         attachments: AttachmentRecords::try_from(&eml_msg, store_attachment_blobs).ok().map(|r| r.attachments),
-                        content_sections: ContentRecords::try_from(&eml_msg).ok().map(|r| r.sections),
+                        content_sections: ContentSectionRecords::try_from(&eml_msg).ok().map(|r| r.sections),
                     })
                 })
             });
