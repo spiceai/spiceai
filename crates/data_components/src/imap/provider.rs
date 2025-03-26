@@ -185,7 +185,7 @@ impl TableProvider for ImapTableProvider {
         let imap_query_msg: String = if self.fetch_content{
             "(ENVELOPE BODY.PEEK[HEADER] BODY.PEEK[])".to_string()
         }else{
-            "(ENVELOPE BODY.PEEK[HEADER]".to_string()
+            "(ENVELOPE BODY.PEEK[HEADER])".to_string()
         };
 
         let fetch_messages = session
