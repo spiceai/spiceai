@@ -27,10 +27,7 @@ use datafusion::{
 use datafusion_table_providers::{
     duckdb::{write::DuckDBTableWriter, DuckDB, DuckDBTableFactory, TableDefinition},
     sql::{
-        db_connection_pool::{
-            dbconnection::duckdbconn::DuckDbConnection, duckdbpool::DuckDbConnectionPool,
-        },
-        sql_provider_datafusion::expr::Engine,
+        db_connection_pool::duckdbpool::DuckDbConnectionPool, sql_provider_datafusion::expr::Engine,
     },
     util,
 };
@@ -51,6 +48,12 @@ pub enum Error {
 
     #[snafu(display("Unable to begin duckdb transaction: {source}"))]
     UnableToBeginTransaction { source: duckdb::Error },
+
+    #[snafu(display("Unable to delete data from the duckdb table.\nAn internal table and base table exist for the same table.\nManually migrate the table by deleting '{internal_table}' or {table_name}', and try again."))]
+    UnableToDeleteDataInternalTable {
+        internal_table: String,
+        table_name: String,
+    },
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -103,9 +106,20 @@ impl DeletionSink for DuckDBDeletionSink {
             .conn
             .transaction()
             .context(UnableToBeginTransactionSnafu)?;
+        let has_table = self.table_definition.has_table(&tx)?;
         let mut internal_tables = self.table_definition.list_internal_tables(&tx)?;
-        let Some((table_name, _)) = internal_tables.pop() else {
-            return Ok(0);
+        let table_name = match (internal_tables.pop(), has_table) {
+            (Some((table_name, _)), true) => {
+                return Err(Box::new(Error::UnableToDeleteDataInternalTable {
+                    internal_table: table_name.to_string(),
+                    table_name: self.table_definition.name().to_string(),
+                }));
+            }
+            (Some((table_name, _)), false) => table_name,
+            (None, true) => self.table_definition.name().clone(),
+            (None, false) => {
+                return Ok(0);
+            }
         };
 
         let sql = util::filters_to_sql(&self.filters, Some(Engine::DuckDB))?;

@@ -3633,7 +3633,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=a53e0ee19a50deb6cf3c14ad1d3c750bd86cc635#a53e0ee19a50deb6cf3c14ad1d3c750bd86cc635"
+source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=b959ba80b0ed2b5d2374b85f337d95b6634e83cd#b959ba80b0ed2b5d2374b85f337d95b6634e83cd"
 dependencies = [
  "arrow",
  "arrow-json",
@@ -13715,7 +13715,7 @@ version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf221c93e13a30d793f7645a0e7762c55d169dbb0a49671918a2319d289b10bb"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
