@@ -47,32 +47,10 @@ pub struct AttachmentRecords{
 }
 
 
-
-// This is not a useful pattern because we down-convert into a pure Vec before we call
-// for build_recordbatch
-// impl Into<ListArray> for AttachmentRecords {
-//     fn into(self) -> ListArray {
-//     }
-// }
-
-//
-// pub struct AttachmentParseOptions{
-//     pub raw_email: String,
-//     pub store_blobs: bool, //spend cpu decoding the attachments from base64/other
-// }
-
-
-
-// impl TryFrom<AttachmentParseOptions> for AttachmentRecords {
-//     type Error = String;
-
 impl AttachmentRecords{
-    pub fn try_from(eml_msg: &Message, store_blobs: bool) -> Result<Self, String> {
+    pub fn try_from(message: &Message, store_blobs: bool) -> Result<Self, String> {
 
         let mut attachments = Vec::<AttachmentInfo>::new();
-
-        //if let Some(message) = MessageParser::default().parse(raw_email) {
-        let message = eml_msg;
 
         for attachment in message.attachments() {
 
@@ -110,12 +88,11 @@ impl AttachmentRecords{
 
 
             //attachments are decoded automatically by mail_parse
-            //encoding type is available. not sure if encoded bytes are.
+            //encoding type is available. not sure if encoded bytes(base64/etc) are.
             let attachment_blob = if store_blobs {
                 Some(
                     attachment.contents().to_vec()
                 )
-
             } else {
                 None
             };
@@ -140,23 +117,20 @@ impl AttachmentRecords{
 
         } //loop attachments for email
 
-        //} //can we parse this email?
-
 
         if attachments.is_empty() {
             Err("No attachments found.".to_string())
         }else{
-
             //sane parse
             Ok(
                 AttachmentRecords{
                     attachments
                 }
             )
-
         }
-
+        
     }
+    
 }
 
 
