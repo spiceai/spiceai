@@ -24,6 +24,7 @@ mod chat;
 mod embed;
 mod eval;
 mod metrics;
+mod model_factory;
 mod tool_use;
 mod wrapper;
 
