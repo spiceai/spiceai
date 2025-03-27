@@ -36,9 +36,11 @@ use datafusion_table_providers::{
 };
 use duckdb::AccessMode;
 use snafu::prelude::*;
-use std::{any::Any, ffi::OsStr, sync::Arc};
+use std::{any::Any, cmp::max, ffi::OsStr, sync::Arc};
 
 use super::{DataAccelerator, Error as DataAcceleratorError};
+
+const DEFAULT_MIN_IDLE_CONNECTIONS: u32 = 10;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -128,8 +130,13 @@ impl DuckDBAccelerator {
             (Ok(duckdb_file), Mode::File) => {
                 let num_accelerating_datasets =
                     self.get_num_accelerating_datasets(Some(duckdb_file.as_str()), dataset.app());
+                let max_size = Self::get_max_size(num_accelerating_datasets);
                 self.duckdb_factory
-                    .get_or_init_file_instance(duckdb_file, Some(num_accelerating_datasets))
+                    .get_or_init_file_instance_with_size_config(
+                        duckdb_file,
+                        Some(max_size),
+                        Some(DEFAULT_MIN_IDLE_CONNECTIONS),
+                    )
                     .await
                     .boxed()
                     .context(AccelerationCreationFailedSnafu)?
@@ -138,7 +145,10 @@ impl DuckDBAccelerator {
                 let num_accelerating_datasets =
                     self.get_num_accelerating_datasets(None, dataset.app());
                 self.duckdb_factory
-                    .get_or_init_memory_instance(Some(num_accelerating_datasets))
+                    .get_or_init_memory_instance_with_size_config(
+                        Some(num_accelerating_datasets),
+                        Some(DEFAULT_MIN_IDLE_CONNECTIONS),
+                    )
                     .await
                     .boxed()
                     .context(AccelerationCreationFailedSnafu)?
@@ -184,6 +194,10 @@ impl DuckDBAccelerator {
         }
 
         instance_usage
+    }
+
+    fn get_max_size(num_accelerating_datasets: u32) -> u32 {
+        max(DEFAULT_MIN_IDLE_CONNECTIONS, num_accelerating_datasets)
     }
 }
 
