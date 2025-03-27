@@ -116,7 +116,7 @@ fn eml_three_attachments(){
 
         let extracted_set = attachment_records.attachments;
         for rec in &extracted_set {
-            let blob = rec.blob.clone().unwrap();
+            let blob = rec.blob.clone().expect("blob not set");
 
             let blob_str = if let Ok(blob) = String::from_utf8(blob) {
                 blob
