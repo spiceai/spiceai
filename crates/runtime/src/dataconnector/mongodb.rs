@@ -136,6 +136,7 @@ impl MongoDB {
     }
 }
 
+#[derive(Default, Copy, Clone)]
 pub struct MongoDBFactory {}
 
 impl MongoDBFactory {

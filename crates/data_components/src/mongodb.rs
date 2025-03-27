@@ -57,7 +57,7 @@ impl MongoDBTableProvider {
 
         let table_schema = Self::infer_schema(Arc::clone(&client), &database_name, &collection_name).await?;
         let filter_document = Self::parse_query(&query_body)
-            .unwrap_or(Document::new());
+            .unwrap_or_default();
 
         Ok(Self {
             client,
@@ -73,7 +73,7 @@ impl MongoDBTableProvider {
         database_name: &str,
         collection_name: &str,
     ) -> Result<(), Error> {
-        let existing_collections = client.database(&database_name)
+        let existing_collections = client.database(database_name)
             .list_collection_names().await
             .map_err(|e| Error::CollectionListSearchingError { source: e })?;
 
@@ -154,7 +154,7 @@ impl TableProvider for MongoDBTableProvider {
         let projection_document_for_mongodb = build_mongodb_projection(&self.table_schema, projection);
 
         let limit: Option<i64> = limit
-            .map(|val| i64::try_from(val))
+            .map(i64::try_from)
             .transpose()
             .map_err(|_| DataFusionError::Execution("Limit is too large".to_string()))?;
 
