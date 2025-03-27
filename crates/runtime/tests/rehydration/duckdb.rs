@@ -25,7 +25,7 @@ pub(crate) async fn query_local_db(
     db_file_path: &str,
     query: &str,
 ) -> Result<SendableRecordBatchStream> {
-    let pool = DuckDbConnectionPool::new_file(db_file_path, &AccessMode::ReadOnly, None)
+    let pool = DuckDbConnectionPool::new_file(db_file_path, &AccessMode::ReadOnly)
         .map_err(|e| Error::msg(format!("Failed to create DuckDB connection pool: {e}")))?;
 
     let conn_dyn = pool
