@@ -55,7 +55,7 @@ impl TryFrom<&Option<String>> for MimeExtract {
                         )
                     )
                 })
-            }).unwrap();
+            }).unwrap(); //FIXME: snafu error for failed mime parse
 
         Ok(
             MimeExtract{
@@ -90,7 +90,7 @@ pub struct AttachmentRecords{
 
 
 impl TryFrom<&Message<'_>> for AttachmentRecords{
-    type Error = String;
+    type Error = String; //FIXME: upgrade to snafu
 
     fn try_from(message: &Message) -> Result<Self, Self::Error> {
 
@@ -200,7 +200,7 @@ pub struct ContentSectionRecords {
 
 
 impl TryFrom<&Message<'_>> for ContentSectionRecords {
-    type Error = String;
+    type Error = String; //FIXME: upgrade to snafu
 
     fn try_from( eml_msg: &Message ) -> Result<ContentSectionRecords, Self::Error> {
 

@@ -83,6 +83,7 @@ fn build_listarray_for_strings(values: Vec<Option<Vec<Option<String>>>>) -> List
 }
 
 
+//FIXME: ret Result<> - handle expect() properly (content_sections)
 fn build_listarray_for_content_sections(values: Vec<Option<Vec<ContentSectionInfo>>>) -> ListArray {
 
     let struct_builder = StructBuilder::new(
@@ -125,6 +126,8 @@ fn build_listarray_for_content_sections(values: Vec<Option<Vec<ContentSectionInf
 }
 
 
+
+//FIXME: ret Result<> - handle expect() properly (attachments)
 fn build_listarray_for_attachments(values: Vec<Option<Vec<AttachmentInfo>>>) -> ListArray {
 
     let struct_builder = StructBuilder::new(

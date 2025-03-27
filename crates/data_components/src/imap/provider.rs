@@ -221,7 +221,7 @@ impl TableProvider for ImapTableProvider {
             };
 
 
-            let mime_extract = MimeExtract::try_from(&body).ok().unwrap();
+            let mime_extract = MimeExtract::try_from(&body).ok().unwrap(); //FIXME: unwrap
 
 
             messages.push(EmailMessage {
