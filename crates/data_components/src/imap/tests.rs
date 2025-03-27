@@ -109,9 +109,7 @@ fn eml_three_attachments(){
     let eml_msg = MessageParser::default().parse(&raw_email);
 
     if let Some(message) = eml_msg {
-        //println!("message html_body_count: {}", message.html_body_count());
-        let _content_records = ContentSectionRecords::try_from( &message ).unwrap();
-        //println!("\ncontent_records = {:#?}", content_records);
+        let _content_records = ContentSectionRecords::try_from( &message ).expect("Failed to parse message");
 
 
         let attachment_records = AttachmentRecords::try_from(&message).unwrap();
