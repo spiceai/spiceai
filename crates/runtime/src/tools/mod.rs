@@ -16,6 +16,8 @@ limitations under the License.
 
 use async_trait::async_trait;
 use catalog::SpiceToolCatalog;
+#[cfg(feature = "mcp")]
+use mcp::McpProxy;
 use serde_json::Value;
 use std::{borrow::Cow, sync::Arc};
 
@@ -82,6 +84,14 @@ pub trait SpiceModelTool: Sync + Send {
         arg: &str,
         rt: Arc<Runtime>,
     ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>>;
+
+    /// If the tool is a proxy around an MCP tool, this method should return the proxy. Otherwise, it should return None.
+    ///
+    /// This enables direct pass through of MCP tool calls.
+    #[cfg(feature = "mcp")]
+    async fn as_mcp_proxy(&self) -> Option<&dyn McpProxy> {
+        None
+    }
 }
 
 /// Recreate a tool with a new name.

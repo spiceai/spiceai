@@ -250,7 +250,9 @@ func upgradeCli(force bool, rtcontext *context.RuntimeContext) bool {
 		slog.Error("upgrading the spice binary", "error", err)
 		return false
 	}
-	os.RemoveAll(tmpDir)
+	if err := os.RemoveAll(tmpDir); err != nil {
+		slog.Error("failed to remove temporary directory", "path", tmpDir, "error", err)
+	}
 
 	slog.Info(fmt.Sprintf("Spice.ai CLI upgraded to %s successfully.", release.TagName))
 

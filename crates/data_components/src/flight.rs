@@ -15,7 +15,10 @@ limitations under the License.
 */
 
 use crate::{Read, ReadWrite};
-use arrow::{array::RecordBatch, datatypes::SchemaRef};
+use arrow::{
+    array::RecordBatch,
+    datatypes::{Schema, SchemaRef},
+};
 use arrow_flight::error::FlightError;
 use async_stream::stream;
 use async_trait::async_trait;
@@ -279,14 +282,29 @@ impl FlightTable {
             }
         };
 
-        let schema = client
-            .get_schema(table_paths)
-            .await
-            .context(UnableToGetSchemaSnafu {
-                table: table_reference.to_quoted_string(),
-            })?;
-
+        let schema = if let Ok(schema) = client.get_schema(table_paths).await {
+            schema
+        } else {
+            tracing::debug!("Failed to get schema from Arrow Flight for table {table_reference} via the native GetSchema call. Falling back to query schema.");
+            Self::get_query_schema(
+                client.clone(),
+                &format!(
+                    "SELECT * FROM {} LIMIT 0",
+                    table_reference.to_quoted_string()
+                ),
+            )
+            .await?
+        };
         Ok(Arc::new(schema))
+    }
+
+    async fn get_query_schema(client: FlightClient, sql: &str) -> Result<Schema> {
+        let schema = client
+            .get_query_schema(sql.into())
+            .await
+            .context(FlightSnafu)?;
+
+        Ok(schema)
     }
 
     fn create_physical_plan(

@@ -21,6 +21,7 @@ import (
 	"log/slog"
 	"os"
 	"path"
+	"path/filepath"
 	"strings"
 
 	"github.com/logrusorgru/aurora"
@@ -46,7 +47,7 @@ spice init my_app
 				slog.Error("getting current working directory", "error", err)
 				return
 			}
-			dirName := path.Base(wd)
+			dirName := filepath.Base(wd)
 
 			cmd.Printf("name: (%s)? ", dirName)
 			_, _ = fmt.Scanf("%s", &spicepodName)

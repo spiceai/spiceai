@@ -33,8 +33,8 @@ func AddElementToString(contentToModify string, elementToAdd string, addAfter st
 
 	scanner.Split(bufio.ScanLines)
 
-	var checkNextLine bool = false
-	var alreadyAdded bool = false
+	var checkNextLine = false
+	var alreadyAdded = false
 	for scanner.Scan() {
 		thisLine := scanner.Text()
 
