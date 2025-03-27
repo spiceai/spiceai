@@ -24,7 +24,7 @@ fn eml_utf8() {
         let _content_records = ContentSectionRecords::try_from( &message ).expect("Failed to parse message");
 
 
-        let attachment_records = AttachmentRecords::try_from( &message ).unwrap();
+        let attachment_records = AttachmentRecords::try_from( &message ).expect("Failed to parse attachments");
 
         let extracted_set = attachment_records.attachments;
 
