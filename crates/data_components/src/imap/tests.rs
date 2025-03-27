@@ -188,10 +188,11 @@ fn eml_malformed(){
                 mime_type: Some("application/pdf".to_string()),
                 blob: None
             },
-            // AttachmentInfo{
-            //     filename: None,
-            //     mime_type: None,
-            // },
+            AttachmentInfo{
+                filename: None,
+                mime_type: Some("application/octet-stream".to_string()), // No filename or mime-type was detected. Default assigned.
+                blob: None
+            },
             AttachmentInfo {
                 filename: Some("no_mime_type.png".to_string()),
                 mime_type: None,
