@@ -83,14 +83,6 @@ fn build_listarray_for_strings(values: Vec<Option<Vec<Option<String>>>>) -> List
 }
 
 
-//FIXME: The following fn were written with help from GPT.
-// They seem plausible but I am not versed in the construction of Arrow suitable structures.
-// I had a look at snowflakeconn.rs - seems similar.
-// - build_listarray_for_content_sections(..)
-// - build_listarray_for_attachments(..)
-
-
-
 fn build_listarray_for_content_sections(values: Vec<Option<Vec<ContentSectionInfo>>>) -> ListArray {
 
     let struct_builder = StructBuilder::new(
