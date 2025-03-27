@@ -29,9 +29,6 @@ fn eml_utf8() {
         let attachment_records = AttachmentRecords::try_from( &message ).unwrap();
 
         let extracted_set = attachment_records.attachments;
-        // for rec in &collated{
-        //     println!("-rec: {:?}", rec);
-        // }
 
         let correct_set = vec!(
 
