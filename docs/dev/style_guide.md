@@ -189,7 +189,7 @@ pub enum Error {
     UnableToWriteGoodLinesError { source: IngestError },
 }
 
-// Snafu re-writes Error to Snafu
+// Snafu drops the `Error` part of the name
 some_result.context(UnableToWriteGoodLinesSnafu)?;
 ```
 
