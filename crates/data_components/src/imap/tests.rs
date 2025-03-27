@@ -121,7 +121,7 @@ fn eml_three_attachments(){
             let blob_str = if let Ok(blob) = String::from_utf8(blob) {
                 blob
             } else {
-                format!("[{}] Could not decode into utf8 for display", rec.mime_type.clone().unwrap())
+                format!("[{}] Could not decode into utf8 for display", rec.mime_type.clone().expect("mime type not set"))
             };
             println!("-rec: {:?}", &blob_str);
             println!("");
