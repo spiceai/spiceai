@@ -1,8 +1,24 @@
+/*
+Copyright 2024-2025 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 use std::any::Any;
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use async_trait::async_trait;
 use datafusion::catalog::TableProvider;
 use mongodb::Client;
@@ -12,6 +28,24 @@ use regex::Regex;
 use crate::component::dataset::Dataset;
 use crate::dataconnector::{ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory, DataConnectorResult};
 use crate::parameters::{ParameterSpec, Parameters};
+
+const TLS_INVALID_HOSTNAMES_CONN_OPTION: &str = r"(?i:(tls|ssl)allowinvalidhostnames)=true";
+static TLS_INVALID_HOSTNAMES_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    #[allow(clippy::expect_used)]
+    Regex::new(TLS_INVALID_HOSTNAMES_CONN_OPTION).expect("tlsAllowInvalidHostnames(sslAllowInvalidHostnames) connection option regex should build")
+});
+
+const CA_FILE_PATH_CONN_OPTION: &str = r"(tls|ssl)CAFile=([^&]+)";
+static CA_FILE_PATH_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    #[allow(clippy::expect_used)]
+    Regex::new(CA_FILE_PATH_CONN_OPTION).expect("tlsCAFile(sslCAFile) connection option regex should build")
+});
+
+const TLS_INVALID_HOSTNAMES_WITH_AMPERSAND_CONN_OPTION: &str = r"(&)?(?i:(tls|ssl)allowinvalidhostnames)=true";
+static TLS_INVALID_HOSTNAMES_WITH_AMPERSAND_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    #[allow(clippy::expect_used)]
+    Regex::new(TLS_INVALID_HOSTNAMES_WITH_AMPERSAND_CONN_OPTION).expect("&tlsAllowInvalidHostnames(&sslAllowInvalidHostnames) should build")
+});
 
 pub struct MongoDB {
     params: Parameters,
@@ -24,7 +58,7 @@ impl MongoDB {
     ) -> DataConnectorResult<ClientOptions> {
         let mut client_options;
 
-        let is_allowing_tls_invalid_hostnames = Regex::new(r"(?i:(tls|ssl)allowinvalidhostnames)=true").unwrap()
+        let is_allowing_tls_invalid_hostnames = TLS_INVALID_HOSTNAMES_REGEX
             .is_match(connection_string.as_str());
 
         if is_allowing_tls_invalid_hostnames { // suppose user is trying to connect documentdb through ssh tunneling
@@ -42,10 +76,10 @@ impl MongoDB {
             // is not supported by ClientOptions::parse() function,
             // so injecting the option through TlsOptions is needed.
             if let Some(_tls_options) = client_options.tls.take() {
-                let pem_file_path = Self::get_pem_file_path(connection_string.as_str())
+                let ca_file_path = Self::get_ca_file_path(connection_string.as_str())
                     .unwrap_or("".to_string());
                 let new_tls = TlsOptions::builder()
-                    .ca_file_path(Some(PathBuf::from(pem_file_path)))
+                    .ca_file_path(Some(PathBuf::from(ca_file_path)))
                     .allow_invalid_hostnames(true)
                     .build();
 
@@ -65,20 +99,16 @@ impl MongoDB {
         Ok(client_options)
     }
 
-    fn get_pem_file_path(connection_string: &str) -> Option<String> {
-        let ca_file_regex = Regex::new(r"tlsCAFile=([^&]+)").unwrap();
-        let ca_file = ca_file_regex
+    fn get_ca_file_path(connection_string: &str) -> Option<String> {
+        CA_FILE_PATH_REGEX
             .captures(connection_string)
-            .and_then(|caps| caps.get(1).map(|m| m.as_str().to_string()));
-
-        ca_file
+            .and_then(|caps| caps.get(2).map(|m| m.as_str().to_string()))
     }
 
     fn remove_tls_allow_invalid_hostnames_option(connection_string: &str) -> String {
-        let target_regex = Regex::new(r"(&)?(?i:(tls|ssl)allowinvalidhostnames)=true").unwrap();
-        let cleaned = target_regex.replace_all(connection_string, "").to_string();
-
-        cleaned
+        TLS_INVALID_HOSTNAMES_WITH_AMPERSAND_REGEX
+            .replace_all(connection_string, "")
+            .to_string()
     }
 
     fn parse_params(
