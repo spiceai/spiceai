@@ -46,14 +46,14 @@ impl TryFrom<&Option<String>> for MimeExtract {
         // Attempt to convert email into parsed mime data and extract attachments and content_sections
         let (attachments, content_sections) =
             body.as_ref().and_then(|body_raw| {
-                MessageParser::default().parse(body_raw).and_then(|eml_msg| {
+                MessageParser::default().parse(body_raw).map(|eml_msg| {
                     // We now have a parsed mime msg to work with: eml_msg
-                    Some(
+                    // Some(
                         (
                             AttachmentRecords::try_from(&eml_msg).ok().map(|r| r.attachments),
                             ContentSectionRecords::try_from(&eml_msg).ok().map(|r| r.sections),
                         )
-                    )
+                    // )
                 })
             }).unwrap(); //FIXME: snafu error for failed mime parse
 
@@ -99,11 +99,9 @@ impl TryFrom<&Message<'_>> for AttachmentRecords{
         for attachment in message.attachments() {
 
             //extract filename
-            let filename = if let Some(attachment_name) = attachment.attachment_name() {
-                Some(attachment_name.to_string())
-            }else{
-                None
-            };
+            //let filename = attachment.attachment_name().map(|attachment_name| attachment_name.to_string());
+            let filename = attachment.attachment_name().map(ToString::to_string);
+
 
             //extract mime type
             let mime_type = if let Some(content_type_struct) = attachment.content_type() {
@@ -115,7 +113,7 @@ impl TryFrom<&Message<'_>> for AttachmentRecords{
                 let mime_type = match &content_type_struct.c_subtype {
                     Some(subtype_val) => {
                         // concat major type and subtype into a string like "text/plain"
-                        format!("{}/{}", major_type_val, subtype_val)
+                        format!("{major_type_val}/{subtype_val}")
                     }
                     None => {
                         // no subtype: returns eg "text"
@@ -206,8 +204,7 @@ impl TryFrom<&Message<'_>> for ContentSectionRecords {
 
         let mut content_records = Vec::<ContentSectionInfo>::new();
 
-        let mut html_iter = eml_msg.html_bodies();
-        while let Some(rec) = html_iter.next() {
+        for rec in eml_msg.html_bodies() {
             content_records.push(
                 ContentSectionInfo {
                     mime_type: Some("text/html".to_string()),
@@ -216,8 +213,7 @@ impl TryFrom<&Message<'_>> for ContentSectionRecords {
             );
         }
 
-        let mut text_iter = eml_msg.text_bodies();
-        while let Some(rec) = text_iter.next() {
+        for rec in eml_msg.text_bodies() {
             content_records.push(
                 ContentSectionInfo {
                     mime_type: Some("text/plain".to_string()),

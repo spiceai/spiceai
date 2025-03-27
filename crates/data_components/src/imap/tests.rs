@@ -124,7 +124,7 @@ fn eml_three_attachments(){
                 format!("[{}] Could not decode into utf8 for display", rec.mime_type.clone().expect("mime type not set"))
             };
             println!("-rec: {:?}", &blob_str);
-            println!("");
+            println!();
         }
 
 
