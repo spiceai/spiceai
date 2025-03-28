@@ -27,6 +27,9 @@ use crate::secrets::Secrets;
 pub enum Error {
     #[snafu(display("Invalid configuration for {component}. {message}"))]
     InvalidConfigurationNoSource { component: String, message: String },
+
+    #[snafu(display("Invalid configuration for {component}. Missing parameter: {param}"))]
+    MissingParameter { component: String, param: String },
 }
 impl Parameters {
     fn validate_and_format_key(
@@ -143,7 +146,7 @@ impl Parameters {
         provided_parameters: &mut Vec<(String, SecretString)>,
         prefix: &'static str,
         all_params: &'static [ParameterSpec],
-    ) -> AnyErrorResult<()> {
+    ) -> Result<(), Box<Error>> {
         for parameter in all_params {
             // If the parameter is missing and has a default value, add it to the params
             let missing = !provided_parameters.iter().any(|p| p.0 == parameter.name);
@@ -162,9 +165,9 @@ impl Parameters {
                     parameter.name.to_string()
                 };
 
-                return Err(Box::new(Error::InvalidConfigurationNoSource {
+                return Err(Box::new(Error::MissingParameter {
                     component: component_name.to_string(),
-                    message: format!("Missing required parameter: {param}"),
+                    param: parameter.name.to_string(),
                 }));
             }
         }

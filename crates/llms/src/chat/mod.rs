@@ -119,6 +119,12 @@ pub enum Error {
 
     #[snafu(display("Failed to load a file specified for the model.\nCould not find the file: {file_url}.\nVerify the `files` parameters for the model, and try again."))]
     ModelFileMissing { file_url: String },
+
+    #[snafu(display("Missing required param {param} for component {component}.\nVerify the model configuration, and try again."))]
+    MissingParameter { param: String, component: String },
+
+    #[snafu(display("Invalid configuration for component {component}: {message}"))]
+    InvalidConfiguration { component: String, message: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
