@@ -15,6 +15,8 @@ limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
 
+use async_stream::stream;
+use std::collections::HashSet;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -36,10 +38,12 @@ use datasets_health_monitor::DatasetsHealthMonitor;
 use extension::ExtensionFactory;
 use flight::RateLimits;
 use futures::future::join_all;
+use futures::Stream;
 #[cfg(feature = "openapi")]
-pub use http::ApiDoc;
+pub use http::get_api_doc;
 use model::{EmbeddingModelStore, EvalScorerRegistry, LLMModelStore};
 
+use crate::tools::{with_name, SpiceModelTool};
 use model_components::model::Model;
 pub use notify::Error as NotifyError;
 use secrecy::SecretString;
@@ -401,15 +405,17 @@ impl Runtime {
         let cloned_config = config.clone();
         let http_auth = endpoint_auth.http_auth.clone();
         let self_ref = Arc::clone(&self);
+        let http_shutdown = CancellationToken::new();
 
         let http_future = self
-            .start_server_component(HTTP_SERVER, None, async move {
+            .start_server_component(HTTP_SERVER, Some(http_shutdown.clone()), async move {
                 http::start(
                     cloned_config.http_bind_address,
                     self_ref,
                     cloned_config.into(),
                     cloned_tls_config,
                     http_auth,
+                    Some(http_shutdown),
                 )
                 .await
                 .context(UnableToStartHttpServerSnafu)
@@ -619,7 +625,7 @@ impl Runtime {
             }
         });
 
-        let eval_scorer = tokio::spawn({
+        let evals = tokio::spawn({
             let self_clone = self.clone();
             async move {
                 let app_lock = self_clone.app.read().await;
@@ -633,6 +639,7 @@ impl Runtime {
                 #[cfg(feature = "models")]
                 {
                     self_clone.load_eval_scorer().await;
+                    let () = self_clone.verify_evals().await;
                     let an_eval_exists = app_lock.as_ref().is_some_and(|app| !app.evals.is_empty());
                     if !an_eval_exists {
                         tracing::trace!("No eval spice components defined. Therefore not loading eval tables into database.");
@@ -650,7 +657,7 @@ impl Runtime {
             datasets,
             catalogs,
             models,
-            eval_scorer
+            evals
         );
 
         if let Err(err) = load_result {
@@ -710,7 +717,7 @@ impl Runtime {
 
         join_all(shutdown_futures).await;
 
-        tracing::debug!("Shutdown complete.");
+        tracing::debug!("Shutdown completed");
     }
 
     /// Spawns and registers a server component with optional cancellation support.
@@ -731,6 +738,57 @@ impl Runtime {
             .insert(component_name.to_string(), handle);
 
         future
+    }
+
+    /// List all tools available in the runtime, either within a catalog or standalone.
+    ///
+    /// Tools from default catalogs are also loaded individually, so the default catalogs must be ignored.
+    ///
+    /// For tools from catalog, the name is prefixed with the catalog name. e.g. `catalog_name/tool_name`.
+    fn list_all_tools(self: &Arc<Self>) -> impl Stream<Item = Arc<dyn SpiceModelTool>> {
+        let default_catalogs = default_available_catalogs();
+        let stream_self = Arc::clone(self);
+        stream! {
+            let tool_lock = stream_self.tools.read().await;
+            let default_catalog_names = default_catalogs
+                .iter()
+                .map(|c| c.name())
+                .collect::<HashSet<_>>();
+            for (name, tooling) in tool_lock.iter() {
+                match tooling {
+                    Tooling::Tool(tool) => {
+                        yield Arc::clone(tool);
+                    }
+                    Tooling::Catalog(catalog) => {
+                        // Do not list tools from default catalogs. They are already listed individually as tools.
+                        if default_catalog_names.contains(&name.as_str()) {
+                            continue;
+                        }
+                        let all = catalog.all().await;
+                        for tool in all {
+                            yield with_name(&tool, format!("{}/{}", catalog.name(), tool.name()).as_str());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    pub async fn get_tool(self: &Arc<Self>, tool_name: &str) -> Option<Arc<dyn SpiceModelTool>> {
+        let tools = self.tools.read().await;
+        let tool: Arc<dyn SpiceModelTool> =
+            if let Some((catalog_name, name)) = tool_name.split_once('/') {
+                let Some(Tooling::Catalog(catalog)) = tools.get(catalog_name) else {
+                    return None;
+                };
+                return catalog.get(name).await;
+            } else {
+                let Some(Tooling::Tool(tool)) = tools.get(tool_name) else {
+                    return None;
+                };
+                Arc::clone(tool)
+            };
+        Some(tool)
     }
 }
 

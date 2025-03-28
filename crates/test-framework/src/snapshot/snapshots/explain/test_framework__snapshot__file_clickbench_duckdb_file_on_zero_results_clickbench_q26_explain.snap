@@ -1,0 +1,24 @@
+---
+source: crates/test-framework/src/snapshot/mod.rs
+description: "Query: clickbench_q26"
+---
++---------------+---------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                    |
++---------------+---------------------------------------------------------------------------------------------------------+
+| logical_plan  | Sort: hits.SearchPhrase ASC NULLS LAST, fetch=10                                                        |
+|               |   BytesProcessedNode                                                                                    |
+|               |     Filter: hits.SearchPhrase != LargeBinary("")                                                        |
+|               |       TableScan: hits projection=[SearchPhrase], partial_filters=[hits.SearchPhrase != LargeBinary("")] |
+| physical_plan | SortExec: TopK(fetch=10), expr=[SearchPhrase@0 ASC NULLS LAST], preserve_partitioning=[false]           |
+|               |   CoalescePartitionsExec                                                                                |
+|               |     BytesProcessedExec                                                                                  |
+|               |       CoalesceBatchesExec: target_batch_size=8192                                                       |
+|               |         FilterExec: SearchPhrase@0 !=                                                                   |
+|               |           SchemaCastScanExec                                                                            |
+|               |             RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                       |
+|               |               FallbackOnZeroResultsScanExec                                                             |
+|               |                 CoalescePartitionsExec                                                                  |
+|               |                   RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                 |
+|               |                     DuckSqlExec sql=                                                                    |
+|               |                                                                                                         |
++---------------+---------------------------------------------------------------------------------------------------------+

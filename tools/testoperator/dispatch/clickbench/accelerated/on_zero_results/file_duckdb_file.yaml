@@ -3,3 +3,4 @@ tests:
     spicepod_path: ./test/spicepods/clickbench/accelerated/on_zero_results/file_duckdb_file.yaml
     query_set: clickbench
     runner_type: spiceai-large-runners
+    ready_wait: 1800

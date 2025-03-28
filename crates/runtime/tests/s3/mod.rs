@@ -23,8 +23,8 @@ use spicepod::component::{dataset::Dataset, params::Params};
 
 use crate::{get_test_datafusion, init_tracing, utils::test_request_context};
 
-pub fn get_s3_dataset() -> Dataset {
-    let mut dataset = Dataset::new("s3://spiceai-demo-datasets/taxi_trips/2024/", "taxi_trips");
+pub fn get_s3_dataset(s3_uri: &str, name: &str) -> Dataset {
+    let mut dataset = Dataset::new(s3_uri, name);
     dataset.params = Some(Params::from_string_map(
         vec![
             ("file_format".to_string(), "parquet".to_string()),
@@ -60,7 +60,14 @@ async fn s3_federation() -> Result<(), anyhow::Error> {
     test_request_context()
         .scope(async {
             let app = AppBuilder::new("s3_federation")
-                .with_dataset(get_s3_dataset())
+                .with_dataset(get_s3_dataset(
+                    "s3://spiceai-demo-datasets/taxi_trips/2024/",
+                    "taxi_trips",
+                ))
+                .with_dataset(get_s3_dataset(
+                    "s3://spiceai-public-datasets/taxi_small_samples/taxi_sample.parquet",
+                    "taxi_sample",
+                ))
                 .build();
 
             let status = status::RuntimeStatus::new();
@@ -87,6 +94,22 @@ async fn s3_federation() -> Result<(), anyhow::Error> {
                 .run()
                 .await
                 .map_err(|e| anyhow::anyhow!(e))?;
+            let mut batches = vec![];
+            while let Some(batch) = query_result.data.next().await {
+                batches.push(batch?);
+            }
+
+            assert_eq!(batches.len(), 1);
+            assert_eq!(batches[0].num_rows(), 10);
+
+            let mut query_result = rt
+                .datafusion()
+                .query_builder("SELECT * FROM taxi_sample LIMIT 10")
+                .build()
+                .run()
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?;
+
             let mut batches = vec![];
             while let Some(batch) = query_result.data.next().await {
                 batches.push(batch?);
@@ -159,6 +182,110 @@ async fn s3_hive_partitioning() -> Result<(), anyhow::Error> {
             let partition_not_inferred = arrow::util::pretty::pretty_format_batches(&batches)
                 .map_err(|e| anyhow::Error::msg(e.to_string()))?;
             insta::assert_snapshot!(partition_not_inferred);
+
+            Ok(())
+        })
+        .await
+}
+
+#[tokio::test]
+async fn s3_schema_evolution() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    test_request_context()
+        .scope(async {
+            let app = AppBuilder::new("s3_schema")
+                .with_dataset(get_s3_dataset(
+                    "s3://spiceai-public-datasets/test_schema_evolution/",
+                    "lineitem",
+                ))
+                .build();
+
+            let status = status::RuntimeStatus::new();
+            let df = get_test_datafusion(Arc::clone(&status));
+
+            let rt = Runtime::builder()
+                .with_app(app)
+                .with_datafusion(df)
+                .build()
+                .await;
+
+            // Set a timeout for the test
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
+                }
+                () = rt.load_components() => {}
+            }
+
+            let mut query_result = rt
+                .datafusion()
+                .query_builder("describe lineitem;")
+                .build()
+                .run()
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?;
+            let mut batches = vec![];
+            while let Some(batch) = query_result.data.next().await {
+                batches.push(batch?);
+            }
+
+            // Test S3 bucket contains Parquet files with different schema, inferred schema must represent the lineitem table
+            // based on the most recently added file: `/test_schema_evolution/2/data_0_2_11-new.parquet`
+            // other Parquet files represent the customer table schema
+            let schema = arrow::util::pretty::pretty_format_batches(&batches)
+                .map_err(|e| anyhow::Error::msg(e.to_string()))?;
+            insta::assert_snapshot!(schema);
+
+            Ok(())
+        })
+        .await
+}
+
+#[tokio::test]
+async fn s3_bulk_bucket_schema() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    test_request_context()
+        .scope(async {
+            let app = AppBuilder::new("s3_schema")
+                .with_dataset(get_s3_dataset(
+                    "s3://spiceai-public-datasets/tpch_sf1000/lineitem/",
+                    "lineitem",
+                ))
+                .build();
+
+            let status = status::RuntimeStatus::new();
+            let df = get_test_datafusion(Arc::clone(&status));
+
+            let rt = Runtime::builder()
+                .with_app(app)
+                .with_datafusion(df)
+                .build()
+                .await;
+
+            // Set a timeout for the test
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
+                }
+                () = rt.load_components() => {}
+            }
+
+            let mut query_result = rt
+                .datafusion()
+                .query_builder("describe lineitem;")
+                .build()
+                .run()
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?;
+            let mut batches = vec![];
+            while let Some(batch) = query_result.data.next().await {
+                batches.push(batch?);
+            }
+            let schema = arrow::util::pretty::pretty_format_batches(&batches)
+                .map_err(|e| anyhow::Error::msg(e.to_string()))?;
+            insta::assert_snapshot!(schema);
 
             Ok(())
         })

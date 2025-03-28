@@ -37,11 +37,23 @@ pub async fn record_explain_plan(
 
     let mut assertion_err: Option<String> = None;
 
+    let temp_dir = std::env::temp_dir();
+    let temp_dir_str = temp_dir.to_str().unwrap_or_default();
+    let temp_dir_clean = temp_dir_str.trim_end_matches('/').trim_start_matches('/');
+    let temp_dir_pattern = regex::escape(temp_dir_clean);
+
+    // Create two patterns:
+    // 1. Exact match starting with the temp_dir: {temp_dir}/some_dir/data
+    // 2. Match with "private" prefix: private{temp_dir}/some_dir/data
+    let path_filter_pattern =
+        format!(r"(?:{temp_dir_pattern}|private/{temp_dir_pattern})/[^/]*/data",);
+
     insta::with_settings!({
         description => format!("Query: {query_name}"),
         omit_expression => true,
         snapshot_path => "snapshots/explain",
         filters => vec![
+            (path_filter_pattern.as_str(), "/data"),
             (r"required_guarantees=\[[^\]]*\]", "required_guarantees=[N]"),
         ],
     }, {
@@ -58,4 +70,44 @@ pub async fn record_explain_plan(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_temp_dir_regex_pattern() -> Result<(), String> {
+        let test_cases = [
+            // Test case 1: Mac temp dir path without leading path
+            (
+                "/var/folders/hs/xq6mn_y9293d05rw5bvhfm_c0000gn/T/",
+                "var/folders/hs/xq6mn_y9293d05rw5bvhfm_c0000gn/T/.tmpGbYR27/data/partsupp.parquet:3474778..5212167",
+                "/data/partsupp.parquet:3474778..5212167",
+            ),
+            // Test case 2: Mac temp dir path with leading path
+            (
+                "/var/folders/hs/xq6mn_y9293d05rw5bvhfm_c0000gn/T/",
+                "private/var/folders/hs/xq6mn_y9293d05rw5bvhfm_c0000gn/T/.tmpGbYR27/data/partsupp.parquet:3474778..5212167",
+                "/data/partsupp.parquet:3474778..5212167",
+            ),
+            // Test case 3: Linux temp dir path
+            (
+                "/tmp",
+                "tmp/.tmpJ1DebA/data/orders.parquet:0..2311466",
+                "/data/orders.parquet:0..2311466",
+            ),
+        ];
+
+        for (tmp_dir, input, expected) in test_cases {
+            let temp_dir_clean = tmp_dir.trim_end_matches('/').trim_start_matches('/');
+            let temp_dir_pattern = regex::escape(temp_dir_clean);
+            let path_filter_pattern =
+                format!(r"(?:{temp_dir_pattern}|private/{temp_dir_pattern})/[^/]*/data",);
+
+            let regex = regex::Regex::new(&path_filter_pattern).map_err(|e| format!("{e}"))?;
+            let result = regex.replace(input, "/data");
+            assert_eq!(result, expected, "Failed for input: {input}");
+        }
+
+        Ok(())
+    }
 }

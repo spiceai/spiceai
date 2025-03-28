@@ -22,7 +22,7 @@ SQL
 generate_row() {
   ROW_NUM=$1
   DATA="Sample data $ROW_NUM updated at $(date '+%Y-%m-%d %H:%M:%S')"
-  DATE_CREATED=$(date -v -$((RANDOM % 10))d '+%Y-%m-%d %H:%M:%S')
+  DATE_CREATED=$(date '+%Y-%m-%d %H:%M:%S')
   DATE_UPDATED=$(date '+%Y-%m-%d %H:%M:%S')
 
   echo "$ROW_NUM, '$DATA', '$DATE_CREATED', '$DATE_UPDATED'"

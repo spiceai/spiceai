@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"strings"
@@ -98,7 +99,11 @@ func (s *SpiceApiClient) GetAuthContext(accessToken string, orgName *string, app
 	if err != nil {
 		return spiceAuthContext, err
 	}
-	defer response.Body.Close()
+	defer func() {
+		if err := response.Body.Close(); err != nil {
+			slog.Error("closing response body", "error", err)
+		}
+	}()
 
 	body, err := io.ReadAll(response.Body)
 	if err != nil {
@@ -137,7 +142,11 @@ func (s *SpiceApiClient) ExchangeCode(authCode string) (AccessTokenResponse, err
 	if err != nil {
 		return authStatusResponse, err
 	}
-	defer response.Body.Close()
+	defer func() {
+		if err := response.Body.Close(); err != nil {
+			slog.Error("closing response body", "error", err)
+		}
+	}()
 
 	body, err := io.ReadAll(response.Body)
 	if err != nil {

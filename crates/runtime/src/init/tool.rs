@@ -14,17 +14,19 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use crate::{
     get_params_with_secrets, metrics, status,
     tools::{self, factory::default_available_catalogs, Tooling},
     Runtime, SpiceToolCatalog, UnableToInitializeLlmToolSnafu,
 };
+use futures::future::join_all;
 use opentelemetry::KeyValue;
 use secrecy::SecretString;
 use snafu::ResultExt;
 use spicepod::component::tool::Tool;
+use util::{fibonacci_backoff::FibonacciBackoffBuilder, retry, RetryError};
 
 impl Runtime {
     #[allow(clippy::implicit_hasher)]
@@ -37,6 +39,9 @@ impl Runtime {
             }
         }
 
+        let mut spawned_tasks = vec![];
+        let cloned_self = self.clone();
+
         // Load all built-in tools, regardless if they are in the spicepod.
         // This will enable loading each tool in the catalog, and the catalog as a whole. E.g:
         //   `tools: models, builtin`
@@ -44,9 +49,15 @@ impl Runtime {
         for ctlg in default_available_catalogs() {
             self.insert_tool_catalog(&ctlg).await;
             for tool in ctlg.all().await {
-                self.insert_tool(tool.into()).await;
+                let cloned_self = cloned_self.clone();
+                let handle = tokio::spawn(async move {
+                    cloned_self.insert_tool(tool.into()).await;
+                });
+                spawned_tasks.push(handle);
             }
         }
+
+        let _ = join_all(spawned_tasks).await;
     }
 
     async fn insert_tool_catalog(&self, t: &Arc<dyn SpiceToolCatalog>) {
@@ -72,26 +83,41 @@ impl Runtime {
     }
 
     async fn load_tool(&self, tool: &Tool) {
-        self.status
-            .update_tool(&tool.name, status::ComponentStatus::Initializing);
-        let params_with_secrets: HashMap<String, SecretString> =
-            get_params_with_secrets(self.secrets(), &tool.params).await;
+        let retry_strategy = FibonacciBackoffBuilder::new()
+            .max_retries(None)
+            .max_duration(Some(Duration::from_secs(60)))
+            .build();
 
-        match tools::factory::forge(tool, params_with_secrets)
-            .await
-            .context(UnableToInitializeLlmToolSnafu)
-        {
-            Ok(t) => self.insert_tool(t).await,
-            Err(e) => {
-                metrics::tools::LOAD_ERROR.add(1, &[]);
-                self.status
-                    .update_tool(&tool.name, status::ComponentStatus::Error);
-                tracing::warn!(
-                    "Unable to load tool '{}' from spicepod. Error: {}",
-                    tool.name,
-                    e,
-                );
+        let _ = retry(retry_strategy, || async {
+            self.status
+                .update_tool(&tool.name, status::ComponentStatus::Initializing);
+            let params_with_secrets: HashMap<String, SecretString> =
+                get_params_with_secrets(self.secrets(), &tool.params).await;
+
+            let env_with_secrets: HashMap<String, SecretString> =
+                get_params_with_secrets(self.secrets(), &tool.env).await;
+
+            match tools::factory::forge(tool, params_with_secrets, env_with_secrets)
+                .await
+                .context(UnableToInitializeLlmToolSnafu)
+            {
+                Ok(t) => {
+                    self.insert_tool(t).await;
+                    Ok(())
+                }
+                Err(e) => {
+                    metrics::tools::LOAD_ERROR.add(1, &[]);
+                    self.status
+                        .update_tool(&tool.name, status::ComponentStatus::Error);
+                    tracing::warn!(
+                        "Unable to load tool '{}' from spicepod. Error: {}",
+                        tool.name,
+                        e,
+                    );
+                    Err(RetryError::transient(e))
+                }
             }
-        }
+        })
+        .await;
     }
 }

@@ -16,7 +16,7 @@ limitations under the License.
 
 use async_trait::async_trait;
 use mcp_client::McpClientTrait;
-use mcp_core::Tool as McpTool;
+use mcp_core::{protocol::CallToolResult, Tool as McpTool};
 use serde_json::Value;
 use snafu::ResultExt;
 use std::{borrow::Cow, sync::Arc};
@@ -26,7 +26,7 @@ use tracing_futures::Instrument;
 
 use crate::{tools::SpiceModelTool, Runtime};
 
-use super::Result;
+use super::{McpProxy, Result};
 
 pub struct McpToolWrapper {
     client: Arc<RwLock<Box<dyn McpClientTrait>>>,
@@ -58,6 +58,10 @@ impl SpiceModelTool for McpToolWrapper {
         Some(self.spec.input_schema.clone())
     }
 
+    async fn as_mcp_proxy(&self) -> Option<&dyn McpProxy> {
+        Some(self)
+    }
+
     async fn call(
         &self,
         arg: &str,
@@ -67,13 +71,16 @@ impl SpiceModelTool for McpToolWrapper {
         let tool_use_result: Result<Value, Box<dyn std::error::Error + Send + Sync>> = async {
             let client = self.client.read().await;
 
-            let value = serde_json::from_str(arg).map_err(|e| {
-                tracing::error!(target: "task_history", parent: &span, "Failed to parse input: {e}");
-                e
-            })?;
-
+            let input: Value = if arg.is_empty() {
+                Value::Null
+            } else {
+                serde_json::from_str(arg).map_err(|e| {
+                    tracing::error!(target: "task_history", parent: &span, "Failed to parse input: {e}");
+                    e
+                })?
+            };
             let response = client
-                .call_tool(self.internal_name(), value)
+                .call_tool(self.internal_name(), input)
                 .await
                 .boxed()?;
 
@@ -90,5 +97,13 @@ impl SpiceModelTool for McpToolWrapper {
                 Err(e)
             }
         }
+    }
+}
+
+#[async_trait]
+impl McpProxy for McpToolWrapper {
+    async fn call_tool(&self, arguments: Value) -> Result<CallToolResult, mcp_client::Error> {
+        let inner = self.client.read().await;
+        inner.call_tool(self.internal_name(), arguments).await
     }
 }

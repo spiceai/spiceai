@@ -18,6 +18,7 @@ use super::get_app_and_start_request;
 use crate::{
     args::DatasetTestArgs,
     commands::{TEST_RESULTS_API_KEY, TEST_RESULTS_DATASET},
+    wait_test_and_memory,
 };
 use std::time::Duration;
 use test_framework::{
@@ -31,6 +32,8 @@ use test_framework::{
     spiced::SpicedInstance,
     spicepod::component::dataset::acceleration::RefreshMode,
     spicetest::{append::NotStarted, SpiceTest},
+    tokio_util::sync::CancellationToken,
+    utils::observe_memory,
     TestType,
 };
 
@@ -62,6 +65,8 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
     .await?;
 
     let mut spiced_instance = SpicedInstance::start(start_request).await?;
+    let memory_token = CancellationToken::new();
+    let memory_readings = spiced_instance.process().watch_memory(&memory_token);
 
     spiced_instance
         .wait_for_ready(Duration::from_secs(args.common.ready_wait))
@@ -71,9 +76,10 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
         .with_spiced_instance(spiced_instance)
         .start_test()
         .await?;
-    let test = append_test.wait().await?;
+    let test = wait_test_and_memory!(append_test, memory_token, memory_readings);
     let metrics: QueryMetrics<_, NoExtendedMetrics> = test.collect(TestType::Benchmark)?;
     let mut spiced_instance = test.end()?;
+    let (max_memory, _) = observe_memory(memory_token, memory_readings).await?;
 
     check_table_counts(
         &spiced_instance,
@@ -82,7 +88,7 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
     )
     .await?;
 
-    let records = metrics.build_records()?;
+    let records = metrics.with_memory_usage(max_memory).build_records()?;
     print_batches(&records)?;
 
     if args.common.upload_results_dataset.is_some() {
@@ -92,8 +98,6 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
             .await?;
         put_batches(&mut flight_client, TEST_RESULTS_DATASET, records).await?;
     }
-
-    spiced_instance.show_memory_usage()?;
 
     spiced_instance.stop()?;
     Ok(())

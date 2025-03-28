@@ -19,8 +19,8 @@ The principles guiding this work are as follows:
 
 *Good*:
 
-* Derives `Snafu` and `Debug` functionality
-* Has a useful, end-user-friendly display message
+- Derives `Snafu` and `Debug` functionality
+- Has a useful, end-user-friendly display message
 
 ```rust
 #[derive(Snafu, Debug)]
@@ -44,8 +44,8 @@ pub enum Error {
 
 *Good*:
 
-* Resembles `assert!`
-* More concise
+- Resembles `assert!`
+- More concise
 
 ```rust
 ensure!(!self.schema_sample.is_empty(), NeedsAtLeastOneLine);
@@ -63,8 +63,8 @@ if self.schema_sample.is_empty() {
 
 *Good*:
 
-* Grouping related error conditions with their generating code
-* Minimizing unnecessary `match` statements on irrelevant errors
+- Grouping related error conditions with their generating code
+- Minimizing unnecessary `match` statements on irrelevant errors
 
 ```rust
 #[derive(Debug, Snafu)]
@@ -92,7 +92,7 @@ ensure!(foo.is_implemented(), NotImplemented {
 
 *Good*:
 
-* Reduces repetition
+- Reduces repetition
 
 ```rust
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -111,7 +111,7 @@ fn foo() -> Result<bool, Error> { true }
 
 *Good*:
 
-* Reduces boilerplate
+- Reduces boilerplate
 
 ```rust
 input_reader
@@ -177,6 +177,45 @@ close_writer.context(WritingError {
     message: String::from("Error while closing the table writer"),
 })?;
 ```
+
+### `Error` enum variants do not include the word `Error` in the variant name
+
+When Snafu generates macros for the enum variants, Snafu re-writes variants that end with `Error`. For example:
+
+```rust
+#[derive(Debug, Snafu)]
+pub enum Error {
+    #[snafu(display("Error writing remaining lines {}", source))]
+    UnableToWriteGoodLinesError { source: IngestError },
+}
+
+// Snafu drops the `Error` part of the name
+some_result.context(UnableToWriteGoodLinesSnafu)?;
+```
+
+This behavior can sometimes make it difficult to determine the originating error variant. Additionally, when using variants directly we already have the context they are an `Error` - so there is no need to duplicate `Error` in the variant name.
+
+*Good*:
+
+```rust
+#[derive(Debug, Snafu)]
+pub enum Error {
+    #[snafu(display("Error writing remaining lines {}", source))]
+    UnableToWriteGoodLines { source: IngestError },
+}
+```
+
+*Bad*:
+
+```rust
+#[derive(Debug, Snafu)]
+pub enum Error {
+    #[snafu(display("Error writing remaining lines {}", source))]
+    UnableToWriteGoodLinesError { source: IngestError },
+}
+```
+
+### Notes
 
 **Code linting**: [Clippy](https://doc.rust-lang.org/stable/clippy/index.html) is used for code linting to enhance idiomatic Rust usage. All warnings are treated as errors, with several non-standard lints enabled. Disabling lints using `#[allow(...)]` is acceptable when the lint is not applicable in certain contexts.
 
