@@ -100,7 +100,7 @@ impl MongoDB {
             // so injecting the option through TlsOptions is needed.
             if let Some(_tls_options) = client_options.tls.take() {
                 let ca_file_path =
-                    Self::get_ca_file_path(connection_string.as_str()).unwrap_or("".to_string());
+                    Self::get_ca_file_path(connection_string.as_str()).unwrap_or_default();
                 let new_tls = TlsOptions::builder()
                     .ca_file_path(Some(PathBuf::from(ca_file_path)))
                     .allow_invalid_hostnames(true)
@@ -248,18 +248,15 @@ impl DataConnector for MongoDB {
         dataset: &Dataset,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         let path = dataset.path();
-        let mut db_and_collection = path.split(".");
+        let mut db_and_collection = path.split('.');
 
-        let (database, collection) = match (db_and_collection.next(), db_and_collection.next()) {
-            (Some(database), Some(collection)) => (database, collection),
-            _ => {
+        let (Some(database), Some(collection)) = (db_and_collection.next(), db_and_collection.next()) else {
                 return Err(DataConnectorError::InvalidConfigurationSourceOnly {
                     dataconnector: "mongodb".to_string(),
                     connector_component: ConnectorComponent::from(dataset),
                     source: Box::new(Error::InvalidDatasetFormat {}),
                 })
-            }
-        };
+            };
 
         let connection_string = self
             .params

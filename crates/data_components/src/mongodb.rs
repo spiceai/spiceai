@@ -121,7 +121,7 @@ impl MongoDBTableProvider {
 
         let mut cursor = collection
             .find(Document::new())
-            .limit(NUM_DOCUMENTS_TO_INFER_SCHEMA as i64)
+            .limit(i64::from(NUM_DOCUMENTS_TO_INFER_SCHEMA))
             .await
             .context(FailedToFindDocumentSnafu)?;
 
@@ -131,7 +131,7 @@ impl MongoDBTableProvider {
             .await
             .context(FailedToStreamDocumentSnafu)?
         {
-            extracted_schema_info.push(document_to_json_value(&document))
+            extracted_schema_info.push(document_to_json_value(&document));
         }
 
         let schema = infer_json_schema_from_iterator(extracted_schema_info.iter().map(Ok))
