@@ -337,9 +337,8 @@ mod tests{
                 //reconstruct the email headers into a string blob
                 let headers_blob: String = message.headers_raw()
                     .map(|(k, v)| format!("{k}:{v}"))
-                    .collect::<String>()
-                    .join("");
-                println!("headers blob: [{}]", headers_blob);
+                    .collect::<String>();
+                println!("headers blob: [{headers_blob}]");
 
                 assert!(attachment_records.is_err());
 
