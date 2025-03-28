@@ -278,3 +278,90 @@ pub(crate) struct EmailMessage {
     content_sections: Option<Vec<ContentSectionInfo>>,
 }
 
+
+
+
+
+
+#[cfg(test)]
+mod tests {
+    mod build_listarray{
+        use super::super::*;
+        use arrow::array::{Array, ListArray, StructArray, StringArray};
+        use arrow::datatypes::{DataType, Field};
+
+        #[test]
+        fn test_build_listarray_for_content_sections() {
+            // Prepare test input:
+            // - First element: a list with two content sections.
+            // - Second element: None.
+            // - Third element: an empty list.
+            let values = vec![
+                Some(vec![
+                    ContentSectionInfo {
+                        content: Some("Hello".to_string()),
+                        mime_type: Some("text/plain".to_string()),
+                    },
+                    ContentSectionInfo {
+                        content: Some("World".to_string()),
+                        mime_type: None,
+                    },
+                ]),
+                None,
+                Some(vec![]),
+            ];
+
+            // Call your function.
+            let list_array = build_listarray_for_content_sections(values)
+                .expect("Failed to build ListArray");
+
+            // Verify the outer ListArray has three entries.
+            assert_eq!(list_array.len(), 3);
+            // The second element should be null.
+            assert!(!list_array.is_valid(1));
+            // The first and third elements should be valid.
+            assert!(list_array.is_valid(0));
+            assert!(list_array.is_valid(2));
+
+            // Get the offsets into the inner array.
+            let offsets = list_array.value_offsets();
+            // For the first element, we expect two inner records.
+            assert_eq!(offsets[0], 0);
+            assert_eq!(offsets[1], 2);
+            // The third element is an empty list.
+            assert_eq!(offsets[2], offsets[3]);
+
+            // Retrieve the inner StructArray.
+            let struct_array = list_array.values()
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .expect("Expected a StructArray");
+
+            // Get the "content" and "mime_type" fields from the struct.
+            let content_array = struct_array.column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("Expected a StringArray for 'content'");
+
+            let mime_type_array = struct_array.column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("Expected a StringArray for 'mime_type'");
+
+            // For the first element (records 0 and 1 in the inner array):
+            // Record 0: content = "Hello", mime_type = "text/plain"
+            assert_eq!(content_array.value(0), "Hello");
+            assert!(mime_type_array.is_valid(0));
+            assert_eq!(mime_type_array.value(0), "text/plain");
+
+            // Record 1: content = "World", mime_type should be null.
+            assert_eq!(content_array.value(1), "World");
+            assert!(!mime_type_array.is_valid(1));
+        }
+
+    }
+
+}
+
+
+
