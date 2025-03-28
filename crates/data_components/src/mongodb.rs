@@ -14,11 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::any::Any;
-use std::fmt;
-use std::fmt::{Debug, Formatter};
-use std::io::Cursor;
-use std::sync::Arc;
 use arrow::datatypes::SchemaRef;
 use arrow::json::reader::infer_json_schema_from_iterator;
 use arrow::json::ReaderBuilder;
@@ -29,14 +24,21 @@ use datafusion::datasource::{TableProvider, TableType};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::Expr;
 use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
-use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionMode, ExecutionPlan, PlanProperties};
 use datafusion::physical_plan::stream::RecordBatchReceiverStream;
+use datafusion::physical_plan::{
+    DisplayAs, DisplayFormatType, ExecutionMode, ExecutionPlan, PlanProperties,
+};
 use futures::TryStreamExt;
 use mongodb::bson::{to_bson, Bson, Document};
-use mongodb::{Client, Collection};
 use mongodb::options::FindOptions;
-use serde_json::{Value, to_value, from_str};
+use mongodb::{Client, Collection};
+use serde_json::{from_str, to_value, Value};
 use snafu::{ResultExt, Snafu};
+use std::any::Any;
+use std::fmt;
+use std::fmt::{Debug, Formatter};
+use std::io::Cursor;
+use std::sync::Arc;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -68,12 +70,18 @@ pub struct MongoDBTableProvider {
 }
 
 impl MongoDBTableProvider {
-    pub async fn try_new(client: Arc<Client>, database_name: Arc<str>, collection_name: Arc<str>, query_body: Arc<str>) -> Result<Self, Error> {
-        Self::check_collection_exists(Arc::clone(&client), &database_name, &collection_name).await?;
+    pub async fn try_new(
+        client: Arc<Client>,
+        database_name: Arc<str>,
+        collection_name: Arc<str>,
+        query_body: Arc<str>,
+    ) -> Result<Self, Error> {
+        Self::check_collection_exists(Arc::clone(&client), &database_name, &collection_name)
+            .await?;
 
-        let table_schema = Self::infer_schema(Arc::clone(&client), &database_name, &collection_name).await?;
-        let filter_document = Self::parse_query(&query_body)
-            .unwrap_or_default();
+        let table_schema =
+            Self::infer_schema(Arc::clone(&client), &database_name, &collection_name).await?;
+        let filter_document = Self::parse_query(&query_body).unwrap_or_default();
 
         Ok(Self {
             client,
@@ -89,8 +97,10 @@ impl MongoDBTableProvider {
         database_name: &str,
         collection_name: &str,
     ) -> Result<(), Error> {
-        let existing_collections = client.database(database_name)
-            .list_collection_names().await
+        let existing_collections = client
+            .database(database_name)
+            .list_collection_names()
+            .await
             .context(FailedToListCollectionsSnafu)?;
 
         if !existing_collections.contains(&collection_name.to_string()) {
@@ -100,19 +110,27 @@ impl MongoDBTableProvider {
         Ok(())
     }
 
-    async fn infer_schema(client: Arc<Client>, database_name: &str, collection_name: &str) -> Result<SchemaRef, Error> {
+    async fn infer_schema(
+        client: Arc<Client>,
+        database_name: &str,
+        collection_name: &str,
+    ) -> Result<SchemaRef, Error> {
         let collection = client
             .database(database_name)
             .collection::<Document>(collection_name);
 
-        let mut cursor = collection.find(
-            Document::new()
-        ).limit(NUM_DOCUMENTS_TO_INFER_SCHEMA as i64).await
+        let mut cursor = collection
+            .find(Document::new())
+            .limit(NUM_DOCUMENTS_TO_INFER_SCHEMA as i64)
+            .await
             .context(FailedToFindDocumentSnafu)?;
 
         let mut extracted_schema_info = Vec::new();
-        while let Some(document) = cursor.try_next().await
-            .context(FailedToStreamDocumentSnafu)? {
+        while let Some(document) = cursor
+            .try_next()
+            .await
+            .context(FailedToStreamDocumentSnafu)?
+        {
             extracted_schema_info.push(document_to_json_value(&document))
         }
 
@@ -135,7 +153,8 @@ impl MongoDBTableProvider {
 
 fn document_to_json_value(document: &Document) -> Value {
     Value::Object(
-        document.iter()
+        document
+            .iter()
             .map(|(k, v)| (k.clone(), to_value(v).unwrap_or(Value::Null)))
             .collect(),
     )
@@ -162,12 +181,14 @@ impl TableProvider for MongoDBTableProvider {
         _filters: &[Expr],
         limit: Option<usize>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        let collection = self.client
+        let collection = self
+            .client
             .database(self.database_name.as_ref())
             .collection::<Document>(self.collection_name.as_ref());
 
         let projected_schema = project_schema(&self.table_schema, projection)?;
-        let projection_document_for_mongodb = build_mongodb_projection(&self.table_schema, projection);
+        let projection_document_for_mongodb =
+            build_mongodb_projection(&self.table_schema, projection);
 
         let limit: Option<i64> = limit
             .map(i64::try_from)
@@ -216,7 +237,12 @@ pub struct MongoDBTableProviderExec {
 
 impl MongoDBTableProviderExec {
     #[must_use]
-    pub fn new(collection: Collection<Document>, filter_document: Document, find_options: Option<FindOptions>, table_schema: SchemaRef) -> Self {
+    pub fn new(
+        collection: Collection<Document>,
+        filter_document: Document,
+        find_options: Option<FindOptions>,
+        table_schema: SchemaRef,
+    ) -> Self {
         Self {
             collection,
             filter_document,
@@ -226,7 +252,7 @@ impl MongoDBTableProviderExec {
                 EquivalenceProperties::new(table_schema),
                 Partitioning::UnknownPartitioning(1),
                 ExecutionMode::Bounded,
-            )
+            ),
         }
     }
 }
@@ -260,11 +286,18 @@ impl ExecutionPlan for MongoDBTableProviderExec {
         vec![]
     }
 
-    fn with_new_children(self: Arc<Self>, _children: Vec<Arc<dyn ExecutionPlan>>) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
+    fn with_new_children(
+        self: Arc<Self>,
+        _children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
         Ok(self)
     }
 
-    fn execute(&self, _partition: usize, _context: Arc<TaskContext>) -> datafusion::common::Result<SendableRecordBatchStream> {
+    fn execute(
+        &self,
+        _partition: usize,
+        _context: Arc<TaskContext>,
+    ) -> datafusion::common::Result<SendableRecordBatchStream> {
         let mut builder = RecordBatchReceiverStream::builder(Arc::clone(&self.table_schema), 2);
         let tx = builder.tx();
         let schema = Arc::clone(&self.table_schema);
@@ -273,12 +306,17 @@ impl ExecutionPlan for MongoDBTableProviderExec {
         let filter_document = self.filter_document.clone();
 
         builder.spawn(async move {
-            let mut cursor = collection.find(
-                filter_document
-            ).with_options(find_options).await
-            .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+            let mut cursor = collection
+                .find(filter_document)
+                .with_options(find_options)
+                .await
+                .map_err(|e| DataFusionError::Execution(e.to_string()))?;
 
-            while let Some(document) = cursor.try_next().await.map_err(|e| DataFusionError::Execution(e.to_string()))? {
+            while let Some(document) = cursor
+                .try_next()
+                .await
+                .map_err(|e| DataFusionError::Execution(e.to_string()))?
+            {
                 let json_value = document_to_json_value(&document).to_string();
 
                 let batches = ReaderBuilder::new(Arc::clone(&schema))

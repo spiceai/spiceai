@@ -14,21 +14,24 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::component::dataset::Dataset;
+use crate::dataconnector::{
+    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
+    DataConnectorResult,
+};
+use crate::parameters::{ParameterSpec, Parameters};
+use async_trait::async_trait;
+use data_components::mongodb::MongoDBTableProvider;
+use datafusion::catalog::TableProvider;
+use mongodb::options::{ClientOptions, Credential, ServerAddress, Tls, TlsOptions};
+use mongodb::Client;
+use regex::Regex;
+use snafu::Snafu;
 use std::any::Any;
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
-use async_trait::async_trait;
-use datafusion::catalog::TableProvider;
-use mongodb::Client;
-use mongodb::options::{ClientOptions, Credential, ServerAddress, Tls, TlsOptions};
-use data_components::mongodb::MongoDBTableProvider;
-use regex::Regex;
-use snafu::Snafu;
-use crate::component::dataset::Dataset;
-use crate::dataconnector::{ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory, DataConnectorResult};
-use crate::parameters::{ParameterSpec, Parameters};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -45,19 +48,24 @@ pub enum Error {
 const TLS_INVALID_HOSTNAMES_CONN_OPTION: &str = r"(?i:(tls|ssl)allowinvalidhostnames)=true";
 static TLS_INVALID_HOSTNAMES_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     #[allow(clippy::expect_used)]
-    Regex::new(TLS_INVALID_HOSTNAMES_CONN_OPTION).expect("tlsAllowInvalidHostnames(sslAllowInvalidHostnames) connection option regex should build")
+    Regex::new(TLS_INVALID_HOSTNAMES_CONN_OPTION).expect(
+        "tlsAllowInvalidHostnames(sslAllowInvalidHostnames) connection option regex should build",
+    )
 });
 
 const CA_FILE_PATH_CONN_OPTION: &str = r"(tls|ssl)CAFile=([^&]+)";
 static CA_FILE_PATH_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     #[allow(clippy::expect_used)]
-    Regex::new(CA_FILE_PATH_CONN_OPTION).expect("tlsCAFile(sslCAFile) connection option regex should build")
+    Regex::new(CA_FILE_PATH_CONN_OPTION)
+        .expect("tlsCAFile(sslCAFile) connection option regex should build")
 });
 
-const TLS_INVALID_HOSTNAMES_WITH_AMPERSAND_CONN_OPTION: &str = r"(&)?(?i:(tls|ssl)allowinvalidhostnames)=true";
+const TLS_INVALID_HOSTNAMES_WITH_AMPERSAND_CONN_OPTION: &str =
+    r"(&)?(?i:(tls|ssl)allowinvalidhostnames)=true";
 static TLS_INVALID_HOSTNAMES_WITH_AMPERSAND_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     #[allow(clippy::expect_used)]
-    Regex::new(TLS_INVALID_HOSTNAMES_WITH_AMPERSAND_CONN_OPTION).expect("&tlsAllowInvalidHostnames(&sslAllowInvalidHostnames) should build")
+    Regex::new(TLS_INVALID_HOSTNAMES_WITH_AMPERSAND_CONN_OPTION)
+        .expect("&tlsAllowInvalidHostnames(&sslAllowInvalidHostnames) should build")
 });
 
 pub struct MongoDB {
@@ -71,13 +79,16 @@ impl MongoDB {
     ) -> DataConnectorResult<ClientOptions> {
         let mut client_options;
 
-        let is_allowing_tls_invalid_hostnames = TLS_INVALID_HOSTNAMES_REGEX
-            .is_match(connection_string.as_str());
+        let is_allowing_tls_invalid_hostnames =
+            TLS_INVALID_HOSTNAMES_REGEX.is_match(connection_string.as_str());
 
-        if is_allowing_tls_invalid_hostnames { // suppose user is trying to connect documentdb through ssh tunneling
-            let parsable_connection_string = Self::remove_tls_allow_invalid_hostnames_option(connection_string.as_str());
+        if is_allowing_tls_invalid_hostnames {
+            // suppose user is trying to connect documentdb through ssh tunneling
+            let parsable_connection_string =
+                Self::remove_tls_allow_invalid_hostnames_option(connection_string.as_str());
 
-            client_options = ClientOptions::parse(parsable_connection_string).await
+            client_options = ClientOptions::parse(parsable_connection_string)
+                .await
                 .map_err(|_| DataConnectorError::InvalidConfigurationNoSource {
                     dataconnector: "mongodb".to_string(),
                     connector_component: ConnectorComponent::from(dataset),
@@ -88,8 +99,8 @@ impl MongoDB {
             // is not supported by ClientOptions::parse() function,
             // so injecting the option through TlsOptions is needed.
             if let Some(_tls_options) = client_options.tls.take() {
-                let ca_file_path = Self::get_ca_file_path(connection_string.as_str())
-                    .unwrap_or("".to_string());
+                let ca_file_path =
+                    Self::get_ca_file_path(connection_string.as_str()).unwrap_or("".to_string());
                 let new_tls = TlsOptions::builder()
                     .ca_file_path(Some(PathBuf::from(ca_file_path)))
                     .allow_invalid_hostnames(true)
@@ -99,12 +110,13 @@ impl MongoDB {
                 client_options.direct_connection = Some(true); // to make connection directly to 'localhost', not amazon domain which leads to connection failure.
             }
         } else {
-            client_options = ClientOptions::parse(connection_string).await
-                .map_err(|_| DataConnectorError::InvalidConfigurationNoSource {
+            client_options = ClientOptions::parse(connection_string).await.map_err(|_| {
+                DataConnectorError::InvalidConfigurationNoSource {
                     dataconnector: "mongodb".to_string(),
                     connector_component: ConnectorComponent::from(dataset),
                     message: format!("{}", InvalidConnectionStringSnafu.build()),
-                })?;
+                }
+            })?;
         }
 
         Ok(client_options)
@@ -122,10 +134,7 @@ impl MongoDB {
             .to_string()
     }
 
-    fn parse_params(
-        params: &Parameters,
-        dataset: &Dataset,
-    ) -> DataConnectorResult<ClientOptions> {
+    fn parse_params(params: &Parameters, dataset: &Dataset) -> DataConnectorResult<ClientOptions> {
         let host = params
             .get("host")
             .expose()
@@ -162,18 +171,18 @@ impl MongoDB {
             .map(ToString::to_string);
 
         Ok(ClientOptions::builder()
-            .hosts(
-                vec![ServerAddress::Tcp {
-                    host,
-                    port: Some(port),
-                }])
+            .hosts(vec![ServerAddress::Tcp {
+                host,
+                port: Some(port),
+            }])
             .credential(
                 Credential::builder()
                     .username(username)
                     .password(password)
-                    .source(auth_source)// `--authenticationDatabase` in mongodb shell, `authSource` in connection string
-                    .build()
-            ).build())
+                    .source(auth_source) // `--authenticationDatabase` in mongodb shell, `authSource` in connection string
+                    .build(),
+            )
+            .build())
     }
 }
 
@@ -194,7 +203,6 @@ impl MongoDBFactory {
 
 const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("connection_string").secret(), // especially recommended when connecting to cloud environment (MongoDB Atlas, Amazon DocumentDB)
-
     ParameterSpec::component("username").secret(),
     ParameterSpec::component("password").secret(),
     ParameterSpec::component("host"),
@@ -235,20 +243,26 @@ impl DataConnector for MongoDB {
         self
     }
 
-    async fn read_provider(&self, dataset: &Dataset) -> DataConnectorResult<Arc<dyn TableProvider>> {
+    async fn read_provider(
+        &self,
+        dataset: &Dataset,
+    ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         let path = dataset.path();
         let mut db_and_collection = path.split(".");
 
         let (database, collection) = match (db_and_collection.next(), db_and_collection.next()) {
             (Some(database), Some(collection)) => (database, collection),
-            _ => return Err(DataConnectorError::InvalidConfigurationNoSource {
-                dataconnector: "mongodb".to_string(),
-                connector_component: ConnectorComponent::from(dataset),
-                message: format!("{}", InvalidDatasetFormatSnafu.build()),
-            }),
+            _ => {
+                return Err(DataConnectorError::InvalidConfigurationNoSource {
+                    dataconnector: "mongodb".to_string(),
+                    connector_component: ConnectorComponent::from(dataset),
+                    message: format!("{}", InvalidDatasetFormatSnafu.build()),
+                })
+            }
         };
 
-        let connection_string = self.params
+        let connection_string = self
+            .params
             .get("connection_string")
             .expose()
             .ok()
@@ -260,26 +274,28 @@ impl DataConnector for MongoDB {
             Self::parse_params(&self.params, dataset)?
         };
 
-        let client = Client::with_options(client_options)
-            .map_err(|e| DataConnectorError::UnableToConnectInternal {
+        let client = Client::with_options(client_options).map_err(|e| {
+            DataConnectorError::UnableToConnectInternal {
                 dataconnector: "mongodb".to_string(),
                 connector_component: ConnectorComponent::from(dataset),
                 source: Box::new(e),
-            })?;
+            }
+        })?;
 
-        let query_body = self.params
-            .get("query_body")
-            .expose()
-            .ok()
-            .unwrap_or("{}"); // empty query body means selecting all fields in collection
+        let query_body = self.params.get("query_body").expose().ok().unwrap_or("{}"); // empty query body means selecting all fields in collection
 
-        let provider = MongoDBTableProvider::try_new(Arc::new(client), Arc::from(database), Arc::from(collection), Arc::from(query_body))
-            .await
-            .map_err(|e| DataConnectorError::UnableToGetReadProvider {
-                dataconnector: "mongodb".to_string(),
-                connector_component: ConnectorComponent::from(dataset),
-                source: Box::new(e),
-            })?;
+        let provider = MongoDBTableProvider::try_new(
+            Arc::new(client),
+            Arc::from(database),
+            Arc::from(collection),
+            Arc::from(query_body),
+        )
+        .await
+        .map_err(|e| DataConnectorError::UnableToGetReadProvider {
+            dataconnector: "mongodb".to_string(),
+            connector_component: ConnectorComponent::from(dataset),
+            source: Box::new(e),
+        })?;
 
         Ok(Arc::new(provider))
     }

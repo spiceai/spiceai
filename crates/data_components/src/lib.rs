@@ -44,6 +44,8 @@ pub mod flightsql;
 pub mod iceberg;
 #[cfg(feature = "debezium")]
 pub mod kafka;
+#[cfg(feature = "mongodb")]
+pub mod mongodb;
 #[cfg(feature = "mssql")]
 pub mod mssql;
 #[cfg(feature = "mysql")]
@@ -62,8 +64,6 @@ pub mod spice_cloud;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
 pub mod unity_catalog;
-#[cfg(feature = "mongodb")]
-pub mod mongodb;
 
 pub mod github;
 pub mod rate_limit;

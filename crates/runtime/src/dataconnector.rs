@@ -90,6 +90,8 @@ pub const ODBC_DATACONNECTOR: &str = "odbc"; // const needs to be accessible whe
 pub mod iceberg;
 #[cfg(feature = "imap")]
 pub mod imap;
+#[cfg(feature = "mongodb")]
+pub mod mongodb;
 #[cfg(feature = "postgres")]
 pub mod postgres;
 pub mod s3;
@@ -103,8 +105,6 @@ pub mod snowflake;
 #[cfg(feature = "spark")]
 pub mod spark;
 pub mod spiceai;
-#[cfg(feature = "mongodb")]
-pub mod mongodb;
 
 #[derive(Debug, Snafu)]
 pub enum DataConnectorError {
