@@ -25,9 +25,22 @@ use mongodb::Client;
 use mongodb::options::{ClientOptions, Credential, ServerAddress, Tls, TlsOptions};
 use data_components::mongodb::MongoDBTableProvider;
 use regex::Regex;
+use snafu::Snafu;
 use crate::component::dataset::Dataset;
 use crate::dataconnector::{ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory, DataConnectorResult};
 use crate::parameters::{ParameterSpec, Parameters};
+
+#[derive(Debug, Snafu)]
+pub enum Error {
+    #[snafu(display("Failed to parse the connection string.\nVerify the connection string is valid, and try again."))]
+    InvalidConnectionString,
+
+    #[snafu(display("Failed to parse database_name and collection_name. The format of `from` field is `mongodb:database_name.collection_name`"))]
+    InvalidDatasetFormat,
+
+    #[snafu(display("host is required"))]
+    HostIsMissing,
+}
 
 const TLS_INVALID_HOSTNAMES_CONN_OPTION: &str = r"(?i:(tls|ssl)allowinvalidhostnames)=true";
 static TLS_INVALID_HOSTNAMES_REGEX: LazyLock<Regex> = LazyLock::new(|| {
@@ -65,11 +78,10 @@ impl MongoDB {
             let parsable_connection_string = Self::remove_tls_allow_invalid_hostnames_option(connection_string.as_str());
 
             client_options = ClientOptions::parse(parsable_connection_string).await
-                .map_err(|e| DataConnectorError::InvalidConfiguration {
+                .map_err(|e| DataConnectorError::InvalidConfigurationNoSource {
                     dataconnector: "mongodb".to_string(),
                     connector_component: ConnectorComponent::from(dataset),
-                    message: "failed to parse connection string".to_string(),
-                    source: Box::new(e),
+                    message: format!("{}", InvalidConnectionStringSnafu.build()),
                 })?;
 
             // parsing tlsAllowInvalidHostnames(sslAllowInvalidHostnames) option in connection string
@@ -88,11 +100,10 @@ impl MongoDB {
             }
         } else {
             client_options = ClientOptions::parse(connection_string).await
-                .map_err(|e| DataConnectorError::InvalidConfiguration {
+                .map_err(|e| DataConnectorError::InvalidConfigurationNoSource {
                     dataconnector: "mongodb".to_string(),
                     connector_component: ConnectorComponent::from(dataset),
-                    message: "failed to parse connection string".to_string(),
-                    source: Box::new(e),
+                    message: format!("{}", InvalidConnectionStringSnafu.build()),
                 })?;
         }
 
@@ -121,7 +132,7 @@ impl MongoDB {
             .ok_or_else(|_| DataConnectorError::InvalidConfigurationNoSource {
                 dataconnector: "mongodb".to_string(),
                 connector_component: ConnectorComponent::from(dataset),
-                message: "host is required".to_string(),
+                message: format!("{}", HostIsMissingSnafu.build()),
             })?
             .to_string();
 
@@ -233,7 +244,7 @@ impl DataConnector for MongoDB {
             _ => return Err(DataConnectorError::InvalidConfigurationNoSource {
                 dataconnector: "mongodb".to_string(),
                 connector_component: ConnectorComponent::from(dataset),
-                message: "failed to parse database_name and collection_name. The format of `from` field is `mongodb:{database_name}.{collection_name}`".to_string(),
+                message: format!("{}", InvalidDatasetFormatSnafu.build()),
             }),
         };
 
