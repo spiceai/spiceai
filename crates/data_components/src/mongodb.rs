@@ -56,6 +56,11 @@ pub enum Error {
 
     #[snafu(display("Failed to infer schema: {source}"))]
     FailedToInferSchema { source: arrow::error::ArrowError },
+
+    #[snafu(display("Failed to parse `query`: {source}"))]
+    FailedToParseQuery {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 }
 
 const NUM_DOCUMENTS_TO_INFER_SCHEMA: u8 = 20;
@@ -81,7 +86,7 @@ impl MongoDBTableProvider {
 
         let table_schema =
             Self::infer_schema(Arc::clone(&client), &database_name, &collection_name).await?;
-        let filter_document = Self::parse_query(&query_body).unwrap_or_default();
+        let filter_document = Self::parse_query(&query_body).context(FailedToParseQuerySnafu)?;
 
         Ok(Self {
             client,
@@ -140,7 +145,7 @@ impl MongoDBTableProvider {
         Ok(Arc::new(schema))
     }
 
-    fn parse_query(input: &str) -> Result<Document, Box<dyn std::error::Error>> {
+    fn parse_query(input: &str) -> Result<Document, Box<dyn std::error::Error + Send + Sync>> {
         let json_value: Value = from_str(input)?;
         let bson_value = to_bson(&json_value)?;
 
@@ -214,17 +219,14 @@ fn build_mongodb_projection(
     table_schema: &SchemaRef,
     projection: Option<&Vec<usize>>,
 ) -> Option<Document> {
-    if let Some(indices) = projection {
-        let mut doc = Document::new();
+    let indices = projection?;
+    let mut doc = Document::new();
 
-        for &index in indices {
-            let field = table_schema.field(index);
-            doc.insert(field.name(), Bson::Int32(1)); // 1 : include this field / 0 : exclude this field
-        }
-        Some(doc)
-    } else {
-        None
+    for &index in indices {
+        let field = table_schema.field(index);
+        doc.insert(field.name(), Bson::Int32(1)); // 1 : include this field / 0 : exclude this field
     }
+    Some(doc)
 }
 
 pub struct MongoDBTableProviderExec {
@@ -336,5 +338,33 @@ impl ExecutionPlan for MongoDBTableProviderExec {
         });
 
         Ok(builder.build())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mongodb::bson::doc;
+    use snafu::ResultExt;
+
+    #[test]
+    fn test_parsing_query() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // parsing fail
+        let query_body: &str = "{ 123: aa }";
+        let filter_document =
+            MongoDBTableProvider::parse_query(query_body).context(FailedToParseQuerySnafu);
+        assert_eq!(
+            filter_document
+                .expect_err("Must be an error because of parsing failure")
+                .to_string(),
+            "Failed to parse `query`: key must be a string at line 1 column 3"
+        );
+
+        // parsing success
+        let query_body: &str = "{ \"status\": { \"$in\": [\"A\", \"D\"] } }";
+        let filter_document =
+            MongoDBTableProvider::parse_query(query_body).context(FailedToParseQuerySnafu)?;
+        assert_eq!(filter_document, doc! {"status": {"$in": ["A", "D"]}});
+        Ok(())
     }
 }

@@ -41,7 +41,7 @@ pub enum Error {
     #[snafu(display("Failed to parse database_name and collection_name. The format of `from` field is `mongodb:database_name.collection_name`"))]
     InvalidDatasetFormat,
 
-    #[snafu(display("host is required"))]
+    #[snafu(display("`host` is a required parameter for the MongoDB Data Connector."))]
     HostIsMissing,
 }
 
