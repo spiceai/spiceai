@@ -15,7 +15,7 @@ limitations under the License.
 */
 use crate::{
     datafusion::DataFusion,
-    http::v1::{sql_to_http_response, ArrowFormat},
+    http::v1::{run_sql, to_http_response, ArrowFormat},
     model::LLMModelStore,
     tools::{
         builtin::{
@@ -40,7 +40,7 @@ use datafusion::sql::TableReference;
 use headers_accept::Accept;
 
 use itertools::Itertools;
-use llms::chat::nsql::default::DefaultSqlGeneration;
+use llms::chat::nsql::{default::DefaultSqlGeneration, FailedAttempt, QueryGenerationContext};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -48,6 +48,9 @@ use tracing::Span;
 use tracing_futures::Instrument;
 
 use super::accept_header_types;
+
+// Default number of retries for NSQL queries if the generated query fails to execute
+const DEFAULT_NSQL_RETRIES: u8 = 3;
 
 fn clean_model_based_sql(input: &str) -> String {
     let no_dashes = match input.strip_prefix("--") {
@@ -190,6 +193,7 @@ LIMIT 5
         )))
     )
 ))]
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn post(
     Extension(df): Extension<Arc<DataFusion>>,
     Extension(rt): Extension<Arc<Runtime>>,
@@ -248,55 +252,82 @@ pub(crate) async fn post(
     };
 
     let sql_gen = nql_model.as_sql().unwrap_or(&DefaultSqlGeneration {});
-    let Ok(mut req) = sql_gen.create_request_for_query(&payload.model, &payload.query) else {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Error preparing data for NQL model".to_string(),
-        )
-            .into_response();
-    };
+    // Tracks previously generated queries and associated errors to enable an efficient retry mechanism
+    let mut sql_gen_ctx = QueryGenerationContext::default();
+    let mut num_retries = 0;
 
-    req.messages.extend(schema_messages);
-    req.messages.extend(sample_data_messages);
-
-    let resp = match nql_model.chat_request(req).instrument(span.clone()).await {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::error!("Error running NQL model: {e}");
-            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
-        }
-    };
-
-    // Run the SQL from the NSQL model through datafusion.
-    match sql_gen.parse_response(resp) {
-        Ok(Some(model_sql_query)) => {
-            let cleaned_query = clean_model_based_sql(&model_sql_query);
-
-            if return_sql_only(accept.as_ref()) {
-                tracing::trace!("Not running query, requested SQL only:\n{cleaned_query}");
-                return (StatusCode::OK, cleaned_query).into_response();
-            }
-
-            tracing::trace!("Running query:\n{cleaned_query}");
-            sql_to_http_response(
-                Arc::clone(&df),
-                &cleaned_query,
-                ArrowFormat::from_accept_header(accept.as_ref()),
-            )
-            .instrument(span.clone())
-            .await
-        }
-        Ok(None) => {
-            tracing::trace!("No query produced from NSQL model");
-            (
+    loop {
+        let Ok(mut req) =
+            sql_gen.create_request_for_query(&payload.model, &payload.query, &sql_gen_ctx)
+        else {
+            return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "No query produced from NSQL model".to_string(),
+                "Error preparing data for NQL model".to_string(),
             )
-                .into_response()
-        }
-        Err(e) => {
-            tracing::error!("Error running NSQL model: {e}");
-            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
-        }
+                .into_response();
+        };
+
+        req.messages.extend(schema_messages.clone());
+        req.messages.extend(sample_data_messages.clone());
+
+        let resp = match nql_model.chat_request(req).instrument(span.clone()).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!("Error running NQL model: {e}");
+                return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+            }
+        };
+
+        // Run the SQL from the NSQL model through datafusion.
+        match sql_gen.parse_response(resp) {
+            Ok(Some(model_sql_query)) => {
+                let cleaned_query = clean_model_based_sql(&model_sql_query);
+
+                if return_sql_only(accept.as_ref()) {
+                    tracing::trace!("Not running query, requested SQL only:\n{cleaned_query}");
+                    return (StatusCode::OK, cleaned_query).into_response();
+                }
+
+                tracing::debug!("Running query:\n{cleaned_query}");
+
+                match run_sql(Arc::clone(&df), &cleaned_query)
+                    .instrument(span.clone())
+                    .await
+                {
+                    Ok((data, cache_status)) => {
+                        return to_http_response(data, cache_status, ArrowFormat::Json)
+                            .instrument(span.clone())
+                            .await;
+                    }
+                    Err(e) => {
+                        // If query failed, retry with the updated context
+
+                        if num_retries >= DEFAULT_NSQL_RETRIES {
+                            tracing::error!("Error executing query: {e}");
+                            return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
+                        }
+
+                        tracing::debug!("Error executing query: {e}. Retrying...");
+
+                        num_retries += 1;
+                        sql_gen_ctx
+                            .failed_attempts
+                            .push(FailedAttempt::new(cleaned_query.clone(), e.to_string()));
+                    }
+                }
+            }
+            Ok(None) => {
+                tracing::trace!("No query produced from NSQL model");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "No query produced from NSQL model".to_string(),
+                )
+                    .into_response();
+            }
+            Err(e) => {
+                tracing::error!("Error running NSQL model: {e}");
+                return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+            }
+        };
     }
 }

@@ -25,7 +25,7 @@ use serde_json::Value;
 
 use crate::chat::nsql::create_prompt;
 
-use super::SqlGeneration;
+use super::{QueryGenerationContext, SqlGeneration};
 
 /// Implementation for [`SqlGeneration`] for [`super::Chat`] models that support [`ResponseFormat::JsonSchema`].
 pub struct StructuredOutputSqlGeneration;
@@ -36,8 +36,9 @@ impl SqlGeneration for StructuredOutputSqlGeneration {
         &self,
         model_id: &str,
         query: &str,
+        context: &QueryGenerationContext,
     ) -> Result<CreateChatCompletionRequest, OpenAIError> {
-        let prompt = create_prompt(query);
+        let prompt = create_prompt(query, context);
 
         let messages: Vec<ChatCompletionRequestMessage> =
             vec![ChatCompletionRequestSystemMessageArgs::default()
