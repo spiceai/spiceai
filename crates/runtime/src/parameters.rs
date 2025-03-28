@@ -115,24 +115,42 @@ impl Parameters {
             }
         }
 
-        // Check for deprecated parameters
+        Self::check_for_deprecated_parameters(component_name, &params, all_params);
+        Self::ensure_required_parameters(component_name, &mut params, prefix, all_params)?;
+
+        Ok(Parameters::new(params, prefix, all_params))
+    }
+
+    pub fn check_for_deprecated_parameters(
+        component_name: &str,
+        provided_parameters: &Vec<(String, SecretString)>,
+        all_params: &'static [ParameterSpec],
+    ) {
         for parameter in all_params {
             if let Some(deprecation_message) = parameter.deprecation_message {
-                if let Some((param, _)) = params.iter().find(|p| p.0 == parameter.name) {
+                if let Some((param, _)) = provided_parameters.iter().find(|p| p.0 == parameter.name)
+                {
                     tracing::warn!(
                         "Parameter '{param}' is deprecated for {component_name}: {deprecation_message}",
                     );
                 }
             }
         }
+    }
 
-        // Check if all required parameters are present
+    pub fn ensure_required_parameters(
+        component_name: &str,
+        provided_parameters: &mut Vec<(String, SecretString)>,
+        prefix: &'static str,
+        all_params: &'static [ParameterSpec],
+    ) -> AnyErrorResult<()> {
         for parameter in all_params {
             // If the parameter is missing and has a default value, add it to the params
-            let missing = !params.iter().any(|p| p.0 == parameter.name);
+            let missing = !provided_parameters.iter().any(|p| p.0 == parameter.name);
             if missing {
                 if let Some(default_value) = parameter.default {
-                    params.push((parameter.name.to_string(), default_value.to_string().into()));
+                    provided_parameters
+                        .push((parameter.name.to_string(), default_value.to_string().into()));
                     continue;
                 }
             }
@@ -151,7 +169,7 @@ impl Parameters {
             }
         }
 
-        Ok(Parameters::new(params, prefix, all_params))
+        Ok(())
     }
 
     #[must_use]
