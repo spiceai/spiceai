@@ -250,13 +250,15 @@ impl DataConnector for MongoDB {
         let path = dataset.path();
         let mut db_and_collection = path.split('.');
 
-        let (Some(database), Some(collection)) = (db_and_collection.next(), db_and_collection.next()) else {
-                return Err(DataConnectorError::InvalidConfigurationSourceOnly {
-                    dataconnector: "mongodb".to_string(),
-                    connector_component: ConnectorComponent::from(dataset),
-                    source: Box::new(Error::InvalidDatasetFormat {}),
-                })
-            };
+        let (Some(database), Some(collection)) =
+            (db_and_collection.next(), db_and_collection.next())
+        else {
+            return Err(DataConnectorError::InvalidConfigurationSourceOnly {
+                dataconnector: "mongodb".to_string(),
+                connector_component: ConnectorComponent::from(dataset),
+                source: Box::new(Error::InvalidDatasetFormat {}),
+            });
+        };
 
         let connection_string = self
             .params
