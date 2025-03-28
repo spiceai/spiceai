@@ -35,6 +35,7 @@ pub mod session;
 mod mime;
 
 use Error::FailedToBuildListArrayForAttachments;
+use crate::imap::Error::FailedToBuildListArrayForContentSections;
 
 #[cfg(test)]
 mod tests;
@@ -94,8 +95,11 @@ fn build_listarray_for_strings(values: Vec<Option<Vec<Option<String>>>>) -> List
 }
 
 
-//FIXME: ret Result<> - handle expect() properly (content_sections)
-fn build_listarray_for_content_sections(values: Vec<Option<Vec<ContentSectionInfo>>>) -> ListArray {
+
+pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+
+fn build_listarray_for_content_sections(values: Vec<Option<Vec<ContentSectionInfo>>>) -> Result<ListArray> {
 
     let struct_builder = StructBuilder::new(
         Fields::from(vec![
@@ -112,17 +116,15 @@ fn build_listarray_for_content_sections(values: Vec<Option<Vec<ContentSectionInf
             for content_section in attachments {
                 let struct_builder = list_builder.values();
 
-                //FIXME: the expect() msgs in this code seem like they could be improved? (content_sections)
-
-                struct_builder
+                let content_field_builder = struct_builder
                     .field_builder::<StringBuilder>(0)
-                    .expect("Should return a field builder")
-                    .append_option(content_section.content.as_deref());
+                    .ok_or( FailedToBuildListArrayForContentSections { field_number: 0, field_name: String::from("content_section") })?;
+                content_field_builder.append_option(content_section.content.as_deref());
 
-                struct_builder
+                let mime_type_field_builder = struct_builder
                     .field_builder::<StringBuilder>(1)
-                    .expect("Should return a field builder")
-                    .append_option(content_section.mime_type.as_deref());
+                    .ok_or( FailedToBuildListArrayForContentSections { field_number: 1, field_name: String::from("mime_type") })?;
+                mime_type_field_builder.append_option(content_section.mime_type.as_deref());
 
                 struct_builder.append(true);
             }
@@ -132,12 +134,9 @@ fn build_listarray_for_content_sections(values: Vec<Option<Vec<ContentSectionInf
         }
     }
 
-    list_builder.finish()
+    Ok(list_builder.finish())
 }
 
-
-
-pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 
 fn build_listarray_for_attachments(values: Vec<Option<Vec<AttachmentInfo>>>) -> Result<ListArray> {
@@ -245,12 +244,14 @@ impl ImapTableProvider {
         if self.fetch_content {
             fields.push(Arc::new(StringArray::from(bodies))); // field name mismatch. "content" in schema
 
+
+            //FIXME: this field sequence needs checking. attachments after content or before?
             fields.push(
-                Arc::new(build_listarray_for_content_sections(content_sections))
+                Arc::new(build_listarray_for_content_sections(content_sections).ok().unwrap()) //FIXME: unwrap
             );
 
             fields.push(
-                Arc::new(build_listarray_for_attachments(attachments))
+                Arc::new(build_listarray_for_attachments(attachments).ok().unwrap()) //FIXME: unwrap
             );
 
         };
