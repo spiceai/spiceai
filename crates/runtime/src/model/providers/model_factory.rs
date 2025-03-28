@@ -10,7 +10,7 @@ use spicepod::component::model::ModelSource;
 
 use crate::secrets::Secrets;
 
-trait ChatModel {
+pub trait ChatModel {
     fn create_chat(
         &self,
         model_id: &Option<String>,
@@ -19,7 +19,7 @@ trait ChatModel {
     ) -> Result<Box<dyn Chat>, LlmError>;
 }
 
-trait EmbedModel {
+pub trait EmbedModel {
     fn create_embed(
         &self,
         model_id: &Option<String>,
