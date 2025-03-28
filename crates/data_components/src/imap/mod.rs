@@ -37,8 +37,6 @@ mod mime;
 use Error::FailedToBuildListArrayForAttachments;
 use crate::imap::Error::FailedToBuildListArrayForContentSections;
 
-#[cfg(test)]
-mod tests;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
