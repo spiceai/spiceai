@@ -41,19 +41,19 @@ use snafu::{ResultExt, Snafu};
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Failed to find collection list: {source}"))]
-    CollectionListSearchingError { source: mongodb::error::Error },
+    FailedToListCollections { source: mongodb::error::Error },
 
     #[snafu(display("Collection does not exist: {collection_name}"))]
-    CollectionDoesNotExistError { collection_name: Arc<str> },
+    CollectionDoesNotExist { collection_name: Arc<str> },
 
     #[snafu(display("Failed to find document: {source}"))]
-    DocumentFindError { source: mongodb::error::Error },
+    FailedToFindDocument { source: mongodb::error::Error },
 
     #[snafu(display("Error occurred while fetching documents: {source}"))]
-    DocumentStreamingError { source: mongodb::error::Error },
+    FailedToStreamDocument { source: mongodb::error::Error },
 
     #[snafu(display("Failed to infer schema: {source}"))]
-    SchemaInferenceError { source: arrow::error::ArrowError },
+    FailedToInferSchema { source: arrow::error::ArrowError },
 }
 
 const NUM_DOCUMENTS_TO_INFER_SCHEMA: u8 = 20;
@@ -91,7 +91,7 @@ impl MongoDBTableProvider {
     ) -> Result<(), Error> {
         let existing_collections = client.database(database_name)
             .list_collection_names().await
-            .context(CollectionListSearchingSnafu)?;
+            .context(FailedToListCollectionsSnafu)?;
 
         if !existing_collections.contains(&collection_name.to_string()) {
             return CollectionDoesNotExistSnafu { collection_name }.fail();
@@ -108,16 +108,16 @@ impl MongoDBTableProvider {
         let mut cursor = collection.find(
             Document::new()
         ).limit(NUM_DOCUMENTS_TO_INFER_SCHEMA as i64).await
-            .context(DocumentFindSnafu)?;
+            .context(FailedToFindDocumentSnafu)?;
 
         let mut extracted_schema_info = Vec::new();
         while let Some(document) = cursor.try_next().await
-            .context(DocumentStreamingSnafu)? {
+            .context(FailedToStreamDocumentSnafu)? {
             extracted_schema_info.push(document_to_json_value(&document))
         }
 
         let schema = infer_json_schema_from_iterator(extracted_schema_info.iter().map(Ok))
-            .context(SchemaInferenceSnafu)?;
+            .context(FailedToInferSchemaSnafu)?;
 
         Ok(Arc::new(schema))
     }

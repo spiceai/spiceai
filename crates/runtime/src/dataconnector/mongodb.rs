@@ -78,7 +78,7 @@ impl MongoDB {
             let parsable_connection_string = Self::remove_tls_allow_invalid_hostnames_option(connection_string.as_str());
 
             client_options = ClientOptions::parse(parsable_connection_string).await
-                .map_err(|e| DataConnectorError::InvalidConfigurationNoSource {
+                .map_err(|_| DataConnectorError::InvalidConfigurationNoSource {
                     dataconnector: "mongodb".to_string(),
                     connector_component: ConnectorComponent::from(dataset),
                     message: format!("{}", InvalidConnectionStringSnafu.build()),
@@ -100,7 +100,7 @@ impl MongoDB {
             }
         } else {
             client_options = ClientOptions::parse(connection_string).await
-                .map_err(|e| DataConnectorError::InvalidConfigurationNoSource {
+                .map_err(|_| DataConnectorError::InvalidConfigurationNoSource {
                     dataconnector: "mongodb".to_string(),
                     connector_component: ConnectorComponent::from(dataset),
                     message: format!("{}", InvalidConnectionStringSnafu.build()),
