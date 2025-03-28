@@ -89,10 +89,10 @@ impl MongoDB {
 
             client_options = ClientOptions::parse(parsable_connection_string)
                 .await
-                .map_err(|_| DataConnectorError::InvalidConfigurationNoSource {
+                .map_err(|_| DataConnectorError::InvalidConfigurationSourceOnly {
                     dataconnector: "mongodb".to_string(),
                     connector_component: ConnectorComponent::from(dataset),
-                    message: format!("{}", InvalidConnectionStringSnafu.build()),
+                    source: Box::new(Error::InvalidConnectionString {}),
                 })?;
 
             // parsing tlsAllowInvalidHostnames(sslAllowInvalidHostnames) option in connection string
@@ -111,10 +111,10 @@ impl MongoDB {
             }
         } else {
             client_options = ClientOptions::parse(connection_string).await.map_err(|_| {
-                DataConnectorError::InvalidConfigurationNoSource {
+                DataConnectorError::InvalidConfigurationSourceOnly {
                     dataconnector: "mongodb".to_string(),
                     connector_component: ConnectorComponent::from(dataset),
-                    message: format!("{}", InvalidConnectionStringSnafu.build()),
+                    source: Box::new(Error::InvalidConnectionString {}),
                 }
             })?;
         }
@@ -138,10 +138,10 @@ impl MongoDB {
         let host = params
             .get("host")
             .expose()
-            .ok_or_else(|_| DataConnectorError::InvalidConfigurationNoSource {
+            .ok_or_else(|_| DataConnectorError::InvalidConfigurationSourceOnly {
                 dataconnector: "mongodb".to_string(),
                 connector_component: ConnectorComponent::from(dataset),
-                message: format!("{}", HostIsMissingSnafu.build()),
+                source: Box::new(Error::HostIsMissing {}),
             })?
             .to_string();
 
@@ -253,10 +253,10 @@ impl DataConnector for MongoDB {
         let (database, collection) = match (db_and_collection.next(), db_and_collection.next()) {
             (Some(database), Some(collection)) => (database, collection),
             _ => {
-                return Err(DataConnectorError::InvalidConfigurationNoSource {
+                return Err(DataConnectorError::InvalidConfigurationSourceOnly {
                     dataconnector: "mongodb".to_string(),
                     connector_component: ConnectorComponent::from(dataset),
-                    message: format!("{}", InvalidDatasetFormatSnafu.build()),
+                    source: Box::new(Error::InvalidDatasetFormat {}),
                 })
             }
         };
