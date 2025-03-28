@@ -2812,6 +2812,12 @@ checksum = "7c74b8349d32d297c9134b8c88677813a227df8f779daa29bfc29c183fe3dca6"
 
 [[package]]
 name = "convert_case"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6245d59a3e82a7fc217c5828a6692dbc6dfb63a0c8c90495621f7b9d79704a0e"
+
+[[package]]
+name = "convert_case"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ec182b0ca2f35d8fc196cf3404988fd8b8c739a4d270ff118a398feb0cbec1ca"
@@ -3916,7 +3922,7 @@ version = "0.99.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3da29a38df43d6f156149c9b43ded5e018ddff2a855cf2cfd62e8cd7d079c69f"
 dependencies = [
- "convert_case",
+ "convert_case 0.4.0",
  "proc-macro2",
  "quote",
  "rustc_version",
@@ -7353,7 +7359,7 @@ version = "1.0.7"
 source = "git+https://github.com/spiceai/modelcontextprotocol-rust-sdk.git?rev=a61112adf47ffbcc591bf199d30038f661f6a6bb#a61112adf47ffbcc591bf199d30038f661f6a6bb"
 dependencies = [
  "async-trait",
- "convert_case",
+ "convert_case 0.6.0",
  "mcp-core",
  "proc-macro2",
  "quote",
