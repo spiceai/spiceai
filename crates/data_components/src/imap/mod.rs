@@ -34,6 +34,8 @@ pub mod session;
 
 mod mime;
 
+use Error::FailedToBuildListArrayForAttachments;
+
 #[cfg(test)]
 mod tests;
 
@@ -65,6 +67,15 @@ pub enum Error {
     InvalidSSLMode { ssl_mode: String },
     #[snafu(display("An invalid authentication mode was provided: {auth_mode}"))]
     InvalidAuthMode { auth_mode: String },
+
+
+    //FIXME: Not happy with error descriptions.
+    #[snafu(display("Should return a field builder: {field_number}/{field_name}"))]
+    FailedToBuildListArrayForAttachments { field_number: i32, field_name: String },
+
+    #[snafu(display("Should return a field builder: {field_number}/{field_name}"))]
+    FailedToBuildListArrayForContentSections { field_number: i32, field_name: String },
+
 }
 
 #[derive(Debug)]
@@ -121,14 +132,15 @@ fn build_listarray_for_content_sections(values: Vec<Option<Vec<ContentSectionInf
         }
     }
 
-    panic!("Fn needs review to ensure correct Arrow data struct.");
     list_builder.finish()
 }
 
 
 
-//FIXME: ret Result<> - handle expect() properly (attachments)
-fn build_listarray_for_attachments(values: Vec<Option<Vec<AttachmentInfo>>>) -> ListArray {
+pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+
+fn build_listarray_for_attachments(values: Vec<Option<Vec<AttachmentInfo>>>) -> Result<ListArray> {
 
     let struct_builder = StructBuilder::new(
         Fields::from(vec![
@@ -146,22 +158,20 @@ fn build_listarray_for_attachments(values: Vec<Option<Vec<AttachmentInfo>>>) -> 
             for attachment in attachments {
                 let struct_builder = list_builder.values();
 
-                //FIXME: the expect() msgs in this code seem like they could be improved? (attachments)
-
-                struct_builder
+                let filename_field_builder = struct_builder
                     .field_builder::<StringBuilder>(0)
-                    .expect("Should return a field builder")
-                    .append_option(attachment.filename.as_deref());
+                    .ok_or( FailedToBuildListArrayForAttachments { field_number: 0, field_name:"filename".to_string() } )?;
+                filename_field_builder.append_option(attachment.filename.as_deref());
 
-                struct_builder
+                let mime_type_field_builder = struct_builder
                     .field_builder::<StringBuilder>(1)
-                    .expect("Should return a field builder")
-                    .append_option(attachment.mime_type.as_deref());
+                    .ok_or( FailedToBuildListArrayForAttachments { field_number: 1, field_name:"mime_type".to_string() } )?;
+                mime_type_field_builder.append_option(attachment.mime_type.as_deref());
 
-                struct_builder
+                let blob_field_builder = struct_builder
                     .field_builder::<BinaryBuilder>(2)
-                    .expect("Should return a field builder")
-                    .append_option(attachment.blob.as_deref());
+                    .ok_or( FailedToBuildListArrayForAttachments { field_number: 2, field_name:"blob".to_string() } )?;
+                blob_field_builder.append_option(attachment.blob.as_deref());
 
                 struct_builder.append(true);
             }
@@ -171,8 +181,7 @@ fn build_listarray_for_attachments(values: Vec<Option<Vec<AttachmentInfo>>>) -> 
         }
     }
 
-    panic!("Fn needs review to ensure correct Arrow data struct.");
-    list_builder.finish()
+    Ok(list_builder.finish())
 }
 
 
