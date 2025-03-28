@@ -244,16 +244,13 @@ impl ImapTableProvider {
         if self.fetch_content {
             fields.push(Arc::new(StringArray::from(bodies))); // field name mismatch. "content" in schema
 
+            let list_array_content_sections = build_listarray_for_content_sections(content_sections)
+                .map_err(|e| ArrowError::ComputeError(format!("Failed to build ListArray: {e}")))?;
+            fields.push(Arc::new(list_array_content_sections));
 
-            //FIXME: this field sequence needs checking. attachments after content or before?
-            fields.push(
-                Arc::new(build_listarray_for_content_sections(content_sections).ok().unwrap()) //FIXME: unwrap
-            );
-
-            fields.push(
-                Arc::new(build_listarray_for_attachments(attachments).ok().unwrap()) //FIXME: unwrap
-            );
-
+            let list_array_attachments = build_listarray_for_attachments(attachments)
+                .map_err(|e| ArrowError::ComputeError(format!("Failed to build ListArray: {e}")))?;
+            fields.push(Arc::new(list_array_attachments));
         };
 
         RecordBatch::try_new(self.schema(), fields)
