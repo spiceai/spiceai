@@ -66,36 +66,6 @@ impl From<Option<String>> for MimeExtract {
 }
 
 
-// try_from seems to be the wrong idiom for a struct that can always return with None as member var values.
-
-// impl TryFrom<&Option<String>> for MimeExtract {
-//     type Error = String;
-//
-//     fn try_from(body: &Option<String>) -> Result<Self, Self::Error> {
-//
-//         // Attempt to convert email into parsed mime data and extract attachments and content_sections
-//         let (attachments, content_sections) =
-//             body.as_ref().and_then(|body_raw| {
-//                 MessageParser::default().parse(body_raw).map(|eml_msg| {
-//                     // We now have a parsed mime msg to work with: eml_msg
-//                     // Some(
-//                         (
-//                             AttachmentRecords::try_from(&eml_msg).ok().map(|r| r.attachments),
-//                             ContentSectionRecords::try_from(&eml_msg).ok().map(|r| r.sections),
-//                         )
-//                     // )
-//                 })
-//             }).unwrap(); //FIXME: snafu error for failed mime parse
-//
-//         Ok(
-//             MimeExtract{
-//             attachments,
-//             content_sections,
-//             }
-//         )
-//
-//     }
-// }
 
 
 
