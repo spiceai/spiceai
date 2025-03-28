@@ -32,7 +32,7 @@ use datafusion::{
 };
 use datafusion_table_providers::{
     duckdb::{write::DuckDBTableWriter, DuckDBTableProviderFactory},
-    sql::db_connection_pool::duckdbpool::DuckDbConnectionPool,
+    sql::db_connection_pool::duckdbpool::{DuckDbConnectionPool, DuckDbConnectionPoolBuilder},
 };
 use duckdb::AccessMode;
 use snafu::prelude::*;
@@ -131,12 +131,11 @@ impl DuckDBAccelerator {
                 let num_accelerating_datasets =
                     self.get_num_accelerating_datasets(Some(duckdb_file.as_str()), dataset.app());
                 let max_size = Self::get_max_size(num_accelerating_datasets);
+                let pool_builder = DuckDbConnectionPoolBuilder::file(&duckdb_file)
+                    .with_max_size(Some(max_size))
+                    .with_min_idle(Some(DEFAULT_MIN_IDLE_CONNECTIONS));
                 self.duckdb_factory
-                    .get_or_init_file_instance_with_size_config(
-                        duckdb_file,
-                        Some(max_size),
-                        Some(DEFAULT_MIN_IDLE_CONNECTIONS),
-                    )
+                    .get_or_init_instance_with_builder(pool_builder)
                     .await
                     .boxed()
                     .context(AccelerationCreationFailedSnafu)?
@@ -144,11 +143,12 @@ impl DuckDBAccelerator {
             (_, Mode::Memory) => {
                 let num_accelerating_datasets =
                     self.get_num_accelerating_datasets(None, dataset.app());
+                let max_size = Self::get_max_size(num_accelerating_datasets);
+                let pool_builder = DuckDbConnectionPoolBuilder::memory()
+                    .with_max_size(Some(max_size))
+                    .with_min_idle(Some(DEFAULT_MIN_IDLE_CONNECTIONS));
                 self.duckdb_factory
-                    .get_or_init_memory_instance_with_size_config(
-                        Some(num_accelerating_datasets),
-                        Some(DEFAULT_MIN_IDLE_CONNECTIONS),
-                    )
+                    .get_or_init_instance_with_builder(pool_builder)
                     .await
                     .boxed()
                     .context(AccelerationCreationFailedSnafu)?
