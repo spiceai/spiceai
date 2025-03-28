@@ -29,6 +29,7 @@ limitations under the License.
 // https://www.rfc-editor.org/rfc/rfc2231
 
 
+use snafu::Snafu;
 use mail_parser::{MimeHeaders, Message, MessageParser};
 
 
@@ -38,7 +39,7 @@ pub struct MimeExtract{
 }
 
 
-impl From<Option<String>> for MimeExtract {
+impl From<&Option<String>> for MimeExtract {
     fn from(body: &Option<String>) -> Self {
         // worst case return value is {attachments: None, content_sections: None}
         // schema and build_recordbatch() code are setup to handle these gracefully.
@@ -57,7 +58,7 @@ impl From<Option<String>> for MimeExtract {
                     }
                 })
             })
-            .unwrap_or_else(|| MimeExtract {
+            .unwrap_or(MimeExtract {
                 attachments: None,
                 content_sections: None,
             })
@@ -68,12 +69,22 @@ impl From<Option<String>> for MimeExtract {
 
 
 
+#[derive(Debug, Snafu)]
+pub enum MimeExtractError{
+    #[snafu(display("No attachments found."))]
+    AttachmentsNotFound,
+
+    #[snafu(display("No content sections found."))]
+    ContentSectionsNotFound,
+}
+
+
+
 
 // Attachment extraction code.
 // filename, mime-type, blob
 
-#[derive(Debug)]
-#[derive(PartialEq)]
+#[derive(Debug, PartialEq)]
 pub struct AttachmentInfo {
     pub mime_type: Option<String>,
     pub filename: Option<String>,
@@ -82,15 +93,15 @@ pub struct AttachmentInfo {
 }
 
 
-#[derive(Debug)]
-#[derive(PartialEq)]
+#[derive(Debug, PartialEq)]
 pub struct AttachmentRecords{
     pub attachments: Vec<AttachmentInfo>,
 }
 
 
+
 impl TryFrom<&Message<'_>> for AttachmentRecords{
-    type Error = String; //FIXME: upgrade to snafu
+    type Error = MimeExtractError;
 
     fn try_from(message: &Message) -> Result<Self, Self::Error> {
 
@@ -162,7 +173,7 @@ impl TryFrom<&Message<'_>> for AttachmentRecords{
 
 
         if attachments.is_empty() {
-            Err("No attachments found.".to_string())
+            Err(MimeExtractError::AttachmentsNotFound)
         }else{
             //sane parse
             Ok(
@@ -182,23 +193,21 @@ impl TryFrom<&Message<'_>> for AttachmentRecords{
 // Content Section code.
 // Extracts the user-relevant content in text/plain and text/html sections.
 
-#[derive(Debug)]
-#[derive(PartialEq)]
+#[derive(Debug, PartialEq)]
 pub struct ContentSectionInfo {
     pub mime_type: Option<String>,
     pub content: Option<String>,
 }
 
 
-#[derive(Debug)]
-#[derive(PartialEq)]
+#[derive(Debug, PartialEq)]
 pub struct ContentSectionRecords {
     pub sections: Vec<ContentSectionInfo>,
 }
 
 
 impl TryFrom<&Message<'_>> for ContentSectionRecords {
-    type Error = String; //FIXME: upgrade to snafu
+    type Error = MimeExtractError;
 
     fn try_from( eml_msg: &Message ) -> Result<ContentSectionRecords, Self::Error> {
 
@@ -224,7 +233,7 @@ impl TryFrom<&Message<'_>> for ContentSectionRecords {
 
 
         if content_records.is_empty() {
-            Err("No content sections found.".to_string())
+            Err(MimeExtractError::ContentSectionsNotFound)
         }else{
             Ok(
                 ContentSectionRecords {
