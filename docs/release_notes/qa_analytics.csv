@@ -3,3 +3,4 @@ version,qa_start_time,qa_end_time,human_count,human_hours,recipes_total,recipes_
 1.0.4,2025-02-17T07:00:00Z,2025-02-17T09:00:00Z,6,9,72,7,0,AI QA engineer did not exist.
 1.0.5,2025-03-10T22:00:00Z,2025-03-11T04:00:00Z,4,6,72,15,1,AI QA engineer runs recipes post-release.
 1.0.6,2025-03-18T22:00:00Z,2025-03-19T07:00:00Z,4,12,72,8,1,AI QA engineer runs recipes post-release.
+1.0.7,2025-03-26T14:00:00Z,2025-03-27T03:00:00Z,3,13,72,72,1,AI QA engineer runs recipes post-release.
