@@ -292,10 +292,12 @@ mod tests {
                 let attachment_records = AttachmentRecords::try_from(&message);
 
                 //reconstruct the email headers into a string blob
-                let headers_blob: String = message
+                let headers_blob = message
                     .headers_raw()
-                    .map(|(k, v)| format!("{k}:{v}"))
-                    .collect::<String>();
+                    .fold(String::new(), |mut acc, (k, v)| {
+                        acc.push_str(&format!("{k}:{v}"));
+                        acc
+                    });
                 println!("headers blob: [{headers_blob}]");
 
                 assert!(attachment_records.is_err());
