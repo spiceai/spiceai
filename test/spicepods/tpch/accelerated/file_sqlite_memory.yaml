@@ -2,7 +2,7 @@ version: v1
 kind: Spicepod
 name: file_sqlite_memory
 datasets:
-  - from: file:data/customer.parquet
+  - from: file:data/sf0_1/customer.parquet
     name: customer
     acceleration:
       enabled: true
@@ -11,7 +11,7 @@ datasets:
       indexes:
         c_phone: enabled
         c_acctbal: enabled
-  - from: file:data/lineitem.parquet
+  - from: file:data/sf0_1/lineitem.parquet
     name: lineitem
     acceleration:
       enabled: true
@@ -24,7 +24,7 @@ datasets:
         l_shipdate: enabled
         l_partkey: enabled
         l_quantity: enabled
-  - from: file:data/nation.parquet
+  - from: file:data/sf0_1/nation.parquet
     name: nation
     acceleration:
       enabled: true
@@ -32,7 +32,7 @@ datasets:
       mode: memory
       indexes:
         n_nationkey: enabled
-  - from: file:data/orders.parquet
+  - from: file:data/sf0_1/orders.parquet
     name: orders
     acceleration:
       enabled: true
@@ -42,7 +42,7 @@ datasets:
         o_orderdate: enabled
         o_orderkey: enabled
         o_custkey: enabled
-  - from: file:data/part.parquet
+  - from: file:data/sf0_1/part.parquet
     name: part
     acceleration:
       enabled: true
@@ -52,7 +52,7 @@ datasets:
         p_partkey: enabled
         p_brand: enabled
         p_container: enabled
-  - from: file:data/partsupp.parquet
+  - from: file:data/sf0_1/partsupp.parquet
     name: partsupp
     acceleration:
       enabled: true
@@ -61,13 +61,13 @@ datasets:
       indexes:
         ps_suppkey: enabled
         ps_partkey: enabled
-  - from: file:data/region.parquet
+  - from: file:data/sf0_1/region.parquet
     name: region
     acceleration:
       enabled: true
       engine: sqlite
       mode: memory
-  - from: file:data/supplier.parquet
+  - from: file:data/sf0_1/supplier.parquet
     name: supplier
     acceleration:
       enabled: true

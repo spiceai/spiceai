@@ -197,6 +197,7 @@ pub enum QueryOverrides {
     Snowflake,
     IcebergSF1,
     SpicecloudCatalog,
+    Spicecloud,
 }
 
 impl QueryOverrides {
@@ -457,6 +458,11 @@ pub fn get_tpcds_test_queries(
             );
             add_tpcds_query_overrides!(queries, "postgres", 36, 70, 86)
         }
+        Some(QueryOverrides::Spicecloud) => remove_tpcds_query!(
+            queries, 8,  // https://github.com/spiceai/spiceai/issues/4668
+            38, // https://github.com/spiceai/spiceai/issues/4667
+            87  // https://github.com/spiceai/spiceai/issues/4667
+        ),
         Some(_) | None => queries,
     }
 }
