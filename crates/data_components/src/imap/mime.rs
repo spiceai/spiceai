@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-
 // RFC for MIME
 // https://www.rfc-editor.org/rfc/rfc2045
 // https://www.rfc-editor.org/rfc/rfc2046
@@ -28,16 +27,13 @@ limitations under the License.
 // RFC for multibyte filenames (MIME Parameter Value and Encoded Word Extensions:Character Sets, Languages, and Continuations)
 // https://www.rfc-editor.org/rfc/rfc2231
 
-
+use mail_parser::{Message, MessageParser, MimeHeaders};
 use snafu::Snafu;
-use mail_parser::{MimeHeaders, Message, MessageParser};
 
-
-pub struct MimeExtract{
+pub struct MimeExtract {
     pub attachments: Option<Vec<AttachmentInfo>>,
     pub content_sections: Option<Vec<ContentSectionInfo>>,
 }
-
 
 impl From<&Option<String>> for MimeExtract {
     fn from(body: &Option<String>) -> Self {
@@ -50,8 +46,12 @@ impl From<&Option<String>> for MimeExtract {
             .and_then(|body| {
                 MessageParser::default().parse(body).map(|eml_msg| {
                     // We now have a parsed mime msg to work with: eml_msg
-                    let attachments = AttachmentRecords::try_from(&eml_msg).ok().map(|r| r.attachments);
-                    let content_sections = ContentSectionRecords::try_from(&eml_msg).ok().map(|r| r.sections);
+                    let attachments = AttachmentRecords::try_from(&eml_msg)
+                        .ok()
+                        .map(|r| r.attachments);
+                    let content_sections = ContentSectionRecords::try_from(&eml_msg)
+                        .ok()
+                        .map(|r| r.sections);
                     MimeExtract {
                         attachments,
                         content_sections,
@@ -63,24 +63,18 @@ impl From<&Option<String>> for MimeExtract {
                 content_sections: None,
             })
     }
-
 }
-
-
 
 //FIXME: Apparently overload/shadow of "Error" is normal Rust idiomatic code.
 // not sure, went with this for now.
 #[derive(Debug, Snafu)]
-pub enum MimeExtractError{
+pub enum MimeExtractError {
     #[snafu(display("No attachments found."))]
     AttachmentsNotFound,
 
     #[snafu(display("No content sections found."))]
     ContentSectionsNotFound,
 }
-
-
-
 
 // Attachment extraction code.
 // filename, mime-type, blob
@@ -93,27 +87,21 @@ pub struct AttachmentInfo {
     //FIXME: store charset?
 }
 
-
 #[derive(Debug, PartialEq)]
-pub struct AttachmentRecords{
+pub struct AttachmentRecords {
     pub attachments: Vec<AttachmentInfo>,
 }
 
-
-
-impl TryFrom<&Message<'_>> for AttachmentRecords{
+impl TryFrom<&Message<'_>> for AttachmentRecords {
     type Error = MimeExtractError;
 
     fn try_from(message: &Message) -> Result<Self, Self::Error> {
-
         let mut attachments = Vec::<AttachmentInfo>::new();
 
         for attachment in message.attachments() {
-
             //extract filename
             //let filename = attachment.attachment_name().map(|attachment_name| attachment_name.to_string());
             let filename = attachment.attachment_name().map(ToString::to_string);
-
 
             //extract mime type
             let mime_type = if let Some(content_type_struct) = attachment.content_type() {
@@ -134,22 +122,18 @@ impl TryFrom<&Message<'_>> for AttachmentRecords{
                 };
 
                 Some(mime_type)
-
-            }else{
+            } else {
                 //unable to extract mime type
                 None
             };
 
-
             //attachments are decoded automatically by mail_parse
             //encoding type is available. not sure if encoded bytes(base64/etc) are.
-            let attachment_blob =
-                if attachment.contents().is_empty() {
-                    None
-                }else{
-                    Some( attachment.contents().to_vec() )
-                };
-
+            let attachment_blob = if attachment.contents().is_empty() {
+                None
+            } else {
+                Some(attachment.contents().to_vec())
+            };
 
             // Deal with None,None case where there's no filename AND no mime_type
             match (filename, mime_type) {
@@ -158,38 +142,31 @@ impl TryFrom<&Message<'_>> for AttachmentRecords{
 
                     //FIXME: invalid_attachment_action::warn ?
 
-                    attachments.push( AttachmentInfo{
+                    attachments.push(AttachmentInfo {
                         filename: None,
                         mime_type: Some("application/octet-stream".to_string()), //mime_type,
-                        blob:attachment_blob } );
-
-                },
+                        blob: attachment_blob,
+                    });
+                }
                 (filename, mime_type) => {
                     // Any other combo of filename and mime_type gives us a useful decode.
-                    attachments.push( AttachmentInfo{ filename, mime_type, blob:attachment_blob } );
+                    attachments.push(AttachmentInfo {
+                        filename,
+                        mime_type,
+                        blob: attachment_blob,
+                    });
                 }
             };
-
         } //loop attachments for email
-
 
         if attachments.is_empty() {
             Err(MimeExtractError::AttachmentsNotFound)
-        }else{
+        } else {
             //sane parse
-            Ok(
-                AttachmentRecords{
-                    attachments
-                }
-            )
+            Ok(AttachmentRecords { attachments })
         }
-        
     }
-    
 }
-
-
-
 
 // Content Section code.
 // Extracts the user-relevant content in text/plain and text/html sections.
@@ -200,60 +177,46 @@ pub struct ContentSectionInfo {
     pub content: Option<String>,
 }
 
-
 #[derive(Debug, PartialEq)]
 pub struct ContentSectionRecords {
     pub sections: Vec<ContentSectionInfo>,
 }
 
-
 impl TryFrom<&Message<'_>> for ContentSectionRecords {
     type Error = MimeExtractError;
 
-    fn try_from( eml_msg: &Message ) -> Result<ContentSectionRecords, Self::Error> {
-
+    fn try_from(eml_msg: &Message) -> Result<ContentSectionRecords, Self::Error> {
         let mut content_records = Vec::<ContentSectionInfo>::new();
 
         for rec in eml_msg.html_bodies() {
-            content_records.push(
-                ContentSectionInfo {
-                    mime_type: Some("text/html".to_string()),
-                    content: Some(rec.to_string()),
-                }
-            );
+            content_records.push(ContentSectionInfo {
+                mime_type: Some("text/html".to_string()),
+                content: Some(rec.to_string()),
+            });
         }
 
         for rec in eml_msg.text_bodies() {
-            content_records.push(
-                ContentSectionInfo {
-                    mime_type: Some("text/plain".to_string()),
-                    content: Some(rec.to_string()),
-                }
-            );
+            content_records.push(ContentSectionInfo {
+                mime_type: Some("text/plain".to_string()),
+                content: Some(rec.to_string()),
+            });
         }
-
 
         if content_records.is_empty() {
             Err(MimeExtractError::ContentSectionsNotFound)
-        }else{
-            Ok(
-                ContentSectionRecords {
-                    sections: content_records
-                }
-            )
+        } else {
+            Ok(ContentSectionRecords {
+                sections: content_records,
+            })
         }
-
     }
 }
 
-
-
-
 #[cfg(test)]
-mod tests{
-    mod mime_extract{
-        use mail_parser::MessageParser;
+mod tests {
+    mod mime_extract {
         use crate::imap::mime::{AttachmentInfo, AttachmentRecords, ContentSectionRecords};
+        use mail_parser::MessageParser;
 
         #[test]
         fn test_eml_utf8() {
@@ -268,61 +231,52 @@ mod tests{
             let eml_msg = MessageParser::default().parse(&raw_email);
 
             if let Some(message) = eml_msg {
-                let _content_records = ContentSectionRecords::try_from( &message ).expect("Failed to parse message");
+                let _content_records =
+                    ContentSectionRecords::try_from(&message).expect("Failed to parse message");
 
-
-                let attachment_records = AttachmentRecords::try_from( &message ).expect("Failed to parse attachments");
+                let attachment_records =
+                    AttachmentRecords::try_from(&message).expect("Failed to parse attachments");
 
                 let extracted_set = attachment_records.attachments;
 
-                let correct_set = vec!(
-
+                let correct_set = vec![
                     //filenames contains \" escape strings
-                    AttachmentInfo{
+                    AttachmentInfo {
                         filename: Some("report \"Q1 2024\" (final).pdf".to_string()),
                         mime_type: Some("application/pdf".to_string()),
-                        blob: None
+                        blob: None,
                     },
-
                     //filename has an embedded ; char
-                    AttachmentInfo{
+                    AttachmentInfo {
                         filename: Some("data; Q1-2024.png".to_string()),
                         mime_type: Some("image/png".to_string()),
-                        blob: None
+                        blob: None,
                     },
-
                     //filename is multibyte
-                    AttachmentInfo{
+                    AttachmentInfo {
                         filename: Some("résumé.txt".to_string()),
                         mime_type: Some("text/plain".to_string()),
-                        blob: None
+                        blob: None,
                     },
-
                     //FIXME: the mail-parser crate has a bug and this test relies on it's broken behaviour.
-                    AttachmentInfo{
+                    AttachmentInfo {
                         filename: Some("BROKEN_PARSE_BUG_a_b_c.txt".to_string()),
                         mime_type: Some("text/plain".to_string()),
-                        blob: None
+                        blob: None,
                     },
-
-                    AttachmentInfo{
+                    AttachmentInfo {
                         filename: Some("CORRECT_a_b_c.txt".to_string()),
                         mime_type: Some("text/plain".to_string()),
-                        blob: None
+                        blob: None,
                     },
-                );
+                ];
 
-                assert_eq!( extracted_set, correct_set, "mismatched sets" );
-
-
+                assert_eq!(extracted_set, correct_set, "mismatched sets");
             };
-
-
         }
 
-
         #[test]
-        fn test_eml_no_attachments(){
+        fn test_eml_no_attachments() {
             let raw_email = include_str!("test_data/no_attachments.txt").to_string(); // Load an email file
 
             println!("\nno attachments");
@@ -330,24 +284,26 @@ mod tests{
             let eml_msg = MessageParser::default().parse(&raw_email);
 
             if let Some(message) = eml_msg {
-                let _content_records = ContentSectionRecords::try_from(&message).expect("Failed to parse message");
+                let _content_records =
+                    ContentSectionRecords::try_from(&message).expect("Failed to parse message");
 
+                //Dont unwrap() or expect() this as the test condition at the end depends on it
+                //being an Result/Err
                 let attachment_records = AttachmentRecords::try_from(&message);
 
                 //reconstruct the email headers into a string blob
-                let headers_blob: String = message.headers_raw()
+                let headers_blob: String = message
+                    .headers_raw()
                     .map(|(k, v)| format!("{k}:{v}"))
                     .collect::<String>();
                 println!("headers blob: [{headers_blob}]");
 
                 assert!(attachment_records.is_err());
-
             }
         }
 
-
         #[test]
-        fn test_eml_three_attachments(){
+        fn test_eml_three_attachments() {
             let raw_email = include_str!("test_data/three_attachments.txt").to_string(); // Load an email file
 
             println!("\nthree attachments");
@@ -355,10 +311,11 @@ mod tests{
             let eml_msg = MessageParser::default().parse(&raw_email);
 
             if let Some(message) = eml_msg {
-                let _content_records = ContentSectionRecords::try_from( &message ).expect("Failed to parse message");
+                let _content_records =
+                    ContentSectionRecords::try_from(&message).expect("Failed to parse message");
 
-
-                let attachment_records = AttachmentRecords::try_from(&message).expect("Failed to parse attachments");
+                let attachment_records =
+                    AttachmentRecords::try_from(&message).expect("Failed to parse attachments");
 
                 let extracted_set = attachment_records.attachments;
                 for rec in &extracted_set {
@@ -367,42 +324,41 @@ mod tests{
                     let blob_str = if let Ok(blob) = String::from_utf8(blob) {
                         blob
                     } else {
-                        format!("[{}] Could not decode into utf8 for display", rec.mime_type.clone().expect("mime type not set"))
+                        format!(
+                            "[{}] Could not decode into utf8 for display",
+                            rec.mime_type.clone().expect("mime type not set")
+                        )
                     };
                     println!("-rec: {:?}", &blob_str);
                     println!();
                 }
 
-
                 let image_bytes = include_bytes!("../../../../media/Mark - Orange on White.png");
 
-
-                let correct_set = vec!(
+                let correct_set = vec![
                     AttachmentInfo {
                         filename: Some("document.pdf".to_string()),
                         mime_type: Some("application/pdf".to_string()),
-                        blob: Some("Test content encoded as b64".as_bytes().to_vec())
+                        blob: Some("Test content encoded as b64".as_bytes().to_vec()),
                     },
                     AttachmentInfo {
                         filename: Some("image.png".to_string()),
                         mime_type: Some("image/png".to_string()),
-                        blob: Some(image_bytes.to_vec())
+                        blob: Some(image_bytes.to_vec()),
                     },
                     AttachmentInfo {
                         filename: Some("notes.txt".to_string()),
                         mime_type: Some("text/plain".to_string()),
-                        blob: Some("Sample text content in the file.\n".as_bytes().to_vec())
+                        blob: Some("Sample text content in the file.\n".as_bytes().to_vec()),
                     },
-                );
+                ];
 
                 assert_eq!(extracted_set, correct_set, "mismatched sets");
             }
         }
 
-
         #[test]
-        fn test_eml_malformed(){
-
+        fn test_eml_malformed() {
             // This tests some awkward corner cases for weird headers.
 
             let raw_email = include_str!("test_data/malformed_headers.txt").to_string(); // Load an email file
@@ -412,46 +368,44 @@ mod tests{
             let eml_msg = MessageParser::default().parse(&raw_email);
 
             if let Some(message) = eml_msg {
-                let _content_records = ContentSectionRecords::try_from(&message).expect("Failed to parse message");
+                let _content_records =
+                    ContentSectionRecords::try_from(&message).expect("Failed to parse message");
 
-
-                let attachment_records = AttachmentRecords::try_from(&message).expect("Failed to parse attachments");
+                let attachment_records =
+                    AttachmentRecords::try_from(&message).expect("Failed to parse attachments");
 
                 let extracted_set = attachment_records.attachments;
 
-                let correct_set = vec!(
+                let correct_set = vec![
                     AttachmentInfo {
                         filename: Some("document.pdf".to_string()),
                         mime_type: Some("application/pdf".to_string()),
-                        blob: None
+                        blob: None,
                     },
                     AttachmentInfo {
                         filename: None,
                         mime_type: Some("application/pdf".to_string()),
-                        blob: None
+                        blob: None,
                     },
-                    AttachmentInfo{
+                    AttachmentInfo {
                         filename: None,
                         mime_type: Some("application/octet-stream".to_string()), // No filename or mime-type was detected. Default assigned.
-                        blob: None
+                        blob: None,
                     },
                     AttachmentInfo {
                         filename: Some("no_mime_type.png".to_string()),
                         mime_type: None,
-                        blob: None
+                        blob: None,
                     },
                     AttachmentInfo {
                         filename: Some("notes.tx_t".to_string()),
                         mime_type: Some("text/plain".to_string()),
-                        blob: None
+                        blob: None,
                     },
-                );
+                ];
 
                 assert_eq!(extracted_set, correct_set, "mismatched sets");
             }
         }
-
     }
 }
-
-
