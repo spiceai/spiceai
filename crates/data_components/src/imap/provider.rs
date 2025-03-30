@@ -25,17 +25,14 @@ use datafusion::{
     logical_expr::Expr,
     physical_plan::ExecutionPlan,
 };
-use mailparse::{dateparse};
+use mailparse::dateparse;
 use snafu::prelude::*;
 
-use crate::arrow::write::MemTable;
 use super::{
-    EmailMessage, Error, FailedToLogoutSnafu, FailedToParseHeaderSnafu, FetchMessagesSnafu,
-    GetMailboxStatusSnafu, ImapTableProvider,
-    mime::{
-        MimeExtract,
-    },
+    mime::MimeExtract, EmailMessage, Error, FailedToLogoutSnafu, FailedToParseHeaderSnafu,
+    FetchMessagesSnafu, GetMailboxStatusSnafu, ImapTableProvider,
 };
+use crate::arrow::write::MemTable;
 
 fn decode_string(value: &[u8]) -> String {
     match String::from_utf8(value.to_vec()) {
@@ -72,9 +69,6 @@ macro_rules! parse_addreses_from_envelope {
             .transpose()?
     };
 }
-
-
-
 
 #[async_trait]
 impl TableProvider for ImapTableProvider {
@@ -117,40 +111,33 @@ impl TableProvider for ImapTableProvider {
         ];
 
         if self.fetch_content {
-            fields.push(
-                Field::new("content", DataType::Utf8, true)
-            );
+            fields.push(Field::new("content", DataType::Utf8, true));
 
             // These contain the extracted text/html or text/plain user-content sections
-            fields.push(
-                Field::new(
-                    "content_sections",
-                    DataType::List(Arc::new(Field::new_list_field(
-                        DataType::Struct(Fields::from(vec![
-                            Field::new("content", DataType::Utf8, true),
-                            Field::new("mime_type", DataType::Utf8, true),
-                        ])),
-                        true,
-                    ))),
+            fields.push(Field::new(
+                "content_sections",
+                DataType::List(Arc::new(Field::new_list_field(
+                    DataType::Struct(Fields::from(vec![
+                        Field::new("content", DataType::Utf8, true),
+                        Field::new("mime_type", DataType::Utf8, true),
+                    ])),
                     true,
-                )
-            );
+                ))),
+                true,
+            ));
 
-            fields.push(
-                Field::new(
-                    "attachments",
-                    DataType::List(Arc::new(Field::new_list_field(
-                        DataType::Struct(Fields::from(vec![
-                            Field::new("filename", DataType::Utf8, true),
-                            Field::new("mime_type", DataType::Utf8, true),
-                            Field::new("blob", DataType::Binary, true),
-                        ])),
-                        true,
-                    ))),
+            fields.push(Field::new(
+                "attachments",
+                DataType::List(Arc::new(Field::new_list_field(
+                    DataType::Struct(Fields::from(vec![
+                        Field::new("filename", DataType::Utf8, true),
+                        Field::new("mime_type", DataType::Utf8, true),
+                        Field::new("blob", DataType::Binary, true),
+                    ])),
                     true,
-                )
-            );
-
+                ))),
+                true,
+            ));
         };
 
         Arc::new(Schema::new(fields))
@@ -178,18 +165,14 @@ impl TableProvider for ImapTableProvider {
             status.exists as usize
         };
 
-
-        let imap_query_msg: String = if self.fetch_content{
+        let imap_query_msg: String = if self.fetch_content {
             "(ENVELOPE BODY.PEEK[HEADER] BODY.PEEK[])".to_string()
-        }else{
+        } else {
             "(ENVELOPE BODY.PEEK[HEADER])".to_string()
         };
 
         let fetch_messages = session
-            .fetch(
-                format!("1:{message_count}"),
-                &imap_query_msg,
-            )
+            .fetch(format!("1:{message_count}"), &imap_query_msg)
             .context(FetchMessagesSnafu)?;
         let mut messages = vec![];
 
@@ -199,8 +182,9 @@ impl TableProvider for ImapTableProvider {
                 segment: "envelope".to_string(),
             })?;
             let subject = envelope.subject.as_ref().map(|v| decode_string(v));
-            let date = dateparse(&decode_string(envelope.date.as_ref().ok_or( //FIXME: mailparse crate is used here only?
-                                                                              Error::EnvelopeNotFound {
+            let date = dateparse(&decode_string(envelope.date.as_ref().ok_or(
+                //FIXME: mailparse crate is used here only?
+                Error::EnvelopeNotFound {
                     segment: "date".to_string(),
                 },
             )?))
@@ -220,9 +204,7 @@ impl TableProvider for ImapTableProvider {
                 None
             };
 
-
             let mime_extract = MimeExtract::from(&body);
-
 
             messages.push(EmailMessage {
                 date,
@@ -249,5 +231,3 @@ impl TableProvider for ImapTableProvider {
         table.scan(state, projection, filters, limit).await
     }
 }
-
-
