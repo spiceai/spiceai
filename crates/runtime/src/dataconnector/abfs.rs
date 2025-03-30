@@ -243,13 +243,19 @@ impl ListingTableConnector for AzureBlobFS {
         &self.params
     }
 
-    fn get_object_store_url(&self, dataset: &Dataset) -> DataConnectorResult<Url> {
+    fn get_object_store_url(
+        &self,
+        dataset: &Dataset,
+        url: Option<&str>,
+    ) -> DataConnectorResult<Url> {
+        let url = url.unwrap_or(dataset.from.as_str());
+
         let mut azure_url =
-            Url::parse(&dataset.from)
+            Url::parse(url)
                 .boxed()
                 .context(super::InvalidConfigurationSnafu {
                     dataconnector: format!("{self}"),
-                    message: format!("{} is not a valid URL. Ensure the URL is valid and try again.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/abfs#from", &dataset.from),
+                    message: format!("{url} is not a valid URL. Ensure the URL is valid and try again.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/abfs#from"),
                     connector_component: ConnectorComponent::from(dataset)
                 })?;
 
