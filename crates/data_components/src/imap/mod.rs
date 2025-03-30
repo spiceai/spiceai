@@ -18,7 +18,8 @@ use std::sync::Arc;
 
 use arrow::{
     array::{
-        ArrayRef, BinaryBuilder, Date64Array, ListArray, ListBuilder, RecordBatch, StringArray, StringBuilder, StructBuilder,
+        ArrayRef, BinaryBuilder, Date64Array, ListArray, ListBuilder, RecordBatch, StringArray,
+        StringBuilder, StructBuilder,
     },
     datatypes::{DataType, Field, Fields},
     error::ArrowError,
@@ -27,16 +28,15 @@ use datafusion::{catalog::TableProvider, error::DataFusionError};
 use session::ImapSession;
 use snafu::prelude::*;
 
-use mime::{AttachmentInfo,ContentSectionInfo};
+use mime::{AttachmentInfo, ContentSectionInfo};
 
 pub mod provider;
 pub mod session;
 
 mod mime;
 
-use Error::FailedToBuildListArrayForAttachments;
 use crate::imap::Error::FailedToBuildListArrayForContentSections;
-
+use Error::FailedToBuildListArrayForAttachments;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -67,14 +67,18 @@ pub enum Error {
     #[snafu(display("An invalid authentication mode was provided: {auth_mode}"))]
     InvalidAuthMode { auth_mode: String },
 
-
     //FIXME: Not happy with error descriptions.
     #[snafu(display("Should return a field builder: {field_number}/{field_name}"))]
-    FailedToBuildListArrayForAttachments { field_number: i32, field_name: String },
+    FailedToBuildListArrayForAttachments {
+        field_number: i32,
+        field_name: String,
+    },
 
     #[snafu(display("Should return a field builder: {field_number}/{field_name}"))]
-    FailedToBuildListArrayForContentSections { field_number: i32, field_name: String },
-
+    FailedToBuildListArrayForContentSections {
+        field_number: i32,
+        field_name: String,
+    },
 }
 
 #[derive(Debug)]
@@ -92,19 +96,21 @@ fn build_listarray_for_strings(values: Vec<Option<Vec<Option<String>>>>) -> List
     builder.finish()
 }
 
-
 //FIXME: I don't really like the overload/shadow of Result here but GPT told me it was an accepted Rust idiom.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-
-fn build_listarray_for_content_sections(values: Vec<Option<Vec<ContentSectionInfo>>>) -> Result<ListArray> {
-
+fn build_listarray_for_content_sections(
+    values: Vec<Option<Vec<ContentSectionInfo>>>,
+) -> Result<ListArray> {
     let struct_builder = StructBuilder::new(
         Fields::from(vec![
             Field::new("content", DataType::Utf8, true),
             Field::new("mime_type", DataType::Utf8, true),
         ]),
-        vec![Box::new(StringBuilder::new()), Box::new(StringBuilder::new())],
+        vec![
+            Box::new(StringBuilder::new()),
+            Box::new(StringBuilder::new()),
+        ],
     );
 
     let mut list_builder = ListBuilder::new(struct_builder);
@@ -116,12 +122,18 @@ fn build_listarray_for_content_sections(values: Vec<Option<Vec<ContentSectionInf
 
                 let content_field_builder = struct_builder
                     .field_builder::<StringBuilder>(0)
-                    .ok_or( FailedToBuildListArrayForContentSections { field_number: 0, field_name: String::from("content_section") })?;
+                    .ok_or(FailedToBuildListArrayForContentSections {
+                        field_number: 0,
+                        field_name: String::from("content_section"),
+                    })?;
                 content_field_builder.append_option(content_section.content.as_deref());
 
                 let mime_type_field_builder = struct_builder
                     .field_builder::<StringBuilder>(1)
-                    .ok_or( FailedToBuildListArrayForContentSections { field_number: 1, field_name: String::from("mime_type") })?;
+                    .ok_or(FailedToBuildListArrayForContentSections {
+                        field_number: 1,
+                        field_name: String::from("mime_type"),
+                    })?;
                 mime_type_field_builder.append_option(content_section.mime_type.as_deref());
 
                 struct_builder.append(true);
@@ -135,10 +147,7 @@ fn build_listarray_for_content_sections(values: Vec<Option<Vec<ContentSectionInf
     Ok(list_builder.finish())
 }
 
-
-
 fn build_listarray_for_attachments(values: Vec<Option<Vec<AttachmentInfo>>>) -> Result<ListArray> {
-
     let struct_builder = StructBuilder::new(
         Fields::from(vec![
             Field::new("filename", DataType::Utf8, true),
@@ -148,7 +157,7 @@ fn build_listarray_for_attachments(values: Vec<Option<Vec<AttachmentInfo>>>) -> 
         vec![
             Box::new(StringBuilder::new()),
             Box::new(StringBuilder::new()),
-            Box::new(BinaryBuilder::new())
+            Box::new(BinaryBuilder::new()),
         ],
     );
 
@@ -161,17 +170,26 @@ fn build_listarray_for_attachments(values: Vec<Option<Vec<AttachmentInfo>>>) -> 
 
                 let filename_field_builder = struct_builder
                     .field_builder::<StringBuilder>(0)
-                    .ok_or( FailedToBuildListArrayForAttachments { field_number: 0, field_name:"filename".to_string() } )?;
+                    .ok_or(FailedToBuildListArrayForAttachments {
+                        field_number: 0,
+                        field_name: "filename".to_string(),
+                    })?;
                 filename_field_builder.append_option(attachment.filename.as_deref());
 
                 let mime_type_field_builder = struct_builder
                     .field_builder::<StringBuilder>(1)
-                    .ok_or( FailedToBuildListArrayForAttachments { field_number: 1, field_name:"mime_type".to_string() } )?;
+                    .ok_or(FailedToBuildListArrayForAttachments {
+                        field_number: 1,
+                        field_name: "mime_type".to_string(),
+                    })?;
                 mime_type_field_builder.append_option(attachment.mime_type.as_deref());
 
-                let blob_field_builder = struct_builder
-                    .field_builder::<BinaryBuilder>(2)
-                    .ok_or( FailedToBuildListArrayForAttachments { field_number: 2, field_name:"blob".to_string() } )?;
+                let blob_field_builder = struct_builder.field_builder::<BinaryBuilder>(2).ok_or(
+                    FailedToBuildListArrayForAttachments {
+                        field_number: 2,
+                        field_name: "blob".to_string(),
+                    },
+                )?;
                 blob_field_builder.append_option(attachment.blob.as_deref());
 
                 struct_builder.append(true);
@@ -184,7 +202,6 @@ fn build_listarray_for_attachments(values: Vec<Option<Vec<AttachmentInfo>>>) -> 
 
     Ok(list_builder.finish())
 }
-
 
 impl ImapTableProvider {
     #[must_use]
@@ -246,8 +263,10 @@ impl ImapTableProvider {
         if self.fetch_content {
             fields.push(Arc::new(StringArray::from(bodies))); // field name mismatch. "content" in schema
 
-            let list_array_content_sections = build_listarray_for_content_sections(content_sections)
-                .map_err(|e| ArrowError::ComputeError(format!("Failed to build ListArray: {e}")))?;
+            let list_array_content_sections =
+                build_listarray_for_content_sections(content_sections).map_err(|e| {
+                    ArrowError::ComputeError(format!("Failed to build ListArray: {e}"))
+                })?;
             fields.push(Arc::new(list_array_content_sections));
 
             let list_array_attachments = build_listarray_for_attachments(attachments)
@@ -282,18 +301,12 @@ pub(crate) struct EmailMessage {
     content_sections: Option<Vec<ContentSectionInfo>>,
 }
 
-
-
-
-
-
 #[cfg(test)]
 mod tests {
-    mod build_listarray{
+    mod build_listarray {
         use super::super::*;
-        use arrow::array::{Array, ListArray, StructArray, StringArray, BinaryArray};
+        use arrow::array::{Array, BinaryArray, ListArray, StringArray, StructArray};
         use arrow::datatypes::{DataType, Field};
-
 
         #[test]
         fn test_build_listarray_for_content_sections() {
@@ -319,8 +332,8 @@ mod tests {
             ];
 
             // Call your function.
-            let list_array = build_listarray_for_content_sections(values)
-                .expect("Failed to build ListArray");
+            let list_array =
+                build_listarray_for_content_sections(values).expect("Failed to build ListArray");
 
             // Verify the outer ListArray has three entries.
             assert_eq!(list_array.len(), 3);
@@ -339,18 +352,21 @@ mod tests {
             assert_eq!(offsets[2], offsets[3]);
 
             // Retrieve the inner StructArray.
-            let struct_array = list_array.values()
+            let struct_array = list_array
+                .values()
                 .as_any()
                 .downcast_ref::<StructArray>()
                 .expect("Expected a StructArray");
 
             // Get the "content" and "mime_type" fields from the struct.
-            let content_array = struct_array.column(0)
+            let content_array = struct_array
+                .column(0)
                 .as_any()
                 .downcast_ref::<StringArray>()
                 .expect("Expected a StringArray for 'content'");
 
-            let mime_type_array = struct_array.column(1)
+            let mime_type_array = struct_array
+                .column(1)
                 .as_any()
                 .downcast_ref::<StringArray>()
                 .expect("Expected a StringArray for 'mime_type'");
@@ -365,9 +381,6 @@ mod tests {
             assert_eq!(content_array.value(1), "World");
             assert!(!mime_type_array.is_valid(1));
         }
-
-
-
 
         #[test]
         fn test_build_listarray_for_attachments() {
@@ -412,7 +425,8 @@ mod tests {
             assert_eq!(offsets[2], offsets[3]);
 
             // Downcast the inner array to a StructArray.
-            let struct_array = list_array.values()
+            let struct_array = list_array
+                .values()
                 .as_any()
                 .downcast_ref::<StructArray>()
                 .expect("Expected a StructArray");
@@ -421,17 +435,20 @@ mod tests {
             // - filename: StringArray
             // - mime_type: StringArray
             // - blob: BinaryArray
-            let filename_array = struct_array.column(0)
+            let filename_array = struct_array
+                .column(0)
                 .as_any()
                 .downcast_ref::<StringArray>()
                 .expect("Expected a StringArray for filename");
 
-            let mime_type_array = struct_array.column(1)
+            let mime_type_array = struct_array
+                .column(1)
                 .as_any()
                 .downcast_ref::<StringArray>()
                 .expect("Expected a StringArray for mime_type");
 
-            let blob_array = struct_array.column(2)
+            let blob_array = struct_array
+                .column(2)
                 .as_any()
                 .downcast_ref::<arrow::array::BinaryArray>()
                 .expect("Expected a BinaryArray for blob");
@@ -450,12 +467,5 @@ mod tests {
             // The blob field is null.
             assert!(!blob_array.is_valid(1));
         }
-
-
-
     }
-
 }
-
-
-
