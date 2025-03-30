@@ -2,17 +2,17 @@
 source: crates/test-framework/src/spicetest/datasets/worker.rs
 description: "Query: tpcds_q5"
 ---
-+-----------------+------------------------------+-----------+---------+-----------+
-| channel         | id                           | sales     | returns | profit    |
-+-----------------+------------------------------+-----------+---------+-----------+
-| catalog channel | catalog_pageAAAAAAAAAAHBAAAA | 0.00      | 2573.86 | -2314.21  |
-| catalog channel | catalog_pageAAAAAAAAAAIBAAAA | 79271.26  | 0.00    | -15373.96 |
-| catalog channel | catalog_pageAAAAAAAAAAKBAAAA | 84480.65  | 0.00    | 6246.81   |
-| catalog channel | catalog_pageAAAAAAAAABHBAAAA | 0.00      | 778.91  | -737.66   |
-| catalog channel | catalog_pageAAAAAAAAABKBAAAA | 101276.24 | 0.00    | 10193.83  |
-| catalog channel | catalog_pageAAAAAAAAACEBAAAA | 0.00      | 147.18  | -161.10   |
-| catalog channel | catalog_pageAAAAAAAAACHBAAAA | 0.00      | 5603.78 | -3477.14  |
-| catalog channel | catalog_pageAAAAAAAAACKBAAAA | 39547.67  | 0.00    | -13233.16 |
-| catalog channel | catalog_pageAAAAAAAAADHBAAAA | 0.00      | 1291.83 | -1529.96  |
-| catalog channel | catalog_pageAAAAAAAAADIBAAAA | 0.00      | 371.25  | -135.98   |
-+-----------------+------------------------------+-----------+---------+-----------+
++-----------------+------------------------------+----------+---------+-----------+
+| channel         | id                           | sales    | returns | profit    |
++-----------------+------------------------------+----------+---------+-----------+
+| catalog channel | catalog_pageAAAAAAAAAAHBAAAA | 0.00     | 58.05   | -197.42   |
+| catalog channel | catalog_pageAAAAAAAAAAIBAAAA | 3396.48  | 0.00    | 634.24    |
+| catalog channel | catalog_pageAAAAAAAAAAKBAAAA | 6785.28  | 0.00    | 2593.12   |
+| catalog channel | catalog_pageAAAAAAAAABHBAAAA | 0.00     | 894.14  | -1971.13  |
+| catalog channel | catalog_pageAAAAAAAAABKBAAAA | 5107.30  | 0.00    | -7341.29  |
+| catalog channel | catalog_pageAAAAAAAAACKBAAAA | 15233.36 | 0.00    | -4898.50  |
+| catalog channel | catalog_pageAAAAAAAAAEHBAAAA | 4283.00  | 0.00    | 613.32    |
+| catalog channel | catalog_pageAAAAAAAAAFHBAAAA | 38143.23 | 0.00    | -21590.88 |
+| catalog channel | catalog_pageAAAAAAAAAGHBAAAA | 19949.72 | 834.45  | -5500.39  |
+| catalog channel | catalog_pageAAAAAAAAAHHBAAAA | 20058.75 | 0.00    | -4707.32  |
++-----------------+------------------------------+----------+---------+-----------+
