@@ -305,8 +305,8 @@ pub(crate) struct EmailMessage {
 mod tests {
     mod build_listarray {
         use super::super::*;
-        use arrow::array::{Array, BinaryArray, ListArray, StringArray, StructArray};
-        use arrow::datatypes::{DataType, Field};
+        use arrow::array::{Array, BinaryArray, StringArray, StructArray};
+        //use arrow::datatypes::{DataType, Field};
 
         #[test]
         fn test_build_listarray_for_content_sections() {
@@ -450,7 +450,7 @@ mod tests {
             let blob_array = struct_array
                 .column(2)
                 .as_any()
-                .downcast_ref::<arrow::array::BinaryArray>()
+                .downcast_ref::<BinaryArray>()
                 .expect("Expected a BinaryArray for blob");
 
             // Verify first attachment in the first element.
