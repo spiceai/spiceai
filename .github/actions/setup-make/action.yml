@@ -3,7 +3,7 @@ description: 'composite action'
 inputs:
   os:
     description: 'Operating system to install make for'
-    default: 'linux' # 'linux', 'windows'
+    default: 'linux' # 'linux', 'windows','macos'
 
 runs:
   using: 'composite'

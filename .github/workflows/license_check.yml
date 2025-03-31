@@ -44,6 +44,8 @@ jobs:
 
       - name: Set up make
         uses: ./.github/actions/setup-make
+        with:
+          os: macos
 
       - name: Check Rust Licenses
         run: make dep-licenses |& ${{ env.FORBIDDEN_LICENSE_CHECK }}
