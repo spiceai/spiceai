@@ -78,32 +78,32 @@ runs:
         mc cp spice-minio/benchmarks/tpcds_sf1/web_returns/ ./ --recursive
         mc cp spice-minio/benchmarks/tpcds_sf1/web_sales/ ./ --recursive
         mc cp spice-minio/benchmarks/tpcds_sf1/web_site/ ./ --recursive
-        mkdir ./sf0_1
-        cd ./sf0_1
-        mc cp spice-minio/benchmarks/tpcds_sf0_1/call_center/ ./ --recursive
-        mc cp spice-minio/benchmarks/tpcds_sf0_1/catalog_page/ ./ --recursive
-        mc cp spice-minio/benchmarks/tpcds_sf0_1/catalog_returns/ ./ --recursive
-        mc cp spice-minio/benchmarks/tpcds_sf0_1/catalog_sales/ ./ --recursive
-        mc cp spice-minio/benchmarks/tpcds_sf0_1/customer/ ./ --recursive
-        mc cp spice-minio/benchmarks/tpcds_sf0_1/customer_address/ ./ --recursive
-        mc cp spice-minio/benchmarks/tpcds_sf0_1/customer_demographics/ ./ --recursive
-        mc cp spice-minio/benchmarks/tpcds_sf0_1/date_dim/ ./ --recursive
-        mc cp spice-minio/benchmarks/tpcds_sf0_1/household_demographics/ ./ --recursive
-        mc cp spice-minio/benchmarks/tpcds_sf0_1/income_band/ ./ --recursive
-        mc cp spice-minio/benchmarks/tpcds_sf0_1/inventory/ ./ --recursive
-        mc cp spice-minio/benchmarks/tpcds_sf0_1/item/ ./ --recursive
-        mc cp spice-minio/benchmarks/tpcds_sf0_1/promotion/ ./ --recursive
-        mc cp spice-minio/benchmarks/tpcds_sf0_1/reason/ ./ --recursive
-        mc cp spice-minio/benchmarks/tpcds_sf0_1/ship_mode/ ./ --recursive
-        mc cp spice-minio/benchmarks/tpcds_sf0_1/store/ ./ --recursive
-        mc cp spice-minio/benchmarks/tpcds_sf0_1/store_returns/ ./ --recursive
-        mc cp spice-minio/benchmarks/tpcds_sf0_1/store_sales/ ./ --recursive
-        mc cp spice-minio/benchmarks/tpcds_sf0_1/time_dim/ ./ --recursive
-        mc cp spice-minio/benchmarks/tpcds_sf0_1/warehouse/ ./ --recursive
-        mc cp spice-minio/benchmarks/tpcds_sf0_1/web_page/ ./ --recursive
-        mc cp spice-minio/benchmarks/tpcds_sf0_1/web_returns/ ./ --recursive
-        mc cp spice-minio/benchmarks/tpcds_sf0_1/web_sales/ ./ --recursive
-        mc cp spice-minio/benchmarks/tpcds_sf0_1/web_site/ ./ --recursive
+        mkdir ./sf0_01
+        cd ./sf0_01
+        mc cp spice-minio/benchmarks/tpcds_sf0_01/call_center/ ./ --recursive
+        mc cp spice-minio/benchmarks/tpcds_sf0_01/catalog_page/ ./ --recursive
+        mc cp spice-minio/benchmarks/tpcds_sf0_01/catalog_returns/ ./ --recursive
+        mc cp spice-minio/benchmarks/tpcds_sf0_01/catalog_sales/ ./ --recursive
+        mc cp spice-minio/benchmarks/tpcds_sf0_01/customer/ ./ --recursive
+        mc cp spice-minio/benchmarks/tpcds_sf0_01/customer_address/ ./ --recursive
+        mc cp spice-minio/benchmarks/tpcds_sf0_01/customer_demographics/ ./ --recursive
+        mc cp spice-minio/benchmarks/tpcds_sf0_01/date_dim/ ./ --recursive
+        mc cp spice-minio/benchmarks/tpcds_sf0_01/household_demographics/ ./ --recursive
+        mc cp spice-minio/benchmarks/tpcds_sf0_01/income_band/ ./ --recursive
+        mc cp spice-minio/benchmarks/tpcds_sf0_01/inventory/ ./ --recursive
+        mc cp spice-minio/benchmarks/tpcds_sf0_01/item/ ./ --recursive
+        mc cp spice-minio/benchmarks/tpcds_sf0_01/promotion/ ./ --recursive
+        mc cp spice-minio/benchmarks/tpcds_sf0_01/reason/ ./ --recursive
+        mc cp spice-minio/benchmarks/tpcds_sf0_01/ship_mode/ ./ --recursive
+        mc cp spice-minio/benchmarks/tpcds_sf0_01/store/ ./ --recursive
+        mc cp spice-minio/benchmarks/tpcds_sf0_01/store_returns/ ./ --recursive
+        mc cp spice-minio/benchmarks/tpcds_sf0_01/store_sales/ ./ --recursive
+        mc cp spice-minio/benchmarks/tpcds_sf0_01/time_dim/ ./ --recursive
+        mc cp spice-minio/benchmarks/tpcds_sf0_01/warehouse/ ./ --recursive
+        mc cp spice-minio/benchmarks/tpcds_sf0_01/web_page/ ./ --recursive
+        mc cp spice-minio/benchmarks/tpcds_sf0_01/web_returns/ ./ --recursive
+        mc cp spice-minio/benchmarks/tpcds_sf0_01/web_sales/ ./ --recursive
+        mc cp spice-minio/benchmarks/tpcds_sf0_01/web_site/ ./ --recursive
     
     - name: Download File Connector ClickBench Data
       shell: bash
