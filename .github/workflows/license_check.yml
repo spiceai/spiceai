@@ -38,19 +38,21 @@ env:
 jobs:
   license-check-rust:
     name: Check Rust Licenses
-    runs-on: spiceai-runners
+    runs-on: spiceai-macos
     steps:
       - uses: actions/checkout@v4
 
       - name: Set up make
         uses: ./.github/actions/setup-make
+        with:
+          os: macos
 
       - name: Check Rust Licenses
-        run: make dep-licenses |& ${{ env.FORBIDDEN_LICENSE_CHECK }}
+        run: make dep-licenses 2>&1 | ${{ env.FORBIDDEN_LICENSE_CHECK }}
 
   license-check-go:
     name: Check Golang Licenses
-    runs-on: spiceai-runners
+    runs-on: spiceai-macos
     env:
       GOVER: 1.23.4
 
@@ -68,4 +70,4 @@ jobs:
       - name: Check spice licenses
         working-directory: bin/spice
         run: |
-          go-licenses csv . |& ${{ env.FORBIDDEN_LICENSE_CHECK }}
+          go-licenses csv . 2>&1 | ${{ env.FORBIDDEN_LICENSE_CHECK }}
