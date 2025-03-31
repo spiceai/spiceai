@@ -463,6 +463,12 @@ pub fn get_tpcds_test_queries(
             38, // https://github.com/spiceai/spiceai/issues/4667
             87  // https://github.com/spiceai/spiceai/issues/4667
         ),
+        Some(QueryOverrides::SQLite) => remove_tpcds_query!(
+            queries, 
+            17, 29, 35, 74, // SQLite does not support `stddev`
+            5, 14, 18, 22, 27, 36, 67, 70, 77, 80, 86,// SQLite does not support `ROLLUP` and `GROUPING`
+            8, 14, 38, 87 // EXCEPT and INTERSECT aren't supported
+        ),
         Some(_) | None => queries,
     }
 }
