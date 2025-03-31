@@ -109,6 +109,7 @@ jobs:
           PGPASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
           PGUSER: postgres
         run: |
+          sudo apt install -y postgresql-client
           psql -c "CREATE DATABASE tpcds_accelerated;"
           psql -c "CREATE DATABASE tpch_accelerated;"
           psql -c "CREATE DATABASE clickbench_accelerated;"
