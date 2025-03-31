@@ -141,6 +141,9 @@ pub enum Error {
 
     #[snafu(display("Failed to parse the output column from the evaluation dataset.\n{reason}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"))]
     InvalidOutputFormatReport { reason: String },
+
+    #[snafu(display("An error occured whilst scoring the results of the eval run. {source}"))]
+    FailedToScoreEvalRun { source: scorer::Error },
 }
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -234,7 +237,25 @@ async fn run_eval(
 
     // Score the results
     let scorers_to_use = get_scorers_for_eval(eval, Arc::clone(&scorer_registry)).await?;
-    let scores = score_results(&input, &actual, &ideal, &scorers_to_use).await;
+
+    let span = tracing::span!(
+        target: "task_history",
+        tracing::Level::INFO,
+        "eval_scoring",
+        scorers = %serde_json::to_string(&scorers_to_use.keys().collect::<Vec<_>>()).unwrap_or_default(),
+    );
+
+    let scores = match score_results(&input, &actual, &ideal, &scorers_to_use)
+        .instrument(span.clone())
+        .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(target: "task_history", parent: &span, "{e}");
+            return Err(Error::FailedToScoreEvalRun { source: e });
+        }
+    };
+
     write_results(id, Arc::clone(&df), &input, &actual, &ideal, &scores).await?;
 
     // Compute metrics

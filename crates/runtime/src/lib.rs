@@ -618,16 +618,11 @@ impl Runtime {
             }
         });
 
-        let models = tokio::spawn({
+        let models_and_evals = tokio::spawn({
             let self_clone = self.clone();
             async move {
                 self_clone.load_models().await;
-            }
-        });
 
-        let evals = tokio::spawn({
-            let self_clone = self.clone();
-            async move {
                 let app_lock = self_clone.app.read().await;
 
                 if !cfg!(feature = "models")
@@ -656,8 +651,7 @@ impl Runtime {
             results_cache,
             datasets,
             catalogs,
-            models,
-            evals
+            models_and_evals
         );
 
         if let Err(err) = load_result {

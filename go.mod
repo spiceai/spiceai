@@ -2,6 +2,8 @@ module github.com/spiceai/spiceai
 
 go 1.23.0
 
+toolchain go1.24.1
+
 require (
 	github.com/AzureAD/microsoft-authentication-library-for-go v1.4.1
 	github.com/bradleyjkemp/cupaloy v2.3.0+incompatible
@@ -14,7 +16,7 @@ require (
 	github.com/peterh/liner v1.2.2
 	github.com/pkg/browser v0.0.0-20240102092130-5ac0b6a4141c
 	github.com/spf13/cobra v1.9.1
-	github.com/spf13/viper v1.20.0
+	github.com/spf13/viper v1.20.1
 	github.com/stretchr/testify v1.10.0
 	golang.org/x/mod v0.24.0
 )
@@ -23,7 +25,6 @@ require (
 	github.com/chzyer/readline v0.0.0-20180603132655-2972be24d48e // indirect
 	github.com/go-viper/mapstructure/v2 v2.2.1 // indirect
 	github.com/golang-jwt/jwt/v5 v5.2.2 // indirect
-	github.com/google/go-cmp v0.6.0 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/kylelemons/godebug v1.1.0 // indirect
 	github.com/rogpeppe/go-internal v1.12.0 // indirect

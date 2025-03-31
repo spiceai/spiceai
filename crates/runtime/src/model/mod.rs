@@ -22,7 +22,7 @@ use std::sync::Arc;
 
 mod chat;
 mod embed;
-mod eval;
+pub(crate) mod eval;
 mod metrics;
 mod tool_use;
 mod wrapper;

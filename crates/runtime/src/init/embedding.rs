@@ -45,7 +45,7 @@ impl Runtime {
                     Ok(e) => {
                         let mut embeds_map = self.embeds.write().await;
 
-                        embeds_map.insert(in_embed.name.clone(), Box::new(e) as Box<dyn Embed>);
+                        embeds_map.insert(in_embed.name.clone(), Arc::new(e) as Arc<dyn Embed>);
 
                         tracing::info!("Embedding [{}] ready to embed", in_embed.name);
                         metrics::embeddings::COUNT.add(
