@@ -12,7 +12,7 @@ datasets:
       s3_key: ${secrets:S3_KEY}
       s3_secret: ${secrets:S3_SECRET}
     acceleration:
-      refresh_sql: "SELECT * FROM hits LIMIT 10000000"
+      refresh_sql: "SELECT * FROM hits LIMIT 5000000"
       engine: postgres
       refresh_on_startup: always
       params:
