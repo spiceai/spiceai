@@ -26,6 +26,7 @@ use serde::{Deserialize, Serialize};
 use snafu::{ResultExt, Snafu};
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::{path::Path, pin::Pin};
 use tracing_futures::Instrument;
 
@@ -682,9 +683,9 @@ pub fn create_hf_model(
     model_type: Option<&str>,
     from_gguf: Option<PathBuf>,
     hf_token_literal: Option<&SecretString>,
-) -> Result<Box<dyn Chat>> {
+) -> Result<Arc<dyn Chat>> {
     mistral::MistralLlama::from_hf(model_id, model_type, hf_token_literal, from_gguf)
-        .map(|x| Box::new(x) as Box<dyn Chat>)
+        .map(|x| Arc::new(x) as Arc<dyn Chat>)
 }
 
 #[allow(unused_variables)]
@@ -695,7 +696,7 @@ pub fn create_local_model(
     tokenizer_config: Option<&str>,
     generation_config: Option<&str>,
     chat_template_literal: Option<&str>,
-) -> Result<Box<dyn Chat>> {
+) -> Result<Arc<dyn Chat>> {
     mistral::MistralLlama::from(
         model_weights
             .iter()
@@ -710,5 +711,5 @@ pub fn create_local_model(
         generation_config.map(Path::new),
         chat_template_literal,
     )
-    .map(|x| Box::new(x) as Box<dyn Chat>)
+    .map(|x| Arc::new(x) as Arc<dyn Chat>)
 }

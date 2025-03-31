@@ -36,7 +36,7 @@ use url::Url;
 
 use crate::{get_params_with_secrets, secrets::Secrets};
 
-pub type EmbeddingModelStore = HashMap<String, Box<dyn Embed>>;
+pub type EmbeddingModelStore = HashMap<String, Arc<dyn Embed>>;
 
 /// Extract a secret from a hashmap of secrets, if it exists.
 macro_rules! extract_secret {
@@ -48,7 +48,7 @@ macro_rules! extract_secret {
 pub async fn try_to_embedding(
     component: &spicepod::component::embeddings::Embeddings,
     secrets: Arc<RwLock<Secrets>>,
-) -> Result<Box<dyn Embed>, EmbedError> {
+) -> Result<Arc<dyn Embed>, EmbedError> {
     let params = get_params_with_secrets(Arc::clone(&secrets), &component.params).await;
     let model_id = component.get_model_id();
     let prefix = component
@@ -69,12 +69,12 @@ async fn huggingface(
     model_id: Option<String>,
     component: &spicepod::component::embeddings::Embeddings,
     params: &HashMap<String, SecretString>,
-) -> Result<Box<dyn Embed>, EmbedError> {
+) -> Result<Arc<dyn Embed>, EmbedError> {
     let hf_token = extract_secret!(params, "hf_token");
     let pooling = extract_secret!(params, "pooling");
     let max_seq_len = max_seq_length_from_params(params)?;
     if let Some(id) = model_id {
-        Ok(Box::new(
+        Ok(Arc::new(
             TeiEmbed::from_hf(&id, None, hf_token, pooling, max_seq_len).await?,
         ))
     } else {
@@ -88,7 +88,7 @@ fn file(
     model_id: Option<&str>,
     component: &spicepod::component::embeddings::Embeddings,
     params: &HashMap<String, SecretString>,
-) -> Result<Box<dyn Embed>, EmbedError> {
+) -> Result<Arc<dyn Embed>, EmbedError> {
     let weights_path = model_id
         .map(ToString::to_string)
         .or(component.find_any_file_path(ModelFileType::Weights))
@@ -113,7 +113,7 @@ fn file(
         .map(SecretBox::expose_secret)
         .map(String::from);
     let max_seq_len = max_seq_length_from_params(params)?;
-    Ok(Box::new(TeiEmbed::from_local(
+    Ok(Arc::new(TeiEmbed::from_local(
         Path::new(&weights_path),
         Path::new(&config_path),
         Path::new(&tokenizer_path),
@@ -126,7 +126,7 @@ fn azure(
     model_id: Option<String>,
     model_name: &str,
     params: &HashMap<String, SecretString>,
-) -> Result<Box<dyn Embed>, EmbedError> {
+) -> Result<Arc<dyn Embed>, EmbedError> {
     let Some(model_name) = model_id else {
         return Err(EmbedError::FailedToInstantiateEmbeddingModel {
             source: format!("For embedding model '{model_name}', model id must be specified in `from:azure:<model_id>`.").into(),
@@ -155,7 +155,7 @@ fn azure(
         });
     }
 
-    Ok(Box::new(OpenaiEmbed::new(llms::openai::new_azure_client(
+    Ok(Arc::new(OpenaiEmbed::new(llms::openai::new_azure_client(
         model_name,
         api_base,
         api_version,
@@ -170,7 +170,7 @@ async fn openai(
     component: &spicepod::component::embeddings::Embeddings,
     params: &HashMap<String, SecretString>,
     secrets: Arc<RwLock<Secrets>>,
-) -> Result<Box<dyn Embed>, EmbedError> {
+) -> Result<Arc<dyn Embed>, EmbedError> {
     // If parameter is from secret store, it will have `openai_` prefix
     let mut embed = OpenaiEmbed::new(llms::openai::new_openai_client(
         model_id.unwrap_or(DEFAULT_EMBEDDING_MODEL.to_string()),
@@ -209,7 +209,7 @@ async fn openai(
 
         embed = embed.try_with_tokenizer_bytes(&bytz)?;
     }
-    Ok(Box::new(embed))
+    Ok(Arc::new(embed))
 }
 
 /// Retrieves [`Bytes`] for a file/url path.

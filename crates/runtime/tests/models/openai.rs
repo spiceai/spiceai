@@ -595,7 +595,7 @@ async fn get_openai_chat_model(
     model: impl Into<String>,
     name: impl Into<String>,
     tools: impl Into<String>,
-) -> Result<Box<dyn Chat>, anyhow::Error> {
+) -> Result<Arc<dyn Chat>, anyhow::Error> {
     let mut model_with_tools = get_openai_model(model, name);
     model_with_tools
         .params

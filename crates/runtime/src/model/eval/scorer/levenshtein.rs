@@ -36,7 +36,7 @@ impl Scorer for Levenshtein {
         _input: &DatasetInput,
         actual: &DatasetOutput,
         ideal: &DatasetOutput,
-    ) -> f32 {
+    ) -> super::Result<f32> {
         let actual_text = extract_text(actual);
         let ideal_text = extract_text(ideal);
 
@@ -46,11 +46,11 @@ impl Scorer for Levenshtein {
 
         // If both strings are empty, treat it as an exact match.
         if max_len == 0 {
-            return 1.0;
+            return Ok(1.0);
         }
 
         // Normalize
-        1.0 - (distance as f32 / max_len as f32)
+        Ok(1.0 - (distance as f32 / max_len as f32))
     }
 
     fn metrics(&self, scores: &[f32]) -> Vec<(String, f32)> {
@@ -78,7 +78,8 @@ mod tests {
                 &DatasetOutput::from_raw("Hello"),
                 &DatasetOutput::from_raw("Hello"),
             )
-            .await;
+            .await
+            .expect("Levenshtein returned error");
         assert!(float_eq(score, 1.0), "Expected score 1.0, got {score}");
     }
 
@@ -90,7 +91,8 @@ mod tests {
                 &DatasetOutput::from_raw("kitten"),
                 &DatasetOutput::from_raw("sitting"),
             )
-            .await;
+            .await
+            .expect("Levenshtein returned error");
         let expected = 1.0 - (3.0 / 7.0);
         assert!(
             float_eq(score, expected),
@@ -106,7 +108,8 @@ mod tests {
                 &DatasetOutput::from_raw(""),
                 &DatasetOutput::from_raw(""),
             )
-            .await;
+            .await
+            .expect("Levenshtein returned error");
         assert!(float_eq(score, 1.0), "Expected score 1.0, got {score}");
     }
 
@@ -118,7 +121,8 @@ mod tests {
                 &DatasetOutput::from_raw(""),
                 &DatasetOutput::from_raw("Hello"),
             )
-            .await;
+            .await
+            .expect("Levenshtein returned error");
         assert!(float_eq(score, 0.0), "Expected score 0.0, got {score}");
     }
 
@@ -143,7 +147,8 @@ mod tests {
 
         let score = Levenshtein {}
             .score(&DatasetInput::Messages(vec![]), &actual, &ideal)
-            .await;
+            .await
+            .expect("Levenshtein returned error");
         assert!(float_eq(score, 1.0), "Expected score 1.0, got {score}");
     }
 
@@ -175,7 +180,8 @@ mod tests {
 
         let score = Levenshtein {}
             .score(&DatasetInput::Messages(vec![]), &actual, &ideal)
-            .await;
+            .await
+            .expect("Levenshtein returned error");
 
         let expected = 1.0 - (10.0 / 11.0);
         assert!(
@@ -204,7 +210,8 @@ mod tests {
                 &DatasetOutput::from_raw("Greetings"),
                 &ideal,
             )
-            .await;
+            .await
+            .expect("Levenshtein returned error");
         assert!(float_eq(score, 1.0), "Expected score 1.0, got {score}");
     }
 
@@ -228,7 +235,8 @@ mod tests {
                 &DatasetOutput::from_raw("Hi"),
                 &ideal,
             )
-            .await;
+            .await
+            .expect("Levenshtein returned error");
 
         let expected = 1.0 - (10.0 / 11.0);
         assert!(

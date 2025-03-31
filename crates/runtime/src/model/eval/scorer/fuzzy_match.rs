@@ -31,7 +31,7 @@ impl Scorer for FuzzyMatch {
         _input: &DatasetInput,
         actual: &DatasetOutput,
         ideal: &DatasetOutput,
-    ) -> f32 {
+    ) -> super::Result<f32> {
         // Extract strings from outputs
         let actual_str: Vec<_> = match actual {
             DatasetOutput::AssistantResponse(a) => vec![a.clone()],
@@ -50,7 +50,7 @@ impl Scorer for FuzzyMatch {
         };
 
         if ideal_strs.len() != actual_str.len() {
-            return 0.0;
+            return Ok(0.0);
         }
 
         // Perform fuzzy matching on all corresponding pairs
@@ -67,9 +67,9 @@ impl Scorer for FuzzyMatch {
 
         // TODO: Also use F1 Score, see https://github.com/spiceai/spiceai/issues/3932
         if is_match {
-            1.0
+            Ok(1.0)
         } else {
-            0.0
+            Ok(0.0)
         }
     }
 
@@ -123,7 +123,7 @@ mod tests {
                     let fuzzy_match = FuzzyMatch;
                     let actual_output = DatasetOutput::AssistantResponse($actual.to_string());
                     let ideal_output = DatasetOutput::AssistantResponse($ideal.to_string());
-                    let actual_score = fuzzy_match.score(&DatasetInput::UserInput(String::new()), &actual_output, &ideal_output).await;
+                    let actual_score = fuzzy_match.score(&DatasetInput::UserInput(String::new()), &actual_output, &ideal_output).await.expect("FuzzyMatch's score returned an error");
                     assert!(
                         ($score - actual_score).abs() < f32::EPSILON,
                         "Test case `{}` failed: expected {}, got {}",
@@ -180,7 +180,7 @@ mod tests {
 
                     let actual_output = DatasetOutput::Choices(actual_choices);
                     let ideal_output = DatasetOutput::Choices(ideal_choices);
-                    let actual_score = fuzzy_match.score(&DatasetInput::UserInput(String::new()), &actual_output, &ideal_output).await;
+                    let actual_score = fuzzy_match.score(&DatasetInput::UserInput(String::new()), &actual_output, &ideal_output).await.expect("FuzzyMatch's score returned an error");
                     assert!(
                         ($score - actual_score).abs() < f32::EPSILON,
                         "Test case `{}` failed: expected {}, got {}",
