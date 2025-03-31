@@ -57,7 +57,7 @@ pub trait Scorer: Sync + Send {
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "Could not score case [input={input}, actual={actual}, expected={ideal}]. Error: {source}"
+        "Could not score case [input={input:?}, actual={actual:?}, expected={ideal:?}]. Error: {source}"
     ))]
     ErrorScoringCase {
         input: DatasetInput,
