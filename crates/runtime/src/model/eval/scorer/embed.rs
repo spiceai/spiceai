@@ -26,16 +26,16 @@ use super::{extract_text, DatasetInput, DatasetOutput, Error, Scorer};
 
 /// [`EmbedScorer`] scores based on the similarity of two [`DatasetOutput`] using the L2 distance of the outputs' embeddings.
 pub struct EmbedScorer {
-    model: Arc<dyn Embed>,
+    embed_model: Arc<dyn Embed>,
 
     /// Provide domain context for improved embedding comparison.
     prefix: Option<String>,
 }
 
 impl EmbedScorer {
-    pub fn new(model: Arc<dyn Embed>) -> Self {
+    pub fn new(embed_model: Arc<dyn Embed>) -> Self {
         Self {
-            model,
+            embed_model,
             prefix: None,
         }
     }
@@ -54,7 +54,7 @@ impl Scorer for EmbedScorer {
         let ideal_input = format!("{prefix}{}", extract_text(ideal));
 
         let embeddings = self
-            .model
+            .embed_model
             .embed(EmbeddingInput::StringArray(vec![actual_input, ideal_input]))
             .await
             .map_err(|e| Error::ErrorScoringCase {

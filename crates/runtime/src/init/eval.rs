@@ -62,11 +62,11 @@ impl Runtime {
         // Load all Embedding models as [`EmbedScorer`].
         let embeddings = self.embeds();
         let model_lock = embeddings.read().await;
-        for model in model_lock.keys() {
+        for (model_name, model) in model_lock.iter() {
             let mut reg = self.eval_scorers.write().await;
             reg.insert(
-                model.to_string(),
-                Arc::new(EmbedScorer::new(self.embeds(), model.to_string())),
+                model_name.clone(),
+                Arc::new(EmbedScorer::new(Arc::clone(model))),
             );
         }
     }
