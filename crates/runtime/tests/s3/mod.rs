@@ -19,7 +19,10 @@ use std::sync::Arc;
 use app::AppBuilder;
 use futures::StreamExt;
 use runtime::{status, Runtime};
-use spicepod::component::{dataset::Dataset, params::Params};
+use spicepod::component::{
+    dataset::Dataset,
+    params::{ParamValue, Params},
+};
 
 use crate::{get_test_datafusion, init_tracing, utils::test_request_context};
 
@@ -286,6 +289,107 @@ async fn s3_bulk_bucket_schema() -> Result<(), anyhow::Error> {
             let schema = arrow::util::pretty::pretty_format_batches(&batches)
                 .map_err(|e| anyhow::Error::msg(e.to_string()))?;
             insta::assert_snapshot!(schema);
+
+            Ok(())
+        })
+        .await
+}
+
+#[tokio::test]
+async fn s3_schema_source_path() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    test_request_context()
+        .scope(async {
+            let mut ds1 = get_s3_dataset(
+                "s3://spiceai-public-datasets/test_schema_evolution/",
+                "ds1_customer",
+            );
+
+            // refer to s3 bucket containing `customer` schema objects to infer schema
+            if let Some(params) = ds1.params.as_mut() {
+                params.data.insert(
+                    "schema_source_path".to_string(),
+                    ParamValue::String(
+                        "s3://spiceai-public-datasets/test_schema_evolution/1/"
+                            .to_string(),
+                    ),
+                );
+            }
+
+            let mut ds2 = get_s3_dataset(
+                "s3://spiceai-public-datasets/test_schema_evolution/",
+                "ds2_customer",
+            );
+
+            // refer to s3 object containing `customer` schema to infer schema
+            if let Some(params) = ds2.params.as_mut() {
+                params.data.insert(
+                    "schema_source_path".to_string(),
+                    ParamValue::String(
+                        "s3://spiceai-public-datasets/test_schema_evolution/1/data_0_0_10.parquet"
+                            .to_string(),
+                    ),
+                );
+            }
+
+            let mut ds3 = get_s3_dataset(
+                "s3://spiceai-public-datasets/test_schema_evolution/",
+                "ds3_lineitem",
+            );
+
+            // refer to s3 object containing `lineitem` schema to infer schema
+            if let Some(params) = ds3.params.as_mut() {
+                params.data.insert(
+                    "schema_source_path".to_string(),
+                    ParamValue::String(
+                        "s3://spiceai-public-datasets/test_schema_evolution/2/data_0_2_11-new.parquet"
+                            .to_string(),
+                    ),
+                );
+            }
+
+            let app = AppBuilder::new("s3_schema_source_path")
+                .with_dataset(ds1)
+                .with_dataset(ds2)
+                .with_dataset(ds3)
+                .build();
+
+            let status = status::RuntimeStatus::new();
+            let df = get_test_datafusion(Arc::clone(&status));
+
+            let rt = Runtime::builder()
+                .with_app(app)
+                .with_datafusion(df)
+                .build()
+                .await;
+
+            // Set a timeout for the test
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
+                }
+                () = rt.load_components() => {}
+            }
+
+            for dataset_name in &["ds1_customer", "ds2_customer", "ds3_lineitem"] {
+                let query = format!("describe {dataset_name};");
+                let mut query_result = rt
+                    .datafusion()
+                    .query_builder(&query)
+                    .build()
+                    .run()
+                    .await
+                    .map_err(|e| anyhow::anyhow!(e))?;
+                let mut batches = vec![];
+                while let Some(batch) = query_result.data.next().await {
+                    batches.push(batch?);
+                }
+
+                let schema = arrow::util::pretty::pretty_format_batches(&batches)
+                .map_err(|e| anyhow::Error::msg(e.to_string()))?;
+                insta::assert_snapshot!(format!("s3_schema_source_path_{dataset_name}"), schema);
+            }
 
             Ok(())
         })
