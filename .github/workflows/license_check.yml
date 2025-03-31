@@ -48,7 +48,7 @@ jobs:
           os: macos
 
       - name: Check Rust Licenses
-        run: make dep-licenses |& ${{ env.FORBIDDEN_LICENSE_CHECK }}
+        run: make dep-licenses 2>&1 | ${{ env.FORBIDDEN_LICENSE_CHECK }}
 
   license-check-go:
     name: Check Golang Licenses
@@ -70,4 +70,4 @@ jobs:
       - name: Check spice licenses
         working-directory: bin/spice
         run: |
-          go-licenses csv . |& ${{ env.FORBIDDEN_LICENSE_CHECK }}
+          go-licenses csv . 2>&1 | ${{ env.FORBIDDEN_LICENSE_CHECK }}
