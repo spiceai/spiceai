@@ -5,7 +5,14 @@ description: "Query: tpcds_q84"
 +------------------+-----------------+
 | customer_id      | customername    |
 +------------------+-----------------+
-| AAAAAAAAGJCCAAAA | Howell, Darrell |
-| AAAAAAAALDMBAAAA | Porter, Kenneth |
-| AAAAAAAALDMBAAAA | Porter, Kenneth |
+| AAAAAAAAAENGBAAA | Chavez, Allyson |
+| AAAAAAAAEFEBBAAA | Shepherd, Linda |
+| AAAAAAAAEGPDAAAA | Garcia, Rose    |
+| AAAAAAAAHJHBAAAA | Brewer, Richard |
+| AAAAAAAAHNFDAAAA | Gaskin, Helen   |
+| AAAAAAAAIIHCAAAA | Fisher, Helene  |
+| AAAAAAAAIJMGAAAA | Oakes, Joseph   |
+| AAAAAAAAJHACAAAA | Rose, Nancy     |
+| AAAAAAAAJNHAAAAA | Dixon, Nicole   |
+| AAAAAAAAKBGDAAAA | Bowen, Daniel   |
 +------------------+-----------------+

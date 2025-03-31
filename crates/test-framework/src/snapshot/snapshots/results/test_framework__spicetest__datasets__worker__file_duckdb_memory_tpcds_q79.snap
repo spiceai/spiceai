@@ -5,14 +5,14 @@ description: "Query: tpcds_q79"
 +-------------+--------------+--------------------------------------+------------------+----------+-----------+
 | c_last_name | c_first_name | substr(ms.s_city,Int64(1),Int64(30)) | ss_ticket_number | amt      | profit    |
 +-------------+--------------+--------------------------------------+------------------+----------+-----------+
+| Abbott      | Harriet      | Midway                               | 111376           | 0.00     | -2946.62  |
+| Abel        | Ida          | Fairview                             | 130398           | 1793.62  | -6395.73  |
+| Abrams      | Fannie       | Midway                               | 177397           | 7743.84  | -13060.99 |
+| Ackerman    | Jeffrey      | Midway                               | 198943           | 1002.45  | -5494.51  |
+| Adams       | Beth         | Midway                               | 73934            | 3831.86  | -20607.93 |
+| Adams       | Farrah       | Midway                               | 65201            | 0.00     | -686.63   |
+| Adams       | Juan         | Fairview                             | 216356           | 582.88   | -8911.99  |
+| Adams       | Kimberly     | Midway                               | 42898            | 3389.37  | -4579.24  |
+| Adams       | Lashawn      | Fairview                             | 3833             | 3916.66  | 5.79      |
 | Adams       | Matilde      | Midway                               | 3209             | 13266.23 | -12751.79 |
-| Anderson    | Jason        | Midway                               | 17429            | 3617.59  | -5833.66  |
-| Angel       | Denise       | Midway                               | 11173            | 639.35   | -1096.10  |
-| Ball        | Samantha     | Midway                               | 6607             | 14.07    | -4568.87  |
-| Beals       | Hilda        | Midway                               | 17348            | 276.94   | -1157.42  |
-| Becker      | Suzanne      | Midway                               | 18831            | 6938.88  | -20121.90 |
-| Bell        | Lacey        | Midway                               | 22034            | 4939.81  | -8340.27  |
-| Betz        | Adriene      | Midway                               | 1127             | 372.06   | -6675.73  |
-| Blackburn   | Katherine    | Midway                               | 9076             | 4537.17  | -11682.05 |
-| Brenner     | Misty        | Midway                               | 17371            | 701.04   | -11451.79 |
 +-------------+--------------+--------------------------------------+------------------+----------+-----------+

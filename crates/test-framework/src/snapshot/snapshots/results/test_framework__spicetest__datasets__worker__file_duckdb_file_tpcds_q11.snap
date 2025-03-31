@@ -2,17 +2,17 @@
 source: crates/test-framework/src/spicetest/datasets/worker.rs
 description: "Query: tpcds_q11"
 ---
-+------------------+---------------------+--------------------+------------------------------------+
-| customer_id      | customer_first_name | customer_last_name | customer_email_address             |
-+------------------+---------------------+--------------------+------------------------------------+
-| AAAAAAAAADBAAAAA | James               | Sherrod            | James.Sherrod@7AC.edu              |
-| AAAAAAAAAPECAAAA | Raymond             | Brown              | Raymond.Brown@MmPDZK3ZrA9lsNAf.org |
-| AAAAAAAADGABAAAA | Scott               | Cote               | Scott.Cote@IKeJqN586XMfA.edu       |
-| AAAAAAAAHDMBAAAA | Michael             | Layne              | Michael.Layne@4lqQSecRH.edu        |
-| AAAAAAAAKAFBAAAA | Caleb               | Pannell            | Caleb.Pannell@a.com                |
-| AAAAAAAALHDBAAAA | William             | Buckner            | William.Buckner@a.edu              |
-| AAAAAAAAMIKBAAAA | Patsy               | Green              | Patsy.Green@jkgA.com               |
-| AAAAAAAAMNIBAAAA | Helen               | Perez              | Helen.Perez@V.org                  |
-| AAAAAAAAMPACAAAA | Matt                | Byrd               | Matt.Byrd@iJMcbHg2rf0a.org         |
-| AAAAAAAANCABAAAA | Joseph              | Wagner             | Joseph.Wagner@7EVZYtxJgM5Nhfs.com  |
-+------------------+---------------------+--------------------+------------------------------------+
++------------------+---------------------+--------------------+-----------------------------------+
+| customer_id      | customer_first_name | customer_last_name | customer_email_address            |
++------------------+---------------------+--------------------+-----------------------------------+
+| AAAAAAAAAGEJAAAA | Michael             | Tolbert            | Michael.Tolbert@D8O5R.com         |
+| AAAAAAAAAGOLAAAA | Lawrence            | Reed               | Lawrence.Reed@4tUSGo1o.org        |
+| AAAAAAAAAHAGBAAA | Nilda               | Bernal             | Nilda.Bernal@afeQH6HuLAeQt.org    |
+| AAAAAAAAAHLFAAAA | Michelle            | Early              | Michelle.Early@XIPPlCYfJv.org     |
+| AAAAAAAAAIFBBAAA | Juana               | Giles              | Juana.Giles@D0JsFLeloECaxb.com    |
+| AAAAAAAAAJNGBAAA | Roger               | Kaufman            | Roger.Kaufman@rMosVj1GQS.org      |
+| AAAAAAAAAKOBBAAA | William             | Alderman           | William.Alderman@LHfDRblj.edu     |
+| AAAAAAAAALDHBAAA | Lori                | Barrett            | Lori.Barrett@XpjxdL.edu           |
+| AAAAAAAAANNNAAAA | Cindy               | Julian             | Cindy.Julian@ChEB5eyUCBe.org      |
+| AAAAAAAAAOGBAAAA | George              | Johnston           | George.Johnston@uxl3oglEmB1hA.org |
++------------------+---------------------+--------------------+-----------------------------------+

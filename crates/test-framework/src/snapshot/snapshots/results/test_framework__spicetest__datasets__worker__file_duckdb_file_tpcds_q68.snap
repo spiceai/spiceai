@@ -2,17 +2,17 @@
 source: crates/test-framework/src/spicetest/datasets/worker.rs
 description: "Query: tpcds_q68"
 ---
-+-------------+--------------+------------+-----------------+------------------+----------------+--------------+------------+
-| c_last_name | c_first_name | ca_city    | bought_city     | ss_ticket_number | extended_price | extended_tax | list_price |
-+-------------+--------------+------------+-----------------+------------------+----------------+--------------+------------+
-| Adcock      | Dawn         | Clifton    | Marion          | 19523            | 37144.42       | 2143.71      | 61434.97   |
-| Albright    | Terrence     | Fairfield  | Waterloo        | 18171            | 39215.52       | 1528.79      | 67021.54   |
-| Allred      | Howard       | Lincoln    | Shady Grove     | 4537             | 25562.96       | 975.88       | 43140.38   |
-| Ames        | Sheri        | Weldon     | Shady Grove     | 1124             | 28497.54       | 1508.43      | 46444.94   |
-| Andrews     | Jason        | New Hope   | Griffin         | 23133            | 17586.95       | 875.88       | 29980.83   |
-| Austin      | Virgil       | Lakeview   | Hamilton        | 16984            | 23034.85       | 1560.57      | 40271.96   |
-| Bailey      | Charlotte    | Providence | Hamilton        | 12226            | 12660.12       | 467.44       | 22492.11   |
-| Bailey      | Charles      | Woodland   | Green Acres     | 17680            | 16825.89       | 756.82       | 45417.94   |
-| Baldwin     | Laura        | Red Hill   | Sulphur Springs | 16488            | 22043.81       | 560.90       | 62207.68   |
-| Belcher     | Carlos       | Harmony    | Five Points     | 6019             | 24714.08       | 1308.29      | 63935.66   |
-+-------------+--------------+------------+-----------------+------------------+----------------+--------------+------------+
++-------------+--------------+---------------+----------------+------------------+----------------+--------------+------------+
+| c_last_name | c_first_name | ca_city       | bought_city    | ss_ticket_number | extended_price | extended_tax | list_price |
++-------------+--------------+---------------+----------------+------------------+----------------+--------------+------------+
+| Abbott      | Joseph       | Greenfield    | Midway         | 62751            | 26919.52       | 1116.58      | 57080.40   |
+| Abbott      | Harriet      | Wesley        | Forest Hills   | 84405            | 22861.50       | 1369.56      | 44009.90   |
+| Abney       | Louis        | Gladstone     | Green Acres    | 140967           | 19446.55       | 877.95       | 32461.55   |
+| Acosta      | Johnnie      | Centerville   | Enterprise     | 69183            | 11146.93       | 215.50       | 17512.59   |
+| Adair       | Kimberly     | Centerville   | Forest Hills   | 157619           | 14342.77       | 506.62       | 49363.10   |
+| Adams       | Jonathon     | Highland Park | Pleasant Grove | 26218            | 19024.55       | 813.18       | 38782.23   |
+| Adams       | Michelle     | Unionville    | Hillcrest      | 55515            | 24054.10       | 1006.01      | 60759.95   |
+| Adams       | Genevieve    | Enterprise    | Union Hill     | 109910           | 38112.60       | 2078.45      | 68698.50   |
+| Adams       | David        | Bridgeport    | Antioch        | 213366           | 7487.49        | 228.52       | 16742.78   |
+| Adkins      | Daniel       | Wilson        | Providence     | 131164           | 20810.88       | 812.72       | 50529.61   |
++-------------+--------------+---------------+----------------+------------------+----------------+--------------+------------+
