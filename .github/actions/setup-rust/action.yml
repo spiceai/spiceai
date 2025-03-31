@@ -3,7 +3,7 @@ description: 'composite action'
 inputs:
   os:
     description: 'Operating system to set up the toolchain for'
-    default: 'linux' # 'linux', 'darwin', 'windows'
+    default: 'linux' # 'linux', 'macos', 'windows'
 
 runs:
   using: 'composite'

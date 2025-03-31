@@ -3,7 +3,7 @@ description: 'composite action'
 inputs:
   os:
     description: 'Operating system to install make for'
-    default: 'linux' # 'linux', 'windows'
+    default: 'linux' # 'linux', 'windows','macos'
 
 runs:
   using: 'composite'
@@ -25,3 +25,12 @@ runs:
           echo "C:\ProgramData\Chocolatey\bin" >> $env:GITHUB_PATH
         }
         choco install make -y
+
+    - name: Install make (macOS)
+      if: inputs.os == 'macos'
+      shell: bash
+      run: |
+        # Check if make is already installed
+        if ! command -v make &> /dev/null; then
+          brew install make
+        fi

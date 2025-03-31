@@ -13,8 +13,9 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+
 #![allow(clippy::implicit_hasher)]
-use std::pin::Pin;
+use std::{collections::HashMap, pin::Pin};
 
 use async_openai::{
     error::OpenAIError,
@@ -32,6 +33,7 @@ use llms::{
     chat::{nsql::SqlGeneration, Chat, Result as ChatResult},
 };
 use opentelemetry::KeyValue;
+use tera::Tera;
 use tokio::time::Instant;
 use tracing_futures::Instrument;
 
@@ -42,11 +44,16 @@ use std::task::{Context, Poll};
 
 use super::metrics::request_labels;
 
+mod ast;
+
 /// Wraps [`Chat`] models with additional handling specifically for the spice runtime (e.g. telemetry, injecting system prompts).
 pub struct ChatWrapper {
     pub public_name: String,
-    pub chat: Box<dyn Chat>,
+    pub chat: Arc<dyn Chat>,
     pub system_prompt: Option<String>,
+
+    /// If true, the system prompt will be treated as a template and will be parameterized with the input prompt.
+    pub attempt_to_template_system_prompt: bool,
     pub defaults: Vec<(String, serde_json::Value)>,
 }
 
@@ -73,7 +80,7 @@ macro_rules! set_default_w_warning {
 
 impl ChatWrapper {
     pub fn new(
-        chat: Box<dyn Chat>,
+        chat: Arc<dyn Chat>,
         public_name: &str,
         system_prompt: Option<&str>,
         defaults: Vec<(String, serde_json::Value)>,
@@ -83,6 +90,7 @@ impl ChatWrapper {
             chat,
             system_prompt: system_prompt.map(ToString::to_string),
             defaults,
+            attempt_to_template_system_prompt: false,
         };
 
         // Check defaults provided are valid at startup.
@@ -90,6 +98,19 @@ impl ChatWrapper {
         s.with_model_defaults(CreateChatCompletionRequest::default());
 
         s
+    }
+
+    /// If it is allowed to parameterised, check if there is a system prompt, and the system prompt is a template.
+    /// If its not a template, or there is no system prompt, no reason to attempt templating on each [`ChatWrapper::chat_request`] call.
+    pub fn allowed_to_parameterise(mut self) -> Self {
+        if self
+            .system_prompt
+            .as_ref()
+            .is_some_and(|p| system_prompt_is_template_with_variables(p.as_str()))
+        {
+            self.attempt_to_template_system_prompt = true;
+        }
+        self
     }
 
     fn prepare_req(
@@ -108,7 +129,43 @@ impl ChatWrapper {
         &self,
         mut req: CreateChatCompletionRequest,
     ) -> Result<CreateChatCompletionRequest, OpenAIError> {
-        if let Some(prompt) = self.system_prompt.clone() {
+        let prompt_opt = match (
+            self.system_prompt.as_ref(),
+            self.attempt_to_template_system_prompt,
+        ) {
+            // Template existing system prompt
+            (Some(prompt), true) => {
+                let ctx = match req.metadata.as_ref() {
+                    Some(serde_json::Value::Object(m)) => {
+                        m.clone()
+                            .into_iter()
+                            .collect::<HashMap<String, serde_json::Value>>()
+                    }
+                    Some(_) | None => HashMap::new(),
+                };
+
+                // If request `store` is not set, remove metadata.
+                if !req.store.is_some_and(|s| s) {
+                    req.metadata = None;
+                };
+
+                match template_system_prompt(prompt.as_str(), &ctx) {
+                    Ok(templated_prompt) => Some(templated_prompt),
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to template system prompt for model='{}': {}. Using system_prompt as is.",
+                            self.public_name,
+                            e
+                        );
+                        Some(prompt.clone())
+                    }
+                }
+            }
+            // Don't template, just use system prompt as is.
+            (Some(prompt), false) => Some(prompt.clone()),
+            _ => None,
+        };
+        if let Some(prompt) = prompt_opt {
             let system_message = ChatCompletionRequestSystemMessageArgs::default()
                 .content(prompt)
                 .build()?;
@@ -373,4 +430,30 @@ impl<S> Drop for TracedChatCompletionStream<S> {
             );
         }
     }
+}
+
+fn template_system_prompt(
+    prompt: &str,
+    inputs: &HashMap<String, serde_json::Value>,
+) -> tera::Result<String> {
+    let mut t = Tera::default();
+    t.add_raw_template("system_prompt", prompt)?;
+    let mut context = tera::Context::new();
+    for (k, v) in inputs {
+        context.insert(k, v);
+    }
+    t.render("system_prompt", &context)
+}
+
+/// Return true if the system prompt is a template that would have its variables replaced with the input values.
+fn system_prompt_is_template_with_variables(prompt: &str) -> bool {
+    let mut t = Tera::default();
+    if t.add_raw_template("system_prompt", prompt).is_err() {
+        return false;
+    };
+
+    let Ok(tt) = t.get_template("system_prompt") else {
+        return false;
+    };
+    ast::has_variables_in_ast(&tt.ast)
 }

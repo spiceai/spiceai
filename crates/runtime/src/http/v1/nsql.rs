@@ -50,7 +50,7 @@ use tracing_futures::Instrument;
 use super::accept_header_types;
 
 // Default number of retries for NSQL queries if the generated query fails to execute
-const DEFAULT_NSQL_RETRIES: u8 = 3;
+const DEFAULT_NSQL_RETRIES: u8 = 10;
 
 fn clean_model_based_sql(input: &str) -> String {
     let no_dashes = match input.strip_prefix("--") {

@@ -1,0 +1,16 @@
+---
+source: crates/runtime/tests/s3/mod.rs
+expression: schema
+---
++--------------+-------------------+-------------+
+| column_name  | data_type         | is_nullable |
++--------------+-------------------+-------------+
+| C_CUSTKEY    | Decimal128(38, 0) | NO          |
+| C_NAME       | LargeUtf8         | NO          |
+| C_ADDRESS    | LargeUtf8         | NO          |
+| C_NATIONKEY  | Decimal128(38, 0) | NO          |
+| C_PHONE      | LargeUtf8         | NO          |
+| C_ACCTBAL    | Decimal128(12, 2) | NO          |
+| C_MKTSEGMENT | LargeUtf8         | YES         |
+| C_COMMENT    | LargeUtf8         | YES         |
++--------------+-------------------+-------------+
