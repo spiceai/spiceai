@@ -745,7 +745,7 @@ async fn verify_schema_source_path(
             tracing::warn!(
                 "Failed to find any files matching the extension '{extension}' at the specified path `{schema_source_path}` after scanning {SCHEMA_SOURCE_PATH_FILE_SCAN_LIMIT} files.\nEnsure the `schema_source_path` is correct."
             );
-            break;
+            return Ok(());
         };
     }
 
