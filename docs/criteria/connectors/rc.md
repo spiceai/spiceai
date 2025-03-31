@@ -158,6 +158,7 @@ Indexes are not required for test coverage, but can be introduced if required fo
 - [ ] The connector can load TPC-DS at the [designated scale factor](#rc-release-criteria), and can run all queries with no [Major Bugs](../definitions.md).
 - [ ] All [Minor Bugs](../definitions.md) for TPC-DS are raised as issues.
 - [ ] TPC-DS queries that execute successfully on Datafusion, should execute successfully on the connector.
+- [ ] The TPC-DS end-to-end test is added to the scheduled benchmarks by creating a [`testoperator dispatch`](https://github.com/spiceai/spiceai/tree/trunk/tools/testoperator/dispatch) configuration file for the accelerator.
 
 ##### ClickBench
 
