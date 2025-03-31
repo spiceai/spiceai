@@ -25,11 +25,12 @@
 
 <img width="740" alt="Spice.ai Open Source accelerated data query and LLM-inference engine" src="https://github.com/user-attachments/assets/9db94f9c-10a1-47b0-ab45-05aa964590ff" />
 
-Spice provides three industry standard APIs in a lightweight, portable runtime (single ~140 MB binary):
+Spice provides four industry standard APIs in a lightweight, portable runtime (single ~140 MB binary):
 
-1. **SQL Query APIs**: Arrow Flight, Arrow Flight SQL, ODBC, JDBC, and ADBC.
-2. **OpenAI-Compatible APIs**: HTTP APIs compatible the OpenAI SDK, AI SDK with local model serving (CUDA/Metal accelerated) and gateway to hosted models.
-3. **Iceberg Catalog REST APIs**: A unified Iceberg Catalog API.
+1. **SQL Query APIs**: Supports HTTP, Arrow Flight, Arrow Flight SQL, ODBC, JDBC, and ADBC.
+2. **OpenAI-Compatible APIs**: Provides HTTP APIs for OpenAI SDK compatibility, local model serving (CUDA/Metal accelerated), and hosted model gateway.
+3. **Iceberg Catalog REST APIs**: Offers a unified API for Iceberg Catalog.
+4. **MCP HTTP+SSE APIs**: Enables integration with external tools via Model Context Protocol (MCP) using HTTP and Server-Sent Events (SSE).
 
 🎯 Goal: Developers can focus on building data apps and AI agents confidently, knowing they are grounded in data.
 
@@ -100,7 +101,7 @@ Spice simplifies building data-driven AI applications and agents by making it fa
 | **Unified Data + AI Runtime** | ✅                                   | ―                  | ―          | ―                | ―                             |
 | **Federated Data Query**      | ✅                                   | ―                  | ―          | ―                | ―                             |
 | **Accelerated Data Access**   | ✅                                   | ―                  | ―          | ―                | ―                             |
-| **Tools/Functions**           | ✅                                   | ✅                 | ✅         | Limited          | Limited                       |
+| **Tools/Functions**           | ✅ (MCP HTTP+SSE)                    | ✅                 | ✅         | Limited          | Limited                       |
 | **LLM Memory**                | ✅                                   | ✅                 | ―          | ✅               | ―                             |
 | **Evaluations (Evals)**       | ✅                                   | Limited            | ―          | Limited          | ―                             |
 | **Search**                    | ✅ (VSS)                             | ✅                 | ✅         | Limited          | Limited                       |
