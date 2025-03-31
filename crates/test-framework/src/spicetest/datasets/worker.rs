@@ -167,6 +167,7 @@ impl SpiceTestQueryWorker {
                         // Additional round of query run before recording results.
                         // To discard the abnormal results caused by: establishing initial connection / spark cluster startup time
 
+                        println!("Worker {} - Query '{}' - Pre-run", self.id, query.0);
                         let (connection_succeed, _) = self
                             .run_single_query(
                                 query,
@@ -186,6 +187,7 @@ impl SpiceTestQueryWorker {
                         }
 
                         if self.explain_plan_snapshot && self.id == 0 {
+                            println!("Worker {} - Query '{}' - Explain plan", self.id, query.0);
                             if let Err(e) = record_explain_plan(
                                 &self.flight_client,
                                 self.name.as_str(),
