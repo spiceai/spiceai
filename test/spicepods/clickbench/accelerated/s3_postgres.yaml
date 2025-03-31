@@ -12,5 +12,13 @@ datasets:
       s3_key: ${secrets:S3_KEY}
       s3_secret: ${secrets:S3_SECRET}
     acceleration:
-      engine: duckdb
-      mode: file
+      refresh_sql: "SELECT * FROM hits LIMIT 10000000"
+      engine: postgres
+      refresh_on_startup: always
+      params:
+        pg_host: ${secrets:POSTGRES_HOST}
+        pg_port: 5432
+        pg_user: postgres
+        pg_pass: ${secrets:POSTGRES_PASSWORD}
+        pg_db: clickbench_accelerated
+        pg_sslmode: disable

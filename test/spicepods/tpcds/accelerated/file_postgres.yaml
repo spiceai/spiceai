@@ -4,26 +4,42 @@ name: file_postgres
 datasets:
   - from: file:data/catalog_sales.parquet
     name: catalog_sales
+    acceleration:
+      enabled: true
+      engine: postgres
+      refresh_on_startup: always
+      params: *pg_params
+      indexes:
+        cs_sold_date_sk: enabled
+  - from: file:data/catalog_returns.parquet
+    name: catalog_returns
     acceleration: &acceleration
       enabled: true
       engine: postgres
       refresh_on_startup: always
-      params:
+      params: &pg_params
         pg_host: ${secrets:POSTGRES_HOST}
         pg_port: 5432
         pg_user: postgres
         pg_pass: ${secrets:POSTGRES_PASSWORD}
         pg_db: tpcds_accelerated
         pg_sslmode: disable
-  - from: file:data/catalog_returns.parquet
-    name: catalog_returns
-    acceleration: *acceleration
   - from: file:data/inventory.parquet
     name: inventory
     acceleration: *acceleration
   - from: file:data/store_sales.parquet
     name: store_sales
-    acceleration: *acceleration
+    acceleration:
+      enabled: true
+      engine: postgres
+      refresh_on_startup: always
+      params: *pg_params
+      indexes:
+        ss_item_sk: enabled
+        ss_store_sk: enabled
+        ss_customer_sk: enabled
+        ss_ticket_number: enabled
+        ss_hdemo_sk: enabled
   - from: file:data/store_returns.parquet
     name: store_returns
     acceleration: *acceleration
@@ -35,22 +51,50 @@ datasets:
     acceleration: *acceleration
   - from: file:data/customer.parquet
     name: customer
-    acceleration: *acceleration
+    acceleration:
+      enabled: true
+      engine: postgres
+      refresh_on_startup: always
+      params: *pg_params
+      indexes:
+        c_current_addr_sk: enabled
+        c_customer_sk: enabled
+        c_current_hdemo_sk: enabled
   - from: file:data/customer_address.parquet
     name: customer_address
     acceleration: *acceleration
   - from: file:data/customer_demographics.parquet
     name: customer_demographics
-    acceleration: *acceleration
+    acceleration:
+      enabled: true
+      engine: postgres
+      refresh_on_startup: always
+      params: *pg_params
+      indexes:
+        cd_demo_sk: enabled
   - from: file:data/date_dim.parquet
     name: date_dim
-    acceleration: *acceleration
+    acceleration:
+      enabled: true
+      engine: postgres
+      refresh_on_startup: always
+      params: *pg_params
+      indexes:
+        d_year: enabled
+        d_date: enabled
   - from: file:data/household_demographics.parquet
     name: household_demographics
     acceleration: *acceleration
   - from: file:data/item.parquet
     name: item
-    acceleration: *acceleration
+    acceleration:
+      enabled: true
+      engine: postgres
+      refresh_on_startup: always
+      params: *pg_params
+      indexes:
+        i_item_sk: enabled
+        i_manufact_id: enabled
   - from: file:data/promotion.parquet
     name: promotion
     acceleration: *acceleration
@@ -59,7 +103,14 @@ datasets:
     acceleration: *acceleration
   - from: file:data/store.parquet
     name: store
-    acceleration: *acceleration
+    acceleration:
+      enabled: true
+      engine: postgres
+      refresh_on_startup: always
+      params: *pg_params
+      indexes:
+        s_store_name: enabled
+        s_zip: enabled
   - from: file:data/time_dim.parquet
     name: time_dim
     acceleration: *acceleration

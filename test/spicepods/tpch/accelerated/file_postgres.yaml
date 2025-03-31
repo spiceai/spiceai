@@ -8,7 +8,7 @@ datasets:
       enabled: true
       engine: postgres
       refresh_on_startup: always
-      params:
+      params: &pg_params
         pg_host: ${secrets:POSTGRES_HOST}
         pg_port: 5432
         pg_user: postgres
@@ -17,7 +17,13 @@ datasets:
         pg_sslmode: disable
   - from: file:data/lineitem.parquet
     name: lineitem
-    acceleration: *acceleration
+    acceleration:
+      enabled: true
+      engine: postgres
+      refresh_on_startup: always
+      params: *pg_params
+      indexes:
+        l_partkey: enabled
   - from: file:data/nation.parquet
     name: nation
     acceleration: *acceleration
@@ -26,10 +32,22 @@ datasets:
     acceleration: *acceleration
   - from: file:data/part.parquet
     name: part
-    acceleration: *acceleration
+    acceleration:
+      enabled: true
+      engine: postgres
+      refresh_on_startup: always
+      params: *pg_params
+      indexes:
+        p_partkey: enabled
   - from: file:data/partsupp.parquet
     name: partsupp
-    acceleration: *acceleration
+    acceleration:
+      enabled: true
+      engine: postgres
+      refresh_on_startup: always
+      params: *pg_params
+      indexes:
+        ps_partkey: enabled
   - from: file:data/region.parquet
     name: region
     acceleration: *acceleration
