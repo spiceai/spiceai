@@ -39,6 +39,7 @@ use super::{EvalScorerRegistry, LLMModelStore, Scorer};
 pub(crate) mod dataset;
 pub(crate) mod result;
 pub(crate) mod runs;
+#[cfg(feature = "models")]
 pub(crate) mod scorer;
 
 #[derive(Debug, Snafu)]

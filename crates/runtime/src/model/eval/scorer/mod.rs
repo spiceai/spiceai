@@ -22,23 +22,14 @@ use tokio::sync::RwLock;
 
 use super::{DatasetInput, DatasetOutput};
 
-#[cfg(feature = "models")]
 pub mod embed;
-#[cfg(feature = "models")]
 pub use embed::EmbedScorer;
-#[cfg(feature = "models")]
 pub mod fuzzy_match;
-#[cfg(feature = "models")]
 pub mod includes;
-#[cfg(feature = "models")]
 pub mod json_match;
-#[cfg(feature = "models")]
 pub mod levenshtein;
-#[cfg(feature = "models")]
 pub mod match_;
-#[cfg(feature = "models")]
 pub mod modelgraded;
-#[cfg(feature = "models")]
 pub use modelgraded::ModelGradedScorer;
 
 #[async_trait]

@@ -50,7 +50,7 @@ impl Scorer for EmbedScorer {
         ideal: &DatasetOutput,
     ) -> super::Result<f32> {
         let prefix = self.prefix.as_deref().unwrap_or_default();
-        let actual_input = format!("{prefix}{}", extract_text(actual),);
+        let actual_input = format!("{prefix}{}", extract_text(actual));
         let ideal_input = format!("{prefix}{}", extract_text(ideal));
 
         let embeddings = self
