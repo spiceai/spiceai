@@ -80,30 +80,7 @@ runs:
         mc cp spice-minio/benchmarks/tpcds_sf1/web_site/ ./ --recursive
         mkdir ./sf0_01
         cd ./sf0_01
-        mc cp spice-minio/benchmarks/tpcds_sf0_01/call_center/ ./ --recursive
-        mc cp spice-minio/benchmarks/tpcds_sf0_01/catalog_page/ ./ --recursive
-        mc cp spice-minio/benchmarks/tpcds_sf0_01/catalog_returns/ ./ --recursive
-        mc cp spice-minio/benchmarks/tpcds_sf0_01/catalog_sales/ ./ --recursive
-        mc cp spice-minio/benchmarks/tpcds_sf0_01/customer/ ./ --recursive
-        mc cp spice-minio/benchmarks/tpcds_sf0_01/customer_address/ ./ --recursive
-        mc cp spice-minio/benchmarks/tpcds_sf0_01/customer_demographics/ ./ --recursive
-        mc cp spice-minio/benchmarks/tpcds_sf0_01/date_dim/ ./ --recursive
-        mc cp spice-minio/benchmarks/tpcds_sf0_01/household_demographics/ ./ --recursive
-        mc cp spice-minio/benchmarks/tpcds_sf0_01/income_band/ ./ --recursive
-        mc cp spice-minio/benchmarks/tpcds_sf0_01/inventory/ ./ --recursive
-        mc cp spice-minio/benchmarks/tpcds_sf0_01/item/ ./ --recursive
-        mc cp spice-minio/benchmarks/tpcds_sf0_01/promotion/ ./ --recursive
-        mc cp spice-minio/benchmarks/tpcds_sf0_01/reason/ ./ --recursive
-        mc cp spice-minio/benchmarks/tpcds_sf0_01/ship_mode/ ./ --recursive
-        mc cp spice-minio/benchmarks/tpcds_sf0_01/store/ ./ --recursive
-        mc cp spice-minio/benchmarks/tpcds_sf0_01/store_returns/ ./ --recursive
-        mc cp spice-minio/benchmarks/tpcds_sf0_01/store_sales/ ./ --recursive
-        mc cp spice-minio/benchmarks/tpcds_sf0_01/time_dim/ ./ --recursive
-        mc cp spice-minio/benchmarks/tpcds_sf0_01/warehouse/ ./ --recursive
-        mc cp spice-minio/benchmarks/tpcds_sf0_01/web_page/ ./ --recursive
-        mc cp spice-minio/benchmarks/tpcds_sf0_01/web_returns/ ./ --recursive
-        mc cp spice-minio/benchmarks/tpcds_sf0_01/web_sales/ ./ --recursive
-        mc cp spice-minio/benchmarks/tpcds_sf0_01/web_site/ ./ --recursive
+        mc cp spice-minio/benchmarks/tpcds_sf0_01/*.parquet ./ --recursive
     
     - name: Download File Connector ClickBench Data
       shell: bash
