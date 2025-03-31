@@ -1751,6 +1751,11 @@ mod tests {
                 // Not needed for this test
                 Ok(None)
             }
+
+            async fn last_checkpoint_time(&self) -> Result<Option<SystemTime>> {
+                // Not needed for this test
+                Ok(None)
+            }
         }
 
         // Test case 1: No checkpoint, should refresh regardless of mode
