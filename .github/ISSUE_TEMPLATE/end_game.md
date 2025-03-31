@@ -1,7 +1,7 @@
 ---
 name: Milestone Endgame
 about: Ship a milestone release for Spice.ai Open Source!
-title: 'v0.x.x-beta endgame'
+title: 'v1.x.x endgame'
 labels: 'kind/endgame'
 assignees: ''
 ---
@@ -57,6 +57,13 @@ assignees: ''
 
    - [ ] Verify [E2E Test CI (core)](https://github.com/spiceai/spiceai/actions/workflows/e2e_test_ci.yml) is green on `trunk` and on the release branch.
    - [ ] Verify [E2E Test CI (models)](https://github.com/spiceai/spiceai/actions/workflows/e2e_test_ci_models.yml) is green on `trunk` and on the release branch.
+   - [ ] Verify [Test Operator Dispatch](https://github.com/spiceai/spiceai/actions/workflows/testoperator_dispatch.yml) is green on `trunk` and on the release branch.
+     - Use parameters:
+   - [ ] [E2E Test CLI](https://github.com/spiceai/spiceai/actions/workflows/e2e_test_spice_cli.yml) is green on `trunk` and on the release branch.
+     - Use parameters:
+       - Branch: `trunk`
+       - Build the CLI: `true`
+   - [ ] [Throughput Tests](https://github.com/spiceai/spiceai/actions/workflows/testoperator_run_throughput.yml) is green on `trunk` and on the release branch.
 
 1. **Documentation Review**
 
@@ -88,6 +95,7 @@ assignees: ''
      - [ ] [Supabase](https://github.com/spiceai/cookbook/blob/trunk/postgres/supabase/README.md)
      - [ ] [Spice.ai Cloud Platform](https://github.com/spiceai/cookbook/blob/trunk/spiceai/README.md)
      - [ ] [Debezium CDC (plain & SASL/SCRAM)](https://github.com/spiceai/cookbook/blob/trunk/cdc-debezium/README.md)
+     - [ ] [IMAP](https://github.com/spiceai/cookbook/blob/trunk/imap/README.md)
      - [ ] Update connector status per [Connector RC Criteria](/docs/criteria/connectors/rc.md).
 
    - **Data Accelerators**
@@ -113,14 +121,15 @@ assignees: ''
      - [ ] [OpenAI SDK](https://github.com/spiceai/cookbook/tree/trunk/openai_sdk)
      - [ ] [Nvidia NIM](https://github.com/spiceai/cookbook/tree/trunk/nvidia-nim)
      - [ ] [LLM Memory](https://github.com/spiceai/cookbook/tree/trunk/llm-memory)
+     - [ ] [Model-Context-Protocol (MCP)](https://github.com/spiceai/cookbook/tree/trunk/mcp)
 
    - **SDK Samples**
 
-     - [ ] [Spice with gospice-sdk sample](https://github.com/spiceai/cookbook/blob/trunk/client-sdk/gospice-sdk-sample/README.md)
-     - [ ] [Spice with Java sdk sample](https://github.com/spiceai/cookbook/blob/trunk/client-sdk/spice-java-sdk-sample/README.md)
-     - [ ] [Spice with rust sdk sample](https://github.com/spiceai/cookbook/blob/trunk/client-sdk/spice-rs-sdk-sample/README.md)
-     - [ ] [Spice with spice.js sdk sample](https://github.com/spiceai/cookbook/blob/trunk/client-sdk/spice.js-sdk-sample/README.md)
-     - [ ] [Spice with spicepy sdk sample](https://github.com/spiceai/cookbook/blob/trunk/client-sdk/spicepy-sdk-sample/README.md)
+     - [ ] [Spice with gospice SDK sample](https://github.com/spiceai/cookbook/blob/trunk/client-sdk/gospice-sdk-sample/README.md)
+     - [ ] [Spice with Java SDK sample](https://github.com/spiceai/cookbook/blob/trunk/client-sdk/spice-java-sdk-sample/README.md)
+     - [ ] [Spice with rust SDK sample](https://github.com/spiceai/cookbook/blob/trunk/client-sdk/spice-rs-sdk-sample/README.md)
+     - [ ] [Spice with spice.js SDK sample](https://github.com/spiceai/cookbook/blob/trunk/client-sdk/spice.js-sdk-sample/README.md)
+     - [ ] [Spice with spicepy SDK sample](https://github.com/spiceai/cookbook/blob/trunk/client-sdk/spicepy-sdk-sample/README.md)
 
    - **Other Cookbook Recipes**
      - [ ] [Sales BI (Apache Superset)](https://github.com/spiceai/cookbook/blob/trunk/sales-bi/README.md)
@@ -180,6 +189,11 @@ assignees: ''
   - [ ] [Generate Spicepod JSON schema](https://github.com/spiceai/spiceai/actions/workflows/generate_json_schema.yml)
   - [ ] [E2E Test Release Installation](https://github.com/spiceai/spiceai/actions/workflows/e2e_test_release_install.yml)
   - [ ] [E2E Test Release Installation (AI)](https://github.com/spiceai/spiceai/blob/trunk/.github/workflows/e2e_test_release_install_ai.yml)
+  - [ ] [E2E Test CLI](https://github.com/spiceai/spiceai/actions/workflows/e2e_test_spice_cli.yml)
+    - Use parameters:
+      - Branch: `trunk`
+      - Build the CLI: `false`
+      - Release Version: the version tag released.
 
 ## Post-Release Housekeeping
 
@@ -188,6 +202,7 @@ assignees: ''
 - [ ] Remove or mark the released version in the [ROADMAP](https://github.com/spiceai/spiceai/blob/trunk/docs/ROADMAP.md).
 - [ ] Update the supported version in `SECURITY.md` if necessary.
 - [ ] QA DRI: Add metrics to [QA analytics](https://github.com/spiceai/spiceai/blob/trunk/docs/release_notes/qa_analytics.csv).
+  - Use number of recipes total from [spiceai.org/docs/cookbook](https://spiceai.org/docs/cookbook).
 
 ## Announcement Checklist
 
