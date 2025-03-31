@@ -21,6 +21,7 @@ import (
 	"bytes"
 	"errors"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -32,7 +33,11 @@ func SaveReaderToFile(reader io.Reader, fullFilePath string) error {
 		return err
 	}
 
-	defer fileHandle.Close()
+	defer func() {
+		if err := fileHandle.Close(); err != nil {
+			slog.Error("failed to close file", "error", err)
+		}
+	}()
 
 	_, err = io.Copy(fileHandle, reader)
 	if err != nil {
@@ -70,7 +75,11 @@ func ExtractZip(body []byte, downloadDir string) error {
 			return err
 		}
 
-		defer reader.Close()
+		defer func() {
+			if err := reader.Close(); err != nil {
+				slog.Error("failed to close reader", "error", err)
+			}
+		}()
 
 		fileName := file.FileInfo().Name()
 
@@ -81,7 +90,11 @@ func ExtractZip(body []byte, downloadDir string) error {
 			return err
 		}
 
-		defer newFile.Close()
+		defer func() {
+			if err := newFile.Close(); err != nil {
+				slog.Error("failed to close file", "error", err)
+			}
+		}()
 
 		_, err = io.Copy(newFile, reader)
 		if err != nil {
@@ -105,7 +118,11 @@ func ExtractTarGzInsideZip(body []byte, downloadDir string) error {
 			return err
 		}
 
-		defer reader.Close()
+		defer func() {
+			if err := reader.Close(); err != nil {
+				slog.Error("failed to close reader", "error", err)
+			}
+		}()
 
 		tarFileName := file.FileInfo().Name()
 

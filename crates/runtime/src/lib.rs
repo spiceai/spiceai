@@ -405,15 +405,17 @@ impl Runtime {
         let cloned_config = config.clone();
         let http_auth = endpoint_auth.http_auth.clone();
         let self_ref = Arc::clone(&self);
+        let http_shutdown = CancellationToken::new();
 
         let http_future = self
-            .start_server_component(HTTP_SERVER, None, async move {
+            .start_server_component(HTTP_SERVER, Some(http_shutdown.clone()), async move {
                 http::start(
                     cloned_config.http_bind_address,
                     self_ref,
                     cloned_config.into(),
                     cloned_tls_config,
                     http_auth,
+                    Some(http_shutdown),
                 )
                 .await
                 .context(UnableToStartHttpServerSnafu)
@@ -660,6 +662,24 @@ impl Runtime {
 
         if let Err(err) = load_result {
             tracing::error!("Could not start the Spice runtime: {err}");
+        } else {
+            // Create a background task to report once all components are marked as `Ready`
+            let status = self.status();
+            tokio::spawn({
+                async move {
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+                        if status.is_shutdown() {
+                            break;
+                        }
+                        if status.is_ready() {
+                            tracing::info!("All components are loaded. Spice runtime is ready!");
+                            break;
+                        }
+                    }
+                }
+            });
         }
     }
 
@@ -715,7 +735,7 @@ impl Runtime {
 
         join_all(shutdown_futures).await;
 
-        tracing::debug!("Shutdown complete.");
+        tracing::debug!("Shutdown completed");
     }
 
     /// Spawns and registers a server component with optional cancellation support.

@@ -103,11 +103,16 @@ impl ListingTableConnector for Https {
         &self.params
     }
 
-    fn get_object_store_url(&self, dataset: &Dataset) -> DataConnectorResult<Url> {
-        let mut u = Url::parse(&dataset.from).boxed().map_err(|e| {
+    fn get_object_store_url(
+        &self,
+        dataset: &Dataset,
+        url: Option<&str>,
+    ) -> DataConnectorResult<Url> {
+        let url = url.unwrap_or(dataset.from.as_str());
+        let mut u = Url::parse(url).boxed().map_err(|e| {
             DataConnectorError::InvalidConfiguration {
                 dataconnector: "https".to_string(),
-                message: "The specified URL in the dataset 'from' is not valid. Ensure the URL is valid and try again.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/https".to_string(),
+                message: format!("{url} is not a valid URL. Ensure the URL is valid and try again.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/https"),
                 connector_component: ConnectorComponent::from(dataset),
                 source: e,
             }

@@ -20,7 +20,7 @@ use async_openai::{
     },
 };
 
-use super::{create_prompt, SqlGeneration};
+use super::{create_prompt, QueryGenerationContext, SqlGeneration};
 
 /// Implementation for [`SqlGeneration`] for [`super::Chat`] models that support [`ResponseFormat::JsonObject`].
 pub struct JsonSchemaSqlGeneration;
@@ -38,8 +38,9 @@ impl SqlGeneration for JsonSchemaSqlGeneration {
         &self,
         model_id: &str,
         query: &str,
+        context: &QueryGenerationContext,
     ) -> Result<CreateChatCompletionRequest, OpenAIError> {
-        let prompt = create_prompt(query);
+        let prompt = create_prompt(query, context);
 
         let messages: Vec<ChatCompletionRequestMessage> = vec![
             ChatCompletionRequestSystemMessageArgs::default()

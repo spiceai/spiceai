@@ -34,6 +34,10 @@ use crate::{
 
 pub type LLMModelStore = HashMap<String, Box<dyn Chat>>;
 
+// Default recursion limit for tool usage to prevent infinite loops.
+// This limit can be adjusted using the `tool_recursion_limit` model parameter.
+const DEFAULT_SPICE_TOOL_RECURSION_LIMIT: usize = 10;
+
 /// Extract a secret from a hashmap of secrets, if it exists.
 macro_rules! extract_secret {
     ($params:expr, $key:expr) => {
@@ -65,7 +69,9 @@ pub async fn try_to_chat_model(
                 .into(),
             })
         })
-        .transpose()?;
+        .transpose()?
+        // Prevent infinite recursion in case of circular tool calls.
+        .or(Some(DEFAULT_SPICE_TOOL_RECURSION_LIMIT));
 
     let tool_model = match spice_tool_opt {
         Some(opts) if opts.can_use_tools() => Box::new(ToolUsingChat::new(

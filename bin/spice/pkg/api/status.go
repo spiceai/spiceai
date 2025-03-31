@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 
@@ -133,7 +134,11 @@ WHERE
 		}
 		return nil, nil, err
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			slog.Error("closing response body", "error", err)
+		}
+	}()
 	if resp.StatusCode != http.StatusOK {
 
 		// If 400, it could be that metric service is disabled and `runtime.metrics` table doesn't exist. This isn't an error.

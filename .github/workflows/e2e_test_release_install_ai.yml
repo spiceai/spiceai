@@ -164,6 +164,8 @@ jobs:
       - name: install AI runtime version
         run: |
           spice install ai
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: check installation
         run: |
