@@ -5,9 +5,14 @@ description: "Query: tpcds_q74"
 +------------------+---------------------+--------------------+
 | customer_id      | customer_first_name | customer_last_name |
 +------------------+---------------------+--------------------+
-| AAAAAAAAKLFBAAAA | Michael             | Allen              |
-| AAAAAAAAKJHBAAAA | Roderick            | Ballard            |
-| AAAAAAAAGABBAAAA | Ella                | Davis              |
-| AAAAAAAAFNMBAAAA | Shawnna             | Freeland           |
-| AAAAAAAAEPOBAAAA | Thomas              | Whitehurst         |
+| AAAAAAAAIADEBAAA | Diane               | Aldridge           |
+| AAAAAAAALIOPAAAA | Derek               | Allen              |
+| AAAAAAAAIBHHAAAA | Jennifer            | Ballard            |
+| AAAAAAAAHMJNAAAA | Ryan                | Baptiste           |
+| AAAAAAAACGKBBAAA | Betty               | Bell               |
+| AAAAAAAAKBCABAAA | Debra               | Bell               |
+| AAAAAAAAHJLAAAAA | Audrey              | Beltran            |
+| AAAAAAAAEOAKAAAA | Molly               | Benjamin           |
+| AAAAAAAADLHBBAAA | Henry               | Bertrand           |
+| AAAAAAAADBEFBAAA | Bennie              | Bowers             |
 +------------------+---------------------+--------------------+
