@@ -24,12 +24,20 @@ datasets:
       params: *pg_params
       indexes:
         l_partkey: enabled
+        l_suppkey: enabled
+        l_orderkey: enabled
   - from: file:data/nation.parquet
     name: nation
     acceleration: *acceleration
   - from: file:data/orders.parquet
     name: orders
-    acceleration: *acceleration
+    acceleration:
+      enabled: true
+      engine: postgres
+      refresh_on_startup: always
+      params: *pg_params
+      indexes:
+        o_orderkey: enabled
   - from: file:data/part.parquet
     name: part
     acceleration:
@@ -53,4 +61,10 @@ datasets:
     acceleration: *acceleration
   - from: file:data/supplier.parquet
     name: supplier
-    acceleration: *acceleration
+    acceleration:
+      enabled: true
+      engine: postgres
+      refresh_on_startup: always
+      params: *pg_params
+      indexes:
+        s_suppkey: enabled
