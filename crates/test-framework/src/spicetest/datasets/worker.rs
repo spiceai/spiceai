@@ -206,7 +206,7 @@ impl SpiceTestQueryWorker {
                         while current_query_count < target_count {
                             if self.progress_bar.is_none()
                                 && self.id == 0
-                                && current_query_count % 10 == 0
+                                && (current_query_count % 10 == 0 || target_count <= 5)
                             {
                                 println!(
                                     "Worker {} - Query '{}' - {}/{} - Elapsed time: {:?}",
@@ -356,6 +356,10 @@ impl SpiceTestQueryWorker {
                     return Err(e.into());
                 }
                 Ok(Some(batch)) => {
+                    if batch.num_rows() == 0 {
+                        println!("Worker {} - Query '{}' returned 0 rows", self.id, query.0);
+                    }
+
                     row_count += batch.num_rows();
 
                     if limited_records.len() < 10 {
