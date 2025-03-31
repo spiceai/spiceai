@@ -65,6 +65,10 @@ assignees: ''
        - Build the CLI: `true`
    - [ ] [Throughput Tests](https://github.com/spiceai/spiceai/actions/workflows/testoperator_run_throughput.yml) is green on `trunk` and on the release branch.
 
+1. **AI QA Engineer**
+
+- [ ] Add additional recipe coverage to [SpiceQA](https://github.com/spiceai/cookbook/actions/workflows/spice-qa.yml).
+
 1. **Documentation Review**
 
    - [ ] Update and confirm accuracy of `README.md` and docs in [Spice.ai Docs](https://github.com/spiceai/docs).
