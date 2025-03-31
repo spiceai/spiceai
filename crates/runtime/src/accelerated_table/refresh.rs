@@ -530,7 +530,7 @@ impl Refresher {
                 NextRefresh::WaitFor(duration) => {
                     if !duration.is_zero() {
                         tracing::info!(
-                            "{dataset_name}: Waiting {} seconds before first refresh",
+                            "{dataset_name}: Waiting {}s until next refresh",
                             duration.as_secs()
                         );
                     }
