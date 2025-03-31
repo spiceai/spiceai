@@ -45,7 +45,7 @@ use super::metrics::request_labels;
 /// Wraps [`Chat`] models with additional handling specifically for the spice runtime (e.g. telemetry, injecting system prompts).
 pub struct ChatWrapper {
     pub public_name: String,
-    pub chat: Box<dyn Chat>,
+    pub chat: Arc<dyn Chat>,
     pub system_prompt: Option<String>,
     pub defaults: Vec<(String, serde_json::Value)>,
 }
@@ -73,7 +73,7 @@ macro_rules! set_default_w_warning {
 
 impl ChatWrapper {
     pub fn new(
-        chat: Box<dyn Chat>,
+        chat: Arc<dyn Chat>,
         public_name: &str,
         system_prompt: Option<&str>,
         defaults: Vec<(String, serde_json::Value)>,

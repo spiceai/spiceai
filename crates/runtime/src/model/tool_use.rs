@@ -47,7 +47,7 @@ use crate::tools::SpiceModelTool;
 use crate::Runtime;
 
 pub struct ToolUsingChat {
-    inner_chat: Arc<Box<dyn Chat>>,
+    inner_chat: Arc<dyn Chat>,
     rt: Arc<Runtime>,
     tools: Vec<Arc<dyn SpiceModelTool>>,
     recursion_limit: Option<usize>,
@@ -56,7 +56,7 @@ pub struct ToolUsingChat {
 impl ToolUsingChat {
     #[must_use]
     pub fn new(
-        inner_chat: Arc<Box<dyn Chat>>,
+        inner_chat: Arc<dyn Chat>,
         rt: Arc<Runtime>,
         tools: Vec<Arc<dyn SpiceModelTool>>,
         recursion_limit: Option<usize>,

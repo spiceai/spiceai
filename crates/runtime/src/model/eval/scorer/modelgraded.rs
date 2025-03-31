@@ -24,10 +24,10 @@ use async_openai::{
     },
 };
 use async_trait::async_trait;
+use llms::chat::Chat;
 use serde_json::{json, Number, Value};
-use tokio::sync::RwLock;
 
-use crate::model::{eval::scorer::mean, LLMModelStore};
+use crate::model::eval::scorer::mean;
 
 use super::{DatasetInput, DatasetOutput, Error, Scorer};
 
@@ -35,13 +35,12 @@ use super::{DatasetInput, DatasetOutput, Error, Scorer};
 ///
 /// The [`DatasetInput`] and both [`DatasetOutput`]s are provided to the [`Chat`] model via request metadata (i.e. [`CreateChatCompletionRequest`]'s metadata field]).
 pub struct ModelGradedScorer {
-    models: Arc<RwLock<LLMModelStore>>,
-    model_name: String,
+    model: Arc<dyn Chat>,
 }
 
 impl ModelGradedScorer {
-    pub fn new(models: Arc<RwLock<LLMModelStore>>, model_name: String) -> Self {
-        Self { models, model_name }
+    pub fn new(model: Arc<dyn Chat>) -> Self {
+        Self { model }
     }
 
     fn construct_request(
@@ -91,20 +90,8 @@ impl Scorer for ModelGradedScorer {
                 )),
             })?;
 
-        let model_lock = self.models.read().await;
-        let Some(model) = model_lock.get(&self.model_name) else {
-            return Err(Error::ErrorScoringCase {
-                input: input.clone(),
-                actual: actual.clone(),
-                ideal: ideal.clone(),
-                source: Box::from(format!(
-                    "Model {} not found in store. This is unexpected.",
-                    self.model_name
-                )),
-            });
-        };
-
-        let response = model
+        let response = self
+            .model
             .chat_request(req)
             .await
             .map_err(|e| Error::ErrorScoringCase {

@@ -46,16 +46,13 @@ impl Runtime {
             tracing::debug!("Successfully loaded eval scorer {name}");
         }
 
-        // Load all LLMs are [`ModelGradedScorer`]
+        // Load all LLMs as [`ModelGradedScorer`]
         let model_lock = self.llms.read().await;
-        for model in model_lock.keys() {
+        for (model_name, model) in model_lock.iter() {
             let mut reg = self.eval_scorers.write().await;
             reg.insert(
-                model.to_string(),
-                Arc::new(ModelGradedScorer::new(
-                    Arc::clone(&self.llms),
-                    model.to_string(),
-                )),
+                model_name.clone(),
+                Arc::new(ModelGradedScorer::new(Arc::clone(model))),
             );
         }
 
