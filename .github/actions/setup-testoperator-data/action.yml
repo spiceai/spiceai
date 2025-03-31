@@ -79,6 +79,7 @@ runs:
         mc cp spice-minio/benchmarks/tpcds_sf1/web_sales/ ./ --recursive
         mc cp spice-minio/benchmarks/tpcds_sf1/web_site/ ./ --recursive
         mkdir ./sf0_1
+        cd ./sf0_1
         mc cp spice-minio/benchmarks/tpcds_sf0_1/call_center/ ./ --recursive
         mc cp spice-minio/benchmarks/tpcds_sf0_1/catalog_page/ ./ --recursive
         mc cp spice-minio/benchmarks/tpcds_sf0_1/catalog_returns/ ./ --recursive
