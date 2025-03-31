@@ -26,7 +26,7 @@ aws-sdk-dynamodb = { version = "1", optional = true }
 aws-sdk-secretsmanager = { version = "1", optional = true }
 aws-sdk-sts = { version = "1", optional = true }
 axum.workspace = true
-axum-extra = { version = "0.9.6", features = ["typed-header"] }
+axum-extra = { version = "0.10.1", features = ["typed-header"] }
 base64.workspace = true
 bytes.workspace = true
 cache = { path = "../cache" }
