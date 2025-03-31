@@ -1,0 +1,38 @@
+version: v1
+kind: Spicepod
+name: file_postgres
+datasets:
+  - from: file:data/customer.parquet
+    name: customer
+    acceleration: &acceleration
+      enabled: true
+      engine: postgres
+      refresh_on_startup: always
+      params:
+        pg_host: ${secrets:POSTGRES_HOST}
+        pg_port: 5432
+        pg_user: postgres
+        pg_pass: ${secrets:POSTGRES_PASSWORD}
+        pg_db: tpch_accelerated
+        pg_sslmode: disable
+  - from: file:data/lineitem.parquet
+    name: lineitem
+    acceleration: *acceleration
+  - from: file:data/nation.parquet
+    name: nation
+    acceleration: *acceleration
+  - from: file:data/orders.parquet
+    name: orders
+    acceleration: *acceleration
+  - from: file:data/part.parquet
+    name: part
+    acceleration: *acceleration
+  - from: file:data/partsupp.parquet
+    name: partsupp
+    acceleration: *acceleration
+  - from: file:data/region.parquet
+    name: region
+    acceleration: *acceleration
+  - from: file:data/supplier.parquet
+    name: supplier
+    acceleration: *acceleration

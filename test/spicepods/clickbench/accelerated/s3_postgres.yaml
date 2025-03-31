@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: s3_duckdb_memory
+name: s3_postgres
 datasets:
   - from: s3://benchmarks/clickbench/hits/
     name: hits
@@ -13,4 +13,4 @@ datasets:
       s3_secret: ${secrets:S3_SECRET}
     acceleration:
       engine: duckdb
-      mode: memory
+      mode: file
