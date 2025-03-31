@@ -74,7 +74,7 @@ func untar(r io.Reader, dir string, isGzipped bool) (err error) {
 	t0 := time.Now()
 	nFiles := 0
 	madeDir := map[string]bool{}
-	var reader io.Reader = r
+	var reader = r
 	if isGzipped {
 		reader, err = gzip.NewReader(r)
 		if err != nil {

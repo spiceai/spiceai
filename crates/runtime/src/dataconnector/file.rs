@@ -102,9 +102,17 @@ impl ListingTableConnector for File {
     /// Creates a valid file [`url::Url`], from the dataset, supporting both
     ///   1. Relative paths
     ///   2. Datasets prefixed with `file://` (not just `file:/`). This is to mirror the UX of [`Url::parse`].
-    fn get_object_store_url(&self, dataset: &Dataset) -> DataConnectorResult<Url> {
-        let path = get_path(dataset).to_string_lossy().into_owned();
-
+    fn get_object_store_url(
+        &self,
+        dataset: &Dataset,
+        path: Option<&str>,
+    ) -> DataConnectorResult<Url> {
+        let path = match path {
+            Some(p) => PathBuf::from(p.trim_start_matches("file:"))
+                .to_string_lossy()
+                .into_owned(),
+            None => get_path(dataset).to_string_lossy().into_owned(),
+        };
         // Convert relative path to absolute path
         let url_str = if path.starts_with('/') {
             format!("file:{path}")
@@ -116,7 +124,7 @@ impl ListingTableConnector for File {
                     message: "Could not identify current directory for a relative file path. Does the running user have the right filesystem permissions?".to_string(),
                     connector_component: ConnectorComponent::from(dataset),
                 })?
-                .join(path)
+                .join(&path)
                 .to_string_lossy()
                 .to_string();
 
@@ -127,7 +135,7 @@ impl ListingTableConnector for File {
             .boxed()
             .context(InvalidConfigurationSnafu {
                 dataconnector: "file".to_string(),
-                message: "The specified file path created an invalid URL. Check your file path and try again.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/file".to_string(),
+                message: format!("The specified file path {path} created an invalid URL. Check your file path and try again.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/file"),
                 connector_component: ConnectorComponent::from(dataset),
             })
     }
@@ -249,5 +257,30 @@ mod tests {
             let result = get_path(&dataset);
             assert_eq!(result, expected, "Failed for input: {input}");
         }
+    }
+
+    #[test]
+    fn test_get_object_store_url() {
+        let dataset = Dataset::try_new("file:/tmp/".into(), "test").expect("to create dataset");
+        let connector = File {
+            params: Parameters::new(([]).to_vec(), "test", &[]),
+        };
+
+        let url = connector
+            .get_object_store_url(&dataset, None)
+            .expect("should get a valid URL");
+        assert_eq!(url.as_str(), "file:///tmp/");
+
+        // object store override path with `file:` prefix
+        let url = connector
+            .get_object_store_url(&dataset, Some("file:/tmp/1/"))
+            .expect("should get a valid URL");
+        assert_eq!(url.as_str(), "file:///tmp/1/");
+
+        // object store override without `file:` prefix
+        let url = connector
+            .get_object_store_url(&dataset, Some("/tmp/2/"))
+            .expect("should get a valid URL");
+        assert_eq!(url.as_str(), "file:///tmp/2/");
     }
 }

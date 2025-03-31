@@ -8,7 +8,7 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 
 - See [Bugs](https://github.com/spiceai/spiceai/labels/bug). Feel free to [file a new Issue](https://github.com/spiceai/spiceai/issues/new?template=bug_report.md) if you see a bug and let us know on Discord.
 
-## v1.1 (Feb 2025)
+## v1.1 (Apr 2025)
 
 - DataFusion v44
 - DuckDB v1.2.x
@@ -16,7 +16,7 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 - [#3318](https://github.com/spiceai/spiceai/issues/3318) AI/LLM benchmarks in CI (FinanceBench)
 - MCP Server and Client support
 
-## v1.2 (Mar 2025)
+## v1.2 (Apr 2025)
 
 - Model Providers: HuggingFace, File (Release Candidate)
 - Enterprise Search and Retrieval improvements

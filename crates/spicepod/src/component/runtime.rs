@@ -55,6 +55,11 @@ pub struct Runtime {
 
     #[serde(default, skip_serializing_if = "is_default")]
     pub cors: CorsConfig,
+
+    /// Configures where the runtime will store temporary files needed for operations like
+    /// spilling to disk for queries & accelerations that are larger than memory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temp_directory: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
