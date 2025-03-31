@@ -103,17 +103,6 @@ jobs:
           SPICEPOD_FILENAME=$(basename $SPICEPOD_PATH)
           echo "SPICEPOD_FILENAME=${SPICEPOD_FILENAME}" >> $GITHUB_OUTPUT
 
-      - name: Create empty postgres databases for acceleration
-        env:
-          PGHOST: ${{ secrets.POSTGRES_HOST }}
-          PGPASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
-          PGUSER: postgres
-        run: |
-          sudo apt install -y postgresql-client
-          psql -c "CREATE DATABASE tpcds_accelerated;"
-          psql -c "CREATE DATABASE tpch_accelerated;"
-          psql -c "CREATE DATABASE clickbench_accelerated;"
-
       - name: Run the benchmark test - ${{ steps.extract_spicepod_filename.outputs.SPICEPOD_FILENAME }}
         if: ${{ github.event.inputs.query_overrides == '' }}
         run: |
