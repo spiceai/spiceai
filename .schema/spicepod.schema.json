@@ -1089,6 +1089,13 @@
         "telemetry": {
           "$ref": "#/definitions/TelemetryConfig"
         },
+        "temp_directory": {
+          "description": "Configures where the runtime will store temporary files needed for operations like spilling to disk for queries & accelerations that are larger than memory.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "tls": {
           "description": "If set, the runtime will configure all endpoints to use TLS",
           "anyOf": [
@@ -1275,6 +1282,12 @@
             "string",
             "null"
           ]
+        },
+        "env": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
         },
         "from": {
           "type": "string"

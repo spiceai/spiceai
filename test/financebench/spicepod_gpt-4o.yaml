@@ -1,0 +1,79 @@
+version: v1
+kind: Spicepod
+name: financebench
+
+models:
+  - name: gpt-4o
+    from: openai:gpt-4o-2024-08-06
+    datasets: 
+      - financebench.data
+    params:
+      tools: list_datasets, table_schema, document_similarity
+      openai_api_key: ${ secrets:OPENAI_API_KEY}
+      system_prompt: |
+        # Role and Objective
+        You are a financial expert, tasked to precisely answer the question based on information from `financebench.data`:
+        - Conduct thorough document searches to identify complete and accurate relevant information.
+        - Provide a well-structured, accurate, and concise answer based on retrieved information and the question asked.
+          
+        # Search Guidelines
+        - Always document_similarity tool for searches.
+        - When searching, query both 'content' and 'location' columns.
+        - Limit search to top 3 items.
+        - Don't include keywords
+        - If the first search yields insufficient results to respond, refine the search and perform a second search.
+
+        # Mandatory Guidelines
+        - Do not hallucinate or create theoretical knowledge, the answer must be based on the provided and retrieved data.
+        - Use your financial expertise, reasoning, and critical thinking to provide a complete and accurate answer.
+        - Must include all references ('location' column) to documents used to answer.
+
+        When writing SQL queries, do not put double quotes around schema-qualified table names. For example:
+          Correct: SELECT * FROM schema.table
+          Correct: SELECT * FROM database.schema.table
+          Incorrect: SELECT * FROM "schema.table"
+          Incorrect: SELECT * FROM "database.schema.table"
+
+datasets:
+  - from: spice.ai/spiceai/financebench/datasets/spice.financebench.data
+    name: financebench.data
+    description: Financial information
+    params:
+      spiceai_api_key: ${ secrets:SPICEAI_FINANCEBENCH_API_KEY }
+      spiceai_endpoint: https://flight.spiceai.io
+    acceleration:
+      enabled: true
+      # https://github.com/spiceai/spiceai/issues/5143
+      refresh_sql: |
+        select * from financebench.data limit 50;
+    embeddings:
+      - column: content
+        use: openai_embed
+        column_pk:
+        - location
+  
+  - from: spice.ai/spiceai/financebench/datasets/spice.financebench.tests_oss
+    description: Dataset for evaluating model performance. Must be ignored by the model.
+    name: financebench.tests_oss
+    params:
+      spiceai_api_key: ${ secrets:SPICEAI_FINANCEBENCH_API_KEY }
+      spiceai_endpoint: https://flight.spiceai.io
+    acceleration:
+      enabled: true
+
+views:
+  - name: financebench.evals
+    sql: |
+      SELECT financebench_id, question as input, answer as ideal, company, doc_name, question_type, question_reasoning, justification, evidence from financebench.tests_oss
+
+evals:
+  - name: financebench
+    dataset: financebench.evals
+    scorers:
+      - match
+
+embeddings:
+  - from: openai:text-embedding-3-small
+    name: openai_embed
+    params:
+      openai_api_key: ${secrets:OPENAI_API_KEY}

@@ -14,20 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use async_trait::async_trait;
-use data_components::poly::PolyTableProvider;
-use datafusion::{
-    catalog::TableProviderFactory, datasource::TableProvider, execution::context::SessionContext,
-    logical_expr::CreateExternalTable,
-};
-use datafusion_table_providers::{
-    duckdb::{write::DuckDBTableWriter, DuckDBTableProviderFactory},
-    sql::db_connection_pool::duckdbpool::DuckDbConnectionPool,
-};
-use duckdb::AccessMode;
-use snafu::prelude::*;
-use std::{any::Any, ffi::OsStr, sync::Arc};
-
 use crate::{
     component::dataset::{
         acceleration::{Engine, Mode},
@@ -36,10 +22,25 @@ use crate::{
     datafusion::dialect::new_duckdb_dialect,
     make_spice_data_directory,
     parameters::ParameterSpec,
-    spice_data_base_path, Runtime,
+    spice_data_base_path, App, Runtime,
 };
+use async_trait::async_trait;
+use data_components::poly::PolyTableProvider;
+use datafusion::{
+    catalog::TableProviderFactory, datasource::TableProvider, execution::context::SessionContext,
+    logical_expr::CreateExternalTable,
+};
+use datafusion_table_providers::{
+    duckdb::{write::DuckDBTableWriter, DuckDBTableProviderFactory},
+    sql::db_connection_pool::duckdbpool::{DuckDbConnectionPool, DuckDbConnectionPoolBuilder},
+};
+use duckdb::AccessMode;
+use snafu::prelude::*;
+use std::{any::Any, cmp::max, ffi::OsStr, sync::Arc};
 
 use super::{DataAccelerator, Error as DataAcceleratorError};
+
+const DEFAULT_MIN_IDLE_CONNECTIONS: u32 = 10;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -126,18 +127,32 @@ impl DuckDBAccelerator {
             })?;
 
         let pool = match (duckdb_file, acceleration.mode) {
-            (Ok(duckdb_file), Mode::File) => self
-                .duckdb_factory
-                .get_or_init_file_instance(duckdb_file)
-                .await
-                .boxed()
-                .context(AccelerationCreationFailedSnafu)?,
-            (_, Mode::Memory) => self
-                .duckdb_factory
-                .get_or_init_memory_instance()
-                .await
-                .boxed()
-                .context(AccelerationCreationFailedSnafu)?,
+            (Ok(duckdb_file), Mode::File) => {
+                let num_accelerating_datasets =
+                    self.get_num_accelerating_datasets(Some(duckdb_file.as_str()), dataset.app());
+                let max_size = Self::get_max_size(num_accelerating_datasets);
+                let pool_builder = DuckDbConnectionPoolBuilder::file(&duckdb_file)
+                    .with_max_size(Some(max_size))
+                    .with_min_idle(Some(DEFAULT_MIN_IDLE_CONNECTIONS));
+                self.duckdb_factory
+                    .get_or_init_instance_with_builder(pool_builder)
+                    .await
+                    .boxed()
+                    .context(AccelerationCreationFailedSnafu)?
+            }
+            (_, Mode::Memory) => {
+                let num_accelerating_datasets =
+                    self.get_num_accelerating_datasets(None, dataset.app());
+                let max_size = Self::get_max_size(num_accelerating_datasets);
+                let pool_builder = DuckDbConnectionPoolBuilder::memory()
+                    .with_max_size(Some(max_size))
+                    .with_min_idle(Some(DEFAULT_MIN_IDLE_CONNECTIONS));
+                self.duckdb_factory
+                    .get_or_init_instance_with_builder(pool_builder)
+                    .await
+                    .boxed()
+                    .context(AccelerationCreationFailedSnafu)?
+            }
             (Err(e), Mode::File) => {
                 return Err(Error::InvalidConfiguration {
                     detail: Arc::from(e.to_string()),
@@ -146,6 +161,43 @@ impl DuckDBAccelerator {
         };
 
         Ok(pool)
+    }
+
+    fn get_num_accelerating_datasets(&self, path: Option<&str>, app: Option<Arc<App>>) -> u32 {
+        let mut instance_usage: u32 = 1;
+
+        if let Some(this_app) = app {
+            let datasets = Runtime::get_valid_datasets(&this_app, crate::LogErrors(false));
+            for ds in datasets {
+                if let Some(acceleration) = &ds.acceleration {
+                    if acceleration.engine != Engine::DuckDB {
+                        continue;
+                    }
+
+                    // If the path is Some, we're counting the number of file instances
+                    if let Some(this_file_path) = path {
+                        if acceleration.mode == Mode::File {
+                            if let Ok(file_path) = self.file_path(&ds) {
+                                if this_file_path == file_path {
+                                    instance_usage += 1;
+                                }
+                            }
+                        }
+                    } else {
+                        // If the path is None, we're just counting the number of memory instances
+                        if acceleration.mode == Mode::Memory {
+                            instance_usage += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        instance_usage
+    }
+
+    fn get_max_size(num_accelerating_datasets: u32) -> u32 {
+        max(DEFAULT_MIN_IDLE_CONNECTIONS, num_accelerating_datasets)
     }
 }
 
@@ -240,6 +292,15 @@ impl DataAccelerator for DuckDBAccelerator {
         }
 
         if let Some(this_dataset) = dataset {
+            if let Some(temp_directory) = &this_dataset
+                .app
+                .as_ref()
+                .and_then(|app| app.runtime.temp_directory.clone())
+            {
+                cmd.options
+                    .insert("temp_directory".to_string(), temp_directory.to_string());
+            }
+
             if this_dataset.is_file_accelerated() {
                 // If the user didn't specify a DuckDB file and this is a file-mode DuckDB,
                 // then use the shared DuckDB file `accelerated_duckdb.db`

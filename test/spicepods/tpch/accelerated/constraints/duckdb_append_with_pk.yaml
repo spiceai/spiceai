@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: append-refresh-with-pk-and-indexes
+name: append-refresh-with-pk
 
 runtime:
   task_history:
@@ -20,8 +20,6 @@ datasets:
       refresh_mode: append
       refresh_check_interval: &default_refresh_check_interval 1s
       primary_key: Id
-      indexes:
-        Id: enabled
       on_conflict:
         Id: upsert
 
@@ -35,7 +33,5 @@ datasets:
       refresh_mode: append
       refresh_check_interval: *default_refresh_check_interval
       primary_key: Id
-      indexes:
-        Id: enabled
       on_conflict:
         Id: drop
