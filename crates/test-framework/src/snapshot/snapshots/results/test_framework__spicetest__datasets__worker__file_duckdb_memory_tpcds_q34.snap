@@ -5,14 +5,14 @@ description: "Query: tpcds_q34"
 +-------------+--------------+--------------+-----------------------+------------------+-----+
 | c_last_name | c_first_name | c_salutation | c_preferred_cust_flag | ss_ticket_number | cnt |
 +-------------+--------------+--------------+-----------------------+------------------+-----+
-| Adams       | Willie       | Sir          | Y                     | 88285            | 16  |
-| Akers       | Susan        | Miss         | N                     | 239968           | 15  |
-| Alston      | Jesus        | Sir          | Y                     | 52608            | 15  |
-| Anderson    | Martha       | Mrs.         | Y                     | 205757           | 16  |
-| Anderson    | Norma        | Miss         | Y                     | 132983           | 15  |
-| Andrews     | Cindy        | Miss         | Y                     | 132595           | 15  |
-| Andrews     | Robert       | Sir          | Y                     | 30467            | 16  |
-| Appleton    | Ivan         | Dr.          | Y                     | 74586            | 16  |
-| Archibald   | Cindy        | Miss         | Y                     | 87178            | 16  |
-| Baird       | Jovita       | Miss         | N                     | 27451            | 16  |
+| Barajas     | Mark         | Sir          | N                     | 6906             | 15  |
+| Bennett     | Gary         | Mr.          | N                     | 3324             | 16  |
+| Boucher     | Ivan         | Dr.          | N                     | 8002             | 16  |
+| Collins     | Lacey        | Ms.          | N                     | 6164             | 15  |
+| Dennis      | John         | Mr.          | Y                     | 9759             | 15  |
+| Glover      | Valerie      | Miss         | N                     | 13944            | 15  |
+| Golden      | Johnny       | Dr.          | Y                     | 17570            | 15  |
+| Gonzalez    | David        | Dr.          | Y                     | 14075            | 15  |
+| Hartman     | Todd         | Dr.          | Y                     | 11795            | 15  |
+| Johnson     | Beverly      | Dr.          | N                     | 7637             | 15  |
 +-------------+--------------+--------------+-----------------------+------------------+-----+

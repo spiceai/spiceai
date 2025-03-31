@@ -5,14 +5,14 @@ description: "Query: tpcds_q89"
 +------------+-----------+--------------------+--------------+----------------+-------+-----------+-------------------+
 | i_category | i_class   | i_brand            | s_store_name | s_company_name | d_moy | sum_sales | avg_monthly_sales |
 +------------+-----------+--------------------+--------------+----------------+-------+-----------+-------------------+
-| Music      | classical | edu packscholar #2 | ation        | Unknown        | 3     | 3298.11   | 7507.714167       |
-| Music      | classical | edu packscholar #2 | ation        | Unknown        | 4     | 3550.86   | 7507.714167       |
-| Music      | classical | edu packscholar #2 | able         | Unknown        | 6     | 3755.79   | 7687.866667       |
-| Music      | classical | edu packscholar #2 | able         | Unknown        | 2     | 3757.45   | 7687.866667       |
-| Music      | classical | edu packscholar #2 | bar          | Unknown        | 6     | 3408.82   | 7242.218333       |
-| Music      | classical | edu packscholar #2 | eing         | Unknown        | 5     | 3720.76   | 7549.881667       |
-| Children   | infants   | importoexporti #2  | ese          | Unknown        | 3     | 3152.45   | 6935.281667       |
-| Music      | classical | edu packscholar #2 | ese          | Unknown        | 3     | 3692.96   | 7471.503333       |
-| Music      | classical | edu packscholar #2 | eing         | Unknown        | 7     | 3778.65   | 7549.881667       |
-| Children   | infants   | importoexporti #2  | bar          | Unknown        | 2     | 2986.60   | 6742.470000       |
+| Music      | classical | edu packscholar #2 | ought        | Unknown        | 5     | 1395.54   | 3812.362500       |
+| Music      | classical | edu packscholar #2 | ought        | Unknown        | 6     | 1926.01   | 3812.362500       |
+| Music      | classical | edu packscholar #2 | ought        | Unknown        | 4     | 2038.93   | 3812.362500       |
+| Children   | infants   | importoexporti #2  | ought        | Unknown        | 6     | 1214.74   | 2902.207500       |
+| Music      | classical | edu packscholar #2 | ought        | Unknown        | 7     | 2220.11   | 3812.362500       |
+| Music      | classical | edu packscholar #2 | ought        | Unknown        | 2     | 2228.14   | 3812.362500       |
+| Children   | infants   | importoexporti #2  | ought        | Unknown        | 5     | 1491.39   | 2902.207500       |
+| Children   | infants   | importoexporti #2  | ought        | Unknown        | 3     | 1530.78   | 2902.207500       |
+| Music      | classical | edu packscholar #2 | ought        | Unknown        | 3     | 2464.39   | 3812.362500       |
+| Children   | infants   | importoexporti #2  | ought        | Unknown        | 2     | 1780.06   | 2902.207500       |
 +------------+-----------+--------------------+--------------+----------------+-------+-----------+-------------------+
