@@ -2,15 +2,6 @@ version: v1
 kind: Spicepod
 name: file_postgres
 datasets:
-  - from: file:data/catalog_sales.parquet
-    name: catalog_sales
-    acceleration:
-      enabled: true
-      engine: postgres
-      refresh_on_startup: always
-      params: *pg_params
-      indexes:
-        cs_sold_date_sk: enabled
   - from: file:data/catalog_returns.parquet
     name: catalog_returns
     acceleration: &acceleration
@@ -24,6 +15,15 @@ datasets:
         pg_pass: ${secrets:POSTGRES_PASSWORD}
         pg_db: tpcds_accelerated
         pg_sslmode: disable
+  - from: file:data/catalog_sales.parquet
+    name: catalog_sales
+    acceleration:
+      enabled: true
+      engine: postgres
+      refresh_on_startup: always
+      params: *pg_params
+      indexes:
+        cs_sold_date_sk: enabled
   - from: file:data/inventory.parquet
     name: inventory
     acceleration: *acceleration
