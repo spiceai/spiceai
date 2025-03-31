@@ -455,7 +455,5 @@ fn system_prompt_is_template_with_variables(prompt: &str) -> bool {
     let Ok(tt) = t.get_template("system_prompt") else {
         return false;
     };
-    let result = ast::has_variables_in_ast(&tt.ast);
-    tracing::debug!("Early check if system prompt='{prompt:?}' is template has result='{result}'. Not gating prompts.");
-    true
+    ast::has_variables_in_ast(&tt.ast)
 }
