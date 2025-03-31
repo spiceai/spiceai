@@ -62,7 +62,25 @@ use super::DelimitedFormat;
 pub trait ListingTableConnector: DataConnector {
     fn as_any(&self) -> &dyn Any;
 
-    fn get_object_store_url(&self, dataset: &Dataset) -> DataConnectorResult<Url>;
+    /// Retrieves the object store URL for a given dataset.
+    ///
+    /// Determines the URL of the object store associated with the dataset.
+    /// If a specific URL is provided as an argument, it uses that; otherwise, it derives
+    /// the URL based on the dataset's configuration.
+    ///
+    /// # Arguments
+    ///
+    /// * `dataset` - A reference to the [`Dataset`] for which the object store URL is being retrieved.
+    /// * `url` - An optional reference to a string representing a specific Path or URL to use.
+    ///
+    /// # Returns
+    ///
+    /// A [`DataConnectorResult`] containing the resolved [`Url`] of the object store.
+    fn get_object_store_url(
+        &self,
+        dataset: &Dataset,
+        url: Option<&str>,
+    ) -> DataConnectorResult<Url>;
 
     fn get_params(&self) -> &Parameters;
 
@@ -81,7 +99,7 @@ pub trait ListingTableConnector: DataConnector {
     where
         Self: Display,
     {
-        let store_url = self.get_object_store_url(dataset)?;
+        let store_url = self.get_object_store_url(dataset, None)?;
         let listing_store_url = ListingTableUrl::parse(store_url.clone()).boxed().context(
             crate::dataconnector::UnableToConnectInternalSnafu {
                 dataconnector: format!("{self}"),
@@ -105,7 +123,7 @@ pub trait ListingTableConnector: DataConnector {
     where
         Self: Display,
     {
-        let store_url: Url = self.get_object_store_url(dataset)?;
+        let store_url: Url = self.get_object_store_url(dataset, None)?;
         let store = self.get_object_store(dataset)?;
         let (_, extension) = self.get_file_format_and_extension(dataset)?;
 
@@ -390,24 +408,34 @@ pub trait ListingTableConnector: DataConnector {
 
         let ctx: SessionContext = Self::get_session_context();
 
-        // Get the last modified object for the provided ObjectStore to infer the schema.
-        // Report an error if no files matching required extension are found.
-        let last_modified_or_added = get_last_modified(
-            format!("{self}"),
-            dataset,
-            extension,
-            table_path.clone(),
-            &ctx,
-            &object_store,
-        )
-        .await?;
+        let schema_infer_url = if let Some(url) = dataset.params.get("schema_source_path") {
+            let url = self.get_object_store_url(dataset, Some(url))?;
+            ListingTableUrl::parse(url).boxed().context(
+                crate::dataconnector::UnableToGetSchemaInternalSnafu {
+                    dataconnector: format!("{self}"),
+                    connector_component: ConnectorComponent::from(dataset),
+                },
+            )?
+        } else {
+            // Get the last modified object for the provided ObjectStore to infer the schema.
+            // Report an error if no files matching required extension are found.
+            let last_modified_or_added = get_last_modified(
+                format!("{self}"),
+                dataset,
+                extension,
+                table_path.clone(),
+                &ctx,
+                &object_store,
+            )
+            .await?;
 
-        let schema_infer_url = to_listing_table_url(
-            url,
-            &last_modified_or_added.location,
-            dataset,
-            &format!("{self}"),
-        )?;
+            to_listing_table_url(
+                url,
+                &last_modified_or_added.location,
+                dataset,
+                &format!("{self}"),
+            )?
+        };
 
         tracing::debug!(
             "Dataset '{}' schema will be resolved based on {schema_infer_url}",
@@ -498,7 +526,7 @@ impl<T: ListingTableConnector + Display> DataConnector for T {
         &self,
         dataset: &Dataset,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
-        let url = self.get_object_store_url(dataset)?;
+        let url = self.get_object_store_url(dataset, None)?;
 
         let (file_format_opt, extension) = self.get_file_format_and_extension(dataset)?;
         match file_format_opt {
@@ -736,7 +764,11 @@ mod tests {
             &self.params
         }
 
-        fn get_object_store_url(&self, dataset: &Dataset) -> DataConnectorResult<Url> {
+        fn get_object_store_url(
+            &self,
+            dataset: &Dataset,
+            _url: Option<&str>,
+        ) -> DataConnectorResult<Url> {
             Url::parse("test")
                 .boxed()
                 .context(crate::dataconnector::InvalidConfigurationSnafu {
