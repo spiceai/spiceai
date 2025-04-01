@@ -1,3 +1,3 @@
-pub mod model_factory;
+pub mod registry;
 mod utils;
 pub mod xai;

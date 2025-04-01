@@ -24,7 +24,7 @@ mod chat;
 mod embed;
 pub(crate) mod eval;
 mod metrics;
-mod providers;
+mod modelfactory;
 mod tool_use;
 mod wrapper;
 
