@@ -3,3 +3,4 @@ tests:
     spicepod_path: ./test/spicepods/tpch/spicecloud_catalog.yaml
     query_set: tpch
     runner_type: spiceai-runners
+    query_overrides: spicecloud-catalog
