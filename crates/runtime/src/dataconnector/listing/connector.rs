@@ -412,7 +412,8 @@ pub trait ListingTableConnector: DataConnector {
         let ctx: SessionContext = Self::get_session_context();
 
         let schema_infer_url = if let Some(url) = dataset.params.get("schema_source_path") {
-            let url = self.get_object_store_url(dataset, Some(url))?;
+            let mut url = self.get_object_store_url(dataset, Some(url))?;
+            url.set_fragment(None);
             let schema_infer_url = ListingTableUrl::parse(url).boxed().context(
                 crate::dataconnector::UnableToGetSchemaInternalSnafu {
                     dataconnector: format!("{self}"),
@@ -711,6 +712,8 @@ async fn verify_schema_source_path(
     );
 
     let state = ctx.state();
+    // Intentionally not passing the `file_extension` parameter to `list_all_files` because we want to
+    // short-circuit the listing process if we need to iterate over too many files.
     let mut file_stream = schema_source_path
         .list_all_files(&state, object_store, "")
         .await
@@ -722,6 +725,7 @@ async fn verify_schema_source_path(
 
     let mut scanned_files = 0;
 
+    let lower_extension = extension.to_lowercase();
     while let Some(file) =
         file_stream
             .try_next()
@@ -733,7 +737,7 @@ async fn verify_schema_source_path(
             })?
     {
         if let Some(ext) = file.location.extension() {
-            if format!(".{ext}") == extension {
+            if ext.to_lowercase() == lower_extension {
                 return Ok(());
             }
         };
