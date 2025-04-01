@@ -725,7 +725,6 @@ async fn verify_schema_source_path(
 
     let mut scanned_files = 0;
 
-    let lower_extension = extension.to_lowercase();
     while let Some(file) =
         file_stream
             .try_next()
@@ -737,7 +736,7 @@ async fn verify_schema_source_path(
             })?
     {
         if let Some(ext) = file.location.extension() {
-            if ext.to_lowercase() == lower_extension {
+            if format!(".{ext}") == extension {
                 return Ok(());
             }
         };
@@ -1106,5 +1105,101 @@ mod tests {
         .await;
 
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_verify_schema_source_path_valid() {
+        let url = Url::parse("s3://bucket/schema/").expect("to parse url");
+        let schema_source_path = ListingTableUrl::parse(url.clone()).expect("to parse url");
+        let ctx = SessionContext::new();
+        let dataset =
+            Dataset::try_new("s3://bucket/schema/".to_string(), "test").expect("valid dataset");
+
+        let meta_files = vec![
+            create_meta("schema/file1.parquet", 100, 100),
+            create_meta("schema/file2.csv", 200, 200),
+            create_meta("schema/file3.parquet", 300, 300),
+        ];
+
+        let test_store = Arc::new(TestObjectStore::new(meta_files)) as Arc<dyn ObjectStore>;
+
+        let result = verify_schema_source_path(
+            "TestListingConnector".to_string(),
+            &dataset,
+            ".parquet",
+            schema_source_path,
+            &ctx,
+            &test_store,
+        )
+        .await;
+
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_verify_schema_source_path_no_matching_files() {
+        let url = Url::parse("s3://bucket/schema/").expect("to parse url");
+        let schema_source_path = ListingTableUrl::parse(url.clone()).expect("to parse url");
+        let ctx = SessionContext::new();
+        let dataset =
+            Dataset::try_new("s3://bucket/schema/".to_string(), "test").expect("valid dataset");
+
+        let meta_files = vec![
+            create_meta("schema/file1.csv", 100, 100),
+            create_meta("schema/file2.csv", 200, 200),
+        ];
+
+        let test_store = Arc::new(TestObjectStore::new(meta_files)) as Arc<dyn ObjectStore>;
+
+        let result = verify_schema_source_path(
+            "TestListingConnector".to_string(),
+            &dataset,
+            ".parquet",
+            schema_source_path.clone(),
+            &ctx,
+            &test_store,
+        )
+        .await;
+
+        assert!(result.is_err());
+        if let Err(e) = result {
+            assert_eq!(
+                e.to_string(),
+                format!(
+                    "Cannot setup the dataset test (TestListingConnector) with an invalid configuration.\nFailed to find any files matching the extension '.parquet' at the specified path `{schema_source_path}`.\nVerify that `schema_source_path` is correct and try again."
+                )
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::cast_possible_wrap)]
+    async fn test_verify_schema_source_path_file_limit() {
+        let url = Url::parse("s3://bucket/schema/").expect("to parse url");
+        let schema_source_path = ListingTableUrl::parse(url.clone()).expect("to parse url");
+        let ctx = SessionContext::new();
+        let dataset =
+            Dataset::try_new("s3://bucket/schema/".to_string(), "test").expect("valid dataset");
+
+        // Create more files than SCHEMA_SOURCE_PATH_FILE_SCAN_LIMIT
+        let meta_files: Vec<ObjectMeta> = (0..SCHEMA_SOURCE_PATH_FILE_SCAN_LIMIT + 100)
+            .map(|i| create_meta(&format!("schema/file{i}.csv"), 100 + i as i64, 100))
+            .collect();
+
+        let test_store = Arc::new(TestObjectStore::new(meta_files)) as Arc<dyn ObjectStore>;
+
+        let result = verify_schema_source_path(
+            "TestListingConnector".to_string(),
+            &dataset,
+            ".parquet",
+            schema_source_path,
+            &ctx,
+            &test_store,
+        )
+        .await;
+
+        // Should return Ok even though no matching files were found,
+        // because we hit the scan limit
+        assert!(result.is_ok(), "Expected Ok, got {result:?}");
     }
 }
