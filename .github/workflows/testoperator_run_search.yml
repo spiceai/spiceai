@@ -1,0 +1,63 @@
+name: testoperator search tests
+
+on:
+  workflow_dispatch:
+    inputs:
+      spiced_commit:
+        description: 'spiced build commit'
+        required: false
+        type: string
+      spicepod_path:
+        description: 'The spicepod file to test with'
+        required: true
+        type: string
+      runner_type:
+        description: 'Runner type'
+        required: true
+        default: 'spiceai-runners'
+        type: choice
+        options:
+          - 'spiceai-runners'
+          - 'spiceai-large-runners'
+
+jobs:
+  run-bench:
+    name: Run vector search tests
+    runs-on: ${{ github.event.inputs.runner_type }}
+    timeout-minutes: 600
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install MinIO
+        run: |
+          sudo apt update && sudo apt install wget -y
+          sudo wget https://dl.min.io/client/mc/release/linux-amd64/mc -O /usr/local/bin/mc
+          sudo chmod +x /usr/local/bin/mc
+          mc alias set spice-minio ${{ secrets.MINIO_ENDPOINT }} ${{ secrets.MINIO_ACCESS_KEY }} ${{ secrets.MINIO_SECRET_KEY }}
+      
+      - name: Setup spiced
+        uses: ./.github/actions/setup-spiced
+        with:
+          spiced_commit: ${{ github.event.inputs.spiced_commit }}
+
+      - name: Build Testoperator
+        uses: ./.github/actions/build-testoperator
+
+      - name: Extract spicepod filename path
+        id: extract_spicepod_filename
+        run: |
+          SPICEPOD_PATH="${{ github.event.inputs.spicepod_path }}"
+          SPICEPOD_FILENAME=$(basename $SPICEPOD_PATH)
+          echo "SPICEPOD_FILENAME=${SPICEPOD_FILENAME}" >> $GITHUB_OUTPUT
+
+      - name: Run the benchmark test - ${{ steps.extract_spicepod_filename.outputs.SPICEPOD_FILENAME }}
+        run: |
+          rm -rf .spice/data
+          testoperator run vector_search \
+            -s /usr/local/bin/spiced \
+            -p ${{ github.event.inputs.spicepod_path }} \
+            -d /opt/spiced/data \
+            --disable-progress-bars
+        env:
+          SPICEAI_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TPCH_BENCHMARK_KEY }}
+          OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}

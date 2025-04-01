@@ -78,6 +78,32 @@ runs:
         mc cp spice-minio/benchmarks/tpcds_sf1/web_returns/ ./ --recursive
         mc cp spice-minio/benchmarks/tpcds_sf1/web_sales/ ./ --recursive
         mc cp spice-minio/benchmarks/tpcds_sf1/web_site/ ./ --recursive
+        mkdir ./sf0_01
+        cd ./sf0_01
+        mc cp spice-minio/benchmarks/tpcds_sf0_01/call_center.parquet ./call_center.parquet
+        mc cp spice-minio/benchmarks/tpcds_sf0_01/catalog_page.parquet ./catalog_page.parquet
+        mc cp spice-minio/benchmarks/tpcds_sf0_01/catalog_returns.parquet ./catalog_returns.parquet
+        mc cp spice-minio/benchmarks/tpcds_sf0_01/catalog_sales.parquet ./catalog_sales.parquet
+        mc cp spice-minio/benchmarks/tpcds_sf0_01/customer.parquet ./customer.parquet
+        mc cp spice-minio/benchmarks/tpcds_sf0_01/customer_address.parquet ./customer_address.parquet
+        mc cp spice-minio/benchmarks/tpcds_sf0_01/customer_demographics.parquet ./customer_demographics.parquet
+        mc cp spice-minio/benchmarks/tpcds_sf0_01/date_dim.parquet ./date_dim.parquet
+        mc cp spice-minio/benchmarks/tpcds_sf0_01/household_demographics.parquet ./household_demographics.parquet
+        mc cp spice-minio/benchmarks/tpcds_sf0_01/income_band.parquet ./income_band.parquet
+        mc cp spice-minio/benchmarks/tpcds_sf0_01/inventory.parquet ./inventory.parquet
+        mc cp spice-minio/benchmarks/tpcds_sf0_01/item.parquet ./item.parquet
+        mc cp spice-minio/benchmarks/tpcds_sf0_01/promotion.parquet ./promotion.parquet
+        mc cp spice-minio/benchmarks/tpcds_sf0_01/reason.parquet ./reason.parquet
+        mc cp spice-minio/benchmarks/tpcds_sf0_01/ship_mode.parquet ./ship_mode.parquet
+        mc cp spice-minio/benchmarks/tpcds_sf0_01/store.parquet ./store.parquet
+        mc cp spice-minio/benchmarks/tpcds_sf0_01/store_returns.parquet ./store_returns.parquet
+        mc cp spice-minio/benchmarks/tpcds_sf0_01/store_sales.parquet ./store_sales.parquet
+        mc cp spice-minio/benchmarks/tpcds_sf0_01/time_dim.parquet ./time_dim.parquet
+        mc cp spice-minio/benchmarks/tpcds_sf0_01/warehouse.parquet ./warehouse.parquet
+        mc cp spice-minio/benchmarks/tpcds_sf0_01/web_page.parquet ./web_page.parquet
+        mc cp spice-minio/benchmarks/tpcds_sf0_01/web_returns.parquet ./web_returns.parquet
+        mc cp spice-minio/benchmarks/tpcds_sf0_01/web_sales.parquet ./web_sales.parquet
+        mc cp spice-minio/benchmarks/tpcds_sf0_01/web_site.parquet ./web_site.parquet
     
     - name: Download File Connector ClickBench Data
       shell: bash

@@ -58,11 +58,32 @@ use crate::object_store_registry::default_runtime_env;
 use super::infer::infer_partitions_with_types;
 use super::DelimitedFormat;
 
+/// Maximum number of files to scan when validating that the schema source path contains objects with the expected extension.
+const SCHEMA_SOURCE_PATH_FILE_SCAN_LIMIT: usize = 10_000;
+
 #[async_trait]
 pub trait ListingTableConnector: DataConnector {
     fn as_any(&self) -> &dyn Any;
 
-    fn get_object_store_url(&self, dataset: &Dataset) -> DataConnectorResult<Url>;
+    /// Retrieves the object store URL for a given dataset.
+    ///
+    /// Determines the URL of the object store associated with the dataset.
+    /// If a specific URL is provided as an argument, it uses that; otherwise, it derives
+    /// the URL based on the dataset's configuration.
+    ///
+    /// # Arguments
+    ///
+    /// * `dataset` - A reference to the [`Dataset`] for which the object store URL is being retrieved.
+    /// * `url` - An optional reference to a string representing a specific Path or URL to use.
+    ///
+    /// # Returns
+    ///
+    /// A [`DataConnectorResult`] containing the resolved [`Url`] of the object store.
+    fn get_object_store_url(
+        &self,
+        dataset: &Dataset,
+        url: Option<&str>,
+    ) -> DataConnectorResult<Url>;
 
     fn get_params(&self) -> &Parameters;
 
@@ -81,7 +102,7 @@ pub trait ListingTableConnector: DataConnector {
     where
         Self: Display,
     {
-        let store_url = self.get_object_store_url(dataset)?;
+        let store_url = self.get_object_store_url(dataset, None)?;
         let listing_store_url = ListingTableUrl::parse(store_url.clone()).boxed().context(
             crate::dataconnector::UnableToConnectInternalSnafu {
                 dataconnector: format!("{self}"),
@@ -105,7 +126,7 @@ pub trait ListingTableConnector: DataConnector {
     where
         Self: Display,
     {
-        let store_url: Url = self.get_object_store_url(dataset)?;
+        let store_url: Url = self.get_object_store_url(dataset, None)?;
         let store = self.get_object_store(dataset)?;
         let (_, extension) = self.get_file_format_and_extension(dataset)?;
 
@@ -390,24 +411,44 @@ pub trait ListingTableConnector: DataConnector {
 
         let ctx: SessionContext = Self::get_session_context();
 
-        // Get the last modified object for the provided ObjectStore to infer the schema.
-        // Report an error if no files matching required extension are found.
-        let last_modified_or_added = get_last_modified(
-            format!("{self}"),
-            dataset,
-            extension,
-            table_path.clone(),
-            &ctx,
-            &object_store,
-        )
-        .await?;
+        let schema_infer_url = if let Some(url) = dataset.params.get("schema_source_path") {
+            let url = self.get_object_store_url(dataset, Some(url))?;
+            let schema_infer_url = ListingTableUrl::parse(url).boxed().context(
+                crate::dataconnector::UnableToGetSchemaInternalSnafu {
+                    dataconnector: format!("{self}"),
+                    connector_component: ConnectorComponent::from(dataset),
+                },
+            )?;
+            verify_schema_source_path(
+                format!("{self}"),
+                dataset,
+                extension,
+                schema_infer_url.clone(),
+                &ctx,
+                &object_store,
+            )
+            .await?;
+            schema_infer_url
+        } else {
+            // Get the last modified object for the provided ObjectStore to infer the schema.
+            // Report an error if no files matching required extension are found.
+            let last_modified_or_added = get_last_modified(
+                format!("{self}"),
+                dataset,
+                extension,
+                table_path.clone(),
+                &ctx,
+                &object_store,
+            )
+            .await?;
 
-        let schema_infer_url = to_listing_table_url(
-            url,
-            &last_modified_or_added.location,
-            dataset,
-            &format!("{self}"),
-        )?;
+            to_listing_table_url(
+                url,
+                &last_modified_or_added.location,
+                dataset,
+                &format!("{self}"),
+            )?
+        };
 
         tracing::debug!(
             "Dataset '{}' schema will be resolved based on {schema_infer_url}",
@@ -498,7 +539,7 @@ impl<T: ListingTableConnector + Display> DataConnector for T {
         &self,
         dataset: &Dataset,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
-        let url = self.get_object_store_url(dataset)?;
+        let url = self.get_object_store_url(dataset, None)?;
 
         let (file_format_opt, extension) = self.get_file_format_and_extension(dataset)?;
         match file_format_opt {
@@ -656,6 +697,65 @@ async fn get_last_modified(
     }
 }
 
+async fn verify_schema_source_path(
+    dataconnector: String,
+    dataset: &Dataset,
+    extension: &str,
+    schema_source_path: ListingTableUrl,
+    ctx: &SessionContext,
+    object_store: &Arc<dyn ObjectStore>,
+) -> DataConnectorResult<()> {
+    tracing::debug!(
+        "Verifying dataset {table_name} schema source path is valid: {schema_source_path}",
+        table_name = dataset.name
+    );
+
+    let state = ctx.state();
+    let mut file_stream = schema_source_path
+        .list_all_files(&state, object_store, "")
+        .await
+        .map_err(|err| DataConnectorError::UnableToConnectInternal {
+            dataconnector: dataconnector.clone(),
+            connector_component: ConnectorComponent::from(dataset),
+            source: err.into(),
+        })?;
+
+    let mut scanned_files = 0;
+
+    while let Some(file) =
+        file_stream
+            .try_next()
+            .await
+            .map_err(|err| DataConnectorError::UnableToConnectInternal {
+                dataconnector: dataconnector.clone(),
+                connector_component: ConnectorComponent::from(dataset),
+                source: err.into(),
+            })?
+    {
+        if let Some(ext) = file.location.extension() {
+            if format!(".{ext}") == extension {
+                return Ok(());
+            }
+        };
+
+        scanned_files += 1;
+        if scanned_files > SCHEMA_SOURCE_PATH_FILE_SCAN_LIMIT {
+            // We've reached the limit of files to scan, but have not found any with the expected extension.
+            // We do warning, not an error, as the dataset might have a large number of files.
+            tracing::warn!(
+                "Failed to find any files matching the extension '{extension}' at the specified path `{schema_source_path}` after scanning {SCHEMA_SOURCE_PATH_FILE_SCAN_LIMIT} files.\nEnsure the `schema_source_path` is correct."
+            );
+            return Ok(());
+        };
+    }
+
+    Err(DataConnectorError::InvalidConfigurationNoSource {
+        dataconnector: dataconnector.clone(),
+        connector_component: ConnectorComponent::from(dataset),
+        message: format!("Failed to find any files matching the extension '{extension}' at the specified path `{schema_source_path}`.\nVerify that `schema_source_path` is correct and try again."),
+        })
+}
+
 fn to_listing_table_url(
     original_url: &Url,
     path: &Path,
@@ -736,7 +836,11 @@ mod tests {
             &self.params
         }
 
-        fn get_object_store_url(&self, dataset: &Dataset) -> DataConnectorResult<Url> {
+        fn get_object_store_url(
+            &self,
+            dataset: &Dataset,
+            _url: Option<&str>,
+        ) -> DataConnectorResult<Url> {
             Url::parse("test")
                 .boxed()
                 .context(crate::dataconnector::InvalidConfigurationSnafu {

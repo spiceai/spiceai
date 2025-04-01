@@ -121,6 +121,7 @@ ssh2 = { workspace = true, optional = true }
 strsim = { version = "0.11.1", optional = true }
 suppaftp = { workspace = true, optional = true }
 telemetry = { path = "../telemetry" }
+tera = { version = "1.17" }
 tiberius = { workspace = true, optional = true }
 tokio.workspace = true
 tokio-rusqlite = { workspace = true, optional = true }

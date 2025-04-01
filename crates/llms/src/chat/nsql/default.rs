@@ -19,7 +19,7 @@ use async_openai::{
     },
 };
 
-use super::{create_prompt, SqlGeneration};
+use super::{create_prompt, QueryGenerationContext, SqlGeneration};
 
 pub struct DefaultSqlGeneration;
 
@@ -28,8 +28,9 @@ impl SqlGeneration for DefaultSqlGeneration {
         &self,
         model_id: &str,
         query: &str,
+        context: &QueryGenerationContext,
     ) -> Result<CreateChatCompletionRequest, OpenAIError> {
-        let prompt = create_prompt(query);
+        let prompt = create_prompt(query, context);
 
         CreateChatCompletionRequestArgs::default()
             .model(model_id)

@@ -197,6 +197,7 @@ pub enum QueryOverrides {
     Snowflake,
     IcebergSF1,
     SpicecloudCatalog,
+    Spicecloud,
 }
 
 impl QueryOverrides {
@@ -253,6 +254,15 @@ macro_rules! remove_tpch_query {
                 .collect()
         }
     };
+
+    ( $queries:expr, $( $i:ident ),* ) => {
+        {
+            let query_names: Vec<&str> = vec![ $( concat!("tpch_", stringify!($i)), )* ];
+            $queries.into_iter()
+                .filter(|(name, _)| !query_names.contains(name))
+                .collect()
+        }
+    };
 }
 
 #[allow(clippy::too_many_lines)]
@@ -275,6 +285,7 @@ pub fn get_tpch_test_queries(
             2, // Analysis error: [UNSUPPORTED_SUBQUERY_EXPRESSION_CATEGORY.UNSUPPORTED_CORRELATED_SCALAR_SUBQUERY] Unsupported subquery expression: Correlated scalar subqueries can only be used in filters, aggregations, projections, and UPDATE/MERGE/DELETE commands
             17 // Analysis error: [UNSUPPORTED_SUBQUERY_EXPRESSION_CATEGORY.UNSUPPORTED_CORRELATED_SCALAR_SUBQUERY] Unsupported subquery expression: Correlated scalar subqueries can only be used in filters, aggregations, projections, and UPDATE/MERGE/DELETE commands
         ),
+        Some(QueryOverrides::MySQL) => remove_tpch_query!(queries, simple_q7),
         Some(QueryOverrides::Snowflake) => generate_tpch_queries_override!(
             "snowflake",
             q1,
@@ -457,6 +468,17 @@ pub fn get_tpcds_test_queries(
             );
             add_tpcds_query_overrides!(queries, "postgres", 36, 70, 86)
         }
+        Some(QueryOverrides::Spicecloud) => remove_tpcds_query!(
+            queries, 8,  // https://github.com/spiceai/spiceai/issues/4668
+            38, // https://github.com/spiceai/spiceai/issues/4667
+            87  // https://github.com/spiceai/spiceai/issues/4667
+        ),
+        Some(QueryOverrides::SQLite) => remove_tpcds_query!(
+            queries, 17, 29, 35, 74, // SQLite does not support `stddev`
+            5, 14, 18, 22, 27, 36, 67, 70, 77, 80,
+            86, // SQLite does not support `ROLLUP` and `GROUPING`
+            8, 14, 38, 87 // EXCEPT and INTERSECT aren't supported
+        ),
         Some(_) | None => queries,
     }
 }

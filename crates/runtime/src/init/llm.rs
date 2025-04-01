@@ -29,7 +29,7 @@ impl Runtime {
         &self,
         m: SpicepodModel,
         params: HashMap<String, SecretString>,
-    ) -> Result<Box<dyn Chat>> {
+    ) -> Result<Arc<dyn Chat>> {
         let l = try_to_chat_model(&m, &params, Arc::new(self.clone()))
             .await
             .boxed()

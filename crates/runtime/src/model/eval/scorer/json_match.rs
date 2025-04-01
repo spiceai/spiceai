@@ -54,7 +54,7 @@ impl Scorer for JsonMatch {
         _input: &DatasetInput,
         actual: &DatasetOutput,
         ideal: &DatasetOutput,
-    ) -> f32 {
+    ) -> super::Result<f32> {
         // Extract JSON string from outputs
         let actual_str: Vec<_> = match actual {
             DatasetOutput::AssistantResponse(a) => vec![a.clone()],
@@ -73,7 +73,7 @@ impl Scorer for JsonMatch {
         };
 
         if ideal_strs.len() != actual_str.len() {
-            return 0.0;
+            return Ok(0.0);
         };
 
         let is_match = actual_str.iter().zip(ideal_strs).all(|(a, i)| {
@@ -88,11 +88,8 @@ impl Scorer for JsonMatch {
             Self::normalize_numbers(actual_json) == Self::normalize_numbers(ideal_json)
         });
 
-        if is_match {
-            1.0
-        } else {
-            0.0
-        }
+        let score = if is_match { 1.0 } else { 0.0 };
+        Ok(score)
     }
 
     fn metrics(&self, scores: &[f32]) -> Vec<(String, f32)> {
@@ -118,7 +115,7 @@ mod tests {
                     let score = $score;
                     let actual_output = DatasetOutput::AssistantResponse(actual);
                     let ideal_output = DatasetOutput::AssistantResponse(ideal);
-                    let actual_score = JsonMatch{}.score(&DatasetInput::UserInput(String::new()), &actual_output, &ideal_output).await;
+                    let actual_score = JsonMatch{}.score(&DatasetInput::UserInput(String::new()), &actual_output, &ideal_output).await.expect("JsonMatch's score returned an error");
                     assert!((score-actual_score).abs() < f32::EPSILON);
                 }
             }

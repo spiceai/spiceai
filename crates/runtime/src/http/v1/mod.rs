@@ -140,26 +140,34 @@ fn dataset_status(df: &DataFusion, ds: &Dataset) -> ComponentStatus {
 
 // Runs query and converts query results to HTTP response (as JSON).
 pub async fn sql_to_http_response(df: Arc<DataFusion>, sql: &str, format: ArrowFormat) -> Response {
-    let query = QueryBuilder::new(sql, Arc::clone(&df)).build();
-
-    let (data, results_cache_status) = match query.run().await {
-        Ok(query_result) => match query_result.data.try_collect::<Vec<RecordBatch>>().await {
-            Ok(batches) => (batches, query_result.results_cache_status),
-            Err(e) => {
-                tracing::debug!("Error executing query: {e}");
-                return (
-                    StatusCode::BAD_REQUEST,
-                    format!("Error processing batch: {e}"),
-                )
-                    .into_response();
-            }
-        },
+    let (data, results_cache_status) = match run_sql(df, sql).await {
+        Ok((data, results_cache_status)) => (data, results_cache_status),
         Err(e) => {
             tracing::debug!("Error executing query: {e}");
             return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
         }
     };
+    to_http_response(data, results_cache_status, format).await
+}
 
+// Runs query and returns the results as a vector of `RecordBatch`.
+pub async fn run_sql(
+    df: Arc<DataFusion>,
+    sql: &str,
+) -> Result<(Vec<RecordBatch>, QueryResultsCacheStatus), Box<dyn std::error::Error + Send + Sync>> {
+    let query_res = QueryBuilder::new(sql, df).build().run().await?;
+    Ok((
+        query_res.data.try_collect::<Vec<RecordBatch>>().await?,
+        query_res.results_cache_status,
+    ))
+}
+
+// Converts query result to HTTP response (as JSON).
+pub async fn to_http_response(
+    data: Vec<RecordBatch>,
+    cache_status: QueryResultsCacheStatus,
+    format: ArrowFormat,
+) -> Response {
     let res = match format {
         ArrowFormat::Json => arrow_to_json(&data),
         ArrowFormat::Csv => arrow_to_csv(&data),
@@ -175,7 +183,7 @@ pub async fn sql_to_http_response(df: Arc<DataFusion>, sql: &str, format: ArrowF
 
     let mut headers = HeaderMap::new();
 
-    attach_cache_headers(&mut headers, results_cache_status);
+    attach_cache_headers(&mut headers, cache_status);
 
     (StatusCode::OK, headers, body).into_response()
 }

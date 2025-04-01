@@ -53,6 +53,7 @@ Indexes are not required for test coverage, but can be introduced if required fo
 - [ ] A test script exists that can load TPC-H SF10 and TPC-H SF100 data into this accelerator in all [Access Modes](../definitions.md).
 - [ ] The accelerator can load TPC-H SF10 in all [Access Modes](../definitions.md), and can run all queries with no [Major Bugs](../definitions.md).
 - [ ] The accelerator can load TPC-H SF100 in either [file or database mode](../definitions.md), and can run all queries with no [Major Bugs](../definitions.md).
+- [ ] The TPC-H end-to-end test is added to the scheduled benchmarks by creating a [`testoperator dispatch`](https://github.com/spiceai/spiceai/tree/trunk/tools/testoperator/dispatch) configuration file for the accelerator.
 
 #### TPC-DS
 
@@ -61,6 +62,7 @@ Indexes are not required for test coverage, but can be introduced if required fo
 - [ ] A test script exists that can load TPC-DS SF10 and TPC-DS SF100 data into this accelerator in all [Access Modes](../definitions.md).
 - [ ] The accelerator can load TPC-DS SF10 in all [Access Modes](../definitions.md), and can run all queries with no [Major Bugs](../definitions.md).
 - [ ] The accelerator can load TPC-DS SF100 in either [file or database mode](../definitions.md), and can run all queries with no [Major Bugs](../definitions.md).
+- [ ] The TPC-DS end-to-end test is added to the scheduled benchmarks by creating a [`testoperator dispatch`](https://github.com/spiceai/spiceai/tree/trunk/tools/testoperator/dispatch) configuration file for the accelerator.
 
 #### ClickBench
 

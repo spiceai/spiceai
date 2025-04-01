@@ -2,13 +2,16 @@ tests:
   bench:
     spicepod_path: ./test/spicepods/tpch/mysql.yaml
     query_set: tpch
+    query_overrides: mysql
     runner_type: spiceai-runners
   throughput:
     spicepod_path: ./test/spicepods/tpch/mysql.yaml
     query_set: tpch
+    query_overrides: mysql
     runner_type: spiceai-runners
   load:
     spicepod_path: ./test/spicepods/tpch/mysql.yaml
     query_set: tpch
+    query_overrides: mysql
     runner_type: spiceai-runners
     duration: 28800

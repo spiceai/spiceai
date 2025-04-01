@@ -113,6 +113,11 @@ where
     }
 }
 
+pub(crate) enum NextRefresh {
+    WaitFor(Duration),
+    Disabled,
+}
+
 impl Refresh {
     #[allow(clippy::needless_pass_by_value)]
     #[must_use]
@@ -240,31 +245,59 @@ impl Refresh {
         Ok(())
     }
 
-    pub(crate) async fn should_refresh(
+    /// Determine the next refresh when Spice starts based on the refresh mode and the last checkpoint.
+    pub(crate) async fn startup_next_refresh(
         &self,
+        refresh_on_startup: RefreshOnStartup,
         last_checkpoint: Option<Arc<dyn DatasetCheckpointer>>,
-    ) -> bool {
-        // If there is no checkpoint, we need to start a refresh.
-        let Some(last_checkpoint) = last_checkpoint else {
-            return true;
-        };
-
-        let has_previous_checkpoint = match self.mode {
-            RefreshMode::Full => last_checkpoint.exists().await,
+    ) -> NextRefresh {
+        let previous_checkpoint = match self.mode {
+            RefreshMode::Full => {
+                // If there is no checkpoint, we need to start a refresh.
+                let Some(last_checkpoint) = last_checkpoint else {
+                    return NextRefresh::WaitFor(Duration::ZERO);
+                };
+                last_checkpoint.last_checkpoint_time().await.ok().flatten()
+            }
             // Append and Changes modes are always refreshed since they stream changes from the source table.
-            RefreshMode::Append | RefreshMode::Changes => return true,
-            RefreshMode::Disabled => return false,
+            RefreshMode::Append | RefreshMode::Changes => {
+                return NextRefresh::WaitFor(Duration::ZERO)
+            }
+            RefreshMode::Disabled => return NextRefresh::Disabled,
         };
 
         // If there is no previous checkpoint, we need to start a refresh.
-        if !has_previous_checkpoint {
-            return true;
-        }
+        let Some(prev_checkpoint_time) = previous_checkpoint else {
+            return NextRefresh::WaitFor(Duration::ZERO);
+        };
 
-        // Current behavior is temporary - we simply refresh if an interval is set.
-        // Future implementation should compare the elapsed time since last checkpoint against the refresh interval
-        // to determine if a refresh is needed.
-        self.check_interval.is_some()
+        // If the refresh interval is set, we need to start a refresh if the elapsed time since the last checkpoint is greater than the refresh interval.
+        // Otherwise, we don't need to start a refresh.
+        if let Some(check_interval) = self.check_interval {
+            let elapsed_time_since_checkpoint = SystemTime::now()
+                .duration_since(prev_checkpoint_time)
+                .unwrap_or(Duration::ZERO);
+            if elapsed_time_since_checkpoint > check_interval {
+                // The elapsed time since the last checkpoint is greater than the refresh interval, so we need to refresh now.
+                NextRefresh::WaitFor(Duration::ZERO)
+            } else {
+                match refresh_on_startup {
+                    // The elapsed time since the last checkpoint is less than the refresh interval, so we need to wait for the refresh interval to pass.
+                    RefreshOnStartup::Auto => {
+                        NextRefresh::WaitFor(check_interval - elapsed_time_since_checkpoint)
+                    }
+                    // The refresh mode is `Always`, so we need to refresh now.
+                    RefreshOnStartup::Always => NextRefresh::WaitFor(Duration::ZERO),
+                }
+            }
+        } else {
+            match refresh_on_startup {
+                // We have a previous checkpoint, but no refresh interval, so we don't need to refresh.
+                RefreshOnStartup::Auto => NextRefresh::Disabled,
+                // We have a previous checkpoint, but the refresh mode is `Always`, so we need to refresh now.
+                RefreshOnStartup::Always => NextRefresh::WaitFor(Duration::ZERO),
+            }
+        }
     }
 }
 
@@ -476,22 +509,35 @@ impl Refresher {
         acceleration_refresh_mode: AccelerationRefreshMode,
         ready_sender: oneshot::Sender<()>,
     ) -> Option<tokio::task::JoinHandle<()>> {
+        let dataset_name = self.dataset_name.clone();
         let time_column = self.refresh.read().await.time_column.clone();
-        {
+        let initial_refresh_delay = {
             let refresh = self.refresh.read().await;
 
             // If the table already has an existing acceleration and the refresh options wouldn't start a new refresh,
             // we can exit early.
-            if self.refresh_on_startup == RefreshOnStartup::Auto
-                && !refresh.should_refresh(self.checkpointer.clone()).await
+            match refresh
+                .startup_next_refresh(self.refresh_on_startup, self.checkpointer.clone())
+                .await
             {
-                tracing::debug!(
-                    "Skipped refresh for {}: existing acceleration is available",
-                    self.dataset_name
-                );
-                return None;
+                NextRefresh::Disabled => {
+                    tracing::debug!(
+                        "Skipped refresh for {}: existing acceleration is available",
+                        self.dataset_name
+                    );
+                    return None;
+                }
+                NextRefresh::WaitFor(duration) => {
+                    if !duration.is_zero() {
+                        tracing::info!(
+                            "{dataset_name}: Waiting {}s until next refresh",
+                            duration.as_secs()
+                        );
+                    }
+                    duration
+                }
             }
-        }
+        };
 
         let mut on_start_refresh_external = match (acceleration_refresh_mode, time_column) {
             (AccelerationRefreshMode::Disabled, _) => return None,
@@ -518,7 +564,6 @@ impl Refresher {
         self.refresh_task_runner = Some(refresh_task_runner);
 
         let mut ready_sender = Some(ready_sender);
-        let dataset_name = self.dataset_name.clone();
         let refresh = Arc::clone(&self.refresh);
 
         let cache_provider = self.cache_provider.clone();
@@ -542,9 +587,8 @@ impl Refresher {
         //   2. The periodic refresh happening less than `refresh_check_interval` after a manual
         //        refresh (the sleep future is reset when a manual refresh completes).
         Some(tokio::spawn(async move {
-            // first refresh is on start, thus duration is 0
             let mut next_scheduled_refresh_timer = Some(sleep(Self::compute_delay(
-                Duration::from_secs(0),
+                initial_refresh_delay,
                 max_jitter,
             )));
 
@@ -757,9 +801,51 @@ mod tests {
     use prometheus::proto::MetricType;
     use tokio::{sync::mpsc, time::timeout};
 
+    use crate::dataaccelerator::spice_sys::{dataset_checkpoint::DatasetCheckpointer, Result};
     use crate::status;
+    use arrow::datatypes::SchemaRef;
+    use async_trait::async_trait;
 
     use super::*;
+
+    // Mock implementation of DatasetCheckpointer trait
+    struct MockCheckpointer {
+        exists_value: bool,
+        last_checkpoint_time: Option<SystemTime>,
+    }
+
+    impl MockCheckpointer {
+        fn new_arc(
+            exists_value: bool,
+            last_checkpoint_time: Option<SystemTime>,
+        ) -> Arc<dyn DatasetCheckpointer> {
+            Arc::new(Self {
+                exists_value,
+                last_checkpoint_time,
+            })
+        }
+    }
+
+    #[async_trait]
+    impl DatasetCheckpointer for MockCheckpointer {
+        async fn exists(&self) -> bool {
+            self.exists_value
+        }
+
+        async fn checkpoint(&self, _schema: &SchemaRef) -> Result<()> {
+            // Not needed for this test
+            Ok(())
+        }
+
+        async fn get_schema(&self) -> Result<Option<SchemaRef>> {
+            // Not needed for this test
+            Ok(None)
+        }
+
+        async fn last_checkpoint_time(&self) -> Result<Option<SystemTime>> {
+            Ok(self.last_checkpoint_time)
+        }
+    }
 
     async fn setup_and_test(
         status: Arc<status::RuntimeStatus>,
@@ -1720,76 +1806,247 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_should_refresh() {
-        use crate::dataaccelerator::spice_sys::{dataset_checkpoint::DatasetCheckpointer, Result};
-        use arrow::datatypes::SchemaRef;
-        use async_trait::async_trait;
-
-        // Mock implementation of DatasetCheckpointer trait
-        struct MockCheckpointer {
-            exists_value: bool,
+    #[allow(clippy::too_many_lines)]
+    async fn test_startup_next_refresh() {
+        struct TestCase {
+            description: &'static str,
+            refresh_mode: RefreshMode,
+            refresh_on_startup: RefreshOnStartup,
+            checkpoint: Option<Arc<dyn DatasetCheckpointer>>,
+            check_interval: Option<Duration>,
+            assert_fn: Box<dyn Fn(NextRefresh) -> bool>,
         }
 
-        impl MockCheckpointer {
-            fn new_arc(exists_value: bool) -> Arc<dyn DatasetCheckpointer> {
-                Arc::new(Self { exists_value })
+        let now = SystemTime::now();
+        let checkpoint = MockCheckpointer::new_arc(true, Some(now));
+        let non_existing_checkpoint = MockCheckpointer::new_arc(false, None);
+
+        let test_cases = vec![
+            TestCase {
+                description: "No checkpoint, Full mode should refresh immediately",
+                refresh_mode: RefreshMode::Full,
+                refresh_on_startup: RefreshOnStartup::Auto,
+                checkpoint: None,
+                check_interval: None,
+                assert_fn: Box::new(|result| {
+                    matches!(result, NextRefresh::WaitFor(duration) if duration.is_zero())
+                }),
+            },
+            TestCase {
+                description: "No checkpoint, Append mode should refresh immediately",
+                refresh_mode: RefreshMode::Append,
+                refresh_on_startup: RefreshOnStartup::Auto,
+                checkpoint: None,
+                check_interval: None,
+                assert_fn: Box::new(|result| {
+                    matches!(result, NextRefresh::WaitFor(duration) if duration.is_zero())
+                }),
+            },
+            TestCase {
+                description: "No checkpoint, Changes mode should refresh immediately",
+                refresh_mode: RefreshMode::Changes,
+                refresh_on_startup: RefreshOnStartup::Auto,
+                checkpoint: None,
+                check_interval: None,
+                assert_fn: Box::new(|result| {
+                    matches!(result, NextRefresh::WaitFor(duration) if duration.is_zero())
+                }),
+            },
+            TestCase {
+                description: "No checkpoint, Disabled mode should be disabled",
+                refresh_mode: RefreshMode::Disabled,
+                refresh_on_startup: RefreshOnStartup::Auto,
+                checkpoint: None,
+                check_interval: None,
+                assert_fn: Box::new(|result| matches!(result, NextRefresh::Disabled)),
+            },
+            TestCase {
+                description: "Checkpoint exists, Append mode should refresh immediately",
+                refresh_mode: RefreshMode::Append,
+                refresh_on_startup: RefreshOnStartup::Auto,
+                checkpoint: Some(Arc::clone(&checkpoint)),
+                check_interval: None,
+                assert_fn: Box::new(|result| {
+                    matches!(result, NextRefresh::WaitFor(duration) if duration.is_zero())
+                }),
+            },
+            TestCase {
+                description: "Checkpoint exists, Changes mode should refresh immediately",
+                refresh_mode: RefreshMode::Changes,
+                refresh_on_startup: RefreshOnStartup::Auto,
+                checkpoint: Some(Arc::clone(&checkpoint)),
+                check_interval: None,
+                assert_fn: Box::new(|result| {
+                    matches!(result, NextRefresh::WaitFor(duration) if duration.is_zero())
+                }),
+            },
+            TestCase {
+                description: "Checkpoint exists, Disabled mode should be disabled",
+                refresh_mode: RefreshMode::Disabled,
+                refresh_on_startup: RefreshOnStartup::Auto,
+                checkpoint: Some(Arc::clone(&checkpoint)),
+                check_interval: None,
+                assert_fn: Box::new(|result| matches!(result, NextRefresh::Disabled)),
+            },
+            TestCase {
+                description: "Checkpoint exists, Full mode with no check interval should be disabled",
+                refresh_mode: RefreshMode::Full,
+                refresh_on_startup: RefreshOnStartup::Auto,
+                checkpoint: Some(Arc::clone(&checkpoint)),
+                check_interval: None,
+                assert_fn: Box::new(|result| matches!(result, NextRefresh::Disabled)),
+            },
+            TestCase {
+                description: "Checkpoint exists, Full mode with check interval should wait appropriate time",
+                refresh_mode: RefreshMode::Full,
+                refresh_on_startup: RefreshOnStartup::Auto,
+                checkpoint: Some(Arc::clone(&checkpoint)),
+                check_interval: Some(Duration::from_secs(60)),
+                assert_fn: Box::new(|result| {
+                    if let NextRefresh::WaitFor(duration) = result {
+                        duration <= Duration::from_secs(60) && duration > Duration::ZERO
+                    } else {
+                        false
+                    }
+                }),
+            },
+            TestCase {
+                description: "Non-existent checkpoint, Full mode should refresh immediately",
+                refresh_mode: RefreshMode::Full,
+                refresh_on_startup: RefreshOnStartup::Auto,
+                checkpoint: Some(non_existing_checkpoint),
+                check_interval: None,
+                assert_fn: Box::new(|result| {
+                    matches!(result, NextRefresh::WaitFor(duration) if duration.is_zero())
+                }),
+            },
+            TestCase {
+                description: "Checkpoint exists, Full mode with RefreshOnStartup::Always should refresh immediately",
+                refresh_mode: RefreshMode::Full,
+                refresh_on_startup: RefreshOnStartup::Always,
+                checkpoint: Some(Arc::clone(&checkpoint)),
+                check_interval: None,
+                assert_fn: Box::new(|result| {
+                    matches!(result, NextRefresh::WaitFor(duration) if duration.is_zero())
+                }),
+            },
+            TestCase {
+                description: "No checkpoint, Full mode with RefreshOnStartup::Always should refresh immediately",
+                refresh_mode: RefreshMode::Full,
+                refresh_on_startup: RefreshOnStartup::Always,
+                checkpoint: None,
+                check_interval: None,
+                assert_fn: Box::new(|result| {
+                    matches!(result, NextRefresh::WaitFor(duration) if duration.is_zero())
+                }),
+            },
+            TestCase {
+                description: "Checkpoint exists, Full mode with check interval and RefreshOnStartup::Always should refresh immediately",
+                refresh_mode: RefreshMode::Full,
+                refresh_on_startup: RefreshOnStartup::Always,
+                checkpoint: Some(checkpoint),
+                check_interval: Some(Duration::from_secs(60)),
+                assert_fn: Box::new(|result| {
+                    matches!(result, NextRefresh::WaitFor(duration) if duration.is_zero())
+                }),
+            },
+        ];
+
+        for case in test_cases {
+            let mut refresh = Refresh::new(case.refresh_mode);
+            if let Some(check_interval) = case.check_interval {
+                refresh = refresh.check_interval(check_interval);
             }
+
+            let result = refresh
+                .startup_next_refresh(case.refresh_on_startup, case.checkpoint)
+                .await;
+
+            assert!(
+                (case.assert_fn)(result),
+                "Test case failed: {}",
+                case.description
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn test_startup_next_refresh_wait_time() {
+        struct TestCase {
+            description: &'static str,
+            last_checkpoint_time: SystemTime,
+            check_interval: Duration,
+            expected_wait_time: Duration,
         }
 
-        #[async_trait]
-        impl DatasetCheckpointer for MockCheckpointer {
-            async fn exists(&self) -> bool {
-                self.exists_value
-            }
+        let now = SystemTime::now();
+        let test_cases = vec![
+            TestCase {
+                description: "Checkpoint just happened, should wait full interval",
+                last_checkpoint_time: now,
+                check_interval: Duration::from_secs(60),
+                expected_wait_time: Duration::from_secs(60),
+            },
+            TestCase {
+                description: "Checkpoint happened 30 seconds ago, should wait 30 seconds",
+                last_checkpoint_time: now - Duration::from_secs(30),
+                check_interval: Duration::from_secs(60),
+                expected_wait_time: Duration::from_secs(30),
+            },
+            TestCase {
+                description: "Checkpoint happened 45 seconds ago, should wait 15 seconds",
+                last_checkpoint_time: now - Duration::from_secs(45),
+                check_interval: Duration::from_secs(60),
+                expected_wait_time: Duration::from_secs(15),
+            },
+            TestCase {
+                description: "Checkpoint happened 59 seconds ago, should wait 1 second",
+                last_checkpoint_time: now - Duration::from_secs(59),
+                check_interval: Duration::from_secs(60),
+                expected_wait_time: Duration::from_secs(1),
+            },
+            TestCase {
+                description:
+                    "Checkpoint happened more than interval ago, should refresh immediately",
+                last_checkpoint_time: now - Duration::from_secs(61),
+                check_interval: Duration::from_secs(60),
+                expected_wait_time: Duration::ZERO,
+            },
+        ];
 
-            async fn checkpoint(&self, _schema: &SchemaRef) -> Result<()> {
-                // Not needed for this test
-                Ok(())
-            }
+        for case in test_cases {
+            let checkpoint = MockCheckpointer::new_arc(true, Some(case.last_checkpoint_time));
+            let refresh = Refresh::new(RefreshMode::Full).check_interval(case.check_interval);
 
-            async fn get_schema(&self) -> Result<Option<SchemaRef>> {
-                // Not needed for this test
-                Ok(None)
+            let result = refresh
+                .startup_next_refresh(RefreshOnStartup::Auto, Some(Arc::clone(&checkpoint)))
+                .await;
+
+            match result {
+                NextRefresh::WaitFor(duration) => {
+                    // Allow for a small margin of error due to test execution time
+                    let margin = Duration::from_millis(100);
+                    let min_expected = case.expected_wait_time.saturating_sub(margin);
+                    let max_expected = case.expected_wait_time + margin;
+                    assert!(
+                        duration >= min_expected && duration <= max_expected,
+                        "Test case failed: {}. Expected wait time between {:?} and {:?}, got {:?}",
+                        case.description,
+                        min_expected,
+                        max_expected,
+                        duration
+                    );
+                }
+                NextRefresh::Disabled => {
+                    assert!(
+                        case.expected_wait_time.is_zero(),
+                        "Test case failed: {}. Expected wait time of {:?}, got Disabled",
+                        case.description,
+                        case.expected_wait_time
+                    );
+                }
             }
         }
-
-        // Test case 1: No checkpoint, should refresh regardless of mode
-        let refresh = Refresh::new(RefreshMode::Full);
-        assert!(refresh.should_refresh(None).await);
-
-        let refresh = Refresh::new(RefreshMode::Append);
-        assert!(refresh.should_refresh(None).await);
-
-        let refresh = Refresh::new(RefreshMode::Changes);
-        assert!(refresh.should_refresh(None).await);
-
-        let refresh = Refresh::new(RefreshMode::Disabled);
-        assert!(refresh.should_refresh(None).await);
-
-        // Test case 2: Checkpoint exists, but mode is Append or Changes - should always refresh
-        let checkpoint = MockCheckpointer::new_arc(true);
-
-        let refresh = Refresh::new(RefreshMode::Append);
-        assert!(refresh.should_refresh(Some(Arc::clone(&checkpoint))).await);
-
-        let refresh = Refresh::new(RefreshMode::Changes);
-        assert!(refresh.should_refresh(Some(Arc::clone(&checkpoint))).await);
-
-        // Test case 3: Checkpoint exists, mode is Disabled - should never refresh
-        let refresh = Refresh::new(RefreshMode::Disabled);
-        assert!(!refresh.should_refresh(Some(Arc::clone(&checkpoint))).await);
-
-        // Test case 4: Checkpoint exists, mode is Full, previous checkpoint exists
-        let refresh = Refresh::new(RefreshMode::Full);
-        assert!(!refresh.should_refresh(Some(Arc::clone(&checkpoint))).await);
-
-        // Test case 5: Checkpoint exists, mode is Full, previous checkpoint exists, check_interval is set
-        let refresh = Refresh::new(RefreshMode::Full).check_interval(Duration::from_secs(60));
-        assert!(refresh.should_refresh(Some(checkpoint)).await);
-
-        // Test case 6: Checkpoint exists, mode is Full, previous checkpoint doesn't exist
-        let non_existing_checkpoint = MockCheckpointer::new_arc(false);
-        let refresh = Refresh::new(RefreshMode::Full);
-        assert!(refresh.should_refresh(Some(non_existing_checkpoint)).await);
     }
 }

@@ -618,16 +618,11 @@ impl Runtime {
             }
         });
 
-        let models = tokio::spawn({
+        let models_and_evals = tokio::spawn({
             let self_clone = self.clone();
             async move {
                 self_clone.load_models().await;
-            }
-        });
 
-        let evals = tokio::spawn({
-            let self_clone = self.clone();
-            async move {
                 let app_lock = self_clone.app.read().await;
 
                 if !cfg!(feature = "models")
@@ -656,12 +651,29 @@ impl Runtime {
             results_cache,
             datasets,
             catalogs,
-            models,
-            evals
+            models_and_evals
         );
 
         if let Err(err) = load_result {
             tracing::error!("Could not start the Spice runtime: {err}");
+        } else {
+            // Create a background task to report once all components are marked as `Ready`
+            let status = self.status();
+            tokio::spawn({
+                async move {
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+                        if status.is_shutdown() {
+                            break;
+                        }
+                        if status.is_ready() {
+                            tracing::info!("All components are loaded. Spice runtime is ready!");
+                            break;
+                        }
+                    }
+                }
+            });
         }
     }
 
