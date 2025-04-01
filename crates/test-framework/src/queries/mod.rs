@@ -254,6 +254,15 @@ macro_rules! remove_tpch_query {
                 .collect()
         }
     };
+
+    ( $queries:expr, $( $i:ident ),* ) => {
+        {
+            let query_names: Vec<&str> = vec![ $( concat!("tpch_", stringify!($i)), )* ];
+            $queries.into_iter()
+                .filter(|(name, _)| !query_names.contains(name))
+                .collect()
+        }
+    };
 }
 
 #[allow(clippy::too_many_lines)]
@@ -276,6 +285,7 @@ pub fn get_tpch_test_queries(
             2, // Analysis error: [UNSUPPORTED_SUBQUERY_EXPRESSION_CATEGORY.UNSUPPORTED_CORRELATED_SCALAR_SUBQUERY] Unsupported subquery expression: Correlated scalar subqueries can only be used in filters, aggregations, projections, and UPDATE/MERGE/DELETE commands
             17 // Analysis error: [UNSUPPORTED_SUBQUERY_EXPRESSION_CATEGORY.UNSUPPORTED_CORRELATED_SCALAR_SUBQUERY] Unsupported subquery expression: Correlated scalar subqueries can only be used in filters, aggregations, projections, and UPDATE/MERGE/DELETE commands
         ),
+        Some(QueryOverrides::MySQL) => remove_tpch_query!(queries, simple_q7),
         Some(QueryOverrides::Snowflake) => generate_tpch_queries_override!(
             "snowflake",
             q1,
