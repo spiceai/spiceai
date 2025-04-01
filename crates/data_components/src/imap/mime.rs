@@ -100,7 +100,6 @@ impl TryFrom<&Message<'_>> for AttachmentRecords {
 
         for attachment in message.attachments() {
             //extract filename
-            //let filename = attachment.attachment_name().map(|attachment_name| attachment_name.to_string());
             let filename = attachment.attachment_name().map(ToString::to_string);
 
             //extract mime type
