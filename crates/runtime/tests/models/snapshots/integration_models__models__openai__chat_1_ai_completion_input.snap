@@ -5,6 +5,10 @@ expression: "serde_json::to_string_pretty(&task_input).expect(\"Failed to serial
 {
   "messages": [
     {
+      "content": "\n    When writing SQL queries, do not put double quotes around schema-qualified table names. For example:\n\n    Correct: SELECT * FROM schema.table\n    Correct: SELECT * FROM database.schema.table\n    Incorrect: SELECT * FROM \"schema.table\"\n    Incorrect: SELECT * FROM \"database.schema.table\"\n\n    Only use double quotes when you need to preserve case sensitivity or when identifiers contain special characters.\n\n    Prefer quoting column names. For example:\n    Correct: `SELECT COUNT(*) AS \"total_records\" FROM \"spice\".\"public\".\"taxi_trips\"`\n    Incorrect: `SELECT COUNT(*) AS total_records FROM \"spice\".\"public\".\"taxi_trips\"`\n    ",
+      "role": "system"
+    },
+    {
       "role": "assistant",
       "tool_calls": [
         {
@@ -210,6 +214,7 @@ expression: "serde_json::to_string_pretty(&task_input).expect(\"Failed to serial
               "type": "string"
             }
           },
+          "description": "A tool to retrieve the schema of one or more available SQL tables.",
           "properties": {
             "output": {
               "allOf": [
@@ -221,7 +226,7 @@ expression: "serde_json::to_string_pretty(&task_input).expect(\"Failed to serial
               "description": "If `full` return metadata and semantic details about the columns."
             },
             "tables": {
-              "description": "Which subset of tables to return results for. Default to all tables.",
+              "description": "Which tables to return the schema of.",
               "items": {
                 "type": "string"
               },
