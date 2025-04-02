@@ -67,7 +67,7 @@ async fn wait_for_checkpoints(
                     }
                     Ok(())
                 }
-                Err(e) => Err(anyhow::anyhow!("Failed to create checkpoint: {}", e)),
+                Err(e) => Err(anyhow::anyhow!("Failed to verify checkpoint: {e}")),
             }
         };
         checkpoint_futures.push(check_future);
