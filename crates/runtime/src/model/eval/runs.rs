@@ -311,15 +311,15 @@ async fn update_eval_run(
     })?;
 
     // Invalidate cache so subsequent calls to [`update_eval_run`] get the most up to date table.
-    if let Some(cache) = df.cache_provider() {
-        cache
-            .invalidate_for_table(EVAL_RUNS_TABLE_REFERENCE.clone())
-            .await
-            .boxed()
-            .context(FailedToUpdateEvalRunTableSnafu {
-                eval_run_id: id.clone(),
-            })?;
-    }
+    // if let Some(cache) = df.cache_provider() {
+    //     cache
+    //         .invalidate_for_table(EVAL_RUNS_TABLE_REFERENCE.clone())
+    //         .await
+    //         .boxed()
+    //         .context(FailedToUpdateEvalRunTableSnafu {
+    //             eval_run_id: id.clone(),
+    //         })?;
+    // }
     Ok(())
 }
 
