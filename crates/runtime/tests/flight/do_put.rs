@@ -454,11 +454,6 @@ async fn start_spice_test_app(
     })
     .await;
 
-    let channel = Channel::from_shared(format!("http://localhost:{flight_port}"))?
-        .connect()
-        .await
-        .map_err(anyhow::Error::from)?;
-
     // HTTP server readiness doesn't essentially mean the flight server is ready
     // Validate the flight server readiness by sending a handshake request
     let start_time = std::time::Instant::now();
