@@ -238,6 +238,8 @@ impl DataConnectorFactory for S3Factory {
                         tracing::info!(
                             "Using temporary credentials with session token for S3 auth."
                         );
+
+                        // Set environment variable because session token cannot be used in URL fragment
                         std::env::set_var("AWS_SESSION_TOKEN", secret.expose_secret());
                     }
                 }
@@ -305,6 +307,7 @@ impl ListingTableConnector for S3 {
                 "client_timeout",
                 "allow_http",
                 "auth",
+                // "session_token" cannot be sent via URL fragments
             ],
         )));
 
