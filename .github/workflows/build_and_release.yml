@@ -247,7 +247,7 @@ jobs:
       - name: Build spiced (odbc,models)
         if: matrix.target.target_os != 'windows' && contains(matrix.target.tags, 'odbc') && contains(matrix.target.tags, 'models')
         working-directory: bin/spiced
-        run: cargo build --release --features release,odbc --target-dir ../../target
+        run: cargo build --release --features release,odbc,models --target-dir ../../target
 
       - name: tar binary (odbc,models)
         if: matrix.target.target_os != 'windows' && contains(matrix.target.tags, 'odbc') && contains(matrix.target.tags, 'models')
@@ -365,11 +365,11 @@ jobs:
           name: spiced_models_linux_x86_64
           path: ${{ env.ARTIFACT_DIR }}
 
-      - name: download artifacts - spiced_odbc_models_models_linux_x86_64
+      - name: download artifacts - spiced_odbc_models_linux_x86_64
         continue-on-error: true
         uses: actions/download-artifact@v4
         with:
-          name: spiced_odbc_models_models_linux_x86_64
+          name: spiced_odbc_models_linux_x86_64
           path: ${{ env.ARTIFACT_DIR }}
 
       - name: Upload artifacts to Minio
@@ -388,8 +388,8 @@ jobs:
             mc cp ${{ env.ARTIFACT_DIR }}/spiced_models_linux_x86_64.tar.gz spice-minio/artifacts/spiced/linux-x86_64/${{ env.COMMIT_SHA }}/
           fi;
 
-          if [ -f "${ARTIFACT_DIR}/spiced_odbc_models_models_linux_x86_64.tar.gz" ]; then
-            mc cp ${{ env.ARTIFACT_DIR }}/spiced_odbc_models_models_linux_x86_64.tar.gz spice-minio/artifacts/spiced/linux-x86_64/${{ env.COMMIT_SHA }}/
+          if [ -f "${ARTIFACT_DIR}/spiced_odbc_models_linux_x86_64.tar.gz" ]; then
+            mc cp ${{ env.ARTIFACT_DIR }}/spiced_odbc_models_linux_x86_64.tar.gz spice-minio/artifacts/spiced/linux-x86_64/${{ env.COMMIT_SHA }}/
           fi;
 
           if [ -f "${ARTIFACT_DIR}/spice_linux_x86_64.tar.gz" ]; then
