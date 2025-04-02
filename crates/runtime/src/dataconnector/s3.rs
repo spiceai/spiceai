@@ -32,6 +32,8 @@ use std::string::String;
 use std::sync::{Arc, LazyLock};
 use url::Url;
 
+static PREFIX: &str = "s3";
+
 // https://docs.aws.amazon.com/general/latest/gr/rande.html
 pub const AWS_REGIONS: [&str; 32] = [
     "us-east-1",
@@ -217,7 +219,7 @@ impl DataConnectorFactory for S3Factory {
                     for param in key_params {
                         if matches!(params.parameters.get(param), ParamLookup::Present(_)) {
                             return Err(Box::new(Error::InvalidAuthParameterCombination {
-                                parameter: format!("s3_{param}"),
+                                parameter: format!("{PREFIX}_{param}"),
                                 auth: "key".to_string(),
                             })
                                 as Box<dyn std::error::Error + Send + Sync>);
@@ -251,7 +253,7 @@ impl DataConnectorFactory for S3Factory {
     }
 
     fn prefix(&self) -> &'static str {
-        "s3"
+        PREFIX
     }
 
     fn parameters(&self) -> &'static [ParameterSpec] {
@@ -261,7 +263,7 @@ impl DataConnectorFactory for S3Factory {
 
 impl std::fmt::Display for S3 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "s3")
+        write!(f, "{PREFIX}")
     }
 }
 
@@ -285,7 +287,7 @@ impl ListingTableConnector for S3 {
                 .boxed()
                 .context(super::InvalidConfigurationSnafu {
                     dataconnector: format!("{self}"),
-                    message: format!("The specified URL is not valid: {url}.\nEnsure the URL is valid and try again.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/s3#from"),
+                    message: format!("The specified URL is not valid: {url}.\nEnsure the URL is valid and try again.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/{PREFIX}#from"),
                     connector_component: ConnectorComponent::from(dataset)
                 })?;
 
