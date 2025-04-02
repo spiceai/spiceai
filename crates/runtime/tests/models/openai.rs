@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 #![allow(clippy::expect_used)]
-use crate::models::{sort_json_keys, sql_to_display, sql_to_single_json_value};
+use crate::models::{sort_json_keys, sql_to_display, sql_to_json_values, sql_to_single_json_value};
 use crate::{
     init_tracing, init_tracing_with_task_history,
     models::{
@@ -384,7 +384,6 @@ async fn openai_test_chat_completion() -> Result<(), anyhow::Error> {
 }
 
 #[tokio::test]
-#[ignore] // https://github.com/spiceai/spiceai/issues/4870
 async fn openai_test_chat_messages() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(None);
 
@@ -533,11 +532,10 @@ async fn verify_similarity_search_chat_completion(
         serde_json::to_value(&response).expect("Failed to serialize response.choices: {}");
     sort_json_keys(&mut resp_value);
 
-    let selector = JsonPath::from_str(
-        "$.choices[*].message[?(@.content~='.*there just big vehicles. Journalists.*')].length()",
-    )
-    .expect("Failed to create JSONPath selector");
+    let selector = JsonPath::from_str(r#"$.choices[?(@.finish_reason=="stop")].length()"#)
+        .expect("Failed to create JSONPath selector");
 
+    // Verify Response exsitence instead of correctness - Model is not guaranteed to return the same response
     insta::assert_snapshot!(
         "chat_2_response",
         serde_json::to_string_pretty(&selector.find(&resp_value))
@@ -546,22 +544,48 @@ async fn verify_similarity_search_chat_completion(
 
     // ensure all spans are exported into task_history
     let _ = trace_provider.force_flush();
+    let task_input = sql_to_json_values(
+        &rt,
+        format!(
+            "SELECT input
+            FROM runtime.task_history
+            WHERE start_time >= '{}' and task='tool_use::document_similarity';",
+            Into::<DateTime<Utc>>::into(task_start_time).to_rfc3339()
+        )
+        .as_str(),
+    )
+    .await;
+
+    let mut stable_inputs: Vec<serde_json::Value> = Vec::new();
+
+    for mut value in task_input {
+        if let serde_json::Value::Object(ref mut map) = value {
+            // Remove the unstable "text" and "datasets" field
+            map.remove("text");
+            map.remove("datasets");
+
+            // Sort the keys for consistent ordering
+            sort_json_keys(&mut value);
+
+            // Add the filtered value to our stable array
+            stable_inputs.push(value);
+        }
+    }
+
+    // Sort the array of objects for consistent ordering in snapshots
+    stable_inputs.sort_by(|a, b| {
+        let a_str = serde_json::to_string(a).unwrap_or_default();
+        let b_str = serde_json::to_string(b).unwrap_or_default();
+        a_str.cmp(&b_str)
+    });
+
+    // Create a combined JSON array with all filtered values
+    let combined_value = serde_json::Value::Array(stable_inputs);
 
     // Verify Task History
     insta::assert_snapshot!(
         "chat_2_document_similarity_tasks",
-        sql_to_display(
-            &rt,
-            format!(
-                "SELECT input
-                FROM runtime.task_history
-                WHERE start_time >= '{}' and task='tool_use::document_similarity';",
-                Into::<DateTime<Utc>>::into(task_start_time).to_rfc3339()
-            )
-            .as_str()
-        )
-        .await
-        .expect("Failed to execute HTTP SQL query")
+        serde_json::to_string_pretty(&combined_value).expect("Failed to serialize task_input")
     );
 
     Ok(())
