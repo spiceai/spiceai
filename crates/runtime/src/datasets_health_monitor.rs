@@ -242,7 +242,7 @@ AND labels.error_code IS NULL"
                     Arc::new(HashSet::new())
                 };
 
-                tracing::debug!("Datasets excluded from availability check as they were recently successfully accessed: {recently_accessed_datasets:?}");
+                tracing::trace!("Datasets excluded from availability check as they were recently successfully accessed: {recently_accessed_datasets:?}");
 
                 // subset them from the datasets to check
                 let datasets_to_check: Vec<_> = datasets_to_check
@@ -250,7 +250,7 @@ AND labels.error_code IS NULL"
                     .filter(|item| !recently_accessed_datasets.contains(&item.name))
                     .collect();
 
-                tracing::debug!("Datasets to check: {datasets_to_check:?}");
+                tracing::trace!("Datasets to check: {datasets_to_check:?}");
 
                 let tasks: Vec<_> = datasets_to_check
                     .into_iter()
@@ -290,7 +290,7 @@ AND labels.error_code IS NULL"
 
                 join_all(tasks).await;
 
-                tracing::debug!("Finished checking datasets availability");
+                tracing::trace!("Finished checking datasets availability");
 
                 tokio::time::sleep(Duration::from_secs(
                     DATASETS_AVAILABILITY_CHECK_INTERVAL_SECONDS,
@@ -308,7 +308,7 @@ async fn update_dataset_availability_info(
 ) {
     match test_result {
         AvailabilityVerificationResult::Available => {
-            tracing::debug!("Successfully verified access to federated dataset {dataset_name}");
+            tracing::trace!("Successfully verified access to federated dataset {dataset_name}");
             let mut monitored_datasets_lock = monitored_datasets.lock().await;
             if let Some(dataset) = monitored_datasets_lock.get_mut(dataset_name) {
                 Arc::make_mut(dataset).last_available_time = SystemTime::now();
