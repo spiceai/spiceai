@@ -104,7 +104,7 @@ jobs:
           echo "SPICEPOD_FILENAME=${SPICEPOD_FILENAME}" >> $GITHUB_OUTPUT
 
       - name: Setup ODBC
-        if: ${{ github.event.inputs.query_overrides == 'odbc-athena' }}
+        if: ${{ contains(steps.extract_spicepod_filename.outputs.SPICEPOD_FILENAME, 'odbc') }}
         uses: ./.github/actions/setup-odbc
 
       - name: Run the benchmark test - ${{ steps.extract_spicepod_filename.outputs.SPICEPOD_FILENAME }}
