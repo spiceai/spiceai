@@ -58,6 +58,7 @@ impl ModelGradedScorer {
                 .content(String::new())
                 .build()?
                 .into()])
+            .store(true)
             .build()
     }
 
