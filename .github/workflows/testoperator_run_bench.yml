@@ -32,6 +32,7 @@ on:
           - 'mysql'
           - 'dremio'
           - 'odbc-athena'
+          - 'odbc-databricks'
           - 'duckdb'
           - 'snowflake'
           - 'spark'
