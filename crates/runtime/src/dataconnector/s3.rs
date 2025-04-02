@@ -234,13 +234,11 @@ impl DataConnectorFactory for S3Factory {
                     }
 
                     // Session token is optional; log if present
-                    if matches!(
-                        params.parameters.get("session_token"),
-                        ParamLookup::Present(_)
-                    ) {
+                    if let ParamLookup::Present(secret) = params.parameters.get("session_token") {
                         tracing::info!(
                             "Using temporary credentials with session token for S3 auth."
                         );
+                        std::env::set_var("AWS_SESSION_TOKEN", secret.expose_secret());
                     }
                 }
                 Some(auth) => {
@@ -250,11 +248,6 @@ impl DataConnectorFactory for S3Factory {
                         as Box<dyn std::error::Error + Send + Sync>);
                 }
             };
-
-            if let ParamLookup::Present(secret) = params.parameters.get("session_token") {
-                tracing::debug!("Setting AWS_SESSION_TOKEN env variable");
-                std::env::set_var("AWS_SESSION_TOKEN", secret.expose_secret());
-            }
 
             let s3 = S3 {
                 params: params.parameters,
