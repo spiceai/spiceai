@@ -96,6 +96,8 @@ async fn test_acceleration_duckdb_single_instance() -> Result<(), anyhow::Error>
                 () = rt.load_components() => {}
             }
 
+            runtime_ready_check(&rt).await;
+
             // Verify if checkpoints are created before shutting down runtime
             wait_for_checkpoints(&runtime_datasets, 120).await?;
 
@@ -181,7 +183,7 @@ async fn wait_for_checkpoints(
     }
 
     tokio::select! {
-        _ = tokio::time::sleep(std::time::Duration::from_secs(timeout_secs)) => {
+        () = tokio::time::sleep(std::time::Duration::from_secs(timeout_secs)) => {
             Err(anyhow::anyhow!("Timed out waiting for dataset checkpoints"))
         },
         result = futures::future::try_join_all(checkpoint_futures) => {
