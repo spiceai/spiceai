@@ -91,8 +91,6 @@ async fn test_acceleration_duckdb_checkpoint() -> Result<(), anyhow::Error> {
             // Verify checkpoints are created before shutting down runtime
             wait_for_checkpoints(&runtime_datasets, 120).await?;
 
-            // Wait for the checkpoint to be created
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             drop(rt);
             runtime::dataaccelerator::unregister_all().await;
             runtime::dataaccelerator::register_all().await;
