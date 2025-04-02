@@ -33,4 +33,4 @@ runs:
         Driver=/opt/athena/odbc/lib/libathena-odbc.so
         Setup=/opt/athena/odbc/lib/libathena-odbc.so
         EOF
-        sudo cat /tmp/odbcinst.ini >> /etc/odbcinst.ini
+        cat /tmp/odbcinst.ini | sudo tee -a /etc/odbcinst.ini
