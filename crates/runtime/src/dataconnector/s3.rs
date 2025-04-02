@@ -23,6 +23,7 @@ use super::{
 use crate::parameters::ParamLookup;
 use crate::{component::dataset::Dataset, dataconnector::listing::LISTING_TABLE_PARAMETERS};
 
+use secrecy::ExposeSecret;
 use snafu::prelude::*;
 use std::any::Any;
 use std::clone::Clone;
@@ -245,6 +246,11 @@ impl DataConnectorFactory for S3Factory {
                 }
             };
 
+            if let ParamLookup::Present(secret) = params.parameters.get("session_token") {
+                tracing::debug!("Setting AWS_SESSION_TOKEN env variable");
+                std::env::set_var("AWS_SESSION_TOKEN", secret.expose_secret());
+            }
+
             let s3 = S3 {
                 params: params.parameters,
             };
@@ -298,7 +304,6 @@ impl ListingTableConnector for S3 {
                 "endpoint",
                 "key",
                 "secret",
-                "session_token",
                 "client_timeout",
                 "allow_http",
                 "auth",
