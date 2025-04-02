@@ -14,13 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::acceleration::wait_for_checkpoints;
 use app::AppBuilder;
 use arrow::array::RecordBatch;
 use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
 use datafusion_table_providers::sql::db_connection_pool::DbConnectionPool;
 use duckdb::AccessMode;
 use futures::TryStreamExt;
-use runtime::dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint;
 use runtime::{component::dataset::Dataset as RuntimeDataset, status, Runtime};
 use spicepod::component::dataset::{
     acceleration::{Acceleration, Mode, RefreshMode},
@@ -159,35 +159,4 @@ async fn test_acceleration_duckdb_single_instance() -> Result<(), anyhow::Error>
             Ok(())
         })
         .await
-}
-
-async fn wait_for_checkpoints(
-    datasets: &Vec<RuntimeDataset>,
-    timeout_secs: u64,
-) -> Result<(), anyhow::Error> {
-    let mut checkpoint_futures = Vec::new();
-
-    for dataset in datasets {
-        let check_future = async move {
-            match DatasetCheckpoint::try_new(dataset).await {
-                Ok(checkpoint) => {
-                    while !checkpoint.exists().await {
-                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                    }
-                    Ok(())
-                }
-                Err(e) => Err(anyhow::anyhow!("Failed to create checkpoint: {}", e)),
-            }
-        };
-        checkpoint_futures.push(check_future);
-    }
-
-    tokio::select! {
-        () = tokio::time::sleep(std::time::Duration::from_secs(timeout_secs)) => {
-            Err(anyhow::anyhow!("Timed out waiting for dataset checkpoints"))
-        },
-        result = futures::future::try_join_all(checkpoint_futures) => {
-            result.map(|_| ())
-        }
-    }
 }

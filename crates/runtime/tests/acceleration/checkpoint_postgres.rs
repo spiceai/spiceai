@@ -14,11 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::acceleration::wait_for_checkpoints;
 use app::AppBuilder;
 use arrow::array::RecordBatch;
 use datafusion_table_providers::sql::db_connection_pool::DbConnectionPool;
 use futures::TryStreamExt;
-use runtime::{status, Runtime};
+use runtime::{component::dataset::Dataset as RuntimeDataset, status, Runtime};
 use secrecy::ExposeSecret;
 use spicepod::component::dataset::acceleration::{Acceleration, RefreshMode};
 use spicepod::component::dataset::Dataset;
@@ -67,6 +68,13 @@ async fn test_acceleration_postgres_checkpoint() -> Result<(), anyhow::Error> {
                 .with_dataset(dataset)
                 .build();
 
+            let runtime_datasets = app
+                .datasets
+                .clone()
+                .into_iter()
+                .map(RuntimeDataset::try_from)
+                .collect::<Result<Vec<_>, _>>()?;
+
             let rt = Arc::new(
                 Runtime::builder()
                     .with_app(app)
@@ -85,6 +93,9 @@ async fn test_acceleration_postgres_checkpoint() -> Result<(), anyhow::Error> {
             }
 
             runtime_ready_check(&rt).await;
+
+            // Verify if checkpoints are created before shutting down runtime
+            wait_for_checkpoints(&runtime_datasets, 120).await?;
 
             // Wait for the checkpoint to be created
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
