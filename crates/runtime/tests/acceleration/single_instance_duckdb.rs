@@ -14,13 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::acceleration::wait_for_checkpoints;
 use app::AppBuilder;
 use arrow::array::RecordBatch;
 use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
 use datafusion_table_providers::sql::db_connection_pool::DbConnectionPool;
 use duckdb::AccessMode;
 use futures::TryStreamExt;
-use runtime::{status, Runtime};
+use runtime::{component::dataset::Dataset as RuntimeDataset, status, Runtime};
 use spicepod::component::dataset::{
     acceleration::{Acceleration, Mode, RefreshMode},
     Dataset,
@@ -72,6 +73,13 @@ async fn test_acceleration_duckdb_single_instance() -> Result<(), anyhow::Error>
                 ))
                 .build();
 
+            let runtime_datasets = app
+                .datasets
+                .clone()
+                .into_iter()
+                .map(RuntimeDataset::try_from)
+                .collect::<Result<Vec<_>, _>>()?;
+
             let rt = Arc::new(
                 Runtime::builder()
                     .with_app(app)
@@ -90,7 +98,9 @@ async fn test_acceleration_duckdb_single_instance() -> Result<(), anyhow::Error>
 
             runtime_ready_check(&rt).await;
 
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            // Verify checkpoints are created before shutting down runtime
+            wait_for_checkpoints(&runtime_datasets, 120).await?;
+
             rt.shutdown().await;
             runtime::dataaccelerator::unregister_all().await;
             runtime::dataaccelerator::register_all().await;
