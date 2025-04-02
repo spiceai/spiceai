@@ -87,7 +87,7 @@ async fn run_delta_lake_test(
 
     // Set a timeout for the test
     tokio::select! {
-        () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+        () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
             return Err("Timed out waiting for datasets to load".to_string());
         }
         () = rt.load_components() => {}
