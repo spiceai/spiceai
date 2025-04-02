@@ -167,6 +167,7 @@ impl SpiceTestQueryWorker {
                         // Additional round of query run before recording results.
                         // To discard the abnormal results caused by: establishing initial connection / spark cluster startup time
 
+                        println!("Worker {} - Query '{}' - Pre-run", self.id, query.0);
                         let (connection_succeed, _) = self
                             .run_single_query(
                                 query,
@@ -186,6 +187,7 @@ impl SpiceTestQueryWorker {
                         }
 
                         if self.explain_plan_snapshot && self.id == 0 {
+                            println!("Worker {} - Query '{}' - Explain plan", self.id, query.0);
                             if let Err(e) = record_explain_plan(
                                 &self.flight_client,
                                 self.name.as_str(),
@@ -206,7 +208,7 @@ impl SpiceTestQueryWorker {
                         while current_query_count < target_count {
                             if self.progress_bar.is_none()
                                 && self.id == 0
-                                && current_query_count % 10 == 0
+                                && (current_query_count % 10 == 0 || target_count <= 5)
                             {
                                 println!(
                                     "Worker {} - Query '{}' - {}/{} - Elapsed time: {:?}",
@@ -356,6 +358,10 @@ impl SpiceTestQueryWorker {
                     return Err(e.into());
                 }
                 Ok(Some(batch)) => {
+                    if batch.num_rows() == 0 {
+                        println!("Worker {} - Query '{}' returned 0 rows", self.id, query.0);
+                    }
+
                     row_count += batch.num_rows();
 
                     if limited_records.len() < 10 {

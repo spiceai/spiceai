@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: spicecloud_clickbench
+name: spicecloud
 datasets:
   - from: spice.ai:spiceai/benchmarks-clickbench/datasets/clickbench.hits
     name: hits

@@ -1,0 +1,9 @@
+---
+source: crates/test-framework/src/spicetest/datasets/worker.rs
+description: "Query: tpcds_q52"
+---
++--------+----------+------------------+-----------+
+| d_year | brand_id | brand            | ext_price |
++--------+----------+------------------+-----------+
+| 2000   | 7008009  | namelessbrand #9 | 43822.54  |
++--------+----------+------------------+-----------+

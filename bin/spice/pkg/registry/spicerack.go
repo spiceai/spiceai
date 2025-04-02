@@ -68,7 +68,11 @@ func (r *SpiceRackRegistry) GetPod(ctx *context.RuntimeContext, podFullPath stri
 		slog.Debug(fmt.Sprintf("%s: %s", failureMessage, err.Error()))
 		return "", errors.New(failureMessage)
 	}
-	defer response.Body.Close()
+	defer func() {
+		if err := response.Body.Close(); err != nil {
+			slog.Error("closing response body", "error", err)
+		}
+	}()
 
 	if response.StatusCode == 404 {
 		return "", NewRegistryItemNotFound(fmt.Errorf("spicepod %s not found", podPath))
@@ -82,7 +86,11 @@ func (r *SpiceRackRegistry) GetPod(ctx *context.RuntimeContext, podFullPath stri
 	if err != nil {
 		return "", err
 	}
-	defer os.Remove(tmpFile.Name())
+	defer func() {
+		if err := tmpFile.Close(); err != nil {
+			slog.Error("failed to close file", "error", err)
+		}
+	}()
 
 	_, err = io.Copy(tmpFile, response.Body)
 	if err != nil {
@@ -128,13 +136,21 @@ func (r *SpiceRackRegistry) GetPod(ctx *context.RuntimeContext, podFullPath stri
 		if err != nil {
 			return "", err
 		}
-		defer outFile.Close()
+		defer func() {
+			if err := outFile.Close(); err != nil {
+				slog.Error("failed to close output file", "file", outFile.Name(), "error", err)
+			}
+		}()
 
 		zipFile, err := f.Open()
 		if err != nil {
 			return "", err
 		}
-		defer zipFile.Close()
+		defer func() {
+			if err := zipFile.Close(); err != nil {
+				slog.Error("failed to close zip file", "error", err)
+			}
+		}()
 
 		_, err = io.Copy(outFile, zipFile)
 		if err != nil {

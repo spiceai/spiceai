@@ -27,6 +27,7 @@ use crate::{
     component::dataset::{acceleration::Acceleration, TimeFormat},
     datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA, SPICE_EVAL_SCHEMA},
     internal_table::create_internal_accelerated_table,
+    model::eval::scorer::{EmbedScorer, ModelGradedScorer},
     model::{
         builtin_scorer, EVAL_RESULTS_TABLE_REFERENCE, EVAL_RESULTS_TABLE_SCHEMA,
         EVAL_RESULTS_TABLE_TIME_COLUMN, EVAL_RUNS_TABLE_PRIMARY_KEY, EVAL_RUNS_TABLE_REFERENCE,
@@ -43,6 +44,27 @@ impl Runtime {
             let mut reg = self.eval_scorers.write().await;
             reg.insert(name.to_string(), Arc::clone(&scorer));
             tracing::debug!("Successfully loaded eval scorer {name}");
+        }
+
+        // Load all LLMs as [`ModelGradedScorer`]
+        let model_lock = self.llms.read().await;
+        for (model_name, model) in model_lock.iter() {
+            let mut reg = self.eval_scorers.write().await;
+            reg.insert(
+                model_name.clone(),
+                Arc::new(ModelGradedScorer::new(Arc::clone(model))),
+            );
+        }
+
+        // Load all Embedding models as [`EmbedScorer`].
+        let embeddings = self.embeds();
+        let model_lock = embeddings.read().await;
+        for (model_name, model) in model_lock.iter() {
+            let mut reg = self.eval_scorers.write().await;
+            reg.insert(
+                model_name.clone(),
+                Arc::new(EmbedScorer::new(Arc::clone(model))),
+            );
         }
     }
 

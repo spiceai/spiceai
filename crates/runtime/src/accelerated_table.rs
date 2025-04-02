@@ -610,7 +610,7 @@ impl AcceleratedTable {
                 };
 
                 if is_spice_internal_dataset(&dataset_name) {
-                    tracing::debug!(
+                    tracing::trace!(
                         "[retention] Evicting data for {dataset_name} where {time_column} < {}...",
                         timestamp
                     );
@@ -621,7 +621,7 @@ impl AcceleratedTable {
                     );
                 }
 
-                tracing::debug!("[retention] Expr {expr:?}");
+                tracing::trace!("[retention] Expr {expr:?}");
 
                 let plan = deleted_table_provider
                     .delete_from(&ctx.state(), &vec![expr])
@@ -641,7 +641,7 @@ impl AcceleratedTable {
                                 });
 
                                 if is_spice_internal_dataset(&dataset_name) {
-                                    tracing::debug!("[retention] Evicted {num_records} records for {dataset_name}");
+                                    tracing::trace!("[retention] Evicted {num_records} records for {dataset_name}");
                                 } else {
                                     tracing::info!("[retention] Evicted {num_records} records for {dataset_name}");
                                 }

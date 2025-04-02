@@ -54,10 +54,10 @@ macro_rules! test_case {
 }
 
 /// For a given mode name, a function that instantiates the model..
-type ModelFn<'a> = (&'a str, Box<dyn Fn() -> Arc<Box<dyn Chat>>>);
+type ModelFn<'a> = (&'a str, Box<dyn Fn() -> Arc<dyn Chat>>);
 
 /// A given model to test.
-type ModelDef<'a> = (&'a str, Arc<Box<dyn Chat>>);
+type ModelDef<'a> = (&'a str, Arc<dyn Chat>);
 #[allow(clippy::expect_used)]
 static TEST_MODELS: LazyLock<Vec<ModelDef>> = LazyLock::new(|| {
     let model_creators: [ModelFn; 6] = [

@@ -140,6 +140,7 @@ Indexes are not required for test coverage, but can be introduced if required fo
 - [ ] The connector can load TPC-H at the [designated scale factor](#beta-release-criteria), and can run all queries with no [Major Bugs](../definitions.md).
 - [ ] All [Minor Bugs](../definitions.md) for TPC-H are raised as issues.
 - [ ] TPC-H queries pass with a success rate equal or greater than TPC-H execution on Datafusion.
+- [ ] The TPC-H end-to-end test is added to the scheduled benchmarks by creating a [`testoperator dispatch`](https://github.com/spiceai/spiceai/tree/trunk/tools/testoperator/dispatch) configuration file for the connector.
 
 #### Data Correctness
 

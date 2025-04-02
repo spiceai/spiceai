@@ -20,6 +20,10 @@ use flight_client::FlightClient;
 
 use crate::flight::query_to_batches;
 
+fn make_tmpdir_regex_pattern(tempdir: &str) -> String {
+    format!(r"(?:{tempdir}|private/{tempdir})/[^/]*/(\.spice/)?data")
+}
+
 pub async fn record_explain_plan(
     client: &FlightClient,
     name: &str,
@@ -45,8 +49,7 @@ pub async fn record_explain_plan(
     // Create two patterns:
     // 1. Exact match starting with the temp_dir: {temp_dir}/some_dir/data
     // 2. Match with "private" prefix: private{temp_dir}/some_dir/data
-    let path_filter_pattern =
-        format!(r"(?:{temp_dir_pattern}|private/{temp_dir_pattern})/[^/]*/data",);
+    let path_filter_pattern = make_tmpdir_regex_pattern(temp_dir_pattern.as_str());
 
     insta::with_settings!({
         description => format!("Query: {query_name}"),
@@ -95,13 +98,17 @@ mod tests {
                 "tmp/.tmpJ1DebA/data/orders.parquet:0..2311466",
                 "/data/orders.parquet:0..2311466",
             ),
+            (
+                "/tmp",
+                "tmp/.tmpJ1DebA/.spice/data/accelerated_duckdb.db",
+                "/data/accelerated_duckdb.db",
+            )
         ];
 
         for (tmp_dir, input, expected) in test_cases {
             let temp_dir_clean = tmp_dir.trim_end_matches('/').trim_start_matches('/');
             let temp_dir_pattern = regex::escape(temp_dir_clean);
-            let path_filter_pattern =
-                format!(r"(?:{temp_dir_pattern}|private/{temp_dir_pattern})/[^/]*/data",);
+            let path_filter_pattern = super::make_tmpdir_regex_pattern(temp_dir_pattern.as_str());
 
             let regex = regex::Regex::new(&path_filter_pattern).map_err(|e| format!("{e}"))?;
             let result = regex.replace(input, "/data");
