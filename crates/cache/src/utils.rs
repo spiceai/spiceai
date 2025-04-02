@@ -22,7 +22,7 @@ use datafusion::{
     physical_plan::stream::RecordBatchStreamAdapter, sql::TableReference,
 };
 
-use crate::{CachedQueryResult, QueryResultsCacheProvider};
+use crate::{raw::QueryResultsCacheProviderRaw, CachedQueryResult};
 
 use async_stream::stream;
 
@@ -31,7 +31,7 @@ use futures::StreamExt;
 #[must_use]
 #[allow(clippy::implicit_hasher)]
 pub fn to_cached_record_batch_stream(
-    cache_provider: Arc<QueryResultsCacheProvider>,
+    cache_provider: Arc<QueryResultsCacheProviderRaw>,
     mut stream: SendableRecordBatchStream,
     plan_key: u64,
     input_tables: Arc<HashSet<TableReference>>,

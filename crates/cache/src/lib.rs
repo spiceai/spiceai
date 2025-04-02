@@ -39,6 +39,7 @@ use spicepod::component::runtime::ResultsCache;
 
 mod lru_cache;
 mod metrics;
+pub mod raw;
 mod utils;
 
 pub use utils::get_logical_plan_input_tables;

@@ -39,7 +39,7 @@ use arrow::datatypes::{Schema, SchemaRef};
 use arrow::error::ArrowError;
 use arrow_tools::schema::verify_schema;
 use builder::DataFusionBuilder;
-use cache::QueryResultsCacheProvider;
+use cache::raw::QueryResultsCacheProviderRaw;
 use datafusion::catalog::CatalogProvider;
 use datafusion::catalog::SchemaProvider;
 use datafusion::datasource::{TableProvider, ViewTable};
@@ -250,7 +250,7 @@ pub struct DataFusion {
     runtime_status: Arc<status::RuntimeStatus>,
     data_writers: RwLock<HashSet<TableReference>>,
     accelerated_tables: TokioRwLock<HashSet<TableReference>>,
-    cache_provider: RwLock<Option<Arc<QueryResultsCacheProvider>>>,
+    cache_provider: RwLock<Option<Arc<QueryResultsCacheProviderRaw>>>,
 
     pending_sink_tables: TokioRwLock<Vec<PendingSinkRegistration>>,
 }
@@ -275,7 +275,7 @@ impl DataFusion {
         None
     }
 
-    pub fn set_cache_provider(&self, cache_provider: QueryResultsCacheProvider) {
+    pub fn set_cache_provider(&self, cache_provider: QueryResultsCacheProviderRaw) {
         if let Ok(mut a) = self.cache_provider.write() {
             *a = Some(Arc::new(cache_provider));
         };
@@ -836,7 +836,7 @@ impl DataFusion {
 
         accelerated_table_builder.ready_state(dataset.ready_state);
 
-        accelerated_table_builder.cache_provider(self.cache_provider());
+        // accelerated_table_builder.cache_provider(self.cache_provider());
 
         accelerated_table_builder.checkpointer_opt(DatasetCheckpoint::try_new(dataset).await.ok());
 
@@ -924,7 +924,7 @@ impl DataFusion {
         );
     }
 
-    pub fn cache_provider(&self) -> Option<Arc<QueryResultsCacheProvider>> {
+    pub fn cache_provider(&self) -> Option<Arc<QueryResultsCacheProviderRaw>> {
         let Ok(provider) = self.cache_provider.read() else {
             return None;
         };

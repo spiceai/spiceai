@@ -108,7 +108,7 @@ impl Query {
         df: &DataFusion,
         ctx: Arc<RequestContext>,
         mut tracker: QueryTracker,
-        plan: &LogicalPlan,
+        sql: &str,
     ) -> CacheResult {
         let Some(cache_provider) = df.cache_provider() else {
             return CacheResult::MissOrSkipped(tracker, QueryResultsCacheStatus::CacheDisabled);
@@ -119,7 +119,7 @@ impl Query {
             return CacheResult::MissOrSkipped(tracker, QueryResultsCacheStatus::CacheBypass);
         }
 
-        let cached_result = match cache_provider.get(plan).await {
+        let cached_result = match cache_provider.get(sql).await {
             Ok(Some(result)) => result,
             Ok(None) => {
                 return CacheResult::MissOrSkipped(tracker, QueryResultsCacheStatus::CacheMiss)
@@ -152,14 +152,15 @@ impl Query {
     }
 
     fn should_cache_results(
-        df: &DataFusion,
-        plan: &LogicalPlan,
+        _df: &DataFusion,
+        _plan: &LogicalPlan,
         cache_status: QueryResultsCacheStatus,
     ) -> (bool, QueryResultsCacheStatus) {
-        match df.cache_provider() {
-            Some(provider) if provider.cache_is_enabled_for_plan(plan) => (true, cache_status),
-            _ => (false, QueryResultsCacheStatus::CacheDisabled),
-        }
+        // match df.cache_provider() {
+        //     Some(provider) if provider.cache_is_enabled_for_plan(plan) => (true, cache_status),
+        //     _ => (false, QueryResultsCacheStatus::CacheDisabled),
+        // }
+        (true, cache_status)
     }
 
     fn wrap_stream_with_cache(
@@ -194,6 +195,20 @@ impl Query {
                 .config_mut()
                 .set_extension(Arc::clone(&request_context));
 
+            // Try to get cached results first
+            let (mut tracker, cache_status) = match Self::try_get_cached_result(
+                &ctx.df,
+                Arc::clone(&request_context),
+                tracker,
+                &ctx.sql,
+            )
+            .await
+            {
+                CacheResult::Hit(result) => return Ok(result),
+                CacheResult::MissOrSkipped(tracker, status) => (tracker, status),
+                CacheResult::Error(e) => return Err(e),
+            };
+
             let plan = match session.create_logical_plan(&ctx.sql).await {
                 Ok(plan) => plan,
                 Err(e) => {
@@ -209,23 +224,9 @@ impl Query {
                 }
             };
 
-            // Try to get cached results first
-            let (mut tracker, cache_status) = match Self::try_get_cached_result(
-                &ctx.df,
-                Arc::clone(&request_context),
-                tracker,
-                &plan,
-            )
-            .await
-            {
-                CacheResult::Hit(result) => return Ok(result),
-                CacheResult::MissOrSkipped(tracker, status) => (tracker, status),
-                CacheResult::Error(e) => return Err(e),
-            };
-
             let (plan_is_cache_enabled, cache_status) =
                 Self::should_cache_results(&ctx.df, &plan, cache_status);
-            let plan_cache_key = cache::key_for_logical_plan(&plan);
+            let plan_cache_key = cache::raw::key_for_sql(&ctx.sql);
             tracker = tracker.results_cache_hit(false);
 
             if let Err(e) =

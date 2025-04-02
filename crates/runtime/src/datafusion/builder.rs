@@ -19,7 +19,7 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-use cache::QueryResultsCacheProvider;
+use cache::raw::QueryResultsCacheProviderRaw;
 use datafusion::{
     catalog_common::{CatalogProvider, MemoryCatalogProvider},
     execution::SessionStateBuilder,
@@ -48,7 +48,7 @@ use super::{
 pub struct DataFusionBuilder {
     config: SessionConfig,
     status: Arc<status::RuntimeStatus>,
-    cache_provider: Option<Arc<QueryResultsCacheProvider>>,
+    cache_provider: Option<Arc<QueryResultsCacheProviderRaw>>,
 }
 
 pub(crate) fn get_df_default_config() -> SessionConfig {
@@ -97,7 +97,10 @@ impl DataFusionBuilder {
     }
 
     #[must_use]
-    pub fn with_cache_provider(mut self, cache_provider: Arc<QueryResultsCacheProvider>) -> Self {
+    pub fn with_cache_provider(
+        mut self,
+        cache_provider: Arc<QueryResultsCacheProviderRaw>,
+    ) -> Self {
         self.cache_provider = Some(cache_provider);
         self
     }
