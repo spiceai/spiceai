@@ -76,6 +76,9 @@ pub enum Error {
     #[snafu(display("S3 auth method 'key' requires an AWS access key.\nSpecify an access key with the `s3_key` parameter.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/s3#auth"))]
     NoAccessKey,
 
+    #[snafu(display("S3 auth method 'key' requires an AWS session token.\nSpecify a session token with the `s3_key` parameter.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/s3#auth"))]
+    NoAccessSessionToken,
+
     #[snafu(display("Unsupported S3 auth method '{method}'.\nUse 'public', 'iam_role', or 'key' for `s3_auth` parameter.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/s3#auth"))]
     UnsupportedAuthenticationMethod { method: String },
 
@@ -133,6 +136,7 @@ static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
             ParameterSpec::component("endpoint").secret(),
             ParameterSpec::component("key").secret(),
             ParameterSpec::component("secret").secret(),
+            ParameterSpec::component("session_token").secret(),
             ParameterSpec::component("auth")
                 .description("Configures the authentication method for S3. Supported methods are: public (i.e. no auth), iam_role, key.")
                 .secret(),
@@ -206,33 +210,29 @@ impl DataConnectorFactory for S3Factory {
                 }
             }
 
+            let key_params = ["key", "secret", "session_token"];
             match params.parameters.get("auth").expose().ok() {
                 None | Some("public" | "iam_role") => {
-                    if matches!(params.parameters.get("key"), ParamLookup::Present(_)) {
-                        // The 's3_key' parameter cannot be set unless the `s3_auth` parameter is set to 'key'.
-                        return Err(Box::new(Error::InvalidAuthParameterCombination {
-                            parameter: "s3_key".to_string(),
-                            auth: "key".to_string(),
-                        })
-                            as Box<dyn std::error::Error + Send + Sync>);
-                    }
-                    if matches!(params.parameters.get("secret"), ParamLookup::Present(_)) {
-                        // The 's3_secret' parameter cannot be set unless the `s3_auth` parameter is set to 'key'.
-                        return Err(Box::new(Error::InvalidAuthParameterCombination {
-                            parameter: "s3_secret".to_string(),
-                            auth: "key".to_string(),
-                        })
-                            as Box<dyn std::error::Error + Send + Sync>);
+                    // These parameters cannot be set unless the `s3_auth` parameter is set to 'key'.
+                    for param in key_params {
+                        if matches!(params.parameters.get(param), ParamLookup::Present(_)) {
+                            return Err(Box::new(Error::InvalidAuthParameterCombination {
+                                parameter: format!("s3_{param}"),
+                                auth: "key".to_string(),
+                            })
+                                as Box<dyn std::error::Error + Send + Sync>);
+                        }
                     }
                 }
                 Some("key") => {
-                    if matches!(params.parameters.get("key"), ParamLookup::Absent(_)) {
-                        return Err(Box::new(Error::NoAccessKey)
-                            as Box<dyn std::error::Error + Send + Sync>);
-                    }
-                    if matches!(params.parameters.get("secret"), ParamLookup::Absent(_)) {
-                        return Err(Box::new(Error::NoAccessSecret)
-                            as Box<dyn std::error::Error + Send + Sync>);
+                    for (param, e) in key_params.iter().zip([
+                        Error::NoAccessKey,
+                        Error::NoAccessSecret,
+                        Error::NoAccessSessionToken,
+                    ]) {
+                        if matches!(params.parameters.get(param), ParamLookup::Absent(_)) {
+                            return Err(Box::new(e) as Box<dyn std::error::Error + Send + Sync>);
+                        }
                     }
                 }
                 Some(auth) => {
@@ -296,6 +296,7 @@ impl ListingTableConnector for S3 {
                 "endpoint",
                 "key",
                 "secret",
+                "session_token",
                 "client_timeout",
                 "allow_http",
                 "auth",
