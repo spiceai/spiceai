@@ -103,6 +103,10 @@ jobs:
           SPICEPOD_FILENAME=$(basename $SPICEPOD_PATH)
           echo "SPICEPOD_FILENAME=${SPICEPOD_FILENAME}" >> $GITHUB_OUTPUT
 
+      - name: Setup ODBC
+        if: ${{ github.event.inputs.query_overrides == 'odbc-athena' }}
+        uses: ./.github/actions/setup-odbc
+
       - name: Run the benchmark test - ${{ steps.extract_spicepod_filename.outputs.SPICEPOD_FILENAME }}
         if: ${{ github.event.inputs.query_overrides == '' }}
         run: |
