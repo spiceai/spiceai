@@ -16,6 +16,6 @@ jobs:
         with:
           require_title_min_length: '5'
           require_description_min_length: '50'
-          required_labels_any: 'kind/refactor,kind/bug,kind/enhancement,kind/documentation,kind/optimization,kind/dependencies'
+          required_labels_any: 'kind/refactor,kind/bug,kind/enhancement,kind/documentation,kind/optimization,kind/dependencies,kind/endgame'
           banned_labels: 'invalid,wontfix,nomerge,duplicate'
           require_assignee: 'true'
