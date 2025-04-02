@@ -1,8 +1,8 @@
 name: Enforce PR labels
 
 on:
-  pull_request:
-    types: [labeled, unlabeled, opened, edited, synchronize]
+  # pull_request:
+  #   types: [labeled, unlabeled, opened, edited, synchronize]
   merge_group:
     types: [checks_requested]
 jobs:
