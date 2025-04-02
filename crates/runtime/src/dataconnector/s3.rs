@@ -79,9 +79,6 @@ pub enum Error {
     #[snafu(display("S3 auth method 'key' requires an AWS access key.\nSpecify an access key with the `s3_key` parameter.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/s3#auth"))]
     NoAccessKey,
 
-    #[snafu(display("S3 auth method 'key' requires an AWS session token.\nSpecify a session token with the `s3_key` parameter.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/s3#auth"))]
-    NoAccessSessionToken,
-
     #[snafu(display("Unsupported S3 auth method '{method}'.\nUse 'public', 'iam_role', or 'key' for `s3_auth` parameter.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/s3#auth"))]
     UnsupportedAuthenticationMethod { method: String },
 
@@ -213,11 +210,10 @@ impl DataConnectorFactory for S3Factory {
                 }
             }
 
-            let key_params = ["key", "secret", "session_token"];
             match params.parameters.get("auth").expose().ok() {
                 None | Some("public" | "iam_role") => {
                     // These parameters cannot be set unless the `s3_auth` parameter is set to 'key'.
-                    for param in key_params {
+                    for param in ["key", "secret", "session_token"] {
                         if matches!(params.parameters.get(param), ParamLookup::Present(_)) {
                             return Err(Box::new(Error::InvalidAuthParameterCombination {
                                 parameter: format!("{PREFIX}_{param}"),
@@ -228,14 +224,23 @@ impl DataConnectorFactory for S3Factory {
                     }
                 }
                 Some("key") => {
-                    for (param, e) in key_params.iter().zip([
-                        Error::NoAccessKey,
-                        Error::NoAccessSecret,
-                        Error::NoAccessSessionToken,
-                    ]) {
+                    for (param, e) in [
+                        ("key", Error::NoAccessKey),
+                        ("secret", Error::NoAccessSecret),
+                    ] {
                         if matches!(params.parameters.get(param), ParamLookup::Absent(_)) {
                             return Err(Box::new(e) as Box<dyn std::error::Error + Send + Sync>);
                         }
+                    }
+
+                    // Session token is optional; log if present
+                    if matches!(
+                        params.parameters.get("session_token"),
+                        ParamLookup::Present(_)
+                    ) {
+                        tracing::info!(
+                            "Using temporary credentials with session token for S3 auth."
+                        );
                     }
                 }
                 Some(auth) => {
