@@ -67,6 +67,8 @@ pub enum QueryOverridesArg {
     IcebergSF1,
     #[serde(rename = "spicecloud-catalog")]
     SpicecloudCatalog,
+    #[serde(rename = "spicecloud")]
+    Spicecloud,
 }
 
 impl From<QuerySetArg> for QuerySet {
@@ -92,6 +94,7 @@ impl From<QueryOverridesArg> for QueryOverrides {
             QueryOverridesArg::Snowflake => QueryOverrides::Snowflake,
             QueryOverridesArg::IcebergSF1 => QueryOverrides::IcebergSF1,
             QueryOverridesArg::SpicecloudCatalog => QueryOverrides::SpicecloudCatalog,
+            QueryOverridesArg::Spicecloud => QueryOverrides::Spicecloud,
         }
     }
 }

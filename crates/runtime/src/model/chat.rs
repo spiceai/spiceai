@@ -118,12 +118,19 @@ pub fn construct_model(
         }
         None => None,
     };
-    let wrapper = ChatWrapper::new(
+    let mut wrapper = ChatWrapper::new(
         model,
         component.name.as_str(),
         system_prompt,
         component.get_openai_request_overrides(),
     );
+
+    if let Some(Value::String(s)) = component.params.get("parameterized_prompt") {
+        if matches!(s.as_str(), "enabled") {
+            wrapper = wrapper.allowed_to_parameterise();
+        }
+    }
+
     Ok(Arc::new(wrapper))
 }
 

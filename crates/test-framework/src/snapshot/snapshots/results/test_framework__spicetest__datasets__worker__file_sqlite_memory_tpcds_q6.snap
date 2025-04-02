@@ -1,0 +1,10 @@
+---
+source: crates/test-framework/src/spicetest/datasets/worker.rs
+description: "Query: tpcds_q6"
+---
++-------+-----+
+| state | cnt |
++-------+-----+
+| AK    | 11  |
+| TX    | 12  |
++-------+-----+

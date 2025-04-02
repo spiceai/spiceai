@@ -37,6 +37,7 @@ on:
           - 'spark'
           - 'iceberg-sf1'
           - 'spicecloud-catalog'
+          - 'spicecloud'
       ready_wait:
         description: 'How long (in seconds) to wait for spiced to start'
         required: true
@@ -131,6 +132,7 @@ jobs:
           MYSQL_USER: root
           MYSQL_PASSWORD: ${{ secrets.MYSQL_PASSWORD }}
           POSTGRES_HOST: ${{ secrets.POSTGRES_HOST }}
+          POSTGRES_RW_HOST: ${{ secrets.POSTGRES_RW_HOST }}
           POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
           SPICEAI_TPCH_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TPCH_BENCHMARK_KEY }}
           SPICEAI_TPCDS_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TPCDS_BENCHMARK_KEY }}
@@ -163,6 +165,7 @@ jobs:
           MYSQL_USER: root
           MYSQL_PASSWORD: ${{ secrets.MYSQL_PASSWORD }}
           POSTGRES_HOST: ${{ secrets.POSTGRES_HOST }}
+          POSTGRES_RW_HOST: ${{ secrets.POSTGRES_RW_HOST }}
           POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
           SPICEAI_TPCH_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TPCH_BENCHMARK_KEY }}
           SPICEAI_TPCDS_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TPCDS_BENCHMARK_KEY }}
