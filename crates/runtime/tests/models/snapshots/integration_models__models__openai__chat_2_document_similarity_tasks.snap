@@ -4,18 +4,12 @@ expression: "serde_json::to_string_pretty(&combined_value).expect(\"Failed to se
 ---
 [
   {
-    "datasets": [
-      "spice.public.item"
-    ],
     "keywords": [
       "journalists"
     ],
     "limit": 5
   },
   {
-    "datasets": [
-      "spice.public.item"
-    ],
     "keywords": [
       "vehicles"
     ],

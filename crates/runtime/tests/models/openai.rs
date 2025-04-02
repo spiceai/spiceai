@@ -544,8 +544,6 @@ async fn verify_similarity_search_chat_completion(
 
     // ensure all spans are exported into task_history
     let _ = trace_provider.force_flush();
-
-    // Flaky - Contain multuple tasks
     let task_input = sql_to_json_values(
         &rt,
         format!(
@@ -562,8 +560,9 @@ async fn verify_similarity_search_chat_completion(
 
     for mut value in task_input {
         if let serde_json::Value::Object(ref mut map) = value {
-            // Remove the unstable "text" field
+            // Remove the unstable "text" and "datasets" field
             map.remove("text");
+            map.remove("datasets");
 
             // Sort the keys for consistent ordering
             sort_json_keys(&mut value);
