@@ -16,6 +16,9 @@ limitations under the License.
 
 use std::sync::LazyLock;
 
+use runtime::{
+    component::dataset::Dataset, dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint,
+};
 use spicepod::component::{dataset::acceleration::Mode, params::Params};
 use tokio::sync::Mutex;
 
@@ -47,4 +50,35 @@ fn get_params(mode: &Mode, file: Option<String>, engine: &str) -> Option<Params>
         ));
     }
     None
+}
+
+async fn wait_for_checkpoints(
+    datasets: &Vec<Dataset>,
+    timeout_secs: u64,
+) -> Result<(), anyhow::Error> {
+    let mut checkpoint_futures = Vec::new();
+
+    for dataset in datasets {
+        let check_future = async move {
+            match DatasetCheckpoint::try_new(dataset).await {
+                Ok(checkpoint) => {
+                    while !checkpoint.exists().await {
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
+                    Ok(())
+                }
+                Err(e) => Err(anyhow::anyhow!("Failed to verify checkpoint: {e}")),
+            }
+        };
+        checkpoint_futures.push(check_future);
+    }
+
+    tokio::select! {
+        () = tokio::time::sleep(std::time::Duration::from_secs(timeout_secs)) => {
+            Err(anyhow::anyhow!("Timed out waiting for dataset checkpoints"))
+        },
+        result = futures::future::try_join_all(checkpoint_futures) => {
+            result.map(|_| ())
+        }
+    }
 }

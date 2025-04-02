@@ -27,6 +27,7 @@ use crate::{config, request::RequestContext};
 
 use app::App;
 use axum::{extract::State, routing::patch};
+use http::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
 use opentelemetry::KeyValue;
 use spicepod::component::runtime::CorsConfig;
 use std::sync::Arc;
@@ -301,7 +302,8 @@ fn cors_layer(cors_config: &CorsConfig) -> CorsLayer {
         cors_config.allowed_origins
     );
 
-    cors.allow_methods([Method::GET, Method::POST, Method::PATCH])
+    cors.allow_methods([Method::GET, Method::POST, Method::PATCH, Method::OPTIONS])
+        .allow_headers([ACCEPT, CONTENT_TYPE, AUTHORIZATION])
         .allow_origin(allowed_origins)
 }
 
