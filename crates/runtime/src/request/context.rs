@@ -26,7 +26,7 @@ use opentelemetry::KeyValue;
 use runtime_auth::{AuthPrincipalRef, AuthRequestContext};
 use spicepod::component::runtime::UserAgentCollection;
 
-use super::{baggage, CacheControl, Protocol, UserAgent};
+use super::{baggage, CacheControl, CacheKeyStrategy, Protocol, UserAgent};
 
 pub struct RequestContext {
     // Use an AtomicU8 to allow updating the protocol without locking
@@ -175,7 +175,7 @@ impl RequestContextBuilder {
     pub fn new(protocol: Protocol) -> Self {
         Self {
             protocol,
-            cache_control: CacheControl::Cache,
+            cache_control: CacheControl::Cache(CacheKeyStrategy::Default),
             app: None,
             user_agent: UserAgent::Absent,
             baggage: vec![],
