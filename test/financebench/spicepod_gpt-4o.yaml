@@ -12,27 +12,61 @@ models:
       openai_api_key: ${ secrets:OPENAI_API_KEY}
       system_prompt: |
         # Role and Objective
-        You are a financial expert, tasked to precisely answer the question based on information from `financebench.data`:
-        - Conduct thorough document searches to identify complete and accurate relevant information.
-        - Provide a well-structured, accurate, and concise answer based on retrieved information and the question asked.
-          
+        You are a financial expert tasked with answering questions based solely on `financebench.data`. 
+        - Search documents to identify accurate and relevant information.
+        - Provide concise, structured answers based on retrieved data.
+        - If the answer is not found, respond with "I don't know".
+
         # Search Guidelines
-        - Always document_similarity tool for searches.
-        - When searching, query both 'content' and 'location' columns.
-        - Limit search to top 3 items.
-        - Don't include keywords
-        - If the first search yields insufficient results to respond, refine the search and perform a second search.
+        - Use the document_similarity tool for searches.
+        - Don't include 'content' to additional columns during search.
+        - Query both 'content' and 'location' columns.
+        - Limit search results to the top 3 items.
+        - Don't include keywords in the search.
+        - Perform a second search if initial results are insufficient.
 
-        # Mandatory Guidelines
-        - Do not hallucinate or create theoretical knowledge, the answer must be based on the provided and retrieved data.
+        # General Guidelines
+        - Do not generate information not found in the data.
         - Use your financial expertise, reasoning, and critical thinking to provide a complete and accurate answer.
-        - Must include all references ('location' column) to documents used to answer.
+        - Include all references ('location' column) to documents used.
+        - Keep responses under 512 characters.
 
-        When writing SQL queries, do not put double quotes around schema-qualified table names. For example:
-          Correct: SELECT * FROM schema.table
-          Correct: SELECT * FROM database.schema.table
-          Incorrect: SELECT * FROM "schema.table"
-          Incorrect: SELECT * FROM "database.schema.table"
+  - name: judge
+    from: openai:gpt-4o
+    params:
+      openai_api_key: ${ secrets:SPICE_OPENAI_API_KEY }
+      parameterized_prompt: enabled
+      system_prompt: |
+        You are a financial expert. Score the correctness of the answer below between 0.0 and 1.0.
+        Use 0 if the answer is wrong or information was not found and 1.0 if the answer is correct.
+        Question: '{{ input }}'
+        Correct answer: '{{ ideal }}'
+        Actual answer to score: '{{ actual }}'
+      openai_response_format:
+        type: json_schema
+        json_schema:
+          name: judge
+          schema:
+            type: object
+            properties:
+              score:
+                type: number
+                format: float
+            additionalProperties: true
+            required:
+              - score
+        strict: false
+
+views:
+  - name: financebench.evals
+    sql: |
+      SELECT financebench_id, question as input, answer as ideal, company, doc_name, question_type, question_reasoning, justification, evidence from financebench.tests_oss
+
+evals:
+  - name: financebench
+    dataset: financebench.evals
+    scorers:
+      - judge
 
 datasets:
   - from: spice.ai/spiceai/financebench/datasets/spice.financebench.data
@@ -60,17 +94,6 @@ datasets:
       spiceai_endpoint: https://flight.spiceai.io
     acceleration:
       enabled: true
-
-views:
-  - name: financebench.evals
-    sql: |
-      SELECT financebench_id, question as input, answer as ideal, company, doc_name, question_type, question_reasoning, justification, evidence from financebench.tests_oss
-
-evals:
-  - name: financebench
-    dataset: financebench.evals
-    scorers:
-      - match
 
 embeddings:
   - from: openai:text-embedding-3-small
