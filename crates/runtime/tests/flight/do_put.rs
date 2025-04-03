@@ -473,7 +473,7 @@ async fn start_spice_test_app(
             Ok(channel) => {
                 break channel;
             }
-            Err(e) => {
+            Err(_) => {
                 // Wait before next attempt
                 sleep(std::time::Duration::from_millis(100)).await;
             }
