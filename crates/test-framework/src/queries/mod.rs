@@ -494,6 +494,9 @@ pub fn get_tpcds_test_queries(
             38, 87, // https://github.com/spiceai/spiceai/issues/5247
             6, 32, 92 // https://github.com/spiceai/spiceai/issues/5246
         ),
+        Some(QueryOverrides::Dremio) => remove_tpcds_query!(
+            queries, 8, 38, 87 // LEFT SEMI, and LEFT ANTI
+        ),
         Some(_) | None => queries,
     }
 }
