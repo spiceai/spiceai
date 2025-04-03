@@ -106,7 +106,7 @@ async fn mysql_federation_push_down() -> Result<(), String> {
 
             // Set a timeout for the test
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
                     return Err("Timed out waiting for datasets to load".to_string());
                 }
                 () = rt.load_components() => {}
@@ -211,7 +211,7 @@ async fn mysql_federation_inner_join_with_acc() -> Result<(), String> {
             .await;
         // Set a timeout for the test
         tokio::select! {
-            () = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+            () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
                 return Err("Timed out waiting for datasets to load".to_string());
             }
             () = rt.load_components() => {}

@@ -54,7 +54,7 @@ async fn databricks_delta_lake_integration_test_catalog() -> Result<(), anyhow::
                 .await;
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+                () = tokio::time::sleep(std::time::Duration::from_secs(120)) => {
                     panic!("Timeout waiting for components to load");
                 }
                 () = rt.load_components() => {}

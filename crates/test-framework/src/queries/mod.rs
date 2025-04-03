@@ -193,6 +193,7 @@ pub enum QueryOverrides {
     Dremio,
     Spark,
     ODBCAthena,
+    ODBCDatabricks,
     DuckDB,
     Snowflake,
     IcebergSF1,
@@ -279,6 +280,10 @@ pub fn get_tpch_test_queries(
         Some(QueryOverrides::ODBCAthena) => remove_tpch_query!(
             queries, 4,  // https://github.com/spiceai/spiceai/issues/2077
             20  // https://github.com/spiceai/spiceai/issues/2078
+        ),
+        Some(QueryOverrides::ODBCDatabricks) => remove_tpch_query!(
+            queries,
+            2 // Analysis error: [UNSUPPORTED_SUBQUERY_EXPRESSION_CATEGORY.UNSUPPORTED_CORRELATED_SCALAR_SUBQUERY] Unsupported subquery expression: Correlated scalar subqueries can only be used in filters, aggregations, projections, and UPDATE/MERGE/DELETE commands
         ),
         Some(QueryOverrides::Spark) => remove_tpch_query!(
             queries,

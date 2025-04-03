@@ -60,7 +60,7 @@ jobs:
                 target_os: "linux",
                 target_arch: "x86_64",
                 target_arch_go: "amd64",
-                tags: ["default", "models"],
+                tags: ["default", "models", "odbc"],
               }, {
                 name: "Linux aarch64",
                 runner: "hosted-linux-arm-runner",
@@ -243,6 +243,29 @@ jobs:
           name: spiced.exe_models_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: spiced.exe_models_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz
 
+      ## ODBC + Models flavor - for now, assume ODBC only builds with models because this binary is only used for internal testing.
+      - name: Build spiced (odbc,models)
+        if: matrix.target.target_os != 'windows' && contains(matrix.target.tags, 'odbc') && contains(matrix.target.tags, 'models')
+        working-directory: bin/spiced
+        run: cargo build --release --features release,odbc,models --target-dir ../../target
+
+      - name: tar binary (odbc,models)
+        if: matrix.target.target_os != 'windows' && contains(matrix.target.tags, 'odbc') && contains(matrix.target.tags, 'models')
+        run: |
+          mv target/release/spiced spiced
+          chmod +x spiced
+          tar czf spiced_odbc_models_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz spiced
+
+      - name: Print version (odbc,models)
+        if: matrix.target.target_os != 'windows' && contains(matrix.target.tags, 'odbc') && contains(matrix.target.tags, 'models')
+        run: ./spiced --version
+
+      - uses: actions/upload-artifact@v4
+        if: matrix.target.target_os != 'windows' && contains(matrix.target.tags, 'odbc') && contains(matrix.target.tags, 'models')
+        with:
+          name: spiced_odbc_models_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
+          path: spiced_odbc_models_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz
+
       ## Models + metal flavor
       - name: Build spiced (models)
         if: matrix.target.target_os == 'darwin'
@@ -342,6 +365,13 @@ jobs:
           name: spiced_models_linux_x86_64
           path: ${{ env.ARTIFACT_DIR }}
 
+      - name: download artifacts - spiced_odbc_models_linux_x86_64
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: spiced_odbc_models_linux_x86_64
+          path: ${{ env.ARTIFACT_DIR }}
+
       - name: Upload artifacts to Minio
         run: |
           sudo apt-get update
@@ -356,6 +386,10 @@ jobs:
 
           if [ -f "${ARTIFACT_DIR}/spiced_models_linux_x86_64.tar.gz" ]; then
             mc cp ${{ env.ARTIFACT_DIR }}/spiced_models_linux_x86_64.tar.gz spice-minio/artifacts/spiced/linux-x86_64/${{ env.COMMIT_SHA }}/
+          fi;
+
+          if [ -f "${ARTIFACT_DIR}/spiced_odbc_models_linux_x86_64.tar.gz" ]; then
+            mc cp ${{ env.ARTIFACT_DIR }}/spiced_odbc_models_linux_x86_64.tar.gz spice-minio/artifacts/spiced/linux-x86_64/${{ env.COMMIT_SHA }}/
           fi;
 
           if [ -f "${ARTIFACT_DIR}/spice_linux_x86_64.tar.gz" ]; then

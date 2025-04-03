@@ -14,7 +14,7 @@ datasets:
         ThriftTransport=2;
         AuthMech=3;
         UID=token;
-        PWD=${ env:DATABRICKS_TOKEN }
+        PWD=${ env:DATABRICKS_TOKEN };
   - from: odbc:spiceai_sandbox.tpch.lineitem
     name: lineitem
     params: *odbc_params

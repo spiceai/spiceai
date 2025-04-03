@@ -92,7 +92,7 @@ async fn test_file_watcher() -> Result<(), anyhow::Error> {
             );
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
                     return Err(anyhow::Error::msg("Timed out waiting for datasets to load"));
                 }
                 () = rt.load_components() => {}

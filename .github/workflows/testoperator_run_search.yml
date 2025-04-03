@@ -29,11 +29,11 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install MinIO
-        run: |
-          sudo apt update && sudo apt install wget -y
-          sudo wget https://dl.min.io/client/mc/release/linux-amd64/mc -O /usr/local/bin/mc
-          sudo chmod +x /usr/local/bin/mc
-          mc alias set spice-minio ${{ secrets.MINIO_ENDPOINT }} ${{ secrets.MINIO_ACCESS_KEY }} ${{ secrets.MINIO_SECRET_KEY }}
+        uses: ./.github/actions/setup-minio
+        with:
+          minio_endpoint: ${{ secrets.MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.MINIO_SECRET_KEY }}
       
       - name: Setup spiced
         uses: ./.github/actions/setup-spiced
