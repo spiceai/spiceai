@@ -63,7 +63,7 @@ pub fn get_random_port() -> Result<usize, anyhow::Error> {
 
     for _ in 0..100 {
         let port: usize = rng.random_range(15432..65535);
-        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port as u16));
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], u16::try_from(port)?));
         if std::net::TcpListener::bind(addr).is_ok() {
             return Ok(port);
         }

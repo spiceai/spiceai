@@ -189,23 +189,23 @@ jobs:
         if: ${{ needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true' }}
         run: sccache --show-stats
 
-  build-docker:
-    name: Build Docker Image
-    runs-on: spiceai-runners
-    needs: check_changes
+  # build-docker:
+  #   name: Build Docker Image
+  #   runs-on: spiceai-runners
+  #   needs: check_changes
 
-    steps:
-      - uses: actions/checkout@v4
+  #   steps:
+  #     - uses: actions/checkout@v4
 
-      - name: Build and push Docker images
-        uses: docker/build-push-action@v6
-        if: needs.check_changes.outputs.relevant_changes == 'true'
-        with:
-          context: .
-          file: Dockerfile
-          platforms: linux/amd64
-          push: false
-          build-args: |
-            CARGO_FEATURES=odbc
-          tags: |
-            ghcr.io/spiceai/spiceai-rust:ci
+  #     - name: Build and push Docker images
+  #       uses: docker/build-push-action@v6
+  #       if: needs.check_changes.outputs.relevant_changes == 'true'
+  #       with:
+  #         context: .
+  #         file: Dockerfile
+  #         platforms: linux/amd64
+  #         push: false
+  #         build-args: |
+  #           CARGO_FEATURES=odbc
+  #         tags: |
+  #           ghcr.io/spiceai/spiceai-rust:ci
