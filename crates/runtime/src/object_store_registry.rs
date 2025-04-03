@@ -84,6 +84,9 @@ impl SpiceObjectStoreRegistry {
         if let (Some(key), Some(secret)) = (params.get("key"), params.get("secret")) {
             s3_builder = s3_builder.with_access_key_id(key);
             s3_builder = s3_builder.with_secret_access_key(secret);
+            if let Some(token) = params.get("session_token") {
+                s3_builder = s3_builder.with_token(token);
+            }
         } else {
             match params.get("auth") {
                 Some(auth) if auth == "iam_role" => {

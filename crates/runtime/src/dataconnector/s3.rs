@@ -23,7 +23,6 @@ use super::{
 use crate::parameters::ParamLookup;
 use crate::{component::dataset::Dataset, dataconnector::listing::LISTING_TABLE_PARAMETERS};
 
-use secrecy::ExposeSecret;
 use snafu::prelude::*;
 use std::any::Any;
 use std::clone::Clone;
@@ -136,7 +135,7 @@ static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
             ParameterSpec::component("endpoint").secret(),
             ParameterSpec::component("key").secret(),
             ParameterSpec::component("secret").secret(),
-            ParameterSpec::component("session_token").secret(),
+            ParameterSpec::component("session_token").secret().disable_auto_load(),
             ParameterSpec::component("auth")
                 .description("Configures the authentication method for S3. Supported methods are: public (i.e. no auth), iam_role, key.")
                 .secret(),
@@ -232,16 +231,6 @@ impl DataConnectorFactory for S3Factory {
                             return Err(Box::new(e) as Box<dyn std::error::Error + Send + Sync>);
                         }
                     }
-
-                    // Session token is optional; log if present
-                    if let ParamLookup::Present(secret) = params.parameters.get("session_token") {
-                        tracing::info!(
-                            "Using temporary credentials with session token for S3 auth."
-                        );
-
-                        // Set environment variable because session token cannot be used in URL fragment
-                        std::env::set_var("AWS_SESSION_TOKEN", secret.expose_secret());
-                    }
                 }
                 Some(auth) => {
                     return Err(Box::new(Error::UnsupportedAuthenticationMethod {
@@ -307,7 +296,7 @@ impl ListingTableConnector for S3 {
                 "client_timeout",
                 "allow_http",
                 "auth",
-                // "session_token" cannot be sent via URL fragments
+                "session_token",
             ],
         )));
 
