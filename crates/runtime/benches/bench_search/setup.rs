@@ -30,7 +30,7 @@ use app::AppBuilder;
 use spicepod::component::{
     dataset::{acceleration::Acceleration, replication::Replication, Dataset, Mode},
     embeddings::{EmbeddingChunkConfig, Embeddings},
-    runtime::ResultsCache,
+    runtime::{CacheKeyType, ResultsCache},
 };
 
 use super::SearchBenchmarkResultBuilder;
@@ -241,6 +241,7 @@ async fn build_bench_app(
             cache_max_size: None,
             item_ttl: None,
             eviction_policy: None,
+            cache_key_type: CacheKeyType::default(),
         })
         .with_embedding(create_embeddings_model(embeddings_model));
 

@@ -32,7 +32,7 @@ use spicepod::component::{
         replication::Replication,
         Dataset, Mode,
     },
-    runtime::ResultsCache,
+    runtime::{CacheKeyType, ResultsCache},
 };
 use std::{collections::HashMap, sync::Arc};
 /// The number of times to run each query in the benchmark.
@@ -121,6 +121,7 @@ fn build_app(
             cache_max_size: None,
             item_ttl: None,
             eviction_policy: None,
+            cache_key_type: CacheKeyType::default(),
         });
 
     app_builder = match connector {
