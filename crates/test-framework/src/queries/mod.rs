@@ -193,7 +193,9 @@ pub enum QueryOverrides {
     Dremio,
     Spark,
     ODBCAthena,
+    ODBCDatabricks,
     DuckDB,
+    DuckDBOnZeroResults,
     Snowflake,
     IcebergSF1,
     SpicecloudCatalog,
@@ -279,6 +281,10 @@ pub fn get_tpch_test_queries(
         Some(QueryOverrides::ODBCAthena) => remove_tpch_query!(
             queries, 4,  // https://github.com/spiceai/spiceai/issues/2077
             20  // https://github.com/spiceai/spiceai/issues/2078
+        ),
+        Some(QueryOverrides::ODBCDatabricks) => remove_tpch_query!(
+            queries,
+            2 // Analysis error: [UNSUPPORTED_SUBQUERY_EXPRESSION_CATEGORY.UNSUPPORTED_CORRELATED_SCALAR_SUBQUERY] Unsupported subquery expression: Correlated scalar subqueries can only be used in filters, aggregations, projections, and UPDATE/MERGE/DELETE commands
         ),
         Some(QueryOverrides::Spark) => remove_tpch_query!(
             queries,
@@ -444,6 +450,9 @@ pub fn get_tpcds_test_queries(
             38, // EXCEPT and INTERSECT aren't supported
             87  // EXCEPT and INTERSECT aren't supported
         ),
+        Some(QueryOverrides::DuckDBOnZeroResults) => remove_tpcds_query!(
+            queries, 44, 54, 77 // https://github.com/spiceai/spiceai/issues/5261
+        ),
         Some(QueryOverrides::MySQL) => remove_tpcds_query!(
             queries, 8,  // EXCEPT and INTERSECT aren't supported
             38, // EXCEPT and INTERSECT aren't supported
@@ -478,6 +487,12 @@ pub fn get_tpcds_test_queries(
             5, 14, 18, 22, 27, 36, 67, 70, 77, 80,
             86, // SQLite does not support `ROLLUP` and `GROUPING`
             8, 14, 38, 87 // EXCEPT and INTERSECT aren't supported
+        ),
+        Some(QueryOverrides::Spark) => remove_tpcds_query!(
+            queries, 8, // https://github.com/spiceai/spiceai/issues/5250
+            36, 44, 47, 49, 57, 67, 70, 86, // https://github.com/spiceai/spiceai/issues/5249
+            38, 87, // https://github.com/spiceai/spiceai/issues/5247
+            6, 32, 92 // https://github.com/spiceai/spiceai/issues/5246
         ),
         Some(_) | None => queries,
     }

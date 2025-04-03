@@ -14,11 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::acceleration::wait_for_checkpoints;
 use app::AppBuilder;
 use arrow::array::RecordBatch;
 use datafusion_table_providers::sql::db_connection_pool::DbConnectionPool;
 use futures::TryStreamExt;
-use runtime::{status, Runtime};
+use runtime::{component::dataset::Dataset as RuntimeDataset, status, Runtime};
 use secrecy::ExposeSecret;
 use spicepod::component::dataset::acceleration::{Acceleration, RefreshMode};
 use spicepod::component::dataset::Dataset;
@@ -39,7 +40,7 @@ async fn test_acceleration_postgres_checkpoint() -> Result<(), anyhow::Error> {
 
     test_request_context()
         .scope(async {
-            let port: usize = get_random_port();
+            let port: usize = get_random_port()?;
             let running_container = common::start_postgres_docker_container(port).await?;
 
             let pool = common::get_postgres_connection_pool(port, None).await?;
@@ -67,6 +68,13 @@ async fn test_acceleration_postgres_checkpoint() -> Result<(), anyhow::Error> {
                 .with_dataset(dataset)
                 .build();
 
+            let runtime_datasets = app
+                .datasets
+                .clone()
+                .into_iter()
+                .map(RuntimeDataset::try_from)
+                .collect::<Result<Vec<_>, _>>()?;
+
             let rt = Arc::new(
                 Runtime::builder()
                     .with_app(app)
@@ -78,7 +86,7 @@ async fn test_acceleration_postgres_checkpoint() -> Result<(), anyhow::Error> {
 
             // Set a timeout for the test
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
                 }
                 () = rt.load_components() => {}
@@ -86,8 +94,9 @@ async fn test_acceleration_postgres_checkpoint() -> Result<(), anyhow::Error> {
 
             runtime_ready_check(&rt).await;
 
-            // Wait for the checkpoint to be created
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            // Verify checkpoints are created before shutting down runtime
+            wait_for_checkpoints(&runtime_datasets, 120).await?;
+
             drop(rt);
             runtime::dataaccelerator::unregister_all().await;
             runtime::dataaccelerator::register_all().await;

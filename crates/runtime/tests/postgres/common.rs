@@ -58,8 +58,17 @@ pub fn get_pg_params(port: usize) -> HashMap<String, SecretString> {
     params
 }
 
-pub fn get_random_port() -> usize {
-    rand::rng().random_range(15432..65535)
+pub fn get_random_port() -> Result<usize, anyhow::Error> {
+    let mut rng = rand::rng();
+
+    for _ in 0..100 {
+        let port: usize = rng.random_range(15432..65535);
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], u16::try_from(port)?));
+        if std::net::TcpListener::bind(addr).is_ok() {
+            return Ok(port);
+        }
+    }
+    Err(anyhow::anyhow!("No available port found"))
 }
 
 #[instrument]
