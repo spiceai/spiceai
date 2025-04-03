@@ -114,7 +114,13 @@ impl Query {
         };
 
         let cache_status = Self::should_cache_results(df, &plan, cache_status);
-        let plan_cache_key = CacheKey::LogicalPlan(&plan).as_raw_key();
+        let cache_control = request_context.cache_control();
+        let plan_cache_key = match cache_control {
+            CacheControl::Cache(CacheKeyType::Default) | CacheControl::NoCache => {
+                CacheKey::LogicalPlan(&plan).as_raw_key()
+            }
+            CacheControl::Cache(CacheKeyType::Raw) => CacheKey::String(sql).as_raw_key(),
+        };
         tracker = tracker.results_cache_hit(false);
 
         Ok(PlanOrCached::Plan(
