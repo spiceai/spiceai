@@ -14,9 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use cache::raw::QueryResultsCacheProviderRaw;
+use cache::QueryResultsCacheProvider;
 
-use crate::Runtime;
+use crate::{datafusion::SPICE_RUNTIME_SCHEMA, Runtime};
 
 impl Runtime {
     pub async fn init_results_cache(&self) {
@@ -29,7 +29,10 @@ impl Runtime {
             return;
         }
 
-        match QueryResultsCacheProviderRaw::try_new(cache_config) {
+        match QueryResultsCacheProvider::try_new(
+            cache_config,
+            Box::new([SPICE_RUNTIME_SCHEMA.into(), "information_schema".into()]),
+        ) {
             Ok(cache_provider) => {
                 tracing::info!("Initialized results cache; {cache_provider}");
                 self.datafusion().set_cache_provider(cache_provider);

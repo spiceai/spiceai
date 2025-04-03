@@ -1,4 +1,3 @@
-use crate::key_for_logical_plan;
 /*
 Copyright 2024-2025 The Spice.ai OSS Authors
 
@@ -14,12 +13,14 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+
+use crate::CacheKey;
 use crate::CachedQueryResult;
 use crate::FailedToInvalidateCacheSnafu;
 use crate::QueryResultCache;
+use crate::RawCacheKey;
 use crate::Result;
 use async_trait::async_trait;
-use datafusion::logical_expr::LogicalPlan;
 use datafusion::sql::TableReference;
 use moka::future::Cache;
 use snafu::ResultExt;
@@ -65,22 +66,20 @@ impl LruCache {
 
 #[async_trait]
 impl QueryResultCache for LruCache {
-    async fn get(&self, plan: &LogicalPlan) -> Result<Option<CachedQueryResult>> {
-        let key = key_for_logical_plan(plan);
-        match self.cache.get(&key).await {
+    async fn get<'a>(&self, key: CacheKey<'a>) -> Result<Option<CachedQueryResult>> {
+        match self.cache.get(&key.as_raw_key().0).await {
             Some(value) => Ok(Some(value)),
             None => Ok(None),
         }
     }
 
-    async fn put(&self, plan: &LogicalPlan, result: CachedQueryResult) -> Result<()> {
-        let key = key_for_logical_plan(plan);
-        self.cache.insert(key, result).await;
+    async fn put<'a>(&self, key: CacheKey<'a>, result: CachedQueryResult) -> Result<()> {
+        self.cache.insert(key.as_raw_key().0, result).await;
         Ok(())
     }
 
-    async fn put_key(&self, plan_key: u64, result: CachedQueryResult) -> Result<()> {
-        self.cache.insert(plan_key, result).await;
+    async fn put_raw_key(&self, raw_key: RawCacheKey, result: CachedQueryResult) -> Result<()> {
+        self.cache.insert(raw_key.0, result).await;
         Ok(())
     }
 

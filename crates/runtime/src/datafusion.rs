@@ -39,7 +39,7 @@ use arrow::datatypes::{Schema, SchemaRef};
 use arrow::error::ArrowError;
 use arrow_tools::schema::verify_schema;
 use builder::DataFusionBuilder;
-use cache::raw::QueryResultsCacheProviderRaw;
+use cache::QueryResultsCacheProvider;
 use datafusion::catalog::CatalogProvider;
 use datafusion::catalog::SchemaProvider;
 use datafusion::datasource::{TableProvider, ViewTable};
@@ -250,7 +250,7 @@ pub struct DataFusion {
     runtime_status: Arc<status::RuntimeStatus>,
     data_writers: RwLock<HashSet<TableReference>>,
     accelerated_tables: TokioRwLock<HashSet<TableReference>>,
-    cache_provider: RwLock<Option<Arc<QueryResultsCacheProviderRaw>>>,
+    cache_provider: RwLock<Option<Arc<QueryResultsCacheProvider>>>,
 
     pending_sink_tables: TokioRwLock<Vec<PendingSinkRegistration>>,
 }
@@ -275,7 +275,7 @@ impl DataFusion {
         None
     }
 
-    pub fn set_cache_provider(&self, cache_provider: QueryResultsCacheProviderRaw) {
+    pub fn set_cache_provider(&self, cache_provider: QueryResultsCacheProvider) {
         if let Ok(mut a) = self.cache_provider.write() {
             *a = Some(Arc::new(cache_provider));
         };
@@ -924,7 +924,7 @@ impl DataFusion {
         );
     }
 
-    pub fn cache_provider(&self) -> Option<Arc<QueryResultsCacheProviderRaw>> {
+    pub fn cache_provider(&self) -> Option<Arc<QueryResultsCacheProvider>> {
         let Ok(provider) = self.cache_provider.read() else {
             return None;
         };
