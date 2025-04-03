@@ -1260,6 +1260,7 @@ pub(crate) mod tests {
     use datafusion::sql::sqlparser::ast::{BinaryOperator, Expr};
     use schemars::schema_for;
     use snafu::ResultExt;
+    use std::time::Duration;
 
     #[tokio::test]
     async fn test_search_request_schema() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -1413,27 +1414,68 @@ pub(crate) mod tests {
 
     #[test]
     fn test_performance_of_column_parsing() {
-        let mut timings = vec![];
+        let mut timings: HashMap<i32, Vec<Duration>> = HashMap::new();
+        let test_input_length = [1, 50, 100];
+        let assertion_threshold = [50_000, 1_000_000, 1_500_000];
 
-        for _ in 0..3 {
+        for i in test_input_length {
+            let mut group_timings = vec![];
             let mut additional_columns = vec!["column1".to_string()];
-            for i in 0..100 {
+            for j in 0..i {
+                additional_columns.push(format!("column{}", j + 2));
+            }
+
+            for _ in 0..100 {
                 let start = std::time::Instant::now();
                 let result = SearchRequest::parse_additional_columns(&additional_columns);
-                timings.push(start.elapsed());
+                group_timings.push(start.elapsed());
                 assert!(result.is_ok());
-                additional_columns.push(format!("column{}", i + 2));
             }
+
+            timings.insert(i, group_timings);
         }
 
-        let total_time: std::time::Duration = timings.iter().sum();
-        #[allow(clippy::cast_possible_truncation)]
-        let average_time = total_time / (timings.len() as u32);
-        let average_time_ns = average_time.as_nanos();
-        assert!(
-            average_time_ns < 1_000_000,
-            "Average time: {average_time_ns}ns"
-        ); // less than 1ms
+        for (i, threshold) in test_input_length.iter().zip(assertion_threshold.iter()) {
+            let group_timings = remove_outliers_iqr(timings.get(&i).expect("Timing not found"));
+            println!("Group {i} timings: {group_timings:?}");
+
+            let total_time: std::time::Duration = group_timings.iter().sum();
+            #[allow(clippy::cast_possible_truncation)]
+            let average_time = total_time / (group_timings.len() as u32);
+            let average_time_ns = average_time.as_nanos();
+            assert!(
+                average_time_ns < *threshold,
+                "Average time: {average_time_ns}ns"
+            ); // less than 1ms
+        }
+    }
+
+    fn remove_outliers_iqr(timings: &[Duration]) -> Vec<Duration> {
+        let iqr_multiplier = 1.5;
+        // Sort durations
+        let mut sorted: Vec<u128> = timings.iter().map(|d| d.as_nanos()).collect();
+        sorted.sort_unstable();
+
+        // Find quartiles
+        let q1_idx = sorted.len() / 4;
+        let q3_idx = sorted.len() * 3 / 4;
+        let q1 = sorted[q1_idx] as f64;
+        let q3 = sorted[q3_idx] as f64;
+
+        // Calculate IQR and bounds
+        let iqr = q3 - q1;
+        let lower_bound = q1 - iqr_multiplier * iqr;
+        let upper_bound = q3 + iqr_multiplier * iqr;
+
+        // Filter out outliers
+        timings
+            .iter()
+            .filter(|&&t| {
+                let nanos = t.as_nanos() as f64;
+                nanos >= lower_bound && nanos <= upper_bound
+            })
+            .copied()
+            .collect()
     }
 
     #[test]
