@@ -35,7 +35,7 @@ async fn test_postgres_types() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
     test_request_context().scope(async {
-        let port = common::get_random_port();
+        let port = common::get_random_port()?;
         let running_container = common::start_postgres_docker_container(port).await?;
 
         let ctx = SessionContext::new();
@@ -119,7 +119,7 @@ async fn test_postgres_unsupported_type_action() -> Result<(), anyhow::Error> {
 
     test_request_context()
         .scope(async {
-            let port = common::get_random_port();
+            let port = common::get_random_port()?;
             let running_container = common::start_postgres_docker_container(port).await?;
 
             let ctx = SessionContext::new();
