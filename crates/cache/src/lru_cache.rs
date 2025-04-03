@@ -105,3 +105,150 @@ impl QueryResultCache for LruCache {
         self.cache.entry_count()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::{Int32Array, RecordBatch};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use std::collections::HashSet;
+    use std::time::Duration;
+
+    fn create_test_record_batch() -> RecordBatch {
+        let schema = Schema::new(vec![Field::new("id", DataType::Int32, false)]);
+        let array = Int32Array::from(vec![1, 2, 3]);
+        RecordBatch::try_new(Arc::new(schema), vec![Arc::new(array)])
+            .expect("Failed to create record batch")
+    }
+
+    fn create_test_cached_result() -> CachedQueryResult {
+        let record_batch = create_test_record_batch();
+        let mut input_tables = HashSet::new();
+        input_tables.insert(TableReference::Bare {
+            table: Arc::from("test_table"),
+        });
+
+        CachedQueryResult {
+            records: Arc::new(vec![record_batch.clone()]),
+            schema: Arc::new(record_batch.schema().as_ref().to_owned()),
+            input_tables: Arc::new(input_tables),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cache_put_and_get() {
+        let cache = LruCache::new(10, Duration::from_secs(60));
+        let key = CacheKey::String("test_query");
+        let result = create_test_cached_result();
+
+        // Put a value in the cache
+        cache
+            .put(key, result.clone())
+            .await
+            .expect("Failed to put in cache");
+
+        let key = CacheKey::String("test_query");
+
+        // Get the value from the cache
+        let retrieved = cache.get(key).await.expect("Failed to get from cache");
+        assert!(retrieved.is_some());
+        assert_eq!(
+            retrieved.expect("Failed to get from cache").records.len(),
+            result.records.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cache_miss() {
+        let cache = LruCache::new(10, Duration::from_secs(60));
+        let key = CacheKey::String("nonexistent_query");
+
+        // Try to get a non-existent key
+        let retrieved = cache.get(key).await.expect("Failed to get from cache");
+        assert!(retrieved.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_cache_put_raw_key() {
+        let cache = LruCache::new(10, Duration::from_secs(60));
+        let raw_key = CacheKey::String("test_query").as_raw_key();
+        let result = create_test_cached_result();
+
+        // Put a value with a raw key
+        cache
+            .put_raw_key(raw_key, result.clone())
+            .await
+            .expect("Failed to put with raw key");
+
+        let retrieved = cache
+            .get(CacheKey::String("test_query"))
+            .await
+            .expect("Failed to get from cache");
+        assert!(retrieved.is_some());
+        assert_eq!(
+            retrieved.expect("Failed to get from cache").records.len(),
+            result.records.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cache_invalidate_for_table() {
+        let cache = LruCache::new(10, Duration::from_secs(60));
+        let table_ref = TableReference::Bare {
+            table: Arc::from("test_table"),
+        };
+        let result = create_test_cached_result();
+
+        // Put a value in the cache
+        let get_key = || CacheKey::String("test_query");
+        let key = get_key();
+        cache
+            .put(key, result)
+            .await
+            .expect("Failed to put in cache");
+
+        // Verify the value is in the cache
+        let retrieved = cache
+            .get(get_key())
+            .await
+            .expect("Failed to get from cache");
+        assert!(retrieved.is_some());
+
+        // Invalidate the cache for the table
+        cache
+            .invalidate_for_table(table_ref)
+            .await
+            .expect("Failed to invalidate cache");
+
+        // Verify the value is no longer in the cache
+        let retrieved = cache
+            .get(get_key())
+            .await
+            .expect("Failed to get from cache");
+        assert!(retrieved.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_cache_ttl() {
+        let cache = LruCache::new(10, Duration::from_millis(100));
+        let key = || CacheKey::String("test_query");
+        let result = create_test_cached_result();
+
+        // Put a value in the cache
+        cache
+            .put(key(), result)
+            .await
+            .expect("Failed to put in cache");
+
+        // Verify the value is in the cache
+        let retrieved = cache.get(key()).await.expect("Failed to get from cache");
+        assert!(retrieved.is_some());
+
+        // Wait for the TTL to expire
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // Verify the value is no longer in the cache
+        let retrieved = cache.get(key()).await.expect("Failed to get from cache");
+        assert!(retrieved.is_none());
+    }
+}
