@@ -183,20 +183,6 @@ impl QueryResultsCacheProvider {
     /// # Errors
     ///
     /// Will return `Err` if method fails to access the cache
-    pub async fn get_plan(&self, plan: &LogicalPlan) -> Result<Option<CachedQueryResult>> {
-        self.get(CacheKey::LogicalPlan(plan)).await
-    }
-
-    /// # Errors
-    ///
-    /// Will return `Err` if method fails to access the cache
-    pub async fn get_sql(&self, sql: &str) -> Result<Option<CachedQueryResult>> {
-        self.get(CacheKey::String(sql)).await
-    }
-
-    /// # Errors
-    ///
-    /// Will return `Err` if method fails to access the cache
     pub async fn get(&self, key: CacheKey<'_>) -> Result<Option<CachedQueryResult>> {
         metrics::REQUESTS.add(1, &[]);
         match self.cache.get(key).await {
@@ -207,24 +193,6 @@ impl QueryResultsCacheProvider {
             Ok(None) => Ok(None),
             Err(e) => Err(e),
         }
-    }
-
-    /// # Errors
-    ///
-    /// Will return `Err` if method fails to access the cache
-    pub async fn put_plan(&self, plan: &LogicalPlan, result: CachedQueryResult) -> Result<()> {
-        let res = self.cache.put(CacheKey::LogicalPlan(plan), result).await;
-        self.report_size_metrics();
-        res
-    }
-
-    /// # Errors
-    ///
-    /// Will return `Err` if method fails to access the cache
-    pub async fn put_sql(&self, sql: &str, result: CachedQueryResult) -> Result<()> {
-        let res = self.cache.put(CacheKey::String(sql), result).await;
-        self.report_size_metrics();
-        res
     }
 
     /// # Errors
