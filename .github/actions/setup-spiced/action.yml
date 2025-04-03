@@ -9,6 +9,11 @@ inputs:
     description: 'spiced build commit'
     required: false
     type: string
+  with_odbc: # whether to download the ODBC-enabled binary
+    description: 'download the ODBC-enabled spiced binary'
+    required: false
+    default: 'false'
+    type: boolean
 outputs:
   spiced_commit:
     value: ${{ steps.output_spiced_commit.outputs.spiced_commit }}
@@ -21,10 +26,16 @@ runs:
       run: |
         git fetch --depth=10 origin trunk
         commit_hashes=($(git log origin/trunk --pretty=format:"%H" -n 10))
+        
+        if [[ "${{ inputs.with_odbc }}" == "true" ]]; then
+          features="odbc_models"
+        else
+          features="models"
+        fi
 
         for hash in "${commit_hashes[@]}"; do
           echo "Checking $hash in MinIO"
-          if mc stat spice-minio/artifacts/spiced/linux-x86_64/$hash/spiced_odbc_models_linux_x86_64.tar.gz; then
+          if mc stat spice-minio/artifacts/spiced/linux-x86_64/$hash/spiced_$features_linux_x86_64.tar.gz; then
             echo "Found $hash in MinIO"
             echo "SPICED_COMMIT=$hash" >> $GITHUB_ENV
             exit 0

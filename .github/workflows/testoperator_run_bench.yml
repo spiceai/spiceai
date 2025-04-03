@@ -69,6 +69,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Extract spicepod filename path
+        id: extract_spicepod_filename
+        run: |
+          SPICEPOD_PATH="${{ github.event.inputs.spicepod_path }}"
+          SPICEPOD_FILENAME=$(basename $SPICEPOD_PATH)
+          echo "SPICEPOD_FILENAME=${SPICEPOD_FILENAME}" >> $GITHUB_OUTPUT
+
       - name: Install MinIO
         uses: ./.github/actions/setup-minio
         with:
@@ -80,6 +87,7 @@ jobs:
         uses: ./.github/actions/setup-spiced
         with:
           spiced_commit: ${{ github.event.inputs.spiced_commit }}
+          with_odbc: ${{ contains(steps.extract_spicepod_filename.outputs.SPICEPOD_FILENAME, 'odbc') }}
 
       - name: Build Testoperator
         uses: ./.github/actions/build-testoperator
@@ -96,13 +104,6 @@ jobs:
           elif [[ ${{ github.event.inputs.query_set }} == "tpch" ]]; then
             echo "MYSQL_DB=tpch_sf1" >> $GITHUB_ENV
           fi
-
-      - name: Extract spicepod filename path
-        id: extract_spicepod_filename
-        run: |
-          SPICEPOD_PATH="${{ github.event.inputs.spicepod_path }}"
-          SPICEPOD_FILENAME=$(basename $SPICEPOD_PATH)
-          echo "SPICEPOD_FILENAME=${SPICEPOD_FILENAME}" >> $GITHUB_OUTPUT
 
       - name: Setup ODBC
         if: ${{ contains(steps.extract_spicepod_filename.outputs.SPICEPOD_FILENAME, 'odbc') }}
