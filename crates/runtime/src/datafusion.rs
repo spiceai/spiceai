@@ -836,7 +836,7 @@ impl DataFusion {
 
         accelerated_table_builder.ready_state(dataset.ready_state);
 
-        // accelerated_table_builder.cache_provider(self.cache_provider());
+        accelerated_table_builder.cache_provider(self.cache_provider());
 
         accelerated_table_builder.checkpointer_opt(DatasetCheckpoint::try_new(dataset).await.ok());
 
