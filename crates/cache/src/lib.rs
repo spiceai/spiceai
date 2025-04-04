@@ -87,6 +87,7 @@ pub enum QueryResultsCacheStatus {
     CacheMiss,
 }
 
+#[derive(Hash, Eq, PartialEq)]
 pub enum CacheKey<'a> {
     LogicalPlan(&'a LogicalPlan),
     String(&'a str),
@@ -96,16 +97,8 @@ impl CacheKey<'_> {
     #[must_use]
     pub fn as_raw_key(&self) -> RawCacheKey {
         let mut hasher = DefaultHasher::new();
-        match *self {
-            CacheKey::LogicalPlan(plan) => {
-                plan.hash(&mut hasher);
-                RawCacheKey(hasher.finish())
-            }
-            CacheKey::String(sql) => {
-                sql.hash(&mut hasher);
-                RawCacheKey(hasher.finish())
-            }
-        }
+        (*self).hash(&mut hasher);
+        RawCacheKey(hasher.finish())
     }
 }
 
