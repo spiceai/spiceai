@@ -1,9 +1,0 @@
----
-source: crates/runtime/benches/bench.rs
-expression: records_pretty
----
-+---------+------+--------------+-------------+---------------+
-| channel | item | return_ratio | return_rank | currency_rank |
-+---------+------+--------------+-------------+---------------+
-| catalog | 125  | 0.925        | 1           | 1             |
-+---------+------+--------------+-------------+---------------+

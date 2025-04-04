@@ -221,10 +221,6 @@ extended_tests = []
 
 [[bench]]
 harness = false
-name = "bench"
-
-[[bench]]
-harness = false
 name = "vector_search"
 
 [target.'cfg(windows)'.dependencies]
