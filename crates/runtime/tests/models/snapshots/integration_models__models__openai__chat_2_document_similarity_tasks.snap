@@ -4,15 +4,15 @@ expression: "serde_json::to_string_pretty(&combined_value).expect(\"Failed to se
 ---
 [
   {
-    "keywords": [
-      "journalists"
-    ],
-    "limit": 5
+    "datasets": "dummy_value",
+    "keywords": "dummy_value",
+    "limit": "dummy_value",
+    "text": "dummy_value"
   },
   {
-    "keywords": [
-      "vehicles"
-    ],
-    "limit": 5
+    "datasets": "dummy_value",
+    "keywords": "dummy_value",
+    "limit": "dummy_value",
+    "text": "dummy_value"
   }
 ]

@@ -560,9 +560,9 @@ async fn verify_similarity_search_chat_completion(
 
     for mut value in task_input {
         if let serde_json::Value::Object(ref mut map) = value {
-            // Remove the unstable "text" and "datasets" field
-            map.remove("text");
-            map.remove("datasets");
+            for (_, val) in map.iter_mut() {
+                *val = serde_json::Value::String("dummy_value".to_string());
+            }
 
             // Sort the keys for consistent ordering
             sort_json_keys(&mut value);
