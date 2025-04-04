@@ -31,7 +31,7 @@ ci:
 
 .PHONY: test
 test:
-	@cargo test --all --lib
+	@cargo test --all --lib -- --nocapture
 
 .PHONY: nextest
 nextest:
