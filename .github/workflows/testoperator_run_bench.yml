@@ -67,6 +67,14 @@ jobs:
     name: Run benchmark e2e tests
     runs-on: ${{ github.event.inputs.runner_type }}
     timeout-minutes: 600
+    services:
+      mssql_tpch:
+        image: ${{ contains(github.event.inputs.spicepod_path, 'mssql') && 'ghcr.io/spiceai/spice-mssql-bench:latest' || '' }}
+        ports:
+          - 1433:1433
+        env:
+          MSSQL_SA_PASSWORD: S3cretP@ssw0rd
+          DB_NAME: tpch_sf1
     steps:
       - uses: actions/checkout@v4
 
@@ -151,6 +159,10 @@ jobs:
           DREMIO_USERNAME: ${{ secrets.SPICE_DREMIO_USERNAME}}
           DREMIO_PASSWORD: ${{ secrets.SPICE_DREMIO_PASSWORD}}
           INSTA_UPDATE: ${{ github.event.inputs.update_snapshots}}
+          MSSQL_HOST: localhost
+          MSSQL_USER: sa
+          MSSQL_PASSWORD: S3cretP@ssw0rd
+          MSSQL_TPCH_DB: tpch_sf1
 
       - name: Run the benchmark test (with overrides) - ${{ steps.extract_spicepod_filename.outputs.SPICEPOD_FILENAME }}
         if: ${{ github.event.inputs.query_overrides != '' }}
@@ -187,6 +199,10 @@ jobs:
           DREMIO_USERNAME: ${{ secrets.SPICE_DREMIO_USERNAME}}
           DREMIO_PASSWORD: ${{ secrets.SPICE_DREMIO_PASSWORD}}
           INSTA_UPDATE: ${{ github.event.inputs.update_snapshots}}
+          MSSQL_HOST: localhost
+          MSSQL_USER: sa
+          MSSQL_PASSWORD: S3cretP@ssw0rd
+          MSSQL_TPCH_DB: tpch_sf1
       
       - name: Install GH CLI
         if: github.event.inputs.update_snapshots == 'always'

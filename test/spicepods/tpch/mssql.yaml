@@ -8,7 +8,7 @@ datasets:
       mssql_host: ${secrets:MSSQL_HOST}
       mssql_username: ${secrets:MSSQL_USER}
       mssql_password: ${secrets:MSSQL_PASSWORD}
-      mssql_database: ${secrets:MSSQL_DB}
+      mssql_database: ${secrets:MSSQL_TPCH_DB}
       mssql_encrypt: false
       mssql_trust_server_certificate: true
   - from: mssql:lineitem

@@ -494,6 +494,28 @@ pub fn get_tpcds_test_queries(
             38, 87, // https://github.com/spiceai/spiceai/issues/5247
             6, 32, 92 // https://github.com/spiceai/spiceai/issues/5246
         ),
+        Some(QueryOverrides::ODBCDatabricks) => {
+            let queries: Vec<(&'static str, &'static str)> = remove_tpcds_query!(
+                queries, 6, 8, 13, 14, 23, 24, 32, 36, 38, 39, 44, 47, 49, 57, 67, 70, 86, 87, 91,
+                92
+            );
+
+            add_tpcds_query_overrides!(
+                queries,
+                "odbc_databricks",
+                6,
+                32,
+                36,
+                44,
+                47,
+                49,
+                57,
+                67,
+                70,
+                86,
+                92
+            )
+        }
         Some(QueryOverrides::Dremio) => remove_tpcds_query!(
             queries, 8, 38, 87 // LEFT SEMI, and LEFT ANTI
         ),
