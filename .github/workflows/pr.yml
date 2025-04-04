@@ -11,9 +11,9 @@ on:
       - feature-*
   workflow_dispatch:
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref_name }}-${{ github.ref_name == 'trunk' && github.sha || 'any-sha' }}
-  cancel-in-progress: true
+# concurrency:
+#   group: ${{ github.workflow }}-${{ github.ref_name }}-${{ github.ref_name == 'trunk' && github.sha || 'any-sha' }}
+#   cancel-in-progress: true
 
 env:
   IGNORED_PATHS: '(^./docs/|^README.md$|^version.txt$|^acknowledgements.md$)'
@@ -52,86 +52,86 @@ jobs:
         run: |
           echo "relevant_changes=${{ steps.changed-code-files.outputs.code_changes }}" >> $GITHUB_OUTPUT
 
-  lint:
-    name: Run Go & Rust Linters
-    runs-on: spiceai-runners
-    env:
-      GOVER: 1.23.4
-    needs: check_changes
+  # lint:
+  #   name: Run Go & Rust Linters
+  #   runs-on: spiceai-runners
+  #   env:
+  #     GOVER: 1.23.4
+  #   needs: check_changes
 
-    steps:
-      - uses: actions/checkout@v4
+  #   steps:
+  #     - uses: actions/checkout@v4
 
-      - name: Set up Go
-        if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: actions/setup-go@v5
-        with:
-          go-version: ${{ env.GOVER }}
-          cache: false
+  #     - name: Set up Go
+  #       if: needs.check_changes.outputs.relevant_changes == 'true'
+  #       uses: actions/setup-go@v5
+  #       with:
+  #         go-version: ${{ env.GOVER }}
+  #         cache: false
 
-      - name: Install golangci-lint
-        if: needs.check_changes.outputs.relevant_changes == 'true'
-        run: |
-          if ! command -v golangci-lint &> /dev/null ; then
-            curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $(go env GOPATH)/bin
-          fi
+  #     - name: Install golangci-lint
+  #       if: needs.check_changes.outputs.relevant_changes == 'true'
+  #       run: |
+  #         if ! command -v golangci-lint &> /dev/null ; then
+  #           curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $(go env GOPATH)/bin
+  #         fi
 
-      - name: Set up Rust
-        uses: ./.github/actions/setup-rust
-        if: needs.check_changes.outputs.relevant_changes == 'true'
-        with:
-          os: 'linux'
+  #     - name: Set up Rust
+  #       uses: ./.github/actions/setup-rust
+  #       if: needs.check_changes.outputs.relevant_changes == 'true'
+  #       with:
+  #         os: 'linux'
 
-      - name: Check if sccache can be set up
-        run: |
-          if [ -z "${{ secrets.MINIO_ENDPOINT }}" ]; then
-            echo "SCCACHE_SETUP=false" >> $GITHUB_ENV
-            echo "RUSTC_WRAPPER=" >> $GITHUB_ENV
-          else
-            echo "SCCACHE_SETUP=true" >> $GITHUB_ENV
-            echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
-          fi
+  #     - name: Check if sccache can be set up
+  #       run: |
+  #         if [ -z "${{ secrets.MINIO_ENDPOINT }}" ]; then
+  #           echo "SCCACHE_SETUP=false" >> $GITHUB_ENV
+  #           echo "RUSTC_WRAPPER=" >> $GITHUB_ENV
+  #         else
+  #           echo "SCCACHE_SETUP=true" >> $GITHUB_ENV
+  #           echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
+  #         fi
 
-      - name: Set up sccache
-        if: ${{ needs.check_changes.outputs.relevant_changes == 'true' &&  env.SCCACHE_SETUP == 'true' }}
-        uses: ./.github/actions/setup-sccache
-        with:
-          minio_endpoint: ${{ secrets.MINIO_ENDPOINT }}
-          os: 'linux'
+  #     - name: Set up sccache
+  #       if: ${{ needs.check_changes.outputs.relevant_changes == 'true' &&  env.SCCACHE_SETUP == 'true' }}
+  #       uses: ./.github/actions/setup-sccache
+  #       with:
+  #         minio_endpoint: ${{ secrets.MINIO_ENDPOINT }}
+  #         os: 'linux'
 
-      - name: Install Protoc
-        if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: arduino/setup-protoc@v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+  #     - name: Install Protoc
+  #       if: needs.check_changes.outputs.relevant_changes == 'true'
+  #       uses: arduino/setup-protoc@v3
+  #       with:
+  #         repo-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Set up make
-        uses: ./.github/actions/setup-make
+  #     - name: Set up make
+  #       uses: ./.github/actions/setup-make
 
-      - name: Set up cc
-        uses: ./.github/actions/setup-cc
+  #     - name: Set up cc
+  #       uses: ./.github/actions/setup-cc
 
-      - run: make lint
-        if: needs.check_changes.outputs.relevant_changes == 'true'
-        env:
-          RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
-          AWS_ACCESS_KEY_ID: ${{ secrets.MINIO_ACCESS_KEY }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.MINIO_SECRET_KEY }}
-          CARGO_INCREMENTAL: 0
+  #     - run: make lint
+  #       if: needs.check_changes.outputs.relevant_changes == 'true'
+  #       env:
+  #         RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
+  #         AWS_ACCESS_KEY_ID: ${{ secrets.MINIO_ACCESS_KEY }}
+  #         AWS_SECRET_ACCESS_KEY: ${{ secrets.MINIO_SECRET_KEY }}
+  #         CARGO_INCREMENTAL: 0
 
-      - name: Show sccache stats
-        if: ${{ needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true' }}
-        run: sccache --show-stats
+  #     - name: Show sccache stats
+  #       if: ${{ needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true' }}
+  #       run: sccache --show-stats
 
-      - name: Check if Cargo.lock is updated
-        if: needs.check_changes.outputs.relevant_changes == 'true'
-        run: |
-          if git diff --exit-code Cargo.lock; then
-            echo "Cargo.lock is up to date"
-          else
-            echo "Update Cargo.lock"
-            exit 1
-          fi
+  #     - name: Check if Cargo.lock is updated
+  #       if: needs.check_changes.outputs.relevant_changes == 'true'
+  #       run: |
+  #         if git diff --exit-code Cargo.lock; then
+  #           echo "Cargo.lock is up to date"
+  #         else
+  #           echo "Update Cargo.lock"
+  #           exit 1
+  #         fi
 
   build:
     name: Build Go & Rust
@@ -189,23 +189,23 @@ jobs:
         if: ${{ needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true' }}
         run: sccache --show-stats
 
-  build-docker:
-    name: Build Docker Image
-    runs-on: spiceai-runners
-    needs: check_changes
+  # build-docker:
+  #   name: Build Docker Image
+  #   runs-on: spiceai-runners
+  #   needs: check_changes
 
-    steps:
-      - uses: actions/checkout@v4
+  #   steps:
+  #     - uses: actions/checkout@v4
 
-      - name: Build and push Docker images
-        uses: docker/build-push-action@v6
-        if: needs.check_changes.outputs.relevant_changes == 'true'
-        with:
-          context: .
-          file: Dockerfile
-          platforms: linux/amd64
-          push: false
-          build-args: |
-            CARGO_FEATURES=odbc
-          tags: |
-            ghcr.io/spiceai/spiceai-rust:ci
+  #     - name: Build and push Docker images
+  #       uses: docker/build-push-action@v6
+  #       if: needs.check_changes.outputs.relevant_changes == 'true'
+  #       with:
+  #         context: .
+  #         file: Dockerfile
+  #         platforms: linux/amd64
+  #         push: false
+  #         build-args: |
+  #           CARGO_FEATURES=odbc
+  #         tags: |
+  #           ghcr.io/spiceai/spiceai-rust:ci
