@@ -1443,8 +1443,6 @@ pub(crate) mod tests {
                 .statistical_set()
                 .expect("Failed to get statistical set");
 
-            println!("Column parsing group {i}: {group_timings:?}");
-
             let median_time_ns = group_timings
                 .median()
                 .expect("Failed to calculate median")
@@ -1513,8 +1511,6 @@ pub(crate) mod tests {
                 .median()
                 .expect("Failed to calculate median")
                 .as_nanos();
-
-            println!("Keyword parsing group {i}: {group_timings:?}");
 
             assert!(
                 median_time_ns < *threshold,
