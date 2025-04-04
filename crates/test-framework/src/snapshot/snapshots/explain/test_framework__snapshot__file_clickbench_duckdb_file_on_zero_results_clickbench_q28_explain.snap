@@ -10,8 +10,8 @@ description: "Query: clickbench_q28"
 |               |     Filter: count(*) > Int64(100000)                                                                                                              |
 |               |       Aggregate: groupBy=[[hits.CounterID]], aggr=[[avg(CAST(character_length(CAST(hits.URL AS Utf8)) AS Float64)), count(Int64(1)) AS count(*)]] |
 |               |         BytesProcessedNode                                                                                                                        |
-|               |           Filter: hits.URL != LargeBinary("")                                                                                                     |
-|               |             TableScan: hits projection=[CounterID, URL], partial_filters=[hits.URL != LargeBinary("")]                                            |
+|               |           Filter: CAST(hits.URL AS Utf8) != Utf8("")                                                                                              |
+|               |             TableScan: hits projection=[CounterID, URL], partial_filters=[CAST(hits.URL AS Utf8) != Utf8("")]                                     |
 | physical_plan | SortExec: TopK(fetch=25), expr=[l@1 DESC], preserve_partitioning=[false]                                                                          |
 |               |   CoalescePartitionsExec                                                                                                                          |
 |               |     ProjectionExec: expr=[CounterID@0 as CounterID, avg(character_length(hits.URL))@1 as l, count(*)@2 as c]                                      |
@@ -23,12 +23,12 @@ description: "Query: clickbench_q28"
 |               |                 AggregateExec: mode=Partial, gby=[CounterID@0 as CounterID], aggr=[avg(character_length(hits.URL)), count(*)]                     |
 |               |                   BytesProcessedExec                                                                                                              |
 |               |                     CoalesceBatchesExec: target_batch_size=8192                                                                                   |
-|               |                       FilterExec: URL@1 !=                                                                                                        |
+|               |                       FilterExec: CAST(URL@1 AS Utf8) !=                                                                                          |
 |               |                         SchemaCastScanExec                                                                                                        |
 |               |                           RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                   |
 |               |                             FallbackOnZeroResultsScanExec                                                                                         |
 |               |                               CoalescePartitionsExec                                                                                              |
 |               |                                 RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                             |
-|               |                                   DuckSqlExec sql=                                                                                                |
+|               |                                   DuckSqlExec sql= SELECT "CounterID", "URL" FROM hits WHERE (CAST("URL" AS VARCHAR) <> '')                       |
 |               |                                                                                                                                                   |
 +---------------+---------------------------------------------------------------------------------------------------------------------------------------------------+
