@@ -26,3 +26,9 @@ FROM eval.results
 WHERE run_id = (SELECT id FROM latest_run)
 " | jq
 ```
+
+To review overall eval workflow:
+
+```bash
+ spice trace eval_run --include-input --truncate 250
+```
