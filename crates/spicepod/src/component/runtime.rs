@@ -62,6 +62,15 @@ pub struct Runtime {
     pub temp_directory: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum CacheKeyType {
+    #[default]
+    Plan,
+    Sql,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub struct ResultsCache {
@@ -70,6 +79,8 @@ pub struct ResultsCache {
     pub cache_max_size: Option<String>,
     pub item_ttl: Option<String>,
     pub eviction_policy: Option<String>,
+    #[serde(default)]
+    pub cache_key_type: CacheKeyType,
 }
 
 const fn default_true() -> bool {
@@ -83,6 +94,7 @@ impl Default for ResultsCache {
             cache_max_size: None,
             item_ttl: None,
             eviction_policy: None,
+            cache_key_type: CacheKeyType::default(),
         }
     }
 }

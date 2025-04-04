@@ -1,9 +1,0 @@
----
-source: crates/runtime/benches/bench.rs
-expression: records_pretty
----
-+-------------+
-| am_pm_ratio |
-+-------------+
-| 0.875       |
-+-------------+

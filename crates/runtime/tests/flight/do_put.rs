@@ -454,10 +454,31 @@ async fn start_spice_test_app(
     })
     .await;
 
-    let channel = Channel::from_shared(format!("http://localhost:{flight_port}"))?
-        .connect()
-        .await
-        .map_err(anyhow::Error::from)?;
+    // HTTP server readiness doesn't essentially mean the flight server is ready
+    // Validate the flight server readiness by sending a handshake request
+    let start_time = std::time::Instant::now();
+    let channel = loop {
+        if start_time.elapsed() > std::time::Duration::from_secs(30) {
+            return Err(anyhow::anyhow!(
+                "Flight server not ready within 30 seconds timeout"
+            ));
+        }
+
+        // Attempt to connect
+        match Channel::from_shared(format!("http://localhost:{flight_port}"))
+            .map_err(anyhow::Error::from)?
+            .connect()
+            .await
+        {
+            Ok(channel) => {
+                break channel;
+            }
+            Err(_) => {
+                // Wait before next attempt
+                sleep(std::time::Duration::from_millis(100)).await;
+            }
+        }
+    };
 
     Ok((channel, df))
 }

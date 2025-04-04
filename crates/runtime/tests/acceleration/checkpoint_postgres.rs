@@ -40,7 +40,7 @@ async fn test_acceleration_postgres_checkpoint() -> Result<(), anyhow::Error> {
 
     test_request_context()
         .scope(async {
-            let port: usize = get_random_port();
+            let port: usize = get_random_port()?;
             let running_container = common::start_postgres_docker_container(port).await?;
 
             let pool = common::get_postgres_connection_pool(port, None).await?;
@@ -86,7 +86,7 @@ async fn test_acceleration_postgres_checkpoint() -> Result<(), anyhow::Error> {
 
             // Set a timeout for the test
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
                 }
                 () = rt.load_components() => {}

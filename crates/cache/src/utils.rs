@@ -22,7 +22,7 @@ use datafusion::{
     physical_plan::stream::RecordBatchStreamAdapter, sql::TableReference,
 };
 
-use crate::{CachedQueryResult, QueryResultsCacheProvider};
+use crate::{CachedQueryResult, QueryResultsCacheProvider, RawCacheKey};
 
 use async_stream::stream;
 
@@ -33,7 +33,7 @@ use futures::StreamExt;
 pub fn to_cached_record_batch_stream(
     cache_provider: Arc<QueryResultsCacheProvider>,
     mut stream: SendableRecordBatchStream,
-    plan_key: u64,
+    raw_cache_key: RawCacheKey,
     input_tables: Arc<HashSet<TableReference>>,
 ) -> SendableRecordBatchStream {
     let schema = stream.schema();
@@ -62,7 +62,7 @@ pub fn to_cached_record_batch_stream(
                 input_tables,
             };
 
-            if let Err(e) = cache_provider.put_key(plan_key, cached_result).await {
+            if let Err(e) = cache_provider.put_raw_key(raw_cache_key, cached_result).await {
                 tracing::error!("Failed to cache query results: {e}");
             }
         }

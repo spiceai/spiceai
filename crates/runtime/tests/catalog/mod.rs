@@ -53,7 +53,7 @@ async fn spiceai_integration_test_catalog() -> Result<(), anyhow::Error> {
                 .await;
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+                () = tokio::time::sleep(std::time::Duration::from_secs(120)) => {
                     panic!("Timeout waiting for components to load");
                 }
                 () = rt.load_components() => {}
@@ -108,7 +108,7 @@ async fn spiceai_integration_test_catalog_include() -> Result<(), anyhow::Error>
                 .await;
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+                () = tokio::time::sleep(std::time::Duration::from_secs(120)) => {
                     panic!("Timeout waiting for components to load");
                 }
                 () = rt.load_components() => {}

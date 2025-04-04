@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: file_clickbench_duckdb_file_on_zero_results
+name: file_clickbench_duckdb_memory_on_zero_results
 datasets:
   - from: file:data/hits_0.parquet
     name: hits

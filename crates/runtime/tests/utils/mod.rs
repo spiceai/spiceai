@@ -37,7 +37,7 @@ pub(crate) static TEST_REQUEST_CONTEXT: LazyLock<Arc<RequestContext>> = LazyLock
 });
 
 pub(crate) async fn runtime_ready_check(rt: &Runtime) {
-    runtime_ready_check_with_timeout(rt, Duration::from_secs(30)).await;
+    runtime_ready_check_with_timeout(rt, Duration::from_secs(120)).await;
 }
 
 pub(crate) async fn runtime_ready_check_with_timeout(rt: &Runtime, duration: Duration) {

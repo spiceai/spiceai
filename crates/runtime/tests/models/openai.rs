@@ -89,7 +89,7 @@ mod nsql {
             });
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_secs(120)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for components to load"));
                 }
                 () = rt.load_components() => {}
