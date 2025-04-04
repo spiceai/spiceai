@@ -34,7 +34,7 @@ models:
   - name: judge
     from: openai:gpt-4o
     params:
-      openai_api_key: ${ secrets:SPICE_OPENAI_API_KEY }
+      openai_api_key: ${ secrets:OPENAI_API_KEY }
       parameterized_prompt: enabled
       system_prompt: |
         You are a financial expert. Score the correctness of the answer below between 0.0 and 1.0.
