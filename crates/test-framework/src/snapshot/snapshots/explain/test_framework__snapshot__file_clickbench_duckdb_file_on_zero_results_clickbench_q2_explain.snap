@@ -18,10 +18,10 @@ description: "Query: clickbench_q2"
 |               |           CoalesceBatchesExec: target_batch_size=8192                                             |
 |               |             FilterExec: AdvEngineID@0 != 0                                                        |
 |               |               SchemaCastScanExec                                                                  |
-|               |                 RepartitionExec: partitioning=RoundRobinBatch(24), input_partitions=1             |
+|               |                 RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1             |
 |               |                   FallbackOnZeroResultsScanExec                                                   |
 |               |                     CoalescePartitionsExec                                                        |
-|               |                       RepartitionExec: partitioning=RoundRobinBatch(24), input_partitions=1       |
+|               |                       RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1       |
 |               |                         DuckSqlExec sql= SELECT "AdvEngineID" FROM hits WHERE (AdvEngineID <> 0)  |
 |               |                                                                                                   |
 +---------------+---------------------------------------------------------------------------------------------------+
