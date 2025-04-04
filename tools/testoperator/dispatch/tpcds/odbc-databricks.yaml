@@ -2,4 +2,5 @@ tests:
   bench:
     spicepod_path: ./test/spicepods/tpcds/odbc-databricks.yaml
     query_set: tpcds
+    query_overrides: odbc-databricks
     runner_type: spiceai-runners
