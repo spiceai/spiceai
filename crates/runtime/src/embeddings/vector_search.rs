@@ -1485,14 +1485,14 @@ pub(crate) mod tests {
 
         for i in test_input_length {
             let mut group_timings = vec![];
-            let mut additional_columns = vec!["column1".to_string()];
+            let mut keywords = vec!["column1".to_string()];
             for j in 0..i {
-                additional_columns.push(format!("column{}", j + 2));
+                keywords.push(format!("column{}", j + 2));
             }
 
             for _ in 0..100 {
                 let start = std::time::Instant::now();
-                let result = SearchRequest::parse_keywords(&additional_columns);
+                let result = SearchRequest::parse_keywords(&keywords);
                 group_timings.push(start.elapsed());
                 assert!(result.is_ok());
             }
