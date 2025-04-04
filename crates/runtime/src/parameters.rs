@@ -92,7 +92,7 @@ impl Parameters {
         let secret_guard = secrets.read().await;
 
         // Try to autoload secrets that might be missing from params.
-        for secret_key in all_params.iter().filter(|p| p.secret && p.auto_load) {
+        for secret_key in all_params.iter().filter(|p| p.secret) {
             let secret_key_with_prefix = if secret_key.name.starts_with(prefix) {
                 secret_key.name.to_string()
             } else {
@@ -312,7 +312,6 @@ impl<'a> ExposedParamLookup<'a> {
 pub struct ParameterSpec {
     pub name: &'static str,
     pub required: bool,
-    pub auto_load: bool,
     pub default: Option<&'static str>,
     pub secret: bool,
     pub description: &'static str,
@@ -328,7 +327,6 @@ impl ParameterSpec {
         Self {
             name,
             required: false,
-            auto_load: true,
             default: None,
             secret: false,
             description: "",
@@ -344,7 +342,6 @@ impl ParameterSpec {
         Self {
             name,
             required: false,
-            auto_load: true,
             default: None,
             secret: false,
             description: "",
@@ -358,12 +355,6 @@ impl ParameterSpec {
     #[must_use]
     pub const fn required(mut self) -> Self {
         self.required = true;
-        self
-    }
-
-    #[must_use]
-    pub const fn disable_auto_load(mut self) -> Self {
-        self.auto_load = false;
         self
     }
 

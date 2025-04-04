@@ -135,7 +135,7 @@ static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
             ParameterSpec::component("endpoint").secret(),
             ParameterSpec::component("key").secret(),
             ParameterSpec::component("secret").secret(),
-            ParameterSpec::component("session_token").secret().disable_auto_load(),
+            ParameterSpec::component("session_token").secret(),
             ParameterSpec::component("auth")
                 .description("Configures the authentication method for S3. Supported methods are: public (i.e. no auth), iam_role, key.")
                 .secret(),
