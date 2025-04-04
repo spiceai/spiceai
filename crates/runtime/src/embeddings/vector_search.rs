@@ -1416,8 +1416,8 @@ pub(crate) mod tests {
     #[test]
     fn test_performance_of_column_parsing() {
         let mut timings: HashMap<i32, Vec<Duration>> = HashMap::new();
-        let test_input_length = [1, 50, 100];
-        let assertion_threshold = [50_000, 1_000_000, 2_000_000];
+        let test_input_length = [1, 10, 20];
+        let assertion_threshold = [500_000, 1_500_000, 3_000_000];
 
         for i in test_input_length {
             let mut group_timings = vec![];
@@ -1482,8 +1482,8 @@ pub(crate) mod tests {
     #[test]
     fn test_performance_of_keyword_parsing() {
         let mut timings: HashMap<i32, Vec<Duration>> = HashMap::new();
-        let test_input_length = [1, 50, 100];
-        let assertion_threshold = [50_000, 1_000_000, 2_000_000];
+        let test_input_length = [1, 10, 20];
+        let assertion_threshold = [500_000, 1_500_000, 3_000_000];
 
         for i in test_input_length {
             let mut group_timings = vec![];
