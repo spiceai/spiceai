@@ -21,9 +21,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::{
-    embeddings::ColumnEmbeddingConfig, is_default, params::Params, Nameable, WithDependsOn,
-};
+use super::{embeddings::ColumnEmbeddingConfig, is_default, Nameable, WithDependsOn};
+use crate::param::Params;
 use crate::semantic::Column;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -205,7 +204,7 @@ pub mod acceleration {
     use serde::{Deserialize, Serialize};
     use std::{collections::HashMap, fmt::Display};
 
-    use crate::component::params::Params;
+    use crate::param::Params;
 
     use super::ReadyState;
 

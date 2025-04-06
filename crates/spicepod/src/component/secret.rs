@@ -18,7 +18,8 @@ limitations under the License.
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use super::{params::Params, Nameable};
+use super::Nameable;
+use crate::param::Params;
 
 /// The secrets configuration for a Spicepod.
 ///
