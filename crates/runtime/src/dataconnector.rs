@@ -712,7 +712,9 @@ mod tests {
             }
         }
 
+        #[derive(Debug)]
         struct TestConnector;
+
         #[async_trait]
         impl DataConnector for TestConnector {
             fn as_any(&self) -> &dyn Any {

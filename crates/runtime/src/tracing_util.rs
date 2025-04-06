@@ -108,6 +108,7 @@ mod tests {
     use std::any::Any;
     use std::time::Duration;
 
+    #[derive(Debug)]
     struct TestDataConnector {}
 
     #[async_trait]
