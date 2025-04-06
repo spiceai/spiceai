@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::sync::Arc;
+
 use crate::component::metrics::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
 use snafu::prelude::*;
 
@@ -37,7 +39,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 pub(crate) static COMPONENTS_METER: LazyLock<Meter> = LazyLock::new(|| global::meter("component"));
 
 pub(crate) fn register_component_metric(
-    metric_provider: &dyn MetricsProvider,
+    metric_provider: &Arc<dyn MetricsProvider>,
     metric: MetricSpec,
 ) -> Result<()> {
     let metric_name = format!(

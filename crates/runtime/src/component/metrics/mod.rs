@@ -51,6 +51,14 @@ pub trait MetricsProvider: Debug + Send + Sync + 'static {
     fn callback_to_observe_metric(&self, metric: &MetricSpec) -> Option<ObserveMetricCallback>;
 }
 
+impl dyn MetricsProvider {
+    pub fn get_metric(&self, metric_name: &str) -> Option<&MetricSpec> {
+        self.available_metrics()
+            .iter()
+            .find(|metric| metric.name == metric_name)
+    }
+}
+
 pub enum ObserveMetricCallback {
     U64(Callback<u64>),
     I64(Callback<i64>),

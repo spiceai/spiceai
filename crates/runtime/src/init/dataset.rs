@@ -29,7 +29,8 @@ use crate::{
     embeddings::connector::EmbeddingConnector,
     error_spaced,
     federated_table::FederatedTable,
-    metrics, status,
+    metrics::{self, components::register_component_metric},
+    status,
     tracing_util::dataset_registered_trace,
     warn_spaced, AcceleratedReadWriteTableWithoutReplicationSnafu,
     AcceleratedTableInvalidChangesSnafu, AcceleratorEngineNotAvailableSnafu,
@@ -507,8 +508,35 @@ impl Runtime {
             return Ok(Arc::new(LocalPodConnector::new(Arc::clone(&self.df))));
         }
 
+        let enabled_metrics = params.enabled_metrics.clone();
+
         match dataconnector::create_new_connector(source, params).await {
-            Some(dc) => dc.context(UnableToInitializeDataConnectorSnafu {}),
+            Some(dc) => match dc.context(UnableToInitializeDataConnectorSnafu {}) {
+                Ok(dc) => {
+                    // TODO: This is a bit ugly
+                    if !enabled_metrics.is_empty() {
+                        if let Some(metrics_provider) = dc.metrics_provider() {
+                            for metric in &enabled_metrics {
+                                if let Some(metric) = metrics_provider.get_metric(metric) {
+                                    if let Err(e) =
+                                        register_component_metric(&metrics_provider, *metric)
+                                    {
+                                        tracing::error!(
+                                            "Unable to register component metric {}: {}",
+                                            metric.name,
+                                            e
+                                        );
+                                    }
+                                } else {
+                                    tracing::warn!("Metric {metric} not available in {source}");
+                                }
+                            }
+                        }
+                    }
+                    Ok(dc)
+                }
+                Err(e) => Err(e),
+            },
             None => {
                 if source == ODBC_DATACONNECTOR {
                     OdbcNotInstalledSnafu.fail()
