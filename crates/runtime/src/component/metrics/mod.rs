@@ -37,6 +37,30 @@ pub struct MetricSpec {
     pub unit: Option<&'static str>,
 }
 
+impl MetricSpec {
+    #[must_use]
+    pub const fn new(name: &'static str, metric_type: MetricType) -> Self {
+        Self {
+            name,
+            metric_type,
+            description: None,
+            unit: None,
+        }
+    }
+
+    #[must_use]
+    pub const fn description(mut self, description: &'static str) -> Self {
+        self.description = Some(description);
+        self
+    }
+
+    #[must_use]
+    pub const fn unit(mut self, unit: &'static str) -> Self {
+        self.unit = Some(unit);
+        self
+    }
+}
+
 pub trait MetricsProviderComponent: Debug + Send + Sync + 'static {
     /// Returns a `MetricsProvider` for the component.
     ///
