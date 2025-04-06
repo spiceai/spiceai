@@ -21,9 +21,6 @@ use super::{global, LazyLock, Meter};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Metric type not supported"))]
-    UnsupportedMetricType,
-
     #[snafu(display("Internal error. Please report an issue on https://github.com/spiceai/spiceai.\nMetric callback not implemented for metric {} with type {:?}", metric.name, metric.metric_type))]
     MetricCallbackNotImplemented { metric: MetricSpec },
 
