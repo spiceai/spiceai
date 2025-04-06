@@ -20,7 +20,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::component::Nameable;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub struct Metrics {
     pub metrics: Vec<Metric>,
@@ -47,11 +47,11 @@ impl<'de> Deserialize<'de> for Metrics {
 
 impl Metrics {
     #[must_use]
-    pub fn enabled_metrics(&self) -> Vec<&str> {
+    pub fn enabled_metrics(&self) -> Vec<String> {
         self.metrics
             .iter()
             .filter(|m| m.enabled)
-            .map(|m| m.name.as_str())
+            .map(|m| m.name.clone())
             .collect()
     }
 }

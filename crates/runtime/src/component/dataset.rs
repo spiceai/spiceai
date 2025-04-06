@@ -28,6 +28,7 @@ use datafusion_table_providers::util::column_reference;
 use snafu::prelude::*;
 use spicepod::{
     component::{dataset as spicepod_dataset, embeddings::ColumnEmbeddingConfig},
+    metric::Metrics,
     param::Params,
     semantic::Column,
 };
@@ -216,6 +217,7 @@ pub struct Dataset {
     schema: Option<SchemaRef>,
     pub unsupported_type_action: Option<UnsupportedTypeAction>,
     pub ready_state: ReadyState,
+    pub metrics: Metrics,
 }
 
 // Implement a custom PartialEq for Dataset to ignore the app field
@@ -237,6 +239,7 @@ impl PartialEq for Dataset {
             && self.embeddings == other.embeddings
             && self.schema == other.schema
             && self.columns == other.columns
+            && self.metrics == other.metrics
     }
 }
 
@@ -296,6 +299,7 @@ impl TryFrom<spicepod_dataset::Dataset> for Dataset {
                 .unsupported_type_action
                 .map(UnsupportedTypeAction::from),
             ready_state,
+            metrics: dataset.metrics.unwrap_or_default(),
         })
     }
 }
@@ -321,6 +325,7 @@ impl Dataset {
             app: None,
             unsupported_type_action: None,
             ready_state: ReadyState::default(),
+            metrics: Metrics::default(),
         })
     }
 

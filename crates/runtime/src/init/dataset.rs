@@ -180,6 +180,7 @@ impl Runtime {
 
         let source = ds.source();
         let params = ConnectorParamsBuilder::new(source.into(), (&ds).into())
+            .with_enabled_metrics(ds.metrics.enabled_metrics())
             .build(self.secrets())
             .await
             .context(UnableToInitializeDataConnectorSnafu)?;
