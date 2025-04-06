@@ -23,9 +23,8 @@ use datafusion_table_providers::mysql::MySQLTableFactory;
 use datafusion_table_providers::sql::db_connection_pool::{
     dbconnection,
     mysqlpool::{self, MySQLConnectionPool},
-    DbConnectionPool, Error as DbConnectionPoolError,
+    Error as DbConnectionPoolError,
 };
-use mysql_async::prelude::ToValue;
 use snafu::prelude::*;
 use std::any::Any;
 use std::future::Future;
@@ -86,11 +85,7 @@ impl DataConnectorFactory for MySQLFactory {
         params: ConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
-            let pool: Arc<
-                dyn DbConnectionPool<mysql_async::Conn, &'static (dyn ToValue + Sync)>
-                    + Send
-                    + Sync,
-            > = match MySQLConnectionPool::new(params.parameters.to_secret_map()).await {
+            let pool = match MySQLConnectionPool::new(params.parameters.to_secret_map()).await {
                 Ok(pool) => Arc::new(pool),
                 Err(error) => match error {
                     mysqlpool::Error::InvalidUsernameOrPassword { .. } => {
