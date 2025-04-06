@@ -100,6 +100,7 @@ object_store = { version = "0.11" }
 odbc-api = { version = "8.1.2" }
 opentelemetry = { version = "0.27", default-features = false, features = [
     "metrics",
+    "trace",
 ] }
 opentelemetry-http = { version = "0.27", features = ["reqwest-rustls"] }
 opentelemetry-prometheus = "0.27"

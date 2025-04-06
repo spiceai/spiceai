@@ -26,7 +26,7 @@ use opentelemetry::KeyValue;
 use runtime_auth::{AuthPrincipalRef, AuthRequestContext};
 use spicepod::component::runtime::UserAgentCollection;
 
-use super::{baggage, CacheControl, Protocol, UserAgent};
+use super::{baggage, CacheControl, CacheKeyType, Protocol, UserAgent};
 
 pub struct RequestContext {
     // Use an AtomicU8 to allow updating the protocol without locking
@@ -175,7 +175,7 @@ impl RequestContextBuilder {
     pub fn new(protocol: Protocol) -> Self {
         Self {
             protocol,
-            cache_control: CacheControl::Cache,
+            cache_control: CacheControl::Cache(CacheKeyType::Default),
             app: None,
             user_agent: UserAgent::Absent,
             baggage: vec![],
@@ -265,9 +265,17 @@ impl RequestContextBuilder {
             }
         }
 
+        // Apply the runtime parameter `runtime.results_cache.cache_key_type` to the cache control if set.
+        let cache_control = if let CacheControl::Cache(CacheKeyType::Default) = self.cache_control {
+            let cache_key_type = CacheKeyType::from_app_runtime(self.app.as_ref());
+            CacheControl::Cache(cache_key_type)
+        } else {
+            self.cache_control
+        };
+
         RequestContext {
             protocol: AtomicU8::new(self.protocol as u8),
-            cache_control: self.cache_control,
+            cache_control,
             dimensions,
             auth_principal: OnceLock::new(),
         }

@@ -64,7 +64,7 @@ pub enum QueryOverridesArg {
     #[serde(rename = "duckdb")]
     Duckdb,
     #[serde(rename = "duckdb-zero-results")]
-    DuckDBOnZeroResults,
+    DuckdbZeroResults,
     #[serde(rename = "snowflake")]
     Snowflake,
     #[serde(rename = "iceberg-sf1")]
@@ -96,7 +96,7 @@ impl From<QueryOverridesArg> for QueryOverrides {
             QueryOverridesArg::ODBCAthena => QueryOverrides::ODBCAthena,
             QueryOverridesArg::ODBCDatabricks => QueryOverrides::ODBCDatabricks,
             QueryOverridesArg::Duckdb => QueryOverrides::DuckDB,
-            QueryOverridesArg::DuckDBOnZeroResults => QueryOverrides::DuckDBOnZeroResults,
+            QueryOverridesArg::DuckdbZeroResults => QueryOverrides::DuckDBOnZeroResults,
             QueryOverridesArg::Snowflake => QueryOverrides::Snowflake,
             QueryOverridesArg::IcebergSF1 => QueryOverrides::IcebergSF1,
             QueryOverridesArg::SpicecloudCatalog => QueryOverrides::SpicecloudCatalog,
