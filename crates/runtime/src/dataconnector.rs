@@ -46,6 +46,7 @@ use datafusion_table_providers::UnsupportedTypeAction;
 use snafu::prelude::*;
 use std::any::Any;
 use std::collections::HashMap;
+use std::fmt::Debug;
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
 use tokio::sync::Mutex;
@@ -400,7 +401,7 @@ pub trait DataConnectorFactory: Send + Sync {
 
 /// A `DataConnector` knows how to retrieve and optionally write or stream data.
 #[async_trait]
-pub trait DataConnector: Send + Sync {
+pub trait DataConnector: Debug + Send + Sync + 'static {
     fn as_any(&self) -> &dyn Any;
 
     /// Resolves the default refresh mode for the data connector.

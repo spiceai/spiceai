@@ -31,11 +31,12 @@ use super::{
     InvalidConfigurationSnafu, ParameterSpec, Parameters,
 };
 
+#[derive(Debug)]
 pub struct GraphQL {
     params: Parameters,
 }
 
-#[derive(Default, Copy, Clone)]
+#[derive(Default, Debug, Copy, Clone)]
 pub struct GraphQLFactory {}
 
 impl GraphQLFactory {

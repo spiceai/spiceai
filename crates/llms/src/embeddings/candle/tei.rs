@@ -51,6 +51,7 @@ use super::util::{
     max_seq_length_from_st_config, pool_from_str, position_offset,
 };
 
+#[derive(Debug)]
 pub struct TeiEmbed {
     pub infer: Infer,
     pub model_size: i32,     // Used for `size` method.

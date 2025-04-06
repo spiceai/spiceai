@@ -43,6 +43,7 @@ pub enum Error {
     UnableToCreatePostgresConnectionPool { source: DbConnectionPoolError },
 }
 
+#[derive(Debug)]
 pub struct Postgres {
     postgres_factory: PostgresTableFactory,
 }
