@@ -17,6 +17,7 @@ limitations under the License.
 use std::sync::Arc;
 
 use crate::component::metrics::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
+use opentelemetry::{metrics::UpDownCounter, KeyValue};
 use snafu::prelude::*;
 
 use super::{global, LazyLock, Meter};
@@ -38,9 +39,17 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub(crate) static COMPONENTS_METER: LazyLock<Meter> = LazyLock::new(|| global::meter("component"));
 
+pub(crate) static REGISTERED_COUNT: LazyLock<UpDownCounter<i64>> = LazyLock::new(|| {
+    COMPONENTS_METER
+        .i64_up_down_counter("component_metric_registered_count")
+        .with_description("Number of currently registered component metrics.")
+        .build()
+});
+
 pub(crate) fn register_component_metric(
     metric_provider: &Arc<dyn MetricsProvider>,
     metric: MetricSpec,
+    instance_name: &str,
 ) -> Result<()> {
     let metric_name = format!(
         "{}_{}_{}",
@@ -48,6 +57,8 @@ pub(crate) fn register_component_metric(
         metric_provider.component_name(),
         metric.name
     );
+
+    let attributes = vec![KeyValue::new("name", instance_name.to_string())];
 
     match metric.metric_type {
         MetricType::ObservableCounterU64 => {
@@ -59,7 +70,7 @@ pub(crate) fn register_component_metric(
                 counter = counter.with_unit(unit);
             }
             let metric_callback = metric_provider
-                .callback_to_observe_metric(&metric)
+                .callback_to_observe_metric(&metric, attributes)
                 .context(MetricCallbackNotImplementedSnafu { metric })?;
             let callback_type = metric_callback_type(&metric_callback);
             let ObserveMetricCallback::U64(callback) = metric_callback else {
@@ -70,13 +81,32 @@ pub(crate) fn register_component_metric(
                 });
             };
             let _ = counter.with_callback(callback).build();
+            REGISTERED_COUNT.add(1, &[]);
             Ok(())
         }
-        MetricType::ObservableGaugeU64 => todo!(),
-        MetricType::ObservableCounterI64 => todo!(),
-        MetricType::ObservableGaugeI64 => todo!(),
-        MetricType::ObservableCounterF64 => todo!(),
-        MetricType::ObservableGaugeF64 => todo!(),
+        MetricType::ObservableGaugeU64 => {
+            let mut gauge = COMPONENTS_METER.u64_observable_gauge(metric_name);
+            if let Some(description) = metric.description {
+                gauge = gauge.with_description(description);
+            }
+            if let Some(unit) = metric.unit {
+                gauge = gauge.with_unit(unit);
+            }
+            let metric_callback = metric_provider
+                .callback_to_observe_metric(&metric, attributes)
+                .context(MetricCallbackNotImplementedSnafu { metric })?;
+            let callback_type = metric_callback_type(&metric_callback);
+            let ObserveMetricCallback::U64(callback) = metric_callback else {
+                return Err(Error::MetricCallbackWrongType {
+                    metric,
+                    expected_type: "u64",
+                    actual_type: callback_type,
+                });
+            };
+            let _ = gauge.with_callback(callback).build();
+            REGISTERED_COUNT.add(1, &[]);
+            Ok(())
+        }
     }
 }
 

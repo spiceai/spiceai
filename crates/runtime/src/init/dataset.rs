@@ -180,7 +180,6 @@ impl Runtime {
 
         let source = ds.source();
         let params = ConnectorParamsBuilder::new(source.into(), (&ds).into())
-            .with_enabled_metrics(ds.metrics.enabled_metrics())
             .build(self.secrets())
             .await
             .context(UnableToInitializeDataConnectorSnafu)?;
@@ -203,6 +202,34 @@ impl Runtime {
                 return Err(crate::Error::UnableToInitializeDataConnector { source: err.into() });
             }
         };
+
+        // Register any component metrics that the user has enabled for this dataset.
+        if ds.metrics.has_enabled_metrics() {
+            let enabled_metrics = ds.metrics.enabled_metrics();
+            let Some(metrics_provider) = data_connector.metrics_provider() else {
+                tracing::warn!(
+                    "Dataset {} does not support metrics. Skipping metric registration for {}.",
+                    ds.name,
+                    enabled_metrics.join(", ")
+                );
+                return Ok(data_connector);
+            };
+            for metric in enabled_metrics {
+                if let Some(metric) = metrics_provider.get_metric(&metric) {
+                    if let Err(e) =
+                        register_component_metric(&metrics_provider, *metric, &ds.name.to_string())
+                    {
+                        tracing::error!(
+                            "Unable to register component metric {}: {}",
+                            metric.name,
+                            e
+                        );
+                    }
+                } else {
+                    tracing::warn!("Metric {metric} not available in {source}");
+                }
+            }
+        }
 
         Ok(data_connector)
     }
@@ -509,35 +536,8 @@ impl Runtime {
             return Ok(Arc::new(LocalPodConnector::new(Arc::clone(&self.df))));
         }
 
-        let enabled_metrics = params.enabled_metrics.clone();
-
         match dataconnector::create_new_connector(source, params).await {
-            Some(dc) => match dc.context(UnableToInitializeDataConnectorSnafu {}) {
-                Ok(dc) => {
-                    // TODO: This is a bit ugly
-                    if !enabled_metrics.is_empty() {
-                        if let Some(metrics_provider) = dc.metrics_provider() {
-                            for metric in &enabled_metrics {
-                                if let Some(metric) = metrics_provider.get_metric(metric) {
-                                    if let Err(e) =
-                                        register_component_metric(&metrics_provider, *metric)
-                                    {
-                                        tracing::error!(
-                                            "Unable to register component metric {}: {}",
-                                            metric.name,
-                                            e
-                                        );
-                                    }
-                                } else {
-                                    tracing::warn!("Metric {metric} not available in {source}");
-                                }
-                            }
-                        }
-                    }
-                    Ok(dc)
-                }
-                Err(e) => Err(e),
-            },
+            Some(dc) => dc.context(UnableToInitializeDataConnectorSnafu {}),
             None => {
                 if source == ODBC_DATACONNECTOR {
                     OdbcNotInstalledSnafu.fail()

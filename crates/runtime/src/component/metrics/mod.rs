@@ -17,16 +17,12 @@ limitations under the License.
 use std::{fmt::Debug, sync::Arc};
 
 use super::ComponentType;
-use opentelemetry::metrics::Callback;
+use opentelemetry::{metrics::Callback, KeyValue};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MetricType {
     ObservableCounterU64,
     ObservableGaugeU64,
-    ObservableCounterI64,
-    ObservableGaugeI64,
-    ObservableCounterF64,
-    ObservableGaugeF64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -72,7 +68,11 @@ pub trait MetricsProvider: Debug + Send + Sync + 'static {
     fn component_type(&self) -> ComponentType;
     fn component_name(&self) -> &'static str;
     fn available_metrics(&self) -> &'static [MetricSpec];
-    fn callback_to_observe_metric(&self, metric: &MetricSpec) -> Option<ObserveMetricCallback>;
+    fn callback_to_observe_metric(
+        &self,
+        metric: &MetricSpec,
+        attributes: Vec<KeyValue>,
+    ) -> Option<ObserveMetricCallback>;
 }
 
 impl dyn MetricsProvider {

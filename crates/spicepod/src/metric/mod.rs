@@ -54,6 +54,11 @@ impl Metrics {
             .map(|m| m.name.clone())
             .collect()
     }
+
+    #[must_use]
+    pub fn has_enabled_metrics(&self) -> bool {
+        self.metrics.iter().any(|m| m.enabled)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

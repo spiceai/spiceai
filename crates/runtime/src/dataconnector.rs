@@ -557,13 +557,11 @@ pub struct ConnectorParams {
     pub(crate) parameters: Parameters,
     pub(crate) unsupported_type_action: Option<UnsupportedTypeAction>,
     pub(crate) component: ConnectorComponent,
-    pub(crate) enabled_metrics: Vec<String>,
 }
 
 pub struct ConnectorParamsBuilder {
     connector: Arc<str>,
     component: ConnectorComponent,
-    enabled_metrics: Vec<String>,
 }
 
 impl ConnectorParamsBuilder {
@@ -572,14 +570,7 @@ impl ConnectorParamsBuilder {
         Self {
             connector,
             component,
-            enabled_metrics: vec![],
         }
-    }
-
-    #[must_use]
-    pub fn with_enabled_metrics(mut self, enabled_metrics: Vec<String>) -> Self {
-        self.enabled_metrics = enabled_metrics;
-        self
     }
 
     pub async fn build(
@@ -643,7 +634,6 @@ impl ConnectorParamsBuilder {
             parameters,
             unsupported_type_action: unsupported_type_action.map(UnsupportedTypeAction::from),
             component: self.component,
-            enabled_metrics: self.enabled_metrics,
         })
     }
 }

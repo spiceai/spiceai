@@ -28,6 +28,7 @@ use datafusion_table_providers::sql::db_connection_pool::{
     Error as DbConnectionPoolError,
 };
 use mysql_async::Metrics;
+use opentelemetry::KeyValue;
 use snafu::prelude::*;
 use std::any::Any;
 use std::future::Future;
@@ -266,7 +267,11 @@ impl MetricsProvider for MySQLMetricsProvider {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn callback_to_observe_metric(&self, metric: &MetricSpec) -> Option<ObserveMetricCallback> {
+    fn callback_to_observe_metric(
+        &self,
+        metric: &MetricSpec,
+        attributes: Vec<KeyValue>,
+    ) -> Option<ObserveMetricCallback> {
         let metrics = Arc::clone(&self.metrics);
         match metric.name {
             "connection_count" => Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
@@ -274,7 +279,7 @@ impl MetricsProvider for MySQLMetricsProvider {
                     metrics
                         .connection_count
                         .load(std::sync::atomic::Ordering::Relaxed) as u64,
-                    &[],
+                    &attributes,
                 );
             }))),
             "connections_in_pool" => {
@@ -284,7 +289,7 @@ impl MetricsProvider for MySQLMetricsProvider {
                             .connections_in_pool
                             .load(std::sync::atomic::Ordering::Relaxed)
                             as u64,
-                        &[],
+                        &attributes,
                     );
                 })))
             }
@@ -295,7 +300,7 @@ impl MetricsProvider for MySQLMetricsProvider {
                             .active_wait_requests
                             .load(std::sync::atomic::Ordering::Relaxed)
                             as u64,
-                        &[],
+                        &attributes,
                     );
                 })))
             }
@@ -304,7 +309,7 @@ impl MetricsProvider for MySQLMetricsProvider {
                     metrics
                         .create_failed
                         .load(std::sync::atomic::Ordering::Relaxed) as u64,
-                    &[],
+                    &attributes,
                 );
             }))),
             "discarded_superfluous_connection" => {
@@ -314,7 +319,7 @@ impl MetricsProvider for MySQLMetricsProvider {
                             .discarded_superfluous_connection
                             .load(std::sync::atomic::Ordering::Relaxed)
                             as u64,
-                        &[],
+                        &attributes,
                     );
                 })))
             }
@@ -325,7 +330,7 @@ impl MetricsProvider for MySQLMetricsProvider {
                             .discarded_unestablished_connection
                             .load(std::sync::atomic::Ordering::Relaxed)
                             as u64,
-                        &[],
+                        &attributes,
                     );
                 })))
             }
@@ -336,7 +341,7 @@ impl MetricsProvider for MySQLMetricsProvider {
                             .dirty_connection_return
                             .load(std::sync::atomic::Ordering::Relaxed)
                             as u64,
-                        &[],
+                        &attributes,
                     );
                 })))
             }
@@ -347,7 +352,7 @@ impl MetricsProvider for MySQLMetricsProvider {
                             .discarded_expired_connection
                             .load(std::sync::atomic::Ordering::Relaxed)
                             as u64,
-                        &[],
+                        &attributes,
                     );
                 })))
             }
@@ -358,7 +363,7 @@ impl MetricsProvider for MySQLMetricsProvider {
                             .resetting_connection
                             .load(std::sync::atomic::Ordering::Relaxed)
                             as u64,
-                        &[],
+                        &attributes,
                     );
                 })))
             }
@@ -369,7 +374,7 @@ impl MetricsProvider for MySQLMetricsProvider {
                             .discarded_error_during_cleanup
                             .load(std::sync::atomic::Ordering::Relaxed)
                             as u64,
-                        &[],
+                        &attributes,
                     );
                 })))
             }
@@ -380,7 +385,7 @@ impl MetricsProvider for MySQLMetricsProvider {
                             .connection_returned_to_pool
                             .load(std::sync::atomic::Ordering::Relaxed)
                             as u64,
-                        &[],
+                        &attributes,
                     );
                 })))
             }
