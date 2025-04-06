@@ -44,9 +44,14 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-#[derive(Debug)]
 pub struct MySQL {
     mysql_factory: MySQLTableFactory,
+}
+
+impl std::fmt::Debug for MySQL {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MySQL").finish_non_exhaustive()
+    }
 }
 
 #[derive(Default, Copy, Clone)]

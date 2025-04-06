@@ -43,9 +43,14 @@ pub enum Error {
     UnableToCreatePostgresConnectionPool { source: DbConnectionPoolError },
 }
 
-#[derive(Debug)]
 pub struct Postgres {
     postgres_factory: PostgresTableFactory,
+}
+
+impl std::fmt::Debug for Postgres {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Postgres").finish_non_exhaustive()
+    }
 }
 
 #[derive(Default, Copy, Clone)]
