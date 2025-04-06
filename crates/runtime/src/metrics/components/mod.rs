@@ -1,0 +1,90 @@
+/*
+Copyright 2024-2025 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+use crate::component::metrics::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
+use snafu::prelude::*;
+
+use super::{global, LazyLock, Meter};
+
+#[derive(Debug, Snafu)]
+pub enum Error {
+    #[snafu(display("Metric type not supported"))]
+    UnsupportedMetricType,
+
+    #[snafu(display("Internal error. Please report an issue on https://github.com/spiceai/spiceai.\nMetric callback not implemented for metric {} with type {:?}", metric.name, metric.metric_type))]
+    MetricCallbackNotImplemented { metric: MetricSpec },
+
+    #[snafu(display("Internal error. Please report an issue on https://github.com/spiceai/spiceai.\nMetric {} callback has wrong type. Expected {}, got {}", metric.name, expected_type, actual_type))]
+    MetricCallbackWrongType {
+        metric: MetricSpec,
+        expected_type: &'static str,
+        actual_type: &'static str,
+    },
+}
+
+pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+pub(crate) static COMPONENTS_METER: LazyLock<Meter> = LazyLock::new(|| global::meter("component"));
+
+pub(crate) fn register_component_metric(
+    metric_provider: &dyn MetricsProvider,
+    metric: MetricSpec,
+) -> Result<()> {
+    let metric_name = format!(
+        "{}_{}_{}",
+        metric_provider.component_type(),
+        metric_provider.component_name(),
+        metric.name
+    );
+
+    match metric.metric_type {
+        MetricType::ObservableCounterU64 => {
+            let mut counter = COMPONENTS_METER.u64_observable_counter(metric_name);
+            if let Some(description) = metric.description {
+                counter = counter.with_description(description);
+            }
+            if let Some(unit) = metric.unit {
+                counter = counter.with_unit(unit);
+            }
+            let metric_callback = metric_provider
+                .callback_to_observe_metric(&metric)
+                .context(MetricCallbackNotImplementedSnafu { metric })?;
+            let callback_type = metric_callback_type(&metric_callback);
+            let ObserveMetricCallback::U64(callback) = metric_callback else {
+                return Err(Error::MetricCallbackWrongType {
+                    metric,
+                    expected_type: "u64",
+                    actual_type: callback_type,
+                });
+            };
+            let _ = counter.with_callback(callback).build();
+            Ok(())
+        }
+        MetricType::ObservableGaugeU64 => todo!(),
+        MetricType::ObservableCounterI64 => todo!(),
+        MetricType::ObservableGaugeI64 => todo!(),
+        MetricType::ObservableCounterF64 => todo!(),
+        MetricType::ObservableGaugeF64 => todo!(),
+    }
+}
+
+fn metric_callback_type(metric_callback: &ObserveMetricCallback) -> &'static str {
+    match metric_callback {
+        ObserveMetricCallback::U64(_) => "u64",
+        ObserveMetricCallback::I64(_) => "i64",
+        ObserveMetricCallback::F64(_) => "f64",
+    }
+}

@@ -19,6 +19,8 @@ use crate::catalogconnector::CATALOG_CONNECTOR_FACTORY_REGISTRY;
 use crate::component::catalog::Catalog;
 use crate::component::dataset::acceleration::RefreshMode;
 use crate::component::dataset::Dataset;
+use crate::component::metrics::MetricsProvider;
+use crate::component::metrics::MetricsProviderComponent;
 use crate::datafusion::error::find_datafusion_root;
 use crate::federated_table::FederatedTable;
 use crate::get_params_with_secrets;
@@ -456,6 +458,19 @@ pub trait DataConnector: Debug + Send + Sync + 'static {
         _accelerated_table: &mut AcceleratedTable,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Ok(())
+    }
+
+    /// Returns a `MetricsProvider` for the data connector.
+    ///
+    /// If the data connector does not support metrics, return `None`.
+    fn metrics_provider(&self) -> Option<Arc<dyn MetricsProvider>> {
+        None
+    }
+}
+
+impl<T: DataConnector + Debug + 'static> MetricsProviderComponent for T {
+    fn metrics_provider(&self) -> Option<Arc<dyn MetricsProvider>> {
+        self.metrics_provider()
     }
 }
 
