@@ -61,6 +61,12 @@ where
     odbc_factory: ODBCTableFactory<'a>,
 }
 
+impl std::fmt::Debug for ODBC<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ODBC").finish_non_exhaustive()
+    }
+}
+
 pub struct SQLDialectParam(String);
 impl SQLDialectParam {
     #[must_use]

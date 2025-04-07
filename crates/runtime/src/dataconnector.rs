@@ -19,6 +19,8 @@ use crate::catalogconnector::CATALOG_CONNECTOR_FACTORY_REGISTRY;
 use crate::component::catalog::Catalog;
 use crate::component::dataset::acceleration::RefreshMode;
 use crate::component::dataset::Dataset;
+use crate::component::metrics::MetricsProvider;
+use crate::component::metrics::MetricsProviderComponent;
 use crate::datafusion::error::find_datafusion_root;
 use crate::federated_table::FederatedTable;
 use crate::get_params_with_secrets;
@@ -46,6 +48,7 @@ use datafusion_table_providers::UnsupportedTypeAction;
 use snafu::prelude::*;
 use std::any::Any;
 use std::collections::HashMap;
+use std::fmt::Debug;
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
 use tokio::sync::Mutex;
@@ -400,7 +403,7 @@ pub trait DataConnectorFactory: Send + Sync {
 
 /// A `DataConnector` knows how to retrieve and optionally write or stream data.
 #[async_trait]
-pub trait DataConnector: Send + Sync {
+pub trait DataConnector: Debug + Send + Sync + 'static {
     fn as_any(&self) -> &dyn Any;
 
     /// Resolves the default refresh mode for the data connector.
@@ -455,6 +458,19 @@ pub trait DataConnector: Send + Sync {
         _accelerated_table: &mut AcceleratedTable,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Ok(())
+    }
+
+    /// Returns a `MetricsProvider` for the data connector.
+    ///
+    /// If the data connector does not support metrics, return `None`.
+    fn metrics_provider(&self) -> Option<Arc<dyn MetricsProvider>> {
+        None
+    }
+}
+
+impl<T: DataConnector + Debug + 'static> MetricsProviderComponent for T {
+    fn metrics_provider(&self) -> Option<Arc<dyn MetricsProvider>> {
+        self.metrics_provider()
     }
 }
 
@@ -558,7 +574,7 @@ impl ConnectorParamsBuilder {
     }
 
     pub async fn build(
-        &self,
+        self,
         secrets: Arc<RwLock<Secrets>>,
     ) -> Result<ConnectorParams, Box<dyn std::error::Error + Send + Sync>> {
         let name = self.connector.to_string();
@@ -617,7 +633,7 @@ impl ConnectorParamsBuilder {
         Ok(ConnectorParams {
             parameters,
             unsupported_type_action: unsupported_type_action.map(UnsupportedTypeAction::from),
-            component: self.component.clone(),
+            component: self.component,
         })
     }
 }
@@ -696,7 +712,9 @@ mod tests {
             }
         }
 
+        #[derive(Debug)]
         struct TestConnector;
+
         #[async_trait]
         impl DataConnector for TestConnector {
             fn as_any(&self) -> &dyn Any {

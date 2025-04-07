@@ -23,13 +23,17 @@ use std::collections::HashMap;
 use std::{fmt::Debug, path::PathBuf};
 
 use component::{
-    catalog::Catalog, dataset::Dataset, embeddings::Embeddings, eval::Eval, extension::Extension,
-    model::Model, runtime::Runtime, secret::Secret, tool::Tool, view::View,
+    catalog::Catalog, dataset::Dataset, embeddings::Embeddings, eval::Eval, model::Model,
+    runtime::Runtime, secret::Secret, tool::Tool, view::View,
 };
+use extension::Extension;
 
 use spec::{SpicepodDefinition, SpicepodVersion};
 
 pub mod component;
+pub mod extension;
+pub mod metric;
+pub mod param;
 pub mod reader;
 pub mod semantic;
 pub mod spec;

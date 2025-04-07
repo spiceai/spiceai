@@ -29,9 +29,9 @@ use crate::{
 
 use std::collections::HashMap;
 
-use spicepod::component::{
-    dataset::{acceleration::Acceleration, Dataset},
-    params::Params as DatasetParams,
+use spicepod::{
+    component::dataset::{acceleration::Acceleration, Dataset},
+    param::Params as DatasetParams,
 };
 
 // This method is only used in tests

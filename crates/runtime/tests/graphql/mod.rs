@@ -25,7 +25,7 @@ use async_graphql::{Object, Schema};
 use async_graphql_axum::{GraphQLRequest, GraphQLResponse};
 use axum::{routing::post, Extension, Router};
 use runtime::{status, Runtime};
-use spicepod::component::{dataset::Dataset, params::Params as DatasetParams};
+use spicepod::{component::dataset::Dataset, param::Params as DatasetParams};
 use tokio::net::TcpListener;
 
 use crate::utils::test_request_context;

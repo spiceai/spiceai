@@ -23,7 +23,7 @@ use app::AppBuilder;
 use arrow::record_batch::RecordBatch;
 use futures::StreamExt;
 use runtime::{status, Runtime};
-use spicepod::component::{catalog::Catalog, params::Params};
+use spicepod::{component::catalog::Catalog, param::Params};
 use std::sync::Arc;
 
 #[tokio::test]

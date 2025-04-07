@@ -55,6 +55,7 @@ pub enum Error {
     InsecureEndpointWithoutAllowHTTP { endpoint: String },
 }
 
+#[derive(Debug)]
 pub struct AzureBlobFS {
     params: Parameters,
 }

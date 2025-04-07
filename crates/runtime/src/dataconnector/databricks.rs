@@ -57,6 +57,12 @@ pub struct Databricks {
     read_provider: Arc<dyn Read>,
 }
 
+impl std::fmt::Debug for Databricks {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Databricks").finish_non_exhaustive()
+    }
+}
+
 impl Databricks {
     pub async fn new(params: Parameters) -> Result<Self> {
         let mode = params.get("mode").expose().ok().unwrap_or_default();

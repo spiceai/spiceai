@@ -19,7 +19,7 @@ use std::sync::LazyLock;
 use runtime::{
     component::dataset::Dataset, dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint,
 };
-use spicepod::component::{dataset::acceleration::Mode, params::Params};
+use spicepod::{component::dataset::acceleration::Mode, param::Params};
 use tokio::sync::Mutex;
 
 #[cfg(feature = "duckdb")]

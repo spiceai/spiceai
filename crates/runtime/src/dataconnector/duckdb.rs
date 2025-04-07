@@ -49,6 +49,12 @@ pub struct DuckDB {
     duckdb_factory: DuckDBTableFactory,
 }
 
+impl std::fmt::Debug for DuckDB {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DuckDB").finish_non_exhaustive()
+    }
+}
+
 impl DuckDB {
     pub(crate) fn create_in_memory(params: &ConnectorParams) -> AnyErrorResult<DuckDBTableFactory> {
         let pool = Arc::new(

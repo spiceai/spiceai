@@ -21,9 +21,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::{
-    embeddings::ColumnEmbeddingConfig, is_default, params::Params, Nameable, WithDependsOn,
-};
+use super::{embeddings::ColumnEmbeddingConfig, is_default, Nameable, WithDependsOn};
+use crate::metric::Metrics;
+use crate::param::Params;
 use crate::semantic::Column;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -135,6 +135,9 @@ pub struct Dataset {
 
     #[serde(default, skip_serializing_if = "is_default")]
     pub ready_state: ReadyState,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metrics: Option<Metrics>,
 }
 
 impl Nameable for Dataset {
@@ -165,6 +168,7 @@ impl Dataset {
             depends_on: Vec::default(),
             unsupported_type_action: None,
             ready_state: ReadyState::default(),
+            metrics: None,
         }
     }
 
@@ -195,6 +199,7 @@ impl WithDependsOn<Dataset> for Dataset {
             depends_on: depends_on.to_vec(),
             unsupported_type_action: self.unsupported_type_action,
             ready_state: self.ready_state,
+            metrics: self.metrics.clone(),
         }
     }
 }
@@ -205,7 +210,7 @@ pub mod acceleration {
     use serde::{Deserialize, Serialize};
     use std::{collections::HashMap, fmt::Display};
 
-    use crate::component::params::Params;
+    use crate::{metric::Metrics, param::Params};
 
     use super::ReadyState;
 
@@ -384,6 +389,9 @@ pub mod acceleration {
 
         #[serde(default, skip_serializing_if = "HashMap::is_empty")]
         pub on_conflict: HashMap<String, OnConflictBehavior>,
+
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub metrics: Option<Metrics>,
     }
 
     #[allow(clippy::trivially_copy_pass_by_ref)]
@@ -421,6 +429,7 @@ pub mod acceleration {
                 indexes: HashMap::default(),
                 primary_key: None,
                 on_conflict: HashMap::default(),
+                metrics: None,
             }
         }
     }
@@ -491,6 +500,8 @@ struct DatasetDeserializer {
     unsupported_type_action: Option<UnsupportedTypeAction>,
     #[serde(default, skip_serializing_if = "is_default")]
     ready_state: ReadyState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    metrics: Option<Metrics>,
 }
 
 #[allow(deprecated)]
@@ -539,6 +550,7 @@ impl TryFrom<DatasetDeserializer> for Dataset {
             depends_on: deserializer.depends_on,
             unsupported_type_action,
             ready_state: deserializer.ready_state,
+            metrics: deserializer.metrics,
         })
     }
 }
