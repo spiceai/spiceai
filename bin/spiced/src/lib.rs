@@ -247,7 +247,7 @@ pub async fn run(args: Args) -> Result<()> {
 
     let rt = Arc::new(rt);
 
-    let cloned_rt = rt.clone();
+    let cloned_rt = Arc::clone(&rt);
     let endpoint_auth = match app.as_ref() {
         Some(app) => EndpointAuth::new(rt.secrets(), app).await,
         None => EndpointAuth::no_auth(),

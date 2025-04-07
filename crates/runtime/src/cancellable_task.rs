@@ -57,8 +57,8 @@ impl CancellableTaskHandle {
         };
     }
 
-     /// Returns true if the task has already completed, false otherwise.
-     pub fn is_finished(&self) -> bool {
+    /// Returns true if the task has already completed, false otherwise.
+    pub fn is_finished(&self) -> bool {
         // returns true when the corresponding receiver has been dropped, which happens when the task completes or is aborted.
         self.notify_abort_task.is_closed()
     }

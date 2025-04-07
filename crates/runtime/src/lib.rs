@@ -21,6 +21,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::time::Duration;
 use std::{collections::HashMap, sync::Arc};
+use tokio::task::JoinHandle;
 
 use crate::{
     auth::EndpointAuth, dataconnector::DataConnector, datafusion::DataFusion,
@@ -38,7 +39,7 @@ use datasets_health_monitor::DatasetsHealthMonitor;
 use extension::ExtensionFactory;
 use flight::RateLimits;
 use futures::future::{join_all, try_join_all};
-use futures::{FutureExt, Stream};
+use futures::Stream;
 #[cfg(feature = "openapi")]
 pub use http::get_api_doc;
 use model::{EmbeddingModelStore, EvalScorerRegistry, LLMModelStore};
@@ -585,6 +586,7 @@ impl Runtime {
     ///
     /// The future returned by this function will not resolve until all components have been loaded and marked as ready.
     /// This includes waiting for the first refresh of any accelerated tables to complete.
+    #[allow(clippy::too_many_lines)]
     pub async fn load_components(self: Arc<Self>) {
         self.set_components_initializing().await;
 
@@ -671,17 +673,17 @@ impl Runtime {
                 async move {
                     let abort_handlers = components
                         .iter()
-                        .map(|task| task.abort_handle())
+                        .map(JoinHandle::abort_handle)
                         .collect::<Vec<_>>();
 
                     tokio::select! {
                         load_result = try_join_all(components) => {
                             load_result.map(|_| ()).context(ComponentsInitializationFailedSnafu)
                         }
-                        _ = cancel_loading.cancelled() => {
-                            abort_handlers.into_iter().for_each(|handle| {
+                        () = cancel_loading.cancelled() => {
+                            for handle in abort_handlers {
                                 handle.abort();
-                            });
+                            }
                             ComponentsInitializationCancelledSnafu.fail()
                         }
                     }
