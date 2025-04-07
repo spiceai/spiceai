@@ -82,6 +82,12 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("db"),
     ParameterSpec::component("sslmode"),
     ParameterSpec::component("sslrootcert"),
+    ParameterSpec::component("pool_min")
+        .description("The minimum number of connections to keep open in the pool, lazily created when requested.")
+        .default("10"),
+    ParameterSpec::component("pool_max")
+        .description("The maximum number of connections to allow in the pool.")
+        .default("100"),
 ];
 
 impl DataConnectorFactory for MySQLFactory {
