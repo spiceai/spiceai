@@ -727,8 +727,8 @@ impl VectorSearch {
                             cosine_distance(unnest({embed_col_embedding}), {embedding:?}) AS {VECTOR_DISTANCE_COLUMN_NAME}
                         FROM {VSS_TEMP_TABLE_NAME}
                     )",
-                    embed_col_offset=offset_col!(quote_identifier(embedding_column).to_string()),
-                    embed_col_embedding=embedding_col!(quote_identifier(embedding_column).to_string())
+                    embed_col_offset=quote_identifier(&offset_col!(embedding_column)),
+                    embed_col_embedding=quote_identifier(&embedding_col!(embedding_column))
                 );
 
             (
@@ -752,8 +752,8 @@ impl VectorSearch {
                         {where_cond}
                     )",
                     pks = pks.iter().join(", "),
-                    embed_col_offset=offset_col!(quote_identifier(embedding_column).to_string()),
-                    embed_col_embedding=embedding_col!(quote_identifier(embedding_column).to_string())
+                    embed_col_offset=quote_identifier(&offset_col!(embedding_column)),
+                    embed_col_embedding=quote_identifier(&embedding_col!(embedding_column))
                 );
 
             (pks, distances_table, table_name.to_string())
@@ -787,12 +787,13 @@ impl VectorSearch {
                 LIMIT {n}
             )
             SELECT
-                substring(t.{embed_col}, rd.offset[1], rd.offset[2] - rd.offset[1]) AS {embed_col}_chunk,
+                substring(t.{embed_col}, rd.offset[1], rd.offset[2] - rd.offset[1]) AS {chunk_col},
                 {projection_str}
                 rd.{VECTOR_DISTANCE_COLUMN_NAME}
             FROM ranked_docs rd
             JOIN {proj_table} t ON {join_on_conditions}",
-                embed_col=quote_identifier(embedding_column).to_string(),
+                embed_col=quote_identifier(embedding_column),
+                chunk_col=quote_identifier(&format!("{embedding_column}_chunk")),
                 pks = pks.iter().join(", "),
                 projection_str = final_projection_str,
                 join_on_conditions = pks
@@ -896,12 +897,9 @@ impl VectorSearch {
             .context(DataFusionSnafu)?;
 
         let embedding_column = if is_chunked {
-            format!(
-                "{embed_col}_chunk",
-                embed_col = quote_identifier(embedding_column)
-            )
+            format!("{embedding_column}_chunk")
         } else {
-            quote_identifier(embedding_column).to_string()
+            embedding_column.to_string()
         };
 
         Ok(VectorSearchTableResult {
@@ -1196,12 +1194,15 @@ impl VectorSearch {
 
 /// Convert a list of column names to a list of column indices. If a column name is not found in the schema, it is ignored.
 fn get_projection(schema: &SchemaRef, column_names: &[String]) -> Vec<usize> {
+    tracing::trace!("vector search result schema: {schema:?}");
+    tracing::trace!("vector search projection column names: {column_names:?}");
     column_names
         .iter()
         .filter_map(|name| {
             schema
                 .index_of(quote_identifier(name).to_string().as_str())
                 .ok()
+                .or(schema.index_of(name.as_str()).ok())
         })
         .collect_vec()
 }
@@ -1260,8 +1261,6 @@ pub(crate) mod tests {
     use datafusion::sql::sqlparser::ast::{BinaryOperator, Expr};
     use schemars::schema_for;
     use snafu::ResultExt;
-    use std::time::Duration;
-    use test_framework::metrics::StatisticsCollector;
 
     #[tokio::test]
     async fn test_search_request_schema() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -1415,44 +1414,27 @@ pub(crate) mod tests {
 
     #[test]
     fn test_performance_of_column_parsing() {
-        let mut timings: HashMap<i32, Vec<Duration>> = HashMap::new();
-        let test_input_length = [1, 10, 20];
-        let assertion_threshold = [500_000, 1_500_000, 3_000_000];
+        let mut timings = vec![];
 
-        for i in test_input_length {
-            let mut group_timings = vec![];
+        for _ in 0..3 {
             let mut additional_columns = vec!["column1".to_string()];
-            for j in 0..i {
-                additional_columns.push(format!("column{}", j + 2));
-            }
-
-            for _ in 0..100 {
+            for i in 0..100 {
                 let start = std::time::Instant::now();
                 let result = SearchRequest::parse_additional_columns(&additional_columns);
-                group_timings.push(start.elapsed());
+                timings.push(start.elapsed());
                 assert!(result.is_ok());
+                additional_columns.push(format!("column{}", i + 2));
             }
-
-            timings.insert(i, group_timings);
         }
 
-        for (i, threshold) in test_input_length.iter().zip(assertion_threshold.iter()) {
-            let group_timings = timings
-                .get(i)
-                .expect("Timing not found")
-                .statistical_set()
-                .expect("Failed to get statistical set");
-
-            let median_time_ns = group_timings
-                .median()
-                .expect("Failed to calculate median")
-                .as_nanos();
-
-            assert!(
-                median_time_ns < *threshold,
-                "Median time: {median_time_ns}ns"
-            );
-        }
+        let total_time: std::time::Duration = timings.iter().sum();
+        #[allow(clippy::cast_possible_truncation)]
+        let average_time = total_time / (timings.len() as u32);
+        let average_time_ns = average_time.as_nanos();
+        assert!(
+            average_time_ns < 1_000_000,
+            "Average time: {average_time_ns}ns"
+        ); // less than 1ms
     }
 
     #[test]
@@ -1479,43 +1461,72 @@ pub(crate) mod tests {
 
     #[test]
     fn test_performance_of_keyword_parsing() {
-        let mut timings: HashMap<i32, Vec<Duration>> = HashMap::new();
-        let test_input_length = [1, 10, 20];
-        let assertion_threshold = [500_000, 1_500_000, 3_000_000];
+        let mut timings = vec![];
 
-        for i in test_input_length {
-            let mut group_timings = vec![];
+        for _ in 0..3 {
             let mut keywords = vec!["column1".to_string()];
-            for j in 0..i {
-                keywords.push(format!("column{}", j + 2));
-            }
-
-            for _ in 0..100 {
+            for i in 0..100 {
                 let start = std::time::Instant::now();
                 let result = SearchRequest::parse_keywords(&keywords);
-                group_timings.push(start.elapsed());
+                timings.push(start.elapsed());
                 assert!(result.is_ok());
+                keywords.push(format!("column{}", i + 2));
             }
-
-            timings.insert(i, group_timings);
         }
 
-        for (i, threshold) in test_input_length.iter().zip(assertion_threshold.iter()) {
-            let group_timings = timings
-                .get(i)
-                .expect("Timing not found")
-                .statistical_set()
-                .expect("Failed to get statistical set");
+        let total_time: std::time::Duration = timings.iter().sum();
+        #[allow(clippy::cast_possible_truncation)]
+        let average_time = total_time / (timings.len() as u32);
+        let average_time_ns = average_time.as_nanos();
+        assert!(
+            average_time_ns < 1_000_000,
+            "Average time: {average_time_ns}ns"
+        ); // less than 1ms
+    }
 
-            let median_time_ns = group_timings
-                .median()
-                .expect("Failed to calculate median")
-                .as_nanos();
+    #[test]
+    fn test_quoting_embedding_columns() {
+        // lowercase
+        assert_eq!(offset_col!("embedding"), "embedding_offset");
+        assert_eq!(embedding_col!("embedding"), "embedding_embedding");
+        assert_eq!(
+            quote_identifier(&offset_col!("embedding")),
+            "embedding_offset"
+        );
+        assert_eq!(
+            quote_identifier(&embedding_col!("embedding")),
+            "embedding_embedding"
+        );
+        assert_eq!(
+            offset_col!(quote_identifier("embedding")),
+            "embedding_offset"
+        );
+        assert_eq!(
+            embedding_col!(quote_identifier("embedding")),
+            "embedding_embedding"
+        );
 
-            assert!(
-                median_time_ns < *threshold,
-                "Median time: {median_time_ns}ns"
-            );
-        }
+        // mixed case
+        assert_eq!(offset_col!("Embedding"), "Embedding_offset");
+        assert_eq!(embedding_col!("Embedding"), "Embedding_embedding");
+        assert_eq!(
+            quote_identifier(&offset_col!("Embedding")),
+            "\"Embedding_offset\""
+        );
+
+        assert_eq!(
+            quote_identifier(&embedding_col!("Embedding")),
+            "\"Embedding_embedding\""
+        );
+
+        assert_eq!(
+            offset_col!(quote_identifier("Embedding")),
+            "\"Embedding\"_offset"
+        );
+
+        assert_eq!(
+            embedding_col!(quote_identifier("Embedding")),
+            "\"Embedding\"_embedding"
+        );
     }
 }
