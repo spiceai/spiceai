@@ -1,4 +1,4 @@
-use super::registry::ModelFactory;
+use super::registry::ChatModelFactory;
 use crate::parameters::{ParameterSpec, Parameters};
 use llms::chat::{Chat, Error as LlmError};
 use llms::xai::Xai;
@@ -8,13 +8,13 @@ const PARAMETERS: &[ParameterSpec] = &[ParameterSpec::component("api_key").requi
 
 pub struct XaiFactory {}
 
-impl ModelFactory for XaiFactory {
-    fn create_chat(
+impl ChatModelFactory for XaiFactory {
+    fn create(
         &self,
         model_id: Option<&str>,
         _component: &spicepod::component::model::Model,
         params: Parameters,
-    ) -> Result<std::sync::Arc<dyn Chat>, LlmError> {
+    ) -> Result<Arc<dyn Chat>, LlmError> {
         let api_key =
             params
                 .get("api_key")
@@ -27,17 +27,6 @@ impl ModelFactory for XaiFactory {
         Ok(Arc::new(Xai::new(model_id, api_key)) as Arc<dyn Chat>)
     }
 
-    fn create_embedding(
-        &self,
-        _model_id: Option<&str>,
-        _component: &spicepod::component::model::Model,
-        _params: Parameters,
-    ) -> Result<std::sync::Arc<dyn Chat>, LlmError> {
-        Err(LlmError::UnknownModelSource {
-            from: String::from("xai"),
-        })
-    }
-
     fn parameters(&self) -> &'static [ParameterSpec] {
         PARAMETERS
     }
@@ -48,7 +37,7 @@ impl ModelFactory for XaiFactory {
 }
 
 impl XaiFactory {
-    pub fn new_arc() -> Arc<dyn ModelFactory> {
-        Arc::new(XaiFactory {}) as Arc<dyn ModelFactory>
+    pub fn new_arc() -> Arc<dyn ChatModelFactory> {
+        Arc::new(XaiFactory {}) as Arc<dyn ChatModelFactory>
     }
 }
