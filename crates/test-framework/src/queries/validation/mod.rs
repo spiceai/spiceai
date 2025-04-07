@@ -206,7 +206,7 @@ mod test {
     #[test]
     fn test_tpch_answers() {
         // Check that the TPCH answers are loaded correctly
-        assert_eq!(TPCH_ANSWERS.len(), 1);
+        assert_eq!(TPCH_ANSWERS.len(), 22);
         assert_eq!(
             TPCH_ANSWERS.get("q1").expect("should have q1 answer").len(),
             1
@@ -223,7 +223,7 @@ mod test {
     #[test]
     fn test_validate_tpch_query() {
         // Create a dummy query
-        let query = Query::new("q1".into(), "SELECT * FROM lineitem".into(), false);
+        let query = Query::new("tpch_q1".into(), "SELECT * FROM lineitem".into(), false);
 
         // Create a batch of results using the real answer columns
         // l_returnflag|l_linestatus|sum_qty|sum_base_price|sum_disc_price|sum_charge|avg_qty|avg_price|avg_disc|count_order
