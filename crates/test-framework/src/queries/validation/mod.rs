@@ -56,39 +56,42 @@ macro_rules! generate_tpch_answers {
 }
 
 static TPCH_ANSWERS: LazyLock<BTreeMap<Arc<str>, Vec<RecordBatch>>> = LazyLock::new(|| {
-    let mut map = BTreeMap::new();
-    // Load TPCH answers from CSV files, into RecordBatches
-    // and store them in the map with the query name as the key
-    let answers = generate_tpch_answers!(
-        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22
-    );
+    #[allow(clippy::expect_used)]
+    {
+        let mut map = BTreeMap::new();
+        // Load TPCH answers from CSV files, into RecordBatches
+        // and store them in the map with the query name as the key
+        let answers = generate_tpch_answers!(
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22
+        );
 
-    for (query_name, csv_contents) in answers {
-        let mut string_reader = std::io::Cursor::new(csv_contents);
-        let format = Format::default().with_delimiter(b'|').with_header(true);
-        let (schema, _) = format
-            .infer_schema(&mut string_reader, None)
-            .expect("Should infer schema");
-        string_reader.rewind().expect("Should rewind file");
+        for (query_name, csv_contents) in answers {
+            let mut string_reader = std::io::Cursor::new(csv_contents);
+            let format = Format::default().with_delimiter(b'|').with_header(true);
+            let (schema, _) = format
+                .infer_schema(&mut string_reader, None)
+                .expect("Should infer schema");
+            string_reader.rewind().expect("Should rewind file");
 
-        // create a builder
-        let reader = ReaderBuilder::new(Arc::new(schema))
-            .with_format(format.clone())
-            .build(string_reader)
-            .expect("Should build reader");
+            // create a builder
+            let reader = ReaderBuilder::new(Arc::new(schema))
+                .with_format(format.clone())
+                .build(string_reader)
+                .expect("Should build reader");
 
-        // read the batches
-        let mut batches = Vec::new();
-        for batch in reader {
-            let batch = batch.expect("Should read batch");
-            batches.push(batch);
+            // read the batches
+            let mut batches = Vec::new();
+            for batch in reader {
+                let batch = batch.expect("Should read batch");
+                batches.push(batch);
+            }
+
+            // Store the batches in the map
+            map.insert(query_name.into(), batches);
         }
 
-        // Store the batches in the map
-        map.insert(query_name.into(), batches);
+        map
     }
-
-    map
 });
 
 fn datatype_equivalent(expected_type: DataType, actual_type: DataType) -> bool {
