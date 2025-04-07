@@ -37,8 +37,8 @@ use dataconnector::ConnectorComponent;
 use datasets_health_monitor::DatasetsHealthMonitor;
 use extension::ExtensionFactory;
 use flight::RateLimits;
-use futures::future::join_all;
-use futures::Stream;
+use futures::future::{join_all, try_join_all};
+use futures::{FutureExt, Stream};
 #[cfg(feature = "openapi")]
 pub use http::get_api_doc;
 use model::{EmbeddingModelStore, EvalScorerRegistry, LLMModelStore};
@@ -282,6 +282,12 @@ pub enum Error {
 
     #[snafu(display("{source}"))]
     ComponentError { source: component::Error },
+
+    #[snafu(display("{source}"))]
+    ComponentsInitializationFailed { source: tokio::task::JoinError },
+
+    #[snafu(display("Initialization has been cancelled"))]
+    ComponentsInitializationCancelled,
 }
 
 const HTTP_SERVER: &str = "http_server";
@@ -289,6 +295,7 @@ const METRICS_SERVER: &str = "metrics_server";
 const FLIGHT_SERVER: &str = "flight_server";
 const OPENTELEMETRY_SERVER: &str = "opentelemetry_server";
 const PODS_WATCHER: &str = "pods_watcher";
+const COMPONENTS_INITIAL_LOAD: &str = "components_inition_load";
 
 // Allow 30 seconds for server components to shutdown
 const SERVER_COMPONENT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
@@ -509,7 +516,6 @@ impl Runtime {
             shutdown_signal().await;
             tracing::debug!("Shutdown signal received.");
             self.shutdown().await;
-            tracing::info!("Goodbye!");
             Ok(())
         };
 
@@ -579,7 +585,7 @@ impl Runtime {
     ///
     /// The future returned by this function will not resolve until all components have been loaded and marked as ready.
     /// This includes waiting for the first refresh of any accelerated tables to complete.
-    pub async fn load_components(&self) {
+    pub async fn load_components(self: Arc<Self>) {
         self.set_components_initializing().await;
 
         self.start_extensions().await;
@@ -589,7 +595,7 @@ impl Runtime {
 
         // Spawn each component load in its own task to run in parallel
         let task_history = tokio::spawn({
-            let self_clone = self.clone();
+            let self_clone = Arc::clone(&self);
             async move {
                 if let Err(err) = self_clone.init_task_history().await {
                     tracing::warn!("Creating internal task history table: {err}");
@@ -598,28 +604,28 @@ impl Runtime {
         });
 
         let results_cache = tokio::spawn({
-            let self_clone = self.clone();
+            let self_clone = Arc::clone(&self);
             async move {
                 self_clone.init_results_cache().await;
             }
         });
 
         let datasets = tokio::spawn({
-            let self_clone = Arc::new(self.clone());
+            let self_clone = Arc::clone(&self);
             async move {
                 self_clone.load_datasets().await;
             }
         });
 
         let catalogs = tokio::spawn({
-            let self_clone = self.clone();
+            let self_clone = Arc::clone(&self);
             async move {
                 self_clone.load_catalogs().await;
             }
         });
 
         let models_and_evals = tokio::spawn({
-            let self_clone = self.clone();
+            let self_clone = Arc::clone(&self);
             async move {
                 self_clone.load_models().await;
 
@@ -645,17 +651,48 @@ impl Runtime {
             }
         });
 
-        // Wait for all tasks to complete
-        let load_result = tokio::try_join!(
+        let components = vec![
             task_history,
             results_cache,
             datasets,
             catalogs,
-            models_and_evals
-        );
+            models_and_evals,
+        ];
 
-        if let Err(err) = load_result {
-            tracing::error!("Could not start the Spice runtime: {err}");
+        // Signal that the load must be canceled if the runtime is shut down before the components are loaded
+        let cancel_loading = CancellationToken::new();
+
+        // Wait for all components to load returning the first error
+        // or canceling spawned tokio tasks if the runtime is shutting down
+        let load_result = self
+            .start_server_component(
+                COMPONENTS_INITIAL_LOAD,
+                Some(cancel_loading.clone()),
+                async move {
+                    let abort_handlers = components
+                        .iter()
+                        .map(|task| task.abort_handle())
+                        .collect::<Vec<_>>();
+
+                    tokio::select! {
+                        load_result = try_join_all(components) => {
+                            load_result.map(|_| ()).context(ComponentsInitializationFailedSnafu)
+                        }
+                        _ = cancel_loading.cancelled() => {
+                            abort_handlers.into_iter().for_each(|handle| {
+                                handle.abort();
+                            });
+                            ComponentsInitializationCancelledSnafu.fail()
+                        }
+                    }
+                },
+            )
+            .await;
+
+        if let Err(err) = load_result.await {
+            if !matches!(err, Error::ComponentsInitializationCancelled) {
+                tracing::error!("Could not start the Spice runtime: {err}");
+            }
         } else {
             // Create a background task to report once all components are marked as `Ready`
             let status = self.status();
@@ -702,9 +739,13 @@ impl Runtime {
 
         let shutdown_futures: Vec<_> = first_shutdown_group
             .into_iter()
-            .map(|(name, handle)| {
-                tracing::debug!("Shutting down {name}");
-                handle.cancel(SERVER_COMPONENT_SHUTDOWN_TIMEOUT)
+            .filter_map(|(name, handle)| {
+                if handle.is_finished() {
+                    None
+                } else {
+                    tracing::debug!("Shutting down {name}");
+                    Some(handle.cancel(SERVER_COMPONENT_SHUTDOWN_TIMEOUT))
+                }
             })
             .collect();
 

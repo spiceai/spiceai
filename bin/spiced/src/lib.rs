@@ -245,6 +245,8 @@ pub async fn run(args: Args) -> Result<()> {
 
     start_anonymous_telemetry(&args, telemetry_config.as_ref(), app_name.as_ref()).await;
 
+    let rt = Arc::new(rt);
+
     let cloned_rt = rt.clone();
     let endpoint_auth = match app.as_ref() {
         Some(app) => EndpointAuth::new(rt.secrets(), app).await,
@@ -252,11 +254,11 @@ pub async fn run(args: Args) -> Result<()> {
     };
 
     let server_thread = tokio::spawn(async move {
-        Box::pin(Arc::new(cloned_rt).start_servers(args.runtime, tls_config, endpoint_auth)).await
+        Box::pin(cloned_rt.start_servers(args.runtime, tls_config, endpoint_auth)).await
     });
 
     tokio::select! {
-        () = rt.load_components() => {},
+        () = Arc::clone(&rt).load_components() => {},
         () = runtime::shutdown_signal() => {
             tracing::debug!("Cancelling runtime initializing!");
         },
