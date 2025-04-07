@@ -84,7 +84,7 @@ impl BuiltinToolCatalog {
                     .to_string()
             }
             ("list_datasets", None) => "List available datasets".to_string(),
-            (_, None) => format!("Tool for {}", id),
+            (_, None) => format!("Tool for {id}"),
         };
 
         match id {
