@@ -7086,7 +7086,7 @@ dependencies = [
 [[package]]
 name = "lopdf"
 version = "0.36.0"
-source = "git+https://github.com/spiceai/lopdf.git?rev=bd7b007750fe2174c2b3bbaef8c3f572f8371501#bd7b007750fe2174c2b3bbaef8c3f572f8371501"
+source = "git+https://github.com/spiceai/lopdf.git?rev=a0c08a6e954b75d725476df5682ad0d418a96246#a0c08a6e954b75d725476df5682ad0d418a96246"
 dependencies = [
  "aes",
  "bitflags 2.8.0",
@@ -8998,7 +8998,7 @@ dependencies = [
 [[package]]
 name = "pdf-extract"
 version = "0.9.0"
-source = "git+https://github.com/spiceai/pdf-extract.git?rev=d9a718b63b6b76b43086bb2c9976385a8e83762e#d9a718b63b6b76b43086bb2c9976385a8e83762e"
+source = "git+https://github.com/spiceai/pdf-extract.git?rev=3989f973c061cd805ba6fe905f14b01074844dfc#3989f973c061cd805ba6fe905f14b01074844dfc"
 dependencies = [
  "adobe-cmap-parser",
  "cff-parser",
