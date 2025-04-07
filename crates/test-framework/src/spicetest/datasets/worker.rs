@@ -170,6 +170,10 @@ impl SpiceTestQueryWorker {
                     // For QuerySetCompleted, run each query target_count times before moving to next
                     let start = SystemTime::now();
                     for query in &self.query_set {
+                        if self.validate && query.name.contains("simple") {
+                            continue; // skip validation for simple TPCH queries, because they are not part of the spec
+                        }
+
                         let mut current_query_count = 0;
                         let query_start = SystemTime::now();
                         let mut query_status = QueryStatus::Passed;
@@ -236,7 +240,6 @@ impl SpiceTestQueryWorker {
                                 );
                             }
 
-                            println!("validate: {}", self.validate);
                             let (connection_succeed, query_succeed) = self
                                 .run_single_query(
                                     query,
@@ -418,10 +421,9 @@ impl SpiceTestQueryWorker {
         if validate {
             // Validate the query results
             let validation_result = validation::validate_tpch_query(query, &validation_records)?;
-            println!("validation_result: {:?}", validation_result);
-            if let QueryValidationResult::Fail(_) = validation_result {
+            if let QueryValidationResult::Fail(validation_reason) = validation_result {
                 eprintln!(
-                    "FAIL - Worker {} - Query '{}' validation failed",
+                    "FAIL - Worker {} - Query '{}' validation failed: {validation_reason:?}",
                     self.id, query.name
                 );
                 return Err(anyhow::anyhow!("Query validation failed"));
