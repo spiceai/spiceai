@@ -18,12 +18,12 @@ use app::AppBuilder;
 use arrow::array::RecordBatch;
 use futures::TryStreamExt;
 use runtime::{status, Runtime};
-use spicepod::component::{
-    dataset::{
+use spicepod::{
+    component::dataset::{
         acceleration::{Acceleration, Mode, RefreshMode},
         Dataset,
     },
-    params::Params,
+    param::Params,
 };
 use std::io::Write;
 use std::sync::Arc;

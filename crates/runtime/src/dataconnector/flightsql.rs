@@ -50,7 +50,7 @@ pub struct FlightSQL {
     pub flightsql_factory: DataComponentFlightSQLFactory,
 }
 
-#[derive(Default, Copy, Clone)]
+#[derive(Default, Debug, Copy, Clone)]
 pub struct FlightSQLFactory {}
 
 impl FlightSQLFactory {

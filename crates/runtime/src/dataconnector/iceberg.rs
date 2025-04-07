@@ -38,7 +38,7 @@ use crate::{
     parameters::{ParameterSpec, Parameters},
 };
 
-#[derive(Default, Copy, Clone)]
+#[derive(Default, Debug, Copy, Clone)]
 pub struct IcebergDataConnectorFactory {}
 
 impl IcebergDataConnectorFactory {
@@ -79,7 +79,7 @@ impl DataConnectorFactory for IcebergDataConnectorFactory {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct IcebergDataConnector {
     params: Parameters,
 }

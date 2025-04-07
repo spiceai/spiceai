@@ -29,6 +29,7 @@ use tracing::{Instrument, Span};
 
 use super::metrics::{handle_metrics, request_labels, simple_labels};
 
+#[derive(Debug)]
 pub struct TaskEmbed {
     name: String,
     inner: Arc<dyn Embed>,

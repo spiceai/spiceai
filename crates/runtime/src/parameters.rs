@@ -229,6 +229,19 @@ pub struct Parameters {
     all_params: &'static [ParameterSpec],
 }
 
+impl std::fmt::Debug for Parameters {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Parameters")
+            .field(
+                "params",
+                &self.params.iter().map(|(k, _)| k).collect::<Vec<_>>(),
+            )
+            .field("prefix", &self.prefix)
+            .field("all_params", &self.all_params)
+            .finish_non_exhaustive()
+    }
+}
+
 impl<'a> IntoIterator for &'a Parameters {
     type Item = &'a (String, SecretString);
     type IntoIter = std::slice::Iter<'a, (String, SecretString)>;
