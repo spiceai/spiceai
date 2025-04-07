@@ -29,7 +29,8 @@ use crate::{
     embeddings::connector::EmbeddingConnector,
     error_spaced,
     federated_table::FederatedTable,
-    metrics, status,
+    metrics::{self, components::register_component_metric},
+    status,
     tracing_util::dataset_registered_trace,
     warn_spaced, AcceleratedReadWriteTableWithoutReplicationSnafu,
     AcceleratedTableInvalidChangesSnafu, AcceleratorEngineNotAvailableSnafu,
@@ -201,6 +202,34 @@ impl Runtime {
                 return Err(crate::Error::UnableToInitializeDataConnector { source: err.into() });
             }
         };
+
+        // Register any component metrics that the user has enabled for this dataset.
+        if ds.metrics.has_enabled_metrics() {
+            let enabled_metrics = ds.metrics.enabled_metrics();
+            let Some(metrics_provider) = data_connector.metrics_provider() else {
+                tracing::warn!(
+                    "Dataset {} does not support metrics. Skipping metric registration for {}.",
+                    ds.name,
+                    enabled_metrics.join(", ")
+                );
+                return Ok(data_connector);
+            };
+            for metric in enabled_metrics {
+                if let Some(metric) = metrics_provider.get_metric(&metric) {
+                    if let Err(e) =
+                        register_component_metric(&metrics_provider, *metric, &ds.name.to_string())
+                    {
+                        tracing::error!(
+                            "Unable to register component metric {}: {}",
+                            metric.name,
+                            e
+                        );
+                    }
+                } else {
+                    tracing::warn!("Metric {metric} not available in {source}");
+                }
+            }
+        }
 
         Ok(data_connector)
     }

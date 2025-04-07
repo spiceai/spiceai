@@ -17,7 +17,7 @@ limitations under the License.
 use crate::Runtime;
 use async_trait::async_trait;
 use snafu::prelude::*;
-use spicepod::component::extension::Extension as ExtensionComponent;
+use spicepod::extension::Extension as ExtensionComponent;
 
 pub type ExtensionManifest = ExtensionComponent;
 

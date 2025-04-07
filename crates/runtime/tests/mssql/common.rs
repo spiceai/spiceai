@@ -17,7 +17,7 @@ limitations under the License.
 use std::collections::HashMap;
 
 use bollard::secret::HealthConfig;
-use spicepod::component::{dataset::Dataset, params::Params as DatasetParams};
+use spicepod::{component::dataset::Dataset, param::Params as DatasetParams};
 use tracing::instrument;
 
 use crate::docker::{ContainerRunnerBuilder, RunningContainer};

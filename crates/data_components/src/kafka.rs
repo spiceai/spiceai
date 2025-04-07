@@ -59,7 +59,7 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-#[derive(Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum SslIdentification {
     None,
     #[default]
@@ -97,6 +97,30 @@ pub struct KafkaConfig {
     pub ssl_ca_location: Option<String>,
     pub enable_ssl_certificate_verification: bool,
     pub ssl_endpoint_identification_algorithm: SslIdentification,
+}
+
+impl std::fmt::Debug for KafkaConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KafkaConfig")
+            .field("brokers", &self.brokers)
+            .field("security_protocol", &self.security_protocol)
+            .field("sasl_mechanism", &self.sasl_mechanism)
+            .field("sasl_username", &self.sasl_username)
+            .field(
+                "sasl_password",
+                &self.sasl_password.as_ref().map(|_| "REDACTED"),
+            )
+            .field("ssl_ca_location", &self.ssl_ca_location)
+            .field(
+                "enable_ssl_certificate_verification",
+                &self.enable_ssl_certificate_verification,
+            )
+            .field(
+                "ssl_endpoint_identification_algorithm",
+                &self.ssl_endpoint_identification_algorithm,
+            )
+            .finish()
+    }
 }
 
 pub struct KafkaConsumer {

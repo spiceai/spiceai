@@ -95,7 +95,7 @@ indexmap = "2"
 insta = { version = "1.42.0", features = ["filters"] }
 itertools = "0.14"
 mailparse = "0.15.0"
-mysql_async = { version = "0.34.1", features = ["native-tls-tls", "chrono"] }
+mysql_async = { version = "0.35.1", features = ["native-tls-tls", "chrono"] }
 object_store = { version = "0.11" }
 odbc-api = { version = "8.1.2" }
 opentelemetry = { version = "0.27", default-features = false, features = [
@@ -170,7 +170,7 @@ arrow-json = { git = "https://github.com/spiceai/arrow-rs.git", rev = "b7925192b
 object_store = { git = "https://github.com/spiceai/arrow-rs.git", rev = "b7925192b38cfcaca04e0af42f5aa9a3b5dc9ce0" }
 
 datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "8b373f95e3fa0eaa4f13b93435275acc4096bf2f" }
-datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "e7cb6ac7cdc2041125aaf25f4c01e304e4b476ff" }
+datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "86e4a034a3c8d1091491d458ff26a07456c2ae53" }
 
 duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "cc3f3b4e00ab22b3d9b3351d69b22147b482d7d3" }
 

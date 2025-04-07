@@ -255,6 +255,17 @@ pub struct DataFusion {
     pending_sink_tables: TokioRwLock<Vec<PendingSinkRegistration>>,
 }
 
+impl std::fmt::Debug for DataFusion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DataFusion")
+            .field("runtime_status", &self.runtime_status)
+            .field("data_writers", &self.data_writers)
+            .field("accelerated_tables", &self.accelerated_tables)
+            .field("cache_provider", &self.cache_provider)
+            .finish_non_exhaustive()
+    }
+}
+
 impl DataFusion {
     #[must_use]
     pub fn builder(status: Arc<status::RuntimeStatus>) -> DataFusionBuilder {

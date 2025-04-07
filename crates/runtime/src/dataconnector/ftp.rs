@@ -29,6 +29,7 @@ use super::{
     ParameterSpec, Parameters,
 };
 
+#[derive(Debug)]
 pub struct FTP {
     params: Parameters,
 }
@@ -39,7 +40,7 @@ impl std::fmt::Display for FTP {
     }
 }
 
-#[derive(Default, Copy, Clone)]
+#[derive(Default, Debug, Copy, Clone)]
 pub struct FTPFactory {}
 
 impl FTPFactory {

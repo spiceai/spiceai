@@ -67,6 +67,7 @@ mod pull_requests;
 mod rate_limit;
 mod stargazers;
 
+#[derive(Debug)]
 pub struct Github {
     params: Parameters,
     token: Option<Arc<dyn TokenProvider>>,
@@ -281,7 +282,7 @@ fn github_gql_raw_schema_cast(
     RecordBatch::try_new(schema, columns).map_err(std::convert::Into::into)
 }
 
-#[derive(Default, Copy, Clone)]
+#[derive(Default, Debug, Copy, Clone)]
 pub struct GithubFactory {}
 
 impl GithubFactory {

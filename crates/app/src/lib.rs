@@ -26,13 +26,13 @@ use spicepod::{
         dataset::Dataset,
         embeddings::Embeddings,
         eval::Eval,
-        extension::Extension,
         model::Model,
         runtime::{CorsConfig, ResultsCache, Runtime, TlsConfig},
         secret::Secret,
         tool::Tool,
         view::View,
     },
+    extension::Extension,
     Spicepod,
 };
 

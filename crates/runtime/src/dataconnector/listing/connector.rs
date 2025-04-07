@@ -793,6 +793,7 @@ mod tests {
 
     use super::*;
 
+    #[derive(Debug)]
     struct TestConnector {
         params: Parameters,
     }
