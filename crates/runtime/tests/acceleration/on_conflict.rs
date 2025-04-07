@@ -24,12 +24,12 @@ use datafusion::{assert_batches_eq, error::DataFusionError};
 use futures::TryStreamExt;
 use rand::Rng;
 use runtime::{status, Runtime};
-use spicepod::component::{
-    dataset::{
+use spicepod::{
+    component::dataset::{
         acceleration::{Acceleration, Mode, OnConflictBehavior, RefreshMode},
         Dataset,
     },
-    params::Params,
+    param::Params,
 };
 use std::{collections::HashMap, sync::Arc};
 

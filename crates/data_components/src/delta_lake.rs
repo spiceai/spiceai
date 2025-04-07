@@ -70,6 +70,14 @@ pub struct DeltaTableFactory {
     params: HashMap<String, SecretString>,
 }
 
+impl std::fmt::Debug for DeltaTableFactory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeltaTableFactory")
+            .field("params", &self.params.keys())
+            .finish_non_exhaustive()
+    }
+}
+
 impl DeltaTableFactory {
     #[must_use]
     pub fn new(params: HashMap<String, SecretString>) -> Self {

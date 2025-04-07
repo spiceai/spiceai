@@ -19,9 +19,9 @@ use std::sync::Arc;
 use app::AppBuilder;
 use futures::StreamExt;
 use runtime::{status, Runtime};
-use spicepod::component::{
-    dataset::Dataset,
-    params::{ParamValue, Params},
+use spicepod::{
+    component::dataset::Dataset,
+    param::{ParamValue, Params},
 };
 
 use crate::{get_test_datafusion, init_tracing, utils::test_request_context};

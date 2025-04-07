@@ -16,7 +16,7 @@ limitations under the License.
 
 use datafusion_table_providers::util::column_reference::ColumnReference;
 use serde::{Deserialize, Serialize};
-use spicepod::component::{dataset::acceleration as spicepod_acceleration, params::Params};
+use spicepod::{component::dataset::acceleration as spicepod_acceleration, param::Params};
 use std::{collections::HashMap, fmt::Display, time::Duration};
 
 pub mod constraints;
@@ -362,7 +362,7 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
             .as_mut()
             .and_then(|x| x.data.remove("disable_query_push_down"))
         {
-            Some(spicepod::component::params::ParamValue::Bool(value)) => value,
+            Some(spicepod::param::ParamValue::Bool(value)) => value,
             _ => false,
         };
 

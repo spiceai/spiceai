@@ -23,7 +23,7 @@ use async_openai::{
 use async_trait::async_trait;
 use hf_hub::api::tokio::ApiError as HfApiError;
 use snafu::{ResultExt, Snafu};
-use std::sync::Arc;
+use std::{fmt::Debug, sync::Arc};
 
 pub mod candle;
 
@@ -93,7 +93,7 @@ fn encode_embedding(format: &EncodingFormat, array: Vec<f32>) -> EmbeddingVector
 }
 
 #[async_trait]
-pub trait Embed: Sync + Send {
+pub trait Embed: Debug + Sync + Send {
     async fn embed(&self, input: EmbeddingInput) -> Result<Vec<Vec<f32>>>;
 
     /// A basic health check to ensure the model can process future [`Self::embed`] requests.

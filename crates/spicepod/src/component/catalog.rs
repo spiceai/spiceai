@@ -21,7 +21,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::{params::Params, WithDependsOn};
+use super::WithDependsOn;
+use crate::{metric::Metrics, param::Params};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
@@ -48,6 +49,9 @@ pub struct Catalog {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     #[serde(rename = "dependsOn", default)]
     pub depends_on: Vec<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metrics: Option<Metrics>,
 }
 
 impl Catalog {
@@ -62,6 +66,7 @@ impl Catalog {
             params: None,
             dataset_params: None,
             depends_on: Vec::default(),
+            metrics: None,
         }
     }
 }
@@ -77,6 +82,7 @@ impl WithDependsOn<Catalog> for Catalog {
             params: self.params.clone(),
             dataset_params: self.dataset_params.clone(),
             depends_on: depends_on.to_vec(),
+            metrics: self.metrics.clone(),
         }
     }
 }

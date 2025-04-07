@@ -110,6 +110,7 @@ pub enum Error {
     InsecureEndpointWithoutAllowHTTP { endpoint: String },
 }
 
+#[derive(Debug)]
 pub struct S3 {
     params: Parameters,
 }

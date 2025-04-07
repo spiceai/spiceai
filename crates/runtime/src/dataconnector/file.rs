@@ -39,6 +39,7 @@ use super::{
     InvalidConfigurationSnafu, ParameterSpec, Parameters,
 };
 
+#[derive(Debug)]
 pub struct File {
     params: Parameters,
 }
@@ -49,7 +50,7 @@ impl std::fmt::Display for File {
     }
 }
 
-#[derive(Default, Copy, Clone)]
+#[derive(Default, Debug, Copy, Clone)]
 pub struct FileFactory {}
 
 impl FileFactory {
