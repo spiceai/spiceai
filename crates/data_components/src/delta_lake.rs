@@ -377,9 +377,7 @@ impl TableProvider for DeltaTable {
             })
             .await
             .map_err(|e| {
-                datafusion::error::DataFusionError::Execution(format!(
-                    "Blocking task panicked: {e}"
-                ))
+                datafusion::error::DataFusionError::Execution(format!("Delta Scan panicked: {e}"))
             })??;
 
         if let Some(err) = scan_context.errs.into_iter().next() {
