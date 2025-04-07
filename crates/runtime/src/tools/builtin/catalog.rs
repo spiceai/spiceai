@@ -76,8 +76,13 @@ impl BuiltinToolCatalog {
             ("sample_distinct_columns", None) => {
                 "Sample distinct column values from a Spice.ai dataset".to_string()
             }
-            ("random_sample", None) => "Get a random sample from a Spice.ai dataset".to_string(),
-            ("top_n_sample", None) => "Get top N samples from a Spice.ai dataset".to_string(),
+            ("random_sample", None) => {
+                "Get a random sample of rows from a Spice.ai dataset".to_string()
+            }
+            ("top_n_sample", None) => {
+                "Get top N samples from a Spice.ai dataset based on a specified ordering"
+                    .to_string()
+            }
             ("list_datasets", None) => "List available datasets".to_string(),
             (_, None) => format!("Tool for {}", id),
         };
