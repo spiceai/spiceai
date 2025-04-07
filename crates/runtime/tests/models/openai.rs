@@ -137,7 +137,10 @@ mod nsql {
 mod search {
     use spicepod::component::embeddings::EmbeddingChunkConfig;
 
-    use crate::models::{search::run_search_test, search::TestCase};
+    use crate::models::{
+        get_small_clickbench_dataset,
+        search::{run_search_test, TestCase},
+    };
 
     use super::*;
 
@@ -228,6 +231,96 @@ mod search {
                             "text": "friends",
                             "datasets": ["catalog_page_with_chunking"],
                             "limit": 1,
+                        }),
+                    },
+                ];
+
+                for ts in test_cases {
+                    run_search_test(http_base_url.as_str(), &ts).await?;
+                }
+                Ok(())
+            })
+            .await
+    }
+
+    #[tokio::test]
+    async fn test_search_column_casing() -> Result<(), anyhow::Error> {
+        let _tracing = init_tracing(None);
+
+        test_request_context()
+            .scope(async {
+                verify_env_secret_exists("SPICE_OPENAI_API_KEY")
+                    .await
+                    .map_err(anyhow::Error::msg)?;
+
+                let mut clickbench_dataset_no_chunking =
+                    get_small_clickbench_dataset("clickbench_no_chunking");
+                let mut clickbench_dataset_chunking =
+                    get_small_clickbench_dataset("clickbench_chunking");
+                clickbench_dataset_no_chunking.embeddings = vec![ColumnEmbeddingConfig {
+                    column: "Referer".to_string(),
+                    model: "openai_embeddings".to_string(),
+                    primary_keys: None,
+                    chunking: None,
+                }];
+
+                clickbench_dataset_chunking.embeddings = vec![ColumnEmbeddingConfig {
+                    column: "Referer".to_string(),
+                    model: "openai_embeddings".to_string(),
+                    primary_keys: None,
+                    chunking: Some(EmbeddingChunkConfig {
+                        enabled: true,
+                        target_chunk_size: 512,
+                        overlap_size: 128,
+                        trim_whitespace: false,
+                    }),
+                }];
+
+                let app = AppBuilder::new("search_app")
+                    .with_dataset(clickbench_dataset_no_chunking)
+                    .with_dataset(clickbench_dataset_chunking)
+                    .with_embedding(get_openai_embeddings(
+                        Some("text-embedding-3-small"),
+                        "openai_embeddings",
+                    ))
+                    .build();
+
+                let api_config = create_api_bindings_config();
+                let http_base_url = format!("http://{}", api_config.http_bind_address);
+                let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+
+                let _ = init_tracing_with_task_history(None, &rt);
+
+                let rt_ref_copy = Arc::clone(&rt);
+                tokio::spawn(async move {
+                    Box::pin(rt_ref_copy.start_servers(api_config, None, EndpointAuth::no_auth()))
+                        .await
+                });
+
+                tokio::select! {
+                    () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                        return Err(anyhow::anyhow!("Timed out waiting for components to load"));
+                    }
+                    () = rt.load_components() => {}
+                }
+
+                runtime_ready_check(&rt).await;
+
+                let test_cases = [
+                    TestCase {
+                        name: "openai_casing_no_chunking",
+                        body: json!({
+                            "text": "go.mail",
+                            "limit": 2,
+                            "datasets": ["clickbench_no_chunking"],
+                        }),
+                    },
+                    TestCase {
+                        name: "openai_casing_chunking",
+                        body: json!({
+                            "text": "go.mail",
+                            "limit": 2,
+                            "datasets": ["clickbench_chunking"],
                         }),
                     },
                 ];

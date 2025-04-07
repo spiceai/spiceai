@@ -190,6 +190,27 @@ fn get_taxi_trips_dataset() -> Dataset {
     dataset
 }
 
+fn get_small_clickbench_dataset(name: &str) -> Dataset {
+    let mut dataset = Dataset::new(
+        "s3://spiceai-public-datasets/clickbench/hits_small.parquet",
+        name,
+    );
+    dataset.params = Some(Params::from_string_map(
+        vec![
+            ("file_format".to_string(), "parquet".to_string()),
+            ("client_timeout".to_string(), "120s".to_string()),
+        ]
+        .into_iter()
+        .collect(),
+    ));
+    dataset.acceleration = Some(Acceleration {
+        enabled: true,
+        refresh_sql: Some(format!("SELECT * FROM {name} LIMIT 500")),
+        ..Default::default()
+    });
+    dataset
+}
+
 fn get_tpcds_dataset(
     ds_name: &str,
     spice_name: Option<&str>,
