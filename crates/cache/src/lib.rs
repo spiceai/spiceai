@@ -143,6 +143,20 @@ pub struct QueryResultsCacheProvider {
     ignore_schemas: Box<[Box<str>]>,
 }
 
+impl std::fmt::Debug for QueryResultsCacheProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QueryResultsCacheProvider")
+            .field("cache_max_size", &self.cache_max_size)
+            .field("ttl", &self.ttl)
+            .field("ignore_schemas", &self.ignore_schemas)
+            .field(
+                "metrics_reported_last_time",
+                &self.metrics_reported_last_time,
+            )
+            .finish_non_exhaustive()
+    }
+}
+
 impl QueryResultsCacheProvider {
     /// # Errors
     ///

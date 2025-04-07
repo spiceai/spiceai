@@ -22,9 +22,9 @@ use reqwest::{header::HeaderMap, Client};
 use runtime::{config::Config, get_params_with_secrets, Runtime};
 use secrecy::SecretString;
 use snafu::ResultExt;
-use spicepod::component::{
-    dataset::{acceleration::Acceleration, Dataset},
-    params::Params,
+use spicepod::{
+    component::dataset::{acceleration::Acceleration, Dataset},
+    param::Params,
 };
 use std::sync::Arc;
 use std::{

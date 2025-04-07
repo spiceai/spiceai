@@ -21,7 +21,7 @@ use app::AppBuilder;
 
 use arrow::array::RecordBatch;
 use runtime::{status, Runtime};
-use spicepod::component::{dataset::Dataset, params::Params as DatasetParams};
+use spicepod::{component::dataset::Dataset, param::Params as DatasetParams};
 
 use crate::{
     get_test_datafusion, init_tracing, run_query_and_check_results, utils::test_request_context,

@@ -23,7 +23,7 @@ use runtime::{component::dataset::Dataset as RuntimeDataset, status, Runtime};
 use secrecy::ExposeSecret;
 use spicepod::component::dataset::acceleration::{Acceleration, RefreshMode};
 use spicepod::component::dataset::Dataset;
-use spicepod::component::params::Params;
+use spicepod::param::Params;
 use std::{collections::HashMap, sync::Arc};
 
 use crate::utils::test_request_context;

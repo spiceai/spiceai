@@ -39,6 +39,7 @@ pub enum Error {
     },
 }
 
+#[derive(Debug)]
 pub struct SFTP {
     params: Parameters,
 }

@@ -23,7 +23,7 @@ use crate::{
     ValidateFn,
 };
 use runtime::{status, Runtime};
-use spicepod::component::{dataset::Dataset, params::Params};
+use spicepod::{component::dataset::Dataset, param::Params};
 
 fn make_spark_dataset(path: &str, name: &str) -> Dataset {
     let mut dataset = Dataset::new(format!("spark:{path}"), name.to_string());

@@ -32,6 +32,7 @@ use crate::model::ENABLE_MODEL_SUPPORT_MESSAGE;
 
 use super::table::EmbeddingTable;
 
+#[derive(Debug)]
 pub struct EmbeddingConnector {
     inner_connector: Arc<dyn DataConnector>,
 

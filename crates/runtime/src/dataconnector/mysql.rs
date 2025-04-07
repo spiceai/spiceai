@@ -15,6 +15,8 @@ limitations under the License.
 */
 
 use crate::component::dataset::Dataset;
+use crate::component::metrics::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
+use crate::component::ComponentType;
 use async_trait::async_trait;
 use data_components::Read;
 use datafusion::datasource::TableProvider;
@@ -23,9 +25,10 @@ use datafusion_table_providers::mysql::MySQLTableFactory;
 use datafusion_table_providers::sql::db_connection_pool::{
     dbconnection,
     mysqlpool::{self, MySQLConnectionPool},
-    DbConnectionPool, Error as DbConnectionPoolError,
+    Error as DbConnectionPoolError,
 };
-use mysql_async::prelude::ToValue;
+use mysql_async::Metrics;
+use opentelemetry::KeyValue;
 use snafu::prelude::*;
 use std::any::Any;
 use std::future::Future;
@@ -47,6 +50,12 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct MySQL {
     mysql_factory: MySQLTableFactory,
+}
+
+impl std::fmt::Debug for MySQL {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MySQL").finish_non_exhaustive()
+    }
 }
 
 #[derive(Default, Copy, Clone)]
@@ -85,11 +94,7 @@ impl DataConnectorFactory for MySQLFactory {
         params: ConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
-            let pool: Arc<
-                dyn DbConnectionPool<mysql_async::Conn, &'static (dyn ToValue + Sync)>
-                    + Send
-                    + Sync,
-            > = match MySQLConnectionPool::new(params.parameters.to_secret_map()).await {
+            let pool = match MySQLConnectionPool::new(params.parameters.to_secret_map()).await {
                 Ok(pool) => Arc::new(pool),
                 Err(error) => match error {
                     mysqlpool::Error::InvalidUsernameOrPassword { .. } => {
@@ -184,6 +189,207 @@ impl DataConnector for MySQL {
                     source: e,
                 });
             }
+        }
+    }
+
+    fn metrics_provider(&self) -> Option<Arc<dyn MetricsProvider>> {
+        Some(Arc::new(MySQLMetricsProvider::new(
+            self.mysql_factory.conn_pool_metrics(),
+        )))
+    }
+}
+
+#[derive(Debug, Clone)]
+struct MySQLMetricsProvider {
+    metrics: Arc<Metrics>,
+}
+
+impl MySQLMetricsProvider {
+    fn new(metrics: Arc<Metrics>) -> Self {
+        Self { metrics }
+    }
+}
+
+const METRICS: &[MetricSpec] = &[
+    MetricSpec::new("connection_count", MetricType::ObservableGaugeU64)
+        .description("Gauge of active connections to the database server"),
+    MetricSpec::new("connections_in_pool", MetricType::ObservableGaugeU64)
+        .description("Gauge of active connections that are idling in the pool"),
+    MetricSpec::new("active_wait_requests", MetricType::ObservableGaugeU64).description(
+        "Gauge of requests that are waiting for a connection to be returned to the pool",
+    ),
+    MetricSpec::new("create_failed", MetricType::ObservableCounterU64)
+        .description("Counter of connections that failed to be created"),
+    MetricSpec::new(
+        "discarded_superfluous_connection",
+        MetricType::ObservableCounterU64,
+    )
+        .description(
+            "Counter of connections that were closed because there were already enough idle connections in the pool",
+        ),
+    MetricSpec::new("discarded_unestablished_connection", MetricType::ObservableCounterU64)
+        .description(
+            "Counter of connections that were closed because they could not be established",
+        ),
+    MetricSpec::new("dirty_connection_return", MetricType::ObservableCounterU64)
+        .description(
+            "Counter of connections that were returned to the pool but were dirty (ie. open transactions, pending queries, etc)",
+        ),
+    MetricSpec::new("discarded_expired_connection", MetricType::ObservableCounterU64)
+        .description(
+            "Counter of connections that were discarded because they were expired by the pool constraints (i.e. TTL expired)",
+        ),
+    MetricSpec::new("resetting_connection", MetricType::ObservableCounterU64)
+        .description(
+            "Counter of connections that were reset",
+        ),
+    MetricSpec::new("discarded_error_during_cleanup", MetricType::ObservableCounterU64)
+        .description(
+            "Counter of connections that were discarded because they returned an error during cleanup",
+        ),
+    MetricSpec::new("connection_returned_to_pool", MetricType::ObservableCounterU64)
+        .description(
+            "Counter of connections that were returned to the pool",
+        ),
+];
+
+impl MetricsProvider for MySQLMetricsProvider {
+    fn component_type(&self) -> ComponentType {
+        ComponentType::Dataset
+    }
+
+    fn component_name(&self) -> &'static str {
+        "mysql"
+    }
+
+    fn available_metrics(&self) -> &'static [MetricSpec] {
+        METRICS
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn callback_to_observe_metric(
+        &self,
+        metric: &MetricSpec,
+        attributes: Vec<KeyValue>,
+    ) -> Option<ObserveMetricCallback> {
+        let metrics = Arc::clone(&self.metrics);
+        match metric.name {
+            "connection_count" => Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                instrument.observe(
+                    metrics
+                        .connection_count
+                        .load(std::sync::atomic::Ordering::Relaxed) as u64,
+                    &attributes,
+                );
+            }))),
+            "connections_in_pool" => {
+                Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                    instrument.observe(
+                        metrics
+                            .connections_in_pool
+                            .load(std::sync::atomic::Ordering::Relaxed)
+                            as u64,
+                        &attributes,
+                    );
+                })))
+            }
+            "active_wait_requests" => {
+                Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                    instrument.observe(
+                        metrics
+                            .active_wait_requests
+                            .load(std::sync::atomic::Ordering::Relaxed)
+                            as u64,
+                        &attributes,
+                    );
+                })))
+            }
+            "create_failed" => Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                instrument.observe(
+                    metrics
+                        .create_failed
+                        .load(std::sync::atomic::Ordering::Relaxed) as u64,
+                    &attributes,
+                );
+            }))),
+            "discarded_superfluous_connection" => {
+                Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                    instrument.observe(
+                        metrics
+                            .discarded_superfluous_connection
+                            .load(std::sync::atomic::Ordering::Relaxed)
+                            as u64,
+                        &attributes,
+                    );
+                })))
+            }
+            "discarded_unestablished_connection" => {
+                Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                    instrument.observe(
+                        metrics
+                            .discarded_unestablished_connection
+                            .load(std::sync::atomic::Ordering::Relaxed)
+                            as u64,
+                        &attributes,
+                    );
+                })))
+            }
+            "dirty_connection_return" => {
+                Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                    instrument.observe(
+                        metrics
+                            .dirty_connection_return
+                            .load(std::sync::atomic::Ordering::Relaxed)
+                            as u64,
+                        &attributes,
+                    );
+                })))
+            }
+            "discarded_expired_connection" => {
+                Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                    instrument.observe(
+                        metrics
+                            .discarded_expired_connection
+                            .load(std::sync::atomic::Ordering::Relaxed)
+                            as u64,
+                        &attributes,
+                    );
+                })))
+            }
+            "resetting_connection" => {
+                Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                    instrument.observe(
+                        metrics
+                            .resetting_connection
+                            .load(std::sync::atomic::Ordering::Relaxed)
+                            as u64,
+                        &attributes,
+                    );
+                })))
+            }
+            "discarded_error_during_cleanup" => {
+                Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                    instrument.observe(
+                        metrics
+                            .discarded_error_during_cleanup
+                            .load(std::sync::atomic::Ordering::Relaxed)
+                            as u64,
+                        &attributes,
+                    );
+                })))
+            }
+            "connection_returned_to_pool" => {
+                Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                    instrument.observe(
+                        metrics
+                            .connection_returned_to_pool
+                            .load(std::sync::atomic::Ordering::Relaxed)
+                            as u64,
+                        &attributes,
+                    );
+                })))
+            }
+            _ => None,
         }
     }
 }

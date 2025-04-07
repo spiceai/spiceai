@@ -541,7 +541,7 @@ mod tests {
     use llms::embeddings::{self, Embed};
     use std::collections::HashMap;
 
-    #[derive(Default)]
+    #[derive(Default, Debug)]
     pub(crate) struct MockEmbedder {
         pub map: HashMap<String, Vec<f32>>,
     }

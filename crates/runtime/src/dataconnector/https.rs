@@ -31,6 +31,7 @@ use super::{
 };
 use super::{ConnectorComponent, ConnectorParams};
 
+#[derive(Debug)]
 pub struct Https {
     params: Parameters,
 }
@@ -41,7 +42,7 @@ impl std::fmt::Display for Https {
     }
 }
 
-#[derive(Default, Copy, Clone)]
+#[derive(Default, Debug, Copy, Clone)]
 pub struct HttpsFactory {}
 
 impl HttpsFactory {

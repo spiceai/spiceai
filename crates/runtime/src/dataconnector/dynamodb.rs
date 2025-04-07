@@ -28,11 +28,12 @@ use super::{
     ParameterSpec, Parameters,
 };
 
+#[derive(Debug)]
 pub struct DynamoDB {
     params: Parameters,
 }
 
-#[derive(Default, Copy, Clone)]
+#[derive(Default, Debug, Copy, Clone)]
 pub struct DynamoDBFactory {}
 
 impl DynamoDBFactory {
