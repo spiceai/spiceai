@@ -543,13 +543,14 @@ async fn run_ready_state_test(
             .with_app(app)
             .build()
             .await;
+        let cloned_rt = Arc::new(rt.clone());
 
         tracing::info!("Loading components");
         tokio::select! {
             () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
                 return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
             }
-            () = rt.load_components() => {}
+            () = cloned_rt.load_components() => {}
         }
 
         tracing::info!("Running initial query");
@@ -813,13 +814,14 @@ async fn test_ready_state_mixed_arrow_acceleration() -> Result<(), anyhow::Error
                 .with_app(app)
                 .build()
                 .await;
+            let cloned_rt = Arc::new(rt.clone());
 
             tracing::info!("Loading components");
             tokio::select! {
                 () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
                 }
-                () = rt.load_components() => {}
+                () = cloned_rt.load_components() => {}
             }
 
             // Queries to native_on_registration_mixed should work right away
@@ -928,13 +930,14 @@ async fn test_ready_state_mixed_duckdb_acceleration() -> Result<(), anyhow::Erro
                 .with_app(app)
                 .build()
                 .await;
+            let cloned_rt = Arc::new(rt.clone());
 
             tracing::info!("Loading components");
             tokio::select! {
                 () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
                 }
-                () = rt.load_components() => {}
+                () = cloned_rt.load_components() => {}
             }
 
             // Queries to native_on_registration_mixed should work right away

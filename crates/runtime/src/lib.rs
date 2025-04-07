@@ -296,7 +296,7 @@ const METRICS_SERVER: &str = "metrics_server";
 const FLIGHT_SERVER: &str = "flight_server";
 const OPENTELEMETRY_SERVER: &str = "opentelemetry_server";
 const PODS_WATCHER: &str = "pods_watcher";
-const COMPONENTS_INITIAL_LOAD: &str = "components_inition_load";
+const COMPONENTS_INITIAL_LOAD: &str = "components_initial_load";
 
 // Allow 30 seconds for server components to shutdown
 const SERVER_COMPONENT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);

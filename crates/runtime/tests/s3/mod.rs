@@ -81,13 +81,14 @@ async fn s3_federation() -> Result<(), anyhow::Error> {
                 .with_app(app)
                 .build()
                 .await;
+            let cloned_rt = Arc::new(rt.clone());
 
             // Set a timeout for the test
             tokio::select! {
                 () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
                 }
-                () = rt.load_components() => {}
+                () = cloned_rt.load_components() => {}
             }
 
             let mut query_result = rt
@@ -145,13 +146,14 @@ async fn s3_hive_partitioning() -> Result<(), anyhow::Error> {
                 .with_datafusion(df)
                 .build()
                 .await;
+            let cloned_rt = Arc::new(rt.clone());
 
             // Set a timeout for the test
             tokio::select! {
                 () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
                 }
-                () = rt.load_components() => {}
+                () = cloned_rt.load_components() => {}
             }
 
             let mut query_result = rt
@@ -212,13 +214,14 @@ async fn s3_schema_evolution() -> Result<(), anyhow::Error> {
                 .with_datafusion(df)
                 .build()
                 .await;
+            let cloned_rt = Arc::new(rt.clone());
 
             // Set a timeout for the test
             tokio::select! {
                 () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
                 }
-                () = rt.load_components() => {}
+                () = cloned_rt.load_components() => {}
             }
 
             let mut query_result = rt
@@ -266,13 +269,14 @@ async fn s3_bulk_bucket_schema() -> Result<(), anyhow::Error> {
                 .with_datafusion(df)
                 .build()
                 .await;
+            let cloned_rt = Arc::new(rt.clone());
 
             // Set a timeout for the test
             tokio::select! {
                 () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
                 }
-                () = rt.load_components() => {}
+                () =cloned_rt.load_components() => {}
             }
 
             let mut query_result = rt
@@ -363,13 +367,14 @@ async fn s3_schema_source_path() -> Result<(), anyhow::Error> {
                 .with_datafusion(df)
                 .build()
                 .await;
+            let cloned_rt = Arc::new(rt.clone());
 
             // Set a timeout for the test
             tokio::select! {
                 () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
                 }
-                () = rt.load_components() => {}
+                () = cloned_rt.load_components() => {}
             }
 
             for dataset_name in &["ds1_customer", "ds2_customer", "ds3_lineitem"] {
