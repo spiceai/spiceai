@@ -340,7 +340,7 @@ impl DataAccelerator for SqliteAccelerator {
 mod tests {
     use std::{collections::HashMap, sync::Arc};
 
-    use crate::dataaccelerator::DataAccelerator;
+    use crate::{builder::RuntimeBuilder, dataaccelerator::DataAccelerator};
     use arrow::{
         array::{Int64Array, RecordBatch, StringArray, UInt64Array},
         datatypes::{DataType, Schema},
@@ -384,7 +384,8 @@ mod tests {
             temporary: false,
         };
         let ctx = SessionContext::new();
-        let table = SqliteAccelerator::new()
+        let runtime = RuntimeBuilder::new().build().await;
+        let table = SqliteAccelerator::new(runtime.accelerator_registry())
             .create_external_table(&external_table, None)
             .await
             .expect("table should be created");
@@ -472,7 +473,8 @@ mod tests {
             ..Default::default()
         });
 
-        let accelerator = SqliteAccelerator::new();
+        let runtime = RuntimeBuilder::new().build().await;
+        let accelerator = SqliteAccelerator::new(runtime.accelerator_registry());
         assert!(!accelerator.is_initialized(&dataset));
 
         accelerator

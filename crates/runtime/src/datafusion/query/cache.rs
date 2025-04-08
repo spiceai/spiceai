@@ -232,6 +232,7 @@ mod tests {
     use spicepod::component::runtime::ResultsCache;
 
     use crate::{
+        builder::RuntimeBuilder,
         datafusion::{query::QueryBuilder, DataFusion},
         request::{CacheControl, CacheKeyType, Protocol, RequestContext},
         status,
@@ -273,8 +274,9 @@ mod tests {
         let cache_provider =
             QueryResultsCacheProvider::try_new(&results_cache_config, Box::new([]))
                 .expect("valid cache provider");
+        let runtime = RuntimeBuilder::new().build().await;
         let df = Arc::new(
-            DataFusion::builder(status::RuntimeStatus::new())
+            DataFusion::builder(status::RuntimeStatus::new(), runtime.accelerator_registry())
                 .with_cache_provider(Arc::new(cache_provider))
                 .build(),
         );

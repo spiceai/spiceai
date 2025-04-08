@@ -382,7 +382,10 @@ async fn test_connectivity(
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::{component::dataset::Dataset, status::RuntimeStatus};
+    use crate::{
+        builder::RuntimeBuilder, component::dataset::Dataset, status::RuntimeStatus,
+        DataAccelerator, Engine,
+    };
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion::{
         catalog::SchemaProvider, catalog_common::MemorySchemaProvider, datasource::MemTable,
@@ -391,7 +394,10 @@ mod test {
 
     #[tokio::test]
     async fn test_register_dataset_with_schema() {
-        let df = create_test_datafusion();
+        let runtime = RuntimeBuilder::new().build().await;
+        let accelerator_registry: Arc<Mutex<HashMap<Engine, Arc<dyn DataAccelerator>>>> =
+            runtime.accelerator_registry();
+        let df = create_test_datafusion(accelerator_registry);
 
         let dataset = Dataset::try_new("spice.ai".to_string(), "foo.dataset_name")
             .expect("to create dataset");
@@ -408,8 +414,14 @@ mod test {
         monitor.deregister_dataset(&dataset.name.to_string()).await;
     }
 
-    fn create_test_datafusion() -> Arc<DataFusion> {
-        let df = Arc::new(DataFusion::builder(RuntimeStatus::new()).build());
+    fn create_test_datafusion(
+        accelerator_registry: Arc<
+            Mutex<
+                HashMap<crate::component::dataset::acceleration::Engine, Arc<dyn DataAccelerator>>,
+            >,
+        >,
+    ) -> Arc<DataFusion> {
+        let df = Arc::new(DataFusion::builder(RuntimeStatus::new(), accelerator_registry).build());
 
         let catalog = df.ctx.catalog("spice").expect("default catalog is spice");
 

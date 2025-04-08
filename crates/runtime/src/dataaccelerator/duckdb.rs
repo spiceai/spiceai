@@ -404,10 +404,10 @@ mod tests {
     };
     use datafusion_table_providers::util::test::MockExec;
 
-    use crate::component::dataset::acceleration::Acceleration;
     use crate::component::dataset::acceleration::{Engine, Mode};
     use crate::component::dataset::Dataset;
     use crate::dataaccelerator::{duckdb::DuckDBAccelerator, DataAccelerator};
+    use crate::{builder::RuntimeBuilder, component::dataset::acceleration::Acceleration};
 
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
@@ -446,7 +446,8 @@ mod tests {
             column_defaults: HashMap::default(),
             temporary: false,
         };
-        let duckdb_accelerator = DuckDBAccelerator::new();
+        let rt = RuntimeBuilder::new().build().await;
+        let duckdb_accelerator = DuckDBAccelerator::new(rt.accelerator_registry());
         let ctx = SessionContext::new();
         let table = duckdb_accelerator
             .create_external_table(&external_table, None)
@@ -629,7 +630,8 @@ mod tests {
             ..Default::default()
         });
 
-        let accelerator = DuckDBAccelerator::new();
+        let runtime = RuntimeBuilder::new().build().await;
+        let accelerator = DuckDBAccelerator::new(runtime.accelerator_registry());
         assert!(!accelerator.is_initialized(&dataset));
 
         accelerator

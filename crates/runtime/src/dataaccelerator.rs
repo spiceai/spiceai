@@ -473,12 +473,13 @@ mod test {
     #[tokio::test]
     #[cfg(feature = "duckdb")]
     async fn test_file_mode_duckdb_creation() {
+        use crate::builder::RuntimeBuilder;
         use std::{fs, path::Path};
 
         let path = "./abc-duckdb.db".to_string();
         let params = HashMap::from([("duckdb_file".to_string(), path.clone())]);
-
-        register_all().await;
+        let runtime = Arc::new(RuntimeBuilder::new().build().await);
+        register_all(Arc::clone(&runtime)).await;
         let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Utf8, false)]));
         let acceleration_settings = Acceleration {
             params,
@@ -488,6 +489,7 @@ mod test {
             ..Acceleration::default()
         };
         let _ = create_accelerator_table(
+            runtime.accelerator_registry(),
             "abc".into(),
             schema,
             None,
@@ -506,12 +508,13 @@ mod test {
     #[tokio::test]
     #[cfg(feature = "sqlite")]
     async fn test_file_mode_sqlite_creation() {
+        use crate::builder::RuntimeBuilder;
         use std::{fs, path::Path};
 
         let path = "./abc-sqlite.db".to_string();
         let params = HashMap::from([("sqlite_file".to_string(), path.clone())]);
-
-        register_all().await;
+        let runtime = Arc::new(RuntimeBuilder::new().build().await);
+        register_all(Arc::clone(&runtime)).await;
         let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Utf8, false)]));
         let acceleration_settings = Acceleration {
             params: params.clone(),
@@ -522,6 +525,7 @@ mod test {
         };
 
         let _ = create_accelerator_table(
+            runtime.accelerator_registry(),
             "abc".into(),
             schema,
             None,
@@ -540,15 +544,16 @@ mod test {
     #[tokio::test]
     #[cfg(feature = "sqlite")]
     async fn test_file_mode_sqlite_creation_default_path() {
-        use std::{fs, path::Path};
-
+        use crate::builder::RuntimeBuilder;
         use crate::make_spice_data_directory;
+        use std::{fs, path::Path};
 
         let spice_data_dir = crate::spice_data_base_path();
         make_spice_data_directory().expect("spice data directory created");
         let path = format!("{spice_data_dir}/abc_sqlite.db");
 
-        register_all().await;
+        let runtime = Arc::new(RuntimeBuilder::new().build().await);
+        register_all(Arc::clone(&runtime)).await;
         let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Utf8, false)]));
         let acceleration_settings = Acceleration {
             params: HashMap::new(),
@@ -558,6 +563,7 @@ mod test {
             ..Acceleration::default()
         };
         let _ = create_accelerator_table(
+            runtime.accelerator_registry(),
             "abc".into(),
             schema,
             None,
