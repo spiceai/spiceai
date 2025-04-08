@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::collections::HashMap;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -22,7 +23,7 @@ use async_trait::async_trait;
 use datafusion::sql::TableReference;
 use opentelemetry_sdk::metrics::MetricError;
 use snafu::prelude::*;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 use crate::accelerated_table::refresh::Refresh;
 use crate::accelerated_table::Retention;
@@ -33,6 +34,8 @@ use crate::datafusion::{DataFusion, SPICE_RUNTIME_SCHEMA};
 use crate::dataupdate::{DataUpdate, UpdateType};
 use crate::internal_table::{create_internal_accelerated_table, Error as InternalTableError};
 use crate::secrets::Secrets;
+use crate::DataAccelerator;
+use crate::Engine;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -87,7 +90,10 @@ impl otel_arrow::ArrowExporter for SpiceMetricsExporter {
     }
 }
 
-pub async fn register_metrics_table(datafusion: &Arc<DataFusion>) -> Result<(), Error> {
+pub async fn register_metrics_table(
+    accelerator_registry: Arc<Mutex<HashMap<Engine, Arc<dyn DataAccelerator>>>>,
+    datafusion: &Arc<DataFusion>,
+) -> Result<(), Error> {
     let metrics_table_reference = get_metrics_table_reference();
 
     let retention = Retention::new(
@@ -101,6 +107,7 @@ pub async fn register_metrics_table(datafusion: &Arc<DataFusion>) -> Result<(), 
     );
 
     let table = create_internal_accelerated_table(
+        accelerator_registry,
         datafusion.runtime_status(),
         metrics_table_reference.clone(),
         otel_arrow::schema(),

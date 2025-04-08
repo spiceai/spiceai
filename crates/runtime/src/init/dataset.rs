@@ -33,16 +33,18 @@ use crate::{
     tracing_util::dataset_registered_trace,
     warn_spaced, AcceleratedReadWriteTableWithoutReplicationSnafu,
     AcceleratedTableInvalidChangesSnafu, AcceleratorEngineNotAvailableSnafu,
-    AcceleratorInitializationFailedSnafu, Error, LogErrors, OdbcNotInstalledSnafu, Result, Runtime,
-    UnableToAttachDataConnectorSnafu, UnableToCreateAcceleratedTableSnafu,
-    UnableToInitializeDataConnectorSnafu, UnableToLoadDatasetConnectorSnafu,
-    UnableToReceiveAcceleratedTableStatusSnafu, UnknownDataConnectorSnafu,
+    AcceleratorInitializationFailedSnafu, DataAccelerator, Engine, Error, LogErrors,
+    OdbcNotInstalledSnafu, Result, Runtime, UnableToAttachDataConnectorSnafu,
+    UnableToCreateAcceleratedTableSnafu, UnableToInitializeDataConnectorSnafu,
+    UnableToLoadDatasetConnectorSnafu, UnableToReceiveAcceleratedTableStatusSnafu,
+    UnknownDataConnectorSnafu,
 };
 use app::App;
 use datafusion::sql::TableReference;
 use futures::{future::join_all, StreamExt};
 use opentelemetry::KeyValue;
 use snafu::prelude::*;
+use tokio::sync::Mutex;
 use tokio::sync::Semaphore;
 use util::{fibonacci_backoff::FibonacciBackoffBuilder, retry, RetryError};
 
@@ -282,8 +284,12 @@ impl Runtime {
             Err(err) => {
                 // We couldn't connect to the federated table. If the dataset has an existing
                 // accelerated table, we can defer the federated table creation.
-                if let Some(federated_table) =
-                    FederatedTable::new_deferred(Arc::clone(&ds), Arc::clone(&connector)).await
+                if let Some(federated_table) = FederatedTable::new_deferred(
+                    self.accelerator_registry(),
+                    Arc::clone(&ds),
+                    Arc::clone(&connector),
+                )
+                .await
                 {
                     tracing::warn!(
                         "Unable to connect to the remote source for {}. Data will be served from the pre-existing accelerated table for {} while attempting to establish the connection.\n\n{err}",
@@ -535,7 +541,6 @@ impl Runtime {
         } = register_dataset_ctx;
 
         let replicate = ds.replication.as_ref().is_some_and(|r| r.enabled);
-
         // FEDERATED TABLE
         if !ds.is_accelerated() {
             let ds_name: TableReference = ds.name.clone();
@@ -571,7 +576,7 @@ impl Runtime {
             AcceleratedReadWriteTableWithoutReplicationSnafu.fail()?;
         }
 
-        dataaccelerator::get_accelerator_engine(accelerator_engine)
+        dataaccelerator::get_accelerator_engine(self.accelerator_registry(), accelerator_engine)
             .await
             .context(AcceleratorEngineNotAvailableSnafu {
                 name: accelerator_engine.to_string(),
@@ -640,11 +645,14 @@ impl Runtime {
         let mut initialized_datasets = vec![];
         for ds in datasets {
             if let Some(acceleration) = &ds.acceleration {
-                let accelerator = match dataaccelerator::get_accelerator_engine(acceleration.engine)
-                    .await
-                    .context(AcceleratorEngineNotAvailableSnafu {
-                        name: acceleration.engine.to_string(),
-                    }) {
+                let accelerator = match dataaccelerator::get_accelerator_engine(
+                    self.accelerator_registry(),
+                    acceleration.engine,
+                )
+                .await
+                .context(AcceleratorEngineNotAvailableSnafu {
+                    name: acceleration.engine.to_string(),
+                }) {
                     Ok(accelerator) => accelerator,
                     Err(err) => {
                         let ds_name = &ds.name;
@@ -683,23 +691,30 @@ impl Runtime {
 
     /// Returns a list of valid datasets from the given App, skipping any that fail to parse and logging an error for them.
     pub(crate) async fn get_initialized_datasets(
+        accelerator_registry: Arc<Mutex<HashMap<Engine, Arc<dyn DataAccelerator>>>>,
         app: &Arc<App>,
         log_errors: LogErrors,
     ) -> Vec<Arc<Dataset>> {
         let valid_datasets = Self::get_valid_datasets(app, log_errors);
         futures::stream::iter(valid_datasets)
-            .filter_map(|ds| async move {
-                match (ds.is_accelerated(), ds.is_accelerator_initialized().await) {
-                    (true, true) | (false, _) => Some(Arc::clone(&ds)),
-                    (true, false) => {
-                        if log_errors.0 {
-                            metrics::datasets::LOAD_ERROR.add(1, &[]);
-                            tracing::error!(
+            .filter_map(|ds| {
+                let value = Arc::clone(&accelerator_registry);
+                async move {
+                    match (
+                        ds.is_accelerated(),
+                        ds.is_accelerator_initialized(Arc::clone(&value)).await,
+                    ) {
+                        (true, true) | (false, _) => Some(Arc::clone(&ds)),
+                        (true, false) => {
+                            if log_errors.0 {
+                                metrics::datasets::LOAD_ERROR.add(1, &[]);
+                                tracing::error!(
                                 dataset = &ds.name.to_string(),
                                 "Dataset is accelerated but the accelerator failed to initialize."
                             );
+                            }
+                            None
                         }
-                        None
                     }
                 }
             })

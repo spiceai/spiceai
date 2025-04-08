@@ -26,7 +26,9 @@ use datafusion_table_providers::{
 };
 use rusqlite::ffi::{sqlite3_auto_extension, sqlite3_decimal_init};
 use snafu::prelude::*;
+use std::collections::HashMap;
 use std::{any::Any, ffi::OsStr, sync::Arc, time::Duration};
+use tokio::sync::Mutex;
 
 use crate::{
     component::dataset::{
@@ -82,11 +84,14 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct SqliteAccelerator {
     sqlite_factory: SqliteTableProviderFactory,
+    accelerator_registry: Arc<Mutex<HashMap<Engine, Arc<dyn DataAccelerator>>>>,
 }
 
 impl SqliteAccelerator {
     #[must_use]
-    pub fn new() -> Self {
+    pub fn new(
+        accelerator_registry: Arc<Mutex<HashMap<Engine, Arc<dyn DataAccelerator>>>>,
+    ) -> Self {
         // Initialize the decimal extension for SQLite
         //
         // SAFETY: This is safe because sqlite3_decimal_init is a valid function pointer.
@@ -95,6 +100,7 @@ impl SqliteAccelerator {
         }
         Self {
             sqlite_factory: SqliteTableProviderFactory::new(),
+            accelerator_registry,
         }
     }
 
@@ -158,13 +164,17 @@ impl SqliteAccelerator {
 
         Ok(pool)
     }
-}
 
-impl Default for SqliteAccelerator {
-    fn default() -> Self {
-        Self::new()
+    fn accelerator_registry(&self) -> Arc<Mutex<HashMap<Engine, Arc<dyn DataAccelerator>>>> {
+        Arc::clone(&self.accelerator_registry)
     }
 }
+
+// impl Default for SqliteAccelerator {
+//     fn default() -> Self {
+//         Self::new()
+//     }
+// }
 
 const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("file"),
@@ -261,8 +271,12 @@ impl DataAccelerator for SqliteAccelerator {
                 }
 
                 if let Some(app) = &this_dataset.app {
-                    let datasets =
-                        Runtime::get_initialized_datasets(app, crate::LogErrors(false)).await;
+                    let datasets = Runtime::get_initialized_datasets(
+                        self.accelerator_registry(),
+                        app,
+                        crate::LogErrors(false),
+                    )
+                    .await;
                     let self_path = self.file_path(this_dataset)?;
                     let attach_databases =
                         datasets

@@ -27,8 +27,9 @@ limitations under the License.
 //! Unlike the `AcceleratedTable` struct, this struct does not implement the `TableProvider` trait itself.
 //! It only provides a way to get the underlying table provider and schema.
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
+use crate::DataAccelerator;
 use arrow::datatypes::SchemaRef;
 use datafusion::catalog::TableProvider;
 use tokio::sync::{oneshot, Mutex};
@@ -36,7 +37,7 @@ use util::{fibonacci_backoff::FibonacciBackoffBuilder, retry, RetryError};
 
 use crate::{
     component::dataset::Dataset, dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint,
-    dataconnector::DataConnector,
+    dataconnector::DataConnector, Engine,
 };
 
 #[derive(Debug)]
@@ -78,6 +79,7 @@ impl FederatedTable {
     ///
     /// Returns `None` if the dataset isn't a valid file-accelerated dataset.
     pub async fn new_deferred(
+        accelerator_registry: Arc<Mutex<HashMap<Engine, Arc<dyn DataAccelerator>>>>,
         dataset: Arc<Dataset>,
         data_connector: Arc<dyn DataConnector>,
     ) -> Option<Self> {
@@ -85,7 +87,9 @@ impl FederatedTable {
             return None;
         }
 
-        let checkpoint = DatasetCheckpoint::try_new(&dataset).await.ok()?;
+        let checkpoint = DatasetCheckpoint::try_new(accelerator_registry, &dataset)
+            .await
+            .ok()?;
         let federated_schema = checkpoint.get_schema().await.ok()??;
         let dataset_name = dataset.name.clone();
 

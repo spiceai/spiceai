@@ -37,6 +37,9 @@ use {
 
 use super::get_accelerator_engine;
 use crate::component::dataset::{acceleration::Engine, Dataset};
+use crate::DataAccelerator;
+use std::collections::HashMap;
+use tokio::sync::Mutex;
 
 pub mod dataset_checkpoint;
 #[cfg(feature = "debezium")]
@@ -54,6 +57,7 @@ enum AccelerationConnection {
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 async fn acceleration_connection(
+    accelerator_registry: Arc<Mutex<HashMap<Engine, Arc<dyn DataAccelerator>>>>,
     dataset: &Dataset,
     create_table_if_not_exists: bool,
 ) -> Result<AccelerationConnection> {
@@ -64,7 +68,7 @@ async fn acceleration_connection(
     match acceleration.engine {
         #[cfg(feature = "duckdb")]
         Engine::DuckDB => {
-            let accelerator = get_accelerator_engine(Engine::DuckDB)
+            let accelerator = get_accelerator_engine(accelerator_registry, Engine::DuckDB)
                 .await
                 .ok_or("DuckDB accelerator engine not available")?;
             let duckdb_accelerator = accelerator
@@ -88,7 +92,7 @@ async fn acceleration_connection(
         Engine::DuckDB => Err("Spice wasn't built with DuckDB support enabled".into()),
         #[cfg(feature = "sqlite")]
         Engine::Sqlite => {
-            let accelerator = get_accelerator_engine(Engine::Sqlite)
+            let accelerator = get_accelerator_engine(accelerator_registry, Engine::Sqlite)
                 .await
                 .ok_or("Sqlite accelerator engine not available")?;
             let sqlite_accelerator = accelerator

@@ -14,23 +14,23 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use arrow::datatypes::Schema;
 use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
 use snafu::prelude::*;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 use crate::accelerated_table::{AcceleratedTableBuilderError, Retention};
-use crate::component::dataset::acceleration::Acceleration;
+use crate::component::dataset::acceleration::{Acceleration, Engine};
 use crate::component::dataset::{Dataset, Mode};
 use crate::federated_table::FederatedTable;
 use crate::secrets::Secrets;
 use crate::status;
 use crate::{
     accelerated_table::{refresh::Refresh, AcceleratedTable},
-    dataaccelerator::{self, create_accelerator_table},
+    dataaccelerator::{self, create_accelerator_table, DataAccelerator},
     dataconnector::{sink::SinkConnector, DataConnector, DataConnectorError},
 };
 
@@ -95,6 +95,7 @@ async fn get_local_table_provider(
 
 #[allow(clippy::too_many_arguments)]
 pub async fn create_internal_accelerated_table(
+    accelerator_registry: Arc<Mutex<HashMap<Engine, Arc<dyn DataAccelerator>>>>,
     runtime_status: Arc<status::RuntimeStatus>,
     name: TableReference,
     schema: Arc<Schema>,
@@ -108,6 +109,7 @@ pub async fn create_internal_accelerated_table(
         get_local_table_provider(&name, &schema, primary_key.clone()).await?;
     let federated_table = Arc::new(FederatedTable::new(Arc::clone(&source_table_provider)));
     let accelerated_table_provider = create_accelerator_table(
+        accelerator_registry,
         name.clone(),
         Arc::clone(&schema),
         Arc::clone(&source_table_provider).constraints(),

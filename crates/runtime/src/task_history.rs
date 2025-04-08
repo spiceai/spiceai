@@ -32,9 +32,11 @@ use snafu::{ResultExt, Snafu};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 use crate::accelerated_table::{AcceleratedTable, Retention};
+use crate::DataAccelerator;
+use crate::Engine;
 
 pub mod otel_exporter;
 
@@ -77,6 +79,7 @@ pub(crate) struct TaskSpan {
 
 impl TaskSpan {
     pub async fn instantiate_table(
+        accelerator_registry: Arc<Mutex<HashMap<Engine, Arc<dyn DataAccelerator>>>>,
         status: Arc<status::RuntimeStatus>,
         retention_period_secs: u64,
         retention_check_interval_secs: u64,
@@ -102,6 +105,7 @@ impl TaskSpan {
             TableReference::partial(SPICE_RUNTIME_SCHEMA, DEFAULT_TASK_HISTORY_TABLE);
 
         create_internal_accelerated_table(
+            accelerator_registry,
             status,
             tbl_reference,
             Arc::new(TaskSpan::table_schema()),

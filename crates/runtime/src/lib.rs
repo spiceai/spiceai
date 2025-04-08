@@ -52,12 +52,15 @@ use snafu::prelude::*;
 use spicepod::component::eval::Eval;
 use status::ComponentStatus;
 use tls::TlsConfig;
+use tokio::sync::Mutex;
 use tokio::sync::{oneshot::error::RecvError, RwLock};
 use tokio_util::sync::CancellationToken;
 use tools::factory::default_available_catalogs;
 use tools::{catalog::SpiceToolCatalog, Tooling};
 pub use util::shutdown_signal;
 
+use crate::component::dataset::acceleration::Engine;
+use crate::dataaccelerator::DataAccelerator;
 use crate::extension::Extension;
 pub mod accelerated_table;
 pub mod auth;
@@ -322,6 +325,7 @@ pub struct Runtime {
     status: Arc<status::RuntimeStatus>,
 
     server_components: Arc<RwLock<HashMap<String, CancellableTaskHandle>>>,
+    accelerator_registry: Arc<Mutex<HashMap<Engine, Arc<dyn DataAccelerator>>>>,
 }
 
 impl Runtime {
@@ -353,6 +357,10 @@ impl Runtime {
     #[must_use]
     pub fn app(&self) -> Arc<RwLock<Option<Arc<App>>>> {
         Arc::clone(&self.app)
+    }
+
+    pub fn accelerator_registry(&self) -> Arc<Mutex<HashMap<Engine, Arc<dyn DataAccelerator>>>> {
+        Arc::clone(&self.accelerator_registry)
     }
 
     /// Requests a loaded extension, or will attempt to load it if part of the autoloaded extensions.
@@ -714,7 +722,7 @@ impl Runtime {
         self.df.shutdown().await;
         dataconnector::unregister_all().await;
         catalogconnector::unregister_all().await;
-        dataaccelerator::unregister_all().await;
+        dataaccelerator::unregister_all(self).await;
         tools::factory::unregister_all_factories().await;
         document_parse::unregister_all().await;
 

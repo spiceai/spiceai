@@ -14,16 +14,18 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use crate::accelerated_table::refresh::{self, RefreshOverrides};
 use crate::accelerated_table::{self, AcceleratedTableBuilderError};
 use crate::accelerated_table::{refresh::Refresh, AcceleratedTable, Retention};
+use crate::component::dataset::acceleration::Engine;
 use crate::component::dataset::acceleration::RefreshMode;
 use crate::component::dataset::{Dataset, Mode};
 use crate::dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint;
+use crate::dataaccelerator::DataAccelerator;
 use crate::dataaccelerator::{self, create_accelerator_table};
 use crate::dataconnector::localpod::LOCALPOD_DATACONNECTOR;
 use crate::dataconnector::sink::SinkConnector;
@@ -34,6 +36,7 @@ use crate::dataupdate::{
 use crate::federated_table::FederatedTable;
 use crate::secrets::Secrets;
 use crate::{status, view};
+use tokio::sync::Mutex;
 
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow::error::ArrowError;
@@ -253,12 +256,16 @@ pub struct DataFusion {
     cache_provider: RwLock<Option<Arc<QueryResultsCacheProvider>>>,
 
     pending_sink_tables: TokioRwLock<Vec<PendingSinkRegistration>>,
+    accelerator_registry: Arc<Mutex<HashMap<Engine, Arc<dyn DataAccelerator>>>>,
 }
 
 impl DataFusion {
     #[must_use]
-    pub fn builder(status: Arc<status::RuntimeStatus>) -> DataFusionBuilder {
-        DataFusionBuilder::new(status)
+    pub fn builder(
+        status: Arc<status::RuntimeStatus>,
+        accelerator_registry: Arc<Mutex<HashMap<Engine, Arc<dyn DataAccelerator>>>>,
+    ) -> DataFusionBuilder {
+        DataFusionBuilder::new(status, accelerator_registry)
     }
 
     #[must_use]
@@ -273,6 +280,10 @@ impl DataFusion {
         }
 
         None
+    }
+
+    fn accelerator_registry(&self) -> Arc<Mutex<HashMap<Engine, Arc<dyn DataAccelerator>>>> {
+        Arc::clone(&self.accelerator_registry)
     }
 
     pub fn set_cache_provider(&self, cache_provider: QueryResultsCacheProvider) {
@@ -748,6 +759,7 @@ impl DataFusion {
         };
 
         let accelerated_table_provider = create_accelerator_table(
+            self.accelerator_registry(),
             dataset.name.clone(),
             Arc::clone(&refresh_schema),
             constraints,
@@ -762,7 +774,9 @@ impl DataFusion {
         // it means there is data from a previous acceleration and we don't need
         // to wait for the first refresh to complete to mark it ready.
         let mut initial_load_complete = false;
-        if let Ok(checkpoint) = DatasetCheckpoint::try_new(dataset).await {
+        if let Ok(checkpoint) =
+            DatasetCheckpoint::try_new(self.accelerator_registry(), dataset).await
+        {
             if checkpoint.exists().await {
                 self.runtime_status
                     .update_dataset(&dataset.name, status::ComponentStatus::Ready);
@@ -838,7 +852,11 @@ impl DataFusion {
 
         accelerated_table_builder.cache_provider(self.cache_provider());
 
-        accelerated_table_builder.checkpointer_opt(DatasetCheckpoint::try_new(dataset).await.ok());
+        accelerated_table_builder.checkpointer_opt(
+            DatasetCheckpoint::try_new(self.accelerator_registry(), dataset)
+                .await
+                .ok(),
+        );
 
         accelerated_table_builder.initial_load_complete(initial_load_complete);
 

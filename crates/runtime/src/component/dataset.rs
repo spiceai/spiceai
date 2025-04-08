@@ -31,8 +31,10 @@ use spicepod::{
     semantic::Column,
 };
 use std::{collections::HashMap, fmt::Display, str::FromStr, sync::Arc, time::Duration};
+use tokio::sync::Mutex;
 
 use crate::dataaccelerator::get_accelerator_engine;
+use crate::DataAccelerator;
 
 use super::{find_first_delimiter, validate_identifier};
 
@@ -571,9 +573,14 @@ impl Dataset {
     }
 
     #[must_use]
-    pub async fn is_accelerator_initialized(&self) -> bool {
+    pub async fn is_accelerator_initialized(
+        &self,
+        accelerator_registry: Arc<Mutex<HashMap<Engine, Arc<dyn DataAccelerator>>>>,
+    ) -> bool {
         if let Some(acceleration) = &self.acceleration {
-            let Some(accelerator) = get_accelerator_engine(acceleration.engine).await else {
+            let Some(accelerator) =
+                get_accelerator_engine(accelerator_registry, acceleration.engine).await
+            else {
                 return false; // if the accelerator engine is not found, it's impossible for it to be initialized
             };
 

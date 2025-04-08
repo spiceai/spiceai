@@ -20,6 +20,7 @@ use crate::dataaccelerator::spice_sys::debezium_kafka::DebeziumKafkaSys;
 use crate::dataconnector::ConnectorComponent;
 use crate::datafusion::refresh_sql;
 use crate::federated_table::FederatedTable;
+use crate::DataAccelerator;
 use arrow::datatypes::SchemaRef;
 use async_stream::stream;
 use async_trait::async_trait;
@@ -33,9 +34,11 @@ use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
 use std::any::Any;
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use tokio::sync::Mutex;
 
 use super::{ConnectorParams, DataConnector, DataConnectorFactory, ParameterSpec, Parameters};
 
@@ -58,11 +61,19 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct Debezium {
     kafka_config: KafkaConfig,
+    accelerator_registry: Arc<Mutex<HashMap<Engine, Arc<dyn DataAccelerator>>>>,
 }
 
 impl Debezium {
+    pub fn accelerator_registry(&self) -> Arc<Mutex<HashMap<Engine, Arc<dyn DataAccelerator>>>> {
+        Arc::clone(&self.accelerator_registry)
+    }
+
     #[allow(clippy::needless_pass_by_value)]
-    pub fn new(params: Parameters) -> Result<Self> {
+    pub fn new(
+        accelerator_registry: Arc<Mutex<HashMap<Engine, Arc<dyn DataAccelerator>>>>,
+        params: Parameters,
+    ) -> Result<Self> {
         let transport = params.get("transport").expose().ok().unwrap_or("kafka");
 
         let message_format = params.get("message_format").expose().ok().unwrap_or("json");
@@ -134,22 +145,39 @@ impl Debezium {
                 }),
         };
 
-        Ok(Self { kafka_config })
+        Ok(Self {
+            accelerator_registry,
+            kafka_config,
+        })
     }
 }
 
-#[derive(Default, Copy, Clone)]
-pub struct DebeziumFactory {}
+#[derive(Default, Clone)]
+pub struct DebeziumFactory {
+    accelerator_registry: Arc<Mutex<HashMap<Engine, Arc<dyn DataAccelerator>>>>,
+}
 
 impl DebeziumFactory {
     #[must_use]
-    pub fn new() -> Self {
-        Self {}
+    pub fn new(
+        accelerator_registry: Arc<Mutex<HashMap<Engine, Arc<dyn DataAccelerator>>>>,
+    ) -> Self {
+        Self {
+            accelerator_registry,
+        }
     }
 
     #[must_use]
-    pub fn new_arc() -> Arc<dyn DataConnectorFactory> {
-        Arc::new(Self {}) as Arc<dyn DataConnectorFactory>
+    pub fn new_arc(
+        accelerator_registry: Arc<Mutex<HashMap<Engine, Arc<dyn DataAccelerator>>>>,
+    ) -> Arc<dyn DataConnectorFactory> {
+        Arc::new(Self {
+            accelerator_registry,
+        }) as Arc<dyn DataConnectorFactory>
+    }
+
+    fn accelerator_registry(&self) -> Arc<Mutex<HashMap<Engine, Arc<dyn DataAccelerator>>>> {
+        Arc::clone(&self.accelerator_registry)
     }
 }
 
@@ -199,8 +227,10 @@ impl DataConnectorFactory for DebeziumFactory {
         &self,
         params: ConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
+        let accelerator_registry = self.accelerator_registry();
+
         Box::pin(async move {
-            let debezium = Debezium::new(params.parameters)?;
+            let debezium = Debezium::new(accelerator_registry, params.parameters)?;
             Ok(Arc::new(debezium) as Arc<dyn DataConnector>)
         })
     }
@@ -267,20 +297,20 @@ impl DataConnector for Debezium {
 
         let topic = dataset.path();
 
-        let (kafka_consumer, metadata, schema) = match get_metadata_from_accelerator(dataset).await
-        {
-            Some(metadata) => {
-                let kafka_consumer = KafkaConsumer::create_with_existing_group_id(
-                    &metadata.consumer_group_id,
-                    self.kafka_config.clone(),
-                )
-                .boxed()
-                .context(super::UnableToGetReadProviderSnafu {
-                    dataconnector: "debezium",
-                    connector_component: ConnectorComponent::from(dataset),
-                })?;
+        let (kafka_consumer, metadata, schema) =
+            match get_metadata_from_accelerator(self.accelerator_registry(), dataset).await {
+                Some(metadata) => {
+                    let kafka_consumer = KafkaConsumer::create_with_existing_group_id(
+                        &metadata.consumer_group_id,
+                        self.kafka_config.clone(),
+                    )
+                    .boxed()
+                    .context(super::UnableToGetReadProviderSnafu {
+                        dataconnector: "debezium",
+                        connector_component: ConnectorComponent::from(dataset),
+                    })?;
 
-                ensure!(
+                    ensure!(
                     topic == metadata.topic,
                     super::InvalidConfigurationNoSourceSnafu {
                         dataconnector: "debezium",
@@ -289,26 +319,34 @@ impl DataConnector for Debezium {
                     }
                 );
 
-                let schema = debezium::arrow::convert_fields_to_arrow_schema(
-                    metadata.schema_fields.iter().collect(),
-                )
-                .boxed()
-                .context(super::UnableToGetReadProviderSnafu {
-                    dataconnector: "debezium",
-                    connector_component: ConnectorComponent::from(dataset),
-                })?;
-
-                kafka_consumer.subscribe(topic).boxed().context(
-                    super::UnableToGetReadProviderSnafu {
+                    let schema = debezium::arrow::convert_fields_to_arrow_schema(
+                        metadata.schema_fields.iter().collect(),
+                    )
+                    .boxed()
+                    .context(super::UnableToGetReadProviderSnafu {
                         dataconnector: "debezium",
                         connector_component: ConnectorComponent::from(dataset),
-                    },
-                )?;
+                    })?;
 
-                (kafka_consumer, metadata, Arc::new(schema))
-            }
-            None => get_metadata_from_kafka(dataset, topic, self.kafka_config.clone()).await?,
-        };
+                    kafka_consumer.subscribe(topic).boxed().context(
+                        super::UnableToGetReadProviderSnafu {
+                            dataconnector: "debezium",
+                            connector_component: ConnectorComponent::from(dataset),
+                        },
+                    )?;
+
+                    (kafka_consumer, metadata, Arc::new(schema))
+                }
+                None => {
+                    get_metadata_from_kafka(
+                        self.accelerator_registry(),
+                        dataset,
+                        topic,
+                        self.kafka_config.clone(),
+                    )
+                    .await?
+                }
+            };
 
         let refresh_sql = dataset.refresh_sql();
         let refresh_schema = if let Some(refresh_sql) = &refresh_sql {
@@ -361,20 +399,28 @@ pub(crate) struct DebeziumKafkaMetadata {
     pub(crate) schema_fields: Vec<change_event::Field>,
 }
 
-async fn get_metadata_from_accelerator(dataset: &Dataset) -> Option<DebeziumKafkaMetadata> {
-    let debezium_kafka_sys = DebeziumKafkaSys::try_new(dataset).await.ok()?;
+async fn get_metadata_from_accelerator(
+    accelerator_registry: Arc<Mutex<HashMap<Engine, Arc<dyn DataAccelerator>>>>,
+    dataset: &Dataset,
+) -> Option<DebeziumKafkaMetadata> {
+    let debezium_kafka_sys = DebeziumKafkaSys::try_new(accelerator_registry, dataset)
+        .await
+        .ok()?;
     debezium_kafka_sys.get().await
 }
 
 async fn set_metadata_to_accelerator(
+    accelerator_registry: Arc<Mutex<HashMap<Engine, Arc<dyn DataAccelerator>>>>,
     dataset: &Dataset,
     metadata: &DebeziumKafkaMetadata,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let debezium_kafka_sys = DebeziumKafkaSys::try_new_create_if_not_exists(dataset).await?;
+    let debezium_kafka_sys =
+        DebeziumKafkaSys::try_new_create_if_not_exists(accelerator_registry, dataset).await?;
     debezium_kafka_sys.upsert(metadata).await
 }
 
 async fn get_metadata_from_kafka(
+    accelerator_registry: Arc<Mutex<HashMap<Engine, Arc<dyn DataAccelerator>>>>,
     dataset: &Dataset,
     topic: &str,
     kafka_config: KafkaConfig,
@@ -440,7 +486,7 @@ async fn get_metadata_from_kafka(
     };
 
     if dataset.is_file_accelerated() {
-        set_metadata_to_accelerator(dataset, &metadata)
+        set_metadata_to_accelerator(accelerator_registry, dataset, &metadata)
             .await
             .context(super::UnableToGetReadProviderSnafu {
                 dataconnector: "debezium",

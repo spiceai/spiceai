@@ -19,6 +19,8 @@ use std::{
     sync::{Arc, RwLock},
 };
 
+use crate::DataAccelerator;
+use crate::Engine;
 use cache::QueryResultsCacheProvider;
 use datafusion::{
     catalog_common::{CatalogProvider, MemoryCatalogProvider},
@@ -34,6 +36,8 @@ use datafusion::{
     prelude::{SessionConfig, SessionContext},
 };
 use datafusion_federation::FederationAnalyzerRule;
+use std::collections::HashMap;
+use tokio::sync::Mutex;
 use tokio::sync::RwLock as TokioRwLock;
 
 use crate::{embeddings, object_store_registry::default_runtime_env, status};
@@ -49,6 +53,7 @@ pub struct DataFusionBuilder {
     config: SessionConfig,
     status: Arc<status::RuntimeStatus>,
     cache_provider: Option<Arc<QueryResultsCacheProvider>>,
+    accelerator_registry: Arc<Mutex<HashMap<Engine, Arc<dyn DataAccelerator>>>>,
 }
 
 pub(crate) fn get_df_default_config() -> SessionConfig {
@@ -81,7 +86,10 @@ pub(crate) fn get_df_default_config() -> SessionConfig {
 
 impl DataFusionBuilder {
     #[must_use]
-    pub fn new(status: Arc<status::RuntimeStatus>) -> Self {
+    pub fn new(
+        status: Arc<status::RuntimeStatus>,
+        accelerator_registry: Arc<Mutex<HashMap<Engine, Arc<dyn DataAccelerator>>>>,
+    ) -> Self {
         let mut df_config = get_df_default_config()
             .with_information_schema(true)
             .with_create_default_catalog_and_schema(false);
@@ -93,12 +101,22 @@ impl DataFusionBuilder {
             config: df_config,
             status,
             cache_provider: None,
+            accelerator_registry,
         }
     }
 
     #[must_use]
     pub fn with_cache_provider(mut self, cache_provider: Arc<QueryResultsCacheProvider>) -> Self {
         self.cache_provider = Some(cache_provider);
+        self
+    }
+
+    #[must_use]
+    pub fn with_accelerator_registry(
+        mut self,
+        accelerator_registry: Arc<Mutex<HashMap<Engine, Arc<dyn DataAccelerator>>>>,
+    ) -> Self {
+        self.accelerator_registry = accelerator_registry;
         self
     }
 
@@ -173,6 +191,7 @@ impl DataFusionBuilder {
             cache_provider: RwLock::new(self.cache_provider),
             pending_sink_tables: TokioRwLock::new(Vec::new()),
             accelerated_tables: TokioRwLock::new(HashSet::new()),
+            accelerator_registry: self.accelerator_registry,
         }
     }
 }

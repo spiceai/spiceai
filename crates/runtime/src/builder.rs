@@ -17,7 +17,7 @@ limitations under the License.
 use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 
 use app::App;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 use crate::{
     catalogconnector, dataaccelerator, dataconnector,
@@ -29,7 +29,7 @@ use crate::{
     secrets::{self, Secrets},
     status,
     timing::TimeMeasurement,
-    tools, tracers, Runtime,
+    tools, tracers, DataAccelerator, Engine, Runtime,
 };
 
 pub struct RuntimeBuilder {
@@ -131,9 +131,11 @@ impl RuntimeBuilder {
     }
 
     pub async fn build(self) -> Runtime {
-        dataconnector::register_all().await;
+        let accelerator_registry: Arc<Mutex<HashMap<Engine, Arc<dyn DataAccelerator>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+
+        dataconnector::register_all(Arc::clone(&accelerator_registry)).await;
         catalogconnector::register_all().await;
-        dataaccelerator::register_all().await;
         tools::factory::register_all_factories().await;
         document_parse::register_all().await;
 
@@ -144,7 +146,9 @@ impl RuntimeBuilder {
 
         let df = match self.datafusion {
             Some(df) => df,
-            None => Arc::new(DataFusion::builder(Arc::clone(&status)).build()),
+            None => Arc::new(
+                DataFusion::builder(Arc::clone(&status), Arc::clone(&accelerator_registry)).build(),
+            ),
         };
 
         let datasets_health_monitor = if self.datasets_health_monitor_enabled {
@@ -188,6 +192,7 @@ impl RuntimeBuilder {
             rate_limits: self.rate_limits.unwrap_or_default(),
             status,
             server_components: Arc::new(RwLock::new(HashMap::new())),
+            accelerator_registry: Arc::clone(&accelerator_registry),
         };
 
         let mut extensions: HashMap<String, Arc<dyn Extension>> = HashMap::new();
@@ -201,6 +206,7 @@ impl RuntimeBuilder {
             };
         }
         rt.extensions = Arc::new(RwLock::new(extensions));
+        dataaccelerator::register_all(Arc::new(rt.clone())).await;
 
         rt
     }

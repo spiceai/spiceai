@@ -22,6 +22,8 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::json;
 use snafu::prelude::*;
 
+use runtime::component::dataset::acceleration::Engine;
+use runtime::dataaccelerator::DataAccelerator;
 use runtime::{
     accelerated_table::{
         refresh::Refresh, AcceleratedTable, AcceleratedTableBuilderError, Retention,
@@ -39,6 +41,8 @@ use runtime::{
     spice_metrics::get_metrics_table_reference,
     status, Runtime,
 };
+use std::collections::HashMap;
+use tokio::sync::Mutex;
 use tokio::sync::RwLock;
 
 #[derive(Debug, Snafu)]
@@ -169,6 +173,7 @@ impl SpiceExtension {
         let metrics_table_reference = get_metrics_table_reference();
 
         let table = create_synced_internal_accelerated_table(
+            runtime.accelerator_registry(),
             runtime.status(),
             metrics_table_reference.clone(),
             from.as_str(),
@@ -307,6 +312,7 @@ async fn get_spiceai_table_provider(
 ///
 /// This function will return an error if the accelerated table provider cannot be created
 pub async fn create_synced_internal_accelerated_table(
+    accelerator_registry: Arc<Mutex<HashMap<Engine, Arc<dyn DataAccelerator>>>>,
     runtime_status: Arc<status::RuntimeStatus>,
     table_reference: TableReference,
     from: &str,
@@ -320,6 +326,7 @@ pub async fn create_synced_internal_accelerated_table(
     let federated_table = Arc::new(FederatedTable::new(source_table_provider));
 
     let accelerated_table_provider = create_accelerator_table(
+        accelerator_registry,
         table_reference.clone(),
         federated_table.schema(),
         None,

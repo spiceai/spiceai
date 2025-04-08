@@ -36,7 +36,9 @@ use datafusion_table_providers::{
 };
 use duckdb::AccessMode;
 use snafu::prelude::*;
+use std::collections::HashMap;
 use std::{any::Any, cmp::max, ffi::OsStr, sync::Arc};
+use tokio::sync::Mutex;
 
 use super::{DataAccelerator, Error as DataAcceleratorError};
 
@@ -79,16 +81,24 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct DuckDBAccelerator {
     duckdb_factory: DuckDBTableProviderFactory,
+    accelerator_registry: Arc<Mutex<HashMap<Engine, Arc<dyn DataAccelerator>>>>,
 }
 
 impl DuckDBAccelerator {
     #[must_use]
-    pub fn new() -> Self {
+    pub fn new(
+        accelerator_registry: Arc<Mutex<HashMap<Engine, Arc<dyn DataAccelerator>>>>,
+    ) -> Self {
         Self {
             // DuckDB accelerator uses params.duckdb_file for file connection
             duckdb_factory: DuckDBTableProviderFactory::new(AccessMode::ReadWrite)
                 .with_dialect(new_duckdb_dialect()),
+            accelerator_registry,
         }
+    }
+
+    fn accelerator_registry(&self) -> Arc<Mutex<HashMap<Engine, Arc<dyn DataAccelerator>>>> {
+        Arc::clone(&self.accelerator_registry)
     }
 
     /// Returns the `DuckDB` file path that would be used for a file-based `DuckDB` accelerator from this dataset
@@ -201,11 +211,11 @@ impl DuckDBAccelerator {
     }
 }
 
-impl Default for DuckDBAccelerator {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+// impl Default for DuckDBAccelerator {
+//     fn default() -> Self {
+//         Self::new()
+//     }
+// }
 
 const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("file"),
@@ -311,8 +321,12 @@ impl DataAccelerator for DuckDBAccelerator {
                 }
 
                 if let Some(app) = &this_dataset.app {
-                    let datasets =
-                        Runtime::get_initialized_datasets(app, crate::LogErrors(false)).await;
+                    let datasets = Runtime::get_initialized_datasets(
+                        self.accelerator_registry(),
+                        app,
+                        crate::LogErrors(false),
+                    )
+                    .await;
                     let self_path = self.file_path(this_dataset)?;
                     let attach_databases =
                         datasets

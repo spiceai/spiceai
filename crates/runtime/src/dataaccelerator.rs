@@ -20,6 +20,7 @@ use crate::parameters::ParameterSpec;
 use crate::parameters::Parameters;
 use crate::secrets::{ExposeSecret, ParamStr, Secrets};
 use crate::spice_data_base_path;
+use crate::Runtime;
 use ::arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::common::Constraint;
@@ -33,7 +34,6 @@ use datafusion_table_providers::util::{
 };
 use secrecy::SecretString;
 use snafu::prelude::*;
-use std::sync::LazyLock;
 use std::{any::Any, collections::HashMap, sync::Arc};
 use tokio::sync::{Mutex, RwLock};
 
@@ -75,35 +75,58 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-static DATA_ACCELERATOR_ENGINES: LazyLock<Mutex<HashMap<Engine, Arc<dyn DataAccelerator>>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-
 pub async fn register_accelerator_engine(
     name: Engine,
     accelerator_engine: Arc<dyn DataAccelerator>,
+    rt: Arc<Runtime>,
 ) {
-    let mut registry = DATA_ACCELERATOR_ENGINES.lock().await;
+    let accelerator_registry = rt.accelerator_registry();
+    let mut registry = accelerator_registry.lock().await;
 
     registry.insert(name, accelerator_engine);
 }
 
-pub async fn register_all() {
-    register_accelerator_engine(Engine::Arrow, Arc::new(ArrowAccelerator::new())).await;
+pub async fn register_all(rt: Arc<Runtime>) {
+    register_accelerator_engine(
+        Engine::Arrow,
+        Arc::new(ArrowAccelerator::new()),
+        Arc::clone(&rt),
+    )
+    .await;
     #[cfg(feature = "duckdb")]
-    register_accelerator_engine(Engine::DuckDB, Arc::new(DuckDBAccelerator::new())).await;
+    register_accelerator_engine(
+        Engine::DuckDB,
+        Arc::new(DuckDBAccelerator::new(rt.accelerator_registry())),
+        Arc::clone(&rt),
+    )
+    .await;
     #[cfg(feature = "postgres")]
-    register_accelerator_engine(Engine::PostgreSQL, Arc::new(PostgresAccelerator::new())).await;
+    register_accelerator_engine(
+        Engine::PostgreSQL,
+        Arc::new(PostgresAccelerator::new()),
+        Arc::clone(&rt),
+    )
+    .await;
     #[cfg(feature = "sqlite")]
-    register_accelerator_engine(Engine::Sqlite, Arc::new(SqliteAccelerator::new())).await;
+    register_accelerator_engine(
+        Engine::Sqlite,
+        Arc::new(SqliteAccelerator::new(rt.accelerator_registry())),
+        rt,
+    )
+    .await;
 }
 
-pub async fn unregister_all() {
-    let mut registry = DATA_ACCELERATOR_ENGINES.lock().await;
+pub async fn unregister_all(rt: &Runtime) {
+    let accelerator_registry = rt.accelerator_registry();
+    let mut registry = accelerator_registry.lock().await;
     registry.clear();
 }
 
-pub async fn get_accelerator_engine(engine: Engine) -> Option<Arc<dyn DataAccelerator>> {
-    let guard = DATA_ACCELERATOR_ENGINES.lock().await;
+pub async fn get_accelerator_engine(
+    accelerator_registry: Arc<Mutex<HashMap<Engine, Arc<dyn DataAccelerator>>>>,
+    engine: Engine,
+) -> Option<Arc<dyn DataAccelerator>> {
+    let guard = accelerator_registry.lock().await;
 
     let engine = guard.get(&engine);
 
@@ -316,6 +339,7 @@ impl AcceleratorExternalTableBuilder {
 }
 
 pub async fn create_accelerator_table(
+    accelerator_registry: Arc<Mutex<HashMap<Engine, Arc<dyn DataAccelerator>>>>,
     table_name: TableReference,
     schema: SchemaRef,
     constraints: Option<&Constraints>,
@@ -325,12 +349,11 @@ pub async fn create_accelerator_table(
 ) -> Result<Arc<dyn TableProvider>> {
     let engine = acceleration_settings.engine;
 
-    let accelerator =
-        get_accelerator_engine(engine)
-            .await
-            .ok_or_else(|| Error::InvalidConfiguration {
-                msg: format!("Unknown engine: {engine}"),
-            })?;
+    let accelerator = get_accelerator_engine(accelerator_registry, engine)
+        .await
+        .ok_or_else(|| Error::InvalidConfiguration {
+            msg: format!("Unknown engine: {engine}"),
+        })?;
 
     if let Err(e) = acceleration_settings.validate_indexes(&schema) {
         InvalidConfigurationSnafu {

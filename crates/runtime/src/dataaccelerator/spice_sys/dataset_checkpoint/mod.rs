@@ -21,13 +21,16 @@ limitations under the License.
 //!     `updated_at` TIMESTAMP DEFAULT `CURRENT_TIMESTAMP` ON UPDATE `CURRENT_TIMESTAMP`,
 //! );
 
-use std::{sync::Arc, time::SystemTime};
+use std::{collections::HashMap, sync::Arc, time::SystemTime};
 
 use super::{acceleration_connection, AccelerationConnection, Result};
 use crate::component::dataset::Dataset;
+use crate::DataAccelerator;
+use crate::Engine;
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::{Schema, SchemaRef};
 use serde_json;
+use tokio::sync::Mutex;
 
 const CHECKPOINT_TABLE_NAME: &str = "spice_sys_dataset_checkpoint";
 const SCHEMA_MIGRATION_01_STMT: &str =
@@ -73,8 +76,12 @@ pub struct DatasetCheckpoint {
 }
 
 impl DatasetCheckpoint {
-    pub async fn try_new(dataset: &Dataset) -> Result<Arc<dyn DatasetCheckpointer>> {
-        let acceleration_connection = acceleration_connection(dataset, true).await?;
+    pub async fn try_new(
+        accelerator_registry: Arc<Mutex<HashMap<Engine, Arc<dyn DataAccelerator>>>>,
+        dataset: &Dataset,
+    ) -> Result<Arc<dyn DatasetCheckpointer>> {
+        let acceleration_connection =
+            acceleration_connection(Arc::clone(&accelerator_registry), dataset, true).await?;
         Self::init(&acceleration_connection).await?;
         Ok(Arc::new(Self {
             dataset_name: dataset.name.to_string(),
