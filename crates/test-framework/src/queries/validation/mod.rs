@@ -213,7 +213,7 @@ mod test {
         );
 
         let batches = TPCH_ANSWERS
-            .get("q1")
+            .get("tpch_q1")
             .expect("should have q1 answer")
             .clone();
         let schema = batches[0].schema();
@@ -272,7 +272,7 @@ mod test {
 
         // Use the correct answer
         let correct_batches = TPCH_ANSWERS
-            .get("q1")
+            .get("tpch_q1")
             .expect("should have q1 answer")
             .clone();
         let result = validate_tpch_query(&query, &correct_batches);
