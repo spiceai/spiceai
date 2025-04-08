@@ -208,7 +208,10 @@ mod test {
         // Check that the TPCH answers are loaded correctly
         assert_eq!(TPCH_ANSWERS.len(), 22);
         assert_eq!(
-            TPCH_ANSWERS.get("q1").expect("should have q1 answer").len(),
+            TPCH_ANSWERS
+                .get("tpch_q1")
+                .expect("should have q1 answer")
+                .len(),
             1
         );
 
