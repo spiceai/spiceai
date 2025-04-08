@@ -14,12 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::sync::LazyLock;
-
 use runtime::{
-    component::dataset::Dataset, dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint,
+    component::dataset::{acceleration::Engine, Dataset},
+    dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint,
+    dataaccelerator::DataAccelerator,
 };
 use spicepod::component::{dataset::acceleration::Mode, params::Params};
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock};
 use tokio::sync::Mutex;
 
 #[cfg(feature = "duckdb")]
@@ -53,14 +55,16 @@ fn get_params(mode: &Mode, file: Option<String>, engine: &str) -> Option<Params>
 }
 
 async fn wait_for_checkpoints(
+    accelerator_registry: Arc<Mutex<HashMap<Engine, Arc<dyn DataAccelerator>>>>,
     datasets: &Vec<Dataset>,
     timeout_secs: u64,
 ) -> Result<(), anyhow::Error> {
     let mut checkpoint_futures = Vec::new();
 
     for dataset in datasets {
+        let value = Arc::clone(&accelerator_registry);
         let check_future = async move {
-            match DatasetCheckpoint::try_new(dataset).await {
+            match DatasetCheckpoint::try_new(Arc::clone(&value), dataset).await {
                 Ok(checkpoint) => {
                     while !checkpoint.exists().await {
                         tokio::time::sleep(std::time::Duration::from_millis(100)).await;

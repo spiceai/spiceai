@@ -18,6 +18,7 @@ use std::sync::Arc;
 
 use app::AppBuilder;
 use futures::StreamExt;
+use runtime::dataaccelerator::create_accelerator_registry;
 use runtime::{status, Runtime};
 use spicepod::component::{
     dataset::Dataset,
@@ -74,11 +75,14 @@ async fn s3_federation() -> Result<(), anyhow::Error> {
                 .build();
 
             let status = status::RuntimeStatus::new();
-            let df = get_test_datafusion(Arc::clone(&status));
+            let accelerator_registry = create_accelerator_registry();
+            let df = get_test_datafusion(Arc::clone(&status), Arc::clone(&accelerator_registry));
 
             let rt = Runtime::builder()
                 .with_datafusion(df)
                 .with_app(app)
+                .with_runtime_status(status)
+                .with_accelerator_registry(accelerator_registry)
                 .build()
                 .await;
 
@@ -138,11 +142,14 @@ async fn s3_hive_partitioning() -> Result<(), anyhow::Error> {
                 .build();
 
             let status = status::RuntimeStatus::new();
-            let df = get_test_datafusion(Arc::clone(&status));
+            let accelerator_registry = create_accelerator_registry();
+            let df = get_test_datafusion(Arc::clone(&status), Arc::clone(&accelerator_registry));
 
             let rt = Runtime::builder()
                 .with_app(app)
                 .with_datafusion(df)
+                .with_runtime_status(status)
+                .with_accelerator_registry(accelerator_registry)
                 .build()
                 .await;
 
@@ -205,11 +212,14 @@ async fn s3_schema_evolution() -> Result<(), anyhow::Error> {
                 .build();
 
             let status = status::RuntimeStatus::new();
-            let df = get_test_datafusion(Arc::clone(&status));
+            let accelerator_registry = create_accelerator_registry();
+            let df = get_test_datafusion(Arc::clone(&status), Arc::clone(&accelerator_registry));
 
             let rt = Runtime::builder()
                 .with_app(app)
                 .with_datafusion(df)
+                .with_runtime_status(status)
+                .with_accelerator_registry(accelerator_registry)
                 .build()
                 .await;
 
@@ -259,11 +269,14 @@ async fn s3_bulk_bucket_schema() -> Result<(), anyhow::Error> {
                 .build();
 
             let status = status::RuntimeStatus::new();
-            let df = get_test_datafusion(Arc::clone(&status));
+            let accelerator_registry = create_accelerator_registry();
+            let df = get_test_datafusion(Arc::clone(&status), Arc::clone(&accelerator_registry));
 
             let rt = Runtime::builder()
                 .with_app(app)
                 .with_datafusion(df)
+                .with_runtime_status(status)
+                .with_accelerator_registry(accelerator_registry)
                 .build()
                 .await;
 
@@ -356,11 +369,14 @@ async fn s3_schema_source_path() -> Result<(), anyhow::Error> {
                 .build();
 
             let status = status::RuntimeStatus::new();
-            let df = get_test_datafusion(Arc::clone(&status));
+            let accelerator_registry = create_accelerator_registry();
+            let df = get_test_datafusion(Arc::clone(&status), Arc::clone(&accelerator_registry));
 
             let rt = Runtime::builder()
                 .with_app(app)
                 .with_datafusion(df)
+                .with_runtime_status(status)
+                .with_accelerator_registry(accelerator_registry)
                 .build()
                 .await;
 

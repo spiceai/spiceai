@@ -86,6 +86,10 @@ pub async fn register_accelerator_engine(
     registry.insert(name, accelerator_engine);
 }
 
+pub fn create_accelerator_registry() -> Arc<Mutex<HashMap<Engine, Arc<dyn DataAccelerator>>>> {
+    Arc::new(Mutex::new(HashMap::new()))
+}
+
 pub async fn register_all(rt: Arc<Runtime>) {
     register_accelerator_engine(
         Engine::Arrow,

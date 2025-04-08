@@ -29,6 +29,7 @@ use datafusion_table_providers::sql::arrow_sql_gen::statement::{
     CreateTableBuilder, InsertBuilder,
 };
 use mysql_async::{prelude::Queryable, Params, Row};
+use runtime::dataaccelerator::create_accelerator_registry;
 use runtime::Runtime;
 use tracing::instrument;
 use util::{fibonacci_backoff::FibonacciBackoffBuilder, retry, RetryError};
@@ -95,12 +96,14 @@ async fn mysql_federation_push_down() -> Result<(), String> {
                 .build();
 
             let status = status::RuntimeStatus::new();
-            let df = get_test_datafusion(Arc::clone(&status));
+            let accelerator_registry = create_accelerator_registry();
+            let df = get_test_datafusion(Arc::clone(&status), Arc::clone(&accelerator_registry));
 
             let mut rt = Runtime::builder()
                 .with_app(app)
                 .with_datafusion(df)
                 .with_runtime_status(status)
+                .with_accelerator_registry(accelerator_registry)
                 .build()
                 .await;
 
@@ -201,12 +204,14 @@ async fn mysql_federation_inner_join_with_acc() -> Result<(), String> {
             .build();
 
         let status = status::RuntimeStatus::new();
-        let df = get_test_datafusion(Arc::clone(&status));
+        let accelerator_registry = create_accelerator_registry();
+        let df = get_test_datafusion(Arc::clone(&status), Arc::clone(&accelerator_registry));
 
         let mut rt = Runtime::builder()
             .with_app(app)
             .with_datafusion(df)
             .with_runtime_status(status)
+            .with_accelerator_registry(accelerator_registry)
             .build()
             .await;
         // Set a timeout for the test

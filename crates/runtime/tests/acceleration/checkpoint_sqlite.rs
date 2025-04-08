@@ -21,6 +21,7 @@ use datafusion_table_providers::sql::db_connection_pool::sqlitepool::SqliteConne
 use datafusion_table_providers::sql::db_connection_pool::DbConnectionPool;
 use datafusion_table_providers::sql::db_connection_pool::JoinPushDown;
 use futures::TryStreamExt;
+use runtime::dataaccelerator::create_accelerator_registry;
 use runtime::{component::dataset::Dataset as RuntimeDataset, status, Runtime};
 use spicepod::component::dataset::acceleration::Mode;
 use spicepod::component::dataset::acceleration::{Acceleration, RefreshMode};
@@ -39,7 +40,8 @@ async fn test_acceleration_sqlite_checkpoint() -> Result<(), anyhow::Error> {
     test_request_context()
         .scope(async {
             let status = status::RuntimeStatus::new();
-            let df = get_test_datafusion(Arc::clone(&status));
+            let accelerator_registry = create_accelerator_registry();
+            let df = get_test_datafusion(Arc::clone(&status), Arc::clone(&accelerator_registry));
 
             let mut dataset =
                 Dataset::new("https://public-data.spiceai.org/decimal.parquet", "decimal");
@@ -73,6 +75,7 @@ async fn test_acceleration_sqlite_checkpoint() -> Result<(), anyhow::Error> {
                     .with_app(app)
                     .with_datafusion(df)
                     .with_runtime_status(status)
+                    .with_accelerator_registry(accelerator_registry)
                     .build()
                     .await,
             );
@@ -87,11 +90,10 @@ async fn test_acceleration_sqlite_checkpoint() -> Result<(), anyhow::Error> {
             runtime_ready_check(&rt).await;
 
             // Verify checkpoints are created before shutting down runtime
-            wait_for_checkpoints(&runtime_datasets, 120).await?;
+            wait_for_checkpoints(rt.accelerator_registry(), &runtime_datasets, 120).await?;
 
+            rt.shutdown().await;
             drop(rt);
-            runtime::dataaccelerator::unregister_all().await;
-            runtime::dataaccelerator::register_all().await;
 
             let conn_pool = SqliteConnectionPool::new(
                 "./decimal_sqlite.db",

@@ -18,6 +18,7 @@ use std::sync::Arc;
 
 use common::{get_mysql_conn, make_mysql_dataset, start_mysql_docker_container};
 use mysql_async::prelude::Queryable;
+use runtime::dataaccelerator::create_accelerator_registry;
 use util::{fibonacci_backoff::FibonacciBackoffBuilder, retry, RetryError};
 
 use crate::init_tracing;
@@ -203,12 +204,14 @@ async fn mysql_integration_test() -> Result<(), String> {
                 .build();
 
             let status = status::RuntimeStatus::new();
-            let df = get_test_datafusion(Arc::clone(&status));
+            let accelerator_registry = create_accelerator_registry();
+            let df = get_test_datafusion(Arc::clone(&status), Arc::clone(&accelerator_registry));
 
             let mut rt = Runtime::builder()
                 .with_app(app)
                 .with_datafusion(df)
                 .with_runtime_status(status)
+                .with_accelerator_registry(accelerator_registry)
                 .build()
                 .await;
 

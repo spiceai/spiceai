@@ -36,6 +36,7 @@ use datafusion_table_providers::sql::arrow_sql_gen::statement::{
 };
 use futures::TryStreamExt;
 use mysql_async::{prelude::Queryable, Params, Row};
+use runtime::dataaccelerator::create_accelerator_registry;
 use runtime::{spice_data_base_path, status, Runtime};
 use spicepod::component::dataset::{
     acceleration::{Acceleration, IndexType, Mode},
@@ -164,9 +165,7 @@ async fn execute_spill_to_disk_and_rehydration(
     assert_eq!(num_rows_loaded as u64, 10);
 
     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-    drop(rt);
-    runtime::dataaccelerator::unregister_all().await;
-    runtime::dataaccelerator::register_all().await;
+    rt.shutdown().await;
     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
     let retry_strategy = FibonacciBackoffBuilder::new().max_retries(Some(10)).build();
@@ -205,9 +204,8 @@ async fn execute_spill_to_disk_and_rehydration(
     insta::assert_snapshot!("records", restart2_items_pretty);
 
     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    rt.shutdown().await;
     drop(rt);
-    runtime::dataaccelerator::unregister_all().await;
-    runtime::dataaccelerator::register_all().await;
     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
     // Simulate federated dataset access issue after the runtime is restarted, ensure query result remain consistent
@@ -284,12 +282,14 @@ async fn init_spice_app(
     let app = AppBuilder::new("spiceapp").with_dataset(ds).build();
 
     let status = status::RuntimeStatus::new();
-    let df = get_test_datafusion(Arc::clone(&status));
+    let accelerator_registry = create_accelerator_registry();
+    let df = get_test_datafusion(Arc::clone(&status), Arc::clone(&accelerator_registry));
 
     let rt = Runtime::builder()
         .with_app(app)
         .with_datafusion(df)
         .with_runtime_status(status)
+        .with_accelerator_registry(accelerator_registry)
         .build()
         .await;
 

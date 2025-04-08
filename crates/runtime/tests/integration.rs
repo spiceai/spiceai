@@ -25,9 +25,15 @@ use datafusion::{
 };
 use futures::TryStreamExt;
 
-use runtime::{datafusion::DataFusion, status, Runtime};
+use runtime::{
+    component::dataset::acceleration::Engine, dataaccelerator::DataAccelerator,
+    datafusion::DataFusion, status, Runtime,
+};
+use std::collections::HashMap;
+use tokio::sync::Mutex;
 use tracing::subscriber::DefaultGuard;
 use tracing_subscriber::EnvFilter;
+
 mod abfs;
 mod acceleration;
 mod catalog;
@@ -81,8 +87,11 @@ mod rehydration;
 /// Gets a test `DataFusion` to make test results reproducible across all machines.
 ///
 /// 1) Sets the number of `target_partitions` to 3, by default its the number of CPU cores available.
-fn get_test_datafusion(status: Arc<status::RuntimeStatus>) -> Arc<DataFusion> {
-    let mut df = DataFusion::builder(status).build();
+fn get_test_datafusion(
+    status: Arc<status::RuntimeStatus>,
+    accelerator_registry: Arc<Mutex<HashMap<Engine, Arc<dyn DataAccelerator>>>>,
+) -> Arc<DataFusion> {
+    let mut df = DataFusion::builder(status, accelerator_registry).build();
 
     // Set the target partitions to 3 to make RepartitionExec show consistent partitioning across machines with different CPU counts.
     let mut new_state = df.ctx.state();

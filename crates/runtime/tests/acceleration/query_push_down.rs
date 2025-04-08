@@ -18,6 +18,7 @@ use app::AppBuilder;
 use datafusion::assert_batches_eq;
 use futures::StreamExt;
 use futures::TryStreamExt;
+use runtime::dataaccelerator::create_accelerator_registry;
 use runtime::Runtime;
 use spicepod::component::{
     dataset::{acceleration::Acceleration, Dataset},
@@ -122,7 +123,8 @@ async fn acceleration_with_and_without_federation() -> Result<(), anyhow::Error>
             });
 
             let status = status::RuntimeStatus::new();
-            let df = get_test_datafusion(Arc::clone(&status));
+            let accelerator_registry = create_accelerator_registry();
+            let df = get_test_datafusion(Arc::clone(&status), Arc::clone(&accelerator_registry));
 
             let app = AppBuilder::new("acceleration_federation")
                 .with_dataset(federated_acc)
@@ -133,6 +135,7 @@ async fn acceleration_with_and_without_federation() -> Result<(), anyhow::Error>
                 .with_app(app)
                 .with_datafusion(df)
                 .with_runtime_status(status)
+                .with_accelerator_registry(accelerator_registry)
                 .build()
                 .await;
 

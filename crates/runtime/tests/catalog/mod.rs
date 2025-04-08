@@ -19,6 +19,7 @@ use app::AppBuilder;
 use arrow::array::RecordBatch;
 use datafusion::assert_batches_eq;
 use futures::StreamExt;
+use runtime::dataaccelerator::create_accelerator_registry;
 use runtime::extension::ExtensionFactory;
 use runtime::{status, Runtime};
 use spice_cloud::SpiceExtensionFactory;
@@ -43,12 +44,14 @@ async fn spiceai_integration_test_catalog() -> Result<(), anyhow::Error> {
                 .build();
 
             let status = status::RuntimeStatus::new();
-            let df = get_test_datafusion(Arc::clone(&status));
+            let accelerator_registry = create_accelerator_registry();
+            let df = get_test_datafusion(Arc::clone(&status), Arc::clone(&accelerator_registry));
 
             let rt = Runtime::builder()
                 .with_app(app)
                 .with_datafusion(df)
                 .with_runtime_status(status)
+                .with_accelerator_registry(accelerator_registry)
                 .build()
                 .await;
 
@@ -95,11 +98,14 @@ async fn spiceai_integration_test_catalog_include() -> Result<(), anyhow::Error>
                 .build();
 
             let status = status::RuntimeStatus::new();
-            let df = get_test_datafusion(Arc::clone(&status));
+            let accelerator_registry = create_accelerator_registry();
+            let df = get_test_datafusion(Arc::clone(&status), Arc::clone(&accelerator_registry));
 
             let rt = Runtime::builder()
                 .with_app(app)
                 .with_datafusion(df)
+                .with_runtime_status(status)
+                .with_accelerator_registry(accelerator_registry)
                 .with_autoload_extensions(HashMap::from([(
                     "spice_cloud".to_string(),
                     Box::new(SpiceExtensionFactory::default()) as Box<dyn ExtensionFactory>,

@@ -20,6 +20,7 @@ use app::AppBuilder;
 use arrow::array::RecordBatch;
 use cache::QueryResultsCacheStatus;
 use futures::TryStreamExt;
+use runtime::dataaccelerator::create_accelerator_registry;
 use runtime::{datafusion::query::QueryBuilder, status, Runtime};
 use spicepod::component::{dataset::Dataset, params::Params, runtime::ResultsCache};
 
@@ -56,11 +57,14 @@ async fn results_cache_system_queries() -> Result<(), String> {
                 .build();
 
             let status = status::RuntimeStatus::new();
-            let df = get_test_datafusion(Arc::clone(&status));
+            let accelerator_registry = create_accelerator_registry();
+            let df = get_test_datafusion(Arc::clone(&status), Arc::clone(&accelerator_registry));
 
             let rt = Runtime::builder()
                 .with_app(app)
                 .with_datafusion(df)
+                .with_runtime_status(status)
+                .with_accelerator_registry(accelerator_registry)
                 .build()
                 .await;
 

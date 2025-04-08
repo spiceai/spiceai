@@ -198,12 +198,14 @@ async fn mssql_integration_test() -> Result<(), String> {
                 .build();
 
             let status = status::RuntimeStatus::new();
-            let df = get_test_datafusion(Arc::clone(&status));
+            let accelerator_registry = create_accelerator_registry();
+            let df = get_test_datafusion(Arc::clone(&status), Arc::clone(&accelerator_registry));
 
             let mut rt = Runtime::builder()
                 .with_app(app)
                 .with_datafusion(df)
                 .with_runtime_status(status)
+                .with_accelerator_registry(accelerator_registry)
                 .build()
                 .await;
 

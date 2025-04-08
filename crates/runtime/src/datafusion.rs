@@ -282,7 +282,7 @@ impl DataFusion {
         None
     }
 
-    fn accelerator_registry(&self) -> Arc<Mutex<HashMap<Engine, Arc<dyn DataAccelerator>>>> {
+    pub fn accelerator_registry(&self) -> Arc<Mutex<HashMap<Engine, Arc<dyn DataAccelerator>>>> {
         Arc::clone(&self.accelerator_registry)
     }
 

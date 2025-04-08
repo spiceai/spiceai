@@ -24,6 +24,7 @@ use async_graphql::{EmptyMutation, EmptySubscription, SimpleObject};
 use async_graphql::{Object, Schema};
 use async_graphql_axum::{GraphQLRequest, GraphQLResponse};
 use axum::{routing::post, Extension, Router};
+use runtime::dataaccelerator::create_accelerator_registry;
 use runtime::{status, Runtime};
 use spicepod::component::{dataset::Dataset, params::Params as DatasetParams};
 use tokio::net::TcpListener;
@@ -249,11 +250,13 @@ async fn test_graphql() -> Result<(), String> {
                 ))
                 .build();
             let status = status::RuntimeStatus::new();
-            let df = get_test_datafusion(Arc::clone(&status));
+            let accelerator_registry = create_accelerator_registry();
+            let df = get_test_datafusion(Arc::clone(&status), Arc::clone(&accelerator_registry));
             let mut rt = Runtime::builder()
                 .with_app(app)
                 .with_datafusion(df)
                 .with_runtime_status(status)
+                .with_accelerator_registry(accelerator_registry)
                 .build()
                 .await;
 
@@ -326,11 +329,13 @@ async fn test_graphql_pagination() -> Result<(), String> {
             ))
             .build();
         let status = status::RuntimeStatus::new();
-        let df = get_test_datafusion(Arc::clone(&status));
+        let accelerator_registry = create_accelerator_registry();
+        let df = get_test_datafusion(Arc::clone(&status), Arc::clone(&accelerator_registry));
         let mut rt = Runtime::builder()
             .with_app(app)
             .with_datafusion(df)
             .with_runtime_status(status)
+            .with_accelerator_registry(accelerator_registry)
             .build()
             .await;
 

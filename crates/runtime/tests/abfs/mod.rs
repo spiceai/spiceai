@@ -22,7 +22,7 @@ use azure_storage_blobs::prelude::*;
 use bollard::secret::HealthConfig;
 use datafusion::assert_batches_eq;
 use futures::TryStreamExt;
-use runtime::{status, Runtime};
+use runtime::{dataaccelerator::create_accelerator_registry, status, Runtime};
 use spicepod::component::{dataset::Dataset, params::Params as DatasetParams};
 use std::sync::Arc;
 use tracing::instrument;
@@ -137,11 +137,14 @@ async fn run_queries() -> Result<(), anyhow::Error> {
         .build();
 
     let status = status::RuntimeStatus::new();
-    let df = get_test_datafusion(Arc::clone(&status));
+    let accelerator_registry = create_accelerator_registry();
+    let df = get_test_datafusion(Arc::clone(&status), Arc::clone(&accelerator_registry));
 
     let rt = Runtime::builder()
         .with_app(app)
         .with_datafusion(df)
+        .with_runtime_status(status)
+        .with_accelerator_registry(accelerator_registry)
         .build()
         .await;
 

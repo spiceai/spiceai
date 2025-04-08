@@ -35,6 +35,7 @@ use datafusion_table_providers::sql::arrow_sql_gen::statement::{
 use mysql_async::{prelude::Queryable, Params, Row};
 use runtime::{
     accelerated_table::{refresh::Refresh, refresh_task::RefreshTask, AcceleratedTable},
+    component::dataset::acceleration,
     Runtime,
 };
 use spicepod::component::dataset::acceleration::Acceleration;
@@ -169,11 +170,15 @@ async fn mysql_refresh_retries() -> Result<(), String> {
                 .build();
 
             let status = runtime::status::RuntimeStatus::new();
-            let df = crate::get_test_datafusion(Arc::clone(&status));
+            let accelerator_registry = runtime::dataaccelerator::create_accelerator_registry();
+            let df =
+                crate::get_test_datafusion(Arc::clone(&status), Arc::clone(&accelerator_registry));
 
             let rt = Runtime::builder()
                 .with_app(app)
                 .with_datafusion(df)
+                .with_runtime_status(status)
+                .with_accelerator_registry(accelerator_registry)
                 .build()
                 .await;
 

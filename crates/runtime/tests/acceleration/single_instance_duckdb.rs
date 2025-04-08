@@ -21,6 +21,7 @@ use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConne
 use datafusion_table_providers::sql::db_connection_pool::DbConnectionPool;
 use duckdb::AccessMode;
 use futures::TryStreamExt;
+use runtime::dataaccelerator::create_accelerator_registry;
 use runtime::{component::dataset::Dataset as RuntimeDataset, status, Runtime};
 use spicepod::component::dataset::{
     acceleration::{Acceleration, Mode, RefreshMode},
@@ -57,7 +58,8 @@ async fn test_acceleration_duckdb_single_instance() -> Result<(), anyhow::Error>
     test_request_context()
         .scope_retry(3, || async {
             let status = status::RuntimeStatus::new();
-            let df = get_test_datafusion(Arc::clone(&status));
+            let accelerator_registry = create_accelerator_registry();
+            let df = get_test_datafusion(Arc::clone(&status), Arc::clone(&accelerator_registry));
 
             let expected_path = "./single_duckdb.db";
             let app = AppBuilder::new("test_acceleration_duckdb_single_instance")
@@ -85,6 +87,7 @@ async fn test_acceleration_duckdb_single_instance() -> Result<(), anyhow::Error>
                     .with_app(app)
                     .with_datafusion(df)
                     .with_runtime_status(status)
+                    .with_accelerator_registry(accelerator_registry)
                     .build()
                     .await,
             );
@@ -99,11 +102,10 @@ async fn test_acceleration_duckdb_single_instance() -> Result<(), anyhow::Error>
             runtime_ready_check(&rt).await;
 
             // Verify checkpoints are created before shutting down runtime
-            wait_for_checkpoints(&runtime_datasets, 120).await?;
+            wait_for_checkpoints(rt.accelerator_registry(), &runtime_datasets, 120).await?;
 
             rt.shutdown().await;
-            runtime::dataaccelerator::unregister_all().await;
-            runtime::dataaccelerator::register_all().await;
+            drop(rt);
             tokio::time::sleep(std::time::Duration::from_secs(15)).await;
 
             let pool = DuckDbConnectionPool::new_file(expected_path, &AccessMode::ReadWrite)

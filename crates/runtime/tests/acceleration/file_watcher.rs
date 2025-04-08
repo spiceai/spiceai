@@ -17,6 +17,7 @@ limitations under the License.
 use app::AppBuilder;
 use arrow::array::RecordBatch;
 use futures::TryStreamExt;
+use runtime::dataaccelerator::create_accelerator_registry;
 use runtime::{status, Runtime};
 use spicepod::component::{
     dataset::{
@@ -52,7 +53,8 @@ async fn test_file_watcher() -> Result<(), anyhow::Error> {
     test_request_context()
         .scope(async {
             let status = status::RuntimeStatus::new();
-            let df = get_test_datafusion(Arc::clone(&status));
+            let accelerator_registry = create_accelerator_registry();
+            let df = get_test_datafusion(Arc::clone(&status), Arc::clone(&accelerator_registry));
 
             // Write the CSV to a file next to the test binary
             std::fs::write("./test_file_watcher.csv", NAMES_CSV).expect("write file");
@@ -87,6 +89,7 @@ async fn test_file_watcher() -> Result<(), anyhow::Error> {
                     .with_app(app)
                     .with_datafusion(df)
                     .with_runtime_status(status)
+                    .with_accelerator_registry(accelerator_registry)
                     .build()
                     .await,
             );
