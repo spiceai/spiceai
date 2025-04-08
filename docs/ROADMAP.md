@@ -10,7 +10,7 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 
 ## v1.2 (Apr 2025)
 
-- DataFusion v44
+- DataFusion v45
 - DuckDB v1.2.x
 - [#4910](https://github.com/spiceai/spiceai/issues/4910) Parameterized queries
 - [#3318](https://github.com/spiceai/spiceai/issues/3318) AI/LLM benchmarks in CI (FinanceBench)
