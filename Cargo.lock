@@ -275,7 +275,7 @@ dependencies = [
 
 [[package]]
 name = "app"
-version = "1.1.1-unstable"
+version = "1.2.0-unstable"
 dependencies = [
  "snafu",
  "spicepod",
@@ -583,7 +583,7 @@ dependencies = [
 
 [[package]]
 name = "arrow_sql_gen"
-version = "1.1.1-unstable"
+version = "1.2.0-unstable"
 dependencies = [
  "arrow",
  "bigdecimal",
@@ -597,7 +597,7 @@ dependencies = [
 
 [[package]]
 name = "arrow_tools"
-version = "1.1.1-unstable"
+version = "1.2.0-unstable"
 dependencies = [
  "arrow",
  "arrow-cast",
@@ -2172,7 +2172,7 @@ dependencies = [
 
 [[package]]
 name = "cache"
-version = "1.1.1-unstable"
+version = "1.2.0-unstable"
 dependencies = [
  "arrow",
  "async-stream",
@@ -3165,7 +3165,7 @@ checksum = "575f75dfd25738df5b91b8e43e14d44bda14637a58fae779fd2b064f8bf3e010"
 
 [[package]]
 name = "data_components"
-version = "1.1.1-unstable"
+version = "1.2.0-unstable"
 dependencies = [
  "arrow",
  "arrow-buffer",
@@ -3697,7 +3697,7 @@ dependencies = [
 
 [[package]]
 name = "db_connection_pool"
-version = "1.1.1-unstable"
+version = "1.2.0-unstable"
 dependencies = [
  "arrow",
  "arrow-odbc",
@@ -4026,7 +4026,7 @@ checksum = "aac81fa3e28d21450aa4d2ac065992ba96a1d7303efbce51a95f4fd175b67562"
 
 [[package]]
 name = "document_parse"
-version = "1.1.1-unstable"
+version = "1.2.0-unstable"
 dependencies = [
  "bytes",
  "docx-rs",
@@ -4465,7 +4465,7 @@ dependencies = [
 
 [[package]]
 name = "flight_client"
-version = "1.1.1-unstable"
+version = "1.2.0-unstable"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -4480,7 +4480,7 @@ dependencies = [
 
 [[package]]
 name = "flightpublisher"
-version = "1.1.1-unstable"
+version = "1.2.0-unstable"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -4493,7 +4493,7 @@ dependencies = [
 
 [[package]]
 name = "flightrepl"
-version = "1.1.1-unstable"
+version = "1.2.0-unstable"
 dependencies = [
  "ansi_term",
  "arrow-flight",
@@ -4514,7 +4514,7 @@ dependencies = [
 
 [[package]]
 name = "flightsubscriber"
-version = "1.1.1-unstable"
+version = "1.2.0-unstable"
 dependencies = [
  "arrow-flight",
  "clap",
@@ -6907,7 +6907,7 @@ dependencies = [
 
 [[package]]
 name = "llms"
-version = "1.1.1-unstable"
+version = "1.2.0-unstable"
 dependencies = [
  "anyhow",
  "async-openai",
@@ -7588,7 +7588,7 @@ dependencies = [
 
 [[package]]
 name = "model_components"
-version = "1.1.1-unstable"
+version = "1.2.0-unstable"
 dependencies = [
  "anyhow",
  "arrow",
@@ -7935,7 +7935,7 @@ checksum = "5e0826a989adedc2a244799e823aece04662b66609d96af8dff7ac6df9a8925d"
 
 [[package]]
 name = "ns_lookup"
-version = "1.1.1-unstable"
+version = "1.2.0-unstable"
 dependencies = [
  "snafu",
  "tracing",
@@ -8729,7 +8729,7 @@ dependencies = [
 
 [[package]]
 name = "otel-arrow"
-version = "1.1.1-unstable"
+version = "1.2.0-unstable"
 dependencies = [
  "arrow",
  "arrow-buffer",
@@ -8740,7 +8740,7 @@ dependencies = [
 
 [[package]]
 name = "otelpublisher"
-version = "1.1.1-unstable"
+version = "1.2.0-unstable"
 dependencies = [
  "clap",
  "futures",
@@ -8787,7 +8787,7 @@ checksum = "b15813163c1d831bf4a13c3610c05c0d03b39feb07f7e09fa234dac9b15aaf39"
 
 [[package]]
 name = "package"
-version = "1.1.1-unstable"
+version = "1.2.0-unstable"
 dependencies = [
  "bytes",
  "futures",
@@ -10387,7 +10387,7 @@ dependencies = [
 
 [[package]]
 name = "runtime"
-version = "1.1.1-unstable"
+version = "1.2.0-unstable"
 dependencies = [
  "anyhow",
  "app",
@@ -10529,7 +10529,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-auth"
-version = "1.1.1-unstable"
+version = "1.2.0-unstable"
 dependencies = [
  "app",
  "axum",
@@ -11521,7 +11521,7 @@ dependencies = [
 
 [[package]]
 name = "spice-cloud"
-version = "1.1.1-unstable"
+version = "1.2.0-unstable"
 dependencies = [
  "async-trait",
  "datafusion",
@@ -11538,7 +11538,7 @@ dependencies = [
 
 [[package]]
 name = "spiced"
-version = "1.1.1-unstable"
+version = "1.2.0-unstable"
 dependencies = [
  "app",
  "clap",
@@ -11571,7 +11571,7 @@ dependencies = [
 
 [[package]]
 name = "spicepod"
-version = "1.1.1-unstable"
+version = "1.2.0-unstable"
 dependencies = [
  "fundu",
  "regex",
@@ -11586,7 +11586,7 @@ dependencies = [
 
 [[package]]
 name = "spicepodschema"
-version = "1.1.1-unstable"
+version = "1.2.0-unstable"
 dependencies = [
  "schemars",
  "serde_json",
@@ -11595,7 +11595,7 @@ dependencies = [
 
 [[package]]
 name = "spiceschema"
-version = "1.1.1-unstable"
+version = "1.2.0-unstable"
 dependencies = [
  "clap",
  "runtime",
@@ -11979,7 +11979,7 @@ dependencies = [
 
 [[package]]
 name = "telemetry"
-version = "1.1.1-unstable"
+version = "1.2.0-unstable"
 dependencies = [
  "arrow",
  "async-trait",
@@ -12050,7 +12050,7 @@ dependencies = [
 
 [[package]]
 name = "test-framework"
-version = "1.1.1-unstable"
+version = "1.2.0-unstable"
 dependencies = [
  "anyhow",
  "app",
@@ -12082,7 +12082,7 @@ dependencies = [
 
 [[package]]
 name = "testoperator"
-version = "1.1.1-unstable"
+version = "1.2.0-unstable"
 dependencies = [
  "arrow-json",
  "clap",
@@ -12740,7 +12740,7 @@ checksum = "8df9b6e13f2d32c91b9bd719c00d1958837bc7dec474d94952798cc8e69eeec3"
 
 [[package]]
 name = "tpc-extension"
-version = "1.1.1-unstable"
+version = "1.2.0-unstable"
 dependencies = [
  "async-trait",
  "datafusion",
@@ -13474,7 +13474,7 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 
 [[package]]
 name = "util"
-version = "1.1.1-unstable"
+version = "1.2.0-unstable"
 dependencies = [
  "backoff",
  "humantime",
