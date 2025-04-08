@@ -59,10 +59,17 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-#[derive(Debug)]
 pub struct Debezium {
     kafka_config: KafkaConfig,
     accelerator_registry: Arc<Mutex<HashMap<Engine, Arc<dyn DataAccelerator>>>>,
+}
+
+impl std::fmt::Debug for Debezium {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Debezium")
+            .field("kafka_config", &self.kafka_config)
+            .finish()
+    }
 }
 
 impl Debezium {
@@ -153,9 +160,16 @@ impl Debezium {
     }
 }
 
-#[derive(Default, Debug, Clone)]
+#[derive(Default, Clone)]
 pub struct DebeziumFactory {
     accelerator_registry: Arc<Mutex<HashMap<Engine, Arc<dyn DataAccelerator>>>>,
+}
+
+// For the DebeziumFactory struct
+impl std::fmt::Debug for DebeziumFactory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DebeziumFactory").finish()
+    }
 }
 
 impl DebeziumFactory {
