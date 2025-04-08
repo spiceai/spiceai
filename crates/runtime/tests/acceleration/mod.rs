@@ -19,7 +19,7 @@ use runtime::{
     dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint,
     dataaccelerator::DataAccelerator,
 };
-use spicepod::component::{dataset::acceleration::Mode, params::Params};
+use spicepod::{component::dataset::acceleration::Mode, param::Params};
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 use tokio::sync::Mutex;

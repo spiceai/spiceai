@@ -81,6 +81,17 @@ pub struct FlightFactory {
     extra_compute_context: Option<Arc<str>>,
 }
 
+impl std::fmt::Debug for FlightFactory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FlightFactory")
+            .field("name", &self.name)
+            .field("client", &self.client)
+            .field("subquery_use_partial_path", &self.subquery_use_partial_path)
+            .field("extra_compute_context", &self.extra_compute_context)
+            .finish_non_exhaustive()
+    }
+}
+
 impl FlightFactory {
     #[must_use]
     pub fn new(

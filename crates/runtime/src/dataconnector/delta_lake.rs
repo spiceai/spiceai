@@ -30,6 +30,7 @@ use super::{
     Parameters,
 };
 
+#[derive(Debug)]
 pub struct DeltaLake {
     delta_table_factory: DeltaTableFactory,
 }

@@ -94,6 +94,7 @@ pub enum Error {
     PasswordAndAccessTokenError,
 }
 
+#[derive(Debug)]
 pub struct Imap {
     session: ImapSession,
 }

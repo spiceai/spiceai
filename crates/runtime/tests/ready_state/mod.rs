@@ -112,6 +112,7 @@ fn mock_data_mem_table() -> Arc<dyn TableProvider> {
 }
 
 // Native data connector implementation
+#[derive(Debug)]
 struct SlowNativeDataConnector {
     mock_data: Arc<dyn TableProvider>,
 }
@@ -145,6 +146,7 @@ impl DataConnector for SlowNativeDataConnector {
 }
 
 // Federated data connector implementation
+#[derive(Debug)]
 struct SlowFederatedDataConnector {
     schema: SchemaRef,
 }

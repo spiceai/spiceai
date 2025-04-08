@@ -32,6 +32,8 @@ use std::string::String;
 use std::sync::{Arc, LazyLock};
 use url::Url;
 
+static PREFIX: &str = "s3";
+
 // https://docs.aws.amazon.com/general/latest/gr/rande.html
 pub const AWS_REGIONS: [&str; 32] = [
     "us-east-1",
@@ -108,6 +110,7 @@ pub enum Error {
     InsecureEndpointWithoutAllowHTTP { endpoint: String },
 }
 
+#[derive(Debug)]
 pub struct S3 {
     params: Parameters,
 }
@@ -133,6 +136,7 @@ static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
             ParameterSpec::component("endpoint").secret(),
             ParameterSpec::component("key").secret(),
             ParameterSpec::component("secret").secret(),
+            ParameterSpec::component("session_token").secret(),
             ParameterSpec::component("auth")
                 .description("Configures the authentication method for S3. Supported methods are: public (i.e. no auth), iam_role, key.")
                 .secret(),
@@ -208,31 +212,25 @@ impl DataConnectorFactory for S3Factory {
 
             match params.parameters.get("auth").expose().ok() {
                 None | Some("public" | "iam_role") => {
-                    if matches!(params.parameters.get("key"), ParamLookup::Present(_)) {
-                        // The 's3_key' parameter cannot be set unless the `s3_auth` parameter is set to 'key'.
-                        return Err(Box::new(Error::InvalidAuthParameterCombination {
-                            parameter: "s3_key".to_string(),
-                            auth: "key".to_string(),
-                        })
-                            as Box<dyn std::error::Error + Send + Sync>);
-                    }
-                    if matches!(params.parameters.get("secret"), ParamLookup::Present(_)) {
-                        // The 's3_secret' parameter cannot be set unless the `s3_auth` parameter is set to 'key'.
-                        return Err(Box::new(Error::InvalidAuthParameterCombination {
-                            parameter: "s3_secret".to_string(),
-                            auth: "key".to_string(),
-                        })
-                            as Box<dyn std::error::Error + Send + Sync>);
+                    // These parameters cannot be set unless the `s3_auth` parameter is set to 'key'.
+                    for param in ["key", "secret", "session_token"] {
+                        if matches!(params.parameters.get(param), ParamLookup::Present(_)) {
+                            return Err(Box::new(Error::InvalidAuthParameterCombination {
+                                parameter: format!("{PREFIX}_{param}"),
+                                auth: "key".to_string(),
+                            })
+                                as Box<dyn std::error::Error + Send + Sync>);
+                        }
                     }
                 }
                 Some("key") => {
-                    if matches!(params.parameters.get("key"), ParamLookup::Absent(_)) {
-                        return Err(Box::new(Error::NoAccessKey)
-                            as Box<dyn std::error::Error + Send + Sync>);
-                    }
-                    if matches!(params.parameters.get("secret"), ParamLookup::Absent(_)) {
-                        return Err(Box::new(Error::NoAccessSecret)
-                            as Box<dyn std::error::Error + Send + Sync>);
+                    for (param, e) in [
+                        ("key", Error::NoAccessKey),
+                        ("secret", Error::NoAccessSecret),
+                    ] {
+                        if matches!(params.parameters.get(param), ParamLookup::Absent(_)) {
+                            return Err(Box::new(e) as Box<dyn std::error::Error + Send + Sync>);
+                        }
                     }
                 }
                 Some(auth) => {
@@ -251,7 +249,7 @@ impl DataConnectorFactory for S3Factory {
     }
 
     fn prefix(&self) -> &'static str {
-        "s3"
+        PREFIX
     }
 
     fn parameters(&self) -> &'static [ParameterSpec] {
@@ -261,7 +259,7 @@ impl DataConnectorFactory for S3Factory {
 
 impl std::fmt::Display for S3 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "s3")
+        write!(f, "{PREFIX}")
     }
 }
 
@@ -285,7 +283,7 @@ impl ListingTableConnector for S3 {
                 .boxed()
                 .context(super::InvalidConfigurationSnafu {
                     dataconnector: format!("{self}"),
-                    message: format!("The specified URL is not valid: {url}.\nEnsure the URL is valid and try again.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/s3#from"),
+                    message: format!("The specified URL is not valid: {url}.\nEnsure the URL is valid and try again.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/{PREFIX}#from"),
                     connector_component: ConnectorComponent::from(dataset)
                 })?;
 
@@ -299,6 +297,7 @@ impl ListingTableConnector for S3 {
                 "client_timeout",
                 "allow_http",
                 "auth",
+                "session_token",
             ],
         )));
 

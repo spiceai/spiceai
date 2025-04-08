@@ -727,8 +727,8 @@ impl VectorSearch {
                             cosine_distance(unnest({embed_col_embedding}), {embedding:?}) AS {VECTOR_DISTANCE_COLUMN_NAME}
                         FROM {VSS_TEMP_TABLE_NAME}
                     )",
-                    embed_col_offset=offset_col!(quote_identifier(embedding_column).to_string()),
-                    embed_col_embedding=embedding_col!(quote_identifier(embedding_column).to_string())
+                    embed_col_offset=quote_identifier(&offset_col!(embedding_column)),
+                    embed_col_embedding=quote_identifier(&embedding_col!(embedding_column))
                 );
 
             (
@@ -752,8 +752,8 @@ impl VectorSearch {
                         {where_cond}
                     )",
                     pks = pks.iter().join(", "),
-                    embed_col_offset=offset_col!(quote_identifier(embedding_column).to_string()),
-                    embed_col_embedding=embedding_col!(quote_identifier(embedding_column).to_string())
+                    embed_col_offset=quote_identifier(&offset_col!(embedding_column)),
+                    embed_col_embedding=quote_identifier(&embedding_col!(embedding_column))
                 );
 
             (pks, distances_table, table_name.to_string())
@@ -787,12 +787,13 @@ impl VectorSearch {
                 LIMIT {n}
             )
             SELECT
-                substring(t.{embed_col}, rd.offset[1], rd.offset[2] - rd.offset[1]) AS {embed_col}_chunk,
+                substring(t.{embed_col}, rd.offset[1], rd.offset[2] - rd.offset[1]) AS {chunk_col},
                 {projection_str}
                 rd.{VECTOR_DISTANCE_COLUMN_NAME}
             FROM ranked_docs rd
             JOIN {proj_table} t ON {join_on_conditions}",
-                embed_col=quote_identifier(embedding_column).to_string(),
+                embed_col=quote_identifier(embedding_column),
+                chunk_col=quote_identifier(&format!("{embedding_column}_chunk")),
                 pks = pks.iter().join(", "),
                 projection_str = final_projection_str,
                 join_on_conditions = pks
@@ -896,12 +897,9 @@ impl VectorSearch {
             .context(DataFusionSnafu)?;
 
         let embedding_column = if is_chunked {
-            format!(
-                "{embed_col}_chunk",
-                embed_col = quote_identifier(embedding_column)
-            )
+            format!("{embedding_column}_chunk")
         } else {
-            quote_identifier(embedding_column).to_string()
+            embedding_column.to_string()
         };
 
         Ok(VectorSearchTableResult {
@@ -1196,12 +1194,15 @@ impl VectorSearch {
 
 /// Convert a list of column names to a list of column indices. If a column name is not found in the schema, it is ignored.
 fn get_projection(schema: &SchemaRef, column_names: &[String]) -> Vec<usize> {
+    tracing::trace!("vector search result schema: {schema:?}");
+    tracing::trace!("vector search projection column names: {column_names:?}");
     column_names
         .iter()
         .filter_map(|name| {
             schema
                 .index_of(quote_identifier(name).to_string().as_str())
                 .ok()
+                .or(schema.index_of(name.as_str()).ok())
         })
         .collect_vec()
 }
@@ -1481,5 +1482,51 @@ pub(crate) mod tests {
             average_time_ns < 1_000_000,
             "Average time: {average_time_ns}ns"
         ); // less than 1ms
+    }
+
+    #[test]
+    fn test_quoting_embedding_columns() {
+        // lowercase
+        assert_eq!(offset_col!("embedding"), "embedding_offset");
+        assert_eq!(embedding_col!("embedding"), "embedding_embedding");
+        assert_eq!(
+            quote_identifier(&offset_col!("embedding")),
+            "embedding_offset"
+        );
+        assert_eq!(
+            quote_identifier(&embedding_col!("embedding")),
+            "embedding_embedding"
+        );
+        assert_eq!(
+            offset_col!(quote_identifier("embedding")),
+            "embedding_offset"
+        );
+        assert_eq!(
+            embedding_col!(quote_identifier("embedding")),
+            "embedding_embedding"
+        );
+
+        // mixed case
+        assert_eq!(offset_col!("Embedding"), "Embedding_offset");
+        assert_eq!(embedding_col!("Embedding"), "Embedding_embedding");
+        assert_eq!(
+            quote_identifier(&offset_col!("Embedding")),
+            "\"Embedding_offset\""
+        );
+
+        assert_eq!(
+            quote_identifier(&embedding_col!("Embedding")),
+            "\"Embedding_embedding\""
+        );
+
+        assert_eq!(
+            offset_col!(quote_identifier("Embedding")),
+            "\"Embedding\"_offset"
+        );
+
+        assert_eq!(
+            embedding_col!(quote_identifier("Embedding")),
+            "\"Embedding\"_embedding"
+        );
     }
 }

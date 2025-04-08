@@ -24,12 +24,12 @@ use arrow::array::RecordBatch;
 use futures::StreamExt;
 use runtime::dataaccelerator::create_accelerator_registry;
 use runtime::{status, Runtime};
-use spicepod::component::{
-    dataset::{
+use spicepod::{
+    component::dataset::{
         acceleration::{Acceleration, Mode},
         Dataset,
     },
-    params::Params as DatasetParams,
+    param::Params as DatasetParams,
 };
 use std::collections::HashMap;
 use std::sync::Arc;

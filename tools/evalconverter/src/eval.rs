@@ -80,6 +80,7 @@ pub(super) fn spice_components(
             dataset: dataset.name.clone(),
             description: None,
             depends_on: vec![],
+            metrics: None,
         },
         dataset,
     ))

@@ -116,16 +116,16 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
 
     let mut test_passed = true;
     let mut yellow_measurements = 0;
-    for (query, _) in queries {
-        let Some(baseline_percentile) = baseline_percentiles.get(query) else {
+    for query in queries {
+        let Some(baseline_percentile) = baseline_percentiles.get(&query.name.to_string()) else {
             // Query Failed, no percentile statistics recorded
             continue;
         };
 
-        let Some(duration) = test_durations.get(query) else {
+        let Some(duration) = test_durations.get(&query.name.to_string()) else {
             return Err(anyhow::anyhow!(
                 "Query {} not found in test durations",
-                query
+                query.name
             ));
         };
 
@@ -147,11 +147,13 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
         if red {
             println!(
                 "FAIL - Query {query} has a 99th percentile that increased {percentile_ratio}% of the baseline 99th percentile",
+                query = query.name
             );
             test_passed = false;
         } else if yellow {
             println!(
                 "WARN - Query {query} has a 99th percentile that increased {percentile_ratio}% of the baseline 99th percentile",
+                query = query.name
             );
             yellow_measurements += 1;
         }

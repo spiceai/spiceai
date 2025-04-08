@@ -24,7 +24,7 @@ use crate::{
 };
 use runtime::dataaccelerator::create_accelerator_registry;
 use runtime::{status, Runtime};
-use spicepod::component::{dataset::Dataset, params::Params};
+use spicepod::{component::dataset::Dataset, param::Params};
 
 fn make_dataset(path: &str, name: &str) -> Dataset {
     let mut dataset = Dataset::new(format!("databricks:{path}"), name.to_string());

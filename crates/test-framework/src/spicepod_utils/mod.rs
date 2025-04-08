@@ -20,10 +20,10 @@ use app::App;
 use spicepod::{
     component::{
         dataset::{replication::Replication, Dataset, Mode},
-        params::Params,
         runtime::{ApiKey, ApiKeyAuth, Auth, Runtime},
         ComponentOrReference,
     },
+    param::Params,
     spec::{SpicepodDefinition, SpicepodKind, SpicepodVersion},
 };
 

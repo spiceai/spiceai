@@ -25,12 +25,12 @@ use futures::TryStreamExt;
 use rand::Rng;
 use runtime::dataaccelerator::create_accelerator_registry;
 use runtime::{status, Runtime};
-use spicepod::component::{
-    dataset::{
+use spicepod::{
+    component::dataset::{
         acceleration::{Acceleration, Mode, OnConflictBehavior, RefreshMode},
         Dataset,
     },
-    params::Params,
+    param::Params,
 };
 use std::{collections::HashMap, sync::Arc};
 

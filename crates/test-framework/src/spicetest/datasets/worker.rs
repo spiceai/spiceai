@@ -17,6 +17,7 @@ limitations under the License.
 use std::{
     collections::BTreeMap,
     panic,
+    sync::Arc,
     time::{Duration, Instant, SystemTime},
 };
 
@@ -26,19 +27,27 @@ use futures::TryStreamExt;
 use indicatif::ProgressBar;
 use tokio::task::JoinHandle;
 
-use crate::{metrics::QueryStatus, snapshot::record_explain_plan};
+use crate::{
+    metrics::QueryStatus,
+    queries::{
+        validation::{self, QueryValidationResult},
+        Query,
+    },
+    snapshot::record_explain_plan,
+};
 
 use super::EndCondition;
 
 pub(crate) struct SpiceTestQueryWorker {
     id: usize,
-    query_set: Vec<(&'static str, &'static str)>,
+    query_set: Vec<Query>,
     end_condition: EndCondition,
     flight_client: FlightClient,
     explain_plan_snapshot: bool,
     results_snapshot_predicate: Option<fn(&str) -> bool>,
     name: String,
     pub progress_bar: Option<ProgressBar>,
+    validate: bool,
 }
 
 pub struct SpiceTestQueryWorkerResult {
@@ -70,7 +79,7 @@ impl SpiceTestQueryWorkerResult {
 impl SpiceTestQueryWorker {
     pub fn new(
         id: usize,
-        query_set: Vec<(&'static str, &'static str)>,
+        query_set: Vec<Query>,
         end_condition: EndCondition,
         flight_client: FlightClient,
         name: String,
@@ -84,7 +93,13 @@ impl SpiceTestQueryWorker {
             results_snapshot_predicate: None,
             name,
             progress_bar: None,
+            validate: false,
         }
+    }
+
+    pub fn with_validate(mut self, validate: bool) -> Self {
+        self.validate = validate;
+        self
     }
 
     pub fn with_explain_plan_snapshot(mut self, explain_plan_snapshot: bool) -> Self {
@@ -155,25 +170,30 @@ impl SpiceTestQueryWorker {
                     // For QuerySetCompleted, run each query target_count times before moving to next
                     let start = SystemTime::now();
                     for query in &self.query_set {
+                        if self.validate && query.name.contains("simple") {
+                            continue; // skip validation for simple TPCH queries, because they are not part of the spec
+                        }
+
                         let mut current_query_count = 0;
                         let query_start = SystemTime::now();
                         let mut query_status = QueryStatus::Passed;
 
                         let snapshot_results = self
                             .results_snapshot_predicate
-                            .is_some_and(|predicate| predicate(query.0))
+                            .is_some_and(|predicate| predicate(&query.name))
                             && self.id == 0; // only one worker should snapshot results
 
                         // Additional round of query run before recording results.
                         // To discard the abnormal results caused by: establishing initial connection / spark cluster startup time
 
-                        println!("Worker {} - Query '{}' - Pre-run", self.id, query.0);
+                        println!("Worker {} - Query '{}' - Pre-run", self.id, query.name);
                         let (connection_succeed, _) = self
                             .run_single_query(
                                 query,
                                 &mut BTreeMap::new(),
                                 &mut BTreeMap::new(),
                                 snapshot_results,
+                                false,
                             )
                             .await?;
                         if !connection_succeed {
@@ -187,18 +207,18 @@ impl SpiceTestQueryWorker {
                         }
 
                         if self.explain_plan_snapshot && self.id == 0 {
-                            println!("Worker {} - Query '{}' - Explain plan", self.id, query.0);
+                            println!("Worker {} - Query '{}' - Explain plan", self.id, query.name);
                             if let Err(e) = record_explain_plan(
                                 &self.flight_client,
                                 self.name.as_str(),
-                                query.0,
-                                query.1,
+                                &query.name,
+                                &query.sql,
                             )
                             .await
                             {
                                 println!(
                                     "Worker {} - Query '{}' explain plan failed: {}",
-                                    self.id, query.0, e
+                                    self.id, query.name, e
                                 );
 
                                 query_status = QueryStatus::Failed;
@@ -213,7 +233,7 @@ impl SpiceTestQueryWorker {
                                 println!(
                                     "Worker {} - Query '{}' - {}/{} - Elapsed time: {:?}",
                                     self.id,
-                                    query.0,
+                                    query.name,
                                     current_query_count + 1,
                                     target_count,
                                     start.elapsed().unwrap_or_default()
@@ -226,6 +246,7 @@ impl SpiceTestQueryWorker {
                                     &mut query_durations,
                                     &mut row_counts,
                                     false, // don't attempt to snapshot results more than once
+                                    self.validate,
                                 )
                                 .await?;
 
@@ -246,8 +267,9 @@ impl SpiceTestQueryWorker {
                             current_query_count += 1;
                         }
                         let end = SystemTime::now();
-                        query_iteration_durations.insert(query.0.to_string(), (query_start, end));
-                        query_statuses.insert(query.0.to_string(), query_status);
+                        query_iteration_durations
+                            .insert(query.name.to_string(), (query_start, end));
+                        query_statuses.insert(query.name.to_string(), query_status);
                     }
                 }
             }
@@ -271,7 +293,7 @@ impl SpiceTestQueryWorker {
     ) -> Result<bool> {
         for query in &self.query_set {
             let (connection_succeed, query_succeed) = self
-                .run_single_query(query, query_durations, row_counts, false)
+                .run_single_query(query, query_durations, row_counts, false, false)
                 .await?;
             if !connection_succeed {
                 return Ok(false);
@@ -284,7 +306,7 @@ impl SpiceTestQueryWorker {
             };
 
             query_statuses
-                .entry(query.0.to_string())
+                .entry(query.name.to_string())
                 .and_modify(|existing_status| {
                     // If the worker reports failure, update the status to Failed
                     if worker_status == QueryStatus::Failed {
@@ -299,13 +321,20 @@ impl SpiceTestQueryWorker {
     // run queries as a set-completion based test
     async fn run_single_query(
         &self,
-        query: &(&'static str, &'static str),
+        query: &Query,
         query_durations: &mut BTreeMap<String, Vec<Duration>>,
         row_counts: &mut BTreeMap<String, Vec<usize>>,
         results_snapshot: bool,
+        validate: bool,
     ) -> Result<(bool, bool)> {
         match self
-            .execute_query(query, query_durations, row_counts, results_snapshot)
+            .execute_query(
+                query,
+                query_durations,
+                row_counts,
+                results_snapshot,
+                validate,
+            )
             .await
         {
             Ok(()) => Ok((true, true)),
@@ -318,15 +347,15 @@ impl SpiceTestQueryWorker {
                 {
                     eprintln!(
                         "FAIL - EARLY EXIT - Worker {} - Query '{}' failed: {}",
-                        self.id, query.0, e
+                        self.id, query.name, e
                     );
                     Ok((false, false))
                 } else {
                     eprintln!(
                         "FAIL - Worker {} - Query '{}' failed: {}",
-                        self.id, query.0, e
+                        self.id, query.name, e
                     );
-                    query_durations.entry(query.0.to_string()).or_default();
+                    query_durations.entry(query.name.to_string()).or_default();
                     Ok((true, false))
                 }
             }
@@ -335,16 +364,18 @@ impl SpiceTestQueryWorker {
 
     async fn execute_query(
         &self,
-        query: &(&'static str, &'static str),
+        query: &Query,
         query_durations: &mut BTreeMap<String, Vec<Duration>>,
         row_counts: &mut BTreeMap<String, Vec<usize>>,
         results_snapshot: bool,
+        validate: bool,
     ) -> Result<()> {
         let query_start = Instant::now();
-        let mut result_stream = self.flight_client.query(query.1).await?;
+        let mut result_stream = self.flight_client.query(&query.sql).await?;
 
         let mut row_count: usize = 0;
         let mut limited_records = vec![];
+        let mut validation_records = vec![];
         loop {
             let batch = result_stream.try_next().await;
             match batch {
@@ -352,14 +383,21 @@ impl SpiceTestQueryWorker {
                 Err(e) => {
                     eprintln!(
                         "FAIL - Worker {} - Query '{}' failed: {}",
-                        self.id, query.0, e
+                        self.id, query.name, e
                     );
-                    query_durations.entry(query.0.to_string()).or_default();
+                    query_durations.entry(query.name.to_string()).or_default();
                     return Err(e.into());
                 }
                 Ok(Some(batch)) => {
+                    if validate {
+                        validation_records.push(batch.clone());
+                    }
+
                     if batch.num_rows() == 0 {
-                        println!("Worker {} - Query '{}' returned 0 rows", self.id, query.0);
+                        println!(
+                            "Worker {} - Query '{}' returned 0 rows",
+                            self.id, query.name
+                        );
                     }
 
                     row_count += batch.num_rows();
@@ -380,9 +418,21 @@ impl SpiceTestQueryWorker {
             }
         }
 
+        if validate {
+            // Validate the query results
+            let validation_result = validation::validate_tpch_query(query, &validation_records)?;
+            if let QueryValidationResult::Fail(validation_reason) = validation_result {
+                eprintln!(
+                    "FAIL - Worker {} - Query '{}' validation failed: {validation_reason:?}",
+                    self.id, query.name
+                );
+                return Err(anyhow::anyhow!("Query validation failed"));
+            }
+        }
+
         if results_snapshot {
             println!("snapshotting results");
-            let query_name = query.0;
+            let query_name = Arc::clone(&query.name);
             let name = self.name.clone();
 
             let records_pretty = arrow::util::pretty::pretty_format_batches(&limited_records)?;
@@ -405,12 +455,12 @@ impl SpiceTestQueryWorker {
 
         let duration = query_start.elapsed();
         query_durations
-            .entry(query.0.to_string())
+            .entry(query.name.to_string())
             .or_default()
             .push(duration);
 
         row_counts
-            .entry(query.0.to_string())
+            .entry(query.name.to_string())
             .or_default()
             .push(row_count);
 

@@ -59,6 +59,7 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+#[derive(Debug)]
 pub struct Debezium {
     kafka_config: KafkaConfig,
     accelerator_registry: Arc<Mutex<HashMap<Engine, Arc<dyn DataAccelerator>>>>,
@@ -152,7 +153,7 @@ impl Debezium {
     }
 }
 
-#[derive(Default, Clone)]
+#[derive(Default, Debug, Clone)]
 pub struct DebeziumFactory {
     accelerator_registry: Arc<Mutex<HashMap<Engine, Arc<dyn DataAccelerator>>>>,
 }

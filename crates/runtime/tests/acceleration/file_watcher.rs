@@ -19,12 +19,12 @@ use arrow::array::RecordBatch;
 use futures::TryStreamExt;
 use runtime::dataaccelerator::create_accelerator_registry;
 use runtime::{status, Runtime};
-use spicepod::component::{
-    dataset::{
+use spicepod::{
+    component::dataset::{
         acceleration::{Acceleration, Mode, RefreshMode},
         Dataset,
     },
-    params::Params,
+    param::Params,
 };
 use std::io::Write;
 use std::sync::Arc;

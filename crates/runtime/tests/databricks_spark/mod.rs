@@ -24,7 +24,7 @@ use crate::{
 };
 use runtime::dataaccelerator::create_accelerator_registry;
 use runtime::{status, Runtime};
-use spicepod::component::{catalog::Catalog, params::Params};
+use spicepod::{component::catalog::Catalog, param::Params};
 
 fn make_catalog(path: &str, name: &str) -> Catalog {
     let mut catalog = Catalog::new(format!("databricks:{path}"), name.to_string());

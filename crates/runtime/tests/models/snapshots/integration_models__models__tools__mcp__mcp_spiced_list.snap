@@ -1,11 +1,10 @@
 ---
 source: crates/runtime/tests/models/tools.rs
 expression: tools_list
-snapshot_kind: text
 ---
 [
   {
-    "description": null,
+    "description": "Search Spice.ai datasets using Vector Similarity Search (VSS)",
     "name": "document_similarity",
     "parameters": {
       "$schema": "http://json-schema.org/draft-07/schema#",
@@ -68,12 +67,12 @@ snapshot_kind: text
     }
   },
   {
-    "description": null,
+    "description": "Get the readiness status of the Spice.ai runtime",
     "name": "get_readiness",
     "parameters": null
   },
   {
-    "description": null,
+    "description": "List available datasets",
     "name": "list_datasets",
     "parameters": null
   },
@@ -96,7 +95,7 @@ snapshot_kind: text
     }
   },
   {
-    "description": "",
+    "description": "Search Spice.ai datasets using Vector Similarity Search (VSS)",
     "name": "mcp_from_spiced/document_similarity",
     "parameters": {
       "$schema": "http://json-schema.org/draft-07/schema#",
@@ -159,7 +158,7 @@ snapshot_kind: text
     }
   },
   {
-    "description": "",
+    "description": "Get the readiness status of the Spice.ai runtime",
     "name": "mcp_from_spiced/get_readiness",
     "parameters": {
       "$schema": "http://json-schema.org/draft-07/schema#",
@@ -170,7 +169,7 @@ snapshot_kind: text
     }
   },
   {
-    "description": "",
+    "description": "List available datasets",
     "name": "mcp_from_spiced/list_datasets",
     "parameters": {
       "$schema": "http://json-schema.org/draft-07/schema#",
@@ -199,7 +198,7 @@ snapshot_kind: text
     }
   },
   {
-    "description": "Sample random rows from a table.",
+    "description": "Get a random sample of rows from a Spice.ai dataset",
     "name": "mcp_from_spiced/random_sample",
     "parameters": {
       "$schema": "http://json-schema.org/draft-07/schema#",
@@ -224,7 +223,7 @@ snapshot_kind: text
     }
   },
   {
-    "description": "Generate synthetic data by sampling distinct column values from a table.",
+    "description": "Sample distinct column values from a Spice.ai dataset",
     "name": "mcp_from_spiced/sample_distinct_columns",
     "parameters": {
       "$schema": "http://json-schema.org/draft-07/schema#",
@@ -259,7 +258,7 @@ snapshot_kind: text
     }
   },
   {
-    "description": "",
+    "description": "Execute SQL queries (PostgreSQL dialect) using the Spice.ai runtime",
     "name": "mcp_from_spiced/sql",
     "parameters": {
       "$schema": "http://json-schema.org/draft-07/schema#",
@@ -298,7 +297,7 @@ snapshot_kind: text
     }
   },
   {
-    "description": "",
+    "description": "Get the schema of the Spice.ai dataset",
     "name": "mcp_from_spiced/table_schema",
     "parameters": {
       "$schema": "http://json-schema.org/draft-07/schema#",
@@ -338,7 +337,7 @@ snapshot_kind: text
     }
   },
   {
-    "description": "Sample the top N rows from a table based on a specified ordering",
+    "description": "Get top N samples from a Spice.ai dataset based on a specified ordering",
     "name": "mcp_from_spiced/top_n_sample",
     "parameters": {
       "$schema": "http://json-schema.org/draft-07/schema#",
@@ -368,7 +367,7 @@ snapshot_kind: text
     }
   },
   {
-    "description": "Sample random rows from a table.",
+    "description": "Get a random sample of rows from a Spice.ai dataset",
     "name": "random_sample",
     "parameters": {
       "$schema": "http://json-schema.org/draft-07/schema#",
@@ -393,7 +392,7 @@ snapshot_kind: text
     }
   },
   {
-    "description": "Generate synthetic data by sampling distinct column values from a table.",
+    "description": "Sample distinct column values from a Spice.ai dataset",
     "name": "sample_distinct_columns",
     "parameters": {
       "$schema": "http://json-schema.org/draft-07/schema#",
@@ -428,7 +427,7 @@ snapshot_kind: text
     }
   },
   {
-    "description": null,
+    "description": "Execute SQL queries (PostgreSQL dialect) using the Spice.ai runtime",
     "name": "sql",
     "parameters": {
       "$schema": "http://json-schema.org/draft-07/schema#",
@@ -467,7 +466,7 @@ snapshot_kind: text
     }
   },
   {
-    "description": null,
+    "description": "Get the schema of the Spice.ai dataset",
     "name": "table_schema",
     "parameters": {
       "$schema": "http://json-schema.org/draft-07/schema#",
@@ -507,7 +506,7 @@ snapshot_kind: text
     }
   },
   {
-    "description": "Sample the top N rows from a table based on a specified ordering",
+    "description": "Get top N samples from a Spice.ai dataset based on a specified ordering",
     "name": "top_n_sample",
     "parameters": {
       "$schema": "http://json-schema.org/draft-07/schema#",

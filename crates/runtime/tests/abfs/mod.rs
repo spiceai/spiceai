@@ -23,7 +23,7 @@ use bollard::secret::HealthConfig;
 use datafusion::assert_batches_eq;
 use futures::TryStreamExt;
 use runtime::{dataaccelerator::create_accelerator_registry, status, Runtime};
-use spicepod::component::{dataset::Dataset, params::Params as DatasetParams};
+use spicepod::{component::dataset::Dataset, param::Params as DatasetParams};
 use std::sync::Arc;
 use tracing::instrument;
 

@@ -22,7 +22,10 @@ use cache::QueryResultsCacheStatus;
 use futures::TryStreamExt;
 use runtime::dataaccelerator::create_accelerator_registry;
 use runtime::{datafusion::query::QueryBuilder, status, Runtime};
-use spicepod::component::{dataset::Dataset, params::Params, runtime::ResultsCache};
+use spicepod::{
+    component::{dataset::Dataset, runtime::ResultsCache},
+    param::Params,
+};
 
 use crate::{get_test_datafusion, init_tracing, utils::test_request_context};
 

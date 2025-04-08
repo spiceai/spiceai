@@ -19,9 +19,12 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-use crate::metrics::{
-    system_time_to_unix_epoch_ms, DatasetMetrics, MetricCollector, NoExtendedMetrics, QueryMetric,
-    QueryStatus, ThroughputMetrics,
+use crate::{
+    metrics::{
+        system_time_to_unix_epoch_ms, DatasetMetrics, MetricCollector, NoExtendedMetrics,
+        QueryMetric, QueryStatus, ThroughputMetrics,
+    },
+    queries::Query,
 };
 use anyhow::Result;
 use futures::future::join_all;
@@ -56,10 +59,11 @@ impl EndCondition {
 
 #[derive(Default)]
 pub struct NotStarted {
-    query_set: Vec<(&'static str, &'static str)>,
+    query_set: Vec<Query>,
     end_condition: EndCondition,
     query_count: usize,
     parallel_count: usize,
+    validate: bool,
 }
 
 impl NotStarted {
@@ -75,7 +79,7 @@ impl NotStarted {
     }
 
     #[must_use]
-    pub fn with_query_set(mut self, query_set: Vec<(&'static str, &'static str)>) -> Self {
+    pub fn with_query_set(mut self, query_set: Vec<Query>) -> Self {
         self.query_count = query_set.len();
         self.query_set = query_set;
         self
@@ -84,6 +88,12 @@ impl NotStarted {
     #[must_use]
     pub fn with_end_condition(mut self, end_condition: EndCondition) -> Self {
         self.end_condition = end_condition;
+        self
+    }
+
+    #[must_use]
+    pub fn with_validate(mut self, validate: bool) -> Self {
+        self.validate = validate;
         self
     }
 }
@@ -164,7 +174,8 @@ impl SpiceTest<NotStarted> {
                     self.name.clone(),
                 )
                 .with_explain_plan_snapshot(self.explain_plan_snapshot)
-                .with_results_snapshot(self.results_snapshot_predicate);
+                .with_results_snapshot(self.results_snapshot_predicate)
+                .with_validate(self.state.validate);
 
                 if let Some(multi) = &multi {
                     worker.with_progress_bar(multi.add(self.get_new_progress_bar()))

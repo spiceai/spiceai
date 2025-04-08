@@ -124,6 +124,16 @@
             "$ref": "#/definitions/IndexType"
           }
         },
+        "metrics": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Metrics"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "mode": {
           "default": "memory",
           "allOf": [
@@ -335,6 +345,13 @@
       },
       "additionalProperties": false
     },
+    "CacheKeyType": {
+      "type": "string",
+      "enum": [
+        "plan",
+        "sql"
+      ]
+    },
     "Catalog": {
       "type": "object",
       "required": [
@@ -376,6 +393,16 @@
         "metadata": {
           "type": "object",
           "additionalProperties": true
+        },
+        "metrics": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Metrics"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "name": {
           "type": "string"
@@ -639,6 +666,16 @@
           "type": "object",
           "additionalProperties": true
         },
+        "metrics": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Metrics"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "mode": {
           "$ref": "#/definitions/Mode"
         },
@@ -766,6 +803,16 @@
         "from": {
           "type": "string"
         },
+        "metrics": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Metrics"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "name": {
           "type": "string"
         },
@@ -800,6 +847,16 @@
             "null"
           ]
         },
+        "metrics": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Metrics"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "name": {
           "type": "string"
         },
@@ -832,6 +889,35 @@
         "enabled",
         "unique"
       ]
+    },
+    "Metric": {
+      "type": "object",
+      "required": [
+        "name"
+      ],
+      "properties": {
+        "enabled": {
+          "default": true,
+          "type": "boolean"
+        },
+        "name": {
+          "type": "string"
+        }
+      }
+    },
+    "Metrics": {
+      "type": "object",
+      "required": [
+        "metrics"
+      ],
+      "properties": {
+        "metrics": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/Metric"
+          }
+        }
+      }
     },
     "Mode": {
       "type": "string",
@@ -884,6 +970,16 @@
         "metadata": {
           "type": "object",
           "additionalProperties": true
+        },
+        "metrics": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Metrics"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "name": {
           "type": "string"
@@ -1026,6 +1122,14 @@
     "ResultsCache": {
       "type": "object",
       "properties": {
+        "cache_key_type": {
+          "default": "plan",
+          "allOf": [
+            {
+              "$ref": "#/definitions/CacheKeyType"
+            }
+          ]
+        },
         "cache_max_size": {
           "type": [
             "string",
@@ -1291,6 +1395,16 @@
         },
         "from": {
           "type": "string"
+        },
+        "metrics": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Metrics"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "name": {
           "type": "string"

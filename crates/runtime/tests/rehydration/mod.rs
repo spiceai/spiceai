@@ -38,12 +38,13 @@ use futures::TryStreamExt;
 use mysql_async::{prelude::Queryable, Params, Row};
 use runtime::dataaccelerator::create_accelerator_registry;
 use runtime::{spice_data_base_path, status, Runtime};
-use spicepod::component::dataset::{
-    acceleration::{Acceleration, IndexType, Mode},
-    Dataset,
+use spicepod::{
+    component::dataset::{
+        acceleration::{Acceleration, IndexType, Mode},
+        Dataset,
+    },
+    param::Params as SpicepodParams,
 };
-
-use spicepod::component::params::Params as SpicepodParams;
 
 use tracing::instrument;
 use util::{fibonacci_backoff::FibonacciBackoffBuilder, retry, RetryError};
