@@ -12057,7 +12057,6 @@ dependencies = [
  "arrow",
  "async-openai",
  "clap",
- "datafusion",
  "duckdb",
  "flight_client",
  "futures",
