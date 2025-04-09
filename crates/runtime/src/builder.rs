@@ -17,6 +17,7 @@ limitations under the License.
 use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 
 use app::App;
+use datafusion::config::ConfigOptions;
 use tokio::sync::RwLock;
 
 use crate::{
@@ -42,10 +43,10 @@ pub struct RuntimeBuilder {
     datasets_health_monitor_enabled: bool,
     metrics_endpoint: Option<SocketAddr>,
     prometheus_registry: Option<prometheus::Registry>,
-    datafusion: Option<Arc<DataFusion>>,
     runtime_status: Option<Arc<status::RuntimeStatus>>,
     rate_limits: Option<Arc<RateLimits>>,
     accelerator_registry: AcceleratorRegistry,
+    datafusion_options: Option<Box<dyn FnOnce(&mut ConfigOptions)>>,
 }
 
 impl RuntimeBuilder {
@@ -57,7 +58,6 @@ impl RuntimeBuilder {
             datasets_health_monitor_enabled: false,
             metrics_endpoint: None,
             prometheus_registry: None,
-            datafusion: None,
             autoload_extensions: HashMap::new(),
             runtime_status: None,
             rate_limits: None,
@@ -123,8 +123,13 @@ impl RuntimeBuilder {
         self
     }
 
-    pub fn with_datafusion(mut self, datafusion: Arc<DataFusion>) -> Self {
-        self.datafusion = Some(datafusion);
+    /// Used to set DataFusion partition
+    #[cfg(test)]
+    pub fn with_datafusion_options(
+        mut self,
+        callback: Box<dyn FnOnce(&mut ConfigOptions)>,
+    ) -> Self {
+        self.datafusion_options = Some(callback);
         self
     }
 
@@ -151,12 +156,13 @@ impl RuntimeBuilder {
             None => status::RuntimeStatus::new(),
         };
 
-        let df = match self.datafusion {
-            Some(df) => df,
-            None => Arc::new(
-                DataFusion::builder(Arc::clone(&status), Arc::clone(&accelerator_registry)).build(),
-            ),
-        };
+        let df = Arc::new(
+            DataFusion::builder(Arc::clone(&status), Arc::clone(&accelerator_registry)).build(),
+        );
+
+        if let Some(callback) = self.datafusion_options {
+            callback(&mut df.ctx.config_mut().options_mut());
+        }
 
         let datasets_health_monitor = if self.datasets_health_monitor_enabled {
             let is_task_history_enabled = self
