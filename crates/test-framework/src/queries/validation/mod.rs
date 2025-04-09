@@ -669,8 +669,7 @@ mod test {
 
     #[test]
     fn test_wrong_answers() {
-        // Use the correct answer, but a different datatype
-        // Q22 from CSV, cntrycode is Utf8. Query returns it as Int64
+        // Use the wrong answer and validate it fails
         let query = QuerySet::Tpch
             .get_queries(None)
             .get(20)
