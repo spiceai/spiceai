@@ -145,6 +145,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn test_validate_identifier() {
         // Valid identifiers
         assert!(validate_identifier("valid_identifier").is_ok());
