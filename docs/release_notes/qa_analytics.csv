@@ -5,3 +5,4 @@ version,qa_start_time,qa_end_time,human_count,human_hours,recipes_total,recipes_
 1.0.6,2025-03-18T22:00:00Z,2025-03-19T07:00:00Z,4,12,63,8,1,AI QA engineer runs recipes post-release.
 1.0.7,2025-03-26T14:00:00Z,2025-03-27T03:00:00Z,3,13,63,63,1,AI QA engineer runs recipes post-release.
 1.1.0,2025-03-31T07:11:00Z,2025-03-31T12:00:00Z,4,5,65,65,1,AI QA engineer runs recipes post-release.
+1.1.1,2025-04-07T11:00:00Z,2025-04-08T00:00:00Z,4,6,65,65,2,AI QA engineer runs recipes post-release; new recipe tested by AI QA: Dremio data connector
