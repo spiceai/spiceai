@@ -25,7 +25,7 @@ use datafusion::{
 };
 use futures::TryStreamExt;
 
-use runtime::{accelerated_table::AcceleratorRegistry, datafusion::DataFusion, status, Runtime};
+use runtime::{dataaccelerator::AcceleratorRegistry, datafusion::DataFusion, status, Runtime};
 use tracing::subscriber::DefaultGuard;
 use tracing_subscriber::EnvFilter;
 

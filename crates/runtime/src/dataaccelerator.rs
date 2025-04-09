@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::accelerated_table::AcceleratorRegistry;
 use crate::component::dataset::acceleration::{self, Acceleration, Engine, IndexType, Mode};
 use crate::component::dataset::Dataset;
 use crate::parameters::ParameterSpec;
@@ -75,6 +74,8 @@ pub enum Error {
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+pub type AcceleratorRegistry = Arc<Mutex<HashMap<Engine, Arc<dyn DataAccelerator>>>>;
 
 pub async fn register_accelerator_engine(
     name: Engine,

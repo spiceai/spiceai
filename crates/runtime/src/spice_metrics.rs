@@ -25,10 +25,10 @@ use snafu::prelude::*;
 use tokio::sync::RwLock;
 
 use crate::accelerated_table::refresh::Refresh;
-use crate::accelerated_table::AcceleratorRegistry;
 use crate::accelerated_table::Retention;
 use crate::component::dataset::acceleration::Acceleration;
 use crate::component::dataset::TimeFormat;
+use crate::dataaccelerator::AcceleratorRegistry;
 use crate::datafusion::Error as DataFusionError;
 use crate::datafusion::{DataFusion, SPICE_RUNTIME_SCHEMA};
 use crate::dataupdate::{DataUpdate, UpdateType};

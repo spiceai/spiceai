@@ -25,7 +25,7 @@ limitations under the License.
 //! );
 
 use super::{acceleration_connection, AccelerationConnection, Result};
-use crate::accelerated_table::AcceleratorRegistry;
+use crate::dataaccelerator::AcceleratorRegistry;
 use crate::{component::dataset::Dataset, dataconnector::debezium::DebeziumKafkaMetadata};
 
 const DEBEZIUM_KAFKA_TABLE_NAME: &str = "spice_sys_debezium_kafka";

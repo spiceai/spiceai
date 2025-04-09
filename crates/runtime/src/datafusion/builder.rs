@@ -19,7 +19,7 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-use crate::accelerated_table::AcceleratorRegistry;
+use crate::dataaccelerator::AcceleratorRegistry;
 use cache::QueryResultsCacheProvider;
 use datafusion::{
     catalog_common::{CatalogProvider, MemoryCatalogProvider},

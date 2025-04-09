@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use std::time::SystemTime;
-use std::{any::Any, collections::HashMap, sync::Arc, time::Duration};
+use std::{any::Any, sync::Arc, time::Duration};
 
 use crate::component::dataset::acceleration::{RefreshMode, RefreshOnStartup, ZeroResultsAction};
 use crate::component::dataset::{ReadyState, TimeFormat};
@@ -24,8 +24,6 @@ use crate::datafusion::error::SpiceExternalError;
 use crate::datafusion::is_spice_internal_dataset;
 use crate::federated_table::FederatedTable;
 use crate::status;
-use crate::DataAccelerator;
-use crate::Engine;
 use arrow::array::UInt64Array;
 use arrow::datatypes::SchemaRef;
 use arrow::error::ArrowError;
@@ -49,7 +47,7 @@ use opentelemetry::KeyValue;
 use refresh::RefreshOverrides;
 use snafu::prelude::*;
 use synchronized_table::SynchronizedTable;
-use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
+use tokio::sync::{mpsc, oneshot, RwLock};
 use tokio::task::JoinHandle;
 
 use crate::datafusion::filter_converter::TimestampFilterConvert;
@@ -146,8 +144,6 @@ pub enum AcceleratedTableBuilderError {
 }
 
 pub type AcceleratedTableBuilderResult<T> = std::result::Result<T, AcceleratedTableBuilderError>;
-
-pub type AcceleratorRegistry = Arc<Mutex<HashMap<Engine, Arc<dyn DataAccelerator>>>>;
 
 // An accelerated table consists of a federated table and a local accelerator.
 //

@@ -382,11 +382,8 @@ async fn test_connectivity(
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::accelerated_table::AcceleratorRegistry;
-    use crate::{
-        builder::RuntimeBuilder, component::dataset::Dataset, status::RuntimeStatus,
-        DataAccelerator,
-    };
+    use crate::dataaccelerator::AcceleratorRegistry;
+    use crate::{builder::RuntimeBuilder, component::dataset::Dataset, status::RuntimeStatus};
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion::{
         catalog::SchemaProvider, catalog_common::MemorySchemaProvider, datasource::MemTable,
@@ -414,13 +411,7 @@ mod test {
         monitor.deregister_dataset(&dataset.name.to_string()).await;
     }
 
-    fn create_test_datafusion(
-        accelerator_registry: Arc<
-            Mutex<
-                HashMap<crate::component::dataset::acceleration::Engine, Arc<dyn DataAccelerator>>,
-            >,
-        >,
-    ) -> Arc<DataFusion> {
+    fn create_test_datafusion(accelerator_registry: AcceleratorRegistry) -> Arc<DataFusion> {
         let df = Arc::new(DataFusion::builder(RuntimeStatus::new(), accelerator_registry).build());
 
         let catalog = df.ctx.catalog("spice").expect("default catalog is spice");

@@ -17,11 +17,12 @@ limitations under the License.
 use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 
 use app::App;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::RwLock;
 
 use crate::{
-    accelerated_table::AcceleratorRegistry,
-    catalogconnector, dataaccelerator, dataconnector,
+    catalogconnector, dataaccelerator,
+    dataaccelerator::{create_accelerator_registry, AcceleratorRegistry},
+    dataconnector,
     datafusion::DataFusion,
     datasets_health_monitor::DatasetsHealthMonitor,
     extension::{Extension, ExtensionFactory},
@@ -141,7 +142,7 @@ impl RuntimeBuilder {
     pub async fn build(self) -> Runtime {
         let accelerator_registry = match self.accelerator_registry {
             Some(registry) => registry,
-            None => Arc::new(Mutex::new(HashMap::new())),
+            None => create_accelerator_registry(),
         };
 
         dataconnector::register_all(Arc::clone(&accelerator_registry)).await;

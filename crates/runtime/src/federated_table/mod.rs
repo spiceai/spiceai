@@ -29,7 +29,7 @@ limitations under the License.
 
 use std::sync::Arc;
 
-use crate::accelerated_table::AcceleratorRegistry;
+use crate::dataaccelerator::AcceleratorRegistry;
 use arrow::datatypes::SchemaRef;
 use datafusion::catalog::TableProvider;
 use tokio::sync::{oneshot, Mutex};

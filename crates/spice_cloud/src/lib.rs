@@ -24,15 +24,14 @@ use snafu::prelude::*;
 
 use runtime::{
     accelerated_table::{
-        refresh::Refresh, AcceleratedTable, AcceleratedTableBuilderError, AcceleratorRegistry,
-        Retention,
+        refresh::Refresh, AcceleratedTable, AcceleratedTableBuilderError, Retention,
     },
     component::dataset::{
         acceleration::{Acceleration, RefreshMode},
         replication::Replication,
         Dataset, Mode, TimeFormat,
     },
-    dataaccelerator::{self, create_accelerator_table},
+    dataaccelerator::{self, create_accelerator_table, AcceleratorRegistry},
     dataconnector::{create_new_connector, ConnectorParamsBuilder, DataConnectorError},
     extension::{Error as ExtensionError, Extension, ExtensionFactory, ExtensionManifest, Result},
     federated_table::FederatedTable,

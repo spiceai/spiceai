@@ -36,8 +36,8 @@ use {
 };
 
 use super::get_accelerator_engine;
-use crate::accelerated_table::AcceleratorRegistry;
 use crate::component::dataset::{acceleration::Engine, Dataset};
+use crate::dataaccelerator::AcceleratorRegistry;
 
 pub mod dataset_checkpoint;
 #[cfg(feature = "debezium")]

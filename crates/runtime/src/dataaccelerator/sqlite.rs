@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::accelerated_table::AcceleratorRegistry;
+use crate::dataaccelerator::AcceleratorRegistry;
 use async_trait::async_trait;
 use data_components::poly::PolyTableProvider;
 use datafusion::{

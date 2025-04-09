@@ -15,13 +15,13 @@ limitations under the License.
 */
 
 use crate::accelerated_table::AcceleratedTable;
-use crate::accelerated_table::AcceleratorRegistry;
 use crate::catalogconnector::CATALOG_CONNECTOR_FACTORY_REGISTRY;
 use crate::component::catalog::Catalog;
 use crate::component::dataset::acceleration::RefreshMode;
 use crate::component::dataset::Dataset;
 use crate::component::metrics::MetricsProvider;
 use crate::component::metrics::MetricsProviderComponent;
+use crate::dataaccelerator::AcceleratorRegistry;
 use crate::datafusion::error::find_datafusion_root;
 use crate::federated_table::FederatedTable;
 use crate::get_params_with_secrets;

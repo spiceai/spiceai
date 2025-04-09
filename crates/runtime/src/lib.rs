@@ -23,7 +23,7 @@ use std::time::Duration;
 use std::{collections::HashMap, sync::Arc};
 use tokio::task::JoinHandle;
 
-use crate::accelerated_table::AcceleratorRegistry;
+use crate::dataaccelerator::AcceleratorRegistry;
 use crate::{
     auth::EndpointAuth, dataconnector::DataConnector, datafusion::DataFusion,
     internal_table::Error as InternalTableError, model::ENABLE_MODEL_SUPPORT_MESSAGE,
@@ -61,8 +61,6 @@ use tools::factory::default_available_catalogs;
 use tools::{catalog::SpiceToolCatalog, Tooling};
 pub use util::shutdown_signal;
 
-use crate::component::dataset::acceleration::Engine;
-use crate::dataaccelerator::DataAccelerator;
 use crate::extension::Extension;
 pub mod accelerated_table;
 pub mod auth;

@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use crate::accelerated_table::refresh::Refresh;
-use crate::accelerated_table::AcceleratorRegistry;
+use crate::dataaccelerator::AcceleratorRegistry;
 use crate::datafusion::DataFusion;
 use crate::dataupdate::{DataUpdate, UpdateType};
 use crate::internal_table::create_internal_accelerated_table;

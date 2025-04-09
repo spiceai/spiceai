@@ -16,7 +16,7 @@ limitations under the License.
 
 use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc};
 
-use crate::accelerated_table::AcceleratorRegistry;
+use crate::dataaccelerator::AcceleratorRegistry;
 use crate::{
     accelerated_table::AcceleratedTable,
     component::dataset::{self, acceleration::RefreshMode, Dataset},

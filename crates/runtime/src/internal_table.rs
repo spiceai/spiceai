@@ -22,10 +22,10 @@ use datafusion::sql::TableReference;
 use snafu::prelude::*;
 use tokio::sync::RwLock;
 
-use crate::accelerated_table::AcceleratorRegistry;
 use crate::accelerated_table::{AcceleratedTableBuilderError, Retention};
 use crate::component::dataset::acceleration::Acceleration;
 use crate::component::dataset::{Dataset, Mode};
+use crate::dataaccelerator::AcceleratorRegistry;
 use crate::federated_table::FederatedTable;
 use crate::secrets::Secrets;
 use crate::status;
