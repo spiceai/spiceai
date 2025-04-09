@@ -125,14 +125,13 @@ fn datatype_equivalent(expected_type: DataType, actual_type: DataType) -> bool {
         return true;
     }
 
-    // Check for logical equivalence
+    // Check for logical equivalence, with a lenient set of rules
+    // E.g. a number could be returned as a string, number, or float.
     matches!(
         (expected_type, actual_type),
         (DataType::Float32, DataType::Float64)
             | (
-                DataType::Float64 | DataType::Int64, // why do we return ints as a decimal?
-                // TODO: the answer store needs to get updated with a defined schema?
-                // the inferred CSV schema isn't right with the context of the originating query
+                DataType::Float64 | DataType::Int64,
                 DataType::Decimal128(_, _)
             )
             | (DataType::Int32, DataType::Int64)
