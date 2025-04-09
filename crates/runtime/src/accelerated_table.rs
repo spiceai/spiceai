@@ -577,6 +577,7 @@ impl AcceleratedTable {
 
     #[allow(clippy::cast_possible_wrap)]
     #[allow(clippy::cast_possible_truncation)]
+    #[allow(clippy::too_many_lines)]
     async fn start_retention_check(
         dataset_name: TableReference,
         accelerator: Arc<dyn TableProvider>,
