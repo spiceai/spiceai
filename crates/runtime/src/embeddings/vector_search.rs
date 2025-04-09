@@ -298,7 +298,7 @@ impl SearchRequest {
         additional_columns
             .iter()
             .map(|c| {
-                let select_statement = format!("{c} FROM testing");
+                let select_statement = format!("SELECT {c} FROM testing");
                 let parser = Parser::new(&GenericDialect);
                 let mut parser = parser.try_with_sql(&select_statement).map_err(|err| {
                     tracing::trace!("vector_search additional column parsing failed. {err}");
@@ -1420,9 +1420,9 @@ pub(crate) mod tests {
             let mut additional_columns = vec!["column1".to_string()];
             for i in 0..100 {
                 let start = std::time::Instant::now();
-                let result = SearchRequest::parse_additional_columns(&additional_columns);
+                let _ = SearchRequest::parse_additional_columns(&additional_columns)
+                    .expect("to parse additional columns");
                 timings.push(start.elapsed());
-                assert!(result.is_ok());
                 additional_columns.push(format!("column{}", i + 2));
             }
         }
