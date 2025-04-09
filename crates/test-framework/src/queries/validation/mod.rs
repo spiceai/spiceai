@@ -229,8 +229,8 @@ pub fn array_value_to_string(array: &dyn Array, index: usize) -> Result<Option<S
     match array.data_type() {
         DataType::Int64 => downcast_and_format!(array, index, Int64Array),
         DataType::Int32 => downcast_and_format!(array, index, Int32Array),
-        DataType::Int16 => downcast_and_format!(array, index, Int32Array),
-        DataType::Int8 => downcast_and_format!(array, index, Int32Array),
+        DataType::Int16 => downcast_and_format!(array, index, Int16Array),
+        DataType::Int8 => downcast_and_format!(array, index, Int8Array),
         DataType::UInt64 => downcast_and_format!(array, index, UInt64Array),
         DataType::UInt32 => downcast_and_format!(array, index, UInt32Array),
         DataType::UInt16 => downcast_and_format!(array, index, UInt16Array),
@@ -713,8 +713,8 @@ mod test {
             QueryValidationResult::Fail(QueryValidationReason::DataMismatch {
                 column: "cntrycode".to_string(),
                 row_number: 7,
-                expected: format!("{:?}", Some("31")),
-                actual: format!("{:?}", Some("39")),
+                expected: format!("{:?}", "31"),
+                actual: format!("{:?}", "39"),
             })
         );
 
@@ -755,8 +755,8 @@ mod test {
             QueryValidationResult::Fail(QueryValidationReason::DataMismatch {
                 column: "cntrycode".to_string(),
                 row_number: 6,
-                expected: format!("{:?}", Some("30")),
-                actual: format!("{:?}", Some("14")),
+                expected: format!("{:?}", "30"),
+                actual: format!("{:?}", "14"),
             })
         );
     }
