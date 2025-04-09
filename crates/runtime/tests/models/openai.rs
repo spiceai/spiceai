@@ -675,9 +675,11 @@ async fn verify_similarity_search_chat_completion(
     // Instead of creating a snapshot, verify keywords contain expected values
     let mut found_journalist = false;
     let mut found_vehicle = false;
+    let mut actual_keywords = Vec::new();
 
     for input in &stable_inputs {
         if let Some(keywords) = input.get("keywords").and_then(|k| k.as_array()) {
+            actual_keywords.push(keywords.clone());
             for keyword in keywords {
                 if let Some(keyword_str) = keyword.as_str() {
                     if keyword_str.contains("journalist") {
@@ -692,11 +694,11 @@ async fn verify_similarity_search_chat_completion(
 
     assert!(
         found_journalist,
-        "Expected to find 'journalists' in keywords"
+        "Expected to find 'journalist' in keywords, found {actual_keywords:?}",
     );
     assert!(
         found_vehicle,
-        "Expected to find a keyword containing 'vehicle'"
+        "Expected to find 'vehicle' in keywords, found {actual_keywords:?}",
     );
 
     Ok(())
