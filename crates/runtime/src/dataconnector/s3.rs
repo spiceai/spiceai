@@ -15,9 +15,9 @@ limitations under the License.
 */
 
 use super::{
-    listing::{self, ListingTableConnector},
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult, ParameterSpec, Parameters,
+    listing::{self, ListingTableConnector},
 };
 
 use crate::parameters::ParamLookup;
@@ -72,13 +72,19 @@ pub const AWS_REGIONS: [&str; 32] = [
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("S3 auth method 'key' requires an AWS access secret.\nSpecify an access secret with the `s3_secret` parameter.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/s3#auth"))]
+    #[snafu(display(
+        "S3 auth method 'key' requires an AWS access secret.\nSpecify an access secret with the `s3_secret` parameter.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/s3#auth"
+    ))]
     NoAccessSecret,
 
-    #[snafu(display("S3 auth method 'key' requires an AWS access key.\nSpecify an access key with the `s3_key` parameter.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/s3#auth"))]
+    #[snafu(display(
+        "S3 auth method 'key' requires an AWS access key.\nSpecify an access key with the `s3_key` parameter.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/s3#auth"
+    ))]
     NoAccessKey,
 
-    #[snafu(display("Unsupported S3 auth method '{method}'.\nUse 'public', 'iam_role', or 'key' for `s3_auth` parameter.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/s3#auth"))]
+    #[snafu(display(
+        "Unsupported S3 auth method '{method}'.\nUse 'public', 'iam_role', or 'key' for `s3_auth` parameter.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/s3#auth"
+    ))]
     UnsupportedAuthenticationMethod { method: String },
 
     #[snafu(display(
@@ -101,12 +107,16 @@ pub enum Error {
     ))]
     InvalidRegionCorrected { region: String },
 
-    #[snafu(display("IAM role authentication failed.\nAre you sure you're running in an environment with an IAM role?\n{source}\nFor details, visit: https://spiceai.org/docs/components/data-connectors/s3#auth"))]
+    #[snafu(display(
+        "IAM role authentication failed.\nAre you sure you're running in an environment with an IAM role?\n{source}\nFor details, visit: https://spiceai.org/docs/components/data-connectors/s3#auth"
+    ))]
     InvalidIAMRoleAuthentication {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("The '{endpoint}' is a HTTP URL, but `allow_http` is not enabled. Set the parameter `allow_http: true` and retry.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/abfs#params"))]
+    #[snafu(display(
+        "The '{endpoint}' is a HTTP URL, but `allow_http` is not enabled. Set the parameter `allow_http: true` and retry.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/abfs#params"
+    ))]
     InsecureEndpointWithoutAllowHTTP { endpoint: String },
 }
 

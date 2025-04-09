@@ -19,8 +19,8 @@ use rand::RngCore;
 
 use crate::{
     component::dataset::{
-        acceleration::{Acceleration, Mode, RefreshMode, ZeroResultsAction},
         Dataset,
+        acceleration::{Acceleration, Mode, RefreshMode, ZeroResultsAction},
     },
     dataconnector::DataConnector,
 };
@@ -151,7 +151,10 @@ mod tests {
 
         let test_data_connector: Arc<dyn DataConnector> = Arc::new(TestDataConnector {});
         let info = dataset_registered_trace(&test_data_connector, &ds, true);
-        assert_eq!(info, "Dataset taxi_trips registered (s3://taxi_trips/2024/), acceleration (arrow), results cache enabled.");
+        assert_eq!(
+            info,
+            "Dataset taxi_trips registered (s3://taxi_trips/2024/), acceleration (arrow), results cache enabled."
+        );
     }
 
     #[test]
@@ -174,6 +177,9 @@ mod tests {
 
         let test_data_connector: Arc<dyn DataConnector> = Arc::new(TestDataConnector {});
         let info = dataset_registered_trace(&test_data_connector, &ds, false);
-        assert_eq!(info, "Dataset taxi_trips registered (s3://taxi_trips/2024/), acceleration (duckdb:file, append, 30s refresh, 1hr retention, fallback on source on empty result).");
+        assert_eq!(
+            info,
+            "Dataset taxi_trips registered (s3://taxi_trips/2024/), acceleration (duckdb:file, append, 30s refresh, 1hr retention, fallback on source on empty result)."
+        );
     }
 }

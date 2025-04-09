@@ -25,7 +25,7 @@ use datafusion::physical_plan::{
     PlanProperties,
 };
 use datafusion::sql::TableReference;
-use futures::{stream, StreamExt};
+use futures::{StreamExt, stream};
 use opentelemetry::KeyValue;
 use std::any::Any;
 use std::fmt;
@@ -335,7 +335,7 @@ mod tests {
     mod non_empty_filtered_fallback {
         use datafusion::{
             catalog::TableProvider,
-            logical_expr::{binary_expr, col, Expr, Operator},
+            logical_expr::{Expr, Operator, binary_expr, col},
             scalar::ScalarValue,
         };
 

@@ -20,7 +20,7 @@ use axum::Router;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::{Builder, Connection};
 use hyper_util::service::TowerToHyperService;
-use runtime_auth::{layer::http::AuthLayer, HttpAuth};
+use runtime_auth::{HttpAuth, layer::http::AuthLayer};
 use snafu::prelude::*;
 use spicepod::component::runtime::CorsConfig;
 use tokio::net::TcpStream;
@@ -30,11 +30,10 @@ use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    config,
+    Runtime, config,
     embeddings::vector_search::{self, parse_explicit_primary_keys},
     metrics as runtime_metrics,
     tls::TlsConfig,
-    Runtime,
 };
 
 #[cfg(feature = "openapi")]
@@ -206,7 +205,7 @@ async fn handle_connection<S>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{routing::get, Router};
+    use axum::{Router, routing::get};
     use futures::future;
     use http::StatusCode;
     use std::time::Duration;
@@ -268,9 +267,11 @@ mod tests {
 
         // Verify that the shutdown does not fail if there are no active connections
         shutdown_notify.send(()).ok();
-        assert!(timeout(Duration::from_secs(1), shutdown_notify.closed())
-            .await
-            .is_ok());
+        assert!(
+            timeout(Duration::from_secs(1), shutdown_notify.closed())
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]
@@ -305,11 +306,15 @@ mod tests {
 
         // Verify that the shutdown will close the active request and drop all receivers
         shutdown_notify.send(()).ok();
-        assert!(timeout(Duration::from_secs(5), request_completion_handle)
-            .await
-            .is_ok());
-        assert!(timeout(Duration::from_secs(1), shutdown_notify.closed())
-            .await
-            .is_ok());
+        assert!(
+            timeout(Duration::from_secs(5), request_completion_handle)
+                .await
+                .is_ok()
+        );
+        assert!(
+            timeout(Duration::from_secs(1), shutdown_notify.closed())
+                .await
+                .is_ok()
+        );
     }
 }

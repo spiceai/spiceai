@@ -20,8 +20,8 @@ use std::{
 };
 
 pub mod fibonacci_backoff;
-pub use backoff::future::retry;
 pub use backoff::Error as RetryError;
+pub use backoff::future::retry;
 
 #[allow(clippy::cast_precision_loss)]
 #[allow(clippy::cast_sign_loss)]
@@ -61,7 +61,7 @@ pub async fn shutdown_signal() {
 
 #[cfg(unix)]
 async fn shutdown_signal_impl() {
-    use tokio::signal::unix::{signal, SignalKind};
+    use tokio::signal::unix::{SignalKind, signal};
 
     let Ok(mut signal_terminate) = signal(SignalKind::terminate()) else {
         tracing::error!("Failed to listen to terminate signal");

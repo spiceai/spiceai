@@ -41,10 +41,10 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 use tracing::{Instrument, Span};
 
-use crate::request::{AsyncMarker, RequestContext};
-use crate::tools::builtin::list_datasets::ListDatasetsTool;
-use crate::tools::SpiceModelTool;
 use crate::Runtime;
+use crate::request::{AsyncMarker, RequestContext};
+use crate::tools::SpiceModelTool;
+use crate::tools::builtin::list_datasets::ListDatasetsTool;
 
 pub struct ToolUsingChat {
     inner_chat: Arc<dyn Chat>,

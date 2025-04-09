@@ -30,8 +30,8 @@ use tokio::task::JoinHandle;
 use crate::{
     metrics::QueryStatus,
     queries::{
-        validation::{self, QueryValidationResult},
         Query,
+        validation::{self, QueryValidationResult},
     },
     snapshot::record_explain_plan,
 };

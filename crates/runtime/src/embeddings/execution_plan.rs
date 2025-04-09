@@ -275,10 +275,10 @@ pub(crate) async fn compute_additional_embedding_columns(
 
         let Some(arr_iter) = convert_string_arrow_to_iterator!(raw_data) else {
             tracing::warn!(
-                    "Expected 'StringArray', 'StringViewArray' or 'LargeStringArray' for column '{}', but got {}",
-                    col,
-                    raw_data.data_type()
-                );
+                "Expected 'StringArray', 'StringViewArray' or 'LargeStringArray' for column '{}', but got {}",
+                col,
+                raw_data.data_type()
+            );
             continue;
         };
 
@@ -606,8 +606,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_vectors_with_nulls_and_empty(
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn test_get_vectors_with_nulls_and_empty()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let result = get_vectors(
             vec![None, Some("world"), Some(""), Some("hello"), None].into_iter(),
             &MockEmbedder::default()

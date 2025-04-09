@@ -17,11 +17,11 @@ limitations under the License.
 use app::AppBuilder;
 use arrow::array::RecordBatch;
 use futures::TryStreamExt;
-use runtime::{status, Runtime};
+use runtime::{Runtime, status};
 use spicepod::{
     component::dataset::{
-        acceleration::{Acceleration, Mode, RefreshMode},
         Dataset,
+        acceleration::{Acceleration, Mode, RefreshMode},
     },
     param::Params,
 };

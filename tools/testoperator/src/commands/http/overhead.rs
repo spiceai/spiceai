@@ -22,19 +22,19 @@ use crate::{
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use std::{sync::Arc, time::Duration};
 use test_framework::{
+    TestType,
     anyhow::{self, anyhow},
     arrow::util::pretty::print_batches,
     metrics::MetricCollector,
     spiced::SpicedInstance,
     spicetest::{
+        SpiceTest,
         http::{
+            HttpConfig,
             component::HttpComponent,
             overhead::{self, BaselineConfig},
-            HttpConfig,
         },
-        SpiceTest,
     },
-    TestType,
 };
 
 /// Runs a test to ensure the P50 & p90 latencies do not increase by some threshold over the
@@ -125,21 +125,25 @@ fn check_threshold(
 ) -> Result<(), anyhow::Error> {
     let multiple = spice_duration as f64 / baseline_duration as f64;
     if multiple > increase_threshold {
-        return Err(anyhow::anyhow!(with_color!(Color::RedBold,
+        return Err(anyhow::anyhow!(with_color!(
+            Color::RedBold,
             "Spice {} duration ({}) increased beyond baseline ({}) by more than the threshold ({} > {})",
             label,
             spice_duration,
             baseline_duration,
-                multiple,
-                increase_threshold
-            )));
+            multiple,
+            increase_threshold
+        )));
     }
-    println!("{}", with_color!(Color::Green,
-                "Spice {} duration ({}) increased beyond baseline ({}) by less than the threshold ({} <= {})",
-                label,
-                spice_duration,
-                baseline_duration,
-                multiple,
+    println!(
+        "{}",
+        with_color!(
+            Color::Green,
+            "Spice {} duration ({}) increased beyond baseline ({}) by less than the threshold ({} <= {})",
+            label,
+            spice_duration,
+            baseline_duration,
+            multiple,
             increase_threshold
         )
     );

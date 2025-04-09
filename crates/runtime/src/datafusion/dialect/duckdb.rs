@@ -95,7 +95,7 @@ mod tests {
         logical_expr::expr::ScalarFunction,
         prelude::lit,
         scalar::ScalarValue,
-        sql::{unparser::Unparser, TableReference},
+        sql::{TableReference, unparser::Unparser},
     };
 
     use crate::datafusion::dialect::new_duckdb_dialect;

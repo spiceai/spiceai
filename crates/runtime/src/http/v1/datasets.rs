@@ -16,23 +16,23 @@ limitations under the License.
 use std::{collections::HashMap, sync::Arc};
 
 use crate::{
-    accelerated_table::refresh::RefreshOverrides, component::dataset::Dataset,
-    datafusion::DataFusion, status::ComponentStatus, LogErrors, Runtime,
+    LogErrors, Runtime, accelerated_table::refresh::RefreshOverrides, component::dataset::Dataset,
+    datafusion::DataFusion, status::ComponentStatus,
 };
 use app::App;
 use axum::{
+    Extension, Json,
     extract::Path,
     extract::Query,
     http::status,
     response::{IntoResponse, Response},
-    Extension, Json,
 };
 use datafusion::sql::TableReference;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::RwLock;
 
-use super::{convert_entry_to_csv, dataset_status, Format};
+use super::{Format, convert_entry_to_csv, dataset_status};
 
 #[derive(Debug, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::IntoParams, utoipa::ToSchema))]

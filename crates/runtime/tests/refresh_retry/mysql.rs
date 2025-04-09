@@ -32,15 +32,15 @@ use datafusion::{
 use datafusion_table_providers::sql::arrow_sql_gen::statement::{
     CreateTableBuilder, InsertBuilder,
 };
-use mysql_async::{prelude::Queryable, Params, Row};
+use mysql_async::{Params, Row, prelude::Queryable};
 use runtime::{
-    accelerated_table::{refresh::Refresh, refresh_task::RefreshTask, AcceleratedTable},
     Runtime,
+    accelerated_table::{AcceleratedTable, refresh::Refresh, refresh_task::RefreshTask},
 };
 use spicepod::component::dataset::acceleration::Acceleration;
 use tokio::time;
 use tracing::instrument;
-use util::{fibonacci_backoff::FibonacciBackoffBuilder, retry, RetryError};
+use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
 
 const MYSQL_DOCKER_CONTAINER: &str = "runtime-integration-test-refresh-retry-mysql";
 const MYSQL_PORT: u16 = 13307;
@@ -211,14 +211,16 @@ async fn mysql_refresh_retries() -> Result<(), String> {
                 // restore connectivity after few seconds
                 time::sleep(Duration::from_secs(2)).await;
                 tracing::debug!("Restoring connectivity...");
-                assert!(running_container_reference_copy
-                    .start()
-                    .await
-                    .map_err(|e| {
-                        tracing::error!("running_container.start: {e}");
-                        e.to_string()
-                    })
-                    .is_ok());
+                assert!(
+                    running_container_reference_copy
+                        .start()
+                        .await
+                        .map_err(|e| {
+                            tracing::error!("running_container.start: {e}");
+                            e.to_string()
+                        })
+                        .is_ok()
+                );
             });
 
             // set custom refresh sql to check number of items loaded later

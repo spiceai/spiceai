@@ -17,13 +17,13 @@ limitations under the License.
 use async_openai::types::{ChatCompletionStreamOptions, CreateChatCompletionRequest};
 use jsonpath_rust::JsonPath;
 use llms::{accumulate::accumulate, chat::Chat};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::{
     str::FromStr,
     sync::{Arc, LazyLock},
 };
 
-use crate::{init_tracing, TEST_ARGS};
+use crate::{TEST_ARGS, init_tracing};
 
 mod create;
 

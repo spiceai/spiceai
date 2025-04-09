@@ -19,18 +19,18 @@ use async_trait::async_trait;
 
 use std::{any::Any, fmt, pin::Pin, sync::Arc};
 
-use crate::component::dataset::{acceleration::RefreshMode, Dataset};
+use crate::component::dataset::{Dataset, acceleration::RefreshMode};
 use datafusion::{
     catalog::Session,
     common::{Constraint, Constraints},
     datasource::{TableProvider, TableType},
     execution::{SendableRecordBatchStream, TaskContext},
-    logical_expr::{dml::InsertOp, Expr},
+    logical_expr::{Expr, dml::InsertOp},
     physical_plan::{
+        DisplayAs, DisplayFormatType, ExecutionPlan,
         empty::EmptyExec,
         insert::{DataSink, DataSinkExec},
         metrics::MetricsSet,
-        DisplayAs, DisplayFormatType, ExecutionPlan,
     },
 };
 use futures::Future;

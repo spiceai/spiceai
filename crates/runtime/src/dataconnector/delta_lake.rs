@@ -16,8 +16,8 @@ limitations under the License.
 
 use crate::component::dataset::Dataset;
 use async_trait::async_trait;
-use data_components::delta_lake::DeltaTableFactory;
 use data_components::Read;
+use data_components::delta_lake::DeltaTableFactory;
 use datafusion::datasource::TableProvider;
 use snafu::prelude::*;
 use std::any::Any;

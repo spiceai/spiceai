@@ -14,18 +14,17 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::component::ComponentType;
 use crate::component::dataset::Dataset;
 use crate::component::metrics::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
-use crate::component::ComponentType;
 use async_trait::async_trait;
 use data_components::Read;
 use datafusion::datasource::TableProvider;
 use datafusion::sql::sqlparser::dialect::MySqlDialect;
 use datafusion_table_providers::mysql::MySQLTableFactory;
 use datafusion_table_providers::sql::db_connection_pool::{
-    dbconnection,
+    Error as DbConnectionPoolError, dbconnection,
     mysqlpool::{self, MySQLConnectionPool},
-    Error as DbConnectionPoolError,
 };
 use mysql_async::Metrics;
 use opentelemetry::KeyValue;
@@ -157,7 +156,7 @@ impl DataConnectorFactory for MySQLFactory {
                                 connector_component: params.component.clone(),
                             }
                             .into(),
-                        )
+                        );
                     }
 
                     mysqlpool::Error::InvalidHostOrPortError {
@@ -171,7 +170,7 @@ impl DataConnectorFactory for MySQLFactory {
                             host,
                             port: format!("{port}"),
                         }
-                        .into())
+                        .into());
                     }
 
                     _ => {
@@ -180,7 +179,7 @@ impl DataConnectorFactory for MySQLFactory {
                             connector_component: params.component.clone(),
                             source: Box::new(error),
                         }
-                        .into())
+                        .into());
                     }
                 },
             };

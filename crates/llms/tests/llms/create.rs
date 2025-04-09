@@ -16,10 +16,10 @@ limitations under the License.
 
 use anyhow::Context;
 use async_openai::error::OpenAIError;
-use hf_hub::{api::sync::ApiBuilder, Repo, RepoType};
+use hf_hub::{Repo, RepoType, api::sync::ApiBuilder};
 use llms::{
     anthropic::Anthropic,
-    chat::{create_hf_model, create_local_model, Chat, Error as ChatError},
+    chat::{Chat, Error as ChatError, create_hf_model, create_local_model},
     config::GenericAuthMechanism,
     embeddings::candle::link_files_into_tmp_dir,
     openai::new_openai_client,

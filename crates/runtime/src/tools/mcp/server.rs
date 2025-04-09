@@ -17,9 +17,9 @@ limitations under the License.
 use crate::Runtime;
 use futures::StreamExt;
 use mcp_core::{
+    Content, ToolError,
     handler::{PromptError, ResourceError},
     protocol::{ServerCapabilities, ToolsCapability},
-    Content, ToolError,
 };
 use mcp_server;
 use serde_json::json;

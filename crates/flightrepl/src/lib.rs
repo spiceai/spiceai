@@ -23,18 +23,18 @@ use std::time::Instant;
 use ansi_term::Colour;
 use arrow_flight::sql::{CommandStatementQuery, ProstMessageExt};
 use arrow_flight::{
-    decode::FlightRecordBatchStream, error::FlightError,
-    flight_service_client::FlightServiceClient, FlightDescriptor,
+    FlightDescriptor, decode::FlightRecordBatchStream, error::FlightError,
+    flight_service_client::FlightServiceClient,
 };
 
 use clap::Parser;
 use config::get_user_agent;
 use datafusion::arrow::array::RecordBatch;
 use datafusion::dataframe::DataFrame;
-use datafusion::datasource::{provider_as_source, MemTable};
+use datafusion::datasource::{MemTable, provider_as_source};
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::{LogicalPlanBuilder, UNNAMED_TABLE};
-use flight_client::{TonicStatusError, MAX_DECODING_MESSAGE_SIZE, MAX_ENCODING_MESSAGE_SIZE};
+use flight_client::{MAX_DECODING_MESSAGE_SIZE, MAX_ENCODING_MESSAGE_SIZE, TonicStatusError};
 use futures::{StreamExt, TryStreamExt};
 use llms::chat::LlmRuntime;
 use prost::Message;
@@ -281,7 +281,7 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
                     Some(ref err) => {
                         let err = TonicStatusError::from(err.clone());
                         println!("{err}");
-                    },
+                    }
                     None => println!("No error to display"),
                 }
                 continue;
@@ -307,9 +307,13 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
                 let _ = rl.add_history_entry(line);
                 get_and_display_nql_records(
                     repl_config.http_endpoint.clone(),
-                     line.strip_prefix(NQL_LINE_PREFIX).unwrap_or(line).to_string(),
-                    &user_agent
-                ).await.map_err(|e| format!("Error occured on NQL request: {e}"))?;
+                    line.strip_prefix(NQL_LINE_PREFIX)
+                        .unwrap_or(line)
+                        .to_string(),
+                    &user_agent,
+                )
+                .await
+                .map_err(|e| format!("Error occured on NQL request: {e}"))?;
                 continue;
             }
             _ => line,
@@ -550,7 +554,12 @@ fn display_grpc_error(err: &Status) {
             match (truncate, lines.len() > 1) {
                 (true, true) => {
                     // truncating due to length, and multiple error lines
-                    ("Query Error", format!("{first_line}\nThis error message has been truncated.\nFor the full error message, execute `.error`."))
+                    (
+                        "Query Error",
+                        format!(
+                            "{first_line}\nThis error message has been truncated.\nFor the full error message, execute `.error`."
+                        ),
+                    )
                 }
                 (true, false) => {
                     // truncating due to length, but only one line

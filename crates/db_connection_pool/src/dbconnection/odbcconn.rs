@@ -21,9 +21,9 @@ use std::sync::Arc;
 use arrow::datatypes::Schema;
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
-use arrow_odbc::arrow_schema_from;
 use arrow_odbc::OdbcReader;
 use arrow_odbc::OdbcReaderBuilder;
+use arrow_odbc::arrow_schema_from;
 use async_stream::stream;
 use async_trait::async_trait;
 use datafusion::error::DataFusionError;
@@ -31,20 +31,20 @@ use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::sql::TableReference;
 use datafusion_table_providers::sql::db_connection_pool::{
-    dbconnection::{self, AsyncDbConnection, DbConnection, GenericError},
     DbConnectionPool,
+    dbconnection::{self, AsyncDbConnection, DbConnection, GenericError},
 };
 use dyn_clone::DynClone;
 use futures::lock::Mutex;
+use odbc_api::Cursor;
+use odbc_api::CursorImpl;
 use odbc_api::handles::SqlResult;
 use odbc_api::handles::Statement;
 use odbc_api::handles::StatementImpl;
 use odbc_api::parameter::InputParameter;
-use odbc_api::Cursor;
-use odbc_api::CursorImpl;
 use secrecy::{ExposeSecret, SecretBox, SecretString};
-use snafu::prelude::*;
 use snafu::Snafu;
+use snafu::prelude::*;
 use tokio::runtime::Handle;
 
 use odbc_api::Connection;
@@ -339,8 +339,8 @@ fn bind_parameters(statement: &mut StatementImpl, params: &[ODBCParameter]) -> R
 
 #[cfg(test)]
 mod tests {
-    use odbc_api::handles::OutputStringBuffer;
     use odbc_api::IntoParameter;
+    use odbc_api::handles::OutputStringBuffer;
 
     use crate::odbcpool::ODBCPool;
     use std::str;

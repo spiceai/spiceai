@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::listing::{build_fragments, ListingTableConnector};
+use super::listing::{ListingTableConnector, build_fragments};
 use super::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorFactory, DataConnectorResult,
     ParameterSpec, Parameters,
@@ -51,7 +51,9 @@ pub enum Error {
     ))]
     InvalidEndpoint { endpoint: String },
 
-    #[snafu(display("The '{endpoint}' is a HTTP URL, but `allow_http` is not enabled. Set the parameter `allow_http: true` and retry.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/abfs#params"))]
+    #[snafu(display(
+        "The '{endpoint}' is a HTTP URL, but `allow_http` is not enabled. Set the parameter `allow_http: true` and retry.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/abfs#params"
+    ))]
     InsecureEndpointWithoutAllowHTTP { endpoint: String },
 }
 

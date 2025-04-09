@@ -30,19 +30,19 @@ use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::DataFusionError;
 use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::logical_expr::utils::conjunction;
-use datafusion::logical_expr::{lit, Expr, TableProviderFilterPushDown};
+use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, lit};
 use datafusion::parquet::arrow::arrow_reader::RowSelection;
 use datafusion::parquet::file::metadata::RowGroupMetaData;
 use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
 use datafusion::physical_plan::{ExecutionPlan, PhysicalExpr};
 use datafusion::scalar::ScalarValue;
 use datafusion::sql::TableReference;
-use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
-use delta_kernel::engine::default::DefaultEngine;
-use delta_kernel::scan::state::{DvInfo, GlobalScanState, Stats};
-use delta_kernel::scan::ScanBuilder;
-use delta_kernel::snapshot::Snapshot;
 use delta_kernel::Table;
+use delta_kernel::engine::default::DefaultEngine;
+use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
+use delta_kernel::scan::ScanBuilder;
+use delta_kernel::scan::state::{DvInfo, GlobalScanState, Stats};
+use delta_kernel::snapshot::Snapshot;
 use indexmap::IndexMap;
 use object_store::ObjectMeta;
 use pruning::{can_be_evaluted_for_partition_pruning, prune_partitions};
@@ -57,10 +57,14 @@ mod pruning;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Failed to connect to the Delta Lake Table.\nVerify the Delta Lake Table configuration is valid, and try again.\nReceived the following error while connecting: {source}"))]
+    #[snafu(display(
+        "Failed to connect to the Delta Lake Table.\nVerify the Delta Lake Table configuration is valid, and try again.\nReceived the following error while connecting: {source}"
+    ))]
     DeltaTableError { source: delta_kernel::Error },
 
-    #[snafu(display("Delta Lake Table checkpoint files are missing or incorrect.\nRecreate the checkpoint for the Delta Lake Table and try again.\n{source}"))]
+    #[snafu(display(
+        "Delta Lake Table checkpoint files are missing or incorrect.\nRecreate the checkpoint for the Delta Lake Table and try again.\n{source}"
+    ))]
     DeltaCheckpointError { source: delta_kernel::Error },
 }
 

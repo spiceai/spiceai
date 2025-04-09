@@ -14,9 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use arrow::compute::{filter_record_batch, SortOptions};
+use arrow::compute::{SortOptions, filter_record_batch};
 use arrow::{
-    array::{make_comparator, RecordBatch, StructArray, TimestampNanosecondArray},
+    array::{RecordBatch, StructArray, TimestampNanosecondArray, make_comparator},
     datatypes::DataType,
 };
 use arrow_schema::SchemaRef;
@@ -25,15 +25,15 @@ use datafusion::logical_expr::dml::InsertOp;
 use datafusion_table_providers::util::retriable_error::{
     check_and_mark_retriable_error, is_retriable_error,
 };
-use futures::{stream, StreamExt};
+use futures::{StreamExt, stream};
 use opentelemetry::KeyValue;
 use snafu::{OptionExt, ResultExt};
 use tracing::{Instrument, Span};
 use util::fibonacci_backoff::FibonacciBackoffBuilder;
-use util::{retry, RetryError};
+use util::{RetryError, retry};
 
 use crate::datafusion::builder::get_df_default_config;
-use crate::datafusion::error::{find_datafusion_root, get_spice_df_error, SpiceExternalError};
+use crate::datafusion::error::{SpiceExternalError, find_datafusion_root, get_spice_df_error};
 use crate::datafusion::is_spice_internal_dataset;
 use crate::datafusion::schema::BaseSchema;
 use crate::federated_table::FederatedTable;
@@ -51,19 +51,19 @@ use crate::{
 use super::refresh::get_timestamp;
 use super::sink::AccelerationSink;
 use super::synchronized_table::SynchronizedTable;
-use super::{metrics, UnableToCreateMemTableFromUpdateSnafu};
+use super::{UnableToCreateMemTableFromUpdateSnafu, metrics};
 
 use crate::component::dataset::TimeFormat;
 use std::time::UNIX_EPOCH;
 use std::{cmp::Ordering, sync::Arc, time::SystemTime};
-use tokio::sync::{oneshot, RwLock};
+use tokio::sync::{RwLock, oneshot};
 
 use datafusion::execution::context::SessionContext;
 use datafusion::{
     dataframe::DataFrame,
     datasource::TableProvider,
     error::DataFusionError,
-    logical_expr::{cast, col, Expr, Operator},
+    logical_expr::{Expr, Operator, cast, col},
     physical_plan::stream::RecordBatchStreamAdapter,
     sql::TableReference,
 };
@@ -279,7 +279,9 @@ impl RefreshTask {
                         }
                     } else {
                         if notify_refresh_stat_available.send(stat).is_err() {
-                            tracing::error!("Failed to provide stats on the amount of data written to the dataset: {ds_name}");
+                            tracing::error!(
+                                "Failed to provide stats on the amount of data written to the dataset: {ds_name}"
+                            );
                         }
                         None
                     }

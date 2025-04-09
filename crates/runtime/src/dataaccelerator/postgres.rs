@@ -21,7 +21,7 @@ use datafusion::{
     logical_expr::CreateExternalTable,
 };
 use datafusion_table_providers::postgres::{
-    write::PostgresTableWriter, PostgresTableProviderFactory,
+    PostgresTableProviderFactory, write::PostgresTableWriter,
 };
 use snafu::prelude::*;
 use std::{any::Any, sync::Arc};

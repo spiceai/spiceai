@@ -16,7 +16,7 @@ limitations under the License.
 
 use std::sync::Arc;
 
-use crate::{init_tracing, utils::test_request_context, RecordBatch};
+use crate::{RecordBatch, init_tracing, utils::test_request_context};
 use app::AppBuilder;
 use datafusion::assert_batches_eq;
 use futures::TryStreamExt;

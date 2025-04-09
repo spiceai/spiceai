@@ -30,8 +30,8 @@ use indicatif::{MultiProgress, ProgressBar};
 use tokio::task::JoinHandle;
 
 use super::{
-    datasets::{self, EndCondition, SpiceTestQueryWorker, SpiceTestQueryWorkers},
     SpiceTest, TestNotStarted, TestState,
+    datasets::{self, EndCondition, SpiceTestQueryWorker, SpiceTestQueryWorkers},
 };
 
 mod worker;

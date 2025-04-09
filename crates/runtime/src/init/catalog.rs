@@ -17,16 +17,17 @@ limitations under the License.
 use std::sync::Arc;
 
 use crate::{
-    catalogconnector::{self, get_catalog_provider, CatalogConnector},
+    LogErrors, Result, Runtime, UnableToInitializeCatalogConnectorSnafu,
+    UnableToLoadCatalogConnectorSnafu,
+    catalogconnector::{self, CatalogConnector, get_catalog_provider},
     component::catalog::Catalog,
     dataconnector::ConnectorParamsBuilder,
-    metrics, status, warn_spaced, LogErrors, Result, Runtime,
-    UnableToInitializeCatalogConnectorSnafu, UnableToLoadCatalogConnectorSnafu,
+    metrics, status, warn_spaced,
 };
 use app::App;
 use futures::future::join_all;
 use snafu::prelude::*;
-use util::{fibonacci_backoff::FibonacciBackoffBuilder, retry, RetryError};
+use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
 
 impl Runtime {
     pub(crate) async fn load_catalogs(&self) {

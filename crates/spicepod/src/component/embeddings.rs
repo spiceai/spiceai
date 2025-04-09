@@ -19,8 +19,8 @@ use std::{collections::HashMap, fmt::Display};
 use crate::metric::Metrics;
 
 use super::{
-    model::{ModelFile, ModelFileType, HUGGINGFACE_PATH_REGEX},
     Nameable, WithDependsOn,
+    model::{HUGGINGFACE_PATH_REGEX, ModelFile, ModelFileType},
 };
 #[cfg(feature = "schemars")]
 use schemars::JsonSchema;

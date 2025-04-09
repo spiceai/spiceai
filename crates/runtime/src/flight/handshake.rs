@@ -20,8 +20,8 @@ use runtime_auth::FlightBasicAuth;
 use std::pin::Pin;
 use std::sync::Arc;
 use tonic::{
-    metadata::{MetadataMap, MetadataValue},
     Response, Status,
+    metadata::{MetadataMap, MetadataValue},
 };
 use uuid::Uuid;
 

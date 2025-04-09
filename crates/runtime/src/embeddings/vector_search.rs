@@ -55,7 +55,9 @@ pub enum Error {
     #[snafu(display("Failed to find table '{}'. An internal error occurred during vector search.\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues", table.to_quoted_string()))]
     DataSourceNotFound { table: TableReference },
 
-    #[snafu(display("Vector search failed: No tables with embeddings are available. Ensure embeddings are configured and try again."))]
+    #[snafu(display(
+        "Vector search failed: No tables with embeddings are available. Ensure embeddings are configured and try again."
+    ))]
     NoTablesWithEmbeddingsFound {},
 
     #[snafu(display("Vector search cannot be run on {}.", data_source.to_quoted_string()))]
@@ -846,13 +848,11 @@ impl VectorSearch {
             let mut chunked_projection = projection.clone();
             let c = quote_identifier(embedding_column);
             if !additional_columns.contains(&c.to_string()) {
-                if let Some(index) = chunked_projection.iter().enumerate().find_map(|(i, col)| {
-                    if col == &c {
-                        Some(i)
-                    } else {
-                        None
-                    }
-                }) {
+                if let Some(index) = chunked_projection
+                    .iter()
+                    .enumerate()
+                    .find_map(|(i, col)| if col == &c { Some(i) } else { None })
+                {
                     chunked_projection.remove(index);
                 }
             }

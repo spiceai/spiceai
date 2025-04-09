@@ -23,8 +23,8 @@ use datafusion::datasource::TableProvider;
 use datafusion_table_providers::postgres::PostgresTableFactory;
 use datafusion_table_providers::sql::db_connection_pool::dbconnection;
 use datafusion_table_providers::sql::db_connection_pool::{
-    postgrespool::{self, PostgresConnectionPool},
     Error as DbConnectionPoolError,
+    postgrespool::{self, PostgresConnectionPool},
 };
 use snafu::prelude::*;
 use std::any::Any;

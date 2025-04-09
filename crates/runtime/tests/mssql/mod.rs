@@ -16,9 +16,9 @@ limitations under the License.
 
 use std::sync::Arc;
 
-use common::{make_mssql_dataset, start_mssql_docker_container, MSSQL_ROOT_PASSWORD};
+use common::{MSSQL_ROOT_PASSWORD, make_mssql_dataset, start_mssql_docker_container};
 use data_components::mssql::connection_manager::SqlServerConnectionManager;
-use util::{fibonacci_backoff::FibonacciBackoffBuilder, retry, RetryError};
+use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
 
 use crate::init_tracing;
 use crate::utils::test_request_context;

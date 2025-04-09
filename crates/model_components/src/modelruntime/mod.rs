@@ -18,7 +18,7 @@ limitations under the License.
 use arrow::record_batch::RecordBatch;
 use std::result::Result;
 
-use crate::modelformat::{from_path as format_from_path, ModelFormat};
+use crate::modelformat::{ModelFormat, from_path as format_from_path};
 
 #[cfg(feature = "full")]
 pub mod tract;
@@ -32,7 +32,9 @@ pub fn supported_runtime_for_path(path: &str) -> Result<Box<dyn ModelRuntime>, S
                     path: path.to_string(),
                 }));
             }
-            Err(format!("Unsupported model format for path: {format}.\nSpecify a valid model path or check the model format.\nFor details, visit: https://spiceai.org/docs/components/models"))
+            Err(format!(
+                "Unsupported model format for path: {format}.\nSpecify a valid model path or check the model format.\nFor details, visit: https://spiceai.org/docs/components/models"
+            ))
         }
         None => Err(format!(
             "Model format for path '{path}' could not be inferred.\nSpecify a valid model path or check the model format.\nFor details, visit: https://spiceai.org/docs/components/models"

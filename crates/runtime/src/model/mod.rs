@@ -27,8 +27,8 @@ mod metrics;
 mod tool_use;
 mod wrapper;
 
-pub use chat::{try_to_chat_model, LLMModelStore};
-pub use embed::{try_to_embedding, EmbeddingModelStore};
+pub use chat::{LLMModelStore, try_to_chat_model};
+pub use embed::{EmbeddingModelStore, try_to_embedding};
 pub use eval::{
     dataset::{DatasetInput, DatasetOutput},
     handle_eval_run,
@@ -36,10 +36,10 @@ pub use eval::{
         EVAL_RESULTS_TABLE_REFERENCE, EVAL_RESULTS_TABLE_SCHEMA, EVAL_RESULTS_TABLE_TIME_COLUMN,
     },
     runs::{
-        sql_query_for, start_tracing_eval_run, EvalRunResponse, EVAL_RUNS_TABLE_PRIMARY_KEY,
-        EVAL_RUNS_TABLE_REFERENCE, EVAL_RUNS_TABLE_SCHEMA, EVAL_RUNS_TABLE_TIME_COLUMN,
+        EVAL_RUNS_TABLE_PRIMARY_KEY, EVAL_RUNS_TABLE_REFERENCE, EVAL_RUNS_TABLE_SCHEMA,
+        EVAL_RUNS_TABLE_TIME_COLUMN, EvalRunResponse, sql_query_for, start_tracing_eval_run,
     },
-    scorer::{builtin_scorer, EvalScorerRegistry, Scorer},
+    scorer::{EvalScorerRegistry, Scorer, builtin_scorer},
 };
 pub use tool_use::ToolUsingChat;
 

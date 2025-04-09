@@ -16,7 +16,7 @@ limitations under the License.
 
 use cache::QueryResultsCacheProvider;
 
-use crate::{datafusion::SPICE_RUNTIME_SCHEMA, Runtime};
+use crate::{Runtime, datafusion::SPICE_RUNTIME_SCHEMA};
 
 impl Runtime {
     pub async fn init_results_cache(&self) {

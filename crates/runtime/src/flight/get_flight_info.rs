@@ -17,15 +17,15 @@ limitations under the License.
 use std::sync::Arc;
 
 use arrow_flight::{
-    sql::{Any, Command},
     FlightDescriptor, FlightEndpoint, FlightInfo, Ticket,
+    sql::{Any, Command},
 };
 use prost::Message;
 use tonic::{Request, Response, Status};
 
 use crate::flight::metrics;
 
-use super::{flightsql, to_tonic_err, Service};
+use super::{Service, flightsql, to_tonic_err};
 
 pub(crate) async fn handle(
     flight_svc: &Service,

@@ -32,11 +32,11 @@ use std::sync::{Arc, Mutex};
 use arrow::{datatypes::SchemaRef, record_batch::RecordBatch};
 use async_trait::async_trait;
 use datafusion::common::{Constraint, Constraints, SchemaExt};
-use datafusion::datasource::{provider_as_source, TableProvider, TableType};
+use datafusion::datasource::{TableProvider, TableType, provider_as_source};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::context::SessionContext;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
-use datafusion::logical_expr::{is_not_true, Expr, LogicalPlanBuilder};
+use datafusion::logical_expr::{Expr, LogicalPlanBuilder, is_not_true};
 use datafusion::physical_plan::insert::{DataSink, DataSinkExec};
 use datafusion::physical_plan::memory::MemoryExec;
 use datafusion::physical_plan::metrics::MetricsSet;
@@ -444,7 +444,9 @@ fn filter_existing(
             if let Some(k) = k {
                 keep_row_builder.append_value(!overwriting_primary_keys.contains(&k));
             } else {
-                unreachable!("Primary keys in `MemSink` record batch contain(s) null(s). This should be impossible, We check non-nullity of primary keys at insertion.");
+                unreachable!(
+                    "Primary keys in `MemSink` record batch contain(s) null(s). This should be impossible, We check non-nullity of primary keys at insertion."
+                );
             }
         }
         let filtered_batch = filter_record_batch(&batch, &keep_row_builder.finish())?;

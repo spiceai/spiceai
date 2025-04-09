@@ -18,13 +18,13 @@ use flight_client::{Credentials, FlightClient};
 use serde::{Deserialize, Serialize};
 use std::{net::SocketAddr, sync::Arc};
 use tonic::transport::Channel;
-use tonic_health::{pb::health_client::HealthClient, ServingStatus};
+use tonic_health::{ServingStatus, pb::health_client::HealthClient};
 
 use axum::{
+    Extension, Json,
     extract::Query,
     http::status,
     response::{IntoResponse, Response},
-    Extension, Json,
 };
 
 use crate::{config, status::ComponentStatus};

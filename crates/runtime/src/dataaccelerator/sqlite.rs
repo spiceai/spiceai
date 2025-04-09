@@ -22,20 +22,21 @@ use datafusion::{
 };
 use datafusion_table_providers::{
     sql::db_connection_pool::sqlitepool::SqliteConnectionPool,
-    sqlite::{write::SqliteTableWriter, SqliteTableProviderFactory},
+    sqlite::{SqliteTableProviderFactory, write::SqliteTableWriter},
 };
 use rusqlite::ffi::{sqlite3_auto_extension, sqlite3_decimal_init};
 use snafu::prelude::*;
 use std::{any::Any, ffi::OsStr, sync::Arc, time::Duration};
 
 use crate::{
+    Runtime,
     component::dataset::{
-        acceleration::{Engine, Mode},
         Dataset,
+        acceleration::{Engine, Mode},
     },
     make_spice_data_directory,
     parameters::ParameterSpec,
-    spice_data_base_path, Runtime,
+    spice_data_base_path,
 };
 
 use super::{DataAccelerator, Error as DataAcceleratorError};
@@ -57,7 +58,9 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("The \"sqlite_file\" acceleration parameter has an invalid extension. Expected one of \"{valid_extensions}\" but got \"{extension}\"."))]
+    #[snafu(display(
+        "The \"sqlite_file\" acceleration parameter has an invalid extension. Expected one of \"{valid_extensions}\" but got \"{extension}\"."
+    ))]
     InvalidFileExtension {
         valid_extensions: String,
         extension: String,
@@ -335,15 +338,15 @@ mod tests {
     use datafusion::{
         common::{Constraints, TableReference, ToDFSchema},
         execution::context::SessionContext,
-        logical_expr::{cast, col, dml::InsertOp, lit, CreateExternalTable},
+        logical_expr::{CreateExternalTable, cast, col, dml::InsertOp, lit},
         physical_plan::collect,
         scalar::ScalarValue,
     };
     use datafusion_table_providers::util::test::MockExec;
 
+    use crate::component::dataset::Dataset;
     use crate::component::dataset::acceleration::Acceleration;
     use crate::component::dataset::acceleration::{Engine, Mode};
-    use crate::component::dataset::Dataset;
     use crate::dataaccelerator::sqlite::SqliteAccelerator;
 
     #[tokio::test]

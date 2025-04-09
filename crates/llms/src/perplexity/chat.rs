@@ -23,9 +23,9 @@ use async_openai::{
 use async_trait::async_trait;
 use futures::TryStreamExt;
 
-use crate::chat::{nsql::SqlGeneration, Chat};
+use crate::chat::{Chat, nsql::SqlGeneration};
 
-use super::{types::PerplexityRequest, PerplexitySonar};
+use super::{PerplexitySonar, types::PerplexityRequest};
 
 #[async_trait]
 impl Chat for PerplexitySonar {

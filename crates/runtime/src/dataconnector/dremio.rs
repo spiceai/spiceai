@@ -22,8 +22,8 @@ use super::ParameterSpec;
 use crate::component::dataset::Dataset;
 use crate::dataconnector::DataConnectorError;
 use async_trait::async_trait;
-use data_components::flight::FlightFactory;
 use data_components::ReadWrite;
+use data_components::flight::FlightFactory;
 use datafusion::datasource::TableProvider;
 use datafusion::sql::sqlparser::ast::TimezoneInfo;
 use datafusion::sql::sqlparser::ast::WindowFrameBound;
@@ -42,16 +42,22 @@ use std::sync::Arc;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Missing required parameter: {parameter}. Specify a value.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/dremio#configuration"))]
+    #[snafu(display(
+        "Missing required parameter: {parameter}. Specify a value.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/dremio#configuration"
+    ))]
     MissingParameter { parameter: String },
 
-    #[snafu(display("Failed to connect to endpoint '{endpoint}'.\nVerify the endpoint is valid/online, and try again.\n{source}"))]
+    #[snafu(display(
+        "Failed to connect to endpoint '{endpoint}'.\nVerify the endpoint is valid/online, and try again.\n{source}"
+    ))]
     UnableToVerifyEndpointConnection {
         source: ns_lookup::Error,
         endpoint: Arc<str>,
     },
 
-    #[snafu(display("Failed to connect to Dremio over Flight.\nVerify your connection configuration, and try again.\n{source}"))]
+    #[snafu(display(
+        "Failed to connect to Dremio over Flight.\nVerify your connection configuration, and try again.\n{source}"
+    ))]
     UnableToCreateFlightClient { source: flight_client::Error },
 }
 

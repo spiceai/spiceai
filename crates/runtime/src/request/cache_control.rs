@@ -17,7 +17,7 @@ limitations under the License.
 use std::sync::Arc;
 
 use app::App;
-use http::{header::CACHE_CONTROL, HeaderMap};
+use http::{HeaderMap, header::CACHE_CONTROL};
 
 #[derive(Debug, Clone, Copy, Default)]
 pub enum CacheKeyType {

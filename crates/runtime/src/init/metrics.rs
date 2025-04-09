@@ -15,8 +15,8 @@ limitations under the License.
 */
 
 use crate::{
-    spice_metrics::{self, get_metrics_table_reference},
     Result, Runtime, UnableToStartLocalMetricsSnafu,
+    spice_metrics::{self, get_metrics_table_reference},
 };
 use snafu::prelude::*;
 

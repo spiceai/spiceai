@@ -24,11 +24,11 @@ use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
 use url::Url;
 
-use super::{
-    listing::{self, ListingTableConnector},
-    DataConnector, DataConnectorFactory, DataConnectorResult, ParameterSpec, Parameters,
-};
 use super::{ConnectorComponent, ConnectorParams};
+use super::{
+    DataConnector, DataConnectorFactory, DataConnectorResult, ParameterSpec, Parameters,
+    listing::{self, ListingTableConnector},
+};
 
 #[derive(Debug, Snafu)]
 pub enum Error {

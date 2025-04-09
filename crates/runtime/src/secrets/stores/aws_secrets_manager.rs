@@ -33,7 +33,10 @@ const SPICE_KEY_PREFIX: &str = "spice_";
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("AWS identity verification failed, check configuration with `aws configure list` and `aws sts get-caller-identity`: {}", source))]
+    #[snafu(display(
+        "AWS identity verification failed, check configuration with `aws configure list` and `aws sts get-caller-identity`: {}",
+        source
+    ))]
     UnableToVerifyAwsIdentity {
         source: SdkError<GetCallerIdentityError>,
     },

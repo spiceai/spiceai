@@ -20,8 +20,8 @@ use datafusion::error::Result;
 use datafusion::execution::context::SessionState;
 use datafusion::logical_expr::{BinaryExpr, Expr, Operator};
 use datafusion::physical_expr::create_physical_expr;
-use datafusion::physical_plan::filter::FilterExec;
 use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_plan::filter::FilterExec;
 use std::sync::Arc;
 
 pub mod fallback_on_zero_results;

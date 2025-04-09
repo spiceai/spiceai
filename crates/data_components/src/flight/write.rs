@@ -21,11 +21,11 @@ use datafusion::{
     datasource::{TableProvider, TableType},
     error::DataFusionError,
     execution::{SendableRecordBatchStream, TaskContext},
-    logical_expr::{dml::InsertOp, Expr},
+    logical_expr::{Expr, dml::InsertOp},
     physical_plan::{
+        DisplayAs, DisplayFormatType, ExecutionPlan,
         insert::{DataSink, DataSinkExec},
         metrics::MetricsSet,
-        DisplayAs, DisplayFormatType, ExecutionPlan,
     },
     sql::TableReference,
 };

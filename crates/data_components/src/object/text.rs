@@ -24,22 +24,22 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use datafusion::{
     catalog::Session,
-    common::{project_schema, Constraints},
+    common::{Constraints, project_schema},
     datasource::{TableProvider, TableType},
     error::{DataFusionError, Result as DataFusionResult},
     execution::{SendableRecordBatchStream, TaskContext},
     logical_expr::{Expr, TableProviderFilterPushDown},
     physical_expr::EquivalenceProperties,
     physical_plan::{
+        DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
         execution_plan::{Boundedness, EmissionType},
         stream::RecordBatchStreamAdapter,
-        DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
     },
 };
 use document_parse::DocumentParser;
 use futures::Stream;
 use futures::StreamExt;
-use object_store::{path::Path, GetResult, ObjectMeta, ObjectStore};
+use object_store::{GetResult, ObjectMeta, ObjectStore, path::Path};
 use snafu::ResultExt;
 use std::{any::Any, fmt, sync::Arc};
 

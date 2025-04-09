@@ -20,15 +20,15 @@ use std::time::Duration;
 use async_stream::stream;
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures::stream::BoxStream;
 use futures::AsyncReadExt;
-use object_store::{
-    path::Path, GetOptions, GetResult, GetResultPayload, ListResult, ObjectMeta, ObjectStore,
-    PutOptions, PutResult,
-};
+use futures::stream::BoxStream;
 use object_store::{Attributes, GetRange, MultipartUpload, PutMultipartOpts, PutPayload};
-use suppaftp::types::FileType;
+use object_store::{
+    GetOptions, GetResult, GetResultPayload, ListResult, ObjectMeta, ObjectStore, PutOptions,
+    PutResult, path::Path,
+};
 use suppaftp::AsyncFtpStream;
+use suppaftp::types::FileType;
 
 #[derive(Debug)]
 pub struct FTPObjectStore {

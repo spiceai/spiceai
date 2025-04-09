@@ -17,21 +17,21 @@ limitations under the License.
 use async_openai::types::{ChatCompletionTool, ChatCompletionToolType, FunctionObject};
 use async_trait::async_trait;
 use mcp_client::{
-    transport::Error as TransportError, ClientCapabilities, ClientInfo, Error as McpError,
-    McpClient, McpClientTrait, McpService, SseTransport, StdioTransport, Transport,
+    ClientCapabilities, ClientInfo, Error as McpError, McpClient, McpClientTrait, McpService,
+    SseTransport, StdioTransport, Transport, transport::Error as TransportError,
 };
 use mcp_core::Tool as McpTool;
 use snafu::ResultExt;
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::{
     sync::RwLock,
-    time::{interval, MissedTickBehavior},
+    time::{MissedTickBehavior, interval},
 };
 
-use crate::tools::{catalog::SpiceToolCatalog, SpiceModelTool};
+use crate::tools::{SpiceModelTool, catalog::SpiceToolCatalog};
 
 use super::{
-    tool::McpToolWrapper, MCPConfig, Result, UnderlyingInitilizationSnafu, UnderlyingTransportSnafu,
+    MCPConfig, Result, UnderlyingInitilizationSnafu, UnderlyingTransportSnafu, tool::McpToolWrapper,
 };
 
 const HEARTBEAT_INTERVAL_SECONDS: u64 = 30; // 30 seconds

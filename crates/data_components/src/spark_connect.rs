@@ -43,7 +43,7 @@ use datafusion_table_providers::sql::sql_provider_datafusion::expr::{self, Engin
 use futures::Stream;
 use spark_connect_rs::errors::SparkError;
 use spark_connect_rs::{
-    client::ChannelBuilder, functions::col, DataFrame, SparkSession, SparkSessionBuilder,
+    DataFrame, SparkSession, SparkSessionBuilder, client::ChannelBuilder, functions::col,
 };
 
 use std::error::Error;

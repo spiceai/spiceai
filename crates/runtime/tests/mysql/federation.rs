@@ -28,10 +28,10 @@ use datafusion::sql::TableReference;
 use datafusion_table_providers::sql::arrow_sql_gen::statement::{
     CreateTableBuilder, InsertBuilder,
 };
-use mysql_async::{prelude::Queryable, Params, Row};
+use mysql_async::{Params, Row, prelude::Queryable};
 use runtime::Runtime;
 use tracing::instrument;
-use util::{fibonacci_backoff::FibonacciBackoffBuilder, retry, RetryError};
+use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
 
 const MYSQL_DOCKER_CONTAINER: &str = "runtime-integration-test-federation-mysql";
 const MYSQL_PORT: u16 = 13306;

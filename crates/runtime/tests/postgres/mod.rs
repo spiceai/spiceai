@@ -22,8 +22,8 @@ use arrow::{
 };
 use datafusion::execution::context::SessionContext;
 use datafusion_table_providers::{
-    postgres::DynPostgresConnectionPool, sql::sql_provider_datafusion::SqlTable,
-    UnsupportedTypeAction,
+    UnsupportedTypeAction, postgres::DynPostgresConnectionPool,
+    sql::sql_provider_datafusion::SqlTable,
 };
 
 use crate::{init_tracing, utils::test_request_context};

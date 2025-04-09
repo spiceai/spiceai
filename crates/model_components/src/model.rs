@@ -18,8 +18,8 @@ limitations under the License.
 
 use crate::{
     modelformat::from_path as format_from_path,
-    modelruntime::{supported_runtime_for_path, Error as ModelRuntimeError, Runnable},
-    modelsource::{path, Error as ModelSourceError, ModelSource, ModelSourceType},
+    modelruntime::{Error as ModelRuntimeError, Runnable, supported_runtime_for_path},
+    modelsource::{Error as ModelSourceError, ModelSource, ModelSourceType, path},
 };
 use arrow::record_batch::RecordBatch;
 use secrecy::SecretString;
@@ -46,7 +46,9 @@ pub enum Error {
     #[snafu(display("{source}"))]
     UnableToRunModel { source: ModelRuntimeError },
 
-    #[snafu(display("Unable to load required secrets.\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"))]
+    #[snafu(display(
+        "Unable to load required secrets.\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+    ))]
     UnableToLoadRequiredSecrets {},
 }
 

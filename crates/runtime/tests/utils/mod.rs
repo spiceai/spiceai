@@ -21,8 +21,8 @@ use std::{
 };
 
 use runtime::{
-    request::{Protocol, RequestContext, UserAgent},
     Runtime,
+    request::{Protocol, RequestContext, UserAgent},
 };
 
 pub(crate) static TEST_REQUEST_CONTEXT: LazyLock<Arc<RequestContext>> = LazyLock::new(|| {

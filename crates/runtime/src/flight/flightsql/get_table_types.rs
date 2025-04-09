@@ -20,15 +20,15 @@ use arrow::{
     datatypes::{DataType, Field, Schema},
 };
 use arrow_flight::{
-    flight_service_server::FlightService, sql, FlightDescriptor, FlightEndpoint, FlightInfo, Ticket,
+    FlightDescriptor, FlightEndpoint, FlightInfo, Ticket, flight_service_server::FlightService, sql,
 };
 use datafusion::datasource::TableType;
 use tonic::{Request, Response, Status};
 
 use crate::{
     flight::{
-        flightsql::get_tables, metrics, record_batches_to_flight_stream, to_tonic_err,
-        util::set_flightsql_protocol, Service,
+        Service, flightsql::get_tables, metrics, record_batches_to_flight_stream, to_tonic_err,
+        util::set_flightsql_protocol,
     },
     timing::TimedStream,
 };

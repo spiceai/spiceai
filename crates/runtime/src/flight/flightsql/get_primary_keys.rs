@@ -21,12 +21,12 @@ use arrow::{
     datatypes::{DataType, Field, Schema},
 };
 use arrow_flight::{
-    flight_service_server::FlightService, sql, FlightDescriptor, FlightEndpoint, FlightInfo, Ticket,
+    FlightDescriptor, FlightEndpoint, FlightInfo, Ticket, flight_service_server::FlightService, sql,
 };
 use tonic::{Request, Response, Status};
 
 use crate::{
-    flight::{metrics, record_batches_to_flight_stream, util::set_flightsql_protocol, Service},
+    flight::{Service, metrics, record_batches_to_flight_stream, util::set_flightsql_protocol},
     timing::TimedStream,
 };
 

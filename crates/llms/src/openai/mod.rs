@@ -16,7 +16,7 @@ limitations under the License.
 #![allow(clippy::missing_errors_doc)]
 
 use async_openai::config::{AzureConfig, Config, OPENAI_API_BASE};
-use async_openai::{config::OpenAIConfig, Client};
+use async_openai::{Client, config::OpenAIConfig};
 
 pub mod chat;
 pub mod embed;

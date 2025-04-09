@@ -18,7 +18,7 @@ use crate::component::dataset::Dataset;
 use async_trait::async_trait;
 use data_components::mssql::connection_manager::SqlServerConnectionManager;
 use data_components::mssql::{
-    self, connection_manager::SqlServerConnectionPool, SqlServerTableProvider,
+    self, SqlServerTableProvider, connection_manager::SqlServerConnectionPool,
 };
 use datafusion::datasource::TableProvider;
 use snafu::{ResultExt, Snafu};
@@ -34,19 +34,29 @@ use super::{
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Missing required parameter: '{parameter}'. Specify a value.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/mssql#configuration"))]
+    #[snafu(display(
+        "Missing required parameter: '{parameter}'. Specify a value.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/mssql#configuration"
+    ))]
     MissingParameter { parameter: String },
 
-    #[snafu(display("Failed to connect to the MS SQL Server.\nVerify your connection configuration, and try again.\n{source}"))]
+    #[snafu(display(
+        "Failed to connect to the MS SQL Server.\nVerify your connection configuration, and try again.\n{source}"
+    ))]
     UnableToCreateConnectionPool { source: mssql::Error },
 
-    #[snafu(display("Invalid connection string.\nVerify the connection string is valid, and try again.\n{source}"))]
+    #[snafu(display(
+        "Invalid connection string.\nVerify the connection string is valid, and try again.\n{source}"
+    ))]
     InvalidConnectionStringError { source: tiberius::error::Error },
 
-    #[snafu(display("Invalid value provided for the 'port' parameter: {port}.\nSpecify a valid port, and try again.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/mssql#configuration"))]
+    #[snafu(display(
+        "Invalid value provided for the 'port' parameter: {port}.\nSpecify a valid port, and try again.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/mssql#configuration"
+    ))]
     FailedToParsePort { port: String },
 
-    #[snafu(display("Invalid value provided for parameter '{parameter}'\nSpecify a valid value, and try again.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/mssql#configuration"))]
+    #[snafu(display(
+        "Invalid value provided for parameter '{parameter}'\nSpecify a valid value, and try again.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/mssql#configuration"
+    ))]
     InvalidParameterValue { parameter: String },
 }
 

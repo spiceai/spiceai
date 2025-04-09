@@ -24,10 +24,10 @@ use datafusion::{
     },
 };
 use object_store::{
-    aws::AmazonS3Builder, azure::MicrosoftAzureBuilder, http::HttpBuilder, ClientOptions,
-    ObjectStore, RetryConfig,
+    ClientOptions, ObjectStore, RetryConfig, aws::AmazonS3Builder, azure::MicrosoftAzureBuilder,
+    http::HttpBuilder,
 };
-use url::{form_urlencoded::parse, Url};
+use url::{Url, form_urlencoded::parse};
 
 #[cfg(feature = "ftp")]
 use crate::objectstore::ftp::FTPObjectStore;

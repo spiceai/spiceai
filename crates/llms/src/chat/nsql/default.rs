@@ -19,7 +19,7 @@ use async_openai::{
     },
 };
 
-use super::{create_prompt, QueryGenerationContext, SqlGeneration};
+use super::{QueryGenerationContext, SqlGeneration, create_prompt};
 
 pub struct DefaultSqlGeneration;
 
@@ -35,10 +35,12 @@ impl SqlGeneration for DefaultSqlGeneration {
         CreateChatCompletionRequestArgs::default()
             .model(model_id)
             .response_format(ResponseFormat::Text)
-            .messages(vec![ChatCompletionRequestSystemMessageArgs::default()
-                .content(prompt)
-                .build()?
-                .into()])
+            .messages(vec![
+                ChatCompletionRequestSystemMessageArgs::default()
+                    .content(prompt)
+                    .build()?
+                    .into(),
+            ])
             .build()
     }
 

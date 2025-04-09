@@ -36,7 +36,7 @@ use {
 };
 
 use super::get_accelerator_engine;
-use crate::component::dataset::{acceleration::Engine, Dataset};
+use crate::component::dataset::{Dataset, acceleration::Engine};
 
 pub mod dataset_checkpoint;
 #[cfg(feature = "debezium")]

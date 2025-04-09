@@ -16,21 +16,21 @@ limitations under the License.
 
 use std::sync::Arc;
 
-use arrow::array::{make_builder, ArrayBuilder, ListBuilder, RecordBatch, StringBuilder};
+use arrow::array::{ArrayBuilder, ListBuilder, RecordBatch, StringBuilder, make_builder};
 use arrow::array::{ListArray, StringArray, StructArray};
 use arrow::datatypes::{DataType, Field, SchemaRef};
-use arrow_flight::{flight_service_server::FlightService, FlightData, SchemaAsIpc};
+use arrow_flight::{FlightData, SchemaAsIpc, flight_service_server::FlightService};
 use arrow_ipc::writer::{self, DictionaryTracker, IpcDataGenerator};
 use data_components::cdc::changes_schema;
 use datafusion::common::{Constraint, Constraints};
 use datafusion::sql::TableReference;
-use futures::{stream, StreamExt};
+use futures::{StreamExt, stream};
 use tokio::sync::broadcast;
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::dataupdate::{DataUpdate, UpdateType};
 
-use super::{metrics, Service};
+use super::{Service, metrics};
 
 #[allow(clippy::too_many_lines)]
 pub(crate) async fn handle(

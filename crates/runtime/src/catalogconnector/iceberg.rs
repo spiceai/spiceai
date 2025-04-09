@@ -16,13 +16,13 @@ limitations under the License.
 
 use super::{CatalogConnector, ConnectorComponent, ParameterSpec, Parameters};
 use crate::{
-    component::catalog::Catalog, dataconnector::ConnectorParams,
-    http::v1::iceberg::namespace::Namespace as HttpNamespace, Runtime,
+    Runtime, component::catalog::Catalog, dataconnector::ConnectorParams,
+    http::v1::iceberg::namespace::Namespace as HttpNamespace,
 };
 use async_trait::async_trait;
 use data_components::{
-    iceberg::{catalog::RestCatalog, provider::IcebergCatalogProvider},
     RefreshableCatalogProvider,
+    iceberg::{catalog::RestCatalog, provider::IcebergCatalogProvider},
 };
 use iceberg::{Namespace, NamespaceIdent};
 use iceberg_catalog_rest::RestCatalogConfig;
@@ -55,7 +55,9 @@ pub enum Error {
     #[snafu(display("Failed to parse URL: {}", source))]
     UrlParse { source: url::ParseError },
 
-    #[snafu(display("Failed to connect to the S3 endpoint at '{url}'.\nVerify the S3 endpoint is accessible and try again."))]
+    #[snafu(display(
+        "Failed to connect to the S3 endpoint at '{url}'.\nVerify the S3 endpoint is accessible and try again."
+    ))]
     FailedToConnectS3Endpoint { url: String },
 
     #[snafu(display("Path must contain 'tables' segment followed by a table name"))]
@@ -199,7 +201,9 @@ impl CatalogConnector for IcebergCatalog {
             Err(e) => {
                 return Err(super::Error::InvalidConfiguration {
                     connector: "iceberg".into(),
-                    message: format!("A Catalog Path is required for Iceberg in the format of: http://<host_and_port>/v1/namespaces/<namespace>.\nFor details, visit: https://spiceai.org/docs/components/catalogs/iceberg#from\n{e}"),
+                    message: format!(
+                        "A Catalog Path is required for Iceberg in the format of: http://<host_and_port>/v1/namespaces/<namespace>.\nFor details, visit: https://spiceai.org/docs/components/catalogs/iceberg#from\n{e}"
+                    ),
                     connector_component: ConnectorComponent::from(catalog),
                     source: Box::new(e),
                 });
@@ -338,7 +342,7 @@ fn parse_iceberg_url(url: &str) -> Result<(String, HashMap<String, String>, Iceb
             return InvalidSchemeSnafu {
                 scheme: other.to_string(),
             }
-            .fail()
+            .fail();
         }
     }
 
@@ -478,10 +482,12 @@ mod tests {
                 .as_str(),
             "spiceai_sandbox"
         );
-        assert!(namespace
-            .expect("Namespace is None")
-            .properties()
-            .is_empty());
+        assert!(
+            namespace
+                .expect("Namespace is None")
+                .properties()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -500,10 +506,12 @@ mod tests {
                 .as_str(),
             "spiceai_sandbox"
         );
-        assert!(namespace
-            .expect("Namespace is None")
-            .properties()
-            .is_empty());
+        assert!(
+            namespace
+                .expect("Namespace is None")
+                .properties()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -557,10 +565,12 @@ mod tests {
                 .as_str(),
             "default"
         );
-        assert!(namespace
-            .expect("Namespace is None")
-            .properties()
-            .is_empty());
+        assert!(
+            namespace
+                .expect("Namespace is None")
+                .properties()
+                .is_empty()
+        );
     }
 
     #[test]

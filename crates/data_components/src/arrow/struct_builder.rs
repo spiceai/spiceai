@@ -18,7 +18,7 @@
 use std::{any::Any, sync::Arc};
 
 use arrow::{
-    array::{make_builder, ArrayBuilder, ArrayRef, StructArray},
+    array::{ArrayBuilder, ArrayRef, StructArray, make_builder},
     datatypes::{DataType, Fields, SchemaBuilder},
 };
 use arrow_buffer::NullBufferBuilder;

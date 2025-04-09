@@ -17,12 +17,11 @@ limitations under the License.
 use std::{collections::HashMap, collections::HashSet, sync::Arc};
 
 use crate::{
-    component::view::View, metrics, status,
-    topological_ordering::construct_effected_in_topological_order, view, LogErrors, Result,
-    Runtime, UnableToAttachViewSnafu,
+    LogErrors, Result, Runtime, UnableToAttachViewSnafu, component::view::View, metrics, status,
+    topological_ordering::construct_effected_in_topological_order, view,
 };
 use app::App;
-use datafusion::sql::{parser::DFParser, sqlparser::dialect::PostgreSqlDialect, TableReference};
+use datafusion::sql::{TableReference, parser::DFParser, sqlparser::dialect::PostgreSqlDialect};
 use itertools::Itertools;
 use snafu::prelude::*;
 

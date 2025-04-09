@@ -16,17 +16,17 @@ limitations under the License.
 use std::sync::Arc;
 
 use axum::{
+    Extension,
     body::Bytes,
     http::StatusCode,
     response::{IntoResponse, Response},
-    Extension,
 };
 use axum_extra::TypedHeader;
 use headers_accept::Accept;
 
 use crate::datafusion::DataFusion;
 
-use super::{sql_to_http_response, ArrowFormat};
+use super::{ArrowFormat, sql_to_http_response};
 
 /// SQL Query
 ///

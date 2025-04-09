@@ -14,13 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 use crate::embeddings::vector_search::{
-    self, to_matches_sorted, Match, SearchRequest, SearchRequestAIJson, SearchRequestHTTPJson,
-    VectorSearch,
+    self, Match, SearchRequest, SearchRequestAIJson, SearchRequestHTTPJson, VectorSearch,
+    to_matches_sorted,
 };
 use axum::{
+    Extension, Json,
     http::StatusCode,
     response::{IntoResponse, Response},
-    Extension, Json,
 };
 use serde::{Deserialize, Serialize};
 use std::{sync::Arc, time::Instant};

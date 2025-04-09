@@ -19,7 +19,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use clickhouse_rs::{ClientHandle, Options, Pool};
 use datafusion_table_providers::sql::db_connection_pool::{
-    dbconnection::DbConnection, DbConnectionPool, JoinPushDown,
+    DbConnectionPool, JoinPushDown, dbconnection::DbConnection,
 };
 use snafu::Snafu;
 

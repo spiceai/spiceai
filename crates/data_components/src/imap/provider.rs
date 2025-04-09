@@ -59,7 +59,7 @@ macro_rules! parse_addreses_from_envelope {
                         (Some(_), None) | (None, Some(_)) => {
                             return Err(Error::EnvelopeNotFound {
                                 segment: stringify!($segment).to_string(),
-                            })
+                            });
                         }
                         (None, None) => continue,
                     }
@@ -187,7 +187,7 @@ impl TableProvider for ImapTableProvider {
         }
 
         session.logout().context(FailedToLogoutSnafu)?; // good IMAP etiquette to not leave the session open
-                                                        // logging out will drop the session, which also drops the client, which drops the stream/connection
+        // logging out will drop the session, which also drops the client, which drops the stream/connection
 
         let record_batch = self.build_recordbatch(messages)?;
         let table = MemTable::try_new(self.schema(), vec![vec![record_batch]])?;

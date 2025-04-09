@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime};
 use datafusion_table_providers::sql::arrow_sql_gen::arrow::map_data_type_to_array_builder;
-use tiberius::{numeric::Numeric, xml::XmlData, ColumnType, Row};
+use tiberius::{ColumnType, Row, numeric::Numeric, xml::XmlData};
 use uuid::Uuid;
 
 use arrow::{
@@ -281,7 +281,7 @@ pub(crate) fn rows_to_arrow(rows: &[Row], schema: &SchemaRef) -> super::Result<R
                         Some(v) => {
                             if matches!(mssql_type, ColumnType::BigChar | ColumnType::NChar) {
                                 builder.append_value(v.trim_end()); // MS SQL returns space-padded chars to the length of the char
-                                                                    // memory execution does not trim space-padded chars in WHERE clauses, but MS SQL does - trim incoming CHARs to replicate this behavior
+                            // memory execution does not trim space-padded chars in WHERE clauses, but MS SQL does - trim incoming CHARs to replicate this behavior
                             } else {
                                 builder.append_value(v);
                             }

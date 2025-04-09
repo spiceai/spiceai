@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use common::{get_mysql_conn, make_mysql_dataset, start_mysql_docker_container};
 use mysql_async::prelude::Queryable;
-use util::{fibonacci_backoff::FibonacciBackoffBuilder, retry, RetryError};
+use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
 
 use crate::init_tracing;
 use crate::utils::test_request_context;

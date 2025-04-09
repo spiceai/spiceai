@@ -22,9 +22,9 @@ use snafu::ResultExt;
 use std::{borrow::Cow, collections::HashMap, sync::Arc};
 
 use crate::{
+    Runtime,
     datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA},
     tools::SpiceModelTool,
-    Runtime,
 };
 
 pub struct ListDatasetsTool {

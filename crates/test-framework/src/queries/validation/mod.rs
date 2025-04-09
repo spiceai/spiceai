@@ -20,14 +20,14 @@ use std::{
     sync::{Arc, LazyLock},
 };
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 
 use arrow::{
     array::{
-        Array, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array, Int16Array,
-        Int32Array, Int64Array, Int8Array, LargeStringArray, RecordBatch, StringArray,
+        Array, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array, Int8Array,
+        Int16Array, Int32Array, Int64Array, LargeStringArray, RecordBatch, StringArray,
         TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
-        TimestampSecondArray, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
+        TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
     },
     csv::reader::Format,
     datatypes::TimeUnit,
@@ -448,7 +448,7 @@ pub fn validate_tpch_query(
         _ => {
             return Ok(QueryValidationResult::Fail(
                 QueryValidationFailReason::NoAnswer,
-            ))
+            ));
         }
     }
 
@@ -501,8 +501,8 @@ mod test {
     use super::*;
     use arrow::{
         array::{
-            Decimal128Builder, Float32Array, Int16Array, Int8Array, UInt16Array, UInt32Array,
-            UInt64Array, UInt8Array,
+            Decimal128Builder, Float32Array, Int8Array, Int16Array, UInt8Array, UInt16Array,
+            UInt32Array, UInt64Array,
         },
         datatypes::{Field, Schema, SchemaRef},
     };

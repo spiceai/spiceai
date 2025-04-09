@@ -24,7 +24,7 @@ limitations under the License.
 //!     `updated_at` TIMESTAMP DEFAULT `CURRENT_TIMESTAMP` ON UPDATE `CURRENT_TIMESTAMP`,
 //! );
 
-use super::{acceleration_connection, AccelerationConnection, Result};
+use super::{AccelerationConnection, Result, acceleration_connection};
 use crate::{component::dataset::Dataset, dataconnector::debezium::DebeziumKafkaMetadata};
 
 const DEBEZIUM_KAFKA_TABLE_NAME: &str = "spice_sys_debezium_kafka";

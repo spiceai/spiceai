@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::{DebeziumKafkaMetadata, DebeziumKafkaSys, Result, DEBEZIUM_KAFKA_TABLE_NAME};
+use super::{DEBEZIUM_KAFKA_TABLE_NAME, DebeziumKafkaMetadata, DebeziumKafkaSys, Result};
 use data_components::debezium::change_event;
 use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
 use std::sync::Arc;

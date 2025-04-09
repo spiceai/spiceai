@@ -20,7 +20,7 @@ use app::App;
 use tokio::sync::RwLock;
 
 use crate::{
-    catalogconnector, dataaccelerator, dataconnector,
+    Runtime, catalogconnector, dataaccelerator, dataconnector,
     datafusion::DataFusion,
     datasets_health_monitor::DatasetsHealthMonitor,
     extension::{Extension, ExtensionFactory},
@@ -29,7 +29,7 @@ use crate::{
     secrets::{self, Secrets},
     status,
     timing::TimeMeasurement,
-    tools, tracers, Runtime,
+    tools, tracers,
 };
 
 pub struct RuntimeBuilder {

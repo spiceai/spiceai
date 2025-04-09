@@ -17,13 +17,13 @@ limitations under the License.
 use crate::{dataconnector::ConnectorComponent, datafusion::error::find_datafusion_root};
 
 use super::{
-    commits_inject_parameters, filter_pushdown, inject_parameters, GitHubTableArgs,
-    GitHubTableGraphQLParams,
+    GitHubTableArgs, GitHubTableGraphQLParams, commits_inject_parameters, filter_pushdown,
+    inject_parameters,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use data_components::{
     github::error_checker,
-    graphql::{client::GraphQLQuery, ErrorChecker, FilterPushdownResult, GraphQLContext},
+    graphql::{ErrorChecker, FilterPushdownResult, GraphQLContext, client::GraphQLQuery},
 };
 use datafusion::prelude::Expr;
 use std::sync::Arc;

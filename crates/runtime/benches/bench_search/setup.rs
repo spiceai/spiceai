@@ -19,16 +19,16 @@ use std::{collections::HashMap, sync::Arc};
 use arrow::array::RecordBatch;
 use datafusion::sql::TableReference;
 use futures::TryStreamExt;
-use runtime::{dataupdate::DataUpdate, Runtime};
+use runtime::{Runtime, dataupdate::DataUpdate};
 
 use crate::{
-    utils::{get_branch_name, get_commit_sha, init_tracing},
     SearchBenchmarkConfiguration,
+    utils::{get_branch_name, get_commit_sha, init_tracing},
 };
 
 use app::AppBuilder;
 use spicepod::component::{
-    dataset::{acceleration::Acceleration, replication::Replication, Dataset, Mode},
+    dataset::{Dataset, Mode, acceleration::Acceleration, replication::Replication},
     embeddings::{EmbeddingChunkConfig, Embeddings},
     runtime::{CacheKeyType, ResultsCache},
 };

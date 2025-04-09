@@ -19,7 +19,7 @@ use std::time::SystemTime;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion_table_providers::sql::db_connection_pool::postgrespool::PostgresConnectionPool;
 
-use super::{DatasetCheckpoint, Result, CHECKPOINT_TABLE_NAME, SCHEMA_MIGRATION_01_STMT};
+use super::{CHECKPOINT_TABLE_NAME, DatasetCheckpoint, Result, SCHEMA_MIGRATION_01_STMT};
 
 impl DatasetCheckpoint {
     pub(super) async fn init_postgres(pool: &PostgresConnectionPool) -> Result<()> {

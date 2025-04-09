@@ -25,7 +25,7 @@ use datafusion::{
 };
 use futures::TryStreamExt;
 
-use runtime::{datafusion::DataFusion, status, Runtime};
+use runtime::{Runtime, datafusion::DataFusion, status};
 use tracing::subscriber::DefaultGuard;
 use tracing_subscriber::EnvFilter;
 mod abfs;

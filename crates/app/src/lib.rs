@@ -21,6 +21,7 @@ use std::{collections::HashMap, path::PathBuf};
 use snafu::prelude::*;
 pub use spicepod;
 use spicepod::{
+    Spicepod,
     component::{
         catalog::Catalog,
         dataset::Dataset,
@@ -33,7 +34,6 @@ use spicepod::{
         view::View,
     },
     extension::Extension,
-    Spicepod,
 };
 
 pub mod runtime;

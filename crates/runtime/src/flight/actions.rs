@@ -20,14 +20,14 @@ use prost::Message;
 use tonic::{Request, Response, Status};
 
 use crate::{
-    flight::{flightsql::prepared_statement_query, metrics, to_tonic_err, Service},
+    flight::{Service, flightsql::prepared_statement_query, metrics, to_tonic_err},
     timing::TimedStream,
 };
 
 use arrow_flight::{
+    Action, ActionType as FlightActionType,
     flight_service_server::FlightService,
     sql::{self, Any, ProstMessageExt},
-    Action, ActionType as FlightActionType,
 };
 
 enum ActionType {

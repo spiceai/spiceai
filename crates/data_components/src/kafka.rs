@@ -16,11 +16,11 @@ limitations under the License.
 
 use futures::{Stream, StreamExt};
 use rdkafka::{
+    ClientConfig, Message, Offset,
     config::RDKafkaLogLevel,
     consumer::{Consumer, StreamConsumer},
     message::BorrowedMessage,
     util::get_rdkafka_version,
-    ClientConfig, Message, Offset,
 };
 use serde::de::DeserializeOwned;
 use snafu::prelude::*;

@@ -24,8 +24,8 @@ use snafu::prelude::*;
 
 use async_trait::async_trait;
 use runtime::{
-    extension::{Error as ExtensionError, Extension, ExtensionFactory, ExtensionManifest, Result},
     Runtime,
+    extension::{Error as ExtensionError, Extension, ExtensionFactory, ExtensionManifest, Result},
 };
 
 #[derive(Debug, Snafu)]
@@ -114,7 +114,9 @@ impl Extension for TpcExtension {
             .boxed()
             .map_err(|source| ExtensionError::UnableToStartExtension { source })?;
 
-        tracing::info!("Setting up {benchmark} benchamrk datasets with scale factor {scale_factor}, using file {path}");
+        tracing::info!(
+            "Setting up {benchmark} benchamrk datasets with scale factor {scale_factor}, using file {path}"
+        );
 
         let gen_func = match benchmark.as_str() {
             "tpch" => String::from("dbgen"),
@@ -124,7 +126,7 @@ impl Extension for TpcExtension {
                     source: Box::new(Error::InvalidBenchmark {
                         benchmark: benchmark.clone(),
                     }),
-                })
+                });
             }
         };
 

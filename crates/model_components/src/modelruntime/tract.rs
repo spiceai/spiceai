@@ -23,8 +23,8 @@ use arrow::datatypes::DataType;
 use arrow::datatypes::Field;
 use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
-use snafu::prelude::*;
 use snafu::ResultExt;
+use snafu::prelude::*;
 use std::sync::Arc;
 
 use crate::modelformat::onnx;
@@ -159,11 +159,13 @@ impl Runnable for Model {
             })?
             .into_tensor();
 
-            let output = this.model.run(tvec!(small_vec
-                .cast_to_dt(DatumType::F32)
-                .context(TractSnafu)?
-                .deep_clone()
-                .into()));
+            let output = this.model.run(tvec!(
+                small_vec
+                    .cast_to_dt(DatumType::F32)
+                    .context(TractSnafu)?
+                    .deep_clone()
+                    .into()
+            ));
 
             let result: Vec<f32> = output?[0]
                 .to_array_view::<f32>()

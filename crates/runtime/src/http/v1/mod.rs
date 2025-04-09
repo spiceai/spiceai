@@ -38,7 +38,7 @@ use std::sync::Arc;
 
 use crate::{
     component::dataset::Dataset,
-    datafusion::{query::QueryBuilder, DataFusion},
+    datafusion::{DataFusion, query::QueryBuilder},
     status::ComponentStatus,
 };
 use arrow::{array::RecordBatch, util::pretty::pretty_format_batches};
@@ -59,8 +59,8 @@ use futures::TryStreamExt;
 #[cfg(feature = "openapi")]
 use utoipa::{
     openapi::{
-        path::{Parameter, ParameterBuilder, ParameterIn},
         Required,
+        path::{Parameter, ParameterBuilder, ParameterIn},
     },
     schema,
 };
@@ -80,13 +80,15 @@ pub enum Format {
 #[cfg(feature = "openapi")]
 impl utoipa::IntoParams for Format {
     fn into_params(parameter_in_provider: impl Fn() -> Option<ParameterIn>) -> Vec<Parameter> {
-        vec![ParameterBuilder::new()
-            .description(Some(""))
-            .name("format")
-            .required(Required::True)
-            .parameter_in(parameter_in_provider().unwrap_or_default())
-            .schema(Some(schema!(Format)))
-            .build()]
+        vec![
+            ParameterBuilder::new()
+                .description(Some(""))
+                .name("format")
+                .required(Required::True)
+                .parameter_in(parameter_in_provider().unwrap_or_default())
+                .schema(Some(schema!(Format)))
+                .build(),
+        ]
     }
 }
 

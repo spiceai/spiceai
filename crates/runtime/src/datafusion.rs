@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use crate::accelerated_table::refresh::{self, RefreshOverrides};
 use crate::accelerated_table::{self, AcceleratedTableBuilderError};
-use crate::accelerated_table::{refresh::Refresh, AcceleratedTable, Retention};
+use crate::accelerated_table::{AcceleratedTable, Retention, refresh::Refresh};
 use crate::component::dataset::acceleration::RefreshMode;
 use crate::component::dataset::{Dataset, Mode};
 use crate::dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint;
@@ -49,7 +49,7 @@ use datafusion::logical_expr::dml::InsertOp;
 use datafusion::physical_plan::collect;
 use datafusion::sql::parser::DFParser;
 use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
-use datafusion::sql::{sqlparser, TableReference};
+use datafusion::sql::{TableReference, sqlparser};
 use datafusion_federation::FederatedTableProviderAdaptor;
 use error::find_datafusion_root;
 use itertools::Itertools;
@@ -57,9 +57,9 @@ use query::QueryBuilder;
 use schema::ensure_schema_exists;
 use snafu::prelude::*;
 use tokio::spawn;
-use tokio::sync::oneshot;
 use tokio::sync::RwLock as TokioRwLock;
-use tokio::time::{sleep, Instant};
+use tokio::sync::oneshot;
+use tokio::time::{Instant, sleep};
 
 pub mod query;
 
@@ -116,10 +116,14 @@ pub enum Error {
     #[snafu(display("Unable to resolve table provider: {source}"))]
     UnableToResolveTableProvider { source: DataConnectorError },
 
-    #[snafu(display("Table {table_name} was marked as read_write, but the underlying provider only supports reads."))]
+    #[snafu(display(
+        "Table {table_name} was marked as read_write, but the underlying provider only supports reads."
+    ))]
     WriteProviderNotImplemented { table_name: String },
 
-    #[snafu(display("Table {table_name} is expected to provide metadata, but the underlying provider does not support this."))]
+    #[snafu(display(
+        "Table {table_name} is expected to provide metadata, but the underlying provider does not support this."
+    ))]
     MetadataProviderNotImplemented { table_name: String },
 
     #[snafu(display("Unable to register table in DataFusion: {source}"))]
@@ -198,7 +202,9 @@ pub enum Error {
     #[snafu(display("Unable to get the lock of data writers"))]
     UnableToLockDataWriters {},
 
-    #[snafu(display("The schema returned by the data connector for 'refresh_mode: changes' does not contain a data field"))]
+    #[snafu(display(
+        "The schema returned by the data connector for 'refresh_mode: changes' does not contain a data field"
+    ))]
     ChangeSchemaWithoutDataField { source: ArrowError },
 
     #[snafu(display("Unable to create streaming data update: {source}"))]
@@ -210,7 +216,7 @@ pub enum Error {
     InvalidTimeColumnTimeFormat { source: refresh::Error },
 
     #[snafu(display(
-         "Acceleration mode `append` requires `time_column` parameter for source {from}.\nConfigure `time_column` parameter and try again.\nFor details, visit: https://spiceai.org/docs/reference/spicepod/datasets#time_column"
+        "Acceleration mode `append` requires `time_column` parameter for source {from}.\nConfigure `time_column` parameter and try again.\nFor details, visit: https://spiceai.org/docs/reference/spicepod/datasets#time_column"
     ))]
     AppendRequiresTimeColumn { from: String },
 
@@ -904,34 +910,45 @@ impl DataFusion {
     ) {
         let parent_table_reference = TableReference::parse_str(dataset.path());
         let Ok(parent_table) = self.get_table_provider(&parent_table_reference).await else {
-            tracing::debug!("Could not synchronize refreshes with parent table {parent_table_reference}. Parent table not found.");
+            tracing::debug!(
+                "Could not synchronize refreshes with parent table {parent_table_reference}. Parent table not found."
+            );
             return;
         };
         let Some(parent_table_federation_adaptor) = parent_table
             .as_any()
             .downcast_ref::<FederatedTableProviderAdaptor>(
         ) else {
-            tracing::debug!("Could not synchronize refreshes with parent table {parent_table_reference}. Parent table is not a federated table.");
+            tracing::debug!(
+                "Could not synchronize refreshes with parent table {parent_table_reference}. Parent table is not a federated table."
+            );
             return;
         };
         let Some(parent_table) = parent_table_federation_adaptor.table_provider.clone() else {
-            tracing::debug!("Could not synchronize refreshes with parent table {parent_table_reference}. Parent federated table doesn't contain a table provider.");
+            tracing::debug!(
+                "Could not synchronize refreshes with parent table {parent_table_reference}. Parent federated table doesn't contain a table provider."
+            );
             return;
         };
         let Some(parent_table) = parent_table.as_any().downcast_ref::<AcceleratedTable>() else {
-            tracing::debug!("Could not synchronize refreshes with parent table {parent_table_reference}. Parent table is not an accelerated table.");
+            tracing::debug!(
+                "Could not synchronize refreshes with parent table {parent_table_reference}. Parent table is not an accelerated table."
+            );
             return;
         };
         if let Err(e) = accelerated_table_builder
             .synchronize_with(parent_table)
             .await
         {
-            tracing::debug!("Could not synchronize refreshes with parent table {parent_table_reference}. Error: {e}");
+            tracing::debug!(
+                "Could not synchronize refreshes with parent table {parent_table_reference}. Error: {e}"
+            );
             return;
         }
 
         tracing::info!(
-            "Localpod dataset {} synchronizing refreshes with parent table {parent_table_reference}", dataset.name
+            "Localpod dataset {} synchronizing refreshes with parent table {parent_table_reference}",
+            dataset.name
         );
     }
 
@@ -1180,7 +1197,9 @@ impl DataFusion {
                         }
 
                         if attempts % 10 == 0 {
-                            tracing::warn!("Dependent table {dependent_table_name} for view {table} does not exist, retrying...");
+                            tracing::warn!(
+                                "Dependent table {dependent_table_name} for view {table} does not exist, retrying..."
+                            );
                         }
                         attempts += 1;
                         sleep(Duration::from_secs(1)).await;
@@ -1191,7 +1210,9 @@ impl DataFusion {
             }
 
             if let Some(missing_table) = unresolved_dependent_table {
-                tracing::error!("Failed to create view {table}. Dependent table {missing_table} does not exist.");
+                tracing::error!(
+                    "Failed to create view {table}. Dependent table {missing_table} does not exist."
+                );
                 return;
             }
 

@@ -20,7 +20,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use super::{DatasetCheckpoint, Result, CHECKPOINT_TABLE_NAME, SCHEMA_MIGRATION_01_STMT};
+use super::{CHECKPOINT_TABLE_NAME, DatasetCheckpoint, Result, SCHEMA_MIGRATION_01_STMT};
 use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
 
 impl DatasetCheckpoint {
@@ -395,11 +395,13 @@ mod tests {
         let (checkpoint, _) = create_in_memory_duckdb_checkpoint();
 
         // Initially, there should be no checkpoint time
-        assert!(checkpoint
-            .last_checkpoint_time()
-            .await
-            .expect("Unexpected checkpoint failure")
-            .is_none());
+        assert!(
+            checkpoint
+                .last_checkpoint_time()
+                .await
+                .expect("Unexpected checkpoint failure")
+                .is_none()
+        );
 
         // Create a test schema
         let schema = Schema::new(vec![

@@ -17,19 +17,19 @@ limitations under the License.
 use std::sync::Arc;
 
 use arrow_flight::{
+    FlightDescriptor, FlightEndpoint, FlightInfo, Ticket,
     flight_service_server::FlightService,
     sql::{self, ProstMessageExt},
-    FlightDescriptor, FlightEndpoint, FlightInfo, Ticket,
 };
 use prost::Message;
 use tonic::{Request, Response, Status};
 
 use crate::{
     flight::{
+        Service,
         metrics::track_flight_request,
         to_tonic_err,
         util::{attach_cache_metadata, set_flightsql_protocol},
-        Service,
     },
     timing::TimedStream,
 };

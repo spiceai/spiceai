@@ -41,7 +41,9 @@ pub enum Error {
     #[snafu(display("Missing the parameters map for org.apache.kafka.connect.data.Decimal"))]
     MissingParametersForDecimal,
 
-    #[snafu(display("Missing the `connect.decimal.precision` parameter for org.apache.kafka.connect.data.Decimal"))]
+    #[snafu(display(
+        "Missing the `connect.decimal.precision` parameter for org.apache.kafka.connect.data.Decimal"
+    ))]
     MissingPrecisionForDecimal,
 
     #[snafu(display("Unable to parse precision value for decimal: {source}"))]

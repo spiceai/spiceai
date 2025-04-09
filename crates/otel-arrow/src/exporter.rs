@@ -17,7 +17,7 @@ limitations under the License.
 use arrow::array::RecordBatch;
 use async_trait::async_trait;
 use opentelemetry_sdk::metrics::{
-    data::ResourceMetrics, exporter::PushMetricExporter, MetricError, Temporality,
+    MetricError, Temporality, data::ResourceMetrics, exporter::PushMetricExporter,
 };
 
 use crate::converter::OtelToArrowConverter;
