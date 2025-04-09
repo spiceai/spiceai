@@ -150,10 +150,13 @@ async fn s3_pdfs() -> Result<(), anyhow::Error> {
             let app = AppBuilder::new("s3_pdfs").with_dataset(dataset).build();
 
             let status = status::RuntimeStatus::new();
-            let df = get_test_datafusion(Arc::clone(&status));
+            let accelerator_registry = runtime::dataaccelerator::create_accelerator_registry();
+            let df = get_test_datafusion(Arc::clone(&status), Arc::clone(&accelerator_registry));
 
             let rt = Runtime::builder()
                 .with_datafusion(df)
+                .with_runtime_status(status)
+                .with_accelerator_registry(accelerator_registry)
                 .with_app(app)
                 .build()
                 .await;
