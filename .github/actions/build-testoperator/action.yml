@@ -29,13 +29,13 @@ runs:
     
     - name: Setup Rust
       if: ${{ env.TESTOPERATOR_DOWNLOADED != 'true' }}
-      uses: spiceai/spiceai/.github/actions/setup-rust
+      uses: spiceai/spiceai/.github/actions/setup-rust@feature/upgrade-datafusion
       with:
         os: 'linux'
 
     - name: Setup cc
       if: ${{ env.TESTOPERATOR_DOWNLOADED != 'true' }}
-      uses: spiceai/spiceai/.github/actions/setup-cc
+      uses: spiceai/spiceai/.github/actions/setup-cc@trunk
 
     - name: Build the testoperator if it wasn't downloaded
       shell: bash
