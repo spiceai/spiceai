@@ -22,6 +22,7 @@ use datafusion::sql::TableReference;
 use snafu::prelude::*;
 use tokio::sync::{Mutex, RwLock};
 
+use crate::accelerated_table::AcceleratorRegistry;
 use crate::accelerated_table::{AcceleratedTableBuilderError, Retention};
 use crate::component::dataset::acceleration::{Acceleration, Engine};
 use crate::component::dataset::{Dataset, Mode};
@@ -95,7 +96,7 @@ async fn get_local_table_provider(
 
 #[allow(clippy::too_many_arguments)]
 pub async fn create_internal_accelerated_table(
-    accelerator_registry: Arc<Mutex<HashMap<Engine, Arc<dyn DataAccelerator>>>>,
+    accelerator_registry: AcceleratorRegistry,
     runtime_status: Arc<status::RuntimeStatus>,
     name: TableReference,
     schema: Arc<Schema>,

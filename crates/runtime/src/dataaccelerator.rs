@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::accelerated_table::AcceleratorRegistry;
 use crate::component::dataset::acceleration::{self, Acceleration, Engine, IndexType, Mode};
 use crate::component::dataset::Dataset;
 use crate::parameters::ParameterSpec;
@@ -86,7 +87,7 @@ pub async fn register_accelerator_engine(
     registry.insert(name, accelerator_engine);
 }
 
-pub fn create_accelerator_registry() -> Arc<Mutex<HashMap<Engine, Arc<dyn DataAccelerator>>>> {
+pub fn create_accelerator_registry() -> AcceleratorRegistry {
     Arc::new(Mutex::new(HashMap::new()))
 }
 
@@ -127,7 +128,7 @@ pub async fn unregister_all(rt: &Runtime) {
 }
 
 pub async fn get_accelerator_engine(
-    accelerator_registry: Arc<Mutex<HashMap<Engine, Arc<dyn DataAccelerator>>>>,
+    accelerator_registry: AcceleratorRegistry,
     engine: Engine,
 ) -> Option<Arc<dyn DataAccelerator>> {
     let guard = accelerator_registry.lock().await;
@@ -343,7 +344,7 @@ impl AcceleratorExternalTableBuilder {
 }
 
 pub async fn create_accelerator_table(
-    accelerator_registry: Arc<Mutex<HashMap<Engine, Arc<dyn DataAccelerator>>>>,
+    accelerator_registry: AcceleratorRegistry,
     table_name: TableReference,
     schema: SchemaRef,
     constraints: Option<&Constraints>,

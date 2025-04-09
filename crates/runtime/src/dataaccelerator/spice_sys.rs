@@ -36,10 +36,9 @@ use {
 };
 
 use super::get_accelerator_engine;
+use crate::accelerated_table::AcceleratorRegistry;
 use crate::component::dataset::{acceleration::Engine, Dataset};
 use crate::DataAccelerator;
-use std::collections::HashMap;
-use tokio::sync::Mutex;
 
 pub mod dataset_checkpoint;
 #[cfg(feature = "debezium")]
@@ -57,7 +56,7 @@ enum AccelerationConnection {
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 async fn acceleration_connection(
-    accelerator_registry: Arc<Mutex<HashMap<Engine, Arc<dyn DataAccelerator>>>>,
+    accelerator_registry: AcceleratorRegistry,
     dataset: &Dataset,
     create_table_if_not_exists: bool,
 ) -> Result<AccelerationConnection> {

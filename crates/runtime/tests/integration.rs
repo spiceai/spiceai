@@ -25,6 +25,7 @@ use datafusion::{
 };
 use futures::TryStreamExt;
 
+use crate::accelerated_table::AcceleratorRegistry;
 use runtime::{
     component::dataset::acceleration::Engine, dataaccelerator::DataAccelerator,
     datafusion::DataFusion, status, Runtime,
@@ -89,7 +90,7 @@ mod rehydration;
 /// 1) Sets the number of `target_partitions` to 3, by default its the number of CPU cores available.
 fn get_test_datafusion(
     status: Arc<status::RuntimeStatus>,
-    accelerator_registry: Arc<Mutex<HashMap<Engine, Arc<dyn DataAccelerator>>>>,
+    accelerator_registry: AcceleratorRegistry,
 ) -> Arc<DataFusion> {
     let mut df = DataFusion::builder(status, accelerator_registry).build();
 

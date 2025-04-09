@@ -14,14 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use crate::accelerated_table::refresh::{self, RefreshOverrides};
+use crate::accelerated_table::AcceleratorRegistry;
 use crate::accelerated_table::{self, AcceleratedTableBuilderError};
 use crate::accelerated_table::{refresh::Refresh, AcceleratedTable, Retention};
-use crate::component::dataset::acceleration::Engine;
 use crate::component::dataset::acceleration::RefreshMode;
 use crate::component::dataset::{Dataset, Mode};
 use crate::dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint;
@@ -36,7 +36,6 @@ use crate::dataupdate::{
 use crate::federated_table::FederatedTable;
 use crate::secrets::Secrets;
 use crate::{status, view};
-use tokio::sync::Mutex;
 
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow::error::ArrowError;
@@ -256,7 +255,7 @@ pub struct DataFusion {
     cache_provider: RwLock<Option<Arc<QueryResultsCacheProvider>>>,
 
     pending_sink_tables: TokioRwLock<Vec<PendingSinkRegistration>>,
-    accelerator_registry: Arc<Mutex<HashMap<Engine, Arc<dyn DataAccelerator>>>>,
+    accelerator_registry: AcceleratorRegistry,
 }
 
 impl std::fmt::Debug for DataFusion {
@@ -274,7 +273,7 @@ impl DataFusion {
     #[must_use]
     pub fn builder(
         status: Arc<status::RuntimeStatus>,
-        accelerator_registry: Arc<Mutex<HashMap<Engine, Arc<dyn DataAccelerator>>>>,
+        accelerator_registry: AcceleratorRegistry,
     ) -> DataFusionBuilder {
         DataFusionBuilder::new(status, accelerator_registry)
     }
@@ -293,7 +292,7 @@ impl DataFusion {
         None
     }
 
-    pub fn accelerator_registry(&self) -> Arc<Mutex<HashMap<Engine, Arc<dyn DataAccelerator>>>> {
+    pub fn accelerator_registry(&self) -> AcceleratorRegistry {
         Arc::clone(&self.accelerator_registry)
     }
 

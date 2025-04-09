@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use crate::accelerated_table::refresh::Refresh;
+use crate::accelerated_table::AcceleratorRegistry;
 use crate::datafusion::DataFusion;
 use crate::dataupdate::{DataUpdate, UpdateType};
 use crate::internal_table::create_internal_accelerated_table;
@@ -79,7 +80,7 @@ pub(crate) struct TaskSpan {
 
 impl TaskSpan {
     pub async fn instantiate_table(
-        accelerator_registry: Arc<Mutex<HashMap<Engine, Arc<dyn DataAccelerator>>>>,
+        accelerator_registry: AcceleratorRegistry,
         status: Arc<status::RuntimeStatus>,
         retention_period_secs: u64,
         retention_check_interval_secs: u64,

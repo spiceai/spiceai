@@ -16,6 +16,7 @@ limitations under the License.
 
 use std::{sync::Arc, time::Duration};
 
+use crate::accelerated_table::AcceleratorRegistry;
 use async_trait::async_trait;
 use datafusion::{datasource::TableProvider, sql::TableReference};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -312,7 +313,7 @@ async fn get_spiceai_table_provider(
 ///
 /// This function will return an error if the accelerated table provider cannot be created
 pub async fn create_synced_internal_accelerated_table(
-    accelerator_registry: Arc<Mutex<HashMap<Engine, Arc<dyn DataAccelerator>>>>,
+    accelerator_registry: AcceleratorRegistry,
     runtime_status: Arc<status::RuntimeStatus>,
     table_reference: TableReference,
     from: &str,

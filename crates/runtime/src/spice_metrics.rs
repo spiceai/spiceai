@@ -26,6 +26,7 @@ use snafu::prelude::*;
 use tokio::sync::{Mutex, RwLock};
 
 use crate::accelerated_table::refresh::Refresh;
+use crate::accelerated_table::AcceleratorRegistry;
 use crate::accelerated_table::Retention;
 use crate::component::dataset::acceleration::Acceleration;
 use crate::component::dataset::TimeFormat;
@@ -91,7 +92,7 @@ impl otel_arrow::ArrowExporter for SpiceMetricsExporter {
 }
 
 pub async fn register_metrics_table(
-    accelerator_registry: Arc<Mutex<HashMap<Engine, Arc<dyn DataAccelerator>>>>,
+    accelerator_registry: AcceleratorRegistry,
     datafusion: &Arc<DataFusion>,
 ) -> Result<(), Error> {
     let metrics_table_reference = get_metrics_table_reference();

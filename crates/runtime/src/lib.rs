@@ -22,6 +22,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 use std::{collections::HashMap, sync::Arc};
 
+use crate::accelerated_table::AcceleratorRegistry;
 use crate::{
     auth::EndpointAuth, dataconnector::DataConnector, datafusion::DataFusion,
     internal_table::Error as InternalTableError, model::ENABLE_MODEL_SUPPORT_MESSAGE,
@@ -52,7 +53,7 @@ use snafu::prelude::*;
 use spicepod::component::eval::Eval;
 use status::ComponentStatus;
 use tls::TlsConfig;
-use tokio::sync::Mutex;
+
 use tokio::sync::{oneshot::error::RecvError, RwLock};
 use tokio_util::sync::CancellationToken;
 use tools::factory::default_available_catalogs;
@@ -325,7 +326,7 @@ pub struct Runtime {
     status: Arc<status::RuntimeStatus>,
 
     server_components: Arc<RwLock<HashMap<String, CancellableTaskHandle>>>,
-    accelerator_registry: Arc<Mutex<HashMap<Engine, Arc<dyn DataAccelerator>>>>,
+    accelerator_registry: AcceleratorRegistry,
 }
 
 impl Runtime {
@@ -359,7 +360,7 @@ impl Runtime {
         Arc::clone(&self.app)
     }
 
-    pub fn accelerator_registry(&self) -> Arc<Mutex<HashMap<Engine, Arc<dyn DataAccelerator>>>> {
+    pub fn accelerator_registry(&self) -> AcceleratorRegistry {
         Arc::clone(&self.accelerator_registry)
     }
 

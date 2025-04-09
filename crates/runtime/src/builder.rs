@@ -20,6 +20,7 @@ use app::App;
 use tokio::sync::{Mutex, RwLock};
 
 use crate::{
+    accelerated_table::AcceleratorRegistry,
     catalogconnector, dataaccelerator, dataconnector,
     datafusion::DataFusion,
     datasets_health_monitor::DatasetsHealthMonitor,
@@ -29,7 +30,7 @@ use crate::{
     secrets::{self, Secrets},
     status,
     timing::TimeMeasurement,
-    tools, tracers, DataAccelerator, Engine, Runtime,
+    tools, tracers, DataAccelerator, Runtime,
 };
 
 pub struct RuntimeBuilder {
@@ -43,7 +44,7 @@ pub struct RuntimeBuilder {
     datafusion: Option<Arc<DataFusion>>,
     runtime_status: Option<Arc<status::RuntimeStatus>>,
     rate_limits: Option<Arc<RateLimits>>,
-    accelerator_registry: Option<Arc<Mutex<HashMap<Engine, Arc<dyn DataAccelerator>>>>>,
+    accelerator_registry: Option<AcceleratorRegistry>,
 }
 
 impl RuntimeBuilder {
@@ -127,10 +128,7 @@ impl RuntimeBuilder {
         self
     }
 
-    pub fn with_accelerator_registry(
-        mut self,
-        accelerator_registry: Arc<Mutex<HashMap<Engine, Arc<dyn DataAccelerator>>>>,
-    ) -> Self {
+    pub fn with_accelerator_registry(mut self, accelerator_registry: AcceleratorRegistry) -> Self {
         self.accelerator_registry = Some(accelerator_registry);
         self
     }

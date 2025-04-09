@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::accelerated_table::AcceleratorRegistry;
 use crate::{
     component::dataset::{
         acceleration::{Engine, Mode},
@@ -36,9 +37,7 @@ use datafusion_table_providers::{
 };
 use duckdb::AccessMode;
 use snafu::prelude::*;
-use std::collections::HashMap;
 use std::{any::Any, cmp::max, ffi::OsStr, sync::Arc};
-use tokio::sync::Mutex;
 
 use super::{DataAccelerator, Error as DataAcceleratorError};
 
@@ -81,14 +80,12 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct DuckDBAccelerator {
     duckdb_factory: DuckDBTableProviderFactory,
-    accelerator_registry: Arc<Mutex<HashMap<Engine, Arc<dyn DataAccelerator>>>>,
+    accelerator_registry: AcceleratorRegistry,
 }
 
 impl DuckDBAccelerator {
     #[must_use]
-    pub fn new(
-        accelerator_registry: Arc<Mutex<HashMap<Engine, Arc<dyn DataAccelerator>>>>,
-    ) -> Self {
+    pub fn new(accelerator_registry: AcceleratorRegistry) -> Self {
         Self {
             // DuckDB accelerator uses params.duckdb_file for file connection
             duckdb_factory: DuckDBTableProviderFactory::new(AccessMode::ReadWrite)
@@ -97,7 +94,7 @@ impl DuckDBAccelerator {
         }
     }
 
-    fn accelerator_registry(&self) -> Arc<Mutex<HashMap<Engine, Arc<dyn DataAccelerator>>>> {
+    fn accelerator_registry(&self) -> AcceleratorRegistry {
         Arc::clone(&self.accelerator_registry)
     }
 

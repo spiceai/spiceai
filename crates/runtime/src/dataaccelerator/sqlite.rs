@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::accelerated_table::AcceleratorRegistry;
 use async_trait::async_trait;
 use data_components::poly::PolyTableProvider;
 use datafusion::{
@@ -26,9 +27,7 @@ use datafusion_table_providers::{
 };
 use rusqlite::ffi::{sqlite3_auto_extension, sqlite3_decimal_init};
 use snafu::prelude::*;
-use std::collections::HashMap;
 use std::{any::Any, ffi::OsStr, sync::Arc, time::Duration};
-use tokio::sync::Mutex;
 
 use crate::{
     component::dataset::{
@@ -84,14 +83,12 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct SqliteAccelerator {
     sqlite_factory: SqliteTableProviderFactory,
-    accelerator_registry: Arc<Mutex<HashMap<Engine, Arc<dyn DataAccelerator>>>>,
+    accelerator_registry: AcceleratorRegistry,
 }
 
 impl SqliteAccelerator {
     #[must_use]
-    pub fn new(
-        accelerator_registry: Arc<Mutex<HashMap<Engine, Arc<dyn DataAccelerator>>>>,
-    ) -> Self {
+    pub fn new(accelerator_registry: AcceleratorRegistry) -> Self {
         // Initialize the decimal extension for SQLite
         //
         // SAFETY: This is safe because sqlite3_decimal_init is a valid function pointer.
@@ -165,7 +162,7 @@ impl SqliteAccelerator {
         Ok(pool)
     }
 
-    fn accelerator_registry(&self) -> Arc<Mutex<HashMap<Engine, Arc<dyn DataAccelerator>>>> {
+    fn accelerator_registry(&self) -> AcceleratorRegistry {
         Arc::clone(&self.accelerator_registry)
     }
 }

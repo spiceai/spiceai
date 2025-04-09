@@ -29,6 +29,7 @@ limitations under the License.
 
 use std::{collections::HashMap, sync::Arc};
 
+use crate::accelerated_table::AcceleratorRegistry;
 use crate::DataAccelerator;
 use arrow::datatypes::SchemaRef;
 use datafusion::catalog::TableProvider;
@@ -79,7 +80,7 @@ impl FederatedTable {
     ///
     /// Returns `None` if the dataset isn't a valid file-accelerated dataset.
     pub async fn new_deferred(
-        accelerator_registry: Arc<Mutex<HashMap<Engine, Arc<dyn DataAccelerator>>>>,
+        accelerator_registry: AcceleratorRegistry,
         dataset: Arc<Dataset>,
         data_connector: Arc<dyn DataConnector>,
     ) -> Option<Self> {

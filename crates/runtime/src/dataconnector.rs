@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use crate::accelerated_table::AcceleratedTable;
+use crate::accelerated_table::AcceleratorRegistry;
 use crate::catalogconnector::CATALOG_CONNECTOR_FACTORY_REGISTRY;
 use crate::component::catalog::Catalog;
 use crate::component::dataset::acceleration::RefreshMode;
@@ -28,7 +29,6 @@ use crate::parameters::ParameterSpec;
 use crate::parameters::Parameters;
 use crate::secrets::Secrets;
 use crate::DataAccelerator;
-use crate::Engine;
 use arrow_schema::SchemaRef;
 use arrow_tools::schema::schema_meta_get_computed_columns;
 use async_trait::async_trait;
@@ -316,9 +316,7 @@ pub async fn create_new_connector(
     Some(result)
 }
 
-pub async fn register_all(
-    accelerator_registry: Arc<Mutex<HashMap<Engine, Arc<dyn DataAccelerator>>>>,
-) {
+pub async fn register_all(accelerator_registry: AcceleratorRegistry) {
     register_connector_factory("sink", sink::SinkConnectorFactory::new_arc()).await;
     #[cfg(feature = "databricks")]
     register_connector_factory("databricks", databricks::DatabricksFactory::new_arc()).await;

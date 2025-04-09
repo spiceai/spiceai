@@ -16,6 +16,7 @@ limitations under the License.
 
 use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc};
 
+use crate::accelerated_table::AcceleratorRegistry;
 use crate::{
     accelerated_table::AcceleratedTable,
     component::dataset::{self, acceleration::RefreshMode, Dataset},
@@ -720,7 +721,7 @@ impl Runtime {
 
     /// Returns a list of valid datasets from the given App, skipping any that fail to parse and logging an error for them.
     pub(crate) async fn get_initialized_datasets(
-        accelerator_registry: Arc<Mutex<HashMap<Engine, Arc<dyn DataAccelerator>>>>,
+        accelerator_registry: AcceleratorRegistry,
         app: &Arc<App>,
         log_errors: LogErrors,
     ) -> Vec<Arc<Dataset>> {

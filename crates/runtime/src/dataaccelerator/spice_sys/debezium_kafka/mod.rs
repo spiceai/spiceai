@@ -25,12 +25,10 @@ limitations under the License.
 //! );
 
 use super::{acceleration_connection, AccelerationConnection, Result};
+use crate::accelerated_table::AcceleratorRegistry;
 use crate::{
     component::dataset::Dataset, dataconnector::debezium::DebeziumKafkaMetadata, DataAccelerator,
-    Engine,
 };
-use std::{collections::HashMap, sync::Arc};
-use tokio::sync::Mutex;
 
 const DEBEZIUM_KAFKA_TABLE_NAME: &str = "spice_sys_debezium_kafka";
 
@@ -48,7 +46,7 @@ pub struct DebeziumKafkaSys {
 
 impl DebeziumKafkaSys {
     pub async fn try_new(
-        accelerator_registry: Arc<Mutex<HashMap<Engine, Arc<dyn DataAccelerator>>>>,
+        accelerator_registry: AcceleratorRegistry,
         dataset: &Dataset,
     ) -> Result<Self> {
         Ok(Self {
@@ -59,7 +57,7 @@ impl DebeziumKafkaSys {
     }
 
     pub async fn try_new_create_if_not_exists(
-        accelerator_registry: Arc<Mutex<HashMap<Engine, Arc<dyn DataAccelerator>>>>,
+        accelerator_registry: AcceleratorRegistry,
         dataset: &Dataset,
     ) -> Result<Self> {
         Ok(Self {

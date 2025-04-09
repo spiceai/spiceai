@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::accelerated_table::AcceleratorRegistry;
 use runtime::{
     component::dataset::{acceleration::Engine, Dataset},
     dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint,
@@ -55,7 +56,7 @@ fn get_params(mode: &Mode, file: Option<String>, engine: &str) -> Option<Params>
 }
 
 async fn wait_for_checkpoints(
-    accelerator_registry: Arc<Mutex<HashMap<Engine, Arc<dyn DataAccelerator>>>>,
+    accelerator_registry: AcceleratorRegistry,
     datasets: &Vec<Dataset>,
     timeout_secs: u64,
 ) -> Result<(), anyhow::Error> {

@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::accelerated_table::AcceleratorRegistry;
 use acceleration::Engine;
 use app::App;
 use arrow::datatypes::SchemaRef;
@@ -33,7 +34,6 @@ use spicepod::{
     semantic::Column,
 };
 use std::{collections::HashMap, fmt::Display, str::FromStr, sync::Arc, time::Duration};
-use tokio::sync::Mutex;
 
 use crate::dataaccelerator::get_accelerator_engine;
 use crate::DataAccelerator;
@@ -581,7 +581,7 @@ impl Dataset {
     #[must_use]
     pub async fn is_accelerator_initialized(
         &self,
-        accelerator_registry: Arc<Mutex<HashMap<Engine, Arc<dyn DataAccelerator>>>>,
+        accelerator_registry: AcceleratorRegistry,
     ) -> bool {
         if let Some(acceleration) = &self.acceleration {
             let Some(accelerator) =

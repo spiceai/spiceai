@@ -382,6 +382,7 @@ async fn test_connectivity(
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::accelerated_table::AcceleratorRegistry;
     use crate::{
         builder::RuntimeBuilder, component::dataset::Dataset, status::RuntimeStatus,
         DataAccelerator, Engine,
@@ -395,8 +396,7 @@ mod test {
     #[tokio::test]
     async fn test_register_dataset_with_schema() {
         let runtime = RuntimeBuilder::new().build().await;
-        let accelerator_registry: Arc<Mutex<HashMap<Engine, Arc<dyn DataAccelerator>>>> =
-            runtime.accelerator_registry();
+        let accelerator_registry: AcceleratorRegistry = runtime.accelerator_registry();
         let df = create_test_datafusion(accelerator_registry);
 
         let dataset = Dataset::try_new("spice.ai".to_string(), "foo.dataset_name")

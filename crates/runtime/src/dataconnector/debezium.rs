@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::accelerated_table::AcceleratorRegistry;
 use crate::component::dataset::acceleration::{Engine, RefreshMode};
 use crate::component::dataset::Dataset;
 use crate::dataaccelerator::spice_sys::debezium_kafka::DebeziumKafkaSys;
@@ -34,11 +35,9 @@ use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
 use std::any::Any;
-use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use tokio::sync::Mutex;
 
 use super::{ConnectorParams, DataConnector, DataConnectorFactory, ParameterSpec, Parameters};
 
@@ -61,7 +60,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct Debezium {
     kafka_config: KafkaConfig,
-    accelerator_registry: Arc<Mutex<HashMap<Engine, Arc<dyn DataAccelerator>>>>,
+    accelerator_registry: AcceleratorRegistry,
 }
 
 impl std::fmt::Debug for Debezium {
@@ -73,15 +72,12 @@ impl std::fmt::Debug for Debezium {
 }
 
 impl Debezium {
-    pub fn accelerator_registry(&self) -> Arc<Mutex<HashMap<Engine, Arc<dyn DataAccelerator>>>> {
+    pub fn accelerator_registry(&self) -> AcceleratorRegistry {
         Arc::clone(&self.accelerator_registry)
     }
 
     #[allow(clippy::needless_pass_by_value)]
-    pub fn new(
-        accelerator_registry: Arc<Mutex<HashMap<Engine, Arc<dyn DataAccelerator>>>>,
-        params: Parameters,
-    ) -> Result<Self> {
+    pub fn new(accelerator_registry: AcceleratorRegistry, params: Parameters) -> Result<Self> {
         let transport = params.get("transport").expose().ok().unwrap_or("kafka");
 
         let message_format = params.get("message_format").expose().ok().unwrap_or("json");
@@ -162,7 +158,7 @@ impl Debezium {
 
 #[derive(Default, Clone)]
 pub struct DebeziumFactory {
-    accelerator_registry: Arc<Mutex<HashMap<Engine, Arc<dyn DataAccelerator>>>>,
+    accelerator_registry: AcceleratorRegistry,
 }
 
 // For the DebeziumFactory struct
@@ -174,24 +170,20 @@ impl std::fmt::Debug for DebeziumFactory {
 
 impl DebeziumFactory {
     #[must_use]
-    pub fn new(
-        accelerator_registry: Arc<Mutex<HashMap<Engine, Arc<dyn DataAccelerator>>>>,
-    ) -> Self {
+    pub fn new(accelerator_registry: AcceleratorRegistry) -> Self {
         Self {
             accelerator_registry,
         }
     }
 
     #[must_use]
-    pub fn new_arc(
-        accelerator_registry: Arc<Mutex<HashMap<Engine, Arc<dyn DataAccelerator>>>>,
-    ) -> Arc<dyn DataConnectorFactory> {
+    pub fn new_arc(accelerator_registry: AcceleratorRegistry) -> Arc<dyn DataConnectorFactory> {
         Arc::new(Self {
             accelerator_registry,
         }) as Arc<dyn DataConnectorFactory>
     }
 
-    fn accelerator_registry(&self) -> Arc<Mutex<HashMap<Engine, Arc<dyn DataAccelerator>>>> {
+    fn accelerator_registry(&self) -> AcceleratorRegistry {
         Arc::clone(&self.accelerator_registry)
     }
 }
@@ -415,7 +407,7 @@ pub(crate) struct DebeziumKafkaMetadata {
 }
 
 async fn get_metadata_from_accelerator(
-    accelerator_registry: Arc<Mutex<HashMap<Engine, Arc<dyn DataAccelerator>>>>,
+    accelerator_registry: AcceleratorRegistry,
     dataset: &Dataset,
 ) -> Option<DebeziumKafkaMetadata> {
     let debezium_kafka_sys = DebeziumKafkaSys::try_new(accelerator_registry, dataset)
@@ -425,7 +417,7 @@ async fn get_metadata_from_accelerator(
 }
 
 async fn set_metadata_to_accelerator(
-    accelerator_registry: Arc<Mutex<HashMap<Engine, Arc<dyn DataAccelerator>>>>,
+    accelerator_registry: AcceleratorRegistry,
     dataset: &Dataset,
     metadata: &DebeziumKafkaMetadata,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -435,7 +427,7 @@ async fn set_metadata_to_accelerator(
 }
 
 async fn get_metadata_from_kafka(
-    accelerator_registry: Arc<Mutex<HashMap<Engine, Arc<dyn DataAccelerator>>>>,
+    accelerator_registry: AcceleratorRegistry,
     dataset: &Dataset,
     topic: &str,
     kafka_config: KafkaConfig,
