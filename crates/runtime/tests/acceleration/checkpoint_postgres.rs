@@ -19,7 +19,7 @@ use app::AppBuilder;
 use arrow::array::RecordBatch;
 use datafusion_table_providers::sql::db_connection_pool::DbConnectionPool;
 use futures::TryStreamExt;
-use runtime::dataaccelerator::create_accelerator_registry;
+
 use runtime::{component::dataset::Dataset as RuntimeDataset, status, Runtime};
 use secrecy::ExposeSecret;
 use spicepod::component::dataset::acceleration::{Acceleration, RefreshMode};
@@ -47,8 +47,6 @@ async fn test_acceleration_postgres_checkpoint() -> Result<(), anyhow::Error> {
             let pool = common::get_postgres_connection_pool(port, None).await?;
 
             let status = status::RuntimeStatus::new();
-            let accelerator_registry = create_accelerator_registry();
-            let df = get_test_datafusion(Arc::clone(&status), Arc::clone(&accelerator_registry));
 
             let mut dataset =
                 Dataset::new("https://public-data.spiceai.org/decimal.parquet", "decimal");
@@ -77,12 +75,15 @@ async fn test_acceleration_postgres_checkpoint() -> Result<(), anyhow::Error> {
                 .map(RuntimeDataset::try_from)
                 .collect::<Result<Vec<_>, _>>()?;
 
+            let status = status::RuntimeStatus::new();
+            let rt_builder = Runtime::builder();
+            let df = get_test_datafusion(Arc::clone(&status), rt_builder.accelerator_registry());
+
             let rt = Arc::new(
-                Runtime::builder()
+                rt_builder
                     .with_app(app)
                     .with_datafusion(df)
                     .with_runtime_status(status)
-                    .with_accelerator_registry(accelerator_registry)
                     .build()
                     .await,
             );

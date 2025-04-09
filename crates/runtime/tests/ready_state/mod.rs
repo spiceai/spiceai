@@ -51,7 +51,7 @@ use datafusion_federation::{
 };
 use datafusion_federation_sql::{SQLExecutor, SQLFederationProvider, SQLTableSource};
 use futures::{Stream, TryStreamExt};
-use runtime::dataaccelerator::create_accelerator_registry;
+
 use runtime::{
     component::dataset::Dataset,
     dataconnector::{
@@ -537,14 +537,13 @@ async fn run_ready_state_test(
         };
 
         let status = status::RuntimeStatus::new();
-        let accelerator_registry = create_accelerator_registry();
-        let df = get_test_datafusion(Arc::clone(&status), Arc::clone(&accelerator_registry));
+        let rt_builder = Runtime::builder();
+        let df = get_test_datafusion(Arc::clone(&status), rt_builder.accelerator_registry());
 
-        let rt = Runtime::builder()
-            .with_datafusion(df)
+        let mut rt = rt_builder
             .with_app(app)
+            .with_datafusion(df)
             .with_runtime_status(status)
-            .with_accelerator_registry(accelerator_registry)
             .build()
             .await;
         let cloned_rt = Arc::new(rt.clone());
@@ -811,14 +810,13 @@ async fn test_ready_state_mixed_arrow_acceleration() -> Result<(), anyhow::Error
                 .build();
 
             let status = status::RuntimeStatus::new();
-            let accelerator_registry = create_accelerator_registry();
-            let df = get_test_datafusion(Arc::clone(&status), Arc::clone(&accelerator_registry));
+            let rt_builder = Runtime::builder();
+            let df = get_test_datafusion(Arc::clone(&status), rt_builder.accelerator_registry());
 
-            let rt = Runtime::builder()
-                .with_datafusion(df)
+            let mut rt = rt_builder
                 .with_app(app)
+                .with_datafusion(df)
                 .with_runtime_status(status)
-                .with_accelerator_registry(accelerator_registry)
                 .build()
                 .await;
             let cloned_rt = Arc::new(rt.clone());
@@ -930,14 +928,13 @@ async fn test_ready_state_mixed_duckdb_acceleration() -> Result<(), anyhow::Erro
                 .build();
 
             let status = status::RuntimeStatus::new();
-            let accelerator_registry = create_accelerator_registry();
-            let df = get_test_datafusion(Arc::clone(&status), Arc::clone(&accelerator_registry));
+            let rt_builder = Runtime::builder();
+            let df = get_test_datafusion(Arc::clone(&status), rt_builder.accelerator_registry());
 
-            let rt = Runtime::builder()
-                .with_datafusion(df)
+            let mut rt = rt_builder
                 .with_app(app)
+                .with_datafusion(df)
                 .with_runtime_status(status)
-                .with_accelerator_registry(accelerator_registry)
                 .build()
                 .await;
             let cloned_rt = Arc::new(rt.clone());

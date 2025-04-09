@@ -29,7 +29,6 @@ use crate::{
 
 use std::collections::HashMap;
 
-use runtime::dataaccelerator::create_accelerator_registry;
 use spicepod::{
     component::dataset::{acceleration::Acceleration, Dataset},
     param::Params as DatasetParams,
@@ -80,16 +79,14 @@ async fn databricks_odbc() -> Result<(), String> {
                 ))
                 .build();
 
-            let status = runtime::status::RuntimeStatus::new();
-            let accelerator_registry = create_accelerator_registry();
-            let df =
-                crate::get_test_datafusion(Arc::clone(&status), Arc::clone(&accelerator_registry));
+            let status = status::RuntimeStatus::new();
+            let rt_builder = Runtime::builder();
+            let df = get_test_datafusion(Arc::clone(&status), rt_builder.accelerator_registry());
 
-            let rt = Runtime::builder()
+            let mut rt = rt_builder
                 .with_app(app)
-                .with_runtime_status(status)
-                .with_accelerator_registry(accelerator_registry)
                 .with_datafusion(df)
+                .with_runtime_status(status)
                 .build()
                 .await;
             let cloned_rt = Arc::new(rt.clone());
@@ -145,17 +142,15 @@ async fn databricks_odbc_with_acceleration() -> Result<(), String> {
                         engine,
                     ))
                     .build();
-                let status = runtime::status::RuntimeStatus::new();
-                let accelerator_registry = create_accelerator_registry();
-                let df = crate::get_test_datafusion(
-                    Arc::clone(&status),
-                    Arc::clone(&accelerator_registry),
-                );
-                let rt = Runtime::builder()
+                let status = status::RuntimeStatus::new();
+                let rt_builder = Runtime::builder();
+                let df =
+                    get_test_datafusion(Arc::clone(&status), rt_builder.accelerator_registry());
+
+                let mut rt = rt_builder
                     .with_app(app)
-                    .with_runtime_status(status)
-                    .with_accelerator_registry(accelerator_registry)
                     .with_datafusion(df)
+                    .with_runtime_status(status)
                     .build()
                     .await;
                 let cloned_rt = Arc::new(rt.clone());

@@ -36,7 +36,7 @@ use datafusion_table_providers::sql::arrow_sql_gen::statement::{
 };
 use futures::TryStreamExt;
 use mysql_async::{prelude::Queryable, Params, Row};
-use runtime::dataaccelerator::create_accelerator_registry;
+
 use runtime::{spice_data_base_path, status, Runtime};
 use spicepod::{
     component::dataset::{
@@ -283,14 +283,13 @@ async fn init_spice_app(
     let app = AppBuilder::new("spiceapp").with_dataset(ds).build();
 
     let status = status::RuntimeStatus::new();
-    let accelerator_registry = create_accelerator_registry();
-    let df = get_test_datafusion(Arc::clone(&status), Arc::clone(&accelerator_registry));
+    let rt_builder = Runtime::builder();
+    let df = get_test_datafusion(Arc::clone(&status), rt_builder.accelerator_registry());
 
-    let rt = Runtime::builder()
+    let mut rt = rt_builder
         .with_app(app)
         .with_datafusion(df)
         .with_runtime_status(status)
-        .with_accelerator_registry(accelerator_registry)
         .build()
         .await;
     let cloned_rt = Arc::new(rt.clone());

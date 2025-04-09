@@ -169,15 +169,14 @@ async fn mysql_refresh_retries() -> Result<(), String> {
                 .build();
 
             let status = runtime::status::RuntimeStatus::new();
-            let accelerator_registry = runtime::dataaccelerator::create_accelerator_registry();
+            let rt_builder = Runtime::builder();
             let df =
-                crate::get_test_datafusion(Arc::clone(&status), Arc::clone(&accelerator_registry));
+                crate::get_test_datafusion(Arc::clone(&status), rt_builder.accelerator_registry());
 
-            let rt = Runtime::builder()
+            let mut rt = rt_builder
                 .with_app(app)
                 .with_datafusion(df)
                 .with_runtime_status(status)
-                .with_accelerator_registry(accelerator_registry)
                 .build()
                 .await;
             let cloned_rt = Arc::new(rt.clone());

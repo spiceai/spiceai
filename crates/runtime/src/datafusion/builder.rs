@@ -108,12 +108,6 @@ impl DataFusionBuilder {
         self
     }
 
-    #[must_use]
-    pub fn with_accelerator_registry(mut self, accelerator_registry: AcceleratorRegistry) -> Self {
-        self.accelerator_registry = accelerator_registry;
-        self
-    }
-
     /// Builds the `DataFusion` instance.
     ///
     /// # Panics

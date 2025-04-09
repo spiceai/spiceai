@@ -45,7 +45,7 @@ pub struct RuntimeBuilder {
     datafusion: Option<Arc<DataFusion>>,
     runtime_status: Option<Arc<status::RuntimeStatus>>,
     rate_limits: Option<Arc<RateLimits>>,
-    accelerator_registry: Option<AcceleratorRegistry>,
+    accelerator_registry: AcceleratorRegistry,
 }
 
 impl RuntimeBuilder {
@@ -61,8 +61,12 @@ impl RuntimeBuilder {
             autoload_extensions: HashMap::new(),
             runtime_status: None,
             rate_limits: None,
-            accelerator_registry: None,
+            accelerator_registry: create_accelerator_registry(),
         }
+    }
+
+    pub fn accelerator_registry(&self) -> AcceleratorRegistry {
+        Arc::clone(&self.accelerator_registry)
     }
 
     pub fn with_app(mut self, app: app::App) -> Self {
@@ -129,21 +133,13 @@ impl RuntimeBuilder {
         self
     }
 
-    pub fn with_accelerator_registry(mut self, accelerator_registry: AcceleratorRegistry) -> Self {
-        self.accelerator_registry = Some(accelerator_registry);
-        self
-    }
-
     pub fn with_rate_limits(mut self, rate_limits: RateLimits) -> Self {
         self.rate_limits = Some(Arc::new(rate_limits));
         self
     }
 
     pub async fn build(self) -> Runtime {
-        let accelerator_registry = match self.accelerator_registry {
-            Some(registry) => registry,
-            None => create_accelerator_registry(),
-        };
+        let accelerator_registry = self.accelerator_registry();
 
         dataconnector::register_all(Arc::clone(&accelerator_registry)).await;
         catalogconnector::register_all().await;
@@ -203,7 +199,7 @@ impl RuntimeBuilder {
             rate_limits: self.rate_limits.unwrap_or_default(),
             status,
             runtime_tasks: Arc::new(RwLock::new(HashMap::new())),
-            accelerator_registry: Arc::clone(&accelerator_registry),
+            accelerator_registry,
         };
 
         let mut extensions: HashMap<String, Arc<dyn Extension>> = HashMap::new();

@@ -78,13 +78,13 @@ async fn run_delta_lake_test(
         .build();
 
     let status = runtime::status::RuntimeStatus::new();
-    let accelerator_registry = runtime::dataaccelerator::create_accelerator_registry();
-    let df = crate::get_test_datafusion(Arc::clone(&status), Arc::clone(&accelerator_registry));
-    let rt = Runtime::builder()
+    let rt_builder = Runtime::builder();
+    let df = crate::get_test_datafusion(Arc::clone(&status), rt_builder.accelerator_registry());
+
+    let mut rt = rt_builder
         .with_app(app)
-        .with_runtime_status(status)
-        .with_accelerator_registry(accelerator_registry)
         .with_datafusion(df)
+        .with_runtime_status(status)
         .build()
         .await;
     let cloned_rt = Arc::new(rt.clone());
