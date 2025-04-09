@@ -190,7 +190,6 @@ macro_rules! downcast_and_format_ts {
     }};
 }
 
-#[allow(clippy::too_many_lines)]
 /// Converts a value from an Arrow `Array` at a specific index into its string representation.
 ///
 /// Designed not to be used for production stringification, but rather for producing consistent values for validation results.
@@ -218,6 +217,7 @@ macro_rules! downcast_and_format_ts {
 /// - If the function fails to downcast the array to the expected type (e.g., if the array's type is
 ///   mismatched), it will return an error.
 /// - If the array's data type is not supported for conversion, `None` is returned.
+#[allow(clippy::too_many_lines)]
 pub fn array_value_to_string(array: &dyn Array, index: usize) -> Result<Option<String>> {
     if array.len() <= index {
         return Err(anyhow!("Index out of bounds: {index} >= {}", array.len()));
