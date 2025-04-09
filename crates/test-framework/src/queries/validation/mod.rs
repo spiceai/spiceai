@@ -24,10 +24,10 @@ use anyhow::{anyhow, Result};
 
 use arrow::{
     array::{
-        Array, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array, Int32Array,
-        Int64Array, LargeStringArray, RecordBatch, StringArray, TimestampMicrosecondArray,
-        TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt16Array,
-        UInt32Array, UInt64Array, UInt8Array,
+        Array, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array, Int16Array,
+        Int32Array, Int64Array, Int8Array, LargeStringArray, RecordBatch, StringArray,
+        TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+        TimestampSecondArray, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
     },
     csv::reader::Format,
     datatypes::TimeUnit,
@@ -41,7 +41,7 @@ use chrono::{DateTime, NaiveDate};
 use super::Query;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum QueryValidationReason {
+pub enum QueryValidationFailReason {
     NoExpectedAnswer,
     NoAnswer,
     SchemaMismatch,
@@ -65,7 +65,7 @@ pub enum QueryValidationReason {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QueryValidationResult {
     Pass,
-    Fail(QueryValidationReason),
+    Fail(QueryValidationFailReason),
 }
 
 macro_rules! generate_tpch_answers {
@@ -158,7 +158,7 @@ fn equivalent_schemas(expected_schema: &SchemaRef, actual_schema: &SchemaRef) ->
         })
 }
 
-macro_rules! downcast_and_format {
+macro_rules! downcast_and_stringify {
     ($array:expr, $index:expr, $t:ty) => {{
         Ok(Some(
             $array
@@ -171,7 +171,7 @@ macro_rules! downcast_and_format {
     }};
 }
 
-macro_rules! downcast_and_format_ts {
+macro_rules! downcast_and_stringify_ts {
     ($array:expr, $index:expr, $t:ty, $scale:expr, $format:expr) => {{
         let ts = $array
             .as_any()
@@ -227,19 +227,19 @@ pub fn array_value_to_string(array: &dyn Array, index: usize) -> Result<Option<S
     }
 
     match array.data_type() {
-        DataType::Int64 => downcast_and_format!(array, index, Int64Array),
-        DataType::Int32 => downcast_and_format!(array, index, Int32Array),
-        DataType::Int16 => downcast_and_format!(array, index, Int16Array),
-        DataType::Int8 => downcast_and_format!(array, index, Int8Array),
-        DataType::UInt64 => downcast_and_format!(array, index, UInt64Array),
-        DataType::UInt32 => downcast_and_format!(array, index, UInt32Array),
-        DataType::UInt16 => downcast_and_format!(array, index, UInt16Array),
-        DataType::UInt8 => downcast_and_format!(array, index, UInt8Array),
-        DataType::Float32 => downcast_and_format!(array, index, Float32Array),
-        DataType::Float64 => downcast_and_format!(array, index, Float64Array),
-        DataType::Utf8 => downcast_and_format!(array, index, StringArray),
-        DataType::LargeUtf8 => downcast_and_format!(array, index, LargeStringArray),
-        DataType::Boolean => downcast_and_format!(array, index, BooleanArray),
+        DataType::Int64 => downcast_and_stringify!(array, index, Int64Array),
+        DataType::Int32 => downcast_and_stringify!(array, index, Int32Array),
+        DataType::Int16 => downcast_and_stringify!(array, index, Int16Array),
+        DataType::Int8 => downcast_and_stringify!(array, index, Int8Array),
+        DataType::UInt64 => downcast_and_stringify!(array, index, UInt64Array),
+        DataType::UInt32 => downcast_and_stringify!(array, index, UInt32Array),
+        DataType::UInt16 => downcast_and_stringify!(array, index, UInt16Array),
+        DataType::UInt8 => downcast_and_stringify!(array, index, UInt8Array),
+        DataType::Float32 => downcast_and_stringify!(array, index, Float32Array),
+        DataType::Float64 => downcast_and_stringify!(array, index, Float64Array),
+        DataType::Utf8 => downcast_and_stringify!(array, index, StringArray),
+        DataType::LargeUtf8 => downcast_and_stringify!(array, index, LargeStringArray),
+        DataType::Boolean => downcast_and_stringify!(array, index, BooleanArray),
 
         DataType::Date32 => {
             let days = array
@@ -309,7 +309,7 @@ pub fn array_value_to_string(array: &dyn Array, index: usize) -> Result<Option<S
                 Ok(Some(dt.format("%Y-%m-%d %H:%M:%S%.3f").to_string()))
             }
             TimeUnit::Microsecond => {
-                downcast_and_format_ts!(
+                downcast_and_stringify_ts!(
                     array,
                     index,
                     TimestampMicrosecondArray,
@@ -318,7 +318,7 @@ pub fn array_value_to_string(array: &dyn Array, index: usize) -> Result<Option<S
                 )
             }
             TimeUnit::Nanosecond => {
-                downcast_and_format_ts!(
+                downcast_and_stringify_ts!(
                     array,
                     index,
                     TimestampNanosecondArray,
@@ -328,7 +328,9 @@ pub fn array_value_to_string(array: &dyn Array, index: usize) -> Result<Option<S
             }
         },
 
-        _ => Ok(None),
+        dt => Err(anyhow::anyhow!(
+            "Unsupported data type for validation: {dt:?}",
+        )),
     }
 }
 
@@ -346,7 +348,7 @@ pub fn validate_batches_as_strings(
 
         if expected_array.len() != actual_array.len() {
             return Ok(QueryValidationResult::Fail(
-                QueryValidationReason::ColumnLengthMismatch {
+                QueryValidationFailReason::ColumnLengthMismatch {
                     column_name: column_name.clone(),
                     left_len: expected_array.len(),
                     right_len: actual_array.len(),
@@ -362,7 +364,7 @@ pub fn validate_batches_as_strings(
                 (None, None) => {}
                 (Some(val), None) => {
                     return Ok(QueryValidationResult::Fail(
-                        QueryValidationReason::DataMismatch {
+                        QueryValidationFailReason::DataMismatch {
                             column: column_name.clone(),
                             row_number: row + 1, // indexes are 0-based, counts are 1-based
                             expected: format!("{val:?}"),
@@ -372,7 +374,7 @@ pub fn validate_batches_as_strings(
                 }
                 (None, Some(val)) => {
                     return Ok(QueryValidationResult::Fail(
-                        QueryValidationReason::DataMismatch {
+                        QueryValidationFailReason::DataMismatch {
                             column: column_name.clone(),
                             row_number: row + 1, // indexes are 0-based, counts are 1-based
                             expected: "None".to_string(),
@@ -410,7 +412,7 @@ pub fn validate_batches_as_strings(
                         }
 
                         return Ok(QueryValidationResult::Fail(
-                            QueryValidationReason::DataMismatch {
+                            QueryValidationFailReason::DataMismatch {
                                 column: column_name.clone(),
                                 row_number: row + 1, // indexes are 0-based, counts are 1-based
                                 expected: format!("{expected_val:?}"),
@@ -432,7 +434,7 @@ pub fn validate_tpch_query(
 ) -> Result<QueryValidationResult> {
     let Some(expected_batches) = TPCH_ANSWERS.get(&query.name) else {
         return Ok(QueryValidationResult::Fail(
-            QueryValidationReason::NoExpectedAnswer,
+            QueryValidationFailReason::NoExpectedAnswer,
         ));
     };
 
@@ -440,20 +442,28 @@ pub fn validate_tpch_query(
         (true, true) | (false, false) => {}
         (true, false) => {
             return Ok(QueryValidationResult::Fail(
-                QueryValidationReason::NoExpectedAnswer,
+                QueryValidationFailReason::NoExpectedAnswer,
             ));
         }
-        _ => return Ok(QueryValidationResult::Fail(QueryValidationReason::NoAnswer)),
+        _ => {
+            return Ok(QueryValidationResult::Fail(
+                QueryValidationFailReason::NoAnswer,
+            ))
+        }
     }
 
     let Some(expected_schema) = expected_batches
         .first()
         .map(arrow::array::RecordBatch::schema)
     else {
-        return Ok(QueryValidationResult::Fail(QueryValidationReason::NoAnswer));
+        return Ok(QueryValidationResult::Fail(
+            QueryValidationFailReason::NoAnswer,
+        ));
     };
     let Some(actual_schema) = batches.first().map(arrow::array::RecordBatch::schema) else {
-        return Ok(QueryValidationResult::Fail(QueryValidationReason::NoAnswer));
+        return Ok(QueryValidationResult::Fail(
+            QueryValidationFailReason::NoAnswer,
+        ));
     };
 
     if !equivalent_schemas(&expected_schema, &actual_schema) {
@@ -461,7 +471,7 @@ pub fn validate_tpch_query(
         println!("actual_schema: {actual_schema:?}");
 
         return Ok(QueryValidationResult::Fail(
-            QueryValidationReason::SchemaMismatch,
+            QueryValidationFailReason::SchemaMismatch,
         ));
     }
 
@@ -472,7 +482,7 @@ pub fn validate_tpch_query(
     // check the row counts are equal
     if expected_batches.num_rows() != actual_batches.num_rows() {
         return Ok(QueryValidationResult::Fail(
-            QueryValidationReason::RowCountMismatch {
+            QueryValidationFailReason::RowCountMismatch {
                 expected: expected_batches.num_rows(),
                 actual: actual_batches.num_rows(),
             },
@@ -563,7 +573,7 @@ mod test {
         assert!(result.is_ok());
         assert_eq!(
             result.expect("Should validate"),
-            QueryValidationResult::Fail(QueryValidationReason::RowCountMismatch {
+            QueryValidationResult::Fail(QueryValidationFailReason::RowCountMismatch {
                 expected: 4,
                 actual: 2
             })
@@ -710,7 +720,7 @@ mod test {
         assert!(result.is_ok());
         assert_eq!(
             result.expect("Should validate"),
-            QueryValidationResult::Fail(QueryValidationReason::DataMismatch {
+            QueryValidationResult::Fail(QueryValidationFailReason::DataMismatch {
                 column: "cntrycode".to_string(),
                 row_number: 7,
                 expected: format!("{:?}", "31"),
@@ -752,7 +762,7 @@ mod test {
         assert!(result.is_ok());
         assert_eq!(
             result.expect("Should validate"),
-            QueryValidationResult::Fail(QueryValidationReason::DataMismatch {
+            QueryValidationResult::Fail(QueryValidationFailReason::DataMismatch {
                 column: "cntrycode".to_string(),
                 row_number: 6,
                 expected: format!("{:?}", "30"),
