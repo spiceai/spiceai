@@ -70,8 +70,9 @@ async fn results_cache_system_queries() -> Result<(), String> {
                 .with_accelerator_registry(accelerator_registry)
                 .build()
                 .await;
+            let cloned_rt = Arc::new(rt.clone());
 
-            rt.load_components().await;
+            cloned_rt.load_components().await;
 
             assert!(execute_query_and_check_cache_status(
                 &rt,

@@ -92,13 +92,14 @@ async fn databricks_odbc() -> Result<(), String> {
                 .with_datafusion(df)
                 .build()
                 .await;
+            let cloned_rt = Arc::new(rt.clone());
 
             // Set a timeout for the test
             tokio::select! {
                 () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
                     return Err("Timed out waiting for datasets to load".to_string());
                 }
-                () = rt.load_components() => {}
+                () = cloned_rt.load_components() => {}
             }
 
             let query_result = rt
@@ -157,13 +158,14 @@ async fn databricks_odbc_with_acceleration() -> Result<(), String> {
                     .with_datafusion(df)
                     .build()
                     .await;
+                let cloned_rt = Arc::new(rt.clone());
 
                 // Set a timeout for the test
                 tokio::select! {
                     () = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
                         return Err("Timed out waiting for datasets to load".to_string());
                     }
-                    () = rt.load_components() => {}
+                    () = cloned_rt.load_components() => {}
                 }
 
                 assert!(
