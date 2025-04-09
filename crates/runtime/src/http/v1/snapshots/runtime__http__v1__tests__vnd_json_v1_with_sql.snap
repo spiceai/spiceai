@@ -1,0 +1,17 @@
+---
+source: crates/runtime/src/http/v1/mod.rs
+expression: "serde_json::from_str::<serde_json::Value>(&result_with_sql).unwrap()"
+---
+{
+  "data": [
+    {
+      "customer_id": "12345",
+      "total_sales": 150000
+    },
+    {
+      "customer_id": "67890",
+      "total_sales": 125000
+    }
+  ],
+  "sql": "SELECT customer_id, total_sales FROM sales_summary LIMIT 2;"
+}

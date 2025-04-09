@@ -36,7 +36,7 @@ use crate::{
 #[cfg(feature = "openapi")]
 use crate::model::EvalRunResponse;
 
-use super::{sql_to_http_response, ArrowFormat};
+use super::{sql_to_http_response, DataFormat};
 
 /// Input parameters to start an evaluation run for a given model.
 #[derive(Debug, Serialize, Deserialize)]
@@ -138,7 +138,7 @@ pub(crate) async fn post(
             sql_to_http_response(
                 Arc::clone(&df),
                 sql_query_for(&id).as_str(),
-                ArrowFormat::from_accept_header(accept.as_ref()),
+                DataFormat::from_accept_header(accept.as_ref()),
             )
             .await
         }

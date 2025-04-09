@@ -15,7 +15,7 @@ limitations under the License.
 */
 use crate::{
     datafusion::DataFusion,
-    http::v1::{run_sql, to_http_response, ArrowFormat},
+    http::v1::{run_sql, to_http_response, DataFormat, ResponseMetadata},
     model::LLMModelStore,
     tools::{
         builtin::{
@@ -295,9 +295,14 @@ pub(crate) async fn post(
                     .await
                 {
                     Ok((data, cache_status)) => {
-                        return to_http_response(data, cache_status, ArrowFormat::Json)
-                            .instrument(span.clone())
-                            .await;
+                        return to_http_response(
+                            data,
+                            cache_status,
+                            DataFormat::from_accept_header(accept.as_ref()),
+                            ResponseMetadata::empty().with_sql(&cleaned_query),
+                        )
+                        .instrument(span.clone())
+                        .await;
                     }
                     Err(e) => {
                         // If query failed, retry with the updated context
