@@ -57,6 +57,12 @@ pub struct Spark {
     read_provider: Arc<dyn Read>,
 }
 
+impl std::fmt::Debug for Spark {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Spark").finish_non_exhaustive()
+    }
+}
+
 impl Spark {
     async fn new(params: Parameters) -> Result<Self> {
         let conn = params.get("remote").expose().ok();

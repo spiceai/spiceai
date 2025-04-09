@@ -19,9 +19,9 @@ use datafusion::assert_batches_eq;
 use futures::StreamExt;
 use futures::TryStreamExt;
 use runtime::Runtime;
-use spicepod::component::{
-    dataset::{acceleration::Acceleration, Dataset},
-    params::Params,
+use spicepod::{
+    component::dataset::{acceleration::Acceleration, Dataset},
+    param::Params,
 };
 
 use crate::{init_tracing, utils::test_request_context};
@@ -86,7 +86,7 @@ async fn acceleration_with_and_without_federation() -> Result<(), anyhow::Error>
             federated_acc.params = Some(params.clone());
             params.data.insert(
                 "disable_query_push_down".to_string(),
-                spicepod::component::params::ParamValue::Bool(false),
+                spicepod::param::ParamValue::Bool(false),
             );
 
             federated_acc.acceleration = Some(Acceleration {
@@ -111,7 +111,7 @@ async fn acceleration_with_and_without_federation() -> Result<(), anyhow::Error>
             non_federated_acc.params = Some(non_federated_params.clone());
             non_federated_params.data.insert(
                 "disable_query_push_down".to_string(),
-                spicepod::component::params::ParamValue::Bool(true),
+                spicepod::param::ParamValue::Bool(true),
             );
 
             non_federated_acc.acceleration = Some(Acceleration {
@@ -136,12 +136,14 @@ async fn acceleration_with_and_without_federation() -> Result<(), anyhow::Error>
                 .build()
                 .await;
 
+            let cloned_rt = Arc::new(rt.clone());
+
             // Set a timeout for the test
             tokio::select! {
                 () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
                 }
-                () = rt.load_components() => {}
+                () = cloned_rt.load_components() => {}
             }
 
             runtime_ready_check(&rt).await;

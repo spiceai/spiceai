@@ -22,9 +22,9 @@ use reqwest::{header::HeaderMap, Client};
 use runtime::{config::Config, get_params_with_secrets, Runtime};
 use secrecy::SecretString;
 use snafu::ResultExt;
-use spicepod::component::{
-    dataset::{acceleration::Acceleration, Dataset},
-    params::Params,
+use spicepod::{
+    component::dataset::{acceleration::Acceleration, Dataset},
+    param::Params,
 };
 use std::sync::Arc;
 use std::{
@@ -185,6 +185,27 @@ fn get_taxi_trips_dataset() -> Dataset {
     dataset.acceleration = Some(Acceleration {
         enabled: true,
         refresh_sql: Some("SELECT * FROM taxi_trips LIMIT 10".to_string()),
+        ..Default::default()
+    });
+    dataset
+}
+
+fn get_small_clickbench_dataset(name: &str) -> Dataset {
+    let mut dataset = Dataset::new(
+        "s3://spiceai-public-datasets/clickbench/hits_small.parquet",
+        name,
+    );
+    dataset.params = Some(Params::from_string_map(
+        vec![
+            ("file_format".to_string(), "parquet".to_string()),
+            ("client_timeout".to_string(), "120s".to_string()),
+        ]
+        .into_iter()
+        .collect(),
+    ));
+    dataset.acceleration = Some(Acceleration {
+        enabled: true,
+        refresh_sql: Some(format!("SELECT * FROM {name} LIMIT 500")),
         ..Default::default()
     });
     dataset

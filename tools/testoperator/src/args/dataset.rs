@@ -36,6 +36,9 @@ pub struct DatasetTestArgs {
 
     #[arg(long)]
     pub(crate) query_overrides: Option<QueryOverridesArg>,
+
+    #[arg(long)]
+    pub(crate) validate: bool,
 }
 
 #[derive(Clone, ValueEnum, Debug)]

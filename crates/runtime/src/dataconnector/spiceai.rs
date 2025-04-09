@@ -72,7 +72,7 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct SpiceAI {
     flight_factory: FlightFactory,
 }

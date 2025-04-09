@@ -47,6 +47,13 @@ pub struct SnowflakeTableFactory {
     pool: Arc<SnowflakeConnectionPool>,
 }
 
+impl std::fmt::Debug for SnowflakeTableFactory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SnowflakeTableFactory")
+            .finish_non_exhaustive()
+    }
+}
+
 impl SnowflakeTableFactory {
     #[must_use]
     pub fn new(pool: Arc<SnowflakeConnectionPool>) -> Self {

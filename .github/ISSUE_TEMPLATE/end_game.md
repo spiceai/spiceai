@@ -65,6 +65,8 @@ assignees: ''
      - Parameters: Branch: `trunk`
      - Build CLI: `true`
    - [ ] Verify [Throughput Tests](https://github.com/spiceai/spiceai/actions/workflows/testoperator_run_throughput.yml) is green on `trunk` and the release branch.
+     - Use the [Test Operator Dispatch](https://github.com/spiceai/spiceai/actions/workflows/testoperator_dispatch.yml) workflow.
+     - Use the same parameters from the benchmark test, but specify the `throughput` workflow. Throughput tests are only supported for `./tools/testoperator/dispatch/tpch` and `./tools/testoperator/dispatch/tpcds`.
 
 1. **Documentation Review**
 

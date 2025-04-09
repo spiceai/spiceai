@@ -23,12 +23,12 @@ use app::AppBuilder;
 use arrow::array::RecordBatch;
 use futures::StreamExt;
 use runtime::{status, Runtime};
-use spicepod::component::{
-    dataset::{
+use spicepod::{
+    component::dataset::{
         acceleration::{Acceleration, Mode},
         Dataset,
     },
-    params::Params as DatasetParams,
+    param::Params as DatasetParams,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -146,12 +146,13 @@ async fn run_iceberg_test(
         .with_runtime_status(status)
         .build()
         .await;
+    let cloned_rt = Arc::new(rt.clone());
 
     tokio::select! {
         () = tokio::time::sleep(std::time::Duration::from_secs(120)) => {
             panic!("Timeout waiting for components to load");
         }
-        () = rt.load_components() => {}
+        () = cloned_rt.load_components() => {}
     }
 
     runtime_ready_check(&rt).await;

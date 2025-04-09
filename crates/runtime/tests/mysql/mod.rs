@@ -211,13 +211,14 @@ async fn mysql_integration_test() -> Result<(), String> {
                 .with_runtime_status(status)
                 .build()
                 .await;
+            let cloned_rt = Arc::new(rt.clone());
 
             // Set a timeout for the test
             tokio::select! {
                 () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
                     return Err("Timed out waiting for datasets to load".to_string());
                 }
-                () = rt.load_components() => {}
+                () = cloned_rt.load_components() => {}
             }
 
             let queries: QueryTests = vec![(

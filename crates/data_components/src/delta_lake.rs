@@ -70,6 +70,14 @@ pub struct DeltaTableFactory {
     params: HashMap<String, SecretString>,
 }
 
+impl std::fmt::Debug for DeltaTableFactory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeltaTableFactory")
+            .field("params", &self.params.keys())
+            .finish_non_exhaustive()
+    }
+}
+
 impl DeltaTableFactory {
     #[must_use]
     pub fn new(params: HashMap<String, SecretString>) -> Self {
@@ -331,32 +339,46 @@ impl TableProvider for DeltaTable {
             Arc::clone(&self.delta_schema),
             projection,
         );
-
-        let scan = ScanBuilder::new(Arc::new(snapshot))
-            .with_schema(projected_delta_schema)
-            // technically filter can be converted into predicates but right now delta_kernel
-            // ignores it
-            .build()
-            .map_err(map_delta_error_to_datafusion_err)?;
         let engine = Arc::clone(&self.engine);
-        let scan_state = scan.global_scan_state();
 
-        let mut scan_context = ScanContext::new(scan_state, Arc::clone(&self.engine));
+        // The following Delta Lake scan is blocking - run it in a separate blocking task to prevent the Tokio runtime from starving
+        let (scan_context, parquet_file_reader_factory, df_schema) =
+            tokio::task::spawn_blocking(move || {
+                let scan = ScanBuilder::new(Arc::new(snapshot))
+                    .with_schema(projected_delta_schema)
+                    // technically filter can be converted into predicates but right now delta_kernel
+                    // ignores it
+                    .build()
+                    .map_err(map_delta_error_to_datafusion_err)?;
+                let scan_state = scan.global_scan_state();
 
-        let scan_iter = scan
-            .scan_data(engine.as_ref())
-            .map_err(map_delta_error_to_datafusion_err)?;
+                let mut scan_context = ScanContext::new(scan_state, Arc::clone(&engine));
 
-        for scan_result in scan_iter {
-            let data = scan_result.map_err(map_delta_error_to_datafusion_err)?;
-            scan_context = delta_kernel::scan::state::visit_scan_files(
-                data.0.as_ref(),
-                data.1.as_ref(),
-                scan_context,
-                handle_scan_file,
-            )
-            .map_err(map_delta_error_to_datafusion_err)?;
-        }
+                let scan_iter = scan
+                    .scan_data(engine.as_ref())
+                    .map_err(map_delta_error_to_datafusion_err)?;
+
+                for scan_result in scan_iter {
+                    let data = scan_result.map_err(map_delta_error_to_datafusion_err)?;
+                    scan_context = delta_kernel::scan::state::visit_scan_files(
+                        data.0.as_ref(),
+                        data.1.as_ref(),
+                        scan_context,
+                        handle_scan_file,
+                    )
+                    .map_err(map_delta_error_to_datafusion_err)?;
+                }
+
+                Ok::<_, datafusion::error::DataFusionError>((
+                    scan_context,
+                    parquet_file_reader_factory,
+                    df_schema,
+                ))
+            })
+            .await
+            .map_err(|e| {
+                datafusion::error::DataFusionError::Execution(format!("Delta Scan panicked: {e}"))
+            })??;
 
         if let Some(err) = scan_context.errs.into_iter().next() {
             return Err(err);

@@ -58,26 +58,58 @@ impl BuiltinToolCatalog {
         params: &HashMap<String, SecretString>,
     ) -> Result<Arc<dyn SpiceModelTool>> {
         let name = name.unwrap_or(id);
+
+        // Get default description if none is provided
+        let description = match (id, description) {
+            (_, Some(desc)) => desc, // Use provided description if available
+            ("websearch", None) => "Search the web for information".to_string(),
+            ("get_readiness", None) => {
+                "Get the readiness status of the Spice.ai runtime".to_string()
+            }
+            ("document_similarity", None) => {
+                "Search Spice.ai datasets using Vector Similarity Search (VSS)".to_string()
+            }
+            ("table_schema", None) => "Get the schema of the Spice.ai dataset".to_string(),
+            ("sql", None) => {
+                "Execute SQL queries (PostgreSQL dialect) using the Spice.ai runtime".to_string()
+            }
+            ("sample_distinct_columns", None) => {
+                "Sample distinct column values from a Spice.ai dataset".to_string()
+            }
+            ("random_sample", None) => {
+                "Get a random sample of rows from a Spice.ai dataset".to_string()
+            }
+            ("top_n_sample", None) => {
+                "Get top N samples from a Spice.ai dataset based on a specified ordering"
+                    .to_string()
+            }
+            ("list_datasets", None) => "List available datasets".to_string(),
+            (_, None) => format!("Tool for {id}"),
+        };
+
         match id {
             "websearch" => Ok(Arc::new(
-                WebSearchTool::try_new(name, description, params)
+                WebSearchTool::try_new(name, Some(description), params)
                     .context(FailedToConstructToolSnafu { id: id.to_string() })?,
             )),
-            "get_readiness" => Ok(Arc::new(GetReadinessTool::new(name, description))),
-            "document_similarity" => Ok(Arc::new(DocumentSimilarityTool::new(name, description))),
-            "table_schema" => Ok(Arc::new(TableSchemaTool::new(name, description))),
-            "sql" => Ok(Arc::new(SqlTool::new(name, description))),
+            "get_readiness" => Ok(Arc::new(GetReadinessTool::new(name, Some(description)))),
+            "document_similarity" => Ok(Arc::new(DocumentSimilarityTool::new(
+                name,
+                Some(description),
+            ))),
+            "table_schema" => Ok(Arc::new(TableSchemaTool::new(name, Some(description)))),
+            "sql" => Ok(Arc::new(SqlTool::new(name, Some(description)))),
             "sample_distinct_columns" => Ok(Arc::new(
                 SampleDataTool::new(SampleTableMethod::DistinctColumns)
-                    .with_overrides(Some(name), description.as_deref()),
+                    .with_overrides(Some(name), Some(&description)),
             )),
             "random_sample" => Ok(Arc::new(
                 SampleDataTool::new(SampleTableMethod::RandomSample)
-                    .with_overrides(Some(name), description.as_deref()),
+                    .with_overrides(Some(name), Some(&description)),
             )),
             "top_n_sample" => Ok(Arc::new(
                 SampleDataTool::new(SampleTableMethod::TopNSample)
-                    .with_overrides(Some(name), description.as_deref()),
+                    .with_overrides(Some(name), Some(&description)),
             )),
             "list_datasets" => {
                 let table_allowlist: Option<Vec<&str>> = params
@@ -85,7 +117,7 @@ impl BuiltinToolCatalog {
                     .map(|t| t.expose_secret().split(',').map(str::trim).collect());
                 Ok(Arc::new(ListDatasetsTool::new(
                     name,
-                    description,
+                    Some(description),
                     table_allowlist,
                 )))
             }

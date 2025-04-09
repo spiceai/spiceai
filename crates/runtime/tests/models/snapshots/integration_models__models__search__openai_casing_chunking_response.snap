@@ -1,0 +1,17 @@
+---
+source: crates/runtime/tests/models/mod.rs
+expression: normalize_search_response(response)
+---
+{
+  "duration_ms": "duration_ms_val",
+  "matches": [
+    {
+      "dataset": "clickbench_chunking",
+      "value": "https://go.mail/folder-1/online=on&acceTWg&bvm=bv.48705608,d.bGE&cad=rjt&fu=0&int[234][to]=&inpu"
+    },
+    {
+      "dataset": "clickbench_chunking",
+      "value": "https://go.mail/folder-1/online=on&acceTWg&bvm=bv.48705608,d.bGE&cad=rjt&fu=0&int[234][to]=&inpu"
+    }
+  ]
+}

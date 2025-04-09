@@ -39,6 +39,7 @@ expression: "serde_json::to_string_pretty(&task_input).expect(\"Failed to serial
   "tools": [
     {
       "function": {
+        "description": "Search Spice.ai datasets using Vector Similarity Search (VSS)",
         "name": "document_similarity",
         "parameters": {
           "$schema": "http://json-schema.org/draft-07/schema#",
@@ -104,19 +105,21 @@ expression: "serde_json::to_string_pretty(&task_input).expect(\"Failed to serial
     },
     {
       "function": {
+        "description": "Get the readiness status of the Spice.ai runtime",
         "name": "get_readiness"
       },
       "type": "function"
     },
     {
       "function": {
+        "description": "List available datasets",
         "name": "list_datasets"
       },
       "type": "function"
     },
     {
       "function": {
-        "description": "Sample random rows from a table.",
+        "description": "Get a random sample of rows from a Spice.ai dataset",
         "name": "random_sample",
         "parameters": {
           "$schema": "http://json-schema.org/draft-07/schema#",
@@ -144,7 +147,7 @@ expression: "serde_json::to_string_pretty(&task_input).expect(\"Failed to serial
     },
     {
       "function": {
-        "description": "Generate synthetic data by sampling distinct column values from a table.",
+        "description": "Sample distinct column values from a Spice.ai dataset",
         "name": "sample_distinct_columns",
         "parameters": {
           "$schema": "http://json-schema.org/draft-07/schema#",
@@ -182,6 +185,7 @@ expression: "serde_json::to_string_pretty(&task_input).expect(\"Failed to serial
     },
     {
       "function": {
+        "description": "Execute SQL queries (PostgreSQL dialect) using the Spice.ai runtime",
         "name": "sql",
         "parameters": {
           "$schema": "http://json-schema.org/draft-07/schema#",
@@ -202,6 +206,7 @@ expression: "serde_json::to_string_pretty(&task_input).expect(\"Failed to serial
     },
     {
       "function": {
+        "description": "Get the schema of the Spice.ai dataset",
         "name": "table_schema",
         "parameters": {
           "$schema": "http://json-schema.org/draft-07/schema#",
@@ -244,7 +249,7 @@ expression: "serde_json::to_string_pretty(&task_input).expect(\"Failed to serial
     },
     {
       "function": {
-        "description": "Sample the top N rows from a table based on a specified ordering",
+        "description": "Get top N samples from a Spice.ai dataset based on a specified ordering",
         "name": "top_n_sample",
         "parameters": {
           "$schema": "http://json-schema.org/draft-07/schema#",

@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use app::AppBuilder;
 use runtime::{status, Runtime};
-use spicepod::component::{dataset::Dataset, params::Params};
+use spicepod::{component::dataset::Dataset, param::Params};
 
 use crate::{
     get_test_datafusion, init_tracing, run_query_and_check_results, utils::test_request_context,
@@ -70,12 +70,13 @@ async fn spiceai_federation() -> Result<(), anyhow::Error> {
                 .with_runtime_status(status)
                 .build()
                 .await;
+            let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {
                 () = tokio::time::sleep(std::time::Duration::from_secs(120)) => {
                     panic!("Timeout waiting for components to load");
                 }
-                () = rt.load_components() => {}
+                () = cloned_rt.load_components() => {}
             }
 
             let queries: QueryTests = vec![(

@@ -44,6 +44,13 @@ pub struct ClickhouseTableFactory {
     pool: Arc<ClickhouseConnectionPool>,
 }
 
+impl std::fmt::Debug for ClickhouseTableFactory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClickhouseTableFactory")
+            .finish_non_exhaustive()
+    }
+}
+
 impl ClickhouseTableFactory {
     #[must_use]
     pub fn new(pool: Arc<ClickhouseConnectionPool>) -> Self {
