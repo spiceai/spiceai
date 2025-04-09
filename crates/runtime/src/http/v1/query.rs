@@ -26,7 +26,7 @@ use headers_accept::Accept;
 
 use crate::datafusion::DataFusion;
 
-use super::{sql_to_http_response, DataFormat};
+use super::{sql_to_http_response, ResponseMimeType};
 
 /// SQL Query
 ///
@@ -115,5 +115,10 @@ pub(crate) async fn post(
         }
     };
 
-    sql_to_http_response(df, &query, DataFormat::from_accept_header(accept.as_ref())).await
+    sql_to_http_response(
+        df,
+        &query,
+        ResponseMimeType::from_accept_header(accept.as_ref()),
+    )
+    .await
 }

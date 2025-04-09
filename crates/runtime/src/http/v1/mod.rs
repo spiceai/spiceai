@@ -94,7 +94,7 @@ impl utoipa::IntoParams for Format {
 #[derive(Default, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 /// The various formats that the Arrow data can be converted and returned from HTTP requests.
-pub enum DataFormat {
+pub enum ResponseMimeType {
     #[default]
     Json,
     Csv,
@@ -125,19 +125,19 @@ pub(crate) fn accept_header_types(accept: &TypedHeader<Accept>) -> Vec<String> {
     accept.0.media_types().map(ToString::to_string).collect()
 }
 
-impl DataFormat {
-    pub fn from_accept_header(accept: Option<&TypedHeader<Accept>>) -> DataFormat {
-        accept.map_or(DataFormat::default(), |header| {
+impl ResponseMimeType {
+    pub fn from_accept_header(accept: Option<&TypedHeader<Accept>>) -> ResponseMimeType {
+        accept.map_or(ResponseMimeType::default(), |header| {
             accept_header_types(header)
                 .iter()
                 .find_map(|h| match h.as_str() {
-                    "application/json" => Some(DataFormat::Json),
-                    "application/vnd.spiceai.v1+json" => Some(DataFormat::VndJsonV1),
-                    "text/csv" => Some(DataFormat::Csv),
-                    "text/plain" => Some(DataFormat::Plain),
+                    "application/json" => Some(ResponseMimeType::Json),
+                    "application/vnd.spiceai.sql.v1+json" => Some(ResponseMimeType::VndJsonV1),
+                    "text/csv" => Some(ResponseMimeType::Csv),
+                    "text/plain" => Some(ResponseMimeType::Plain),
                     _ => None,
                 })
-                .unwrap_or(DataFormat::default())
+                .unwrap_or(ResponseMimeType::default())
         })
     }
 }
@@ -160,7 +160,11 @@ fn dataset_status(df: &DataFusion, ds: &Dataset) -> ComponentStatus {
 }
 
 // Runs query and converts query results to HTTP response (as JSON).
-pub async fn sql_to_http_response(df: Arc<DataFusion>, sql: &str, format: DataFormat) -> Response {
+pub async fn sql_to_http_response(
+    df: Arc<DataFusion>,
+    sql: &str,
+    format: ResponseMimeType,
+) -> Response {
     let (data, results_cache_status) = match run_sql(df, sql).await {
         Ok((data, results_cache_status)) => (data, results_cache_status),
         Err(e) => {
@@ -194,14 +198,14 @@ pub async fn run_sql(
 pub async fn to_http_response(
     data: Vec<RecordBatch>,
     cache_status: QueryResultsCacheStatus,
-    format: DataFormat,
+    format: ResponseMimeType,
     meta: ResponseMetadata,
 ) -> Response {
     let res = match format {
-        DataFormat::Json => arrow_to_json(&data),
-        DataFormat::Csv => arrow_to_csv(&data),
-        DataFormat::Plain => arrow_to_plain(&data),
-        DataFormat::VndJsonV1 => arrow_to_vnd_json_v1(&data, meta),
+        ResponseMimeType::Json => arrow_to_json(&data),
+        ResponseMimeType::Csv => arrow_to_csv(&data),
+        ResponseMimeType::Plain => arrow_to_plain(&data),
+        ResponseMimeType::VndJsonV1 => arrow_to_vnd_json_v1(&data, meta),
     };
 
     let body = match res {

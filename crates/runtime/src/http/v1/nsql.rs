@@ -15,7 +15,7 @@ limitations under the License.
 */
 use crate::{
     datafusion::DataFusion,
-    http::v1::{run_sql, to_http_response, DataFormat, ResponseMetadata},
+    http::v1::{run_sql, to_http_response, ResponseMetadata, ResponseMimeType},
     model::LLMModelStore,
     tools::{
         builtin::{
@@ -298,7 +298,7 @@ pub(crate) async fn post(
                         return to_http_response(
                             data,
                             cache_status,
-                            DataFormat::from_accept_header(accept.as_ref()),
+                            ResponseMimeType::from_accept_header(accept.as_ref()),
                             ResponseMetadata::empty().with_sql(&cleaned_query),
                         )
                         .instrument(span.clone())
