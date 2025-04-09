@@ -193,7 +193,7 @@ macro_rules! downcast_and_format_ts {
 /// Converts a value from an Arrow `Array` at a specific index into its string representation.
 ///
 /// Designed not to be used for production stringification, but rather for producing consistent values for validation results.
-/// Using input `RecordBatch` values, it removes any system differences from underlying sources (e.g. different trailing zeros, etc).
+/// Using input `RecordBatch` values, it attempts to remove any system differences from underlying sources (e.g. timestamp formats, etc).
 ///
 /// # Parameters:
 /// - `array`: A reference to a dynamically typed Arrow `Array`. This is the array that holds the data.
