@@ -113,6 +113,7 @@ async fn iceberg_integration_test_duckdb_acceleration_restart() -> Result<(), an
             )
             .await?;
 
+            rt.shutdown().await;
             drop(rt);
 
             let _ = run_iceberg_test(
