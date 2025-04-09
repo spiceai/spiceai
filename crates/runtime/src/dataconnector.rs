@@ -28,7 +28,6 @@ use crate::get_params_with_secrets;
 use crate::parameters::ParameterSpec;
 use crate::parameters::Parameters;
 use crate::secrets::Secrets;
-use crate::DataAccelerator;
 use arrow_schema::SchemaRef;
 use arrow_tools::schema::schema_meta_get_computed_columns;
 use async_trait::async_trait;

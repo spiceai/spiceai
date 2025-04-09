@@ -87,6 +87,7 @@ pub async fn register_accelerator_engine(
     registry.insert(name, accelerator_engine);
 }
 
+#[must_use]
 pub fn create_accelerator_registry() -> AcceleratorRegistry {
     Arc::new(Mutex::new(HashMap::new()))
 }

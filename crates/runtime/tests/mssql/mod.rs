@@ -18,6 +18,7 @@ use std::sync::Arc;
 
 use common::{make_mssql_dataset, start_mssql_docker_container, MSSQL_ROOT_PASSWORD};
 use data_components::mssql::connection_manager::SqlServerConnectionManager;
+use runtime::dataaccelerator::create_accelerator_registry;
 use util::{fibonacci_backoff::FibonacciBackoffBuilder, retry, RetryError};
 
 use crate::init_tracing;

@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::collections::HashMap;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -23,7 +22,7 @@ use async_trait::async_trait;
 use datafusion::sql::TableReference;
 use opentelemetry_sdk::metrics::MetricError;
 use snafu::prelude::*;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::RwLock;
 
 use crate::accelerated_table::refresh::Refresh;
 use crate::accelerated_table::AcceleratorRegistry;
@@ -35,8 +34,6 @@ use crate::datafusion::{DataFusion, SPICE_RUNTIME_SCHEMA};
 use crate::dataupdate::{DataUpdate, UpdateType};
 use crate::internal_table::{create_internal_accelerated_table, Error as InternalTableError};
 use crate::secrets::Secrets;
-use crate::DataAccelerator;
-use crate::Engine;
 
 #[derive(Debug, Snafu)]
 pub enum Error {

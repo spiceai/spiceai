@@ -35,7 +35,6 @@ use datafusion_table_providers::sql::arrow_sql_gen::statement::{
 use mysql_async::{prelude::Queryable, Params, Row};
 use runtime::{
     accelerated_table::{refresh::Refresh, refresh_task::RefreshTask, AcceleratedTable},
-    component::dataset::acceleration,
     Runtime,
 };
 use spicepod::component::dataset::acceleration::Acceleration;

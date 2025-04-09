@@ -30,7 +30,7 @@ use crate::{
     secrets::{self, Secrets},
     status,
     timing::TimeMeasurement,
-    tools, tracers, DataAccelerator, Runtime,
+    tools, tracers, Runtime,
 };
 
 pub struct RuntimeBuilder {

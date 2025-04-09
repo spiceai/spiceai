@@ -360,6 +360,7 @@ impl Runtime {
         Arc::clone(&self.app)
     }
 
+    #[must_use]
     pub fn accelerator_registry(&self) -> AcceleratorRegistry {
         Arc::clone(&self.accelerator_registry)
     }

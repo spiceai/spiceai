@@ -36,7 +36,6 @@ use spicepod::{
 use std::{collections::HashMap, fmt::Display, str::FromStr, sync::Arc, time::Duration};
 
 use crate::dataaccelerator::get_accelerator_engine;
-use crate::DataAccelerator;
 
 use super::{find_first_delimiter, validate_identifier};
 

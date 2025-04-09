@@ -14,14 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::accelerated_table::AcceleratorRegistry;
 use runtime::{
-    component::dataset::{acceleration::Engine, Dataset},
+    accelerated_table::AcceleratorRegistry, component::dataset::Dataset,
     dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint,
-    dataaccelerator::DataAccelerator,
 };
 use spicepod::{component::dataset::acceleration::Mode, param::Params};
-use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 use tokio::sync::Mutex;
 

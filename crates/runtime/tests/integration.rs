@@ -25,13 +25,7 @@ use datafusion::{
 };
 use futures::TryStreamExt;
 
-use crate::accelerated_table::AcceleratorRegistry;
-use runtime::{
-    component::dataset::acceleration::Engine, dataaccelerator::DataAccelerator,
-    datafusion::DataFusion, status, Runtime,
-};
-use std::collections::HashMap;
-use tokio::sync::Mutex;
+use runtime::{accelerated_table::AcceleratorRegistry, datafusion::DataFusion, status, Runtime};
 use tracing::subscriber::DefaultGuard;
 use tracing_subscriber::EnvFilter;
 

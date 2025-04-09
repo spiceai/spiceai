@@ -25,7 +25,6 @@ use crate::accelerated_table::{refresh::Refresh, AcceleratedTable, Retention};
 use crate::component::dataset::acceleration::RefreshMode;
 use crate::component::dataset::{Dataset, Mode};
 use crate::dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint;
-use crate::dataaccelerator::DataAccelerator;
 use crate::dataaccelerator::{self, create_accelerator_table};
 use crate::dataconnector::localpod::LOCALPOD_DATACONNECTOR;
 use crate::dataconnector::sink::SinkConnector;

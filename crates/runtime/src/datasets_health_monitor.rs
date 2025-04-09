@@ -385,7 +385,7 @@ mod test {
     use crate::accelerated_table::AcceleratorRegistry;
     use crate::{
         builder::RuntimeBuilder, component::dataset::Dataset, status::RuntimeStatus,
-        DataAccelerator, Engine,
+        DataAccelerator,
     };
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion::{

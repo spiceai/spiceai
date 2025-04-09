@@ -14,24 +14,24 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
 use arrow::datatypes::Schema;
 use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
 use snafu::prelude::*;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::RwLock;
 
 use crate::accelerated_table::AcceleratorRegistry;
 use crate::accelerated_table::{AcceleratedTableBuilderError, Retention};
-use crate::component::dataset::acceleration::{Acceleration, Engine};
+use crate::component::dataset::acceleration::Acceleration;
 use crate::component::dataset::{Dataset, Mode};
 use crate::federated_table::FederatedTable;
 use crate::secrets::Secrets;
 use crate::status;
 use crate::{
     accelerated_table::{refresh::Refresh, AcceleratedTable},
-    dataaccelerator::{self, create_accelerator_table, DataAccelerator},
+    dataaccelerator::{self, create_accelerator_table},
     dataconnector::{sink::SinkConnector, DataConnector, DataConnectorError},
 };
 

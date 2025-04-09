@@ -21,7 +21,6 @@ use crate::dataaccelerator::spice_sys::debezium_kafka::DebeziumKafkaSys;
 use crate::dataconnector::ConnectorComponent;
 use crate::datafusion::refresh_sql;
 use crate::federated_table::FederatedTable;
-use crate::DataAccelerator;
 use arrow::datatypes::SchemaRef;
 use async_stream::stream;
 use async_trait::async_trait;
@@ -67,11 +66,13 @@ impl std::fmt::Debug for Debezium {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Debezium")
             .field("kafka_config", &self.kafka_config)
+            .field("accelerator_registry", &"<accelerator_registry>")
             .finish()
     }
 }
 
 impl Debezium {
+    #[must_use]
     pub fn accelerator_registry(&self) -> AcceleratorRegistry {
         Arc::clone(&self.accelerator_registry)
     }
@@ -150,8 +151,8 @@ impl Debezium {
         };
 
         Ok(Self {
-            accelerator_registry,
             kafka_config,
+            accelerator_registry,
         })
     }
 }

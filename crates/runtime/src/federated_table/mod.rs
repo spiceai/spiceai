@@ -27,10 +27,9 @@ limitations under the License.
 //! Unlike the `AcceleratedTable` struct, this struct does not implement the `TableProvider` trait itself.
 //! It only provides a way to get the underlying table provider and schema.
 
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
 use crate::accelerated_table::AcceleratorRegistry;
-use crate::DataAccelerator;
 use arrow::datatypes::SchemaRef;
 use datafusion::catalog::TableProvider;
 use tokio::sync::{oneshot, Mutex};
@@ -38,7 +37,7 @@ use util::{fibonacci_backoff::FibonacciBackoffBuilder, retry, RetryError};
 
 use crate::{
     component::dataset::Dataset, dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint,
-    dataconnector::DataConnector, Engine,
+    dataconnector::DataConnector,
 };
 
 #[derive(Debug)]

@@ -22,6 +22,7 @@ use crate::{
     get_test_datafusion, init_tracing, run_query_and_check_results, utils::test_request_context,
     ValidateFn,
 };
+use runtime::dataaccelerator::create_accelerator_registry;
 use runtime::{status, Runtime};
 use spicepod::{component::dataset::Dataset, param::Params};
 

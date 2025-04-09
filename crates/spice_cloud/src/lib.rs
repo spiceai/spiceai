@@ -16,18 +16,16 @@ limitations under the License.
 
 use std::{sync::Arc, time::Duration};
 
-use crate::accelerated_table::AcceleratorRegistry;
 use async_trait::async_trait;
 use datafusion::{datasource::TableProvider, sql::TableReference};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::json;
 use snafu::prelude::*;
 
-use runtime::component::dataset::acceleration::Engine;
-use runtime::dataaccelerator::DataAccelerator;
 use runtime::{
     accelerated_table::{
-        refresh::Refresh, AcceleratedTable, AcceleratedTableBuilderError, Retention,
+        refresh::Refresh, AcceleratedTable, AcceleratedTableBuilderError, AcceleratorRegistry,
+        Retention,
     },
     component::dataset::{
         acceleration::{Acceleration, RefreshMode},
@@ -42,8 +40,6 @@ use runtime::{
     spice_metrics::get_metrics_table_reference,
     status, Runtime,
 };
-use std::collections::HashMap;
-use tokio::sync::Mutex;
 use tokio::sync::RwLock;
 
 #[derive(Debug, Snafu)]
@@ -312,6 +308,7 @@ async fn get_spiceai_table_provider(
 /// # Errors
 ///
 /// This function will return an error if the accelerated table provider cannot be created
+#[allow(clippy::too_many_arguments)]
 pub async fn create_synced_internal_accelerated_table(
     accelerator_registry: AcceleratorRegistry,
     runtime_status: Arc<status::RuntimeStatus>,

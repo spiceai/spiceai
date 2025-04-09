@@ -33,11 +33,9 @@ use snafu::{ResultExt, Snafu};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::RwLock;
 
 use crate::accelerated_table::{AcceleratedTable, Retention};
-use crate::DataAccelerator;
-use crate::Engine;
 
 pub mod otel_exporter;
 

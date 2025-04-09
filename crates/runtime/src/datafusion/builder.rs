@@ -20,8 +20,6 @@ use std::{
 };
 
 use crate::accelerated_table::AcceleratorRegistry;
-use crate::DataAccelerator;
-use crate::Engine;
 use cache::QueryResultsCacheProvider;
 use datafusion::{
     catalog_common::{CatalogProvider, MemoryCatalogProvider},
@@ -37,8 +35,6 @@ use datafusion::{
     prelude::{SessionConfig, SessionContext},
 };
 use datafusion_federation::FederationAnalyzerRule;
-use std::collections::HashMap;
-use tokio::sync::Mutex;
 use tokio::sync::RwLock as TokioRwLock;
 
 use crate::{embeddings, object_store_registry::default_runtime_env, status};

@@ -35,18 +35,16 @@ use crate::{
     tracing_util::dataset_registered_trace,
     warn_spaced, AcceleratedReadWriteTableWithoutReplicationSnafu,
     AcceleratedTableInvalidChangesSnafu, AcceleratorEngineNotAvailableSnafu,
-    AcceleratorInitializationFailedSnafu, DataAccelerator, Engine, Error, LogErrors,
-    OdbcNotInstalledSnafu, Result, Runtime, UnableToAttachDataConnectorSnafu,
-    UnableToCreateAcceleratedTableSnafu, UnableToInitializeDataConnectorSnafu,
-    UnableToLoadDatasetConnectorSnafu, UnableToReceiveAcceleratedTableStatusSnafu,
-    UnknownDataConnectorSnafu,
+    AcceleratorInitializationFailedSnafu, Error, LogErrors, OdbcNotInstalledSnafu, Result, Runtime,
+    UnableToAttachDataConnectorSnafu, UnableToCreateAcceleratedTableSnafu,
+    UnableToInitializeDataConnectorSnafu, UnableToLoadDatasetConnectorSnafu,
+    UnableToReceiveAcceleratedTableStatusSnafu, UnknownDataConnectorSnafu,
 };
 use app::App;
 use datafusion::sql::TableReference;
 use futures::{future::join_all, StreamExt};
 use opentelemetry::KeyValue;
 use snafu::prelude::*;
-use tokio::sync::Mutex;
 use tokio::sync::Semaphore;
 use util::{fibonacci_backoff::FibonacciBackoffBuilder, retry, RetryError};
 
