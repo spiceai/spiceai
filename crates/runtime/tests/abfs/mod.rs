@@ -145,12 +145,14 @@ async fn run_queries() -> Result<(), anyhow::Error> {
         .build()
         .await;
 
+    let cloned_rt = Arc::new(rt.clone());
+
     // Set a timeout for the test
     tokio::select! {
         () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
             return Err(anyhow!("Timed out waiting for datasets to load".to_string()));
         }
-        () = rt.load_components() => {}
+        () = cloned_rt.load_components() => {}
     }
 
     let queries = vec![

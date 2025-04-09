@@ -431,7 +431,6 @@ impl SpiceTestQueryWorker {
         }
 
         if results_snapshot {
-            println!("snapshotting results");
             let query_name = Arc::clone(&query.name);
             let name = self.name.clone();
 

@@ -21,6 +21,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::time::Duration;
 use std::{collections::HashMap, sync::Arc};
+use tokio::task::JoinHandle;
 
 use crate::{
     auth::EndpointAuth, dataconnector::DataConnector, datafusion::DataFusion,
@@ -37,7 +38,7 @@ use dataconnector::ConnectorComponent;
 use datasets_health_monitor::DatasetsHealthMonitor;
 use extension::ExtensionFactory;
 use flight::RateLimits;
-use futures::future::join_all;
+use futures::future::{join_all, try_join_all};
 use futures::Stream;
 #[cfg(feature = "openapi")]
 pub use http::get_api_doc;
@@ -282,6 +283,12 @@ pub enum Error {
 
     #[snafu(display("{source}"))]
     ComponentError { source: component::Error },
+
+    #[snafu(display("{source}"))]
+    ComponentsInitializationFailed { source: tokio::task::JoinError },
+
+    #[snafu(display("Initialization has been cancelled"))]
+    ComponentsInitializationCancelled,
 }
 
 const HTTP_SERVER: &str = "http_server";
@@ -289,9 +296,10 @@ const METRICS_SERVER: &str = "metrics_server";
 const FLIGHT_SERVER: &str = "flight_server";
 const OPENTELEMETRY_SERVER: &str = "opentelemetry_server";
 const PODS_WATCHER: &str = "pods_watcher";
+const COMPONENTS_INITIAL_LOAD: &str = "components_initial_load";
 
-// Allow 30 seconds for server components to shutdown
-const SERVER_COMPONENT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+// Allow 30 seconds for tasks for graceful shutdown
+const RUNTIME_TASK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -321,7 +329,7 @@ pub struct Runtime {
 
     status: Arc<status::RuntimeStatus>,
 
-    server_components: Arc<RwLock<HashMap<String, CancellableTaskHandle>>>,
+    runtime_tasks: Arc<RwLock<HashMap<String, CancellableTaskHandle>>>,
 }
 
 impl Runtime {
@@ -408,7 +416,7 @@ impl Runtime {
         let http_shutdown = CancellationToken::new();
 
         let http_future = self
-            .start_server_component(HTTP_SERVER, Some(http_shutdown.clone()), async move {
+            .start_runtime_task(HTTP_SERVER, Some(http_shutdown.clone()), async move {
                 http::start(
                     cloned_config.http_bind_address,
                     self_ref,
@@ -428,7 +436,7 @@ impl Runtime {
         let cloned_tls_config = tls_config.clone();
 
         let metrics_future = self
-            .start_server_component(METRICS_SERVER, None, async move {
+            .start_runtime_task(METRICS_SERVER, None, async move {
                 metrics_server::start(metrics_endpoint, prometheus_registry, cloned_tls_config)
                     .await
                     .context(UnableToStartMetricsServerSnafu)
@@ -443,7 +451,7 @@ impl Runtime {
         let cloned_app_ref = self_ref.app.read().await.as_ref().map(Arc::clone);
 
         let flight_future = self
-            .start_server_component(FLIGHT_SERVER, Some(flight_shutdown.clone()), async move {
+            .start_runtime_task(FLIGHT_SERVER, Some(flight_shutdown.clone()), async move {
                 flight::start(
                     config.flight_bind_address,
                     cloned_app_ref,
@@ -465,7 +473,7 @@ impl Runtime {
         let grpc_auth = endpoint_auth.grpc_auth.clone();
 
         let opentelemetry_future = self
-            .start_server_component(
+            .start_runtime_task(
                 OPENTELEMETRY_SERVER,
                 Some(opentelemetry_graceful_shutdown.clone()),
                 async move {
@@ -496,7 +504,7 @@ impl Runtime {
         // Start Spicepod watcher
         let self_ref = Arc::clone(&self);
         let pods_watcher_future = self
-            .start_server_component(PODS_WATCHER, None, async move {
+            .start_runtime_task(PODS_WATCHER, None, async move {
                 self_ref
                     .start_pods_watcher()
                     .await
@@ -509,7 +517,6 @@ impl Runtime {
             shutdown_signal().await;
             tracing::debug!("Shutdown signal received.");
             self.shutdown().await;
-            tracing::info!("Goodbye!");
             Ok(())
         };
 
@@ -579,7 +586,8 @@ impl Runtime {
     ///
     /// The future returned by this function will not resolve until all components have been loaded and marked as ready.
     /// This includes waiting for the first refresh of any accelerated tables to complete.
-    pub async fn load_components(&self) {
+    #[allow(clippy::too_many_lines)]
+    pub async fn load_components(self: Arc<Self>) {
         self.set_components_initializing().await;
 
         self.start_extensions().await;
@@ -589,7 +597,7 @@ impl Runtime {
 
         // Spawn each component load in its own task to run in parallel
         let task_history = tokio::spawn({
-            let self_clone = self.clone();
+            let self_clone = Arc::clone(&self);
             async move {
                 if let Err(err) = self_clone.init_task_history().await {
                     tracing::warn!("Creating internal task history table: {err}");
@@ -598,28 +606,28 @@ impl Runtime {
         });
 
         let results_cache = tokio::spawn({
-            let self_clone = self.clone();
+            let self_clone = Arc::clone(&self);
             async move {
                 self_clone.init_results_cache().await;
             }
         });
 
         let datasets = tokio::spawn({
-            let self_clone = Arc::new(self.clone());
+            let self_clone = Arc::clone(&self);
             async move {
                 self_clone.load_datasets().await;
             }
         });
 
         let catalogs = tokio::spawn({
-            let self_clone = self.clone();
+            let self_clone = Arc::clone(&self);
             async move {
                 self_clone.load_catalogs().await;
             }
         });
 
         let models_and_evals = tokio::spawn({
-            let self_clone = self.clone();
+            let self_clone = Arc::clone(&self);
             async move {
                 self_clone.load_models().await;
 
@@ -645,17 +653,48 @@ impl Runtime {
             }
         });
 
-        // Wait for all tasks to complete
-        let load_result = tokio::try_join!(
+        let components = vec![
             task_history,
             results_cache,
             datasets,
             catalogs,
-            models_and_evals
-        );
+            models_and_evals,
+        ];
 
-        if let Err(err) = load_result {
-            tracing::error!("Could not start the Spice runtime: {err}");
+        // Signal that the load must be canceled if the runtime is shut down before the components are loaded
+        let cancel_loading = CancellationToken::new();
+
+        // Wait for all components to load returning the first error
+        // or canceling spawned tokio tasks if the runtime is shutting down
+        let load_result = self
+            .start_runtime_task(
+                COMPONENTS_INITIAL_LOAD,
+                Some(cancel_loading.clone()),
+                async move {
+                    let abort_handlers = components
+                        .iter()
+                        .map(JoinHandle::abort_handle)
+                        .collect::<Vec<_>>();
+
+                    tokio::select! {
+                        load_result = try_join_all(components) => {
+                            load_result.map(|_| ()).context(ComponentsInitializationFailedSnafu)
+                        }
+                        () = cancel_loading.cancelled() => {
+                            for handle in abort_handlers {
+                                handle.abort();
+                            }
+                            ComponentsInitializationCancelledSnafu.fail()
+                        }
+                    }
+                },
+            )
+            .await;
+
+        if let Err(err) = load_result.await {
+            if !matches!(err, Error::ComponentsInitializationCancelled) {
+                tracing::error!("Could not start the Spice runtime: {err}");
+            }
         } else {
             // Create a background task to report once all components are marked as `Ready`
             let status = self.status();
@@ -687,13 +726,13 @@ impl Runtime {
         self.status.mark_shutdown();
 
         // shutdown all running components except the HTTP and Metrics servers
-        let mut running_components = self.server_components.write().await;
+        let mut runtime_tasks = self.runtime_tasks.write().await;
 
         // HTTP and METRICS servers must be shutdown last
         let mut first_shutdown_group = Vec::new();
         let mut last_shutdown_group = Vec::new();
 
-        for (name, handle) in running_components.drain() {
+        for (name, handle) in runtime_tasks.drain() {
             match name.as_str() {
                 HTTP_SERVER | METRICS_SERVER => last_shutdown_group.push((name, handle)),
                 _ => first_shutdown_group.push((name, handle)),
@@ -702,9 +741,13 @@ impl Runtime {
 
         let shutdown_futures: Vec<_> = first_shutdown_group
             .into_iter()
-            .map(|(name, handle)| {
-                tracing::debug!("Shutting down {name}");
-                handle.cancel(SERVER_COMPONENT_SHUTDOWN_TIMEOUT)
+            .filter_map(|(name, handle)| {
+                if handle.is_finished() {
+                    None
+                } else {
+                    tracing::debug!("Shutting down {name}");
+                    Some(handle.cancel(RUNTIME_TASK_SHUTDOWN_TIMEOUT))
+                }
             })
             .collect();
 
@@ -723,7 +766,7 @@ impl Runtime {
             .into_iter()
             .map(|(name, handle)| {
                 tracing::debug!("Shutting down {name}");
-                handle.cancel(SERVER_COMPONENT_SHUTDOWN_TIMEOUT)
+                handle.cancel(RUNTIME_TASK_SHUTDOWN_TIMEOUT)
             })
             .collect();
 
@@ -732,8 +775,8 @@ impl Runtime {
         tracing::debug!("Shutdown completed");
     }
 
-    /// Spawns and registers a server component with optional cancellation support.
-    async fn start_server_component<F>(
+    /// Spawns and registers a runtime task with optional cancellation support.
+    async fn start_runtime_task<F>(
         self: &Arc<Self>,
         component_name: &str,
         cancellation_token: Option<CancellationToken>,
@@ -744,7 +787,7 @@ impl Runtime {
     {
         let (future, handle) = spawn_cancellable_task(cancellation_token, task_fn);
 
-        self.server_components
+        self.runtime_tasks
             .write()
             .await
             .insert(component_name.to_string(), handle);

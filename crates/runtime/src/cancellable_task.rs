@@ -56,6 +56,12 @@ impl CancellableTaskHandle {
             _ = self.on_task_completed => {}
         };
     }
+
+    /// Returns true if the task has already completed, false otherwise.
+    pub fn is_finished(&self) -> bool {
+        // returns true when the corresponding receiver has been dropped, which happens when the task completes or is aborted.
+        self.notify_abort_task.is_closed()
+    }
 }
 
 /// Spawns a task that allows external cancellation.
@@ -236,5 +242,23 @@ mod tests {
         .await;
 
         assert!(cancel_result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_is_completed() {
+        let (task_future, handle) = spawn_cancellable_task(None, async move {
+            // Finish task after 100 ms
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            Ok::<(), Error>(())
+        });
+
+        assert!(!handle.is_finished());
+
+        task_future.await.expect("to complete successfully");
+
+        assert!(handle.is_finished());
+
+        // Verify completion check could be used multiple times
+        assert!(handle.is_finished());
     }
 }

@@ -67,12 +67,13 @@ async fn spiceai_integration_test_refresh_sql_override_append() -> Result<(), an
                 .with_runtime_status(status)
                 .build()
                 .await;
+            let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {
                 () = tokio::time::sleep(std::time::Duration::from_secs(120)) => {
                     panic!("Timeout waiting for components to load");
                 }
-                () = rt.load_components() => {}
+                () = cloned_rt.load_components() => {}
             }
 
             runtime_ready_check(&rt).await;
