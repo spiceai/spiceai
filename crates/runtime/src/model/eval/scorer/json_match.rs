@@ -66,7 +66,7 @@ impl Scorer for JsonMatch {
 
         let ideal_strs = match ideal {
             DatasetOutput::AssistantResponse(a) => vec![a.clone()],
-            DatasetOutput::Choices(ref c) => c
+            DatasetOutput::Choices(c) => c
                 .iter()
                 .map(|c| c.message.content.clone().unwrap_or_default())
                 .collect(),

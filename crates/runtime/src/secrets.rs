@@ -368,7 +368,7 @@ mod tests {
         secrets.load_from(&[]).await.expect("to load successfully"); // Will automatically load `env` as the default
 
         let key = &format!("MY_SECRET_KEY_{}", rand::random::<u64>());
-        std::env::set_var(key, "super_secret");
+        unsafe { std::env::set_var(key, "super_secret") };
 
         let result = secrets
             .inject_secrets(
@@ -387,7 +387,7 @@ mod tests {
         let key = &format!("MY_SECRET_KEY_{}", rand::random::<u64>());
 
         // Ensure `MY_SECRET_KEY` is not set from other tests.
-        std::env::remove_var(key);
+        unsafe { std::env::remove_var(key) };
 
         let result = secrets
             .inject_secrets(

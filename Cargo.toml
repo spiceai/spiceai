@@ -35,12 +35,12 @@ members = [
 resolver = "2"
 
 [workspace.package]
-edition = "2021"
+edition = "2024"
 exclude = [".github/"]
 homepage = "https://spice.ai"
 license = "Apache-2.0"
 repository = "https://github.com/spiceai/spiceai"
-rust-version = "1.84"
+rust-version = "1.85"
 version = "1.2.0-unstable"
 
 [workspace.dependencies]

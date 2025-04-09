@@ -109,7 +109,7 @@ async fn datafusion_task_history_tracing<S>(
     df: Arc<DataFusion>,
     app: Option<&Arc<App>>,
     config: Option<&TracingConfig>,
-) -> Result<impl Layer<S>, Box<dyn std::error::Error + Send + Sync>>
+) -> Result<impl Layer<S> + use<S>, Box<dyn std::error::Error + Send + Sync>>
 where
     S: Subscriber + for<'span> LookupSpan<'span>,
 {

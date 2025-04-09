@@ -20,16 +20,16 @@ use super::{ArrowInternalSnafu, Error, ErrorChecker, ReqwestInternalSnafu, Resul
 use arrow::{
     array::RecordBatch,
     datatypes::SchemaRef,
-    json::{reader::infer_json_schema_from_iterator, ReaderBuilder},
+    json::{ReaderBuilder, reader::infer_json_schema_from_iterator},
 };
 use graphql_parser::query::{
-    parse_query, Definition, Document, Field, InlineFragment, OperationDefinition, Query,
-    Selection, SelectionSet, Text,
+    Definition, Document, Field, InlineFragment, OperationDefinition, Query, Selection,
+    SelectionSet, Text, parse_query,
 };
 use regex::Regex;
 use reqwest::{RequestBuilder, StatusCode};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use snafu::ResultExt;
 use std::{cmp::min, fmt::Display, io::Cursor, sync::Arc};
 
@@ -447,7 +447,9 @@ impl PaginationParameters {
 
                         // Check [`PaginationArgument`] and `pageInfo` fields are consistent.
                         if let Err(e) = pagination_argument.validate_page_info(field) {
-                            tracing::warn!("GraphQL query has pagination specified ({pagination_argument}), but invalid pagination fields: {e}");
+                            tracing::warn!(
+                                "GraphQL query has pagination specified ({pagination_argument}), but invalid pagination fields: {e}"
+                            );
                             return (None, None);
                         }
 
@@ -549,7 +551,7 @@ fn unnest_json_object(unnest_parameters: &UnnestParameters, object: &Value) -> R
 
             new_object.retain(|_, value| {
                 match value {
-                    Value::Object(ref mut inner_obj) => {
+                    Value::Object(inner_obj) => {
                         inner_obj.retain(|inner_key, inner_value| {
                             additions.push((inner_key.clone(), inner_value.clone())); // add the inner key to the additions list
                             false
@@ -955,13 +957,17 @@ fn handle_http_error(status: StatusCode, response: &Value) -> Result<()> {
         .to_string();
 
         return match status {
-            StatusCode::UNAUTHORIZED => {
-                Err(Error::InvalidCredentialsOrPermissions { message: format!("The API failed with status code {status}.\nVerify the provided credentials are correct.") })
-            },
-            StatusCode::FORBIDDEN => {
-                Err(Error::InvalidCredentialsOrPermissions { message: format!("The API failed with status code {status}.\nVerify the provided credentials have the necessary permissions.") })
-            },
-            _ => Err(Error::InvalidReqwestStatus { status, message })
+            StatusCode::UNAUTHORIZED => Err(Error::InvalidCredentialsOrPermissions {
+                message: format!(
+                    "The API failed with status code {status}.\nVerify the provided credentials are correct."
+                ),
+            }),
+            StatusCode::FORBIDDEN => Err(Error::InvalidCredentialsOrPermissions {
+                message: format!(
+                    "The API failed with status code {status}.\nVerify the provided credentials have the necessary permissions."
+                ),
+            }),
+            _ => Err(Error::InvalidReqwestStatus { status, message }),
         };
     }
     Ok(())
@@ -993,7 +999,11 @@ fn handle_graphql_query_error(response: &Value, query: &str) -> Result<()> {
 
         if let Some(error_type) = error_type {
             if error_type.to_lowercase() == "forbidden" {
-                return Err(Error::InvalidCredentialsOrPermissions { message: format!("The API returned a 'FORBIDDEN' error.\nVerify the credentials have the necessary permissions.\n{message}") });
+                return Err(Error::InvalidCredentialsOrPermissions {
+                    message: format!(
+                        "The API returned a 'FORBIDDEN' error.\nVerify the credentials have the necessary permissions.\n{message}"
+                    ),
+                });
             }
         }
 
@@ -1043,7 +1053,7 @@ mod tests {
 
     use crate::graphql::client::GraphQLQuery;
 
-    use super::{handle_http_error, DuplicateBehavior, PaginationParameters};
+    use super::{DuplicateBehavior, PaginationParameters, handle_http_error};
 
     struct TestPaginationParseCase {
         name: &'static str,

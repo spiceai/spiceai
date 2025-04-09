@@ -6,11 +6,11 @@ use std::sync::Arc;
 use datafusion::{
     arrow::datatypes::SchemaRef,
     error::{DataFusionError, Result as DataFusionResult},
-    physical_plan::{stream::RecordBatchStreamAdapter, SendableRecordBatchStream},
-    sql::{unparser::dialect::Dialect, TableReference},
+    physical_plan::{SendableRecordBatchStream, stream::RecordBatchStreamAdapter},
+    sql::{TableReference, unparser::dialect::Dialect},
 };
 
-use super::{query_to_stream, FlightTable};
+use super::{FlightTable, query_to_stream};
 
 impl FlightTable {
     fn create_federated_table_source(
@@ -63,7 +63,7 @@ impl SQLExecutor for FlightTable {
     ) -> DataFusionResult<SendableRecordBatchStream> {
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             schema,
-            query_to_stream(self.client.clone(), query),
+            query_to_stream(self.client.clone(), query.to_string()),
         )))
     }
 
