@@ -14,7 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::dataaccelerator::AcceleratorRegistry;
+use super::{find_first_delimiter, validate_identifier};
+use crate::dataaccelerator::AcceleratorEngineRegistry;
 use acceleration::Engine;
 use app::App;
 use arrow::datatypes::SchemaRef;
@@ -34,10 +35,6 @@ use spicepod::{
     semantic::Column,
 };
 use std::{collections::HashMap, fmt::Display, str::FromStr, sync::Arc, time::Duration};
-
-use crate::dataaccelerator::get_accelerator_engine;
-
-use super::{find_first_delimiter, validate_identifier};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -582,11 +579,12 @@ impl Dataset {
     #[must_use]
     pub async fn is_accelerator_initialized(
         &self,
-        accelerator_registry: AcceleratorRegistry,
+        accelerator_engine_registry: AcceleratorEngineRegistry,
     ) -> bool {
         if let Some(acceleration) = &self.acceleration {
-            let Some(accelerator) =
-                get_accelerator_engine(accelerator_registry, acceleration.engine).await
+            let Some(accelerator) = accelerator_engine_registry
+                .get_accelerator_engine(acceleration.engine)
+                .await
             else {
                 return false; // if the accelerator engine is not found, it's impossible for it to be initialized
             };

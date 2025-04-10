@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::dataaccelerator::AcceleratorRegistry;
+use crate::dataaccelerator::AcceleratorEngineRegistry;
 use crate::{
     App, Runtime,
     component::dataset::{
@@ -81,22 +81,22 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct DuckDBAccelerator {
     duckdb_factory: DuckDBTableProviderFactory,
-    accelerator_registry: AcceleratorRegistry,
+    accelerator_engine_registry: AcceleratorEngineRegistry,
 }
 
 impl DuckDBAccelerator {
     #[must_use]
-    pub fn new(accelerator_registry: AcceleratorRegistry) -> Self {
+    pub fn new(accelerator_engine_registry: AcceleratorEngineRegistry) -> Self {
         Self {
             // DuckDB accelerator uses params.duckdb_file for file connection
             duckdb_factory: DuckDBTableProviderFactory::new(AccessMode::ReadWrite)
                 .with_dialect(new_duckdb_dialect()),
-            accelerator_registry,
+            accelerator_engine_registry,
         }
     }
 
-    fn accelerator_registry(&self) -> AcceleratorRegistry {
-        Arc::clone(&self.accelerator_registry)
+    fn accelerator_engine_registry(&self) -> AcceleratorEngineRegistry {
+        self.accelerator_engine_registry.clone()
     }
 
     /// Returns the `DuckDB` file path that would be used for a file-based `DuckDB` accelerator from this dataset
@@ -320,7 +320,7 @@ impl DataAccelerator for DuckDBAccelerator {
 
                 if let Some(app) = &this_dataset.app {
                     let datasets = Runtime::get_initialized_datasets(
-                        self.accelerator_registry(),
+                        self.accelerator_engine_registry(),
                         app,
                         crate::LogErrors(false),
                     )
@@ -445,7 +445,7 @@ mod tests {
             temporary: false,
         };
         let rt = RuntimeBuilder::new().build().await;
-        let duckdb_accelerator = DuckDBAccelerator::new(rt.accelerator_registry());
+        let duckdb_accelerator = DuckDBAccelerator::new(rt.accelerator_engine_registry());
         let ctx = SessionContext::new();
         let table = duckdb_accelerator
             .create_external_table(&external_table, None)
@@ -629,7 +629,7 @@ mod tests {
         });
 
         let runtime = RuntimeBuilder::new().build().await;
-        let accelerator = DuckDBAccelerator::new(runtime.accelerator_registry());
+        let accelerator = DuckDBAccelerator::new(runtime.accelerator_engine_registry());
         assert!(!accelerator.is_initialized(&dataset));
 
         accelerator

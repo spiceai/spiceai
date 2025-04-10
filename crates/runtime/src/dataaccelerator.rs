@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::Runtime;
 use crate::component::dataset::Dataset;
 use crate::component::dataset::acceleration::{self, Acceleration, Engine, IndexType, Mode};
 use crate::parameters::ParameterSpec;
@@ -75,71 +74,171 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-pub type AcceleratorRegistry = Arc<Mutex<HashMap<Engine, Arc<dyn DataAccelerator>>>>;
-
-pub async fn register_accelerator_engine(
-    name: Engine,
-    accelerator_engine: Arc<dyn DataAccelerator>,
-    rt: Arc<Runtime>,
-) {
-    let accelerator_registry = rt.accelerator_registry();
-    let mut registry = accelerator_registry.lock().await;
-
-    registry.insert(name, accelerator_engine);
+#[derive(Default, Clone)]
+pub struct AcceleratorEngineRegistry {
+    pub accelerator_engine_registry: Arc<Mutex<HashMap<Engine, Arc<dyn DataAccelerator>>>>,
 }
 
-#[must_use]
-pub fn create_accelerator_registry() -> AcceleratorRegistry {
-    Arc::new(Mutex::new(HashMap::new()))
-}
+impl AcceleratorEngineRegistry {
+    pub fn new() -> Self {
+        Self {
+            accelerator_engine_registry: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
 
-pub async fn register_all(rt: Arc<Runtime>) {
-    register_accelerator_engine(
-        Engine::Arrow,
-        Arc::new(ArrowAccelerator::new()),
-        Arc::clone(&rt),
-    )
-    .await;
-    #[cfg(feature = "duckdb")]
-    register_accelerator_engine(
-        Engine::DuckDB,
-        Arc::new(DuckDBAccelerator::new(rt.accelerator_registry())),
-        Arc::clone(&rt),
-    )
-    .await;
-    #[cfg(feature = "postgres")]
-    register_accelerator_engine(
-        Engine::PostgreSQL,
-        Arc::new(PostgresAccelerator::new()),
-        Arc::clone(&rt),
-    )
-    .await;
-    #[cfg(feature = "sqlite")]
-    register_accelerator_engine(
-        Engine::Sqlite,
-        Arc::new(SqliteAccelerator::new(rt.accelerator_registry())),
-        rt,
-    )
-    .await;
-}
+    pub async fn get_accelerator_engine(&self, engine: Engine) -> Option<Arc<dyn DataAccelerator>> {
+        let guard = self.accelerator_engine_registry.lock().await;
+        let engine = guard.get(&engine);
+        match engine {
+            Some(engine_ref) => Some(Arc::clone(engine_ref)),
+            None => None,
+        }
+    }
 
-pub async fn unregister_all(rt: &Runtime) {
-    let accelerator_registry = rt.accelerator_registry();
-    let mut registry = accelerator_registry.lock().await;
-    registry.clear();
-}
+    async fn register_accelerator_engine(
+        &self,
+        name: Engine,
+        accelerator_engine: Arc<dyn DataAccelerator>,
+    ) {
+        let mut registry = self.accelerator_engine_registry.lock().await;
+        registry.insert(name, accelerator_engine);
+    }
 
-pub async fn get_accelerator_engine(
-    accelerator_registry: AcceleratorRegistry,
-    engine: Engine,
-) -> Option<Arc<dyn DataAccelerator>> {
-    let guard = accelerator_registry.lock().await;
+    pub async fn register_all(&self) {
+        self.register_accelerator_engine(Engine::Arrow, Arc::new(ArrowAccelerator::new()))
+            .await;
+        #[cfg(feature = "duckdb")]
+        self.register_accelerator_engine(
+            Engine::DuckDB,
+            Arc::new(DuckDBAccelerator::new(self.clone())),
+        )
+        .await;
+        #[cfg(feature = "postgres")]
+        self.register_accelerator_engine(Engine::PostgreSQL, Arc::new(PostgresAccelerator::new()))
+            .await;
+        #[cfg(feature = "sqlite")]
+        self.register_accelerator_engine(
+            Engine::Sqlite,
+            Arc::new(SqliteAccelerator::new(self.clone())),
+        )
+        .await
+    }
 
-    let engine = guard.get(&engine);
+    pub async fn unregister_all(&self) {
+        let mut registry = self.accelerator_engine_registry.lock().await;
+        registry.clear();
+    }
 
-    match engine {
-        Some(engine_ref) => Some(Arc::clone(engine_ref)),
-        None => None,
+    pub async fn create_accelerator_table(
+        &self,
+        table_name: TableReference,
+        schema: SchemaRef,
+        constraints: Option<&Constraints>,
+        acceleration_settings: &acceleration::Acceleration,
+        secrets: Arc<RwLock<Secrets>>,
+        dataset: Option<&Dataset>,
+    ) -> Result<Arc<dyn TableProvider>> {
+        let engine = acceleration_settings.engine;
+
+        let accelerator = self.get_accelerator_engine(engine).await.ok_or_else(|| {
+            Error::InvalidConfiguration {
+                msg: format!("Unknown engine: {engine}"),
+            }
+        })?;
+
+        if let Err(e) = acceleration_settings.validate_indexes(&schema) {
+            InvalidConfigurationSnafu {
+                msg: format!("{e}"),
+            }
+            .fail()?;
+        };
+
+        if let Err(e) = acceleration_settings.validate_primary_key(&schema) {
+            InvalidConfigurationSnafu {
+                msg: format!("{e}"),
+            }
+            .fail()?;
+        };
+
+        let cloned_secrets = Arc::clone(&secrets);
+        let secret_guard = cloned_secrets.read().await;
+        let mut params_with_secrets: HashMap<String, SecretString> = HashMap::new();
+
+        // Inject secrets from the user-supplied params.
+        // This will replace any instances of `${ store:key }` with the actual secret value.
+        for (k, v) in &acceleration_settings.params {
+            let secret = secret_guard.inject_secrets(k, ParamStr(v)).await;
+            params_with_secrets.insert(k.clone(), secret);
+        }
+
+        let params = Parameters::try_new(
+            &format!("accelerator {}", accelerator.name()),
+            params_with_secrets.into_iter().collect::<Vec<_>>(),
+            accelerator.prefix(),
+            secrets,
+            accelerator.parameters(),
+        )
+        .await
+        .context(AccelerationCreationFailedSnafu)?;
+
+        // Not all acceleration engines support creating tables with schemas so we include the schema as part of the table name.
+        // For example, Table {schema: "schema", table: "table_name"} is converted to Table {table: "schema.table_name"}.
+        let accelerated_table_name = TableReference::bare(table_name.to_string());
+
+        let mut external_table_builder = AcceleratorExternalTableBuilder::new(
+            accelerated_table_name,
+            Arc::clone(&schema),
+            engine,
+        )
+        .mode(acceleration_settings.mode)
+        .options(params)
+        .indexes(acceleration_settings.indexes.clone());
+
+        // If there are constraints from the federated table, then add them to the accelerated table
+        // and automatically configure upsert behavior for them. This can be overridden by the user.
+        if let Some(constraints) = constraints {
+            if !constraints.is_empty() {
+                external_table_builder = external_table_builder.constraints(constraints.clone());
+                let primary_keys: Vec<String> =
+                    get_primary_keys_from_constraints(constraints, &schema);
+                external_table_builder = external_table_builder
+                    .on_conflict(OnConflict::Upsert(ColumnReference::new(primary_keys)));
+            }
+        }
+
+        if let Some(on_conflict) =
+            acceleration_settings
+                .on_conflict()
+                .map_err(|e| Error::InvalidConfiguration {
+                    msg: format!("on_conflict invalid: {e}"),
+                })?
+        {
+            external_table_builder = external_table_builder.on_conflict(on_conflict);
+        };
+
+        match acceleration_settings.table_constraints(Arc::clone(&schema)) {
+            Ok(Some(constraints)) => {
+                if !constraints.is_empty() {
+                    external_table_builder = external_table_builder.constraints(constraints);
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
+                InvalidConfigurationSnafu {
+                    msg: format!("{e}"),
+                }
+                .fail()?;
+            }
+        }
+
+        let external_table = external_table_builder.build()?;
+
+        let table_provider = accelerator
+            .create_external_table(&external_table, dataset)
+            .await
+            .context(AccelerationCreationFailedSnafu)?;
+
+        Ok(table_provider)
     }
 }
 
@@ -345,114 +444,6 @@ impl AcceleratorExternalTableBuilder {
     }
 }
 
-pub async fn create_accelerator_table(
-    accelerator_registry: AcceleratorRegistry,
-    table_name: TableReference,
-    schema: SchemaRef,
-    constraints: Option<&Constraints>,
-    acceleration_settings: &acceleration::Acceleration,
-    secrets: Arc<RwLock<Secrets>>,
-    dataset: Option<&Dataset>,
-) -> Result<Arc<dyn TableProvider>> {
-    let engine = acceleration_settings.engine;
-
-    let accelerator = get_accelerator_engine(accelerator_registry, engine)
-        .await
-        .ok_or_else(|| Error::InvalidConfiguration {
-            msg: format!("Unknown engine: {engine}"),
-        })?;
-
-    if let Err(e) = acceleration_settings.validate_indexes(&schema) {
-        InvalidConfigurationSnafu {
-            msg: format!("{e}"),
-        }
-        .fail()?;
-    };
-
-    if let Err(e) = acceleration_settings.validate_primary_key(&schema) {
-        InvalidConfigurationSnafu {
-            msg: format!("{e}"),
-        }
-        .fail()?;
-    };
-
-    let cloned_secrets = Arc::clone(&secrets);
-    let secret_guard = cloned_secrets.read().await;
-    let mut params_with_secrets: HashMap<String, SecretString> = HashMap::new();
-
-    // Inject secrets from the user-supplied params.
-    // This will replace any instances of `${ store:key }` with the actual secret value.
-    for (k, v) in &acceleration_settings.params {
-        let secret = secret_guard.inject_secrets(k, ParamStr(v)).await;
-        params_with_secrets.insert(k.clone(), secret);
-    }
-
-    let params = Parameters::try_new(
-        &format!("accelerator {}", accelerator.name()),
-        params_with_secrets.into_iter().collect::<Vec<_>>(),
-        accelerator.prefix(),
-        secrets,
-        accelerator.parameters(),
-    )
-    .await
-    .context(AccelerationCreationFailedSnafu)?;
-
-    // Not all acceleration engines support creating tables with schemas so we include the schema as part of the table name.
-    // For example, Table {schema: "schema", table: "table_name"} is converted to Table {table: "schema.table_name"}.
-    let accelerated_table_name = TableReference::bare(table_name.to_string());
-
-    let mut external_table_builder =
-        AcceleratorExternalTableBuilder::new(accelerated_table_name, Arc::clone(&schema), engine)
-            .mode(acceleration_settings.mode)
-            .options(params)
-            .indexes(acceleration_settings.indexes.clone());
-
-    // If there are constraints from the federated table, then add them to the accelerated table
-    // and automatically configure upsert behavior for them. This can be overridden by the user.
-    if let Some(constraints) = constraints {
-        if !constraints.is_empty() {
-            external_table_builder = external_table_builder.constraints(constraints.clone());
-            let primary_keys: Vec<String> = get_primary_keys_from_constraints(constraints, &schema);
-            external_table_builder = external_table_builder
-                .on_conflict(OnConflict::Upsert(ColumnReference::new(primary_keys)));
-        }
-    }
-
-    if let Some(on_conflict) =
-        acceleration_settings
-            .on_conflict()
-            .map_err(|e| Error::InvalidConfiguration {
-                msg: format!("on_conflict invalid: {e}"),
-            })?
-    {
-        external_table_builder = external_table_builder.on_conflict(on_conflict);
-    };
-
-    match acceleration_settings.table_constraints(Arc::clone(&schema)) {
-        Ok(Some(constraints)) => {
-            if !constraints.is_empty() {
-                external_table_builder = external_table_builder.constraints(constraints);
-            }
-        }
-        Ok(None) => {}
-        Err(e) => {
-            InvalidConfigurationSnafu {
-                msg: format!("{e}"),
-            }
-            .fail()?;
-        }
-    }
-
-    let external_table = external_table_builder.build()?;
-
-    let table_provider = accelerator
-        .create_external_table(&external_table, dataset)
-        .await
-        .context(AccelerationCreationFailedSnafu)?;
-
-    Ok(table_provider)
-}
-
 fn get_primary_keys_from_constraints(constraints: &Constraints, schema: &SchemaRef) -> Vec<String> {
     constraints
         .iter()
@@ -486,7 +477,7 @@ mod test {
         let path = "./abc-duckdb.db".to_string();
         let params = HashMap::from([("duckdb_file".to_string(), path.clone())]);
         let runtime = Arc::new(RuntimeBuilder::new().build().await);
-        register_all(Arc::clone(&runtime)).await;
+        runtime.accelerator_engine_registry().register_all().await;
         let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Utf8, false)]));
         let acceleration_settings = Acceleration {
             params,
@@ -495,17 +486,18 @@ mod test {
             engine: Engine::DuckDB,
             ..Acceleration::default()
         };
-        let _ = create_accelerator_table(
-            runtime.accelerator_registry(),
-            "abc".into(),
-            schema,
-            None,
-            &acceleration_settings,
-            Arc::new(RwLock::new(Secrets::new())),
-            None,
-        )
-        .await
-        .expect("accelerator table created");
+        let _ = runtime
+            .accelerator_engine_registry
+            .create_accelerator_table(
+                "abc".into(),
+                schema,
+                None,
+                &acceleration_settings,
+                Arc::new(RwLock::new(Secrets::new())),
+                None,
+            )
+            .await
+            .expect("accelerator table created");
 
         let path = Path::new(&path);
         assert!(path.is_file());
@@ -521,7 +513,7 @@ mod test {
         let path = "./abc-sqlite.db".to_string();
         let params = HashMap::from([("sqlite_file".to_string(), path.clone())]);
         let runtime = Arc::new(RuntimeBuilder::new().build().await);
-        register_all(Arc::clone(&runtime)).await;
+        runtime.accelerator_engine_registry().register_all().await;
         let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Utf8, false)]));
         let acceleration_settings = Acceleration {
             params: params.clone(),
@@ -531,17 +523,18 @@ mod test {
             ..Acceleration::default()
         };
 
-        let _ = create_accelerator_table(
-            runtime.accelerator_registry(),
-            "abc".into(),
-            schema,
-            None,
-            &acceleration_settings,
-            Arc::new(RwLock::new(Secrets::new())),
-            None,
-        )
-        .await
-        .expect("accelerator table created");
+        let _ = runtime
+            .accelerator_engine_registry
+            .create_accelerator_table(
+                "abc".into(),
+                schema,
+                None,
+                &acceleration_settings,
+                Arc::new(RwLock::new(Secrets::new())),
+                None,
+            )
+            .await
+            .expect("accelerator table created");
 
         let path = Path::new(&path);
         assert!(path.is_file());
@@ -560,7 +553,7 @@ mod test {
         let path = format!("{spice_data_dir}/abc_sqlite.db");
 
         let runtime = Arc::new(RuntimeBuilder::new().build().await);
-        register_all(Arc::clone(&runtime)).await;
+        runtime.accelerator_engine_registry().register_all().await;
         let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Utf8, false)]));
         let acceleration_settings = Acceleration {
             params: HashMap::new(),
@@ -569,17 +562,18 @@ mod test {
             engine: Engine::Sqlite,
             ..Acceleration::default()
         };
-        let _ = create_accelerator_table(
-            runtime.accelerator_registry(),
-            "abc".into(),
-            schema,
-            None,
-            &acceleration_settings,
-            Arc::new(RwLock::new(Secrets::new())),
-            None,
-        )
-        .await
-        .expect("accelerator table created");
+        let _ = runtime
+            .accelerator_engine_registry
+            .create_accelerator_table(
+                "abc".into(),
+                schema,
+                None,
+                &acceleration_settings,
+                Arc::new(RwLock::new(Secrets::new())),
+                None,
+            )
+            .await
+            .expect("accelerator table created");
 
         let path = Path::new(&path);
         assert!(path.is_file());

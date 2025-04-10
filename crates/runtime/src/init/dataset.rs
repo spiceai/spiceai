@@ -16,7 +16,7 @@ limitations under the License.
 
 use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc};
 
-use crate::dataaccelerator::AcceleratorRegistry;
+use crate::dataaccelerator::AcceleratorEngineRegistry;
 use crate::{
     AcceleratedReadWriteTableWithoutReplicationSnafu, AcceleratedTableInvalidChangesSnafu,
     AcceleratorEngineNotAvailableSnafu, AcceleratorInitializationFailedSnafu, Error, LogErrors,
@@ -26,7 +26,6 @@ use crate::{
     UnknownDataConnectorSnafu,
     accelerated_table::AcceleratedTable,
     component::dataset::{self, Dataset, acceleration::RefreshMode},
-    dataaccelerator,
     dataconnector::{
         self, ConnectorComponent, ConnectorParams, ConnectorParamsBuilder, DataConnector,
         DataConnectorError, ODBC_DATACONNECTOR,
@@ -313,7 +312,7 @@ impl Runtime {
                 // We couldn't connect to the federated table. If the dataset has an existing
                 // accelerated table, we can defer the federated table creation.
                 if let Some(federated_table) = FederatedTable::new_deferred(
-                    self.accelerator_registry(),
+                    self.accelerator_engine_registry(),
                     Arc::clone(&ds),
                     Arc::clone(&connector),
                 )
@@ -607,7 +606,8 @@ impl Runtime {
             AcceleratedReadWriteTableWithoutReplicationSnafu.fail()?;
         }
 
-        dataaccelerator::get_accelerator_engine(self.accelerator_registry(), accelerator_engine)
+        self.accelerator_engine_registry
+            .get_accelerator_engine(accelerator_engine)
             .await
             .context(AcceleratorEngineNotAvailableSnafu {
                 name: accelerator_engine.to_string(),
@@ -676,14 +676,13 @@ impl Runtime {
         let mut initialized_datasets = vec![];
         for ds in datasets {
             if let Some(acceleration) = &ds.acceleration {
-                let accelerator = match dataaccelerator::get_accelerator_engine(
-                    self.accelerator_registry(),
-                    acceleration.engine,
-                )
-                .await
-                .context(AcceleratorEngineNotAvailableSnafu {
-                    name: acceleration.engine.to_string(),
-                }) {
+                let accelerator = match self
+                    .accelerator_engine_registry
+                    .get_accelerator_engine(acceleration.engine)
+                    .await
+                    .context(AcceleratorEngineNotAvailableSnafu {
+                        name: acceleration.engine.to_string(),
+                    }) {
                     Ok(accelerator) => accelerator,
                     Err(err) => {
                         let ds_name = &ds.name;
@@ -722,18 +721,18 @@ impl Runtime {
 
     /// Returns a list of valid datasets from the given App, skipping any that fail to parse and logging an error for them.
     pub(crate) async fn get_initialized_datasets(
-        accelerator_registry: AcceleratorRegistry,
+        accelerator_engine_registry: AcceleratorEngineRegistry,
         app: &Arc<App>,
         log_errors: LogErrors,
     ) -> Vec<Arc<Dataset>> {
         let valid_datasets = Self::get_valid_datasets(app, log_errors);
         futures::stream::iter(valid_datasets)
             .filter_map(|ds| {
-                let value = Arc::clone(&accelerator_registry);
+                let accelerator_engine_registry_clone = accelerator_engine_registry.clone();
                 async move {
                     match (
                         ds.is_accelerated(),
-                        ds.is_accelerator_initialized(Arc::clone(&value)).await,
+                        ds.is_accelerator_initialized(accelerator_engine_registry_clone).await,
                     ) {
                         (true, true) | (false, _) => Some(Arc::clone(&ds)),
                         (true, false) => {

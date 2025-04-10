@@ -20,8 +20,8 @@ use app::App;
 use tokio::sync::RwLock;
 
 use crate::{
-    Runtime, catalogconnector, dataaccelerator,
-    dataaccelerator::{AcceleratorRegistry, create_accelerator_registry},
+    Runtime, catalogconnector,
+    dataaccelerator::AcceleratorEngineRegistry,
     dataconnector,
     datafusion::DataFusion,
     datasets_health_monitor::DatasetsHealthMonitor,
@@ -44,7 +44,7 @@ pub struct RuntimeBuilder {
     prometheus_registry: Option<prometheus::Registry>,
     runtime_status: Option<Arc<status::RuntimeStatus>>,
     rate_limits: Option<Arc<RateLimits>>,
-    accelerator_registry: AcceleratorRegistry,
+    accelerator_engine_registry: AcceleratorEngineRegistry,
     datafusion_configuration: Option<Box<dyn FnOnce(&mut DataFusion)>>,
 }
 
@@ -60,13 +60,9 @@ impl RuntimeBuilder {
             autoload_extensions: HashMap::new(),
             runtime_status: None,
             rate_limits: None,
-            accelerator_registry: create_accelerator_registry(),
+            accelerator_engine_registry: AcceleratorEngineRegistry::new(),
             datafusion_configuration: None,
         }
-    }
-
-    pub fn accelerator_registry(&self) -> AcceleratorRegistry {
-        Arc::clone(&self.accelerator_registry)
     }
 
     pub fn with_app(mut self, app: app::App) -> Self {
@@ -143,9 +139,8 @@ impl RuntimeBuilder {
     }
 
     pub async fn build(self) -> Runtime {
-        let accelerator_registry = self.accelerator_registry();
-
-        dataconnector::register_all(Arc::clone(&accelerator_registry)).await;
+        self.accelerator_engine_registry.register_all().await;
+        dataconnector::register_all(self.accelerator_engine_registry.clone()).await;
         catalogconnector::register_all().await;
         tools::factory::register_all_factories().await;
         document_parse::register_all().await;
@@ -155,8 +150,11 @@ impl RuntimeBuilder {
             None => status::RuntimeStatus::new(),
         };
 
-        let mut df =
-            DataFusion::builder(Arc::clone(&status), Arc::clone(&accelerator_registry)).build();
+        let mut df = DataFusion::builder(
+            Arc::clone(&status),
+            self.accelerator_engine_registry.clone(),
+        )
+        .build();
 
         if let Some(callback) = self.datafusion_configuration {
             callback(&mut df);
@@ -205,7 +203,7 @@ impl RuntimeBuilder {
             rate_limits: self.rate_limits.unwrap_or_default(),
             status,
             runtime_tasks: Arc::new(RwLock::new(HashMap::new())),
-            accelerator_registry,
+            accelerator_engine_registry: self.accelerator_engine_registry.clone(),
         };
 
         let mut extensions: HashMap<String, Arc<dyn Extension>> = HashMap::new();
@@ -219,7 +217,6 @@ impl RuntimeBuilder {
             };
         }
         rt.extensions = Arc::new(RwLock::new(extensions));
-        dataaccelerator::register_all(Arc::new(rt.clone())).await;
 
         rt
     }

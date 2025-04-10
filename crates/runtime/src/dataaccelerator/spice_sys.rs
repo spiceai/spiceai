@@ -35,9 +35,8 @@ use {
     datafusion_table_providers::sql::db_connection_pool::sqlitepool::SqliteConnectionPool,
 };
 
-use super::get_accelerator_engine;
 use crate::component::dataset::{Dataset, acceleration::Engine};
-use crate::dataaccelerator::AcceleratorRegistry;
+use crate::dataaccelerator::AcceleratorEngineRegistry;
 
 pub mod dataset_checkpoint;
 #[cfg(feature = "debezium")]
@@ -55,7 +54,7 @@ enum AccelerationConnection {
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 async fn acceleration_connection(
-    accelerator_registry: AcceleratorRegistry,
+    accelerator_engine_registry: AcceleratorEngineRegistry,
     dataset: &Dataset,
     create_table_if_not_exists: bool,
 ) -> Result<AccelerationConnection> {
@@ -66,7 +65,8 @@ async fn acceleration_connection(
     match acceleration.engine {
         #[cfg(feature = "duckdb")]
         Engine::DuckDB => {
-            let accelerator = get_accelerator_engine(accelerator_registry, Engine::DuckDB)
+            let accelerator = accelerator_engine_registry
+                .get_accelerator_engine(Engine::DuckDB)
                 .await
                 .ok_or("DuckDB accelerator engine not available")?;
             let duckdb_accelerator = accelerator
@@ -90,7 +90,8 @@ async fn acceleration_connection(
         Engine::DuckDB => Err("Spice wasn't built with DuckDB support enabled".into()),
         #[cfg(feature = "sqlite")]
         Engine::Sqlite => {
-            let accelerator = get_accelerator_engine(accelerator_registry, Engine::Sqlite)
+            let accelerator = accelerator_engine_registry
+                .get_accelerator_engine(Engine::Sqlite)
                 .await
                 .ok_or("Sqlite accelerator engine not available")?;
             let sqlite_accelerator = accelerator

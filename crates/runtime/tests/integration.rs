@@ -80,9 +80,9 @@ mod rehydration;
 /// 1) Sets the number of `target_partitions` to 3, by default its the number of CPU cores available.
 // fn get_test_datafusion(
 //     status: Arc<status::RuntimeStatus>,
-//     accelerator_registry: AcceleratorRegistry,
+//     accelerator_engine_registry: AcceleratorEngineRegistry,
 // ) -> Arc<DataFusion> {
-//     let mut df = DataFusion::builder(status, accelerator_registry).build();
+//     let mut df = DataFusion::builder(status, accelerator_engine_registry).build();
 
 //     // Set the target partitions to 3 to make RepartitionExec show consistent partitioning across machines with different CPU counts.
 //     let mut new_state = df.ctx.state();

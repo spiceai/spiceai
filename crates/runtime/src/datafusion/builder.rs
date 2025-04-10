@@ -19,7 +19,7 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-use crate::dataaccelerator::AcceleratorRegistry;
+use crate::dataaccelerator::AcceleratorEngineRegistry;
 use cache::QueryResultsCacheProvider;
 use datafusion::{
     catalog::{CatalogProvider, MemoryCatalogProvider},
@@ -50,7 +50,7 @@ pub struct DataFusionBuilder {
     config: SessionConfig,
     status: Arc<status::RuntimeStatus>,
     cache_provider: Option<Arc<QueryResultsCacheProvider>>,
-    accelerator_registry: AcceleratorRegistry,
+    accelerator_engine_registry: AcceleratorEngineRegistry,
 }
 
 pub(crate) fn get_df_default_config() -> SessionConfig {
@@ -85,7 +85,7 @@ impl DataFusionBuilder {
     #[must_use]
     pub fn new(
         status: Arc<status::RuntimeStatus>,
-        accelerator_registry: AcceleratorRegistry,
+        accelerator_engine_registry: AcceleratorEngineRegistry,
     ) -> Self {
         let mut df_config = get_df_default_config()
             .with_information_schema(true)
@@ -98,7 +98,7 @@ impl DataFusionBuilder {
             config: df_config,
             status,
             cache_provider: None,
-            accelerator_registry,
+            accelerator_engine_registry,
         }
     }
 
@@ -179,7 +179,7 @@ impl DataFusionBuilder {
             cache_provider: RwLock::new(self.cache_provider),
             pending_sink_tables: TokioRwLock::new(Vec::new()),
             accelerated_tables: TokioRwLock::new(HashSet::new()),
-            accelerator_registry: self.accelerator_registry,
+            accelerator_engine_registry: self.accelerator_engine_registry,
         }
     }
 }

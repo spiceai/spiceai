@@ -25,7 +25,7 @@ use std::{sync::Arc, time::SystemTime};
 
 use super::{AccelerationConnection, Result, acceleration_connection};
 use crate::component::dataset::Dataset;
-use crate::dataaccelerator::AcceleratorRegistry;
+use crate::dataaccelerator::AcceleratorEngineRegistry;
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::{Schema, SchemaRef};
 use serde_json;
@@ -75,11 +75,11 @@ pub struct DatasetCheckpoint {
 
 impl DatasetCheckpoint {
     pub async fn try_new(
-        accelerator_registry: AcceleratorRegistry,
+        accelerator_engine_registry: AcceleratorEngineRegistry,
         dataset: &Dataset,
     ) -> Result<Arc<dyn DatasetCheckpointer>> {
         let acceleration_connection =
-            acceleration_connection(Arc::clone(&accelerator_registry), dataset, true).await?;
+            acceleration_connection(accelerator_engine_registry.clone(), dataset, true).await?;
         Self::init(&acceleration_connection).await?;
         Ok(Arc::new(Self {
             dataset_name: dataset.name.to_string(),

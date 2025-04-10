@@ -32,7 +32,7 @@ use runtime::{
         acceleration::{Acceleration, RefreshMode},
         replication::Replication,
     },
-    dataaccelerator::{self, AcceleratorRegistry, create_accelerator_table},
+    dataaccelerator::{self, AcceleratorEngineRegistry},
     dataconnector::{ConnectorParamsBuilder, DataConnectorError, create_new_connector},
     extension::{Error as ExtensionError, Extension, ExtensionFactory, ExtensionManifest, Result},
     federated_table::FederatedTable,
@@ -170,7 +170,7 @@ impl SpiceExtension {
         let metrics_table_reference = get_metrics_table_reference();
 
         let table = create_synced_internal_accelerated_table(
-            runtime.accelerator_registry(),
+            runtime.accelerator_engine_registry(),
             runtime.status(),
             metrics_table_reference.clone(),
             from.as_str(),
@@ -310,7 +310,7 @@ async fn get_spiceai_table_provider(
 /// This function will return an error if the accelerated table provider cannot be created
 #[allow(clippy::too_many_arguments)]
 pub async fn create_synced_internal_accelerated_table(
-    accelerator_registry: AcceleratorRegistry,
+    accelerator_engine_registry: AcceleratorEngineRegistry,
     runtime_status: Arc<status::RuntimeStatus>,
     table_reference: TableReference,
     from: &str,
@@ -323,17 +323,17 @@ pub async fn create_synced_internal_accelerated_table(
         get_spiceai_table_provider(table_reference.table(), from, Arc::clone(&secrets)).await?;
     let federated_table = Arc::new(FederatedTable::new(source_table_provider));
 
-    let accelerated_table_provider = create_accelerator_table(
-        accelerator_registry,
-        table_reference.clone(),
-        federated_table.schema(),
-        None,
-        &acceleration,
-        secrets,
-        None,
-    )
-    .await
-    .context(UnableToCreateAcceleratedTableProviderSnafu)?;
+    let accelerated_table_provider = accelerator_engine_registry
+        .create_accelerator_table(
+            table_reference.clone(),
+            federated_table.schema(),
+            None,
+            &acceleration,
+            secrets,
+            None,
+        )
+        .await
+        .context(UnableToCreateAcceleratedTableProviderSnafu)?;
 
     let mut builder = AcceleratedTable::builder(
         runtime_status,

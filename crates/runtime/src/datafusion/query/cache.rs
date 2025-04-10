@@ -276,7 +276,7 @@ mod tests {
                 .expect("valid cache provider");
         let runtime = RuntimeBuilder::new().build().await;
         let df = Arc::new(
-            DataFusion::builder(status::RuntimeStatus::new(), runtime.accelerator_registry())
+            DataFusion::builder(status::RuntimeStatus::new(), runtime.accelerator_engine_registry())
                 .with_cache_provider(Arc::new(cache_provider))
                 .build(),
         );

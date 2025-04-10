@@ -28,7 +28,7 @@ impl Runtime {
 
             if metrics_table.is_none() {
                 tracing::debug!("Registering local metrics table");
-                spice_metrics::register_metrics_table(self.accelerator_registry(), &self.df)
+                spice_metrics::register_metrics_table(self.accelerator_engine_registry(), &self.df)
                     .await
                     .context(UnableToStartLocalMetricsSnafu)?;
             }

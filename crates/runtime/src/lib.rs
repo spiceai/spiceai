@@ -23,7 +23,7 @@ use std::time::Duration;
 use std::{collections::HashMap, sync::Arc};
 use tokio::task::JoinHandle;
 
-use crate::dataaccelerator::AcceleratorRegistry;
+use crate::dataaccelerator::AcceleratorEngineRegistry;
 use crate::{
     auth::EndpointAuth, dataconnector::DataConnector, datafusion::DataFusion,
     internal_table::Error as InternalTableError, model::ENABLE_MODEL_SUPPORT_MESSAGE,
@@ -348,7 +348,7 @@ pub struct Runtime {
     status: Arc<status::RuntimeStatus>,
 
     runtime_tasks: Arc<RwLock<HashMap<String, CancellableTaskHandle>>>,
-    accelerator_registry: AcceleratorRegistry,
+    accelerator_engine_registry: AcceleratorEngineRegistry,
 }
 
 impl Runtime {
@@ -383,8 +383,8 @@ impl Runtime {
     }
 
     #[must_use]
-    pub fn accelerator_registry(&self) -> AcceleratorRegistry {
-        Arc::clone(&self.accelerator_registry)
+    pub fn accelerator_engine_registry(&self) -> AcceleratorEngineRegistry {
+        self.accelerator_engine_registry.clone()
     }
 
     /// Requests a loaded extension, or will attempt to load it if part of the autoloaded extensions.
@@ -785,7 +785,7 @@ impl Runtime {
         self.df.shutdown().await;
         dataconnector::unregister_all().await;
         catalogconnector::unregister_all().await;
-        dataaccelerator::unregister_all(self).await;
+        self.accelerator_engine_registry.unregister_all().await;
         tools::factory::unregister_all_factories().await;
         document_parse::unregister_all().await;
 

@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use runtime::{
-    component::dataset::Dataset, dataaccelerator::AcceleratorRegistry,
+    component::dataset::Dataset, dataaccelerator::AcceleratorEngineRegistry,
     dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint,
 };
 use spicepod::{component::dataset::acceleration::Mode, param::Params};
@@ -53,14 +53,14 @@ fn get_params(mode: &Mode, file: Option<String>, engine: &str) -> Option<Params>
 }
 
 async fn wait_for_checkpoints(
-    accelerator_registry: AcceleratorRegistry,
+    accelerator_engine_registry: AcceleratorEngineRegistry,
     datasets: &Vec<Dataset>,
     timeout_secs: u64,
 ) -> Result<(), anyhow::Error> {
     let mut checkpoint_futures = Vec::new();
 
     for dataset in datasets {
-        let value = Arc::clone(&accelerator_registry);
+        let value = Arc::clone(&accelerator_engine_registry);
         let check_future = async move {
             match DatasetCheckpoint::try_new(Arc::clone(&value), dataset).await {
                 Ok(checkpoint) => {

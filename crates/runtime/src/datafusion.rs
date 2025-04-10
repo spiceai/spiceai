@@ -23,9 +23,9 @@ use crate::accelerated_table::{self, AcceleratedTableBuilderError};
 use crate::accelerated_table::{AcceleratedTable, Retention, refresh::Refresh};
 use crate::component::dataset::acceleration::RefreshMode;
 use crate::component::dataset::{Dataset, Mode};
-use crate::dataaccelerator::AcceleratorRegistry;
+use crate::dataaccelerator::AcceleratorEngineRegistry;
 use crate::dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint;
-use crate::dataaccelerator::{self, create_accelerator_table};
+use crate::dataaccelerator::{self};
 use crate::dataconnector::localpod::LOCALPOD_DATACONNECTOR;
 use crate::dataconnector::sink::SinkConnector;
 use crate::dataconnector::{DataConnector, DataConnectorError};
@@ -260,7 +260,7 @@ pub struct DataFusion {
     cache_provider: RwLock<Option<Arc<QueryResultsCacheProvider>>>,
 
     pending_sink_tables: TokioRwLock<Vec<PendingSinkRegistration>>,
-    accelerator_registry: AcceleratorRegistry,
+    accelerator_engine_registry: AcceleratorEngineRegistry,
 }
 
 impl std::fmt::Debug for DataFusion {
@@ -278,9 +278,9 @@ impl DataFusion {
     #[must_use]
     pub fn builder(
         status: Arc<status::RuntimeStatus>,
-        accelerator_registry: AcceleratorRegistry,
+        accelerator_engine_registry: AcceleratorEngineRegistry,
     ) -> DataFusionBuilder {
-        DataFusionBuilder::new(status, accelerator_registry)
+        DataFusionBuilder::new(status, accelerator_engine_registry)
     }
 
     #[must_use]
@@ -297,8 +297,8 @@ impl DataFusion {
         None
     }
 
-    pub fn accelerator_registry(&self) -> AcceleratorRegistry {
-        Arc::clone(&self.accelerator_registry)
+    pub fn accelerator_engine_registry(&self) -> AcceleratorEngineRegistry {
+        self.accelerator_engine_registry.clone()
     }
 
     pub fn set_cache_provider(&self, cache_provider: QueryResultsCacheProvider) {
@@ -773,24 +773,25 @@ impl DataFusion {
             FederatedTable::Deferred(_) => None,
         };
 
-        let accelerated_table_provider = create_accelerator_table(
-            self.accelerator_registry(),
-            dataset.name.clone(),
-            Arc::clone(&refresh_schema),
-            constraints,
-            &acceleration_settings,
-            secrets,
-            Some(dataset),
-        )
-        .await
-        .context(UnableToCreateDataAcceleratorSnafu)?;
+        let accelerated_table_provider = self
+            .accelerator_engine_registry
+            .create_accelerator_table(
+                dataset.name.clone(),
+                Arc::clone(&refresh_schema),
+                constraints,
+                &acceleration_settings,
+                secrets,
+                Some(dataset),
+            )
+            .await
+            .context(UnableToCreateDataAcceleratorSnafu)?;
 
         // If we already have an existing dataset checkpoint table that has been checkpointed,
         // it means there is data from a previous acceleration and we don't need
         // to wait for the first refresh to complete to mark it ready.
         let mut initial_load_complete = false;
         if let Ok(checkpoint) =
-            DatasetCheckpoint::try_new(self.accelerator_registry(), dataset).await
+            DatasetCheckpoint::try_new(self.accelerator_engine_registry(), dataset).await
         {
             if checkpoint.exists().await {
                 self.runtime_status
@@ -868,7 +869,7 @@ impl DataFusion {
         accelerated_table_builder.cache_provider(self.cache_provider());
 
         accelerated_table_builder.checkpointer_opt(
-            DatasetCheckpoint::try_new(self.accelerator_registry(), dataset)
+            DatasetCheckpoint::try_new(self.accelerator_engine_registry(), dataset)
                 .await
                 .ok(),
         );

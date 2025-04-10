@@ -50,8 +50,6 @@ use synchronized_table::SynchronizedTable;
 use tokio::sync::{RwLock, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
-use tokio::sync::{RwLock, mpsc, oneshot};
-
 use crate::datafusion::filter_converter::TimestampFilterConvert;
 use crate::execution_plan::TableScanParams;
 use crate::execution_plan::fallback_on_zero_results::FallbackOnZeroResultsScanExec;

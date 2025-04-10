@@ -25,13 +25,13 @@ use tokio::sync::RwLock;
 use crate::accelerated_table::{AcceleratedTableBuilderError, Retention};
 use crate::component::dataset::acceleration::Acceleration;
 use crate::component::dataset::{Dataset, Mode};
-use crate::dataaccelerator::AcceleratorRegistry;
+use crate::dataaccelerator::AcceleratorEngineRegistry;
 use crate::federated_table::FederatedTable;
 use crate::secrets::Secrets;
 use crate::status;
 use crate::{
     accelerated_table::{AcceleratedTable, refresh::Refresh},
-    dataaccelerator::{self, create_accelerator_table},
+    dataaccelerator::{self},
     dataconnector::{DataConnector, DataConnectorError, sink::SinkConnector},
 };
 
@@ -96,7 +96,7 @@ async fn get_local_table_provider(
 
 #[allow(clippy::too_many_arguments)]
 pub async fn create_internal_accelerated_table(
-    accelerator_registry: AcceleratorRegistry,
+    accelerator_engine_registry: AcceleratorEngineRegistry,
     runtime_status: Arc<status::RuntimeStatus>,
     name: TableReference,
     schema: Arc<Schema>,
@@ -109,17 +109,17 @@ pub async fn create_internal_accelerated_table(
     let source_table_provider =
         get_local_table_provider(&name, &schema, primary_key.clone()).await?;
     let federated_table = Arc::new(FederatedTable::new(Arc::clone(&source_table_provider)));
-    let accelerated_table_provider = create_accelerator_table(
-        accelerator_registry,
-        name.clone(),
-        Arc::clone(&schema),
-        Arc::clone(&source_table_provider).constraints(),
-        &acceleration,
-        secrets,
-        None,
-    )
-    .await
-    .context(UnableToCreateAcceleratedTableProviderSnafu)?;
+    let accelerated_table_provider = accelerator_engine_registry
+        .create_accelerator_table(
+            name.clone(),
+            Arc::clone(&schema),
+            Arc::clone(&source_table_provider).constraints(),
+            &acceleration,
+            secrets,
+            None,
+        )
+        .await
+        .context(UnableToCreateAcceleratedTableProviderSnafu)?;
 
     let mut builder = AcceleratedTable::builder(
         runtime_status,

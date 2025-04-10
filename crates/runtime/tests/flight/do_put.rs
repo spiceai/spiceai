@@ -527,7 +527,7 @@ async fn register_test_table(
     table_name: TableReference,
 ) -> Result<(), anyhow::Error> {
     let table = create_internal_accelerated_table(
-        datafusion.accelerator_registry(),
+        datafusion.accelerator_engine_registry(),
         datafusion.runtime_status(),
         table_name.clone(),
         schema,
