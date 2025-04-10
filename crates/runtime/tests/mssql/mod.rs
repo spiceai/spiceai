@@ -198,16 +198,14 @@ async fn mssql_integration_test() -> Result<(), String> {
                 .with_dataset(make_mssql_dataset("test", "test", MSSQL_PORT))
                 .build();
 
-            let status = status::RuntimeStatus::new();
-            let rt_builder = Runtime::builder();
-            let df = get_test_datafusion(Arc::clone(&status), rt_builder.accelerator_registry());
+            let rt = Arc::new(
+                Runtime::builder()
+                    .with_app(app)
+                    .with_datafusion_options(Box::new(configure_test_datafusion))
+                    .build()
+                    .await,
+            );
 
-            let mut rt = rt_builder
-                .with_app(app)
-                .with_datafusion(df)
-                .with_runtime_status(status)
-                .build()
-                .await;
             let cloned_rt = Arc::new(rt.clone());
 
             // Set a timeout for the test

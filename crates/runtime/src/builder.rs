@@ -62,6 +62,7 @@ impl RuntimeBuilder {
             runtime_status: None,
             rate_limits: None,
             accelerator_registry: create_accelerator_registry(),
+            datafusion_options: None,
         }
     }
 
@@ -124,7 +125,6 @@ impl RuntimeBuilder {
     }
 
     /// Used to set DataFusion partition
-    #[cfg(test)]
     pub fn with_datafusion_options(
         mut self,
         callback: Box<dyn FnOnce(&mut ConfigOptions)>,
@@ -161,7 +161,7 @@ impl RuntimeBuilder {
         );
 
         if let Some(callback) = self.datafusion_options {
-            callback(&mut df.ctx.config_mut().options_mut());
+            callback(&mut df.ctx.state().config_mut().options_mut());
         }
 
         let datasets_health_monitor = if self.datasets_health_monitor_enabled {

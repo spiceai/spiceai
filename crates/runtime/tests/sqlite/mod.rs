@@ -24,14 +24,14 @@ use arrow::{
     datatypes::{DataType, Decimal128Type},
 };
 
-use runtime::{status, Runtime};
+use runtime::Runtime;
 use spicepod::component::dataset::{
     acceleration::{Acceleration, Mode},
     Dataset,
 };
 
 use crate::{
-    get_test_datafusion, init_tracing, run_query_and_check_results,
+    configure_test_datafusion, init_tracing, run_query_and_check_results,
     run_query_and_check_results_with_plan_checks,
     utils::{runtime_ready_check, test_request_context},
     PlanCheckFn, ValidateFn,
@@ -130,16 +130,12 @@ async fn test_sqlite_decimal_memory() -> anyhow::Result<()> {
                 .with_dataset(make_sqlite_decimal_dataset(Mode::Memory))
                 .build();
 
-            let status = status::RuntimeStatus::new();
-            let rt_builder = Runtime::builder();
-            let df = get_test_datafusion(Arc::clone(&status), rt_builder.accelerator_registry());
-
-            let mut rt = rt_builder
+            let mut rt = Runtime::builder()
                 .with_app(app)
-                .with_datafusion(df)
-                .with_runtime_status(status)
+                .with_datafusion_options(Box::new(configure_test_datafusion))
                 .build()
                 .await;
+
             let cloned_rt = Arc::new(rt.clone());
 
             // Set a timeout for the test
@@ -194,16 +190,12 @@ async fn test_sqlite_decimal_file() -> anyhow::Result<()> {
                 .with_dataset(make_sqlite_decimal_dataset(Mode::File))
                 .build();
 
-            let status = status::RuntimeStatus::new();
-            let rt_builder = Runtime::builder();
-            let df = get_test_datafusion(Arc::clone(&status), rt_builder.accelerator_registry());
-
-            let mut rt = rt_builder
+            let mut rt = Runtime::builder()
                 .with_app(app)
-                .with_datafusion(df)
-                .with_runtime_status(status)
+                .with_datafusion_options(Box::new(configure_test_datafusion))
                 .build()
                 .await;
+
             let cloned_rt = Arc::new(rt.clone());
 
             // Set a timeout for the test

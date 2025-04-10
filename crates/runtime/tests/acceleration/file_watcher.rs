@@ -18,7 +18,7 @@ use app::AppBuilder;
 use arrow::array::RecordBatch;
 use futures::TryStreamExt;
 
-use runtime::{status, Runtime};
+use runtime::Runtime;
 use spicepod::{
     component::dataset::{
         acceleration::{Acceleration, Mode, RefreshMode},
@@ -31,7 +31,7 @@ use std::sync::Arc;
 
 use crate::{
     acceleration::get_params,
-    get_test_datafusion, init_tracing,
+    configure_test_datafusion, init_tracing,
     utils::{runtime_ready_check, test_request_context},
 };
 
@@ -52,8 +52,6 @@ async fn test_file_watcher() -> Result<(), anyhow::Error> {
 
     test_request_context()
         .scope(async {
-            let status = status::RuntimeStatus::new();
-
             // Write the CSV to a file next to the test binary
             std::fs::write("./test_file_watcher.csv", NAMES_CSV).expect("write file");
 
@@ -82,15 +80,10 @@ async fn test_file_watcher() -> Result<(), anyhow::Error> {
                 .with_dataset(dataset)
                 .build();
 
-            let status = status::RuntimeStatus::new();
-            let rt_builder = Runtime::builder();
-            let df = get_test_datafusion(Arc::clone(&status), rt_builder.accelerator_registry());
-
             let rt = Arc::new(
-                rt_builder
+                Runtime::builder()
                     .with_app(app)
-                    .with_datafusion(df)
-                    .with_runtime_status(status)
+                    .with_datafusion_options(Box::new(configure_test_datafusion))
                     .build()
                     .await,
             );

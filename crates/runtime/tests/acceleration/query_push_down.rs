@@ -31,11 +31,10 @@ use crate::{init_tracing, utils::test_request_context};
 #[allow(clippy::too_many_lines)]
 #[tokio::test]
 async fn acceleration_with_and_without_federation() -> Result<(), anyhow::Error> {
-    use crate::get_test_datafusion;
+    use crate::configure_test_datafusion;
     use crate::postgres::common;
     use crate::utils::runtime_ready_check;
     use arrow::array::RecordBatch;
-    use runtime::status;
     use std::sync::Arc;
 
     let _guard = super::ACCELERATION_MUTEX.lock().await;
@@ -127,16 +126,13 @@ async fn acceleration_with_and_without_federation() -> Result<(), anyhow::Error>
                 .with_dataset(non_federated_acc)
                 .build();
 
-            let status = status::RuntimeStatus::new();
-            let rt_builder = Runtime::builder();
-            let df = get_test_datafusion(Arc::clone(&status), rt_builder.accelerator_registry());
-        
-            let mut rt = rt_builder
-                .with_app(app)
-                .with_datafusion(df)
-                .with_runtime_status(status)
-                .build()
-                .await;
+            let rt =
+                Runtime::builder()
+                    .with_app(app)
+                    .with_datafusion_options(Box::new(configure_test_datafusion))
+                    .build()
+                    .await
+            ;
 
             let cloned_rt = Arc::new(rt.clone());
 

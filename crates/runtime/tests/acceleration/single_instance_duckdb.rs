@@ -22,7 +22,7 @@ use datafusion_table_providers::sql::db_connection_pool::DbConnectionPool;
 use duckdb::AccessMode;
 use futures::TryStreamExt;
 
-use runtime::{component::dataset::Dataset as RuntimeDataset, status, Runtime};
+use runtime::{component::dataset::Dataset as RuntimeDataset, Runtime};
 use spicepod::component::dataset::{
     acceleration::{Acceleration, Mode, RefreshMode},
     Dataset,
@@ -30,7 +30,7 @@ use spicepod::component::dataset::{
 use std::sync::Arc;
 
 use crate::{
-    get_test_datafusion, init_tracing,
+    configure_test_datafusion, init_tracing,
     utils::{runtime_ready_check, test_request_context},
 };
 
@@ -78,15 +78,10 @@ async fn test_acceleration_duckdb_single_instance() -> Result<(), anyhow::Error>
                 .map(RuntimeDataset::try_from)
                 .collect::<Result<Vec<_>, _>>()?;
 
-            let status = status::RuntimeStatus::new();
-            let rt_builder = Runtime::builder();
-            let df = get_test_datafusion(Arc::clone(&status), rt_builder.accelerator_registry());
-
             let rt = Arc::new(
-                rt_builder
+                Runtime::builder()
                     .with_app(app)
-                    .with_datafusion(df)
-                    .with_runtime_status(status)
+                    .with_datafusion_options(Box::new(configure_test_datafusion))
                     .build()
                     .await,
             );

@@ -18,12 +18,12 @@ use std::sync::Arc;
 
 use app::AppBuilder;
 
-use runtime::{status, Runtime};
+use runtime::Runtime;
 use spicepod::{component::dataset::Dataset, param::Params};
 
 use crate::{
-    get_test_datafusion, init_tracing, run_query_and_check_results, utils::test_request_context,
-    ValidateFn,
+    configure_test_datafusion, init_tracing, run_query_and_check_results,
+    utils::test_request_context, ValidateFn,
 };
 
 fn make_spiceai_dataset(path: &str, name: &str) -> Dataset {
@@ -62,16 +62,13 @@ async fn spiceai_federation() -> Result<(), anyhow::Error> {
                 ))
                 .build();
 
-            let status = status::RuntimeStatus::new();
-            let rt_builder = Runtime::builder();
-            let df = get_test_datafusion(Arc::clone(&status), rt_builder.accelerator_registry());
+            let mut rt =
+                Runtime::builder()
+                    .with_app(app)
+                    .with_datafusion_options(Box::new(configure_test_datafusion))
+                    .build()
+                    .await;
 
-            let mut rt = rt_builder
-                .with_app(app)
-                .with_datafusion(df)
-                .with_runtime_status(status)
-                .build()
-                .await;
             let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {

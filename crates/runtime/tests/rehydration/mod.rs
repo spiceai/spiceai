@@ -18,8 +18,8 @@ limitations under the License.
 //! Expects a Docker daemon to be running.
 use crate::{
     acceleration::ACCELERATION_MUTEX,
+    configure_test_datafusion,
     docker::RunningContainer,
-    get_test_datafusion,
     mysql::common::{get_mysql_conn, make_mysql_dataset, start_mysql_docker_container},
     utils::{runtime_ready_check, test_request_context},
 };
@@ -37,7 +37,7 @@ use datafusion_table_providers::sql::arrow_sql_gen::statement::{
 use futures::TryStreamExt;
 use mysql_async::{prelude::Queryable, Params, Row};
 
-use runtime::{spice_data_base_path, status, Runtime};
+use runtime::{spice_data_base_path, Runtime};
 use spicepod::{
     component::dataset::{
         acceleration::{Acceleration, IndexType, Mode},
@@ -282,16 +282,12 @@ async fn init_spice_app(
 
     let app = AppBuilder::new("spiceapp").with_dataset(ds).build();
 
-    let status = status::RuntimeStatus::new();
-    let rt_builder = Runtime::builder();
-    let df = get_test_datafusion(Arc::clone(&status), rt_builder.accelerator_registry());
-
-    let mut rt = rt_builder
+    let rt = Runtime::builder()
         .with_app(app)
-        .with_datafusion(df)
-        .with_runtime_status(status)
+        .with_datafusion_options(Box::new(configure_test_datafusion))
         .build()
         .await;
+
     let cloned_rt = Arc::new(rt.clone());
 
     tokio::select! {

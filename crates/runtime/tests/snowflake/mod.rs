@@ -19,7 +19,7 @@ use std::sync::Arc;
 use app::AppBuilder;
 
 use crate::{
-    get_test_datafusion, init_tracing, run_query_and_check_results, utils::test_request_context,
+    configure_test_datafusion, init_tracing, run_query_and_check_results, utils::test_request_context,
     ValidateFn,
 };
 
@@ -81,16 +81,14 @@ async fn snowflake_integration_test() -> Result<(), anyhow::Error> {
                 ))
                 .build();
 
-            let status = status::RuntimeStatus::new();
-            let rt_builder = Runtime::builder();
-            let df = get_test_datafusion(Arc::clone(&status), rt_builder.accelerator_registry());
+            let rt = Arc::new(
+                Runtime::builder()
+                    .with_app(app)
+                    .with_datafusion_options(Box::new(configure_test_datafusion))
+                    .build()
+                    .await,
+            );
 
-            let mut rt = rt_builder
-                .with_app(app)
-                .with_datafusion(df)
-                .with_runtime_status(status)
-                .build()
-                .await;
             let cloned_rt = Arc::new(rt.clone());
 
             // Set a timeout for the test

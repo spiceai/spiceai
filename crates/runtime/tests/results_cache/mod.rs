@@ -21,13 +21,13 @@ use arrow::array::RecordBatch;
 use cache::QueryResultsCacheStatus;
 use futures::TryStreamExt;
 
-use runtime::{datafusion::query::QueryBuilder, status, Runtime};
+use runtime::{datafusion::query::QueryBuilder, Runtime};
 use spicepod::{
     component::{dataset::Dataset, runtime::ResultsCache},
     param::Params,
 };
 
-use crate::{get_test_datafusion, init_tracing, utils::test_request_context};
+use crate::{configure_test_datafusion, init_tracing, utils::test_request_context};
 
 fn make_s3_tpch_dataset(name: &str) -> Dataset {
     let mut test_dataset = Dataset::new(
@@ -59,16 +59,12 @@ async fn results_cache_system_queries() -> Result<(), String> {
                 .with_dataset(make_s3_tpch_dataset("customer"))
                 .build();
 
-            let status = status::RuntimeStatus::new();
-            let rt_builder = Runtime::builder();
-            let df = get_test_datafusion(Arc::clone(&status), rt_builder.accelerator_registry());
-
-            let mut rt = rt_builder
+            let rt = Runtime::builder()
                 .with_app(app)
-                .with_datafusion(df)
-                .with_runtime_status(status)
+                .with_datafusion_options(Box::new(configure_test_datafusion))
                 .build()
                 .await;
+
             let cloned_rt = Arc::new(rt.clone());
 
             cloned_rt.load_components().await;

@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use crate::{
-    get_test_datafusion, init_tracing,
+    configure_test_datafusion, init_tracing,
     utils::{runtime_ready_check, test_request_context},
 };
 use anyhow::Context;
@@ -23,7 +23,7 @@ use app::AppBuilder;
 use arrow::array::RecordBatch;
 use futures::StreamExt;
 
-use runtime::{status, Runtime};
+use runtime::Runtime;
 use spicepod::{
     component::dataset::{
         acceleration::{Acceleration, Mode},
@@ -139,16 +139,12 @@ async fn run_iceberg_test(
 ) -> Result<Runtime, anyhow::Error> {
     let app = AppBuilder::new(app_name).with_dataset(dataset).build();
 
-    let status = status::RuntimeStatus::new();
-    let rt_builder = Runtime::builder();
-    let df = get_test_datafusion(Arc::clone(&status), rt_builder.accelerator_registry());
-
-    let mut rt = rt_builder
+    let rt = Runtime::builder()
         .with_app(app)
-        .with_datafusion(df)
-        .with_runtime_status(status)
+        .with_datafusion_options(Box::new(configure_test_datafusion))
         .build()
         .await;
+
     let cloned_rt = Arc::new(rt.clone());
 
     tokio::select! {

@@ -15,13 +15,13 @@ limitations under the License.
 */
 
 use crate::{
-    get_test_datafusion, init_tracing, run_query_and_check_results,
+    configure_test_datafusion, init_tracing, run_query_and_check_results,
     utils::{runtime_ready_check, test_request_context},
     ValidateFn,
 };
 use app::AppBuilder;
 
-use runtime::{status, Runtime};
+use runtime::Runtime;
 use spicepod::{component::catalog::Catalog, param::Params};
 use std::sync::Arc;
 
@@ -44,16 +44,13 @@ async fn databricks_spark_connect_integration_test_catalog() -> Result<(), anyho
                 .with_catalog(db_catalog)
                 .build();
 
-            let status = status::RuntimeStatus::new();
-            let rt_builder = Runtime::builder();
-            let df = get_test_datafusion(Arc::clone(&status), rt_builder.accelerator_registry());
-        
-            let mut rt = rt_builder
-                .with_app(app)
-                .with_datafusion(df)
-                .with_runtime_status(status)
-                .build()
-                .await;
+            let mut rt =
+                Runtime::builder()
+                    .with_app(app)
+                    .with_datafusion_options(Box::new(configure_test_datafusion))
+                    .build()
+                    .await;
+
             let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {

@@ -22,7 +22,7 @@ use datafusion_table_providers::sql::db_connection_pool::DbConnectionPool;
 use datafusion_table_providers::sql::db_connection_pool::JoinPushDown;
 use futures::TryStreamExt;
 
-use runtime::{component::dataset::Dataset as RuntimeDataset, status, Runtime};
+use runtime::{component::dataset::Dataset as RuntimeDataset, Runtime};
 use spicepod::component::dataset::acceleration::Mode;
 use spicepod::component::dataset::acceleration::{Acceleration, RefreshMode};
 use spicepod::component::dataset::Dataset;
@@ -30,7 +30,7 @@ use std::sync::Arc;
 
 use crate::acceleration::get_params;
 use crate::utils::test_request_context;
-use crate::{get_test_datafusion, init_tracing, utils::runtime_ready_check};
+use crate::{configure_test_datafusion, init_tracing, utils::runtime_ready_check};
 
 #[tokio::test]
 async fn test_acceleration_sqlite_checkpoint() -> Result<(), anyhow::Error> {
@@ -66,15 +66,10 @@ async fn test_acceleration_sqlite_checkpoint() -> Result<(), anyhow::Error> {
                 .map(RuntimeDataset::try_from)
                 .collect::<Result<Vec<_>, _>>()?;
 
-            let status = status::RuntimeStatus::new();
-            let rt_builder = Runtime::builder();
-            let df = get_test_datafusion(Arc::clone(&status), rt_builder.accelerator_registry());
-
             let rt = Arc::new(
-                rt_builder
+                Runtime::builder()
                     .with_app(app)
-                    .with_datafusion(df)
-                    .with_runtime_status(status)
+                    .with_datafusion_options(Box::new(configure_test_datafusion))
                     .build()
                     .await,
             );

@@ -23,12 +23,12 @@ use app::AppBuilder;
 
 use runtime::{
     accelerated_table::refresh::RefreshOverrides, component::dataset::acceleration::RefreshMode,
-    status, Runtime,
+    Runtime,
 };
 use spicepod::component::dataset::{acceleration::Acceleration, Dataset};
 
 use crate::{
-    get_test_datafusion, init_tracing,
+    configure_test_datafusion, init_tracing,
     utils::{runtime_ready_check, test_request_context, wait_until_true},
 };
 
@@ -59,16 +59,12 @@ async fn spiceai_integration_test_refresh_sql_override_append() -> Result<(), an
                 ))
                 .build();
 
-            let status = status::RuntimeStatus::new();
-            let rt_builder = Runtime::builder();
-            let df = get_test_datafusion(Arc::clone(&status), rt_builder.accelerator_registry());
-
-            let mut rt = rt_builder
+            let rt = Runtime::builder()
                 .with_app(app)
-                .with_datafusion(df)
-                .with_runtime_status(status)
+                .with_datafusion_options(Box::new(configure_test_datafusion))
                 .build()
                 .await;
+
             let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {

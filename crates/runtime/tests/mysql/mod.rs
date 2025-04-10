@@ -203,16 +203,12 @@ async fn mysql_integration_test() -> Result<(), String> {
                 .with_dataset(make_mysql_dataset("test", "test", MYSQL_PORT, false))
                 .build();
 
-            let status = status::RuntimeStatus::new();
-            let rt_builder = Runtime::builder();
-            let df = get_test_datafusion(Arc::clone(&status), rt_builder.accelerator_registry());
-
-            let mut rt = rt_builder
+            let mut rt = Runtime::builder()
                 .with_app(app)
-                .with_datafusion(df)
-                .with_runtime_status(status)
+                .with_datafusion_options(Box::new(configure_test_datafusion))
                 .build()
                 .await;
+
             let cloned_rt = Arc::new(rt.clone());
 
             // Set a timeout for the test

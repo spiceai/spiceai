@@ -24,7 +24,7 @@ use std::{
 };
 
 use crate::{
-    init_tracing,
+    configure_test_datafusion, init_tracing,
     utils::{test_request_context, wait_until_true},
 };
 use arrow::array::{Int32Array, RecordBatch, StringArray};
@@ -416,14 +416,15 @@ async fn start_spice_test_app(
 
     let registry = prometheus::Registry::new();
 
-    let mut rt_builder =
-        Runtime::builder().with_metrics_server(SocketAddr::new(LOCALHOST, metrics_port), registry);
+    let mut rt_builder = Runtime::builder()
+        .with_metrics_server(SocketAddr::new(LOCALHOST, metrics_port), registry)
+        .with_datafusion_options(Box::new(configure_test_datafusion));
 
     if let Some(rate_limits) = rate_limits {
         rt_builder = rt_builder.with_rate_limits(rate_limits);
     }
 
-    let mut rt = rt_builder.build().await;
+    let rt = rt_builder.build().await;
 
     let df = rt.datafusion();
 

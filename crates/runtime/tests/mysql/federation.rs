@@ -95,16 +95,12 @@ async fn mysql_federation_push_down() -> Result<(), String> {
                 .with_dataset(make_mysql_dataset("lineitem", "line", MYSQL_PORT, false))
                 .build();
 
-            let status = status::RuntimeStatus::new();
-            let rt_builder = Runtime::builder();
-            let df = get_test_datafusion(Arc::clone(&status), rt_builder.accelerator_registry());
-
-            let mut rt = rt_builder
+            let mut rt = Runtime::builder()
                 .with_app(app)
-                .with_datafusion(df)
-                .with_runtime_status(status)
+                .with_datafusion_options(Box::new(configure_test_datafusion))
                 .build()
                 .await;
+
             let cloned_rt = Arc::new(rt.clone());
 
             // Set a timeout for the test
@@ -203,16 +199,13 @@ async fn mysql_federation_inner_join_with_acc() -> Result<(), String> {
             .with_dataset(make_mysql_dataset("lineitem", "acc_line", mysql_port, true))
             .build();
 
-        let status = status::RuntimeStatus::new();
-        let rt_builder = Runtime::builder();
-        let df = get_test_datafusion(Arc::clone(&status), rt_builder.accelerator_registry());
+        let mut rt =
+            Runtime::builder()
+                .with_app(app)
+                .with_datafusion_options(Box::new(configure_test_datafusion))
+                .build()
+                .await;
 
-        let mut rt = rt_builder
-            .with_app(app)
-            .with_datafusion(df)
-            .with_runtime_status(status)
-            .build()
-            .await;
         let cloned_rt = Arc::new(rt.clone());
         // Set a timeout for the test
         tokio::select! {

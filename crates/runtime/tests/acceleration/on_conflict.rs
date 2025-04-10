@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use crate::{
-    get_test_datafusion, init_tracing,
+    configure_test_datafusion, init_tracing,
     postgres::common,
     utils::{runtime_ready_check, test_request_context},
 };
@@ -24,7 +24,7 @@ use datafusion::{assert_batches_eq, error::DataFusionError};
 use futures::TryStreamExt;
 use rand::Rng;
 
-use runtime::{status, Runtime};
+use runtime::Runtime;
 use spicepod::{
     component::dataset::{
         acceleration::{Acceleration, Mode, OnConflictBehavior, RefreshMode},
@@ -191,15 +191,10 @@ INSERT INTO event_logs (event_name, event_timestamp) VALUES
                 .with_dataset(sqlite_file_on_conflict_drop)
                 .build();
 
-            let status = status::RuntimeStatus::new();
-            let rt_builder = Runtime::builder();
-            let df = get_test_datafusion(Arc::clone(&status), rt_builder.accelerator_registry());
-
             let rt = Arc::new(
-                rt_builder
+                Runtime::builder()
                     .with_app(app)
-                    .with_datafusion(df)
-                    .with_runtime_status(status)
+                    .with_datafusion_options(Box::new(configure_test_datafusion))
                     .build()
                     .await,
             );
