@@ -15,9 +15,11 @@ limitations under the License.
 */
 
 use runtime::{
-    component::dataset::Dataset, dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint,
+    Runtime, component::dataset::Dataset,
+    dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint,
 };
 use spicepod::{component::dataset::acceleration::Mode, param::Params};
+use std::sync::Arc;
 use std::sync::LazyLock;
 use tokio::sync::Mutex;
 
@@ -52,14 +54,16 @@ fn get_params(mode: &Mode, file: Option<String>, engine: &str) -> Option<Params>
 }
 
 async fn wait_for_checkpoints(
-    datasets: &Vec<Dataset>,
+    rt: Arc<Runtime>,
+    datasets: Vec<Dataset>,
     timeout_secs: u64,
 ) -> Result<(), anyhow::Error> {
     let mut checkpoint_futures = Vec::new();
 
     for dataset in datasets {
+        let dataset = dataset.with_runtime(Arc::clone(&rt));
         let check_future = async move {
-            match DatasetCheckpoint::try_new(dataset).await {
+            match DatasetCheckpoint::try_new(&dataset).await {
                 Ok(checkpoint) => {
                     while !checkpoint.exists().await {
                         tokio::time::sleep(std::time::Duration::from_millis(100)).await;

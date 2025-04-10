@@ -96,7 +96,7 @@ async fn test_acceleration_duckdb_single_instance() -> Result<(), anyhow::Error>
             runtime_ready_check(&rt).await;
 
             // Verify checkpoints are created before shutting down runtime
-            wait_for_checkpoints(&runtime_datasets, 120).await?;
+            wait_for_checkpoints(Arc::clone(&rt), runtime_datasets, 120).await?;
 
             rt.shutdown().await;
             drop(rt);
