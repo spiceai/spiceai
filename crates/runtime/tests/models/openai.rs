@@ -33,7 +33,7 @@ use chrono::{DateTime, Utc};
 use jsonpath_rust::JsonPath;
 use llms::chat::Chat;
 use opentelemetry_sdk::trace::TracerProvider;
-use runtime::{auth::EndpointAuth, model::try_to_chat_model, Runtime};
+use runtime::{Runtime, auth::EndpointAuth, model::try_to_chat_model};
 use serde_json::json;
 use spicepod::component::{
     embeddings::{ColumnEmbeddingConfig, Embeddings},
@@ -45,7 +45,7 @@ use std::sync::Arc;
 #[allow(clippy::expect_used)]
 mod nsql {
 
-    use crate::models::nsql::{run_nsql_test, TestCase};
+    use crate::models::nsql::{TestCase, run_nsql_test};
 
     use super::*;
 
@@ -139,7 +139,7 @@ mod search {
 
     use crate::models::{
         get_small_clickbench_dataset,
-        search::{run_search_test, TestCase},
+        search::{TestCase, run_search_test},
     };
 
     use super::*;
@@ -339,7 +339,7 @@ mod embeddings {
     use std::time::Duration;
 
     use crate::models::embedding::{
-        run_beta_functionality_criteria_test, run_embedding_tests, EmbeddingTestCase,
+        EmbeddingTestCase, run_beta_functionality_criteria_test, run_embedding_tests,
     };
 
     use super::*;

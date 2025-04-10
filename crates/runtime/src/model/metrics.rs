@@ -20,9 +20,8 @@ use async_openai::types::{
     ChatCompletionNamedToolChoice, ChatCompletionToolChoiceOption, CreateChatCompletionRequest,
 };
 use opentelemetry::{
-    global,
+    Key, KeyValue, StringValue, Value, global,
     metrics::{Counter, Histogram, Meter},
-    Key, KeyValue, StringValue, Value,
 };
 
 static METER: LazyLock<Meter> = LazyLock::new(|| global::meter("llms"));

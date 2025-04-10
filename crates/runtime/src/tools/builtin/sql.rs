@@ -18,8 +18,8 @@ use async_trait::async_trait;
 use std::{borrow::Cow, sync::Arc};
 
 use crate::{
-    tools::{utils::parameters, SpiceModelTool},
     Runtime,
+    tools::{SpiceModelTool, utils::parameters},
 };
 use futures::TryStreamExt;
 use schemars::JsonSchema;

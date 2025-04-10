@@ -23,7 +23,7 @@ limitations under the License.
 
 use std::{sync::Arc, time::SystemTime};
 
-use super::{acceleration_connection, AccelerationConnection, Result};
+use super::{AccelerationConnection, Result, acceleration_connection};
 use crate::component::dataset::Dataset;
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::{Schema, SchemaRef};

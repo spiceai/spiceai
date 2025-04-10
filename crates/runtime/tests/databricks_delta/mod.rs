@@ -19,10 +19,10 @@ use std::sync::Arc;
 use app::AppBuilder;
 
 use crate::{
-    get_test_datafusion, init_tracing, run_query_and_check_results, utils::test_request_context,
-    ValidateFn,
+    ValidateFn, get_test_datafusion, init_tracing, run_query_and_check_results,
+    utils::test_request_context,
 };
-use runtime::{status, Runtime};
+use runtime::{Runtime, status};
 use spicepod::{component::dataset::Dataset, param::Params};
 
 fn make_dataset(path: &str, name: &str) -> Dataset {

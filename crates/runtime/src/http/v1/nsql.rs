@@ -14,33 +14,33 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 use crate::{
+    Runtime,
     datafusion::DataFusion,
-    http::v1::{run_sql, to_http_response, ArrowFormat},
+    http::v1::{ResponseMetadata, ResponseMimeType, run_sql, to_http_response},
     model::LLMModelStore,
     tools::{
         builtin::{
             sample::{
-                distinct::DistinctColumnsParams, random::RandomSampleParams, tool::SampleDataTool,
-                SampleTableMethod, SampleTableParams,
+                SampleTableMethod, SampleTableParams, distinct::DistinctColumnsParams,
+                random::RandomSampleParams, tool::SampleDataTool,
             },
             table_schema::{TableSchemaTool, TableSchemaToolParams},
         },
         utils::create_tool_use_messages,
     },
-    Runtime,
 };
 use async_openai::types::ChatCompletionRequestMessage;
 use axum::{
+    Extension, Json,
     http::StatusCode,
     response::{IntoResponse, Response},
-    Extension, Json,
 };
 use axum_extra::TypedHeader;
 use datafusion::sql::TableReference;
 use headers_accept::Accept;
 
 use itertools::Itertools;
-use llms::chat::nsql::{default::DefaultSqlGeneration, FailedAttempt, QueryGenerationContext};
+use llms::chat::nsql::{FailedAttempt, QueryGenerationContext, default::DefaultSqlGeneration};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -295,9 +295,14 @@ pub(crate) async fn post(
                     .await
                 {
                     Ok((data, cache_status)) => {
-                        return to_http_response(data, cache_status, ArrowFormat::Json)
-                            .instrument(span.clone())
-                            .await;
+                        return to_http_response(
+                            data,
+                            cache_status,
+                            ResponseMimeType::from_accept_header(accept.as_ref()),
+                            ResponseMetadata::empty().with_sql(&cleaned_query),
+                        )
+                        .instrument(span.clone())
+                        .await;
                     }
                     Err(e) => {
                         // If query failed, retry with the updated context

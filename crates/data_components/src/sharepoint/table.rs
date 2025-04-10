@@ -27,8 +27,9 @@ use datafusion::{
     logical_expr::Expr,
     physical_expr::EquivalenceProperties,
     physical_plan::{
-        stream::RecordBatchStreamAdapter, DisplayAs, DisplayFormatType, ExecutionMode,
-        ExecutionPlan, Partitioning, PlanProperties,
+        DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
+        execution_plan::{Boundedness, EmissionType},
+        stream::RecordBatchStreamAdapter,
     },
 };
 use document_parse::DocumentParser;
@@ -40,7 +41,7 @@ use crate::sharepoint::drive_items::drive_items_to_record_batch;
 
 use super::{
     client::SharepointClient,
-    drive_items::{drive_item_table_schema, DRIVE_ITEM_FILE_CONTENT_COLUMN},
+    drive_items::{DRIVE_ITEM_FILE_CONTENT_COLUMN, drive_item_table_schema},
     error::Error,
 };
 
@@ -104,8 +105,9 @@ impl TableProvider for SharepointTableProvider {
     }
 }
 
+#[derive(Clone)]
 struct SharepointListExec {
-    client: SharepointClient,
+    client: Arc<SharepointClient>,
     schema: SchemaRef,
     properties: PlanProperties,
     projections: Option<Vec<usize>>,
@@ -125,11 +127,12 @@ impl SharepointListExec {
         let properties = PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(&projected_schema)),
             Partitioning::UnknownPartitioning(1),
-            ExecutionMode::Bounded,
+            EmissionType::Incremental,
+            Boundedness::Bounded,
         );
 
         Ok(Self {
-            client,
+            client: Arc::new(client),
             schema: projected_schema,
             properties,
             limit,
@@ -142,19 +145,20 @@ impl SharepointListExec {
     /// If `include_file_content`, the file content for each drive item is downloaded and included
     /// under the `DRIVE_ITEM_FILE_CONTENT_COLUMN` column.
     fn create_record_stream(
-        &self,
+        self: Arc<Self>,
         include_file_content: bool,
-    ) -> DataFusionResult<impl Stream<Item = DataFusionResult<RecordBatch>>> {
-        let mut resp_stream = self.client.stream_drive_items(self.limit).map_err(|e| {
-            DataFusionError::External(Error::MicrosoftGraphFailure { source: e }.into())
-        })?;
+    ) -> DataFusionResult<impl Stream<Item = DataFusionResult<RecordBatch>> + use<>> {
+        let mut resp_stream = Arc::clone(&self.client)
+            .stream_drive_items(self.limit)
+            .map_err(|e| {
+                DataFusionError::External(Error::MicrosoftGraphFailure { source: e }.into())
+            })?;
 
-        let client = self.client.clone();
+        let client = Arc::clone(&self.client);
         let projection = self.projections.clone();
         let formatter = self.formatter.clone();
 
         Ok(stream! {
-
             while let Some(s) = resp_stream.next().await {
                 let response = match s {
                     Ok(r) => r,
@@ -232,13 +236,15 @@ impl ExecutionPlan for SharepointListExec {
         _context: Arc<TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
         // Only retrieve file content if it is in projected schema.
+
+        let sharepoint_exec = Arc::new(self.clone());
         let include_file_content: bool = self
             .schema()
             .index_of(DRIVE_ITEM_FILE_CONTENT_COLUMN)
             .is_ok();
         let stream_adapter = RecordBatchStreamAdapter::new(
             self.schema(),
-            self.create_record_stream(include_file_content)?,
+            sharepoint_exec.create_record_stream(include_file_content)?,
         );
 
         Ok(Box::pin(stream_adapter))

@@ -22,7 +22,7 @@ use anyhow::Context;
 use app::AppBuilder;
 use arrow::record_batch::RecordBatch;
 use futures::StreamExt;
-use runtime::{status, Runtime};
+use runtime::{Runtime, status};
 use spicepod::{component::catalog::Catalog, param::Params};
 use std::sync::Arc;
 

@@ -18,7 +18,7 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use arrow::array::RecordBatch;
 use arrow_flight::{
-    flight_service_server::FlightService, utils::flight_data_to_arrow_batch, FlightData, PutResult,
+    FlightData, PutResult, flight_service_server::FlightService, utils::flight_data_to_arrow_batch,
 };
 use arrow_ipc::convert::try_schema_from_flatbuffer_bytes;
 use arrow_schema::SchemaRef;
@@ -44,20 +44,30 @@ use crate::{
     timing::TimedStream,
 };
 
-use super::{metrics, Service};
+use super::{Service, metrics};
 
 pub(crate) async fn handle(
     flight_svc: &Service,
     request: Request<Streaming<FlightData>>,
 ) -> Result<Response<<Service as FlightService>::DoPutStream>, Status> {
     match RequestContext::current(crate::request::AsyncMarker::new().await).auth_principal() {
-            Some(principal) => {
-                if !principal.groups().iter().any(|group| *group == "write" || *group == "read_write") {
-                    return Err(Status::permission_denied("Write access denied. Verify that authentication key used has write access and try again."));
-                }
-            },
-            None => return Err(Status::unauthenticated("Flight DoPut requires authentication.\nFor auth details, visit https://spiceai.org/docs/api/auth")),
-     }
+        Some(principal) => {
+            if !principal
+                .groups()
+                .iter()
+                .any(|group| *group == "write" || *group == "read_write")
+            {
+                return Err(Status::permission_denied(
+                    "Write access denied. Verify that authentication key used has write access and try again.",
+                ));
+            }
+        }
+        None => {
+            return Err(Status::unauthenticated(
+                "Flight DoPut requires authentication.\nFor auth details, visit https://spiceai.org/docs/api/auth",
+            ));
+        }
+    }
 
     let mut streaming_flight = request.into_inner();
 
@@ -115,7 +125,7 @@ fn create_response_stream(
     df: Arc<DataFusion>,
     mut streaming_flight: Streaming<FlightData>,
     first_message: &FlightData,
-) -> impl futures::Stream<Item = Result<PutResult, Status>> {
+) -> impl futures::Stream<Item = Result<PutResult, Status>> + use<> {
     let dictionaries_by_id = Arc::new(HashMap::new());
 
     // Sometimes the first message only contains the schema and no data

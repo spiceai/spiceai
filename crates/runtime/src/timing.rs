@@ -21,7 +21,7 @@ use std::{
 };
 
 use futures::Stream;
-use opentelemetry::{metrics::Histogram, KeyValue};
+use opentelemetry::{KeyValue, metrics::Histogram};
 use pin_project::pin_project;
 
 /// Measures the time in milliseconds it takes to execute a block of code and records it in a histogram metric.

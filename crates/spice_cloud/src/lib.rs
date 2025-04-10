@@ -18,26 +18,27 @@ use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use datafusion::{datasource::TableProvider, sql::TableReference};
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::json;
 use snafu::prelude::*;
 
 use runtime::{
+    Runtime,
     accelerated_table::{
-        refresh::Refresh, AcceleratedTable, AcceleratedTableBuilderError, Retention,
+        AcceleratedTable, AcceleratedTableBuilderError, Retention, refresh::Refresh,
     },
     component::dataset::{
+        Dataset, Mode, TimeFormat,
         acceleration::{Acceleration, RefreshMode},
         replication::Replication,
-        Dataset, Mode, TimeFormat,
     },
     dataaccelerator::{self, create_accelerator_table},
-    dataconnector::{create_new_connector, ConnectorParamsBuilder, DataConnectorError},
+    dataconnector::{ConnectorParamsBuilder, DataConnectorError, create_new_connector},
     extension::{Error as ExtensionError, Extension, ExtensionFactory, ExtensionManifest, Result},
     federated_table::FederatedTable,
     secrets::{ExposeSecret, Secrets},
     spice_metrics::get_metrics_table_reference,
-    status, Runtime,
+    status,
 };
 use tokio::sync::RwLock;
 

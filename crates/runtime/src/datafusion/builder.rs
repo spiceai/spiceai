@@ -21,15 +21,15 @@ use std::{
 
 use cache::QueryResultsCacheProvider;
 use datafusion::{
-    catalog_common::{CatalogProvider, MemoryCatalogProvider},
+    catalog::{CatalogProvider, MemoryCatalogProvider},
     execution::SessionStateBuilder,
     optimizer::{
+        AnalyzerRule,
         analyzer::{
             count_wildcard_rule::CountWildcardRule, expand_wildcard_rule::ExpandWildcardRule,
             inline_table_scan::InlineTableScan, resolve_grouping_function::ResolveGroupingFunction,
             type_coercion::TypeCoercion,
         },
-        AnalyzerRule,
     },
     prelude::{SessionConfig, SessionContext},
 };
@@ -39,10 +39,10 @@ use tokio::sync::RwLock as TokioRwLock;
 use crate::{embeddings, object_store_registry::default_runtime_env, status};
 
 use super::{
-    extension::{bytes_processed::BytesProcessedOptimizerRule, SpiceQueryPlanner},
-    schema::SpiceSchemaProvider,
     DataFusion, SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA, SPICE_METADATA_SCHEMA,
     SPICE_RUNTIME_SCHEMA,
+    extension::{SpiceQueryPlanner, bytes_processed::BytesProcessedOptimizerRule},
+    schema::SpiceSchemaProvider,
 };
 
 pub struct DataFusionBuilder {

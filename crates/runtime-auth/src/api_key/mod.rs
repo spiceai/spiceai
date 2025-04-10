@@ -19,7 +19,7 @@ use std::sync::Arc;
 use app::spicepod::component::runtime::ApiKey;
 use axum::http;
 
-use crate::{error::Error, AuthVerdict, FlightBasicAuth, GrpcAuth, HttpAuth};
+use crate::{AuthVerdict, FlightBasicAuth, GrpcAuth, HttpAuth, error::Error};
 
 pub struct ApiKeyAuth {
     api_keys: Vec<ApiKey>,

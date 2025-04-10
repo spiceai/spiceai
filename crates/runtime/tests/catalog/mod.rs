@@ -20,7 +20,7 @@ use arrow::array::RecordBatch;
 use datafusion::assert_batches_eq;
 use futures::StreamExt;
 use runtime::extension::ExtensionFactory;
-use runtime::{status, Runtime};
+use runtime::{Runtime, status};
 use spice_cloud::SpiceExtensionFactory;
 use spicepod::component::catalog::Catalog;
 use std::collections::HashMap;

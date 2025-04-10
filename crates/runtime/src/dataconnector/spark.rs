@@ -17,8 +17,8 @@ limitations under the License.
 use async_trait::async_trait;
 
 use crate::component::dataset::Dataset;
-use data_components::spark_connect::SparkConnect;
 use data_components::Read;
+use data_components::spark_connect::SparkConnect;
 use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
 use snafu::prelude::*;

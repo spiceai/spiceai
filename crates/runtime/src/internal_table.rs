@@ -29,9 +29,9 @@ use crate::federated_table::FederatedTable;
 use crate::secrets::Secrets;
 use crate::status;
 use crate::{
-    accelerated_table::{refresh::Refresh, AcceleratedTable},
+    accelerated_table::{AcceleratedTable, refresh::Refresh},
     dataaccelerator::{self, create_accelerator_table},
-    dataconnector::{sink::SinkConnector, DataConnector, DataConnectorError},
+    dataconnector::{DataConnector, DataConnectorError, sink::SinkConnector},
 };
 
 #[derive(Debug, Snafu)]

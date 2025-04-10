@@ -31,7 +31,7 @@ use datafusion_table_providers::sql::db_connection_pool::dbconnection::{
     self, AsyncDbConnection, DbConnection,
 };
 use futures::lock::Mutex;
-use futures::{stream, Stream, StreamExt};
+use futures::{Stream, StreamExt, stream};
 use snafu::prelude::*;
 
 #[derive(Debug, Snafu)]
@@ -233,7 +233,7 @@ fn map_clickhouse_type_to_arrow(type_str: &str) -> Result<DataType, clickhouse_r
                 _ => {
                     return Err(clickhouse_rs::errors::Error::Other(
                         format!("Invalid Decimal type: {type_str}").into(),
-                    ))
+                    ));
                 }
             };
             if precision <= 38 {

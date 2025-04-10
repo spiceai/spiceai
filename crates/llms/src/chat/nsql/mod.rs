@@ -63,7 +63,10 @@ pub fn create_prompt(query: &str, ctx: &QueryGenerationContext) -> String {
     );
 
     if !ctx.failed_attempts.is_empty() {
-        let failed_atttempts_str = format!("\nUse incorrectly written SQL queries and associated errors below to ensure that the new query avoids repeating the same mistakes or generating identical queries:\n\n{}", failed_attempts_formatted(&ctx.failed_attempts));
+        let failed_atttempts_str = format!(
+            "\nUse incorrectly written SQL queries and associated errors below to ensure that the new query avoids repeating the same mistakes or generating identical queries:\n\n{}",
+            failed_attempts_formatted(&ctx.failed_attempts)
+        );
         prompt.push_str(&failed_atttempts_str);
     }
 

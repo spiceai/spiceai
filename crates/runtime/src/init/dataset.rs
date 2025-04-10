@@ -17,14 +17,19 @@ limitations under the License.
 use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc};
 
 use crate::{
+    AcceleratedReadWriteTableWithoutReplicationSnafu, AcceleratedTableInvalidChangesSnafu,
+    AcceleratorEngineNotAvailableSnafu, AcceleratorInitializationFailedSnafu, Error, LogErrors,
+    OdbcNotInstalledSnafu, Result, Runtime, UnableToAttachDataConnectorSnafu,
+    UnableToCreateAcceleratedTableSnafu, UnableToInitializeDataConnectorSnafu,
+    UnableToLoadDatasetConnectorSnafu, UnableToReceiveAcceleratedTableStatusSnafu,
+    UnknownDataConnectorSnafu,
     accelerated_table::AcceleratedTable,
-    component::dataset::{self, acceleration::RefreshMode, Dataset},
+    component::dataset::{self, Dataset, acceleration::RefreshMode},
     dataaccelerator,
     dataconnector::{
-        self,
-        localpod::{LocalPodConnector, LOCALPOD_DATACONNECTOR},
-        ConnectorComponent, ConnectorParams, ConnectorParamsBuilder, DataConnector,
+        self, ConnectorComponent, ConnectorParams, ConnectorParamsBuilder, DataConnector,
         DataConnectorError, ODBC_DATACONNECTOR,
+        localpod::{LOCALPOD_DATACONNECTOR, LocalPodConnector},
     },
     embeddings::connector::EmbeddingConnector,
     error_spaced,
@@ -32,20 +37,15 @@ use crate::{
     metrics::{self, components::register_component_metric},
     status,
     tracing_util::dataset_registered_trace,
-    warn_spaced, AcceleratedReadWriteTableWithoutReplicationSnafu,
-    AcceleratedTableInvalidChangesSnafu, AcceleratorEngineNotAvailableSnafu,
-    AcceleratorInitializationFailedSnafu, Error, LogErrors, OdbcNotInstalledSnafu, Result, Runtime,
-    UnableToAttachDataConnectorSnafu, UnableToCreateAcceleratedTableSnafu,
-    UnableToInitializeDataConnectorSnafu, UnableToLoadDatasetConnectorSnafu,
-    UnableToReceiveAcceleratedTableStatusSnafu, UnknownDataConnectorSnafu,
+    warn_spaced,
 };
 use app::App;
 use datafusion::sql::TableReference;
-use futures::{future::join_all, StreamExt};
+use futures::{StreamExt, future::join_all};
 use opentelemetry::KeyValue;
 use snafu::prelude::*;
 use tokio::sync::Semaphore;
-use util::{fibonacci_backoff::FibonacciBackoffBuilder, retry, RetryError};
+use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
 
 impl Runtime {
     pub(crate) async fn load_datasets(&self) {
@@ -440,7 +440,10 @@ impl Runtime {
                             .update_dataset(&ds.name, status::ComponentStatus::Ready);
                         return;
                     }
-                    tracing::debug!("Failed to create accelerated table for dataset {}, falling back to full dataset reload", ds.name);
+                    tracing::debug!(
+                        "Failed to create accelerated table for dataset {}, falling back to full dataset reload",
+                        ds.name
+                    );
                 }
 
                 self.remove_dataset(&ds).await;

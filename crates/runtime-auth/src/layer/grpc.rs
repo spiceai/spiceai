@@ -16,8 +16,8 @@ limitations under the License.
 
 use crate::{AuthVerdict, GrpcAuth};
 use std::sync::Arc;
-use tonic::service::Interceptor;
 use tonic::Status;
+use tonic::service::Interceptor;
 
 #[must_use]
 pub fn make_interceptor(

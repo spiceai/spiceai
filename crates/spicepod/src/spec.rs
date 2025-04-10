@@ -28,7 +28,7 @@ use crate::component::is_default;
 use crate::component::runtime::Runtime;
 use crate::component::secret::Secret;
 use crate::component::tool::Tool;
-use crate::component::{dataset::Dataset, model::Model, view::View, ComponentOrReference};
+use crate::component::{ComponentOrReference, dataset::Dataset, model::Model, view::View};
 use crate::extension::Extension;
 
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize, Default)]

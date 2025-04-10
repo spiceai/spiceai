@@ -22,11 +22,11 @@ use anyhow::Context;
 use app::AppBuilder;
 use arrow::array::RecordBatch;
 use futures::StreamExt;
-use runtime::{status, Runtime};
+use runtime::{Runtime, status};
 use spicepod::{
     component::dataset::{
-        acceleration::{Acceleration, Mode},
         Dataset,
+        acceleration::{Acceleration, Mode},
     },
     param::Params as DatasetParams,
 };
@@ -182,7 +182,9 @@ fn make_iceberg_dataset(
     let account_id =
         std::env::var("AWS_ICEBERG_ACCOUNT_ID").context("AWS_ICEBERG_ACCOUNT_ID is not set")?;
 
-    let from = format!("iceberg:https://glue.ap-northeast-2.amazonaws.com/iceberg/v1/catalogs/{account_id}/namespaces/{namespace}/tables/{table}");
+    let from = format!(
+        "iceberg:https://glue.ap-northeast-2.amazonaws.com/iceberg/v1/catalogs/{account_id}/namespaces/{namespace}/tables/{table}"
+    );
     let mut dataset = Dataset::new(from, name);
     dataset.params = Some(DatasetParams::from_string_map(HashMap::from([
         (

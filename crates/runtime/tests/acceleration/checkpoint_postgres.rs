@@ -19,10 +19,10 @@ use app::AppBuilder;
 use arrow::array::RecordBatch;
 use datafusion_table_providers::sql::db_connection_pool::DbConnectionPool;
 use futures::TryStreamExt;
-use runtime::{component::dataset::Dataset as RuntimeDataset, status, Runtime};
+use runtime::{Runtime, component::dataset::Dataset as RuntimeDataset, status};
 use secrecy::ExposeSecret;
-use spicepod::component::dataset::acceleration::{Acceleration, RefreshMode};
 use spicepod::component::dataset::Dataset;
+use spicepod::component::dataset::acceleration::{Acceleration, RefreshMode};
 use spicepod::param::Params;
 use std::{collections::HashMap, sync::Arc};
 

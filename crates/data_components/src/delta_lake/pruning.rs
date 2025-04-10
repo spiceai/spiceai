@@ -23,8 +23,8 @@ use arrow::{
 };
 use datafusion::{
     common::{
-        tree_node::{TreeNode, TreeNodeRecursion},
         Column, DFSchema,
+        tree_node::{TreeNode, TreeNodeRecursion},
     },
     datasource::listing::PartitionedFile,
     execution::context::ExecutionProps,
@@ -48,8 +48,12 @@ pub(crate) fn prune_partitions(
     // We will use DataFusion itself to evaluate the filters on the partition values, so we need to
     // first extract the partition values from the `PartitionedFile`s and create a `RecordBatch`.
     // First verify all files have the correct number of partition values
-    assert!(partitioned_files.iter().all(|file| file.partition_values.len() == partition_cols.len()),
-        "PartitionedFile has a different number of partition values than the number of partition columns");
+    assert!(
+        partitioned_files
+            .iter()
+            .all(|file| file.partition_values.len() == partition_cols.len()),
+        "PartitionedFile has a different number of partition values than the number of partition columns"
+    );
 
     let partition_arrays: Vec<ArrayRef> = (0..partition_cols.len())
         .map(|col_idx| {
@@ -140,7 +144,7 @@ pub(crate) fn can_be_evaluted_for_partition_pruning(
 fn expr_applicable_for_cols(col_names: &[&str], expr: &Expr) -> bool {
     let mut is_applicable = true;
     expr.apply(|expr| match expr {
-        Expr::Column(Column { ref name, .. }) => {
+        Expr::Column(Column { name, .. }) => {
             is_applicable &= col_names.contains(&name.as_str());
             if is_applicable {
                 Ok(TreeNodeRecursion::Jump)

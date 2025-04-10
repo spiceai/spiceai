@@ -124,7 +124,9 @@ impl SqlServerTableProvider {
             let numeric_scale: Option<i32> = row.get(3);
 
             let Some(column_type) = map_type_name_to_column_type(data_type) else {
-                tracing::warn!("Column '{column_name}' of table '{table_name}' has unsupported data type '{data_type}' and will be ignored");
+                tracing::warn!(
+                    "Column '{column_name}' of table '{table_name}' has unsupported data type '{data_type}' and will be ignored"
+                );
                 continue;
             };
 

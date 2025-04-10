@@ -14,14 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::accelerated_table::refresh_task::RefreshTask;
-use crate::component::dataset::acceleration::{RefreshMode, RefreshOnStartup};
 use crate::component::dataset::TimeFormat;
+use crate::component::dataset::acceleration::{RefreshMode, RefreshOnStartup};
 use crate::dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpointer;
 use crate::federated_table::FederatedTable;
 use crate::status;
@@ -36,9 +36,9 @@ use rand::Rng;
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
 use tokio::select;
+use tokio::sync::RwLock;
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::oneshot;
-use tokio::sync::RwLock;
 use tokio::time::sleep;
 
 use super::metrics;
@@ -47,7 +47,9 @@ use super::synchronized_table::SynchronizedTable;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("time_column '{time_column}' in dataset {table_name} has data type '{actual_time_format}', but time_format is configured as '{expected_time_format}'"))]
+    #[snafu(display(
+        "time_column '{time_column}' in dataset {table_name} has data type '{actual_time_format}', but time_format is configured as '{expected_time_format}'"
+    ))]
     TimeFormatMismatch {
         table_name: String,
         time_column: String,
@@ -261,7 +263,7 @@ impl Refresh {
             }
             // Append and Changes modes are always refreshed since they stream changes from the source table.
             RefreshMode::Append | RefreshMode::Changes => {
-                return NextRefresh::WaitFor(Duration::ZERO)
+                return NextRefresh::WaitFor(Duration::ZERO);
             }
             RefreshMode::Disabled => return NextRefresh::Disabled,
         };
@@ -544,10 +546,10 @@ impl Refresher {
             (AccelerationRefreshMode::Append(Some(receiver)), Some(_))
             | (AccelerationRefreshMode::Full(receiver), _) => receiver,
             (AccelerationRefreshMode::Append(_), _) => {
-                return Some(self.start_streaming_append(ready_sender))
+                return Some(self.start_streaming_append(ready_sender));
             }
             (AccelerationRefreshMode::Changes(stream), _) => {
-                return Some(self.start_changes_stream(stream, ready_sender))
+                return Some(self.start_changes_stream(stream, ready_sender));
             }
         };
 
@@ -682,7 +684,9 @@ impl Refresher {
                 .add_synchronized_table(synchronized_table)
                 .await;
         } else {
-            unreachable!("Only tables configured with a full refresh mode can subscribe to new table providers - this is an implementation bug");
+            unreachable!(
+                "Only tables configured with a full refresh mode can subscribe to new table providers - this is an implementation bug"
+            );
         }
     }
 
@@ -797,11 +801,11 @@ mod tests {
     use data_components::arrow::write::MemTable;
     use datafusion::{physical_plan::collect, prelude::SessionContext};
     use opentelemetry::global;
-    use opentelemetry_sdk::{metrics::SdkMeterProvider, Resource};
+    use opentelemetry_sdk::{Resource, metrics::SdkMeterProvider};
     use prometheus::proto::MetricType;
     use tokio::{sync::mpsc, time::timeout};
 
-    use crate::dataaccelerator::spice_sys::{dataset_checkpoint::DatasetCheckpointer, Result};
+    use crate::dataaccelerator::spice_sys::{Result, dataset_checkpoint::DatasetCheckpointer};
     use crate::status;
     use arrow::datatypes::SchemaRef;
     use async_trait::async_trait;
@@ -1592,9 +1596,11 @@ mod tests {
     fn test_validate_time_column_when_no_time_column() {
         let refresh = Refresh::new(RefreshMode::Full);
         let schema = Arc::new(Schema::empty());
-        assert!(refresh
-            .validate_time_format("dataset_name".to_string(), &schema)
-            .is_ok());
+        assert!(
+            refresh
+                .validate_time_format("dataset_name".to_string(), &schema)
+                .is_ok()
+        );
     }
 
     #[test]
@@ -1709,9 +1715,11 @@ mod tests {
             .time_format(TimeFormat::ISO8601);
 
         let schema = Arc::new(Schema::new(vec![Field::new("time", DataType::Utf8, false)]));
-        assert!(refresh
-            .validate_time_format("dataset_name".to_string(), &schema)
-            .is_ok());
+        assert!(
+            refresh
+                .validate_time_format("dataset_name".to_string(), &schema)
+                .is_ok()
+        );
     }
 
     #[test]
@@ -1726,9 +1734,11 @@ mod tests {
                 DataType::Int64,
                 false,
             )]));
-            assert!(refresh
-                .validate_time_format("dataset_name".to_string(), &schema)
-                .is_ok());
+            assert!(
+                refresh
+                    .validate_time_format("dataset_name".to_string(), &schema)
+                    .is_ok()
+            );
         }
     }
 
@@ -1743,9 +1753,11 @@ mod tests {
             DataType::Timestamp(arrow::datatypes::TimeUnit::Second, None),
             false,
         )]));
-        assert!(refresh
-            .validate_time_format("dataset_name".to_string(), &schema)
-            .is_ok());
+        assert!(
+            refresh
+                .validate_time_format("dataset_name".to_string(), &schema)
+                .is_ok()
+        );
     }
 
     #[test]
@@ -1759,9 +1771,11 @@ mod tests {
             DataType::Timestamp(arrow::datatypes::TimeUnit::Second, Some("+00:00".into())),
             false,
         )]));
-        assert!(refresh
-            .validate_time_format("dataset_name".to_string(), &schema)
-            .is_ok());
+        assert!(
+            refresh
+                .validate_time_format("dataset_name".to_string(), &schema)
+                .is_ok()
+        );
     }
 
     #[test]
@@ -1775,9 +1789,11 @@ mod tests {
             DataType::Date32,
             false,
         )]));
-        assert!(refresh
-            .validate_time_format("dataset_name".to_string(), &schema)
-            .is_ok());
+        assert!(
+            refresh
+                .validate_time_format("dataset_name".to_string(), &schema)
+                .is_ok()
+        );
     }
 
     #[test]
@@ -1828,9 +1844,9 @@ mod tests {
                 refresh_on_startup: RefreshOnStartup::Auto,
                 checkpoint: None,
                 check_interval: None,
-                assert_fn: Box::new(|result| {
-                    matches!(result, NextRefresh::WaitFor(duration) if duration.is_zero())
-                }),
+                assert_fn: Box::new(
+                    |result| matches!(result, NextRefresh::WaitFor(duration) if duration.is_zero()),
+                ),
             },
             TestCase {
                 description: "No checkpoint, Append mode should refresh immediately",
@@ -1838,9 +1854,9 @@ mod tests {
                 refresh_on_startup: RefreshOnStartup::Auto,
                 checkpoint: None,
                 check_interval: None,
-                assert_fn: Box::new(|result| {
-                    matches!(result, NextRefresh::WaitFor(duration) if duration.is_zero())
-                }),
+                assert_fn: Box::new(
+                    |result| matches!(result, NextRefresh::WaitFor(duration) if duration.is_zero()),
+                ),
             },
             TestCase {
                 description: "No checkpoint, Changes mode should refresh immediately",
@@ -1848,9 +1864,9 @@ mod tests {
                 refresh_on_startup: RefreshOnStartup::Auto,
                 checkpoint: None,
                 check_interval: None,
-                assert_fn: Box::new(|result| {
-                    matches!(result, NextRefresh::WaitFor(duration) if duration.is_zero())
-                }),
+                assert_fn: Box::new(
+                    |result| matches!(result, NextRefresh::WaitFor(duration) if duration.is_zero()),
+                ),
             },
             TestCase {
                 description: "No checkpoint, Disabled mode should be disabled",
@@ -1866,9 +1882,9 @@ mod tests {
                 refresh_on_startup: RefreshOnStartup::Auto,
                 checkpoint: Some(Arc::clone(&checkpoint)),
                 check_interval: None,
-                assert_fn: Box::new(|result| {
-                    matches!(result, NextRefresh::WaitFor(duration) if duration.is_zero())
-                }),
+                assert_fn: Box::new(
+                    |result| matches!(result, NextRefresh::WaitFor(duration) if duration.is_zero()),
+                ),
             },
             TestCase {
                 description: "Checkpoint exists, Changes mode should refresh immediately",
@@ -1876,9 +1892,9 @@ mod tests {
                 refresh_on_startup: RefreshOnStartup::Auto,
                 checkpoint: Some(Arc::clone(&checkpoint)),
                 check_interval: None,
-                assert_fn: Box::new(|result| {
-                    matches!(result, NextRefresh::WaitFor(duration) if duration.is_zero())
-                }),
+                assert_fn: Box::new(
+                    |result| matches!(result, NextRefresh::WaitFor(duration) if duration.is_zero()),
+                ),
             },
             TestCase {
                 description: "Checkpoint exists, Disabled mode should be disabled",
@@ -1916,9 +1932,9 @@ mod tests {
                 refresh_on_startup: RefreshOnStartup::Auto,
                 checkpoint: Some(non_existing_checkpoint),
                 check_interval: None,
-                assert_fn: Box::new(|result| {
-                    matches!(result, NextRefresh::WaitFor(duration) if duration.is_zero())
-                }),
+                assert_fn: Box::new(
+                    |result| matches!(result, NextRefresh::WaitFor(duration) if duration.is_zero()),
+                ),
             },
             TestCase {
                 description: "Checkpoint exists, Full mode with RefreshOnStartup::Always should refresh immediately",
@@ -1926,9 +1942,9 @@ mod tests {
                 refresh_on_startup: RefreshOnStartup::Always,
                 checkpoint: Some(Arc::clone(&checkpoint)),
                 check_interval: None,
-                assert_fn: Box::new(|result| {
-                    matches!(result, NextRefresh::WaitFor(duration) if duration.is_zero())
-                }),
+                assert_fn: Box::new(
+                    |result| matches!(result, NextRefresh::WaitFor(duration) if duration.is_zero()),
+                ),
             },
             TestCase {
                 description: "No checkpoint, Full mode with RefreshOnStartup::Always should refresh immediately",
@@ -1936,9 +1952,9 @@ mod tests {
                 refresh_on_startup: RefreshOnStartup::Always,
                 checkpoint: None,
                 check_interval: None,
-                assert_fn: Box::new(|result| {
-                    matches!(result, NextRefresh::WaitFor(duration) if duration.is_zero())
-                }),
+                assert_fn: Box::new(
+                    |result| matches!(result, NextRefresh::WaitFor(duration) if duration.is_zero()),
+                ),
             },
             TestCase {
                 description: "Checkpoint exists, Full mode with check interval and RefreshOnStartup::Always should refresh immediately",
@@ -1946,9 +1962,9 @@ mod tests {
                 refresh_on_startup: RefreshOnStartup::Always,
                 checkpoint: Some(checkpoint),
                 check_interval: Some(Duration::from_secs(60)),
-                assert_fn: Box::new(|result| {
-                    matches!(result, NextRefresh::WaitFor(duration) if duration.is_zero())
-                }),
+                assert_fn: Box::new(
+                    |result| matches!(result, NextRefresh::WaitFor(duration) if duration.is_zero()),
+                ),
             },
         ];
 
@@ -2007,8 +2023,7 @@ mod tests {
                 expected_wait_time: Duration::from_secs(1),
             },
             TestCase {
-                description:
-                    "Checkpoint happened more than interval ago, should refresh immediately",
+                description: "Checkpoint happened more than interval ago, should refresh immediately",
                 last_checkpoint_time: now - Duration::from_secs(61),
                 check_interval: Duration::from_secs(60),
                 expected_wait_time: Duration::ZERO,

@@ -30,8 +30,8 @@ use tokio::task::JoinHandle;
 use crate::{
     metrics::QueryStatus,
     queries::{
-        validation::{self, QueryValidationResult},
         Query,
+        validation::{self, QueryValidationResult},
     },
     snapshot::record_explain_plan,
 };
@@ -431,7 +431,6 @@ impl SpiceTestQueryWorker {
         }
 
         if results_snapshot {
-            println!("snapshotting results");
             let query_name = Arc::clone(&query.name);
             let name = self.name.clone();
 

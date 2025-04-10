@@ -16,7 +16,7 @@ limitations under the License.
 
 use std::{collections::HashSet, sync::Arc};
 
-use cache::{to_cached_record_batch_stream, CacheKey, QueryResultsCacheStatus, RawCacheKey};
+use cache::{CacheKey, QueryResultsCacheStatus, RawCacheKey, to_cached_record_batch_stream};
 use datafusion::{
     execution::{SendableRecordBatchStream, SessionState},
     logical_expr::LogicalPlan,
@@ -26,11 +26,11 @@ use datafusion::{
 use tracing::Span;
 
 use crate::{
-    datafusion::{error::find_datafusion_root, query::error_code::ErrorCode, DataFusion},
+    datafusion::{DataFusion, error::find_datafusion_root, query::error_code::ErrorCode},
     request::{CacheControl, CacheKeyType, RequestContext},
 };
 
-use super::{attach_query_tracker_to_stream, Query, QueryResult, QueryTracker};
+use super::{Query, QueryResult, QueryTracker, attach_query_tracker_to_stream};
 
 /// Returns `Plan` if the result is not cached and needs to be executed, otherwise returns `Cached`
 pub(super) enum PlanOrCached {
@@ -168,7 +168,7 @@ impl Query {
                 return Ok(CacheResult::MissOrSkipped(
                     tracker,
                     QueryResultsCacheStatus::CacheMiss,
-                ))
+                ));
             }
             Err(e) => return Err(super::Error::FailedToAccessCache { source: e }),
         };
@@ -232,7 +232,7 @@ mod tests {
     use spicepod::component::runtime::ResultsCache;
 
     use crate::{
-        datafusion::{query::QueryBuilder, DataFusion},
+        datafusion::{DataFusion, query::QueryBuilder},
         request::{CacheControl, CacheKeyType, Protocol, RequestContext},
         status,
     };

@@ -29,7 +29,7 @@ datafusion-federation = { workspace = true }
 datafusion-federation-sql = { workspace = true }
 datafusion-table-providers = { workspace = true }
 db_connection_pool = { path = "../db_connection_pool" }
-delta_kernel = { git="https://github.com/spiceai/delta-kernel-rs.git", rev = "69e11a29a6dc67ec1d969e3a652f00924b995b3a", features = [
+delta_kernel = { version = "0.6.1", features = [
     "default-engine",
     "cloud",
 ], optional = true }
@@ -64,9 +64,9 @@ serde.workspace = true
 serde_json.workspace = true
 snafu.workspace = true
 snowflake-api = { workspace = true, optional = true }
-spark-connect-rs = { git = "https://github.com/spiceai/spark-connect-rs.git", rev = "81b159ccd10f806fcb2d30f86715f77350ba24a2", features = [
+spark-connect-rs = { git = "https://github.com/spiceai/spark-connect-rs.git", rev = "f6e07191d1432184c4f447f4f1ab187d8abd33df", features = [
     "tls",
-], optional = true }
+], optional = true } # spiceai
 tiberius = { workspace = true, optional = true }
 tokio.workspace = true
 tokio-postgres = { workspace = true, features = [

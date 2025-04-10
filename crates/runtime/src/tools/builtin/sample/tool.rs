@@ -14,8 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 use crate::{
-    tools::{utils::parameters, SpiceModelTool},
     Runtime,
+    tools::{SpiceModelTool, utils::parameters},
 };
 use arrow::util::pretty::pretty_format_batches;
 use arrow_tools::record_batch::{truncate_numeric_column_length, truncate_string_columns};
@@ -27,8 +27,8 @@ use tracing::Span;
 use tracing_futures::Instrument;
 
 use super::{
-    distinct::DistinctColumnsParams, RandomSampleParams, SampleFrom, SampleTableMethod,
-    TopSamplesParams,
+    RandomSampleParams, SampleFrom, SampleTableMethod, TopSamplesParams,
+    distinct::DistinctColumnsParams,
 };
 
 /// A tool to sample data from a table in a variety of ways. How data is sampled is determined by

@@ -15,14 +15,15 @@ limitations under the License.
 */
 
 use crate::{
+    App, Runtime,
     component::dataset::{
-        acceleration::{Engine, Mode},
         Dataset,
+        acceleration::{Engine, Mode},
     },
     datafusion::dialect::new_duckdb_dialect,
     make_spice_data_directory,
     parameters::ParameterSpec,
-    spice_data_base_path, App, Runtime,
+    spice_data_base_path,
 };
 use async_trait::async_trait;
 use data_components::poly::PolyTableProvider;
@@ -31,7 +32,7 @@ use datafusion::{
     logical_expr::CreateExternalTable,
 };
 use datafusion_table_providers::{
-    duckdb::{write::DuckDBTableWriter, DuckDBTableProviderFactory},
+    duckdb::{DuckDBTableProviderFactory, write::DuckDBTableWriter},
     sql::db_connection_pool::duckdbpool::{DuckDbConnectionPool, DuckDbConnectionPoolBuilder},
 };
 use duckdb::AccessMode;
@@ -156,7 +157,7 @@ impl DuckDBAccelerator {
             (Err(e), Mode::File) => {
                 return Err(Error::InvalidConfiguration {
                     detail: Arc::from(e.to_string()),
-                })
+                });
             }
         };
 
@@ -384,16 +385,16 @@ mod tests {
     use datafusion::{
         common::{Constraints, TableReference, ToDFSchema},
         execution::context::SessionContext,
-        logical_expr::{cast, col, dml::InsertOp, lit, CreateExternalTable},
+        logical_expr::{CreateExternalTable, cast, col, dml::InsertOp, lit},
         physical_plan::collect,
         scalar::ScalarValue,
     };
     use datafusion_table_providers::util::test::MockExec;
 
+    use crate::component::dataset::Dataset;
     use crate::component::dataset::acceleration::Acceleration;
     use crate::component::dataset::acceleration::{Engine, Mode};
-    use crate::component::dataset::Dataset;
-    use crate::dataaccelerator::{duckdb::DuckDBAccelerator, DataAccelerator};
+    use crate::dataaccelerator::{DataAccelerator, duckdb::DuckDBAccelerator};
 
     #[tokio::test]
     #[allow(clippy::too_many_lines)]

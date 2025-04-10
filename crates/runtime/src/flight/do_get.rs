@@ -17,9 +17,9 @@ limitations under the License.
 use std::sync::Arc;
 
 use arrow_flight::{
+    Ticket,
     flight_service_server::FlightService,
     sql::{Any, Command},
-    Ticket,
 };
 use prost::Message;
 use tonic::{Request, Response, Status};
@@ -29,7 +29,7 @@ use crate::{
     timing::TimedStream,
 };
 
-use super::{flightsql, to_tonic_err, Service};
+use super::{Service, flightsql, to_tonic_err};
 
 pub(crate) async fn handle(
     flight_svc: &Service,

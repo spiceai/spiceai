@@ -17,12 +17,12 @@ limitations under the License.
 use std::sync::Arc;
 
 use app::AppBuilder;
-use runtime::{status, Runtime};
+use runtime::{Runtime, status};
 use spicepod::component::dataset::Dataset;
 
 use crate::{
-    get_test_datafusion, init_tracing, run_query_and_check_results, utils::test_request_context,
-    ValidateFn,
+    ValidateFn, get_test_datafusion, init_tracing, run_query_and_check_results,
+    utils::test_request_context,
 };
 
 pub fn get_dataset() -> Result<Dataset, anyhow::Error> {

@@ -20,8 +20,8 @@ use super::DataConnector;
 use super::DataConnectorFactory;
 use super::ParameterSpec;
 use async_trait::async_trait;
-use data_components::snowflake::SnowflakeTableFactory;
 use data_components::Read;
+use data_components::snowflake::SnowflakeTableFactory;
 use datafusion_table_providers::sql::db_connection_pool::DbConnectionPool;
 
 use crate::component::dataset::Dataset;

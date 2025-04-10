@@ -17,8 +17,8 @@ limitations under the License.
 use std::{collections::HashMap, sync::Arc};
 
 use crate::{
-    get_params_with_secrets, metrics, model::ENABLE_MODEL_SUPPORT_MESSAGE, status,
-    timing::TimeMeasurement, Runtime,
+    Runtime, get_params_with_secrets, metrics, model::ENABLE_MODEL_SUPPORT_MESSAGE, status,
+    timing::TimeMeasurement,
 };
 use app::App;
 use model_components::model::Model;
@@ -56,7 +56,9 @@ impl Runtime {
         let app_lock = self.app.read().await;
 
         if !cfg!(feature = "models") && app_lock.as_ref().is_some_and(|s| !s.models.is_empty()) {
-            tracing::error!("Cannot load models without the 'models' feature enabled. {ENABLE_MODEL_SUPPORT_MESSAGE}");
+            tracing::error!(
+                "Cannot load models without the 'models' feature enabled. {ENABLE_MODEL_SUPPORT_MESSAGE}"
+            );
             return;
         }
 

@@ -23,7 +23,7 @@ use datafusion::{
     common::Constraints,
     datasource::{TableProvider, TableType},
     error::Result as DataFusionResult,
-    logical_expr::{dml::InsertOp, LogicalPlan, TableProviderFilterPushDown},
+    logical_expr::{LogicalPlan, TableProviderFilterPushDown, dml::InsertOp},
     physical_plan::ExecutionPlan,
     prelude::Expr,
 };

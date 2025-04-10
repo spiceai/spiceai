@@ -43,7 +43,7 @@ impl Scorer for Includes {
 
         let ideal_strs = match ideal {
             DatasetOutput::AssistantResponse(a) => vec![a.clone()],
-            DatasetOutput::Choices(ref c) => c
+            DatasetOutput::Choices(c) => c
                 .iter()
                 .map(|c| c.message.content.clone().unwrap_or_default())
                 .collect(),
@@ -57,11 +57,7 @@ impl Scorer for Includes {
             .zip(ideal_strs.iter())
             .all(|(a, i)| a.contains(i));
 
-        if is_match {
-            Ok(1.0)
-        } else {
-            Ok(0.0)
-        }
+        if is_match { Ok(1.0) } else { Ok(0.0) }
     }
 
     fn metrics(&self, scores: &[f32]) -> Vec<(String, f32)> {

@@ -16,7 +16,7 @@ limitations under the License.
 
 use std::{cell::LazyCell, sync::Arc};
 
-use ::cache::{get_logical_plan_input_tables, QueryResult};
+use ::cache::{QueryResult, get_logical_plan_input_tables};
 use arrow::{
     array::RecordBatch,
     datatypes::{Schema, SchemaRef},
@@ -25,7 +25,7 @@ use arrow_tools::schema::verify_schema;
 use cache::PlanOrCached;
 use datafusion::{
     error::DataFusionError,
-    execution::{context::SQLOptions, SendableRecordBatchStream},
+    execution::{SendableRecordBatchStream, context::SQLOptions},
     physical_plan::stream::RecordBatchStreamAdapter,
     prelude::DataFrame,
 };
@@ -48,7 +48,7 @@ use futures::StreamExt;
 
 use crate::request::{AsyncMarker, RequestContext};
 
-use super::{error::find_datafusion_root, SPICE_RUNTIME_SCHEMA};
+use super::{SPICE_RUNTIME_SCHEMA, error::find_datafusion_root};
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 

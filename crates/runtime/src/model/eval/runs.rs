@@ -331,7 +331,7 @@ fn eval_runs_record(id: &str, model: &str, eval: &Eval) -> Result<RecordBatch, A
     let arrays: Vec<ArrayRef> = vec![
         Arc::new(StringArray::from(vec![id.to_string()])),
         Arc::new(TimestampSecondArray::from(vec![
-            chrono::Utc::now().timestamp()
+            chrono::Utc::now().timestamp(),
         ])),
         Arc::new(TimestampSecondArray::from(vec![None])),
         Arc::new(StringArray::from(vec![eval.dataset.clone()])),

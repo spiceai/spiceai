@@ -16,7 +16,7 @@ limitations under the License.
 
 use std::time::SystemTime;
 
-use super::{DatasetCheckpoint, Result, CHECKPOINT_TABLE_NAME};
+use super::{CHECKPOINT_TABLE_NAME, DatasetCheckpoint, Result};
 use chrono::{DateTime, Utc};
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion_table_providers::sql::db_connection_pool::{
@@ -190,7 +190,7 @@ mod tests {
     use crate::dataaccelerator::spice_sys::AccelerationConnection;
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion_table_providers::sql::db_connection_pool::{
-        sqlitepool::SqliteConnectionPoolFactory, Mode,
+        Mode, sqlitepool::SqliteConnectionPoolFactory,
     };
 
     async fn create_in_memory_sqlite_checkpoint() -> DatasetCheckpoint {
@@ -435,11 +435,13 @@ mod tests {
         let checkpoint = create_in_memory_sqlite_checkpoint().await;
 
         // Initially, there should be no checkpoint time
-        assert!(checkpoint
-            .last_checkpoint_time()
-            .await
-            .expect("Unexpected checkpoint failure")
-            .is_none());
+        assert!(
+            checkpoint
+                .last_checkpoint_time()
+                .await
+                .expect("Unexpected checkpoint failure")
+                .is_none()
+        );
 
         // Create a test schema
         let schema = Schema::new(vec![

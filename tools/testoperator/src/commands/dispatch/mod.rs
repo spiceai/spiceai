@@ -15,11 +15,11 @@ limitations under the License.
 */
 
 use test_framework::{
+    TestType,
     anyhow::{self, Result},
-    gh_utils::{map_numbers_to_strings, GitHubWorkflow},
+    gh_utils::{GitHubWorkflow, map_numbers_to_strings},
     octocrab,
     utils::scan_directory_for_yamls,
-    TestType,
 };
 
 use crate::args::dispatch::{DispatchArgs, DispatchTestFile, DispatchTests, WorkflowArgs};
@@ -135,7 +135,7 @@ pub async fn dispatch(args: DispatchArgs) -> Result<()> {
             _ => {
                 return Err(anyhow::anyhow!(
                     "Test type {test_type} not supported for dispatching"
-                ))
+                ));
             }
         };
 

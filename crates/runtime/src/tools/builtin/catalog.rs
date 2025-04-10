@@ -25,14 +25,14 @@ use crate::tools::{
 };
 
 use super::{
+    SpiceModelTool,
     document_similarity::DocumentSimilarityTool,
     get_readiness::GetReadinessTool,
     list_datasets::ListDatasetsTool,
-    sample::{tool::SampleDataTool, SampleTableMethod},
+    sample::{SampleTableMethod, tool::SampleDataTool},
     sql::SqlTool,
     table_schema::TableSchemaTool,
     web_search::WebSearchTool,
-    SpiceModelTool,
 };
 
 #[derive(Debug, Snafu)]

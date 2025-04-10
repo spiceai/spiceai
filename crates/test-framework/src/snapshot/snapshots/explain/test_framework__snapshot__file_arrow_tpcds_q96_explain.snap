@@ -27,7 +27,7 @@ description: "Query: tpcds_q96"
 |               |           BytesProcessedNode                                                                                                                                   |
 |               |             Filter: store.s_store_name = LargeUtf8("ese")                                                                                                      |
 |               |               TableScan: store projection=[s_store_sk, s_store_name]                                                                                           |
-| physical_plan | SortExec: TopK(fetch=100), expr=[count(*)@0 ASC NULLS LAST], preserve_partitioning=[false]                                                                     |
+| physical_plan | GlobalLimitExec: skip=0, fetch=100                                                                                                                             |
 |               |   AggregateExec: mode=Final, gby=[], aggr=[count(*)]                                                                                                           |
 |               |     CoalescePartitionsExec                                                                                                                                     |
 |               |       AggregateExec: mode=Partial, gby=[], aggr=[count(*)]                                                                                                     |

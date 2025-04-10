@@ -15,7 +15,7 @@ limitations under the License.
 */
 mod embeddings {
     use std::{
-        fs::{create_dir_all, File},
+        fs::{File, create_dir_all},
         io::Write,
         path::PathBuf,
         time::Duration,

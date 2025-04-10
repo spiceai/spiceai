@@ -20,24 +20,24 @@ use std::task::Poll;
 
 use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
+use arrow_flight::FlightData;
+use arrow_flight::FlightDescriptor;
+use arrow_flight::HandshakeRequest;
 use arrow_flight::decode::FlightDataDecoder;
 use arrow_flight::decode::FlightRecordBatchStream;
 use arrow_flight::encode::FlightDataEncoderBuilder;
 use arrow_flight::error::FlightError;
 use arrow_flight::flight_service_client::FlightServiceClient;
-use arrow_flight::FlightData;
-use arrow_flight::FlightDescriptor;
-use arrow_flight::HandshakeRequest;
-use base64::prelude::BASE64_STANDARD;
 use base64::Engine;
+use base64::prelude::BASE64_STANDARD;
 use bytes::Bytes;
 use futures::StreamExt;
-use futures::{ready, stream, TryStreamExt};
+use futures::{TryStreamExt, ready, stream};
 use snafu::prelude::*;
 use std::error::Error as StdError;
-use tonic::transport::Channel;
 use tonic::IntoRequest;
 use tonic::IntoStreamingRequest;
+use tonic::transport::Channel;
 
 pub mod tls;
 
@@ -113,8 +113,11 @@ impl From<&str> for TonicStatusMessage {
 impl std::fmt::Display for TonicStatusMessage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            TonicStatusMessage::TransportError => write!(f, "A network error occurred. Check the network connection/server configuration, and try again."),
-            TonicStatusMessage::Unmatched(message) => write!(f, "{message}")
+            TonicStatusMessage::TransportError => write!(
+                f,
+                "A network error occurred. Check the network connection/server configuration, and try again."
+            ),
+            TonicStatusMessage::Unmatched(message) => write!(f, "{message}"),
         }
     }
 }
@@ -141,7 +144,9 @@ pub enum Error {
         source: tonic::metadata::errors::ToStrError,
     },
 
-    #[snafu(display("Failed to get schema.\n{source}\nReport a bug to request support: https://github.com/spiceai/spiceai/issues"))]
+    #[snafu(display(
+        "Failed to get schema.\n{source}\nReport a bug to request support: https://github.com/spiceai/spiceai/issues"
+    ))]
     UnableToConvertSchema { source: arrow::error::ArrowError },
 
     #[snafu(display("Query execution failed.\n{source}"))]

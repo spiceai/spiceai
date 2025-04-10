@@ -22,7 +22,7 @@ use llms::embeddings::Embed;
 
 use crate::model::eval::scorer::mean;
 
-use super::{extract_text, DatasetInput, DatasetOutput, Error, Scorer};
+use super::{DatasetInput, DatasetOutput, Error, Scorer, extract_text};
 
 /// [`EmbedScorer`] scores based on the similarity of two [`DatasetOutput`] using the L2 distance of the outputs' embeddings.
 pub struct EmbedScorer {

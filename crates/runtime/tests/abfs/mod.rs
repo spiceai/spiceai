@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::{init_tracing, utils::test_request_context, RecordBatch};
+use crate::{RecordBatch, init_tracing, utils::test_request_context};
 
 use anyhow::anyhow;
 use app::AppBuilder;
@@ -22,7 +22,7 @@ use azure_storage_blobs::prelude::*;
 use bollard::secret::HealthConfig;
 use datafusion::assert_batches_eq;
 use futures::TryStreamExt;
-use runtime::{status, Runtime};
+use runtime::{Runtime, status};
 use spicepod::{component::dataset::Dataset, param::Params as DatasetParams};
 use std::sync::Arc;
 use tracing::instrument;

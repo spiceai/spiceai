@@ -14,8 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::unity_catalog::UnityCatalog;
 use crate::Read;
+use crate::unity_catalog::UnityCatalog;
 use crate::{delta_lake::DeltaTable, unity_catalog::Endpoint};
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
@@ -34,9 +34,13 @@ pub struct DatabricksDelta {
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("A storage location for the Databricks table '{table_reference}' must be provided.\nSpecify a storage location, and try again."))]
+    #[snafu(display(
+        "A storage location for the Databricks table '{table_reference}' must be provided.\nSpecify a storage location, and try again."
+    ))]
     TableDoesNotHaveStorageLocation { table_reference: TableReference },
-    #[snafu(display("Failed to find the Databricks table '{table_reference}'.\nVerify the table exists, and try again."))]
+    #[snafu(display(
+        "Failed to find the Databricks table '{table_reference}'.\nVerify the table exists, and try again."
+    ))]
     TableDoesNotExist { table_reference: TableReference },
 }
 

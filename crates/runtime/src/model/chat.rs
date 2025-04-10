@@ -28,8 +28,8 @@ use std::{collections::HashMap, path::PathBuf, str::FromStr, sync::Arc};
 
 use super::{tool_use::ToolUsingChat, wrapper::ChatWrapper};
 use crate::{
-    tools::{options::SpiceToolsOptions, utils::get_tools},
     Runtime,
+    tools::{options::SpiceToolsOptions, utils::get_tools},
 };
 
 pub type LLMModelStore = HashMap<String, Arc<dyn Chat>>;
@@ -244,7 +244,7 @@ fn openai(
                 return Err(LlmError::InvalidParamError {
                     param: "openai_temperature".to_string(),
                     message: "Ensure it is a non-negative number.".to_string(),
-                })
+                });
             }
         }
     }

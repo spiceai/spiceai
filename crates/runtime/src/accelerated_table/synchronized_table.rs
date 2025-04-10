@@ -19,8 +19,8 @@ use std::sync::Arc;
 use datafusion::catalog::TableProvider;
 use datafusion::sql::TableReference;
 
-use crate::accelerated_table::refresh::Refresher;
 use crate::accelerated_table::AcceleratedTable;
+use crate::accelerated_table::refresh::Refresher;
 
 #[derive(Clone)]
 pub struct SynchronizedTable {

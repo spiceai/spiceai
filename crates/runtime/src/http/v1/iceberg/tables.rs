@@ -21,14 +21,14 @@ use super::{
     error::{IcebergResponseError, InternalServerErrorCode},
     namespace::{Namespace, NamespacePath},
 };
-use crate::datafusion::is_spice_internal_schema;
 use crate::DataFusion;
+use crate::datafusion::is_spice_internal_schema;
 use arrow::datatypes::Schema as ArrowSchema;
 use axum::{
+    Extension, Json,
     extract::Path,
     http::status,
     response::{IntoResponse, Response},
-    Extension, Json,
 };
 use datafusion::sql::TableReference;
 use iceberg::{arrow::arrow_schema_to_schema, spec::Schema};

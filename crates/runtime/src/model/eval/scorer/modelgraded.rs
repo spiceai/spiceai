@@ -25,7 +25,7 @@ use async_openai::{
 };
 use async_trait::async_trait;
 use llms::chat::Chat;
-use serde_json::{json, Number, Value};
+use serde_json::{Number, Value, json};
 
 use crate::model::eval::scorer::mean;
 
@@ -54,10 +54,12 @@ impl ModelGradedScorer {
                 "actual": actual,
                 "ideal": ideal,
             }))
-            .messages(vec![ChatCompletionRequestUserMessageArgs::default()
-                .content(String::new())
-                .build()?
-                .into()])
+            .messages(vec![
+                ChatCompletionRequestUserMessageArgs::default()
+                    .content(String::new())
+                    .build()?
+                    .into(),
+            ])
             .store(true)
             .build()
     }

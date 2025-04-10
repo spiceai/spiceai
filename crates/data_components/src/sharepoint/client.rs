@@ -20,8 +20,8 @@ use document_parse::DocumentParser;
 use futures::Stream;
 
 use graph_rs_sdk::{
-    default_drive::DefaultDriveApiClient, drives::DrivesIdApiClient, error::ErrorMessage,
-    GraphClient, GraphFailure, ODataQuery,
+    GraphClient, GraphFailure, ODataQuery, default_drive::DefaultDriveApiClient,
+    drives::DrivesIdApiClient, error::ErrorMessage,
 };
 
 use http::Response;
@@ -110,7 +110,7 @@ pub fn parse_from(from: &str) -> Result<(PublicDrivePtr, DriveItemPtr), Error> {
         _ => {
             return Err(Error::InvalidDriveFormat {
                 input: drive.to_string(),
-            })
+            });
         }
     };
 
@@ -128,7 +128,7 @@ pub fn parse_from(from: &str) -> Result<(PublicDrivePtr, DriveItemPtr), Error> {
         _ => {
             return Err(Error::InvalidDriveFormat {
                 input: item.to_string(),
-            })
+            });
         }
     };
 
@@ -309,7 +309,7 @@ impl SharepointClient {
 
     /// Streams [`DriveItemResponse`] from the Microsoft Graph API for the [`SharepointListExec`]'s selected drive and drive item.
     pub(crate) fn stream_drive_items(
-        &self,
+        self: Arc<Self>,
         limit: Option<usize>,
     ) -> Result<
         impl Stream<Item = Result<Response<Result<DriveItemResponse, ErrorMessage>>, GraphFailure>>,

@@ -17,6 +17,7 @@ limitations under the License.
 use std::collections::HashMap;
 
 use bollard::{
+    Docker,
     container::{
         Config, CreateContainerOptions, ListContainersOptions, RemoveContainerOptions,
         StartContainerOptions,
@@ -26,7 +27,6 @@ use bollard::{
         ContainerState, ContainerStateStatusEnum, Health, HealthConfig, HealthStatusEnum,
         HostConfig, PortBinding,
     },
-    Docker,
 };
 use futures::StreamExt;
 pub struct RunningContainer<'a> {

@@ -15,8 +15,8 @@ limitations under the License.
 */
 
 use crate::{
-    datafusion::SPICE_RUNTIME_SCHEMA, task_history, Error, Result, Runtime,
-    UnableToCreateBackendSnafu,
+    Error, Result, Runtime, UnableToCreateBackendSnafu, datafusion::SPICE_RUNTIME_SCHEMA,
+    task_history,
 };
 use datafusion::sql::TableReference;
 use snafu::prelude::*;

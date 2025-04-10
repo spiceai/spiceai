@@ -17,7 +17,7 @@ limitations under the License.
 use std::{
     future::Future,
     marker::PhantomData,
-    sync::{atomic::AtomicU8, Arc, LazyLock, OnceLock},
+    sync::{Arc, LazyLock, OnceLock, atomic::AtomicU8},
 };
 
 use app::App;
@@ -26,7 +26,7 @@ use opentelemetry::KeyValue;
 use runtime_auth::{AuthPrincipalRef, AuthRequestContext};
 use spicepod::component::runtime::UserAgentCollection;
 
-use super::{baggage, CacheControl, CacheKeyType, Protocol, UserAgent};
+use super::{CacheControl, CacheKeyType, Protocol, UserAgent, baggage};
 
 pub struct RequestContext {
     // Use an AtomicU8 to allow updating the protocol without locking

@@ -102,7 +102,7 @@ mod tests {
                 "/tmp",
                 "tmp/.tmpJ1DebA/.spice/data/accelerated_duckdb.db",
                 "/data/accelerated_duckdb.db",
-            )
+            ),
         ];
 
         for (tmp_dir, input, expected) in test_cases {

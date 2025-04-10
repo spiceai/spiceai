@@ -45,11 +45,7 @@ impl Scorer for MatchScorer {
                 *a == b
             }
         };
-        if is_equal {
-            Ok(1.0_f32)
-        } else {
-            Ok(0.0_f32)
-        }
+        if is_equal { Ok(1.0_f32) } else { Ok(0.0_f32) }
     }
 
     fn metrics(&self, scores: &[f32]) -> Vec<(String, f32)> {

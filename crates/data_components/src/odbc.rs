@@ -18,13 +18,13 @@ use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::{
     datasource::TableProvider,
-    sql::{unparser::dialect::Dialect, TableReference},
+    sql::{TableReference, unparser::dialect::Dialect},
 };
 use datafusion_table_providers::sql::{
     db_connection_pool as db_connection_pool_datafusion,
     sql_provider_datafusion::{
-        expr::{self, Engine},
         SqlTable,
+        expr::{self, Engine},
     },
 };
 use db_connection_pool::dbconnection::odbcconn::ODBCDbConnectionPool;

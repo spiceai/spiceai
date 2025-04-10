@@ -23,10 +23,10 @@ use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
 use url::Url;
 
-use super::{listing, ConnectorComponent, ConnectorParams};
+use super::{ConnectorComponent, ConnectorParams, listing};
 use super::{
-    listing::ListingTableConnector, DataConnector, DataConnectorFactory, DataConnectorResult,
-    ParameterSpec, Parameters,
+    DataConnector, DataConnectorFactory, DataConnectorResult, ParameterSpec, Parameters,
+    listing::ListingTableConnector,
 };
 
 #[derive(Debug)]

@@ -40,18 +40,19 @@ use datafusion::{
     error::{DataFusionError, Result as DataFusionResult},
     execution::TaskContext,
     physical_plan::{
-        memory::MemoryExec, stream::RecordBatchStreamAdapter, DisplayAs, DisplayFormatType,
-        ExecutionPlan, PlanProperties, SendableRecordBatchStream,
+        DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
+        memory::MemoryExec, stream::RecordBatchStreamAdapter,
     },
     prelude::{Expr, SessionContext},
     sql::unparser::dialect::{Dialect, PostgreSqlDialect},
 };
 use datafusion_federation::{
-    table_reference::MultiPartTableReference, FederatedTableProviderAdaptor,
+    FederatedTableProviderAdaptor, table_reference::MultiPartTableReference,
 };
 use datafusion_federation_sql::{SQLExecutor, SQLFederationProvider, SQLTableSource};
 use futures::{Stream, TryStreamExt};
 use runtime::{
+    Runtime,
     component::dataset::Dataset,
     dataconnector::{
         self, ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError,
@@ -59,10 +60,10 @@ use runtime::{
     },
     parameters::ParameterSpec,
     request::{AsyncMarker, Protocol, RequestContext},
-    status, Runtime,
+    status,
 };
 use spicepod::component::dataset::{
-    acceleration::Acceleration, Dataset as SpicepodDataset, ReadyState,
+    Dataset as SpicepodDataset, ReadyState, acceleration::Acceleration,
 };
 
 use crate::{get_test_datafusion, init_tracing};
@@ -712,8 +713,8 @@ async fn test_ready_state_on_registration_federated_arrow_acceleration() -> Resu
 // Test that the runtime is ready immediately with ready_state = on_registration for federated provider
 #[cfg(feature = "duckdb")]
 #[tokio::test]
-async fn test_ready_state_on_registration_federated_duckdb_acceleration(
-) -> Result<(), anyhow::Error> {
+async fn test_ready_state_on_registration_federated_duckdb_acceleration()
+-> Result<(), anyhow::Error> {
     // Federated provider, OnRegistration, DuckDB engine, should not error initially
     run_ready_state_test(
         false,

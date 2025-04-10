@@ -17,9 +17,8 @@ limitations under the License.
 use std::sync::LazyLock;
 
 use opentelemetry::{
-    global,
+    KeyValue, global,
     metrics::{Counter, Histogram, Meter},
-    KeyValue,
 };
 
 use crate::{

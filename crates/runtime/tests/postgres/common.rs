@@ -18,7 +18,7 @@ use std::collections::HashMap;
 
 use bollard::secret::HealthConfig;
 use datafusion_table_providers::{
-    sql::db_connection_pool::postgrespool::PostgresConnectionPool, UnsupportedTypeAction,
+    UnsupportedTypeAction, sql::db_connection_pool::postgrespool::PostgresConnectionPool,
 };
 use rand::Rng;
 use secrecy::SecretString;

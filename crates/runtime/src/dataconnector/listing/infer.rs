@@ -22,8 +22,8 @@ use datafusion::{
 };
 use futures::{StreamExt, TryStreamExt};
 use itertools::Itertools;
-use object_store::path::{Path, DELIMITER};
 use object_store::ObjectStore;
+use object_store::path::{DELIMITER, Path};
 use snafu::prelude::*;
 
 #[derive(Debug, Snafu)]

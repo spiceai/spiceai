@@ -15,25 +15,25 @@ limitations under the License.
 */
 use std::sync::Arc;
 
-use crate::{component::catalog::Catalog, LogErrors, Runtime};
+use crate::{LogErrors, Runtime, component::catalog::Catalog};
 use app::App;
 use axum::{
+    Extension, Json,
     extract::Query,
     http::status,
     response::{IntoResponse, Response},
-    Extension, Json,
 };
 use axum_extra::TypedHeader;
 use headers_accept::Accept;
 use mediatype::{
-    names::{APPLICATION, CSV, JSON, TEXT},
     MediaType,
+    names::{APPLICATION, CSV, JSON, TEXT},
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tract_core::tract_data::itertools::Itertools;
 
-use super::{convert_entry_to_csv, Format};
+use super::{Format, convert_entry_to_csv};
 
 #[derive(Debug, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::IntoParams))]

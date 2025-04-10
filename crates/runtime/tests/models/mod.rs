@@ -18,12 +18,12 @@ use arrow::{array::StringArray, compute::concat_batches, util::pretty::pretty_fo
 use async_openai::types::EmbeddingInput;
 use futures::TryStreamExt;
 use rand::Rng;
-use reqwest::{header::HeaderMap, Client};
-use runtime::{config::Config, get_params_with_secrets, Runtime};
+use reqwest::{Client, header::HeaderMap};
+use runtime::{Runtime, config::Config, get_params_with_secrets};
 use secrecy::SecretString;
 use snafu::ResultExt;
 use spicepod::{
-    component::dataset::{acceleration::Acceleration, Dataset},
+    component::dataset::{Dataset, acceleration::Acceleration},
     param::Params,
 };
 use std::sync::Arc;
@@ -32,7 +32,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
 };
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 mod embedding;
 mod hf;
 mod local;
@@ -42,8 +42,8 @@ mod tools;
 mod nsql {
     use chrono::{DateTime, Utc};
     use http::{
-        header::{ACCEPT, CONTENT_TYPE},
         HeaderMap, HeaderValue,
+        header::{ACCEPT, CONTENT_TYPE},
     };
     use opentelemetry_sdk::trace::TracerProvider;
 
@@ -114,8 +114,8 @@ mod nsql {
 
 mod search {
     use http::{
-        header::{ACCEPT, CONTENT_TYPE},
         HeaderMap, HeaderValue,
+        header::{ACCEPT, CONTENT_TYPE},
     };
 
     use crate::models::{http_post, normalize_search_response};

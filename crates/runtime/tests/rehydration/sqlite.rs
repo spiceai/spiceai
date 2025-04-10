@@ -17,7 +17,7 @@ limitations under the License.
 use anyhow::{Error, Result};
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion_table_providers::sql::db_connection_pool::{
-    sqlitepool::SqliteConnectionPool, DbConnectionPool, JoinPushDown,
+    DbConnectionPool, JoinPushDown, sqlitepool::SqliteConnectionPool,
 };
 
 pub(crate) async fn query_local_db(

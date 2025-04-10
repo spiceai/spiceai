@@ -16,7 +16,7 @@ limitations under the License.
 
 use async_trait::async_trait;
 use mcp_client::McpClientTrait;
-use mcp_core::{protocol::CallToolResult, Tool as McpTool};
+use mcp_core::{Tool as McpTool, protocol::CallToolResult};
 use serde_json::Value;
 use snafu::ResultExt;
 use std::{borrow::Cow, sync::Arc};
@@ -24,7 +24,7 @@ use tokio::sync::RwLock;
 use tracing::Span;
 use tracing_futures::Instrument;
 
-use crate::{tools::SpiceModelTool, Runtime};
+use crate::{Runtime, tools::SpiceModelTool};
 
 use super::{McpProxy, Result};
 

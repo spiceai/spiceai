@@ -24,12 +24,12 @@ use std::{borrow::Cow, sync::Arc};
 use tracing_futures::Instrument;
 
 use crate::{
-    dataupdate::{DataUpdate, UpdateType},
-    tools::{utils::parameters, SpiceModelTool},
     Runtime,
+    dataupdate::{DataUpdate, UpdateType},
+    tools::{SpiceModelTool, utils::parameters},
 };
 
-use super::{memory_table_name, try_from, MemoryTableElement};
+use super::{MemoryTableElement, memory_table_name, try_from};
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct StoreMemoryParams {

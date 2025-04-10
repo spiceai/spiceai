@@ -21,10 +21,11 @@ use async_stream::stream;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::EquivalenceProperties;
+use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::memory::MemoryStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionMode, ExecutionPlan, Partitioning, PlanProperties,
+    DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
 };
 use futures::{StreamExt, TryStreamExt};
 use tokio::sync::Mutex;
@@ -106,7 +107,8 @@ impl StreamingDataUpdateExecutionPlan {
             properties: PlanProperties::new(
                 EquivalenceProperties::new(schema),
                 Partitioning::UnknownPartitioning(1),
-                ExecutionMode::Bounded,
+                EmissionType::Incremental,
+                Boundedness::Bounded,
             ),
         }
     }

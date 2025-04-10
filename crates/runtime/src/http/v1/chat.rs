@@ -29,12 +29,12 @@ use async_openai::{
 };
 use async_stream::stream;
 use axum::{
+    Extension, Json,
     http::{HeaderMap, StatusCode},
     response::{
-        sse::{Event, KeepAlive, Sse},
         IntoResponse, Response,
+        sse::{Event, KeepAlive, Sse},
     },
-    Extension, Json,
 };
 use futures::StreamExt;
 use serde::Serialize;

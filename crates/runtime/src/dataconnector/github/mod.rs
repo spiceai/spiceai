@@ -18,16 +18,15 @@ use crate::component::dataset::Dataset;
 use arrow::array::{Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
-use chrono::{offset::LocalResult, SecondsFormat, TimeZone, Utc};
+use chrono::{SecondsFormat, TimeZone, Utc, offset::LocalResult};
 use commits::CommitsTableArgs;
 use data_components::{
     github::{self, GithubFilesTableProvider, GithubRestClient},
     graphql::{
-        self,
+        self, FilterPushdownResult, GraphQLContext,
         builder::GraphQLClientBuilder,
         client::{GraphQLClient, GraphQLQuery, PaginationParameters},
         provider::GraphQLTableProviderBuilder,
-        FilterPushdownResult, GraphQLContext,
     },
     rate_limit::RateLimiter,
     token_provider::{StaticTokenProvider, TokenProvider},
@@ -56,8 +55,8 @@ use std::{any::Any, future::Future, pin::Pin, str::FromStr, sync::Arc};
 use url::Url;
 
 use super::{
-    graphql::default_spice_client, ConnectorComponent, ConnectorParams, DataConnector,
-    DataConnectorError, DataConnectorFactory, ParameterSpec, Parameters,
+    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
+    ParameterSpec, Parameters, graphql::default_spice_client,
 };
 
 mod commits;
@@ -765,7 +764,7 @@ pub(crate) fn filter_pushdown(expr: &Expr) -> FilterPushdownResult {
                                     filter_pushdown: TableProviderFilterPushDown::Unsupported,
                                     expr: expr.clone(),
                                     context: None,
-                                }
+                                };
                             }
                         },
                         _ => {
@@ -773,7 +772,7 @@ pub(crate) fn filter_pushdown(expr: &Expr) -> FilterPushdownResult {
                                 filter_pushdown: TableProviderFilterPushDown::Unsupported,
                                 expr: expr.clone(),
                                 context: None,
-                            }
+                            };
                         }
                     }
                 }

@@ -31,7 +31,7 @@ use tracing_futures::Instrument;
 
 use crate::{
     component::dataset::Dataset,
-    datafusion::{error::find_datafusion_root, DataFusion},
+    datafusion::{DataFusion, error::find_datafusion_root},
     metrics,
 };
 
@@ -54,7 +54,9 @@ pub enum Error {
     #[snafu(display("Failed to get recently access datasets.\n{source}"))]
     UnableToGetRecentlyAccessedDatasets { source: DataFusionError },
 
-    #[snafu(display("Spice received an unexpected data type from a `task_history` query: {data_type}\nThis is likely a bug in Spice, which can be reported here: https://github.com/spiceai/spiceai/issues"))]
+    #[snafu(display(
+        "Spice received an unexpected data type from a `task_history` query: {data_type}\nThis is likely a bug in Spice, which can be reported here: https://github.com/spiceai/spiceai/issues"
+    ))]
     UnexpectedDataType {
         data_type: arrow::datatypes::DataType,
     },
@@ -198,7 +200,7 @@ AND labels.error_code IS NULL"
                 dt => {
                     return Err(Error::UnexpectedDataType {
                         data_type: dt.clone(),
-                    })
+                    });
                 }
             };
 
@@ -242,7 +244,9 @@ AND labels.error_code IS NULL"
                     Arc::new(HashSet::new())
                 };
 
-                tracing::trace!("Datasets excluded from availability check as they were recently successfully accessed: {recently_accessed_datasets:?}");
+                tracing::trace!(
+                    "Datasets excluded from availability check as they were recently successfully accessed: {recently_accessed_datasets:?}"
+                );
 
                 // subset them from the datasets to check
                 let datasets_to_check: Vec<_> = datasets_to_check
@@ -385,7 +389,7 @@ mod test {
     use crate::{component::dataset::Dataset, status::RuntimeStatus};
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion::{
-        catalog::SchemaProvider, catalog_common::MemorySchemaProvider, datasource::MemTable,
+        catalog::MemorySchemaProvider, catalog::SchemaProvider, datasource::MemTable,
     };
     use std::sync::Arc;
 

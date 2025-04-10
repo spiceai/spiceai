@@ -24,17 +24,19 @@ use datafusion::{
     logical_expr::{Expr, TableProviderFilterPushDown},
     physical_expr::EquivalenceProperties,
     physical_plan::{
-        expressions::Column, projection::ProjectionExec, stream::RecordBatchStreamAdapter,
-        DisplayAs, DisplayFormatType, ExecutionMode, ExecutionPlan, Partitioning, PhysicalExpr,
-        PlanProperties,
+        DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PhysicalExpr, PlanProperties,
+        execution_plan::{Boundedness, EmissionType},
+        expressions::Column,
+        projection::ProjectionExec,
+        stream::RecordBatchStreamAdapter,
     },
 };
 use futures::StreamExt;
 use snafu::ResultExt;
 use std::{any::Any, fmt, sync::Arc};
 
-use super::{client::GraphQLClient, ErrorChecker, GraphQLContext, ResultTransformSnafu};
-use super::{client::GraphQLQuery, Result};
+use super::{ErrorChecker, GraphQLContext, ResultTransformSnafu, client::GraphQLClient};
+use super::{Result, client::GraphQLQuery};
 
 pub type TransformFn =
     fn(&RecordBatch) -> Result<RecordBatch, Box<dyn std::error::Error + Send + Sync>>;
@@ -239,7 +241,8 @@ impl GraphQLTableProviderExec {
             properties: PlanProperties::new(
                 EquivalenceProperties::new(table_schema),
                 Partitioning::UnknownPartitioning(1),
-                ExecutionMode::Bounded,
+                EmissionType::Incremental,
+                Boundedness::Bounded,
             ),
         }
     }

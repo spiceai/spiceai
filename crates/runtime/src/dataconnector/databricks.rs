@@ -16,10 +16,10 @@ limitations under the License.
 
 use crate::component::dataset::Dataset;
 use async_trait::async_trait;
+use data_components::Read;
 use data_components::databricks_delta::DatabricksDelta;
 use data_components::databricks_spark::DatabricksSparkConnect;
 use data_components::unity_catalog::Endpoint;
-use data_components::Read;
 use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
 use secrecy::ExposeSecret;
@@ -36,18 +36,26 @@ use super::{
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Missing required parameter: {parameter}. Specify a value.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/databricks#parameters"))]
+    #[snafu(display(
+        "Missing required parameter: {parameter}. Specify a value.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/databricks#parameters"
+    ))]
     MissingParameter { parameter: String },
 
-    #[snafu(display("Invalid `databricks_use_ssl` value: '{value}'. Use 'true' or 'false'.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/databricks#parameters"))]
+    #[snafu(display(
+        "Invalid `databricks_use_ssl` value: '{value}'. Use 'true' or 'false'.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/databricks#parameters"
+    ))]
     InvalidUsessl { value: String },
 
-    #[snafu(display("Failed to connect to Databricks Spark.\n{source}\nVerify the connector configuration, and try again.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/databricks#parameters"))]
+    #[snafu(display(
+        "Failed to connect to Databricks Spark.\n{source}\nVerify the connector configuration, and try again.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/databricks#parameters"
+    ))]
     UnableToConstructDatabricksSpark {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Invalid `mode` value: '{value}'. Use 'delta_lake' or 'spark_connect'.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/databricks#parameters"))]
+    #[snafu(display(
+        "Invalid `mode` value: '{value}'. Use 'delta_lake' or 'spark_connect'.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/databricks#parameters"
+    ))]
     InvalidMode { value: String },
 }
 
@@ -95,7 +103,7 @@ impl Databricks {
                             return InvalidUsesslSnafu {
                                 value: databricks_use_ssl_value,
                             }
-                            .fail()
+                            .fail();
                         }
                     };
                 }

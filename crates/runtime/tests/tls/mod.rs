@@ -25,13 +25,13 @@ use crate::{
     utils::{test_request_context, wait_until_true},
 };
 use arrow_flight::{
+    FlightDescriptor,
     flight_service_client::FlightServiceClient,
     sql::{CommandStatementQuery, ProstMessageExt},
-    FlightDescriptor,
 };
 use prost::Message;
 use rand::Rng;
-use runtime::{auth::EndpointAuth, config::Config, tls::TlsConfig, Runtime};
+use runtime::{Runtime, auth::EndpointAuth, config::Config, tls::TlsConfig};
 use tonic::transport::Channel;
 use tonic_health::pb::health_client::HealthClient;
 

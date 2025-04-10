@@ -15,9 +15,9 @@ limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
 
-use crate::chat::nsql::structured_output::StructuredOutputSqlGeneration;
-use crate::chat::nsql::{json::JsonSchemaSqlGeneration, SqlGeneration};
 use crate::chat::Chat;
+use crate::chat::nsql::structured_output::StructuredOutputSqlGeneration;
+use crate::chat::nsql::{SqlGeneration, json::JsonSchemaSqlGeneration};
 use async_openai::config::Config;
 use async_openai::error::OpenAIError;
 use async_openai::types::{

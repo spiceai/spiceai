@@ -31,18 +31,18 @@ use futures::future::join_all;
 use snafu::ResultExt;
 use tei_backend::{Backend, DType, ModelType, Pool};
 use tei_core::{
+    TextEmbeddingsError,
     infer::{Infer, PooledEmbeddingsInferResponse},
     queue::Queue,
     tokenization::{EncodingInput, Tokenization},
-    TextEmbeddingsError,
 };
 use tokenizers::{Tokenizer, TruncationDirection};
 
 use crate::{
     chunking::{Chunker, ChunkingConfig, RecursiveSplittingChunker},
     embeddings::{
-        candle::util::link_files_into_tmp_dir, encode_embedding, Embed, Error,
-        FailedToCreateEmbeddingSnafu, FailedToInstantiateEmbeddingModelSnafu, Result,
+        Embed, Error, FailedToCreateEmbeddingSnafu, FailedToInstantiateEmbeddingModelSnafu, Result,
+        candle::util::link_files_into_tmp_dir, encode_embedding,
     },
 };
 

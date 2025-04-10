@@ -21,8 +21,8 @@ use crate::component::dataset::Dataset;
 use arrow_flight::flight_service_client::FlightServiceClient;
 use arrow_flight::sql::client::FlightSqlServiceClient;
 use async_trait::async_trait;
-use data_components::flightsql::FlightSQLFactory as DataComponentFlightSQLFactory;
 use data_components::Read;
+use data_components::flightsql::FlightSQLFactory as DataComponentFlightSQLFactory;
 use datafusion::datasource::TableProvider;
 use flight_client::tls::new_tls_flight_channel;
 use flight_client::{MAX_DECODING_MESSAGE_SIZE, MAX_ENCODING_MESSAGE_SIZE};
@@ -33,7 +33,9 @@ use std::{future::Future, sync::Arc};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Missing required parameter: {parameter}. Specify a value.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/flightsql#params"))]
+    #[snafu(display(
+        "Missing required parameter: {parameter}. Specify a value.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/flightsql#params"
+    ))]
     MissingParameter { parameter: String },
 
     #[snafu(display("Failed to connect to the Flight server. A TLS error occurred.\n{source}"))]

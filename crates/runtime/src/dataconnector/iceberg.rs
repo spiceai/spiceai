@@ -110,7 +110,9 @@ impl DataConnector for IcebergDataConnector {
             Err(e) => {
                 return Err(Error::InvalidConfiguration {
                     dataconnector: "iceberg".into(),
-                    message: format!("A Dataset Path is required for Iceberg in the format of: http://<host_and_port>/v1/namespaces/<namespace>/tables/<table_name>.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/iceberg#from\n{e}"),
+                    message: format!(
+                        "A Dataset Path is required for Iceberg in the format of: http://<host_and_port>/v1/namespaces/<namespace>/tables/<table_name>.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/iceberg#from\n{e}"
+                    ),
                     connector_component: ConnectorComponent::from(dataset),
                     source: Box::new(e),
                 });

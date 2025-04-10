@@ -15,12 +15,11 @@ limitations under the License.
 */
 
 use crate::{
-    get_test_datafusion, init_tracing, run_query_and_check_results,
+    ValidateFn, get_test_datafusion, init_tracing, run_query_and_check_results,
     utils::{runtime_ready_check, test_request_context},
-    ValidateFn,
 };
 use app::AppBuilder;
-use runtime::{status, Runtime};
+use runtime::{Runtime, status};
 use spicepod::{component::catalog::Catalog, param::Params};
 use std::sync::Arc;
 

@@ -22,12 +22,12 @@ mod mcp {
     use crate::init_tracing_with_task_history;
     use crate::models::create_api_bindings_config;
 
-    use crate::utils::runtime_ready_check;
     use crate::Runtime;
+    use crate::utils::runtime_ready_check;
     use app::AppBuilder;
     use http::{
-        header::{ACCEPT, CONTENT_TYPE},
         HeaderMap, HeaderValue,
+        header::{ACCEPT, CONTENT_TYPE},
     };
     use insta::{assert_json_snapshot, assert_snapshot};
     use runtime::auth::EndpointAuth;
@@ -46,8 +46,10 @@ from: mcp:docker
 params:
   mcp_args: run -i --rm mcp/fetch
 ";
-        let http_base_url = start_spiced_with_tools(vec![serde_yaml::from_str(tool_yaml)
-            .expect("Tool spicepod component is not in expected format")])
+        let http_base_url = start_spiced_with_tools(vec![
+            serde_yaml::from_str(tool_yaml)
+                .expect("Tool spicepod component is not in expected format"),
+        ])
         .await
         .expect("Failed to start spiced with tools");
 
@@ -71,11 +73,12 @@ params:
             .expect("Failed to start spiced with tools");
 
         let tool_yaml = format!("name: mcp_from_spiced\nfrom: mcp:{http_server_url}/v1/mcp/sse");
-        let http_client_url =
-            start_spiced_with_tools(vec![serde_yaml::from_str(tool_yaml.as_str())
-                .expect("Tool spicepod component is not in expected format")])
-            .await
-            .expect("Failed to start spiced with tools");
+        let http_client_url = start_spiced_with_tools(vec![
+            serde_yaml::from_str(tool_yaml.as_str())
+                .expect("Tool spicepod component is not in expected format"),
+        ])
+        .await
+        .expect("Failed to start spiced with tools");
 
         let tools_list = call_tool_list(http_client_url.as_str()).await?;
         assert_json_snapshot!("mcp_spiced_list", tools_list);

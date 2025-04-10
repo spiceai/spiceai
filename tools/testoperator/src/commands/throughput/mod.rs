@@ -18,18 +18,17 @@ use super::get_app_and_start_request;
 use crate::{args::DatasetTestArgs, wait_test_and_memory};
 use std::time::Duration;
 use test_framework::{
-    anyhow,
+    TestType, anyhow,
     arrow::util::pretty::print_batches,
     metrics::{MetricCollector, QueryMetrics, ThroughputMetrics},
     queries::{QueryOverrides, QuerySet},
     spiced::SpicedInstance,
     spicetest::{
-        datasets::{EndCondition, NotStarted},
         SpiceTest,
+        datasets::{EndCondition, NotStarted},
     },
     tokio_util::sync::CancellationToken,
     utils::observe_memory,
-    TestType,
 };
 
 pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {

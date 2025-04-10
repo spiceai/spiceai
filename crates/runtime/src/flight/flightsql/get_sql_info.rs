@@ -21,23 +21,22 @@ use arrow::{
     datatypes::{DataType, IntervalUnit, TimeUnit},
 };
 use arrow_flight::{
+    FlightDescriptor, FlightEndpoint, FlightInfo, Ticket,
     encode::FlightDataEncoderBuilder,
     flight_service_server::FlightService,
     sql::{
-        self,
-        metadata::{SqlInfoData, SqlInfoDataBuilder},
-        ProstMessageExt, SqlInfo, SqlNullOrdering, SqlSupportedCaseSensitivity,
+        self, ProstMessageExt, SqlInfo, SqlNullOrdering, SqlSupportedCaseSensitivity,
         SqlSupportedTransactions, SqlSupportsConvert, SupportedSqlGrammar,
+        metadata::{SqlInfoData, SqlInfoDataBuilder},
     },
-    FlightDescriptor, FlightEndpoint, FlightInfo, Ticket,
 };
-use futures::{stream, StreamExt, TryStreamExt};
+use futures::{StreamExt, TryStreamExt, stream};
 use once_cell::sync::Lazy;
 use prost::Message;
 use tonic::{Request, Response, Status};
 
 use crate::{
-    flight::{metrics, to_tonic_err, util::set_flightsql_protocol, Service},
+    flight::{Service, metrics, to_tonic_err, util::set_flightsql_protocol},
     timing::TimedStream,
 };
 

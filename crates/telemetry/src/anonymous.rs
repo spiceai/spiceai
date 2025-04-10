@@ -22,12 +22,12 @@ use std::{
 use crate::exporter::AnonymousTelemetryExporter;
 use opentelemetry::KeyValue;
 use opentelemetry_sdk::{
+    Resource,
     metrics::{
-        data::ResourceMetrics, exporter::PushMetricExporter, reader::MetricReader, InstrumentKind,
-        ManualReader, PeriodicReader, Pipeline, SdkMeterProvider, Temporality,
+        InstrumentKind, ManualReader, PeriodicReader, Pipeline, SdkMeterProvider, Temporality,
+        data::ResourceMetrics, exporter::PushMetricExporter, reader::MetricReader,
     },
     runtime::Tokio,
-    Resource,
 };
 use otel_arrow::OtelArrowExporter;
 use sha2::{Digest, Sha256};
@@ -92,7 +92,9 @@ pub async fn start(spicepod_name: &str, telemetry_properties: Vec<KeyValue>) {
         .set(Arc::new(provider))
         .is_err()
     {
-        tracing::trace!("Failed to set global meter provider for the anonymous telemetry, already set by another codepath?");
+        tracing::trace!(
+            "Failed to set global meter provider for the anonymous telemetry, already set by another codepath?"
+        );
     }
 
     // Send an initial telemetry event to indicate the start of telemetry collection

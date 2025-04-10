@@ -20,7 +20,7 @@ use datafusion::{datasource::TableProvider, sql::TableReference};
 use std::{error::Error, sync::Arc};
 use uuid::Uuid;
 
-use crate::{spark_connect::SparkConnect, Read};
+use crate::{Read, spark_connect::SparkConnect};
 
 #[derive(Clone)]
 pub struct DatabricksSparkConnect {
@@ -34,7 +34,9 @@ impl DatabricksSparkConnect {
         databricks_use_ssl: bool,
     ) -> Result<Self, Box<dyn Error + Send + Sync>> {
         let session_id = Uuid::new_v4();
-        let connection = format!("sc://{endpoint}:443/;use_ssl={databricks_use_ssl};user_id=spice.ai;session_id={session_id};token={token};x-databricks-cluster-id={cluster_id}");
+        let connection = format!(
+            "sc://{endpoint}:443/;use_ssl={databricks_use_ssl};user_id=spice.ai;session_id={session_id};token={token};x-databricks-cluster-id={cluster_id}"
+        );
         Ok(Self {
             spark_connect: SparkConnect::from_connection(connection.as_str()).await?,
         })

@@ -18,7 +18,7 @@ use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::{
     datasource::TableProvider,
-    sql::{unparser::dialect, TableReference},
+    sql::{TableReference, unparser::dialect},
 };
 use datafusion_table_providers::sql::{
     db_connection_pool::DbConnectionPool,

@@ -17,7 +17,7 @@ limitations under the License.
 use crate::component::dataset::TimeFormat;
 use arrow::datatypes::DataType;
 use datafusion::{
-    logical_expr::{binary_expr, cast, col, lit, Expr, Operator},
+    logical_expr::{Expr, Operator, binary_expr, cast, col, lit},
     prelude::and,
     scalar::ScalarValue,
 };
@@ -204,11 +204,7 @@ mod test {
             "CAST(timestamp AS Timestamp(Nanosecond, None)) > TimestampNanosecond(1620000000000000000, None)",
         );
         test(
-            Field::new(
-                "timestamp",
-                DataType::Utf8,
-                false,
-            ),
+            Field::new("timestamp", DataType::Utf8, false),
             TimeFormat::UnixSeconds,
             1_620_000_000_000_000_000,
             "CAST(timestamp AS Timestamp(Nanosecond, None)) > TimestampNanosecond(1620000000000000000, None)",

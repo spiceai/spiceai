@@ -20,7 +20,7 @@ use async_openai::{
     },
 };
 
-use super::{create_prompt, QueryGenerationContext, SqlGeneration};
+use super::{QueryGenerationContext, SqlGeneration, create_prompt};
 
 /// Implementation for [`SqlGeneration`] for [`super::Chat`] models that support [`ResponseFormat::JsonObject`].
 pub struct JsonSchemaSqlGeneration;

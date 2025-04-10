@@ -18,11 +18,11 @@ use acceleration::Engine;
 use app::App;
 use arrow::datatypes::SchemaRef;
 use datafusion::sql::{
+    TableReference,
     sqlparser::{
         dialect::{Dialect, GenericDialect},
         parser::{Parser, ParserError},
     },
-    TableReference,
 };
 use datafusion_table_providers::util::column_reference;
 use snafu::prelude::*;
@@ -66,7 +66,9 @@ pub enum Error {
         source: datafusion::error::DataFusionError,
     },
 
-    #[snafu(display("Only one `on_conflict` target can be specified, or all `on_conflict` targets must be specified and set to `drop`. {extra_detail}"))]
+    #[snafu(display(
+        "Only one `on_conflict` target can be specified, or all `on_conflict` targets must be specified and set to `drop`. {extra_detail}"
+    ))]
     OnConflictTargetMismatch { extra_detail: String },
 
     #[snafu(display("Error parsing column reference {column_ref}: {source}"))]

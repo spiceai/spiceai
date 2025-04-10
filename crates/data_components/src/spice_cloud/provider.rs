@@ -35,25 +35,35 @@ use crate::iceberg::catalog::RestCatalog;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Failed to load the Spice.ai table '{table}'.\n{source}\nReport an issue on GitHub: https://github.com/spiceai/spiceai/issues"))]
+    #[snafu(display(
+        "Failed to load the Spice.ai table '{table}'.\n{source}\nReport an issue on GitHub: https://github.com/spiceai/spiceai/issues"
+    ))]
     TableProviderCreation {
         table: String,
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Failed to list namespaces for the Spice Cloud Catalog.\n{source}\nReport an issue on GitHub: https://github.com/spiceai/spiceai/issues"))]
+    #[snafu(display(
+        "Failed to list namespaces for the Spice Cloud Catalog.\n{source}\nReport an issue on GitHub: https://github.com/spiceai/spiceai/issues"
+    ))]
     ListNamespaces { source: iceberg::Error },
 
-    #[snafu(display("Failed to list tables for the Spice Cloud Catalog.\n{source}\nReport an issue on GitHub: https://github.com/spiceai/spiceai/issues"))]
+    #[snafu(display(
+        "Failed to list tables for the Spice Cloud Catalog.\n{source}\nReport an issue on GitHub: https://github.com/spiceai/spiceai/issues"
+    ))]
     ListTables { source: iceberg::Error },
 
-    #[snafu(display("Failed to load the table '{table}'.\n{source}\nReport an issue on GitHub: https://github.com/spiceai/spiceai/issues"))]
+    #[snafu(display(
+        "Failed to load the table '{table}'.\n{source}\nReport an issue on GitHub: https://github.com/spiceai/spiceai/issues"
+    ))]
     LoadTable {
         source: iceberg::Error,
         table: String,
     },
 
-    #[snafu(display("Failed to find a schema for the table '{table}'.\nVerify the table exists in Spice Cloud, and try again."))]
+    #[snafu(display(
+        "Failed to find a schema for the table '{table}'.\nVerify the table exists in Spice Cloud, and try again."
+    ))]
     NoSchemaFound { table: String },
 }
 

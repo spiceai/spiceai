@@ -16,18 +16,18 @@ limitations under the License.
 
 use super::{CatalogConnector, ConnectorComponent, ParameterSpec, Parameters};
 use crate::{
+    Runtime,
     component::{catalog::Catalog, dataset::Dataset},
     dataconnector::{
-        spiceai::{SpiceAI, SpiceAIDatasetPath, SpiceAIFactory},
         ConnectorParams, ConnectorParamsBuilder, DataConnector, DataConnectorFactory,
+        spiceai::{SpiceAI, SpiceAIDatasetPath, SpiceAIFactory},
     },
     parameters::ExposedParamLookup,
-    Runtime,
 };
 use async_trait::async_trait;
 use data_components::{
-    iceberg::catalog::RestCatalog, spice_cloud::provider::SpiceCloudPlatformCatalogProvider, Read,
-    RefreshableCatalogProvider,
+    Read, RefreshableCatalogProvider, iceberg::catalog::RestCatalog,
+    spice_cloud::provider::SpiceCloudPlatformCatalogProvider,
 };
 use iceberg::NamespaceIdent;
 use iceberg_catalog_rest::RestCatalogConfig;

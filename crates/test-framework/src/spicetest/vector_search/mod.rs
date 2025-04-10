@@ -17,8 +17,8 @@ limitations under the License.
 use std::{collections::BTreeMap, time::SystemTime};
 
 use crate::metrics::{
-    system_time_to_unix_epoch_ms, Builder, BuilderTarget, ExtendedMetrics, MetricCollector,
-    NoExtendedMetrics, QueryMetric, QueryStatus,
+    Builder, BuilderTarget, ExtendedMetrics, MetricCollector, NoExtendedMetrics, QueryMetric,
+    QueryStatus, system_time_to_unix_epoch_ms,
 };
 use anyhow::{Context, Result};
 use arrow::{

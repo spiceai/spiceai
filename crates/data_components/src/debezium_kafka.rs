@@ -30,7 +30,7 @@ use datafusion::{
     datasource::{TableProvider, TableType},
     error::Result as DataFusionResult,
     logical_expr::Expr,
-    physical_plan::{empty::EmptyExec, ExecutionPlan},
+    physical_plan::{ExecutionPlan, empty::EmptyExec},
 };
 use futures::StreamExt;
 use std::{any::Any, sync::Arc};

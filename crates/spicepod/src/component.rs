@@ -21,7 +21,7 @@ use std::{fmt::Debug, marker::PhantomData};
 #[cfg(feature = "schemars")]
 use schemars::JsonSchema;
 use serde::de::{self, Visitor};
-use serde::{de::DeserializeOwned, Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de::DeserializeOwned};
 use serde_value::Value;
 use snafu::prelude::*;
 

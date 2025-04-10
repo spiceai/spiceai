@@ -24,10 +24,10 @@ use cache::QueryResultsCacheProvider;
 use datafusion::physical_plan::ExecutionPlanProperties;
 use futures::{Stream, StreamExt};
 use snafu::ResultExt;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::SystemTime;
-use tokio::sync::{oneshot, RwLock};
+use tokio::sync::{RwLock, oneshot};
 
 impl RefreshTask {
     pub async fn start_streaming_append(

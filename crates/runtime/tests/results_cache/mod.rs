@@ -20,7 +20,7 @@ use app::AppBuilder;
 use arrow::array::RecordBatch;
 use cache::QueryResultsCacheStatus;
 use futures::TryStreamExt;
-use runtime::{datafusion::query::QueryBuilder, status, Runtime};
+use runtime::{Runtime, datafusion::query::QueryBuilder, status};
 use spicepod::{
     component::{dataset::Dataset, runtime::ResultsCache},
     param::Params,
@@ -70,20 +70,24 @@ async fn results_cache_system_queries() -> Result<(), String> {
 
             cloned_rt.load_components().await;
 
-            assert!(execute_query_and_check_cache_status(
-                &rt,
-                "show tables",
-                QueryResultsCacheStatus::CacheDisabled
-            )
-            .await
-            .is_ok());
-            assert!(execute_query_and_check_cache_status(
-                &rt,
-                "describe customer",
-                QueryResultsCacheStatus::CacheDisabled
-            )
-            .await
-            .is_ok());
+            assert!(
+                execute_query_and_check_cache_status(
+                    &rt,
+                    "show tables",
+                    QueryResultsCacheStatus::CacheDisabled
+                )
+                .await
+                .is_ok()
+            );
+            assert!(
+                execute_query_and_check_cache_status(
+                    &rt,
+                    "describe customer",
+                    QueryResultsCacheStatus::CacheDisabled
+                )
+                .await
+                .is_ok()
+            );
 
             Ok(())
         })

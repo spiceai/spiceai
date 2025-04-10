@@ -20,7 +20,7 @@ use std::sync::Arc;
 use app::AppBuilder;
 
 use arrow::array::RecordBatch;
-use runtime::{status, Runtime};
+use runtime::{Runtime, status};
 use spicepod::{component::dataset::Dataset, param::Params as DatasetParams};
 
 use crate::{

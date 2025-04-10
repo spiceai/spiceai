@@ -15,12 +15,12 @@ limitations under the License.
 */
 
 use notify::{
-    event::{CreateKind, ModifyKind, RemoveKind},
     EventKind, RecursiveMode, Watcher,
+    event::{CreateKind, ModifyKind, RemoveKind},
 };
 use spicepod::component::ComponentOrReference;
 use std::path::PathBuf;
-use tokio::sync::mpsc::{channel, Receiver};
+use tokio::sync::mpsc::{Receiver, channel};
 
 use app::{App, AppBuilder};
 
@@ -69,7 +69,9 @@ impl PodsWatcher {
                         match AppBuilder::build_from_filesystem_path(root_path.clone()) {
                             Ok(app) => {
                                 if let Err(e) = tx.blocking_send(app) {
-                                    tracing::error!("Pods content watcher is unable to notify detected state change: {e}");
+                                    tracing::error!(
+                                        "Pods content watcher is unable to notify detected state change: {e}"
+                                    );
                                 }
                             }
                             Err(e) => tracing::warn!(

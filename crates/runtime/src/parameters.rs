@@ -58,8 +58,8 @@ impl Parameters {
 
         if !prefix_removed && spec.r#type.is_prefixed() {
             tracing::warn!(
-            "Ignoring parameter {key}: must be prefixed with `{full_prefix}` for {component_name}."
-        );
+                "Ignoring parameter {key}: must be prefixed with `{full_prefix}` for {component_name}."
+            );
             return None;
         }
 
@@ -192,7 +192,9 @@ impl Parameters {
         if let Some(spec) = self.all_params.iter().find(|p| p.name == name) {
             spec
         } else {
-            panic!("Parameter `{name}` not found in parameters list. Add it to the parameters() list on the DataConnectorFactory or DataAccelerator.");
+            panic!(
+                "Parameter `{name}` not found in parameters list. Add it to the parameters() list on the DataConnectorFactory or DataAccelerator."
+            );
         }
     }
 

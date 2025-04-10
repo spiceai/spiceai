@@ -24,12 +24,12 @@ use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
 use url::Url;
 
+use super::{ConnectorComponent, ConnectorParams};
 use super::{
-    listing::{self, ListingTableConnector},
     DataConnector, DataConnectorError, DataConnectorFactory, DataConnectorResult, ParameterSpec,
     Parameters,
+    listing::{self, ListingTableConnector},
 };
-use super::{ConnectorComponent, ConnectorParams};
 
 #[derive(Debug)]
 pub struct Https {

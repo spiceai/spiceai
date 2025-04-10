@@ -17,10 +17,11 @@ limitations under the License.
 use std::sync::Arc;
 
 use crate::{
+    Result, Runtime, UnableToInitializeEmbeddingModelSnafu,
     embeddings::task::TaskEmbed,
     metrics,
-    model::{try_to_embedding, ENABLE_MODEL_SUPPORT_MESSAGE},
-    status, Result, Runtime, UnableToInitializeEmbeddingModelSnafu,
+    model::{ENABLE_MODEL_SUPPORT_MESSAGE, try_to_embedding},
+    status,
 };
 use llms::embeddings::Embed;
 use opentelemetry::KeyValue;
@@ -33,7 +34,9 @@ impl Runtime {
         let app_opt = self.app.read().await;
 
         if !cfg!(feature = "models") && app_opt.as_ref().is_some_and(|s| !s.embeddings.is_empty()) {
-            tracing::error!("Cannot load embedding models without the 'models' feature enabled. {ENABLE_MODEL_SUPPORT_MESSAGE}");
+            tracing::error!(
+                "Cannot load embedding models without the 'models' feature enabled. {ENABLE_MODEL_SUPPORT_MESSAGE}"
+            );
             return;
         };
 
@@ -68,7 +71,11 @@ impl Runtime {
                         metrics::embeddings::LOAD_ERROR.add(1, &[]);
                         self.status
                             .update_embedding(&in_embed.name, status::ComponentStatus::Error);
-                        tracing::warn!("Failed to load embedding {}.\nError: {}\nVerify configuration and try again.\nFor details, visit https://spiceai.org/docs/components/embeddings", in_embed.name, e);
+                        tracing::warn!(
+                            "Failed to load embedding {}.\nError: {}\nVerify configuration and try again.\nFor details, visit https://spiceai.org/docs/components/embeddings",
+                            in_embed.name,
+                            e
+                        );
                     }
                 }
             }

@@ -184,9 +184,9 @@ impl SearchBenchmarkResultBuilder {
                 ])),
                 Arc::new(Float64Array::from(vec![self.rps().unwrap_or_default()])),
                 Arc::new(Float64Array::from(vec![self.mean().unwrap_or_default()])),
-                Arc::new(Float64Array::from(vec![self
-                    .quantile(0.95)
-                    .unwrap_or_default()])),
+                Arc::new(Float64Array::from(vec![
+                    self.quantile(0.95).unwrap_or_default(),
+                ])),
                 Arc::new(Float64Array::from(vec![self.score])),
             ],
         );

@@ -195,7 +195,9 @@ impl ChangeBatch {
         let primary_keys_values = primary_keys_col.value(row);
         let Some(primary_keys_values) = primary_keys_values.as_any().downcast_ref::<StringArray>()
         else {
-            unreachable!("The schema is validated to have a 'primary_keys' field which is a ListArray of StringArray");
+            unreachable!(
+                "The schema is validated to have a 'primary_keys' field which is a ListArray of StringArray"
+            );
         };
         let num_keys = primary_keys_values.len();
         let mut primary_keys: Vec<String> = Vec::with_capacity(num_keys);
