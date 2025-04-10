@@ -3737,23 +3737,18 @@ checksum = "aafbece59594ed57696a1a69e8bb3ca1683fbc9cdb41d5c02726070b2cd8f19d"
 
 [[package]]
 name = "delta_kernel"
-version = "0.6.0"
-source = "git+https://github.com/spiceai/delta-kernel-rs.git?rev=69e11a29a6dc67ec1d969e3a652f00924b995b3a#69e11a29a6dc67ec1d969e3a652f00924b995b3a"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2ddd09540e487f7f44a2afc431fdae09c10fe8f8bf339a42fc916dc4f7a21d98"
 dependencies = [
- "arrow-arith",
- "arrow-array",
- "arrow-buffer",
- "arrow-cast",
- "arrow-json",
- "arrow-ord",
- "arrow-schema",
- "arrow-select",
+ "arrow",
  "bytes",
  "chrono",
  "delta_kernel_derive",
  "fix-hidden-lifetime-bug",
  "futures",
  "hdfs-native-object-store",
+ "home",
  "indexmap 2.7.1",
  "itertools 0.13.0",
  "object_store",
@@ -3775,8 +3770,9 @@ dependencies = [
 
 [[package]]
 name = "delta_kernel_derive"
-version = "0.6.0"
-source = "git+https://github.com/spiceai/delta-kernel-rs.git?rev=69e11a29a6dc67ec1d969e3a652f00924b995b3a#69e11a29a6dc67ec1d969e3a652f00924b995b3a"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7840eaa6ae4eab46e0fa0a1eac28326af191a0227843f95ab14d26d5122852f0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -5346,12 +5342,12 @@ dependencies = [
 
 [[package]]
 name = "hdfs-native"
-version = "0.10.4"
+version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4e72db0dfc43c1e6b7ef6d34f6d38eff079cbd30dbc18924b27108793e47893c"
+checksum = "fd346b82c2d000ecd8906bbba1168325df4001a19aadabea325279093c214ae3"
 dependencies = [
  "aes",
- "base64 0.21.7",
+ "base64 0.22.1",
  "bitflags 2.8.0",
  "bytes",
  "cbc",
@@ -5371,13 +5367,13 @@ dependencies = [
  "md-5",
  "num-traits",
  "once_cell",
- "prost 0.12.6",
- "prost-types 0.12.6",
+ "prost 0.13.4",
+ "prost-types 0.13.4",
  "rand 0.8.5",
  "regex",
  "roxmltree",
  "socket2",
- "thiserror 1.0.69",
+ "thiserror 2.0.11",
  "tokio",
  "url",
  "uuid 1.13.1",
@@ -5386,9 +5382,9 @@ dependencies = [
 
 [[package]]
 name = "hdfs-native-object-store"
-version = "0.12.1"
+version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "88d441ed4b31eceee8ffc10690ac2cbcab68d64c453238fa21ec4926f0dbb217"
+checksum = "5ae6ee5ef30abf453bf66d8e9eb940d0e43f845adf45fa650ad9407d7815a20c"
 dependencies = [
  "async-trait",
  "bytes",
@@ -5396,7 +5392,7 @@ dependencies = [
  "futures",
  "hdfs-native",
  "object_store",
- "thiserror 1.0.69",
+ "thiserror 2.0.11",
  "tokio",
 ]
 
@@ -5511,11 +5507,11 @@ dependencies = [
 
 [[package]]
 name = "home"
-version = "0.5.11"
+version = "0.5.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "589533453244b0995c858700322199b2becb13b627df2851f64a2775d024abcf"
+checksum = "e3d1354bf6b7235cb4a0576c2619fd4ed18183f689b12b006a0ee7329eeff9a5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -10358,12 +10354,9 @@ dependencies = [
 
 [[package]]
 name = "roxmltree"
-version = "0.18.1"
+version = "0.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "862340e351ce1b271a378ec53f304a5558f7db87f3769dc655a8f6ecbb68b302"
-dependencies = [
- "xmlparser",
-]
+checksum = "6c20b6793b5c2fa6553b250154b78d6d0db37e72700ae35fad9387a46f487c97"
 
 [[package]]
 name = "rsa"
