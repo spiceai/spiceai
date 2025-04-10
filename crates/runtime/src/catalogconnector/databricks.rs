@@ -18,20 +18,20 @@ use super::CatalogConnector;
 use super::ConnectorComponent;
 use super::ParameterSpec;
 use super::Parameters;
-use crate::component::catalog::Catalog;
-use crate::dataconnector::databricks::Databricks as DatabricksDataConnector;
-use crate::dataconnector::ConnectorParams;
-use crate::get_params_with_secrets;
 use crate::Runtime;
+use crate::component::catalog::Catalog;
+use crate::dataconnector::ConnectorParams;
+use crate::dataconnector::databricks::Databricks as DatabricksDataConnector;
+use crate::get_params_with_secrets;
 use async_trait::async_trait;
+use data_components::Read;
+use data_components::RefreshableCatalogProvider;
 use data_components::delta_lake::DeltaTableFactory;
-use data_components::unity_catalog::provider::UnityCatalogProvider;
 use data_components::unity_catalog::CatalogId;
 use data_components::unity_catalog::Endpoint;
 use data_components::unity_catalog::UCTable;
 use data_components::unity_catalog::UnityCatalog as UnityCatalogClient;
-use data_components::Read;
-use data_components::RefreshableCatalogProvider;
+use data_components::unity_catalog::provider::UnityCatalogProvider;
 use datafusion::sql::TableReference;
 use secrecy::SecretString;
 use snafu::ResultExt;
@@ -212,7 +212,7 @@ impl CatalogConnector for Databricks {
                     connector: "databricks".to_string(),
                     source: Box::new(e),
                     connector_component: ConnectorComponent::from(catalog),
-                })
+                });
             }
         };
 

@@ -16,11 +16,11 @@ limitations under the License.
 
 use crate::objectstore::github::GitHubRawObjectStore;
 use axum::{
-    http::{header::CONTENT_TYPE, StatusCode},
-    response::{IntoResponse, Response},
     Json,
+    http::{StatusCode, header::CONTENT_TYPE},
+    response::{IntoResponse, Response},
 };
-use object_store::{path::Path, ObjectStore};
+use object_store::{ObjectStore, path::Path};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, sync::Arc};
 

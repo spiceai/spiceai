@@ -168,7 +168,7 @@ impl Query {
                 return Ok(CacheResult::MissOrSkipped(
                     tracker,
                     QueryResultsCacheStatus::CacheMiss,
-                ))
+                ));
             }
             Err(e) => return Err(super::Error::FailedToAccessCache { source: e }),
         };

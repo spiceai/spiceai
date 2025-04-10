@@ -21,11 +21,11 @@ use std::{borrow::Cow, sync::Arc};
 use tracing_futures::Instrument;
 
 use crate::{
-    embeddings::vector_search::{
-        parse_explicit_primary_keys, SearchRequest, SearchRequestAIJson, VectorSearch,
-    },
-    tools::{utils::parameters, SpiceModelTool},
     Runtime,
+    embeddings::vector_search::{
+        SearchRequest, SearchRequestAIJson, VectorSearch, parse_explicit_primary_keys,
+    },
+    tools::{SpiceModelTool, utils::parameters},
 };
 
 pub struct DocumentSimilarityTool {

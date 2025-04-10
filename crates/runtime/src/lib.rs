@@ -108,7 +108,9 @@ pub enum Error {
     #[snafu(display("Unable to start HTTP server: {source}"))]
     UnableToStartHttpServer { source: http::Error },
 
-    #[snafu(display("Task execution failed: {source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"))]
+    #[snafu(display(
+        "Task execution failed: {source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+    ))]
     FailedToExecuteTask { source: tokio::task::JoinError },
 
     #[snafu(display("Unable to start Prometheus metrics server: {source}"))]
@@ -157,13 +159,19 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Unknown data connector: {data_connector}.\nSpecify a valid data connector and retry. For details, visit: https://spiceai.org/docs/components/data-connectors"))]
+    #[snafu(display(
+        "Unknown data connector: {data_connector}.\nSpecify a valid data connector and retry. For details, visit: https://spiceai.org/docs/components/data-connectors"
+    ))]
     UnknownDataConnector { data_connector: String },
 
-    #[snafu(display("Unknown catalog connector: {catalog_connector}.\nSpecify a valid catalog connector and retry. For details, visit: https://spiceai.org/docs/components/catalogs"))]
+    #[snafu(display(
+        "Unknown catalog connector: {catalog_connector}.\nSpecify a valid catalog connector and retry. For details, visit: https://spiceai.org/docs/components/catalogs"
+    ))]
     UnknownCatalogConnector { catalog_connector: String },
 
-    #[snafu(display("The runtime is built without ODBC support.\nBuild Spice.ai OSS with the `odbc` feature enabled or use the Docker image that includes ODBC support.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/odbc"))]
+    #[snafu(display(
+        "The runtime is built without ODBC support.\nBuild Spice.ai OSS with the `odbc` feature enabled or use the Docker image that includes ODBC support.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/odbc"
+    ))]
     OdbcNotInstalled,
 
     #[snafu(display("Unable to load secrets for data connector: {data_connector}"))]
@@ -201,19 +209,27 @@ pub enum Error {
     #[snafu(display("Unable to create view: {reason}"))]
     UnableToCreateView { reason: String },
 
-    #[snafu(display("Specify the SQL string for view {name} using either `sql: SELECT * FROM...` inline or as a file reference with `sql_ref: my_view.sql`"))]
+    #[snafu(display(
+        "Specify the SQL string for view {name} using either `sql: SELECT * FROM...` inline or as a file reference with `sql_ref: my_view.sql`"
+    ))]
     NeedToSpecifySQLView { name: String },
 
-    #[snafu(display("An accelerated table was configured as read_write without setting replication.enabled = true"))]
+    #[snafu(display(
+        "An accelerated table was configured as read_write without setting replication.enabled = true"
+    ))]
     AcceleratedReadWriteTableWithoutReplication,
 
-    #[snafu(display("An accelerated table for {dataset_name} was configured with 'refresh_mode = changes', but the data connector doesn't support a changes stream."))]
+    #[snafu(display(
+        "An accelerated table for {dataset_name} was configured with 'refresh_mode = changes', but the data connector doesn't support a changes stream."
+    ))]
     AcceleratedTableInvalidChanges { dataset_name: String },
 
     #[snafu(display("Expected acceleration settings for {name}, found None"))]
     ExpectedAccelerationSettings { name: String },
 
-    #[snafu(display("The accelerator engine {name} is not available. Valid engines are arrow, duckdb, sqlite, and postgres."))]
+    #[snafu(display(
+        "The accelerator engine {name} is not available. Valid engines are arrow, duckdb, sqlite, and postgres."
+    ))]
     AcceleratorEngineNotAvailable { name: String },
 
     #[snafu(display("The accelerator engine {name} failed to initialize: {source}"))]
@@ -644,7 +660,9 @@ impl Runtime {
                 if !cfg!(feature = "models")
                     && app_lock.as_ref().is_some_and(|s| !s.evals.is_empty())
                 {
-                    tracing::error!("Cannot load evals without the 'models' feature enabled. {ENABLE_MODEL_SUPPORT_MESSAGE}");
+                    tracing::error!(
+                        "Cannot load evals without the 'models' feature enabled. {ENABLE_MODEL_SUPPORT_MESSAGE}"
+                    );
                 }
 
                 #[cfg(feature = "models")]
@@ -653,7 +671,9 @@ impl Runtime {
                     let () = self_clone.verify_evals().await;
                     let an_eval_exists = app_lock.as_ref().is_some_and(|app| !app.evals.is_empty());
                     if !an_eval_exists {
-                        tracing::trace!("No eval spice components defined. Therefore not loading eval tables into database.");
+                        tracing::trace!(
+                            "No eval spice components defined. Therefore not loading eval tables into database."
+                        );
                     } else if let Err(err) = self_clone.load_eval_tables().await {
                         tracing::warn!("Creating internal eval run table: {err}");
                     }

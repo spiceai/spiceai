@@ -27,8 +27,8 @@ use bytes::Bytes;
 use chrono::DateTime;
 use futures::stream::BoxStream;
 use object_store::{
-    path::Path, Attributes, GetOptions, GetRange, GetResult, GetResultPayload, ListResult,
-    MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOpts, PutOptions, PutPayload, PutResult,
+    Attributes, GetOptions, GetRange, GetResult, GetResultPayload, ListResult, MultipartUpload,
+    ObjectMeta, ObjectStore, PutMultipartOpts, PutOptions, PutPayload, PutResult, path::Path,
 };
 use ssh2::Session;
 

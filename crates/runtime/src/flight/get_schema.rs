@@ -17,7 +17,7 @@ limitations under the License.
 use std::sync::Arc;
 
 use arrow_flight::{
-    flight_descriptor::DescriptorType, FlightDescriptor, IpcMessage, SchemaAsIpc, SchemaResult,
+    FlightDescriptor, IpcMessage, SchemaAsIpc, SchemaResult, flight_descriptor::DescriptorType,
 };
 use arrow_ipc::writer::IpcWriteOptions;
 use datafusion::sql::TableReference;
@@ -25,7 +25,7 @@ use tonic::{Request, Response, Status};
 
 use crate::flight::metrics;
 
-use super::{to_tonic_err, Service};
+use super::{Service, to_tonic_err};
 
 pub(crate) async fn handle(
     flight_svc: &Service,

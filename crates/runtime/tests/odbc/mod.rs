@@ -22,15 +22,14 @@ use std::time::Duration;
 use tracing::instrument;
 
 use crate::{
-    init_tracing,
+    RecordBatch, init_tracing,
     utils::{test_request_context, wait_until_true},
-    RecordBatch,
 };
 
 use std::collections::HashMap;
 
 use spicepod::{
-    component::dataset::{acceleration::Acceleration, Dataset},
+    component::dataset::{Dataset, acceleration::Acceleration},
     param::Params as DatasetParams,
 };
 

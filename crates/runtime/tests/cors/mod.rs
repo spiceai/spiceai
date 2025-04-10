@@ -26,7 +26,7 @@ use crate::{
 };
 use app::AppBuilder;
 use rand::Rng;
-use runtime::{auth::EndpointAuth, config::Config, Runtime};
+use runtime::{Runtime, auth::EndpointAuth, config::Config};
 use spicepod::component::runtime::CorsConfig;
 
 const LOCALHOST: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));

@@ -24,15 +24,15 @@ use arrow_flight::decode::DecodedPayload;
 use async_stream::stream;
 use async_trait::async_trait;
 use datafusion::datasource::TableProvider;
-use datafusion::sql::unparser::dialect::{Dialect, IntervalStyle, PostgreSqlDialect};
 use datafusion::sql::TableReference;
+use datafusion::sql::unparser::dialect::{Dialect, IntervalStyle, PostgreSqlDialect};
 use datafusion_federation::FederatedTableProviderAdaptor;
 use flight_client::Credentials;
 use flight_client::FlightClient;
 use futures::{Stream, StreamExt};
 use ns_lookup::verify_endpoint_connection;
 use snafu::prelude::*;
-use tonic::metadata::{errors::InvalidMetadataValue, Ascii, MetadataMap, MetadataValue};
+use tonic::metadata::{Ascii, MetadataMap, MetadataValue, errors::InvalidMetadataValue};
 
 use super::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
@@ -48,7 +48,9 @@ use data_components::{Read, ReadWrite};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Missing required parameter: {parameter}. Specify a value.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/spiceai#configuration"))]
+    #[snafu(display(
+        "Missing required parameter: {parameter}. Specify a value.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/spiceai#configuration"
+    ))]
     MissingRequiredParameter { parameter: String },
 
     #[snafu(display(r#"Failed to connect to SpiceAI endpoint "{endpoint}".\n{source}\nEnsure the endpoint is valid and reachable"#))]
@@ -63,7 +65,9 @@ pub enum Error {
     #[snafu(display("Failed to get append stream schema.\n{source}"))]
     UnableToGetAppendSchema { source: flight_client::Error },
 
-    #[snafu(display("Could not parse <org> or <app> as ASCII: {value}\nEnsure the org and app are valid ASCII strings and retry."))]
+    #[snafu(display(
+        "Could not parse <org> or <app> as ASCII: {value}\nEnsure the org and app are valid ASCII strings and retry."
+    ))]
     InvalidMetadataValue {
         value: Arc<str>,
         source: InvalidMetadataValue,

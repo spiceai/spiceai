@@ -22,11 +22,11 @@ use std::{
 };
 
 use crate::{AuthRequestContext, AuthVerdict, FlightBasicAuth};
-use base64::{prelude::BASE64_STANDARD, Engine};
+use base64::{Engine, prelude::BASE64_STANDARD};
 use pin_project::pin_project;
 use tonic::{
-    metadata::{MetadataMap, GRPC_CONTENT_TYPE},
     Status,
+    metadata::{GRPC_CONTENT_TYPE, MetadataMap},
 };
 use tower::{Layer, Service};
 
@@ -164,7 +164,9 @@ where
                         );
                     }
                 } else {
-                    tracing::error!("Failed to associate authentication information with the request: the flight request is missing an authentication context.");
+                    tracing::error!(
+                        "Failed to associate authentication information with the request: the flight request is missing an authentication context."
+                    );
                 }
 
                 let (metadata, extensions, msg) = req.into_parts();

@@ -23,18 +23,18 @@ use spicepod::component::Nameable;
 use tokio::sync::RwLock;
 
 use crate::{
-    accelerated_table::{refresh::Refresh, Retention},
-    component::dataset::{acceleration::Acceleration, TimeFormat},
+    Result, Runtime, UnableToCreateBackendSnafu, UnableToCreateEvalRunsTableSnafu,
+    accelerated_table::{Retention, refresh::Refresh},
+    component::dataset::{TimeFormat, acceleration::Acceleration},
     datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA, SPICE_EVAL_SCHEMA},
     internal_table::create_internal_accelerated_table,
     model::eval::scorer::{EmbedScorer, ModelGradedScorer},
     model::{
-        builtin_scorer, EVAL_RESULTS_TABLE_REFERENCE, EVAL_RESULTS_TABLE_SCHEMA,
-        EVAL_RESULTS_TABLE_TIME_COLUMN, EVAL_RUNS_TABLE_PRIMARY_KEY, EVAL_RUNS_TABLE_REFERENCE,
-        EVAL_RUNS_TABLE_SCHEMA, EVAL_RUNS_TABLE_TIME_COLUMN,
+        EVAL_RESULTS_TABLE_REFERENCE, EVAL_RESULTS_TABLE_SCHEMA, EVAL_RESULTS_TABLE_TIME_COLUMN,
+        EVAL_RUNS_TABLE_PRIMARY_KEY, EVAL_RUNS_TABLE_REFERENCE, EVAL_RUNS_TABLE_SCHEMA,
+        EVAL_RUNS_TABLE_TIME_COLUMN, builtin_scorer,
     },
     secrets::Secrets,
-    Result, Runtime, UnableToCreateBackendSnafu, UnableToCreateEvalRunsTableSnafu,
 };
 
 impl Runtime {

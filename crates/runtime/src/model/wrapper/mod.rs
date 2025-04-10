@@ -30,7 +30,7 @@ use futures::Stream;
 use futures::TryStreamExt;
 use llms::{
     accumulate::{empty_completion_response, fold_completion_stream},
-    chat::{nsql::SqlGeneration, Chat, Result as ChatResult},
+    chat::{Chat, Result as ChatResult, nsql::SqlGeneration},
 };
 use opentelemetry::KeyValue;
 use tera::Tera;

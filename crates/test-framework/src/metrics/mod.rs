@@ -32,7 +32,7 @@ use arrow::{
 };
 use uuid::Uuid;
 
-use crate::{git, TestType};
+use crate::{TestType, git};
 
 const FLOAT_ERROR_MARGIN: f64 = 0.0001;
 
@@ -439,12 +439,12 @@ impl<T: ExtendedMetrics, R: ExtendedMetrics> QueryMetrics<T, R> {
                                 Some(b) => {
                                     return Err(anyhow::anyhow!(
                                         "Invalid builder type for String: {b}"
-                                    ))
+                                    ));
                                 }
                                 None => {
                                     return Err(anyhow::anyhow!(
                                         "No builder found for String: {name}"
-                                    ))
+                                    ));
                                 }
                             }
                         }
@@ -454,12 +454,12 @@ impl<T: ExtendedMetrics, R: ExtendedMetrics> QueryMetrics<T, R> {
                                 Some(b) => {
                                     return Err(anyhow::anyhow!(
                                         "Invalid builder type for UInt64: {b}"
-                                    ))
+                                    ));
                                 }
                                 None => {
                                     return Err(anyhow::anyhow!(
                                         "No builder found for UInt64: {name}"
-                                    ))
+                                    ));
                                 }
                             }
                         }
@@ -469,12 +469,12 @@ impl<T: ExtendedMetrics, R: ExtendedMetrics> QueryMetrics<T, R> {
                                 Some(b) => {
                                     return Err(anyhow::anyhow!(
                                         "Invalid builder type for Float64: {b}"
-                                    ))
+                                    ));
                                 }
                                 None => {
                                     return Err(anyhow::anyhow!(
                                         "No builder found for Float64: {name}"
-                                    ))
+                                    ));
                                 }
                             }
                         }
@@ -549,7 +549,7 @@ impl<T: ExtendedMetrics, R: ExtendedMetrics> QueryMetrics<T, R> {
                     None => {
                         return Err(anyhow::anyhow!(
                             "No builder found for extended metric field: {field}"
-                        ))
+                        ));
                     }
                 }
             }
@@ -630,7 +630,7 @@ impl<T: ExtendedMetrics, R: ExtendedMetrics> QueryMetrics<T, R> {
                     None => {
                         return Err(anyhow::anyhow!(
                             "No builder found for extended metric field: {field}"
-                        ))
+                        ));
                     }
                 }
             }

@@ -18,11 +18,11 @@ limitations under the License.
 use bytes::Bytes;
 use itertools::Itertools;
 use llms::embeddings::{
-    candle::{download_hf_file, tei::TeiEmbed},
     Embed, Error as EmbedError,
+    candle::{download_hf_file, tei::TeiEmbed},
 };
-use llms::openai::embed::OpenaiEmbed;
 use llms::openai::DEFAULT_EMBEDDING_MODEL;
+use llms::openai::embed::OpenaiEmbed;
 use secrecy::{ExposeSecret, SecretBox, SecretString};
 use snafu::ResultExt;
 use spicepod::component::{embeddings::EmbeddingPrefix, model::ModelFileType};
@@ -223,7 +223,16 @@ async fn get_bytes_for_file(
     params: &HashMap<String, SecretString>,
 ) -> Result<Bytes, Box<dyn std::error::Error + Send + Sync>> {
     match url.split('/').collect_vec().as_slice() {
-        ["https:", "", "huggingface.co", org_id, model_id, "blob", branch, file @ ..] => {
+        [
+            "https:",
+            "",
+            "huggingface.co",
+            org_id,
+            model_id,
+            "blob",
+            branch,
+            file @ ..,
+        ] => {
             get_file_from_hf(
                 None,
                 org_id,

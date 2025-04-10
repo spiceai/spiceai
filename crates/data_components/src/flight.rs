@@ -24,15 +24,16 @@ use async_stream::stream;
 use async_trait::async_trait;
 use datafusion::{
     catalog::Session,
-    common::{project_schema, TableReference},
+    common::{TableReference, project_schema},
     datasource::{TableProvider, TableType},
     error::{DataFusionError, Result as DataFusionResult},
     execution::{SendableRecordBatchStream, TaskContext},
     logical_expr::{Expr, TableProviderFilterPushDown},
     physical_expr::EquivalenceProperties,
     physical_plan::{
-        stream::RecordBatchStreamAdapter, DisplayAs, DisplayFormatType, ExecutionMode,
-        ExecutionPlan, Partitioning, PlanProperties,
+        DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
+        execution_plan::{Boundedness, EmissionType},
+        stream::RecordBatchStreamAdapter,
     },
     sql::unparser::dialect::Dialect,
 };
@@ -52,7 +53,9 @@ pub mod write;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Query execution failed.\n{source}\nReport a bug to request support: https://github.com/spiceai/spiceai/issues"))]
+    #[snafu(display(
+        "Query execution failed.\n{source}\nReport a bug to request support: https://github.com/spiceai/spiceai/issues"
+    ))]
     UnableToGenerateSQL { source: expr::Error },
 
     #[snafu(display("Failed to query Arrow Flight.\n{source}"))]
@@ -64,9 +67,7 @@ pub enum Error {
         table: String,
     },
 
-    #[snafu(display(
-        "Query execution failed.\n{source}\nVerify the configuration and try again."
-    ))]
+    #[snafu(display("Query execution failed.\n{source}\nVerify the configuration and try again."))]
     ArrowFlight { source: FlightError },
 }
 
@@ -296,7 +297,9 @@ impl FlightTable {
         let schema = if let Ok(schema) = client.get_schema(table_paths).await {
             schema
         } else {
-            tracing::debug!("Failed to get schema from Arrow Flight for table {table_reference} via the native GetSchema call. Falling back to query schema.");
+            tracing::debug!(
+                "Failed to get schema from Arrow Flight for table {table_reference} via the native GetSchema call. Falling back to query schema."
+            );
             Self::get_query_schema(
                 client.clone(),
                 &format!(
@@ -429,7 +432,8 @@ impl FlightExec {
             properties: PlanProperties::new(
                 EquivalenceProperties::new(projected_schema),
                 Partitioning::UnknownPartitioning(1),
-                ExecutionMode::Bounded,
+                EmissionType::Incremental,
+                Boundedness::Bounded,
             ),
         })
     }
@@ -516,10 +520,8 @@ impl ExecutionPlan for FlightExec {
     ) -> DataFusionResult<SendableRecordBatchStream> {
         let sql = self.sql().map_err(to_execution_error)?;
 
-        let stream_adapter = RecordBatchStreamAdapter::new(
-            self.schema(),
-            query_to_stream(self.client.clone(), sql.as_str()),
-        );
+        let stream_adapter =
+            RecordBatchStreamAdapter::new(self.schema(), query_to_stream(self.client.clone(), sql));
 
         Ok(Box::pin(stream_adapter))
     }
@@ -528,9 +530,8 @@ impl ExecutionPlan for FlightExec {
 #[allow(clippy::needless_pass_by_value)]
 fn query_to_stream(
     client: FlightClient,
-    sql: &str,
+    sql: String,
 ) -> impl Stream<Item = DataFusionResult<RecordBatch>> {
-    let sql = sql.to_string();
     stream! {
         match client.query(sql.as_str()).await {
             Ok(mut stream) => {

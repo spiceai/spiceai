@@ -14,15 +14,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use async_openai::{
+    Client as OpenAIClient,
     config::OpenAIConfig,
     types::{
         ChatCompletionRequestMessage, ChatCompletionRequestUserMessageArgs,
         CreateChatCompletionRequest, CreateChatCompletionRequestArgs, CreateEmbeddingRequest,
         EncodingFormat,
     },
-    Client as OpenAIClient,
 };
 use reqwest::Client;
 use std::time::{Duration, Instant};

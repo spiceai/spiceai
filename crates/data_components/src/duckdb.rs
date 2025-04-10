@@ -15,8 +15,8 @@ limitations under the License.
 */
 
 use crate::{
-    delete::{DeletionExec, DeletionSink, DeletionTableProvider},
     Read, ReadWrite,
+    delete::{DeletionExec, DeletionSink, DeletionTableProvider},
 };
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
@@ -25,7 +25,7 @@ use datafusion::{
     sql::TableReference,
 };
 use datafusion_table_providers::{
-    duckdb::{write::DuckDBTableWriter, DuckDB, DuckDBTableFactory, TableDefinition},
+    duckdb::{DuckDB, DuckDBTableFactory, TableDefinition, write::DuckDBTableWriter},
     sql::{
         db_connection_pool::duckdbpool::DuckDbConnectionPool, sql_provider_datafusion::expr::Engine,
     },
@@ -49,7 +49,9 @@ pub enum Error {
     #[snafu(display("Unable to begin duckdb transaction: {source}"))]
     UnableToBeginTransaction { source: duckdb::Error },
 
-    #[snafu(display("Unable to delete data from the duckdb table.\nAn internal table and base table exist for the same table.\nManually migrate the table by deleting '{internal_table}' or {table_name}', and try again."))]
+    #[snafu(display(
+        "Unable to delete data from the duckdb table.\nAn internal table and base table exist for the same table.\nManually migrate the table by deleting '{internal_table}' or {table_name}', and try again."
+    ))]
     UnableToDeleteDataInternalTable {
         internal_table: String,
         table_name: String,

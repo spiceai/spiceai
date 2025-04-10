@@ -18,9 +18,8 @@ use std::{sync::LazyLock, time::Duration};
 
 use async_openai::types::{CreateEmbeddingRequest, EncodingFormat};
 use opentelemetry::{
-    global,
+    Key, KeyValue, Value, global,
     metrics::{Counter, Histogram, Meter},
-    Key, KeyValue, Value,
 };
 
 static METER: LazyLock<Meter> = LazyLock::new(|| global::meter("embeddings"));

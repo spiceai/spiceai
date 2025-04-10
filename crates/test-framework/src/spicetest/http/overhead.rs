@@ -14,10 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::component::HttpComponent;
 use super::HttpConfig;
+use super::component::HttpComponent;
 use crate::metrics::{
-    system_time_to_unix_epoch_ms, MetricCollector, NoExtendedMetrics, QueryMetric, QueryStatus,
+    MetricCollector, NoExtendedMetrics, QueryMetric, QueryStatus, system_time_to_unix_epoch_ms,
 };
 use crate::spicetest::{SpiceTest, TestCompleted, TestNotStarted, TestState};
 use crate::utils::get_random_element;

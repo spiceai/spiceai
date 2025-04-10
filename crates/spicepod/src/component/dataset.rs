@@ -21,7 +21,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::{embeddings::ColumnEmbeddingConfig, is_default, Nameable, WithDependsOn};
+use super::{Nameable, WithDependsOn, embeddings::ColumnEmbeddingConfig, is_default};
 use crate::metric::Metrics;
 use crate::param::Params;
 use crate::semantic::Column;

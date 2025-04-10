@@ -25,8 +25,8 @@ use hyper::{
 };
 use hyper_util::rt::TokioIo;
 use prometheus::{
-    proto::{Bucket, Histogram, LabelPair, Metric, MetricFamily, MetricType},
     Encoder, TextEncoder,
+    proto::{Bucket, Histogram, LabelPair, Metric, MetricFamily, MetricType},
 };
 use snafu::prelude::*;
 use std::net::ToSocketAddrs;

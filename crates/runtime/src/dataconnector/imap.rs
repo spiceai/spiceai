@@ -17,8 +17,8 @@ limitations under the License.
 use crate::component::dataset::Dataset;
 use async_trait::async_trait;
 use data_components::imap::{
-    session::{ImapAuthMode, ImapAuthModeParameter, ImapSSLMode, ImapSession},
     ImapTableProvider,
+    session::{ImapAuthMode, ImapAuthModeParameter, ImapSSLMode, ImapSession},
 };
 use datafusion::datasource::TableProvider;
 use regex::Regex;

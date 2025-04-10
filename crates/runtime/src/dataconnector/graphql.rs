@@ -21,7 +21,7 @@ use data_components::{
     token_provider::{StaticTokenProvider, TokenProvider},
 };
 use datafusion::datasource::TableProvider;
-use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
+use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
 use snafu::ResultExt;
 use std::{any::Any, future::Future, pin::Pin, sync::Arc};
 use url::Url;

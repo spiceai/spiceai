@@ -16,7 +16,7 @@ limitations under the License.
 
 use crate::chat::message_to_mistral;
 
-use super::{nsql::SqlGeneration, Chat, Error as ChatError, FailedToRunModelSnafu, Result};
+use super::{Chat, Error as ChatError, FailedToRunModelSnafu, Result, nsql::SqlGeneration};
 use async_openai::{
     error::{ApiError, OpenAIError},
     types::{
@@ -49,11 +49,11 @@ use std::{
     pin::Pin,
     str::FromStr,
     sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc,
+        atomic::{AtomicUsize, Ordering},
     },
 };
-use tokio::sync::mpsc::{channel, Receiver, Sender};
+use tokio::sync::mpsc::{Receiver, Sender, channel};
 
 pub struct MistralLlama {
     pipeline: Arc<MistralRs>,
@@ -218,10 +218,14 @@ impl MistralLlama {
         // Default to use file over string literal.
         if let Some(filename) = chat_template.as_ref() {
             if chat_template_literal.is_some() {
-                tracing::warn!("For GGUF model, both a template file was specific '{filename}' and a string literal chat_template. For GGUF only one can be provided, defaulting to the file.");
+                tracing::warn!(
+                    "For GGUF model, both a template file was specific '{filename}' and a string literal chat_template. For GGUF only one can be provided, defaulting to the file."
+                );
             };
         } else {
-            tracing::debug!("For GGUF model, no chat template file provided. Using the provided chat template literal.");
+            tracing::debug!(
+                "For GGUF model, no chat template file provided. Using the provided chat template literal."
+            );
             chat_template = chat_template_literal.map(Into::into);
         };
 

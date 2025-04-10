@@ -22,10 +22,10 @@ use std::{
 };
 
 use crate::{
+    Runtime,
     component::catalog::Catalog,
     dataconnector::{ConnectorComponent, ConnectorParams},
     parameters::{ParameterSpec, Parameters},
-    Runtime,
 };
 use async_trait::async_trait;
 use data_components::RefreshableCatalogProvider;
@@ -42,7 +42,9 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Cannot setup the {connector_component} ({connector}) with an invalid configuration.\n{message}"))]
+    #[snafu(display(
+        "Cannot setup the {connector_component} ({connector}) with an invalid configuration.\n{message}"
+    ))]
     InvalidConfiguration {
         connector: String,
         connector_component: ConnectorComponent,
@@ -50,14 +52,18 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Cannot setup the {connector_component} ({connector}) with an invalid configuration.\n{message}"))]
+    #[snafu(display(
+        "Cannot setup the {connector_component} ({connector}) with an invalid configuration.\n{message}"
+    ))]
     InvalidConfigurationNoSource {
         connector: String,
         connector_component: ConnectorComponent,
         message: String,
     },
 
-    #[snafu(display("Failed to load the {connector_component} ({connector}).\nAn unknown Catalog Connector Error occurred: {source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"))]
+    #[snafu(display(
+        "Failed to load the {connector_component} ({connector}).\nAn unknown Catalog Connector Error occurred: {source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+    ))]
     InternalWithSource {
         connector: String,
         connector_component: ConnectorComponent,

@@ -20,7 +20,7 @@ use datafusion::{
 };
 use datafusion_table_providers::{
     sql::sql_provider_datafusion::expr::Engine,
-    sqlite::{write::SqliteTableWriter, Sqlite},
+    sqlite::{Sqlite, write::SqliteTableWriter},
     util,
 };
 use rusqlite::Transaction;

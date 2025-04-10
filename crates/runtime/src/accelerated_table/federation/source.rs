@@ -19,7 +19,7 @@ use std::{any::Any, sync::Arc};
 use arrow_schema::SchemaRef;
 use datafusion::{datasource::TableType, logical_expr::TableSource};
 use datafusion_federation::{
-    table_reference::MultiPartTableReference, FederatedTableSource, FederationProvider,
+    FederatedTableSource, FederationProvider, table_reference::MultiPartTableReference,
 };
 
 use super::AcceleratedTableFederationProvider;

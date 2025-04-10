@@ -22,7 +22,7 @@ use datafusion::sql::TableReference;
 use once_cell::sync::Lazy;
 use uuid::Uuid;
 
-use crate::{component::validate_identifier, Runtime};
+use crate::{Runtime, component::validate_identifier};
 
 pub mod catalog;
 pub mod load;

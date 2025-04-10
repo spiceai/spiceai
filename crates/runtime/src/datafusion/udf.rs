@@ -16,11 +16,11 @@ limitations under the License.
 
 use arrow::datatypes::DataType;
 use datafusion::{
-    common::{plan_err, Result as DataFusionResult},
+    common::{Result as DataFusionResult, plan_err},
     functions_aggregate::min_max::{MaxAccumulator, MinAccumulator},
     logical_expr::{
-        type_coercion::functions::data_types, Accumulator, ColumnarValue, ScalarUDFImpl, Signature,
-        Volatility,
+        Accumulator, ColumnarValue, ScalarUDFImpl, Signature, Volatility,
+        type_coercion::functions::data_types,
     },
     scalar::ScalarValue,
 };
@@ -100,7 +100,7 @@ impl ScalarUDFImpl for Greatest {
             }
         }
 
-        let types = data_types(arg_types, self.signature())?;
+        let types = data_types("greatest", arg_types, self.signature())?;
 
         match types.first() {
             Some(t) => Ok(t.clone()),
@@ -162,7 +162,7 @@ impl ScalarUDFImpl for Least {
             }
         }
 
-        let types = data_types(arg_types, self.signature())?;
+        let types = data_types("least", arg_types, self.signature())?;
 
         match types.first() {
             Some(t) => Ok(t.clone()),
@@ -257,13 +257,13 @@ mod tests {
 
         assert_batches_eq!(
             &[
-            "+-------------------------+----------------------+---------------------+------------------+------------------------------+---------------------------+",
-            "| greatest(t1.a,Int64(2)) | least(t1.a,Int64(2)) | greatest(t1.a,t1.b) | least(t1.a,t1.b) | greatest(t1.a,t1.b,Int64(2)) | least(t1.a,t1.b,Int64(2)) |",
-            "+-------------------------+----------------------+---------------------+------------------+------------------------------+---------------------------+",
-            "| 2                       | 1                    | 1.0                 | 0.9              | 2.0                          | 0.9                       |",
-            "| 2                       | 2                    | 2.1                 | 2.0              | 2.1                          | 2.0                       |",
-            "| 3                       | 2                    | 3.0                 | 3.0              | 3.0                          | 2.0                       |",
-            "+-------------------------+----------------------+---------------------+------------------+------------------------------+---------------------------+",
+                "+-------------------------+----------------------+---------------------+------------------+------------------------------+---------------------------+",
+                "| greatest(t1.a,Int64(2)) | least(t1.a,Int64(2)) | greatest(t1.a,t1.b) | least(t1.a,t1.b) | greatest(t1.a,t1.b,Int64(2)) | least(t1.a,t1.b,Int64(2)) |",
+                "+-------------------------+----------------------+---------------------+------------------+------------------------------+---------------------------+",
+                "| 2                       | 1                    | 1.0                 | 0.9              | 2.0                          | 0.9                       |",
+                "| 2                       | 2                    | 2.1                 | 2.0              | 2.1                          | 2.0                       |",
+                "| 3                       | 2                    | 3.0                 | 3.0              | 3.0                          | 2.0                       |",
+                "+-------------------------+----------------------+---------------------+------------------+------------------------------+---------------------------+",
             ],
             &actual
         );

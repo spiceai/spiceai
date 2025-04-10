@@ -17,7 +17,7 @@ limitations under the License.
 
 use async_openai::config::Config;
 use reqwest::header::{
-    HeaderMap, HeaderName, HeaderValue, InvalidHeaderValue, AUTHORIZATION, CONTENT_TYPE,
+    AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue, InvalidHeaderValue,
 };
 use secrecy::{ExposeSecret, SecretBox, SecretString};
 use std::sync::LazyLock;

@@ -15,9 +15,9 @@ limitations under the License.
 */
 
 use axum::{
+    Json,
     http::status,
     response::{IntoResponse, Response},
-    Json,
 };
 use serde::{Serialize, Serializer};
 

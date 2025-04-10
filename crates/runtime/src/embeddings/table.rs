@@ -22,10 +22,10 @@ use arrow_schema::Field;
 use arrow_tools::schema;
 use async_trait::async_trait;
 use datafusion::catalog::Session;
-use datafusion::common::{project_schema, Constraints, Statistics};
+use datafusion::common::{Constraints, Statistics, project_schema};
 use datafusion::error::Result as DataFusionResult;
-use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::TableProviderFilterPushDown;
+use datafusion::logical_expr::dml::InsertOp;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::{
     datasource::{TableProvider, TableType},
@@ -121,13 +121,19 @@ impl EmbeddingTable {
                 );
 
                 if chunking_config_opt.is_some() {
-                    tracing::warn!("Column '{}' is an embedding from the base table, but chunking config was provided. It will not be used. Chunking will be determined by base table config.", column);
+                    tracing::warn!(
+                        "Column '{}' is an embedding from the base table, but chunking config was provided. It will not be used. Chunking will be determined by base table config.",
+                        column
+                    );
                 }
 
                 let Some(vector_length) =
                     Self::embedding_size_from_base_table(&column, &base_schema)
                 else {
-                    tracing::warn!("Column '{}' has embeddings in base table, but the vector length could not be determined. Ignoring column.", column);
+                    tracing::warn!(
+                        "Column '{}' has embeddings in base table, but the vector length could not be determined. Ignoring column.",
+                        column
+                    );
                     continue;
                 };
 
@@ -141,14 +147,18 @@ impl EmbeddingTable {
                     },
                 );
             } else {
-                tracing::debug!("Column '{column}' does not have needed embeddings in base table. Will augment with model {model}.");
+                tracing::debug!(
+                    "Column '{column}' does not have needed embeddings in base table. Will augment with model {model}."
+                );
 
                 Self::verify_column_type_supported(&column, &base_schema)?;
 
                 let Some(vector_length) =
                     Self::embedding_size_from_models(&model, &embedding_models).await
                 else {
-                    tracing::warn!("For column '{column}', cannot precompute vector length from model '{model}'. Ignoring column.");
+                    tracing::warn!(
+                        "For column '{column}', cannot precompute vector length from model '{model}'. Ignoring column."
+                    );
                     continue;
                 };
 
@@ -158,7 +168,9 @@ impl EmbeddingTable {
                     {
                         Ok(c) => chunker = Some(c),
                         Err(e) => {
-                            tracing::warn!("Column '{column}' expects to be chunked, but the model '{model}' does not support chunking. Ignoring chunking config. Error: {e}");
+                            tracing::warn!(
+                                "Column '{column}' expects to be chunked, but the model '{model}' does not support chunking. Ignoring chunking config. Error: {e}"
+                            );
                         }
                     }
                 }
@@ -515,7 +527,9 @@ impl TableProvider for EmbeddingTable {
 
         // No embedding work is needed.
         if columns_to_embed.is_empty() {
-            tracing::trace!("For `EmbeddingTable`, no additional embedding columns to compute. Forwarding entirely to base table.");
+            tracing::trace!(
+                "For `EmbeddingTable`, no additional embedding columns to compute. Forwarding entirely to base table."
+            );
             return self
                 .base_table
                 .scan(

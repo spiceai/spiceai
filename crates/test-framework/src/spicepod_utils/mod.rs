@@ -19,9 +19,9 @@ use std::{collections::HashMap, path::PathBuf};
 use app::App;
 use spicepod::{
     component::{
-        dataset::{replication::Replication, Dataset, Mode},
-        runtime::{ApiKey, ApiKeyAuth, Auth, Runtime},
         ComponentOrReference,
+        dataset::{Dataset, Mode, replication::Replication},
+        runtime::{ApiKey, ApiKeyAuth, Auth, Runtime},
     },
     param::Params,
     spec::{SpicepodDefinition, SpicepodKind, SpicepodVersion},

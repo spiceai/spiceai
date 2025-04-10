@@ -29,22 +29,22 @@ use data_components::object::metadata::ObjectStoreMetadataTable;
 use data_components::object::text::ObjectStoreTextTable;
 use datafusion::config::ConfigField;
 use datafusion::config::TableParquetOptions;
+use datafusion::datasource::TableProvider;
+use datafusion::datasource::file_format::FileFormat;
 use datafusion::datasource::file_format::csv::CsvFormat;
 use datafusion::datasource::file_format::file_compression_type::FileCompressionType;
 use datafusion::datasource::file_format::json::JsonFormat;
 use datafusion::datasource::file_format::parquet::ParquetFormat;
-use datafusion::datasource::file_format::FileFormat;
 use datafusion::datasource::listing::{
     ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl, MetadataColumn,
 };
-use datafusion::datasource::TableProvider;
 use datafusion::error::DataFusionError;
 use datafusion::execution::config::SessionConfig;
 use datafusion::execution::context::SessionContext;
 use futures::TryStreamExt;
-use object_store::path::Path;
 use object_store::ObjectMeta;
 use object_store::ObjectStore;
+use object_store::path::Path;
 use snafu::prelude::*;
 use std::any::Any;
 use std::collections::HashSet;
@@ -55,8 +55,8 @@ use url::Url;
 
 use crate::object_store_registry::default_runtime_env;
 
-use super::infer::infer_partitions_with_types;
 use super::DelimitedFormat;
+use super::infer::infer_partitions_with_types;
 
 /// Maximum number of files to scan when validating that the schema source path contains objects with the expected extension.
 const SCHEMA_SOURCE_PATH_FILE_SCAN_LIMIT: usize = 10_000;
@@ -651,9 +651,9 @@ async fn get_last_modified(
         #[allow(clippy::cast_precision_loss)]
         if file_count % 1_000_000 == 0 {
             tracing::debug!(
-            "Continuing to process {table_path} metadata... {} objects processed so far, representing a total size of: {:.2} GiB",
-            file_count,
-            total_size as f64 / BYTES_PER_GIB
+                "Continuing to process {table_path} metadata... {} objects processed so far, representing a total size of: {:.2} GiB",
+                file_count,
+                total_size as f64 / BYTES_PER_GIB
             );
         }
 
@@ -676,8 +676,10 @@ async fn get_last_modified(
         return Err(DataConnectorError::InvalidConfigurationNoSource {
             dataconnector: dataconnector.clone(),
             connector_component: ConnectorComponent::from(dataset),
-            message: format!("Failed to find any files matching the extension '{extension}'.\nSpice could not find any files with extensions at the specified path. Check the path and try again."),
-            });
+            message: format!(
+                "Failed to find any files matching the extension '{extension}'.\nSpice could not find any files with extensions at the specified path. Check the path and try again."
+            ),
+        });
     }
 
     if let Some(best) = last_modified_file {
@@ -755,8 +757,10 @@ async fn verify_schema_source_path(
     Err(DataConnectorError::InvalidConfigurationNoSource {
         dataconnector: dataconnector.clone(),
         connector_component: ConnectorComponent::from(dataset),
-        message: format!("Failed to find any files matching the extension '{extension}' at the specified path `{schema_source_path}`.\nVerify that `schema_source_path` is correct and try again."),
-        })
+        message: format!(
+            "Failed to find any files matching the extension '{extension}' at the specified path `{schema_source_path}`.\nVerify that `schema_source_path` is correct and try again."
+        ),
+    })
 }
 
 fn to_listing_table_url(
@@ -780,8 +784,8 @@ fn to_listing_table_url(
 mod tests {
     use chrono::{TimeZone, Utc};
     use datafusion_table_providers::util::secrets::to_secret_map;
-    use futures::stream::{self, BoxStream};
     use futures::StreamExt;
+    use futures::stream::{self, BoxStream};
     use std::collections::HashMap;
     use std::future::Future;
     use std::pin::Pin;

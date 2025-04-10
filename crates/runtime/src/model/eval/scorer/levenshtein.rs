@@ -19,7 +19,7 @@ use async_trait::async_trait;
 use crate::model::eval::scorer::mean;
 use strsim::levenshtein;
 
-use super::{extract_text, DatasetInput, DatasetOutput, Scorer};
+use super::{DatasetInput, DatasetOutput, Scorer, extract_text};
 
 /// Scorer that computes the Levenshtein distance between two strings.
 ///

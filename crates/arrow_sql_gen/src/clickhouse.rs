@@ -19,9 +19,9 @@ use std::{str::FromStr, sync::Arc};
 use arrow::{
     array::{
         ArrayBuilder, ArrayRef, BooleanBuilder, Date32Builder, Decimal128Builder, Float32Builder,
-        Float64Builder, Int16Builder, Int32Builder, Int64Builder, Int8Builder, RecordBatch,
-        RecordBatchOptions, StringBuilder, TimestampSecondBuilder, UInt16Builder, UInt32Builder,
-        UInt64Builder, UInt8Builder,
+        Float64Builder, Int8Builder, Int16Builder, Int32Builder, Int64Builder, RecordBatch,
+        RecordBatchOptions, StringBuilder, TimestampSecondBuilder, UInt8Builder, UInt16Builder,
+        UInt32Builder, UInt64Builder,
     },
     datatypes::{DataType, Date32Type, Field, Schema, TimeUnit},
 };
@@ -29,8 +29,8 @@ use bigdecimal::{BigDecimal, ToPrimitive};
 use chrono::NaiveDate;
 use chrono_tz::Tz;
 use clickhouse_rs::{
-    types::{ColumnType, Decimal, SqlType},
     Block,
+    types::{ColumnType, Decimal, SqlType},
 };
 use snafu::{ResultExt, Snafu};
 
@@ -161,7 +161,7 @@ pub fn block_to_arrow<T: ColumnType>(block: &Block<T>) -> Result<RecordBatch> {
                 return NoArrowFieldForIndexSnafu { index: i }.fail();
             };
 
-            match *clickhouse_type {
+            match clickhouse_type {
                 SqlType::Uuid | SqlType::Nullable(SqlType::Uuid) => {
                     let Some(builder) = builder else {
                         return NoBuilderForIndexSnafu { index: i }.fail();
@@ -350,7 +350,7 @@ pub fn block_to_arrow<T: ColumnType>(block: &Block<T>) -> Result<RecordBatch> {
                 SqlType::FixedString(size) => {
                     handle_primitive_type!(
                         builder,
-                        SqlType::FixedString(size),
+                        SqlType::FixedString(*size),
                         StringBuilder,
                         String,
                         row,
@@ -395,8 +395,7 @@ pub fn block_to_arrow<T: ColumnType>(block: &Block<T>) -> Result<RecordBatch> {
                         None => builder.append_null(),
                     }
                 }
-                SqlType::DateTime(ref date_type)
-                | SqlType::Nullable(SqlType::DateTime(ref date_type)) => {
+                SqlType::DateTime(date_type) | SqlType::Nullable(SqlType::DateTime(date_type)) => {
                     let Some(builder) = builder else {
                         return NoBuilderForIndexSnafu { index: i }.fail();
                     };
@@ -430,8 +429,8 @@ pub fn block_to_arrow<T: ColumnType>(block: &Block<T>) -> Result<RecordBatch> {
                     }
                 }
 
-                SqlType::Decimal(ref size, ref align)
-                | SqlType::Nullable(SqlType::Decimal(ref size, ref align)) => {
+                SqlType::Decimal(size, align)
+                | SqlType::Nullable(SqlType::Decimal(size, align)) => {
                     let size = *size;
                     let align = *align;
                     let scale = align.try_into().unwrap_or_default();
@@ -540,7 +539,7 @@ mod tests {
     #[test]
     fn test_block_to_arrow() {
         use super::block_to_arrow;
-        use clickhouse_rs::{types::Decimal, Block};
+        use clickhouse_rs::{Block, types::Decimal};
 
         let block = Block::new()
             .add_column("int_8", vec![1_i8, 2, 4])

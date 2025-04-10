@@ -16,8 +16,8 @@ limitations under the License.
 
 use meter::METER;
 use opentelemetry::{
-    metrics::{Counter, Histogram},
     KeyValue,
+    metrics::{Counter, Histogram},
 };
 use std::{sync::LazyLock, time::Duration};
 

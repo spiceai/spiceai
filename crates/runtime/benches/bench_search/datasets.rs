@@ -15,9 +15,9 @@ limitations under the License.
 */
 
 use app::AppBuilder;
-use hf_hub::{api::tokio::ApiBuilder, Repo, RepoType};
+use hf_hub::{Repo, RepoType, api::tokio::ApiBuilder};
 use spicepod::component::{
-    dataset::{acceleration::Acceleration, Dataset},
+    dataset::{Dataset, acceleration::Acceleration},
     embeddings::{ColumnEmbeddingConfig, EmbeddingChunkConfig},
 };
 

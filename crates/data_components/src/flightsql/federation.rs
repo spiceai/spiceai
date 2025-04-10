@@ -22,14 +22,14 @@ use std::sync::Arc;
 use datafusion::{
     arrow::datatypes::SchemaRef,
     error::{DataFusionError, Result as DataFusionResult},
-    physical_plan::{stream::RecordBatchStreamAdapter, SendableRecordBatchStream},
+    physical_plan::{SendableRecordBatchStream, stream::RecordBatchStreamAdapter},
     sql::{
-        unparser::dialect::{DefaultDialect, Dialect},
         TableReference,
+        unparser::dialect::{DefaultDialect, Dialect},
     },
 };
 
-use super::{query_to_stream, FlightSQLTable};
+use super::{FlightSQLTable, query_to_stream};
 
 impl FlightSQLTable {
     fn create_federated_table_source(
@@ -82,7 +82,7 @@ impl SQLExecutor for FlightSQLTable {
     ) -> DataFusionResult<SendableRecordBatchStream> {
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             schema,
-            query_to_stream(self.client.clone(), query),
+            query_to_stream(self.client.clone(), query.to_string()),
         )))
     }
 

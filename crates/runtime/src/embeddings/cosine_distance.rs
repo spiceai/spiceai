@@ -27,7 +27,7 @@ use datafusion::common::cast::{
 use datafusion::common::utils::coerced_fixed_size_list_to_list;
 use datafusion::scalar::ScalarValue;
 use datafusion::{
-    common::{exec_err, DataFusionError, Result as DataFusionResult},
+    common::{DataFusionError, Result as DataFusionResult, exec_err},
     logical_expr::{ColumnarValue, ScalarUDFImpl, Signature, Volatility},
 };
 
@@ -129,7 +129,7 @@ impl ScalarUDFImpl for CosineDistance {
                 _ => {
                     return exec_err!(
                         "The cosine_distance function can only accept List/LargeList/FixedSizeList."
-                    )
+                    );
                 }
             }
         }

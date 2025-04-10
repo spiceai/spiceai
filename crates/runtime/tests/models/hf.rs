@@ -25,10 +25,10 @@ use async_openai::types::{
 };
 use llms::chat::create_hf_model;
 use runtime::{
+    Runtime,
     auth::EndpointAuth,
     model::ToolUsingChat,
     tools::{options::SpiceToolsOptions, utils::get_tools},
-    Runtime,
 };
 use spicepod::component::{
     embeddings::{ColumnEmbeddingConfig, Embeddings},
@@ -42,7 +42,7 @@ use crate::{
     init_tracing, init_tracing_with_task_history,
     models::{
         create_api_bindings_config,
-        embedding::{run_embedding_tests, EmbeddingTestCase},
+        embedding::{EmbeddingTestCase, run_embedding_tests},
         get_taxi_trips_dataset, get_tpcds_dataset, normalize_chat_completion_response,
         send_chat_completions_request,
     },
@@ -64,7 +64,7 @@ mod nsql {
     use serde_json::json;
 
     use crate::{
-        models::nsql::{run_nsql_test, TestCase},
+        models::nsql::{TestCase, run_nsql_test},
         utils::verify_env_secret_exists,
     };
 
@@ -181,7 +181,7 @@ mod search {
     use serde_json::json;
     use spicepod::component::embeddings::EmbeddingChunkConfig;
 
-    use crate::models::search::{run_search_test, TestCase};
+    use crate::models::search::{TestCase, run_search_test};
 
     use super::*;
 

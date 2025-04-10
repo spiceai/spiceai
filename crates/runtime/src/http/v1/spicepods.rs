@@ -17,17 +17,17 @@ use std::sync::Arc;
 
 use app::App;
 use axum::{
+    Extension, Json,
     extract::Query,
     http::status,
     response::{IntoResponse, Response},
-    Extension, Json,
 };
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use spicepod::Spicepod;
 use tokio::sync::RwLock;
 
-use super::{convert_entry_to_csv, Format};
+use super::{Format, convert_entry_to_csv};
 
 #[derive(Default, Debug, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::IntoParams))]

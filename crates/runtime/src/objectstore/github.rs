@@ -20,14 +20,14 @@ use async_trait::async_trait;
 use chrono::TimeZone;
 use futures::stream::BoxStream;
 use http::{
-    header::{ACCEPT, AUTHORIZATION, USER_AGENT},
     HeaderMap, HeaderValue,
+    header::{ACCEPT, AUTHORIZATION, USER_AGENT},
 };
 use object_store::{
-    http::{HttpBuilder, HttpStore},
-    path::Path,
     ClientOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
     PutMultipartOpts, PutOptions, PutPayload, PutResult,
+    http::{HttpBuilder, HttpStore},
+    path::Path,
 };
 use serde::Deserialize;
 use snafu::prelude::*;

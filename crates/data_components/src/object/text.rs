@@ -24,21 +24,22 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use datafusion::{
     catalog::Session,
-    common::{project_schema, Constraints},
+    common::{Constraints, project_schema},
     datasource::{TableProvider, TableType},
     error::{DataFusionError, Result as DataFusionResult},
     execution::{SendableRecordBatchStream, TaskContext},
     logical_expr::{Expr, TableProviderFilterPushDown},
     physical_expr::EquivalenceProperties,
     physical_plan::{
-        stream::RecordBatchStreamAdapter, DisplayAs, DisplayFormatType, ExecutionMode,
-        ExecutionPlan, Partitioning, PlanProperties,
+        DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
+        execution_plan::{Boundedness, EmissionType},
+        stream::RecordBatchStreamAdapter,
     },
 };
 use document_parse::DocumentParser;
 use futures::Stream;
 use futures::StreamExt;
-use object_store::{path::Path, GetResult, ObjectMeta, ObjectStore};
+use object_store::{GetResult, ObjectMeta, ObjectStore, path::Path};
 use snafu::ResultExt;
 use std::{any::Any, fmt, sync::Arc};
 
@@ -256,7 +257,8 @@ impl ObjectStoreTextExec {
             properties: PlanProperties::new(
                 EquivalenceProperties::new(projected_schema),
                 Partitioning::UnknownPartitioning(1),
-                ExecutionMode::Bounded,
+                EmissionType::Incremental,
+                Boundedness::Bounded,
             ),
             ctx,
             formatter,
@@ -281,8 +283,8 @@ pub(crate) fn to_sendable_stream(
                     continue;
                     }
 
-                    let result: GetResult = ctx.store.get(&object_meta.location).await?;
-                    let bytz = result.bytes().await?;
+                    let result: GetResult = ctx.store.get(&object_meta.location).await.map_err(|e| DataFusionError::Execution(format!("{e}")))?;
+                    let bytz = result.bytes().await.map_err(|e| DataFusionError::Execution(format!("{e}")))?;
 
                     match ObjectStoreTextTable::to_record_batch(&[object_meta], &[bytz], formatter.as_ref()) {
                         Ok(batch) => {

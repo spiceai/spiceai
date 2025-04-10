@@ -17,7 +17,7 @@ limitations under the License.
 
 use std::collections::HashMap;
 
-use async_openai::{error::OpenAIError, Client};
+use async_openai::{Client, error::OpenAIError};
 use futures::{StreamExt, TryStreamExt};
 use reqwest_eventsource::Error as SseError;
 use secrecy::{ExposeSecret, SecretString};

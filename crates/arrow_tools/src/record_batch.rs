@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use arrow::{
-    array::{new_null_array, Array, ArrayRef, ListArray, RecordBatch, StructArray},
+    array::{Array, ArrayRef, ListArray, RecordBatch, StructArray, new_null_array},
     buffer::{Buffer, OffsetBuffer},
     datatypes::{DataType, Field, SchemaRef},
     error::ArrowError,
@@ -25,7 +25,7 @@ use arrow_schema::Schema;
 use snafu::prelude::*;
 use std::sync::Arc;
 
-use crate::format::{format_column_data, FormatOperation};
+use crate::format::{FormatOperation, format_column_data};
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 

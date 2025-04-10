@@ -19,7 +19,7 @@ use async_trait::async_trait;
 use data_components::sharepoint::{client::SharepointClient, table::SharepointTableProvider};
 use datafusion::datasource::TableProvider;
 use document_parse::DocumentParser;
-use graph_rs_sdk::{identity::ConfidentialClientApplication, GraphClient};
+use graph_rs_sdk::{GraphClient, identity::ConfidentialClientApplication};
 use snafu::{ResultExt, Snafu};
 use std::any::Any;
 use std::future::Future;
@@ -33,13 +33,19 @@ use super::{
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Missing required parameter: {parameter}. Specify a value.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/sharepoint#parameters"))]
+    #[snafu(display(
+        "Missing required parameter: {parameter}. Specify a value.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/sharepoint#parameters"
+    ))]
     MissingParameter { parameter: String },
 
-    #[snafu(display("No authentication was specified.\nProvide either an 'bearer_token' or 'client_secret'.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/sharepoint#parameters"))]
+    #[snafu(display(
+        "No authentication was specified.\nProvide either an 'bearer_token' or 'client_secret'.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/sharepoint#parameters"
+    ))]
     InvalidAuthentication,
 
-    #[snafu(display("Both `bearer_token` and `client_secret` were specified.\nProvide only one of either an 'bearer_token' or 'client_secret'.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/sharepoint#parameters"))]
+    #[snafu(display(
+        "Both `bearer_token` and `client_secret` were specified.\nProvide only one of either an 'bearer_token' or 'client_secret'.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/sharepoint#parameters"
+    ))]
     DuplicateAuthentication,
 
     #[snafu(display(

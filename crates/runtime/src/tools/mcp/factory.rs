@@ -23,7 +23,7 @@ use spicepod::component::tool::Tool;
 
 use crate::tools::{catalog::SpiceToolCatalog, factory::ToolCatalogFactory};
 
-use super::{catalog::McpToolCatalog, MCPConfig, MCPType};
+use super::{MCPConfig, MCPType, catalog::McpToolCatalog};
 
 pub struct McpCatalogFactory {}
 

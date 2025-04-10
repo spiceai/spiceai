@@ -16,13 +16,13 @@ limitations under the License.
 
 use crate::{embeddings::vector_search, status::RuntimeStatus};
 
+use crate::Runtime;
 #[cfg(feature = "openapi")]
 use crate::http::v1::{
-    datasets::{DatasetFilter, DatasetQueryParams},
     Format,
+    datasets::{DatasetFilter, DatasetQueryParams},
 };
 use crate::request::Protocol;
-use crate::Runtime;
 use crate::{config, request::RequestContext};
 
 use app::App;
@@ -35,8 +35,8 @@ use tokio::sync::RwLock;
 
 #[cfg(feature = "openapi")]
 use utoipa::{
-    openapi::{path::Operation, HttpMethod},
     OpenApi,
+    openapi::{HttpMethod, path::Operation},
 };
 
 #[cfg(feature = "dev")]
@@ -48,13 +48,13 @@ use super::{metrics, v1};
 use super::v1::mcp::McpState;
 
 use axum::{
+    Extension,
     body::Body,
     extract::MatchedPath,
     http::{HeaderValue, Method, Request},
     middleware::{self, Next},
     response::IntoResponse,
-    routing::{get, post, Router},
-    Extension,
+    routing::{Router, get, post},
 };
 use runtime_auth::layer::http::AuthLayer;
 use tokio::time::Instant;

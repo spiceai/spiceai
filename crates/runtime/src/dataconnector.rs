@@ -17,8 +17,8 @@ limitations under the License.
 use crate::accelerated_table::AcceleratedTable;
 use crate::catalogconnector::CATALOG_CONNECTOR_FACTORY_REGISTRY;
 use crate::component::catalog::Catalog;
-use crate::component::dataset::acceleration::RefreshMode;
 use crate::component::dataset::Dataset;
+use crate::component::dataset::acceleration::RefreshMode;
 use crate::component::metrics::MetricsProvider;
 use crate::component::metrics::MetricsProviderComponent;
 use crate::dataaccelerator::AcceleratorRegistry;
@@ -32,19 +32,19 @@ use arrow_schema::SchemaRef;
 use arrow_tools::schema::schema_meta_get_computed_columns;
 use async_trait::async_trait;
 use data_components::cdc::ChangesStream;
+use datafusion::common::Column;
 use datafusion::common::tree_node::Transformed;
 use datafusion::common::tree_node::TreeNode;
-use datafusion::common::Column;
 use datafusion::dataframe::DataFrame;
 use datafusion::datasource::{DefaultTableSource, TableProvider};
 use datafusion::error::DataFusionError;
 use datafusion::error::Result as DataFusionResult;
-use datafusion::execution::context::SessionContext;
 use datafusion::execution::SendableRecordBatchStream;
+use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::logical_expr::{Expr, LogicalPlanBuilder};
-use datafusion::sql::unparser::Unparser;
 use datafusion::sql::TableReference;
+use datafusion::sql::unparser::Unparser;
 use datafusion_table_providers::UnsupportedTypeAction;
 use snafu::prelude::*;
 use std::any::Any;
@@ -117,7 +117,9 @@ pub enum DataConnectorError {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Cannot connect to the {connector_component} ({dataconnector}) on {host}:{port}.\nEnsure that the host and port are correctly configured in the spicepod, and that the host is reachable."))]
+    #[snafu(display(
+        "Cannot connect to the {connector_component} ({dataconnector}) on {host}:{port}.\nEnsure that the host and port are correctly configured in the spicepod, and that the host is reachable."
+    ))]
     UnableToConnectInvalidHostOrPort {
         dataconnector: String,
         connector_component: ConnectorComponent,
@@ -125,13 +127,17 @@ pub enum DataConnectorError {
         port: String,
     },
 
-    #[snafu(display("Cannot connect to the {connector_component} ({dataconnector}). Authentication failed.\nEnsure that the username and password are correctly configured in the spicepod."))]
+    #[snafu(display(
+        "Cannot connect to the {connector_component} ({dataconnector}). Authentication failed.\nEnsure that the username and password are correctly configured in the spicepod."
+    ))]
     UnableToConnectInvalidUsernameOrPassword {
         dataconnector: String,
         connector_component: ConnectorComponent,
     },
 
-    #[snafu(display("Cannot connect to the {connector_component} ({dataconnector}). A TLS error occurred.\nEnsure that the corresponding TLS/secure option is configured to match the data connector's TLS security requirements."))]
+    #[snafu(display(
+        "Cannot connect to the {connector_component} ({dataconnector}). A TLS error occurred.\nEnsure that the corresponding TLS/secure option is configured to match the data connector's TLS security requirements."
+    ))]
     UnableToConnectTlsError {
         dataconnector: String,
         connector_component: ConnectorComponent,
@@ -167,7 +173,9 @@ pub enum DataConnectorError {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Cannot setup the {connector_component} ({dataconnector}) with an invalid configuration.\n{message}"))]
+    #[snafu(display(
+        "Cannot setup the {connector_component} ({dataconnector}) with an invalid configuration.\n{message}"
+    ))]
     InvalidConfiguration {
         dataconnector: String,
         connector_component: ConnectorComponent,
@@ -175,27 +183,35 @@ pub enum DataConnectorError {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Cannot setup the {connector_component} ({dataconnector}) with an invalid configuration.\n{source}"))]
+    #[snafu(display(
+        "Cannot setup the {connector_component} ({dataconnector}) with an invalid configuration.\n{source}"
+    ))]
     InvalidConfigurationSourceOnly {
         dataconnector: String,
         connector_component: ConnectorComponent,
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Cannot setup the {connector_component} ({dataconnector}) with an invalid configuration.\n{message}"))]
+    #[snafu(display(
+        "Cannot setup the {connector_component} ({dataconnector}) with an invalid configuration.\n{message}"
+    ))]
     InvalidConfigurationNoSource {
         dataconnector: String,
         connector_component: ConnectorComponent,
         message: String,
     },
 
-    #[snafu(display("Cannot setup the {connector_component} ({dataconnector}).\nThe connector '{dataconnector}' is not a valid connector.\nFor details, visit: https://spiceai.org/docs/components/data-connectors"))]
+    #[snafu(display(
+        "Cannot setup the {connector_component} ({dataconnector}).\nThe connector '{dataconnector}' is not a valid connector.\nFor details, visit: https://spiceai.org/docs/components/data-connectors"
+    ))]
     InvalidConnectorType {
         dataconnector: String,
         connector_component: ConnectorComponent,
     },
 
-    #[snafu(display("Failed to load the {connector_component} ({dataconnector}).\n An invalid glob pattern was provided '{pattern}'. Ensure the glob pattern is valid.\n{source}"))]
+    #[snafu(display(
+        "Failed to load the {connector_component} ({dataconnector}).\n An invalid glob pattern was provided '{pattern}'. Ensure the glob pattern is valid.\n{source}"
+    ))]
     InvalidGlobPattern {
         dataconnector: String,
         connector_component: ConnectorComponent,
@@ -221,7 +237,9 @@ pub enum DataConnectorError {
         table_name: String,
     },
 
-    #[snafu(display("Failed to load the {connector_component} ({dataconnector}).\nAn unknown Data Connector Error occurred: {source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"))]
+    #[snafu(display(
+        "Failed to load the {connector_component} ({dataconnector}).\nAn unknown Data Connector Error occurred: {source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+    ))]
     InternalWithSource {
         dataconnector: String,
         connector_component: ConnectorComponent,
@@ -255,7 +273,9 @@ pub enum DataConnectorError {
         connector_component: ConnectorComponent,
     },
 
-    #[snafu(display("Failed to load the {connector_component} ({dataconnector}).\nThe field '{field_name}' has an unsupported data type: {data_type}.\nSkip loading this field by setting the `unsupported_type_action` parameter to `ignore` or `warn` in the dataset configuration.\nFor details, visit: https://spiceai.org/docs/reference/spicepod/datasets#unsupported_type_action"))]
+    #[snafu(display(
+        "Failed to load the {connector_component} ({dataconnector}).\nThe field '{field_name}' has an unsupported data type: {data_type}.\nSkip loading this field by setting the `unsupported_type_action` parameter to `ignore` or `warn` in the dataset configuration.\nFor details, visit: https://spiceai.org/docs/reference/spicepod/datasets#unsupported_type_action"
+    ))]
     UnsupportedDataType {
         dataconnector: String,
         connector_component: ConnectorComponent,
@@ -263,7 +283,9 @@ pub enum DataConnectorError {
         field_name: String,
     },
 
-    #[snafu(display("Failed to initialize the {connector_component} (ODBC).\nThe runtime is built without ODBC support.\nBuild Spice.ai OSS with the `odbc` feature enabled or use the Docker image that includes ODBC support.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/odbc"))]
+    #[snafu(display(
+        "Failed to initialize the {connector_component} (ODBC).\nThe runtime is built without ODBC support.\nBuild Spice.ai OSS with the `odbc` feature enabled or use the Docker image that includes ODBC support.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/odbc"
+    ))]
     OdbcNotInstalled {
         connector_component: ConnectorComponent,
     },
@@ -419,7 +441,7 @@ pub trait DataConnector: Debug + Send + Sync + 'static {
     }
 
     async fn read_provider(&self, dataset: &Dataset)
-        -> DataConnectorResult<Arc<dyn TableProvider>>;
+    -> DataConnectorResult<Arc<dyn TableProvider>>;
 
     async fn read_write_provider(
         &self,

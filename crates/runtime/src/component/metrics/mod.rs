@@ -17,7 +17,7 @@ limitations under the License.
 use std::{fmt::Debug, sync::Arc};
 
 use super::ComponentType;
-use opentelemetry::{metrics::Callback, KeyValue};
+use opentelemetry::{KeyValue, metrics::Callback};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MetricType {

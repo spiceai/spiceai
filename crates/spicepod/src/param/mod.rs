@@ -19,8 +19,8 @@ use std::collections::HashMap;
 #[cfg(feature = "schemars")]
 use schemars::JsonSchema;
 use serde::{
-    de::{self, Unexpected},
     Deserialize, Deserializer, Serialize,
+    de::{self, Unexpected},
 };
 use serde_value::Value;
 

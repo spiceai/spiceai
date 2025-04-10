@@ -15,8 +15,8 @@ limitations under the License.
 */
 
 use graph_rs_sdk::{
-    error::{ErrorMessage, ErrorStatus},
     GraphFailure,
+    error::{ErrorMessage, ErrorStatus},
 };
 use snafu::Snafu;
 

@@ -17,7 +17,7 @@ limitations under the License.
 use anyhow::{Error, Result};
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion_table_providers::sql::db_connection_pool::{
-    duckdbpool::DuckDbConnectionPool, DbConnectionPool,
+    DbConnectionPool, duckdbpool::DuckDbConnectionPool,
 };
 use duckdb::AccessMode;
 

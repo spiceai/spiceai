@@ -29,35 +29,49 @@ pub mod candle;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Failed to run an Embedding health check.\nAn error occurred: {source}\nVerify the embedding configuration."))]
+    #[snafu(display(
+        "Failed to run an Embedding health check.\nAn error occurred: {source}\nVerify the embedding configuration."
+    ))]
     HealthCheckError {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Failed to prepare input for embedding.\nAn error occurred: {source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"))]
+    #[snafu(display(
+        "Failed to prepare input for embedding.\nAn error occurred: {source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+    ))]
     FailedToPrepareInput {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Failed to create embedding.\nAn error occurred: {source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"))]
+    #[snafu(display(
+        "Failed to create embedding.\nAn error occurred: {source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+    ))]
     FailedToCreateEmbedding {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Invalid value for `pooling` parameter: {value}.\nSpecify a valid pooling value of `cls`, `mean`, `splade`, or `last_token`."))]
+    #[snafu(display(
+        "Invalid value for `pooling` parameter: {value}.\nSpecify a valid pooling value of `cls`, `mean`, `splade`, or `last_token`."
+    ))]
     InvalidPoolingMode { value: String },
 
-    #[snafu(display("Failed to create chunker.\nAn error occurred: {source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"))]
+    #[snafu(display(
+        "Failed to create chunker.\nAn error occurred: {source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+    ))]
     FailedToCreateChunker {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Failed to create tokenizer.\nAn error occurred: {source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"))]
+    #[snafu(display(
+        "Failed to create tokenizer.\nAn error occurred: {source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+    ))]
     FailedToCreateTokenizer {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Failed to create embedding model.\nAn error occurred: {source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"))]
+    #[snafu(display(
+        "Failed to create embedding model.\nAn error occurred: {source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+    ))]
     FailedToInstantiateEmbeddingModel {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
@@ -67,7 +81,9 @@ pub enum Error {
     ))]
     FailedWithHFApi { source: HfApiError },
 
-    #[snafu(display("An unsupported model source was specified in the 'from' parameter: '{from}'.\nSpecify a valid source, like 'openai', and try again.\nFor details, visit: https://spiceai.org/docs/components/embeddings"))]
+    #[snafu(display(
+        "An unsupported model source was specified in the 'from' parameter: '{from}'.\nSpecify a valid source, like 'openai', and try again.\nFor details, visit: https://spiceai.org/docs/components/embeddings"
+    ))]
     UnknownModelSource { from: String },
 
     #[snafu(display(
@@ -75,7 +91,9 @@ pub enum Error {
     ))]
     ModelDoesNotExist { model_name: String },
 
-    #[snafu(display("The specified model, '{from}', does not support executing the task '{task}'.\nSelect a different model or task, and try again."))]
+    #[snafu(display(
+        "The specified model, '{from}', does not support executing the task '{task}'.\nSelect a different model or task, and try again."
+    ))]
     UnsupportedTaskForModel { from: String, task: String },
 }
 

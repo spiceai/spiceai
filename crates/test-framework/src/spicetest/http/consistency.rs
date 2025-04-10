@@ -16,7 +16,7 @@ limitations under the License.
 
 use super::HttpConfig;
 use crate::metrics::{
-    system_time_to_unix_epoch_ms, MetricCollector, NoExtendedMetrics, QueryMetric, QueryStatus,
+    MetricCollector, NoExtendedMetrics, QueryMetric, QueryStatus, system_time_to_unix_epoch_ms,
 };
 use crate::spicetest::{SpiceTest, TestCompleted, TestNotStarted, TestState};
 use crate::utils::get_random_element;

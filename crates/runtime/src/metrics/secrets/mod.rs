@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::{global, Histogram, LazyLock, Meter};
+use super::{Histogram, LazyLock, Meter, global};
 
 pub(crate) static SECRETS_METER: LazyLock<Meter> = LazyLock::new(|| global::meter("secrets_store"));
 

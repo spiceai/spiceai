@@ -25,8 +25,8 @@ use crate::{
     utils::{test_request_context, wait_until_true},
 };
 use rand::Rng;
-use runtime::{auth::EndpointAuth, config::Config, Runtime};
-use runtime_auth::{api_key::ApiKeyAuth, HttpAuth};
+use runtime::{Runtime, auth::EndpointAuth, config::Config};
+use runtime_auth::{HttpAuth, api_key::ApiKeyAuth};
 use spicepod::component::runtime::ApiKey;
 
 const LOCALHOST: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));

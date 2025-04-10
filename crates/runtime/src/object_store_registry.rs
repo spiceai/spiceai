@@ -20,14 +20,14 @@ use datafusion::{
     error::DataFusionError,
     execution::{
         object_store::{DefaultObjectStoreRegistry, ObjectStoreRegistry},
-        runtime_env::{RuntimeConfig, RuntimeEnv},
+        runtime_env::{RuntimeEnv, RuntimeEnvBuilder},
     },
 };
 use object_store::{
-    aws::AmazonS3Builder, azure::MicrosoftAzureBuilder, http::HttpBuilder, ClientOptions,
-    ObjectStore, RetryConfig,
+    ClientOptions, ObjectStore, RetryConfig, aws::AmazonS3Builder, azure::MicrosoftAzureBuilder,
+    http::HttpBuilder,
 };
-use url::{form_urlencoded::parse, Url};
+use url::{Url, form_urlencoded::parse};
 
 #[cfg(feature = "ftp")]
 use crate::objectstore::ftp::FTPObjectStore;
@@ -445,11 +445,23 @@ impl ObjectStoreRegistry for SpiceObjectStoreRegistry {
 // This method uses unwrap_or_default, however it should never fail on the initialization. See
 // RuntimeEnv::default()
 pub(crate) fn default_runtime_env() -> Arc<RuntimeEnv> {
-    Arc::new(
-        RuntimeEnv::try_new(
-            RuntimeConfig::default()
-                .with_object_store_registry(Arc::new(SpiceObjectStoreRegistry::default())),
-        )
-        .unwrap_or_default(),
-    )
+    match RuntimeEnvBuilder::default()
+        .with_object_store_registry(Arc::new(SpiceObjectStoreRegistry::default()))
+        .build_arc()
+    {
+        Ok(runtime_env) => runtime_env,
+        Err(e) => {
+            unreachable!("Tests ensure this should never fail: {e}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_default_runtime_env() {
+        let _ = default_runtime_env();
+    }
 }

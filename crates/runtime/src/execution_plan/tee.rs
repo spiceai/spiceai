@@ -40,14 +40,16 @@ impl TeeExec {
     /// Create a new `TeeExec`.
     pub fn new(input: Arc<dyn ExecutionPlan>, n: usize) -> Self {
         let eq_properties = input.equivalence_properties().clone();
-        let execution_mode = input.execution_mode();
+        let emission_type = input.pipeline_behavior();
+        let boundedness = input.boundedness();
         Self {
             input,
             n,
             properties: PlanProperties::new(
                 eq_properties,
                 Partitioning::UnknownPartitioning(n),
-                execution_mode,
+                emission_type,
+                boundedness,
             ),
         }
     }

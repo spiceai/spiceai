@@ -21,8 +21,8 @@ use std::{
 
 use crate::{
     metrics::{
-        system_time_to_unix_epoch_ms, DatasetMetrics, MetricCollector, NoExtendedMetrics,
-        QueryMetric, QueryStatus, ThroughputMetrics,
+        DatasetMetrics, MetricCollector, NoExtendedMetrics, QueryMetric, QueryStatus,
+        ThroughputMetrics, system_time_to_unix_epoch_ms,
     },
     queries::Query,
 };
@@ -317,7 +317,9 @@ impl SpiceTest<Completed> {
         // this adjusts for a longer test duration as a result of running multiple query sets, which would otherwise reduce the QpH
         let end_condition_modifier = match self.state.end_condition {
             EndCondition::Duration(_) => {
-                return Err(anyhow::anyhow!("Throughput metric calculation for duration-based tests is not supported. Use a QuerySetCompleted test instead."))
+                return Err(anyhow::anyhow!(
+                    "Throughput metric calculation for duration-based tests is not supported. Use a QuerySetCompleted test instead."
+                ));
             }
             EndCondition::QuerySetCompleted(count) => f64::from(u32::try_from(count)?),
         };

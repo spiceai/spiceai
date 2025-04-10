@@ -22,15 +22,15 @@ use std::path::PathBuf;
 use std::{collections::HashSet, io::Write};
 
 use bytes::Bytes;
-use object_store::{path::Path, ObjectStore};
+use object_store::{ObjectStore, path::Path};
 use snafu::prelude::*;
+use spicepod::component::ComponentOrReference;
 use spicepod::component::catalog::Catalog;
 use spicepod::component::dataset::Dataset;
 use spicepod::component::embeddings::Embeddings;
 use spicepod::component::model::Model;
 use spicepod::component::tool::Tool;
 use spicepod::component::view::View;
-use spicepod::component::ComponentOrReference;
 use spicepod::spec::SpicepodDefinition;
 
 use futures::StreamExt;

@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::{get_app_and_start_request, RowCounts};
+use super::{RowCounts, get_app_and_start_request};
 use crate::{
     args::DatasetTestArgs,
     commands::{TEST_RESULTS_API_KEY, TEST_RESULTS_DATASET},
@@ -22,19 +22,18 @@ use crate::{
 };
 use std::time::Duration;
 use test_framework::{
-    anyhow,
+    TestType, anyhow,
     arrow::util::pretty::print_batches,
     flight::put_batches,
     metrics::{MetricCollector, NoExtendedMetrics, QueryMetrics},
     queries::{QueryOverrides, QuerySet},
     spiced::SpicedInstance,
     spicetest::{
-        datasets::{EndCondition, NotStarted},
         SpiceTest,
+        datasets::{EndCondition, NotStarted},
     },
     tokio_util::sync::CancellationToken,
     utils::observe_memory,
-    TestType,
 };
 
 pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {

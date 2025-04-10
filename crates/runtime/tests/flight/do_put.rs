@@ -29,23 +29,22 @@ use crate::{
 };
 use arrow::array::{Int32Array, RecordBatch, StringArray};
 use arrow_flight::{
-    encode::FlightDataEncoderBuilder, error::FlightError, FlightClient, FlightDescriptor, PutResult,
+    FlightClient, FlightDescriptor, PutResult, encode::FlightDataEncoderBuilder, error::FlightError,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::sql::TableReference;
 use futures::{
-    stream::{self, TryStreamExt},
     Stream,
+    stream::{self, TryStreamExt},
 };
 use governor::Quota;
 use rand::Rng;
 use runtime::{
-    accelerated_table::refresh::Refresh, auth::EndpointAuth,
+    Runtime, accelerated_table::refresh::Refresh, auth::EndpointAuth,
     component::dataset::acceleration::Acceleration, config::Config, datafusion::DataFusion,
     flight::RateLimits, internal_table::create_internal_accelerated_table, secrets::Secrets,
-    Runtime,
 };
-use runtime_auth::{api_key::ApiKeyAuth, FlightBasicAuth};
+use runtime_auth::{FlightBasicAuth, api_key::ApiKeyAuth};
 use spicepod::component::runtime::ApiKey;
 use tokio::{
     sync::RwLock,

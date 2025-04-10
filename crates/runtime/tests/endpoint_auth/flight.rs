@@ -27,8 +27,8 @@ use crate::{
 use arrow_flight::{error::FlightError, flight_service_client::FlightServiceClient};
 use flightrepl::cache_control;
 use rand::Rng;
-use runtime::{auth::EndpointAuth, config::Config, Runtime};
-use runtime_auth::{api_key::ApiKeyAuth, FlightBasicAuth};
+use runtime::{Runtime, auth::EndpointAuth, config::Config};
+use runtime_auth::{FlightBasicAuth, api_key::ApiKeyAuth};
 use spicepod::component::runtime::ApiKey;
 use tonic::transport::Channel;
 

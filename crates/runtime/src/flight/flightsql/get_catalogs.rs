@@ -15,17 +15,17 @@ limitations under the License.
 */
 
 use arrow_flight::{
+    FlightDescriptor, FlightEndpoint, FlightInfo, Ticket,
     flight_service_server::FlightService,
     sql::{self, ProstMessageExt},
-    FlightDescriptor, FlightEndpoint, FlightInfo, Ticket,
 };
 use prost::Message;
 use tonic::{Request, Response, Status};
 
 use crate::{
     flight::{
-        metrics, record_batches_to_flight_stream, to_tonic_err, util::set_flightsql_protocol,
-        Service,
+        Service, metrics, record_batches_to_flight_stream, to_tonic_err,
+        util::set_flightsql_protocol,
     },
     timing::TimedStream,
 };

@@ -18,17 +18,17 @@ use super::CatalogConnector;
 use super::ConnectorComponent;
 use super::ParameterSpec;
 use super::Parameters;
+use crate::Runtime;
 use crate::component::catalog::Catalog;
 use crate::dataconnector::ConnectorParams;
 use crate::get_params_with_secrets;
-use crate::Runtime;
 use async_trait::async_trait;
-use data_components::delta_lake::DeltaTableFactory;
-use data_components::unity_catalog::provider::UnityCatalogProvider;
-use data_components::unity_catalog::UCTable;
-use data_components::unity_catalog::UnityCatalog as UnityCatalogClient;
 use data_components::Read;
 use data_components::RefreshableCatalogProvider;
+use data_components::delta_lake::DeltaTableFactory;
+use data_components::unity_catalog::UCTable;
+use data_components::unity_catalog::UnityCatalog as UnityCatalogClient;
+use data_components::unity_catalog::provider::UnityCatalogProvider;
 use datafusion::sql::TableReference;
 use secrecy::SecretString;
 use snafu::ResultExt;
@@ -173,7 +173,7 @@ impl CatalogConnector for UnityCatalog {
                     connector: "unity_catalog".to_string(),
                     connector_component: ConnectorComponent::from(catalog),
                     source: Box::new(e),
-                })
+                });
             }
         };
 

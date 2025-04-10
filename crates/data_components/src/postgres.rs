@@ -24,12 +24,12 @@ use std::sync::Arc;
 use tokio_postgres::Transaction;
 
 use crate::{
-    delete::{DeletionExec, DeletionSink, DeletionTableProvider},
     Read, ReadWrite,
+    delete::{DeletionExec, DeletionSink, DeletionTableProvider},
 };
 
 use datafusion_table_providers::{
-    postgres::{write::PostgresTableWriter, Postgres, PostgresTableFactory},
+    postgres::{Postgres, PostgresTableFactory, write::PostgresTableWriter},
     util,
 };
 

@@ -21,15 +21,15 @@ use crate::{
 };
 use std::{sync::Arc, time::Duration};
 use test_framework::{
+    TestType,
     anyhow::{self, anyhow},
     arrow::util::pretty::print_batches,
     metrics::MetricCollector,
     spiced::SpicedInstance,
     spicetest::{
-        http::consistency::{self, ConsistencyConfig},
         SpiceTest,
+        http::consistency::{self, ConsistencyConfig},
     },
-    TestType,
 };
 
 /// Runs a test to ensure the P50 & p90 latencies do not increase by some threshold over the

@@ -20,7 +20,7 @@ use crate::{
     model::{DatasetInput, DatasetOutput},
 };
 
-use super::{runs::EvalRunId, FailedToWriteEvalResultsSnafu};
+use super::{FailedToWriteEvalResultsSnafu, runs::EvalRunId};
 use arrow::array::{Float32Builder, RecordBatch, StringBuilder, TimestampSecondBuilder};
 use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef, TimeUnit};
 use chrono::{DateTime, Utc};

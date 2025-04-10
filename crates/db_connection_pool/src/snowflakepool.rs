@@ -16,7 +16,7 @@ limitations under the License.
 
 use async_trait::async_trait;
 use datafusion_table_providers::sql::db_connection_pool::{
-    dbconnection::DbConnection, DbConnectionPool, JoinPushDown,
+    DbConnectionPool, JoinPushDown, dbconnection::DbConnection,
 };
 use pkcs8::{LineEnding, SecretDocument};
 use secrecy::{ExposeSecret, SecretBox, SecretString};
@@ -28,10 +28,14 @@ use crate::dbconnection::snowflakeconn::SnowflakeConnection;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Missing required secret: {name}. Specify a value.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/snowflake#auth"))]
+    #[snafu(display(
+        "Missing required secret: {name}. Specify a value.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/snowflake#auth"
+    ))]
     MissingRequiredSecret { name: String },
 
-    #[snafu(display("Failed to connect to Snowflake.\nVerify your Snowflake configuration, and try again.\n{source}"))]
+    #[snafu(display(
+        "Failed to connect to Snowflake.\nVerify your Snowflake configuration, and try again.\n{source}"
+    ))]
     UnableToConnect {
         source: snowflake_api::SnowflakeApiError,
     },
@@ -43,22 +47,30 @@ pub enum Error {
         source: snowflake_api::SnowflakeApiError,
     },
 
-    #[snafu(display("Failed to authenticate with Snowflake.\nVerify your credentials and warehouse parameters using the SnowSQL tool: https://docs.snowflake.com/en/user-guide/snowsql"))]
+    #[snafu(display(
+        "Failed to authenticate with Snowflake.\nVerify your credentials and warehouse parameters using the SnowSQL tool: https://docs.snowflake.com/en/user-guide/snowsql"
+    ))]
     UnableToAuthenticateGeneric {},
 
-    #[snafu(display("Failed to read private key file {file_path}.\nVerify the key file exists with the necessary permissions, and try again.\n{source}"))]
+    #[snafu(display(
+        "Failed to read private key file {file_path}.\nVerify the key file exists with the necessary permissions, and try again.\n{source}"
+    ))]
     ErrorReadingPrivateKeyFile {
         source: std::io::Error,
         file_path: String,
     },
 
-    #[snafu(display("Invalid value for parameter '{param_key}': {param_value}.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/snowflake#parameters"))]
+    #[snafu(display(
+        "Invalid value for parameter '{param_key}': {param_value}.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/snowflake#parameters"
+    ))]
     InvalidParameterValue {
         param_key: String,
         param_value: String,
     },
 
-    #[snafu(display("Failed to parse private key file.\nVerify the file is a private key file, and try again.\n{source}"))]
+    #[snafu(display(
+        "Failed to parse private key file.\nVerify the file is a private key file, and try again.\n{source}"
+    ))]
     UnableToParsePrivateKey { source: pkcs8::der::Error },
 
     #[snafu(display(
@@ -66,7 +78,9 @@ pub enum Error {
     ))]
     UnableToDecryptPrivateKey { source: pkcs8::Error },
 
-    #[snafu(display("Failed to save decrypted private key content as PEM.\nVerify filesystem permissions, and try again.\n{source}"))]
+    #[snafu(display(
+        "Failed to save decrypted private key content as PEM.\nVerify filesystem permissions, and try again.\n{source}"
+    ))]
     FailedToCreatePem { source: pkcs8::der::Error },
 }
 

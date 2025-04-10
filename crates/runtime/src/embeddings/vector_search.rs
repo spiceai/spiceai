@@ -55,7 +55,9 @@ pub enum Error {
     #[snafu(display("Failed to find table '{}'. An internal error occurred during vector search.\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues", table.to_quoted_string()))]
     DataSourceNotFound { table: TableReference },
 
-    #[snafu(display("Vector search failed: No tables with embeddings are available. Ensure embeddings are configured and try again."))]
+    #[snafu(display(
+        "Vector search failed: No tables with embeddings are available. Ensure embeddings are configured and try again."
+    ))]
     NoTablesWithEmbeddingsFound {},
 
     #[snafu(display("Vector search cannot be run on {}.", data_source.to_quoted_string()))]
@@ -296,7 +298,7 @@ impl SearchRequest {
         additional_columns
             .iter()
             .map(|c| {
-                let select_statement = format!("{c} FROM testing");
+                let select_statement = format!("SELECT {c} FROM testing");
                 let parser = Parser::new(&GenericDialect);
                 let mut parser = parser.try_with_sql(&select_statement).map_err(|err| {
                     tracing::trace!("vector_search additional column parsing failed. {err}");
@@ -846,13 +848,11 @@ impl VectorSearch {
             let mut chunked_projection = projection.clone();
             let c = quote_identifier(embedding_column);
             if !additional_columns.contains(&c.to_string()) {
-                if let Some(index) = chunked_projection.iter().enumerate().find_map(|(i, col)| {
-                    if col == &c {
-                        Some(i)
-                    } else {
-                        None
-                    }
-                }) {
+                if let Some(index) = chunked_projection
+                    .iter()
+                    .enumerate()
+                    .find_map(|(i, col)| if col == &c { Some(i) } else { None })
+                {
                     chunked_projection.remove(index);
                 }
             }
@@ -1420,9 +1420,9 @@ pub(crate) mod tests {
             let mut additional_columns = vec!["column1".to_string()];
             for i in 0..100 {
                 let start = std::time::Instant::now();
-                let result = SearchRequest::parse_additional_columns(&additional_columns);
+                let _ = SearchRequest::parse_additional_columns(&additional_columns)
+                    .expect("to parse additional columns");
                 timings.push(start.elapsed());
-                assert!(result.is_ok());
                 additional_columns.push(format!("column{}", i + 2));
             }
         }

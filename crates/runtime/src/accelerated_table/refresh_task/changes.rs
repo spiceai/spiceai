@@ -25,14 +25,14 @@ use data_components::cdc::{ChangeBatch, ChangeOperation, ChangesStream};
 use data_components::delete::get_deletion_provider;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::lit;
-use datafusion::logical_expr::{col, Expr};
+use datafusion::logical_expr::{Expr, col};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::{execution::context::SessionContext, physical_plan::collect};
-use futures::{stream, StreamExt};
+use futures::{StreamExt, stream};
 use snafu::{OptionExt, ResultExt};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tokio::sync::{oneshot, RwLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::sync::{RwLock, oneshot};
 
 /// Extracts the primary key value from the data, as a tuple of (String, Expr).
 ///

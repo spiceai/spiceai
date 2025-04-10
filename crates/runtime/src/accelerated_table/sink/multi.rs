@@ -31,7 +31,7 @@ use datafusion::{
     prelude::SessionContext,
 };
 use futures::{Stream, StreamExt};
-use tokio::sync::{broadcast, watch, Barrier, BarrierWaitResult};
+use tokio::sync::{Barrier, BarrierWaitResult, broadcast, watch};
 use tokio::task::JoinSet;
 use tokio_stream::wrappers::BroadcastStream;
 use util::RetryError;

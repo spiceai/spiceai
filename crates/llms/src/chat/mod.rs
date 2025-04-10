@@ -20,7 +20,7 @@ use async_trait::async_trait;
 use futures::{Stream, StreamExt, TryStreamExt};
 use nsql::SqlGeneration;
 use rand::distr::Alphanumeric;
-use rand::{rng, Rng};
+use rand::{Rng, rng};
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 use snafu::{ResultExt, Snafu};
@@ -69,56 +69,82 @@ pub enum LlmRuntime {
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Failed to check the status of the model.\nAn error occurred: {source}\nVerify the model configuration."))]
+    #[snafu(display(
+        "Failed to check the status of the model.\nAn error occurred: {source}\nVerify the model configuration."
+    ))]
     HealthCheckError {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Failed to run the model.\nAn error occurred: {source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"))]
+    #[snafu(display(
+        "Failed to run the model.\nAn error occurred: {source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+    ))]
     FailedToRunModel {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Failed to find the Local model at '{expected_path}'.\nVerify the model exists, and try again."))]
+    #[snafu(display(
+        "Failed to find the Local model at '{expected_path}'.\nVerify the model exists, and try again."
+    ))]
     LocalModelNotFound { expected_path: String },
 
-    #[snafu(display("Failed to find the Local model config at '{expected_path}'.\nVerify the model config exists, and try again."))]
+    #[snafu(display(
+        "Failed to find the Local model config at '{expected_path}'.\nVerify the model config exists, and try again."
+    ))]
     LocalModelConfigNotFound { expected_path: String },
 
-    #[snafu(display("Failed to find the Local tokenizer at '{expected_path}'.\nVerify the tokenizer exists, and try again."))]
+    #[snafu(display(
+        "Failed to find the Local tokenizer at '{expected_path}'.\nVerify the tokenizer exists, and try again."
+    ))]
     LocalTokenizerNotFound { expected_path: String },
 
-    #[snafu(display("Failed to load the model.\nAn error occurred: {source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"))]
+    #[snafu(display(
+        "Failed to load the model.\nAn error occurred: {source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+    ))]
     FailedToLoadModel {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Unsupported value for `model_type` parameter.\n{source}\n Verify the `model_type` parameter, and try again"))]
+    #[snafu(display(
+        "Unsupported value for `model_type` parameter.\n{source}\n Verify the `model_type` parameter, and try again"
+    ))]
     UnsupportedModelType {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("The specified model identifier '{model}' is not valid for the source '{model_source}'.\nVerify the model exists, and try again."))]
+    #[snafu(display(
+        "The specified model identifier '{model}' is not valid for the source '{model_source}'.\nVerify the model exists, and try again."
+    ))]
     ModelNotFound { model: String, model_source: String },
 
-    #[snafu(display("Failed to load model tokenizer.\nAn error occurred: {source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"))]
+    #[snafu(display(
+        "Failed to load model tokenizer.\nAn error occurred: {source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+    ))]
     FailedToLoadTokenizer {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("An unsupported model source was specified in the 'from' parameter: '{from}'.\nSpecify a valid source, like 'openai', and try again.\nFor details, visit: https://spiceai.org/docs/components/models"))]
+    #[snafu(display(
+        "An unsupported model source was specified in the 'from' parameter: '{from}'.\nSpecify a valid source, like 'openai', and try again.\nFor details, visit: https://spiceai.org/docs/components/models"
+    ))]
     UnknownModelSource { from: String },
 
-    #[snafu(display("The specified model, '{from}', does not support executing the task '{task}'.\nSelect a different model or task, and try again."))]
+    #[snafu(display(
+        "The specified model, '{from}', does not support executing the task '{task}'.\nSelect a different model or task, and try again."
+    ))]
     UnsupportedTaskForModel { from: String, task: String },
 
     #[snafu(display("Invalid value for parameter {param}. {message}"))]
     InvalidParamError { param: String, message: String },
 
-    #[snafu(display("Failed to find weights for the model.\nExpected tensors with a file extension of: {extensions}.\nVerify the model is correctly configured, and try again."))]
+    #[snafu(display(
+        "Failed to find weights for the model.\nExpected tensors with a file extension of: {extensions}.\nVerify the model is correctly configured, and try again."
+    ))]
     ModelMissingWeights { extensions: String },
 
-    #[snafu(display("Failed to load a file specified for the model.\nCould not find the file: {file_url}.\nVerify the `files` parameters for the model, and try again."))]
+    #[snafu(display(
+        "Failed to load a file specified for the model.\nCould not find the file: {file_url}.\nVerify the `files` parameters for the model, and try again."
+    ))]
     ModelFileMissing { file_url: String },
 }
 
@@ -277,7 +303,7 @@ pub fn message_to_mistral(
         ChatCompletionRequestSystemMessageContent, ChatCompletionRequestToolMessageContent,
     };
     use either::Either;
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
 
     match message {
         ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
@@ -484,12 +510,14 @@ pub trait Chat: Sync + Send {
 
         async move {
             let req = CreateChatCompletionRequestArgs::default()
-                .messages(vec![ChatCompletionRequestSystemMessageArgs::default()
-                    .content(prompt)
-                    .build()
-                    .boxed()
-                    .context(FailedToLoadTokenizerSnafu)?
-                    .into()])
+                .messages(vec![
+                    ChatCompletionRequestSystemMessageArgs::default()
+                        .content(prompt)
+                        .build()
+                        .boxed()
+                        .context(FailedToLoadTokenizerSnafu)?
+                        .into(),
+                ])
                 .build()
                 .boxed()
                 .context(FailedToLoadModelSnafu)?;

@@ -18,8 +18,8 @@ limitations under the License.
 use std::pin::Pin;
 use std::time::SystemTime;
 
-use crate::chat::nsql::SqlGeneration;
 use crate::chat::Chat;
+use crate::chat::nsql::SqlGeneration;
 use async_openai::error::{ApiError, OpenAIError};
 use async_openai::types::{
     ChatChoice, ChatCompletionMessageToolCall, ChatCompletionNamedToolChoice,
@@ -36,13 +36,13 @@ use async_openai::types::{
 };
 use serde_json::json;
 
-use super::types::{
-    default_max_tokens, AnthropicModelVariant, ContentBlock, ContentParam, MessageCreateParams,
-    MessageCreateResponse, MessageParam, MessageRole, MetadataParam, ResponseContentBlock,
-    StopReason, TextBlockParam, ToolChoiceParam, ToolResultBlockParam, ToolUseBlockParam,
-};
-use super::types_stream::{transform_stream, AnthropicStreamError, MessageCreateStreamResponse};
 use super::Anthropic;
+use super::types::{
+    AnthropicModelVariant, ContentBlock, ContentParam, MessageCreateParams, MessageCreateResponse,
+    MessageParam, MessageRole, MetadataParam, ResponseContentBlock, StopReason, TextBlockParam,
+    ToolChoiceParam, ToolResultBlockParam, ToolUseBlockParam, default_max_tokens,
+};
+use super::types_stream::{AnthropicStreamError, MessageCreateStreamResponse, transform_stream};
 use async_trait::async_trait;
 use futures::Stream;
 
@@ -144,7 +144,7 @@ fn create_completion_message(
                             "Failed to serialize tool use argument {}. Error: {e}",
                             t.input
                         )
-                        .into()))
+                        .into()));
                     }
                 };
                 Some(Ok(ChatCompletionMessageToolCall {
@@ -397,7 +397,10 @@ fn system_message_from_messages(messages: &[ChatCompletionRequestMessage]) -> Op
         .collect();
 
     if system_messages.len() > 1 {
-        tracing::warn!("More than one ({count}) system message found in messages. Concatenating into a single String.", count = system_messages.len());
+        tracing::warn!(
+            "More than one ({count}) system message found in messages. Concatenating into a single String.",
+            count = system_messages.len()
+        );
     }
     if system_messages.is_empty() {
         None

@@ -163,7 +163,7 @@ impl DuckDBAccelerator {
             (Err(e), Mode::File) => {
                 return Err(Error::InvalidConfiguration {
                     detail: Arc::from(e.to_string()),
-                })
+                });
             }
         };
 
