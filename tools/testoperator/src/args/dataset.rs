@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use clap::{Parser, ValueEnum};
+use clap::{ArgAction, Parser, ValueEnum};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use test_framework::queries::{QueryOverrides, QuerySet};
@@ -37,7 +37,7 @@ pub struct DatasetTestArgs {
     #[arg(long)]
     pub(crate) query_overrides: Option<QueryOverridesArg>,
 
-    #[arg(long)]
+    #[arg(long, action = ArgAction::Set, default_value_t = false, default_missing_value = "true", num_args = 0..=1, require_equals = false)]
     pub(crate) validate: bool,
 }
 
