@@ -145,13 +145,13 @@ impl DeltaTable {
             .map_err(handle_delta_error)?;
 
         let arrow_schema = Self::get_schema(&snapshot);
-        let delta_schema = snapshot.schema().clone();
+        let delta_schema = snapshot.schema();
 
         Ok(Self {
             table,
             engine,
             arrow_schema: Arc::new(arrow_schema),
-            delta_schema: Arc::new(delta_schema),
+            delta_schema,
         })
     }
 
@@ -360,20 +360,14 @@ impl TableProvider for DeltaTable {
                 let mut scan_context = ScanContext::new(scan_state, Arc::clone(&engine));
 
                 let scan_iter = scan
-                    .scan_data(engine.as_ref())
+                    .scan_metadata(engine.as_ref())
                     .map_err(map_delta_error_to_datafusion_err)?;
 
                 for scan_result in scan_iter {
-                    let (data, selection_vector, transforms) =
-                        scan_result.map_err(map_delta_error_to_datafusion_err)?;
-                    scan_context = delta_kernel::scan::state::visit_scan_files(
-                        data.as_ref(),
-                        &selection_vector,
-                        &transforms,
-                        scan_context,
-                        handle_scan_file,
-                    )
-                    .map_err(map_delta_error_to_datafusion_err)?;
+                    let scan = scan_result.map_err(map_delta_error_to_datafusion_err)?;
+                    scan_context = scan
+                        .visit_scan_files(scan_context, handle_scan_file)
+                        .map_err(map_delta_error_to_datafusion_err)?;
                 }
 
                 Ok::<_, datafusion::error::DataFusionError>((
