@@ -36,7 +36,6 @@ use {
 };
 
 use crate::component::dataset::{Dataset, acceleration::Engine};
-use crate::dataaccelerator::AcceleratorEngineRegistry;
 
 pub mod dataset_checkpoint;
 #[cfg(feature = "debezium")]
@@ -54,10 +53,16 @@ enum AccelerationConnection {
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 async fn acceleration_connection(
-    accelerator_engine_registry: AcceleratorEngineRegistry,
     dataset: &Dataset,
     create_table_if_not_exists: bool,
 ) -> Result<AccelerationConnection> {
+    let runtime = match dataset.runtime() {
+        Some(rt) => rt,
+        None => {
+            return Err("Missing runtime reference for dataset".into());
+        }
+    };
+
     let acceleration = dataset
         .acceleration
         .as_ref()
@@ -65,7 +70,8 @@ async fn acceleration_connection(
     match acceleration.engine {
         #[cfg(feature = "duckdb")]
         Engine::DuckDB => {
-            let accelerator = accelerator_engine_registry
+            let accelerator = runtime
+                .accelerator_engine_registry()
                 .get_accelerator_engine(Engine::DuckDB)
                 .await
                 .ok_or("DuckDB accelerator engine not available")?;
@@ -90,7 +96,8 @@ async fn acceleration_connection(
         Engine::DuckDB => Err("Spice wasn't built with DuckDB support enabled".into()),
         #[cfg(feature = "sqlite")]
         Engine::Sqlite => {
-            let accelerator = accelerator_engine_registry
+            let accelerator = runtime
+                .accelerator_engine_registry()
                 .get_accelerator_engine(Engine::Sqlite)
                 .await
                 .ok_or("Sqlite accelerator engine not available")?;

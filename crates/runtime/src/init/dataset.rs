@@ -16,7 +16,6 @@ limitations under the License.
 
 use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc};
 
-use crate::dataaccelerator::AcceleratorEngineRegistry;
 use crate::{
     AcceleratedReadWriteTableWithoutReplicationSnafu, AcceleratedTableInvalidChangesSnafu,
     AcceleratorEngineNotAvailableSnafu, AcceleratorInitializationFailedSnafu, Error, LogErrors,
@@ -61,7 +60,7 @@ impl Runtime {
             Arc::new(Semaphore::new(Semaphore::MAX_PERMITS))
         };
 
-        let valid_datasets = Self::get_valid_datasets(app, LogErrors(true));
+        let valid_datasets = self.get_valid_datasets(app, LogErrors(true));
 
         if valid_datasets.is_empty() {
             tracing::info!(
@@ -151,8 +150,14 @@ impl Runtime {
     }
 
     /// Returns a list of valid datasets from the given App, skipping any that fail to parse and logging an error for them.
-    pub(crate) fn get_valid_datasets(app: &Arc<App>, log_errors: LogErrors) -> Vec<Arc<Dataset>> {
-        Self::datasets_iter(app)
+    pub(crate) fn get_valid_datasets(
+        &self,
+        app: &Arc<App>,
+        log_errors: LogErrors,
+    ) -> Vec<Arc<Dataset>> {
+        let cloned_self = Arc::new(self.clone());
+        cloned_self
+            .datasets_iter(app)
             .zip(&app.datasets)
             .filter_map(|(ds, spicepod_ds)| match ds {
                 Ok(ds) => Some(Arc::new(ds)),
@@ -167,12 +172,15 @@ impl Runtime {
             .collect()
     }
 
-    fn datasets_iter(app: &Arc<App>) -> impl Iterator<Item = Result<Dataset>> + '_ {
+    // TODO: with rt
+    fn datasets_iter(self: Arc<Self>, app: &Arc<App>) -> impl Iterator<Item = Result<Dataset>> {
         app.datasets
             .clone()
             .into_iter()
             .map(Dataset::try_from)
-            .map(move |ds| ds.map(|ds| Dataset::with_app(ds, Arc::clone(app))))
+            .map(move |ds| {
+                ds.map(|ds| Dataset::with_app(ds, Arc::clone(app)).with_runtime(Arc::clone(&self)))
+            })
     }
 
     async fn load_dataset_connector(&self, ds: Arc<Dataset>) -> Result<Arc<dyn DataConnector>> {
@@ -311,12 +319,8 @@ impl Runtime {
             Err(err) => {
                 // We couldn't connect to the federated table. If the dataset has an existing
                 // accelerated table, we can defer the federated table creation.
-                if let Some(federated_table) = FederatedTable::new_deferred(
-                    self.accelerator_engine_registry(),
-                    Arc::clone(&ds),
-                    Arc::clone(&connector),
-                )
-                .await
+                if let Some(federated_table) =
+                    FederatedTable::new_deferred(Arc::clone(&ds), Arc::clone(&connector)).await
                 {
                     tracing::warn!(
                         "Unable to connect to the remote source for {}. Data will be served from the pre-existing accelerated table for {} while attempting to establish the connection.\n\n{err}",
@@ -634,9 +638,9 @@ impl Runtime {
     }
 
     pub(crate) async fn apply_dataset_diff(&self, current_app: &Arc<App>, new_app: &Arc<App>) {
-        let valid_datasets = Self::get_valid_datasets(new_app, LogErrors(true));
+        let valid_datasets = self.get_valid_datasets(new_app, LogErrors(true));
         let initialized_datasets = self.initialize_accelerators(&valid_datasets).await;
-        let existing_datasets = Self::get_valid_datasets(current_app, LogErrors(false));
+        let existing_datasets = self.get_valid_datasets(current_app, LogErrors(false));
 
         for ds in initialized_datasets {
             if let Some(current_ds) = existing_datasets.iter().find(|d| d.name == ds.name) {
@@ -721,30 +725,28 @@ impl Runtime {
 
     /// Returns a list of valid datasets from the given App, skipping any that fail to parse and logging an error for them.
     pub(crate) async fn get_initialized_datasets(
-        accelerator_engine_registry: AcceleratorEngineRegistry,
+        &self,
         app: &Arc<App>,
         log_errors: LogErrors,
     ) -> Vec<Arc<Dataset>> {
-        let valid_datasets = Self::get_valid_datasets(app, log_errors);
+        let valid_datasets = self.get_valid_datasets(app, log_errors);
         futures::stream::iter(valid_datasets)
-            .filter_map(|ds| {
-                let accelerator_engine_registry_clone = accelerator_engine_registry.clone();
-                async move {
-                    match (
-                        ds.is_accelerated(),
-                        ds.is_accelerator_initialized(accelerator_engine_registry_clone).await,
-                    ) {
-                        (true, true) | (false, _) => Some(Arc::clone(&ds)),
-                        (true, false) => {
-                            if log_errors.0 {
-                                metrics::datasets::LOAD_ERROR.add(1, &[]);
-                                tracing::error!(
+            .filter_map(|ds| async move {
+                match (
+                    ds.is_accelerated(),
+                    ds.is_accelerator_initialized(self.accelerator_engine_registry())
+                        .await,
+                ) {
+                    (true, true) | (false, _) => Some(Arc::clone(&ds)),
+                    (true, false) => {
+                        if log_errors.0 {
+                            metrics::datasets::LOAD_ERROR.add(1, &[]);
+                            tracing::error!(
                                 dataset = &ds.name.to_string(),
                                 "Dataset is accelerated but the accelerator failed to initialize."
                             );
-                            }
-                            None
                         }
+                        None
                     }
                 }
             })

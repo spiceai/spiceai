@@ -29,7 +29,6 @@ limitations under the License.
 
 use std::sync::Arc;
 
-use crate::dataaccelerator::AcceleratorEngineRegistry;
 use arrow::datatypes::SchemaRef;
 use datafusion::catalog::TableProvider;
 use tokio::sync::{Mutex, oneshot};
@@ -79,7 +78,6 @@ impl FederatedTable {
     ///
     /// Returns `None` if the dataset isn't a valid file-accelerated dataset.
     pub async fn new_deferred(
-        accelerator_engine_registry: AcceleratorEngineRegistry,
         dataset: Arc<Dataset>,
         data_connector: Arc<dyn DataConnector>,
     ) -> Option<Self> {
@@ -87,9 +85,7 @@ impl FederatedTable {
             return None;
         }
 
-        let checkpoint = DatasetCheckpoint::try_new(accelerator_engine_registry, &dataset)
-            .await
-            .ok()?;
+        let checkpoint = DatasetCheckpoint::try_new(&dataset).await.ok()?;
         let federated_schema = checkpoint.get_schema().await.ok()??;
         let dataset_name = dataset.name.clone();
 

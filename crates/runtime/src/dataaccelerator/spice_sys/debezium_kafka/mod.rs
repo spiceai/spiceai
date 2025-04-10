@@ -25,7 +25,6 @@ limitations under the License.
 //! );
 
 use super::{AccelerationConnection, Result, acceleration_connection};
-use crate::dataaccelerator::AcceleratorEngineRegistry;
 use crate::{component::dataset::Dataset, dataconnector::debezium::DebeziumKafkaMetadata};
 
 const DEBEZIUM_KAFKA_TABLE_NAME: &str = "spice_sys_debezium_kafka";
@@ -43,25 +42,17 @@ pub struct DebeziumKafkaSys {
 }
 
 impl DebeziumKafkaSys {
-    pub async fn try_new(
-        accelerator_engine_registry: AcceleratorEngineRegistry,
-        dataset: &Dataset,
-    ) -> Result<Self> {
+    pub async fn try_new(dataset: &Dataset) -> Result<Self> {
         Ok(Self {
             dataset_name: dataset.name.to_string(),
-            acceleration_connection: acceleration_connection(accelerator_engine_registry, dataset, false)
-                .await?,
+            acceleration_connection: acceleration_connection(dataset, false).await?,
         })
     }
 
-    pub async fn try_new_create_if_not_exists(
-        accelerator_engine_registry: AcceleratorEngineRegistry,
-        dataset: &Dataset,
-    ) -> Result<Self> {
+    pub async fn try_new_create_if_not_exists(dataset: &Dataset) -> Result<Self> {
         Ok(Self {
             dataset_name: dataset.name.to_string(),
-            acceleration_connection: acceleration_connection(accelerator_engine_registry, dataset, true)
-                .await?,
+            acceleration_connection: acceleration_connection(dataset, true).await?,
         })
     }
 

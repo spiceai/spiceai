@@ -21,7 +21,6 @@ use crate::component::dataset::Dataset;
 use crate::component::dataset::acceleration::RefreshMode;
 use crate::component::metrics::MetricsProvider;
 use crate::component::metrics::MetricsProviderComponent;
-use crate::dataaccelerator::AcceleratorEngineRegistry;
 use crate::datafusion::error::find_datafusion_root;
 use crate::federated_table::FederatedTable;
 use crate::get_params_with_secrets;
@@ -337,7 +336,7 @@ pub async fn create_new_connector(
     Some(result)
 }
 
-pub async fn register_all(accelerator_engine_registry: AcceleratorEngineRegistry) {
+pub async fn register_all() {
     register_connector_factory("sink", sink::SinkConnectorFactory::new_arc()).await;
     #[cfg(feature = "databricks")]
     register_connector_factory("databricks", databricks::DatabricksFactory::new_arc()).await;
@@ -381,11 +380,7 @@ pub async fn register_all(accelerator_engine_registry: AcceleratorEngineRegistry
     #[cfg(feature = "snowflake")]
     register_connector_factory("snowflake", snowflake::SnowflakeFactory::new_arc()).await;
     #[cfg(feature = "debezium")]
-    register_connector_factory(
-        "debezium",
-        debezium::DebeziumFactory::new_arc(accelerator_engine_registry),
-    )
-    .await;
+    register_connector_factory("debezium", debezium::DebeziumFactory::new_arc()).await;
     register_connector_factory("localpod", localpod::LocalPodFactory::new_arc()).await;
     #[cfg(feature = "dynamodb")]
     register_connector_factory("dynamodb", dynamodb::DynamoDBFactory::new_arc()).await;

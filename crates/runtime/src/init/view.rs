@@ -27,7 +27,7 @@ use snafu::prelude::*;
 
 impl Runtime {
     pub(crate) fn load_views(&self, app: &Arc<App>) {
-        let views: Vec<View> = Self::get_valid_views(app, LogErrors(true));
+        let views: Vec<View> = self.get_valid_views(app, LogErrors(true));
 
         for view in &views {
             if let Err(e) = self.load_view(view) {
@@ -37,8 +37,9 @@ impl Runtime {
     }
 
     /// Returns a list of valid views from the given App, skipping any that fail to parse and logging an error for them.
-    pub(crate) fn get_valid_views(app: &Arc<App>, log_errors: LogErrors) -> Vec<View> {
-        let datasets = Self::get_valid_datasets(app, log_errors)
+    pub(crate) fn get_valid_views(&self, app: &Arc<App>, log_errors: LogErrors) -> Vec<View> {
+        let datasets = self
+            .get_valid_datasets(app, log_errors)
             .iter()
             .map(|ds| ds.name.clone())
             .collect::<HashSet<_>>();
@@ -110,8 +111,8 @@ impl Runtime {
     /// This function will update views that have changed, and remove views that are no longer in the app.
     /// It will also update views that have dependencies that have changed.
     pub(crate) fn apply_view_diff(&self, current_app: &Arc<App>, new_app: &Arc<App>) {
-        let valid_views = Self::get_valid_views(new_app, LogErrors(true));
-        let existing_views = Self::get_valid_views(current_app, LogErrors(false));
+        let valid_views = self.get_valid_views(new_app, LogErrors(true));
+        let existing_views = self.get_valid_views(current_app, LogErrors(false));
 
         let views_that_changed = valid_views
             .iter()

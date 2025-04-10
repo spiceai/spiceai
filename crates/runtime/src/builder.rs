@@ -140,7 +140,7 @@ impl RuntimeBuilder {
 
     pub async fn build(self) -> Runtime {
         self.accelerator_engine_registry.register_all().await;
-        dataconnector::register_all(self.accelerator_engine_registry.clone()).await;
+        dataconnector::register_all().await;
         catalogconnector::register_all().await;
         tools::factory::register_all_factories().await;
         document_parse::register_all().await;

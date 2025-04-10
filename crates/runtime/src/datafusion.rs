@@ -790,9 +790,7 @@ impl DataFusion {
         // it means there is data from a previous acceleration and we don't need
         // to wait for the first refresh to complete to mark it ready.
         let mut initial_load_complete = false;
-        if let Ok(checkpoint) =
-            DatasetCheckpoint::try_new(self.accelerator_engine_registry(), dataset).await
-        {
+        if let Ok(checkpoint) = DatasetCheckpoint::try_new(dataset).await {
             if checkpoint.exists().await {
                 self.runtime_status
                     .update_dataset(&dataset.name, status::ComponentStatus::Ready);
@@ -868,11 +866,7 @@ impl DataFusion {
 
         accelerated_table_builder.cache_provider(self.cache_provider());
 
-        accelerated_table_builder.checkpointer_opt(
-            DatasetCheckpoint::try_new(self.accelerator_engine_registry(), dataset)
-                .await
-                .ok(),
-        );
+        accelerated_table_builder.checkpointer_opt(DatasetCheckpoint::try_new(dataset).await.ok());
 
         accelerated_table_builder.initial_load_complete(initial_load_complete);
 

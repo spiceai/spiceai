@@ -565,7 +565,7 @@ impl Runtime {
             return;
         };
 
-        let valid_datasets = Self::get_valid_datasets(app, LogErrors(false));
+        let valid_datasets = self.get_valid_datasets(app, LogErrors(false));
         for ds in &valid_datasets {
             self.status
                 .update_dataset(&ds.name, ComponentStatus::Initializing);
@@ -599,7 +599,7 @@ impl Runtime {
                 .update_catalog(&catalog.name, ComponentStatus::Initializing);
         }
 
-        let valid_views = Self::get_valid_views(app, LogErrors(false));
+        let valid_views = self.get_valid_views(app, LogErrors(false));
         for view in valid_views {
             self.status
                 .update_view(&view.name, ComponentStatus::Initializing);
@@ -872,6 +872,43 @@ impl Runtime {
                 Arc::clone(tool)
             };
         Some(tool)
+    }
+}
+
+impl std::fmt::Debug for Runtime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Runtime")
+            .field("status", &self.status)
+            .field("datasets_count", &{
+                match self.app.try_read() {
+                    Ok(app) => app.as_ref().map_or(0, |a| a.datasets.len()),
+                    _ => 0,
+                }
+            })
+            .field("models_count", &{
+                match self.models.try_read() {
+                    Ok(models) => models.len(),
+                    _ => 0,
+                }
+            })
+            .field("tools_count", &{
+                match self.tools.try_read() {
+                    Ok(tools) => tools.len(),
+                    _ => 0,
+                }
+            })
+            .field("extensions_count", &{
+                match self.extensions.try_read() {
+                    Ok(extensions) => extensions.len(),
+                    _ => 0,
+                }
+            })
+            .field(
+                "accelerator_registry",
+                &format!("<AcceleratorEngineRegistry>"),
+            )
+            .field("datafusion", &format!("<DataFusion>"))
+            .finish()
     }
 }
 

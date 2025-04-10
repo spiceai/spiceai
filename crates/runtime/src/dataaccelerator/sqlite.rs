@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::dataaccelerator::AcceleratorEngineRegistry;
 use async_trait::async_trait;
 use data_components::poly::PolyTableProvider;
 use datafusion::{
@@ -30,7 +29,6 @@ use snafu::prelude::*;
 use std::{any::Any, ffi::OsStr, sync::Arc, time::Duration};
 
 use crate::{
-    Runtime,
     component::dataset::{
         Dataset,
         acceleration::{Engine, Mode},
@@ -86,12 +84,11 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct SqliteAccelerator {
     sqlite_factory: SqliteTableProviderFactory,
-    accelerator_engine_registry: AcceleratorEngineRegistry,
 }
 
 impl SqliteAccelerator {
     #[must_use]
-    pub fn new(accelerator_engine_registry: AcceleratorEngineRegistry) -> Self {
+    pub fn new() -> Self {
         // Initialize the decimal extension for SQLite
         //
         // SAFETY: This is safe because sqlite3_decimal_init is a valid function pointer.
@@ -100,7 +97,6 @@ impl SqliteAccelerator {
         }
         Self {
             sqlite_factory: SqliteTableProviderFactory::new(),
-            accelerator_engine_registry,
         }
     }
 
@@ -163,10 +159,6 @@ impl SqliteAccelerator {
             .context(AccelerationCreationFailedSnafu)?;
 
         Ok(pool)
-    }
-
-    fn accelerator_engine_registry(&self) -> AcceleratorEngineRegistry {
-        self.accelerator_engine_registry.clone()
     }
 }
 
@@ -270,16 +262,13 @@ impl DataAccelerator for SqliteAccelerator {
                     cmd.options.insert("file".to_string(), sqlite_file);
                 }
 
-                if let Some(app) = &this_dataset.app {
-                    let datasets = Runtime::get_initialized_datasets(
-                        self.accelerator_engine_registry(),
-                        app,
-                        crate::LogErrors(false),
-                    )
-                    .await;
-                    let self_path = self.file_path(this_dataset)?;
-                    let attach_databases =
-                        datasets
+                match (&this_dataset.app, &this_dataset.runtime) {
+                    (Some(app), Some(runtime)) => {
+                        let datasets = runtime
+                            .get_initialized_datasets(app, crate::LogErrors(false))
+                            .await;
+                        let self_path = self.file_path(this_dataset)?;
+                        let attach_databases = datasets
                             .iter()
                             .filter_map(|other_dataset| {
                                 if other_dataset.acceleration.as_ref().is_some_and(|a| {
@@ -297,10 +286,12 @@ impl DataAccelerator for SqliteAccelerator {
                             })
                             .collect::<Vec<_>>();
 
-                    if !attach_databases.is_empty() {
-                        cmd.options
-                            .insert("attach_databases".to_string(), attach_databases.join(";"));
+                        if !attach_databases.is_empty() {
+                            cmd.options
+                                .insert("attach_databases".to_string(), attach_databases.join(";"));
+                        }
                     }
+                    _ => {}
                 }
             }
         }
@@ -385,7 +376,7 @@ mod tests {
         };
         let ctx = SessionContext::new();
         let runtime = RuntimeBuilder::new().build().await;
-        let table = SqliteAccelerator::new(runtime.accelerator_engine_registry())
+        let table = SqliteAccelerator::new()
             .create_external_table(&external_table, None)
             .await
             .expect("table should be created");
@@ -474,7 +465,7 @@ mod tests {
         });
 
         let runtime = RuntimeBuilder::new().build().await;
-        let accelerator = SqliteAccelerator::new(runtime.accelerator_engine_registry());
+        let accelerator = SqliteAccelerator::new();
         assert!(!accelerator.is_initialized(&dataset));
 
         accelerator

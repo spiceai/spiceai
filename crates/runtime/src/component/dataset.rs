@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use super::{find_first_delimiter, validate_identifier};
-use crate::dataaccelerator::AcceleratorEngineRegistry;
+use crate::{Runtime, dataaccelerator::AcceleratorEngineRegistry};
 use acceleration::Engine;
 use app::App;
 use arrow::datatypes::SchemaRef;
@@ -218,6 +218,7 @@ pub struct Dataset {
     pub unsupported_type_action: Option<UnsupportedTypeAction>,
     pub ready_state: ReadyState,
     pub metrics: Metrics,
+    pub runtime: Option<Arc<Runtime>>,
 }
 
 // Implement a custom PartialEq for Dataset to ignore the app field
@@ -300,6 +301,7 @@ impl TryFrom<spicepod_dataset::Dataset> for Dataset {
                 .map(UnsupportedTypeAction::from),
             ready_state,
             metrics: dataset.metrics.unwrap_or_default(),
+            runtime: None,
         })
     }
 }
@@ -326,6 +328,7 @@ impl Dataset {
             unsupported_type_action: None,
             ready_state: ReadyState::default(),
             metrics: Metrics::default(),
+            runtime: None,
         })
     }
 
@@ -336,8 +339,19 @@ impl Dataset {
     }
 
     #[must_use]
+    pub fn with_runtime(mut self, runtime: Arc<Runtime>) -> Self {
+        self.runtime = Some(runtime);
+        self
+    }
+
+    #[must_use]
     pub fn app(&self) -> Option<Arc<App>> {
         self.app.clone()
+    }
+
+    #[must_use]
+    pub fn runtime(&self) -> Option<Arc<Runtime>> {
+        self.runtime.clone()
     }
 
     #[must_use]

@@ -16,7 +16,6 @@ limitations under the License.
 
 use crate::component::dataset::Dataset;
 use crate::component::dataset::acceleration::{Engine, RefreshMode};
-use crate::dataaccelerator::AcceleratorEngineRegistry;
 use crate::dataaccelerator::spice_sys::debezium_kafka::DebeziumKafkaSys;
 use crate::dataconnector::ConnectorComponent;
 use crate::datafusion::refresh_sql;
@@ -65,32 +64,19 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct Debezium {
     kafka_config: KafkaConfig,
-    accelerator_engine_registry: AcceleratorEngineRegistry,
 }
 
 impl std::fmt::Debug for Debezium {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Debezium")
             .field("kafka_config", &self.kafka_config)
-            .field(
-                "accelerator_engine_registry",
-                &"<accelerator_engine_registry>",
-            )
             .finish()
     }
 }
 
 impl Debezium {
-    #[must_use]
-    pub fn accelerator_engine_registry(&self) -> AcceleratorEngineRegistry {
-        self.accelerator_engine_registry.clone()
-    }
-
     #[allow(clippy::needless_pass_by_value)]
-    pub fn new(
-        accelerator_engine_registry: AcceleratorEngineRegistry,
-        params: Parameters,
-    ) -> Result<Self> {
+    pub fn new(params: Parameters) -> Result<Self> {
         let transport = params.get("transport").expose().ok().unwrap_or("kafka");
 
         let message_format = params.get("message_format").expose().ok().unwrap_or("json");
@@ -162,17 +148,12 @@ impl Debezium {
                 }),
         };
 
-        Ok(Self {
-            kafka_config,
-            accelerator_engine_registry,
-        })
+        Ok(Self { kafka_config })
     }
 }
 
 #[derive(Default, Clone)]
-pub struct DebeziumFactory {
-    accelerator_engine_registry: AcceleratorEngineRegistry,
-}
+pub struct DebeziumFactory {}
 
 // For the DebeziumFactory struct
 impl std::fmt::Debug for DebeziumFactory {
@@ -183,23 +164,13 @@ impl std::fmt::Debug for DebeziumFactory {
 
 impl DebeziumFactory {
     #[must_use]
-    pub fn new(accelerator_engine_registry: AcceleratorEngineRegistry) -> Self {
-        Self {
-            accelerator_engine_registry,
-        }
+    pub fn new() -> Self {
+        Self {}
     }
 
     #[must_use]
-    pub fn new_arc(
-        accelerator_engine_registry: AcceleratorEngineRegistry,
-    ) -> Arc<dyn DataConnectorFactory> {
-        Arc::new(Self {
-            accelerator_engine_registry,
-        }) as Arc<dyn DataConnectorFactory>
-    }
-
-    fn accelerator_engine_registry(&self) -> AcceleratorEngineRegistry {
-        self.accelerator_engine_registry.clone()
+    pub fn new_arc() -> Arc<dyn DataConnectorFactory> {
+        Arc::new(Self {}) as Arc<dyn DataConnectorFactory>
     }
 }
 
@@ -249,10 +220,8 @@ impl DataConnectorFactory for DebeziumFactory {
         &self,
         params: ConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
-        let accelerator_engine_registry = self.accelerator_engine_registry();
-
         Box::pin(async move {
-            let debezium = Debezium::new(accelerator_engine_registry, params.parameters)?;
+            let debezium = Debezium::new(params.parameters)?;
             Ok(Arc::new(debezium) as Arc<dyn DataConnector>)
         })
     }
@@ -318,11 +287,7 @@ impl DataConnector for Debezium {
 
         let topic = dataset.path();
 
-        let (kafka_consumer, metadata, schema) = match get_metadata_from_accelerator(
-            self.accelerator_engine_registry(),
-            dataset,
-        )
-        .await
+        let (kafka_consumer, metadata, schema) = match get_metadata_from_accelerator(dataset).await
         {
             Some(metadata) => {
                 let kafka_consumer = KafkaConsumer::create_with_existing_group_id(
@@ -365,15 +330,7 @@ impl DataConnector for Debezium {
 
                 (kafka_consumer, metadata, Arc::new(schema))
             }
-            None => {
-                get_metadata_from_kafka(
-                    self.accelerator_engine_registry(),
-                    dataset,
-                    topic,
-                    self.kafka_config.clone(),
-                )
-                .await?
-            }
+            None => get_metadata_from_kafka(dataset, topic, self.kafka_config.clone()).await?,
         };
 
         let refresh_sql = dataset.refresh_sql();
@@ -427,29 +384,20 @@ pub(crate) struct DebeziumKafkaMetadata {
     pub(crate) schema_fields: Vec<change_event::Field>,
 }
 
-async fn get_metadata_from_accelerator(
-    accelerator_engine_registry: AcceleratorEngineRegistry,
-    dataset: &Dataset,
-) -> Option<DebeziumKafkaMetadata> {
-    let debezium_kafka_sys = DebeziumKafkaSys::try_new(accelerator_engine_registry, dataset)
-        .await
-        .ok()?;
+async fn get_metadata_from_accelerator(dataset: &Dataset) -> Option<DebeziumKafkaMetadata> {
+    let debezium_kafka_sys = DebeziumKafkaSys::try_new(dataset).await.ok()?;
     debezium_kafka_sys.get().await
 }
 
 async fn set_metadata_to_accelerator(
-    accelerator_engine_registry: AcceleratorEngineRegistry,
     dataset: &Dataset,
     metadata: &DebeziumKafkaMetadata,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let debezium_kafka_sys =
-        DebeziumKafkaSys::try_new_create_if_not_exists(accelerator_engine_registry, dataset)
-            .await?;
+    let debezium_kafka_sys = DebeziumKafkaSys::try_new_create_if_not_exists(dataset).await?;
     debezium_kafka_sys.upsert(metadata).await
 }
 
 async fn get_metadata_from_kafka(
-    accelerator_engine_registry: AcceleratorEngineRegistry,
     dataset: &Dataset,
     topic: &str,
     kafka_config: KafkaConfig,
@@ -515,7 +463,7 @@ async fn get_metadata_from_kafka(
     };
 
     if dataset.is_file_accelerated() {
-        set_metadata_to_accelerator(accelerator_engine_registry, dataset, &metadata)
+        set_metadata_to_accelerator(dataset, &metadata)
             .await
             .context(super::UnableToGetReadProviderSnafu {
                 dataconnector: "debezium",

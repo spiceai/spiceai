@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::dataaccelerator::AcceleratorEngineRegistry;
 use crate::{
     App, Runtime,
     component::dataset::{
@@ -81,22 +80,16 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct DuckDBAccelerator {
     duckdb_factory: DuckDBTableProviderFactory,
-    accelerator_engine_registry: AcceleratorEngineRegistry,
 }
 
 impl DuckDBAccelerator {
     #[must_use]
-    pub fn new(accelerator_engine_registry: AcceleratorEngineRegistry) -> Self {
+    pub fn new() -> Self {
         Self {
             // DuckDB accelerator uses params.duckdb_file for file connection
             duckdb_factory: DuckDBTableProviderFactory::new(AccessMode::ReadWrite)
                 .with_dialect(new_duckdb_dialect()),
-            accelerator_engine_registry,
         }
-    }
-
-    fn accelerator_engine_registry(&self) -> AcceleratorEngineRegistry {
-        self.accelerator_engine_registry.clone()
     }
 
     /// Returns the `DuckDB` file path that would be used for a file-based `DuckDB` accelerator from this dataset
@@ -136,8 +129,11 @@ impl DuckDBAccelerator {
 
         let pool = match (duckdb_file, acceleration.mode) {
             (Ok(duckdb_file), Mode::File) => {
-                let num_accelerating_datasets =
-                    self.get_num_accelerating_datasets(Some(duckdb_file.as_str()), dataset.app());
+                let num_accelerating_datasets = self.get_num_accelerating_datasets(
+                    Some(duckdb_file.as_str()),
+                    dataset.app(),
+                    dataset.runtime(),
+                );
                 let max_size = Self::get_max_size(num_accelerating_datasets);
                 let pool_builder = DuckDbConnectionPoolBuilder::file(&duckdb_file)
                     .with_max_size(Some(max_size))
@@ -150,7 +146,7 @@ impl DuckDBAccelerator {
             }
             (_, Mode::Memory) => {
                 let num_accelerating_datasets =
-                    self.get_num_accelerating_datasets(None, dataset.app());
+                    self.get_num_accelerating_datasets(None, dataset.app(), dataset.runtime());
                 let max_size = Self::get_max_size(num_accelerating_datasets);
                 let pool_builder = DuckDbConnectionPoolBuilder::memory()
                     .with_max_size(Some(max_size))
@@ -171,34 +167,42 @@ impl DuckDBAccelerator {
         Ok(pool)
     }
 
-    fn get_num_accelerating_datasets(&self, path: Option<&str>, app: Option<Arc<App>>) -> u32 {
+    fn get_num_accelerating_datasets(
+        &self,
+        path: Option<&str>,
+        app: Option<Arc<App>>,
+        rt: Option<Arc<Runtime>>,
+    ) -> u32 {
         let mut instance_usage: u32 = 1;
 
-        if let Some(this_app) = app {
-            let datasets = Runtime::get_valid_datasets(&this_app, crate::LogErrors(false));
-            for ds in datasets {
-                if let Some(acceleration) = &ds.acceleration {
-                    if acceleration.engine != Engine::DuckDB {
-                        continue;
-                    }
+        match (app, rt) {
+            (Some(this_app), Some(this_rt)) => {
+                let datasets = this_rt.get_valid_datasets(&this_app, crate::LogErrors(false));
+                for ds in datasets {
+                    if let Some(acceleration) = &ds.acceleration {
+                        if acceleration.engine != Engine::DuckDB {
+                            continue;
+                        }
 
-                    // If the path is Some, we're counting the number of file instances
-                    if let Some(this_file_path) = path {
-                        if acceleration.mode == Mode::File {
-                            if let Ok(file_path) = self.file_path(&ds) {
-                                if this_file_path == file_path {
-                                    instance_usage += 1;
+                        // If the path is Some, we're counting the number of file instances
+                        if let Some(this_file_path) = path {
+                            if acceleration.mode == Mode::File {
+                                if let Ok(file_path) = self.file_path(&ds) {
+                                    if this_file_path == file_path {
+                                        instance_usage += 1;
+                                    }
                                 }
                             }
-                        }
-                    } else {
-                        // If the path is None, we're just counting the number of memory instances
-                        if acceleration.mode == Mode::Memory {
-                            instance_usage += 1;
+                        } else {
+                            // If the path is None, we're just counting the number of memory instances
+                            if acceleration.mode == Mode::Memory {
+                                instance_usage += 1;
+                            }
                         }
                     }
                 }
             }
+            _ => {}
         }
 
         instance_usage
@@ -208,12 +212,6 @@ impl DuckDBAccelerator {
         max(DEFAULT_MIN_IDLE_CONNECTIONS, num_accelerating_datasets)
     }
 }
-
-// impl Default for DuckDBAccelerator {
-//     fn default() -> Self {
-//         Self::new()
-//     }
-// }
 
 const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("file"),
@@ -318,16 +316,13 @@ impl DataAccelerator for DuckDBAccelerator {
                     cmd.options.insert("open".to_string(), duckdb_file);
                 }
 
-                if let Some(app) = &this_dataset.app {
-                    let datasets = Runtime::get_initialized_datasets(
-                        self.accelerator_engine_registry(),
-                        app,
-                        crate::LogErrors(false),
-                    )
-                    .await;
-                    let self_path = self.file_path(this_dataset)?;
-                    let attach_databases =
-                        datasets
+                match (&this_dataset.app, &this_dataset.runtime) {
+                    (Some(app), Some(runtime)) => {
+                        let datasets = runtime
+                            .get_initialized_datasets(app, crate::LogErrors(false))
+                            .await;
+                        let self_path = self.file_path(this_dataset)?;
+                        let attach_databases = datasets
                             .iter()
                             .filter_map(|other_dataset| {
                                 if other_dataset.acceleration.as_ref().is_some_and(|a| {
@@ -345,10 +340,12 @@ impl DataAccelerator for DuckDBAccelerator {
                             })
                             .collect::<Vec<_>>();
 
-                    if !attach_databases.is_empty() {
-                        cmd.options
-                            .insert("attach_databases".to_string(), attach_databases.join(";"));
+                        if !attach_databases.is_empty() {
+                            cmd.options
+                                .insert("attach_databases".to_string(), attach_databases.join(";"));
+                        }
                     }
+                    _ => {}
                 }
             }
         }
@@ -445,7 +442,7 @@ mod tests {
             temporary: false,
         };
         let rt = RuntimeBuilder::new().build().await;
-        let duckdb_accelerator = DuckDBAccelerator::new(rt.accelerator_engine_registry());
+        let duckdb_accelerator = DuckDBAccelerator::new();
         let ctx = SessionContext::new();
         let table = duckdb_accelerator
             .create_external_table(&external_table, None)
@@ -629,7 +626,7 @@ mod tests {
         });
 
         let runtime = RuntimeBuilder::new().build().await;
-        let accelerator = DuckDBAccelerator::new(runtime.accelerator_engine_registry());
+        let accelerator = DuckDBAccelerator::new();
         assert!(!accelerator.is_initialized(&dataset));
 
         accelerator

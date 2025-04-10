@@ -108,20 +108,14 @@ impl AcceleratorEngineRegistry {
         self.register_accelerator_engine(Engine::Arrow, Arc::new(ArrowAccelerator::new()))
             .await;
         #[cfg(feature = "duckdb")]
-        self.register_accelerator_engine(
-            Engine::DuckDB,
-            Arc::new(DuckDBAccelerator::new(self.clone())),
-        )
-        .await;
+        self.register_accelerator_engine(Engine::DuckDB, Arc::new(DuckDBAccelerator::new()))
+            .await;
         #[cfg(feature = "postgres")]
         self.register_accelerator_engine(Engine::PostgreSQL, Arc::new(PostgresAccelerator::new()))
             .await;
         #[cfg(feature = "sqlite")]
-        self.register_accelerator_engine(
-            Engine::Sqlite,
-            Arc::new(SqliteAccelerator::new(self.clone())),
-        )
-        .await
+        self.register_accelerator_engine(Engine::Sqlite, Arc::new(SqliteAccelerator::new()))
+            .await
     }
 
     pub async fn unregister_all(&self) {
