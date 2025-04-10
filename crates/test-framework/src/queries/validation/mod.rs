@@ -137,7 +137,7 @@ fn datatype_equivalent(expected_type: DataType, actual_type: DataType) -> bool {
             | (DataType::Int32, DataType::Int64)
             | (
                 DataType::Int64,
-                DataType::Int32 | DataType::Float64 | DataType::Utf8
+                DataType::Int32 | DataType::Float64 | DataType::Utf8 | DataType::LargeUtf8
             )
             | (DataType::Utf8, DataType::LargeUtf8)
     )
