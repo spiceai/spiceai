@@ -26,8 +26,8 @@ use futures::StreamExt;
 use runtime::Runtime;
 use spicepod::{
     component::dataset::{
-        acceleration::{Acceleration, Mode},
         Dataset,
+        acceleration::{Acceleration, Mode},
     },
     param::Params as DatasetParams,
 };

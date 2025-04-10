@@ -36,7 +36,7 @@ use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::{Operator, TableProviderFilterPushDown};
 use datafusion::physical_plan::union::UnionExec;
-use datafusion::physical_plan::{collect, ExecutionPlan};
+use datafusion::physical_plan::{ExecutionPlan, collect};
 use datafusion::sql::TableReference;
 use datafusion::{
     datasource::{TableProvider, TableType},
@@ -47,17 +47,17 @@ use opentelemetry::KeyValue;
 use refresh::RefreshOverrides;
 use snafu::prelude::*;
 use synchronized_table::SynchronizedTable;
-use tokio::sync::{mpsc, oneshot, RwLock};
+use tokio::sync::{RwLock, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
-use tokio::sync::{mpsc, oneshot, RwLock};
+use tokio::sync::{RwLock, mpsc, oneshot};
 
 use crate::datafusion::filter_converter::TimestampFilterConvert;
+use crate::execution_plan::TableScanParams;
 use crate::execution_plan::fallback_on_zero_results::FallbackOnZeroResultsScanExec;
 use crate::execution_plan::schema_cast::SchemaCastScanExec;
 use crate::execution_plan::slice::SliceExec;
 use crate::execution_plan::tee::TeeExec;
-use crate::execution_plan::TableScanParams;
 
 pub mod federation;
 mod metrics;

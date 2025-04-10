@@ -22,8 +22,8 @@ use runtime::Runtime;
 use spicepod::{component::dataset::Dataset, param::Params};
 
 use crate::{
-    configure_test_datafusion, init_tracing, run_query_and_check_results,
-    utils::test_request_context, ValidateFn,
+    ValidateFn, configure_test_datafusion, init_tracing, run_query_and_check_results,
+    utils::test_request_context,
 };
 
 fn make_spiceai_dataset(path: &str, name: &str) -> Dataset {

@@ -21,8 +21,8 @@ use datafusion::assert_batches_eq;
 use futures::StreamExt;
 use std::collections::HashMap;
 
-use runtime::extension::ExtensionFactory;
 use runtime::Runtime;
+use runtime::extension::ExtensionFactory;
 use spice_cloud::SpiceExtensionFactory;
 use spicepod::component::catalog::Catalog;
 use std::sync::Arc;

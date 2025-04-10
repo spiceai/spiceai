@@ -35,18 +35,18 @@ use datafusion_table_providers::sql::arrow_sql_gen::statement::{
     CreateTableBuilder, InsertBuilder,
 };
 use futures::TryStreamExt;
-use mysql_async::{prelude::Queryable, Params, Row};
-use runtime::{spice_data_base_path, status, Runtime};
+use mysql_async::{Params, Row, prelude::Queryable};
+use runtime::{Runtime, spice_data_base_path, status};
 use spicepod::{
     component::dataset::{
-        acceleration::{Acceleration, IndexType, Mode},
         Dataset,
+        acceleration::{Acceleration, IndexType, Mode},
     },
     param::Params as SpicepodParams,
 };
 
 use tracing::instrument;
-use util::{fibonacci_backoff::FibonacciBackoffBuilder, retry, RetryError};
+use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
 
 #[cfg(feature = "duckdb")]
 mod duckdb;

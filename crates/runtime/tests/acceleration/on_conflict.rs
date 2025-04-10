@@ -27,8 +27,8 @@ use rand::Rng;
 use runtime::Runtime;
 use spicepod::{
     component::dataset::{
-        acceleration::{Acceleration, Mode, OnConflictBehavior, RefreshMode},
         Dataset,
+        acceleration::{Acceleration, Mode, OnConflictBehavior, RefreshMode},
     },
     param::Params,
 };

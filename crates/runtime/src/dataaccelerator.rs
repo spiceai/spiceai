@@ -14,13 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::Runtime;
 use crate::component::dataset::Dataset;
 use crate::component::dataset::acceleration::{self, Acceleration, Engine, IndexType, Mode};
 use crate::parameters::ParameterSpec;
 use crate::parameters::Parameters;
 use crate::secrets::{ExposeSecret, ParamStr, Secrets};
 use crate::spice_data_base_path;
-use crate::Runtime;
 use ::arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::common::Constraint;

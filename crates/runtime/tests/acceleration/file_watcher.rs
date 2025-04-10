@@ -21,8 +21,8 @@ use futures::TryStreamExt;
 use runtime::Runtime;
 use spicepod::{
     component::dataset::{
-        acceleration::{Acceleration, Mode, RefreshMode},
         Dataset,
+        acceleration::{Acceleration, Mode, RefreshMode},
     },
     param::Params,
 };

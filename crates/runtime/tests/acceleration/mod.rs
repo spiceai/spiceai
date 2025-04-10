@@ -15,8 +15,8 @@ limitations under the License.
 */
 
 use runtime::{
-    component::dataset::Dataset, dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint,
-    dataaccelerator::AcceleratorRegistry,
+    component::dataset::Dataset, dataaccelerator::AcceleratorRegistry,
+    dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint,
 };
 use spicepod::{component::dataset::acceleration::Mode, param::Params};
 use std::sync::{Arc, LazyLock};

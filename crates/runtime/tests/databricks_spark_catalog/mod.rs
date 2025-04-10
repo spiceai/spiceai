@@ -15,9 +15,8 @@ limitations under the License.
 */
 
 use crate::{
-    configure_test_datafusion, init_tracing, run_query_and_check_results,
+    ValidateFn, configure_test_datafusion, init_tracing, run_query_and_check_results,
     utils::{runtime_ready_check, test_request_context},
-    ValidateFn,
 };
 use app::AppBuilder;
 

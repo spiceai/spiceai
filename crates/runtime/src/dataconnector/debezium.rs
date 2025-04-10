@@ -16,8 +16,8 @@ limitations under the License.
 
 use crate::component::dataset::Dataset;
 use crate::component::dataset::acceleration::{Engine, RefreshMode};
-use crate::dataaccelerator::spice_sys::debezium_kafka::DebeziumKafkaSys;
 use crate::dataaccelerator::AcceleratorRegistry;
+use crate::dataaccelerator::spice_sys::debezium_kafka::DebeziumKafkaSys;
 use crate::dataconnector::ConnectorComponent;
 use crate::datafusion::refresh_sql;
 use crate::federated_table::FederatedTable;
@@ -310,20 +310,24 @@ impl DataConnector for Debezium {
 
         let topic = dataset.path();
 
-        let (kafka_consumer, metadata, schema) =
-            match get_metadata_from_accelerator(self.accelerator_registry(), dataset).await {
-                Some(metadata) => {
-                    let kafka_consumer = KafkaConsumer::create_with_existing_group_id(
-                        &metadata.consumer_group_id,
-                        self.kafka_config.clone(),
-                    )
-                    .boxed()
-                    .context(super::UnableToGetReadProviderSnafu {
-                        dataconnector: "debezium",
-                        connector_component: ConnectorComponent::from(dataset),
-                    })?;
+        let (kafka_consumer, metadata, schema) = match get_metadata_from_accelerator(
+            self.accelerator_registry(),
+            dataset,
+        )
+        .await
+        {
+            Some(metadata) => {
+                let kafka_consumer = KafkaConsumer::create_with_existing_group_id(
+                    &metadata.consumer_group_id,
+                    self.kafka_config.clone(),
+                )
+                .boxed()
+                .context(super::UnableToGetReadProviderSnafu {
+                    dataconnector: "debezium",
+                    connector_component: ConnectorComponent::from(dataset),
+                })?;
 
-                    ensure!(
+                ensure!(
                     topic == metadata.topic,
                     super::InvalidConfigurationNoSourceSnafu {
                         dataconnector: "debezium",
@@ -335,34 +339,34 @@ impl DataConnector for Debezium {
                     }
                 );
 
-                    let schema = debezium::arrow::convert_fields_to_arrow_schema(
-                        metadata.schema_fields.iter().collect(),
-                    )
-                    .boxed()
-                    .context(super::UnableToGetReadProviderSnafu {
+                let schema = debezium::arrow::convert_fields_to_arrow_schema(
+                    metadata.schema_fields.iter().collect(),
+                )
+                .boxed()
+                .context(super::UnableToGetReadProviderSnafu {
+                    dataconnector: "debezium",
+                    connector_component: ConnectorComponent::from(dataset),
+                })?;
+
+                kafka_consumer.subscribe(topic).boxed().context(
+                    super::UnableToGetReadProviderSnafu {
                         dataconnector: "debezium",
                         connector_component: ConnectorComponent::from(dataset),
-                    })?;
+                    },
+                )?;
 
-                    kafka_consumer.subscribe(topic).boxed().context(
-                        super::UnableToGetReadProviderSnafu {
-                            dataconnector: "debezium",
-                            connector_component: ConnectorComponent::from(dataset),
-                        },
-                    )?;
-
-                    (kafka_consumer, metadata, Arc::new(schema))
-                }
-                None => {
-                    get_metadata_from_kafka(
-                        self.accelerator_registry(),
-                        dataset,
-                        topic,
-                        self.kafka_config.clone(),
-                    )
-                    .await?
-                }
-            };
+                (kafka_consumer, metadata, Arc::new(schema))
+            }
+            None => {
+                get_metadata_from_kafka(
+                    self.accelerator_registry(),
+                    dataset,
+                    topic,
+                    self.kafka_config.clone(),
+                )
+                .await?
+            }
+        };
 
         let refresh_sql = dataset.refresh_sql();
         let refresh_schema = if let Some(refresh_sql) = &refresh_sql {

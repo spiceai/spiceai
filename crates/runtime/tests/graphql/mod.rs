@@ -23,14 +23,14 @@ use app::AppBuilder;
 use async_graphql::{EmptyMutation, EmptySubscription, SimpleObject};
 use async_graphql::{Object, Schema};
 use async_graphql_axum::{GraphQLRequest, GraphQLResponse};
-use axum::{routing::post, Extension, Router};
+use axum::{Extension, Router, routing::post};
 
 use runtime::Runtime;
 use spicepod::{component::dataset::Dataset, param::Params as DatasetParams};
 use tokio::net::TcpListener;
 
 use crate::utils::test_request_context;
-use crate::{configure_test_datafusion, init_tracing, run_query_and_check_results, ValidateFn};
+use crate::{ValidateFn, configure_test_datafusion, init_tracing, run_query_and_check_results};
 
 type ServiceSchema = Schema<QueryRoot, EmptyMutation, EmptySubscription>;
 

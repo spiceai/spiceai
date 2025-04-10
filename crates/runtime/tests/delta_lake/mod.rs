@@ -14,15 +14,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::RecordBatch;
 use crate::configure_test_datafusion;
 use crate::utils::test_request_context;
-use crate::RecordBatch;
 use app::AppBuilder;
 use arrow::util::pretty::pretty_format_batches;
 use datafusion::assert_batches_eq;
 use futures::TryStreamExt;
 use runtime::Runtime;
-use spicepod::component::dataset::{acceleration::Acceleration, Dataset};
+use spicepod::component::dataset::{Dataset, acceleration::Acceleration};
 use std::{fs::File, io::Write, sync::Arc};
 
 pub fn make_delta_lake_dataset(path: &str, name: &str, accelerated: bool) -> Dataset {

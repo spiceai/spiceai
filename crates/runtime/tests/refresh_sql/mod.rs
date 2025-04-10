@@ -22,10 +22,10 @@ use std::{sync::Arc, time::Duration};
 use app::AppBuilder;
 
 use runtime::{
-    accelerated_table::refresh::RefreshOverrides, component::dataset::acceleration::RefreshMode,
-    Runtime,
+    Runtime, accelerated_table::refresh::RefreshOverrides,
+    component::dataset::acceleration::RefreshMode,
 };
-use spicepod::component::dataset::{acceleration::Acceleration, Dataset};
+use spicepod::component::dataset::{Dataset, acceleration::Acceleration};
 
 use crate::{
     configure_test_datafusion, init_tracing,

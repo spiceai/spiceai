@@ -30,22 +30,22 @@ use crate::{
 };
 
 use ::datafusion::error::DataFusionError;
-use ::datafusion::sql::{sqlparser, TableReference};
+use ::datafusion::sql::{TableReference, sqlparser};
 use app::App;
 use builder::RuntimeBuilder;
-use cancellable_task::{spawn_cancellable_task, CancellableTaskHandle};
+use cancellable_task::{CancellableTaskHandle, spawn_cancellable_task};
 use config::Config;
 use dataconnector::ConnectorComponent;
 use datasets_health_monitor::DatasetsHealthMonitor;
 use extension::ExtensionFactory;
 use flight::RateLimits;
-use futures::future::{join_all, try_join_all};
 use futures::Stream;
+use futures::future::{join_all, try_join_all};
 #[cfg(feature = "openapi")]
 pub use http::get_api_doc;
 use model::{EmbeddingModelStore, EvalScorerRegistry, LLMModelStore};
 
-use crate::tools::{with_name, SpiceModelTool};
+use crate::tools::{SpiceModelTool, with_name};
 use model_components::model::Model;
 pub use notify::Error as NotifyError;
 use secrecy::SecretString;
@@ -55,10 +55,10 @@ use spicepod::component::eval::Eval;
 use status::ComponentStatus;
 use tls::TlsConfig;
 
-use tokio::sync::{oneshot::error::RecvError, RwLock};
+use tokio::sync::{RwLock, oneshot::error::RecvError};
 use tokio_util::sync::CancellationToken;
 use tools::factory::default_available_catalogs;
-use tools::{catalog::SpiceToolCatalog, Tooling};
+use tools::{Tooling, catalog::SpiceToolCatalog};
 pub use util::shutdown_signal;
 
 use crate::extension::Extension;

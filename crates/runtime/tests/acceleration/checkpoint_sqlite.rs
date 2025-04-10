@@ -17,14 +17,14 @@ limitations under the License.
 use crate::acceleration::wait_for_checkpoints;
 use app::AppBuilder;
 use arrow::array::RecordBatch;
-use datafusion_table_providers::sql::db_connection_pool::sqlitepool::SqliteConnectionPool;
 use datafusion_table_providers::sql::db_connection_pool::DbConnectionPool;
 use datafusion_table_providers::sql::db_connection_pool::JoinPushDown;
+use datafusion_table_providers::sql::db_connection_pool::sqlitepool::SqliteConnectionPool;
 use futures::TryStreamExt;
-use runtime::{component::dataset::Dataset as RuntimeDataset, status, Runtime};
+use runtime::{Runtime, component::dataset::Dataset as RuntimeDataset, status};
+use spicepod::component::dataset::Dataset;
 use spicepod::component::dataset::acceleration::Mode;
 use spicepod::component::dataset::acceleration::{Acceleration, RefreshMode};
-use spicepod::component::dataset::Dataset;
 use std::sync::Arc;
 
 use crate::acceleration::get_params;
