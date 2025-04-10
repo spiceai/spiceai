@@ -61,6 +61,11 @@ on:
         options:
           - 'always'
           - 'no'
+      validate_results:
+        description: 'Validate the results?'
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   run-bench:
@@ -128,7 +133,8 @@ jobs:
             -d /opt/spiced/data \
             --query-set ${{ github.event.inputs.query_set }} \
             --ready-wait ${{ github.event.inputs.ready_wait }} \
-            --disable-progress-bars
+            --disable-progress-bars \
+            --validate=${{ github.event.inputs.validate_results }}
         env:
           S3_ENDPOINT: ${{ secrets.MINIO_ENDPOINT}}
           S3_KEY: ${{ secrets.MINIO_ACCESS_KEY}}
@@ -168,7 +174,15 @@ jobs:
         if: ${{ github.event.inputs.query_overrides != '' }}
         run: |
           rm -rf .spice/data
-          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" testoperator run bench -s /usr/local/bin/spiced -p ${{ github.event.inputs.spicepod_path }} -d /opt/spiced/data --query-set ${{ github.event.inputs.query_set }} --query-overrides ${{ github.event.inputs.query_overrides }} --ready-wait ${{ github.event.inputs.ready_wait }} --disable-progress-bars
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" testoperator run bench \
+            -s /usr/local/bin/spiced \
+            -p ${{ github.event.inputs.spicepod_path }} \
+            -d /opt/spiced/data \
+            --query-set ${{ github.event.inputs.query_set }} \
+            --query-overrides ${{ github.event.inputs.query_overrides }} \
+            --ready-wait ${{ github.event.inputs.ready_wait }} \
+            --disable-progress-bars \
+            --validate=${{ github.event.inputs.validate_results }}
         env:
           S3_ENDPOINT: ${{ secrets.MINIO_ENDPOINT}}
           S3_KEY: ${{ secrets.MINIO_ACCESS_KEY}}
