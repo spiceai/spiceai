@@ -375,7 +375,6 @@ mod tests {
             temporary: false,
         };
         let ctx = SessionContext::new();
-        let runtime = RuntimeBuilder::new().build().await;
         let table = SqliteAccelerator::new()
             .create_external_table(&external_table, None)
             .await
@@ -464,7 +463,6 @@ mod tests {
             ..Default::default()
         });
 
-        let runtime = RuntimeBuilder::new().build().await;
         let accelerator = SqliteAccelerator::new();
         assert!(!accelerator.is_initialized(&dataset));
 

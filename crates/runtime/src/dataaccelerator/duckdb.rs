@@ -441,7 +441,6 @@ mod tests {
             column_defaults: HashMap::default(),
             temporary: false,
         };
-        let rt = RuntimeBuilder::new().build().await;
         let duckdb_accelerator = DuckDBAccelerator::new();
         let ctx = SessionContext::new();
         let table = duckdb_accelerator
@@ -625,7 +624,6 @@ mod tests {
             ..Default::default()
         });
 
-        let runtime = RuntimeBuilder::new().build().await;
         let accelerator = DuckDBAccelerator::new();
         assert!(!accelerator.is_initialized(&dataset));
 

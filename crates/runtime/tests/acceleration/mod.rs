@@ -53,16 +53,14 @@ fn get_params(mode: &Mode, file: Option<String>, engine: &str) -> Option<Params>
 }
 
 async fn wait_for_checkpoints(
-    accelerator_engine_registry: AcceleratorEngineRegistry,
     datasets: &Vec<Dataset>,
     timeout_secs: u64,
 ) -> Result<(), anyhow::Error> {
     let mut checkpoint_futures = Vec::new();
 
     for dataset in datasets {
-        let value = Arc::clone(&accelerator_engine_registry);
         let check_future = async move {
-            match DatasetCheckpoint::try_new(Arc::clone(&value), dataset).await {
+            match DatasetCheckpoint::try_new(dataset).await {
                 Ok(checkpoint) => {
                     while !checkpoint.exists().await {
                         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
