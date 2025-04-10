@@ -47,7 +47,7 @@ async fn databricks_delta_lake_integration_test_catalog() -> Result<(), anyhow::
             let mut rt =
                 Runtime::builder()
                     .with_app(app)
-                    .with_datafusion_options(Box::new(configure_test_datafusion))
+                    .with_datafusion_configuration(Box::new(configure_test_datafusion))
                     .build()
                     .await;
 

@@ -76,7 +76,7 @@ async fn s3_federation() -> Result<(), anyhow::Error> {
 
             let rt = Runtime::builder()
                 .with_app(app)
-                .with_datafusion_options(Box::new(configure_test_datafusion))
+                .with_datafusion_configuration(Box::new(configure_test_datafusion))
                 .build()
                 .await;
 
@@ -146,7 +146,7 @@ async fn s3_pdfs() -> Result<(), anyhow::Error> {
 
             let rt = Runtime::builder()
                 .with_app(app)
-                .with_datafusion_options(Box::new(configure_test_datafusion))
+                .with_datafusion_configuration(Box::new(configure_test_datafusion))
                 .build()
                 .await;
 
@@ -192,7 +192,7 @@ async fn s3_hive_partitioning() -> Result<(), anyhow::Error> {
 
             let rt = Runtime::builder()
                 .with_app(app)
-                .with_datafusion_options(Box::new(configure_test_datafusion))
+                .with_datafusion_configuration(Box::new(configure_test_datafusion))
                 .build()
                 .await;
 
@@ -258,7 +258,7 @@ async fn s3_schema_evolution() -> Result<(), anyhow::Error> {
 
             let rt = Runtime::builder()
                 .with_app(app)
-                .with_datafusion_options(Box::new(configure_test_datafusion))
+                .with_datafusion_configuration(Box::new(configure_test_datafusion))
                 .build()
                 .await;
 
@@ -311,7 +311,7 @@ async fn s3_bulk_bucket_schema() -> Result<(), anyhow::Error> {
 
             let rt = Runtime::builder()
                 .with_app(app)
-                .with_datafusion_options(Box::new(configure_test_datafusion))
+                .with_datafusion_configuration(Box::new(configure_test_datafusion))
                 .build()
                 .await;
 
@@ -408,7 +408,7 @@ async fn s3_schema_source_path() -> Result<(), anyhow::Error> {
             let rt =
             Runtime::builder()
                 .with_app(app)
-                .with_datafusion_options(Box::new(configure_test_datafusion))
+                .with_datafusion_configuration(Box::new(configure_test_datafusion))
                 .build()
                 .await;
 

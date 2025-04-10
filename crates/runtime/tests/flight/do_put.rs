@@ -418,7 +418,7 @@ async fn start_spice_test_app(
 
     let mut rt_builder = Runtime::builder()
         .with_metrics_server(SocketAddr::new(LOCALHOST, metrics_port), registry)
-        .with_datafusion_options(Box::new(configure_test_datafusion));
+        .with_datafusion_configuration(Box::new(configure_test_datafusion));
 
     if let Some(rate_limits) = rate_limits {
         rt_builder = rt_builder.with_rate_limits(rate_limits);

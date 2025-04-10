@@ -194,7 +194,7 @@ INSERT INTO event_logs (event_name, event_timestamp) VALUES
             let rt = Arc::new(
                 Runtime::builder()
                     .with_app(app)
-                    .with_datafusion_options(Box::new(configure_test_datafusion))
+                    .with_datafusion_configuration(Box::new(configure_test_datafusion))
                     .build()
                     .await,
             );

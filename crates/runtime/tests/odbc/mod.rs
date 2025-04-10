@@ -82,7 +82,7 @@ async fn databricks_odbc() -> Result<(), String> {
             let rt = Arc::new(
                 Runtime::builder()
                     .with_app(app)
-                    .with_datafusion_options(Box::new(configure_test_datafusion))
+                    .with_datafusion_configuration(Box::new(configure_test_datafusion))
                     .build()
                     .await,
             );
@@ -144,7 +144,7 @@ async fn databricks_odbc_with_acceleration() -> Result<(), String> {
                 let rt = Arc::new(
                     Runtime::builder()
                         .with_app(app)
-                        .with_datafusion_options(Box::new(configure_test_datafusion))
+                        .with_datafusion_configuration(Box::new(configure_test_datafusion))
                         .build()
                         .await,
                 );

@@ -54,7 +54,7 @@ async fn file_connector_datatypes() -> Result<(), anyhow::Error> {
 
             let mut rt = Runtime::builder()
                 .with_app(app)
-                .with_datafusion_options(Box::new(configure_test_datafusion))
+                .with_datafusion_configuration(Box::new(configure_test_datafusion))
                 .build()
                 .await;
 

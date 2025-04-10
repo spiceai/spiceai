@@ -46,7 +46,7 @@ async fn spiceai_integration_test_catalog() -> Result<(), anyhow::Error> {
             let rt = Arc::new(
                 Runtime::builder()
                     .with_app(app)
-                    .with_datafusion_options(Box::new(configure_test_datafusion))
+                    .with_datafusion_configuration(Box::new(configure_test_datafusion))
                     .build()
                     .await,
             );
@@ -98,7 +98,7 @@ async fn spiceai_integration_test_catalog_include() -> Result<(), anyhow::Error>
             let rt = Arc::new(
                 Runtime::builder()
                     .with_app(app)
-                    .with_datafusion_options(Box::new(configure_test_datafusion))
+                    .with_datafusion_configuration(Box::new(configure_test_datafusion))
                     .with_autoload_extensions(HashMap::from([(
                         "spice_cloud".to_string(),
                         Box::new(SpiceExtensionFactory::default()) as Box<dyn ExtensionFactory>,

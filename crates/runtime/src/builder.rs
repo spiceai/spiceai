@@ -17,7 +17,6 @@ limitations under the License.
 use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 
 use app::App;
-use datafusion::config::ConfigOptions;
 use tokio::sync::RwLock;
 
 use crate::{
@@ -46,7 +45,7 @@ pub struct RuntimeBuilder {
     runtime_status: Option<Arc<status::RuntimeStatus>>,
     rate_limits: Option<Arc<RateLimits>>,
     accelerator_registry: AcceleratorRegistry,
-    datafusion_options: Option<Box<dyn FnOnce(&mut ConfigOptions)>>,
+    datafusion_configuration: Option<Box<dyn FnOnce(&mut DataFusion)>>,
 }
 
 impl RuntimeBuilder {
@@ -62,7 +61,7 @@ impl RuntimeBuilder {
             runtime_status: None,
             rate_limits: None,
             accelerator_registry: create_accelerator_registry(),
-            datafusion_options: None,
+            datafusion_configuration: None,
         }
     }
 
@@ -125,11 +124,11 @@ impl RuntimeBuilder {
     }
 
     /// Used to set DataFusion partition
-    pub fn with_datafusion_options(
+    pub fn with_datafusion_configuration(
         mut self,
-        callback: Box<dyn FnOnce(&mut ConfigOptions)>,
+        callback: Box<dyn FnOnce(&mut DataFusion)>,
     ) -> Self {
-        self.datafusion_options = Some(callback);
+        self.datafusion_configuration = Some(callback);
         self
     }
 
@@ -156,13 +155,14 @@ impl RuntimeBuilder {
             None => status::RuntimeStatus::new(),
         };
 
-        let df = Arc::new(
-            DataFusion::builder(Arc::clone(&status), Arc::clone(&accelerator_registry)).build(),
-        );
+        let mut df =
+            DataFusion::builder(Arc::clone(&status), Arc::clone(&accelerator_registry)).build();
 
-        if let Some(callback) = self.datafusion_options {
-            callback(&mut df.ctx.state().config_mut().options_mut());
+        if let Some(callback) = self.datafusion_configuration {
+            callback(&mut df);
         }
+
+        let df = Arc::new(df);
 
         let datasets_health_monitor = if self.datasets_health_monitor_enabled {
             let is_task_history_enabled = self

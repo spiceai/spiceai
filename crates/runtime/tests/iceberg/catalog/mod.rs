@@ -56,7 +56,7 @@ async fn glue_iceberg_integration_test_catalog() -> Result<(), anyhow::Error> {
             let rt =
                 Runtime::builder()
                     .with_app(app)
-                    .with_datafusion_options(Box::new(configure_test_datafusion))
+                    .with_datafusion_configuration(Box::new(configure_test_datafusion))
                     .build()
                     .await;
 

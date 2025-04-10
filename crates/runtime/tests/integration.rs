@@ -17,6 +17,7 @@ limitations under the License.
 #![allow(clippy::large_futures)]
 
 use arrow::{array::RecordBatch, util::display::FormatOptions};
+use datafusion::execution::context::SessionContext;
 use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use futures::TryStreamExt;
 
@@ -97,8 +98,17 @@ mod rehydration;
 //     Arc::new(df)
 // }
 
-fn configure_test_datafusion(config: &mut datafusion::config::ConfigOptions) {
-    config.execution.target_partitions = 3;
+fn configure_test_datafusion(df: &mut runtime::datafusion::DataFusion) {
+    let mut new_state = df.ctx.state();
+    new_state
+        .config_mut()
+        .options_mut()
+        .execution
+        .target_partitions = 3;
+    let new_ctx = SessionContext::new_with_state(new_state);
+
+    // Replace the old context with the modified one
+    df.ctx = new_ctx.into();
 }
 
 fn init_tracing(default_level: Option<&str>) -> DefaultGuard {

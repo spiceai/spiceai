@@ -252,7 +252,7 @@ async fn test_graphql() -> Result<(), String> {
 
             let mut rt = Runtime::builder()
                 .with_app(app)
-                .with_datafusion_options(Box::new(configure_test_datafusion))
+                .with_datafusion_configuration(Box::new(configure_test_datafusion))
                 .build()
                 .await;
 
@@ -330,7 +330,7 @@ async fn test_graphql_pagination() -> Result<(), String> {
         let mut rt =
             Runtime::builder()
                 .with_app(app)
-                .with_datafusion_options(Box::new(configure_test_datafusion))
+                .with_datafusion_configuration(Box::new(configure_test_datafusion))
                 .build()
                 .await
         ;

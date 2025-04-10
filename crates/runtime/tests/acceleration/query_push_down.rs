@@ -129,7 +129,7 @@ async fn acceleration_with_and_without_federation() -> Result<(), anyhow::Error>
             let rt =
                 Runtime::builder()
                     .with_app(app)
-                    .with_datafusion_options(Box::new(configure_test_datafusion))
+                    .with_datafusion_configuration(Box::new(configure_test_datafusion))
                     .build()
                     .await
             ;

@@ -19,8 +19,8 @@ use std::sync::Arc;
 use app::AppBuilder;
 
 use crate::{
-    configure_test_datafusion, init_tracing, run_query_and_check_results, utils::test_request_context,
-    ValidateFn,
+    configure_test_datafusion, init_tracing, run_query_and_check_results,
+    utils::test_request_context, ValidateFn,
 };
 
 use runtime::{status, Runtime};
@@ -84,7 +84,7 @@ async fn snowflake_integration_test() -> Result<(), anyhow::Error> {
             let rt = Arc::new(
                 Runtime::builder()
                     .with_app(app)
-                    .with_datafusion_options(Box::new(configure_test_datafusion))
+                    .with_datafusion_configuration(Box::new(configure_test_datafusion))
                     .build()
                     .await,
             );

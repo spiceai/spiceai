@@ -88,7 +88,7 @@ async fn duckdb_from_functions() -> Result<(), String> {
 
             let rt = Runtime::builder()
                 .with_app(app)
-                .with_datafusion_options(Box::new(configure_test_datafusion))
+                .with_datafusion_configuration(Box::new(configure_test_datafusion))
                 .build()
                 .await;
             let cloned_rt = Arc::new(rt.clone());

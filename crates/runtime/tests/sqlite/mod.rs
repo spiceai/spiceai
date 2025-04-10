@@ -132,7 +132,7 @@ async fn test_sqlite_decimal_memory() -> anyhow::Result<()> {
 
             let mut rt = Runtime::builder()
                 .with_app(app)
-                .with_datafusion_options(Box::new(configure_test_datafusion))
+                .with_datafusion_configuration(Box::new(configure_test_datafusion))
                 .build()
                 .await;
 
@@ -192,7 +192,7 @@ async fn test_sqlite_decimal_file() -> anyhow::Result<()> {
 
             let mut rt = Runtime::builder()
                 .with_app(app)
-                .with_datafusion_options(Box::new(configure_test_datafusion))
+                .with_datafusion_configuration(Box::new(configure_test_datafusion))
                 .build()
                 .await;
 
