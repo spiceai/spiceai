@@ -34,6 +34,8 @@ use crate::{
     tools, tracers,
 };
 
+type DatafusionConfigurationCallback = Box<dyn FnOnce(&mut DataFusion)>;
+
 pub struct RuntimeBuilder {
     app: Option<Arc<app::App>>,
     autoload_extensions: HashMap<String, Box<dyn ExtensionFactory>>,
@@ -45,7 +47,7 @@ pub struct RuntimeBuilder {
     runtime_status: Option<Arc<status::RuntimeStatus>>,
     rate_limits: Option<Arc<RateLimits>>,
     accelerator_engine_registry: AcceleratorEngineRegistry,
-    datafusion_configuration: Option<Box<dyn FnOnce(&mut DataFusion)>>,
+    datafusion_configuration: Option<DatafusionConfigurationCallback>,
 }
 
 impl RuntimeBuilder {
@@ -119,10 +121,10 @@ impl RuntimeBuilder {
         self
     }
 
-    /// Used to set DataFusion partition
+    /// Used to configure `DataFusion` in integration tests & test CI
     pub fn with_datafusion_configuration(
         mut self,
-        callback: Box<dyn FnOnce(&mut DataFusion)>,
+        callback: DatafusionConfigurationCallback,
     ) -> Self {
         self.datafusion_configuration = Some(callback);
         self

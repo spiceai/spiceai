@@ -80,6 +80,7 @@ pub struct AcceleratorEngineRegistry {
 }
 
 impl AcceleratorEngineRegistry {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             accelerator_engine_registry: Arc::new(Mutex::new(HashMap::new())),
@@ -115,7 +116,7 @@ impl AcceleratorEngineRegistry {
             .await;
         #[cfg(feature = "sqlite")]
         self.register_accelerator_engine(Engine::Sqlite, Arc::new(SqliteAccelerator::new()))
-            .await
+            .await;
     }
 
     pub async fn unregister_all(&self) {

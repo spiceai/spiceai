@@ -175,34 +175,31 @@ impl DuckDBAccelerator {
     ) -> u32 {
         let mut instance_usage: u32 = 1;
 
-        match (app, rt) {
-            (Some(this_app), Some(this_rt)) => {
-                let datasets = this_rt.get_valid_datasets(&this_app, crate::LogErrors(false));
-                for ds in datasets {
-                    if let Some(acceleration) = &ds.acceleration {
-                        if acceleration.engine != Engine::DuckDB {
-                            continue;
-                        }
+        if let (Some(this_app), Some(this_rt)) = (app, rt) {
+            let datasets = this_rt.get_valid_datasets(&this_app, crate::LogErrors(false));
+            for ds in datasets {
+                if let Some(acceleration) = &ds.acceleration {
+                    if acceleration.engine != Engine::DuckDB {
+                        continue;
+                    }
 
-                        // If the path is Some, we're counting the number of file instances
-                        if let Some(this_file_path) = path {
-                            if acceleration.mode == Mode::File {
-                                if let Ok(file_path) = self.file_path(&ds) {
-                                    if this_file_path == file_path {
-                                        instance_usage += 1;
-                                    }
+                    // If the path is Some, we're counting the number of file instances
+                    if let Some(this_file_path) = path {
+                        if acceleration.mode == Mode::File {
+                            if let Ok(file_path) = self.file_path(&ds) {
+                                if this_file_path == file_path {
+                                    instance_usage += 1;
                                 }
                             }
-                        } else {
-                            // If the path is None, we're just counting the number of memory instances
-                            if acceleration.mode == Mode::Memory {
-                                instance_usage += 1;
-                            }
+                        }
+                    } else {
+                        // If the path is None, we're just counting the number of memory instances
+                        if acceleration.mode == Mode::Memory {
+                            instance_usage += 1;
                         }
                     }
                 }
             }
-            _ => {}
         }
 
         instance_usage
@@ -210,6 +207,12 @@ impl DuckDBAccelerator {
 
     fn get_max_size(num_accelerating_datasets: u32) -> u32 {
         max(DEFAULT_MIN_IDLE_CONNECTIONS, num_accelerating_datasets)
+    }
+}
+
+impl Default for DuckDBAccelerator {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -316,13 +319,13 @@ impl DataAccelerator for DuckDBAccelerator {
                     cmd.options.insert("open".to_string(), duckdb_file);
                 }
 
-                match (&this_dataset.app, &this_dataset.runtime) {
-                    (Some(app), Some(runtime)) => {
-                        let datasets = runtime
-                            .get_initialized_datasets(app, crate::LogErrors(false))
-                            .await;
-                        let self_path = self.file_path(this_dataset)?;
-                        let attach_databases = datasets
+                if let (Some(app), Some(runtime)) = (&this_dataset.app, &this_dataset.runtime) {
+                    let datasets = runtime
+                        .get_initialized_datasets(app, crate::LogErrors(false))
+                        .await;
+                    let self_path = self.file_path(this_dataset)?;
+                    let attach_databases =
+                        datasets
                             .iter()
                             .filter_map(|other_dataset| {
                                 if other_dataset.acceleration.as_ref().is_some_and(|a| {
@@ -340,12 +343,10 @@ impl DataAccelerator for DuckDBAccelerator {
                             })
                             .collect::<Vec<_>>();
 
-                        if !attach_databases.is_empty() {
-                            cmd.options
-                                .insert("attach_databases".to_string(), attach_databases.join(";"));
-                        }
+                    if !attach_databases.is_empty() {
+                        cmd.options
+                            .insert("attach_databases".to_string(), attach_databases.join(";"));
                     }
-                    _ => {}
                 }
             }
         }
@@ -400,9 +401,9 @@ mod tests {
     use datafusion_table_providers::util::test::MockExec;
 
     use crate::component::dataset::Dataset;
+    use crate::component::dataset::acceleration::Acceleration;
     use crate::component::dataset::acceleration::{Engine, Mode};
     use crate::dataaccelerator::{DataAccelerator, duckdb::DuckDBAccelerator};
-    use crate::{builder::RuntimeBuilder, component::dataset::acceleration::Acceleration};
 
     #[tokio::test]
     #[allow(clippy::too_many_lines)]

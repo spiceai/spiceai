@@ -56,11 +56,8 @@ async fn acceleration_connection(
     dataset: &Dataset,
     create_table_if_not_exists: bool,
 ) -> Result<AccelerationConnection> {
-    let runtime = match dataset.runtime() {
-        Some(rt) => rt,
-        None => {
-            return Err("Missing runtime reference for dataset".into());
-        }
+    let Some(runtime) = dataset.runtime() else {
+        return Err("Missing runtime reference for dataset".into());
     };
 
     let acceleration = dataset

@@ -36,7 +36,7 @@ use datafusion_table_providers::sql::arrow_sql_gen::statement::{
 };
 use futures::TryStreamExt;
 use mysql_async::{Params, Row, prelude::Queryable};
-use runtime::{Runtime, spice_data_base_path, status};
+use runtime::{Runtime, spice_data_base_path};
 use spicepod::{
     component::dataset::{
         Dataset,

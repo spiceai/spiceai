@@ -23,7 +23,7 @@ use crate::{
     utils::test_request_context,
 };
 
-use runtime::{Runtime, status};
+use runtime::Runtime;
 use spicepod::{component::dataset::Dataset, param::Params};
 
 fn make_dataset(path: &str, name: &str) -> Dataset {
@@ -81,13 +81,12 @@ async fn snowflake_integration_test() -> Result<(), anyhow::Error> {
                 ))
                 .build();
 
-            let rt = Arc::new(
+            let mut rt =
                 Runtime::builder()
                     .with_app(app)
                     .with_datafusion_configuration(Box::new(configure_test_datafusion))
                     .build()
-                    .await,
-            );
+                    .await;
 
             let cloned_rt = Arc::new(rt.clone());
 

@@ -86,6 +86,12 @@ pub struct SqliteAccelerator {
     sqlite_factory: SqliteTableProviderFactory,
 }
 
+impl Default for SqliteAccelerator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SqliteAccelerator {
     #[must_use]
     pub fn new() -> Self {
@@ -262,13 +268,13 @@ impl DataAccelerator for SqliteAccelerator {
                     cmd.options.insert("file".to_string(), sqlite_file);
                 }
 
-                match (&this_dataset.app, &this_dataset.runtime) {
-                    (Some(app), Some(runtime)) => {
-                        let datasets = runtime
-                            .get_initialized_datasets(app, crate::LogErrors(false))
-                            .await;
-                        let self_path = self.file_path(this_dataset)?;
-                        let attach_databases = datasets
+                if let (Some(app), Some(runtime)) = (&this_dataset.app, &this_dataset.runtime) {
+                    let datasets = runtime
+                        .get_initialized_datasets(app, crate::LogErrors(false))
+                        .await;
+                    let self_path = self.file_path(this_dataset)?;
+                    let attach_databases =
+                        datasets
                             .iter()
                             .filter_map(|other_dataset| {
                                 if other_dataset.acceleration.as_ref().is_some_and(|a| {
@@ -286,12 +292,10 @@ impl DataAccelerator for SqliteAccelerator {
                             })
                             .collect::<Vec<_>>();
 
-                        if !attach_databases.is_empty() {
-                            cmd.options
-                                .insert("attach_databases".to_string(), attach_databases.join(";"));
-                        }
+                    if !attach_databases.is_empty() {
+                        cmd.options
+                            .insert("attach_databases".to_string(), attach_databases.join(";"));
                     }
-                    _ => {}
                 }
             }
         }
@@ -331,7 +335,7 @@ impl DataAccelerator for SqliteAccelerator {
 mod tests {
     use std::{collections::HashMap, sync::Arc};
 
-    use crate::{builder::RuntimeBuilder, dataaccelerator::DataAccelerator};
+    use crate::dataaccelerator::DataAccelerator;
     use arrow::{
         array::{Int64Array, RecordBatch, StringArray, UInt64Array},
         datatypes::{DataType, Schema},

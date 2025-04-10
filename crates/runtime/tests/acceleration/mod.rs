@@ -15,11 +15,10 @@ limitations under the License.
 */
 
 use runtime::{
-    component::dataset::Dataset, dataaccelerator::AcceleratorEngineRegistry,
-    dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint,
+    component::dataset::Dataset, dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint,
 };
 use spicepod::{component::dataset::acceleration::Mode, param::Params};
-use std::sync::{Arc, LazyLock};
+use std::sync::LazyLock;
 use tokio::sync::Mutex;
 
 #[cfg(feature = "duckdb")]

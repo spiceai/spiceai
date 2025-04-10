@@ -877,38 +877,7 @@ impl Runtime {
 
 impl std::fmt::Debug for Runtime {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Runtime")
-            .field("status", &self.status)
-            .field("datasets_count", &{
-                match self.app.try_read() {
-                    Ok(app) => app.as_ref().map_or(0, |a| a.datasets.len()),
-                    _ => 0,
-                }
-            })
-            .field("models_count", &{
-                match self.models.try_read() {
-                    Ok(models) => models.len(),
-                    _ => 0,
-                }
-            })
-            .field("tools_count", &{
-                match self.tools.try_read() {
-                    Ok(tools) => tools.len(),
-                    _ => 0,
-                }
-            })
-            .field("extensions_count", &{
-                match self.extensions.try_read() {
-                    Ok(extensions) => extensions.len(),
-                    _ => 0,
-                }
-            })
-            .field(
-                "accelerator_registry",
-                &format!("<AcceleratorEngineRegistry>"),
-            )
-            .field("datafusion", &format!("<DataFusion>"))
-            .finish()
+        f.debug_struct("Runtime").finish_non_exhaustive()
     }
 }
 

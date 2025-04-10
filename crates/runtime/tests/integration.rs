@@ -75,9 +75,9 @@ mod utils;
 #[cfg(feature = "mysql")]
 mod rehydration;
 
-/// Gets a test `DataFusion` to make test results reproducible across all machines.
-///
-/// 1) Sets the number of `target_partitions` to 3, by default its the number of CPU cores available.
+// /// Gets a test `DataFusion` to make test results reproducible across all machines.
+// ///
+// /// 1) Sets the number of `target_partitions` to 3, by default its the number of CPU cores available.
 // fn get_test_datafusion(
 //     status: Arc<status::RuntimeStatus>,
 //     accelerator_engine_registry: AcceleratorEngineRegistry,
