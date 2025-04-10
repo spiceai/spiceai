@@ -263,6 +263,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn test_get_plan_or_cached_cache_miss_and_hit() {
         let results_cache_config = ResultsCache {
             enabled: true,
