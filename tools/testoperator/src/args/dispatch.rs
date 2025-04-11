@@ -101,7 +101,7 @@ pub struct BenchArgs {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub update_snapshots: Option<UpdateSnapshots>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub validate: Option<bool>,
+    pub validate_results: Option<bool>,
 }
 
 impl BenchArgs {
@@ -113,7 +113,7 @@ impl BenchArgs {
 
     #[must_use]
     pub fn with_validate(mut self, validate: bool) -> Self {
-        self.validate = Some(validate);
+        self.validate_results = Some(validate);
         self
     }
 }
