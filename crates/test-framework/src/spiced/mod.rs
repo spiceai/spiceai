@@ -135,7 +135,10 @@ impl SpicedInstance {
             .output()?;
 
         if !version_cmd.status.success() {
-            anyhow::bail!("Failed to get spiced version");
+            anyhow::bail!(
+                "Failed to get spiced version: {}",
+                String::from_utf8_lossy(&version_cmd.stderr)
+            );
         }
 
         let version = String::from_utf8_lossy(&version_cmd.stdout).to_string();
