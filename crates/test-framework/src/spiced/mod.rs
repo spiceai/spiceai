@@ -139,6 +139,12 @@ impl SpicedInstance {
         }
 
         let version = String::from_utf8_lossy(&version_cmd.stdout).to_string();
+        // take just the v1.0.0 part of the version
+        let version = match (version.contains('-'), version.contains('+')) {
+            (true, _) => version.split('-').next().unwrap_or(&version).to_string(),
+            (false, true) => version.split('+').next().unwrap_or(&version).to_string(),
+            (false, false) => version,
+        };
 
         // Start the spiced instance
         let mut cmd = Command::new(start_request.spiced_path);
