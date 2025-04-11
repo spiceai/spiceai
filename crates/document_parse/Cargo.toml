@@ -10,7 +10,7 @@ version.workspace = true
 
 [dependencies]
 docx-rs = { git = "https://github.com/spiceai/docx-rs", rev="2d86a60b58afb02b157f96b42a92626417e47f71"}
-pdf-extract = { git = "https://github.com/spiceai/pdf-extract.git", rev = "3989f973c061cd805ba6fe905f14b01074844dfc" }
+pdf-extract = { git = "https://github.com/spiceai/pdf-extract", rev = "3ca5e2c904cdf5897f3d671e3b2c4b62b1612b0c" }
 snafu.workspace = true
 bytes.workspace = true
 tokio = { workspace = true, features = ["sync"] }
