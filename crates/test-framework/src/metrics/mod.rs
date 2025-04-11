@@ -293,6 +293,7 @@ impl StatisticsCollector<BTreeMap<String, Duration>, BTreeMap<String, Vec<Durati
 pub struct QueryMetrics<T: ExtendedMetrics, R: ExtendedMetrics> {
     pub run_id: Uuid,
     pub run_name: String,
+    pub spiced_version: String,
     pub commit_sha: String,
     pub branch_name: String,
     pub test_type: TestType,
@@ -373,6 +374,7 @@ impl<T: ExtendedMetrics, R: ExtendedMetrics> QueryMetrics<T, R> {
 
         let mut base_fields = vec![
             Field::new("run_id", DataType::Utf8, false),
+            Field::new("spiced_version", DataType::Utf8, false),
             Field::new("run_name", DataType::Utf8, false),
             Field::new("commit_sha", DataType::Utf8, false),
             Field::new("branch_name", DataType::Utf8, false),
@@ -397,6 +399,7 @@ impl<T: ExtendedMetrics, R: ExtendedMetrics> QueryMetrics<T, R> {
 
         let mut base_fields = vec![
             Field::new("run_id", DataType::Utf8, false),
+            Field::new("spiced_version", DataType::Utf8, false),
             Field::new("started_at", DataType::Int64, false),
             Field::new("finished_at", DataType::Int64, false),
             Field::new("query_name", DataType::Utf8, false),
@@ -499,6 +502,7 @@ impl<T: ExtendedMetrics, R: ExtendedMetrics> QueryMetrics<T, R> {
     #[allow(clippy::cast_possible_wrap)]
     pub fn build_records(&self) -> Result<Vec<RecordBatch>> {
         let run_id = vec![self.run_id.to_string(); self.metrics.len()];
+        let spiced_version = vec![self.spiced_version.clone(); self.metrics.len()];
 
         let started_at = extract_metric_values!(self.metrics, started_at, as_i64);
         let finished_at = extract_metric_values!(self.metrics, finished_at, as_i64);
@@ -520,6 +524,7 @@ impl<T: ExtendedMetrics, R: ExtendedMetrics> QueryMetrics<T, R> {
 
         let mut columns: Vec<ArrayRef> = vec![
             Arc::new(StringArray::from(run_id)),
+            Arc::new(StringArray::from(spiced_version)),
             Arc::new(Int64Array::from(started_at)),
             Arc::new(Int64Array::from(finished_at)),
             Arc::new(StringArray::from(query_name)),
@@ -569,6 +574,7 @@ impl<T: ExtendedMetrics, R: ExtendedMetrics> QueryMetrics<T, R> {
     /// The record batch is a single row, representing the run as a whole - which can pass or fail separately from individual queries
     pub fn build_run(&self, status: QueryStatus) -> Result<Vec<RecordBatch>> {
         let run_id = vec![self.run_id.to_string()];
+        let spiced_version = vec![self.spiced_version.to_string()];
         let run_name = vec![self.run_name.clone()];
         let commit_sha = vec![self.commit_sha.clone()];
         let branch_name = vec![self.branch_name.clone()];
@@ -602,6 +608,7 @@ impl<T: ExtendedMetrics, R: ExtendedMetrics> QueryMetrics<T, R> {
 
         let mut columns: Vec<ArrayRef> = vec![
             Arc::new(StringArray::from(run_id)),
+            Arc::new(StringArray::from(spiced_version)),
             Arc::new(StringArray::from(run_name)),
             Arc::new(StringArray::from(commit_sha)),
             Arc::new(StringArray::from(branch_name)),
@@ -650,11 +657,13 @@ pub trait MetricCollector<T: ExtendedMetrics, R: ExtendedMetrics> {
     fn start_time(&self) -> SystemTime;
     fn end_time(&self) -> SystemTime;
     fn name(&self) -> String;
+    fn spiced_version(&self) -> Result<&str>;
     fn metrics(&self) -> Result<Vec<QueryMetric<T>>>;
     fn collect(&self, test_type: TestType) -> Result<QueryMetrics<T, R>> {
         Ok(QueryMetrics {
             run_id: uuid::Uuid::new_v4(),
             run_name: self.name(),
+            spiced_version: self.spiced_version()?.to_string(),
             commit_sha: git::get_commit_sha(),
             branch_name: git::get_branch_name(),
             test_type,

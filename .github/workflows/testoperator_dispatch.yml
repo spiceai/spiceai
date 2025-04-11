@@ -29,6 +29,11 @@ on:
         required: false
         type: boolean
         default: false
+      validate:
+        description: 'Validate results?'
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   dispatch-tests:
@@ -62,7 +67,8 @@ jobs:
           testoperator dispatch \
             ${{ github.event.inputs.test_files_path }} \
             --workflow ${{ github.event.inputs.workflow_type }} \
-            --update-snapshots ${{ github.event.inputs.update_snapshots }}
+            --update-snapshots ${{ github.event.inputs.update_snapshots }} \
+            --validate=${{ github.event.inputs.validate }} \
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}

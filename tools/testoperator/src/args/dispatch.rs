@@ -44,6 +44,9 @@ pub struct DispatchArgs {
 
     #[arg(long, default_value = "false", action = ArgAction::Set)]
     pub(crate) update_snapshots: bool,
+
+    #[arg(long, action = ArgAction::Set, default_value_t = false, default_missing_value = "true", num_args = 0..=1, require_equals = false)]
+    pub(crate) validate: bool,
 }
 
 #[derive(Debug, Copy, Clone, ValueEnum)]
@@ -97,12 +100,20 @@ pub struct BenchArgs {
     pub runner_type: RunnerType,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub update_snapshots: Option<UpdateSnapshots>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub validate: Option<bool>,
 }
 
 impl BenchArgs {
     #[must_use]
     pub fn with_update_snapshots(mut self, update_snapshots: UpdateSnapshots) -> Self {
         self.update_snapshots = Some(update_snapshots);
+        self
+    }
+
+    #[must_use]
+    pub fn with_validate(mut self, validate: bool) -> Self {
+        self.validate = Some(validate);
         self
     }
 }

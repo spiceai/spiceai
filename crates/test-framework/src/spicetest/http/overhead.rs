@@ -193,6 +193,15 @@ impl MetricCollector<NoExtendedMetrics, NoExtendedMetrics> for SpiceTest<Complet
         self.name.clone()
     }
 
+    fn spiced_version(&self) -> Result<&str> {
+        let spiced_instance = self.spiced_instance.as_ref().ok_or(
+            anyhow::anyhow!(
+                "Spiced instance is not available. SpiceTest must be started before metrics can be collected."
+            ))?;
+
+        Ok(spiced_instance.version())
+    }
+
     fn metrics(&self) -> Result<Vec<QueryMetric<NoExtendedMetrics>>> {
         let baseline = QueryMetric::new_from_durations(
             "baseline",
