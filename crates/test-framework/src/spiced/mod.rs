@@ -32,6 +32,7 @@ use crate::{process::Process, utils::wait_until_true};
 #[derive(Debug, Clone)]
 pub struct SpicedVersion(String);
 impl SpicedVersion {
+    #[must_use]
     pub fn new(version: String) -> Self {
         Self(version)
     }
@@ -162,6 +163,7 @@ impl SpicedInstance {
         })
     }
 
+    #[must_use]
     pub fn version(&self) -> &str {
         self.version.0.as_str()
     }
