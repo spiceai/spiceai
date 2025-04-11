@@ -11625,7 +11625,7 @@ dependencies = [
 [[package]]
 name = "snowflake-api"
 version = "0.9.0"
-source = "git+https://github.com/spiceai/snowflake-rs.git?rev=e7237c22ebb7a94e11de7d77b3225247d24b3581#e7237c22ebb7a94e11de7d77b3225247d24b3581"
+source = "git+https://github.com/spiceai/snowflake-rs.git?rev=0cd20ce6ebc72bec9f9c98ddb7d242bf48d6b8d3#0cd20ce6ebc72bec9f9c98ddb7d242bf48d6b8d3"
 dependencies = [
  "arrow",
  "async-stream",
