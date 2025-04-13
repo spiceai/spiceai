@@ -1004,6 +1004,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn test_to_delta_kernel_expr() {
         // Test basic column reference
         let col_expr = col("name");
