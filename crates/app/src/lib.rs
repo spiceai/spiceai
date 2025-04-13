@@ -222,6 +222,12 @@ impl AppBuilder {
     }
 
     #[must_use]
+    pub fn with_shutdown_timeout(mut self, timeout: &str) -> AppBuilder {
+        self.runtime.shutdown_timeout = Some(timeout.to_string());
+        self
+    }
+
+    #[must_use]
     pub fn build(self) -> App {
         App {
             name: self.name,
