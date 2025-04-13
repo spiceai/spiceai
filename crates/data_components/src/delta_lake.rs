@@ -364,7 +364,7 @@ impl TableProvider for DeltaTable {
 
                 // Convert and apply predicate if possible
                 if let Some(predicate) = filters_to_delta_kernel_expr(&filters_clone) {
-                    tracing::trace!(
+                    tracing::debug!(
                         "Using delta_kernel predicate for filter pushdown: {predicate:?}"
                     );
                     scan_builder = scan_builder.with_predicate(predicate);
@@ -998,7 +998,7 @@ fn handle_delta_error(delta_error: delta_kernel::Error) -> Error {
 
 #[cfg(test)]
 mod tests {
-    use datafusion::logical_expr::{col, lit, not, Operator};
+    use datafusion::logical_expr::{Operator, col, lit, not};
     use datafusion::parquet::arrow::arrow_reader::RowSelector;
 
     use super::*;
@@ -1014,71 +1014,92 @@ mod tests {
         let lit_expr = lit("value");
         let dk_expr = to_delta_kernel_expr(&lit_expr);
         assert!(dk_expr.is_some(), "Literal expression should be supported");
-        
+
         // Test comparison operators
         // Equality
         let eq_expr = col("age").eq(lit(30));
         let dk_expr = to_delta_kernel_expr(&eq_expr);
         assert!(dk_expr.is_some(), "Equality expression should be supported");
-        
+
         // Less than
         let lt_expr = col("age").lt(lit(30));
         let dk_expr = to_delta_kernel_expr(&lt_expr);
-        assert!(dk_expr.is_some(), "Less than expression should be supported");
-        
+        assert!(
+            dk_expr.is_some(),
+            "Less than expression should be supported"
+        );
+
         // Greater than
         let gt_expr = col("age").gt(lit(30));
         let dk_expr = to_delta_kernel_expr(&gt_expr);
-        assert!(dk_expr.is_some(), "Greater than expression should be supported");
-        
+        assert!(
+            dk_expr.is_some(),
+            "Greater than expression should be supported"
+        );
+
         // Less than or equal
         let lte_expr = col("age").lt_eq(lit(30));
         let dk_expr = to_delta_kernel_expr(&lte_expr);
-        assert!(dk_expr.is_some(), "Less than or equal expression should be supported");
-        
+        assert!(
+            dk_expr.is_some(),
+            "Less than or equal expression should be supported"
+        );
+
         // Greater than or equal
         let gte_expr = col("age").gt_eq(lit(30));
         let dk_expr = to_delta_kernel_expr(&gte_expr);
-        assert!(dk_expr.is_some(), "Greater than or equal expression should be supported");
-        
+        assert!(
+            dk_expr.is_some(),
+            "Greater than or equal expression should be supported"
+        );
+
         // Not equal
         let neq_expr = col("age").not_eq(lit(30));
         let dk_expr = to_delta_kernel_expr(&neq_expr);
-        assert!(dk_expr.is_some(), "Not equal expression should be supported");
-        
+        assert!(
+            dk_expr.is_some(),
+            "Not equal expression should be supported"
+        );
+
         // Test arithmetic operators using binary expressions directly
         // Addition
         let add_expr = datafusion::logical_expr::BinaryExpr::new(
             Box::new(col("age")),
             Operator::Plus,
-            Box::new(lit(5))
+            Box::new(lit(5)),
         );
         let dk_expr = to_delta_kernel_expr(&Expr::BinaryExpr(add_expr));
         assert!(dk_expr.is_some(), "Addition expression should be supported");
-        
+
         // Subtraction
         let sub_expr = datafusion::logical_expr::BinaryExpr::new(
             Box::new(col("age")),
             Operator::Minus,
-            Box::new(lit(5))
+            Box::new(lit(5)),
         );
         let dk_expr = to_delta_kernel_expr(&Expr::BinaryExpr(sub_expr));
-        assert!(dk_expr.is_some(), "Subtraction expression should be supported");
-        
+        assert!(
+            dk_expr.is_some(),
+            "Subtraction expression should be supported"
+        );
+
         // Multiplication
         let mul_expr = datafusion::logical_expr::BinaryExpr::new(
             Box::new(col("age")),
             Operator::Multiply,
-            Box::new(lit(2))
+            Box::new(lit(2)),
         );
         let dk_expr = to_delta_kernel_expr(&Expr::BinaryExpr(mul_expr));
-        assert!(dk_expr.is_some(), "Multiplication expression should be supported");
-        
+        assert!(
+            dk_expr.is_some(),
+            "Multiplication expression should be supported"
+        );
+
         // Division
         let div_expr = datafusion::logical_expr::BinaryExpr::new(
             Box::new(col("age")),
             Operator::Divide,
-            Box::new(lit(2))
+            Box::new(lit(2)),
         );
         let dk_expr = to_delta_kernel_expr(&Expr::BinaryExpr(div_expr));
         assert!(dk_expr.is_some(), "Division expression should be supported");
@@ -1087,52 +1108,94 @@ mod tests {
         let is_null_expr = col("optional_field").is_null();
         let dk_expr = to_delta_kernel_expr(&is_null_expr);
         assert!(dk_expr.is_some(), "IsNull expression should be supported");
-        
+
         // Test is_not_null
         let is_not_null_expr = col("required_field").is_not_null();
         let dk_expr = to_delta_kernel_expr(&is_not_null_expr);
-        assert!(dk_expr.is_some(), "IsNotNull expression should be supported");
-        
+        assert!(
+            dk_expr.is_some(),
+            "IsNotNull expression should be supported"
+        );
+
         // Test NOT expression
         let not_expr = not(col("active").eq(lit(false)));
         let dk_expr = to_delta_kernel_expr(&not_expr);
         assert!(dk_expr.is_some(), "Not expression should be supported");
-        
+
         // Test unsupported expressions
         let case_expr = datafusion::logical_expr::case(col("status"))
             .when(lit("active"), lit(1))
             .otherwise(lit(0))
             .unwrap();
         let dk_expr = to_delta_kernel_expr(&case_expr);
-        assert!(dk_expr.is_none(), "CASE expressions should not be supported");
-        
+        assert!(
+            dk_expr.is_none(),
+            "CASE expressions should not be supported"
+        );
+
         let in_list_expr = datafusion::logical_expr::in_list(
-            col("status"), 
-            vec![lit("active"), lit("pending")], 
-            false
+            col("status"),
+            vec![lit("active"), lit("pending")],
+            false,
         );
         let dk_expr = to_delta_kernel_expr(&in_list_expr);
-        assert!(dk_expr.is_none(), "IN LIST expressions should not be supported");
-        
+        assert!(
+            dk_expr.is_none(),
+            "IN LIST expressions should not be supported"
+        );
+
         let alias_expr = col("age").alias("years");
         let dk_expr = to_delta_kernel_expr(&alias_expr);
-        assert!(dk_expr.is_none(), "ALIAS expressions should not be supported");
+        assert!(
+            dk_expr.is_none(),
+            "ALIAS expressions should not be supported"
+        );
     }
 
     #[test]
     fn test_to_delta_kernel_binary_op() {
         // Test supported operators
-        assert_eq!(to_delta_kernel_binary_op(Operator::Eq), Some(BinaryOperator::Equal));
-        assert_eq!(to_delta_kernel_binary_op(Operator::NotEq), Some(BinaryOperator::NotEqual));
-        assert_eq!(to_delta_kernel_binary_op(Operator::Lt), Some(BinaryOperator::LessThan));
-        assert_eq!(to_delta_kernel_binary_op(Operator::LtEq), Some(BinaryOperator::LessThanOrEqual));
-        assert_eq!(to_delta_kernel_binary_op(Operator::Gt), Some(BinaryOperator::GreaterThan));
-        assert_eq!(to_delta_kernel_binary_op(Operator::GtEq), Some(BinaryOperator::GreaterThanOrEqual));
-        assert_eq!(to_delta_kernel_binary_op(Operator::Plus), Some(BinaryOperator::Plus));
-        assert_eq!(to_delta_kernel_binary_op(Operator::Minus), Some(BinaryOperator::Minus));
-        assert_eq!(to_delta_kernel_binary_op(Operator::Multiply), Some(BinaryOperator::Multiply));
-        assert_eq!(to_delta_kernel_binary_op(Operator::Divide), Some(BinaryOperator::Divide));
-        
+        assert_eq!(
+            to_delta_kernel_binary_op(Operator::Eq),
+            Some(BinaryOperator::Equal)
+        );
+        assert_eq!(
+            to_delta_kernel_binary_op(Operator::NotEq),
+            Some(BinaryOperator::NotEqual)
+        );
+        assert_eq!(
+            to_delta_kernel_binary_op(Operator::Lt),
+            Some(BinaryOperator::LessThan)
+        );
+        assert_eq!(
+            to_delta_kernel_binary_op(Operator::LtEq),
+            Some(BinaryOperator::LessThanOrEqual)
+        );
+        assert_eq!(
+            to_delta_kernel_binary_op(Operator::Gt),
+            Some(BinaryOperator::GreaterThan)
+        );
+        assert_eq!(
+            to_delta_kernel_binary_op(Operator::GtEq),
+            Some(BinaryOperator::GreaterThanOrEqual)
+        );
+        assert_eq!(
+            to_delta_kernel_binary_op(Operator::Plus),
+            Some(BinaryOperator::Plus)
+        );
+        assert_eq!(
+            to_delta_kernel_binary_op(Operator::Minus),
+            Some(BinaryOperator::Minus)
+        );
+        assert_eq!(
+            to_delta_kernel_binary_op(Operator::Multiply),
+            Some(BinaryOperator::Multiply)
+        );
+        assert_eq!(
+            to_delta_kernel_binary_op(Operator::Divide),
+            Some(BinaryOperator::Divide)
+        );
+
         // Test unsupported operators
         assert_eq!(to_delta_kernel_binary_op(Operator::And), None);
         assert_eq!(to_delta_kernel_binary_op(Operator::Or), None);
@@ -1146,130 +1209,134 @@ mod tests {
         let scalar = ScalarValue::Utf8(Some("test".to_string()));
         let dk_scalar = to_delta_kernel_scalar(scalar).unwrap();
         assert!(matches!(dk_scalar, Scalar::String(s) if s == "test"));
-        
+
         // Test other string types
         let scalar = ScalarValue::Utf8View(Some("test_view".to_string()));
         let dk_scalar = to_delta_kernel_scalar(scalar).unwrap();
         assert!(matches!(dk_scalar, Scalar::String(s) if s == "test_view"));
-        
+
         let scalar = ScalarValue::LargeUtf8(Some("large_test".to_string()));
         let dk_scalar = to_delta_kernel_scalar(scalar).unwrap();
         assert!(matches!(dk_scalar, Scalar::String(s) if s == "large_test"));
-        
+
         // Test integer scalars
         let scalar = ScalarValue::Int8(Some(8));
         let dk_scalar = to_delta_kernel_scalar(scalar).unwrap();
         assert!(matches!(dk_scalar, Scalar::Byte(v) if v == 8));
-        
+
         let scalar = ScalarValue::Int16(Some(16));
         let dk_scalar = to_delta_kernel_scalar(scalar).unwrap();
         assert!(matches!(dk_scalar, Scalar::Short(v) if v == 16));
-        
+
         let scalar = ScalarValue::Int32(Some(32));
         let dk_scalar = to_delta_kernel_scalar(scalar).unwrap();
         assert!(matches!(dk_scalar, Scalar::Integer(v) if v == 32));
-        
+
         let scalar = ScalarValue::Int64(Some(64));
         let dk_scalar = to_delta_kernel_scalar(scalar).unwrap();
         assert!(matches!(dk_scalar, Scalar::Long(v) if v == 64));
-        
+
         // Test unsigned integer conversion
         let scalar = ScalarValue::UInt8(Some(8));
         let dk_scalar = to_delta_kernel_scalar(scalar).unwrap();
         assert!(matches!(dk_scalar, Scalar::Short(v) if v == 8));
-        
+
         let scalar = ScalarValue::UInt16(Some(16));
         let dk_scalar = to_delta_kernel_scalar(scalar).unwrap();
         assert!(matches!(dk_scalar, Scalar::Integer(v) if v == 16));
-        
+
         let scalar = ScalarValue::UInt32(Some(32));
         let dk_scalar = to_delta_kernel_scalar(scalar).unwrap();
         assert!(matches!(dk_scalar, Scalar::Long(v) if v == 32));
-        
+
         let scalar = ScalarValue::UInt64(Some(64));
         let dk_scalar = to_delta_kernel_scalar(scalar).unwrap();
         assert!(matches!(dk_scalar, Scalar::Long(v) if v == 64));
-        
+
         // Test large UInt64 conversion (edge case)
         let max_i64 = i64::MAX as u64;
         let scalar = ScalarValue::UInt64(Some(max_i64));
         let dk_scalar = to_delta_kernel_scalar(scalar).unwrap();
         assert!(matches!(dk_scalar, Scalar::Long(v) if v == i64::MAX));
-        
+
         // Test UInt64 that's too large to fit in i64 (should return None)
         let too_large = (i64::MAX as u64) + 1;
         let scalar = ScalarValue::UInt64(Some(too_large));
         let dk_scalar = to_delta_kernel_scalar(scalar);
         assert!(dk_scalar.is_none());
-        
+
         // Test float scalars without Float16 (not available in this crate)
         let scalar = ScalarValue::Float32(Some(32.5));
         let dk_scalar = to_delta_kernel_scalar(scalar).unwrap();
         assert!(matches!(dk_scalar, Scalar::Float(v) if v == 32.5));
-        
+
         let scalar = ScalarValue::Float64(Some(64.5));
         let dk_scalar = to_delta_kernel_scalar(scalar).unwrap();
         assert!(matches!(dk_scalar, Scalar::Double(v) if v == 64.5));
-        
+
         // Test boolean scalar
         let scalar = ScalarValue::Boolean(Some(true));
         let dk_scalar = to_delta_kernel_scalar(scalar).unwrap();
         assert!(matches!(dk_scalar, Scalar::Boolean(v) if v));
-        
+
         // Test null scalars
         let scalar = ScalarValue::Int32(None);
         let dk_scalar = to_delta_kernel_scalar(scalar).unwrap();
-        assert!(matches!(dk_scalar, Scalar::Null(dt) if matches!(dt, delta_kernel::schema::DataType::Primitive(PrimitiveType::Integer))));
-        
+        assert!(
+            matches!(dk_scalar, Scalar::Null(dt) if matches!(dt, delta_kernel::schema::DataType::Primitive(PrimitiveType::Integer)))
+        );
+
         let scalar = ScalarValue::Utf8(None);
         let dk_scalar = to_delta_kernel_scalar(scalar).unwrap();
-        assert!(matches!(dk_scalar, Scalar::Null(dt) if matches!(dt, delta_kernel::schema::DataType::Primitive(PrimitiveType::String))));
-        
+        assert!(
+            matches!(dk_scalar, Scalar::Null(dt) if matches!(dt, delta_kernel::schema::DataType::Primitive(PrimitiveType::String)))
+        );
+
         // Test timestamp scalar with different time units
         let scalar = ScalarValue::TimestampSecond(Some(10), None);
         let dk_scalar = to_delta_kernel_scalar(scalar).unwrap();
         assert!(matches!(dk_scalar, Scalar::TimestampNtz(v) if v == 10_000_000)); // Converted to microseconds
-        
+
         let scalar = ScalarValue::TimestampMillisecond(Some(10_000), None);
         let dk_scalar = to_delta_kernel_scalar(scalar).unwrap();
         assert!(matches!(dk_scalar, Scalar::TimestampNtz(v) if v == 10_000_000)); // Converted to microseconds
-        
+
         let scalar = ScalarValue::TimestampMicrosecond(Some(1000000), None);
         let dk_scalar = to_delta_kernel_scalar(scalar).unwrap();
         assert!(matches!(dk_scalar, Scalar::TimestampNtz(v) if v == 1000000));
-        
+
         let scalar = ScalarValue::TimestampNanosecond(Some(1_000_000_000), None);
         let dk_scalar = to_delta_kernel_scalar(scalar).unwrap();
         assert!(matches!(dk_scalar, Scalar::TimestampNtz(v) if v == 1_000_000)); // Converted to microseconds
-        
+
         // Test timestamp with timezone
         let scalar = ScalarValue::TimestampMicrosecond(Some(1000000), Some("UTC".into()));
         let dk_scalar = to_delta_kernel_scalar(scalar).unwrap();
         assert!(matches!(dk_scalar, Scalar::Timestamp(v) if v == 1000000));
-        
+
         // Test decimal scalar
         let scalar = ScalarValue::Decimal128(Some(1234), 10, 2);
         let dk_scalar = to_delta_kernel_scalar(scalar).unwrap();
         assert!(matches!(dk_scalar, Scalar::Decimal(v, p, s) if v == 1234 && p == 10 && s == 2));
-        
+
         // Test binary data
         let binary_data = vec![1, 2, 3, 4];
         let scalar = ScalarValue::Binary(Some(binary_data.clone()));
         let dk_scalar = to_delta_kernel_scalar(scalar).unwrap();
         assert!(matches!(dk_scalar, Scalar::Binary(v) if v == binary_data));
-        
+
         // Test Date32
         let scalar = ScalarValue::Date32(Some(18000)); // Some number of days since epoch
         let dk_scalar = to_delta_kernel_scalar(scalar).unwrap();
         assert!(matches!(dk_scalar, Scalar::Date(v) if v == 18000));
-        
+
         // Test Date64
         let days = 100;
         let millis = days as i64 * 24 * 60 * 60 * 1000;
         let scalar = ScalarValue::Date64(Some(millis));
         let dk_scalar = to_delta_kernel_scalar(scalar).unwrap();
         assert!(matches!(dk_scalar, Scalar::Date(v) if v == days));
-        
+
         // Test unsupported types (we don't need to test the exact construction since we only care about the return value)
         let dk_scalar = to_delta_kernel_scalar(ScalarValue::Null);
         assert!(dk_scalar.is_none());
@@ -1286,34 +1353,50 @@ mod tests {
         let filters = vec![col("age").eq(lit(30))];
         let dk_expr = filters_to_delta_kernel_expr(&filters);
         assert!(dk_expr.is_some(), "Single filter should be converted");
-        
+
         // Test multiple filters
         let filters = vec![col("age").gt(lit(20)), col("name").eq(lit("John"))];
         let dk_expr = filters_to_delta_kernel_expr(&filters);
-        assert!(dk_expr.is_some(), "Multiple filters should be converted to a single expression");
-        
+        assert!(
+            dk_expr.is_some(),
+            "Multiple filters should be converted to a single expression"
+        );
+
         // Test filters with unsupported expressions
         let case_expr = datafusion::logical_expr::case(col("status"))
             .when(lit("active"), lit(1))
             .otherwise(lit(0))
             .unwrap();
-        
+
         let filters = vec![col("age").gt(lit(20)), case_expr.clone()];
         let dk_expr = filters_to_delta_kernel_expr(&filters);
-        assert!(dk_expr.is_some(), "Mix of supported and unsupported filters should return the supported ones");
-        
+        assert!(
+            dk_expr.is_some(),
+            "Mix of supported and unsupported filters should return the supported ones"
+        );
+
         // Test filters with only unsupported expressions
         let filters = vec![case_expr.clone()];
         let dk_expr = filters_to_delta_kernel_expr(&filters);
-        assert!(dk_expr.is_none(), "Only unsupported filters should return None");
-        
+        assert!(
+            dk_expr.is_none(),
+            "Only unsupported filters should return None"
+        );
+
         // Test with multiple unsupported expressions
         let filters = vec![
             case_expr,
-            datafusion::logical_expr::in_list(col("status"), vec![lit("active"), lit("pending")], false)
+            datafusion::logical_expr::in_list(
+                col("status"),
+                vec![lit("active"), lit("pending")],
+                false,
+            ),
         ];
         let dk_expr = filters_to_delta_kernel_expr(&filters);
-        assert!(dk_expr.is_none(), "Multiple unsupported filters should return None");
+        assert!(
+            dk_expr.is_none(),
+            "Multiple unsupported filters should return None"
+        );
     }
 
     #[test]
@@ -1322,8 +1405,11 @@ mod tests {
         let filter = col("category").eq(lit("electronics"));
         let filters = vec![filter];
         let dk_expr = filters_to_delta_kernel_expr(&filters);
-        assert!(dk_expr.is_some(), "Simple equality expression should be supported");
-        
+        assert!(
+            dk_expr.is_some(),
+            "Simple equality expression should be supported"
+        );
+
         // Test NOT expressions
         let filter = not(col("deleted").eq(lit(true)));
         let filters = vec![filter];
@@ -1371,10 +1457,12 @@ mod tests {
     fn test_get_row_group_access_with_offset() {
         // Test with offset starting row
         // Full selection vector: [true, true, true, true, true, false, false, false, true, true]
-        let selection_vector = &[true, true, true, true, true, false, false, false, true, true];
+        let selection_vector = &[
+            true, true, true, true, true, false, false, false, true, true,
+        ];
         let row_group_row_start = 5; // Start at index 5
-        let row_group_num_rows = 5;  // Take 5 rows (5-9)
-        
+        let row_group_num_rows = 5; // Take 5 rows (5-9)
+
         // The selection should consider rows 5-9: [false, false, false, true, true]
         let row_group_access =
             get_row_group_access(selection_vector, row_group_row_start, row_group_num_rows);
@@ -1382,10 +1470,7 @@ mod tests {
         // Expected selectors:
         // - Skip first 3 rows (false, false, false)
         // - Select last 2 rows (true, true)
-        let selectors = vec![
-            RowSelector::skip(3),
-            RowSelector::select(2),
-        ];
+        let selectors = vec![RowSelector::skip(3), RowSelector::select(2)];
         assert_eq!(
             row_group_access,
             RowGroupAccess::Selection(selectors.into())
@@ -1398,23 +1483,23 @@ mod tests {
         let selection_vector = &[true, false, true];
         let total_rows = 5;
         let full_vector = get_full_selection_vector(selection_vector, total_rows);
-        
+
         // Should copy the provided values and fill the rest with true
         assert_eq!(full_vector, vec![true, false, true, true, true]);
-        
+
         // Test truncating a longer selection vector to a shorter one
         let selection_vector = &[true, false, true, false, true];
         let total_rows = 3;
         let full_vector = get_full_selection_vector(selection_vector, total_rows);
-        
+
         // Should only copy the first 3 values
         assert_eq!(full_vector, vec![true, false, true]);
-        
+
         // Test with empty selection vector
         let selection_vector = &[];
         let total_rows = 3;
         let full_vector = get_full_selection_vector(selection_vector, total_rows);
-        
+
         // Should create a vector of all true values
         assert_eq!(full_vector, vec![true, true, true]);
     }
@@ -1426,13 +1511,13 @@ mod tests {
             ensure_folder_location("s3://my_bucket/".to_string()),
             "s3://my_bucket/"
         );
-        
+
         // Test path without trailing slash (should add slash)
         assert_eq!(
             ensure_folder_location("s3://my_bucket".to_string()),
             "s3://my_bucket/"
         );
-        
+
         // Test path with nested folders
         assert_eq!(
             ensure_folder_location("s3://my_bucket/data/table".to_string()),
