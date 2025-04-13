@@ -539,7 +539,7 @@ async fn run_ready_state_test(
         let rt =
             Runtime::builder()
                 .with_app(app)
-                .with_datafusion_configuration(Box::new(configure_test_datafusion))
+                .with_datafusion_configuration(configure_test_datafusion)
                 .build()
                 .await
         ;
@@ -810,7 +810,7 @@ async fn test_ready_state_mixed_arrow_acceleration() -> Result<(), anyhow::Error
             let rt =
             Runtime::builder()
                 .with_app(app)
-                .with_datafusion_configuration(Box::new(configure_test_datafusion))
+                .with_datafusion_configuration(configure_test_datafusion)
                 .build()
                 .await;
 
@@ -925,7 +925,7 @@ async fn test_ready_state_mixed_duckdb_acceleration() -> Result<(), anyhow::Erro
             let rt =
             Runtime::builder()
                 .with_app(app)
-                .with_datafusion_configuration(Box::new(configure_test_datafusion))
+                .with_datafusion_configuration(configure_test_datafusion)
                 .build()
                 .await;
 

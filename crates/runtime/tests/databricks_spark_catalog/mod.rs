@@ -46,7 +46,7 @@ async fn databricks_spark_connect_integration_test_catalog() -> Result<(), anyho
             let mut rt =
                 Runtime::builder()
                     .with_app(app)
-                    .with_datafusion_configuration(Box::new(configure_test_datafusion))
+                    .with_datafusion_configuration(configure_test_datafusion)
                     .build()
                     .await;
 

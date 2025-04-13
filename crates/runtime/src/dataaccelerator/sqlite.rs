@@ -168,12 +168,6 @@ impl SqliteAccelerator {
     }
 }
 
-// impl Default for SqliteAccelerator {
-//     fn default() -> Self {
-//         Self::new()
-//     }
-// }
-
 const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("file"),
     ParameterSpec::runtime("busy_timeout"),
@@ -269,7 +263,7 @@ impl DataAccelerator for SqliteAccelerator {
                 }
 
                 if let (Some(app), Some(runtime)) = (&this_dataset.app, &this_dataset.runtime) {
-                    let datasets = runtime
+                    let datasets = Arc::clone(runtime)
                         .get_initialized_datasets(app, crate::LogErrors(false))
                         .await;
                     let self_path = self.file_path(this_dataset)?;

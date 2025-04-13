@@ -37,7 +37,6 @@ async fn acceleration_with_and_without_federation() -> Result<(), anyhow::Error>
     use arrow::array::RecordBatch;
     use std::sync::Arc;
 
-    let _guard = super::ACCELERATION_MUTEX.lock().await;
     let _tracing = init_tracing(Some("integration=debug,info"));
 
     test_request_context()
@@ -129,7 +128,7 @@ async fn acceleration_with_and_without_federation() -> Result<(), anyhow::Error>
             let rt =
                 Runtime::builder()
                     .with_app(app)
-                    .with_datafusion_configuration(Box::new(configure_test_datafusion))
+                    .with_datafusion_configuration(configure_test_datafusion)
                     .build()
                     .await
             ;

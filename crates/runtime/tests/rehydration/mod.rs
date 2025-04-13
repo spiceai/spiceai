@@ -17,7 +17,6 @@ limitations under the License.
 //!
 //! Expects a Docker daemon to be running.
 use crate::{
-    acceleration::ACCELERATION_MUTEX,
     configure_test_datafusion,
     docker::RunningContainer,
     mysql::common::{get_mysql_conn, make_mysql_dataset, start_mysql_docker_container},
@@ -57,7 +56,6 @@ mod sqlite;
 #[tokio::test]
 async fn spill_to_disk_and_rehydration() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
-    let _guard = ACCELERATION_MUTEX.lock().await;
 
     test_request_context().scope(async {
         let running_container = prepare_test_environment()
@@ -283,7 +281,7 @@ async fn init_spice_app(
 
     let rt = Runtime::builder()
         .with_app(app)
-        .with_datafusion_configuration(Box::new(configure_test_datafusion))
+        .with_datafusion_configuration(configure_test_datafusion)
         .build()
         .await;
 

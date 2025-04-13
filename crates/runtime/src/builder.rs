@@ -34,7 +34,7 @@ use crate::{
     tools, tracers,
 };
 
-type DatafusionConfigurationCallback = Box<dyn FnOnce(&mut DataFusion)>;
+type DatafusionConfigurationCallback = fn(&mut DataFusion);
 
 pub struct RuntimeBuilder {
     app: Option<Arc<app::App>>,

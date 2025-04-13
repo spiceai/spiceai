@@ -47,7 +47,7 @@ use tokio::sync::Semaphore;
 use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
 
 impl Runtime {
-    pub(crate) async fn load_datasets(&self) {
+    pub(crate) async fn load_datasets(self: Arc<Self>) {
         let app_lock = self.app.read().await;
         let Some(app) = app_lock.as_ref() else {
             return;
@@ -60,7 +60,7 @@ impl Runtime {
             Arc::new(Semaphore::new(Semaphore::MAX_PERMITS))
         };
 
-        let valid_datasets = self.get_valid_datasets(app, LogErrors(true));
+        let valid_datasets = Arc::clone(&self).get_valid_datasets(app, LogErrors(true));
 
         if valid_datasets.is_empty() {
             tracing::info!(
@@ -85,7 +85,7 @@ impl Runtime {
             self.status
                 .update_dataset(&ds.name, status::ComponentStatus::Initializing);
             let ds_clone = Arc::clone(&ds);
-            let cloned_self = self.clone();
+            let cloned_self = Arc::clone(&self);
             let future: Pin<Box<dyn Future<Output = ()> + Send>> =
                 Box::pin(async move { cloned_self.load_dataset(ds_clone).await })
                     as Pin<Box<dyn Future<Output = ()> + Send>>;
@@ -105,7 +105,7 @@ impl Runtime {
             if let Some(parent_future) = dataset_futures.remove(&path_table_ref) {
                 let ds_clone = Arc::clone(&ds);
 
-                let cloned_self = self.clone();
+                let cloned_self = Arc::clone(&self);
                 // Chain the localpod dataset load after its parent
                 let chained_future = Box::pin(async move {
                     parent_future.await;
@@ -146,18 +146,16 @@ impl Runtime {
         let _ = join_all(spawned_tasks).await;
 
         // After all datasets have loaded, load the views.
-        self.load_views(app);
+        Arc::clone(&self).load_views(app);
     }
 
     /// Returns a list of valid datasets from the given App, skipping any that fail to parse and logging an error for them.
     pub(crate) fn get_valid_datasets(
-        &self,
+        self: Arc<Self>,
         app: &Arc<App>,
         log_errors: LogErrors,
     ) -> Vec<Arc<Dataset>> {
-        let cloned_self = Arc::new(self.clone());
-        cloned_self
-            .datasets_iter(app)
+        self.datasets_iter(app)
             .zip(&app.datasets)
             .filter_map(|(ds, spicepod_ds)| match ds {
                 Ok(ds) => Some(Arc::new(ds)),
@@ -172,7 +170,6 @@ impl Runtime {
             .collect()
     }
 
-    // TODO: with rt
     fn datasets_iter(self: Arc<Self>, app: &Arc<App>) -> impl Iterator<Item = Result<Dataset>> {
         app.datasets
             .clone()
@@ -637,10 +634,14 @@ impl Runtime {
             })
     }
 
-    pub(crate) async fn apply_dataset_diff(&self, current_app: &Arc<App>, new_app: &Arc<App>) {
-        let valid_datasets = self.get_valid_datasets(new_app, LogErrors(true));
+    pub(crate) async fn apply_dataset_diff(
+        self: Arc<Self>,
+        current_app: &Arc<App>,
+        new_app: &Arc<App>,
+    ) {
+        let valid_datasets = Arc::clone(&self).get_valid_datasets(new_app, LogErrors(true));
         let initialized_datasets = self.initialize_accelerators(&valid_datasets).await;
-        let existing_datasets = self.get_valid_datasets(current_app, LogErrors(false));
+        let existing_datasets = Arc::clone(&self).get_valid_datasets(current_app, LogErrors(false));
 
         for ds in initialized_datasets {
             if let Some(current_ds) = existing_datasets.iter().find(|d| d.name == ds.name) {
@@ -725,16 +726,18 @@ impl Runtime {
 
     /// Returns a list of valid datasets from the given App, skipping any that fail to parse and logging an error for them.
     pub(crate) async fn get_initialized_datasets(
-        &self,
+        self: Arc<Self>,
         app: &Arc<App>,
         log_errors: LogErrors,
     ) -> Vec<Arc<Dataset>> {
-        let valid_datasets = self.get_valid_datasets(app, log_errors);
+        let valid_datasets = Arc::clone(&self).get_valid_datasets(app, log_errors);
         futures::stream::iter(valid_datasets)
-            .filter_map(|ds| async move {
+            .filter_map(|ds| {
+                let cloned_self = Arc::clone(&self);
+                async move {
                 match (
                     ds.is_accelerated(),
-                    ds.is_accelerator_initialized(self.accelerator_engine_registry())
+                    ds.is_accelerator_initialized(cloned_self.accelerator_engine_registry())
                         .await,
                 ) {
                     (true, true) | (false, _) => Some(Arc::clone(&ds)),
@@ -749,7 +752,7 @@ impl Runtime {
                         None
                     }
                 }
-            })
+            }})
             .collect()
             .await
     }

@@ -19,7 +19,7 @@ use std::sync::Arc;
 use crate::Runtime;
 
 impl Runtime {
-    pub(crate) async fn start_pods_watcher(&self) -> notify::Result<()> {
+    pub(crate) async fn start_pods_watcher(self: Arc<Self>) -> notify::Result<()> {
         let mut pods_watcher = self.pods_watcher.write().await;
         let Some(mut pods_watcher) = pods_watcher.take() else {
             return Ok(());
@@ -41,8 +41,10 @@ impl Runtime {
                 tracing::debug!("Previous pods information: {:?}", current_app);
 
                 self.apply_catalog_diff(current_app, &new_app).await;
-                self.apply_dataset_diff(current_app, &new_app).await;
-                self.apply_view_diff(current_app, &new_app);
+                Arc::clone(&self)
+                    .apply_dataset_diff(current_app, &new_app)
+                    .await;
+                Arc::clone(&self).apply_view_diff(current_app, &new_app);
                 self.apply_model_diff(current_app, &new_app).await;
 
                 drop(app_read_lock);

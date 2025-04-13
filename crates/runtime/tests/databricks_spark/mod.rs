@@ -80,7 +80,7 @@ async fn databricks_spark_integration_test() -> Result<(), anyhow::Error> {
             let mut rt =
                 Runtime::builder()
                     .with_app(app)
-                    .with_datafusion_configuration(Box::new(configure_test_datafusion))
+                    .with_datafusion_configuration(configure_test_datafusion)
                     .build()
                     .await;
 

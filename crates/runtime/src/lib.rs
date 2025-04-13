@@ -559,13 +559,13 @@ impl Runtime {
     }
 
     /// Updates all of the component statuses to `Initializing`.
-    pub async fn set_components_initializing(&self) {
+    pub async fn set_components_initializing(self: Arc<Self>) {
         let app_lock = self.app.read().await;
         let Some(app) = app_lock.as_ref() else {
             return;
         };
 
-        let valid_datasets = self.get_valid_datasets(app, LogErrors(false));
+        let valid_datasets = Arc::clone(&self).get_valid_datasets(app, LogErrors(false));
         for ds in &valid_datasets {
             self.status
                 .update_dataset(&ds.name, ComponentStatus::Initializing);
@@ -599,7 +599,7 @@ impl Runtime {
                 .update_catalog(&catalog.name, ComponentStatus::Initializing);
         }
 
-        let valid_views = self.get_valid_views(app, LogErrors(false));
+        let valid_views = Arc::clone(&self).get_valid_views(app, LogErrors(false));
         for view in valid_views {
             self.status
                 .update_view(&view.name, ComponentStatus::Initializing);
@@ -612,7 +612,7 @@ impl Runtime {
     /// This includes waiting for the first refresh of any accelerated tables to complete.
     #[allow(clippy::too_many_lines)]
     pub async fn load_components(self: Arc<Self>) {
-        self.set_components_initializing().await;
+        Arc::clone(&self).set_components_initializing().await;
 
         self.start_extensions().await;
 

@@ -34,7 +34,6 @@ use crate::{configure_test_datafusion, init_tracing, utils::runtime_ready_check}
 #[tokio::test]
 async fn test_acceleration_sqlite_checkpoint() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
-    let _guard = super::ACCELERATION_MUTEX.lock().await;
 
     test_request_context()
         .scope(async {
@@ -68,7 +67,7 @@ async fn test_acceleration_sqlite_checkpoint() -> Result<(), anyhow::Error> {
             let rt = Arc::new(
                 Runtime::builder()
                     .with_app(app)
-                    .with_datafusion_configuration(Box::new(configure_test_datafusion))
+                    .with_datafusion_configuration(configure_test_datafusion)
                     .build()
                     .await,
             );

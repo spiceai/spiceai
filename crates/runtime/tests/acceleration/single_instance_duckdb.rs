@@ -53,7 +53,6 @@ fn get_dataset(from: &str, name: &str, path: &str) -> Dataset {
 #[tokio::test]
 async fn test_acceleration_duckdb_single_instance() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
-    let _guard = super::ACCELERATION_MUTEX.lock().await;
 
     test_request_context()
         .scope_retry(3, || async {
@@ -81,7 +80,7 @@ async fn test_acceleration_duckdb_single_instance() -> Result<(), anyhow::Error>
             let rt = Arc::new(
                 Runtime::builder()
                     .with_app(app)
-                    .with_datafusion_configuration(Box::new(configure_test_datafusion))
+                    .with_datafusion_configuration(configure_test_datafusion)
                     .build()
                     .await,
             );

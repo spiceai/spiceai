@@ -48,7 +48,6 @@ const NAMES_CSV: &str = include_str!("data/names.csv");
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_file_watcher() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
-    let _guard = super::ACCELERATION_MUTEX.lock().await;
 
     test_request_context()
         .scope(async {
@@ -83,7 +82,7 @@ async fn test_file_watcher() -> Result<(), anyhow::Error> {
             let rt = Arc::new(
                 Runtime::builder()
                     .with_app(app)
-                    .with_datafusion_configuration(Box::new(configure_test_datafusion))
+                    .with_datafusion_configuration(configure_test_datafusion)
                     .build()
                     .await,
             );

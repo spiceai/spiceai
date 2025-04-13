@@ -40,7 +40,6 @@ use super::get_params;
 #[tokio::test]
 async fn test_acceleration_on_conflict() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
-    let _guard = super::ACCELERATION_MUTEX.lock().await;
 
     test_request_context()
         .scope(async {
@@ -194,7 +193,7 @@ INSERT INTO event_logs (event_name, event_timestamp) VALUES
             let rt = Arc::new(
                 Runtime::builder()
                     .with_app(app)
-                    .with_datafusion_configuration(Box::new(configure_test_datafusion))
+                    .with_datafusion_configuration(configure_test_datafusion)
                     .build()
                     .await,
             );
