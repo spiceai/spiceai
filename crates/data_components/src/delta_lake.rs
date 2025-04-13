@@ -30,7 +30,7 @@ use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::DataFusionError;
 use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::logical_expr::utils::conjunction;
-use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, lit};
+use datafusion::logical_expr::{Expr, Operator, TableProviderFilterPushDown, lit};
 use datafusion::parquet::arrow::arrow_reader::RowSelection;
 use datafusion::parquet::file::metadata::RowGroupMetaData;
 use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
@@ -41,9 +41,12 @@ use delta_kernel::ExpressionRef;
 use delta_kernel::Table;
 use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
-use delta_kernel::expressions::Expression;
+use delta_kernel::expressions::{
+    BinaryOperator, Expression, Scalar, UnaryOperator, VariadicOperator,
+};
 use delta_kernel::scan::ScanBuilder;
 use delta_kernel::scan::state::{DvInfo, GlobalScanState, Stats};
+use delta_kernel::schema::PrimitiveType;
 use delta_kernel::snapshot::Snapshot;
 use indexmap::IndexMap;
 use object_store::ObjectMeta;
@@ -346,7 +349,7 @@ impl TableProvider for DeltaTable {
             projection,
         );
         let engine = Arc::clone(&self.engine);
-        
+
         // Clone the filters since we need to move them into the spawn_blocking closure
         let filters_clone = filters.to_vec();
 
@@ -361,13 +364,10 @@ impl TableProvider for DeltaTable {
 
                 // Convert and apply predicate if possible
                 if let Some(predicate) = filters_to_delta_kernel_expr(&filters_clone) {
-                    tracing::debug!("Using delta_kernel predicate for filter pushdown");
-                    scan_builder = scan_builder.with_predicate(predicate);
-                } else if !filters_clone.is_empty() {
-                    tracing::debug!(
-                        "Could not convert filters to delta_kernel predicate: {:?}",
-                        filters_clone
+                    tracing::trace!(
+                        "Using delta_kernel predicate for filter pushdown: {predicate:?}"
                     );
+                    scan_builder = scan_builder.with_predicate(predicate);
                 }
 
                 let scan = scan_builder
@@ -737,87 +737,34 @@ async fn get_parquet_access_plan(
     Ok(ParquetAccessPlan::new(row_groups))
 }
 
-/// Convert a DataFusion filter expression to a delta_kernel expression
-fn to_delta_kernel_expr(expr: &Expr) -> Option<ExpressionRef> {
+/// Convert a `DataFusion` filter expression to a `delta_kernel` expression
+#[allow(clippy::too_many_lines)]
+fn to_delta_kernel_expr(expr: &Expr) -> Option<Expression> {
     match expr {
         Expr::BinaryExpr(binary) => {
-            let _left = to_delta_kernel_expr(&binary.left)?;
-            let _right = to_delta_kernel_expr(&binary.right)?;
+            let left = to_delta_kernel_expr(&binary.left)?;
+            let right = to_delta_kernel_expr(&binary.right)?;
 
-            // Due to type system limitations, it's simpler to just create a new expression
-            // representing a true literal as a placeholder for each binary expression
-            match binary.op {
-                datafusion::logical_expr::Operator::Eq |
-                datafusion::logical_expr::Operator::NotEq |
-                datafusion::logical_expr::Operator::Lt |
-                datafusion::logical_expr::Operator::LtEq |
-                datafusion::logical_expr::Operator::Gt |
-                datafusion::logical_expr::Operator::GtEq |
-                datafusion::logical_expr::Operator::And |
-                datafusion::logical_expr::Operator::Or => {
-                    // We could do a more complex implementation, but for now, use
-                    // a literal true to ensure the code compiles
-                    tracing::debug!("Binary operator {:?} simplified for delta_kernel", binary.op);
-                    Some(Arc::new(Expression::literal(true)))
-                }
-                
-                // Other operators not supported for predicates
-                _ => {
-                    tracing::debug!("Unsupported operator for delta_kernel predicate: {:?}", binary.op);
-                    return None;
-                },
-            }
+            let op = to_delta_kernel_binary_op(binary.op)?;
+            Some(Expression::binary(op, left, right))
         }
         Expr::Column(col) => {
-            // We need to create a vector with just one element (column name)
             let field_names = vec![col.name.as_str()];
-            Some(Arc::new(Expression::column(field_names)))
-        },
-        Expr::Literal(value) => match value {
-            ScalarValue::Int8(Some(v)) => Some(Arc::new(Expression::literal(*v as i32))),
-            ScalarValue::Int16(Some(v)) => Some(Arc::new(Expression::literal(*v as i32))),
-            ScalarValue::Int32(Some(v)) => Some(Arc::new(Expression::literal(*v))),
-            ScalarValue::Int64(Some(v)) => Some(Arc::new(Expression::literal(*v))),
-            // Convert unsigned types to signed (with potential data loss)
-            ScalarValue::UInt8(Some(v)) => Some(Arc::new(Expression::literal(*v as i32))),
-            ScalarValue::UInt16(Some(v)) => Some(Arc::new(Expression::literal(*v as i32))),
-            ScalarValue::UInt32(Some(v)) => Some(Arc::new(Expression::literal(*v as i64))),
-            ScalarValue::UInt64(Some(v)) => {
-                if *v <= i64::MAX as u64 {
-                    Some(Arc::new(Expression::literal(*v as i64)))
-                } else {
-                    None // Cannot represent u64 > i64::MAX in delta_kernel
-                }
-            },
-            ScalarValue::Float32(Some(v)) => Some(Arc::new(Expression::literal(*v))),
-            ScalarValue::Float64(Some(v)) => Some(Arc::new(Expression::literal(*v))),
-            ScalarValue::Utf8(Some(v)) => Some(Arc::new(Expression::literal(v.as_str()))),
-            ScalarValue::Boolean(Some(v)) => Some(Arc::new(Expression::literal(*v))),
-            ScalarValue::Date32(Some(v)) => Some(Arc::new(Expression::literal(*v))),
-            // Handle timestamp types properly
-            ScalarValue::TimestampSecond(Some(v), _) => Some(Arc::new(Expression::literal(*v))),
-            ScalarValue::TimestampMillisecond(Some(v), _) => Some(Arc::new(Expression::literal(*v))),
-            ScalarValue::TimestampMicrosecond(Some(v), _) => Some(Arc::new(Expression::literal(*v))),
-            ScalarValue::TimestampNanosecond(Some(v), _) => Some(Arc::new(Expression::literal(*v))),
-            // Add other scalar types as needed
-            _ => None,
-        },
-        Expr::IsNull(_expr) => {
-            // Simplified implementation to ensure the code compiles
-            tracing::debug!("IsNull expression simplified for delta_kernel");
-            Some(Arc::new(Expression::literal(true)))
-        },
-        Expr::IsNotNull(_expr) => {
-            // Simplified implementation to ensure the code compiles
-            tracing::debug!("IsNotNull expression simplified for delta_kernel");
-            Some(Arc::new(Expression::literal(true)))
-        },
-        Expr::Not(_expr) => {
-            // Simplified implementation to ensure the code compiles
-            tracing::debug!("Not expression simplified for delta_kernel");
-            Some(Arc::new(Expression::literal(true)))
+            Some(Expression::column(field_names))
         }
-        // For conjunction, we need to chain AND operations
+        Expr::Literal(value) => Some(Expression::literal(to_delta_kernel_scalar(value.clone())?)),
+        Expr::IsNull(expr) => {
+            let expr = to_delta_kernel_expr(expr)?;
+            Some(Expression::is_null(expr))
+        }
+        Expr::IsNotNull(expr) => {
+            let expr = to_delta_kernel_expr(expr)?;
+            Some(Expression::is_not_null(expr))
+        }
+        Expr::Not(expr) => {
+            let expr = to_delta_kernel_expr(expr)?;
+            Some(Expression::unary(UnaryOperator::Not, expr))
+        }
         Expr::Case(_)
         | Expr::Cast(_)
         | Expr::TryCast(_)
@@ -851,12 +798,168 @@ fn to_delta_kernel_expr(expr: &Expr) -> Option<ExpressionRef> {
     }
 }
 
-/// Convert a list of DataFusion filter expressions to a single delta_kernel expression
-/// 
-/// This function processes multiple DataFusion expressions and returns a predicate for delta_kernel.
+fn to_delta_kernel_binary_op(op: Operator) -> Option<BinaryOperator> {
+    match op {
+        Operator::Plus => Some(BinaryOperator::Plus),
+        Operator::Minus => Some(BinaryOperator::Minus),
+        Operator::Multiply => Some(BinaryOperator::Multiply),
+        Operator::Divide => Some(BinaryOperator::Divide),
+        Operator::Lt => Some(BinaryOperator::LessThan),
+        Operator::LtEq => Some(BinaryOperator::LessThanOrEqual),
+        Operator::Gt => Some(BinaryOperator::GreaterThan),
+        Operator::GtEq => Some(BinaryOperator::GreaterThanOrEqual),
+        Operator::Eq => Some(BinaryOperator::Equal),
+        Operator::NotEq => Some(BinaryOperator::NotEqual),
+        Operator::And
+        | Operator::Or
+        | Operator::IsDistinctFrom
+        | Operator::IsNotDistinctFrom
+        | Operator::RegexMatch
+        | Operator::RegexIMatch
+        | Operator::RegexNotMatch
+        | Operator::RegexNotIMatch
+        | Operator::LikeMatch
+        | Operator::ILikeMatch
+        | Operator::NotLikeMatch
+        | Operator::NotILikeMatch
+        | Operator::BitwiseAnd
+        | Operator::BitwiseOr
+        | Operator::BitwiseXor
+        | Operator::BitwiseShiftRight
+        | Operator::BitwiseShiftLeft
+        | Operator::StringConcat
+        | Operator::AtArrow
+        | Operator::ArrowAt
+        | Operator::Modulo => None,
+    }
+}
+
+#[allow(clippy::cast_sign_loss)]
+#[allow(clippy::too_many_lines)]
+fn to_delta_kernel_scalar(scalar: ScalarValue) -> Option<Scalar> {
+    match scalar {
+        ScalarValue::Int8(Some(v)) => Some(Scalar::Byte(v)),
+        ScalarValue::Int8(None) => Some(Scalar::Null(delta_kernel::schema::DataType::Primitive(
+            PrimitiveType::Byte,
+        ))),
+        ScalarValue::UInt8(Some(v)) => Some(Scalar::Short(i16::from(v))),
+        ScalarValue::Int16(Some(v)) => Some(Scalar::Short(v)),
+        ScalarValue::UInt8(None) | ScalarValue::Int16(None) => Some(Scalar::Null(
+            delta_kernel::schema::DataType::Primitive(PrimitiveType::Short),
+        )),
+        ScalarValue::Int32(Some(v)) => Some(Scalar::Integer(v)),
+        ScalarValue::UInt16(Some(v)) => Some(Scalar::Integer(i32::from(v))),
+        ScalarValue::UInt16(None) | ScalarValue::Int32(None) => Some(Scalar::Null(
+            delta_kernel::schema::DataType::Primitive(PrimitiveType::Integer),
+        )),
+        ScalarValue::Int64(Some(v)) => Some(Scalar::Long(v)),
+        ScalarValue::UInt32(Some(v)) => Some(Scalar::Long(i64::from(v))),
+        ScalarValue::UInt64(Some(v)) => {
+            if let Ok(v) = i64::try_from(v) {
+                Some(Scalar::Long(v))
+            } else {
+                None // Cannot represent u64 > i64::MAX in delta_kernel
+            }
+        }
+        ScalarValue::UInt64(None) | ScalarValue::UInt32(None) | ScalarValue::Int64(None) => {
+            Some(Scalar::Null(delta_kernel::schema::DataType::Primitive(
+                PrimitiveType::Long,
+            )))
+        }
+        ScalarValue::Boolean(Some(v)) => Some(Scalar::Boolean(v)),
+        ScalarValue::Boolean(None) => Some(Scalar::Null(
+            delta_kernel::schema::DataType::Primitive(PrimitiveType::Boolean),
+        )),
+        ScalarValue::Float16(Some(v)) => Some(Scalar::Float(f32::from(v))),
+        ScalarValue::Float32(Some(v)) => Some(Scalar::Float(v)),
+        ScalarValue::Float16(None) | ScalarValue::Float32(None) => Some(Scalar::Null(
+            delta_kernel::schema::DataType::Primitive(PrimitiveType::Float),
+        )),
+        ScalarValue::Float64(Some(v)) => Some(Scalar::Double(v)),
+        ScalarValue::Float64(None) => Some(Scalar::Null(
+            delta_kernel::schema::DataType::Primitive(PrimitiveType::Double),
+        )),
+        ScalarValue::Decimal128(Some(v), p, s) => Some(Scalar::Decimal(v, p, s as u8)),
+        ScalarValue::Decimal128(None, p, s) => Some(Scalar::Null(
+            delta_kernel::schema::DataType::Primitive(PrimitiveType::Decimal(p, s as u8)),
+        )),
+        ScalarValue::Utf8(Some(v))
+        | ScalarValue::Utf8View(Some(v))
+        | ScalarValue::LargeUtf8(Some(v)) => Some(Scalar::String(v)),
+        ScalarValue::Utf8(None) | ScalarValue::Utf8View(None) | ScalarValue::LargeUtf8(None) => {
+            Some(Scalar::Null(delta_kernel::schema::DataType::Primitive(
+                PrimitiveType::String,
+            )))
+        }
+        ScalarValue::Binary(Some(v))
+        | ScalarValue::BinaryView(Some(v))
+        | ScalarValue::FixedSizeBinary(_, Some(v))
+        | ScalarValue::LargeBinary(Some(v)) => Some(Scalar::Binary(v)),
+        ScalarValue::Binary(None)
+        | ScalarValue::BinaryView(None)
+        | ScalarValue::FixedSizeBinary(_, None)
+        | ScalarValue::LargeBinary(None) => Some(Scalar::Null(
+            delta_kernel::schema::DataType::Primitive(PrimitiveType::Binary),
+        )),
+        ScalarValue::Date32(Some(v)) => Some(Scalar::Date(v)),
+        ScalarValue::Date32(None) | ScalarValue::Date64(None) => Some(Scalar::Null(
+            delta_kernel::schema::DataType::Primitive(PrimitiveType::Date),
+        )),
+        ScalarValue::Date64(Some(v)) => {
+            // Convert milliseconds to days since epoch
+            let days = v / (24 * 60 * 60 * 1000);
+            if let Ok(days) = i32::try_from(days) {
+                Some(Scalar::Date(days))
+            } else {
+                None
+            }
+        }
+        ScalarValue::TimestampSecond(Some(v), Some(_)) => Some(Scalar::Timestamp(v * 1_000_000)), // Convert to microseconds
+        ScalarValue::TimestampSecond(Some(v), None) => Some(Scalar::TimestampNtz(v * 1_000_000)), // Convert to microseconds
+        ScalarValue::TimestampMillisecond(Some(v), Some(_)) => Some(Scalar::Timestamp(v * 1000)), // Convert to microseconds
+        ScalarValue::TimestampMillisecond(Some(v), None) => Some(Scalar::TimestampNtz(v * 1000)), // Convert to microseconds
+        ScalarValue::TimestampMicrosecond(Some(v), Some(_)) => Some(Scalar::Timestamp(v)),
+        ScalarValue::TimestampMicrosecond(Some(v), None) => Some(Scalar::TimestampNtz(v)),
+        ScalarValue::TimestampNanosecond(Some(v), Some(_)) => Some(Scalar::Timestamp(v / 1000)), // Convert to microseconds
+        ScalarValue::TimestampNanosecond(Some(v), None) => Some(Scalar::TimestampNtz(v / 1000)), // Convert to microseconds
+        ScalarValue::TimestampSecond(None, Some(_))
+        | ScalarValue::TimestampMillisecond(None, Some(_))
+        | ScalarValue::TimestampMicrosecond(None, Some(_))
+        | ScalarValue::TimestampNanosecond(None, Some(_)) => Some(Scalar::Null(
+            delta_kernel::schema::DataType::Primitive(PrimitiveType::Timestamp),
+        )),
+        ScalarValue::TimestampSecond(None, None)
+        | ScalarValue::TimestampMillisecond(None, None)
+        | ScalarValue::TimestampMicrosecond(None, None)
+        | ScalarValue::TimestampNanosecond(None, None) => Some(Scalar::Null(
+            delta_kernel::schema::DataType::Primitive(PrimitiveType::TimestampNtz),
+        )),
+        ScalarValue::Null
+        | ScalarValue::Decimal256(_, _, _)
+        | ScalarValue::FixedSizeList(_)
+        | ScalarValue::List(_)
+        | ScalarValue::LargeList(_)
+        | ScalarValue::Struct(_)
+        | ScalarValue::Map(_)
+        | ScalarValue::Time32Second(_)
+        | ScalarValue::Time32Millisecond(_)
+        | ScalarValue::Time64Microsecond(_)
+        | ScalarValue::Time64Nanosecond(_)
+        | ScalarValue::IntervalYearMonth(_)
+        | ScalarValue::IntervalDayTime(_)
+        | ScalarValue::IntervalMonthDayNano(_)
+        | ScalarValue::DurationSecond(_)
+        | ScalarValue::DurationMillisecond(_)
+        | ScalarValue::DurationMicrosecond(_)
+        | ScalarValue::DurationNanosecond(_)
+        | ScalarValue::Union(_, _, _)
+        | ScalarValue::Dictionary(_, _) => None,
+    }
+}
+
+/// Convert a list of `DataFusion` filter expressions to a single `delta_kernel` expression
 ///
-/// Note: Due to type system limitations, this is a simplified implementation that uses
-/// a placeholder expression when multiple filters are present.
+/// This function processes multiple `DataFusion` expressions and returns a predicate for `delta_kernel`.
 fn filters_to_delta_kernel_expr(filters: &[Expr]) -> Option<ExpressionRef> {
     if filters.is_empty() {
         return None;
@@ -872,12 +975,12 @@ fn filters_to_delta_kernel_expr(filters: &[Expr]) -> Option<ExpressionRef> {
     if exprs.is_empty() {
         None
     } else if exprs.len() == 1 {
-        Some(exprs[0].clone())
+        let expr = exprs.into_iter().next()?;
+        Some(Arc::new(expr))
     } else {
-        // When multiple expressions exist, use a placeholder
-        // that would match everything (for safety)
-        tracing::debug!("Multiple filter expressions simplified for delta_kernel");
-        Some(Arc::new(Expression::literal(true)))
+        // Multiple filters are present, so we need to combine them using an AND operation
+        let variadic_expr = Expression::variadic(VariadicOperator::And, exprs);
+        Some(Arc::new(variadic_expr))
     }
 }
 
@@ -894,8 +997,9 @@ fn handle_delta_error(delta_error: delta_kernel::Error) -> Error {
 
 #[cfg(test)]
 mod tests {
-    use datafusion::logical_expr::{col, lit};
+    use datafusion::logical_expr::{col, lit, or, not, and, Operator};
     use datafusion::parquet::arrow::arrow_reader::RowSelector;
+    use delta_kernel::expressions::{BinaryOperator, Expression, UnaryOperator, VariadicOperator};
 
     use super::*;
 
@@ -928,6 +1032,255 @@ mod tests {
     }
 
     #[test]
+    fn test_to_delta_kernel_expr_column() {
+        let col_expr = col("name");
+        let dk_expr = to_delta_kernel_expr(&col_expr).unwrap();
+        
+        // Match expected structure for column reference
+        if let Expression::Column(field_names) = dk_expr {
+            assert_eq!(field_names, vec!["name"]);
+        } else {
+            panic!("Expected Column expression, got: {:?}", dk_expr);
+        }
+    }
+
+    #[test]
+    fn test_to_delta_kernel_expr_literal() {
+        // Test string literal
+        let lit_expr = lit("value");
+        let dk_expr = to_delta_kernel_expr(&lit_expr).unwrap();
+        
+        if let Expression::Literal(scalar) = dk_expr {
+            if let Scalar::String(value) = scalar {
+                assert_eq!(value, "value");
+            } else {
+                panic!("Expected String scalar, got: {:?}", scalar);
+            }
+        } else {
+            panic!("Expected Literal expression, got: {:?}", dk_expr);
+        }
+        
+        // Test integer literal
+        let lit_expr = lit(42);
+        let dk_expr = to_delta_kernel_expr(&lit_expr).unwrap();
+        
+        if let Expression::Literal(scalar) = dk_expr {
+            if let Scalar::Integer(value) = scalar {
+                assert_eq!(value, 42);
+            } else {
+                panic!("Expected Integer scalar, got: {:?}", scalar);
+            }
+        }
+        
+        // Test boolean literal
+        let lit_expr = lit(true);
+        let dk_expr = to_delta_kernel_expr(&lit_expr).unwrap();
+        
+        if let Expression::Literal(scalar) = dk_expr {
+            if let Scalar::Boolean(value) = scalar {
+                assert!(value);
+            } else {
+                panic!("Expected Boolean scalar, got: {:?}", scalar);
+            }
+        }
+    }
+
+    #[test]
+    fn test_to_delta_kernel_expr_comparison() {
+        // Test equality
+        let eq_expr = col("age").eq(lit(30));
+        let dk_expr = to_delta_kernel_expr(&eq_expr).unwrap();
+        
+        if let Expression::BinaryOp { op, left, right } = dk_expr {
+            assert_eq!(op, BinaryOperator::Equal);
+            
+            if let Expression::Column(field_names) = *left {
+                assert_eq!(field_names, vec!["age"]);
+            } else {
+                panic!("Expected Column expression for left operand");
+            }
+            
+            if let Expression::Literal(Scalar::Integer(value)) = *right {
+                assert_eq!(value, 30);
+            } else {
+                panic!("Expected Integer literal for right operand");
+            }
+        } else {
+            panic!("Expected BinaryOp expression");
+        }
+        
+        // Test less than
+        let lt_expr = col("count").lt(lit(10));
+        let dk_expr = to_delta_kernel_expr(&lt_expr).unwrap();
+        
+        if let Expression::BinaryOp { op, .. } = dk_expr {
+            assert_eq!(op, BinaryOperator::LessThan);
+        }
+        
+        // Test greater than or equal
+        let gte_expr = col("score").gt_eq(lit(75.5));
+        let dk_expr = to_delta_kernel_expr(&gte_expr).unwrap();
+        
+        if let Expression::BinaryOp { op, .. } = dk_expr {
+            assert_eq!(op, BinaryOperator::GreaterThanOrEqual);
+        }
+    }
+
+    #[test]
+    fn test_to_delta_kernel_expr_is_null() {
+        let is_null_expr = col("optional_field").is_null();
+        let dk_expr = to_delta_kernel_expr(&is_null_expr).unwrap();
+        
+        if let Expression::IsNull(expr) = dk_expr {
+            if let Expression::Column(field_names) = *expr {
+                assert_eq!(field_names, vec!["optional_field"]);
+            } else {
+                panic!("Expected Column expression inside IsNull");
+            }
+        } else {
+            panic!("Expected IsNull expression, got: {:?}", dk_expr);
+        }
+    }
+
+    #[test]
+    fn test_to_delta_kernel_expr_is_not_null() {
+        let is_not_null_expr = col("required_field").is_not_null();
+        let dk_expr = to_delta_kernel_expr(&is_not_null_expr).unwrap();
+        
+        if let Expression::IsNotNull(expr) = dk_expr {
+            if let Expression::Column(field_names) = *expr {
+                assert_eq!(field_names, vec!["required_field"]);
+            } else {
+                panic!("Expected Column expression inside IsNotNull");
+            }
+        } else {
+            panic!("Expected IsNotNull expression, got: {:?}", dk_expr);
+        }
+    }
+
+    #[test]
+    fn test_to_delta_kernel_expr_not() {
+        let not_expr = not(col("active").eq(lit(true)));
+        let dk_expr = to_delta_kernel_expr(&not_expr).unwrap();
+        
+        if let Expression::UnaryOp { op, expr } = dk_expr {
+            assert_eq!(op, UnaryOperator::Not);
+            
+            if let Expression::BinaryOp { op, .. } = *expr {
+                assert_eq!(op, BinaryOperator::Equal);
+            } else {
+                panic!("Expected BinaryOp expression inside Not");
+            }
+        } else {
+            panic!("Expected UnaryOp expression, got: {:?}", dk_expr);
+        }
+    }
+
+    #[test]
+    fn test_to_delta_kernel_expr_unsupported() {
+        // Test case expression (unsupported)
+        let case_expr = datafusion::logical_expr::case(col("status"))
+            .when(lit("active"), lit(1))
+            .otherwise(lit(0))
+            .unwrap();
+        let dk_expr = to_delta_kernel_expr(&case_expr);
+        assert!(dk_expr.is_none());
+        
+        // Test in list expression (unsupported)
+        let in_list_expr = datafusion::logical_expr::in_list(col("status"), vec![lit("active"), lit("pending")], false);
+        let dk_expr = to_delta_kernel_expr(&in_list_expr);
+        assert!(dk_expr.is_none());
+    }
+
+    #[test]
+    fn test_to_delta_kernel_binary_op() {
+        // Test supported operators
+        assert_eq!(to_delta_kernel_binary_op(Operator::Eq), Some(BinaryOperator::Equal));
+        assert_eq!(to_delta_kernel_binary_op(Operator::NotEq), Some(BinaryOperator::NotEqual));
+        assert_eq!(to_delta_kernel_binary_op(Operator::Lt), Some(BinaryOperator::LessThan));
+        assert_eq!(to_delta_kernel_binary_op(Operator::LtEq), Some(BinaryOperator::LessThanOrEqual));
+        assert_eq!(to_delta_kernel_binary_op(Operator::Gt), Some(BinaryOperator::GreaterThan));
+        assert_eq!(to_delta_kernel_binary_op(Operator::GtEq), Some(BinaryOperator::GreaterThanOrEqual));
+        assert_eq!(to_delta_kernel_binary_op(Operator::Plus), Some(BinaryOperator::Plus));
+        assert_eq!(to_delta_kernel_binary_op(Operator::Minus), Some(BinaryOperator::Minus));
+        assert_eq!(to_delta_kernel_binary_op(Operator::Multiply), Some(BinaryOperator::Multiply));
+        assert_eq!(to_delta_kernel_binary_op(Operator::Divide), Some(BinaryOperator::Divide));
+        
+        // Test unsupported operators
+        assert_eq!(to_delta_kernel_binary_op(Operator::And), None);
+        assert_eq!(to_delta_kernel_binary_op(Operator::Or), None);
+        assert_eq!(to_delta_kernel_binary_op(Operator::Modulo), None);
+        assert_eq!(to_delta_kernel_binary_op(Operator::StringConcat), None);
+    }
+
+    #[test]
+    fn test_to_delta_kernel_scalar() {
+        // Test string scalar
+        let scalar = ScalarValue::Utf8(Some("test".to_string()));
+        let dk_scalar = to_delta_kernel_scalar(scalar).unwrap();
+        assert!(matches!(dk_scalar, Scalar::String(s) if s == "test"));
+        
+        // Test integer scalars
+        let scalar = ScalarValue::Int8(Some(8));
+        let dk_scalar = to_delta_kernel_scalar(scalar).unwrap();
+        assert!(matches!(dk_scalar, Scalar::Byte(v) if v == 8));
+        
+        let scalar = ScalarValue::Int16(Some(16));
+        let dk_scalar = to_delta_kernel_scalar(scalar).unwrap();
+        assert!(matches!(dk_scalar, Scalar::Short(v) if v == 16));
+        
+        let scalar = ScalarValue::Int32(Some(32));
+        let dk_scalar = to_delta_kernel_scalar(scalar).unwrap();
+        assert!(matches!(dk_scalar, Scalar::Integer(v) if v == 32));
+        
+        let scalar = ScalarValue::Int64(Some(64));
+        let dk_scalar = to_delta_kernel_scalar(scalar).unwrap();
+        assert!(matches!(dk_scalar, Scalar::Long(v) if v == 64));
+        
+        // Test float scalars
+        let scalar = ScalarValue::Float32(Some(32.5));
+        let dk_scalar = to_delta_kernel_scalar(scalar).unwrap();
+        assert!(matches!(dk_scalar, Scalar::Float(v) if v == 32.5));
+        
+        let scalar = ScalarValue::Float64(Some(64.5));
+        let dk_scalar = to_delta_kernel_scalar(scalar).unwrap();
+        assert!(matches!(dk_scalar, Scalar::Double(v) if v == 64.5));
+        
+        // Test boolean scalar
+        let scalar = ScalarValue::Boolean(Some(true));
+        let dk_scalar = to_delta_kernel_scalar(scalar).unwrap();
+        assert!(matches!(dk_scalar, Scalar::Boolean(v) if v));
+        
+        // Test null scalars
+        let scalar = ScalarValue::Int32(None);
+        let dk_scalar = to_delta_kernel_scalar(scalar).unwrap();
+        assert!(matches!(dk_scalar, Scalar::Null(dt) if matches!(dt, delta_kernel::schema::DataType::Primitive(PrimitiveType::Integer))));
+        
+        let scalar = ScalarValue::Utf8(None);
+        let dk_scalar = to_delta_kernel_scalar(scalar).unwrap();
+        assert!(matches!(dk_scalar, Scalar::Null(dt) if matches!(dt, delta_kernel::schema::DataType::Primitive(PrimitiveType::String))));
+        
+        // Test timestamp scalar
+        let scalar = ScalarValue::TimestampMicrosecond(Some(1000000), None);
+        let dk_scalar = to_delta_kernel_scalar(scalar).unwrap();
+        assert!(matches!(dk_scalar, Scalar::TimestampNtz(v) if v == 1000000));
+        
+        let scalar = ScalarValue::TimestampMicrosecond(Some(1000000), Some("UTC".into()));
+        let dk_scalar = to_delta_kernel_scalar(scalar).unwrap();
+        assert!(matches!(dk_scalar, Scalar::Timestamp(v) if v == 1000000));
+        
+        // Test decimal scalar
+        let scalar = ScalarValue::Decimal128(Some(1234), 10, 2);
+        let dk_scalar = to_delta_kernel_scalar(scalar).unwrap();
+        assert!(matches!(dk_scalar, Scalar::Decimal(v, p, s) if v == 1234 && p == 10 && s == 2));
+        
+        // Test unsupported scalar
+        let scalar = ScalarValue::FixedSizeList(Arc::new(vec![ScalarValue::Int32(Some(1))]));
+        let dk_scalar = to_delta_kernel_scalar(scalar);
+        assert!(dk_scalar.is_none());
+    }
+
+    #[test]
     fn test_filters_to_delta_kernel_expr() {
         // Test empty filters
         let filters: Vec<Expr> = vec![];
@@ -936,11 +1289,105 @@ mod tests {
 
         // Test single filter
         let filters = vec![col("age").eq(lit(30))];
-        let dk_expr = filters_to_delta_kernel_expr(&filters);
-        assert!(dk_expr.is_some());
+        let dk_expr = filters_to_delta_kernel_expr(&filters).unwrap();
+        
+        // Unwrap Arc
+        let dk_expr = Arc::try_unwrap(dk_expr).unwrap_or_else(|e| (*e).clone());
+        
+        if let Expression::BinaryOp { op, .. } = dk_expr {
+            assert_eq!(op, BinaryOperator::Equal);
+        } else {
+            panic!("Expected BinaryOp expression");
+        }
 
         // Test multiple filters
         let filters = vec![col("age").gt(lit(20)), col("name").eq(lit("John"))];
+        let dk_expr = filters_to_delta_kernel_expr(&filters).unwrap();
+        
+        // Unwrap Arc
+        let dk_expr = Arc::try_unwrap(dk_expr).unwrap_or_else(|e| (*e).clone());
+        
+        if let Expression::VariadicOp { op, exprs } = dk_expr {
+            assert_eq!(op, VariadicOperator::And);
+            assert_eq!(exprs.len(), 2);
+            
+            if let Expression::BinaryOp { op, .. } = &exprs[0] {
+                assert_eq!(*op, BinaryOperator::GreaterThan);
+            } else {
+                panic!("Expected first expression to be BinaryOp");
+            }
+            
+            if let Expression::BinaryOp { op, .. } = &exprs[1] {
+                assert_eq!(*op, BinaryOperator::Equal);
+            } else {
+                panic!("Expected second expression to be BinaryOp");
+            }
+        } else {
+            panic!("Expected VariadicOp expression with And operator");
+        }
+        
+        // Test filters with unsupported expressions
+        let case_expr = datafusion::logical_expr::case(col("status"))
+            .when(lit("active"), lit(1))
+            .otherwise(lit(0))
+            .unwrap();
+        
+        let filters = vec![col("age").gt(lit(20)), case_expr];
+        let dk_expr = filters_to_delta_kernel_expr(&filters).unwrap();
+        
+        // Unwrap Arc - should only contain the supported expression
+        let dk_expr = Arc::try_unwrap(dk_expr).unwrap_or_else(|e| (*e).clone());
+        
+        if let Expression::BinaryOp { op, .. } = dk_expr {
+            assert_eq!(op, BinaryOperator::GreaterThan);
+        } else {
+            panic!("Expected BinaryOp expression");
+        }
+        
+        // Test filters with only unsupported expressions
+        let filters = vec![case_expr];
+        let dk_expr = filters_to_delta_kernel_expr(&filters);
+        assert!(dk_expr.is_none());
+    }
+
+    #[test]
+    fn test_complex_filters_to_delta_kernel_expr() {
+        // Test AND, OR combinations with multiple predicates
+        let filter = and(
+            col("category").eq(lit("electronics")),
+            or(
+                col("price").lt(lit(100.0)),
+                col("rating").gt(lit(4.5))
+            )
+        );
+        
+        let filters = vec![filter];
+        let dk_expr = filters_to_delta_kernel_expr(&filters);
+        assert!(dk_expr.is_some());
+        
+        // Test a complex expression with various operations
+        let filter = and(
+            col("active").eq(lit(true)),
+            and(
+                col("age").gt(lit(18)),
+                or(
+                    col("subscription").eq(lit("premium")),
+                    col("trial_days").gt(lit(0))
+                )
+            )
+        );
+        
+        let filters = vec![filter];
+        let dk_expr = filters_to_delta_kernel_expr(&filters);
+        assert!(dk_expr.is_some());
+        
+        // Test with NOT expressions
+        let filter = and(
+            not(col("deleted").eq(lit(true))),
+            col("status").eq(lit("published"))
+        );
+        
+        let filters = vec![filter];
         let dk_expr = filters_to_delta_kernel_expr(&filters);
         assert!(dk_expr.is_some());
     }
@@ -978,6 +1425,42 @@ mod tests {
             row_group_access,
             RowGroupAccess::Selection(selectors.into())
         );
+    }
+
+    #[test]
+    fn test_get_row_group_access_with_offset() {
+        // Test with offset starting row
+        let selection_vector = &[true, true, true, true, true, false, false, false, true, true];
+        let row_group_row_start = 5; // Start at index 5
+        let row_group_num_rows = 5;  // Take 5 rows (5-9)
+        let row_group_access =
+            get_row_group_access(selection_vector, row_group_row_start, row_group_num_rows);
+
+        // The selection should be [false, false, false, true, true]
+        let selectors = vec![
+            RowSelector::skip(3),
+            RowSelector::select(2),
+        ];
+        assert_eq!(
+            row_group_access,
+            RowGroupAccess::Selection(selectors.into())
+        );
+    }
+
+    #[test]
+    fn test_get_full_selection_vector() {
+        let selection_vector = &[true, false, true];
+        let total_rows = 5;
+        let full_vector = get_full_selection_vector(selection_vector, total_rows);
+        
+        assert_eq!(full_vector, vec![true, false, true, true, true]);
+        
+        // Test when total_rows is less than selection_vector length
+        let selection_vector = &[true, false, true, false, true];
+        let total_rows = 3;
+        let full_vector = get_full_selection_vector(selection_vector, total_rows);
+        
+        assert_eq!(full_vector, vec![true, false, true]);
     }
 
     #[test]
