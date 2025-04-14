@@ -1005,6 +1005,7 @@ mod tests {
 
     #[test]
     #[allow(clippy::too_many_lines)]
+    #[allow(clippy::similar_names)]
     fn test_to_delta_kernel_expr() {
         // Test basic column reference
         let col_expr = col("name");
@@ -1127,7 +1128,7 @@ mod tests {
         let case_expr = datafusion::logical_expr::case(col("status"))
             .when(lit("active"), lit(1))
             .otherwise(lit(0))
-            .unwrap();
+            .expect("Failed to create case expression");
         let dk_expr = to_delta_kernel_expr(&case_expr);
         assert!(
             dk_expr.is_none(),
@@ -1205,59 +1206,72 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn test_to_delta_kernel_scalar() {
         // Test string scalar
         let scalar = ScalarValue::Utf8(Some("test".to_string()));
-        let dk_scalar = to_delta_kernel_scalar(scalar).unwrap();
+        let dk_scalar = to_delta_kernel_scalar(scalar)
+            .expect("Failed to convert string scalar to delta kernel scalar");
         assert!(matches!(dk_scalar, Scalar::String(s) if s == "test"));
 
         // Test other string types
         let scalar = ScalarValue::Utf8View(Some("test_view".to_string()));
-        let dk_scalar = to_delta_kernel_scalar(scalar).unwrap();
+        let dk_scalar = to_delta_kernel_scalar(scalar)
+            .expect("Failed to convert Utf8View scalar to delta kernel scalar");
         assert!(matches!(dk_scalar, Scalar::String(s) if s == "test_view"));
 
         let scalar = ScalarValue::LargeUtf8(Some("large_test".to_string()));
-        let dk_scalar = to_delta_kernel_scalar(scalar).unwrap();
+        let dk_scalar = to_delta_kernel_scalar(scalar)
+            .expect("Failed to convert LargeUtf8 scalar to delta kernel scalar");
         assert!(matches!(dk_scalar, Scalar::String(s) if s == "large_test"));
 
         // Test integer scalars
         let scalar = ScalarValue::Int8(Some(8));
-        let dk_scalar = to_delta_kernel_scalar(scalar).unwrap();
+        let dk_scalar = to_delta_kernel_scalar(scalar)
+            .expect("Failed to convert Int8 scalar to delta kernel scalar");
         assert!(matches!(dk_scalar, Scalar::Byte(v) if v == 8));
 
         let scalar = ScalarValue::Int16(Some(16));
-        let dk_scalar = to_delta_kernel_scalar(scalar).unwrap();
+        let dk_scalar = to_delta_kernel_scalar(scalar)
+            .expect("Failed to convert Int16 scalar to delta kernel scalar");
         assert!(matches!(dk_scalar, Scalar::Short(v) if v == 16));
 
         let scalar = ScalarValue::Int32(Some(32));
-        let dk_scalar = to_delta_kernel_scalar(scalar).unwrap();
+        let dk_scalar = to_delta_kernel_scalar(scalar)
+            .expect("Failed to convert Int32 scalar to delta kernel scalar");
         assert!(matches!(dk_scalar, Scalar::Integer(v) if v == 32));
 
         let scalar = ScalarValue::Int64(Some(64));
-        let dk_scalar = to_delta_kernel_scalar(scalar).unwrap();
+        let dk_scalar = to_delta_kernel_scalar(scalar)
+            .expect("Failed to convert Int64 scalar to delta kernel scalar");
         assert!(matches!(dk_scalar, Scalar::Long(v) if v == 64));
 
         // Test unsigned integer conversion
         let scalar = ScalarValue::UInt8(Some(8));
-        let dk_scalar = to_delta_kernel_scalar(scalar).unwrap();
+        let dk_scalar = to_delta_kernel_scalar(scalar)
+            .expect("Failed to convert UInt8 scalar to delta kernel scalar");
         assert!(matches!(dk_scalar, Scalar::Short(v) if v == 8));
 
         let scalar = ScalarValue::UInt16(Some(16));
-        let dk_scalar = to_delta_kernel_scalar(scalar).unwrap();
+        let dk_scalar = to_delta_kernel_scalar(scalar)
+            .expect("Failed to convert UInt16 scalar to delta kernel scalar");
         assert!(matches!(dk_scalar, Scalar::Integer(v) if v == 16));
 
         let scalar = ScalarValue::UInt32(Some(32));
-        let dk_scalar = to_delta_kernel_scalar(scalar).unwrap();
+        let dk_scalar = to_delta_kernel_scalar(scalar)
+            .expect("Failed to convert UInt32 scalar to delta kernel scalar");
         assert!(matches!(dk_scalar, Scalar::Long(v) if v == 32));
 
         let scalar = ScalarValue::UInt64(Some(64));
-        let dk_scalar = to_delta_kernel_scalar(scalar).unwrap();
+        let dk_scalar = to_delta_kernel_scalar(scalar)
+            .expect("Failed to convert UInt64 scalar to delta kernel scalar");
         assert!(matches!(dk_scalar, Scalar::Long(v) if v == 64));
 
         // Test large UInt64 conversion (edge case)
         let max_i64 = i64::MAX as u64;
         let scalar = ScalarValue::UInt64(Some(max_i64));
-        let dk_scalar = to_delta_kernel_scalar(scalar).unwrap();
+        let dk_scalar = to_delta_kernel_scalar(scalar)
+            .expect("Failed to convert max UInt64 scalar to delta kernel scalar");
         assert!(matches!(dk_scalar, Scalar::Long(v) if v == i64::MAX));
 
         // Test UInt64 that's too large to fit in i64 (should return None)
@@ -1268,74 +1282,88 @@ mod tests {
 
         // Test float scalars without Float16 (not available in this crate)
         let scalar = ScalarValue::Float32(Some(32.5));
-        let dk_scalar = to_delta_kernel_scalar(scalar).unwrap();
-        assert!(matches!(dk_scalar, Scalar::Float(v) if v == 32.5));
+        let dk_scalar = to_delta_kernel_scalar(scalar)
+            .expect("Failed to convert Float32 scalar to delta kernel scalar");
+        assert!(matches!(dk_scalar, Scalar::Float(v) if (v - 32.5).abs() < f32::EPSILON));
 
         let scalar = ScalarValue::Float64(Some(64.5));
-        let dk_scalar = to_delta_kernel_scalar(scalar).unwrap();
-        assert!(matches!(dk_scalar, Scalar::Double(v) if v == 64.5));
+        let dk_scalar = to_delta_kernel_scalar(scalar)
+            .expect("Failed to convert Float64 scalar to delta kernel scalar");
+        assert!(matches!(dk_scalar, Scalar::Double(v) if (v - 64.5).abs() < f64::EPSILON));
 
         // Test boolean scalar
         let scalar = ScalarValue::Boolean(Some(true));
-        let dk_scalar = to_delta_kernel_scalar(scalar).unwrap();
+        let dk_scalar = to_delta_kernel_scalar(scalar)
+            .expect("Failed to convert Boolean scalar to delta kernel scalar");
         assert!(matches!(dk_scalar, Scalar::Boolean(v) if v));
 
         // Test null scalars
         let scalar = ScalarValue::Int32(None);
-        let dk_scalar = to_delta_kernel_scalar(scalar).unwrap();
+        let dk_scalar = to_delta_kernel_scalar(scalar)
+            .expect("Failed to convert Int32 null scalar to delta kernel scalar");
         assert!(
             matches!(dk_scalar, Scalar::Null(dt) if matches!(dt, delta_kernel::schema::DataType::Primitive(PrimitiveType::Integer)))
         );
 
         let scalar = ScalarValue::Utf8(None);
-        let dk_scalar = to_delta_kernel_scalar(scalar).unwrap();
+        let dk_scalar = to_delta_kernel_scalar(scalar)
+            .expect("Failed to convert Utf8 null scalar to delta kernel scalar");
         assert!(
             matches!(dk_scalar, Scalar::Null(dt) if matches!(dt, delta_kernel::schema::DataType::Primitive(PrimitiveType::String)))
         );
 
         // Test timestamp scalar with different time units
         let scalar = ScalarValue::TimestampSecond(Some(10), None);
-        let dk_scalar = to_delta_kernel_scalar(scalar).unwrap();
+        let dk_scalar = to_delta_kernel_scalar(scalar)
+            .expect("Failed to convert TimestampSecond scalar to delta kernel scalar");
         assert!(matches!(dk_scalar, Scalar::TimestampNtz(v) if v == 10_000_000)); // Converted to microseconds
 
         let scalar = ScalarValue::TimestampMillisecond(Some(10_000), None);
-        let dk_scalar = to_delta_kernel_scalar(scalar).unwrap();
+        let dk_scalar = to_delta_kernel_scalar(scalar)
+            .expect("Failed to convert TimestampMillisecond scalar to delta kernel scalar");
         assert!(matches!(dk_scalar, Scalar::TimestampNtz(v) if v == 10_000_000)); // Converted to microseconds
 
-        let scalar = ScalarValue::TimestampMicrosecond(Some(1000000), None);
-        let dk_scalar = to_delta_kernel_scalar(scalar).unwrap();
-        assert!(matches!(dk_scalar, Scalar::TimestampNtz(v) if v == 1000000));
+        let scalar = ScalarValue::TimestampMicrosecond(Some(1_000_000), None);
+        let dk_scalar = to_delta_kernel_scalar(scalar)
+            .expect("Failed to convert TimestampMicrosecond scalar to delta kernel scalar");
+        assert!(matches!(dk_scalar, Scalar::TimestampNtz(v) if v == 1_000_000));
 
         let scalar = ScalarValue::TimestampNanosecond(Some(1_000_000_000), None);
-        let dk_scalar = to_delta_kernel_scalar(scalar).unwrap();
+        let dk_scalar = to_delta_kernel_scalar(scalar)
+            .expect("Failed to convert TimestampNanosecond scalar to delta kernel scalar");
         assert!(matches!(dk_scalar, Scalar::TimestampNtz(v) if v == 1_000_000)); // Converted to microseconds
 
         // Test timestamp with timezone
-        let scalar = ScalarValue::TimestampMicrosecond(Some(1000000), Some("UTC".into()));
-        let dk_scalar = to_delta_kernel_scalar(scalar).unwrap();
-        assert!(matches!(dk_scalar, Scalar::Timestamp(v) if v == 1000000));
+        let scalar = ScalarValue::TimestampMicrosecond(Some(1_000_000), Some("UTC".into()));
+        let dk_scalar = to_delta_kernel_scalar(scalar)
+            .expect("Failed to convert Timestamp with timezone scalar to delta kernel scalar");
+        assert!(matches!(dk_scalar, Scalar::Timestamp(v) if v == 1_000_000));
 
         // Test decimal scalar
         let scalar = ScalarValue::Decimal128(Some(1234), 10, 2);
-        let dk_scalar = to_delta_kernel_scalar(scalar).unwrap();
+        let dk_scalar = to_delta_kernel_scalar(scalar)
+            .expect("Failed to convert Decimal128 scalar to delta kernel scalar");
         assert!(matches!(dk_scalar, Scalar::Decimal(v, p, s) if v == 1234 && p == 10 && s == 2));
 
         // Test binary data
         let binary_data = vec![1, 2, 3, 4];
         let scalar = ScalarValue::Binary(Some(binary_data.clone()));
-        let dk_scalar = to_delta_kernel_scalar(scalar).unwrap();
+        let dk_scalar = to_delta_kernel_scalar(scalar)
+            .expect("Failed to convert Binary scalar to delta kernel scalar");
         assert!(matches!(dk_scalar, Scalar::Binary(v) if v == binary_data));
 
         // Test Date32
         let scalar = ScalarValue::Date32(Some(18000)); // Some number of days since epoch
-        let dk_scalar = to_delta_kernel_scalar(scalar).unwrap();
+        let dk_scalar = to_delta_kernel_scalar(scalar)
+            .expect("Failed to convert Date32 scalar to delta kernel scalar");
         assert!(matches!(dk_scalar, Scalar::Date(v) if v == 18000));
 
         // Test Date64
         let days = 100;
-        let millis = days as i64 * 24 * 60 * 60 * 1000;
+        let millis = i64::from(days) * 24 * 60 * 60 * 1000;
         let scalar = ScalarValue::Date64(Some(millis));
-        let dk_scalar = to_delta_kernel_scalar(scalar).unwrap();
+        let dk_scalar = to_delta_kernel_scalar(scalar)
+            .expect("Failed to convert Date64 scalar to delta kernel scalar");
         assert!(matches!(dk_scalar, Scalar::Date(v) if v == days));
 
         // Test unsupported types (we don't need to test the exact construction since we only care about the return value)
@@ -1367,7 +1395,7 @@ mod tests {
         let case_expr = datafusion::logical_expr::case(col("status"))
             .when(lit("active"), lit(1))
             .otherwise(lit(0))
-            .unwrap();
+            .expect("Failed to create case expression for unsupported expressions test");
 
         let filters = vec![col("age").gt(lit(20)), case_expr.clone()];
         let dk_expr = filters_to_delta_kernel_expr(&filters);
