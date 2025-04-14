@@ -119,7 +119,7 @@ Limited = Partial or restricted support
 - **OpenAI-compatible API**: Connect to hosted models (OpenAI, Anthropic, xAI) or deploy locally (Llama, NVIDIA NIM). [AI Gateway Recipe](https://github.com/spiceai/cookbook/blob/trunk/openai_sdk/README.md)
 - **Federated Data Access**: Query using SQL and NSQL (text-to-SQL) across databases, data warehouses, and data lakes with advanced query push-down for fast retrieval across disparate data sources. [Federated SQL Query Recipe](https://github.com/spiceai/cookbook/blob/trunk/federation/README.md)
 - **Search and RAG**: Search and retrieve context with accelerated embeddings for retrieval-augmented generation (RAG) workflows. [Vector Search over GitHub Files](https://github.com/spiceai/cookbook/blob/trunk/search_github_files/README.md)
-- **LLM Memory and Observability**: Store and retrieve history and context for AI agents while gaining deep visibility into data flows, model performance, and traces. [LLM Memory Recipe](https://github.com/spiceai/cookbook/blob/trunk/llm-memory/README.md) | [Monitoring Features Documentation](https://spiceai.org/docs/features/monitoring)
+- **LLM Memory and Observability**: Store and retrieve history and context for AI agents while gaining deep visibility into data flows, model performance, and traces. [LLM Memory Recipe](https://github.com/spiceai/cookbook/blob/trunk/llm-memory/README.md) | [Observability & Monitoring Features Documentation](https://spiceai.org/docs/features/observability)
 
 ### Database CDN and Query Mesh
 
@@ -181,7 +181,7 @@ See more demos on [YouTube](https://www.youtube.com/playlist?list=PLesJrUXEx3U9a
 | `mongodb`                          | MongoDB                               | Coming Soon       |                              |
 | `elasticsearch`                    | ElasticSearch                         | Roadmap           |                              |
 
-[databricks]: https://github.com/spiceai/cookbook/tree/trunk/databricks/delta_lake
+[databricks]: https://github.com/spiceai/cookbook/blob/trunk/databricks/README.md
 [spark]: https://spark.apache.org/docs/latest/spark-connect-overview.html
 [s3]: https://github.com/spiceai/cookbook/tree/trunk/s3#readme
 [spiceai]: https://github.com/spiceai/cookbook/tree/trunk/spiceai#readme
@@ -526,7 +526,7 @@ Spice.ai is designed to be extensible with extension points documented at [EXTEN
 
 ### 🔨 Upcoming Features
 
-🚀 See the [Roadmap to v1.0-stable](https://github.com/spiceai/spiceai/blob/trunk/docs/ROADMAP.md) for upcoming features.
+🚀 See the [Roadmap](https://github.com/spiceai/spiceai/blob/trunk/docs/ROADMAP.md) for upcoming features.
 
 ### 🤝 Connect with us
 
@@ -536,6 +536,6 @@ We greatly appreciate and value your support! You can help Spice in a number of 
 - [File an issue](https://github.com/spiceai/spiceai/issues/new) if you see something not quite working correctly.
 - Join our team ([We’re hiring!](https://spice.ai/careers))
 - Contribute code or documentation to the project (see [CONTRIBUTING.md](CONTRIBUTING.md)).
-- Follow our blog at [blog.spiceai.org](https://blog.spiceai.org)
+- Follow our blog at [spiceai.org/blog](https://spiceai.org/blog)
 
 ⭐️ star this repo! Thank you for your support! 🙏
