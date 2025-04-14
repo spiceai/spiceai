@@ -87,7 +87,7 @@ async fn runtime_shutdown_timeout_force() -> Result<(), anyhow::Error> {
             let load_components_rt = Arc::clone(&rt);
 
              // Start the servers
-             tokio::spawn(async move {
+            tokio::spawn(async move {
                 Box::pin(start_servers_rt.start_servers(api_config, None, runtime::auth::EndpointAuth::no_auth())).await
             });
 
