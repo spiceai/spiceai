@@ -84,11 +84,8 @@ pub enum Error {
     #[snafu(display("Error parsing `from` path {path} as table reference: {source}"))]
     UnableToParseTableReferenceFromPath { path: String, source: ParserError },
 
-    #[snafu(display("Runtime not found for SpiceDataset"))]
-    MissingAppInSpiceDataset {},
-
-    #[snafu(display("App not found for SpiceDataset"))]
-    MissingRuntimeInSpiceDataset {},
+    #[snafu(display("Unable to build Dataset: {missing_component} missing in DatasetBuilder"))]
+    UnableToBuildDataset { missing_component: String },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -203,7 +200,7 @@ impl Display for ReadyState {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Dataset {
     pub from: String,
     pub name: TableReference,
@@ -225,6 +222,32 @@ pub struct Dataset {
     pub ready_state: ReadyState,
     pub metrics: Metrics,
     pub runtime: Arc<Runtime>,
+}
+
+impl std::fmt::Debug for Dataset {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Dataset")
+            .field("from", &self.from)
+            .field("name", &self.name)
+            .field("mode", &self.mode)
+            .field("params", &self.params)
+            .field("metadata", &self.metadata)
+            .field("columns", &self.columns)
+            .field("has_metadata_table", &self.has_metadata_table)
+            .field("replication", &self.replication)
+            .field("time_column", &self.time_column)
+            .field("time_format", &self.time_format)
+            .field("time_partition_column", &self.time_partition_column)
+            .field("time_partition_format", &self.time_partition_format)
+            .field("acceleration", &self.acceleration)
+            .field("embeddings", &self.embeddings)
+            .field("app", &self.app)
+            .field("schema", &self.schema)
+            .field("unsupported_type_action", &self.unsupported_type_action)
+            .field("ready_state", &self.ready_state)
+            .field("metrics", &self.metrics)
+            .finish_non_exhaustive()
+    }
 }
 
 // Implement a custom PartialEq for Dataset to ignore the app field
@@ -249,7 +272,7 @@ impl PartialEq for Dataset {
             && self.metrics == other.metrics
     }
 }
-#[derive(Debug, Clone)]
+
 pub struct DatasetBuilder {
     pub from: String,
     pub name: TableReference,
@@ -392,8 +415,12 @@ impl DatasetBuilder {
     }
 
     pub fn build(self) -> Result<Dataset> {
-        let app = self.app.ok_or(Error::MissingAppInSpiceDataset {})?;
-        let runtime = self.runtime.ok_or(Error::MissingRuntimeInSpiceDataset {})?;
+        let app = self.app.ok_or(Error::UnableToBuildDataset {
+            missing_component: "app".to_string(),
+        })?;
+        let runtime = self.runtime.ok_or(Error::UnableToBuildDataset {
+            missing_component: "runtime".to_string(),
+        })?;
 
         let dataset = Dataset {
             from: self.from,

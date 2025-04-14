@@ -529,7 +529,6 @@ async fn register_test_table(
     runtime: Arc<Runtime>,
 ) -> Result<(), anyhow::Error> {
     let table = create_internal_accelerated_table(
-        datafusion.accelerator_engine_registry(),
         datafusion.runtime_status(),
         table_name.clone(),
         schema,

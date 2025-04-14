@@ -29,7 +29,6 @@ use crate::accelerated_table::Retention;
 use crate::accelerated_table::refresh::Refresh;
 use crate::component::dataset::TimeFormat;
 use crate::component::dataset::acceleration::Acceleration;
-use crate::dataaccelerator::AcceleratorEngineRegistry;
 use crate::datafusion::Error as DataFusionError;
 use crate::datafusion::{DataFusion, SPICE_RUNTIME_SCHEMA};
 use crate::dataupdate::{DataUpdate, UpdateType};
@@ -90,7 +89,6 @@ impl otel_arrow::ArrowExporter for SpiceMetricsExporter {
 }
 
 pub async fn register_metrics_table(
-    accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
     datafusion: &Arc<DataFusion>,
     runtime: Arc<Runtime>,
 ) -> Result<(), Error> {
@@ -107,7 +105,6 @@ pub async fn register_metrics_table(
     );
 
     let table = create_internal_accelerated_table(
-        accelerator_engine_registry,
         datafusion.runtime_status(),
         metrics_table_reference.clone(),
         otel_arrow::schema(),

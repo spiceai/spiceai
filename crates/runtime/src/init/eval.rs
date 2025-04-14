@@ -122,7 +122,6 @@ impl Runtime {
         );
 
         let table = create_internal_accelerated_table(
-            self.accelerator_engine_registry(),
             self.status(),
             TableReference::partial(SPICE_EVAL_SCHEMA, EVAL_RESULTS_TABLE_REFERENCE.table()), // Cannot parse Catalog.
             EVAL_RESULTS_TABLE_SCHEMA.clone(),
@@ -155,7 +154,6 @@ impl Runtime {
         );
 
         let table = create_internal_accelerated_table(
-            self.accelerator_engine_registry(),
             self.status(),
             TableReference::partial(SPICE_EVAL_SCHEMA, EVAL_RUNS_TABLE_REFERENCE.table()), // Cannot parse Catalog.
             EVAL_RUNS_TABLE_SCHEMA.clone(),

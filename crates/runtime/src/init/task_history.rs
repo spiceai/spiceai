@@ -55,7 +55,6 @@ impl Runtime {
         };
 
         match task_history::TaskSpan::instantiate_table(
-            self.accelerator_engine_registry(),
             self.status(),
             retention_period_secs,
             retention_check_interval_secs,

@@ -32,13 +32,9 @@ impl Runtime {
 
             if metrics_table.is_none() {
                 tracing::debug!("Registering local metrics table");
-                spice_metrics::register_metrics_table(
-                    self.accelerator_engine_registry(),
-                    &self.df,
-                    Arc::clone(&self),
-                )
-                .await
-                .context(UnableToStartLocalMetricsSnafu)?;
+                spice_metrics::register_metrics_table(&self.df, Arc::clone(&self))
+                    .await
+                    .context(UnableToStartLocalMetricsSnafu)?;
             }
         }
 

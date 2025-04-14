@@ -26,7 +26,6 @@ use crate::Runtime;
 use crate::accelerated_table::{AcceleratedTableBuilderError, Retention};
 use crate::component::dataset::acceleration::Acceleration;
 use crate::component::dataset::{DatasetBuilder, Mode};
-use crate::dataaccelerator::AcceleratorEngineRegistry;
 use crate::federated_table::FederatedTable;
 use crate::secrets::Secrets;
 use crate::status;
@@ -120,7 +119,6 @@ async fn get_local_table_provider(
 
 #[allow(clippy::too_many_arguments)]
 pub async fn create_internal_accelerated_table(
-    accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
     runtime_status: Arc<status::RuntimeStatus>,
     name: TableReference,
     schema: Arc<Schema>,
@@ -132,9 +130,10 @@ pub async fn create_internal_accelerated_table(
     runtime: Arc<Runtime>,
 ) -> Result<Arc<AcceleratedTable>, Error> {
     let source_table_provider =
-        get_local_table_provider(&name, &schema, primary_key.clone(), runtime).await?;
+        get_local_table_provider(&name, &schema, primary_key.clone(), Arc::clone(&runtime)).await?;
     let federated_table = Arc::new(FederatedTable::new(Arc::clone(&source_table_provider)));
-    let accelerated_table_provider = accelerator_engine_registry
+    let accelerated_table_provider = runtime
+        .accelerator_engine_registry()
         .create_accelerator_table(
             name.clone(),
             Arc::clone(&schema),

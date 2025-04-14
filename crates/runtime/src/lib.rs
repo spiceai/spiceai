@@ -886,12 +886,6 @@ impl Runtime {
     }
 }
 
-impl std::fmt::Debug for Runtime {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Runtime").finish_non_exhaustive()
-    }
-}
-
 #[allow(clippy::implicit_hasher)]
 pub async fn get_params_with_secrets(
     secrets: Arc<RwLock<Secrets>>,
