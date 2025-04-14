@@ -1,8 +1,30 @@
 ---
 source: crates/runtime/src/http/v1/mod.rs
-expression: "serde_json::from_str::<serde_json::Value>(&result_with_sql).unwrap()"
+expression: "serde_json::from_str::<serde_json::Value>(&result_with_sql).expect(\"to parse\")"
 ---
 {
+  "row_count": 2,
+  "schema": {
+    "fields": [
+      {
+        "name": "customer_id",
+        "data_type": "Utf8",
+        "nullable": false,
+        "dict_id": 0,
+        "dict_is_ordered": false,
+        "metadata": {}
+      },
+      {
+        "name": "total_sales",
+        "data_type": "Int64",
+        "nullable": false,
+        "dict_id": 0,
+        "dict_is_ordered": false,
+        "metadata": {}
+      }
+    ],
+    "metadata": {}
+  },
   "data": [
     {
       "customer_id": "12345",
