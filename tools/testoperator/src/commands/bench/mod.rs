@@ -100,6 +100,7 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
         KeyValue::new("benchmark.name", app.name.as_str()),
         KeyValue::new("benchmark.version", metrics.spiced_version),
         KeyValue::new("benchmark.query_set", args.query_set.as_str()),
+        KeyValue::new("benchmark.commit_sha", metrics.commit_sha),
     ]);
 
     let provider = SdkMeterProvider::builder()
@@ -107,20 +108,50 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
         .build();
     let meter = provider.meter("benchmarks_telemetry");
 
-    let query_duration = meter
-        .u64_gauge("median_query_duration")
+    let query_status = meter.u64_gauge("query_status").with_unit("status").build();
+    let row_count = meter.u64_gauge("row_count").with_unit("rows").build();
+    let median_query_duration = meter
+        .i64_gauge("median_query_duration")
         .with_unit("ms")
         .build();
+    let min_query_duration = meter
+        .i64_gauge("min_query_duration")
+        .with_unit("ms")
+        .build();
+    let max_query_duration = meter
+        .i64_gauge("max_query_duration")
+        .with_unit("ms")
+        .build();
+    let iterations = meter.i64_gauge("iterations").with_unit("count").build();
+    let p90_duration = meter.i64_gauge("p90_duration").with_unit("ms").build();
+    let p95_duration = meter.i64_gauge("p95_duration").with_unit("ms").build();
+    let p99_duration = meter.i64_gauge("p99_duration").with_unit("ms").build();
 
     for query in metrics.metrics {
         let query_name = query.query_name.clone();
-        let query_status = query.query_status.clone();
-        let query_duration_ms = query.median_duration_ms;
+        let commit_sha = metrics.commit_sha.clone();
+        let spiced_version = metrics.spiced_version.clone();
+        let attributes = vec![
+            KeyValue::new("query_name", query_name.as_str()),
+            KeyValue::new("commit_sha", commit_sha.as_str()),
+            KeyValue::new("spiced_version", spiced_version.as_str()),
+            KeyValue::new("query_set", args.query_set.as_str()),
+        ];
 
-        query_duration.record(
-            query_duration_ms as u64,
-            &[KeyValue::new("query_name", query_name.as_str())],
-        )
+        let query_status = if matches!(query.query_status, test_framework::QueryStatus::Success) {
+            1
+        } else {
+            0
+        };
+
+        query_status.record(query_status, &attributes);
+        median_query_duration.record(query.median_duration_ms, &attributes);
+        min_query_duration.record(query.min_duration_ms, &attributes);
+        max_query_duration.record(query.max_duration_ms, &attributes);
+        p90_duration.record(query.percentile_90_duration_ms, &attributes);
+        p95_duration.record(query.percentile_95_duration_ms, &attributes);
+        p99_duration.record(query.percentile_99_duration_ms, &attributes);
+        iterations.record(query.iterations, &attributes);
     }
 
     if !test_succeeded {
