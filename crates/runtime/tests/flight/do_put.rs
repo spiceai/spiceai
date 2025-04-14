@@ -423,7 +423,8 @@ async fn start_spice_test_app(
         rt_builder = rt_builder.with_rate_limits(rate_limits);
     }
 
-    let rt = Arc::new(rt_builder.build().await);
+    let app = app::AppBuilder::new("test_app").build();
+    let rt = Arc::new(rt_builder.with_app(app).build().await);
 
     let df = rt.datafusion();
 
