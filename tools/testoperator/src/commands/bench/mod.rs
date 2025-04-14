@@ -20,6 +20,8 @@ use crate::{
     commands::{TEST_RESULTS_API_KEY, TEST_RESULTS_DATASET},
     wait_test_and_memory,
 };
+use opentelemetry::{KeyValue, metrics::MeterProvider};
+use opentelemetry_sdk::{Resource, metrics::SdkMeterProvider};
 use std::time::Duration;
 use test_framework::{
     TestType, anyhow,
@@ -83,16 +85,43 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
 
     let records = metrics.with_memory_usage(max_memory).build_records()?;
     print_batches(&records)?;
-
-    if args.common.upload_results_dataset.is_some() {
-        println!("Uploading test results...");
-        let mut flight_client = spiced_instance
-            .flight_client(Some(TEST_RESULTS_API_KEY.to_string()))
-            .await?;
-        put_batches(&mut flight_client, TEST_RESULTS_DATASET, records).await?;
-    }
-
     spiced_instance.stop()?;
+
+    // if args.common.upload_results_dataset.is_some() {
+    //     println!("Uploading test results...");
+    //     let mut flight_client = spiced_instance
+    //         .flight_client(Some(TEST_RESULTS_API_KEY.to_string()))
+    //         .await?;
+    //     put_batches(&mut flight_client, TEST_RESULTS_DATASET, records).await?;
+    // }
+
+    let benchmark_resource = Resource::new(vec![
+        KeyValue::new("service.name", "testoperator"),
+        KeyValue::new("benchmark.name", app.name.as_str()),
+        KeyValue::new("benchmark.version", metrics.spiced_version),
+        KeyValue::new("benchmark.query_set", args.query_set.as_str()),
+    ]);
+
+    let provider = SdkMeterProvider::builder()
+        .with_resource(benchmark_resource)
+        .build();
+    let meter = provider.meter("benchmarks_telemetry");
+
+    let query_duration = meter
+        .u64_gauge("median_query_duration")
+        .with_unit("ms")
+        .build();
+
+    for query in metrics.metrics {
+        let query_name = query.query_name.clone();
+        let query_status = query.query_status.clone();
+        let query_duration_ms = query.median_duration_ms;
+
+        query_duration.record(
+            query_duration_ms as u64,
+            &[KeyValue::new("query_name", query_name.as_str())],
+        )
+    }
 
     if !test_succeeded {
         return Err(anyhow::anyhow!(

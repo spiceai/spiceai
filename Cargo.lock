@@ -12253,6 +12253,8 @@ version = "1.2.0-unstable"
 dependencies = [
  "arrow-json",
  "clap",
+ "opentelemetry 0.27.1",
+ "opentelemetry_sdk 0.27.1",
  "reqwest 0.12.12",
  "serde",
  "serde_json",
