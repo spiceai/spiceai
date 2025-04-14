@@ -1001,7 +1001,7 @@ fn filters_to_delta_kernel_expr(filters: &[Expr]) -> Option<ExpressionRef> {
     if exprs.is_empty() {
         None
     } else if exprs.len() == 1 {
-        let expr = exprs.into_iter().next()?;
+        let expr = exprs.pop()?;
         Some(Arc::new(expr))
     } else {
         // Multiple filters are present, so we need to combine them using an AND operation
