@@ -15,11 +15,9 @@ limitations under the License.
 */
 
 use runtime::{
-    Runtime, component::dataset::Dataset,
-    dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint,
+    component::dataset::Dataset, dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint,
 };
 use spicepod::{component::dataset::acceleration::Mode, param::Params};
-use std::sync::Arc;
 
 #[cfg(feature = "duckdb")]
 mod checkpoint_duckdb;
@@ -48,14 +46,12 @@ fn get_params(mode: &Mode, file: Option<String>, engine: &str) -> Option<Params>
 }
 
 async fn wait_for_checkpoints(
-    rt: Arc<Runtime>,
     datasets: Vec<Dataset>,
     timeout_secs: u64,
 ) -> Result<(), anyhow::Error> {
     let mut checkpoint_futures = Vec::new();
 
     for dataset in datasets {
-        let dataset = dataset.with_runtime(Arc::clone(&rt));
         let check_future = async move {
             match DatasetCheckpoint::try_new(&dataset).await {
                 Ok(checkpoint) => {

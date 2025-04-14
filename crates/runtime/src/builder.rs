@@ -46,8 +46,8 @@ pub struct RuntimeBuilder {
     prometheus_registry: Option<prometheus::Registry>,
     runtime_status: Option<Arc<status::RuntimeStatus>>,
     rate_limits: Option<Arc<RateLimits>>,
-    accelerator_engine_registry: AcceleratorEngineRegistry,
-    datafusion_configuration: Option<DatafusionConfigurationCallback>,
+    accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
+    datafusion_configuration_fn: Option<DatafusionConfigurationCallback>,
 }
 
 impl RuntimeBuilder {
@@ -62,8 +62,8 @@ impl RuntimeBuilder {
             autoload_extensions: HashMap::new(),
             runtime_status: None,
             rate_limits: None,
-            accelerator_engine_registry: AcceleratorEngineRegistry::new(),
-            datafusion_configuration: None,
+            accelerator_engine_registry: Arc::new(AcceleratorEngineRegistry::new()),
+            datafusion_configuration_fn: None,
         }
     }
 
@@ -122,11 +122,11 @@ impl RuntimeBuilder {
     }
 
     /// Used to configure `DataFusion` in integration tests & test CI
-    pub fn with_datafusion_configuration(
+    pub fn with_datafusion_configuration_fn(
         mut self,
         callback: DatafusionConfigurationCallback,
     ) -> Self {
-        self.datafusion_configuration = Some(callback);
+        self.datafusion_configuration_fn = Some(callback);
         self
     }
 
@@ -154,11 +154,11 @@ impl RuntimeBuilder {
 
         let mut df = DataFusion::builder(
             Arc::clone(&status),
-            self.accelerator_engine_registry.clone(),
+            Arc::clone(&self.accelerator_engine_registry),
         )
         .build();
 
-        if let Some(callback) = self.datafusion_configuration {
+        if let Some(callback) = self.datafusion_configuration_fn {
             callback(&mut df);
         }
 
@@ -205,7 +205,7 @@ impl RuntimeBuilder {
             rate_limits: self.rate_limits.unwrap_or_default(),
             status,
             runtime_tasks: Arc::new(RwLock::new(HashMap::new())),
-            accelerator_engine_registry: self.accelerator_engine_registry.clone(),
+            accelerator_engine_registry: Arc::clone(&self.accelerator_engine_registry),
         };
 
         let mut extensions: HashMap<String, Arc<dyn Extension>> = HashMap::new();

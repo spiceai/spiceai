@@ -40,7 +40,9 @@ impl Runtime {
                 tracing::debug!("Updated pods information: {:?}", new_app);
                 tracing::debug!("Previous pods information: {:?}", current_app);
 
-                self.apply_catalog_diff(current_app, &new_app).await;
+                Arc::clone(&self)
+                    .apply_catalog_diff(current_app, &new_app)
+                    .await;
                 Arc::clone(&self)
                     .apply_dataset_diff(current_app, &new_app)
                     .await;

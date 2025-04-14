@@ -260,7 +260,7 @@ pub struct DataFusion {
     cache_provider: RwLock<Option<Arc<QueryResultsCacheProvider>>>,
 
     pending_sink_tables: TokioRwLock<Vec<PendingSinkRegistration>>,
-    accelerator_engine_registry: AcceleratorEngineRegistry,
+    accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
 }
 
 impl std::fmt::Debug for DataFusion {
@@ -278,7 +278,7 @@ impl DataFusion {
     #[must_use]
     pub fn builder(
         status: Arc<status::RuntimeStatus>,
-        accelerator_engine_registry: AcceleratorEngineRegistry,
+        accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
     ) -> DataFusionBuilder {
         DataFusionBuilder::new(status, accelerator_engine_registry)
     }
@@ -297,8 +297,8 @@ impl DataFusion {
         None
     }
 
-    pub fn accelerator_engine_registry(&self) -> AcceleratorEngineRegistry {
-        self.accelerator_engine_registry.clone()
+    pub fn accelerator_engine_registry(&self) -> Arc<AcceleratorEngineRegistry> {
+        Arc::clone(&self.accelerator_engine_registry)
     }
 
     pub fn set_cache_provider(&self, cache_provider: QueryResultsCacheProvider) {

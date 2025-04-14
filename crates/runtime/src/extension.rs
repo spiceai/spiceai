@@ -18,6 +18,7 @@ use crate::Runtime;
 use async_trait::async_trait;
 use snafu::prelude::*;
 use spicepod::extension::Extension as ExtensionComponent;
+use std::sync::Arc;
 
 pub type ExtensionManifest = ExtensionComponent;
 
@@ -51,7 +52,7 @@ pub trait Extension: Send + Sync {
 
     async fn initialize(&mut self, runtime: &Runtime) -> Result<()>;
 
-    async fn on_start(&self, runtime: &Runtime) -> Result<()>;
+    async fn on_start(&self, runtime: Arc<Runtime>) -> Result<()>;
 }
 
 pub trait ExtensionFactory: Send + Sync {

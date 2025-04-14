@@ -69,6 +69,9 @@ pub enum Error {
         connector_component: ConnectorComponent,
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+
+    #[snafu(display("Failed to get app from the runtime"))]
+    FailedToGetAppFromRuntime {},
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -190,14 +193,14 @@ pub trait CatalogConnector: Send + Sync {
     /// The returned provider must implement RefreshableCatalogProvider which will be used to refresh the catalog.
     async fn refreshable_catalog_provider(
         self: Arc<Self>,
-        _runtime: &Runtime,
+        _runtime: Arc<Runtime>,
         _catalog: &Catalog,
     ) -> Result<Arc<dyn RefreshableCatalogProvider>>;
 }
 
 pub async fn get_catalog_provider(
     connector: Arc<dyn CatalogConnector>,
-    runtime: &Runtime,
+    runtime: Arc<Runtime>,
     catalog: &Catalog,
     refresh_interval: Option<Duration>,
 ) -> Result<Arc<dyn CatalogProvider>> {

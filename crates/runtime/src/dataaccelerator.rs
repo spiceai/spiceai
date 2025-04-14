@@ -105,7 +105,7 @@ impl AcceleratorEngineRegistry {
         registry.insert(name, accelerator_engine);
     }
 
-    pub async fn register_all(&self) {
+    pub(crate) async fn register_all(&self) {
         self.register_accelerator_engine(Engine::Arrow, Arc::new(ArrowAccelerator::new()))
             .await;
         #[cfg(feature = "duckdb")]
@@ -472,7 +472,6 @@ mod test {
         let path = "./abc-duckdb.db".to_string();
         let params = HashMap::from([("duckdb_file".to_string(), path.clone())]);
         let runtime = Arc::new(RuntimeBuilder::new().build().await);
-        runtime.accelerator_engine_registry().register_all().await;
         let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Utf8, false)]));
         let acceleration_settings = Acceleration {
             params,
@@ -508,7 +507,6 @@ mod test {
         let path = "./abc-sqlite.db".to_string();
         let params = HashMap::from([("sqlite_file".to_string(), path.clone())]);
         let runtime = Arc::new(RuntimeBuilder::new().build().await);
-        runtime.accelerator_engine_registry().register_all().await;
         let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Utf8, false)]));
         let acceleration_settings = Acceleration {
             params: params.clone(),
@@ -548,7 +546,6 @@ mod test {
         let path = format!("{spice_data_dir}/abc_sqlite.db");
 
         let runtime = Arc::new(RuntimeBuilder::new().build().await);
-        runtime.accelerator_engine_registry().register_all().await;
         let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Utf8, false)]));
         let acceleration_settings = Acceleration {
             params: HashMap::new(),

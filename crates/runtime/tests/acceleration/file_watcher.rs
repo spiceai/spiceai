@@ -82,7 +82,7 @@ async fn test_file_watcher() -> Result<(), anyhow::Error> {
             let rt = Arc::new(
                 Runtime::builder()
                     .with_app(app)
-                    .with_datafusion_configuration(configure_test_datafusion)
+                    .with_datafusion_configuration_fn(configure_test_datafusion)
                     .build()
                     .await,
             );

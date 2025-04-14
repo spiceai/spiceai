@@ -138,7 +138,7 @@ async fn run_queries() -> Result<(), anyhow::Error> {
 
     let rt = Runtime::builder()
         .with_app(app)
-        .with_datafusion_configuration(configure_test_datafusion)
+        .with_datafusion_configuration_fn(configure_test_datafusion)
         .build()
         .await;
 

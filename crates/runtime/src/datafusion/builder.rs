@@ -50,7 +50,7 @@ pub struct DataFusionBuilder {
     config: SessionConfig,
     status: Arc<status::RuntimeStatus>,
     cache_provider: Option<Arc<QueryResultsCacheProvider>>,
-    accelerator_engine_registry: AcceleratorEngineRegistry,
+    accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
 }
 
 pub(crate) fn get_df_default_config() -> SessionConfig {
@@ -85,7 +85,7 @@ impl DataFusionBuilder {
     #[must_use]
     pub fn new(
         status: Arc<status::RuntimeStatus>,
-        accelerator_engine_registry: AcceleratorEngineRegistry,
+        accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
     ) -> Self {
         let mut df_config = get_df_default_config()
             .with_information_schema(true)

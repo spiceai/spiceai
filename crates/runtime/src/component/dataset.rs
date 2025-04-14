@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use super::{find_first_delimiter, validate_identifier};
-use crate::{Runtime, dataaccelerator::AcceleratorEngineRegistry};
+use crate::Runtime;
 use acceleration::Engine;
 use app::App;
 use arrow::datatypes::SchemaRef;
@@ -83,6 +83,12 @@ pub enum Error {
 
     #[snafu(display("Error parsing `from` path {path} as table reference: {source}"))]
     UnableToParseTableReferenceFromPath { path: String, source: ParserError },
+
+    #[snafu(display("Runtime not found for SpiceDataset"))]
+    MissingAppInSpiceDataset {},
+
+    #[snafu(display("App not found for SpiceDataset"))]
+    MissingRuntimeInSpiceDataset {},
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -213,12 +219,12 @@ pub struct Dataset {
     pub time_partition_format: Option<TimeFormat>,
     pub acceleration: Option<acceleration::Acceleration>,
     pub embeddings: Vec<ColumnEmbeddingConfig>,
-    pub app: Option<Arc<App>>,
+    pub app: Arc<App>,
     schema: Option<SchemaRef>,
     pub unsupported_type_action: Option<UnsupportedTypeAction>,
     pub ready_state: ReadyState,
     pub metrics: Metrics,
-    pub runtime: Option<Arc<Runtime>>,
+    pub runtime: Arc<Runtime>,
 }
 
 // Implement a custom PartialEq for Dataset to ignore the app field
@@ -243,8 +249,30 @@ impl PartialEq for Dataset {
             && self.metrics == other.metrics
     }
 }
+#[derive(Debug, Clone)]
+pub struct DatasetBuilder {
+    pub from: String,
+    pub name: TableReference,
+    pub mode: Mode,
+    pub params: HashMap<String, String>,
+    pub metadata: HashMap<String, String>,
+    pub columns: Vec<Column>,
+    pub has_metadata_table: bool,
+    pub replication: Option<replication::Replication>,
+    pub time_column: Option<String>,
+    pub time_format: Option<TimeFormat>,
+    pub time_partition_column: Option<String>,
+    pub time_partition_format: Option<TimeFormat>,
+    pub acceleration: Option<acceleration::Acceleration>,
+    pub embeddings: Vec<ColumnEmbeddingConfig>,
+    pub app: Option<Arc<App>>,
+    pub unsupported_type_action: Option<UnsupportedTypeAction>,
+    pub ready_state: ReadyState,
+    pub metrics: Metrics,
+    pub runtime: Option<Arc<Runtime>>,
+}
 
-impl TryFrom<spicepod_dataset::Dataset> for Dataset {
+impl TryFrom<spicepod_dataset::Dataset> for DatasetBuilder {
     type Error = crate::Error;
 
     fn try_from(dataset: spicepod_dataset::Dataset) -> std::result::Result<Self, Self::Error> {
@@ -269,7 +297,7 @@ impl TryFrom<spicepod_dataset::Dataset> for Dataset {
 
         let table_reference = Dataset::parse_table_reference(&dataset.name)?;
 
-        Ok(Dataset {
+        Ok(DatasetBuilder {
             from: dataset.from,
             name: table_reference,
             mode: Mode::from(dataset.mode),
@@ -286,7 +314,7 @@ impl TryFrom<spicepod_dataset::Dataset> for Dataset {
             columns: dataset.columns,
             has_metadata_table: dataset
                 .has_metadata_table
-                .unwrap_or(Dataset::have_metadata_table_by_default()),
+                .unwrap_or(DatasetBuilder::have_metadata_table_by_default()),
             replication: dataset.replication.map(replication::Replication::from),
             time_column: dataset.time_column,
             time_format: dataset.time_format.map(TimeFormat::from),
@@ -294,7 +322,6 @@ impl TryFrom<spicepod_dataset::Dataset> for Dataset {
             time_partition_format: dataset.time_partition_format.map(TimeFormat::from),
             embeddings: dataset.embeddings,
             acceleration,
-            schema: None,
             app: None,
             unsupported_type_action: dataset
                 .unsupported_type_action
@@ -306,9 +333,9 @@ impl TryFrom<spicepod_dataset::Dataset> for Dataset {
     }
 }
 
-impl Dataset {
+impl DatasetBuilder {
     pub fn try_new(from: String, name: &str) -> std::result::Result<Self, crate::Error> {
-        Ok(Dataset {
+        Ok(DatasetBuilder {
             from,
             name: Self::parse_table_reference(name)?,
             mode: Mode::default(),
@@ -323,13 +350,33 @@ impl Dataset {
             time_partition_format: None,
             acceleration: None,
             embeddings: Vec::default(),
-            schema: None,
             app: None,
             unsupported_type_action: None,
             ready_state: ReadyState::default(),
             metrics: Metrics::default(),
             runtime: None,
         })
+    }
+
+    pub(crate) fn parse_table_reference(
+        name: &str,
+    ) -> std::result::Result<TableReference, crate::Error> {
+        match TableReference::parse_str(name) {
+            table_ref @ (TableReference::Bare { .. } | TableReference::Partial { .. }) => {
+                Ok(table_ref)
+            }
+            TableReference::Full { catalog, .. } => crate::DatasetNameIncludesCatalogSnafu {
+                catalog,
+                name: name.to_string(),
+            }
+            .fail(),
+        }
+    }
+
+    #[must_use]
+    /// Returns whether the dataset should enable metadata by default.
+    fn have_metadata_table_by_default() -> bool {
+        false
     }
 
     #[must_use]
@@ -344,14 +391,46 @@ impl Dataset {
         self
     }
 
+    pub fn build(self) -> Result<Dataset> {
+        let app = self.app.ok_or(Error::MissingAppInSpiceDataset {})?;
+        let runtime = self.runtime.ok_or(Error::MissingRuntimeInSpiceDataset {})?;
+
+        let dataset = Dataset {
+            from: self.from,
+            name: self.name,
+            mode: self.mode,
+            params: self.params,
+            metadata: self.metadata,
+            columns: self.columns,
+            has_metadata_table: self.has_metadata_table,
+            replication: self.replication,
+            time_column: self.time_column,
+            time_format: self.time_format,
+            time_partition_column: self.time_partition_column,
+            time_partition_format: self.time_partition_format,
+            acceleration: self.acceleration,
+            embeddings: self.embeddings,
+            app,
+            schema: None,
+            unsupported_type_action: self.unsupported_type_action,
+            ready_state: self.ready_state,
+            metrics: self.metrics,
+            runtime,
+        };
+
+        Ok(dataset)
+    }
+}
+
+impl Dataset {
     #[must_use]
-    pub fn app(&self) -> Option<Arc<App>> {
-        self.app.clone()
+    pub fn app(&self) -> Arc<App> {
+        Arc::clone(&self.app)
     }
 
     #[must_use]
-    pub fn runtime(&self) -> Option<Arc<Runtime>> {
-        self.runtime.clone()
+    pub fn runtime(&self) -> Arc<Runtime> {
+        Arc::clone(&self.runtime)
     }
 
     #[must_use]
@@ -369,12 +448,6 @@ impl Dataset {
     #[must_use]
     pub fn schema(&self) -> Option<SchemaRef> {
         self.schema.clone()
-    }
-
-    #[must_use]
-    /// Returns whether the dataset should enable metadata by default.
-    fn have_metadata_table_by_default() -> bool {
-        false
     }
 
     pub(crate) fn parse_table_reference(
@@ -591,12 +664,11 @@ impl Dataset {
     }
 
     #[must_use]
-    pub async fn is_accelerator_initialized(
-        &self,
-        accelerator_engine_registry: AcceleratorEngineRegistry,
-    ) -> bool {
+    pub async fn is_accelerator_initialized(&self) -> bool {
         if let Some(acceleration) = &self.acceleration {
-            let Some(accelerator) = accelerator_engine_registry
+            let Some(accelerator) = self
+                .runtime()
+                .accelerator_engine_registry()
                 .get_accelerator_engine(acceleration.engine)
                 .await
             else {
@@ -666,6 +738,7 @@ mod tests {
 
     use super::acceleration::{Acceleration, IndexType};
     use super::*;
+    use app::AppBuilder;
 
     #[test]
     fn test_indexes_roundtrip() {
@@ -738,38 +811,49 @@ mod tests {
         );
     }
 
-    fn create_dataset_with_params(params: HashMap<String, String>) -> Dataset {
-        let mut dataset: Dataset =
-            spicepod::component::dataset::Dataset::new("test".to_string(), "test".to_string())
-                .try_into()
-                .expect("valid dataset");
+    async fn create_dataset_with_params(params: HashMap<String, String>) -> Dataset {
+        let spicepod_dataset =
+            spicepod::component::dataset::Dataset::new("test".to_string(), "test".to_string());
+
+        let app = AppBuilder::new("test")
+            .with_dataset(spicepod_dataset.clone())
+            .build();
+        let rt = crate::Runtime::builder().build().await;
+
+        let mut dataset = DatasetBuilder::try_from(spicepod_dataset)
+            .expect("valid dataset builder")
+            .with_app(Arc::new(app))
+            .with_runtime(Arc::new(rt))
+            .build()
+            .expect("valid dataset");
+
         dataset.params = params;
         dataset
     }
 
-    #[test]
-    fn test_get_dataset_param() {
+    #[tokio::test]
+    async fn test_get_dataset_param() {
         // Test case 1: Parameter is not set
-        let dataset = create_dataset_with_params(HashMap::new());
+        let dataset = create_dataset_with_params(HashMap::new()).await;
         assert!(dataset.get_param("test_param", true));
         assert!(!dataset.get_param("test_param", false));
 
         // Test case 2: Parameter is set to "true"
         let mut params = HashMap::new();
         params.insert("test_param".to_string(), "true".to_string());
-        let dataset = create_dataset_with_params(params);
+        let dataset = create_dataset_with_params(params).await;
         assert!(dataset.get_param("test_param", false));
 
         // Test case 3: Parameter is set to "false"
         let mut params = HashMap::new();
         params.insert("test_param".to_string(), "false".to_string());
-        let dataset = create_dataset_with_params(params);
+        let dataset = create_dataset_with_params(params).await;
         assert!(!dataset.get_param("test_param", true));
 
         // Test case 4: Parameter is set to an invalid boolean value
         let mut params = HashMap::new();
         params.insert("test_param".to_string(), "not_a_bool".to_string());
-        let dataset = create_dataset_with_params(params);
+        let dataset = create_dataset_with_params(params).await;
         assert!(dataset.get_param("test_param", true));
         assert!(!dataset.get_param("test_param", false));
 
@@ -778,8 +862,8 @@ mod tests {
         assert!(!dataset.get_param("test_param", false));
     }
 
-    #[test]
-    fn test_source() {
+    #[tokio::test]
+    async fn test_source() {
         let test_cases = vec![
             // Basic delimiter cases
             ("foo:bar", "foo"),
@@ -829,14 +913,21 @@ mod tests {
         ];
 
         for (input, expected) in test_cases {
-            let dataset =
-                Dataset::try_new(input.to_string(), "test").expect("Failed to create dataset");
+            let app = app::AppBuilder::new("test").build();
+            let rt = crate::Runtime::builder().build().await;
+
+            let dataset = DatasetBuilder::try_new(input.to_string(), "test")
+                .expect("Failed to create builder")
+                .with_app(Arc::new(app))
+                .with_runtime(Arc::new(rt))
+                .build()
+                .expect("Failed to build dataset");
             assert_eq!(dataset.source(), expected, "Failed for input: {input}");
         }
     }
 
-    #[test]
-    fn test_path() {
+    #[tokio::test]
+    async fn test_path() {
         let test_cases = vec![
             // Basic delimiter cases
             ("foo:bar", "bar"),
@@ -892,8 +983,15 @@ mod tests {
         ];
 
         for (input, expected) in test_cases {
-            let dataset =
-                Dataset::try_new(input.to_string(), "test").expect("Failed to create dataset");
+            let app = app::AppBuilder::new("test").build();
+            let rt = crate::Runtime::builder().build().await;
+
+            let dataset = DatasetBuilder::try_new(input.to_string(), "test")
+                .expect("Failed to create builder")
+                .with_app(Arc::new(app))
+                .with_runtime(Arc::new(rt))
+                .build()
+                .expect("Failed to build dataset");
             assert_eq!(dataset.path(), expected, "Failed for input: {input}");
         }
     }

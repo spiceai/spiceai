@@ -703,6 +703,7 @@ fn include_computed_columns(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::component::dataset::DatasetBuilder;
     use crate::component::dataset::UnsupportedTypeAction as DatasetUnsupportedTypeAction;
 
     #[tokio::test]
@@ -754,8 +755,15 @@ mod tests {
         register_connector_factory("test", Arc::new(TestConnectorFactory)).await;
 
         // Create a test dataset with unsupported_type_action
-        let mut dataset = Dataset::try_new("test:test_dataset".to_string(), "test_dataset")
-            .expect("failed to create dataset");
+        let app = app::AppBuilder::new("test_app").build();
+        let rt = crate::Runtime::builder().build().await;
+
+        let mut dataset = DatasetBuilder::try_new("test:test_dataset".to_string(), "test_dataset")
+            .expect("Failed to create builder")
+            .with_app(Arc::new(app))
+            .with_runtime(Arc::new(rt))
+            .build()
+            .expect("Failed to build dataset");
         dataset.unsupported_type_action = Some(DatasetUnsupportedTypeAction::Ignore);
 
         let secrets = Arc::new(RwLock::new(Secrets::default()));

@@ -205,7 +205,7 @@ async fn mysql_integration_test() -> Result<(), String> {
 
             let mut rt = Runtime::builder()
                 .with_app(app)
-                .with_datafusion_configuration(configure_test_datafusion)
+                .with_datafusion_configuration_fn(configure_test_datafusion)
                 .build()
                 .await;
 

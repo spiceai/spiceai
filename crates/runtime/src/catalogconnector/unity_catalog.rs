@@ -100,7 +100,7 @@ impl CatalogConnector for UnityCatalog {
 
     async fn refreshable_catalog_provider(
         self: Arc<Self>,
-        runtime: &Runtime,
+        runtime: Arc<Runtime>,
         catalog: &Catalog,
     ) -> super::Result<Arc<dyn RefreshableCatalogProvider>> {
         let Some(catalog_id) = catalog.catalog_id.clone() else {

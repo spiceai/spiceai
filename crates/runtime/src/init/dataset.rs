@@ -20,11 +20,11 @@ use crate::{
     AcceleratedReadWriteTableWithoutReplicationSnafu, AcceleratedTableInvalidChangesSnafu,
     AcceleratorEngineNotAvailableSnafu, AcceleratorInitializationFailedSnafu, Error, LogErrors,
     OdbcNotInstalledSnafu, Result, Runtime, UnableToAttachDataConnectorSnafu,
-    UnableToCreateAcceleratedTableSnafu, UnableToInitializeDataConnectorSnafu,
-    UnableToLoadDatasetConnectorSnafu, UnableToReceiveAcceleratedTableStatusSnafu,
-    UnknownDataConnectorSnafu,
+    UnableToBuildDatasetSnafu, UnableToCreateAcceleratedTableSnafu,
+    UnableToInitializeDataConnectorSnafu, UnableToLoadDatasetConnectorSnafu,
+    UnableToReceiveAcceleratedTableStatusSnafu, UnknownDataConnectorSnafu,
     accelerated_table::AcceleratedTable,
-    component::dataset::{self, Dataset, acceleration::RefreshMode},
+    component::dataset::{self, Dataset, DatasetBuilder, acceleration::RefreshMode},
     dataconnector::{
         self, ConnectorComponent, ConnectorParams, ConnectorParamsBuilder, DataConnector,
         DataConnectorError, ODBC_DATACONNECTOR,
@@ -174,9 +174,17 @@ impl Runtime {
         app.datasets
             .clone()
             .into_iter()
-            .map(Dataset::try_from)
-            .map(move |ds| {
-                ds.map(|ds| Dataset::with_app(ds, Arc::clone(app)).with_runtime(Arc::clone(&self)))
+            .map(DatasetBuilder::try_from)
+            .map(move |ds_builder_result| {
+                ds_builder_result.and_then(|ds_builder| {
+                    let dataset = ds_builder.name.to_string();
+                    ds_builder
+                        .with_app(Arc::clone(app))
+                        .with_runtime(Arc::clone(&self))
+                        .build()
+                        .boxed()
+                        .context(UnableToBuildDatasetSnafu { dataset })
+                })
             })
     }
 
@@ -658,8 +666,20 @@ impl Runtime {
         // Remove datasets that are no longer in the app
         for ds in &current_app.datasets {
             if !new_app.datasets.iter().any(|d| d.name == ds.name) {
-                let ds = match Dataset::try_from(ds.clone()) {
-                    Ok(ds) => ds,
+                let ds = match DatasetBuilder::try_from(ds.clone()) {
+                    Ok(ds_builder) => {
+                        match ds_builder
+                            .with_app(Arc::clone(current_app))
+                            .with_runtime(Arc::clone(&self))
+                            .build()
+                        {
+                            Ok(ds) => ds,
+                            Err(e) => {
+                                tracing::error!("Unable to build dataset {}: {e}", ds.name);
+                                continue;
+                            }
+                        }
+                    }
                     Err(e) => {
                         tracing::error!("Could not remove dataset {}: {e}", ds.name);
                         continue;
@@ -732,14 +752,8 @@ impl Runtime {
     ) -> Vec<Arc<Dataset>> {
         let valid_datasets = Arc::clone(&self).get_valid_datasets(app, log_errors);
         futures::stream::iter(valid_datasets)
-            .filter_map(|ds| {
-                let cloned_self = Arc::clone(&self);
-                async move {
-                match (
-                    ds.is_accelerated(),
-                    ds.is_accelerator_initialized(cloned_self.accelerator_engine_registry())
-                        .await,
-                ) {
+            .filter_map(|ds| async move {
+                match (ds.is_accelerated(), ds.is_accelerator_initialized().await) {
                     (true, true) | (false, _) => Some(Arc::clone(&ds)),
                     (true, false) => {
                         if log_errors.0 {
@@ -752,7 +766,7 @@ impl Runtime {
                         None
                     }
                 }
-            }})
+            })
             .collect()
             .await
     }

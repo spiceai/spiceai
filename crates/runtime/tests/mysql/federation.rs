@@ -97,7 +97,7 @@ async fn mysql_federation_push_down() -> Result<(), String> {
 
             let mut rt = Runtime::builder()
                 .with_app(app)
-                .with_datafusion_configuration(configure_test_datafusion)
+                .with_datafusion_configuration_fn(configure_test_datafusion)
                 .build()
                 .await;
 
@@ -202,7 +202,7 @@ async fn mysql_federation_inner_join_with_acc() -> Result<(), String> {
         let mut rt =
             Runtime::builder()
                 .with_app(app)
-                .with_datafusion_configuration(configure_test_datafusion)
+                .with_datafusion_configuration_fn(configure_test_datafusion)
                 .build()
                 .await;
 

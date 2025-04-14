@@ -19,7 +19,7 @@ use crate::dataaccelerator::AcceleratorEngineRegistry;
 use crate::datafusion::DataFusion;
 use crate::dataupdate::{DataUpdate, UpdateType};
 use crate::internal_table::create_internal_accelerated_table;
-use crate::status;
+use crate::{Runtime, status};
 use crate::{component::dataset::TimeFormat, secrets::Secrets};
 use crate::{component::dataset::acceleration::Acceleration, datafusion::SPICE_RUNTIME_SCHEMA};
 use arrow::array::{ArrayBuilder, MapBuilder, RecordBatch, StringArray, StringBuilder};
@@ -78,10 +78,11 @@ pub(crate) struct TaskSpan {
 
 impl TaskSpan {
     pub async fn instantiate_table(
-        accelerator_engine_registry: AcceleratorEngineRegistry,
+        accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
         status: Arc<status::RuntimeStatus>,
         retention_period_secs: u64,
         retention_check_interval_secs: u64,
+        runtime: Arc<Runtime>,
     ) -> Result<Arc<AcceleratedTable>, Error> {
         let time_column = Some("start_time".to_string());
         let time_format = Some(TimeFormat::UnixSeconds);
@@ -113,6 +114,7 @@ impl TaskSpan {
             Refresh::default(),
             retention,
             Arc::new(RwLock::new(Secrets::default())),
+            runtime,
         )
         .await
         .boxed()

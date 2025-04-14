@@ -76,7 +76,7 @@ async fn databricks_delta_lake_integration_test() -> Result<(), anyhow::Error> {
             let mut rt =
                 Runtime::builder()
                     .with_app(app)
-                    .with_datafusion_configuration(configure_test_datafusion)
+                    .with_datafusion_configuration_fn(configure_test_datafusion)
                     .build()
                     .await
             ;
