@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use std::{
+    fmt::Display,
     path::PathBuf,
     process::{Child, Command},
     time::Duration,
@@ -28,9 +29,25 @@ use tempfile::TempDir;
 
 use crate::{process::Process, utils::wait_until_true};
 
+#[derive(Debug, Clone)]
+pub struct SpicedVersion(String);
+impl SpicedVersion {
+    #[must_use]
+    pub fn new(version: String) -> Self {
+        Self(version)
+    }
+}
+
+impl Display for SpicedVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 pub struct SpicedInstance {
     child: Child,
     tempdir: TempDir,
+    version: SpicedVersion,
 }
 
 pub struct StartRequest {
@@ -113,13 +130,42 @@ impl SpicedInstance {
 
         let tempdir = start_request.tempdir;
 
+        // Get spiced version
+        let version_cmd = Command::new(start_request.spiced_path.clone())
+            .arg("--version")
+            .output()?;
+
+        if !version_cmd.status.success() {
+            anyhow::bail!(
+                "Failed to get spiced version: {}",
+                String::from_utf8_lossy(&version_cmd.stderr)
+            );
+        }
+
+        let version = String::from_utf8_lossy(&version_cmd.stdout).to_string();
+        // take just the v1.0.0 part of the version
+        let version = match (version.contains('-'), version.contains('+')) {
+            (true, _) => version.split('-').next().unwrap_or(&version).to_string(),
+            (false, true) => version.split('+').next().unwrap_or(&version).to_string(),
+            (false, false) => version,
+        };
+
         // Start the spiced instance
         let mut cmd = Command::new(start_request.spiced_path);
         cmd.current_dir(tempdir.path());
         cmd.arg("--telemetry-enabled=false");
         let child = cmd.spawn()?;
 
-        Ok(Self { child, tempdir })
+        Ok(Self {
+            child,
+            tempdir,
+            version: SpicedVersion::new(version),
+        })
+    }
+
+    #[must_use]
+    pub fn version(&self) -> &str {
+        self.version.0.as_str()
     }
 
     #[must_use]

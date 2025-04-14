@@ -61,7 +61,8 @@ pub async fn dispatch(args: DispatchArgs) -> Result<()> {
                 serde_json::json!(WorkflowArgs {
                     specific_args: bench
                         .clone()
-                        .with_update_snapshots(args.update_snapshots.into()),
+                        .with_update_snapshots(args.update_snapshots.into())
+                        .with_validate(args.validate),
                     spiced_commit: args.spiced_commit.clone(),
                 })
             }

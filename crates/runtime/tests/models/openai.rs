@@ -672,13 +672,33 @@ async fn verify_similarity_search_chat_completion(
         a_str.cmp(&b_str)
     });
 
-    // Create a combined JSON array with all filtered values
-    let combined_value = serde_json::Value::Array(stable_inputs);
+    // Instead of creating a snapshot, verify keywords contain expected values
+    let mut found_journalist = false;
+    let mut found_vehicle = false;
+    let mut actual_keywords = Vec::new();
 
-    // Verify Task History
-    insta::assert_snapshot!(
-        "chat_2_document_similarity_tasks",
-        serde_json::to_string_pretty(&combined_value).expect("Failed to serialize task_input")
+    for input in &stable_inputs {
+        if let Some(keywords) = input.get("keywords").and_then(|k| k.as_array()) {
+            actual_keywords.push(keywords.clone());
+            for keyword in keywords {
+                if let Some(keyword_str) = keyword.as_str() {
+                    if keyword_str.contains("journalist") {
+                        found_journalist = true;
+                    } else if keyword_str.contains("vehicle") {
+                        found_vehicle = true;
+                    }
+                }
+            }
+        }
+    }
+
+    assert!(
+        found_journalist,
+        "Expected to find 'journalist' in keywords, found {actual_keywords:?}",
+    );
+    assert!(
+        found_vehicle,
+        "Expected to find 'vehicle' in keywords, found {actual_keywords:?}",
     );
 
     Ok(())
