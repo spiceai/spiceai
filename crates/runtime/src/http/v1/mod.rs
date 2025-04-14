@@ -287,7 +287,7 @@ fn arrow_to_plain(
     pretty_format_batches(data).map(|d| format!("{d}")).boxed()
 }
 
-/// Converts a vector of `RecordBatch` to a application/vnd.spiceai.v1+json format
+/// Converts a vector of `RecordBatch` to an application/vnd.spiceai.sql.v1+json format
 fn arrow_to_vnd_sql_json_v1(
     data: &[RecordBatch],
     meta: ResponseMetadata,
