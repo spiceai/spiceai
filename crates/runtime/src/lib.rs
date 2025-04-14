@@ -792,7 +792,7 @@ impl Runtime {
         document_parse::unregister_all().await;
 
         // Measure elapsed time since shutdown started and calculate remaining time within the configured timeout. Remaining shutdown
-        // group includes only Metrics and HTTP Healthcheck endpoints; general HTTP API endpoints are already stopped accepting requests.
+        // group includes only Metrics and HTTP Healthcheck endpoints; general HTTP API endpoints have already stopped accepting requests.
         let elapsed = start_time.elapsed();
         let remaining_timeout = shutdown_timeout.saturating_sub(elapsed);
 
