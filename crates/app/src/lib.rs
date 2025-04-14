@@ -223,7 +223,7 @@ impl AppBuilder {
 
     #[must_use]
     pub fn with_shutdown_timeout(mut self, timeout: impl Into<String>) -> AppBuilder {
-        self.runtime.shutdown_timeout = Some(timeout.to_string());
+        self.runtime.shutdown_timeout = Some(timeout.into());
         self
     }
 
