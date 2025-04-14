@@ -738,6 +738,12 @@ async fn get_parquet_access_plan(
     Ok(ParquetAccessPlan::new(row_groups))
 }
 
+#[derive(Debug, PartialEq)]
+enum DeltaBinaryOperator {
+    BinaryOperator(BinaryOperator),
+    VariadicOperator(VariadicOperator),
+}
+
 /// Convert a `DataFusion` filter expression to a `delta_kernel` expression
 #[allow(clippy::too_many_lines)]
 fn to_delta_kernel_expr(expr: &Expr) -> Option<Expression> {
@@ -747,7 +753,14 @@ fn to_delta_kernel_expr(expr: &Expr) -> Option<Expression> {
             let right = to_delta_kernel_expr(&binary.right)?;
 
             let op = to_delta_kernel_binary_op(binary.op)?;
-            Some(Expression::binary(op, left, right))
+            match op {
+                DeltaBinaryOperator::BinaryOperator(op) => {
+                    Some(Expression::binary(op, left, right))
+                }
+                DeltaBinaryOperator::VariadicOperator(op) => {
+                    Some(Expression::variadic(op, vec![left, right]))
+                }
+            }
         }
         Expr::Column(col) => {
             let field_names = vec![col.name.as_str()];
@@ -799,21 +812,33 @@ fn to_delta_kernel_expr(expr: &Expr) -> Option<Expression> {
     }
 }
 
-fn to_delta_kernel_binary_op(op: Operator) -> Option<BinaryOperator> {
+fn to_delta_kernel_binary_op(op: Operator) -> Option<DeltaBinaryOperator> {
     match op {
-        Operator::Plus => Some(BinaryOperator::Plus),
-        Operator::Minus => Some(BinaryOperator::Minus),
-        Operator::Multiply => Some(BinaryOperator::Multiply),
-        Operator::Divide => Some(BinaryOperator::Divide),
-        Operator::Lt => Some(BinaryOperator::LessThan),
-        Operator::LtEq => Some(BinaryOperator::LessThanOrEqual),
-        Operator::Gt => Some(BinaryOperator::GreaterThan),
-        Operator::GtEq => Some(BinaryOperator::GreaterThanOrEqual),
-        Operator::Eq => Some(BinaryOperator::Equal),
-        Operator::NotEq => Some(BinaryOperator::NotEqual),
-        Operator::And
-        | Operator::Or
-        | Operator::IsDistinctFrom
+        Operator::Plus => Some(DeltaBinaryOperator::BinaryOperator(BinaryOperator::Plus)),
+        Operator::Minus => Some(DeltaBinaryOperator::BinaryOperator(BinaryOperator::Minus)),
+        Operator::Multiply => Some(DeltaBinaryOperator::BinaryOperator(
+            BinaryOperator::Multiply,
+        )),
+        Operator::Divide => Some(DeltaBinaryOperator::BinaryOperator(BinaryOperator::Divide)),
+        Operator::Lt => Some(DeltaBinaryOperator::BinaryOperator(
+            BinaryOperator::LessThan,
+        )),
+        Operator::LtEq => Some(DeltaBinaryOperator::BinaryOperator(
+            BinaryOperator::LessThanOrEqual,
+        )),
+        Operator::Gt => Some(DeltaBinaryOperator::BinaryOperator(
+            BinaryOperator::GreaterThan,
+        )),
+        Operator::GtEq => Some(DeltaBinaryOperator::BinaryOperator(
+            BinaryOperator::GreaterThanOrEqual,
+        )),
+        Operator::Eq => Some(DeltaBinaryOperator::BinaryOperator(BinaryOperator::Equal)),
+        Operator::NotEq => Some(DeltaBinaryOperator::BinaryOperator(
+            BinaryOperator::NotEqual,
+        )),
+        Operator::And => Some(DeltaBinaryOperator::VariadicOperator(VariadicOperator::And)),
+        Operator::Or => Some(DeltaBinaryOperator::VariadicOperator(VariadicOperator::Or)),
+        Operator::IsDistinctFrom
         | Operator::IsNotDistinctFrom
         | Operator::RegexMatch
         | Operator::RegexIMatch
@@ -1159,48 +1184,68 @@ mod tests {
         // Test supported operators
         assert_eq!(
             to_delta_kernel_binary_op(Operator::Eq),
-            Some(BinaryOperator::Equal)
+            Some(DeltaBinaryOperator::BinaryOperator(BinaryOperator::Equal))
         );
         assert_eq!(
             to_delta_kernel_binary_op(Operator::NotEq),
-            Some(BinaryOperator::NotEqual)
+            Some(DeltaBinaryOperator::BinaryOperator(
+                BinaryOperator::NotEqual
+            ))
         );
         assert_eq!(
             to_delta_kernel_binary_op(Operator::Lt),
-            Some(BinaryOperator::LessThan)
+            Some(DeltaBinaryOperator::BinaryOperator(
+                BinaryOperator::LessThan
+            ))
         );
         assert_eq!(
             to_delta_kernel_binary_op(Operator::LtEq),
-            Some(BinaryOperator::LessThanOrEqual)
+            Some(DeltaBinaryOperator::BinaryOperator(
+                BinaryOperator::LessThanOrEqual
+            ))
         );
         assert_eq!(
             to_delta_kernel_binary_op(Operator::Gt),
-            Some(BinaryOperator::GreaterThan)
+            Some(DeltaBinaryOperator::BinaryOperator(
+                BinaryOperator::GreaterThan
+            ))
         );
         assert_eq!(
             to_delta_kernel_binary_op(Operator::GtEq),
-            Some(BinaryOperator::GreaterThanOrEqual)
+            Some(DeltaBinaryOperator::BinaryOperator(
+                BinaryOperator::GreaterThanOrEqual
+            ))
         );
         assert_eq!(
             to_delta_kernel_binary_op(Operator::Plus),
-            Some(BinaryOperator::Plus)
+            Some(DeltaBinaryOperator::BinaryOperator(BinaryOperator::Plus))
         );
         assert_eq!(
             to_delta_kernel_binary_op(Operator::Minus),
-            Some(BinaryOperator::Minus)
+            Some(DeltaBinaryOperator::BinaryOperator(BinaryOperator::Minus))
         );
         assert_eq!(
             to_delta_kernel_binary_op(Operator::Multiply),
-            Some(BinaryOperator::Multiply)
+            Some(DeltaBinaryOperator::BinaryOperator(
+                BinaryOperator::Multiply
+            ))
         );
         assert_eq!(
             to_delta_kernel_binary_op(Operator::Divide),
-            Some(BinaryOperator::Divide)
+            Some(DeltaBinaryOperator::BinaryOperator(BinaryOperator::Divide))
+        );
+
+        // Test variadic operators
+        assert_eq!(
+            to_delta_kernel_binary_op(Operator::And),
+            Some(DeltaBinaryOperator::VariadicOperator(VariadicOperator::And))
+        );
+        assert_eq!(
+            to_delta_kernel_binary_op(Operator::Or),
+            Some(DeltaBinaryOperator::VariadicOperator(VariadicOperator::Or))
         );
 
         // Test unsupported operators
-        assert_eq!(to_delta_kernel_binary_op(Operator::And), None);
-        assert_eq!(to_delta_kernel_binary_op(Operator::Or), None);
         assert_eq!(to_delta_kernel_binary_op(Operator::Modulo), None);
         assert_eq!(to_delta_kernel_binary_op(Operator::StringConcat), None);
     }
@@ -1425,6 +1470,41 @@ mod tests {
         assert!(
             dk_expr.is_none(),
             "Multiple unsupported filters should return None"
+        );
+
+        // Test AND variadic operator
+        let filters = vec![
+            col("age").gt(lit(20)).and(col("name").eq(lit("John"))),
+            col("active").eq(lit(true)),
+        ];
+        let dk_expr = filters_to_delta_kernel_expr(&filters);
+        assert!(
+            dk_expr.is_some(),
+            "AND variadic operator should be supported"
+        );
+
+        // Test OR variadic operator
+        let filters = vec![
+            col("age").gt(lit(20)).or(col("name").eq(lit("John"))),
+            col("active").eq(lit(true)),
+        ];
+        let dk_expr = filters_to_delta_kernel_expr(&filters);
+        assert!(
+            dk_expr.is_some(),
+            "OR variadic operator should be supported"
+        );
+
+        // Test nested variadic operators
+        let filters = vec![
+            col("age")
+                .gt(lit(20))
+                .and(col("name").eq(lit("John")))
+                .or(col("active").eq(lit(true))),
+        ];
+        let dk_expr = filters_to_delta_kernel_expr(&filters);
+        assert!(
+            dk_expr.is_some(),
+            "Nested variadic operators should be supported"
         );
     }
 
