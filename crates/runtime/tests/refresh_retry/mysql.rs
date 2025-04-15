@@ -16,6 +16,7 @@ limitations under the License.
 //! Runs federation integration tests for `MySQL`.
 //!
 //! Expects a Docker daemon to be running.
+use crate::configure_test_datafusion;
 use crate::{
     docker::RunningContainer,
     mysql::common::{get_mysql_conn, make_mysql_dataset, start_mysql_docker_container},
@@ -168,14 +169,12 @@ async fn mysql_refresh_retries() -> Result<(), String> {
                 .with_dataset(ds_default_retries)
                 .build();
 
-            let status = runtime::status::RuntimeStatus::new();
-            let df = crate::get_test_datafusion(Arc::clone(&status));
-
             let rt = Runtime::builder()
                 .with_app(app)
-                .with_datafusion(df)
+                .with_datafusion_configuration_fn(configure_test_datafusion)
                 .build()
                 .await;
+
             let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {

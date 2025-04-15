@@ -418,10 +418,11 @@ impl CommitChange for SpiceAIChangeCommiter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::component::dataset::DatasetBuilder;
 
-    #[test]
+    #[tokio::test]
     #[allow(clippy::too_many_lines)]
-    fn test_spice_dataset_path() {
+    async fn test_spice_dataset_path() {
         let tests = vec![
             (
                 "spice.ai:lukekim/demo/datasets/my_data".to_string(),
@@ -518,7 +519,16 @@ mod tests {
         ];
 
         for (input, expected) in tests {
-            let dataset = Dataset::try_new(input.clone(), "bar").expect("a valid dataset");
+            let app = app::AppBuilder::new("test").build();
+            let rt = crate::Runtime::builder().build().await;
+
+            let dataset = DatasetBuilder::try_new(input.clone(), "bar")
+                .expect("Failed to create builder")
+                .with_app(Arc::new(app))
+                .with_runtime(Arc::new(rt))
+                .build()
+                .expect("Failed to build dataset");
+
             let dataset_path = SpiceAI::spice_dataset_path(&dataset).expect("a valid dataset path");
             assert_eq!(dataset_path, expected, "Failed for input: {input}");
         }

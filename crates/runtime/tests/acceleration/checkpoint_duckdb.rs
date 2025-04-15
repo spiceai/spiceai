@@ -15,13 +15,14 @@ limitations under the License.
 */
 
 use crate::acceleration::wait_for_checkpoints;
+use anyhow::anyhow;
 use app::AppBuilder;
 use arrow::array::RecordBatch;
 use datafusion_table_providers::sql::db_connection_pool::DbConnectionPool;
 use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
 use duckdb::AccessMode;
 use futures::TryStreamExt;
-use runtime::{Runtime, component::dataset::Dataset as RuntimeDataset, status};
+use runtime::{Runtime, component::dataset::DatasetBuilder};
 use spicepod::component::dataset::{
     Dataset,
     acceleration::{Acceleration, Mode, RefreshMode},
@@ -30,7 +31,7 @@ use std::sync::Arc;
 
 use crate::{
     acceleration::get_params,
-    get_test_datafusion, init_tracing,
+    configure_test_datafusion, init_tracing,
     utils::{runtime_ready_check, test_request_context},
 };
 
@@ -41,13 +42,9 @@ fn get_dataset() -> Dataset {
 #[tokio::test]
 async fn test_acceleration_duckdb_checkpoint() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
-    let _guard = super::ACCELERATION_MUTEX.lock().await;
 
     test_request_context()
         .scope(async {
-            let status = status::RuntimeStatus::new();
-            let df = get_test_datafusion(Arc::clone(&status));
-
             let mut dataset = get_dataset();
             dataset.acceleration = Some(Acceleration {
                 params: get_params(&Mode::File, Some("./decimal.db".to_string()), "duckdb"),
@@ -63,21 +60,38 @@ async fn test_acceleration_duckdb_checkpoint() -> Result<(), anyhow::Error> {
                 .with_dataset(dataset)
                 .build();
 
+            let rt = Arc::new(
+                Runtime::builder()
+                    .with_app(app)
+                    .with_datafusion_configuration_fn(configure_test_datafusion)
+                    .build()
+                    .await,
+            );
+
+            let app_ref = rt.app();
+            let app_lock = app_ref.read().await;
+            let Some(app) = app_lock.as_ref() else {
+                return Err(anyhow!("Failed to obtain app from runtime"));
+            };
+
+            let cloned_rt = Arc::clone(&rt);
             let runtime_datasets = app
                 .datasets
                 .clone()
                 .into_iter()
-                .map(RuntimeDataset::try_from)
+                .map(DatasetBuilder::try_from)
+                .map(move |ds_builder| {
+                    ds_builder
+                        .map_err(|e| anyhow!("Failed to create dataset builder: {}", e))
+                        .and_then(|ds_builder| {
+                            ds_builder
+                                .with_app(Arc::clone(app))
+                                .with_runtime(Arc::clone(&cloned_rt))
+                                .build()
+                                .map_err(|e| anyhow!("Failed to build dataset: {}", e))
+                        })
+                })
                 .collect::<Result<Vec<_>, _>>()?;
-
-            let rt = Arc::new(
-                Runtime::builder()
-                    .with_app(app)
-                    .with_datafusion(df)
-                    .with_runtime_status(status)
-                    .build()
-                    .await,
-            );
 
             tokio::select! {
                 () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
@@ -89,11 +103,11 @@ async fn test_acceleration_duckdb_checkpoint() -> Result<(), anyhow::Error> {
             runtime_ready_check(&rt).await;
 
             // Verify checkpoints are created before shutting down runtime
-            wait_for_checkpoints(&runtime_datasets, 120).await?;
+            wait_for_checkpoints(runtime_datasets, 120).await?;
 
+            rt.shutdown().await;
             drop(rt);
-            runtime::dataaccelerator::unregister_all().await;
-            runtime::dataaccelerator::register_all().await;
+
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
             let pool = DuckDbConnectionPool::new_file("./decimal.db", &AccessMode::ReadWrite)

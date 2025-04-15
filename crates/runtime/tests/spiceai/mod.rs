@@ -17,11 +17,12 @@ limitations under the License.
 use std::sync::Arc;
 
 use app::AppBuilder;
-use runtime::{Runtime, status};
+
+use runtime::Runtime;
 use spicepod::{component::dataset::Dataset, param::Params};
 
 use crate::{
-    ValidateFn, get_test_datafusion, init_tracing, run_query_and_check_results,
+    ValidateFn, configure_test_datafusion, init_tracing, run_query_and_check_results,
     utils::test_request_context,
 };
 
@@ -61,15 +62,13 @@ async fn spiceai_federation() -> Result<(), anyhow::Error> {
                 ))
                 .build();
 
-            let status = status::RuntimeStatus::new();
-            let df = get_test_datafusion(Arc::clone(&status));
+            let mut rt =
+                Runtime::builder()
+                    .with_app(app)
+                    .with_datafusion_configuration_fn(configure_test_datafusion)
+                    .build()
+                    .await;
 
-            let mut rt = Runtime::builder()
-                .with_app(app)
-                .with_datafusion(df)
-                .with_runtime_status(status)
-                .build()
-                .await;
             let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {

@@ -20,11 +20,13 @@ use std::sync::Arc;
 use app::AppBuilder;
 
 use arrow::array::RecordBatch;
-use runtime::{Runtime, status};
+
+use runtime::Runtime;
 use spicepod::{component::dataset::Dataset, param::Params as DatasetParams};
 
 use crate::{
-    get_test_datafusion, init_tracing, run_query_and_check_results, utils::test_request_context,
+    configure_test_datafusion, init_tracing, run_query_and_check_results,
+    utils::test_request_context,
 };
 
 fn make_github_dataset(owner: &str, repo: &str, query_type: &str, query_mode: &str) -> Dataset {
@@ -55,14 +57,13 @@ async fn test_github_issues() -> Result<(), String> {
                     "spiceai", "spiceai", "issues", "search",
                 ))
                 .build();
-            let status = status::RuntimeStatus::new();
-            let df = get_test_datafusion(Arc::clone(&status));
+
             let mut rt = Runtime::builder()
                 .with_app(app)
-                .with_datafusion(df)
-                .with_runtime_status(status)
+                .with_datafusion_configuration_fn(configure_test_datafusion)
                 .build()
                 .await;
+
             let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {
@@ -161,14 +162,13 @@ async fn test_github_commits() -> Result<(), String> {
             let app = AppBuilder::new("github_integration_test")
                 .with_dataset(make_github_dataset("spiceai", "spiceai", "commits", "auto"))
                 .build();
-            let status = status::RuntimeStatus::new();
-            let df = get_test_datafusion(Arc::clone(&status));
+
             let mut rt = Runtime::builder()
                 .with_app(app)
-                .with_datafusion(df)
-                .with_runtime_status(status)
+                .with_datafusion_configuration_fn(configure_test_datafusion)
                 .build()
                 .await;
+
             let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {
@@ -221,14 +221,13 @@ async fn test_github_stargazers() -> Result<(), String> {
                     "auto",
                 ))
                 .build();
-            let status = status::RuntimeStatus::new();
-            let df = get_test_datafusion(Arc::clone(&status));
+
             let mut rt = Runtime::builder()
                 .with_app(app)
-                .with_datafusion(df)
-                .with_runtime_status(status)
+                .with_datafusion_configuration_fn(configure_test_datafusion)
                 .build()
                 .await;
+
             let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {

@@ -22,7 +22,7 @@ insta = { workspace = true, features = ["filters"] }
 regex = "1.10.4"
 reqwest.workspace = true
 reqwest-eventsource = "0.6.0"
-schemars = "0.8.19"
+schemars = "0.8.22"
 secrecy.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
@@ -38,7 +38,7 @@ text-splitter = { git = "https://github.com/spiceai/text-splitter.git", rev = "5
     "tiktoken-rs",
 ] }
 
-pulldown-cmark = "0.12.1"
+pulldown-cmark = "0.13.0"
 tiktoken-rs = "0.6.0"
 
 mistralrs = { git = "https://github.com/spiceai/mistral.rs", rev = "808f39b59fb62ed98612be6207bebe80e735f5ee" }

@@ -232,6 +232,7 @@ mod tests {
     use spicepod::component::runtime::ResultsCache;
 
     use crate::{
+        builder::RuntimeBuilder,
         datafusion::{DataFusion, query::QueryBuilder},
         request::{CacheControl, CacheKeyType, Protocol, RequestContext},
         status,
@@ -262,6 +263,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn test_get_plan_or_cached_cache_miss_and_hit() {
         let results_cache_config = ResultsCache {
             enabled: true,
@@ -273,10 +275,14 @@ mod tests {
         let cache_provider =
             QueryResultsCacheProvider::try_new(&results_cache_config, Box::new([]))
                 .expect("valid cache provider");
+        let runtime = RuntimeBuilder::new().build().await;
         let df = Arc::new(
-            DataFusion::builder(status::RuntimeStatus::new())
-                .with_cache_provider(Arc::new(cache_provider))
-                .build(),
+            DataFusion::builder(
+                status::RuntimeStatus::new(),
+                runtime.accelerator_engine_registry(),
+            )
+            .with_cache_provider(Arc::new(cache_provider))
+            .build(),
         );
 
         // Test with SQL cache key

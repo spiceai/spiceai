@@ -47,9 +47,8 @@ use opentelemetry::KeyValue;
 use refresh::RefreshOverrides;
 use snafu::prelude::*;
 use synchronized_table::SynchronizedTable;
-use tokio::task::JoinHandle;
-
 use tokio::sync::{RwLock, mpsc, oneshot};
+use tokio::task::JoinHandle;
 
 use crate::datafusion::filter_converter::TimestampFilterConvert;
 use crate::execution_plan::TableScanParams;

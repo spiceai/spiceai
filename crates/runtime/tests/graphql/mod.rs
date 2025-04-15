@@ -24,12 +24,13 @@ use async_graphql::{EmptyMutation, EmptySubscription, SimpleObject};
 use async_graphql::{Object, Schema};
 use async_graphql_axum::{GraphQLRequest, GraphQLResponse};
 use axum::{Extension, Router, routing::post};
-use runtime::{Runtime, status};
+
+use runtime::Runtime;
 use spicepod::{component::dataset::Dataset, param::Params as DatasetParams};
 use tokio::net::TcpListener;
 
 use crate::utils::test_request_context;
-use crate::{ValidateFn, get_test_datafusion, init_tracing, run_query_and_check_results};
+use crate::{ValidateFn, configure_test_datafusion, init_tracing, run_query_and_check_results};
 
 type ServiceSchema = Schema<QueryRoot, EmptyMutation, EmptySubscription>;
 
@@ -248,14 +249,13 @@ async fn test_graphql() -> Result<(), String> {
                     None,
                 ))
                 .build();
-            let status = status::RuntimeStatus::new();
-            let df = get_test_datafusion(Arc::clone(&status));
+
             let mut rt = Runtime::builder()
                 .with_app(app)
-                .with_datafusion(df)
-                .with_runtime_status(status)
+                .with_datafusion_configuration_fn(configure_test_datafusion)
                 .build()
                 .await;
+
             let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {
@@ -326,14 +326,15 @@ async fn test_graphql_pagination() -> Result<(), String> {
                 None
             ))
             .build();
-        let status = status::RuntimeStatus::new();
-        let df = get_test_datafusion(Arc::clone(&status));
-        let mut rt = Runtime::builder()
-            .with_app(app)
-            .with_datafusion(df)
-            .with_runtime_status(status)
-            .build()
-            .await;
+
+        let mut rt =
+            Runtime::builder()
+                .with_app(app)
+                .with_datafusion_configuration_fn(configure_test_datafusion)
+                .build()
+                .await
+        ;
+
         let cloned_rt = Arc::new(rt.clone());
 
         tokio::select! {

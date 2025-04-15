@@ -24,6 +24,7 @@ use opentelemetry_sdk::metrics::MetricError;
 use snafu::prelude::*;
 use tokio::sync::RwLock;
 
+use crate::Runtime;
 use crate::accelerated_table::Retention;
 use crate::accelerated_table::refresh::Refresh;
 use crate::component::dataset::TimeFormat;
@@ -87,7 +88,10 @@ impl otel_arrow::ArrowExporter for SpiceMetricsExporter {
     }
 }
 
-pub async fn register_metrics_table(datafusion: &Arc<DataFusion>) -> Result<(), Error> {
+pub async fn register_metrics_table(
+    datafusion: &Arc<DataFusion>,
+    runtime: Arc<Runtime>,
+) -> Result<(), Error> {
     let metrics_table_reference = get_metrics_table_reference();
 
     let retention = Retention::new(
@@ -109,6 +113,7 @@ pub async fn register_metrics_table(datafusion: &Arc<DataFusion>) -> Result<(), 
         Refresh::default(),
         retention,
         Arc::new(RwLock::new(Secrets::default())),
+        runtime,
     )
     .await
     .context(UnableToCreateMetricsTableSnafu)?;

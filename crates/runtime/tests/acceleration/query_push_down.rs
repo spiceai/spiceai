@@ -18,6 +18,7 @@ use app::AppBuilder;
 use datafusion::assert_batches_eq;
 use futures::StreamExt;
 use futures::TryStreamExt;
+
 use runtime::Runtime;
 use spicepod::{
     component::dataset::{Dataset, acceleration::Acceleration},
@@ -30,14 +31,12 @@ use crate::{init_tracing, utils::test_request_context};
 #[allow(clippy::too_many_lines)]
 #[tokio::test]
 async fn acceleration_with_and_without_federation() -> Result<(), anyhow::Error> {
-    use crate::get_test_datafusion;
+    use crate::configure_test_datafusion;
     use crate::postgres::common;
     use crate::utils::runtime_ready_check;
     use arrow::array::RecordBatch;
-    use runtime::status;
     use std::sync::Arc;
 
-    let _guard = super::ACCELERATION_MUTEX.lock().await;
     let _tracing = init_tracing(Some("integration=debug,info"));
 
     test_request_context()
@@ -121,20 +120,18 @@ async fn acceleration_with_and_without_federation() -> Result<(), anyhow::Error>
                 ..Acceleration::default()
             });
 
-            let status = status::RuntimeStatus::new();
-            let df = get_test_datafusion(Arc::clone(&status));
-
             let app = AppBuilder::new("acceleration_federation")
                 .with_dataset(federated_acc)
                 .with_dataset(non_federated_acc)
                 .build();
 
-            let rt = Runtime::builder()
-                .with_app(app)
-                .with_datafusion(df)
-                .with_runtime_status(status)
-                .build()
-                .await;
+            let rt =
+                Runtime::builder()
+                    .with_app(app)
+                    .with_datafusion_configuration_fn(configure_test_datafusion)
+                    .build()
+                    .await
+            ;
 
             let cloned_rt = Arc::new(rt.clone());
 

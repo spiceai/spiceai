@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use crate::{
-    get_test_datafusion, init_tracing,
+    configure_test_datafusion, init_tracing,
     postgres::common,
     utils::{runtime_ready_check, test_request_context},
 };
@@ -23,7 +23,8 @@ use app::AppBuilder;
 use datafusion::{assert_batches_eq, error::DataFusionError};
 use futures::TryStreamExt;
 use rand::Rng;
-use runtime::{Runtime, status};
+
+use runtime::Runtime;
 use spicepod::{
     component::dataset::{
         Dataset,
@@ -39,7 +40,6 @@ use super::get_params;
 #[tokio::test]
 async fn test_acceleration_on_conflict() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
-    let _guard = super::ACCELERATION_MUTEX.lock().await;
 
     test_request_context()
         .scope(async {
@@ -177,9 +177,6 @@ INSERT INTO event_logs (event_name, event_timestamp) VALUES
                 "sqlite",
             );
 
-            let status = status::RuntimeStatus::new();
-            let df = get_test_datafusion(Arc::clone(&status));
-
             let app = AppBuilder::new("on_conflict_behavior")
                 .with_dataset(pg_on_conflict_upsert)
                 .with_dataset(pg_on_conflict_drop)
@@ -196,8 +193,7 @@ INSERT INTO event_logs (event_name, event_timestamp) VALUES
             let rt = Arc::new(
                 Runtime::builder()
                     .with_app(app)
-                    .with_datafusion(df)
-                    .with_runtime_status(status)
+                    .with_datafusion_configuration_fn(configure_test_datafusion)
                     .build()
                     .await,
             );

@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use crate::RecordBatch;
+use crate::configure_test_datafusion;
 use crate::utils::test_request_context;
 use app::AppBuilder;
 use arrow::util::pretty::pretty_format_batches;
@@ -77,13 +78,12 @@ async fn run_delta_lake_test(
         .with_dataset(make_delta_lake_dataset(dataset_path, dataset_name, false))
         .build();
 
-    let status = runtime::status::RuntimeStatus::new();
-    let df = crate::get_test_datafusion(Arc::clone(&status));
     let rt = Runtime::builder()
         .with_app(app)
-        .with_datafusion(df)
+        .with_datafusion_configuration_fn(configure_test_datafusion)
         .build()
         .await;
+
     let cloned_rt = Arc::new(rt.clone());
 
     // Set a timeout for the test
