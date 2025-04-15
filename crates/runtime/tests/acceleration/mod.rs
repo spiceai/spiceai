@@ -33,7 +33,7 @@ mod query_push_down;
 #[cfg(feature = "duckdb")]
 mod single_instance_duckdb;
 
-fn get_params(mode: &Mode, file: Option<String>, engine: &str) -> Option<Params> {
+pub(crate) fn get_params(mode: &Mode, file: Option<String>, engine: &str) -> Option<Params> {
     let param_name = format!("{engine}_file",);
     if mode == &Mode::File {
         return Some(Params::from_string_map(

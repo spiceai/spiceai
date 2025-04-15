@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use crate::{
+    acceleration::get_params,
     configure_test_datafusion, init_tracing,
     utils::{runtime_ready_check, test_request_context},
 };
@@ -71,7 +72,12 @@ async fn iceberg_integration_test_duckdb_acceleration() -> Result<(), anyhow::Er
                 enabled: true,
                 engine: Some("duckdb".to_string()),
                 mode: Mode::File,
-                ..Default::default()
+                params: get_params(
+                    &Mode::File,
+                    Some("iceberg_duckdb_simple".to_string()),
+                    "duckdb",
+                ),
+                ..Acceleration::default()
             });
 
             let _ = run_iceberg_test(
@@ -101,7 +107,12 @@ async fn iceberg_integration_test_duckdb_acceleration_restart() -> Result<(), an
                 enabled: true,
                 engine: Some("duckdb".to_string()),
                 mode: Mode::File,
-                ..Default::default()
+                params: get_params(
+                    &Mode::File,
+                    Some("iceberg_duckdb_restart".to_string()),
+                    "duckdb",
+                ),
+                ..Acceleration::default()
             });
 
             let rt = run_iceberg_test(
