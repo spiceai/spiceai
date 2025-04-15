@@ -747,7 +747,7 @@ impl Runtime {
 
         let shutdown_timeout: Duration = self.app.read().await.as_ref().and_then(|app| {
             app.runtime.shutdown_timeout().unwrap_or_else(|err| {
-                tracing::warn!("Default to {RUNTIME_DEFAULT_SHUTDOWN_TIMEOUT:?} for runtime shutdown timeout due to invalid configuration:\n{err}");
+                tracing::warn!("Invalid shutdown timeout: {err}, using default shutdown timeout {RUNTIME_DEFAULT_SHUTDOWN_TIMEOUT:?}");
                 Some(RUNTIME_DEFAULT_SHUTDOWN_TIMEOUT)
             })
         }).unwrap_or(RUNTIME_DEFAULT_SHUTDOWN_TIMEOUT);
