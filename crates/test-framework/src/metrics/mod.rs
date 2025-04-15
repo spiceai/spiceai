@@ -524,13 +524,13 @@ impl<T: ExtendedMetrics, R: ExtendedMetrics> QueryMetrics<T, R> {
         let mut columns: Vec<ArrayRef> = vec![
             Arc::new(StringArray::from(run_id)),
             Arc::new(StringArray::from(spiced_version)),
-            Arc::new(Int64Array::from(started_at)),
-            Arc::new(Int64Array::from(finished_at)),
+            Arc::new(UInt64Array::from(started_at)),
+            Arc::new(UInt64Array::from(finished_at)),
             Arc::new(StringArray::from(query_name)),
             Arc::new(StringArray::from(query_status)),
             Arc::new(UInt64Array::from(min_duration_ms)),
             Arc::new(UInt64Array::from(max_duration_ms)),
-            Arc::new(Int32Array::from(iterations)),
+            Arc::new(UInt32Array::from(iterations)),
             Arc::new(StringArray::from(commit_sha)),
             Arc::new(StringArray::from(branch_name)),
         ];
