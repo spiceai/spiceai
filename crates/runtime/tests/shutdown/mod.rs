@@ -17,6 +17,7 @@ limitations under the License.
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::Arc,
+    time::Duration,
 };
 
 use app::AppBuilder;
@@ -25,7 +26,10 @@ use rand::Rng;
 use runtime::{Runtime, status};
 use spicepod::{component::dataset::Dataset, param::Params};
 
-use crate::{get_test_datafusion, init_tracing, utils::test_request_context};
+use crate::{
+    get_test_datafusion, init_tracing,
+    utils::{runtime_ready_check_with_timeout, test_request_context},
+};
 
 pub fn get_s3_dataset(s3_uri: &str, name: &str) -> Dataset {
     let mut dataset = Dataset::new(s3_uri, name);
@@ -98,6 +102,8 @@ async fn runtime_shutdown_timeout_force() -> Result<(), anyhow::Error> {
                 () = load_components_rt.load_components() => {}
             }
 
+            runtime_ready_check_with_timeout(rt.as_ref(), Duration::from_secs(30)).await;
+
             // Simulate a long running HTTP query
             let addr = format!("127.0.0.1:{http_port}");
             tokio::spawn(async move {
@@ -108,11 +114,12 @@ async fn runtime_shutdown_timeout_force() -> Result<(), anyhow::Error> {
                     .await
             });
 
+            // Ensures that the HTTP query is started before the shutdown
             sleep(std::time::Duration::from_secs(1)).await;
 
             let start_time = std::time::Instant::now();
 
-           tokio::select! {
+            tokio::select! {
                 // Operation is expected to be completed within 5 seconds, add extra buffer to ensure test robustness
                 () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for runtime termination"));
@@ -188,6 +195,8 @@ async fn runtime_shutdown_timeout_grace() -> Result<(), anyhow::Error> {
                 () = load_components_rt.load_components() => {}
             }
 
+            runtime_ready_check_with_timeout(rt.as_ref(), Duration::from_secs(30)).await;
+
             let start_time = std::time::Instant::now();
 
             // Simulate a long running HTTP query, that is finished (cancelled) after 5 seconds, 
@@ -203,9 +212,10 @@ async fn runtime_shutdown_timeout_grace() -> Result<(), anyhow::Error> {
                 ).await
             });
 
+            // Ensures that the HTTP query is started before the shutdown
             sleep(std::time::Duration::from_secs(1)).await;
 
-           tokio::select! {
+            tokio::select! {
                 // Operation is expected to be completed within 5 seconds, add extra buffer to ensure test robustness
                 () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for runtime termination"));
