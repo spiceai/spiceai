@@ -195,7 +195,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - datafusion-table-providers 0.1.0,  
   <br/>https://github.com/datafusion-contrib/datafusion-table-providers
 
-- delta_kernel 0.6.0, Apache-2.0 
+- delta_kernel 0.9.0, Apache-2.0 
   <br/>https://github.com/delta-io/delta-kernel-rs
 
 - dirs 5.0.1, Apache-2.0 OR MIT 
@@ -411,7 +411,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - path-clean 1.0.1, Apache-2.0 OR MIT 
   <br/>https://github.com/danreeves/path-clean
 
-- pdf-extract 0.9.0, MIT 
+- pdf-extract 0.8.0, MIT 
   <br/>https://github.com/jrmuizel/pdf-extract
 
 - percent-encoding 2.3.1, Apache-2.0 OR MIT 
