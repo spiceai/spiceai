@@ -39,7 +39,7 @@ use super::{ResponseMimeType, sql_to_http_response};
     operation_id = "post_sql",
     tag = "SQL",
     params(
-        ("Accept" = String, Header, description = "The format of the response, one of 'application/json' (default), 'text/csv' or 'text/plain'."),
+        ("Accept" = String, Header, description = "The format of the response, one of 'application/json' (default), 'application/vnd.spiceai.sql.v1+json', 'text/csv' or 'text/plain'."),
     ),
     request_body(
         description = "SQL query to execute",

@@ -54,18 +54,46 @@ impl LogVerbosity {
         LogVerbosity::Default
     }
 }
+
+const INTERNAL_COMPONENTS: &[&str] = &[
+    "task_history",
+    "spiced",
+    "runtime",
+    "secrets",
+    "data_components",
+    "cache",
+    "extensions",
+    "spice_cloud",
+    "llms",
+    "tpc_extension",
+];
+
+const OFF_FILTERS: &str =
+    "reqwest_retry::middleware=off,opentelemetry_sdk=off,delta_kernel::log_segment=off";
+
 impl From<LogVerbosity> for EnvFilter {
     fn from(v: LogVerbosity) -> Self {
+        fn internal_components(level: &str) -> String {
+            INTERNAL_COMPONENTS
+                .iter()
+                .map(|component| format!("{component}={level}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        }
+
         match v {
-            LogVerbosity::Default => EnvFilter::new(
-                "task_history=INFO,spiced=INFO,runtime=INFO,secrets=INFO,data_components=INFO,cache=INFO,extensions=INFO,spice_cloud=INFO,llms=INFO,tpc_extension=INFO,reqwest_retry::middleware=off,opentelemetry_sdk=off,WARN",
-            ),
-            LogVerbosity::Verbose => EnvFilter::new(
-                "task_history=DEBUG,spiced=DEBUG,runtime=DEBUG,secrets=DEBUG,data_components=DEBUG,cache=DEBUG,extensions=DEBUG,spice_cloud=DEBUG,llms=DEBUG,tpc_extension=DEBUG,INFO",
-            ),
-            LogVerbosity::VeryVerbose => EnvFilter::new(
-                "task_history=TRACE,spiced=TRACE,runtime=TRACE,secrets=TRACE,data_components=TRACE,cache=TRACE,extensions=TRACE,spice_cloud=TRACE,llms=TRACE,tpc_extension=TRACE,DEBUG",
-            ),
+            LogVerbosity::Default => EnvFilter::new(format!(
+                "{},{OFF_FILTERS},WARN",
+                internal_components("INFO")
+            )),
+            LogVerbosity::Verbose => EnvFilter::new(format!(
+                "{},{OFF_FILTERS},INFO",
+                internal_components("DEBUG")
+            )),
+            LogVerbosity::VeryVerbose => EnvFilter::new(format!(
+                "{},{OFF_FILTERS},DEBUG",
+                internal_components("TRACE")
+            )),
             LogVerbosity::Specific(filter) => EnvFilter::new(filter),
         }
     }
