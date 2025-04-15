@@ -24,8 +24,8 @@ use std::{
 use anyhow::Result;
 use arrow::{
     array::{
-        ArrayRef, Float64Array, Float64Builder, Int32Array, Int64Array, RecordBatch, StringArray,
-        StringBuilder, UInt64Array, UInt64Builder,
+        ArrayRef, Float64Array, Float64Builder, RecordBatch, StringArray, StringBuilder,
+        UInt64Array, UInt64Builder,
     },
     datatypes::{DataType, Field, Schema, SchemaRef},
     util::pretty::print_batches,
@@ -337,6 +337,14 @@ macro_rules! extract_metric_values {
             .collect::<Vec<_>>()
     };
 
+    // as u32
+    ($metrics:expr, $field:ident, as_u32) => {
+        $metrics
+            .iter()
+            .map(|metric| metric.$field as u64)
+            .collect::<Vec<_>>()
+    };
+
     // as i64
     ($metrics:expr, $field:ident, as_i64) => {
         $metrics
@@ -503,13 +511,13 @@ impl<T: ExtendedMetrics, R: ExtendedMetrics> QueryMetrics<T, R> {
         let run_id = vec![self.run_id.to_string(); self.metrics.len()];
         let spiced_version = vec![self.spiced_version.clone(); self.metrics.len()];
 
-        let started_at = extract_metric_values!(self.metrics, started_at, as_i64);
-        let finished_at = extract_metric_values!(self.metrics, finished_at, as_i64);
+        let started_at = extract_metric_values!(self.metrics, started_at, as_u64);
+        let finished_at = extract_metric_values!(self.metrics, finished_at, as_u64);
         let query_name = extract_metric_values!(self.metrics, query_name, clone);
         let query_status = extract_metric_values!(self.metrics, query_status, to_string);
         let min_duration_ms = extract_metric_values!(self.metrics, min_duration_ms);
         let max_duration_ms = extract_metric_values!(self.metrics, max_duration_ms);
-        let iterations = extract_metric_values!(self.metrics, iterations, as_i32);
+        let iterations = extract_metric_values!(self.metrics, iterations, as_u64);
         let median_duration_ms = extract_metric_values!(self.metrics, median_duration_ms);
         let percentile_99_duration_ms =
             extract_metric_values!(self.metrics, percentile_99_duration_ms);
@@ -530,7 +538,7 @@ impl<T: ExtendedMetrics, R: ExtendedMetrics> QueryMetrics<T, R> {
             Arc::new(StringArray::from(query_status)),
             Arc::new(UInt64Array::from(min_duration_ms)),
             Arc::new(UInt64Array::from(max_duration_ms)),
-            Arc::new(UInt32Array::from(iterations)),
+            Arc::new(UInt64Array::from(iterations)),
             Arc::new(StringArray::from(commit_sha)),
             Arc::new(StringArray::from(branch_name)),
         ];
