@@ -63,9 +63,6 @@ pub enum Error {
     UnableToBuildAcceleratedTable {
         source: AcceleratedTableBuilderError,
     },
-
-    #[snafu(display("Missing App From Runtime"))]
-    MissingAppFromRuntime {},
 }
 
 async fn get_local_table_provider(

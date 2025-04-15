@@ -84,8 +84,13 @@ pub enum Error {
     #[snafu(display("Error parsing `from` path {path} as table reference: {source}"))]
     UnableToParseTableReferenceFromPath { path: String, source: ParserError },
 
-    #[snafu(display("Unable to build Dataset: {missing_component} missing in DatasetBuilder"))]
-    UnableToBuildDataset { missing_component: String },
+    #[snafu(display(
+        "Fail to build dataset '{dataset}': required component '{missing_component}' is missing.\nAn unexpected error occurred. Report a bug to request support: https://github.com/spiceai/spiceai/issues"
+    ))]
+    UnableToBuildDataset {
+        dataset: String,
+        missing_component: String,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -416,9 +421,11 @@ impl DatasetBuilder {
 
     pub fn build(self) -> Result<Dataset> {
         let app = self.app.ok_or(Error::UnableToBuildDataset {
+            dataset: self.name.to_string(),
             missing_component: "app".to_string(),
         })?;
         let runtime = self.runtime.ok_or(Error::UnableToBuildDataset {
+            dataset: self.name.to_string(),
             missing_component: "runtime".to_string(),
         })?;
 

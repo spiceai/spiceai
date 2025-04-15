@@ -70,7 +70,9 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Failed to get app from the runtime"))]
+    #[snafu(display(
+        "Failed to initiate catalog, app reference cannot be obtained from the runtime\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+    ))]
     FailedToGetAppFromRuntime {},
 }
 

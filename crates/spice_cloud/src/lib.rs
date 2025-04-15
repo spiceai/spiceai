@@ -47,7 +47,9 @@ pub enum Error {
     #[snafu(display("Unable to get read-write table provider"))]
     NoReadWriteProvider {},
 
-    #[snafu(display("Unable to create data connector"))]
+    #[snafu(display(
+        "Unable to create data connector: {source}\nReport a bug to request support: https://github.com/spiceai/spiceai/issues"
+    ))]
     UnableToCreateDataConnector {
         source: Box<dyn std::error::Error + Sync + Send>,
     },
