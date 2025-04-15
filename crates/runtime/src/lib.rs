@@ -766,11 +766,11 @@ impl Runtime {
 
         let shutdown_timeout: Duration = self.app.read().await.as_ref().and_then(|app| {
             app.runtime.shutdown_timeout().unwrap_or_else(|err| {
-                tracing::warn!("Invalid shutdown timeout: {err}, using default shutdown timeout {RUNTIME_DEFAULT_SHUTDOWN_TIMEOUT:?}");
+                tracing::warn!("Invalid shutdown timeout: {err}. Using default: {RUNTIME_DEFAULT_SHUTDOWN_TIMEOUT:?}");
                 Some(RUNTIME_DEFAULT_SHUTDOWN_TIMEOUT)
             })
         }).unwrap_or(RUNTIME_DEFAULT_SHUTDOWN_TIMEOUT);
-        tracing::info!("Shutdown initiated (graceful timeout: {shutdown_timeout:?})");
+        tracing::info!("Shutdown initiated; waiting up to {shutdown_timeout:?} for connections to drain");
 
         let start_time = Instant::now();
 
