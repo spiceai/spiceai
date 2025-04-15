@@ -101,7 +101,7 @@ pub enum ResponseMimeType {
     Json,
     Csv,
     Plain,
-    VndSqlJsonV1,
+    VndNsqlJsonV1,
 }
 
 /// Represents additional metadata to produce a response, such as the SQL query used, etc.
@@ -134,7 +134,7 @@ impl ResponseMimeType {
                 .iter()
                 .find_map(|h| match h.as_str() {
                     "application/json" => Some(ResponseMimeType::Json),
-                    "application/vnd.spiceai.sql.v1+json" => Some(ResponseMimeType::VndSqlJsonV1),
+                    "application/vnd.spiceai.nsql.v1+json" => Some(ResponseMimeType::VndNsqlJsonV1),
                     "text/csv" => Some(ResponseMimeType::Csv),
                     "text/plain" => Some(ResponseMimeType::Plain),
                     _ => None,
@@ -207,7 +207,7 @@ pub async fn to_http_response(
         ResponseMimeType::Json => arrow_to_json(&data),
         ResponseMimeType::Csv => arrow_to_csv(&data),
         ResponseMimeType::Plain => arrow_to_plain(&data),
-        ResponseMimeType::VndSqlJsonV1 => arrow_to_vnd_sql_json_v1(&data, meta),
+        ResponseMimeType::VndNsqlJsonV1 => arrow_to_vnd_nsql_json_v1(&data, meta),
     };
 
     let body = match res {
@@ -287,8 +287,8 @@ fn arrow_to_plain(
     pretty_format_batches(data).map(|d| format!("{d}")).boxed()
 }
 
-/// Converts a vector of `RecordBatch` to an application/vnd.spiceai.sql.v1+json format
-fn arrow_to_vnd_sql_json_v1(
+/// Converts a vector of `RecordBatch` to an application/vnd.spiceai.nsql.v1+json format
+fn arrow_to_vnd_nsql_json_v1(
     data: &[RecordBatch],
     meta: ResponseMetadata,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
@@ -348,7 +348,7 @@ mod tests {
 
         // Test conversion without SQL
         let result_without_sql =
-            arrow_to_vnd_sql_json_v1(&[batch.clone()], ResponseMetadata::empty())
+            arrow_to_vnd_nsql_json_v1(&[batch.clone()], ResponseMetadata::empty())
                 .expect("to convert");
         insta::assert_json_snapshot!(
             "vnd_json_v1_without_sql",
@@ -358,7 +358,7 @@ mod tests {
         // Test conversion with SQL
         let metadata = ResponseMetadata::empty()
             .with_sql("SELECT customer_id, total_sales FROM sales_summary LIMIT 2;");
-        let result_with_sql = arrow_to_vnd_sql_json_v1(&[batch], metadata).expect("to convert");
+        let result_with_sql = arrow_to_vnd_nsql_json_v1(&[batch], metadata).expect("to convert");
         insta::assert_json_snapshot!(
             "vnd_json_v1_with_sql",
             serde_json::from_str::<serde_json::Value>(&result_with_sql).expect("to parse")
