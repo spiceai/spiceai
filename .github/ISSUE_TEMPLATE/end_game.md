@@ -71,7 +71,6 @@ assignees: ''
 1. **Documentation Review**
 
    - [ ] Update and confirm accuracy of `README.md` and [Spice.ai Docs](https://github.com/spiceai/docs).
-   - [ ] Ensure version numbers and references match the release.
 
 1. **Cookbook Recipes**
 
@@ -215,3 +214,4 @@ assignees: ''
 - [ ] Telegram: [spiceai](https://t.me/spiceai)
 - [ ] Blog: [spiceai.org/blog](https://spiceai.org/blog)
   - [ ] Update docs banner version in [docusaurus.config.ts](https://github.com/spiceai/docs/blob/trunk/website/docusaurus.config.ts#L95).
+  - [ ] Ensure version numbers and references match the release.
