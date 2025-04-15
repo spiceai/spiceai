@@ -23,11 +23,11 @@ use std::{
 use app::AppBuilder;
 use azure_core::sleep;
 use rand::Rng;
-use runtime::{Runtime, status};
+use runtime::Runtime;
 use spicepod::{component::dataset::Dataset, param::Params};
 
 use crate::{
-    get_test_datafusion, init_tracing,
+    configure_test_datafusion, init_tracing,
     utils::{runtime_ready_check_with_timeout, test_request_context},
 };
 
@@ -79,11 +79,8 @@ async fn runtime_shutdown_timeout_force() -> Result<(), anyhow::Error> {
                 .with_shutdown_timeout("5s")
                 .build();
 
-            let status = status::RuntimeStatus::new();
-            let df = get_test_datafusion(Arc::clone(&status));
-
             let rt =  Arc::new(Runtime::builder()
-                .with_datafusion(df)
+                .with_datafusion_configuration_fn(configure_test_datafusion)
                 .with_app(app)
                 .build()
                 .await);
@@ -172,11 +169,8 @@ async fn runtime_shutdown_timeout_grace() -> Result<(), anyhow::Error> {
                 .with_shutdown_timeout("20s")
                 .build();
 
-            let status = status::RuntimeStatus::new();
-            let df = get_test_datafusion(Arc::clone(&status));
-
             let rt =  Arc::new(Runtime::builder()
-                .with_datafusion(df)
+                .with_datafusion_configuration_fn(configure_test_datafusion)
                 .with_app(app)
                 .build()
                 .await);
