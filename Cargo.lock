@@ -6942,7 +6942,7 @@ dependencies = [
  "mistralrs",
  "mistralrs-core",
  "paste",
- "pulldown-cmark",
+ "pulldown-cmark 0.13.0",
  "rand 0.9.0",
  "regex",
  "reqwest 0.12.12",
@@ -9533,6 +9533,17 @@ name = "pulldown-cmark"
 version = "0.12.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f86ba2052aebccc42cbbb3ed234b8b13ce76f75c3551a303cb2bcffcff12bb14"
+dependencies = [
+ "bitflags 2.8.0",
+ "memchr",
+ "unicase",
+]
+
+[[package]]
+name = "pulldown-cmark"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1e8bbe1a966bd2f362681a44f6edce3c2310ac21e4d5067a6e7ec396297a6ea0"
 dependencies = [
  "bitflags 2.8.0",
  "getopts",
@@ -12334,7 +12345,7 @@ dependencies = [
  "hashbrown 0.15.2",
  "itertools 0.13.0",
  "once_cell",
- "pulldown-cmark",
+ "pulldown-cmark 0.12.2",
  "regex",
  "rustls 0.23.22",
  "strum 0.26.3",
