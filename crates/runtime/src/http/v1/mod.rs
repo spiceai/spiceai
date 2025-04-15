@@ -101,6 +101,7 @@ pub enum ResponseMimeType {
     Json,
     Csv,
     Plain,
+    VndNsqlJsonV1,
     VndSqlJsonV1,
 }
 
@@ -134,6 +135,7 @@ impl ResponseMimeType {
                 .iter()
                 .find_map(|h| match h.as_str() {
                     "application/json" => Some(ResponseMimeType::Json),
+                    "application/vnd.spiceai.nsql.v1+json" => Some(ResponseMimeType::VndNsqlJsonV1),
                     "application/vnd.spiceai.sql.v1+json" => Some(ResponseMimeType::VndSqlJsonV1),
                     "text/csv" => Some(ResponseMimeType::Csv),
                     "text/plain" => Some(ResponseMimeType::Plain),
@@ -207,7 +209,9 @@ pub async fn to_http_response(
         ResponseMimeType::Json => arrow_to_json(&data),
         ResponseMimeType::Csv => arrow_to_csv(&data),
         ResponseMimeType::Plain => arrow_to_plain(&data),
-        ResponseMimeType::VndSqlJsonV1 => arrow_to_vnd_sql_json_v1(&data, meta),
+        ResponseMimeType::VndSqlJsonV1 | ResponseMimeType::VndNsqlJsonV1 => {
+            arrow_to_vnd_sql_json_v1(&data, meta)
+        }
     };
 
     let body = match res {
@@ -287,7 +291,7 @@ fn arrow_to_plain(
     pretty_format_batches(data).map(|d| format!("{d}")).boxed()
 }
 
-/// Converts a vector of `RecordBatch` to an application/vnd.spiceai.sql.v1+json format
+/// Converts a vector of `RecordBatch` to an application/vnd.spiceai.sql.v1+json / application/vnd.spiceai.nsql.v1+json format
 fn arrow_to_vnd_sql_json_v1(
     data: &[RecordBatch],
     meta: ResponseMetadata,
