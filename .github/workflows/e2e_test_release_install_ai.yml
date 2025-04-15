@@ -8,9 +8,7 @@ on:
           type: choice
           options:
             - "all"
-            - "Linux x64 (GPU T4)"
             - "macOS aarch64 (GPU M4)"
-            - "Windows x64 (GPU T4)"
             - "Linux aarch64"
             - "macOS aarch64"
             - "Windows x64"
@@ -31,25 +29,11 @@ jobs:
           script: |
             const matrix = [
               {
-                name: "Linux x64 (GPU T4)",
-                runner: "ubuntu-gpu-t4-4-core",
-                target_os: "linux",
-                target_arch: "x86_64",
-                tags: ["cuda"]
-              },
-              {
                 name: "macOS aarch64 (GPU M4)",
                 runner: "spiceai-macos",
                 target_os: "darwin",
                 target_arch: "aarch64",
                 tags: ["metal"]
-              },
-              {
-                name: "Windows x64 (GPU T4)",
-                runner: "windows-gpu-t4-4-core",
-                target_os: "windows",
-                target_arch: "x86_64",
-                tags: ["cuda"]
               },
               {
                 name: "Linux aarch64",
