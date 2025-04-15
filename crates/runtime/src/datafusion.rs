@@ -69,6 +69,7 @@ pub mod dialect;
 pub mod error;
 mod extension;
 pub mod filter_converter;
+pub mod param_utils;
 pub mod refresh_sql;
 pub mod schema;
 pub mod udf;
