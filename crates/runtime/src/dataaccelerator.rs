@@ -34,7 +34,7 @@ use datafusion_table_providers::util::{
 use secrecy::SecretString;
 use snafu::prelude::*;
 use std::{any::Any, collections::HashMap, sync::Arc};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::RwLock;
 
 use self::arrow::ArrowAccelerator;
 
@@ -76,19 +76,19 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Default, Clone)]
 pub struct AcceleratorEngineRegistry {
-    pub accelerator_engine_registry: Arc<Mutex<HashMap<Engine, Arc<dyn DataAccelerator>>>>,
+    pub accelerator_engine_registry: Arc<RwLock<HashMap<Engine, Arc<dyn DataAccelerator>>>>,
 }
 
 impl AcceleratorEngineRegistry {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            accelerator_engine_registry: Arc::new(Mutex::new(HashMap::new())),
+            accelerator_engine_registry: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
     pub async fn get_accelerator_engine(&self, engine: Engine) -> Option<Arc<dyn DataAccelerator>> {
-        let guard = self.accelerator_engine_registry.lock().await;
+        let guard = self.accelerator_engine_registry.read().await;
         let engine = guard.get(&engine);
         match engine {
             Some(engine_ref) => Some(Arc::clone(engine_ref)),
@@ -101,7 +101,7 @@ impl AcceleratorEngineRegistry {
         name: Engine,
         accelerator_engine: Arc<dyn DataAccelerator>,
     ) {
-        let mut registry = self.accelerator_engine_registry.lock().await;
+        let mut registry = self.accelerator_engine_registry.write().await;
         registry.insert(name, accelerator_engine);
     }
 
@@ -120,7 +120,7 @@ impl AcceleratorEngineRegistry {
     }
 
     pub async fn unregister_all(&self) {
-        let mut registry = self.accelerator_engine_registry.lock().await;
+        let mut registry = self.accelerator_engine_registry.write().await;
         registry.clear();
     }
 

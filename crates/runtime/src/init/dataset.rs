@@ -24,7 +24,10 @@ use crate::{
     UnableToInitializeDataConnectorSnafu, UnableToLoadDatasetConnectorSnafu,
     UnableToReceiveAcceleratedTableStatusSnafu, UnknownDataConnectorSnafu,
     accelerated_table::AcceleratedTable,
-    component::dataset::{self, Dataset, DatasetBuilder, acceleration::RefreshMode},
+    component::dataset::{
+        self, Dataset, DatasetBuilder,
+        acceleration::{Acceleration, RefreshMode},
+    },
     dataconnector::{
         self, ConnectorComponent, ConnectorParams, ConnectorParamsBuilder, DataConnector,
         DataConnectorError, ODBC_DATACONNECTOR,
@@ -177,13 +180,14 @@ impl Runtime {
             .map(DatasetBuilder::try_from)
             .map(move |ds_builder_result| {
                 ds_builder_result.and_then(|ds_builder| {
-                    let dataset = ds_builder.name.to_string();
+                    let dataset_name = ds_builder.name.to_string();
                     ds_builder
                         .with_app(Arc::clone(app))
                         .with_runtime(Arc::clone(&self))
                         .build()
-                        .boxed()
-                        .context(UnableToBuildDatasetSnafu { dataset })
+                        .context(UnableToBuildDatasetSnafu {
+                            dataset: dataset_name,
+                        })
                 })
             })
     }
@@ -409,22 +413,26 @@ impl Runtime {
         }
     }
 
-    async fn remove_dataset(&self, ds: &Dataset) {
-        if self.df.table_exists(ds.name.clone()) {
+    async fn remove_dataset(
+        &self,
+        ds_name: TableReference,
+        ds_acceleration: Option<&Acceleration>,
+    ) {
+        if self.df.table_exists(ds_name.clone()) {
             if let Some(datasets_health_monitor) = &self.datasets_health_monitor {
                 datasets_health_monitor
-                    .deregister_dataset(&ds.name.to_string())
+                    .deregister_dataset(&ds_name.to_string())
                     .await;
             }
 
-            if let Err(e) = self.df.remove_table(&ds.name).await {
-                tracing::warn!("Unable to unload dataset {}: {}", &ds.name, e);
+            if let Err(e) = self.df.remove_table(&ds_name).await {
+                tracing::warn!("Unable to unload dataset {}: {}", &ds_name, e);
                 return;
             }
         }
 
-        tracing::info!("Unloaded dataset {}", &ds.name);
-        let engine = ds.acceleration.as_ref().map_or_else(
+        tracing::info!("Unloaded dataset {}", &ds_name);
+        let engine = ds_acceleration.map_or_else(
             || "None".to_string(),
             |acc| {
                 if acc.enabled {
@@ -459,7 +467,8 @@ impl Runtime {
                     );
                 }
 
-                self.remove_dataset(&ds).await;
+                self.remove_dataset(ds.name.clone(), ds.acceleration.as_ref())
+                    .await;
 
                 if self
                     .register_loaded_dataset(Arc::clone(&ds), Arc::clone(&connector), None)
@@ -666,28 +675,34 @@ impl Runtime {
         // Remove datasets that are no longer in the app
         for ds in &current_app.datasets {
             if !new_app.datasets.iter().any(|d| d.name == ds.name) {
-                let ds = match DatasetBuilder::try_from(ds.clone()) {
-                    Ok(ds_builder) => {
-                        match ds_builder
-                            .with_app(Arc::clone(current_app))
-                            .with_runtime(Arc::clone(&self))
-                            .build()
-                        {
-                            Ok(ds) => ds,
-                            Err(e) => {
-                                tracing::error!("Unable to build dataset {}: {e}", ds.name);
-                                continue;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!("Could not remove dataset {}: {e}", ds.name);
+                let ds_name = match Dataset::parse_table_reference(&ds.name) {
+                    Ok(ds_name) => ds_name,
+                    Err(err) => {
+                        tracing::error!(
+                            "Unable to unload dataset {}: {err}\nReport a bug to request support: https://github.com/spiceai/spiceai/issues ",
+                            ds.name
+                        );
                         continue;
                     }
                 };
+                let ds_acceleration = match ds
+                    .acceleration
+                    .clone()
+                    .map(crate::component::dataset::acceleration::Acceleration::try_from)
+                    .transpose()
+                {
+                    Ok(ds_acceleration) => ds_acceleration,
+                    Err(err) => {
+                        tracing::error!(
+                            "Unable to unload dataset {ds_name}: {err}\nReport a bug to request support: https://github.com/spiceai/spiceai/issues"
+                        );
+                        continue;
+                    }
+                };
+
                 self.status
-                    .update_dataset(&ds.name, status::ComponentStatus::Disabled);
-                self.remove_dataset(&ds).await;
+                    .update_dataset(&ds_name, status::ComponentStatus::Disabled);
+                self.remove_dataset(ds_name, ds_acceleration.as_ref()).await;
             }
         }
     }

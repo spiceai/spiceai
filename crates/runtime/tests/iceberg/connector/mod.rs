@@ -74,7 +74,7 @@ async fn iceberg_integration_test_duckdb_acceleration() -> Result<(), anyhow::Er
                 mode: Mode::File,
                 params: get_params(
                     &Mode::File,
-                    Some("iceberg_duckdb_simple".to_string()),
+                    Some("./iceberg_duckdb_simple.db".to_string()),
                     "duckdb",
                 ),
                 ..Acceleration::default()
@@ -109,7 +109,7 @@ async fn iceberg_integration_test_duckdb_acceleration_restart() -> Result<(), an
                 mode: Mode::File,
                 params: get_params(
                     &Mode::File,
-                    Some("iceberg_duckdb_restart".to_string()),
+                    Some("./iceberg_duckdb_restart.db".to_string()),
                     "duckdb",
                 ),
                 ..Acceleration::default()

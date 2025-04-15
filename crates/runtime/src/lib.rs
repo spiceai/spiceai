@@ -302,7 +302,7 @@ pub enum Error {
     #[snafu(display("Unable to build dataset: {dataset}: {source}"))]
     UnableToBuildDataset {
         dataset: String,
-        source: Box<dyn std::error::Error + Send + Sync>,
+        source: crate::component::dataset::Error,
     },
 
     #[snafu(display("{source}"))]
@@ -681,7 +681,7 @@ impl Runtime {
                     if an_eval_exists {
                         drop(app_lock);
                         if let Err(err) = self_clone.load_eval_tables().await {
-                            tracing::warn!("Creating internal eval run table: {err}");
+                            tracing::warn!("Failed to create internal eval tables: {err}");
                         }
                     } else {
                         tracing::trace!(

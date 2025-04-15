@@ -145,7 +145,7 @@ impl Debezium {
     }
 }
 
-#[derive(Default, Debug, Clone)]
+#[derive(Default, Debug, Copy, Clone)]
 pub struct DebeziumFactory {}
 
 impl DebeziumFactory {
