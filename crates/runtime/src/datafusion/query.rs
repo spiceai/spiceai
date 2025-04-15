@@ -69,6 +69,9 @@ pub enum Error {
 
     #[snafu(display("Schema mismatch: {source}"))]
     SchemaMismatch { source: arrow_tools::schema::Error },
+
+    #[snafu(display("Failed to set parameters in logical plan: {source}"))]
+    BindingParameters { source: DataFusionError },
 }
 
 // There is no need to have a synchronized SQLOptions across all threads, each thread can have its own instance.
@@ -122,6 +125,7 @@ impl Query {
                 &session,
                 Arc::clone(&request_context),
                 &ctx.sql,
+                ctx.parameters.clone(),
                 tracker,
             )
             .await?
@@ -351,4 +355,85 @@ pub fn write_to_json_string(
     writer.finish()?;
 
     String::from_utf8(writer.into_inner()).boxed()
+}
+
+#[cfg(test)]
+mod tests {
+    use ::cache::{QueryResultsCacheProvider, QueryResultsCacheStatus};
+    use serde_json::json;
+    use spicepod::component::runtime::ResultsCache;
+
+    use crate::{
+        dataaccelerator::AcceleratorEngineRegistry,
+        datafusion::{builder::DataFusionBuilder, param_utils::convert_json_to_param_values},
+        status::RuntimeStatus,
+    };
+
+    use super::*;
+
+    #[tokio::test]
+    async fn parameterized_query() {
+        let parameters = convert_json_to_param_values(json!([41])).expect("json to paramvalues");
+        let config = ResultsCache::default();
+        let cache_provider = Arc::new(
+            QueryResultsCacheProvider::try_new(&config, Box::new([])).expect("cache provider new"),
+        );
+        let df = Arc::new(
+            DataFusionBuilder::new(
+                RuntimeStatus::new(),
+                Arc::new(AcceleratorEngineRegistry::new()),
+            )
+            .with_cache_provider(cache_provider)
+            .build(),
+        );
+
+        let mut query = QueryBuilder::new("SELECT $1 + 1 AS the_answer", Arc::clone(&df))
+            .parameters(parameters.clone())
+            .build()
+            .run()
+            .await
+            .expect("Query::run");
+
+        // Need to consume the stream to cache the result
+        while let Some(_) = query.data.next().await {}
+
+        assert_eq!(
+            query.results_cache_status,
+            QueryResultsCacheStatus::CacheMiss
+        );
+
+        // Need to consume the stream to cache the result
+        while let Some(_) = query.data.next().await {}
+
+        let mut query = QueryBuilder::new("SELECT $1 + 1 AS the_answer", Arc::clone(&df))
+            .parameters(parameters)
+            .build()
+            .run()
+            .await
+            .expect("Query::run");
+        assert_eq!(
+            query.results_cache_status,
+            QueryResultsCacheStatus::CacheHit
+        );
+
+        // Need to consume the stream to cache the result
+        while let Some(_) = query.data.next().await {}
+
+        // New parameters should not be cached
+        let parameters = convert_json_to_param_values(json!([1])).expect("json to paramvalues");
+        let mut query = QueryBuilder::new("SELECT $1 + 1 AS the_answer", df)
+            .parameters(parameters)
+            .build()
+            .run()
+            .await
+            .expect("Query::run");
+
+        // Need to consume the stream to cache the result
+        while let Some(_) = query.data.next().await {}
+
+        assert_eq!(
+            query.results_cache_status,
+            QueryResultsCacheStatus::CacheMiss
+        );
+    }
 }
