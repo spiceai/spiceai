@@ -66,7 +66,7 @@ bb8-postgres = "0.8"
 bytes = "1.10.0"
 charset = "0.1.5"
 chrono = "0.4.38"
-clap = { version = "4.5.29", features = ["derive", "env"] }
+clap = { version = "4.5.36", features = ["derive", "env"] }
 clickhouse-rs = { git = "https://github.com/spiceai/clickhouse-rs.git", tag = "0.2.1", features = [
     "tokio_io",
     "tls",
@@ -87,7 +87,7 @@ globset = "0.4.16"
 graph-rs-sdk = { git = "https://github.com/spiceai/graph-rs-sdk", rev = "f8703df260146b313461029d41c4a021306832b8" }
 graphql-parser = "0.4.0"
 hf-hub = { version = "0.3.0", features = ["tokio"] }
-http = "1.1.0"
+http = "1.3.1"
 iceberg = "0.4.0"
 iceberg-catalog-rest = "0.4.0"
 iceberg-datafusion = "0.4.0"
@@ -127,7 +127,7 @@ rusqlite = { version = "0.31.0", features = ["bundled-decimal", "chrono"] }
 rustls = "0.23"
 rustls-pemfile = "2.1.3"
 secrecy = "0.10.3"
-serde = { version = "1.0.217", features = ["derive"] }
+serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9.30"
 snafu = "0.8.5"
