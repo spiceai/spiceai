@@ -360,6 +360,7 @@ pub fn write_to_json_string(
 #[cfg(test)]
 mod tests {
     use ::cache::{QueryResultsCacheProvider, QueryResultsCacheStatus};
+    use arrow::array::Int64Array;
     use serde_json::json;
     use spicepod::component::runtime::ResultsCache;
 
@@ -395,15 +396,20 @@ mod tests {
             .expect("Query::run");
 
         // Need to consume the stream to cache the result
-        while let Some(_) = query.data.next().await {}
+        while let Some(Ok(batch)) = query.data.next().await {
+            let column = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("value");
+            let id_value = column.value(0);
+            assert_eq!(id_value, 42);
+        }
 
         assert_eq!(
             query.results_cache_status,
             QueryResultsCacheStatus::CacheMiss
         );
-
-        // Need to consume the stream to cache the result
-        while let Some(_) = query.data.next().await {}
 
         let mut query = QueryBuilder::new("SELECT $1 + 1 AS the_answer", Arc::clone(&df))
             .parameters(parameters)
@@ -417,7 +423,15 @@ mod tests {
         );
 
         // Need to consume the stream to cache the result
-        while let Some(_) = query.data.next().await {}
+        while let Some(Ok(batch)) = query.data.next().await {
+            let column = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("value");
+            let id_value = column.value(0);
+            assert_eq!(id_value, 42);
+        }
 
         // New parameters should not be cached
         let parameters = convert_json_to_param_values(json!([1])).expect("json to paramvalues");
@@ -429,7 +443,15 @@ mod tests {
             .expect("Query::run");
 
         // Need to consume the stream to cache the result
-        while let Some(_) = query.data.next().await {}
+        while let Some(Ok(batch)) = query.data.next().await {
+            let column = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("value");
+            let id_value = column.value(0);
+            assert_eq!(id_value, 2);
+        }
 
         assert_eq!(
             query.results_cache_status,
