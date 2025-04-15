@@ -24,6 +24,7 @@ use arrow::{
 use arrow_tools::schema::verify_schema;
 use cache::PlanOrCached;
 use datafusion::{
+    common::ParamValues,
     error::DataFusionError,
     execution::{SendableRecordBatchStream, context::SQLOptions},
     physical_plan::stream::RecordBatchStreamAdapter,
@@ -83,6 +84,7 @@ thread_local! {
 pub struct Query {
     df: Arc<crate::datafusion::DataFusion>,
     sql: Arc<str>,
+    parameters: Option<ParamValues>,
     tracker: QueryTracker,
 }
 
