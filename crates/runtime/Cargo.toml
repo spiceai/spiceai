@@ -110,7 +110,7 @@ runtime-auth = { path = "../runtime-auth" }
 rusqlite = { workspace = true, optional = true }
 rustls.workspace = true
 rustls-pemfile.workspace = true
-schemars = "0.8.19"
+schemars = "0.8.22"
 secrecy.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
