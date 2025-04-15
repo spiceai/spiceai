@@ -118,8 +118,8 @@ pub(crate) async fn overhead_run(args: &HttpOverheadTestArgs) -> anyhow::Result<
 /// ```
 #[allow(clippy::cast_precision_loss)]
 fn check_threshold(
-    spice_duration: i64,
-    baseline_duration: i64,
+    spice_duration: u64,
+    baseline_duration: u64,
     increase_threshold: f64,
     label: &str,
 ) -> Result<(), anyhow::Error> {

@@ -66,18 +66,17 @@ pub struct QueryMetric<T: ExtendedMetrics> {
     pub query_status: QueryStatus,
     pub started_at: usize,
     pub finished_at: usize,
-    pub min_duration_ms: i64,
-    pub max_duration_ms: i64,
+    pub min_duration_ms: u64,
+    pub max_duration_ms: u64,
     pub iterations: usize,
-    pub median_duration_ms: i64,
-    pub percentile_99_duration_ms: i64,
-    pub percentile_95_duration_ms: i64,
-    pub percentile_90_duration_ms: i64,
+    pub median_duration_ms: u64,
+    pub percentile_99_duration_ms: u64,
+    pub percentile_95_duration_ms: u64,
+    pub percentile_90_duration_ms: u64,
     pub extended_metrics: Option<T>,
 }
 
 impl<T: ExtendedMetrics> QueryMetric<T> {
-    #[allow(clippy::cast_possible_truncation)]
     pub fn new_from_durations(
         name: &str,
         durations: &Vec<Duration>,
@@ -96,13 +95,13 @@ impl<T: ExtendedMetrics> QueryMetric<T> {
             query_status,
             started_at,
             finished_at,
-            min_duration_ms: durations.min_duration()?.as_millis() as i64,
-            max_duration_ms: durations.max_duration()?.as_millis() as i64,
+            min_duration_ms: durations.min_duration()?.as_millis().try_into()?,
+            max_duration_ms: durations.max_duration()?.as_millis().try_into()?,
             iterations,
-            median_duration_ms: durations.median()?.as_millis() as i64,
-            percentile_99_duration_ms: durations.percentile(99.0)?.as_millis() as i64,
-            percentile_95_duration_ms: durations.percentile(95.0)?.as_millis() as i64,
-            percentile_90_duration_ms: durations.percentile(90.0)?.as_millis() as i64,
+            median_duration_ms: durations.median()?.as_millis().try_into()?,
+            percentile_99_duration_ms: durations.percentile(99.0)?.as_millis().try_into()?,
+            percentile_95_duration_ms: durations.percentile(95.0)?.as_millis().try_into()?,
+            percentile_90_duration_ms: durations.percentile(90.0)?.as_millis().try_into()?,
             extended_metrics: None,
         })
     }
@@ -400,13 +399,13 @@ impl<T: ExtendedMetrics, R: ExtendedMetrics> QueryMetrics<T, R> {
         let mut base_fields = vec![
             Field::new("run_id", DataType::Utf8, false),
             Field::new("spiced_version", DataType::Utf8, false),
-            Field::new("started_at", DataType::Int64, false),
-            Field::new("finished_at", DataType::Int64, false),
+            Field::new("started_at", DataType::UInt64, false),
+            Field::new("finished_at", DataType::UInt64, false),
             Field::new("query_name", DataType::Utf8, false),
             Field::new("status", DataType::Utf8, false),
-            Field::new("min_duration_ms", DataType::Int64, false),
-            Field::new("max_duration_ms", DataType::Int64, false),
-            Field::new("iterations", DataType::Int32, false),
+            Field::new("min_duration_ms", DataType::UInt64, false),
+            Field::new("max_duration_ms", DataType::UInt64, false),
+            Field::new("iterations", DataType::UInt64, false),
             Field::new("commit_sha", DataType::Utf8, false),
             Field::new("branch_name", DataType::Utf8, false),
         ];
@@ -414,10 +413,10 @@ impl<T: ExtendedMetrics, R: ExtendedMetrics> QueryMetrics<T, R> {
         base_fields.extend(extended_fields);
 
         base_fields.extend(vec![
-            Field::new("median_duration_ms", DataType::Int64, false),
-            Field::new("percentile_99_duration_ms", DataType::Int64, false),
-            Field::new("percentile_95_duration_ms", DataType::Int64, false),
-            Field::new("percentile_90_duration_ms", DataType::Int64, false),
+            Field::new("median_duration_ms", DataType::UInt64, false),
+            Field::new("percentile_99_duration_ms", DataType::UInt64, false),
+            Field::new("percentile_95_duration_ms", DataType::UInt64, false),
+            Field::new("percentile_90_duration_ms", DataType::UInt64, false),
         ]);
 
         Arc::new(Schema::new(base_fields))
@@ -529,8 +528,8 @@ impl<T: ExtendedMetrics, R: ExtendedMetrics> QueryMetrics<T, R> {
             Arc::new(Int64Array::from(finished_at)),
             Arc::new(StringArray::from(query_name)),
             Arc::new(StringArray::from(query_status)),
-            Arc::new(Int64Array::from(min_duration_ms)),
-            Arc::new(Int64Array::from(max_duration_ms)),
+            Arc::new(UInt64Array::from(min_duration_ms)),
+            Arc::new(UInt64Array::from(max_duration_ms)),
             Arc::new(Int32Array::from(iterations)),
             Arc::new(StringArray::from(commit_sha)),
             Arc::new(StringArray::from(branch_name)),
@@ -561,10 +560,10 @@ impl<T: ExtendedMetrics, R: ExtendedMetrics> QueryMetrics<T, R> {
         }
 
         columns.extend(vec![
-            Arc::new(Int64Array::from(median_duration_ms)) as ArrayRef,
-            Arc::new(Int64Array::from(percentile_99_duration_ms)) as ArrayRef,
-            Arc::new(Int64Array::from(percentile_95_duration_ms)) as ArrayRef,
-            Arc::new(Int64Array::from(percentile_90_duration_ms)) as ArrayRef,
+            Arc::new(UInt64Array::from(median_duration_ms)) as ArrayRef,
+            Arc::new(UInt64Array::from(percentile_99_duration_ms)) as ArrayRef,
+            Arc::new(UInt64Array::from(percentile_95_duration_ms)) as ArrayRef,
+            Arc::new(UInt64Array::from(percentile_90_duration_ms)) as ArrayRef,
         ]);
 
         Ok(vec![RecordBatch::try_new(Self::records_schema(), columns)?])

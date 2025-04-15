@@ -15,19 +15,14 @@ limitations under the License.
 */
 
 use super::{RowCounts, get_app_and_start_request};
-use crate::{
-    args::DatasetTestArgs,
-    commands::{TEST_RESULTS_API_KEY, TEST_RESULTS_DATASET},
-    wait_test_and_memory,
-};
-use opentelemetry::{KeyValue, metrics::MeterProvider};
-use opentelemetry_sdk::{Resource, metrics::SdkMeterProvider};
+use crate::{args::DatasetTestArgs, wait_test_and_memory};
+use opentelemetry::KeyValue;
+use opentelemetry_sdk::Resource;
 use std::time::Duration;
 use test_framework::{
     TestType, anyhow,
     arrow::util::pretty::print_batches,
-    flight::put_batches,
-    metrics::{MetricCollector, NoExtendedMetrics, QueryMetrics},
+    metrics::{MetricCollector, NoExtendedMetrics, QueryMetrics, QueryStatus},
     queries::{QueryOverrides, QuerySet},
     spiced::SpicedInstance,
     spicetest::{
@@ -67,11 +62,6 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
     .with_explain_plan_snapshot()
     .with_results_snapshot(snapshot_predicate)
     .with_progress_bars(!args.common.disable_progress_bars)
-    .with_api_key(if args.common.upload_results_dataset.is_some() {
-        Some(TEST_RESULTS_API_KEY.to_string())
-    } else {
-        None
-    })
     .start()
     .await?;
 
@@ -83,76 +73,48 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
     let mut spiced_instance = test.end()?;
     let (max_memory, _) = observe_memory(memory_token, memory_readings).await?;
 
+    let commit_sha = metrics.commit_sha.clone();
+    let spiced_version = metrics.spiced_version.clone();
+    let app_name = app.name.clone();
+    let benchmark_resource = Resource::new(vec![
+        KeyValue::new("service.name", "testoperator"),
+        KeyValue::new("benchmark.name", app_name.clone()),
+        KeyValue::new("benchmark.spiced_version", spiced_version.clone()),
+        KeyValue::new("benchmark.query_set", query_set.to_string()),
+        KeyValue::new("benchmark.commit_sha", commit_sha.clone()),
+    ]);
+
+    crate::telemetry::setup(benchmark_resource);
+
+    for query in &metrics.metrics {
+        let query_name = query.query_name.clone();
+        let row_count = row_counts.get(&query_name).unwrap_or(&0);
+        let attributes = vec![
+            KeyValue::new("query_name", query_name),
+            KeyValue::new("commit_sha", commit_sha.clone()),
+            KeyValue::new("spiced_version", spiced_version.clone()),
+            KeyValue::new("query_set", query_set.to_string()),
+        ];
+
+        let status: u64 = u64::from(match query.query_status {
+            QueryStatus::Passed => true,
+            QueryStatus::Failed => false,
+        });
+
+        crate::telemetry::QUERY_STATUS.record(status, &attributes);
+        crate::telemetry::MEDIAN_DURATION.record(query.median_duration_ms, &attributes);
+        crate::telemetry::MIN_DURATION.record(query.min_duration_ms, &attributes);
+        crate::telemetry::MAX_DURATION.record(query.max_duration_ms, &attributes);
+        crate::telemetry::ITERATIONS.record(query.iterations.try_into()?, &attributes);
+        crate::telemetry::P90_DURATION.record(query.percentile_90_duration_ms, &attributes);
+        crate::telemetry::P95_DURATION.record(query.percentile_95_duration_ms, &attributes);
+        crate::telemetry::P99_DURATION.record(query.percentile_99_duration_ms, &attributes);
+        crate::telemetry::ROW_COUNT.record((*row_count).try_into()?, &attributes);
+    }
+
     let records = metrics.with_memory_usage(max_memory).build_records()?;
     print_batches(&records)?;
     spiced_instance.stop()?;
-
-    // if args.common.upload_results_dataset.is_some() {
-    //     println!("Uploading test results...");
-    //     let mut flight_client = spiced_instance
-    //         .flight_client(Some(TEST_RESULTS_API_KEY.to_string()))
-    //         .await?;
-    //     put_batches(&mut flight_client, TEST_RESULTS_DATASET, records).await?;
-    // }
-
-    let benchmark_resource = Resource::new(vec![
-        KeyValue::new("service.name", "testoperator"),
-        KeyValue::new("benchmark.name", app.name.as_str()),
-        KeyValue::new("benchmark.version", metrics.spiced_version),
-        KeyValue::new("benchmark.query_set", args.query_set.as_str()),
-        KeyValue::new("benchmark.commit_sha", metrics.commit_sha),
-    ]);
-
-    let provider = SdkMeterProvider::builder()
-        .with_resource(benchmark_resource)
-        .build();
-    let meter = provider.meter("benchmarks_telemetry");
-
-    let query_status = meter.u64_gauge("query_status").with_unit("status").build();
-    let row_count = meter.u64_gauge("row_count").with_unit("rows").build();
-    let median_query_duration = meter
-        .i64_gauge("median_query_duration")
-        .with_unit("ms")
-        .build();
-    let min_query_duration = meter
-        .i64_gauge("min_query_duration")
-        .with_unit("ms")
-        .build();
-    let max_query_duration = meter
-        .i64_gauge("max_query_duration")
-        .with_unit("ms")
-        .build();
-    let iterations = meter.i64_gauge("iterations").with_unit("count").build();
-    let p90_duration = meter.i64_gauge("p90_duration").with_unit("ms").build();
-    let p95_duration = meter.i64_gauge("p95_duration").with_unit("ms").build();
-    let p99_duration = meter.i64_gauge("p99_duration").with_unit("ms").build();
-
-    for query in metrics.metrics {
-        let query_name = query.query_name.clone();
-        let commit_sha = metrics.commit_sha.clone();
-        let spiced_version = metrics.spiced_version.clone();
-        let attributes = vec![
-            KeyValue::new("query_name", query_name.as_str()),
-            KeyValue::new("commit_sha", commit_sha.as_str()),
-            KeyValue::new("spiced_version", spiced_version.as_str()),
-            KeyValue::new("query_set", args.query_set.as_str()),
-        ];
-
-        let query_status = if matches!(query.query_status, test_framework::QueryStatus::Success) {
-            1
-        } else {
-            0
-        };
-
-        query_status.record(query_status, &attributes);
-        median_query_duration.record(query.median_duration_ms, &attributes);
-        min_query_duration.record(query.min_duration_ms, &attributes);
-        max_query_duration.record(query.max_duration_ms, &attributes);
-        p90_duration.record(query.percentile_90_duration_ms, &attributes);
-        p95_duration.record(query.percentile_95_duration_ms, &attributes);
-        p99_duration.record(query.percentile_99_duration_ms, &attributes);
-        iterations.record(query.iterations, &attributes);
-    }
 
     if !test_succeeded {
         return Err(anyhow::anyhow!(

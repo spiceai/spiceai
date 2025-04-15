@@ -1,0 +1,115 @@
+/*
+Copyright 2024-2025 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+use std::sync::{Arc, LazyLock, OnceLock};
+
+use opentelemetry::metrics::{Gauge, Meter, MeterProvider};
+
+use opentelemetry_sdk::{Resource, metrics::SdkMeterProvider};
+use telemetry::noop::NoopMeterProvider;
+
+pub(crate) static METER_PROVIDER_ONCE: OnceLock<Arc<dyn MeterProvider + Send + Sync>> =
+    OnceLock::new();
+
+/// If the meter provider isn't initialized for anonymous telemetry, use a `NoopMeterProvider`.
+///
+/// This allows the instrumented code to not require any changes when anonymous telemetry is disabled/compiled out.
+static METER_PROVIDER: LazyLock<&'static Arc<dyn MeterProvider + Send + Sync>> =
+    LazyLock::new(|| METER_PROVIDER_ONCE.get_or_init(|| Arc::new(NoopMeterProvider::new())));
+
+pub(crate) static METER: LazyLock<Meter> =
+    LazyLock::new(|| METER_PROVIDER.meter("benchmarks_telemetry"));
+
+pub(crate) fn setup(resource: Resource) {
+    // TODO: setup an exporter with API key
+    let provider = SdkMeterProvider::builder().with_resource(resource).build();
+
+    if METER_PROVIDER_ONCE.set(Arc::new(provider)).is_err() {
+        println!("Testoperator metrics are disabled");
+    }
+}
+
+pub(crate) static ITERATIONS: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+    METER
+        .u64_gauge("iterations")
+        .with_description("Number of query iterations.")
+        .with_unit("iterations")
+        .build()
+});
+
+pub(crate) static QUERY_STATUS: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+    METER
+        .u64_gauge("query_status")
+        .with_description("Query pass status.")
+        .with_unit("status")
+        .build()
+});
+
+pub(crate) static ROW_COUNT: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+    METER
+        .u64_gauge("row_count")
+        .with_description("Number of rows returned from the query.")
+        .with_unit("rows")
+        .build()
+});
+
+pub(crate) static MEDIAN_DURATION: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+    METER
+        .u64_gauge("median_duration")
+        .with_description("Median duration of the query.")
+        .with_unit("ms")
+        .build()
+});
+
+pub(crate) static MIN_DURATION: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+    METER
+        .u64_gauge("min_duration")
+        .with_description("Minimum duration of the query.")
+        .with_unit("ms")
+        .build()
+});
+
+pub(crate) static MAX_DURATION: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+    METER
+        .u64_gauge("max_duration")
+        .with_description("Maximum duration of the query.")
+        .with_unit("ms")
+        .build()
+});
+
+pub(crate) static P90_DURATION: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+    METER
+        .u64_gauge("p90_duration")
+        .with_description("90th percentile duration of the query.")
+        .with_unit("ms")
+        .build()
+});
+
+pub(crate) static P95_DURATION: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+    METER
+        .u64_gauge("p95_duration")
+        .with_description("95th percentile duration of the query.")
+        .with_unit("ms")
+        .build()
+});
+
+pub(crate) static P99_DURATION: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+    METER
+        .u64_gauge("p99_duration")
+        .with_description("99th percentile duration of the query.")
+        .with_unit("ms")
+        .build()
+});

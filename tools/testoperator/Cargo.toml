@@ -13,6 +13,7 @@ clap.workspace = true
 opentelemetry.workspace = true
 opentelemetry_sdk.workspace = true
 reqwest.workspace = true
+telemetry = { path = "../../crates/telemetry" }
 test-framework = { path = "../../crates/test-framework" }
 tokio.workspace = true
 serde.workspace = true
