@@ -389,7 +389,7 @@ impl Chat for ToolUsingChat {
 
         // track ai_inferences_count metric
         let context = RequestContext::current(AsyncMarker::new().await);
-        crate::model::track_ai_inferences_count(&context);
+        crate::model::track_ai_inferences_with_spice_count(&context);
 
         response
     }
@@ -750,7 +750,7 @@ impl<S: Stream> Stream for InferenceTrackingStream<S> {
         match stream.as_mut().poll_next(cx) {
             Poll::Ready(None) => {
                 let context = Arc::clone(context);
-                crate::model::track_ai_inferences_count(&context);
+                crate::model::track_ai_inferences_with_spice_count(&context);
                 Poll::Ready(None)
             }
             Poll::Ready(Some(item)) => Poll::Ready(Some(item)),
