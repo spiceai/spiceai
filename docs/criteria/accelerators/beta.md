@@ -30,6 +30,8 @@ The Beta release criteria expand on and require that all [Alpha release criteria
 - [ ] Embdedded accelerators support file-mode storage (e.g. SQLite, DuckDB)
 - [ ] [Core Arrow Data Types](../definitions.md) are supported
 - [ ] All known [Major Bugs](../definitions.md) are resolved
+- [ ] The accelerator supports reading datasets with the same max column count as the accelerator source.
+  - For example, if the accelerator source supports tables with 1000 columns, the accelerator should support accelerating this table and querying against it.
 
 ### Test Coverage
 
@@ -45,6 +47,7 @@ Indexes are not required for test coverage, but can be introduced if required fo
 
 - [ ] Integration tests to cover accelerating data from S3 parquet, MySQL, Postgres with the [Core Arrow Data Types](../definitions.md)
 - [ ] Integration tests to cover "On Conflict" behaviors.
+- [ ] An integration or benchmark test validating the maximum column count use case is added.
 
 #### TPC-H
 

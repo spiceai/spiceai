@@ -20,12 +20,14 @@ use crate::{
     AcceleratedReadWriteTableWithoutReplicationSnafu, AcceleratedTableInvalidChangesSnafu,
     AcceleratorEngineNotAvailableSnafu, AcceleratorInitializationFailedSnafu, Error, LogErrors,
     OdbcNotInstalledSnafu, Result, Runtime, UnableToAttachDataConnectorSnafu,
-    UnableToCreateAcceleratedTableSnafu, UnableToInitializeDataConnectorSnafu,
-    UnableToLoadDatasetConnectorSnafu, UnableToReceiveAcceleratedTableStatusSnafu,
-    UnknownDataConnectorSnafu,
+    UnableToBuildDatasetSnafu, UnableToCreateAcceleratedTableSnafu,
+    UnableToInitializeDataConnectorSnafu, UnableToLoadDatasetConnectorSnafu,
+    UnableToReceiveAcceleratedTableStatusSnafu, UnknownDataConnectorSnafu,
     accelerated_table::AcceleratedTable,
-    component::dataset::{self, Dataset, acceleration::RefreshMode},
-    dataaccelerator,
+    component::dataset::{
+        self, Dataset, DatasetBuilder,
+        acceleration::{Acceleration, RefreshMode},
+    },
     dataconnector::{
         self, ConnectorComponent, ConnectorParams, ConnectorParamsBuilder, DataConnector,
         DataConnectorError, ODBC_DATACONNECTOR,
@@ -48,7 +50,7 @@ use tokio::sync::Semaphore;
 use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
 
 impl Runtime {
-    pub(crate) async fn load_datasets(&self) {
+    pub(crate) async fn load_datasets(self: Arc<Self>) {
         let app_lock = self.app.read().await;
         let Some(app) = app_lock.as_ref() else {
             return;
@@ -61,7 +63,7 @@ impl Runtime {
             Arc::new(Semaphore::new(Semaphore::MAX_PERMITS))
         };
 
-        let valid_datasets = Self::get_valid_datasets(app, LogErrors(true));
+        let valid_datasets = Arc::clone(&self).get_valid_datasets(app, LogErrors(true));
 
         if valid_datasets.is_empty() {
             tracing::info!(
@@ -86,7 +88,7 @@ impl Runtime {
             self.status
                 .update_dataset(&ds.name, status::ComponentStatus::Initializing);
             let ds_clone = Arc::clone(&ds);
-            let cloned_self = self.clone();
+            let cloned_self = Arc::clone(&self);
             let future: Pin<Box<dyn Future<Output = ()> + Send>> =
                 Box::pin(async move { cloned_self.load_dataset(ds_clone).await })
                     as Pin<Box<dyn Future<Output = ()> + Send>>;
@@ -106,7 +108,7 @@ impl Runtime {
             if let Some(parent_future) = dataset_futures.remove(&path_table_ref) {
                 let ds_clone = Arc::clone(&ds);
 
-                let cloned_self = self.clone();
+                let cloned_self = Arc::clone(&self);
                 // Chain the localpod dataset load after its parent
                 let chained_future = Box::pin(async move {
                     parent_future.await;
@@ -147,12 +149,16 @@ impl Runtime {
         let _ = join_all(spawned_tasks).await;
 
         // After all datasets have loaded, load the views.
-        self.load_views(app);
+        Arc::clone(&self).load_views(app);
     }
 
     /// Returns a list of valid datasets from the given App, skipping any that fail to parse and logging an error for them.
-    pub(crate) fn get_valid_datasets(app: &Arc<App>, log_errors: LogErrors) -> Vec<Arc<Dataset>> {
-        Self::datasets_iter(app)
+    pub(crate) fn get_valid_datasets(
+        self: Arc<Self>,
+        app: &Arc<App>,
+        log_errors: LogErrors,
+    ) -> Vec<Arc<Dataset>> {
+        self.datasets_iter(app)
             .zip(&app.datasets)
             .filter_map(|(ds, spicepod_ds)| match ds {
                 Ok(ds) => Some(Arc::new(ds)),
@@ -167,12 +173,23 @@ impl Runtime {
             .collect()
     }
 
-    fn datasets_iter(app: &Arc<App>) -> impl Iterator<Item = Result<Dataset>> + '_ {
+    fn datasets_iter(self: Arc<Self>, app: &Arc<App>) -> impl Iterator<Item = Result<Dataset>> {
         app.datasets
             .clone()
             .into_iter()
-            .map(Dataset::try_from)
-            .map(move |ds| ds.map(|ds| Dataset::with_app(ds, Arc::clone(app))))
+            .map(DatasetBuilder::try_from)
+            .map(move |ds_builder_result| {
+                ds_builder_result.and_then(|ds_builder| {
+                    let dataset_name = ds_builder.name.to_string();
+                    ds_builder
+                        .with_app(Arc::clone(app))
+                        .with_runtime(Arc::clone(&self))
+                        .build()
+                        .context(UnableToBuildDatasetSnafu {
+                            dataset: dataset_name,
+                        })
+                })
+            })
     }
 
     async fn load_dataset_connector(&self, ds: Arc<Dataset>) -> Result<Arc<dyn DataConnector>> {
@@ -396,22 +413,26 @@ impl Runtime {
         }
     }
 
-    async fn remove_dataset(&self, ds: &Dataset) {
-        if self.df.table_exists(ds.name.clone()) {
+    async fn remove_dataset(
+        &self,
+        ds_name: TableReference,
+        ds_acceleration: Option<&Acceleration>,
+    ) {
+        if self.df.table_exists(ds_name.clone()) {
             if let Some(datasets_health_monitor) = &self.datasets_health_monitor {
                 datasets_health_monitor
-                    .deregister_dataset(&ds.name.to_string())
+                    .deregister_dataset(&ds_name.to_string())
                     .await;
             }
 
-            if let Err(e) = self.df.remove_table(&ds.name).await {
-                tracing::warn!("Unable to unload dataset {}: {}", &ds.name, e);
+            if let Err(e) = self.df.remove_table(&ds_name).await {
+                tracing::warn!("Unable to unload dataset {}: {}", &ds_name, e);
                 return;
             }
         }
 
-        tracing::info!("Unloaded dataset {}", &ds.name);
-        let engine = ds.acceleration.as_ref().map_or_else(
+        tracing::info!("Unloaded dataset {}", &ds_name);
+        let engine = ds_acceleration.map_or_else(
             || "None".to_string(),
             |acc| {
                 if acc.enabled {
@@ -446,7 +467,8 @@ impl Runtime {
                     );
                 }
 
-                self.remove_dataset(&ds).await;
+                self.remove_dataset(ds.name.clone(), ds.acceleration.as_ref())
+                    .await;
 
                 if self
                     .register_loaded_dataset(Arc::clone(&ds), Arc::clone(&connector), None)
@@ -567,7 +589,6 @@ impl Runtime {
         } = register_dataset_ctx;
 
         let replicate = ds.replication.as_ref().is_some_and(|r| r.enabled);
-
         // FEDERATED TABLE
         if !ds.is_accelerated() {
             let ds_name: TableReference = ds.name.clone();
@@ -603,7 +624,8 @@ impl Runtime {
             AcceleratedReadWriteTableWithoutReplicationSnafu.fail()?;
         }
 
-        dataaccelerator::get_accelerator_engine(accelerator_engine)
+        self.accelerator_engine_registry
+            .get_accelerator_engine(accelerator_engine)
             .await
             .context(AcceleratorEngineNotAvailableSnafu {
                 name: accelerator_engine.to_string(),
@@ -629,10 +651,14 @@ impl Runtime {
             })
     }
 
-    pub(crate) async fn apply_dataset_diff(&self, current_app: &Arc<App>, new_app: &Arc<App>) {
-        let valid_datasets = Self::get_valid_datasets(new_app, LogErrors(true));
+    pub(crate) async fn apply_dataset_diff(
+        self: Arc<Self>,
+        current_app: &Arc<App>,
+        new_app: &Arc<App>,
+    ) {
+        let valid_datasets = Arc::clone(&self).get_valid_datasets(new_app, LogErrors(true));
         let initialized_datasets = self.initialize_accelerators(&valid_datasets).await;
-        let existing_datasets = Self::get_valid_datasets(current_app, LogErrors(false));
+        let existing_datasets = Arc::clone(&self).get_valid_datasets(current_app, LogErrors(false));
 
         for ds in initialized_datasets {
             if let Some(current_ds) = existing_datasets.iter().find(|d| d.name == ds.name) {
@@ -649,16 +675,34 @@ impl Runtime {
         // Remove datasets that are no longer in the app
         for ds in &current_app.datasets {
             if !new_app.datasets.iter().any(|d| d.name == ds.name) {
-                let ds = match Dataset::try_from(ds.clone()) {
-                    Ok(ds) => ds,
-                    Err(e) => {
-                        tracing::error!("Could not remove dataset {}: {e}", ds.name);
+                let ds_name = match Dataset::parse_table_reference(&ds.name) {
+                    Ok(ds_name) => ds_name,
+                    Err(err) => {
+                        tracing::error!(
+                            "Unable to unload dataset {}: {err}\nReport a bug to request support: https://github.com/spiceai/spiceai/issues ",
+                            ds.name
+                        );
                         continue;
                     }
                 };
+                let ds_acceleration = match ds
+                    .acceleration
+                    .clone()
+                    .map(crate::component::dataset::acceleration::Acceleration::try_from)
+                    .transpose()
+                {
+                    Ok(ds_acceleration) => ds_acceleration,
+                    Err(err) => {
+                        tracing::error!(
+                            "Unable to unload dataset {ds_name}: {err}\nReport a bug to request support: https://github.com/spiceai/spiceai/issues"
+                        );
+                        continue;
+                    }
+                };
+
                 self.status
-                    .update_dataset(&ds.name, status::ComponentStatus::Disabled);
-                self.remove_dataset(&ds).await;
+                    .update_dataset(&ds_name, status::ComponentStatus::Disabled);
+                self.remove_dataset(ds_name, ds_acceleration.as_ref()).await;
             }
         }
     }
@@ -672,7 +716,9 @@ impl Runtime {
         let mut initialized_datasets = vec![];
         for ds in datasets {
             if let Some(acceleration) = &ds.acceleration {
-                let accelerator = match dataaccelerator::get_accelerator_engine(acceleration.engine)
+                let accelerator = match self
+                    .accelerator_engine_registry
+                    .get_accelerator_engine(acceleration.engine)
                     .await
                     .context(AcceleratorEngineNotAvailableSnafu {
                         name: acceleration.engine.to_string(),
@@ -715,10 +761,11 @@ impl Runtime {
 
     /// Returns a list of valid datasets from the given App, skipping any that fail to parse and logging an error for them.
     pub(crate) async fn get_initialized_datasets(
+        self: Arc<Self>,
         app: &Arc<App>,
         log_errors: LogErrors,
     ) -> Vec<Arc<Dataset>> {
-        let valid_datasets = Self::get_valid_datasets(app, log_errors);
+        let valid_datasets = Arc::clone(&self).get_valid_datasets(app, log_errors);
         futures::stream::iter(valid_datasets)
             .filter_map(|ds| async move {
                 match (ds.is_accelerated(), ds.is_accelerator_initialized().await) {

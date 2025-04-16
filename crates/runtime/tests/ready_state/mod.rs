@@ -51,6 +51,7 @@ use datafusion_federation::{
 };
 use datafusion_federation_sql::{SQLExecutor, SQLFederationProvider, SQLTableSource};
 use futures::{Stream, TryStreamExt};
+
 use runtime::{
     Runtime,
     component::dataset::Dataset,
@@ -60,13 +61,12 @@ use runtime::{
     },
     parameters::ParameterSpec,
     request::{AsyncMarker, Protocol, RequestContext},
-    status,
 };
 use spicepod::component::dataset::{
     Dataset as SpicepodDataset, ReadyState, acceleration::Acceleration,
 };
 
-use crate::{get_test_datafusion, init_tracing};
+use crate::{configure_test_datafusion, init_tracing};
 
 /// A stream that only yields data when signaled
 struct DelayedStream<T: Stream> {
@@ -536,14 +536,14 @@ async fn run_ready_state_test(
                 .build()
         };
 
-        let status = status::RuntimeStatus::new();
-        let df = get_test_datafusion(Arc::clone(&status));
+        let rt =
+            Runtime::builder()
+                .with_app(app)
+                .with_datafusion_configuration_fn(configure_test_datafusion)
+                .build()
+                .await
+        ;
 
-        let rt = Runtime::builder()
-            .with_datafusion(df)
-            .with_app(app)
-            .build()
-            .await;
         let cloned_rt = Arc::new(rt.clone());
 
         tracing::info!("Loading components");
@@ -807,14 +807,13 @@ async fn test_ready_state_mixed_arrow_acceleration() -> Result<(), anyhow::Error
                 ))
                 .build();
 
-            let status = status::RuntimeStatus::new();
-            let df = get_test_datafusion(Arc::clone(&status));
-
-            let rt = Runtime::builder()
-                .with_datafusion(df)
+            let rt =
+            Runtime::builder()
                 .with_app(app)
+                .with_datafusion_configuration_fn(configure_test_datafusion)
                 .build()
                 .await;
+
             let cloned_rt = Arc::new(rt.clone());
 
             tracing::info!("Loading components");
@@ -923,14 +922,13 @@ async fn test_ready_state_mixed_duckdb_acceleration() -> Result<(), anyhow::Erro
                 ))
                 .build();
 
-            let status = status::RuntimeStatus::new();
-            let df = get_test_datafusion(Arc::clone(&status));
-
-            let rt = Runtime::builder()
-                .with_datafusion(df)
+            let rt =
+            Runtime::builder()
                 .with_app(app)
+                .with_datafusion_configuration_fn(configure_test_datafusion)
                 .build()
                 .await;
+
             let cloned_rt = Arc::new(rt.clone());
 
             tracing::info!("Loading components");

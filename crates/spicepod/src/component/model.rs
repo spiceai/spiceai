@@ -347,7 +347,7 @@ impl Model {
 
         if source == ModelSource::SpiceAI {
             return Some(ModelType::Ml);
-        };
+        }
 
         let files = self.get_all_files();
 

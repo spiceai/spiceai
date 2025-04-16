@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::configure_test_datafusion;
 use app::AppBuilder;
 use futures::TryStreamExt;
 use runtime::Runtime;
@@ -78,14 +79,12 @@ async fn databricks_odbc() -> Result<(), String> {
                 ))
                 .build();
 
-            let status = runtime::status::RuntimeStatus::new();
-            let df = crate::get_test_datafusion(Arc::clone(&status));
-
             let rt = Runtime::builder()
                 .with_app(app)
-                .with_datafusion(df)
+                .with_datafusion_configuration_fn(configure_test_datafusion)
                 .build()
                 .await;
+
             let cloned_rt = Arc::new(rt.clone());
 
             // Set a timeout for the test
@@ -139,13 +138,13 @@ async fn databricks_odbc_with_acceleration() -> Result<(), String> {
                         engine,
                     ))
                     .build();
-                let status = runtime::status::RuntimeStatus::new();
-                let df = crate::get_test_datafusion(Arc::clone(&status));
+
                 let rt = Runtime::builder()
                     .with_app(app)
-                    .with_datafusion(df)
+                    .with_datafusion_configuration_fn(configure_test_datafusion)
                     .build()
                     .await;
+
                 let cloned_rt = Arc::new(rt.clone());
 
                 // Set a timeout for the test

@@ -22,14 +22,14 @@ use azure_storage_blobs::prelude::*;
 use bollard::secret::HealthConfig;
 use datafusion::assert_batches_eq;
 use futures::TryStreamExt;
-use runtime::{Runtime, status};
+use runtime::Runtime;
 use spicepod::{component::dataset::Dataset, param::Params as DatasetParams};
 use std::sync::Arc;
 use tracing::instrument;
 
 use crate::{
+    configure_test_datafusion,
     docker::{ContainerRunnerBuilder, RunningContainer},
-    get_test_datafusion,
 };
 
 #[instrument]
@@ -136,12 +136,9 @@ async fn run_queries() -> Result<(), anyhow::Error> {
         .with_dataset(abfs_dataset)
         .build();
 
-    let status = status::RuntimeStatus::new();
-    let df = get_test_datafusion(Arc::clone(&status));
-
     let rt = Runtime::builder()
         .with_app(app)
-        .with_datafusion(df)
+        .with_datafusion_configuration_fn(configure_test_datafusion)
         .build()
         .await;
 

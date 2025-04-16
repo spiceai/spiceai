@@ -18,6 +18,7 @@ use std::sync::Arc;
 
 use common::{MSSQL_ROOT_PASSWORD, make_mssql_dataset, start_mssql_docker_container};
 use data_components::mssql::connection_manager::SqlServerConnectionManager;
+
 use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
 
 use crate::init_tracing;
@@ -197,15 +198,12 @@ async fn mssql_integration_test() -> Result<(), String> {
                 .with_dataset(make_mssql_dataset("test", "test", MSSQL_PORT))
                 .build();
 
-            let status = status::RuntimeStatus::new();
-            let df = get_test_datafusion(Arc::clone(&status));
-
             let mut rt = Runtime::builder()
                 .with_app(app)
-                .with_datafusion(df)
-                .with_runtime_status(status)
+                .with_datafusion_configuration_fn(configure_test_datafusion)
                 .build()
                 .await;
+
             let cloned_rt = Arc::new(rt.clone());
 
             // Set a timeout for the test

@@ -129,8 +129,11 @@ impl DuckDBAccelerator {
 
         let pool = match (duckdb_file, acceleration.mode) {
             (Ok(duckdb_file), Mode::File) => {
-                let num_accelerating_datasets =
-                    self.get_num_accelerating_datasets(Some(duckdb_file.as_str()), dataset.app());
+                let num_accelerating_datasets = self.get_num_accelerating_datasets(
+                    Some(duckdb_file.as_str()),
+                    &dataset.app(),
+                    dataset.runtime(),
+                );
                 let max_size = Self::get_max_size(num_accelerating_datasets);
                 let pool_builder = DuckDbConnectionPoolBuilder::file(&duckdb_file)
                     .with_max_size(Some(max_size))
@@ -143,7 +146,7 @@ impl DuckDBAccelerator {
             }
             (_, Mode::Memory) => {
                 let num_accelerating_datasets =
-                    self.get_num_accelerating_datasets(None, dataset.app());
+                    self.get_num_accelerating_datasets(None, &dataset.app(), dataset.runtime());
                 let max_size = Self::get_max_size(num_accelerating_datasets);
                 let pool_builder = DuckDbConnectionPoolBuilder::memory()
                     .with_max_size(Some(max_size))
@@ -164,31 +167,34 @@ impl DuckDBAccelerator {
         Ok(pool)
     }
 
-    fn get_num_accelerating_datasets(&self, path: Option<&str>, app: Option<Arc<App>>) -> u32 {
+    fn get_num_accelerating_datasets(
+        &self,
+        path: Option<&str>,
+        app: &Arc<App>,
+        rt: Arc<Runtime>,
+    ) -> u32 {
         let mut instance_usage: u32 = 1;
 
-        if let Some(this_app) = app {
-            let datasets = Runtime::get_valid_datasets(&this_app, crate::LogErrors(false));
-            for ds in datasets {
-                if let Some(acceleration) = &ds.acceleration {
-                    if acceleration.engine != Engine::DuckDB {
-                        continue;
-                    }
+        let datasets = rt.get_valid_datasets(app, crate::LogErrors(false));
+        for ds in datasets {
+            if let Some(acceleration) = &ds.acceleration {
+                if acceleration.engine != Engine::DuckDB {
+                    continue;
+                }
 
-                    // If the path is Some, we're counting the number of file instances
-                    if let Some(this_file_path) = path {
-                        if acceleration.mode == Mode::File {
-                            if let Ok(file_path) = self.file_path(&ds) {
-                                if this_file_path == file_path {
-                                    instance_usage += 1;
-                                }
+                // If the path is Some, we're counting the number of file instances
+                if let Some(this_file_path) = path {
+                    if acceleration.mode == Mode::File {
+                        if let Ok(file_path) = self.file_path(&ds) {
+                            if this_file_path == file_path {
+                                instance_usage += 1;
                             }
                         }
-                    } else {
-                        // If the path is None, we're just counting the number of memory instances
-                        if acceleration.mode == Mode::Memory {
-                            instance_usage += 1;
-                        }
+                    }
+                } else {
+                    // If the path is None, we're just counting the number of memory instances
+                    if acceleration.mode == Mode::Memory {
+                        instance_usage += 1;
                     }
                 }
             }
@@ -294,11 +300,7 @@ impl DataAccelerator for DuckDBAccelerator {
         }
 
         if let Some(this_dataset) = dataset {
-            if let Some(temp_directory) = &this_dataset
-                .app
-                .as_ref()
-                .and_then(|app| app.runtime.temp_directory.clone())
-            {
+            if let Some(temp_directory) = &this_dataset.app.runtime.temp_directory.clone() {
                 cmd.options
                     .insert("temp_directory".to_string(), temp_directory.to_string());
             }
@@ -311,33 +313,33 @@ impl DataAccelerator for DuckDBAccelerator {
                     cmd.options.insert("open".to_string(), duckdb_file);
                 }
 
-                if let Some(app) = &this_dataset.app {
-                    let datasets =
-                        Runtime::get_initialized_datasets(app, crate::LogErrors(false)).await;
-                    let self_path = self.file_path(this_dataset)?;
-                    let attach_databases =
-                        datasets
-                            .iter()
-                            .filter_map(|other_dataset| {
-                                if other_dataset.acceleration.as_ref().is_some_and(|a| {
-                                    a.engine == Engine::DuckDB && a.mode == Mode::File
-                                }) {
-                                    if **other_dataset == *this_dataset {
-                                        None
-                                    } else {
-                                        let other_path = self.file_path(other_dataset);
-                                        other_path.ok().filter(|p| p != &self_path)
-                                    }
-                                } else {
-                                    None
-                                }
-                            })
-                            .collect::<Vec<_>>();
+                let datasets = Arc::clone(&this_dataset.runtime)
+                    .get_initialized_datasets(&this_dataset.app, crate::LogErrors(false))
+                    .await;
+                let self_path = self.file_path(this_dataset)?;
+                let attach_databases = datasets
+                    .iter()
+                    .filter_map(|other_dataset| {
+                        if other_dataset
+                            .acceleration
+                            .as_ref()
+                            .is_some_and(|a| a.engine == Engine::DuckDB && a.mode == Mode::File)
+                        {
+                            if **other_dataset == *this_dataset {
+                                None
+                            } else {
+                                let other_path = self.file_path(other_dataset);
+                                other_path.ok().filter(|p| p != &self_path)
+                            }
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<_>>();
 
-                    if !attach_databases.is_empty() {
-                        cmd.options
-                            .insert("attach_databases".to_string(), attach_databases.join(";"));
-                    }
+                if !attach_databases.is_empty() {
+                    cmd.options
+                        .insert("attach_databases".to_string(), attach_databases.join(";"));
                 }
             }
         }
@@ -377,6 +379,7 @@ impl DataAccelerator for DuckDBAccelerator {
 mod tests {
     use std::{collections::HashMap, sync::Arc};
 
+    use crate::component::dataset::DatasetBuilder;
     use arrow::{
         array::{Int64Array, RecordBatch, StringArray, TimestampSecondArray, UInt64Array},
         datatypes::{DataType, Schema},
@@ -391,7 +394,6 @@ mod tests {
     };
     use datafusion_table_providers::util::test::MockExec;
 
-    use crate::component::dataset::Dataset;
     use crate::component::dataset::acceleration::Acceleration;
     use crate::component::dataset::acceleration::{Engine, Mode};
     use crate::dataaccelerator::{DataAccelerator, duckdb::DuckDBAccelerator};
@@ -604,11 +606,18 @@ mod tests {
 
     #[tokio::test]
     async fn test_duckdb_file_initialization() {
-        let mut dataset = Dataset::try_new(
+        let app = app::AppBuilder::new("test").build();
+        let rt = crate::Runtime::builder().build().await;
+
+        let mut dataset = DatasetBuilder::try_new(
             "duckdb_file_accelerator_init".to_string(),
             "duckdb_file_accelerator_init",
         )
-        .expect("dataset should be created");
+        .expect("Failed to create builder")
+        .with_app(Arc::new(app))
+        .with_runtime(Arc::new(rt))
+        .build()
+        .expect("Failed to build dataset");
 
         dataset.acceleration = Some(Acceleration {
             engine: Engine::DuckDB,

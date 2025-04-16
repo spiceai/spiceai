@@ -15,12 +15,13 @@ limitations under the License.
 */
 
 use crate::Runtime;
+use std::sync::Arc;
 
 impl Runtime {
-    pub(crate) async fn start_extensions(&self) {
+    pub(crate) async fn start_extensions(self: Arc<Self>) {
         let mut extensions = self.extensions.write().await;
         for (name, extension) in extensions.iter_mut() {
-            if let Err(err) = extension.on_start(self).await {
+            if let Err(err) = extension.on_start(Arc::clone(&self)).await {
                 tracing::warn!("Failed to start extension {name}: {err}");
             }
         }

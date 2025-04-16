@@ -386,7 +386,9 @@ async fn test_connectivity(
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::{component::dataset::Dataset, status::RuntimeStatus};
+    use crate::component::dataset::DatasetBuilder;
+    use crate::dataaccelerator::AcceleratorEngineRegistry;
+    use crate::{builder::RuntimeBuilder, status::RuntimeStatus};
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion::{
         catalog::MemorySchemaProvider, catalog::SchemaProvider, datasource::MemTable,
@@ -395,10 +397,17 @@ mod test {
 
     #[tokio::test]
     async fn test_register_dataset_with_schema() {
-        let df = create_test_datafusion();
+        let app = app::AppBuilder::new("test").build();
+        let runtime = RuntimeBuilder::new().build().await;
+        let accelerator_engine_registry = runtime.accelerator_engine_registry();
+        let df = create_test_datafusion(accelerator_engine_registry);
 
-        let dataset = Dataset::try_new("spice.ai".to_string(), "foo.dataset_name")
-            .expect("to create dataset");
+        let dataset = DatasetBuilder::try_new("spice.ai".to_string(), "foo.dataset_name")
+            .expect("Failed to create builder")
+            .with_app(Arc::new(app))
+            .with_runtime(Arc::new(runtime))
+            .build()
+            .expect("Failed to build dataset");
         let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
         let table_provider = MemTable::try_new(schema, vec![]).expect("to create table provider");
         df.ctx
@@ -412,8 +421,12 @@ mod test {
         monitor.deregister_dataset(&dataset.name.to_string()).await;
     }
 
-    fn create_test_datafusion() -> Arc<DataFusion> {
-        let df = Arc::new(DataFusion::builder(RuntimeStatus::new()).build());
+    fn create_test_datafusion(
+        accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
+    ) -> Arc<DataFusion> {
+        let df = Arc::new(
+            DataFusion::builder(RuntimeStatus::new(), accelerator_engine_registry).build(),
+        );
 
         let catalog = df.ctx.catalog("spice").expect("default catalog is spice");
 

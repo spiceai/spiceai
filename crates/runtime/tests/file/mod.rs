@@ -17,11 +17,12 @@ limitations under the License.
 use std::sync::Arc;
 
 use app::AppBuilder;
-use runtime::{Runtime, status};
+
+use runtime::Runtime;
 use spicepod::component::dataset::Dataset;
 
 use crate::{
-    ValidateFn, get_test_datafusion, init_tracing, run_query_and_check_results,
+    ValidateFn, configure_test_datafusion, init_tracing, run_query_and_check_results,
     utils::test_request_context,
 };
 
@@ -51,14 +52,12 @@ async fn file_connector_datatypes() -> Result<(), anyhow::Error> {
                 .with_dataset(get_dataset()?)
                 .build();
 
-            let status = status::RuntimeStatus::new();
-            let df = get_test_datafusion(Arc::clone(&status));
-
             let mut rt = Runtime::builder()
-                .with_datafusion(df)
                 .with_app(app)
+                .with_datafusion_configuration_fn(configure_test_datafusion)
                 .build()
                 .await;
+
             let cloned_rt = Arc::new(rt.clone());
 
             // Set a timeout for the test

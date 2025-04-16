@@ -45,9 +45,6 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("password")
         .secret()
         .description("The password to use for the IMAP connection"),
-    ParameterSpec::component("access_token")
-        .secret()
-        .description("The OAuth access token to use for the IMAP connection"),
     ParameterSpec::component("host").description("The IMAP server host to connect to"),
     ParameterSpec::component("mailbox")
         .default("INBOX")
@@ -78,8 +75,6 @@ static PRESET_HOST_CONNECTIONS: LazyLock<HashMap<&str, &str>> = LazyLock::new(||
 pub enum Error {
     #[snafu(display("A password parameter is required, but was not provided"))]
     PasswordRequired,
-    #[snafu(display("An access token parameter is required, but was not provided"))]
-    PasswordOrAccessTokenRequired,
     #[snafu(display("A username parameter is required, but was not provided"))]
     UsernameRequired,
     #[snafu(display("A host parameter is required, but was not provided"))]
@@ -90,8 +85,6 @@ pub enum Error {
     ImapError { source: imap::Error },
     #[snafu(display("The specified 'from' address is not a valid email address: {from}"))]
     InvalidFrom { from: String },
-    #[snafu(display("A password and access token were provided. Only one can be specified."))]
-    PasswordAndAccessTokenError,
 }
 
 #[derive(Debug)]
@@ -190,28 +183,17 @@ impl ImapFactory {
         connector_component: &ConnectorComponent,
         username: &SecretString,
         password: Option<&SecretString>,
-        access_token: Option<&SecretString>,
     ) -> Result<ImapAuthMode, Box<dyn std::error::Error + Send + Sync>> {
-        match (password, access_token) {
-            (Some(_), Some(_)) => Err(DataConnectorError::InvalidConfigurationSourceOnly {
-                dataconnector: "imap".to_string(),
-                connector_component: connector_component.clone(),
-                source: Error::PasswordAndAccessTokenError.into(),
-            }
-            .into()),
-            (Some(password), None) => {
-                Ok(ImapAuthModeParameter::Plain.build(username.clone(), password.clone()))
-            }
-            (None, Some(access_token)) => {
-                Ok(ImapAuthModeParameter::OAuth.build(username.clone(), access_token.clone()))
-            }
-            (None, None) => Err(DataConnectorError::InvalidConfigurationSourceOnly {
-                dataconnector: "imap".to_string(),
-                connector_component: connector_component.clone(),
-                source: Error::PasswordOrAccessTokenRequired.into(),
-            }
-            .into()),
-        }
+        password
+            .map(|p| ImapAuthModeParameter::Plain.build(username.clone(), p.clone()))
+            .ok_or(
+                DataConnectorError::InvalidConfigurationSourceOnly {
+                    dataconnector: "imap".to_string(),
+                    connector_component: connector_component.clone(),
+                    source: Error::PasswordRequired.into(),
+                }
+                .into(),
+            )
     }
 }
 
@@ -237,14 +219,9 @@ impl DataConnectorFactory for ImapFactory {
             };
 
             let password_parameter = params.parameters.get("password").ok();
-            let access_token_parameter = params.parameters.get("access_token").ok();
 
-            let authentication = Self::parse_authentication(
-                &params.component,
-                username,
-                password_parameter,
-                access_token_parameter,
-            )?;
+            let authentication =
+                Self::parse_authentication(&params.component, username, password_parameter)?;
 
             let port = if let Some(port) = params.parameters.get("port").expose().ok() {
                 match port.parse::<u16>() {

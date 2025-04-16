@@ -136,6 +136,7 @@ postgres:aidemo_messages,general,false,false
 pub(crate) async fn get(
     Extension(app): Extension<Arc<RwLock<Option<Arc<App>>>>>,
     Extension(df): Extension<Arc<DataFusion>>,
+    Extension(rt): Extension<Arc<Runtime>>,
     Query(filter): Query<DatasetFilter>,
     Query(params): Query<DatasetQueryParams>,
 ) -> Response {
@@ -156,7 +157,7 @@ pub(crate) async fn get(
             .into_response();
     };
 
-    let valid_datasets = Runtime::get_valid_datasets(readable_app, LogErrors(false));
+    let valid_datasets = rt.get_valid_datasets(readable_app, LogErrors(false));
     let datasets: Vec<Arc<Dataset>> = match filter.source {
         Some(source) => valid_datasets
             .into_iter()

@@ -23,14 +23,15 @@ use arrow::{
     array::{Decimal128Array, RecordBatch},
     datatypes::{DataType, Decimal128Type},
 };
-use runtime::{Runtime, status};
+
+use runtime::Runtime;
 use spicepod::component::dataset::{
     Dataset,
     acceleration::{Acceleration, Mode},
 };
 
 use crate::{
-    PlanCheckFn, ValidateFn, get_test_datafusion, init_tracing, run_query_and_check_results,
+    PlanCheckFn, ValidateFn, configure_test_datafusion, init_tracing, run_query_and_check_results,
     run_query_and_check_results_with_plan_checks,
     utils::{runtime_ready_check, test_request_context},
 };
@@ -146,15 +147,12 @@ async fn test_sqlite_decimal_memory() -> anyhow::Result<()> {
                 .with_dataset(make_sqlite_decimal_dataset(Mode::Memory))
                 .build();
 
-            let status = status::RuntimeStatus::new();
-            let df = get_test_datafusion(Arc::clone(&status));
-
             let mut rt = Runtime::builder()
                 .with_app(app)
-                .with_datafusion(df)
-                .with_runtime_status(status)
+                .with_datafusion_configuration_fn(configure_test_datafusion)
                 .build()
                 .await;
+
             let cloned_rt = Arc::new(rt.clone());
 
             // Set a timeout for the test
@@ -209,15 +207,12 @@ async fn test_sqlite_decimal_file() -> anyhow::Result<()> {
                 .with_dataset(make_sqlite_decimal_dataset(Mode::File))
                 .build();
 
-            let status = status::RuntimeStatus::new();
-            let df = get_test_datafusion(Arc::clone(&status));
-
             let mut rt = Runtime::builder()
                 .with_app(app)
-                .with_datafusion(df)
-                .with_runtime_status(status)
+                .with_datafusion_configuration_fn(configure_test_datafusion)
                 .build()
                 .await;
+
             let cloned_rt = Arc::new(rt.clone());
 
             // Set a timeout for the test

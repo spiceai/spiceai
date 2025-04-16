@@ -59,8 +59,11 @@ async fn test_http_auth() -> Result<(), anyhow::Error> {
 
         let registry = prometheus::Registry::new();
 
+        let app = app::AppBuilder::new("test_app").build();
+
         let rt = Runtime::builder()
             .with_metrics_server(SocketAddr::new(LOCALHOST, metrics_port), registry)
+            .with_app(app)
             .build()
             .await;
 

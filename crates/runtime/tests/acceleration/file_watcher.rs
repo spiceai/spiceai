@@ -17,7 +17,8 @@ limitations under the License.
 use app::AppBuilder;
 use arrow::array::RecordBatch;
 use futures::TryStreamExt;
-use runtime::{Runtime, status};
+
+use runtime::Runtime;
 use spicepod::{
     component::dataset::{
         Dataset,
@@ -30,7 +31,7 @@ use std::sync::Arc;
 
 use crate::{
     acceleration::get_params,
-    get_test_datafusion, init_tracing,
+    configure_test_datafusion, init_tracing,
     utils::{runtime_ready_check, test_request_context},
 };
 
@@ -47,13 +48,9 @@ const NAMES_CSV: &str = include_str!("data/names.csv");
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_file_watcher() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
-    let _guard = super::ACCELERATION_MUTEX.lock().await;
 
     test_request_context()
         .scope(async {
-            let status = status::RuntimeStatus::new();
-            let df = get_test_datafusion(Arc::clone(&status));
-
             // Write the CSV to a file next to the test binary
             std::fs::write("./test_file_watcher.csv", NAMES_CSV).expect("write file");
 
@@ -85,8 +82,7 @@ async fn test_file_watcher() -> Result<(), anyhow::Error> {
             let rt = Arc::new(
                 Runtime::builder()
                     .with_app(app)
-                    .with_datafusion(df)
-                    .with_runtime_status(status)
+                    .with_datafusion_configuration_fn(configure_test_datafusion)
                     .build()
                     .await,
             );

@@ -791,6 +791,7 @@ mod tests {
     use std::pin::Pin;
     use url::Url;
 
+    use crate::component::dataset::DatasetBuilder;
     use crate::dataconnector::listing::LISTING_TABLE_PARAMETERS;
     use crate::dataconnector::{ConnectorParams, DataConnectorFactory};
     use crate::parameters::ParameterSpec;
@@ -861,7 +862,10 @@ mod tests {
 
     const TEST_PARAMETERS: &[ParameterSpec] = LISTING_TABLE_PARAMETERS;
 
-    fn setup_connector(path: String, params: HashMap<String, String>) -> (TestConnector, Dataset) {
+    async fn setup_connector(
+        path: String,
+        params: HashMap<String, String>,
+    ) -> (TestConnector, Dataset) {
         let connector = TestConnector {
             params: Parameters::new(
                 to_secret_map(params).into_iter().collect(),
@@ -869,14 +873,22 @@ mod tests {
                 TEST_PARAMETERS,
             ),
         };
-        let dataset = Dataset::try_new(path, "test").expect("a valid dataset");
+        let app = app::AppBuilder::new("test").build();
+        let rt = crate::Runtime::builder().build().await;
+
+        let dataset = DatasetBuilder::try_new(path, "test")
+            .expect("Failed to create builder")
+            .with_app(Arc::new(app))
+            .with_runtime(Arc::new(rt))
+            .build()
+            .expect("Failed to build dataset");
 
         (connector, dataset)
     }
 
-    #[test]
-    fn test_get_file_format_and_extension_require_file_format() {
-        let (connector, dataset) = setup_connector("test:test/".to_string(), HashMap::new());
+    #[tokio::test]
+    async fn test_get_file_format_and_extension_require_file_format() {
+        let (connector, dataset) = setup_connector("test:test/".to_string(), HashMap::new()).await;
 
         match connector.get_file_format_and_extension(&dataset) {
             Ok(_) => panic!("Unexpected success"),
@@ -887,9 +899,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_get_file_format_and_extension_detect_csv_extension() {
-        let (connector, dataset) = setup_connector("test:test.csv".to_string(), HashMap::new());
+    #[tokio::test]
+    async fn test_get_file_format_and_extension_detect_csv_extension() {
+        let (connector, dataset) =
+            setup_connector("test:test.csv".to_string(), HashMap::new()).await;
 
         if let Ok((Some(_file_format), extension)) =
             connector.get_file_format_and_extension(&dataset)
@@ -900,9 +913,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_get_file_format_and_extension_detect_parquet_extension() {
-        let (connector, dataset) = setup_connector("test:test.parquet".to_string(), HashMap::new());
+    #[tokio::test]
+    async fn test_get_file_format_and_extension_detect_parquet_extension() {
+        let (connector, dataset) =
+            setup_connector("test:test.parquet".to_string(), HashMap::new()).await;
 
         if let Ok((Some(_file_format), extension)) =
             connector.get_file_format_and_extension(&dataset)
@@ -913,11 +927,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_get_file_format_and_extension_csv_from_params() {
+    #[tokio::test]
+    async fn test_get_file_format_and_extension_csv_from_params() {
         let mut params = HashMap::new();
         params.insert("file_format".to_string(), "csv".to_string());
-        let (connector, dataset) = setup_connector("test:test.parquet".to_string(), params);
+        let (connector, dataset) = setup_connector("test:test.parquet".to_string(), params).await;
 
         if let Ok((Some(_file_format), extension)) =
             connector.get_file_format_and_extension(&dataset)
@@ -928,11 +942,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_get_file_format_and_extension_tsv_from_params() {
+    #[tokio::test]
+    async fn test_get_file_format_and_extension_tsv_from_params() {
         let mut params = HashMap::new();
         params.insert("file_format".to_string(), "tsv".to_string());
-        let (connector, dataset) = setup_connector("test:test.parquet".to_string(), params);
+        let (connector, dataset) = setup_connector("test:test.parquet".to_string(), params).await;
 
         if let Ok((Some(_file_format), extension)) =
             connector.get_file_format_and_extension(&dataset)
@@ -943,11 +957,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_get_file_format_and_extension_parquet_from_params() {
+    #[tokio::test]
+    async fn test_get_file_format_and_extension_parquet_from_params() {
         let mut params = HashMap::new();
         params.insert("file_format".to_string(), "parquet".to_string());
-        let (connector, dataset) = setup_connector("test:test.csv".to_string(), params);
+        let (connector, dataset) = setup_connector("test:test.csv".to_string(), params).await;
 
         if let Ok((Some(_file_format), extension)) =
             connector.get_file_format_and_extension(&dataset)
@@ -1060,7 +1074,14 @@ mod tests {
         let url = Url::parse("s3://bucket/").expect("to parse url");
         let table_path = ListingTableUrl::parse(url.clone()).expect("to parse url");
         let ctx = SessionContext::new();
-        let dataset = Dataset::try_new("s3://bucket/".to_string(), "test").expect("valid dataset");
+        let app = app::AppBuilder::new("test").build();
+        let rt = crate::Runtime::builder().build().await;
+        let dataset = DatasetBuilder::try_new("s3://bucket/".to_string(), "test")
+            .expect("Failed to create builder")
+            .with_app(Arc::new(app))
+            .with_runtime(Arc::new(rt))
+            .build()
+            .expect("Failed to build dataset");
 
         let meta_files = vec![
             create_meta("file_old.parquet", 100, 100),
@@ -1090,7 +1111,14 @@ mod tests {
         let url = Url::parse("s3://bucket/").expect("to parse url");
         let table_path = ListingTableUrl::parse(url.clone()).expect("to parse url");
         let ctx = SessionContext::new();
-        let dataset = Dataset::try_new("s3://bucket/".to_string(), "test").expect("valid dataset");
+        let app = app::AppBuilder::new("test").build();
+        let rt = crate::Runtime::builder().build().await;
+        let dataset = DatasetBuilder::try_new("s3://bucket/".to_string(), "test")
+            .expect("Failed to create builder")
+            .with_app(Arc::new(app))
+            .with_runtime(Arc::new(rt))
+            .build()
+            .expect("Failed to build dataset");
 
         let meta_files = vec![
             create_meta("file_old.parquet", 100, 100),
@@ -1117,8 +1145,14 @@ mod tests {
         let url = Url::parse("s3://bucket/schema/").expect("to parse url");
         let schema_source_path = ListingTableUrl::parse(url.clone()).expect("to parse url");
         let ctx = SessionContext::new();
-        let dataset =
-            Dataset::try_new("s3://bucket/schema/".to_string(), "test").expect("valid dataset");
+        let app = app::AppBuilder::new("test").build();
+        let rt = crate::Runtime::builder().build().await;
+        let dataset = DatasetBuilder::try_new("s3://bucket/schema/".to_string(), "test")
+            .expect("Failed to create builder")
+            .with_app(Arc::new(app))
+            .with_runtime(Arc::new(rt))
+            .build()
+            .expect("Failed to build dataset");
 
         let meta_files = vec![
             create_meta("schema/file1.parquet", 100, 100),
@@ -1146,8 +1180,14 @@ mod tests {
         let url = Url::parse("s3://bucket/schema/").expect("to parse url");
         let schema_source_path = ListingTableUrl::parse(url.clone()).expect("to parse url");
         let ctx = SessionContext::new();
-        let dataset =
-            Dataset::try_new("s3://bucket/schema/".to_string(), "test").expect("valid dataset");
+        let app = app::AppBuilder::new("test").build();
+        let rt = crate::Runtime::builder().build().await;
+        let dataset = DatasetBuilder::try_new("s3://bucket/schema/".to_string(), "test")
+            .expect("Failed to create builder")
+            .with_app(Arc::new(app))
+            .with_runtime(Arc::new(rt))
+            .build()
+            .expect("Failed to build dataset");
 
         let meta_files = vec![
             create_meta("schema/file1.csv", 100, 100),
@@ -1183,8 +1223,14 @@ mod tests {
         let url = Url::parse("s3://bucket/schema/").expect("to parse url");
         let schema_source_path = ListingTableUrl::parse(url.clone()).expect("to parse url");
         let ctx = SessionContext::new();
-        let dataset =
-            Dataset::try_new("s3://bucket/schema/".to_string(), "test").expect("valid dataset");
+        let app = app::AppBuilder::new("test").build();
+        let rt = crate::Runtime::builder().build().await;
+        let dataset = DatasetBuilder::try_new("s3://bucket/schema/".to_string(), "test")
+            .expect("Failed to create builder")
+            .with_app(Arc::new(app))
+            .with_runtime(Arc::new(rt))
+            .build()
+            .expect("Failed to build dataset");
 
         // Create more files than SCHEMA_SOURCE_PATH_FILE_SCAN_LIMIT
         let meta_files: Vec<ObjectMeta> = (0..SCHEMA_SOURCE_PATH_FILE_SCAN_LIMIT + 100)

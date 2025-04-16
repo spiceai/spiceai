@@ -22,7 +22,9 @@ use std::net::SocketAddr;
 use std::time::Duration;
 use std::{collections::HashMap, sync::Arc};
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 
+use crate::dataaccelerator::AcceleratorEngineRegistry;
 use crate::{
     auth::EndpointAuth, dataconnector::DataConnector, datafusion::DataFusion,
     internal_table::Error as InternalTableError, model::ENABLE_MODEL_SUPPORT_MESSAGE,
@@ -53,6 +55,7 @@ use snafu::prelude::*;
 use spicepod::component::eval::Eval;
 use status::ComponentStatus;
 use tls::TlsConfig;
+
 use tokio::sync::{RwLock, oneshot::error::RecvError};
 use tokio_util::sync::CancellationToken;
 use tools::factory::default_available_catalogs;
@@ -297,6 +300,12 @@ pub enum Error {
     #[snafu(display("Unable to create directory: {source}"))]
     UnableToCreateDirectory { source: std::io::Error },
 
+    #[snafu(display("Unable to build dataset: {dataset}: {source}"))]
+    UnableToBuildDataset {
+        dataset: String,
+        source: crate::component::dataset::Error,
+    },
+
     #[snafu(display("{source}"))]
     ComponentError { source: component::Error },
 
@@ -315,7 +324,7 @@ const PODS_WATCHER: &str = "pods_watcher";
 const COMPONENTS_INITIAL_LOAD: &str = "components_initial_load";
 
 // Allow 30 seconds for tasks for graceful shutdown
-const RUNTIME_TASK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+const RUNTIME_DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -346,6 +355,7 @@ pub struct Runtime {
     status: Arc<status::RuntimeStatus>,
 
     runtime_tasks: Arc<RwLock<HashMap<String, CancellableTaskHandle>>>,
+    accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
 }
 
 impl Runtime {
@@ -379,8 +389,13 @@ impl Runtime {
         Arc::clone(&self.app)
     }
 
+    #[must_use]
+    pub fn accelerator_engine_registry(&self) -> Arc<AcceleratorEngineRegistry> {
+        Arc::clone(&self.accelerator_engine_registry)
+    }
+
     /// Requests a loaded extension, or will attempt to load it if part of the autoloaded extensions.
-    pub async fn extension(&self, name: &str) -> Option<Arc<dyn Extension>> {
+    pub async fn extension(self: Arc<Self>, name: &str) -> Option<Arc<dyn Extension>> {
         let extensions = self.extensions.read().await;
 
         if let Some(extension) = extensions.get(name) {
@@ -392,12 +407,12 @@ impl Runtime {
             let mut extensions = self.extensions.write().await;
             let mut extension = autoload_factory.create();
             let extension_name = extension.name().to_string();
-            if let Err(err) = extension.initialize(self).await {
+            if let Err(err) = extension.initialize(self.as_ref()).await {
                 tracing::error!("Unable to initialize extension {extension_name}: {err}");
                 return None;
             }
 
-            if let Err(err) = extension.on_start(self).await {
+            if let Err(err) = extension.on_start(Arc::clone(&self)).await {
                 tracing::error!("Unable to start extension {extension_name}: {err}");
                 return None;
             }
@@ -421,7 +436,8 @@ impl Runtime {
         tls_config: Option<Arc<TlsConfig>>,
         endpoint_auth: EndpointAuth,
     ) -> Result<()> {
-        self.register_metrics_table(self.prometheus_registry.is_some())
+        Arc::clone(&self)
+            .register_metrics_table(self.prometheus_registry.is_some())
             .await?;
 
         // Start Http server
@@ -551,13 +567,13 @@ impl Runtime {
     }
 
     /// Updates all of the component statuses to `Initializing`.
-    pub async fn set_components_initializing(&self) {
+    pub async fn set_components_initializing(self: Arc<Self>) {
         let app_lock = self.app.read().await;
         let Some(app) = app_lock.as_ref() else {
             return;
         };
 
-        let valid_datasets = Self::get_valid_datasets(app, LogErrors(false));
+        let valid_datasets = Arc::clone(&self).get_valid_datasets(app, LogErrors(false));
         for ds in &valid_datasets {
             self.status
                 .update_dataset(&ds.name, ComponentStatus::Initializing);
@@ -591,7 +607,7 @@ impl Runtime {
                 .update_catalog(&catalog.name, ComponentStatus::Initializing);
         }
 
-        let valid_views = Self::get_valid_views(app, LogErrors(false));
+        let valid_views = Arc::clone(&self).get_valid_views(app, LogErrors(false));
         for view in valid_views {
             self.status
                 .update_view(&view.name, ComponentStatus::Initializing);
@@ -604,9 +620,9 @@ impl Runtime {
     /// This includes waiting for the first refresh of any accelerated tables to complete.
     #[allow(clippy::too_many_lines)]
     pub async fn load_components(self: Arc<Self>) {
-        self.set_components_initializing().await;
+        Arc::clone(&self).set_components_initializing().await;
 
-        self.start_extensions().await;
+        Arc::clone(&self).start_extensions().await;
 
         // Must be loaded before datasets
         self.load_embeddings().await;
@@ -647,7 +663,8 @@ impl Runtime {
             async move {
                 self_clone.load_models().await;
 
-                let app_lock = self_clone.app.read().await;
+                let app_ref = Arc::clone(&self_clone).app();
+                let app_lock = app_ref.read().await;
 
                 if !cfg!(feature = "models")
                     && app_lock.as_ref().is_some_and(|s| !s.evals.is_empty())
@@ -662,12 +679,15 @@ impl Runtime {
                     self_clone.load_eval_scorer().await;
                     let () = self_clone.verify_evals().await;
                     let an_eval_exists = app_lock.as_ref().is_some_and(|app| !app.evals.is_empty());
-                    if !an_eval_exists {
+                    if an_eval_exists {
+                        drop(app_lock);
+                        if let Err(err) = self_clone.load_eval_tables().await {
+                            tracing::warn!("Failed to create internal eval tables: {err}");
+                        }
+                    } else {
                         tracing::trace!(
                             "No eval spice components defined. Therefore not loading eval tables into database."
                         );
-                    } else if let Err(err) = self_clone.load_eval_tables().await {
-                        tracing::warn!("Creating internal eval run table: {err}");
                     }
                 }
             }
@@ -742,8 +762,19 @@ impl Runtime {
             return;
         }
 
-        tracing::info!("Shutting down runtime...");
         self.status.mark_shutdown();
+
+        let shutdown_timeout: Duration = self.app.read().await.as_ref().and_then(|app| {
+            app.runtime.shutdown_timeout().unwrap_or_else(|err| {
+                tracing::warn!("Invalid shutdown timeout: {err}. Using default: {RUNTIME_DEFAULT_SHUTDOWN_TIMEOUT:?}");
+                Some(RUNTIME_DEFAULT_SHUTDOWN_TIMEOUT)
+            })
+        }).unwrap_or(RUNTIME_DEFAULT_SHUTDOWN_TIMEOUT);
+        tracing::info!(
+            "Shutdown initiated; waiting up to {shutdown_timeout:?} for connections to drain"
+        );
+
+        let start_time = Instant::now();
 
         // shutdown all running components except the HTTP and Metrics servers
         let mut runtime_tasks = self.runtime_tasks.write().await;
@@ -766,7 +797,7 @@ impl Runtime {
                     None
                 } else {
                     tracing::debug!("Shutting down {name}");
-                    Some(handle.cancel(RUNTIME_TASK_SHUTDOWN_TIMEOUT))
+                    Some(handle.cancel(shutdown_timeout))
                 }
             })
             .collect();
@@ -777,16 +808,21 @@ impl Runtime {
         self.df.shutdown().await;
         dataconnector::unregister_all().await;
         catalogconnector::unregister_all().await;
-        dataaccelerator::unregister_all().await;
+        self.accelerator_engine_registry.unregister_all().await;
         tools::factory::unregister_all_factories().await;
         document_parse::unregister_all().await;
+
+        // Measure elapsed time since shutdown started and calculate remaining time within the configured timeout. Remaining shutdown
+        // group includes only Metrics and HTTP Healthcheck endpoints; general HTTP API endpoints have already stopped accepting requests.
+        let elapsed = start_time.elapsed();
+        let remaining_timeout = shutdown_timeout.saturating_sub(elapsed);
 
         // Shutdown HTTP & Metrics servers last
         let shutdown_futures: Vec<_> = last_shutdown_group
             .into_iter()
             .map(|(name, handle)| {
                 tracing::debug!("Shutting down {name}");
-                handle.cancel(RUNTIME_TASK_SHUTDOWN_TIMEOUT)
+                handle.cancel(remaining_timeout)
             })
             .collect();
 

@@ -16,18 +16,14 @@ limitations under the License.
 
 #![allow(clippy::large_futures)]
 
-use std::sync::Arc;
-
 use arrow::{array::RecordBatch, util::display::FormatOptions};
-use datafusion::{
-    execution::context::SessionContext,
-    parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder,
-};
+use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use futures::TryStreamExt;
 
-use runtime::{Runtime, datafusion::DataFusion, status};
+use runtime::Runtime;
 use tracing::subscriber::DefaultGuard;
 use tracing_subscriber::EnvFilter;
+
 mod abfs;
 mod acceleration;
 mod catalog;
@@ -78,24 +74,19 @@ mod utils;
 #[cfg(feature = "mysql")]
 mod rehydration;
 
-/// Gets a test `DataFusion` to make test results reproducible across all machines.
-///
-/// 1) Sets the number of `target_partitions` to 3, by default its the number of CPU cores available.
-fn get_test_datafusion(status: Arc<status::RuntimeStatus>) -> Arc<DataFusion> {
-    let mut df = DataFusion::builder(status).build();
+mod shutdown;
 
-    // Set the target partitions to 3 to make RepartitionExec show consistent partitioning across machines with different CPU counts.
-    let mut new_state = df.ctx.state();
-    new_state
+// /// Modifies the `DataFusion` configuration to make test results reproducible across all machines.
+// ///
+// /// 1) Sets the number of `target_partitions` to 3, by default its the number of CPU cores available.
+fn configure_test_datafusion(df: &mut runtime::datafusion::DataFusion) {
+    let state = df.ctx.state_ref();
+    let mut state_lock = state.write();
+    state_lock
         .config_mut()
         .options_mut()
         .execution
         .target_partitions = 3;
-    let new_ctx = SessionContext::new_with_state(new_state);
-
-    // Replace the old context with the modified one
-    df.ctx = new_ctx.into();
-    Arc::new(df)
 }
 
 fn init_tracing(default_level: Option<&str>) -> DefaultGuard {

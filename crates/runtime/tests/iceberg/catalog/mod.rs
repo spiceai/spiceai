@@ -15,14 +15,15 @@ limitations under the License.
 */
 
 use crate::{
-    get_test_datafusion, init_tracing,
+    configure_test_datafusion, init_tracing,
     utils::{runtime_ready_check, test_request_context},
 };
 use anyhow::Context;
 use app::AppBuilder;
 use arrow::record_batch::RecordBatch;
 use futures::StreamExt;
-use runtime::{Runtime, status};
+
+use runtime::Runtime;
 use spicepod::{component::catalog::Catalog, param::Params};
 use std::sync::Arc;
 
@@ -52,15 +53,13 @@ async fn glue_iceberg_integration_test_catalog() -> Result<(), anyhow::Error> {
                 .with_catalog(db_catalog)
                 .build();
 
-            let status = status::RuntimeStatus::new();
-            let df = get_test_datafusion(Arc::clone(&status));
+            let rt =
+                Runtime::builder()
+                    .with_app(app)
+                    .with_datafusion_configuration_fn(configure_test_datafusion)
+                    .build()
+                    .await;
 
-            let rt = Runtime::builder()
-                .with_app(app)
-                .with_datafusion(df)
-                .with_runtime_status(status)
-                .build()
-                .await;
             let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {

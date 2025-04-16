@@ -16,6 +16,7 @@ limitations under the License.
 
 use std::sync::Arc;
 
+use crate::configure_test_datafusion;
 use crate::{RecordBatch, init_tracing, utils::test_request_context};
 use app::AppBuilder;
 use datafusion::assert_batches_eq;
@@ -85,7 +86,11 @@ async fn duckdb_from_functions() -> Result<(), String> {
         ))
         .build();
 
-            let rt = Runtime::builder().with_app(app).build().await;
+            let rt = Runtime::builder()
+                .with_app(app)
+                .with_datafusion_configuration_fn(configure_test_datafusion)
+                .build()
+                .await;
             let cloned_rt = Arc::new(rt.clone());
 
             // Set a timeout for the test
