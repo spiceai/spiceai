@@ -29,6 +29,10 @@ pub enum Error {
         "An endpoint is required to connect to telemetry.\nSupply an endpoint to the telemetry builder.\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
     ))]
     MissingEndpoint,
+    #[snafu(display(
+        "A service name is required to connect to telemetry.\nSupply a service name to the telemetry builder.\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+    ))]
+    MissingServiceName,
 }
 
 #[derive(Debug, Default)]
@@ -83,9 +87,11 @@ impl TelemetryExporterBuilder {
             }
         };
 
+        let service_name = self.service_name.ok_or(Error::MissingServiceName)?;
+
         Ok(TelemetryExporter {
             flight_client,
-            service_name: self.service_name.unwrap_or("oss_telemetry".into()),
+            service_name,
         })
     }
 }

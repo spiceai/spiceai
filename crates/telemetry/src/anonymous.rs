@@ -74,6 +74,7 @@ pub async fn start(spicepod_name: &str, telemetry_properties: Vec<KeyValue>) {
 
     let Ok(exporter) = TelemetryExporterBuilder::new()
         .with_endpoint(Arc::clone(&ENDPOINT))
+        .with_service_name("oss_telemetry".into())
         .build()
         .await
     else {
