@@ -121,11 +121,15 @@ impl Runtime {
         let views_that_changed = valid_views
             .iter()
             .filter_map(|v| {
-                let old_v = existing_views.iter().find(|vv| v.name == vv.name)?;
-                if old_v == v {
-                    None
-                } else {
-                    Some(v.name.clone())
+                match existing_views.iter().find(|vv| v.name == vv.name) {
+                    Some(old_v) => {
+                        if old_v == v {
+                            None // No change, don't include
+                        } else {
+                            Some(v.name.clone()) // Changed, include the name
+                        }
+                    }
+                    None => Some(v.name.clone()), // New view, include the name
                 }
             })
             .collect_vec();
