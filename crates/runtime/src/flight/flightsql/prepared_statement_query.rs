@@ -17,12 +17,16 @@ limitations under the License.
 use std::sync::Arc;
 
 use arrow_flight::{
-    FlightDescriptor, FlightEndpoint, FlightInfo, Ticket,
+    FlightData, FlightDescriptor, FlightEndpoint, FlightInfo, Ticket,
     flight_service_server::FlightService,
-    sql::{self, ProstMessageExt},
+    sql::{
+        self, CommandPreparedStatementQuery, DoPutPreparedStatementResult, DoPutUpdateResult,
+        ProstMessageExt,
+    },
 };
 use prost::Message;
-use tonic::{Request, Response, Status};
+use tokio_stream::adapters::Peekable;
+use tonic::{Request, Response, Status, Streaming};
 
 use crate::{
     flight::{
@@ -117,4 +121,12 @@ pub(crate) async fn do_get(
             "Invalid prepared statement handle: {e}"
         ))),
     }
+}
+
+pub(crate) async fn do_put_query(
+    flight_svc: &Service,
+    query: CommandPreparedStatementQuery,
+    mut streaming_flight: Peekable<Streaming<FlightData>>,
+) -> Result<Response<<Service as FlightService>::DoPutStream>, Status> {
+    Err(Status::unimplemented("work in progress"))
 }
