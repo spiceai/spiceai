@@ -27,6 +27,7 @@ use crate::get_params_with_secrets;
 use crate::parameters::ParameterSpec;
 use crate::parameters::Parameters;
 use crate::secrets::Secrets;
+use app::App;
 use arrow_schema::SchemaRef;
 use arrow_tools::schema::schema_meta_get_computed_columns;
 use async_trait::async_trait;
@@ -579,11 +580,13 @@ pub struct ConnectorParams {
     pub(crate) parameters: Parameters,
     pub(crate) unsupported_type_action: Option<UnsupportedTypeAction>,
     pub(crate) component: ConnectorComponent,
+    pub(crate) app: Option<Arc<App>>,
 }
 
 pub struct ConnectorParamsBuilder {
     connector: Arc<str>,
     component: ConnectorComponent,
+    app: Option<Arc<App>>,
 }
 
 impl ConnectorParamsBuilder {
@@ -592,7 +595,14 @@ impl ConnectorParamsBuilder {
         Self {
             connector,
             component,
+            app: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_app(mut self, app: Arc<App>) -> Self {
+        self.app = Some(app);
+        self
     }
 
     pub async fn build(
@@ -656,6 +666,7 @@ impl ConnectorParamsBuilder {
             parameters,
             unsupported_type_action: unsupported_type_action.map(UnsupportedTypeAction::from),
             component: self.component,
+            app: self.app,
         })
     }
 }

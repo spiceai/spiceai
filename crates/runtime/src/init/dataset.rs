@@ -197,6 +197,7 @@ impl Runtime {
 
         let source = ds.source();
         let params = ConnectorParamsBuilder::new(source.into(), (&ds).into())
+            .with_app(Arc::clone(&ds.app))
             .build(self.secrets())
             .await
             .context(UnableToInitializeDataConnectorSnafu)?;

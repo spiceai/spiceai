@@ -8,6 +8,7 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+byte-unit.workspace = true
 fundu.workspace = true
 regex.workspace = true
 schemars = { version = "0.8.22", optional = true }
