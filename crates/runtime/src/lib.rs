@@ -22,6 +22,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 use std::{collections::HashMap, sync::Arc};
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 
 use crate::dataaccelerator::AcceleratorEngineRegistry;
 use crate::{
@@ -323,7 +324,7 @@ const PODS_WATCHER: &str = "pods_watcher";
 const COMPONENTS_INITIAL_LOAD: &str = "components_initial_load";
 
 // Allow 30 seconds for tasks for graceful shutdown
-const RUNTIME_TASK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+const RUNTIME_DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -761,8 +762,19 @@ impl Runtime {
             return;
         }
 
-        tracing::info!("Shutting down runtime...");
         self.status.mark_shutdown();
+
+        let shutdown_timeout: Duration = self.app.read().await.as_ref().and_then(|app| {
+            app.runtime.shutdown_timeout().unwrap_or_else(|err| {
+                tracing::warn!("Invalid shutdown timeout: {err}. Using default: {RUNTIME_DEFAULT_SHUTDOWN_TIMEOUT:?}");
+                Some(RUNTIME_DEFAULT_SHUTDOWN_TIMEOUT)
+            })
+        }).unwrap_or(RUNTIME_DEFAULT_SHUTDOWN_TIMEOUT);
+        tracing::info!(
+            "Shutdown initiated; waiting up to {shutdown_timeout:?} for connections to drain"
+        );
+
+        let start_time = Instant::now();
 
         // shutdown all running components except the HTTP and Metrics servers
         let mut runtime_tasks = self.runtime_tasks.write().await;
@@ -785,7 +797,7 @@ impl Runtime {
                     None
                 } else {
                     tracing::debug!("Shutting down {name}");
-                    Some(handle.cancel(RUNTIME_TASK_SHUTDOWN_TIMEOUT))
+                    Some(handle.cancel(shutdown_timeout))
                 }
             })
             .collect();
@@ -800,12 +812,17 @@ impl Runtime {
         tools::factory::unregister_all_factories().await;
         document_parse::unregister_all().await;
 
+        // Measure elapsed time since shutdown started and calculate remaining time within the configured timeout. Remaining shutdown
+        // group includes only Metrics and HTTP Healthcheck endpoints; general HTTP API endpoints have already stopped accepting requests.
+        let elapsed = start_time.elapsed();
+        let remaining_timeout = shutdown_timeout.saturating_sub(elapsed);
+
         // Shutdown HTTP & Metrics servers last
         let shutdown_futures: Vec<_> = last_shutdown_group
             .into_iter()
             .map(|(name, handle)| {
                 tracing::debug!("Shutting down {name}");
-                handle.cancel(RUNTIME_TASK_SHUTDOWN_TIMEOUT)
+                handle.cancel(remaining_timeout)
             })
             .collect();
 

@@ -81,6 +81,8 @@ The Beta release criteria expand on and require that all [Alpha release criteria
 
 - [ ] All [Alpha release criteria](./alpha.md) pass for this connector.
 - [ ] [Core Connector Data Types](../definitions.md) are supported.
+- [ ] The connector supports reading datasets with the same max column count as the connector source.
+  - For example, if the connector source supports tables with 1000 columns, the connector should support adding this table as a dataset and querying against it.
 
 #### Documentation
 
@@ -99,6 +101,7 @@ Documentation criteria should be re-checked on every release, to ensure the docu
 #### Testing
 
 - [ ] Integration tests to cover simple use cases based on the connector type, e.g. a Spicepod sourcing a file from an FTP server, reading latest GitHub issues, etc.
+- [ ] An integration or benchmark test validating the maximum column count use case is added.
 
 ### Conditional Criteria
 
