@@ -84,7 +84,7 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
         KeyValue::new("benchmark.commit_sha", commit_sha.clone()),
     ]);
 
-    crate::telemetry::setup(benchmark_resource);
+    crate::telemetry::setup(benchmark_resource, "".into()).await;
 
     for query in &metrics.metrics {
         let query_name = query.query_name.clone();

@@ -9,9 +9,11 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+async-trait.workspace = true
 clap.workspace = true
 opentelemetry.workspace = true
 opentelemetry_sdk.workspace = true
+otel-arrow = { path = "../../crates/otel-arrow" }
 reqwest.workspace = true
 telemetry = { path = "../../crates/telemetry" }
 test-framework = { path = "../../crates/test-framework" }

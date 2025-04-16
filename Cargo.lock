@@ -12252,9 +12252,11 @@ name = "testoperator"
 version = "1.2.0-unstable"
 dependencies = [
  "arrow-json",
+ "async-trait",
  "clap",
  "opentelemetry 0.27.1",
  "opentelemetry_sdk 0.27.1",
+ "otel-arrow",
  "reqwest 0.12.12",
  "serde",
  "serde_json",

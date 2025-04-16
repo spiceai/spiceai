@@ -14,30 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::sync::{Arc, LazyLock, OnceLock};
+use std::sync::LazyLock;
 
-use opentelemetry::metrics::{Gauge, Meter, MeterProvider};
+use opentelemetry::metrics::Gauge;
 
-use opentelemetry_sdk::{Resource, metrics::SdkMeterProvider};
-use telemetry::noop::NoopMeterProvider;
-
-pub(crate) static METER_PROVIDER_ONCE: OnceLock<Arc<dyn MeterProvider + Send + Sync>> =
-    OnceLock::new();
-
-static METER_PROVIDER: LazyLock<&'static Arc<dyn MeterProvider + Send + Sync>> =
-    LazyLock::new(|| METER_PROVIDER_ONCE.get_or_init(|| Arc::new(NoopMeterProvider::new())));
-
-pub(crate) static METER: LazyLock<Meter> =
-    LazyLock::new(|| METER_PROVIDER.meter("benchmarks_telemetry"));
-
-pub(crate) fn setup(resource: Resource) {
-    // TODO: setup an exporter with API key
-    let provider = SdkMeterProvider::builder().with_resource(resource).build();
-
-    if METER_PROVIDER_ONCE.set(Arc::new(provider)).is_err() {
-        println!("Testoperator metrics are disabled");
-    }
-}
+use super::METER;
 
 pub(crate) static ITERATIONS: LazyLock<Gauge<u64>> = LazyLock::new(|| {
     METER
