@@ -14,18 +14,18 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{
-    sync::{Arc, Weak},
-    time::Duration,
-};
+use std::{sync::Arc, time::Duration};
 
-use crate::exporter::{ENDPOINT, TelemetryExporterBuilder};
+use crate::{
+    exporter::{ENDPOINT, TelemetryExporterBuilder},
+    reader::InitialReader,
+};
 use opentelemetry::KeyValue;
 use opentelemetry_sdk::{
     Resource,
     metrics::{
-        InstrumentKind, ManualReader, PeriodicReader, Pipeline, SdkMeterProvider, Temporality,
-        data::ResourceMetrics, exporter::PushMetricExporter, reader::MetricReader,
+        PeriodicReader, SdkMeterProvider, data::ResourceMetrics, exporter::PushMetricExporter,
+        reader::MetricReader,
     },
     runtime::Tokio,
 };
@@ -112,39 +112,4 @@ pub async fn start(spicepod_name: &str, telemetry_properties: Vec<KeyValue>) {
         });
 
     tracing::trace!("Started anonymous telemetry collection to {}", *ENDPOINT);
-}
-
-#[derive(Debug, Clone)]
-struct InitialReader {
-    reader: Arc<ManualReader>,
-}
-
-impl InitialReader {
-    pub fn new() -> Self {
-        Self {
-            reader: Arc::new(ManualReader::builder().build()),
-        }
-    }
-}
-
-impl MetricReader for InitialReader {
-    fn register_pipeline(&self, pipeline: Weak<Pipeline>) {
-        self.reader.register_pipeline(pipeline);
-    }
-
-    fn collect(&self, rm: &mut ResourceMetrics) -> opentelemetry_sdk::metrics::MetricResult<()> {
-        self.reader.collect(rm)
-    }
-
-    fn force_flush(&self) -> opentelemetry_sdk::metrics::MetricResult<()> {
-        self.reader.force_flush()
-    }
-
-    fn shutdown(&self) -> opentelemetry_sdk::metrics::MetricResult<()> {
-        self.reader.shutdown()
-    }
-
-    fn temporality(&self, kind: InstrumentKind) -> Temporality {
-        self.reader.temporality(kind)
-    }
 }

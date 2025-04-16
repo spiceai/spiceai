@@ -33,6 +33,7 @@ pub static ENDPOINT: LazyLock<Arc<str>> = LazyLock::new(|| {
 #[derive(Debug, Default)]
 pub struct TelemetryExporterBuilder {
     api_key: Option<SecretString>,
+    service_name: Option<Arc<str>>,
 }
 
 impl TelemetryExporterBuilder {
@@ -48,6 +49,12 @@ impl TelemetryExporterBuilder {
     }
 
     #[must_use]
+    pub fn with_service_name(mut self, service_name: impl Into<Arc<str>>) -> Self {
+        self.service_name = Some(service_name.into());
+        self
+    }
+
+    #[must_use]
     pub async fn build(self, url: Arc<str>) -> TelemetryExporter {
         let credentials = if let Some(api_key) = self.api_key {
             Credentials::new("", api_key)
@@ -58,18 +65,22 @@ impl TelemetryExporterBuilder {
         let flight_client = match FlightClient::try_new(url, credentials, None).await {
             Ok(client) => Some(client),
             Err(e) => {
-                tracing::trace!("Unable to initialize anonymous telemetry: {e}");
+                tracing::trace!("Unable to initialize telemetry: {e}");
                 None
             }
         };
 
-        TelemetryExporter { flight_client }
+        TelemetryExporter {
+            flight_client,
+            service_name: self.service_name.unwrap_or("oss_telemetry".into()),
+        }
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct TelemetryExporter {
     flight_client: Option<FlightClient>,
+    service_name: Arc<str>,
 }
 
 #[async_trait]
@@ -79,8 +90,11 @@ impl otel_arrow::ArrowExporter for TelemetryExporter {
             return Ok(());
         };
 
-        if let Err(e) = flight_client.publish("oss_telemetry", vec![metrics]).await {
-            tracing::trace!("Unable to publish anonymous telemetry: {e}");
+        if let Err(e) = flight_client
+            .publish(&self.service_name, vec![metrics])
+            .await
+        {
+            tracing::trace!("Unable to publish telemetry: {e}");
         };
 
         Ok(())
