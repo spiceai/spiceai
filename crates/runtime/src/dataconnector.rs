@@ -586,7 +586,6 @@ pub struct ConnectorParams {
 pub struct ConnectorParamsBuilder {
     connector: Arc<str>,
     component: ConnectorComponent,
-    app: Option<Arc<App>>,
 }
 
 impl ConnectorParamsBuilder {
@@ -595,14 +594,7 @@ impl ConnectorParamsBuilder {
         Self {
             connector,
             component,
-            app: None,
         }
-    }
-
-    #[must_use]
-    pub fn with_app(mut self, app: Arc<App>) -> Self {
-        self.app = Some(app);
-        self
     }
 
     pub async fn build(
@@ -611,7 +603,7 @@ impl ConnectorParamsBuilder {
     ) -> Result<ConnectorParams, Box<dyn std::error::Error + Send + Sync>> {
         let name = self.connector.to_string();
         let mut unsupported_type_action = None;
-        let (params, prefix, parameters) = match &self.component {
+        let (params, prefix, parameters, app) = match &self.component {
             ConnectorComponent::Catalog(catalog) => {
                 let guard = CATALOG_CONNECTOR_FACTORY_REGISTRY.lock().await;
                 let connector_factory = guard.get(&name);
@@ -626,6 +618,7 @@ impl ConnectorParamsBuilder {
                     get_params_with_secrets(Arc::clone(&secrets), &catalog.params).await,
                     factory.prefix(),
                     factory.parameters(),
+                    None,
                 )
             }
             ConnectorComponent::Dataset(dataset) => {
@@ -649,7 +642,12 @@ impl ConnectorParamsBuilder {
 
                 let params = get_params_with_secrets(Arc::clone(&secrets), &dataset.params).await;
 
-                (params, factory.prefix(), factory.parameters())
+                (
+                    params,
+                    factory.prefix(),
+                    factory.parameters(),
+                    Some(Arc::clone(&dataset.app)),
+                )
             }
         };
 
@@ -666,7 +664,7 @@ impl ConnectorParamsBuilder {
             parameters,
             unsupported_type_action: unsupported_type_action.map(UnsupportedTypeAction::from),
             component: self.component,
-            app: self.app,
+            app,
         })
     }
 }
