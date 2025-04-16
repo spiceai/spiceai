@@ -64,6 +64,41 @@ impl ModelGradedScorer {
             .build()
     }
 
+    /// Attempt to call a model graded LLM scorer and parse the `score` JSON key.
+    /// Returns `Ok(None)` if the model call was successful, but no `score` was found in response (score must also be a valid number).
+    async fn attempt_score(
+        &self,
+        req: &CreateChatCompletionRequest,
+    ) -> super::Result<Option<Number>> {
+        let response =
+            self.model
+                .chat_request(req.clone())
+                .await
+                .map_err(|e| Error::ErrorScoringCase {
+                    input: input.clone(),
+                    actual: actual.clone(),
+                    ideal: ideal.clone(),
+                    source: Box::from(format!("Underlying language model failed: {e}")),
+                })?;
+        let Some(content) = response
+            .choices
+            .first()
+            .and_then(|c| c.message.content.clone())
+        else {
+            return Err(Error::ErrorScoringCase {
+                input: input.clone(),
+                actual: actual.clone(),
+                ideal: ideal.clone(),
+                source: Box::from("Underlying language model produced no content in response"),
+            });
+        };
+        let Ok(Some(Value::Number(score))) =
+            serde_json::from_str::<Value>(content.as_str()).map(|v| v.get("score").cloned())
+        else {
+            return Ok(None);
+        };
+    }
+
     #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
     fn convert_number_to_f32(value: &Number) -> Option<f32> {
         match value {
@@ -93,51 +128,35 @@ impl Scorer for ModelGradedScorer {
                 )),
             })?;
 
-        let response = self
-            .model
-            .chat_request(req)
-            .await
-            .map_err(|e| Error::ErrorScoringCase {
-                input: input.clone(),
-                actual: actual.clone(),
-                ideal: ideal.clone(),
-                source: Box::from(format!("Underlying language model failed: {e}")),
-            })?;
-        let Some(content) = response
-            .choices
-            .first()
-            .and_then(|c| c.message.content.clone())
-        else {
-            return Err(Error::ErrorScoringCase {
-                input: input.clone(),
-                actual: actual.clone(),
-                ideal: ideal.clone(),
-                source: Box::from("Underlying language model produced no content in response"),
-            });
-        };
-        let Ok(Some(Value::Number(score))) =
-            serde_json::from_str::<Value>(content.as_str()).map(|v| v.get("score").cloned())
-        else {
-            return Err(Error::ErrorScoringCase {
+        let mut score = self.attempt_score(&req).await?;
+
+        // Retry once for when LLM scorer was successfully called, but `score` key was not returned.
+        if score.is_none() {
+            score = self.attempt_score(&req).await?;
+        }
+
+        if let Some(score) = score {
+            Self::convert_number_to_f32(&score).map_or_else(
+                || {
+                    Err(Error::ErrorScoringCase {
+                        input: input.clone(),
+                        actual: actual.clone(),
+                        ideal: ideal.clone(),
+                        source: Box::from(
+                            format!("Underlying language model produced a non-numeric value for its 'score'={score}"),
+                        ),
+                    })
+                },
+                Ok,
+            )
+        } else {
+            Err(Error::ErrorScoringCase {
                 input: input.clone(),
                 actual: actual.clone(),
                 ideal: ideal.clone(),
                 source: Box::from("Underlying language model produced no score in response"),
-            });
-        };
-        Self::convert_number_to_f32(&score).map_or_else(
-            || {
-                Err(Error::ErrorScoringCase {
-                    input: input.clone(),
-                    actual: actual.clone(),
-                    ideal: ideal.clone(),
-                    source: Box::from(
-                        format!("Underlying language model produced a non-numeric value for its 'score'={score}"),
-                    ),
-                })
-            },
-            Ok,
-        )
+            })
+        }
     }
 
     fn metrics(&self, scores: &[f32]) -> Vec<(String, f32)> {
