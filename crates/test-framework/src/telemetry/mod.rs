@@ -27,6 +27,7 @@ use opentelemetry_sdk::{
     metrics::{SdkMeterProvider, data::ResourceMetrics},
 };
 
+use secrecy::SecretString;
 use telemetry::exporter::TelemetryExporterBuilder;
 pub use telemetry::meter::{METER_PROVIDER, METER_PROVIDER_ONCE};
 use telemetry::reader::InitialReader;
@@ -45,11 +46,12 @@ pub struct Telemetry {
     reader: InitialReader,
     resource: Resource,
     setup: bool,
+    api_key: Option<SecretString>,
 }
 
 impl Telemetry {
     #[must_use]
-    pub fn new(resource: &Resource) -> Self {
+    pub fn new(resource: &Resource, api_key_name: &str) -> Self {
         let reader = InitialReader::default();
 
         let provider = SdkMeterProvider::builder()
@@ -58,7 +60,7 @@ impl Telemetry {
             .build();
 
         let setup = if METER_PROVIDER_ONCE.set(Arc::new(provider)).is_err() {
-            println!("Testoperator metrics are disabled");
+            println!("Telemetry disabled");
             false
         } else {
             true
@@ -68,19 +70,22 @@ impl Telemetry {
             reader,
             resource: resource.clone(),
             setup,
+            api_key: std::env::var(api_key_name)
+                .ok()
+                .as_deref()
+                .map(|key| SecretString::new(key.into())),
         }
     }
 
-    pub async fn read(&self, api_key: Option<&str>) -> Result<()> {
+    pub async fn emit(&self) -> Result<()> {
         if !self.setup {
-            println!("Telemetry is disabled");
             return Ok(());
         }
 
-        if let Some(api_key) = api_key {
+        if let Some(api_key) = &self.api_key {
             let telemetry_exporter = otel_arrow::OtelArrowExporter::new(
                 TelemetryExporterBuilder::new()
-                    .with_api_key(api_key.into())
+                    .with_api_key(api_key.clone())
                     .with_service_name("benchmarks_telemetry".into())
                     .with_endpoint(Arc::clone(&ENDPOINT))
                     .build()

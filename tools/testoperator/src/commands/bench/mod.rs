@@ -85,7 +85,7 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
         KeyValue::new("benchmark.spiced_commit_sha", commit_sha.clone()),
     ]);
 
-    let telemetry = Telemetry::new(&benchmark_resource);
+    let telemetry = Telemetry::new(&benchmark_resource, "SPICEAI_API_KEY");
 
     for query in &metrics.metrics {
         let query_name = query.query_name.clone();
@@ -113,9 +113,7 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
         crate::metrics::ROW_COUNT.record((*row_count).try_into()?, &attributes);
     }
 
-    telemetry
-        .read(std::env::var("SPICEAI_API_KEY").ok().as_deref())
-        .await?;
+    telemetry.emit().await?;
 
     let records = metrics.with_memory_usage(max_memory).build_records()?;
     print_batches(&records)?;

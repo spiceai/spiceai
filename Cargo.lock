@@ -12254,6 +12254,7 @@ dependencies = [
  "reqwest 0.12.12",
  "rstest",
  "rustls 0.23.22",
+ "secrecy",
  "serde",
  "serde_json",
  "serde_yaml",
