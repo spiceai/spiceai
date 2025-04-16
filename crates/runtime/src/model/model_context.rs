@@ -16,7 +16,7 @@ limitations under the License.
 
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicU16, Ordering},
 };
 
 use axum::body::Body;
@@ -30,24 +30,24 @@ use crate::request::{AsyncMarker, RequestContext};
 
 #[derive(Clone)]
 pub struct ModelContextExtension {
-    used_tools: Arc<AtomicBool>,
+    used_tools: Arc<AtomicU16>,
 }
 
 impl ModelContextExtension {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            used_tools: Arc::new(AtomicBool::new(false)),
+            used_tools: Arc::new(AtomicU16::new(0)),
         }
     }
 
     #[must_use]
-    pub fn tools_used(&self) -> bool {
-        self.used_tools.load(Ordering::Relaxed)
+    pub fn tools_used(&self) -> u16 {
+        self.used_tools.load(Ordering::SeqCst)
     }
 
-    pub fn set_tools_used(&self, value: bool) {
-        self.used_tools.store(value, Ordering::Relaxed);
+    pub fn add_tools_used(&self, value: u16) {
+        self.used_tools.fetch_add(value, Ordering::SeqCst);
     }
 }
 
@@ -110,7 +110,7 @@ pub fn track_ai_inferences_count(context: &Arc<RequestContext>) {
     if let Some(model_context) = context.extension::<ModelContextExtension>() {
         let dimensions = vec![KeyValue::new(
             "tools_used",
-            model_context.tools_used().to_string(),
+            model_context.tools_used() as i64,
         )];
         crate::metrics::telemetry::track_ai_inferences_with_spice_count(&dimensions);
     } else if cfg!(feature = "dev") {
@@ -124,9 +124,9 @@ pub fn track_ai_inferences_count(context: &Arc<RequestContext>) {
 /// # Panics
 ///
 /// Panics if the model extension is not found in the request context.
-pub fn set_tools_used(context: &Arc<RequestContext>, value: bool) {
+pub fn add_tools_used(context: &Arc<RequestContext>, value: u16) {
     if let Some(model_context) = context.extension::<ModelContextExtension>() {
-        model_context.set_tools_used(value);
+        model_context.add_tools_used(value);
     } else if cfg!(feature = "dev") {
         panic!("ModelContextExtension not found in request context");
     }

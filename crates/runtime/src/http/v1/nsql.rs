@@ -239,7 +239,7 @@ pub(crate) async fn post(
 ) -> Response {
     // track ai_inferences_count metric
     let context = RequestContext::current(AsyncMarker::new().await);
-    crate::model::set_tools_used(&context, true);
+    crate::model::add_tools_used(&context, 1);
 
     let span = tracing::span!(target: "task_history", tracing::Level::INFO, "nsql", input = %payload.query, model = %payload.model, "labels");
 
