@@ -69,9 +69,11 @@ async fn test_tls_endpoints() -> Result<(), anyhow::Error> {
         let tls_config = TlsConfig::try_new(cert_bytes.clone(), key_bytes).expect("valid TlsConfig");
 
         let registry = prometheus::Registry::new();
+        let app = app::AppBuilder::new("test_app").build();
 
         let rt = Runtime::builder()
             .with_metrics_server(SocketAddr::new(LOCALHOST, metrics_port), registry)
+            .with_app(app)
             .build()
             .await;
 

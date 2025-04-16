@@ -17,9 +17,8 @@ limitations under the License.
 //!
 //! Expects a Docker daemon to be running.
 use crate::{
-    acceleration::ACCELERATION_MUTEX,
+    configure_test_datafusion,
     docker::RunningContainer,
-    get_test_datafusion,
     mysql::common::{get_mysql_conn, make_mysql_dataset, start_mysql_docker_container},
     utils::{runtime_ready_check, test_request_context},
 };
@@ -36,7 +35,7 @@ use datafusion_table_providers::sql::arrow_sql_gen::statement::{
 };
 use futures::TryStreamExt;
 use mysql_async::{Params, Row, prelude::Queryable};
-use runtime::{Runtime, spice_data_base_path, status};
+use runtime::{Runtime, spice_data_base_path};
 use spicepod::{
     component::dataset::{
         Dataset,
@@ -57,7 +56,6 @@ mod sqlite;
 #[tokio::test]
 async fn spill_to_disk_and_rehydration() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
-    let _guard = ACCELERATION_MUTEX.lock().await;
 
     test_request_context().scope(async {
         let running_container = prepare_test_environment()
@@ -165,9 +163,7 @@ async fn execute_spill_to_disk_and_rehydration(
     assert_eq!(num_rows_loaded as u64, 10);
 
     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-    drop(rt);
-    runtime::dataaccelerator::unregister_all().await;
-    runtime::dataaccelerator::register_all().await;
+    rt.shutdown().await;
     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
     let retry_strategy = FibonacciBackoffBuilder::new().max_retries(Some(10)).build();
@@ -206,9 +202,8 @@ async fn execute_spill_to_disk_and_rehydration(
     insta::assert_snapshot!("records", restart2_items_pretty);
 
     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    rt.shutdown().await;
     drop(rt);
-    runtime::dataaccelerator::unregister_all().await;
-    runtime::dataaccelerator::register_all().await;
     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
     // Simulate federated dataset access issue after the runtime is restarted, ensure query result remain consistent
@@ -284,15 +279,12 @@ async fn init_spice_app(
 
     let app = AppBuilder::new("spiceapp").with_dataset(ds).build();
 
-    let status = status::RuntimeStatus::new();
-    let df = get_test_datafusion(Arc::clone(&status));
-
     let rt = Runtime::builder()
         .with_app(app)
-        .with_datafusion(df)
-        .with_runtime_status(status)
+        .with_datafusion_configuration_fn(configure_test_datafusion)
         .build()
         .await;
+
     let cloned_rt = Arc::new(rt.clone());
 
     tokio::select! {

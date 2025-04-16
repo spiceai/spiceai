@@ -24,7 +24,7 @@ use std::{
 };
 
 use crate::{
-    init_tracing,
+    configure_test_datafusion, init_tracing,
     utils::{test_request_context, wait_until_true},
 };
 use arrow::array::{Int32Array, RecordBatch, StringArray};
@@ -415,14 +415,16 @@ async fn start_spice_test_app(
 
     let registry = prometheus::Registry::new();
 
-    let mut rt_builder =
-        Runtime::builder().with_metrics_server(SocketAddr::new(LOCALHOST, metrics_port), registry);
+    let mut rt_builder = Runtime::builder()
+        .with_metrics_server(SocketAddr::new(LOCALHOST, metrics_port), registry)
+        .with_datafusion_configuration_fn(configure_test_datafusion);
 
     if let Some(rate_limits) = rate_limits {
         rt_builder = rt_builder.with_rate_limits(rate_limits);
     }
 
-    let rt = rt_builder.build().await;
+    let app = app::AppBuilder::new("test_app").build();
+    let rt = Arc::new(rt_builder.with_app(app).build().await);
 
     let df = rt.datafusion();
 
@@ -432,6 +434,7 @@ async fn start_spice_test_app(
         &df,
         test_record_batch.schema(),
         TableReference::parse_str("public.my_table"),
+        Arc::clone(&rt),
     )
     .await?;
 
@@ -442,7 +445,7 @@ async fn start_spice_test_app(
     }
 
     // Start the servers
-    tokio::spawn(async move { Box::pin(Arc::new(rt).start_servers(api_config, None, auth)).await });
+    tokio::spawn(async move { Box::pin(rt.start_servers(api_config, None, auth)).await });
 
     // Wait for the servers to start
     tracing::info!("Waiting for servers to start...");
@@ -524,6 +527,7 @@ async fn register_test_table(
     datafusion: &Arc<DataFusion>,
     schema: SchemaRef,
     table_name: TableReference,
+    runtime: Arc<Runtime>,
 ) -> Result<(), anyhow::Error> {
     let table = create_internal_accelerated_table(
         datafusion.runtime_status(),
@@ -534,6 +538,7 @@ async fn register_test_table(
         Refresh::default(),
         None,
         Arc::new(RwLock::new(Secrets::default())),
+        runtime,
     )
     .await
     .map_err(anyhow::Error::from)?;

@@ -183,7 +183,7 @@ impl CatalogConnector for IcebergCatalog {
 
     async fn refreshable_catalog_provider(
         self: Arc<Self>,
-        _runtime: &Runtime,
+        _runtime: Arc<Runtime>,
         catalog: &Catalog,
     ) -> super::Result<Arc<dyn RefreshableCatalogProvider>> {
         let Some(catalog_id) = catalog.catalog_id.clone() else {

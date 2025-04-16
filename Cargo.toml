@@ -66,7 +66,7 @@ bb8-postgres = "0.8"
 bytes = "1.10.0"
 charset = "0.1.5"
 chrono = "0.4.38"
-clap = { version = "4.5.29", features = ["derive", "env"] }
+clap = { version = "4.5.36", features = ["derive", "env"] }
 clickhouse-rs = { git = "https://github.com/spiceai/clickhouse-rs.git", tag = "0.2.1", features = [
     "tokio_io",
     "tls",
@@ -80,14 +80,14 @@ datafusion-federation-sql = { git = "https://github.com/spiceai/datafusion-feder
 datafusion-functions-json = "0.45"
 datafusion-table-providers = "0.1"
 dotenvy = "0.15"
-duckdb = "1.1.3"
+duckdb = "1.2.2"
 fundu = "2.0.1"
 futures = "0.3.30"
 globset = "0.4.16"
 graph-rs-sdk = { git = "https://github.com/spiceai/graph-rs-sdk", rev = "f8703df260146b313461029d41c4a021306832b8" }
 graphql-parser = "0.4.0"
 hf-hub = { version = "0.3.0", features = ["tokio"] }
-http = "1.1.0"
+http = "1.3.1"
 iceberg = "0.4.0"
 iceberg-catalog-rest = "0.4.0"
 iceberg-datafusion = "0.4.0"
@@ -127,7 +127,7 @@ rusqlite = { version = "0.31.0", features = ["bundled-decimal", "chrono"] }
 rustls = "0.23"
 rustls-pemfile = "2.1.3"
 secrecy = "0.10.3"
-serde = { version = "1.0.217", features = ["derive"] }
+serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9.30"
 snafu = "0.8.5"
@@ -168,7 +168,7 @@ datafusion-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "e0
 datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "1c814422cfbdeb7f7bd2399e3369656710413aa8" } # spiceai-45
 datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "f60653b6ff9a0f26e5b44a1d43d947fdf1fd8853" } # spiceai
 
-duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "2e24b958e44ec7419290249e27a15f1a19703fff" } # spiceai-1.1.3-backported-arrow-54
+duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "b850ae60dbe67209320c86daeadf47b51f937660" } # spiceai-1.2.2
 
 rusqlite = { git = "https://github.com/spiceai/rusqlite.git", rev = "97054b6af725caf5d3e952e349746706e00d0ea5" }
 

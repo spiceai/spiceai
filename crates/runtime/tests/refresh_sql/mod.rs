@@ -20,14 +20,15 @@ use futures::TryStreamExt;
 use std::{sync::Arc, time::Duration};
 
 use app::AppBuilder;
+
 use runtime::{
     Runtime, accelerated_table::refresh::RefreshOverrides,
-    component::dataset::acceleration::RefreshMode, status,
+    component::dataset::acceleration::RefreshMode,
 };
 use spicepod::component::dataset::{Dataset, acceleration::Acceleration};
 
 use crate::{
-    get_test_datafusion, init_tracing,
+    configure_test_datafusion, init_tracing,
     utils::{runtime_ready_check, test_request_context, wait_until_true},
 };
 
@@ -58,15 +59,12 @@ async fn spiceai_integration_test_refresh_sql_override_append() -> Result<(), an
                 ))
                 .build();
 
-            let status = status::RuntimeStatus::new();
-            let df = get_test_datafusion(Arc::clone(&status));
-
             let rt = Runtime::builder()
                 .with_app(app)
-                .with_datafusion(df)
-                .with_runtime_status(status)
+                .with_datafusion_configuration_fn(configure_test_datafusion)
                 .build()
                 .await;
+
             let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {

@@ -14,13 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::sync::LazyLock;
-
 use runtime::{
     component::dataset::Dataset, dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint,
 };
 use spicepod::{component::dataset::acceleration::Mode, param::Params};
-use tokio::sync::Mutex;
 
 #[cfg(feature = "duckdb")]
 mod checkpoint_duckdb;
@@ -36,11 +33,7 @@ mod query_push_down;
 #[cfg(feature = "duckdb")]
 mod single_instance_duckdb;
 
-// Several acceleration tests need to use shared state from the acceleration registry.
-// To avoid race conditions, use a mutex to ensure that the acceleration tests are run serially.
-pub static ACCELERATION_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
-
-fn get_params(mode: &Mode, file: Option<String>, engine: &str) -> Option<Params> {
+pub(crate) fn get_params(mode: &Mode, file: Option<String>, engine: &str) -> Option<Params> {
     let param_name = format!("{engine}_file",);
     if mode == &Mode::File {
         return Some(Params::from_string_map(
@@ -53,14 +46,14 @@ fn get_params(mode: &Mode, file: Option<String>, engine: &str) -> Option<Params>
 }
 
 async fn wait_for_checkpoints(
-    datasets: &Vec<Dataset>,
+    datasets: Vec<Dataset>,
     timeout_secs: u64,
 ) -> Result<(), anyhow::Error> {
     let mut checkpoint_futures = Vec::new();
 
     for dataset in datasets {
         let check_future = async move {
-            match DatasetCheckpoint::try_new(dataset).await {
+            match DatasetCheckpoint::try_new(&dataset).await {
                 Ok(checkpoint) => {
                     while !checkpoint.exists().await {
                         tokio::time::sleep(std::time::Duration::from_millis(100)).await;

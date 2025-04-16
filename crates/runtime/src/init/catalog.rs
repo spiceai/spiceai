@@ -30,24 +30,25 @@ use snafu::prelude::*;
 use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
 
 impl Runtime {
-    pub(crate) async fn load_catalogs(&self) {
+    pub(crate) async fn load_catalogs(self: Arc<Self>) {
         let app_lock = self.app.read().await;
         let Some(app) = app_lock.as_ref() else {
             return;
         };
 
         let valid_catalogs = Self::get_valid_catalogs(app, LogErrors(true));
+        drop(app_lock);
         let mut futures = vec![];
         for catalog in &valid_catalogs {
             self.status
                 .update_catalog(&catalog.name, status::ComponentStatus::Initializing);
-            futures.push(self.load_catalog(catalog));
+            futures.push(Arc::clone(&self).load_catalog(catalog));
         }
 
         let _ = join_all(futures).await;
     }
 
-    async fn load_catalog(&self, catalog: &Catalog) {
+    async fn load_catalog(self: Arc<Self>, catalog: &Catalog) {
         let spaced_tracer = Arc::clone(&self.spaced_tracer);
 
         let retry_strategy = FibonacciBackoffBuilder::new().max_retries(None).build();
@@ -65,7 +66,7 @@ impl Runtime {
                 }
             };
 
-            if let Err(err) = self.register_catalog(catalog, connector).await {
+            if let Err(err) = Arc::clone(&self).register_catalog(catalog, connector).await {
                 tracing::error!("{err}");
                 return Err(RetryError::transient(err));
             };
@@ -126,7 +127,7 @@ impl Runtime {
     }
 
     async fn register_catalog(
-        &self,
+        self: Arc<Self>,
         catalog: &Catalog,
         catalog_connector: Arc<dyn CatalogConnector>,
     ) -> Result<()> {
@@ -135,10 +136,11 @@ impl Runtime {
             &catalog.name,
             &catalog.provider
         );
-        let catalog_provider = get_catalog_provider(catalog_connector, self, catalog, None)
-            .await
-            .boxed()
-            .context(UnableToInitializeCatalogConnectorSnafu)?;
+        let catalog_provider =
+            get_catalog_provider(catalog_connector, Arc::clone(&self), catalog, None)
+                .await
+                .boxed()
+                .context(UnableToInitializeCatalogConnectorSnafu)?;
         let num_schemas = catalog_provider
             .schema_names()
             .iter()
@@ -173,7 +175,11 @@ impl Runtime {
         Ok(())
     }
 
-    pub(crate) async fn apply_catalog_diff(&self, current_app: &Arc<App>, new_app: &Arc<App>) {
+    pub(crate) async fn apply_catalog_diff(
+        self: Arc<Self>,
+        current_app: &Arc<App>,
+        new_app: &Arc<App>,
+    ) {
         let valid_catalogs = Self::get_valid_catalogs(new_app, LogErrors(true));
         let existing_catalogs = Self::get_valid_catalogs(current_app, LogErrors(false));
 
@@ -182,12 +188,12 @@ impl Runtime {
             {
                 if catalog != current_catalog {
                     // It isn't currently possible to remove catalogs once they have been loaded in DataFusion. `load_catalog` will overwrite the existing catalog.
-                    self.load_catalog(catalog).await;
+                    Arc::clone(&self).load_catalog(catalog).await;
                 }
             } else {
                 self.status
                     .update_catalog(&catalog.name, status::ComponentStatus::Initializing);
-                self.load_catalog(catalog).await;
+                Arc::clone(&self).load_catalog(catalog).await;
             }
         }
 

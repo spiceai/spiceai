@@ -235,10 +235,10 @@ fn get_path(dataset: &Dataset) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::component::dataset::Dataset;
+    use crate::component::dataset::DatasetBuilder;
 
-    #[test]
-    fn test_get_path() {
+    #[tokio::test]
+    async fn test_get_path() {
         let test_cases = vec![
             ("file:/path/to/file.csv", PathBuf::from("/path/to/file.csv")),
             ("file://path/to/file.csv", PathBuf::from("path/to/file.csv")),
@@ -253,16 +253,33 @@ mod tests {
         ];
 
         for (input, expected) in test_cases {
-            let dataset = Dataset::try_new(input.to_string(), "foo").expect("valid dataset");
+            let app = app::AppBuilder::new("test").build();
+            let rt = crate::Runtime::builder().build().await;
+
+            let dataset = DatasetBuilder::try_new(input.to_string(), "foo")
+                .expect("Failed to create builder")
+                .with_app(Arc::new(app))
+                .with_runtime(Arc::new(rt))
+                .build()
+                .expect("Failed to build dataset");
 
             let result = get_path(&dataset);
             assert_eq!(result, expected, "Failed for input: {input}");
         }
     }
 
-    #[test]
-    fn test_get_object_store_url() {
-        let dataset = Dataset::try_new("file:/tmp/".into(), "test").expect("to create dataset");
+    #[tokio::test]
+    async fn test_get_object_store_url() {
+        let app = app::AppBuilder::new("test").build();
+        let rt = crate::Runtime::builder().build().await;
+
+        let dataset = DatasetBuilder::try_new("file:/tmp/".into(), "test")
+            .expect("Failed to create builder")
+            .with_app(Arc::new(app))
+            .with_runtime(Arc::new(rt))
+            .build()
+            .expect("Failed to build dataset");
+
         let connector = File {
             params: Parameters::new(([]).to_vec(), "test", &[]),
         };

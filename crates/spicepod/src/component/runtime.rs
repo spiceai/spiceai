@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::HashMap, error::Error, sync::Arc};
+use std::{collections::HashMap, error::Error, sync::Arc, time::Duration};
 
 use super::is_default;
 #[cfg(feature = "schemars")]
@@ -60,6 +60,30 @@ pub struct Runtime {
     /// spilling to disk for queries & accelerations that are larger than memory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temp_directory: Option<String>,
+
+    /// Configures how long the runtime waits for connections to be gracefully drained
+    /// and components to shut down cleanly during runtime termination
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shutdown_timeout: Option<String>,
+}
+
+impl Runtime {
+    pub fn shutdown_timeout(&self) -> Result<Option<Duration>, Box<dyn Error + Send + Sync>> {
+        if let Some(timeout_str) = &self.shutdown_timeout {
+            let duration = fundu::parse_duration(timeout_str)
+                .map_err(|e| format!("Failed to parse 'shutdown_timeout': {e}"))?;
+
+            if duration.as_secs() == 0 {
+                return Err(
+                    "'shutdown_timeout' must be a positive duration greater than 0 seconds".into(),
+                );
+            }
+
+            Ok(Some(duration))
+        } else {
+            Ok(None)
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]

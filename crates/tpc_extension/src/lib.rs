@@ -16,9 +16,8 @@ limitations under the License.
 
 // use std::{collections::HashMap, sync::Arc};
 
-use std::{fs, path::PathBuf};
+use std::{fs, path::PathBuf, sync::Arc};
 
-// use datafusion::catalog::TableProvider;
 use duckdb::Connection;
 use snafu::prelude::*;
 
@@ -71,7 +70,7 @@ impl Extension for TpcExtension {
         Ok(())
     }
 
-    async fn on_start(&self, _runtime: &Runtime) -> Result<()> {
+    async fn on_start(&self, _runtime: Arc<Runtime>) -> Result<()> {
         if !self.manifest.enabled {
             return Ok(());
         }

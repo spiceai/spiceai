@@ -105,12 +105,12 @@ impl Runtime {
         }
     }
 
-    pub(crate) async fn load_eval_tables(&self) -> Result<()> {
-        self.load_eval_run_table().await?;
+    pub(crate) async fn load_eval_tables(self: Arc<Self>) -> Result<()> {
+        Arc::clone(&self).load_eval_run_table().await?;
         self.load_eval_results_table().await
     }
 
-    pub(crate) async fn load_eval_results_table(&self) -> Result<()> {
+    pub(crate) async fn load_eval_results_table(self: Arc<Self>) -> Result<()> {
         let retention = Retention::new(
             Some(EVAL_RESULTS_TABLE_TIME_COLUMN.to_string()),
             Some(TimeFormat::Timestamptz),
@@ -130,6 +130,7 @@ impl Runtime {
             Refresh::default(),
             retention,
             Arc::new(RwLock::new(Secrets::default())),
+            Arc::clone(&self),
         )
         .await
         .context(UnableToCreateEvalRunsTableSnafu)?;
@@ -141,7 +142,7 @@ impl Runtime {
         Ok(())
     }
 
-    pub(crate) async fn load_eval_run_table(&self) -> Result<()> {
+    pub(crate) async fn load_eval_run_table(self: Arc<Self>) -> Result<()> {
         let retention = Retention::new(
             Some(EVAL_RUNS_TABLE_TIME_COLUMN.to_string()),
             Some(TimeFormat::Timestamptz),
@@ -161,6 +162,7 @@ impl Runtime {
             Refresh::default(),
             retention,
             Arc::new(RwLock::new(Secrets::default())),
+            Arc::clone(&self),
         )
         .await
         .context(UnableToCreateEvalRunsTableSnafu)?;

@@ -29,6 +29,7 @@ use datafusion_table_providers::sql::arrow_sql_gen::statement::{
     CreateTableBuilder, InsertBuilder,
 };
 use mysql_async::{Params, Row, prelude::Queryable};
+
 use runtime::Runtime;
 use tracing::instrument;
 use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
@@ -94,15 +95,12 @@ async fn mysql_federation_push_down() -> Result<(), String> {
                 .with_dataset(make_mysql_dataset("lineitem", "line", MYSQL_PORT, false))
                 .build();
 
-            let status = status::RuntimeStatus::new();
-            let df = get_test_datafusion(Arc::clone(&status));
-
             let mut rt = Runtime::builder()
                 .with_app(app)
-                .with_datafusion(df)
-                .with_runtime_status(status)
+                .with_datafusion_configuration_fn(configure_test_datafusion)
                 .build()
                 .await;
+
             let cloned_rt = Arc::new(rt.clone());
 
             // Set a timeout for the test
@@ -201,15 +199,13 @@ async fn mysql_federation_inner_join_with_acc() -> Result<(), String> {
             .with_dataset(make_mysql_dataset("lineitem", "acc_line", mysql_port, true))
             .build();
 
-        let status = status::RuntimeStatus::new();
-        let df = get_test_datafusion(Arc::clone(&status));
+        let mut rt =
+            Runtime::builder()
+                .with_app(app)
+                .with_datafusion_configuration_fn(configure_test_datafusion)
+                .build()
+                .await;
 
-        let mut rt = Runtime::builder()
-            .with_app(app)
-            .with_datafusion(df)
-            .with_runtime_status(status)
-            .build()
-            .await;
         let cloned_rt = Arc::new(rt.clone());
         // Set a timeout for the test
         tokio::select! {
