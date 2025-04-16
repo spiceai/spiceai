@@ -25,8 +25,16 @@ use opentelemetry_sdk::{
     metrics::{SdkMeterProvider, data::ResourceMetrics},
 };
 
-use telemetry::exporter::{ENDPOINT, TelemetryExporterBuilder};
+use telemetry::exporter::TelemetryExporterBuilder;
 use telemetry::meter::{METER_PROVIDER, METER_PROVIDER_ONCE};
+
+const ENDPOINT_CONST: &str = "https://telemetry.spiceai.io";
+
+pub static ENDPOINT: LazyLock<Arc<str>> = LazyLock::new(|| {
+    std::env::var("SPICEAI_TELEMETRY_ENDPOINT")
+        .unwrap_or_else(|_| ENDPOINT_CONST.into())
+        .into()
+});
 
 pub(crate) static METER: LazyLock<Meter> =
     LazyLock::new(|| METER_PROVIDER.meter("benchmarks_telemetry"));
@@ -61,9 +69,10 @@ impl Telemetry {
             let telemetry_exporter = otel_arrow::OtelArrowExporter::new(
                 TelemetryExporterBuilder::new()
                     .with_api_key(api_key.into())
-                    .with_service_name("benchmarks_telemetry")
-                    .build(ENDPOINT.clone())
-                    .await,
+                    .with_service_name("benchmarks_telemetry".into())
+                    .with_endpoint(Arc::clone(&ENDPOINT))
+                    .build()
+                    .await?,
             );
 
             let mut rm = ResourceMetrics {

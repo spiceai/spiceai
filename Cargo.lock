@@ -12156,6 +12156,7 @@ dependencies = [
  "otel-arrow",
  "secrecy",
  "sha2",
+ "snafu",
  "tokio",
  "tracing",
 ]

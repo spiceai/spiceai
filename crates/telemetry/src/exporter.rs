@@ -14,26 +14,28 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 
 use arrow::array::RecordBatch;
 use async_trait::async_trait;
 use flight_client::{Credentials, FlightClient};
 use opentelemetry_sdk::metrics::MetricError;
 use secrecy::SecretString;
+use snafu::prelude::*;
 
-const ENDPOINT_CONST: &str = "https://telemetry.spiceai.io";
-
-pub static ENDPOINT: LazyLock<Arc<str>> = LazyLock::new(|| {
-    std::env::var("SPICEAI_TELEMETRY_ENDPOINT")
-        .unwrap_or_else(|_| ENDPOINT_CONST.into())
-        .into()
-});
+#[derive(Debug, Snafu)]
+pub enum Error {
+    #[snafu(display(
+        "An endpoint is required to connect to telemetry.\nSupply an endpoint to the telemetry builder.\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+    ))]
+    MissingEndpoint,
+}
 
 #[derive(Debug, Default)]
 pub struct TelemetryExporterBuilder {
     api_key: Option<SecretString>,
     service_name: Option<Arc<str>>,
+    endpoint: Option<Arc<str>>,
 }
 
 impl TelemetryExporterBuilder {
@@ -49,20 +51,31 @@ impl TelemetryExporterBuilder {
     }
 
     #[must_use]
-    pub fn with_service_name(mut self, service_name: impl Into<Arc<str>>) -> Self {
-        self.service_name = Some(service_name.into());
+    pub fn with_service_name(mut self, service_name: Arc<str>) -> Self {
+        self.service_name = Some(service_name);
         self
     }
 
     #[must_use]
-    pub async fn build(self, url: Arc<str>) -> TelemetryExporter {
+    pub fn with_endpoint(mut self, endpoint: Arc<str>) -> Self {
+        self.endpoint = Some(endpoint);
+        self
+    }
+
+    /// Creates a new telemetry exporter.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the endpoint is not set.
+    pub async fn build(self) -> Result<TelemetryExporter, Error> {
         let credentials = if let Some(api_key) = self.api_key {
             Credentials::new("", api_key)
         } else {
             Credentials::anonymous()
         };
 
-        let flight_client = match FlightClient::try_new(url, credentials, None).await {
+        let endpoint = self.endpoint.ok_or(Error::MissingEndpoint)?;
+        let flight_client = match FlightClient::try_new(endpoint, credentials, None).await {
             Ok(client) => Some(client),
             Err(e) => {
                 tracing::trace!("Unable to initialize telemetry: {e}");
@@ -70,10 +83,10 @@ impl TelemetryExporterBuilder {
             }
         };
 
-        TelemetryExporter {
+        Ok(TelemetryExporter {
             flight_client,
             service_name: self.service_name.unwrap_or("oss_telemetry".into()),
-        }
+        })
     }
 }
 
