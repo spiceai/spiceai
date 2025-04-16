@@ -770,7 +770,9 @@ impl Runtime {
                 Some(RUNTIME_DEFAULT_SHUTDOWN_TIMEOUT)
             })
         }).unwrap_or(RUNTIME_DEFAULT_SHUTDOWN_TIMEOUT);
-        tracing::info!("Shutdown initiated; waiting up to {shutdown_timeout:?} for connections to drain");
+        tracing::info!(
+            "Shutdown initiated; waiting up to {shutdown_timeout:?} for connections to drain"
+        );
 
         let start_time = Instant::now();
 
