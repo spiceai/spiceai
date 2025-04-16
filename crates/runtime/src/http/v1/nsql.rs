@@ -135,7 +135,7 @@ fn return_sql_only(accept: Option<&TypedHeader<Accept>>) -> bool {
     accept.is_some_and(|a| accept_header_types(a).contains(&"application/sql".to_string()))
 }
 
-/// Text to SQL
+/// Text-to-SQL (NSQL)
 ///
 /// Generate and optionally execute an NSQL query.
 ///
