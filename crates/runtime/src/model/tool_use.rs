@@ -373,7 +373,7 @@ impl Chat for ToolUsingChat {
         let context = RequestContext::current(AsyncMarker::new().await);
         let inner_req = self.prepare_req(req).await?;
 
-        // wrap the completion stream to track the `ai_inferences_count` when it is ready.
+        // wrap the completion stream to track the `ai_inferences_with_spice_count` when it is ready.
         let stream = self.chat_stream_inner(inner_req).await?;
         Ok(Box::pin(InferenceTrackingStream::new(stream, context)))
     }
@@ -387,7 +387,7 @@ impl Chat for ToolUsingChat {
             .chat_request_inner(inner_req, self.recursion_limit)
             .await;
 
-        // track ai_inferences_count metric
+        // track ai_inferences_with_spice_count metric
         let context = RequestContext::current(AsyncMarker::new().await);
         crate::model::track_ai_inferences_with_spice_count(&context);
 

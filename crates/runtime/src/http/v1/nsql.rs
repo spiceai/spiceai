@@ -237,7 +237,7 @@ pub(crate) async fn post(
     accept: Option<TypedHeader<Accept>>,
     Json(payload): Json<Request>,
 ) -> Response {
-    // track ai_inferences_count metric
+    // track ai_inferences_with_spice_count metric
     let context = RequestContext::current(AsyncMarker::new().await);
     crate::model::add_tools_used(&context, 1);
 
