@@ -47,6 +47,7 @@ Indexes are not required for test coverage, but can be introduced if required fo
 
 - [ ] Integration tests to cover accelerating data from S3 parquet, MySQL, Postgres with the [Core Arrow Data Types](../definitions.md)
 - [ ] Integration tests to cover "On Conflict" behaviors.
+- [ ] An integration or benchmark test validating the maximum column count use case is added.
 
 #### TPC-H
 
