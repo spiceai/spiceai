@@ -30,6 +30,8 @@ The Beta release criteria expand on and require that all [Alpha release criteria
 - [ ] Embdedded accelerators support file-mode storage (e.g. SQLite, DuckDB)
 - [ ] [Core Arrow Data Types](../definitions.md) are supported
 - [ ] All known [Major Bugs](../definitions.md) are resolved
+- [ ] The accelerator supports reading datasets with the same max column count as the accelerator source.
+  - For example, if the accelerator source supports tables with 1000 columns, the accelerator should support accelerating this table and querying against it.
 
 ### Test Coverage
 

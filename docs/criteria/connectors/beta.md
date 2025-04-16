@@ -82,7 +82,7 @@ The Beta release criteria expand on and require that all [Alpha release criteria
 - [ ] All [Alpha release criteria](./alpha.md) pass for this connector.
 - [ ] [Core Connector Data Types](../definitions.md) are supported.
 - [ ] The connector supports reading datasets with the same max column count as the connector source.
-  - For example, if an underlying database supports tables with 1000 columns, the connector should support adding this table as a dataset and querying against it.
+  - For example, if the connector source supports tables with 1000 columns, the connector should support adding this table as a dataset and querying against it.
 
 #### Documentation
 
