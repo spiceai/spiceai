@@ -16,11 +16,10 @@ limitations under the License.
 
 use std::sync::LazyLock;
 
-use opentelemetry::metrics::Gauge;
+use test_framework::opentelemetry::metrics::Gauge;
+use test_framework::telemetry::METER;
 
-use super::METER;
-
-pub(crate) static ITERATIONS: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+pub static ITERATIONS: LazyLock<Gauge<u64>> = LazyLock::new(|| {
     METER
         .u64_gauge("iterations")
         .with_description("Number of query iterations.")
@@ -28,7 +27,7 @@ pub(crate) static ITERATIONS: LazyLock<Gauge<u64>> = LazyLock::new(|| {
         .build()
 });
 
-pub(crate) static QUERY_STATUS: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+pub static QUERY_STATUS: LazyLock<Gauge<u64>> = LazyLock::new(|| {
     METER
         .u64_gauge("query_status")
         .with_description("Query pass status.")
@@ -36,7 +35,7 @@ pub(crate) static QUERY_STATUS: LazyLock<Gauge<u64>> = LazyLock::new(|| {
         .build()
 });
 
-pub(crate) static ROW_COUNT: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+pub static ROW_COUNT: LazyLock<Gauge<u64>> = LazyLock::new(|| {
     METER
         .u64_gauge("row_count")
         .with_description("Number of rows returned from the query.")
@@ -44,7 +43,7 @@ pub(crate) static ROW_COUNT: LazyLock<Gauge<u64>> = LazyLock::new(|| {
         .build()
 });
 
-pub(crate) static MEDIAN_DURATION: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+pub static MEDIAN_DURATION: LazyLock<Gauge<u64>> = LazyLock::new(|| {
     METER
         .u64_gauge("median_duration")
         .with_description("Median duration of the query.")
@@ -52,7 +51,7 @@ pub(crate) static MEDIAN_DURATION: LazyLock<Gauge<u64>> = LazyLock::new(|| {
         .build()
 });
 
-pub(crate) static MIN_DURATION: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+pub static MIN_DURATION: LazyLock<Gauge<u64>> = LazyLock::new(|| {
     METER
         .u64_gauge("min_duration")
         .with_description("Minimum duration of the query.")
@@ -60,7 +59,7 @@ pub(crate) static MIN_DURATION: LazyLock<Gauge<u64>> = LazyLock::new(|| {
         .build()
 });
 
-pub(crate) static MAX_DURATION: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+pub static MAX_DURATION: LazyLock<Gauge<u64>> = LazyLock::new(|| {
     METER
         .u64_gauge("max_duration")
         .with_description("Maximum duration of the query.")
@@ -68,7 +67,7 @@ pub(crate) static MAX_DURATION: LazyLock<Gauge<u64>> = LazyLock::new(|| {
         .build()
 });
 
-pub(crate) static P90_DURATION: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+pub static P90_DURATION: LazyLock<Gauge<u64>> = LazyLock::new(|| {
     METER
         .u64_gauge("p90_duration")
         .with_description("90th percentile duration of the query.")
@@ -76,7 +75,7 @@ pub(crate) static P90_DURATION: LazyLock<Gauge<u64>> = LazyLock::new(|| {
         .build()
 });
 
-pub(crate) static P95_DURATION: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+pub static P95_DURATION: LazyLock<Gauge<u64>> = LazyLock::new(|| {
     METER
         .u64_gauge("p95_duration")
         .with_description("95th percentile duration of the query.")
@@ -84,7 +83,7 @@ pub(crate) static P95_DURATION: LazyLock<Gauge<u64>> = LazyLock::new(|| {
         .build()
 });
 
-pub(crate) static P99_DURATION: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+pub static P99_DURATION: LazyLock<Gauge<u64>> = LazyLock::new(|| {
     METER
         .u64_gauge("p99_duration")
         .with_description("99th percentile duration of the query.")

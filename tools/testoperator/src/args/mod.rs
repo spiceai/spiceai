@@ -87,7 +87,7 @@ pub struct CommonArgs {
     #[arg(short, long)]
     pub(crate) data_dir: Option<PathBuf>,
 
-    /// The Spice.ai dataset to upload the test results to after the test has completed
+    /// Whether to enable metrics collection
     #[arg(long)]
-    pub(crate) upload_results_dataset: Option<String>,
+    pub(crate) metrics: bool,
 }

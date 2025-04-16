@@ -416,16 +416,13 @@ impl<T: ExtendedMetrics, R: ExtendedMetrics> QueryMetrics<T, R> {
             Field::new("iterations", DataType::UInt64, false),
             Field::new("commit_sha", DataType::Utf8, false),
             Field::new("branch_name", DataType::Utf8, false),
-        ];
-
-        base_fields.extend(extended_fields);
-
-        base_fields.extend(vec![
             Field::new("median_duration_ms", DataType::UInt64, false),
             Field::new("percentile_99_duration_ms", DataType::UInt64, false),
             Field::new("percentile_95_duration_ms", DataType::UInt64, false),
             Field::new("percentile_90_duration_ms", DataType::UInt64, false),
-        ]);
+        ];
+
+        base_fields.extend(extended_fields);
 
         Arc::new(Schema::new(base_fields))
     }
@@ -541,6 +538,10 @@ impl<T: ExtendedMetrics, R: ExtendedMetrics> QueryMetrics<T, R> {
             Arc::new(UInt64Array::from(iterations)),
             Arc::new(StringArray::from(commit_sha)),
             Arc::new(StringArray::from(branch_name)),
+            Arc::new(UInt64Array::from(median_duration_ms)),
+            Arc::new(UInt64Array::from(percentile_99_duration_ms)),
+            Arc::new(UInt64Array::from(percentile_95_duration_ms)),
+            Arc::new(UInt64Array::from(percentile_90_duration_ms)),
         ];
 
         let extended_metrics_fields = T::fields();
@@ -566,13 +567,6 @@ impl<T: ExtendedMetrics, R: ExtendedMetrics> QueryMetrics<T, R> {
                 }
             }
         }
-
-        columns.extend(vec![
-            Arc::new(UInt64Array::from(median_duration_ms)) as ArrayRef,
-            Arc::new(UInt64Array::from(percentile_99_duration_ms)) as ArrayRef,
-            Arc::new(UInt64Array::from(percentile_95_duration_ms)) as ArrayRef,
-            Arc::new(UInt64Array::from(percentile_90_duration_ms)) as ArrayRef,
-        ]);
 
         Ok(vec![RecordBatch::try_new(Self::records_schema(), columns)?])
     }

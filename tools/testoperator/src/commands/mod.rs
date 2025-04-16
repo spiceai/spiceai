@@ -35,6 +35,11 @@ pub(crate) mod vector_search;
 pub(crate) type RowCounts = BTreeMap<String, usize>;
 
 pub(crate) fn get_app_and_start_request(args: &CommonArgs) -> anyhow::Result<(App, StartRequest)> {
+    if !args.metrics {
+        // call the meter to set telemetry to no-op, because the OnceLock hasn't been set yet
+        test_framework::telemetry::METER_PROVIDER.meter("benchmarks_telemetry");
+    }
+
     let spicepod = Spicepod::load_exact(args.spicepod_path.clone())?;
     let app = test_framework::app::AppBuilder::new(spicepod.name.clone())
         .with_spicepod(spicepod)

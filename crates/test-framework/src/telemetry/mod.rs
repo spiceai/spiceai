@@ -16,6 +16,8 @@ limitations under the License.
 
 use std::sync::{Arc, LazyLock};
 
+use anyhow::Result;
+
 use opentelemetry::metrics::Meter;
 
 use opentelemetry_sdk::metrics::exporter::PushMetricExporter;
@@ -26,7 +28,8 @@ use opentelemetry_sdk::{
 };
 
 use telemetry::exporter::TelemetryExporterBuilder;
-use telemetry::meter::{METER_PROVIDER, METER_PROVIDER_ONCE};
+pub use telemetry::meter::{METER_PROVIDER, METER_PROVIDER_ONCE};
+use telemetry::reader::InitialReader;
 
 const ENDPOINT_CONST: &str = "https://telemetry.spiceai.io";
 
@@ -36,17 +39,17 @@ pub static ENDPOINT: LazyLock<Arc<str>> = LazyLock::new(|| {
         .into()
 });
 
-pub(crate) static METER: LazyLock<Meter> =
-    LazyLock::new(|| METER_PROVIDER.meter("benchmarks_telemetry"));
+pub static METER: LazyLock<Meter> = LazyLock::new(|| METER_PROVIDER.meter("benchmarks_telemetry"));
 
-pub(crate) struct Telemetry {
+pub struct Telemetry {
     reader: InitialReader,
     resource: Resource,
+    setup: bool,
 }
 
 impl Telemetry {
     #[must_use]
-    pub(crate) fn new(resource: &Resource) -> Self {
+    pub fn new(resource: &Resource) -> Self {
         let reader = InitialReader::default();
 
         let provider = SdkMeterProvider::builder()
@@ -54,17 +57,26 @@ impl Telemetry {
             .with_reader(reader.clone())
             .build();
 
-        if METER_PROVIDER_ONCE.set(Arc::new(provider)).is_err() {
+        let setup = if METER_PROVIDER_ONCE.set(Arc::new(provider)).is_err() {
             println!("Testoperator metrics are disabled");
-        }
+            false
+        } else {
+            true
+        };
 
         Self {
             reader,
             resource: resource.clone(),
+            setup,
         }
     }
 
-    pub(crate) async fn read(&self, api_key: Option<&str>) -> Result<()> {
+    pub async fn read(&self, api_key: Option<&str>) -> Result<()> {
+        if !self.setup {
+            println!("Telemetry is disabled");
+            return Ok(());
+        }
+
         if let Some(api_key) = api_key {
             let telemetry_exporter = otel_arrow::OtelArrowExporter::new(
                 TelemetryExporterBuilder::new()
@@ -95,8 +107,3 @@ impl Telemetry {
         Ok(())
     }
 }
-
-mod metrics;
-pub(crate) use metrics::*;
-use telemetry::reader::InitialReader;
-use test_framework::anyhow::Result;

@@ -16,19 +16,20 @@ limitations under the License.
 
 use super::{RowCounts, get_app_and_start_request};
 use crate::{args::DatasetTestArgs, wait_test_and_memory};
-use opentelemetry::KeyValue;
-use opentelemetry_sdk::Resource;
 use std::time::Duration;
 use test_framework::{
     TestType, anyhow,
     arrow::util::pretty::print_batches,
     metrics::{MetricCollector, NoExtendedMetrics, QueryMetrics, QueryStatus},
+    opentelemetry::KeyValue,
+    opentelemetry_sdk::Resource,
     queries::{QueryOverrides, QuerySet},
     spiced::SpicedInstance,
     spicetest::{
         SpiceTest,
         datasets::{EndCondition, NotStarted},
     },
+    telemetry::Telemetry,
     tokio_util::sync::CancellationToken,
     utils::observe_memory,
 };
@@ -81,17 +82,17 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
         KeyValue::new("benchmark.name", app_name.clone()),
         KeyValue::new("benchmark.spiced_version", spiced_version.clone()),
         KeyValue::new("benchmark.query_set", query_set.to_string()),
-        KeyValue::new("benchmark.commit_sha", commit_sha.clone()),
+        KeyValue::new("benchmark.spiced_commit_sha", commit_sha.clone()),
     ]);
 
-    let telemetry = crate::telemetry::Telemetry::new(&benchmark_resource);
+    let telemetry = Telemetry::new(&benchmark_resource);
 
     for query in &metrics.metrics {
         let query_name = query.query_name.clone();
         let row_count = row_counts.get(&query_name).unwrap_or(&0);
         let attributes = vec![
             KeyValue::new("query_name", query_name),
-            KeyValue::new("commit_sha", commit_sha.clone()),
+            KeyValue::new("spiced_commit_sha", commit_sha.clone()),
             KeyValue::new("spiced_version", spiced_version.clone()),
             KeyValue::new("query_set", query_set.to_string()),
         ];
@@ -101,15 +102,15 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
             QueryStatus::Failed => false,
         });
 
-        crate::telemetry::QUERY_STATUS.record(status, &attributes);
-        crate::telemetry::MEDIAN_DURATION.record(query.median_duration_ms, &attributes);
-        crate::telemetry::MIN_DURATION.record(query.min_duration_ms, &attributes);
-        crate::telemetry::MAX_DURATION.record(query.max_duration_ms, &attributes);
-        crate::telemetry::ITERATIONS.record(query.iterations.try_into()?, &attributes);
-        crate::telemetry::P90_DURATION.record(query.percentile_90_duration_ms, &attributes);
-        crate::telemetry::P95_DURATION.record(query.percentile_95_duration_ms, &attributes);
-        crate::telemetry::P99_DURATION.record(query.percentile_99_duration_ms, &attributes);
-        crate::telemetry::ROW_COUNT.record((*row_count).try_into()?, &attributes);
+        crate::metrics::QUERY_STATUS.record(status, &attributes);
+        crate::metrics::MEDIAN_DURATION.record(query.median_duration_ms, &attributes);
+        crate::metrics::MIN_DURATION.record(query.min_duration_ms, &attributes);
+        crate::metrics::MAX_DURATION.record(query.max_duration_ms, &attributes);
+        crate::metrics::ITERATIONS.record(query.iterations.try_into()?, &attributes);
+        crate::metrics::P90_DURATION.record(query.percentile_90_duration_ms, &attributes);
+        crate::metrics::P95_DURATION.record(query.percentile_95_duration_ms, &attributes);
+        crate::metrics::P99_DURATION.record(query.percentile_99_duration_ms, &attributes);
+        crate::metrics::ROW_COUNT.record((*row_count).try_into()?, &attributes);
     }
 
     telemetry
