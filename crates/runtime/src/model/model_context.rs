@@ -100,7 +100,7 @@ impl<S> Layer<S> for ModelContextLayer {
     }
 }
 
-/// Emit the `ai_inference_count` metric with the `tools_used` dimension set to true or false.
+/// Emit the `ai_inference_count` metric with the `tools_used` dimension set to the number of called tools.
 /// It requires the model extension to be set for the request context.
 ///
 /// # Panics
@@ -108,10 +108,8 @@ impl<S> Layer<S> for ModelContextLayer {
 /// Panics if the model extension is not found in the request context.
 pub fn track_ai_inferences_count(context: &Arc<RequestContext>) {
     if let Some(model_context) = context.extension::<ModelContextExtension>() {
-        let dimensions = vec![KeyValue::new(
-            "tools_used",
-            model_context.tools_used().try_into().unwrap_or_default(),
-        )];
+        let tools_used: i64 = model_context.tools_used().try_into().unwrap_or_default();
+        let dimensions = vec![KeyValue::new("tools_used", tools_used)];
         crate::metrics::telemetry::track_ai_inferences_with_spice_count(&dimensions);
     } else if cfg!(feature = "dev") {
         panic!("ModelContextExtension not found in request context");
