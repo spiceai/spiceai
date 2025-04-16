@@ -14,34 +14,66 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use arrow::array::RecordBatch;
 use async_trait::async_trait;
 use flight_client::{Credentials, FlightClient};
 use opentelemetry_sdk::metrics::MetricError;
+use secrecy::SecretString;
 
-#[derive(Debug, Clone)]
-pub struct AnonymousTelemetryExporter {
-    flight_client: Option<FlightClient>,
+const ENDPOINT_CONST: &str = "https://telemetry.spiceai.io";
+
+pub static ENDPOINT: LazyLock<Arc<str>> = LazyLock::new(|| {
+    std::env::var("SPICEAI_TELEMETRY_ENDPOINT")
+        .unwrap_or_else(|_| ENDPOINT_CONST.into())
+        .into()
+});
+
+#[derive(Debug, Default)]
+pub struct TelemetryExporterBuilder {
+    api_key: Option<SecretString>,
 }
 
-impl AnonymousTelemetryExporter {
-    #[allow(dead_code)]
-    pub async fn new(url: Arc<str>) -> Self {
-        let flight_client = match FlightClient::try_new(url, Credentials::anonymous(), None).await {
+impl TelemetryExporterBuilder {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[must_use]
+    pub fn with_api_key(mut self, api_key: SecretString) -> Self {
+        self.api_key = Some(api_key);
+        self
+    }
+
+    #[must_use]
+    pub async fn build(self, url: Arc<str>) -> TelemetryExporter {
+        let credentials = if let Some(api_key) = self.api_key {
+            Credentials::new("", api_key)
+        } else {
+            Credentials::anonymous()
+        };
+
+        let flight_client = match FlightClient::try_new(url, credentials, None).await {
             Ok(client) => Some(client),
             Err(e) => {
                 tracing::trace!("Unable to initialize anonymous telemetry: {e}");
                 None
             }
         };
-        Self { flight_client }
+
+        TelemetryExporter { flight_client }
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct TelemetryExporter {
+    flight_client: Option<FlightClient>,
+}
+
 #[async_trait]
-impl otel_arrow::ArrowExporter for AnonymousTelemetryExporter {
+impl otel_arrow::ArrowExporter for TelemetryExporter {
     async fn export(&self, metrics: RecordBatch) -> Result<(), MetricError> {
         let Some(mut flight_client) = self.flight_client.clone() else {
             return Ok(());

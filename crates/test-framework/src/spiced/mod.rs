@@ -183,15 +183,9 @@ impl SpicedInstance {
         metadata.insert("user-agent", "spice-test-framework/1.0".parse()?);
 
         let credentials = if let Some(api_key) = api_key {
-            Credentials::UsernamePassword {
-                username: "".into(),
-                password: api_key.into(),
-            }
+            Credentials::new("", api_key.into())
         } else {
-            Credentials::UsernamePassword {
-                username: "".into(),
-                password: "".into(),
-            }
+            Credentials::new("", "".into())
         };
 
         Ok(

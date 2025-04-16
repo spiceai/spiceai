@@ -4484,6 +4484,7 @@ dependencies = [
  "futures",
  "rustls-native-certs 0.8.1",
  "rustls-pemfile 2.2.0",
+ "secrecy",
  "snafu",
  "tonic",
 ]
@@ -12153,6 +12154,7 @@ dependencies = [
  "opentelemetry 0.27.1",
  "opentelemetry_sdk 0.27.1",
  "otel-arrow",
+ "secrecy",
  "sha2",
  "tokio",
  "tracing",

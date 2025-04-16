@@ -14,40 +14,23 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::sync::{Arc, LazyLock, OnceLock};
+use std::sync::{Arc, LazyLock};
 
-use opentelemetry::metrics::{Meter, MeterProvider};
+use opentelemetry::metrics::Meter;
 
 use opentelemetry_sdk::metrics::exporter::PushMetricExporter;
 use opentelemetry_sdk::{
     Resource,
     metrics::{SdkMeterProvider, data::ResourceMetrics},
 };
-use telemetry::noop::NoopMeterProvider;
 
-const ENDPOINT_CONST: &str = "https://telemetry.spiceai.io";
-
-static ENDPOINT: LazyLock<Arc<str>> = LazyLock::new(|| {
-    std::env::var("SPICEAI_TELEMETRY_ENDPOINT")
-        .unwrap_or_else(|_| ENDPOINT_CONST.into())
-        .into()
-});
-
-pub(crate) static METER_PROVIDER_ONCE: OnceLock<Arc<dyn MeterProvider + Send + Sync>> =
-    OnceLock::new();
-
-static METER_PROVIDER: LazyLock<&'static Arc<dyn MeterProvider + Send + Sync>> =
-    LazyLock::new(|| METER_PROVIDER_ONCE.get_or_init(|| Arc::new(NoopMeterProvider::new())));
+use telemetry::exporter::{ENDPOINT, TelemetryExporterBuilder};
+use telemetry::meter::{METER_PROVIDER, METER_PROVIDER_ONCE};
 
 pub(crate) static METER: LazyLock<Meter> =
     LazyLock::new(|| METER_PROVIDER.meter("benchmarks_telemetry"));
 
-pub(crate) async fn setup(resource: Resource, api_key: Arc<str>) {
-    // TODO: setup an exporter with API key
-    let telemetry_exporter = otel_arrow::OtelArrowExporter::new(
-        AuthenticatedTelemetryExporter::new(ENDPOINT.clone(), api_key).await,
-    );
-
+pub(crate) async fn setup(resource: Resource, api_key: Option<&str>) {
     let provider = SdkMeterProvider::builder()
         .with_resource(resource.clone())
         .build();
@@ -56,20 +39,29 @@ pub(crate) async fn setup(resource: Resource, api_key: Arc<str>) {
         println!("Testoperator metrics are disabled");
     }
 
-    let mut rm = ResourceMetrics {
-        resource,
-        scope_metrics: vec![],
-    };
+    if let Some(api_key) = api_key {
+        let telemetry_exporter = otel_arrow::OtelArrowExporter::new(
+            TelemetryExporterBuilder::new()
+                .with_api_key(api_key.into())
+                .build(ENDPOINT.clone())
+                .await,
+        );
 
-    telemetry_exporter
-        .export(&mut rm)
-        .await
-        .unwrap_or_else(|err| {
-            println!("Failed to export initial telemetry: {err:?}");
-        });
+        let mut rm = ResourceMetrics {
+            resource,
+            scope_metrics: vec![],
+        };
+
+        telemetry_exporter
+            .export(&mut rm)
+            .await
+            .unwrap_or_else(|err| {
+                println!("Failed to export initial telemetry: {err:?}");
+            });
+    } else {
+        println!("No API key provided, telemetry is disabled");
+    }
 }
 
-mod exporter;
 mod metrics;
-pub(crate) use exporter::*;
 pub(crate) use metrics::*;

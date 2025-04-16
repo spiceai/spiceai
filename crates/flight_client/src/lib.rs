@@ -33,6 +33,8 @@ use base64::prelude::BASE64_STANDARD;
 use bytes::Bytes;
 use futures::StreamExt;
 use futures::{TryStreamExt, ready, stream};
+use secrecy::ExposeSecret;
+use secrecy::SecretString;
 use snafu::prelude::*;
 use std::error::Error as StdError;
 use tonic::IntoRequest;
@@ -175,14 +177,14 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 pub enum Credentials {
     UsernamePassword {
         username: Arc<str>,
-        password: Arc<str>,
+        password: Arc<SecretString>,
     },
     Anonymous,
 }
 
 impl Credentials {
     #[must_use]
-    pub fn new(username: &str, password: &str) -> Self {
+    pub fn new(username: &str, password: SecretString) -> Self {
         Credentials::UsernamePassword {
             username: username.into(),
             password: password.into(),
@@ -525,7 +527,11 @@ impl FlightClient {
             payload: Bytes::default(),
         };
         let mut req = tonic::Request::new(stream::iter(vec![cmd]));
-        let val = BASE64_STANDARD.encode(format!("{username}:{password}"));
+        let val = BASE64_STANDARD.encode(format!(
+            "{username}:{password}",
+            password = password.expose_secret()
+        ));
+
         let val = format!("Basic {val}")
             .parse()
             .context(InvalidMetadataSnafu)?;

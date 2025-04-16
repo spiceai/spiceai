@@ -162,9 +162,9 @@ impl DataConnectorFactory for DremioFactory {
                 params
                     .parameters
                     .get("password")
-                    .expose()
                     .ok()
-                    .unwrap_or_default(),
+                    .cloned()
+                    .unwrap_or("".into()),
             );
             let flight_client = FlightClient::try_new(endpoint, credentials, None)
                 .await

@@ -185,9 +185,8 @@ impl DataConnectorFactory for SpiceAIFactory {
             let api_key = params
                 .parameters
                 .get("api_key")
-                .expose()
                 .ok_or_else(|p| MissingRequiredParameterSnafu { parameter: p.0 }.build())?;
-            let credentials = Credentials::new("", api_key);
+            let credentials = Credentials::new("", api_key.clone());
 
             let flight_client = FlightClient::try_new(url, credentials, None)
                 .await

@@ -15,11 +15,11 @@ limitations under the License.
 */
 
 use std::{
-    sync::{Arc, LazyLock, Weak},
+    sync::{Arc, Weak},
     time::Duration,
 };
 
-use crate::exporter::AnonymousTelemetryExporter;
+use crate::exporter::{ENDPOINT, TelemetryExporterBuilder};
 use opentelemetry::KeyValue;
 use opentelemetry_sdk::{
     Resource,
@@ -32,17 +32,9 @@ use opentelemetry_sdk::{
 use otel_arrow::OtelArrowExporter;
 use sha2::{Digest, Sha256};
 
-const ENDPOINT_CONST: &str = "https://telemetry.spiceai.io";
-
 /// How often to send telemetry data to the endpoint
 const TELEMETRY_INTERVAL_SECONDS: u64 = 3600; // 1 hour
 const TELEMETRY_TIMEOUT_SECONDS: u64 = 30;
-
-static ENDPOINT: LazyLock<Arc<str>> = LazyLock::new(|| {
-    std::env::var("SPICEAI_TELEMETRY_ENDPOINT")
-        .unwrap_or_else(|_| ENDPOINT_CONST.into())
-        .into()
-});
 
 fn resource(spicepod_name: &str, telemetry_properties: Vec<KeyValue>) -> Resource {
     let hostname = hostname::get()
@@ -72,8 +64,11 @@ fn resource(spicepod_name: &str, telemetry_properties: Vec<KeyValue>) -> Resourc
 pub async fn start(spicepod_name: &str, telemetry_properties: Vec<KeyValue>) {
     let resource = resource(spicepod_name, telemetry_properties);
 
-    let oss_telemetry_exporter =
-        OtelArrowExporter::new(AnonymousTelemetryExporter::new(Arc::clone(&ENDPOINT)).await);
+    let oss_telemetry_exporter = OtelArrowExporter::new(
+        TelemetryExporterBuilder::new()
+            .build(Arc::clone(&ENDPOINT))
+            .await,
+    );
 
     let periodic_reader = PeriodicReader::builder(oss_telemetry_exporter.clone(), Tokio)
         .with_interval(Duration::from_secs(TELEMETRY_INTERVAL_SECONDS))
