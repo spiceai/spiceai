@@ -2,6 +2,17 @@ use std::collections::HashMap;
 
 use datafusion::{common::ParamValues, scalar::ScalarValue};
 use serde_json::Value;
+use snafu::prelude::*;
+
+#[derive(Snafu, Debug)]
+pub enum Error {
+    #[snafu(display("Nested arrays or objects are not supported as parameter values"))]
+    NestedValues,
+    #[snafu(display("Unsupported JSON number format"))]
+    UnsupportedJsonNumberFormat,
+    #[snafu(display("Parameters must be a JSON array or an object"))]
+    JsonArrayOrObjectRequired,
+}
 
 /// Converts a serde_json::Value into a datafusion::common::ParamValues.
 ///
@@ -19,14 +30,12 @@ use serde_json::Value;
 /// # Errors
 /// - Returns an error if the top-level JSON is not an array or object.
 /// - Returns an error if any value cannot be converted to a ScalarValue.
-pub fn convert_json_to_param_values(json: Value) -> Result<ParamValues, String> {
+pub fn convert_json_to_param_values(json: Value) -> Result<ParamValues, Error> {
     match json {
         Value::Array(arr) => {
             let mut vec = Vec::with_capacity(arr.len());
-            for (i, val) in arr.into_iter().enumerate() {
-                let scalar = json_to_scalar(&val).map_err(|e| {
-                    format!("failed to convert array element at index {}: {}", i, e)
-                })?;
+            for val in arr {
+                let scalar = json_to_scalar(&val)?;
                 vec.push(scalar);
             }
             Ok(ParamValues::List(vec))
@@ -34,13 +43,12 @@ pub fn convert_json_to_param_values(json: Value) -> Result<ParamValues, String> 
         Value::Object(obj) => {
             let mut map = HashMap::new();
             for (key, val) in obj {
-                let scalar = json_to_scalar(&val)
-                    .map_err(|e| format!("failed to convert value for key '{}': {}", key, e))?;
+                let scalar = json_to_scalar(&val)?;
                 map.insert(key, scalar);
             }
             Ok(ParamValues::Map(map))
         }
-        _ => Err("params must be a JSON array or object".to_string()),
+        _ => Err(Error::JsonArrayOrObjectRequired),
     }
 }
 
@@ -58,7 +66,7 @@ pub fn convert_json_to_param_values(json: Value) -> Result<ParamValues, String> 
 /// - Number -> ScalarValue::Int64(Some(i64)) if integer, else ScalarValue::Float64(Some(f64))
 /// - String -> ScalarValue::Utf8(Some(String))
 /// - Arrays and objects return an error (handled at a higher level).
-fn json_to_scalar(json: &Value) -> Result<ScalarValue, String> {
+fn json_to_scalar(json: &Value) -> Result<ScalarValue, Error> {
     match json {
         Value::Null => Ok(ScalarValue::Utf8(None)),
         Value::Bool(b) => Ok(ScalarValue::Boolean(Some(*b))),
@@ -67,14 +75,14 @@ fn json_to_scalar(json: &Value) -> Result<ScalarValue, String> {
                 Ok(ScalarValue::Int64(Some(i)))
             } else if let Some(f) = n.as_f64() {
                 Ok(ScalarValue::Float64(Some(f)))
+            } else if let Some(i) = n.as_u64() {
+                Ok(ScalarValue::UInt64(Some(i)))
             } else {
-                Err("Unsupported JSON number format".to_string())
+                Err(Error::UnsupportedJsonNumberFormat)
             }
         }
         Value::String(s) => Ok(ScalarValue::Utf8(Some(s.clone()))),
-        Value::Array(_) | Value::Object(_) => {
-            Err("Nested arrays or objects are not supported as parameter values".to_string())
-        }
+        Value::Array(_) | Value::Object(_) => Err(Error::NestedValues),
     }
 }
 
