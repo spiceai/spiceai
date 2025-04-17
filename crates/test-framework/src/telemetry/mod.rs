@@ -32,7 +32,7 @@ use telemetry::exporter::TelemetryExporterBuilder;
 pub use telemetry::meter::{METER_PROVIDER, METER_PROVIDER_ONCE};
 use telemetry::reader::InitialReader;
 
-const ENDPOINT_CONST: &str = "https://dev-telemetry.spiceai.io";
+const ENDPOINT_CONST: &str = "https://telemetry.spiceai.io";
 
 pub static ENDPOINT: LazyLock<Arc<str>> = LazyLock::new(|| {
     std::env::var("SPICEAI_TELEMETRY_ENDPOINT")
