@@ -90,3 +90,11 @@ pub static P99_DURATION: LazyLock<Gauge<u64>> = LazyLock::new(|| {
         .with_unit("ms")
         .build()
 });
+
+pub static TEST_DURATION: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+    METER
+        .u64_gauge("test_duration")
+        .with_description("The entire duration of the test.")
+        .with_unit("s")
+        .build()
+});

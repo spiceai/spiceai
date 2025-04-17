@@ -113,6 +113,9 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
         crate::metrics::ROW_COUNT.record((*row_count).try_into()?, &attributes);
     }
 
+    crate::metrics::TEST_DURATION
+        .record((metrics.finished_at - metrics.started_at).try_into()?, &[]);
+
     telemetry.emit().await?;
 
     let records = metrics.with_memory_usage(max_memory).build_records()?;
