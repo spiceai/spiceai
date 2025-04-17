@@ -183,10 +183,10 @@ pub enum Credentials {
     },
     // Anonymous access
     Anonymous,
-    // An explicitly exact token
-    Exact {
+    // An existing bearer token
+    Bearer {
         token: Arc<SecretString>,
-        bearer: bool, // whether this token is a Bearer token, or if it is set to the 'authorization' header verbatim
+        prefix: bool, // whether this token requires the 'Bearer ' prefix, or if it is set to the 'authorization' header verbatim
     },
 }
 
@@ -558,7 +558,10 @@ impl FlightClient {
                 (username.as_ref(), password.expose_secret())
             }
             Credentials::Anonymous => return Ok(None),
-            Credentials::Exact { token, bearer } => {
+            Credentials::Bearer {
+                token,
+                prefix: bearer,
+            } => {
                 return Ok(Some(Token::new(token.expose_secret(), *bearer)));
             }
         };

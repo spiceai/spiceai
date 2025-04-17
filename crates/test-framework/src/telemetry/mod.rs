@@ -86,9 +86,9 @@ impl Telemetry {
             println!("Emitting to exporter at {}", *ENDPOINT);
             let telemetry_exporter = otel_arrow::OtelArrowExporter::new(
                 TelemetryExporterBuilder::new()
-                    .with_credentials(flight_client::Credentials::Exact {
+                    .with_credentials(flight_client::Credentials::Bearer {
                         token: api_key.clone().into(),
-                        bearer: false,
+                        prefix: false,
                     })
                     .with_service_name("benchmarks_telemetry".into())
                     .with_endpoint(Arc::clone(&ENDPOINT))
