@@ -22,7 +22,8 @@ use arrow::{
 };
 use arrow_cast::cast;
 use arrow_schema::Schema;
-use snafu::prelude::*;
+use datafusion::{common::ParamValues, error::DataFusionError, scalar::ScalarValue};
+use snafu::{ResultExt, prelude::*};
 use std::sync::Arc;
 
 use crate::format::{FormatOperation, format_column_data};
@@ -206,6 +207,44 @@ pub fn truncate_numeric_column_length(
         .unzip::<_, _, Vec<_>, Vec<_>>();
 
     RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+}
+
+/// Converts a record batch with a single row into ParamValues
+pub fn record_to_param_values(batch: &RecordBatch) -> Result<ParamValues, DataFusionError> {
+    let mut param_values: Vec<(String, Option<usize>, ScalarValue)> = Vec::new();
+
+    let mut is_list = true;
+    for col_index in 0..batch.num_columns() {
+        let array = batch.column(col_index);
+        let scalar = ScalarValue::try_from_array(array, 0)?;
+        let name = batch
+            .schema_ref()
+            .field(col_index)
+            .name()
+            .trim_start_matches('$')
+            .to_string();
+        let index = name.parse().ok();
+        is_list &= index.is_some();
+        param_values.push((name, index, scalar));
+    }
+    if is_list {
+        let mut values: Vec<(Option<usize>, ScalarValue)> = param_values
+            .into_iter()
+            .map(|(_name, index, value)| (index, value))
+            .collect();
+        values.sort_by_key(|(index, _value)| *index);
+        Ok(values
+            .into_iter()
+            .map(|(_index, value)| value)
+            .collect::<Vec<ScalarValue>>()
+            .into())
+    } else {
+        Ok(param_values
+            .into_iter()
+            .map(|(name, _index, value)| (name, value))
+            .collect::<Vec<(String, ScalarValue)>>()
+            .into())
+    }
 }
 
 fn is_numeric_list(field: &Arc<Field>) -> bool {

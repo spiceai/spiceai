@@ -16,7 +16,7 @@ limitations under the License.
 
 use std::sync::Arc;
 
-use arrow::{array::RecordBatch, compute::concat_batches};
+use arrow::compute::concat_batches;
 use arrow_flight::{
     FlightData, FlightDescriptor, FlightEndpoint, FlightInfo, Ticket,
     decode::{DecodedPayload, FlightDataDecoder},
@@ -25,9 +25,8 @@ use arrow_flight::{
 };
 use arrow_ipc::{reader::StreamReader, writer::StreamWriter};
 use arrow_schema::SchemaRef;
-use datafusion::{
-    common::ParamValues, error::DataFusionError, parquet::data_type::AsBytes, scalar::ScalarValue,
-};
+use arrow_tools::record_batch::record_to_param_values;
+use datafusion::{common::ParamValues, parquet::data_type::AsBytes};
 use prost::Message;
 use tokio_stream::{StreamExt, adapters::Peekable, empty};
 use tonic::{Request, Response, Status, Streaming};
@@ -234,44 +233,6 @@ fn decode_param_values(
             Ok(record_to_param_values(&batch)?)
         })
         .transpose()
-}
-
-// Converts a record batch with a single row into ParamValues
-fn record_to_param_values(batch: &RecordBatch) -> Result<ParamValues, DataFusionError> {
-    let mut param_values: Vec<(String, Option<usize>, ScalarValue)> = Vec::new();
-
-    let mut is_list = true;
-    for col_index in 0..batch.num_columns() {
-        let array = batch.column(col_index);
-        let scalar = ScalarValue::try_from_array(array, 0)?;
-        let name = batch
-            .schema_ref()
-            .field(col_index)
-            .name()
-            .trim_start_matches('$')
-            .to_string();
-        let index = name.parse().ok();
-        is_list &= index.is_some();
-        param_values.push((name, index, scalar));
-    }
-    if is_list {
-        let mut values: Vec<(Option<usize>, ScalarValue)> = param_values
-            .into_iter()
-            .map(|(_name, index, value)| (index, value))
-            .collect();
-        values.sort_by_key(|(index, _value)| *index);
-        Ok(values
-            .into_iter()
-            .map(|(_index, value)| value)
-            .collect::<Vec<ScalarValue>>()
-            .into())
-    } else {
-        Ok(param_values
-            .into_iter()
-            .map(|(name, _index, value)| (name, value))
-            .collect::<Vec<(String, ScalarValue)>>()
-            .into())
-    }
 }
 
 fn error_to_status<E: std::fmt::Debug>(err: E) -> Status {
