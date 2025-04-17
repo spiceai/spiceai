@@ -85,7 +85,7 @@ pub fn verify_schema(
 }
 
 fn is_null_placeholder(field: &Arc<Field>) -> bool {
-    field.name().starts_with("$") && field.data_type() == &DataType::Null
+    field.name().starts_with('$') && field.data_type() == &DataType::Null
 }
 
 #[must_use]
