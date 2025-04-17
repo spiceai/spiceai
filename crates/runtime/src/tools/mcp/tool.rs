@@ -31,11 +31,22 @@ use super::{McpProxy, Result};
 pub struct McpToolWrapper {
     client: Arc<RwLock<Box<dyn McpClientTrait>>>,
     spec: McpTool,
+
+    /// Spicepod defined name, not from underlying MCP.
+    server_name: String,
 }
 
 impl McpToolWrapper {
-    pub fn new(client: Arc<RwLock<Box<dyn McpClientTrait>>>, spec: McpTool) -> Self {
-        Self { client, spec }
+    pub fn new(
+        client: Arc<RwLock<Box<dyn McpClientTrait>>>,
+        spec: McpTool,
+        server_name: String,
+    ) -> Self {
+        Self {
+            client,
+            spec,
+            server_name,
+        }
     }
 
     #[must_use]
@@ -68,6 +79,10 @@ impl SpiceModelTool for McpToolWrapper {
         _rt: Arc<Runtime>,
     ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
         let span: Span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::mcp", tool = self.name().to_string(), input = arg);
+        span.in_scope(
+            || tracing::info!(target: "task_history", task_override = %format!("tool_use::{}/{}", self.server_name, self.spec.name), "labels"),
+        );
+
         let tool_use_result: Result<Value, Box<dyn std::error::Error + Send + Sync>> = async {
             let client = self.client.read().await;
 
