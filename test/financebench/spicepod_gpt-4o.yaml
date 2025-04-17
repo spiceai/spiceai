@@ -2,6 +2,10 @@ version: v1
 kind: Spicepod
 name: financebench
 
+runtime:
+  flight:
+    max_message_size: 1G
+
 models:
   - name: gpt-4o
     from: openai:gpt-4o-2024-08-06
@@ -114,9 +118,8 @@ datasets:
       spiceai_endpoint: https://flight.spiceai.io
     acceleration:
       enabled: true
-      # https://github.com/spiceai/spiceai/issues/5143
-      refresh_sql: |
-        select * from financebench.data limit 50;
+      engine: duckdb
+      mode: file
     embeddings:
       - column: content
         use: openai_embed
