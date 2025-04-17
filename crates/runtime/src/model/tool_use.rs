@@ -225,12 +225,7 @@ impl ToolUsingChat {
         messages.extend(tool_messages);
 
         if !messages.is_empty() {
-            // exclude "list_datasets" tool from counting, since it is used on every AI inference call
-            let used_tools = spiced_tools
-                .iter()
-                .filter(|t| t.function.name != "list_datasets")
-                .count();
-
+            let used_tools = spiced_tools.len();
             if used_tools > 0 {
                 let context = RequestContext::current(AsyncMarker::new().await);
                 crate::model::add_tools_used(&context, used_tools);
